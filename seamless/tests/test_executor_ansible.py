@@ -2469,6 +2469,36 @@ async def test_ansible_output_and_config_variables_are_not_forwarded(env, monkey
     assert child["ANSIBLE_REMOTE_TEMP"].startswith(str(env.settings.data_dir))
 
 
+async def test_host_key_checking_follows_the_setting_and_warns_once_per_run_while_off(
+    env, monkeypatch, caplog
+):
+    """Audit B-02 (SDD §15.1): a run's ANSIBLE_HOST_KEY_CHECKING comes from
+    SEAMLESS_ANSIBLE_HOST_KEY_CHECKING (off by default while SEC-02 is open), never from the
+    control plane's own environment, and a run without it logs one warning, not one per playbook."""
+    monkeypatch.setenv("ANSIBLE_HOST_KEY_CHECKING", "True")  # the environment no longer decides
+    logger = "seamless_migrate.executors.ansible"
+
+    def warnings() -> list[str]:
+        return [r.getMessage() for r in caplog.records if "host key" in r.getMessage().lower()]
+
+    ctx, _ = ctx_for(env, strategy=Strategy.warm)
+    with caplog.at_level(logging.WARNING, logger=logger):
+        await env.executor.run(StepName.PRECOPY, ctx)
+    assert len(warnings()) == 1, warnings()
+    assert "SEAMLESS_ANSIBLE_HOST_KEY_CHECKING" in warnings()[0]
+    assert env.executor._env()["ANSIBLE_HOST_KEY_CHECKING"] == "False"
+
+    caplog.clear()
+    checking = AnsibleExecutor(
+        env.settings.model_copy(update={"ansible_host_key_checking": True}),
+        providers=env.registry,
+        poll_s=0.02,
+    )
+    with caplog.at_level(logging.WARNING, logger=logger):
+        assert checking._env()["ANSIBLE_HOST_KEY_CHECKING"] == "True"
+    assert warnings() == []
+
+
 async def test_vmware_rollback_and_lookup_failures(env):
     failing = AnsibleExecutor(env.settings, providers=FailingRegistry(), poll_s=0.02)
     ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER)

@@ -45,11 +45,12 @@ class Settings(BaseModel):
     data_dir: Path = Path("./data")
     db_url: str = ""
     host: str = "127.0.0.1"
-    port: int = 8080
+    #: SDD §15.1 states the bounds; a value outside them refuses to start the control plane
+    port: int = Field(default=8080, ge=1, le=65535)
     demo: bool = False
-    demo_speed: float = 60.0
+    demo_speed: float = Field(default=60.0, gt=0)
     demo_seed: int = 42
-    demo_failure_rate: float = 0.1
+    demo_failure_rate: float = Field(default=0.1, ge=0, le=1)
     auth_disabled: bool = False
     tokens_file: Path | None = None
     cors_origins: list[str] = Field(default_factory=list)
@@ -60,22 +61,24 @@ class Settings(BaseModel):
     k8s_namespace: str | None = None
     ansible_playbook: str = "ansible-playbook"
     collection_root: Path = Field(default_factory=find_repo_root)
-    max_concurrent_migrations: int = 10
-    max_concurrent_cutovers: int = 3
-    tick_s: float = 1.0
+    #: ANSIBLE_HOST_KEY_CHECKING of every playbook run (SDD §15.1): off while SEC-02 is open
+    ansible_host_key_checking: bool = False
+    max_concurrent_migrations: int = Field(default=10, ge=1)
+    max_concurrent_cutovers: int = Field(default=3, ge=1)
+    tick_s: float = Field(default=1.0, gt=0)
     #: how often a completed migration's source VM is checked for running again (SDD §8.1)
     source_watch_s: float = Field(default=300.0, ge=0)
-    max_step_retries: int = 2
+    max_step_retries: int = Field(default=2, ge=0)
     #: wall-clock ceiling of one step attempt in seconds; 0 = unbounded (SDD §15.1)
-    step_timeout_s: float = 0.0
+    step_timeout_s: float = Field(default=0.0, ge=0)
     #: failed bearer authentications per client address per minute before 429 (0 = off)
-    auth_lockout_per_minute: int = 60
+    auth_lockout_per_minute: int = Field(default=60, ge=0)
     jev_mode: JevMode = "off"
     jev_command: str = "npx -y @jkudish/jev-mcp@0.14.1"
     jev_url: str | None = None
     jev_token: str | None = Field(default=None, repr=False)
-    jev_timeout_s: float = 20.0
-    jev_min_confidence: float = 0.6
+    jev_timeout_s: float = Field(default=20.0, gt=0)
+    jev_min_confidence: float = Field(default=0.6, ge=0, le=1)
     #: where the model runs and the host shown on its badge; with a remote model the console
     #: excerpt stays local unless console_screening_send_to_remote (SDD §13.4, ADV-06)
     jev_deployment: JevDeployment = "remote"
@@ -155,6 +158,7 @@ class Settings(BaseModel):
             "METRICS_PUBLIC": "metrics_public",
             "LOG_JSON": "log_json",
             "CONSOLE_SCREENING_SEND_TO_REMOTE": "console_screening_send_to_remote",
+            "ANSIBLE_HOST_KEY_CHECKING": "ansible_host_key_checking",
         }
         for env_name, field in bool_fields.items():
             value = get(env_name)

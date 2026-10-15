@@ -194,3 +194,90 @@ def test_a_linux_docker_engine_maps_host_docker_internal_to_the_host():
     mapped = yaml.safe_load((ROOT / "deploy" / "compose" / override).read_text())
     hosts = mapped["services"]["seamless"]["extra_hosts"]
     assert hosts == ["host.docker.internal:host-gateway"]
+
+
+# --- the optional backup overlay (SDD §17, Security.md §12 "restore-tested", audit D-06) ---
+
+BACKUP = ROOT / "deploy" / "openshift" / "backup"
+
+
+def _backup_docs(name: str) -> list[dict]:
+    return [doc for doc in yaml.safe_load_all((BACKUP / name).read_text()) if doc]
+
+
+def _backup_pod() -> dict:
+    (cron,) = _backup_docs("cronjob.yaml")
+    assert cron["kind"] == "CronJob"
+    return cron["spec"]["jobTemplate"]["spec"]["template"]
+
+
+def test_backup_cronjob_dumps_the_database_under_its_secret_and_the_restricted_context():
+    """One nightly pg_dump of the system of record into its own PVC, with the database's credentials
+    from the seamless-db Secret and the security context every workload of the namespace runs under
+    (restricted PSA): never as root, read-only root, no capabilities, no SA token."""
+    (cron,) = _backup_docs("cronjob.yaml")
+    assert cron["spec"]["concurrencyPolicy"] == "Forbid"
+    assert cron["spec"]["schedule"].count(" ") == 4
+    pod = _backup_pod()["spec"]
+    assert pod["automountServiceAccountToken"] is False
+    assert pod["securityContext"]["runAsNonRoot"] is True
+    assert pod["securityContext"]["seccompProfile"] == {"type": "RuntimeDefault"}
+    (container,) = pod["containers"]
+    context = container["securityContext"]
+    assert context["readOnlyRootFilesystem"] is True
+    assert context["allowPrivilegeEscalation"] is False
+    assert context["capabilities"] == {"drop": ["ALL"]}
+    assert container["resources"]["limits"]
+    refs = {
+        env["name"]: env["valueFrom"]["secretKeyRef"]
+        for env in container["env"]
+        if "valueFrom" in env
+    }
+    assert {ref["name"] for ref in refs.values()} == {"seamless-db"}
+    keys = {"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"}
+    assert {ref["key"] for ref in refs.values()} == keys
+    script = container["args"][0]
+    assert "pg_dump" in script and "-Fc" in script and "BACKUP_KEEP_DAYS" in script
+    claims = {
+        v["persistentVolumeClaim"]["claimName"]
+        for v in pod["volumes"]
+        if "persistentVolumeClaim" in v
+    }
+    assert claims == {"seamless-backups"}
+    (pvc,) = _backup_docs("pvc.yaml")
+    assert pvc["kind"] == "PersistentVolumeClaim" and pvc["metadata"]["name"] == "seamless-backups"
+
+
+def test_backup_pods_are_admitted_by_their_own_network_policies():
+    """default-deny-all covers every pod of the namespace, and the database admits the control plane
+    only (seamless-postgres-allow-from-seamless): the overlay carries the egress rule of the backup
+    pods and the database's ingress rule for them, matched by the CronJob template's pod label."""
+    label = _backup_pod()["metadata"]["labels"]["app.kubernetes.io/name"]
+    policies = _backup_docs("networkpolicy.yaml")
+    egress = [p for p in policies if p["spec"]["policyTypes"] == ["Egress"]]
+    ingress = [p for p in policies if p["spec"]["policyTypes"] == ["Ingress"]]
+    assert len(egress) == 1 and len(ingress) == 1
+    assert egress[0]["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/name"] == label
+    (rule,) = egress[0]["spec"]["egress"]
+    postgres = {"app.kubernetes.io/name": "seamless-postgres"}
+    assert rule["to"][0]["podSelector"]["matchLabels"] == postgres
+    assert rule["ports"] == [{"protocol": "TCP", "port": 5432}]
+    assert ingress[0]["spec"]["podSelector"]["matchLabels"] == postgres
+    (rule,) = ingress[0]["spec"]["ingress"]
+    assert rule["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"] == label
+    kustomization = yaml.safe_load((BACKUP / "kustomization.yaml").read_text())
+    assert sorted(kustomization["resources"]) == ["cronjob.yaml", "networkpolicy.yaml", "pvc.yaml"]
+    assert kustomization["namespace"] == "seamless-migrate"
+
+
+def test_backup_runbook_names_the_restore_order_and_the_drill():
+    """Security.md §12 asks for restore-tested backups: the README beside the overlay is the
+    runbook, and restore-job.yaml the one-off restore it describes."""
+    text = (BACKUP / "README.md").read_text()
+    for needle in ("pg_restore", "restore-job.yaml", "seamless-data", "drill", "Secrets"):
+        assert needle in text, needle
+    (job,) = _backup_docs("restore-job.yaml")
+    assert job["kind"] == "Job"
+    (container,) = job["spec"]["template"]["spec"]["containers"]
+    assert "pg_restore" in container["args"][0]
+    assert container["securityContext"]["readOnlyRootFilesystem"] is True

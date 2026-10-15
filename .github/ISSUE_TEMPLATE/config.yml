@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/imransetiadi/seamless-vms-migration/security/advisories/new
+    about: Private reporting; please do not open a public issue for a vulnerability (SECURITY.md).
+  - name: Contributing guide
+    url: https://github.com/imransetiadi/seamless-vms-migration/blob/main/CONTRIBUTING.md
+    about: How the project works, test-first development, the SDD rule and the pull request checklist.

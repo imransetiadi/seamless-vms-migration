@@ -10,6 +10,7 @@ import {
 } from '@tanstack/react-query';
 import { createContext, useContext } from 'react';
 import { ApiClient, ApiError } from './client';
+import { useLiveStatus } from './live';
 import { useApiQuery } from './stickyQuery';
 import type {
   AdvisorNoteList,
@@ -248,10 +249,14 @@ export function useMigration(migrationId: string | undefined) {
 
 export function useStats(planId?: string | null) {
   const api = useApi();
+  // the open stream keeps the figures - every migration.* and plan.* event refreshes them (live.ts) - so the 15 s poll
+  // is for while it is not open (SDD §16): one GET /stats per 15 s per tab otherwise, for data the stream brings; the
+  // status alone, so the navigation, which reads the figures on every page, does not draw again on every event
+  const streamOpen = useLiveStatus() === 'open';
   return useApiQuery({
     queryKey: queryKeys.stats(planId),
     queryFn: ({ signal }) => api.get<Stats>('/stats', { signal, query: { plan_id: planId ?? undefined } }),
-    refetchInterval: 15_000,
+    refetchInterval: streamOpen ? false : 15_000,
     placeholderData: keepPreviousData,
     retry: noRetryOnClientErrors,
   });
@@ -454,7 +459,8 @@ export function useCheckAllProviders() {
       }
       return result;
     },
-    onSettled: () => invalidateAll(queryClient, [queryKeys.providers]),
+    // each checked provider's inventory too, as one Check does: a check refreshes its capabilities
+    onSettled: (result) => invalidateAll(queryClient, [queryKeys.providers, ...(result?.checked ?? []).map((p) => queryKeys.inventory(p.id))]),
   });
 }
 
@@ -463,7 +469,11 @@ export function useDeleteProvider() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (providerId: string) => api.delete(`/providers/${enc(providerId)}`),
-    onSuccess: () => invalidateAll(queryClient, [queryKeys.providers]),
+    onSuccess: (_result, providerId) => {
+      // its cached inventory would otherwise outlive it
+      queryClient.removeQueries({ queryKey: queryKeys.inventory(providerId) });
+      invalidateAll(queryClient, [queryKeys.providers]);
+    },
   });
 }
 
@@ -544,7 +554,8 @@ export function useMigrationAction(migrationId: string) {
     },
     onSuccess: (migration) => {
       queryClient.setQueryData(queryKeys.migration(migration.id), migration);
-      invalidateAll(queryClient, [['migrations'], ['stats'], queryKeys.plan(migration.plan_id), ['events']]);
+      // the plan list too: a retry reopens a completed plan, a cancel changes its counts (SDD §5.1, §16)
+      invalidateAll(queryClient, [['migrations'], ['stats'], queryKeys.plan(migration.plan_id), queryKeys.plans, ['events']]);
     },
   });
 }
@@ -579,7 +590,9 @@ export function useSetStrategy(migrationId: string) {
     mutationFn: (strategy: Strategy) => api.put<Migration>(`/migrations/${enc(migrationId)}/strategy`, { strategy }),
     onSuccess: (migration) => {
       queryClient.setQueryData(queryKeys.migration(migration.id), migration);
-      invalidateAll(queryClient, [['migrations']]);
+      // the API records the choice in the plan's strategy_overrides and audits it: the plan page's override count, the
+      // plan list, the figures and the event lists follow (SDD §12, §16)
+      invalidateAll(queryClient, [['migrations'], queryKeys.plan(migration.plan_id), queryKeys.plans, ['stats'], ['events']]);
     },
   });
 }

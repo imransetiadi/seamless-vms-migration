@@ -55,3 +55,24 @@ updates:
       interval: weekly
       day: monday
     labels: [dependencies, image]
+
+  # the collection's own toolchain: requirements.txt (the openstacksdk fork pin is a git URL Dependabot
+  # leaves alone), requirements-tests.txt, requirements-build.txt, requirements-docs.txt (audit D-16)
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      collection-tooling:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    labels: [dependencies, collection]
+
+  # the collection builder image (builder/Containerfile)
+  - package-ecosystem: docker
+    directory: /builder
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, image]

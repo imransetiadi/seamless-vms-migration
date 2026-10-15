@@ -3,6 +3,7 @@
 
 # VCS, agent and worktree scratch (other tracks' worktrees live under .worktrees/)
 .git
+.github
 .worktrees
 .superpowers
 .claude
@@ -18,7 +19,10 @@
 **/node_modules
 dashboard/coverage
 seamless/data
-seamless/*.db
+seamless/tests
+tests/e2e
+**/*.db
+**/*.sqlite3
 
 # Secrets must never enter the build context (SDD 13.3). seamless/Containerfile builds read
 # seamless/.containerignore instead; seamless/tests/test_build_context.py checks both files.
@@ -29,7 +33,10 @@ deploy/compose/compose.local.yaml
 deploy/openshift/secret.yaml
 .env
 .env.*
+**/.env
+**/.env.*
 **/*.env
+**/tokens.yaml
 **/clouds.yaml
 **/clouds.yml
 tests/**/auth_*.yml

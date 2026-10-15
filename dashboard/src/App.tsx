@@ -1,5 +1,5 @@
 import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
-import { Component, lazy, Suspense, type ReactNode } from 'react';
+import { Component, lazy, Suspense, type ErrorInfo, type ReactNode } from 'react';
 import { BrowserRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { ApiProvider } from './api/ApiProvider';
 import type { ApiClient } from './api/client';
@@ -25,11 +25,16 @@ const RecommendationDetail = lazy(() => import('./pages/RecommendationDetail'));
 const Login = lazy(() => import('./pages/Login'));
 const NotFound = lazy(() => import('./pages/NotFound'));
 
-class PageErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+export class PageErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
   override state = { failed: false };
 
   static getDerivedStateFromError(): { failed: boolean } {
     return { failed: true };
+  }
+
+  override componentDidCatch(error: Error, info: ErrorInfo): void {
+    // the panel below is the recovery; this line is the trace support has: the error and where it happened
+    console.error(error, info.componentStack);
   }
 
   override render() {

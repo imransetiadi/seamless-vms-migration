@@ -67,6 +67,13 @@ export function useLiveSnapshot(): LiveSnapshot {
   return useSyncExternalStore(hub.subscribeSnapshot, hub.getSnapshot, hub.getSnapshot);
 }
 
+/** The stream's status alone: what follows it draws again on a status change, not on every event the snapshot times. */
+export function useLiveStatus(): LiveStatus {
+  const hub = useLiveHub();
+  const status = () => hub.getSnapshot().status;
+  return useSyncExternalStore(hub.subscribeSnapshot, status, status);
+}
+
 /** Calls `listener` for every streamed event (persisted and ephemeral) while mounted. */
 export function useLiveEvents(listener: (event: Event) => void): void {
   const hub = useLiveHub();
@@ -85,16 +92,41 @@ function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+/** The least time between two refetches after reopenings of the stream (SDD §16). */
+export const RECONNECT_REFETCH_MIN_MS = 30_000;
+
 /**
  * A stream status listener that refetches every query when the stream opens again after a drop
  * (SDD §16): a connection that dropped before its first persisted event resumes live-only, so the
- * gap is never replayed, and ephemeral progress never is. The first open refetches nothing.
+ * gap is never replayed, and ephemeral progress never is. The first open refetches nothing. Once per
+ * `minIntervalMs` at most: the first reopening refetches at once, and one within that interval of the
+ * last refetch is refetched once the interval has passed, so a connection that drops and opens again
+ * and again - a proxy that ends each response after a moment - never turns into a refetch storm (at
+ * 1,000 VMs a plan, NFR-03, each refetch reads megabytes), while no reopening goes unrefetched as
+ * long as the stream lasts. When the stream ends, a refetch it holds is dropped: the window regaining
+ * focus reads again as before (§16).
  */
-export function refetchAfterReconnect(queryClient: QueryClient): (status: LiveStatus) => void {
+export function refetchAfterReconnect(queryClient: QueryClient, minIntervalMs = RECONNECT_REFETCH_MIN_MS): (status: LiveStatus) => void {
   let opened = false;
+  let lastAt: number | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const refetch = () => {
+    timer = null;
+    lastAt = Date.now();
+    void queryClient.invalidateQueries();
+  };
   return (status) => {
+    if (status === 'closed' || status === 'unauthorized' || status === 'idle') {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      return;
+    }
     if (status !== 'open') return;
-    if (opened) void queryClient.invalidateQueries();
+    if (opened) {
+      const wait = lastAt === null ? 0 : lastAt + minIntervalMs - Date.now();
+      if (wait <= 0) refetch();
+      else timer ??= setTimeout(refetch, wait);
+    }
     opened = true;
   };
 }
@@ -421,5 +453,8 @@ export function applyEventToCache(
     if (kind !== 'provider.checked' && kind !== 'provider.created' && typeof providerId === 'string') {
       invalidate(['inventory', providerId]);
     }
+    return;
   }
+  // a user added by another admin, or by the CLI (SDD §13.1): the Users page's list; auth.denied changes no list
+  if (kind.startsWith('user.')) invalidate(['users']);
 }

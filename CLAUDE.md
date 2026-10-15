@@ -1,7 +1,8 @@
 # CLAUDE.md — working agreement for agents on Seamless Migrate
 
 Seamless Migrate moves VMs from **RHOSP 17.1 / community OpenStack / VMware** into **RHOSO 18.0** with
-minimal downtime. The repository root is the **os-migrate 1.0.5 Ansible collection** (the data mover);
+minimal downtime. The repository root is a **fork of the os-migrate Ansible collection** (the data mover;
+upstream `main` after 1.0.5, versioned 1.1.0 here);
 `seamless/` is the Python control plane, `dashboard/` the React UI, `deploy/` the Compose and OpenShift
 deployment. Read this file fully before changing anything.
 
@@ -43,10 +44,13 @@ reason, never silently.
 | A — collection warm path | `plugins/`, `roles/`, `playbooks/`, `tests/unit/`, `tests/perf/`, `galaxy.yml`, `CHANGELOG.rst` |
 | B — control plane | `seamless/` |
 | C — dashboard | `dashboard/` |
-| D — tooling, deploy, docs | `deploy/`, `scripts/compose-init.sh`, `Makefile`, `README.md`, `.mcp.json`, `.claude/`, `CLAUDE.md`, `.gitignore`, `docs/MEMORY.md`, `docs/QASuite.md`, `docs/Security.md`, `docs/Performance.md` |
+| A — collection warm path (also) | `tests/sanity/`, `tests/func/`, `meta/`, `requirements*.txt`, `requirements.yml`, `bindep.txt`, `docs/src/`, `aee/`, `builder/`, `inventory/` |
+| D — tooling, deploy, docs | `deploy/`, `scripts/`, `Makefile`, `README.md`, `RELEASING.md`, `NOTICE`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTORS.md`, `CODEOWNERS`, `.github/`, `.pre-commit-config.yaml`, `.gitleaks.toml`, `.gitleaks-tree.toml`, `.gitleaksignore`, `.dockerignore`, `seamless/Containerfile`, `seamless/.containerignore`, `.mcp.json`, `.claude/`, `CLAUDE.md`, `.gitignore`, `tests/e2e/`, `docs/MEMORY.md`, `docs/QASuite.md`, `docs/Security.md`, `docs/Performance.md` |
 
-`docs/SDD.md` and `docs/PRD.md` are owned by the controller. Work in the git worktree of your track
-(`.worktrees/track-*`), never in another track's tree.
+`docs/SDD.md`, `docs/PRD.md`, `docs/advisor/` and `docs/audits/` are owned by the controller. Work in the git worktree of your
+track (`.worktrees/track-*`), never in another track's tree — and **one session per worktree**: a second session in a
+checkout can test, lint or commit a half-resolved tree, and an audit measured a moving target that way (audit F-02).
+Never check out `main` in a worktree (audit D-28); the primary checkout belongs to the controller session.
 
 ## 4. Jev (MCP server `jev`, `@jkudish/jev-mcp@0.14.1`)
 
@@ -97,7 +101,7 @@ Server: the developer's host agentmemory at `http://localhost:3111` (`AGENTMEMOR
 
 ```bash
 # Collection (Track A)
-make test-ansible-units                      # CI path (podman container, ansible-test)
+make test-ansible-units                      # upstream's path (podman container); CI runs the pytest line below + scripts/collection-sanity.sh
 PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest tests/unit/test_blocksync.py -v   # blocksync engine; $COLL: QASuite §14.2
 python3 tests/perf/bench_blocksync.py --size-gib 1  # throughput benchmark
 
@@ -126,8 +130,9 @@ No API keys, passwords, tokens, `clouds.yaml`, kubeconfigs, `.env`, `tokens.yaml
 or real hostnames of customer systems — in code, tests, fixtures, docs, logs or commit messages. Use the
 placeholders already in `deploy/openshift/secret-example.yaml`. These files are git-ignored and must stay
 so: `deploy/compose/.env`, `deploy/compose/tokens.yaml`, `clouds.yaml`, `secure.yaml`, `*.pem`, `*.key`.
-Test fixtures are synthetic. `.claude/settings.json` denies *reading* those files from the agent; do not
-work around it with shell tricks. If a secret reaches a commit: **rotate it first**, then purge history,
+Test fixtures are synthetic. `.claude/settings.json` denies *reading* those files from the agent — wherever
+they sit, a worktree's generated `deploy/compose/.env` included (`seamless/tests/test_build_context.py`
+checks the deny list against every local secret path); do not work around it with shell tricks. If a secret reaches a commit: **rotate it first**, then purge history,
 then tell the user. Run `gitleaks dir -c .gitleaks-tree.toml --redact --no-banner .` (working tree: the tree config skips the
 git-ignored local secret files a checkout holds) and `gitleaks git --redact --no-banner .` (history: `.gitleaks.toml`, which
 allowlists no secret path, plus `.gitleaksignore`) before pushing.

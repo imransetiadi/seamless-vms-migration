@@ -8,7 +8,7 @@ import type { Migration } from './types';
 /**
  * Owns the app's single SSE connection while `enabled` (i.e. signed in). The first connection
  * streams live events only; reconnects resume with `since=<last seq>` (SDD §12), and every query
- * is refetched once the stream is open again (SDD §16). While it is open, the window regaining
+ * is refetched once the stream is open again, once per 30 s at most (SDD §16). While it is open, the window regaining
  * focus reads nothing it keeps fresh (§16).
  */
 export function LiveEventsProvider({ enabled, children }: { enabled: boolean; children: ReactNode }) {

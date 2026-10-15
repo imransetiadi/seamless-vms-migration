@@ -230,6 +230,32 @@ def test_plan_apply_refuses_an_update_naming_unknown_fields_like_patch(env, caps
     assert store.get("plan", plan_id, Plan).downtime_slo_s == 600
 
 
+def test_plan_apply_refuses_a_create_naming_unknown_fields_like_post(env, capsys):
+    """SDD §15/§12: POST /plans answers 422 for a field PlanCreate does not have; a create from a
+    file with a typo is refused the same way - never stored without the guard it meant to set."""
+    store = store_for(env)
+    store.put("provider", make_provider(id="src-osp"))
+    store.put(
+        "provider",
+        make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    path = env / "plan.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "name": "Finance web tier",
+                "source_provider_id": "src-osp",
+                "destination_provider_id": "dst-rhoso",
+                "vm_ids": ["vm-1"],
+                "requrie_approval": False,
+            }
+        )
+    )
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    assert capsys.readouterr().err == "error: fields cannot be changed: requrie_approval\n"
+    assert store.list("plan", Plan) == []
+
+
 def _applied_plan(env, capsys):
     store = store_for(env)
     store.put("provider", make_provider(id="src-osp"))

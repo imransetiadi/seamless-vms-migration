@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified by the Seamless Migrate project, 2026.
 
 set -euxo pipefail
 
@@ -10,7 +11,8 @@ if [ ! -f "/run/.containerenv" ]; then
 fi
 
 if [ -z "${VIRTUAL_ENV:-}" ]; then
-    source "$(VENV_DIR)/bin/activate"
+    # shellcheck disable=SC1091
+    source "${VENV_DIR:-.venv}/bin/activate"
 fi
 
 export GITCHANGELOG_CONFIG_FILENAME=./scripts/gitchangelog.rc

@@ -21,12 +21,27 @@
     "deny": [
       "Read(./.env)",
       "Read(./.env.*)",
+      "Read(./**/.env)",
+      "Read(./**/.env.*)",
+      "Read(./**/*.env)",
       "Read(./deploy/compose/.env)",
       "Read(./deploy/compose/tokens.yaml)",
+      "Read(./**/tokens.yaml)",
+      "Read(./**/compose.local.yaml)",
       "Read(./**/clouds.yaml)",
+      "Read(./**/clouds.yml)",
       "Read(./**/secure.yaml)",
       "Read(./**/*.pem)",
-      "Read(./secrets/**)"
+      "Read(./**/*.key)",
+      "Read(./secrets/**)",
+      "Read(./**/secrets/**)",
+      "Read(./**/deploy/openshift/secret.yaml)",
+      "Read(./**/tests/**/auth_*.yml)",
+      "Read(./**/kubeconfig*)",
+      "Read(./**/.kube/**)",
+      "Read(./**/.claude/settings.local.json)",
+      "Read(./**/seamless/data/**)",
+      "Read(./**/seamless/*.db)"
     ]
   }
 }

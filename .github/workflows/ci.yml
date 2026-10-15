@@ -13,9 +13,11 @@ on:
 permissions:
   contents: read
 
+# a push to main must not cancel the nightly scans (nor the nightly a push): one group per event kind;
+# only pull-request runs are superseded by a newer push to the same branch (audit D-13)
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   control-plane:
@@ -109,6 +111,30 @@ jobs:
           ansible-lint --offline roles/import_workloads_warm roles/import_from_hypervisor \
             playbooks/import_workloads_precopy.yml playbooks/import_workloads_cutover.yml \
             playbooks/rollback_workloads.yml
+      - name: Build the collection tarball a release attaches, from the tracked files (audit D-04)
+        # the same recipe as the image (seamless/Containerfile): the openstack.cloud modules the roles
+        # call are vendored from the pinned Galaxy release, then ansible-galaxy packs the tree under
+        # galaxy.yml's build_ignore. Nothing upstream-controlled runs here (make build uses upstream's
+        # builder image); the artifact is what RELEASING.md attaches to a GitHub Release.
+        run: |
+          work="$RUNNER_TEMP/collection-build"
+          mkdir -p "$work/src" "$work/dist"
+          git ls-files -z | rsync -a --from0 --files-from=- ./ "$work/src/"
+          os_cloud=$(grep -oE 'OS_CLOUD_VERSION=[0-9.]+' seamless/Containerfile | cut -d= -f2)
+          ansible-galaxy collection install "openstack.cloud:${os_cloud}" -p "$work/galaxy"
+          scripts/vendor-openstack-cloud.sh "$work/src" "$work/galaxy/ansible_collections/openstack/cloud/plugins"
+          (cd "$work/src" && ansible-galaxy collection build --force --output-path "$work/dist")
+          ls -l "$work/dist"
+          tar tzf "$work/dist"/os_migrate-os_migrate-*.tar.gz | grep -q '^NOTICE$'
+          if tar tzf "$work/dist"/os_migrate-os_migrate-*.tar.gz | grep -qE 'docs/audits|AUDIT-'; then
+            echo "audit material in the artifact"; exit 1
+          fi
+          echo "COLLECTION_DIST=$work/dist" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: collection-tarball
+          path: ${{ env.COLLECTION_DIST }}/os_migrate-os_migrate-*.tar.gz
+          retention-days: 30
 
   dashboard:
     name: dashboard (typecheck, lint, tests, build, audit)
@@ -224,6 +250,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_VERSION: "8.30.1" # the pre-commit hook's rev and the laptops' version (audit D-08)
           GITLEAKS_ENABLE_SUMMARY: "true"
       - name: trivy config on the deployment manifests
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -273,6 +300,19 @@ jobs:
             echo "OpenShift networks are left in the egress policies"; exit 1
           fi
           grep -q 'image: quay.io/sclorg/postgresql-16-c9s@sha256:' /tmp/k8s.yaml
+      - name: Render the optional backup overlay and validate it with the restore job (audit D-06)
+        run: |
+          kubectl kustomize deploy/openshift/backup > /tmp/backup.yaml
+          kubeconform -strict -summary -kubernetes-version 1.30.0 -schema-location default \
+            /tmp/backup.yaml deploy/openshift/backup/restore-job.yaml
+          grep -q '^kind: CronJob' /tmp/backup.yaml
+          [ "$(grep -c '^kind: NetworkPolicy' /tmp/backup.yaml)" -eq 2 ]
+      - name: Compose files parse with a dummy environment (QASuite §13.5 nightly validation, audit D-14)
+        run: |
+          dummy=$(mktemp) && printf 'POSTGRES_PASSWORD=x\nJEV_MCP_AUTH_TOKEN=x\n' > "$dummy"
+          docker compose -f deploy/compose/compose.yaml --env-file "$dummy" --profile '*' config -q
+          docker compose -f deploy/compose/compose.yaml -f deploy/compose/compose.linux-host.yaml \
+            --env-file "$dummy" --profile '*' config -q
       # static checks cannot see what an image writes when it starts: the PostgreSQL StatefulSet passed them
       # and still exited 1 under readOnlyRootFilesystem (QASuite §14.5)
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -297,7 +337,7 @@ jobs:
           name: dashboard-dist
           path: dashboard/dist
       - name: Build
-        run: docker build -f seamless/Containerfile -t seamless-migrate:ci .
+        run: docker build -f seamless/Containerfile -t seamless-migrate:ci --build-arg "SOURCE_COMMIT=${GITHUB_SHA}" .
       - name: Smoke the image (demo mode on SQLite; /health is public, everything else needs a token)
         run: |
           docker run -d --name smoke -p 127.0.0.1:18080:8080 -e SEAMLESS_DEMO=true \

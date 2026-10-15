@@ -8,6 +8,7 @@ reaches local, remote and CI builders.
 """
 
 import http.server
+import json
 import os
 import re
 import shutil
@@ -30,6 +31,8 @@ ROOT = find_repo_root()
 SECRET_PATHS = [
     "deploy/compose/.env",  # scripts/compose-init.sh: DB password, Jev token, TypeSafe key
     "deploy/compose/.env.bak",
+    "seamless/.env.local",  # a developer's own env file next to the control plane
+    "tests/tokens.yaml",  # a token file saved outside deploy/compose
     "deploy/compose/tokens.yaml",
     "deploy/compose/compose.local.yaml",  # README: VMware passwords for the local stack
     "deploy/openshift/secret.yaml",  # a filled-in copy of secret-example.yaml
@@ -543,7 +546,12 @@ def test_tree_gitleaks_config_skips_only_the_git_ignored_secret_files():
     paths = [re.compile(p) for p in config["allowlist"]["paths"]]
     reported = [path for path in SECRET_PATHS if not any(rx.search(path) for rx in paths)]
     assert reported == [], f"working-tree scans would report local secret files: {reported}"
-    samples = [*SECRET_PATHS, "seamless/tests/__pycache__/test_memory.cpython-313.pyc"]
+    samples = [
+        *SECRET_PATHS,
+        "seamless/tests/__pycache__/test_memory.cpython-313.pyc",
+        "seamless/.pytest_cache/v/cache/nodeids",  # test ids of the redaction tests (audit F-05)
+        ".worktrees/track-b/deploy/compose/.env",  # a worktree is a whole checkout
+    ]
     stray = [rx.pattern for rx in paths if not any(rx.search(path) for path in samples)]
     assert stray == [], f"patterns that match no kind of secret file: {stray}"
     for code in (
@@ -691,3 +699,59 @@ def test_publish_warns_when_the_key_is_on_its_own_command_line(tmp_path):
     assert "export ANSIBLE_GALAXY_API_KEY" in run.stderr
     assert f"ANSIBLE_GALAXY_SERVER_RELEASE_GALAXY_TOKEN={GALAXY_KEY}" in lines
     assert "ansible-galaxy collection publish os_migrate-os_migrate-9.9.9.tar.gz" in lines
+
+
+def _agent_read_deny_patterns() -> list[re.Pattern[str]]:
+    """The ``Read(<glob>)`` rules of ``.claude/settings.json`` as regular expressions.
+
+    Claude Code resolves the glob against the project root (``./``); ``**`` spans directories,
+    ``*`` and ``?`` stay inside one path segment."""
+    settings = json.loads((ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    patterns = []
+    for rule in settings["permissions"]["deny"]:
+        match = re.fullmatch(r"Read\((.+)\)", rule)
+        assert match, f"not a Read rule: {rule}"
+        glob = match.group(1).removeprefix("./")
+        out, i = "", 0
+        while i < len(glob):
+            if glob.startswith("**/", i):
+                out, i = out + "(?:.*/)?", i + 3
+            elif glob.startswith("**", i):
+                out, i = out + ".*", i + 2
+            elif glob[i] == "*":
+                out, i = out + "[^/]*", i + 1
+            elif glob[i] == "?":
+                out, i = out + "[^/]", i + 1
+            else:
+                out, i = out + re.escape(glob[i]), i + 1
+        patterns.append(re.compile("^" + out + "$"))
+    return patterns
+
+
+def test_agent_read_deny_list_covers_every_secret_path():
+    """CLAUDE.md §7: the agent settings deny *reading* every local secret file a checkout can hold,
+    wherever it sits — the generated Compose files in a worktree too, since every worktree is a
+    full checkout (audit D-01). The samples are SECRET_PATHS, their worktree copies, and the
+    kubeconfig shapes CLAUDE.md names; source and config files must stay readable."""
+    patterns = _agent_read_deny_patterns()
+    samples = [
+        *SECRET_PATHS,
+        *(f".worktrees/track-b/{path}" for path in SECRET_PATHS),
+        "kubeconfig",
+        "deploy/kubeconfig.yaml",
+        ".kube/config",
+        "deploy/openshift/secrets/clouds.yaml",
+        "seamless/data/secrets/vcenter-dc2/password",
+        "seamless/seamless.db",
+    ]
+    readable = [path for path in samples if not any(rx.match(path) for rx in patterns)]
+    assert readable == [], f"the agent may read secret files: {readable}"
+    for code in (
+        "seamless/src/seamless_migrate/app.py",
+        "deploy/compose/compose.yaml",
+        "deploy/openshift/secret-example.yaml",
+        ".claude/settings.json",
+        "seamless/tests/test_build_context.py",
+        "README.md",
+    ):
+        assert not any(rx.match(code) for rx in patterns), code

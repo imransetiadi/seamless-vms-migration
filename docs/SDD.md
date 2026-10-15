@@ -23,8 +23,8 @@ Seamless Migrate migrates virtual machines into **Red Hat OpenStack Services on 
 2. **Community OpenStack** (any release exposing Keystone v3, Nova ≥ 2.60, Cinder v3, Neutron v2).
 3. **VMware vSphere** 7.0U3+/8.x (vCenter managed).
 
-It is built on the **os-migrate 1.0.5 Ansible collection** (`os_migrate.os_migrate`, this
-repository's root). os-migrate stays the *data mover* and resource exporter/importer. Seamless adds:
+It is built on a fork of the **os-migrate Ansible collection** (`os_migrate.os_migrate`, this
+repository's root; upstream `main` after the 1.0.5 release, versioned 1.1.0 here). os-migrate stays the *data mover* and resource exporter/importer. Seamless adds:
 
 * a **warm migration path** for OpenStack sources (snapshot pre-copy while the VM runs, then a
   hash-based delta sync after shutdown) so downtime is proportional to the *final delta*, not the
@@ -125,6 +125,7 @@ Phase          = pending | validating | blocked | ready | precopy | syncing | aw
 Severity       = blocker | warning | info
 Role           = viewer | operator | approver | admin          (ordered, see §13)
 PlanStatus     = draft | validated | running | paused | completed | failed | cancelled
+DerivedPlanStatus = draft | validated | running | paused | completed | finalized | failed | cancelled   # §4.2, §8.1: what every view shows, derived from the migrations, never stored
 SyncPassKind   = full | delta | final
 DecisionType   = migration_strategy | workload_tier | verification_review | console_screening   (§14.4)
 DecisionStatus = auto_applied | pending_approval | approved | overridden | below_threshold | fallback_rules
@@ -1747,10 +1748,10 @@ names:
 | | Oracle (`oracle`, token `ora`) | tcp 1521 |
 | | MongoDB (`mongo`) · Cassandra · Db2 (`db2`) | tcp 27017 · tcp 9042 · tcp 50000 |
 | | Elasticsearch (`elastic`) · CouchDB | http 9200 `/` · http 5984 `/` |
-| `middleware_queue` | RabbitMQ (`rabbit`) · Kafka · ActiveMQ/Artemis · Redis · Memcached · NATS · ZooKeeper | tcp 5672 · 9092 · 61616 · 6379 · 11211 · 4222 · 2181 |
+| `middleware_queue` | RabbitMQ (`rabbit`) · Kafka · ActiveMQ/Artemis (`activemq`, `artemis`, token `amq`) · Redis · Memcached (`memcache`) · NATS · ZooKeeper | tcp 5672 · 9092 · 61616 · 6379 · 11211 · 4222 · 2181 |
 | | Tomcat, JBoss, WildFly · WebLogic · WebSphere | http 8080 `/` · http 7001 `/` · http 9080 `/` |
 | `stateless_web` | any | http 80 `/` |
-| `infrastructure_service` | LDAP, FreeIPA, Active Directory, domain controller · DNS · Kerberos | tcp 389 · tcp 53 · tcp 88 |
+| `infrastructure_service` | LDAP, FreeIPA, Active Directory, domain controller (`ldap`, `freeipa`, `active-directory`, `activedirectory`, `domain-controller`, `domaincontroller`; tokens `ad`, `dc`, `ipa`, `idm`) · DNS (`dns`; tokens `bind`, `ns`, `ns1`, `ns2`) · Kerberos | tcp 389 · tcp 53 · tcp 88 |
 | `legacy_os`, `manual_review`, a service the table does not name | — | none |
 
 Validation records the suggestion in `Migration.suggested_probes`. A suggestion never runs: the verification
@@ -1854,7 +1855,7 @@ that does not own the tables start the control plane — the application role of
 `events` is insert-only — once the owner role created or upgraded the schema.
 
 Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `advisor_snapshot` (§14.5),
-`advisor_policy` (§14.6).
+`advisor_policy` (§14.6), `user` (§13.1).
 
 `Store` API: `put(kind, model, expected_version=None)` (optimistic concurrency; raises
 `ConflictError`; a versioned write is one statement — an `INSERT` for `expected_version=0`, where a document that
@@ -1872,6 +1873,10 @@ a value that only grows), `versions(kind) -> [(id, version)]` (in creation order
 `get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: {phase: count}}` (one
 `SELECT … GROUP BY` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
 `derived_status` and `migration_counts` from it, §8.1), `delete(kind, id)`,
+`get_versioned(kind, id, model_cls) -> (model, version)` (one read that returns the version too: `plan apply`'s
+compare-and-write, §15), `create_user(user, actor) -> Event` (§13.1: the `user` document and its `user.created` event in
+one transaction; a `ConflictError` for a name that exists in any case), `delete_events_before(before) -> int` (`events
+prune`, §15),
 `append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500, kinds=None, tail=False,
 before_seq=None)` (`kinds` serves `GET /events?audit=true`). SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
@@ -1889,6 +1894,10 @@ auth lockout of §15.1), 500 (`internal_error`, message never carries internals)
 (`provider_error`, the redacted provider message), 503 (`/ready` while degraded). Every response,
 including error responses written by the server-error handler, carries the security headers of
 Security.md R-05.
+A request body with a field the route does not take is refused with 422 (`validation_error`, naming
+the field) — on `POST /plans` and `POST /providers` as on `PATCH /plans/{id}` and `PATCH /providers/{id}`
+— so a misspelt guard (`requrie_approval`, `verify_tsl`) never silently yields a plan or provider
+without it; a stored document keeps loading with fields a later version added (§11).
 Authentication: `Authorization: Bearer <token>` (§13).
 A request body holds at most 1 MiB (1,048,576 bytes). A larger `Content-Length`, or a chunked body
 that grows past it, is refused with 413 before the body is parsed: the framework parses a route's
@@ -1909,7 +1918,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
 | GET | `/providers` | viewer | — | `Provider[]` |
-| POST | `/providers` | admin | `Provider` (status fields ignored) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
+| POST | `/providers` | admin | `Provider` (status fields ignored; a field `Provider` does not have: 422) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
 | PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; no value returned) |
@@ -1918,7 +1927,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
-| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them) | `201 Plan` |
+| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them; a field `PlanCreate` does not have — a misspelt one too — is refused with 422, never dropped) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
 | PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry — except its providers: a changed `source_provider_id` or `destination_provider_id` is refused (409) while a migration of the plan is `failed`, since its rollback acts on the clouds its attempt used (it matches the destination server by name on the cold path) — roll it back or cancel it first; the 409 names each such VM with what releases it — roll back or retry a `failed` one whose source is stopped, finish, roll back or cancel one in flight, finalize or roll back a `completed` one (§8.1); resets status to `draft`); setting `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}`, 1–1000 (422 outside); in `draft`, `validated` or `paused` (409 otherwise, and while a migration of the plan is in flight, as for `PATCH`: the plan returns to `draft`, which the tick does not drive) | `Plan` |
@@ -2016,6 +2025,8 @@ the tokens file refuses (empty, or longer than 128 characters) and the names the
 as actors itself — `anonymous`, `unauthenticated`, `cli`, `system`, in any letter case and with
 blanks around them too, and any name with a colon, the form of the actors the advisor records (`policy:<id>`,
 `user:<name>`, `system:fallback`, `system:advisor`, §14.4) — so no token's audit events pass for theirs.
+The tokens file is refused at start-up (the server does not start) when an entry carries such a name,
+so a hand-edited file cannot add one either.
 `SEAMLESS_AUTH_DISABLED=true` maps every request to principal `anonymous` with role `admin`; the CLI
 refuses to start with it unless the bind host is loopback (`127.0.0.1`, `::1`, `localhost`).
 Demo mode on loopback disables auth by default. Every request refused for its role emits
@@ -2032,9 +2043,13 @@ tokens and database users. The default role is `viewer`. The response returns a 
 token once with `Cache-Control: no-store`; later listings expose only name and role. A `user`
 document stores the SHA-256 digest in the existing database, with its lowercase name as ID.
 Creation and `user.created` (actor, name, role; never token or digest) commit together, and duplicate
-creates cannot replace an existing token. Authentication reads database users on every request,
-so access survives restarts and changes are visible across processes. Adding users is refused
-while authentication is disabled. The bootstrap token file remains read-only.
+creates cannot replace an existing token. Authentication keeps the database users' digests in
+memory per process and reads them again when the `user` kind's change stamp moved (one aggregate
+query, §11) or at the latest after 5 seconds — a deletion and a re-creation at the same version
+leave the stamp unchanged — so access survives restarts, a change is visible across processes
+within seconds, and a flood of invalid tokens costs no document read; once the bootstrap file does
+not know a token, the per-address lockout (§15.1) is consulted before the database is asked at
+all. Adding users is refused while authentication is disabled. The bootstrap token file remains read-only.
 The dashboard holds the issued token only until Done or navigation; it never puts it in browser
 storage. Editing roles, rotating tokens and deleting users are not exposed by this screen.
 
@@ -2066,8 +2081,10 @@ provider then records only the name (`credentials_secret`, `conversion_host.ssh_
 time (`credentials_updated_at`, `conversion_key_updated_at`) with a versioned write, retried when a provider
 check or another write changed the provider meanwhile (they touch other fields): once the secret is written,
 the change is recorded, with its `provider.credentials_updated` event — a 409 after the store already holds the
-new secret would leave the change unaudited. A provider deleted meanwhile answers 404, and the secret just
-written is removed again. `SEAMLESS_SECRET_STORE` selects it:
+new secret would leave the change unaudited; when the provider keeps changing under the write (50 conflicts in a
+row, each a check or another write that landed), the route answers 503 `unavailable` naming the secret — the store
+holds the new value, the provider does not record it yet, and the operator sends the credentials again. A provider
+deleted meanwhile answers 404, and the secret just written is removed again. `SEAMLESS_SECRET_STORE` selects it:
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory,
   each key written to a temporary file and renamed; the directory must be writable (Compose mounts the
@@ -2430,10 +2447,15 @@ seamless events prune (--before ISO | --older-than-days N) --confirm        # au
 seamless version
 ```
 
+The bracketed values are the §9.1 knobs' illustrative inputs: `estimate` with `--link-mbps` unset uses
+`EstimatorParams.link_bps`, the plan default of 131,072,000 B/s (125 MiB/s, about 1,048.6 Mbit/s); `--link-mbps 1000` is
+125,000,000 B/s.
+
 `plan apply` accepts the `PlanCreate` schema in YAML and runs the checks of `POST /plans` on it, in the
 same order and with the same messages (§12: the name and description lengths, repeated `vm_ids`, the plan
 settings, `estimator_overrides`), so it never stores a plan the API and the dashboard's plan form would
-refuse. Commands operating on the store use the same
+refuse; a key `PlanCreate` has no field for is refused on a create as on an update (`fields cannot be
+changed: …`, as `PATCH /plans/{id}` answers, §12) — a typo is never dropped. Commands operating on the store use the same
 settings as `serve` (they open the DB directly; a running server sees changes on its next tick, and its event
 stream sends their events, §12). An
 update follows `PATCH /plans/{id}` (§12): a `draft` or `validated` plan only, refused while a migration of
@@ -2469,11 +2491,12 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_DB_URL` | `sqlite:///{data_dir}/seamless.db` | database |
 | `SEAMLESS_HOST` / `SEAMLESS_PORT` | `127.0.0.1` / `8080` | bind |
 | `SEAMLESS_DEMO`, `SEAMLESS_DEMO_SPEED`, `SEAMLESS_DEMO_SEED`, `SEAMLESS_DEMO_FAILURE_RATE` | `false`, `60`, `42`, `0.1` | demo mode |
-| `SEAMLESS_AUTH_DISABLED`, `SEAMLESS_TOKENS_FILE`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `false`, unset, `60` | auth (§13); failed bearer authentications per client address per minute before further failures get `429` (valid tokens always pass; `0` disables) |
+| `SEAMLESS_AUTH_DISABLED`, `SEAMLESS_TOKENS_FILE`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `false`, unset, `60` | auth (§13); failed bearer authentications per client address per minute before further failures get `429` (a valid bootstrap-file token always passes — a shared ingress or NAT address never locks it out; a database user's token is looked up only while its address is not locked out, §13.1; `0` disables) |
 | `SEAMLESS_CORS_ORIGINS` | empty | comma-separated allowed origins |
 | `SEAMLESS_CLOUDS_YAML`, `SEAMLESS_SECRETS_DIR` | unset, `/var/run/secrets/seamless` | credentials |
 | `SEAMLESS_SECRET_STORE`, `SEAMLESS_K8S_NAMESPACE` | `files`, the pod's namespace | where dashboard-entered credentials are written (§13.3): `files` or `kubernetes` |
 | `SEAMLESS_ANSIBLE_PLAYBOOK`, `SEAMLESS_COLLECTION_ROOT` | `ansible-playbook`, repo root | executors |
+| `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` | `false` | whether the playbooks verify the SSH host keys of the conversion hosts (`ANSIBLE_HOST_KEY_CHECKING` of every run; the control plane's own environment no longer decides it). Off until SEC-02 lands (Security.md §6.3: a per-run `known_hosts` with pinned keys — still open): a host made for the migration has no key to compare with, so `true` works only with hosts whose keys the control plane's `known_hosts` already holds. The executor logs a warning once per run while it is off |
 | `SEAMLESS_MAX_CONCURRENT_MIGRATIONS`, `SEAMLESS_MAX_CONCURRENT_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
 | `SEAMLESS_SOURCE_WATCH_S` | `300` | how often a completed migration's source VM is checked for running again (§8.1; ÷ `demo_speed` in demo mode) |
 | `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§8) |
@@ -2481,6 +2504,14 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` | `remote`, unset, `false` | Where the model runs and whether the console excerpt may go there (§13.4, ADV-06) |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`, `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | unset, unset, `seamless-migrate`, `false` | agentmemory |
 | `SEAMLESS_DASHBOARD_DIR`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | auto, `false`, `INFO`, `false` (`true` in the container and manifests) | misc; JSON logs for log forwarders (§18) |
+
+The numeric variables are bounded; a value outside its bounds refuses to start the control plane
+(`error: …`, exit 1): `SEAMLESS_PORT` 1…65535; `SEAMLESS_TICK_S` (0 would spin), `SEAMLESS_DEMO_SPEED` (a
+divisor) and `SEAMLESS_JEV_TIMEOUT_S` above 0; `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` and
+`SEAMLESS_MAX_CONCURRENT_CUTOVERS` at least 1; `SEAMLESS_MAX_STEP_RETRIES` (a negative count would silently
+disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE`
+0 or more, 0 keeping the meaning each row gives it; `SEAMLESS_DEMO_FAILURE_RATE` and
+`SEAMLESS_JEV_MIN_CONFIDENCE` 0…1.
 
 ---
 
@@ -2515,10 +2546,13 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   hover, and at the bottom the live indicator, the theme and sign out as labelled icons). "Collapse navigation" /
   "Expand navigation" at the column's foot switches between the two at any width from 768 px and is remembered
   in the browser for that viewer (`localStorage`; without a stored choice the width decides, and a failing storage
-  only forgets it). The items stand in four labelled groups, in this order: Migrations — Overview (`/`), Plans
+  only forgets it). The items stand in five labelled groups, in this order: Migrations — Overview (`/`), Plans
   (`/plans`, also current on a migration's page); Clouds — Providers, Inventory; Activity — Events; Advisor —
   Recommendations (`/advisor`, also current on a recommendation's page), Policies (`/advisor/policies`), Audit
-  trail (`/advisor/audit`). The current item is marked `aria-current="page"`. Plans carries the count of failed
+  trail (`/advisor/audit`); Administration — Users (`/users`), for an admin alone: every other role's navigation
+  leaves the group out — the item is hidden, not kept in place unavailable with its reason as an action is
+  (whether it should instead stay, soft-disabled and saying why, is an open decision, tracked in §20). The
+  current item is marked `aria-current="page"`. Plans carries the count of failed
   migrations from `/stats` ("{n} failed", danger tone with its icon; the link's description, so its name stays
   "Plans"; nothing while it is 0 or while the stats are unknown). Below 768 px a header holds the menu button, the brand, the live indicator
   and the theme; the menu is a drawer sliding in from the left over the dimmed page (a modal dialog named
@@ -2824,6 +2858,24 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   nor cancelled, with its status, or a completed one with VMs not finalized, rolled back or cancelled, with their
   number — so nobody types its id to learn that; a cancelled migration's cleanup still under way, and a rolled-back VM keeping
   its copied data, which the plan list does not carry, are refused by the API alone, its 409 naming the plan; the dialog's Then says what stays: finished plans keep its id),
+  `/users` (Users, the Administration group's page — "Give each person their own dashboard access and role. Their
+  name identifies their actions in Events." — on `GET /users` and `POST /users` alone, §12, §13.1. For an admin,
+  two panels. Add user: User name, its hint the rule of §13.1 (1-128 letters, digits, dots, underscores, `@` or
+  hyphens, starting with a letter or digit; unique, ignoring case), Role (Viewer by default, each role's one-line
+  help under it), that it creates a login token to store securely before leaving the page, and Add user — unavailable,
+  saying why, while authentication is off (`/health` `auth_disabled`, as the API refuses it: "Enable authentication on
+  the control plane before adding users.") or while the health is not known yet (its failed load named with Retry);
+  a refused create — a name taken, ignoring case — keeps the typed name, shows the API's reason and issues no token.
+  Once created the panel reads "User {name} created": the one-time token in a read-only field that takes the focus
+  and selects itself, "Save this token now. It cannot be shown again after leaving this page or selecting Done.",
+  whom to share it with and for which access, Copy token (the clipboard; when the browser refuses, that the token is
+  to be selected and copied by hand) and Done, which clears the form and puts the focus on User name. The token is
+  the response's (`Cache-Control: no-store`, §12) and lives in the page alone, never in browser storage (§13.1),
+  until Done or a navigation drops it. Dashboard users: each user's name and role — the bootstrap tokens' and the
+  database's, as `GET /users` lists them, never a token or digest —, "No dashboard users configured." when there
+  are none, and Users are unavailable with Retry when the list cannot be loaded. Any other role, reaching the page by
+  its address, is told that managing dashboard users requires the admin role, and the page asks `GET /users` for
+  nobody else. Editing roles, rotating tokens and deleting users are not offered, §13.1),
   `/inventory/:providerId` — `/inventory` opens the first source provider's, or the first provider when there is no
   source —
   (its Provider select switches the inventory in place: focus stays on the select and the address is replaced, so
@@ -2905,9 +2957,23 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   typed errors); `src/api/stream.ts` (fetch-based SSE with resume). A stream that delivers nothing — no event and no
   heartbeat — for 45 s, three heartbeats (§12), counts as dropped although no error came, as a half-open connection
   does after a laptop sleeps or a network path dies: the dashboard closes it and connects again with `since`, its
-  indicator reading Reconnecting meanwhile, never Live on events that stopped. When the stream opens again after a
-  drop, the dashboard refetches the data it shows: a connection that dropped before its first persisted
-  event resumes live-only, so the gap is never replayed, and ephemeral progress never is. The event history
+  indicator reading Reconnecting meanwhile, never Live on events that stopped. The indicator's label is a focusable
+  term, as a status badge's is, whose detail — "Last update {hh:mm:ss}", when the last event or heartbeat came, or
+  "No updates received yet" — shows on hover, focus and tap, never only in a `title`, so stale data is recognisable
+  without a pointer. It connects again after a growing
+  delay — 1 s, then twice the last, 15 s at most — that starts over only once a connection has stayed open for one
+  heartbeat interval (15 s): a connection that ends sooner, whatever it delivered, counts as a failed attempt, as a
+  refused or unreachable one does, so a proxy that answers 200 and ends each body at once is tried every 15 s, not
+  every second. A stream refused for the role (403) is not tried again: the indicator reads Offline and the page
+  says live updates stopped. One refused for the per-address lockout (429, §15.1) is tried again once the lockout's
+  minute has passed, the indicator reading Reconnecting meanwhile — a token the server no longer accepts then gets
+  401, and the session ends as `/login` says — so a locked-out dashboard sends one refused request a minute, each
+  recorded as `auth.denied` (§13.1), not one every 15 s. When the stream opens again after a
+  drop, the dashboard refetches the data it shows — a connection that dropped before its first persisted
+  event resumes live-only, so the gap is never replayed, and ephemeral progress never is — once per 30 s at most:
+  the first reopening refetches at once, and one within 30 s of the last refetch is refetched once those 30 s have
+  passed, so a connection that drops and opens again and again never turns into a refetch storm (at 1,000 VMs a plan,
+  NFR-03, each such refetch reads megabytes) while no reopening goes unrefetched as long as the stream lasts. The event history
   of the Events page and of a migration's timeline is one `GET /events?tail=true` request (§12).
   A `migration.progress` event, and the pass a `migration.sync_pass` event ended, patch the migration where it is
   cached: its own query and each cached migration list that holds it. A list that does not hold it keeps its data
@@ -2983,6 +3049,12 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 * Single replica in 0.1.0 (the orchestrator is a singleton). HA via PostgreSQL + leader election is
   a 0.2.0 item. The OpenShift kustomization includes a PostgreSQL StatefulSet (or points at an
   existing database through the `seamless-db` Secret).
+* Backups (optional, `deploy/openshift/backup/`): a CronJob runs `pg_dump -Fc` nightly from the database's own
+  image into the `seamless-backups` PVC under the restricted security context, with its own NetworkPolicies
+  (egress to PostgreSQL, ingress from the backup pods), keeping `BACKUP_KEEP_DAYS` days; `restore-job.yaml` and
+  the README beside it are the restore runbook — Secrets, then the database, then the data PVC. The data PVC
+  (Ansible run directories, the recorded warm state) is backed up by the cluster's volume snapshots or
+  Velero/OADP; the Compose stack keeps its `pg_dump` recipe in `deploy/compose/README.md`.
 
 ### 17.1 Local stack: Docker Compose on a dedicated Colima profile
 
@@ -3049,7 +3121,11 @@ tests/unit/test_warm_migration.py             tests/unit/test_warm_destination.p
 tests/unit/test_warm_playbooks.py             tests/perf/bench_blocksync.py
 seamless/ (pyproject.toml, Containerfile, src/seamless_migrate/…, tests/…)
 dashboard/ (package.json, src/…, design-system/…, e2e/…)
-deploy/openshift/   deploy/kubernetes/   deploy/compose/   scripts/compose-init.sh   tests/e2e/
+deploy/openshift/   deploy/openshift/backup/   deploy/kubernetes/   deploy/compose/   tests/e2e/
+scripts/compose-init.sh   scripts/check-readonly-runtime.sh   scripts/collection-sanity.sh   scripts/vendor-openstack-cloud.sh
+.github/workflows/{ci,codeql}.yml   .github/dependabot.yml   .pre-commit-config.yaml   .gitleaks.toml   .gitleaks-tree.toml
+.dockerignore   seamless/.containerignore   RELEASING.md   NOTICE   CONTRIBUTING.md   SECURITY.md   CODE_OF_CONDUCT.md   CONTRIBUTORS.md   CODEOWNERS
+docs/advisor/   docs/audits/   docs/UI-UX-AUDIT-2026-10-15.md   AUDIT-UI-UX-BY-GEMINI.md
 docs/{PRD,SDD,MEMORY,QASuite,Security,Performance}.md
 docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 .mcp.json   .claude/settings.json   CLAUDE.md
@@ -3064,4 +3140,12 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with per-disk parallelism and read-ahead workers | 0.2.0: changed-extent sources that remove the scan — Ceph-direct `rbd diff` between pass snapshots (opt-in, Ceph credentials) and hypervisor-assisted tracking via libvirt checkpoints / incremental backup on the source compute nodes (builds on the existing `import_from_hypervisor` access model) |
 | D2 | Single-replica orchestrator | accepted | PostgreSQL + leader election — 0.2.0 |
 | D3 | Network cut-over (FIP/DNS/BGP) | out of scope; hooks documented | customer demand for OVN BGP integration |
-| D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL` |
+| D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL`; partly decided by the §13.4 knobs (`SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`, `TODO(ADV-06)`) |
+| D5 | Dashboard navigation item **Users** for non-admins: hidden (today) or soft-disabled with the reason, as every other action (§16) | hidden | owner decision (audit C-01) |
+| D6 | Collection identity on Galaxy: FQCN `os_migrate.os_migrate` 1.1.0 with the fork's own metadata; a version scheme that cannot collide with a future upstream 1.1.0; whether `scripts/publish.sh` stays | FQCN kept for upstreamability; the tarball is attached to GitHub Releases and never published to Galaxy (RELEASING.md) | owner decision (audit D-10) |
+| D7 | Python floor of the conversion hosts (§6.2: 3.6, RHEL 8 `platform-python`); nothing runs the tests on 3.6 | 3.6 kept, untested | a 3.6 job for `test_blocksync.py`, or a 3.9 floor (audit A-12) |
+| D8 | SSH trust on both data-path hops: host keys (SEC-02) and the dst→src link key (SEC-06) | `StrictHostKeyChecking=no` with the compensating controls of Security.md §6; the executor's `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` (§15.1) | 0.2.0 (audit A-01, A-02) |
+| D9 | Backups of the cluster deployment: the optional CronJob of §17, or the cluster's backup product (Velero/OADP) as the standard | CronJob shipped | owner decision (audit D-06) |
+| D10 | The commit trailer's model name (CLAUDE.md §2.7) | fixed `Claude Opus 5.5` | owner decision (audit F-13) |
+| D11 | Product documents in the collection artifact (the SDD, PRD, QASuite, Security and Performance documents are packed; audit material and agent plans are not) | packed | owner decision (audit D-21) |
+| D12 | The `TODO(…): confirm` markers of this document — LAB, ADV-04, ADV-06, ADV-17, ADV-18, ADV-19 — each a default taken without the owner's word | the defaults as written | each is an owner decision; remove the marker when decided (audit D-20) |

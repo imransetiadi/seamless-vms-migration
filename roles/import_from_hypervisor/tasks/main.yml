@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 ---
 # Main tasks for import_from_hypervisor role
 # Exports the disks of workloads with use_nbdkit_direct enabled with qemu-nbd

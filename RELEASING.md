@@ -17,7 +17,8 @@ the deployment the artifacts serve is in [SDD §17](docs/SDD.md).
 |---|---|---|
 | Control plane (`seamless/`) | `seamless/pyproject.toml` (`version`) and `seamless/src/seamless_migrate/__init__.py` (`__version__`, printed by `seamless --version` and returned by `GET /api/v1/health`) | container image `seamless-migrate:X.Y.Z`, built from `seamless/Containerfile` |
 | Dashboard (`dashboard/`) | `dashboard/package.json` and `dashboard/package-lock.json` | `dashboard/dist`, baked into the image |
-| Deployment (`deploy/`) | `deploy/compose/compose.yaml` (`${SEAMLESS_VERSION:-X.Y.Z}`, documented in `deploy/compose/README.md`), `newTag` in `deploy/openshift/kustomization.yaml` and `deploy/kubernetes/kustomization.yaml` | the manifests, in the release's source archive |
+| Deployment (`deploy/`) | `deploy/compose/compose.yaml` (`${SEAMLESS_VERSION:-X.Y.Z}`, documented in `deploy/compose/README.md`), `newTag` and the `app.kubernetes.io/version` label in `deploy/openshift/kustomization.yaml`, `newTag` in `deploy/kubernetes/kustomization.yaml` | the manifests, in the release's source archive |
+| Image labels | `org.opencontainers.image.version` in `seamless/Containerfile` | the label `docker inspect` shows on the image |
 | os-migrate collection (repository root) | `galaxy.yml` (`version`) and `plugins/module_utils/const.py` (`OS_MIGRATE_VERSION`); `tests/unit/test_version.py` keeps them equal | `os_migrate-os_migrate-<collection version>.tar.gz` from `make build` |
 
 The image carries the control plane, the built dashboard and this collection (SDD §17), so one image
@@ -81,10 +82,12 @@ perl -pi -e "s/^__version__ = \"\Q$OLD\E\"/__version__ = \"$NEW\"/" seamless/src
 (cd dashboard && npm version --no-git-tag-version "$NEW")
 perl -pi -e "s/SEAMLESS_VERSION:-\Q$OLD\E/SEAMLESS_VERSION:-$NEW/" deploy/compose/compose.yaml
 perl -pi -e "s/newTag: \Q$OLD\E/newTag: $NEW/" deploy/openshift/kustomization.yaml deploy/kubernetes/kustomization.yaml
+perl -pi -e "s{app.kubernetes.io/version: \Q$OLD\E}{app.kubernetes.io/version: $NEW}" deploy/openshift/kustomization.yaml
+perl -pi -e "s/image.version=\"\Q$OLD\E\"/image.version=\"$NEW\"/" seamless/Containerfile
 
 # what pins the version and must follow by hand: the health payload the control-plane tests expect,
 # the Compose README's table of defaults
-grep -n "$OLD" seamless/tests/test_api_core.py seamless/tests/test_build_context.py deploy/compose/README.md
+grep -n "$OLD" seamless/tests/test_api_core.py deploy/compose/README.md
 ```
 
 Then read every remaining `git grep -n "$OLD"` hit, and change only those that name the *current*
@@ -101,7 +104,9 @@ Check the result:
 ```bash
 make seamless-test                 # control plane
 make dashboard-build               # dashboard (npm ci + build); cd dashboard && npm test
-make test-ansible-units            # collection, as CI runs it
+# collection unit tests and ansible-test sanity, as CI runs them (QASuite §14.2; make test-ansible-units is upstream's podman path)
+PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest tests/unit -q -rs
+PATH="$PWD/.venv/bin:$PATH" scripts/collection-sanity.sh
 make seamless-check                # the full local gate
 ```
 
@@ -127,11 +132,15 @@ project's developer machines every `docker` command targets the dedicated Colima
 git clone --branch "v$NEW" https://github.com/imransetiadi/seamless-vms-migration.git release-$NEW
 cd release-$NEW
 
-make build                                   # collection tarball: starts its own os-migrate podman container (needs podman, network)
+# collection tarball: CI builds it from the tracked files on every run (job `collection`, artifact
+# `collection-tarball`, audit D-04) — download that artifact of the release commit's run, or build it
+# the same way locally; `make build` is upstream's path through its builder container
+gh run download --name collection-tarball --dir dist   # the run of the release commit
 ls os_migrate-os_migrate-*.tar.gz
 
 (cd dashboard && npm ci && npm run build)    # the image copies dashboard/dist
-docker build -f seamless/Containerfile -t seamless-migrate:$NEW .
+docker --context colima-seamless build -f seamless/Containerfile -t seamless-migrate:$NEW \
+  --build-arg "SOURCE_COMMIT=$(git rev-parse HEAD)" .
 docker run --rm seamless-migrate:$NEW --version  # prints $NEW: the image's entrypoint is the seamless CLI
 ```
 
@@ -279,3 +288,24 @@ own reviewed change:
   image, attaches the tarball, the SBOM and `SHA256SUMS` to a draft release, and leaves publishing to
   the release manager. It needs `permissions: contents: write`, and registry credentials as repository
   secrets, never in the workflow file.
+
+## 9. Upgrading a deployment
+
+The schema is created and extended by the control plane itself (`Store.create_schema()` at every start adds
+only what is missing, SDD §11); there is no migration tool yet (audit B-04), so the order of operations is
+what protects the data. For every MINOR, and for a PATCH that touches `store.py`:
+
+1. **Back up first**: a run of the backup CronJob (`oc create job --from=cronjob/seamless-pg-backup pre-upgrade`,
+   `deploy/openshift/backup/README.md`) and a snapshot of the `seamless-data` PVC; on Compose the `pg_dump`
+   recipe of `deploy/compose/README.md`. Do the restore drill of that README before the first upgrade of a
+   production deployment.
+2. **Quiesce**: pause every running plan from the dashboard (no cutover in flight), then scale the control
+   plane to 0 (`Recreate` keeps a single writer; a rolling update would start the new version beside the old).
+3. **Roll the image**: set the new tag or digest in the kustomization (or `SEAMLESS_VERSION` on Compose) and
+   apply; with the two-role PostgreSQL setup of Security.md §9.4, start the new version once with the owner
+   role's URL so `create_schema()` can add indexes, then switch back to the application role.
+4. **Verify**: `GET /api/v1/health` reports the new `version` and `db: ok`; the dashboard lists the plans;
+   resume the paused plans.
+5. **Roll back** if step 4 fails: the previous tag plus the dump of step 1 (the restore runbook).
+
+Release notes of a MINOR say which step needs more than this (a new Secret key, a new NetworkPolicy rule).

@@ -964,10 +964,10 @@ regression test (named in the defect) before it is closed.
 | Cadence | What | Output |
 |---|---|---|
 | every change | unit suites, lint | CI status |
-| nightly | PostgreSQL store tests, scans S-17…S-20, compose/kustomize validation | report with trend; failures open defects |
-| weekly | demo E2E, engine benchmark, resilience subset R-01/R-03/R-05 | `tests/perf/results-<host>.md`, E2E log |
+| nightly | PostgreSQL store tests, scans S-17…S-20, compose/kustomize validation (CI jobs `security` and `manifests`) | report with trend; failures open defects |
+| weekly (by hand: no weekly job yet, audit D-14) | demo E2E, engine benchmark, resilience subset R-01/R-03/R-05 | `tests/perf/results-<host>.md`, E2E log |
 | per release candidate | lab matrix, integrity, G1/G2, full resilience, DAST, manual accessibility | signed release report: environment descriptor, commit, per-case result, defect list, waivers |
-| quarterly | restore drill, secret rotation drill, incident-response rehearsal | drill report |
+| quarterly, and before every upgrade | restore drill (`deploy/openshift/backup/README.md`: the latest dump into a scratch namespace, `/stats` compared with production's), secret rotation drill, incident-response rehearsal | drill report: date, dump, result |
 
 ---
 
@@ -995,7 +995,7 @@ COLL=$(mktemp -d)                                      # outside the repo: no sy
 mkdir -p "$COLL/ansible_collections/os_migrate" && ln -s "$PWD" "$COLL/ansible_collections/os_migrate/os_migrate"
 
 # unit tests: the whole directory, as CI and `make seamless-check` run it — no test may skip (the hypervisor
-# NBD-export tests of SEC-01 build their own collection tree; 216 passed on 2026-10-09, ansible-core 2.18 and 2.21)
+# NBD-export tests of SEC-01 build their own collection tree; 407 passed on 2026-10-15, ansible-core 2.18 and 2.21)
 PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest tests/unit -q -rs
 PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest tests/unit/test_blocksync.py -v   # the engine alone; it imports through the collection layout
 python3 plugins/module_utils/blocksync.py --help
@@ -1011,7 +1011,7 @@ done
 # ansible-test refuses the symlinked layout above, so the script copies the tracked collection files into a real tree
 PATH="$PWD/.venv/bin:$PATH" scripts/collection-sanity.sh
 
-# CI path (podman container, as upstream)
+# upstream's path (podman container); CI runs the pytest and sanity commands above, not this
 make test-ansible-lint test-ansible-sanity test-ansible-units
 ```
 

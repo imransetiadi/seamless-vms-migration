@@ -10,8 +10,8 @@ USE_CONTAINER ?= true
 
 # Container and Python Configuration
 CONTAINER_ENGINE ?= podman
-# Pre-built builder image (see builder/Containerfile and the build-builder.yml
-# workflow). It ships the toolchain (python3.12 + devel, gcc, git, make) so the
+# Pre-built builder image (see builder/Containerfile; upstream builds it in a
+# workflow this fork does not carry). It ships the toolchain (python3.12 + devel, gcc, git, make) so the
 # check-python-version / install-deps steps become no-ops and builds are faster.
 # Set BUILDER_NAMESPACE to match your quay namespace, or override CONTAINER_IMAGE
 # entirely to fall back to the plain base, e.g.:
@@ -100,7 +100,6 @@ help:
 	@echo "  test-ansible-sanity   - Launch ansible-sanity tests"
 	@echo "  test-ansible-units    - Launch ansible-test unit tests"
 	@echo "  test-e2e-tenant       - Launch e2e tenant tests"
-	@echo "  test-e2e-admin        - Launch e2e admin tests"
 	@echo "  generate-auth-files   - Generate auth files for e2e tests"
 	@echo "  seamless-help         - Seamless Migrate stack on Colima/Compose (make seamless-help)"
 	@echo ""

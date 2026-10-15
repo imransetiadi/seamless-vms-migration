@@ -228,6 +228,44 @@ def test_credentials_written_while_a_check_updates_the_provider_are_recorded(api
     assert stored.conversion_host.ssh_key_secret == "provider-dst-rhoso-ssh"
 
 
+def test_credentials_of_a_provider_that_keeps_changing_answer_503_naming_the_stored_secret(
+    api, monkeypatch
+):
+    """Audit B-25 (SDD §13.3): a provider rewritten between every read and write of the record is
+    retried RECORD_SECRET_ATTEMPTS times, then the route answers 503 unavailable naming the secret
+    the store already holds, so the operator sends the credentials again - never a hung request."""
+    from seamless_migrate.api import routes_providers
+    from seamless_migrate.store import AsyncStore, ConflictError
+
+    db_put = AsyncStore.put
+    attempts: list[int] = []
+
+    async def rewritten_meanwhile(self, kind, model, expected_version=None):
+        if kind == "provider" and expected_version is not None:
+            attempts.append(expected_version)
+            raise ConflictError(f"provider {model.id!r} is at version 9, not {expected_version}")
+        return await db_put(self, kind, model, expected_version=expected_version)
+
+    monkeypatch.setattr(AsyncStore, "put", rewritten_meanwhile)
+    monkeypatch.setattr(routes_providers, "RECORD_SECRET_ATTEMPTS", 3)
+    res = put(
+        api,
+        "/api/v1/providers/src-osp/credentials",
+        {"username": "svc-migrate", "password": "pw-1", "project_name": "finance"},
+    )
+    assert res.status_code == 503, res.text
+    error = res.json()["error"]
+    assert error["code"] == "unavailable"
+    assert "provider-src-osp" in error["message"] and "again" in error["message"]
+    assert len(attempts) == 3
+    # the store holds the value; the provider does not record it yet, and nothing was audited
+    assert (api.settings.secrets_dir / "provider-src-osp" / "password").read_text() == "pw-1"
+    stored = api.store.get("provider", "src-osp", Provider)
+    assert stored.credentials_updated_at is None and stored.credentials_secret is None
+    kinds = [e.kind for e in api.store.events(since_seq=0)]
+    assert "provider.credentials_updated" not in kinds
+
+
 def test_credentials_of_a_provider_deleted_meanwhile_answer_404_and_leave_no_secret(
     api, monkeypatch
 ):

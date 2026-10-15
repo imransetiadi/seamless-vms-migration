@@ -1366,6 +1366,14 @@ class AnsibleExecutor:
             if k in ENV_PASSTHROUGH or (k.startswith("ANSIBLE_") and k not in ANSIBLE_ENV_DENIED)
         }
         home = Path(self.settings.data_dir) / ".ansible"
+        checking = self.settings.ansible_host_key_checking
+        if not checking:
+            # SEC-02 (Security.md §6.3) is open: a conversion host made for the migration has no
+            # key to compare with; said once per run (SDD §15.1), not once per playbook
+            log.warning(
+                "the conversion hosts' SSH host keys are not verified "
+                "(SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is off)"
+            )
         env.update(
             {
                 "ANSIBLE_COLLECTIONS_PATH": self._collections_path(),
@@ -1378,7 +1386,8 @@ class AnsibleExecutor:
                 "ANSIBLE_NOCOLOR": "1",
                 # the downtime clock reads the stop task's result line: never hide skipped hosts
                 "ANSIBLE_DISPLAY_SKIPPED_HOSTS": "True",
-                "ANSIBLE_HOST_KEY_CHECKING": env.get("ANSIBLE_HOST_KEY_CHECKING", "False"),
+                # SDD §15.1: the setting decides, never the control plane's own environment
+                "ANSIBLE_HOST_KEY_CHECKING": "True" if checking else "False",
                 "PYTHONUNBUFFERED": "1",
             }
         )

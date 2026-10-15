@@ -43,7 +43,7 @@ from . import (
     routes_providers,
     routes_users,
 )
-from .deps import ApiError, Services
+from .deps import ApiError, Services, validation_message
 
 log = logging.getLogger(__name__)
 API_PREFIX = "/api/v1"
@@ -66,14 +66,6 @@ def _error(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse({"error": {"code": code, "message": message}}, status_code=status)
 
 
-def _validation_message(errors: list[Any]) -> str:
-    parts = []
-    for err in errors[:5]:
-        location = ".".join(str(p) for p in err.get("loc", ()) if p != "body")
-        parts.append(f"{location}: {err.get('msg')}" if location else str(err.get("msg")))
-    return "; ".join(parts) or "invalid request"
-
-
 def _install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def api_error(_: Request, exc: ApiError) -> JSONResponse:
@@ -86,11 +78,11 @@ def _install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def request_validation(_: Request, exc: RequestValidationError) -> JSONResponse:
-        return _error(422, "validation_error", _validation_message(list(exc.errors())))
+        return _error(422, "validation_error", validation_message(exc.errors()))
 
     @app.exception_handler(ValidationError)
     async def model_validation(_: Request, exc: ValidationError) -> JSONResponse:
-        return _error(422, "validation_error", _validation_message(list(exc.errors())))
+        return _error(422, "validation_error", validation_message(exc.errors()))
 
     @app.exception_handler(NotFound)
     async def not_found(_: Request, exc: NotFound) -> JSONResponse:

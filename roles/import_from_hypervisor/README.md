@@ -1,3 +1,5 @@
+<!-- Modified by the Seamless Migrate project, 2026. -->
+
 Import From Hypervisor Role
 ============================
 
@@ -91,4 +93,4 @@ The exports carry whole guest disks, so they are locked down by default:
 | `os_migrate_nbdkit_nova_instances_dir` | `/var/lib/nova/instances` | Nova instances directory on the hypervisor |
 
 The SSH user on the hypervisors needs passwordless `sudo`, `qemu-img`,
-`qemu-nbd` (with `--pid-file`, QEMU 4.1 or later) and `netstat`.
+`qemu-nbd` (with `--pid-file`, QEMU 4.1 or later) and `ss` (iproute2).

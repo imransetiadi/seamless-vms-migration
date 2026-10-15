@@ -277,6 +277,12 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
     try:
         spec = PlanCreate.model_validate(document)
     except ValidationError as exc:
+        # SDD §12/§15: a key PlanCreate has no field for - a typo, a server-owned field, a YAML
+        # key that is no string (`1:`, `yes:`) - is refused as POST and PATCH refuse it, on a
+        # create as on an update, never dropped
+        unknown = sorted(str(key) for key in document if key not in PLAN_EDITABLE_FIELDS)
+        if unknown:
+            raise CliError(f"fields cannot be changed: {', '.join(unknown)}") from None
         raise CliError(f"invalid plan: {exc}") from None
     from .plan_checks import PlanSpecError, check_plan_spec
 
@@ -311,11 +317,6 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
 
         # SDD §15: an update follows PATCH /plans/{id} (§12), against the version it read
         existing, version = store.get_versioned("plan", existing.id, Plan)
-        # the file's keys are the PATCH body, refused first as PATCH refuses them (§12)
-        # a YAML key that is no string (`1:`, `yes:`) is a field the plan cannot change too
-        unknown = sorted(str(key) for key in document if key not in PLAN_EDITABLE_FIELDS)
-        if unknown:
-            raise CliError(f"fields cannot be changed: {', '.join(unknown)}")
         if str(existing.status) not in ("draft", "validated"):
             raise CliError(f"plan {existing.id} is {existing.status}; it cannot be changed")
         migrations = store.list("migration", Migration, plan_id=existing.id)

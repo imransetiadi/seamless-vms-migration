@@ -1871,3 +1871,69 @@ def test_an_operator_may_resend_the_current_cutover_window_in_any_spelling(api):
     assert changed.status_code == 403
     malformed = api.client.patch(url, headers=api.h(Role.operator), json={"cutover_window": 5})
     assert malformed.status_code in (403, 422)
+
+
+def test_create_refuses_a_field_the_schema_does_not_have_like_patch(api):
+    """SDD §12: a misspelt field on POST /plans or POST /providers is refused with 422 naming
+    it, as PATCH refuses one - never dropped, which would store a plan without the guard it was
+    meant to carry or a provider verifying TLS it was told not to."""
+    plan = {
+        "name": "typo",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": ["vm-1"],
+        "requrie_approval": False,
+    }
+    refused = api.post("/api/v1/plans", Role.operator, json=plan)
+    assert refused.status_code == 422, refused.text
+    assert "requrie_approval" in refused.json()["error"]["message"]
+    assert api.get("/api/v1/plans").json() == []
+    refused = api.post("/api/v1/providers", json={**SOURCE, "id": "src-typo", "verify_tsl": False})
+    assert refused.status_code == 422, refused.text
+    assert "verify_tsl" in refused.json()["error"]["message"]
+    assert api.get("/api/v1/providers/src-typo").status_code == 404
+
+
+def test_a_plan_rewritten_under_every_retry_answers_409_after_backing_off(api, monkeypatch):
+    """Audit B-14 (SDD §12): an action whose plan other writers rewrite between every read and
+    write of its update is retried with a jittered, growing backoff and then answered 409
+    (conflict) - not a RuntimeError's 500, and not with immediate retries."""
+    from seamless_migrate import orchestrator
+    from seamless_migrate.store import AsyncStore, ConflictError
+
+    body = {
+        "name": "busy",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": first_clean_vms(api, n=2),
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    db_put = AsyncStore.put
+    attempts: list[int] = []
+
+    async def rewritten_meanwhile(self, kind, model, expected_version=None):
+        if kind == "plan" and expected_version:
+            attempts.append(expected_version)
+            raise ConflictError(f"plan {model.id!r} is at version 2, expected {expected_version}")
+        return await db_put(self, kind, model, expected_version=expected_version)
+
+    waits: list[float] = []
+    backoff = orchestrator._update_backoff
+
+    def recorded_but_not_waited(attempt: int) -> float:
+        waits.append(backoff(attempt))
+        return 0.0
+
+    monkeypatch.setattr(AsyncStore, "put", rewritten_meanwhile)
+    monkeypatch.setattr(orchestrator, "_update_backoff", recorded_but_not_waited)
+    res = api.post(
+        f"/api/v1/plans/{plan['id']}/waves/auto", Role.operator, json={"max_wave_size": 5}
+    )
+    assert res.status_code == 409, res.text
+    assert res.json()["error"]["code"] == "conflict"
+    assert "changed too often" in res.json()["error"]["message"]
+    assert len(attempts) == orchestrator.PLAN_UPDATE_ATTEMPTS >= 16
+    assert len(waits) == orchestrator.PLAN_UPDATE_ATTEMPTS - 1
+    assert all(0 < wait <= orchestrator.PLAN_UPDATE_BACKOFF_S for wait in waits)
+    assert waits[0] <= 0.01 < 0.1 <= waits[-1], "5 ms doubling up to the cap, jittered"
+    assert api.get(f"/api/v1/plans/{plan['id']}").json()["waves"] == []

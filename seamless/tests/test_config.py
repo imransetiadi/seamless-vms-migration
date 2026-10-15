@@ -80,6 +80,65 @@ def test_settings_parses_types(tmp_path):
     assert s.dashboard_dir == tmp_path / "dist"
 
 
+def test_settings_ansible_host_key_checking_is_off_by_default_and_can_be_turned_on():
+    """Audit B-02 (SDD §15.1): the run's ANSIBLE_HOST_KEY_CHECKING comes from an explicit
+    setting - off by default while SEC-02 is open - never from the control plane's environment."""
+    assert Settings.from_env({}).ansible_host_key_checking is False
+    on = Settings.from_env({"SEAMLESS_ANSIBLE_HOST_KEY_CHECKING": "true"})
+    assert on.ansible_host_key_checking is True
+    off = Settings.from_env({"SEAMLESS_ANSIBLE_HOST_KEY_CHECKING": "false"})
+    assert off.ansible_host_key_checking is False
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("SEAMLESS_PORT", "0"),
+        ("SEAMLESS_PORT", "65536"),
+        ("SEAMLESS_TICK_S", "0"),
+        ("SEAMLESS_DEMO_SPEED", "0"),
+        ("SEAMLESS_JEV_TIMEOUT_S", "0"),
+        ("SEAMLESS_MAX_CONCURRENT_MIGRATIONS", "0"),
+        ("SEAMLESS_MAX_CONCURRENT_CUTOVERS", "0"),
+        ("SEAMLESS_MAX_STEP_RETRIES", "-1"),
+        ("SEAMLESS_STEP_TIMEOUT_S", "-1"),
+        ("SEAMLESS_SOURCE_WATCH_S", "-1"),
+        ("SEAMLESS_AUTH_LOCKOUT_PER_MINUTE", "-1"),
+        ("SEAMLESS_DEMO_FAILURE_RATE", "-0.1"),
+        ("SEAMLESS_DEMO_FAILURE_RATE", "1.1"),
+        ("SEAMLESS_JEV_MIN_CONFIDENCE", "1.1"),
+    ],
+)
+def test_settings_refuse_a_value_outside_its_bounds(variable, value):
+    """Audit B-08 (SDD §15.1): a tick of 0 would spin and a negative retry count would silently
+    disable the retries - a value outside a setting's bounds is refused, naming the setting."""
+    with pytest.raises(ValueError, match=variable.removeprefix("SEAMLESS_").lower()):
+        Settings.from_env({variable: value})
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("SEAMLESS_PORT", "1"),
+        ("SEAMLESS_PORT", "65535"),
+        ("SEAMLESS_TICK_S", "0.001"),
+        ("SEAMLESS_MAX_CONCURRENT_MIGRATIONS", "1"),
+        ("SEAMLESS_MAX_CONCURRENT_CUTOVERS", "1"),
+        ("SEAMLESS_MAX_STEP_RETRIES", "0"),
+        ("SEAMLESS_STEP_TIMEOUT_S", "0"),
+        ("SEAMLESS_SOURCE_WATCH_S", "0"),
+        ("SEAMLESS_AUTH_LOCKOUT_PER_MINUTE", "0"),
+        ("SEAMLESS_DEMO_FAILURE_RATE", "0"),
+        ("SEAMLESS_DEMO_FAILURE_RATE", "1"),
+        ("SEAMLESS_JEV_MIN_CONFIDENCE", "0"),
+        ("SEAMLESS_JEV_MIN_CONFIDENCE", "1"),
+    ],
+)
+def test_settings_accept_the_edge_of_their_bounds(variable, value):
+    """SDD §15.1: 0 keeps the meaning its row gives it (off, unbounded, once); the edges hold."""
+    Settings.from_env({variable: value})
+
+
 def test_every_setting_is_documented_in_sdd_15_1():
     """Every SEAMLESS_* variable Settings.from_env reads appears in SDD §15.1, and every
     variable the section lists is read (the dashboard-only SEAMLESS_MOCK aside)."""
