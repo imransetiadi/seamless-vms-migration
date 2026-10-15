@@ -31,6 +31,8 @@ ROOT = find_repo_root()
 SECRET_PATHS = [
     "deploy/compose/.env",  # scripts/compose-init.sh: DB password, Jev token, TypeSafe key
     "deploy/compose/.env.bak",
+    "seamless/.env.local",  # a developer's own env file next to the control plane
+    "tests/tokens.yaml",  # a token file saved outside deploy/compose
     "deploy/compose/tokens.yaml",
     "deploy/compose/compose.local.yaml",  # README: VMware passwords for the local stack
     "deploy/openshift/secret.yaml",  # a filled-in copy of secret-example.yaml
