@@ -135,7 +135,10 @@ def test_update_progress_replaces_state_file_atomically(tmp_path):
 
 def _exporter(nbdkit_installed):
     src = fake.FakeCloud("src")
-    src.add_conversion_host("src-conv", "10.0.0.10")
+    conv = src.add_conversion_host("src-conv", "10.0.0.10")
+    # the volume the map names is on the conversion host, at /dev/vdb: the export checks the
+    # disk's identity before it serves it (Seamless Migrate SDD 6.6, review RV13-02)
+    src.attach_volume(conv, src.add_volume("vol-1", "vm1-root", 10))
 
     def which(command):
         if command[0] == "which":

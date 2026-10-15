@@ -1219,14 +1219,16 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
     def _exported_path(self, volume_id, device):
         """
         The path the NBD export of volume ``volume_id``, attached at
-        ``device``, serves. The kernel gives a freed device path to the next
-        disk attached, and nbdkit's file plugin opens its path for each
-        connection, so a volume taken off this host would have the export
-        serve another disk without an error. The disk's virtio serial - the
-        volume id Nova gives it, cut to 20 characters - must not name another
-        volume, and the export serves udev's link of that serial, which goes
-        with the volume. A disk that shows no serial (not virtio-blk) is served
-        by its path (Seamless Migrate SDD 6.6, review RV12-03).
+        ``device``, serves, once its identity is checked. The kernel gives a
+        freed device path to the next disk attached, so a volume taken off
+        this host would have the export serve another disk without an error.
+        The disk's virtio serial - the volume id Nova gives it, cut to 20
+        characters - must not name another volume, and a virtio-blk disk
+        (vdX), which always shows a serial file, must still have one; a disk
+        with no serial file (not virtio-blk, sdX) is served by its path. The
+        export serves udev's link of the serial, but nbdkit resolves it once,
+        at its start: a swap after that is a known residual (Seamless Migrate
+        SDD 6.6, review RV12-03, RV13-01, RV13-02).
         """
         name = device.rsplit("/", 1)[-1]
         try:
@@ -1234,7 +1236,12 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
         except subprocess.CalledProcessError as err:
             if err.returncode == SSH_FAILED:
                 raise
-            serial = ""  # no such disk any more, or no serial: the path is all there is
+            if name.startswith("vd"):
+                raise RuntimeError(
+                    "%s on the conversion host is gone: volume %s left the host"
+                    % (device, volume_id)
+                ) from err
+            serial = ""  # not virtio-blk: no serial file to check
         if not serial:
             self.log.warning("%s shows no virtio serial: exporting it by its path", device)
             return device
@@ -1244,7 +1251,10 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                 "the volume left the host" % (device, serial, volume_id)
             )
         link = "/dev/disk/by-id/virtio-" + serial
-        if self.shell.cmd_val(["test", "-b", link]) != 0:
+        found = self.shell.cmd_val(["test", "-b", link])
+        if found == SSH_FAILED:
+            raise subprocess.CalledProcessError(SSH_FAILED, ["test", "-b", link])
+        if found != 0:
             self.log.warning("%s has no %s link: exporting it by its path", device, link)
             return device
         return link
