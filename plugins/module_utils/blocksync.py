@@ -7,10 +7,16 @@ script that runs on the conversion hosts, so it depends on the Python 3.6+
 standard library only::
 
     python3 blocksync.py send    --device PATH [--chunk-size N] [--workers W]
+                                 [--expect-serial ID]
     python3 blocksync.py receive --device PATH [--chunk-size N] [--workers W]
                                  [--assume-zero] [--progress-interval S]
-                                 -- SENDER_COMMAND [ARGS...]
+                                 [--expect-serial ID] -- SENDER_COMMAND [ARGS...]
     python3 blocksync.py hash    --device PATH [--chunk-size N]
+
+``--expect-serial ID`` checks, before a byte is read or written, that the
+device opened is the disk of volume ``ID``: its virtio serial must be a prefix
+of ``ID`` (exit 3 otherwise); a device that shows no serial is used as given
+(Seamless Migrate SDD 6.2).
 
 The receiver runs next to the destination device and spawns the sender
 (normally ``ssh <source host> sudo python3 blocksync.py send ...``) with

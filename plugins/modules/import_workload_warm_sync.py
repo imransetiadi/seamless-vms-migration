@@ -186,6 +186,7 @@ volume_map:
     "/dev/vda":
       source_id: 059635b7-451f-4a64-978a-7c2e9e4c15ff
       source_dev: /dev/vdc
+      tmp_volume_id: 6d0f1c2e-5a7b-4c3d-9e8f-0a1b2c3d4e5f
       dest_id: 3b7a57d7-8210-47f9-b592-a6627ae52d13
       dest_dev: /dev/vdd
       name: migration-vm-boot
