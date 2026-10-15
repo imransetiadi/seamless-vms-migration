@@ -918,8 +918,11 @@ open_local) and copies into the regular file it created - on RHEL 9, whose /dev 
 ENOSPC. So after nbdcopy exits, whether it succeeded or not, the transfer checks that the path it gave nbdcopy is still
 a block device. If it is not, the transfer removes a regular file found there - udev 252 (RHEL 9) will not make the
 volume's link over one, where udev 239 (RHEL 8) replaces it - and fails as permanent, saying whether the file was
-removed, could not be removed or could not be checked; ssh failing at the check gives up as "SSH timeout: ..." and is
-retried (review RV15-02, RV16-02, RV16-03). A path that is still a disk leaves nbdcopy's own exit to decide. Telling the
+removed, could not be removed or could not be checked. Ssh failing at the check gives up as "SSH timeout: ..." and is
+retried when nbdcopy finished its copy (exit 0) or ssh broke it (exit 255); after nbdcopy failed on its own (any other
+exit) every answer the check could give is permanent, so the transfer keeps nbdcopy's failure, permanent, and says the
+path could not be checked (review RV15-02, RV16-02, RV16-03, RV17-01). A path that is still a disk leaves nbdcopy's own
+exit to decide. Telling the
 two attachments apart
 needs this export's own Cinder attachment id, which a lost answer never gave it: Nova shows the id only from
 microversion 2.89, newer than RHOSP 17.1, and Cinder's attachments API is not yet used. The cleanup re-attaches each
