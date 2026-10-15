@@ -1351,23 +1351,16 @@ def test_workload_file_stem_matches_the_collection():
     assert all("/" not in workload_file_stem(n) for n in names)
 
 
-def _ssh_outage_prefixes(source: str) -> set[str]:
-    """Every prefix a give-up of the collection's SshOutage can carry: its default and each
-    `prefix=` a call passes - a new one, whatever its words, joins this set."""
-    prefixes = set()
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.ClassDef) and node.name == "SshOutage":
-            init = next(f for f in node.body if getattr(f, "name", None) == "__init__")
-            names = [a.arg for a in init.args.args]
-            defaults = dict(
-                zip(names[len(names) - len(init.args.defaults) :], init.args.defaults, strict=True)
-            )
-            prefixes.add(ast.literal_eval(defaults["prefix"]))
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "SshOutage":
-            prefixes.update(
-                ast.literal_eval(kw.value) for kw in node.keywords if kw.arg == "prefix"
-            )
-    return prefixes
+def _give_up_prefixes(source: str) -> list[str]:
+    """The prefixes a give-up of the collection's SshOutage can carry: its GIVE_UP_PREFIXES, the
+    only ones an SshOutage takes, in whatever form a call or a subclass passes one (review
+    RV11-05)."""
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and any(
+            getattr(target, "id", None) == "GIVE_UP_PREFIXES" for target in node.targets
+        ):
+            return list(ast.literal_eval(node.value))
+    pytest.fail("volume_common.py declares no GIVE_UP_PREFIXES")
 
 
 def test_the_collections_conversion_host_failures_are_classified_as_the_sdd_says():
@@ -1382,15 +1375,15 @@ def test_the_collections_conversion_host_failures_are_classified_as_the_sdd_says
     templates = re.findall(r'"([^"]*%[sd][^"]*)"', source)
     unreachable = next(t for t in templates if "unreachable over SSH" in t)
     stuck = next(t for t in templates if "waiting to detach volume" in t)
-    prefixes = sorted(_ssh_outage_prefixes(source))
+    prefixes = sorted(_give_up_prefixes(source))
     waits = {
         "Lock timeout": "/var/lock/v2v-source-volume-lock",
         "SSH timeout": "the source cleanup",
     }
 
     assert prefixes == sorted(waits)
-    for prefix, waiting_for in waits.items():
-        message = unreachable % (prefix, "10.1.0.10", 66, waiting_for)
+    for prefix in prefixes:
+        message = unreachable % (prefix, "10.1.0.10", 66, waits[prefix])
         assert classify_failure(message) is TransientStepError, message
     assert classify_failure(stuck % (1800, "vol-1", "srv-1")) is PermanentStepError
 
