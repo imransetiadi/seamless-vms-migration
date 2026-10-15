@@ -2,8 +2,8 @@ import { QueryClient } from '@tanstack/react-query';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import { StrictMode } from 'react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import App from './App';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import App, { PageErrorBoundary } from './App';
 import { ApiClient } from './api/client';
 import { createMockFetch } from './api/mock';
 import { createTestServer } from './test/utils';
@@ -94,5 +94,24 @@ describe('App shell', () => {
     renderApp('revoked-token');
     expect(await screen.findByRole('heading', { level: 1, name: 'Sign in' }, PAGE_TIMEOUT)).toBeInTheDocument();
     expect(window.location.pathname).toBe('/login');
+  });
+});
+
+describe('PageErrorBoundary', () => {
+  it('keeps the recovery panel and logs the error with its component stack, so support has a trace (audit C-17)', () => {
+    const error = new Error('render failed');
+    function Broken(): never {
+      throw error;
+    }
+    // React and jsdom report the uncaught render error themselves; the boundary's own line names where it happened
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    render(
+      <PageErrorBoundary>
+        <Broken />
+      </PageErrorBoundary>,
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent('This page could not be loaded');
+    expect(screen.getByRole('button', { name: 'Reload page' })).toBeInTheDocument();
+    expect(logged).toHaveBeenCalledWith(error, expect.stringContaining('Broken'));
   });
 });
