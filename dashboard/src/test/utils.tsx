@@ -70,8 +70,10 @@ export function renderWithApp(ui: ReactElement, options: RenderOptions = {}): Re
     options.wrapFetch,
     options.onUnauthorized,
   );
+  // a hook that sets its own `retry` (noRetryOnClientErrors: twice on a 5xx) keeps this `retryDelay`, so a test of a
+  // failed load waits no real 1 s + 2 s; a hook's `retry` overrides the default, its delay does not
   const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false, staleTime: Infinity, refetchOnWindowFocus: false }, mutations: { retry: false } },
+    defaultOptions: { queries: { retry: false, retryDelay: 0, staleTime: Infinity, refetchOnWindowFocus: false }, mutations: { retry: false, retryDelay: 0 } },
   });
   // The app renders pages only after RequireAuth has loaded GET /me, so a page never sees an unknown
   // role. Pages rendered here skip RequireAuth: seed the session like it, or a test that clicks a

@@ -97,7 +97,7 @@ describe('dashboard user access', () => {
     );
     const user = userEvent.setup();
     renderWithApp(<Users />, { server });
-    await screen.findByRole('alert', {}, { timeout: 10_000 });
+    await screen.findByRole('alert');
     fail.mockRestore();
     await user.click(screen.getByRole('button', { name: 'Retry' }));
     expect(await screen.findByText('rina')).toBeInTheDocument();
