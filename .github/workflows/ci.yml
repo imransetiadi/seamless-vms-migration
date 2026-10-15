@@ -109,6 +109,30 @@ jobs:
           ansible-lint --offline roles/import_workloads_warm roles/import_from_hypervisor \
             playbooks/import_workloads_precopy.yml playbooks/import_workloads_cutover.yml \
             playbooks/rollback_workloads.yml
+      - name: Build the collection tarball a release attaches, from the tracked files (audit D-04)
+        # the same recipe as the image (seamless/Containerfile): the openstack.cloud modules the roles
+        # call are vendored from the pinned Galaxy release, then ansible-galaxy packs the tree under
+        # galaxy.yml's build_ignore. Nothing upstream-controlled runs here (make build uses upstream's
+        # builder image); the artifact is what RELEASING.md attaches to a GitHub Release.
+        run: |
+          work="$RUNNER_TEMP/collection-build"
+          mkdir -p "$work/src" "$work/dist"
+          git ls-files -z | rsync -a --from0 --files-from=- ./ "$work/src/"
+          os_cloud=$(grep -oE 'OS_CLOUD_VERSION=[0-9.]+' seamless/Containerfile | cut -d= -f2)
+          ansible-galaxy collection install "openstack.cloud:${os_cloud}" -p "$work/galaxy"
+          scripts/vendor-openstack-cloud.sh "$work/src" "$work/galaxy/ansible_collections/openstack/cloud/plugins"
+          (cd "$work/src" && ansible-galaxy collection build --force --output-path "$work/dist")
+          ls -l "$work/dist"
+          tar tzf "$work/dist"/os_migrate-os_migrate-*.tar.gz | grep -q '^NOTICE$'
+          if tar tzf "$work/dist"/os_migrate-os_migrate-*.tar.gz | grep -qE 'docs/audits|AUDIT-'; then
+            echo "audit material in the artifact"; exit 1
+          fi
+          echo "COLLECTION_DIST=$work/dist" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: collection-tarball
+          path: ${{ env.COLLECTION_DIST }}/os_migrate-os_migrate-*.tar.gz
+          retention-days: 30
 
   dashboard:
     name: dashboard (typecheck, lint, tests, build, audit)

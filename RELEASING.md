@@ -132,7 +132,10 @@ project's developer machines every `docker` command targets the dedicated Colima
 git clone --branch "v$NEW" https://github.com/imransetiadi/seamless-vms-migration.git release-$NEW
 cd release-$NEW
 
-make build                                   # collection tarball: starts its own os-migrate podman container (needs podman, network)
+# collection tarball: CI builds it from the tracked files on every run (job `collection`, artifact
+# `collection-tarball`, audit D-04) — download that artifact of the release commit's run, or build it
+# the same way locally; `make build` is upstream's path through its builder container
+gh run download --name collection-tarball --dir dist   # the run of the release commit
 ls os_migrate-os_migrate-*.tar.gz
 
 (cd dashboard && npm ci && npm run build)    # the image copies dashboard/dist
