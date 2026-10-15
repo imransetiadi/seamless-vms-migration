@@ -586,6 +586,8 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
         "admin": True,
         "roles": ["admin", "member", "reader"],
         "compute_microversion": "2.95",
+        # the stub's block-storage proxy has no version document: unreadable (SDD §10)
+        "block_storage_microversion": "",
         "ovn": True,
         "volume_backends": ["hostgroup@ceph#ssd"],
         "storage_backends": [
@@ -596,6 +598,9 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
                 "family": "rbd",
             }
         ],
+        # an https endpoint, and no service endpoint the stub can tell (SDD §10, Security.md)
+        "tls": True,
+        "plain_http": [],
     }
     stub_openstack(fake_conn(admin=False, ovn=False))
     caps = await OpenStackProvider(make_provider(), settings()).check()
@@ -615,6 +620,120 @@ async def test_the_check_reports_a_real_clouds_compute_maximum_as_major_minor(tm
     # what keystoneauth hands the check: a tuple, never the text a stub hands
     conn = cloud.connect(provider, cloud.settings)
     assert conn.compute.get_endpoint_data().max_microversion == (2, 96)
+
+
+def _versions(conn, compute, block_storage):
+    conn.compute.get_endpoint_data = lambda: NS(max_microversion=compute)
+    conn.block_storage.get_endpoint_data = lambda: NS(max_microversion=block_storage)
+    return conn
+
+
+async def test_openstack_check_reports_release_range_tier_profile_and_tls(stub_openstack):
+    """SDD §10, §10.1, §21.3, §21.5: a destination's check reports the series its maxima read as,
+    the series it settles on, its support tier and its policy profile, and TLS; a source's check
+    reports TLS but no destination keys."""
+    hibiscus = make_provider(
+        id="dst-hibiscus",
+        role=ProviderRole.destination,
+        distribution="kolla",
+        endpoint="https://keystone.dst.example:5000/v3",
+    )
+    stub_openstack(_versions(fake_conn(), "2.104", "3.71"))
+    caps = await OpenStackProvider(hibiscus, settings()).check()
+    assert caps["compute_microversion"] == "2.104" and caps["block_storage_microversion"] == "3.71"
+    assert {
+        key: caps[key] for key in ("release_range", "release", "support_tier", "policy_profile")
+    } == {
+        "release_range": ["2026.2"],
+        "release": "2026.2",
+        "support_tier": {"tier": "tier1", "reason": None, "declared_outside_range": False},
+        "policy_profile": "secure_rbac",
+    }
+    assert caps["tls"] is True and caps["plain_http"] == []
+
+    # 2.96 is 2024.1 or 2024.2: Tier 3 until the operator declares the series; a declared series
+    # the range does not hold warns, and a declared profile wins
+    stub_openstack(_versions(fake_conn(), "2.96", "3.71"))
+    caps = await OpenStackProvider(
+        hibiscus.model_copy(update={"release": "2026.2"}), settings()
+    ).check()
+    assert caps["release_range"] == ["2024.1", "2024.2"] and caps["release"] is None
+    assert caps["support_tier"] == {
+        "tier": "tier3",
+        "reason": "end_of_life",
+        "declared_outside_range": True,
+    }
+    declared = hibiscus.model_copy(update={"release": "2024.1", "policy_profile": "legacy"})
+    caps = await OpenStackProvider(declared, settings()).check()
+    assert caps["release"] == "2024.1" and caps["support_tier"]["tier"] == "tier2"
+    assert caps["policy_profile"] == "legacy"
+
+    # Cinder's maximum reaches the detection: 2.98 alone is 2024.2 or 2025.1, and 3.72 is no
+    # 2024.2 Cinder (SDD §10.1)
+    stub_openstack(_versions(fake_conn(), "2.98", "3.72"))
+    caps = await OpenStackProvider(hibiscus, settings()).check()
+    assert caps["release_range"] == ["2025.1"] and caps["release"] == "2025.1"
+
+    # RHOSO 18.0 is validated by its kind, and legacy until D14 is decided
+    rhoso = make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination)
+    stub_openstack(_versions(fake_conn(), "2.95", "3.70"))
+    caps = await OpenStackProvider(rhoso, settings()).check()
+    assert caps["support_tier"] == {
+        "tier": "validated",
+        "reason": None,
+        "declared_outside_range": False,
+    }
+    assert caps["policy_profile"] == "legacy" and caps["release_range"] == ["2023.1", "2023.2"]
+
+    # a source reports none of a destination's keys
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    assert not {"release_range", "release", "support_tier", "policy_profile"} & set(caps)
+    assert caps["tls"] is True
+
+
+async def test_a_plain_http_endpoint_is_reported(stub_openstack):
+    """SDD §10, §21.7, Security.md: the check names the provider's own endpoint and each service
+    endpoint that uses plain HTTP; an endpoint it cannot read counts neither way."""
+    conn = fake_conn()
+    conn.compute.get_endpoint = lambda: "http://nova.dst.example:8774/v2.1"
+    conn.network = NS(**vars(conn.network), get_endpoint=lambda: "HTTP://neutron.dst.example:9696")
+    conn.identity = NS(
+        **vars(conn.identity), get_endpoint=lambda: "https://keystone.dst.example/v3"
+    )
+
+    def unreadable():
+        raise RuntimeError("the catalog has no block-storage endpoint for this region")
+
+    conn.block_storage.get_endpoint = unreadable
+    stub_openstack(conn)
+    plain = make_provider(endpoint="http://keystone.dst.example:5000/v3")
+    caps = await OpenStackProvider(plain, settings()).check()
+    assert caps["tls"] is False
+    assert caps["plain_http"] == ["endpoint", "compute", "network"]
+
+    secure = make_provider(endpoint="https://keystone.dst.example:5000/v3")
+    caps = await OpenStackProvider(secure, settings()).check()
+    assert caps["tls"] is False and caps["plain_http"] == ["compute", "network"]
+
+    conn.compute.get_endpoint = lambda: "https://nova.dst.example:8774/v2.1"
+    conn.network = NS(**{**vars(conn.network), "get_endpoint": lambda: "https://neutron.example"})
+    caps = await OpenStackProvider(secure, settings()).check()
+    assert caps["tls"] is True and caps["plain_http"] == []
+
+
+async def test_the_demo_destination_reports_rhoso_validated_and_legacy():
+    """The demo's RHOSO 18.0 destination reports the keys a real destination's check does (SDD
+    §10, §10.1), so the dashboard shows them in the demo too."""
+    caps = await FakeDestinationProvider(seed=42).check()
+    assert caps["release_range"] == ["2023.1", "2023.2"] and caps["release"] is None
+    assert caps["support_tier"] == {
+        "tier": "validated",
+        "reason": None,
+        "declared_outside_range": False,
+    }
+    assert caps["policy_profile"] == "legacy"
+    assert caps["tls"] is True and caps["plain_http"] == []
+    assert caps["compute_microversion"] == "2.95" and caps["block_storage_microversion"] == "3.70"
 
 
 async def test_openstack_check_leaves_out_roles_it_cannot_read(stub_openstack):

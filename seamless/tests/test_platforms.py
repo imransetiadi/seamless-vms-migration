@@ -15,6 +15,7 @@ from seamless_migrate.planning.platforms import (
     SERIES,
     ReleaseRange,
     SupportTier,
+    destination_release,
     maximum_microversion,
     release_range,
     support_tier,
@@ -160,6 +161,70 @@ def test_a_declared_series_outside_the_range_warns_and_the_range_decides(
     compute_max, declared, verdict
 ):
     assert support_tier(release_range(compute_max), declared) == verdict
+
+
+@pytest.mark.parametrize(
+    "compute_max, declared, settled",
+    [
+        ("2.104", None, "2026.2"),
+        ("2.96", None, None),
+        ("2.96", "2024.1", "2024.1"),
+        ("2.96", "2026.2", None),  # declared outside the range: the range decides
+        ("2.105", "2026.2", None),
+        (None, "2026.2", None),
+    ],
+)
+def test_a_destination_settles_on_the_declared_series_else_the_ranges_only_one(
+    compute_max, declared, settled
+):
+    report = destination_release("openstack", declared, None, compute_max, None)
+    assert report["release"] == settled
+    assert report["release_range"] == list(release_range(compute_max).series)
+
+
+@pytest.mark.parametrize(
+    "kind, release, declared_profile, compute_max, profile",
+    [
+        ("openstack", None, None, "2.104", "secure_rbac"),
+        ("openstack", None, None, "2.96", "secure_rbac"),  # 2024.1 and 2024.2 both enforce them
+        ("openstack", None, None, "2.95", "unknown"),  # 2023.1 (legacy) or 2023.2 (secure-RBAC)
+        ("openstack", "2023.1", None, "2.95", "legacy"),
+        ("openstack", "2023.2", None, "2.95", "secure_rbac"),
+        ("openstack", "2026.2", None, "2.95", "unknown"),  # declared outside: the range decides
+        ("openstack", None, None, "2.93", "legacy"),  # Zed or older
+        ("openstack", None, None, "2.105", "secure_rbac"),  # newer than the window
+        ("openstack", None, None, None, "unknown"),  # nothing detected
+        ("openstack", None, "legacy", "2.104", "legacy"),  # declared: the new defaults turned off
+        ("openstack", None, "secure_rbac", "2.95", "secure_rbac"),
+        ("rhoso", None, None, "2.95", "legacy"),  # D14
+        ("rhoso", None, "secure_rbac", "2.95", "secure_rbac"),
+    ],
+)
+def test_the_policy_profile_is_the_declared_one_else_by_kind_and_series(
+    kind, release, declared_profile, compute_max, profile
+):
+    """SDD §10.1, §21.5: oslo.policy enforces the new defaults from 2023.2; a range that cannot
+    tell reads unknown, never either profile."""
+    report = destination_release(kind, release, declared_profile, compute_max, None)
+    assert report["policy_profile"] == profile
+
+
+def test_rhoso_is_validated_by_its_kind_never_by_detection():
+    """SDD §10.1: RHOSO 18.0 is validated whatever its maxima read as, and a declared series never
+    makes it warn; a community cloud with the same maxima reads its range's tier."""
+    for compute_max, declared in (("2.95", None), ("2.95", "2026.2"), (None, None)):
+        report = destination_release("rhoso", declared, None, compute_max, None)
+        assert report["support_tier"] == {
+            "tier": "validated",
+            "reason": None,
+            "declared_outside_range": False,
+        }
+    community = destination_release("openstack", None, None, "2.95", None)
+    assert community["support_tier"] == {
+        "tier": "tier3",
+        "reason": "end_of_life",
+        "declared_outside_range": False,
+    }
 
 
 def _sdd_section(heading):

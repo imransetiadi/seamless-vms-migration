@@ -12,6 +12,7 @@ from typing import Any
 
 from ..domain.enums import ProviderKind
 from ..domain.models import Disk, Nic, VMRef
+from ..planning.platforms import destination_release
 from ..planning.preflight import DestinationInventory, SourceInventory
 from .base import ProviderError, VMNotFound
 
@@ -345,8 +346,11 @@ class FakeSourceProvider:
             "admin": True,
             "roles": ["admin", "member", "reader"],
             "compute_microversion": "2.88",
+            "block_storage_microversion": "3.64",  # Wallaby (RHOSP 17.1)
             "ovn": True,
             **_storage_caps(_SOURCE_POOLS.values()),
+            "tls": True,
+            "plain_http": [],
         }
 
     async def list_vms(self) -> list[VMRef]:
@@ -388,8 +392,13 @@ class FakeDestinationProvider:
             "admin": True,
             "roles": ["admin", "member", "reader"],
             "compute_microversion": "2.95",
+            "block_storage_microversion": "3.70",
             "ovn": True,
             **_storage_caps(_DESTINATION_POOLS),
+            "tls": True,
+            "plain_http": [],
+            # RHOSO 18.0: validated by its kind, legacy until D14 (SDD §10.1)
+            **destination_release("rhoso", None, None, "2.95", "3.70"),
         }
 
     async def inventory(self) -> DestinationInventory:

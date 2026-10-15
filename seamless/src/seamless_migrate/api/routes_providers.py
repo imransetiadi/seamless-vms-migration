@@ -55,6 +55,7 @@ PROVIDER_EDITABLE_FIELDS = frozenset(
         "conversion_host",
         "distribution",
         "release",
+        "policy_profile",
     }
 )
 _SERVER_OWNED = {

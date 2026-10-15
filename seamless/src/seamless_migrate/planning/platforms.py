@@ -48,6 +48,9 @@ REVIEWED_MICROVERSIONS = {"compute": "2.100", "block_storage": "3.71"}
 #: the tiers of the window, the most favourable first
 TIERS = ("tier1", "tier2", "tier3")
 
+#: the oldest series whose oslo.policy enforces the new defaults (SDD §21.5)
+SECURE_RBAC_FROM = "2023.2"
+
 _REASONS = {"older": "below_floor", "newer": "newer_than_validated"}
 
 
@@ -131,6 +134,55 @@ def release_range(compute_max: Any, block_storage_max: Any = None) -> ReleaseRan
         ]
         found = narrowed or found
     return ReleaseRange(tuple(series.name for series in found))
+
+
+def _series_number(name: str) -> tuple[int, int]:
+    year, half = name.split(".")
+    return int(year), int(half)
+
+
+def _profile_by_series(settled: str | None, found: ReleaseRange) -> str:
+    """The policy profile a community cloud's series implies: the settled series, else every
+    series of the range, must agree (SDD §10.1, §21.5); ``unknown`` when they do not."""
+    series = (settled,) if settled is not None else found.series
+    if not series:
+        return {"newer": "secure_rbac", "older": "legacy"}.get(found.outside or "", "unknown")
+    secure = {_series_number(name) >= _series_number(SECURE_RBAC_FROM) for name in series}
+    if secure == {True}:
+        return "secure_rbac"
+    return "legacy" if secure == {False} else "unknown"
+
+
+def destination_release(
+    kind: str,
+    release: str | None,
+    policy_profile: str | None,
+    compute_max: Any,
+    block_storage_max: Any,
+) -> dict[str, Any]:
+    """What a destination's check reports about its series (SDD §10, §10.1): the detected range,
+    the series it settles on, its support tier and its policy profile. ``release`` and
+    ``policy_profile`` are what its provider declares (§4.2)."""
+    found = release_range(compute_max, block_storage_max)
+    if release is not None and release in found.series:
+        settled: str | None = release
+    else:
+        settled = found.series[0] if len(found.series) == 1 else None
+    if kind == "rhoso":
+        # validated by its kind; legacy until the lab decides D14
+        tier, default_profile = SupportTier("validated"), "legacy"
+    else:
+        tier, default_profile = support_tier(found, release), _profile_by_series(settled, found)
+    return {
+        "release_range": list(found.series),
+        "release": settled,
+        "support_tier": {
+            "tier": tier.tier,
+            "reason": tier.reason,
+            "declared_outside_range": tier.declared_outside_range,
+        },
+        "policy_profile": policy_profile or default_profile,
+    }
 
 
 def support_tier(found: ReleaseRange, declared: str | None = None) -> SupportTier:

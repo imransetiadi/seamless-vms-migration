@@ -207,7 +207,7 @@ for 0.2.0 (goal G7).
 | AI advisor wrong | Suboptimal choice | Bounded to eligible tie set, confidence threshold, recorded with evidence, overridable |
 | Policy defaults differ by release (secure RBAC from 2023.2; `advsvc` deprecated for `service`) | A permission error late in a cutover, after the source stopped | Capability and role pre-flight per destination by its policy profile (SDD §21.4, §21.5); the lab matrix per Tier 1 series |
 | Upstream API changes in new series (compute 2.101–2.104 change attach status codes, drop flavor fields and `os-volumes_boot`) | A newer SDK or cloud breaks a call | openstacksdk's per-resource microversion caps (SDD §21.7); recorded version documents in contract tests; the window moves only after the lab matrix passes |
-| Community clouds without TLS, or with private CAs | Credentials or guest data in clear text | `verify_tls` on by default, CA bundle per provider; the check reports plain-HTTP endpoints (SDD §21.8, Security.md) |
+| Community clouds without TLS, or with private CAs | Credentials or guest data in clear text | `verify_tls` on by default, CA bundle per provider; the check reports plain-HTTP endpoints (`tls`, `plain_http`, SDD §10, Security.md) |
 | Credentials exposure | Security incident | Secrets in mounted files or the platform secret store (written once through the API, never read back), 0600 temp files for playbooks; redaction; Security.md controls |
 
 ## 12. Glossary

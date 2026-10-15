@@ -595,6 +595,40 @@ def test_a_provider_is_created_and_patched_with_its_declared_release(api):
     assert api.get("/api/v1/providers/vc-01").status_code == 404
 
 
+def test_a_provider_declares_its_policy_profile(api):
+    """SDD §4.2, §12: POST /providers and PATCH /providers/{id} take the declared policy profile;
+    another value, or one on a vmware provider, is 422 and stores nothing."""
+    community = {
+        **DESTINATION,
+        "id": "dst-flamingo",
+        "kind": "openstack",
+        "distribution": "openstack_community",
+        "policy_profile": "legacy",
+    }
+    created = api.post("/api/v1/providers", json=community)
+    assert created.status_code == 201, created.text
+    assert created.json()["policy_profile"] == "legacy"
+
+    def patch(body):
+        return api.client.patch(
+            "/api/v1/providers/dst-flamingo", headers=api.h(Role.admin), json=body
+        )
+
+    assert patch({"policy_profile": "secure_rbac"}).status_code == 200
+    assert patch({"policy_profile": "unknown"}).status_code == 422  # reported, never declared
+    assert api.get("/api/v1/providers/dst-flamingo").json()["policy_profile"] == "secure_rbac"
+    assert patch({"policy_profile": None}).json()["policy_profile"] is None
+    vmware = {
+        "id": "vc-02",
+        "name": "vCenter",
+        "kind": "vmware",
+        "role": "source",
+        "endpoint": "https://vcenter.example",
+        "policy_profile": "legacy",
+    }
+    assert api.post("/api/v1/providers", json=vmware).status_code == 422
+
+
 def test_a_plans_providers_cannot_change_while_one_of_its_migrations_is_failed(api):
     """SDD §12: a failed migration whose source runs keeps its plan editable — to fix the cause
     before a retry — but not its providers: its rollback acts on the clouds its attempt used (the

@@ -149,6 +149,20 @@ def test_a_release_on_a_vmware_provider_is_refused():
     assert make_provider(**destination).release == "2026.2"
 
 
+def test_provider_policy_profile_is_declared_or_null_and_refused_on_vmware():
+    """SDD §4.2, §21.5: a provider declares secure_rbac or legacy, or nothing (by kind and series,
+    §10.1); a vmware provider declares none."""
+    assert make_provider().policy_profile is None
+    for profile in ("secure_rbac", "legacy"):
+        assert make_provider(policy_profile=profile).policy_profile == profile
+    for bad in ("unknown", "strict", "SECURE_RBAC", ""):
+        with pytest.raises(ValidationError, match="policy_profile"):
+            make_provider(policy_profile=bad)
+    vmware = {"id": "vc-01", "kind": ProviderKind.vmware, "endpoint": "https://vcenter.example"}
+    with pytest.raises(ValidationError, match="policy_profile"):
+        make_provider(**vmware, policy_profile="legacy")
+
+
 def test_plan_port_creation_mode_is_nova_unless_neutron_is_chosen():
     """SDD §4.2: "nova" keeps today's ports; "neutron" recreates each with its MAC, every fixed
     IP and its security groups; nothing else is a mode."""

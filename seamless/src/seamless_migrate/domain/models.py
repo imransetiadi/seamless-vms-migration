@@ -124,6 +124,8 @@ class Provider(_Model):
     distribution: Distribution | None = None
     #: the community series its operator declares, e.g. "2026.2" (SDD §4.2, §10.1, §21.3)
     release: str | None = Field(default=None, pattern=r"^20[0-9]{2}\.[12]$")
+    #: the policy defaults its operator declares; None = by kind and series (SDD §4.2, §21.5)
+    policy_profile: Literal["secure_rbac", "legacy"] | None = None
     #: server-owned: when PUT …/credentials / …/conversion-key last wrote the secret store
     credentials_updated_at: UTCDateTime | None = None
     conversion_key_updated_at: UTCDateTime | None = None
@@ -138,11 +140,12 @@ class Provider(_Model):
         return self
 
     @model_validator(mode="after")
-    def _release_is_an_openstack_series(self) -> Provider:
-        if self.release is not None and self.kind == ProviderKind.vmware:
-            raise ValueError(
-                "release: an OpenStack series cannot be declared for a vmware provider"
-            )
+    def _openstack_declarations(self) -> Provider:
+        """A series and a policy profile are OpenStack's: a vmware provider declares neither."""
+        if self.kind == ProviderKind.vmware:
+            for name in ("release", "policy_profile"):
+                if getattr(self, name) is not None:
+                    raise ValueError(f"{name}: an OpenStack {name} cannot be declared for vmware")
         return self
 
 
