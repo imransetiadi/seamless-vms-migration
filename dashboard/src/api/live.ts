@@ -67,6 +67,13 @@ export function useLiveSnapshot(): LiveSnapshot {
   return useSyncExternalStore(hub.subscribeSnapshot, hub.getSnapshot, hub.getSnapshot);
 }
 
+/** The stream's status alone: what follows it draws again on a status change, not on every event the snapshot times. */
+export function useLiveStatus(): LiveStatus {
+  const hub = useLiveHub();
+  const status = () => hub.getSnapshot().status;
+  return useSyncExternalStore(hub.subscribeSnapshot, status, status);
+}
+
 /** Calls `listener` for every streamed event (persisted and ephemeral) while mounted. */
 export function useLiveEvents(listener: (event: Event) => void): void {
   const hub = useLiveHub();

@@ -10,7 +10,7 @@ import {
 } from '@tanstack/react-query';
 import { createContext, useContext } from 'react';
 import { ApiClient, ApiError } from './client';
-import { useLiveSnapshot } from './live';
+import { useLiveStatus } from './live';
 import { useApiQuery } from './stickyQuery';
 import type {
   AdvisorNoteList,
@@ -250,8 +250,9 @@ export function useMigration(migrationId: string | undefined) {
 export function useStats(planId?: string | null) {
   const api = useApi();
   // the open stream keeps the figures - every migration.* and plan.* event refreshes them (live.ts) - so the 15 s poll
-  // is for while it is not open (SDD §16): one GET /stats per 15 s per tab otherwise, for data the stream brings
-  const streamOpen = useLiveSnapshot().status === 'open';
+  // is for while it is not open (SDD §16): one GET /stats per 15 s per tab otherwise, for data the stream brings; the
+  // status alone, so the navigation, which reads the figures on every page, does not draw again on every event
+  const streamOpen = useLiveStatus() === 'open';
   return useApiQuery({
     queryKey: queryKeys.stats(planId),
     queryFn: ({ signal }) => api.get<Stats>('/stats', { signal, query: { plan_id: planId ?? undefined } }),

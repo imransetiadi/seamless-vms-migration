@@ -94,6 +94,34 @@ describe('useStats', () => {
     expect(reads('/stats')).toBe(2);
     unmount();
   });
+
+  it('follows the stream status alone: an event, which moves the snapshot, draws nothing again (NFR-03)', async () => {
+    const hub = new LiveEventHub();
+    const { wrapper, reads } = hookSetup('viewer', hub);
+    let renders = 0;
+    const { result, unmount } = renderHook(
+      () => {
+        renders += 1;
+        return useStats();
+      },
+      { wrapper },
+    );
+    await vi.waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(reads('/stats')).toBe(1);
+    const settled = renders;
+    act(() => {
+      hub.setStatus('open');
+    });
+    expect(renders).toBe(settled + 1);
+    for (let seq = 1; seq <= 3; seq += 1) {
+      act(() => {
+        hub.publish({ seq, ts: '2026-10-08T12:00:01Z', kind: 'migration.phase', plan_id: null, migration_id: null, actor: 'system', message: '', data: {} });
+      });
+      act(() => hub.heartbeat());
+    }
+    expect(renders).toBe(settled + 1);
+    unmount();
+  });
 });
 
 describe('usePlanAction', () => {
