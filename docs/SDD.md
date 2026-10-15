@@ -702,7 +702,11 @@ and a re-run whose record holds an earlier attempt's volume for one of its devic
 volume - the cold path never reuses a volume - unless a server holds it: one a server holds (a server the operator
 renamed rather than deleted) is that server's and only leaves the record, when the new volume of its device is
 recorded; one only the destination conversion host holds (a transfer cut short) is the migration's own and is detached
-from it. The re-run deletes each earlier volume it removes - one Cinder is already deleting (the boot volume Nova
+from it. A known residual: the conversion host is the one the re-run is given, so an earlier volume a replaced
+conversion host the operator kept still holds counts as a server's too, and stays on that host unrecorded until the
+operator deletes that host's volumes - nothing is lost, and os-migrate tags no conversion host, so a name match could
+take a renamed destination VM's volume. The re-run deletes each earlier volume it removes - one Cinder is already
+deleting (the boot volume Nova
 deletes with its server) is not deleted again, and a delete Cinder refuses because the volume began going in between
 (Nova deleting it with its server after it read `available`) counts as that one - and waits, within the transfer's
 timeout, until Cinder no longer has it: an earlier volume stays recorded until it is gone, and no new volume waits
