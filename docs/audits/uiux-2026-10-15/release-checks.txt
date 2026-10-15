@@ -1,0 +1,84 @@
+[unit]
+Test Files  82 passed (82)
+      Tests  1578 passed (1578)
+   Start at  16:42:47
+   Duration  34.65s (tests 74%, environment 14%, import 6%, setup 4%, transform 2%)
+
+    Isolate  82 workers spawned · ~309ms startup each (spawn + environment, per file)
+             at least ~6.03s faster with isolate: false — reuses workers across files instead of one per file
+
+[e2e]
+✓   1 [chromium] › e2e/audit.spec.ts:12:1 › a failed page chunk keeps navigation and offers an explicit reload (1.3s)
+  ✓   3 [chromium] › e2e/audit.spec.ts:41:1 › a definition near the viewport bottom stays fully visible (659ms)
+  ✓   2 [chromium] › e2e/audit.spec.ts:25:1 › network, audit and input scrollers have named keyboard access (2.0s)
+  ✓   4 [chromium] › e2e/audit.spec.ts:57:1 › mobile policy names and recommendation evidence keep readable widths (880ms)
+  ✓   5 [chromium] › e2e/audit.spec.ts:70:1 › Plans keeps filters through detail, Back and reload, and clears them accessibly (1.1s)
+  ✓   6 [chromium] › e2e/audit.spec.ts:84:1 › closing changed plan input asks before discarding it (1.2s)
+  ✓   7 [chromium] › e2e/audit.spec.ts:105:1 › Plans validates URL filters and keeps status and sorting after reload (940ms)
+  ✓   9 [chromium] › e2e/audit.spec.ts:126:1 › compact navigation keeps identity, role and demo context visible (745ms)
+  ✓   8 [chromium] › e2e/audit.spec.ts:116:1 › changing only VM selection in an existing plan also asks before discard (1.2s)
+  ✓  10 [chromium] › e2e/audit.spec.ts:137:1 › a disabled action near the bottom keeps its explanation inside the viewport (867ms)
+  ✓  11 [chromium] › e2e/journeys.spec.ts:14:1 › an operator edits a validated plan; the change is saved and the plan returns to draft (1.2s)
+  ✓  12 [chromium] › e2e/journeys.spec.ts:32:1 › a keyboard user keeps focus on Validate while its request runs (SDD §16) (949ms)
+  ✓  13 [chromium] › e2e/journeys.spec.ts:45:1 › the shown audit events download as JSON lines, oldest first (692ms)
+  ✓  14 [chromium] › e2e/journeys.spec.ts:63:1 › the inventory filters by guest OS and Clear filters brings every VM back (698ms)
+  ✓  15 [chromium] › e2e/journeys.spec.ts:80:1 › storage handover on NetApp NFS names the RHOSO pool each volume type lands on (1.3s)
+  ✓  16 [chromium] › e2e/journeys.spec.ts:99:1 › an admin approves a decision the Finance policy holds; the audit trail names who approved it (ADV-04) (1.9s)
+  ✓  17 [chromium] › e2e/journeys.spec.ts:120:1 › an approver finalizes a completed plan with one approval; it then reads Finalized (ADV-19) (1.2s)
+  ✓  19 [chromium] › e2e/journeys.spec.ts:156:1 › the Overview inbox lists both kinds of pending approval; the advisor decision opens its recommendation (ADV-20) (648ms)
+  ✓  20 [chromium] › e2e/journeys.spec.ts:172:1 › a plan names the advisor policy in force beside its cutover approval; the link lands on the policy (ADV-20) (702ms)
+  ✓  21 [chromium] › e2e/journeys.spec.ts:182:1 › a recommendation shows the evidence it rests on; a fact links to its VM in the inventory (ADV-02) (865ms)
+  ✓  18 [chromium] › e2e/journeys.spec.ts:139:1 › powering a finished migration source VM on in demo mode raises the alert on the next watch; off clears it (ADV-19) (3.2s)
+  ✓  22 [chromium] › e2e/journeys.spec.ts:198:1 › on a phone the demo power note sits under its button, not squeezed beside it (ADV-19, SDD §16) (857ms)
+  ✓  23 [chromium] › e2e/journeys.spec.ts:247:3 › at 1280×800 the plan, policy and provider dialogs keep the focused control clear of their actions (WCAG 2.4.11, SDD §16) (2.1s)
+  ✓  24 [chromium] › e2e/journeys.spec.ts:247:3 › at 375×700 the plan, policy and provider dialogs keep the focused control clear of their actions (WCAG 2.4.11, SDD §16) (2.0s)
+  ✓  25 [chromium] › e2e/journeys.spec.ts:277:1 › on a phone the lifecycle reads down two columns, half the height of one (SDD §16) (682ms)
+  ✓  27 [chromium] › e2e/smoke.spec.ts:14:1 › design tokens reach the browser through the Tailwind build (335ms)
+  ✓  26 [chromium] › e2e/journeys.spec.ts:299:1 › the navigation is on the left at every width: sidebar, rail, then a drawer from the left (SDD §16) (870ms)
+  ✓  28 [chromium] › e2e/smoke.spec.ts:33:1 › the main journey renders: overview, plans, plan detail, migration detail (992ms)
+  ✓  29 [chromium] › e2e/smoke.spec.ts:52:1 › chart code loads with the overview that draws charts, not with the sign-in page (SDD §16) (939ms)
+  ✓  30 [chromium] › e2e/smoke.spec.ts:68:1 › the fonts come with the dashboard: nothing loads from another host (SDD §16) (798ms)
+  ✓  31 [chromium] › e2e/smoke.spec.ts:88:1 › a viewer sees operator and approver actions soft-disabled (1.1s)
+  ✓  32 [chromium] › e2e/smoke.spec.ts:107:1 › light theme switches the token values (361ms)
+  ✓  34 [chromium] › e2e/smoke.spec.ts:138:1 › on a phone the Overview's first downtime clock is on the first screen, under compact key figures (SDD §16) (692ms)
+  ✓  35 [chromium] › e2e/smoke.spec.ts:157:1 › the plans list keeps each plan's progress and clouds on a phone, without scrolling sideways (SDD §16) (647ms)
+  ✓  33 [chromium] › e2e/smoke.spec.ts:116:1 › an admin connects a Kolla-Ansible source and tests the connection (1.7s)
+  ✓  36 [chromium] › e2e/smoke.spec.ts:171:1 › no page scrolls sideways on a 320 px wide screen (NFR-08: WCAG 2.2 reflow) (3.1s)
+  ✓  37 [chromium] › e2e/smoke.spec.ts:195:3 › every target is 24 px or spaced from the next on a 320 px wide screen (WCAG 2.5.8) (3.1s)
+  ✓  39 [chromium] › e2e/smoke.spec.ts:213:1 › the error summaries of the plan, policy and provider dialogs keep their links 24 px or spaced (WCAG 2.5.8) (2.1s)
+  ✓  38 [chromium] › e2e/smoke.spec.ts:195:3 › every target is 24 px or spaced from the next on a 375 px wide screen (WCAG 2.5.8) (3.2s)
+  ✓  40 [chromium] › e2e/smoke.spec.ts:259:3 › no text is cut off with an ellipsis on a 320 px wide screen (WCAG 1.4.10, SDD §16) (2.5s)
+  ✓  41 [chromium] › e2e/smoke.spec.ts:259:3 › no text is cut off with an ellipsis on a 1280 px wide screen (WCAG 1.4.10, SDD §16) (2.5s)
+  ✓  42 [chromium] › e2e/smoke.spec.ts:259:3 › no text is cut off with an ellipsis on a 320 px wide screen without the web fonts (WCAG 1.4.10, SDD §16) (2.7s)
+  ✓  43 [chromium] › e2e/smoke.spec.ts:259:3 › no text is cut off with an ellipsis on a 1280 px wide screen without the web fonts (WCAG 1.4.10, SDD §16) (2.7s)
+  43 passed (32.9s)
+
+[typecheck]
+> seamless-migrate-dashboard@0.1.0 typecheck
+> npm run typecheck:app && tsc -p tsconfig.e2e.json --noEmit
+
+
+> seamless-migrate-dashboard@0.1.0 typecheck:app
+> tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit
+
+[lint]
+> seamless-migrate-dashboard@0.1.0 lint
+> eslint . --ext .ts,.tsx --max-warnings 0
+
+[build]
+dist/assets/charts-C_ZLoNif.js                         379.07 kB │ gzip: 100.48 kB
+
+✓ built in 488ms
+check-bundle: 5 start-up chunks, 279.1 KiB, none of them lazy-only
+
+[audit]
+found 0 vulnerabilities
+
+[gitleaks-tree]
+4:43PM INF scanned ~8123470 bytes (8.12 MB) in 1.45s
+4:43PM INF no leaks found
+
+[gitleaks-git]
+4:46PM INF 1314 commits scanned.
+4:46PM INF scanned ~9233738 bytes (9.23 MB) in 895ms
+4:46PM INF no leaks found

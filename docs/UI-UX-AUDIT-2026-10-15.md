@@ -8,7 +8,7 @@ Dashboard memiliki fondasi kuat untuk operator migrasi: langkah berikutnya terli
 
 Ditemukan **8 temuan yang dapat direproduksi: 1 P1 dan 7 P2**. Tiga peluang desain dicatat terpisah; tidak dianggap pelanggaran atau hasil riset pengguna. Tidak ditemukan P0 dalam cakupan pemeriksaan ini. Pernyataan tersebut bukan jaminan bebas cacat.
 
-**Hasil akhir:** delapan temuan sudah diremediasi pada worktree di bawah. Hasil pengujian ulang dan bukti sesudah perubahan ada di bagian 9. Laporan membedakan kondisi baseline dari hasil remediasi; label UI-xx di sini hanya milik audit ini, bukan ID journey pada QASuite.
+**Hasil akhir:** delapan temuan sudah diremediasi. Bukti snapshot audit ada di bagian 9; revalidasi patch untuk PR berbasis `main` ada di bagian 10. Laporan membedakan kondisi baseline dari hasil remediasi; label UI-xx di sini hanya milik audit ini, bukan ID journey pada QASuite.
 
 ## 2. Baseline dan batas cakupan
 
@@ -254,8 +254,16 @@ Tujuh skenario regresi awal gagal pada baseline sebelum patch. Tiga pemeriksaan 
 
 Jev advisory memverifikasi tiga klaim pemeriksaan; klaim jumlah tes browser masih ditandai untuk review dengan confidence rendah. Output Playwright lengkap tetap menjadi bukti langsung, diperiksa ulang jumlah dan statusnya; verdict advisory tidak digunakan sebagai sertifikasi produk.
 
-Revalidasi sebelum PR pada basis terbaru `origin/main` juga lulus: `npm test` **82 file, 1.578 tes**, `CI=1 npm run test:e2e -- --workers=2 --retries=0` **43 lulus**, typecheck, lint, production build, `npm audit --omit=dev --audit-level=high`, dan dua pemindaian gitleaks. Angka ini mencerminkan basis PR terbaru; angka 1.759/47 di tabel sebelumnya tetap bukti snapshot audit `ea0d58c4`.
-
 Batas remediasi: proteksi draft berlaku pada Cancel/Escape form plan. Menutup tab browser atau berpindah lewat browser Back masih dapat membuang input lokal; tidak ada autosave. Tiga peluang P3 pada bagian 7 tetap rekomendasi untuk riset tugas, bukan fitur baru yang ditambahkan tanpa bukti. Belum ada deployment atau perubahan pada layanan cloud nyata.
 
 Untuk mengulang regresi terarah dari worktree ini, jalankan `cd dashboard && npm run test:e2e -- e2e/audit.spec.ts`. Suite membuat build mock sendiri pada port 4173; hentikan preview lama pada port itu atau gunakan `CI=1` agar tidak memakai bundle kedaluwarsa.
+
+## 10. Revalidasi patch untuk PR
+
+Patch remediasi dipindahkan ke `.worktrees/track-c-uiux-release`, branch `fix/dashboard-uiux-audit`, berbasis `origin/main` **51323403**. Riwayat commit tambahan pada snapshot audit tidak dibawa. Impor `useMigrations` pada Plans dipertahankan sesuai main; route Users dan fitur aksesnya tetap tersedia.
+
+Pada basis PR ini, `npm test` lulus **82 file, 1.578 tes**, termasuk tes Users. `CI=1 npm run test:e2e -- --workers=2 --retries=0` lulus **43 tes**, termasuk 10 regresi audit. Typecheck, lint, build produksi (5 startup chunks, 279.1 KiB), `npm audit --omit=dev --audit-level=high`, dan pemindaian gitleaks working tree serta history juga lulus. [Output revalidasi](audits/uiux-2026-10-15/release-checks.txt).
+
+Angka 1.759/47 dan matriks render pada bagian 9 tetap bukti snapshot audit `ea0d58c4`, bukan klaim matriks ulang pada basis PR. Warning canvas jsdom tetap ada. Tidak ada pengujian migrasi cloud atau deployment produksi.
+
+Jev untuk patch PR memverifikasi angka unit dan browser. Advisory keseluruhan meminta review karena confidence rendah pada cakupan tes dan klaim gabungan pemeriksaan; tidak memberikan diagnosis bug spesifik. Diff dan output pemeriksaan ditinjau langsung, tanpa mengubah ambang advisory atau mengklaim persetujuan otomatis.

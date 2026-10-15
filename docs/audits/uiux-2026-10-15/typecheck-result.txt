@@ -5,4 +5,3 @@
 
 > seamless-migrate-dashboard@0.1.0 typecheck:app
 > tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit
-
