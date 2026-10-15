@@ -895,8 +895,11 @@ this cleanup runs - a window of seconds. The cleanup then takes the volume from 
 host's kernel gives its freed device path to the next disk attached there. So before it starts a disk's NBD export the
 export reads the disk's virtio serial - the volume id Nova gives it, cut to 20 characters: one that names another volume
 fails the export, and so does a virtio-blk disk (`vdX`) whose serial file is gone, the disk having left the host -
-loudly, as permanent (review RV12-03, RV13-02). It serves the disk's udev link `/dev/disk/by-id/virtio-<serial>`, but
-that adds no protection once the export runs: nbdkit resolves the path it serves once, at its start, and opens that
+loudly, as permanent (review RV12-03, RV13-02). ssh failing at the check is no such failure and is retried as
+transient: the serial read's error quotes the ssh command line, ConnectTimeout included, and the check of the by-id link
+gives up with "SSH timeout: conversion host {address} unreachable over SSH, checking the by-id link of {device}" (review
+RV14-02). The export serves the disk's udev link `/dev/disk/by-id/virtio-<serial>`, but that adds no protection once the
+export runs: nbdkit resolves the path it serves once, at its start, and opens that
 device path on every later connection, so a volume taken off the host after the export started still has the transfer
 read whatever disk took its path, without an error - a residual the owner decides on (qemu-nbd keeps the descriptor it
 opened, and nbdkit 1.38's `fd=` mode would too; review RV13-01). A disk that shows no serial file (not virtio-blk,
