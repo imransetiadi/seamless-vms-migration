@@ -136,7 +136,8 @@ make build                                   # collection tarball: starts its ow
 ls os_migrate-os_migrate-*.tar.gz
 
 (cd dashboard && npm ci && npm run build)    # the image copies dashboard/dist
-docker --context colima-seamless build -f seamless/Containerfile -t seamless-migrate:$NEW .
+docker --context colima-seamless build -f seamless/Containerfile -t seamless-migrate:$NEW \
+  --build-arg "SOURCE_COMMIT=$(git rev-parse HEAD)" .
 docker run --rm seamless-migrate:$NEW --version  # prints $NEW: the image's entrypoint is the seamless CLI
 ```
 

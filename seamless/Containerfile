@@ -15,6 +15,8 @@ ARG BASE_IMAGE=registry.access.redhat.com/ubi9/python-311:latest@sha256:a0bdb555
 FROM ${BASE_IMAGE}
 
 ARG DASHBOARD_DIST=dashboard/dist
+# the commit the image was built from: CI passes it (audit D-23)
+ARG SOURCE_COMMIT=unknown
 ARG ANSIBLE_CORE_VERSION=">=2.16,<2.19"
 # The VMware migration kit version comes from requirements.yml (pinned: the executor's variable
 # contract with the kit is checked against that version, Security.md §9.2).
@@ -22,7 +24,12 @@ ARG ANSIBLE_CORE_VERSION=">=2.16,<2.19"
 LABEL org.opencontainers.image.title="seamless-migrate" \
       org.opencontainers.image.description="Seamless Migrate control plane: VM migration to RHOSO 18.0" \
       org.opencontainers.image.version="0.1.0" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.source="https://github.com/imransetiadi/seamless-vms-migration" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}"
+
+# Apache-2.0 §4(d): the NOTICE travels with every distribution (the UBI licences directory)
+COPY LICENSE NOTICE /licenses/
 
 USER 0
 
