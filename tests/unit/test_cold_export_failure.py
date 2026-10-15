@@ -229,7 +229,9 @@ def test_a_successful_image_copy_maps_the_copy_and_the_cleanup_removes_it():
         copy = src.volumes[root["source_id"]]
         assert exported["_exit_code"] in (None, 0), exported
         assert root["image_id"] in src.images and copy.image_id == root["image_id"]
-        assert (root["name"], root["size"], root["bootable"]) == (copy.name, copy.size, True)
+        assert (root["name"], root["size"], root["bootable"], copy.bootable) == (
+            copy.name, copy.size, True, True
+        )
         cleaned = fake.run_module(cleanup_module, dict(
             COMMON, data=data, transfer_uuid=exported["transfer_uuid"],
             volume_map=exported["volume_map"],
@@ -360,3 +362,128 @@ def test_a_failed_exports_rescue_never_detaches_the_volume_another_export_holds(
     assert held_by_a.get("source_attached") is True
     assert not b.volume_map["/dev/vdb"].get("source_attached")
     assert "src-conv" in _holders(src, "vol-shared"), _holders(src, "vol-shared")
+
+
+def _the_wait_fails(src, what):
+    """Cinder or Glance made the resource, then the wait for it failed: the root snapshot or the
+    root copy - of the boot volume, or of the image - went to error, the image was still saving
+    when the timeout ran out. As in openstacksdk, a create with wait=True runs that wait itself and
+    raises out of the create, the resource made; one without it returns the resource still in the
+    making."""
+    failing = set()
+    wait_for_status, wait_for_image = src.block_storage.wait_for_status, src.wait_for_image
+
+    def failing_status_wait(res, status="available", failures=None, interval=2, wait=None, **kwargs):
+        if res.id not in failing:
+            return wait_for_status(res, status, failures, interval, wait, **kwargs)
+        assert wait is not None, "wait_for_status without a wait bound waits forever"
+        src.record("wait_for_status", id=res.id, status=status)
+        (src.volumes.get(res.id) or src.snapshots[res.id]).status = "error"
+        raise fake.SDKException("%s transitioned to failure state error" % res.id)
+
+    def failing_image_wait(image, timeout=3600):
+        if image.id not in failing:
+            return wait_for_image(image, timeout)
+        src.record("wait_for_image", image=image.id, timeout=timeout)
+        raise fake.SDKException("Timeout waiting for image to snapshot")
+
+    src.block_storage.wait_for_status, src.wait_for_image = failing_status_wait, failing_image_wait
+    if what == "root snapshot":
+        create_snapshot = src.create_volume_snapshot
+
+        def create_volume_snapshot(volume_id, force=False, wait=True, timeout=None, **kwargs):
+            snapshot = create_snapshot(volume_id, force=force, wait=wait, timeout=timeout, **kwargs)
+            snapshot.status = "creating"
+            failing.add(snapshot.id)
+            if wait:
+                src.block_storage.wait_for_status(snapshot, wait=timeout)
+            return snapshot
+
+        src.create_volume_snapshot = create_volume_snapshot
+    elif what in ("root copy", "image copy"):
+        create_volume = src.create_volume
+        made_from = "snapshot_id" if what == "root copy" else "image"
+
+        def create_root_copy(size, wait=True, timeout=None, **kwargs):
+            volume = create_volume(size, wait=wait, timeout=timeout, **kwargs)
+            if kwargs.get(made_from) is not None:
+                volume.status = "creating"
+                failing.add(volume.id)
+            if wait or kwargs.get("bootable") is not None:  # openstacksdk waits for bootable too
+                src.block_storage.wait_for_status(volume, wait=timeout)
+            return volume
+
+        src.create_volume = create_root_copy
+    else:
+        create_image = src.compute.create_server_image
+
+        def create_server_image(server, name, metadata=None, wait=False, timeout=120):
+            image = create_image(server, name, metadata=metadata, wait=wait, timeout=timeout)
+            image.status = "saving"
+            failing.add(image.id)
+            if wait:
+                return src.wait_for_image(image, timeout=timeout)
+            return image
+
+        src.compute.create_server_image = create_server_image
+
+
+@pytest.mark.parametrize("what", ["root snapshot", "root copy", "image", "image copy"])
+def test_what_the_export_made_before_its_wait_failed_never_outlives_the_rescue(what):
+    """Review RV8-03: openstacksdk's wait=True raises after Cinder or Glance made the resource - on
+    an error status, or a slow backend's timeout - and the export recorded each only once that call
+    returned: it failed with a map that did not name the resource, so the rescue left it behind,
+    and a root copy left so kept its snapshot from being deleted, which failed the rescue itself.
+    The export now creates each without that wait, records it, then waits within its timeout
+    (Seamless Migrate SDD 6.6)."""
+    src, data = _image_booted_vm() if what.startswith("image") else _boot_from_volume_vm()
+    volumes = set(src.volumes)
+    _the_wait_fails(src, what)
+    host = SourceHost(src)
+
+    exported, cleaned = _export_then_rescue(src, host, data)
+
+    assert exported.get("failed") and "volume_map" in exported, exported
+    assert cleaned is not None and cleaned["_exit_code"] in (None, 0), cleaned
+    assert (set(src.volumes), src.snapshots, src.images) == (volumes, {}, {})
+    for volume_id in volumes:
+        assert _holders(src, volume_id) == ["srv-1"], volume_id
+    assert [call[1]["timeout"] for call in src.calls_to("wait_for_image") if "timeout" in call[1]] == (
+        [COMMON["timeout"]] if what == "image" else []
+    )
+
+
+@pytest.mark.parametrize("vm", ["volume-booted", "image-booted"])
+def test_a_root_copy_the_cleanup_cannot_delete_never_keeps_a_data_volume_off_the_source_vm(vm):
+    """The cleanup after the transfer puts the data volumes back before it removes the root disk's
+    copy, its snapshot and the image, and tries every step: a copy Cinder would not delete used to
+    stop it before the data volumes - the source VM stayed without them - and before the snapshot
+    and the image. It now fails at the end, naming each removal it could not do (Seamless Migrate
+    SDD 6.6, review RV8-03)."""
+    src, data = _image_booted_vm() if vm == "image-booted" else _boot_from_volume_vm()
+    data_volumes = sorted(v for v, volume in src.volumes.items() if not volume.bootable)
+    host = SourceHost(src)
+
+    with mock.patch.object(volume_common.time, "sleep"):
+        exported = fake.run_module(export_module, dict(COMMON, data=data), src, host)
+        assert exported["_exit_code"] in (None, 0), exported
+        root = exported["volume_map"]["/dev/vda"]
+        src.fail_on["delete_volume"] = lambda call: call["name_or_id"] == root["source_id"]
+        cleanup_calls = len(src.calls)
+        with pytest.raises(RuntimeError) as failure:
+            fake.run_module(cleanup_module, dict(
+                COMMON, data=data, transfer_uuid=exported["transfer_uuid"],
+                volume_map=exported["volume_map"],
+            ), src, host)
+
+    for volume_id in data_volumes:
+        assert _holders(src, volume_id) == ["srv-1"], volume_id
+    done = [call[0] for call in src.calls[cleanup_calls:]
+            if call[0] in ("attach_volume", "delete_volume", "delete_volume_snapshot", "delete_image")]
+    assert done == sorted(done, key=lambda name: name != "attach_volume"), done  # data volumes first
+    message = str(failure.value)
+    assert root["source_id"] in message and root["source_id"] in src.volumes, message
+    if root["snap_id"]:  # tried too: Cinder keeps the snapshot of a copy it still has
+        assert root["snap_id"] in message and root["snap_id"] in src.snapshots, message
+    else:  # tried too: Glance removes the image all the same
+        assert root["image_id"] not in src.images and root["image_id"] not in message, message

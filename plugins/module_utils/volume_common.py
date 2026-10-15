@@ -17,6 +17,7 @@ import tempfile
 import time
 import fcntl
 import errno
+import functools
 
 # Default timeout for OpenStack operations
 DEFAULT_TIMEOUT = 1800
@@ -895,31 +896,37 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             mapping = self.volume_map["/dev/vda"]
             volume_id = mapping["source_id"]
 
-            # Create a snapshot of the root volume
+            # Create a snapshot of the root volume. The snapshot, the copy and
+            # the image below are each created without openstacksdk's own wait,
+            # which raises with the resource made, and recorded at once, then
+            # waited for: an export failing at any point leaves the cleanup
+            # what it made to remove (Seamless Migrate SDD 6.6, review RV8-03)
             self.log.info("Boot-from-volume instance, creating boot volume snapshot")
             root_snapshot = self.conn.create_volume_snapshot(
                 force=True,
-                wait=True,
+                wait=False,
                 volume_id=volume_id,
                 name=f"{self.boot_volume_prefix}{volume_id}",
-                timeout=self.timeout,
             )
-            # Recorded at once: an export failing before the copy exists leaves
-            # the cleanup a snapshot to remove (Seamless Migrate SDD 6.6)
             self.volume_map["/dev/vda"]["snap_id"] = root_snapshot.id
+            root_snapshot = self.conn.block_storage.wait_for_status(
+                root_snapshot, status="available", failures=["error"], wait=self.timeout
+            )
 
             # Create a new volume from the snapshot
             self.log.info("Creating new volume from boot volume snapshot")
             root_volume_copy = self.conn.create_volume(
-                wait=True,
+                wait=False,
                 name=f"{self.boot_volume_prefix}{volume_id}",
                 snapshot_id=root_snapshot.id,
                 size=root_snapshot.size,
-                timeout=self.timeout,
             )
 
             # Update the volume map with the new volume ID
             self.volume_map["/dev/vda"]["source_id"] = root_volume_copy.id
+            self.conn.block_storage.wait_for_status(
+                root_volume_copy, status="available", failures=["error"], wait=self.timeout
+            )
         elif sourcevm.image and self.ser_server.migration_params()["boot_disk_copy"]:
             self.log.info(
                 "Image-based instance, boot_disk_copy enabled: creating snapshot"
@@ -927,10 +934,8 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             image = self.conn.compute.create_server_image(
                 name=f"{self.boot_volume_prefix}{sourcevm.name}",
                 server=sourcevm.id,
-                wait=True,
-                timeout=self.timeout,
+                wait=False,
             )
-            image = self.conn.get_image_by_id(image.id)  # refresh
             # Recorded at once, the volume to come: an export failing before it
             # exists leaves the cleanup an image to remove (Seamless Migrate SDD 6.6)
             self.volume_map["/dev/vda"] = dict(
@@ -947,23 +952,29 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                 progress=None,
                 bootable=True,
             )
-            if image.status != "active":
+            self.conn.wait_for_image(image, timeout=self.timeout)
+            image = self.conn.get_image_by_id(image.id)  # refresh
+            if image is None or image.status != "active":
                 raise RuntimeError(
                     "Could not create new image of image-based instance!"
                 )
+            # bootable is set once the volume is available: openstacksdk waits
+            # in the create whenever it is given
             volume = self.conn.create_volume(
                 image=image.id,
-                bootable=True,
-                wait=True,
+                wait=False,
                 name=image.name,
-                timeout=self.timeout,
                 size=max(image.size // (1024**3), image.min_disk),
             )
+            self.volume_map["/dev/vda"]["source_id"] = volume.id
+            volume = self.conn.block_storage.wait_for_status(
+                volume, status="available", failures=["error"], wait=self.timeout
+            )
+            self.conn.block_storage.set_volume_bootable_status(volume, True)
             self.volume_map["/dev/vda"].update(
-                source_id=volume["id"],
                 name=volume["name"],
                 size=volume["size"],
-                bootable=volume["bootable"],
+                bootable=True,
             )
             self._update_progress("/dev/vda", 0.0)
         elif (
@@ -1545,55 +1556,82 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
 
     def _attach_data_volumes_to_source(self):
         """
-        Clean up the copy of the root volume and reattach data volumes. The
-        map may be one a failed export left: the root entry names the source
-        VM's own boot volume until the copy exists, and that volume is never
-        deleted (Seamless Migrate SDD 6.6, review RV6-01).
+        Reattach the data volumes, then clean up the copy of the root volume,
+        its snapshot and image. The map may be one a failed export left: the
+        root entry names the source VM's own boot volume until the copy exists,
+        and that volume is never deleted (Seamless Migrate SDD 6.6, review
+        RV6-01). Every step is tried, the data volumes first: one that fails -
+        a copy Cinder will not delete - never keeps a data volume off the
+        source VM, and the cleanup fails at the end naming each step it could
+        not do (review RV8-03).
         """
         self.log.info("Re-attaching volumes to source VM...")
-        for path, mapping in sorted(self.volume_map.items()):
-            if path == "/dev/vda":
-                root = self._get_volume_maybe(mapping["source_id"])
-                if root is None:
-                    self.log.info("No copy of the root volume to remove")
-                elif self._volume_still_attached(root, self._source_vm()):
-                    self.log.info(
-                        "Volume %s is the source VM's own boot volume, keeping it",
-                        root.id,
-                    )
-                else:
-                    # Delete the temporary copy of the source root disk
-                    self.log.info("Removing copy of root volume")
-                    self.conn.delete_volume(
-                        name_or_id=root.id, wait=True, timeout=self.timeout
-                    )
+        steps = [
+            (
+                "attach volume %s back to the source VM" % mapping["source_id"],
+                functools.partial(self._attach_volume_to_source, mapping["source_id"]),
+            )
+            for path, mapping in sorted(self.volume_map.items())
+            if path != "/dev/vda"
+        ]
+        root = self.volume_map.get("/dev/vda")
+        if root is not None:
+            steps.append((
+                "remove the copy %s of the root volume" % root["source_id"],
+                functools.partial(self._remove_root_volume_copy, root["source_id"]),
+            ))
+            if root["snap_id"]:
+                steps.append((
+                    "delete the root volume snapshot %s" % root["snap_id"],
+                    functools.partial(self._delete_root_snapshot, root["snap_id"]),
+                ))
+            if root["image_id"]:
+                steps.append((
+                    "delete the root image %s" % root["image_id"],
+                    functools.partial(self._delete_root_image, root["image_id"]),
+                ))
+        failures = []
+        for what, step in steps:
+            try:
+                step()
+            except Exception as err:  # pylint: disable=broad-except
+                self.log.error("Could not %s: %s", what, err)
+                failures.append("could not %s: %s" % (what, err))
+        if failures:
+            raise RuntimeError("Source cleanup incomplete: " + "; ".join(failures))
 
-                # Remove the root volume snapshot
-                if mapping["snap_id"]:
-                    self.log.info("Deleting temporary root device snapshot")
-                    self.conn.delete_volume_snapshot(
-                        timeout=self.timeout, wait=True, name_or_id=mapping["snap_id"]
-                    )
+    def _attach_volume_to_source(self, volume_id):
+        """Attach a data volume back to the source VM, unless it holds it."""
+        volume = self.conn.get_volume_by_id(volume_id)
+        sourcevm = self._source_vm()
+        if self._volume_still_attached(volume, sourcevm):
+            self.log.info("Volume %s is already attached to source VM", volume.id)
+            return
+        self.log.info("Attaching %s back to source VM", volume.id)
+        self.conn.attach_volume(
+            volume=volume, server=sourcevm, wait=True, timeout=self.timeout
+        )
 
-                # Remove root image copy, for image-launched instances
-                if mapping["image_id"]:
-                    self.log.info("Deleting temporary root device image")
-                    self.conn.delete_image(
-                        timeout=self.timeout, wait=True, name_or_id=mapping["image_id"]
-                    )
-            else:
-                # Attach data volumes back to source VM
-                volume = self.conn.get_volume_by_id(mapping["source_id"])
-                sourcevm = self._source_vm()
-                try:
-                    self._get_attachment(volume, sourcevm)
-                except RuntimeError:
-                    self.log.info("Attaching %s back to source VM", volume.id)
-                    self.conn.attach_volume(
-                        volume=volume, server=sourcevm, wait=True, timeout=self.timeout
-                    )
-                else:
-                    self.log.info(
-                        "Volume %s is already attached to source VM", volume.id
-                    )
-                    continue
+    def _remove_root_volume_copy(self, volume_id):
+        """Delete the temporary copy of the source root disk, never the source VM's own."""
+        root = self._get_volume_maybe(volume_id)
+        if root is None:
+            self.log.info("No copy of the root volume to remove")
+        elif self._volume_still_attached(root, self._source_vm()):
+            self.log.info(
+                "Volume %s is the source VM's own boot volume, keeping it", root.id
+            )
+        else:
+            self.log.info("Removing copy of root volume")
+            self.conn.delete_volume(name_or_id=root.id, wait=True, timeout=self.timeout)
+
+    def _delete_root_snapshot(self, snapshot_id):
+        self.log.info("Deleting temporary root device snapshot")
+        self.conn.delete_volume_snapshot(
+            timeout=self.timeout, wait=True, name_or_id=snapshot_id
+        )
+
+    def _delete_root_image(self, image_id):
+        """Remove the root image copy, of an image-launched instance."""
+        self.log.info("Deleting temporary root device image")
+        self.conn.delete_image(timeout=self.timeout, wait=True, name_or_id=image_id)

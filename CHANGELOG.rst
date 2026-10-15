@@ -338,7 +338,15 @@ This project follows a simple changelog to satisfy collection metadata validatio
   migration's export attached - re-attaches the data volumes, and removes the
   root copy, its snapshot or the image only
   when the export made them, never the VM's own boot volume. The export
-  records the snapshot and the image as soon as each exists.
+  creates the root snapshot, the root copy and the image without
+  openstacksdk's own wait, which raises with the resource made, records
+  each at once, then waits for it within the module's timeout: a snapshot
+  or copy that went to ``error``, or an image still saving, was left
+  behind, and a copy left so failed the rescue. The cleanup re-attaches the
+  data volumes first and tries every step: a root copy Cinder will not
+  delete no longer keeps the data volumes off the source VM, and the cleanup
+  fails at the end with ``Source cleanup incomplete: ...`` naming each step
+  it could not do.
 - A wait for a conversion host's attach or port lock gives up once ssh to the
   host has failed for 15 minutes without a break, with ``Lock timeout:
   conversion host ADDRESS unreachable over SSH for N s, waiting for LOCK``,
