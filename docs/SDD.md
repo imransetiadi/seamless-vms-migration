@@ -2935,7 +2935,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   typed errors); `src/api/stream.ts` (fetch-based SSE with resume). A stream that delivers nothing — no event and no
   heartbeat — for 45 s, three heartbeats (§12), counts as dropped although no error came, as a half-open connection
   does after a laptop sleeps or a network path dies: the dashboard closes it and connects again with `since`, its
-  indicator reading Reconnecting meanwhile, never Live on events that stopped. It connects again after a growing
+  indicator reading Reconnecting meanwhile, never Live on events that stopped. The indicator's label is a focusable
+  term, as a status badge's is, whose detail — "Last update {hh:mm:ss}", when the last event or heartbeat came, or
+  "No updates received yet" — shows on hover, focus and tap, never only in a `title`, so stale data is recognisable
+  without a pointer. It connects again after a growing
   delay — 1 s, then twice the last, 15 s at most — that starts over only once a connection has stayed open for one
   heartbeat interval (15 s): a connection that ends sooner, whatever it delivered, counts as a failed attempt, as a
   refused or unreachable one does, so a proxy that answers 200 and ends each body at once is tried every 15 s, not
