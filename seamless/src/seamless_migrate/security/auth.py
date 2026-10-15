@@ -104,16 +104,26 @@ class TokenStore:
         for index, item in enumerate(items):
             if not isinstance(item, dict) or not item.get("name"):
                 raise AuthConfigError(f"token #{index} has no name")
-            if len(str(item["name"])) > MAX_TOKEN_NAME:
+            name = str(item["name"])
+            if len(name) > MAX_TOKEN_NAME:
                 raise AuthConfigError(f"token #{index}: name longer than {MAX_TOKEN_NAME}")
+            # SDD §13.1: what `token create` and POST /users refuse, a hand-edited file cannot add
+            if name.strip().casefold() in RESERVED_TOKEN_NAMES:
+                raise AuthConfigError(
+                    f"token #{index}: {name!r} is an actor the control plane records itself"
+                )
+            if ":" in name:
+                raise AuthConfigError(
+                    f"token #{index}: {name!r} has a colon, the form of the advisor's actors"
+                )
             try:
                 role = Role(str(item.get("role")))
             except ValueError:
-                raise AuthConfigError(f"token {item['name']!r} has an unknown role") from None
+                raise AuthConfigError(f"token {name!r} has an unknown role") from None
             digest = str(item.get("sha256") or "").lower()
             if not _SHA256.match(digest):
-                raise AuthConfigError(f"token {item['name']!r} needs a hex sha256 digest")
-            entries.append(TokenEntry(name=str(item["name"]), role=role, sha256=digest))
+                raise AuthConfigError(f"token {name!r} needs a hex sha256 digest")
+            entries.append(TokenEntry(name=name, role=role, sha256=digest))
         return cls(entries)
 
     def authenticate(self, token: str) -> Principal | None:

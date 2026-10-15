@@ -57,6 +57,20 @@ def test_token_store_rejects_bad_files(tmp_path, content):
         TokenStore.from_file(path)
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["system", " System ", "cli", "anonymous", "unauthenticated", "user:alice", "policy:pol-1"],
+)
+def test_token_store_refuses_reserved_actor_names_and_colons(tmp_path, name):
+    """Audit B-10 (SDD §13.1): a hand-edited tokens file cannot name a token after an actor the
+    control plane records itself, nor in the advisor's `kind:id` form - what `token create` and
+    POST /users refuse, the file refuses too, so no token's audit events pass for theirs."""
+    path = tmp_path / "tokens.yaml"
+    path.write_text(f"tokens:\n  - {{name: '{name}', role: admin, sha256: {'a' * 64}}}\n")
+    with pytest.raises(AuthConfigError, match="actor"):
+        TokenStore.from_file(path)
+
+
 def test_missing_tokens_file_is_an_error(tmp_path):
     with pytest.raises(AuthConfigError):
         TokenStore.from_file(tmp_path / "absent.yaml")
