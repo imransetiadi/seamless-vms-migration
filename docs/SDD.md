@@ -806,6 +806,20 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_rollback_delete_ports` | `true` | `delete_ports` of `import_workload_rollback` |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | `conversion_host` of `import_workload_rollback` |
 
+Role `conversion_host_content` (upstream, modified; plan task T7, D15) installs the copy tools on a conversion host by
+its OS. `os_migrate_conversion_host_content_tasks` (role vars, a Jinja expression of the gathered facts) names the task
+file:
+
+| Conversion host | Task file | What it installs |
+|---|---|---|
+| RHEL (`ansible_distribution` RedHat) | `rhel.yml` | the subscription (RHC) tasks, then `nbdkit`, `nbdkit-basic-plugins`, `qemu-img`, `libguestfs-tools`, `libvirt` (libvirtd started) |
+| another member of the RHEL family (`ansible_os_family` RedHat: CentOS Stream 9 and 10, Rocky Linux 9, AlmaLinux 9) | `centos.yml` | EPEL, then `nbdkit`, `nbdkit-basic-plugins`, `qemu-img`, `guestfs-tools`, `libvirt` (libvirtd started) |
+| Ubuntu 24.04 or later | `ubuntu.yml` | with apt (the package lists refreshed): `qemu-utils`, `nbdkit`, `libnbd-bin` (nbdcopy), `libguestfs-tools` |
+
+Any other OS fails the role with a message that names it and the supported ones, where it used to install nothing and
+the transfer then failed for want of nbdkit. An Ubuntu cloud image logs in as `ubuntu`: the provider's
+`conversion_host.ssh_user` (default `cloud-user`, §4.2) names it.
+
 ### 6.6 Hardening of existing code (required)
 
 `roles/import_from_hypervisor/tasks/process_disk.yml` exports hypervisor disks with `qemu-nbd`
@@ -3410,11 +3424,10 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
 
 ### 21.6 Conversion hosts on community clouds
 
-* Today `conversion_host_content` installs the copy tools only when `ansible_distribution` is CentOS or RedHat: a
-  community cloud's conversion host image is CentOS Stream 9 (no subscription) or RHEL 9.
-* Planned (D15): the RHEL family by `ansible_os_family` (Rocky Linux 9, AlmaLinux 9, CentOS Stream 10), then Ubuntu
-  24.04 LTS (apt: `qemu-utils`, `nbdkit`, `libnbd-bin` for nbdcopy, `libguestfs-tools`). Every image keeps Python 3.6 or
-  later for blocksync (§6.2, D7).
+* `conversion_host_content` installs the copy tools on the RHEL family by `ansible_os_family` (RHEL with its
+  subscription; CentOS Stream 9 and 10, Rocky Linux 9, AlmaLinux 9 with EPEL) and on Ubuntu 24.04 LTS or later (apt:
+  `qemu-utils`, `nbdkit`, `libnbd-bin` for nbdcopy, `libguestfs-tools`), and fails on any other OS (§6.5; T7, in
+  D15's order). Every image keeps Python 3.6 or later for blocksync (§6.2, D7); an Ubuntu image's user is `ubuntu`.
 * VMware sources need VDDK on the destination conversion host, as on RHOSO 18.0.
 
 ### 21.7 API changes the design absorbs (today)
@@ -3440,7 +3453,7 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
 | findings `DST_CAPABILITY_MISSING` (blocker), `DST_RELEASE_OUTSIDE_SUPPORT` (warning) | §21.4 (binding); §9.3 with the catalog | T4 |
 | `NET_PORT_NOT_PERMITTED` by the policy profile (§21.5) | §6.6, §9.3 (binding); the dashboard's picker with T8 | T5 |
 | destination-neutral texts: findings, events, the CLI and the dashboard name the destination provider | §9.3, §16 | T6 |
-| conversion host images (§21.6) | §6.5, Performance.md | T7 |
+| conversion host images (§21.6) | §6.5 (binding), Performance.md | T7 |
 | the provider page shows series, tier and profile; the provider form takes the declared series | §16 | T8 |
 | the demo: a community destination (2026.2 Hibiscus, Kolla-Ansible preset) beside `rhoso18` | §10, §7.4 | T9 |
 | the lab matrix M7–M12 and the LAB-D cases | QASuite §6.7, §7 | T10 |
