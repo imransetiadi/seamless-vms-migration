@@ -432,7 +432,10 @@ class Server(osm_resource.Resource):
         for port_data in params.get("ports") or []:
             errors.extend(
                 ServerPort.from_data(port_data).dst_port_errors(
-                    conn, migration_params["port_creation_mode"]
+                    conn,
+                    migration_params["port_creation_mode"],
+                    # written by Seamless Migrate before each run (SDD 6.6); none: legacy
+                    migration_params.get("policy_profile"),
                 )
             )
         for fip_data in params.get("floating_ips") or []:

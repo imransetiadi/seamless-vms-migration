@@ -147,13 +147,19 @@ This project follows a simple changelog to satisfy collection metadata validatio
   Such a network must be shared with the credential's project or external: an
   admin sees every project's networks, and a port on another tenant's private
   network would put the server there. The credential's token must also carry
-  the ``admin`` or ``advsvc`` role. Neutron's policy (2023.1
-  ``create_port:fixed_ips:ip_address``, ``create_port:mac_address``,
+  a role the destination's policy profile counts. Neutron's policy
+  (``create_port:fixed_ips:ip_address``, ``create_port:mac_address``,
   ``create_port:port_security_enabled``) lets only those roles, or the
-  network's own project, choose a port's address, MAC or port security. The
-  import chooses them for every port: Nova creates the port with the user's
-  token and its fixed IP, and ``port_creation_mode: neutron`` sends the MAC,
-  every address and the port-security flag.
+  network's own project, choose a port's address, MAC or port security:
+  ``admin`` or ``advsvc`` under the legacy rules (2023.1), ``admin`` or
+  ``service`` under the secure-RBAC defaults (from 2023.2), and ``admin``
+  alone when the profile is unknown. The profile is the server's
+  ``_migration_params.policy_profile``, which Seamless Migrate writes before
+  each run; an export without it reads ``legacy``, and a value the check
+  does not know counts ``admin`` alone. The import chooses them for every
+  port: Nova creates the port with the user's token and its fixed IP, and
+  ``port_creation_mode: neutron`` sends the MAC, every address and the
+  port-security flag.
 - A port recreated through Neutron is created without its addresses on SLAAC
   or DHCPv6-stateless subnets. Neutron 2023.1 allocates such a subnet's EUI-64
   address of the MAC on every port it creates, also when the address is sent,

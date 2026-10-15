@@ -521,7 +521,7 @@ class TestServerDstNetworkCheck(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def errors(self, ports, mode="nova", floating_ips=(), fip_mode="auto"):
+    def errors(self, ports, mode="nova", floating_ips=(), fip_mode="auto", profile=None):
         srv = server.Server.from_data(
             {
                 "type": "openstack.compute.Server",
@@ -541,6 +541,7 @@ class TestServerDstNetworkCheck(unittest.TestCase):
                     "boot_disk_copy": True,
                     "port_creation_mode": mode,
                     "floating_ip_mode": fip_mode,
+                    **({"policy_profile": profile} if profile is not None else {}),
                 },
             }
         )
@@ -600,6 +601,46 @@ class TestServerDstNetworkCheck(unittest.TestCase):
                 # tenant's private one
                 [private] = self.errors([network_port("p1", "private-b", app)], mode=mode)
                 self.assertIn("is neither shared with the credential's project nor external", private)
+
+    def test_judges_another_projects_network_by_the_policy_profile(self):
+        """Seamless Migrate SDD 6.6, 21.5: the roles that may choose a port's address or MAC
+        on another project's network follow the destination's policy profile - admin or advsvc
+        under legacy (also with none: an export from before the param), admin or service under
+        secure_rbac, admin alone under unknown or a value it does not know."""
+        app = [{"ip_address": "10.0.0.5"}]
+        counted = {
+            None: {"admin", "advsvc"},
+            "legacy": {"admin", "advsvc"},
+            "secure_rbac": {"admin", "service"},
+            "unknown": {"admin"},
+            "strict": {"admin"},
+        }
+        for profile, roles in counted.items():
+            for role in ("admin", "advsvc", "service", "member"):
+                self.dst.roles = [role, "reader"]
+                for mode in ("nova", "neutron"):
+                    found = self.errors([network_port("p1", "provider", app)], mode=mode, profile=profile)
+                    self.assertEqual(found == [], role in roles, (profile, role, mode, found))
+                    # the credential's own network, whatever its roles and profile
+                    self.assertEqual(self.errors([network_port("p1", "app", app)], mode=mode, profile=profile), [])
+        self.dst.roles = ["advsvc", "reader"]
+        [secure] = self.errors([network_port("p1", "provider", app)], profile="secure_rbac")
+        self.assertEqual(
+            "Destination prerequisites not met: port p1 on network 'provider': the network "
+            "belongs to project project-admin, and Neutron's secure-RBAC defaults let only the "
+            "admin or service role, or that project, choose a port's address or MAC there; the "
+            "destination credential's token has neither role",
+            secure,
+        )
+        [unknown] = self.errors([network_port("p1", "provider", app)], profile="unknown")
+        self.assertEqual(
+            "Destination prerequisites not met: port p1 on network 'provider': the network "
+            "belongs to project project-admin, and the destination's policy profile is unknown, "
+            "so only the admin role, or that project, may choose a port's address or MAC there; "
+            "the destination credential's token lacks it (declare the provider's policy profile "
+            "or series)",
+            unknown,
+        )
 
     def test_refuses_an_unshared_external_network_to_a_token_without_admin(self):
         """SDD 6.6, review RT-03: Nova (2023.1 network:attach_external_network, admin by

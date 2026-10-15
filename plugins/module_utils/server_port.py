@@ -25,10 +25,15 @@ SERVER_PORT_ORDER_MAX = 1000
 # what makes Neutron derive a port's address on a subnet from its MAC (SDD 6.6)
 AUTO_ADDRESS_MODES = ("slaac", "dhcpv6-stateless")
 
-# the roles Neutron's policy (2023.1 create_port:fixed_ips:ip_address, :mac_address,
+# the roles Neutron's policy (create_port:fixed_ips:ip_address, :mac_address,
 # :port_security_enabled) lets choose a port's address, MAC or port security on another
-# project's network (SDD 6.6)
-PORT_ROLES = ("admin", "advsvc")
+# project's network, by the destination's policy profile (Seamless Migrate SDD 6.6, 21.5):
+# the 2023.1 rules, the defaults from 2023.2, and the role both count
+PORT_ROLES_BY_PROFILE = {
+    "legacy": ("admin", "advsvc"),
+    "secure_rbac": ("admin", "service"),
+    "unknown": ("admin",),
+}
 
 
 def credential_roles(conn):
@@ -36,13 +41,15 @@ def credential_roles(conn):
     return set(conn.session.auth.get_access(conn.session).role_names or [])
 
 
-def network_refusal(conn, network_id):
+def network_refusal(conn, network_id, policy_profile=None):
     """Why the credential of `conn` may not put a port on the network `network_id`, or
     None (SDD 6.6). Another project's network takes it only when shared with the
     credential's project or external - an admin sees every project's networks - and the
-    import chooses every port's address or MAC, which Neutron lets only PORT_ROLES, or
-    the network's own project, choose. An external network that is not shared, the
-    credential's own included, Nova attaches to a server for the admin role only."""
+    import chooses every port's address or MAC, which Neutron lets only the roles the
+    destination's `policy_profile` counts (PORT_ROLES_BY_PROFILE; none given: legacy, a
+    value it does not know: unknown), or the network's own project, choose. An external
+    network that is not shared, the credential's own included, Nova attaches to a server
+    for the admin role only."""
     network = conn.network.get_network(network_id)
     project = network["project_id"]
     roles = None
@@ -53,12 +60,11 @@ def network_refusal(conn, network_id):
                 "credential's project nor external"
             )
         roles = credential_roles(conn)
-        if not roles & set(PORT_ROLES):
-            return (
-                f"the network belongs to project {project}, and Neutron lets only the admin or "
-                "advsvc role, or that project, choose a port's address or MAC there; the "
-                "destination credential's token has neither role"
-            )
+        profile = policy_profile or "legacy"
+        if profile not in PORT_ROLES_BY_PROFILE:
+            profile = "unknown"
+        if not roles & set(PORT_ROLES_BY_PROFILE[profile]):
+            return "the network belongs to project %s, and %s" % (project, _ROLE_RULE[profile])
     if network["is_router_external"] and not network["is_shared"]:
         # Nova's network:attach_external_network, admin only by default (2023.1)
         if "admin" not in (roles if roles is not None else credential_roles(conn)):
@@ -67,6 +73,25 @@ def network_refusal(conn, network_id):
                 "attach such a network to a server; the destination credential's token lacks it"
             )
     return None
+
+
+# what each profile's rule says when the token has none of its roles (SDD 6.6, 21.5)
+_ROLE_RULE = {
+    "legacy": (
+        "Neutron lets only the admin or advsvc role, or that project, choose a port's address "
+        "or MAC there; the destination credential's token has neither role"
+    ),
+    "secure_rbac": (
+        "Neutron's secure-RBAC defaults let only the admin or service role, or that project, "
+        "choose a port's address or MAC there; the destination credential's token has neither "
+        "role"
+    ),
+    "unknown": (
+        "the destination's policy profile is unknown, so only the admin role, or that project, "
+        "may choose a port's address or MAC there; the destination credential's token lacks it "
+        "(declare the provider's policy profile or series)"
+    ),
+}
 
 
 def port_description(source_port_id):
@@ -242,7 +267,7 @@ class ServerPort(osm_resource.Resource):
             "fixed_ip": refs["fixed_ips"][0]["ip_address"],
         }
 
-    def dst_port_errors(self, conn, port_creation_mode):
+    def dst_port_errors(self, conn, port_creation_mode, policy_profile=None):
         """What would make the import fail to create this port after the source stops,
         looked up now as the import will look it up (SDD 6.6): its network and subnet
         references, whether the credential may put a port on that network, and every fixed
@@ -256,7 +281,7 @@ class ServerPort(osm_resource.Resource):
         )
         try:
             refs = self._refs_from_ser(conn)
-            refused = network_refusal(conn, refs["network_id"])
+            refused = network_refusal(conn, refs["network_id"], policy_profile)
         except (
             osm_resource.OPENSTACK_EXC.ResourceFailure,
             osm_resource.OPENSTACK_EXC.ResourceNotFound,
