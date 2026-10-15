@@ -397,6 +397,25 @@ def _message_texts(tree, exempt=frozenset()):
 
 #: where SshOutage, its give-up and the setter that checks the give-up's prefix live
 GIVE_UP_HOME = Path("module_utils") / "volume_common.py"
+#: the prefixes the control plane retries, and the check every give-up's prefix passes
+PREFIX_CHECKS = frozenset({"GIVE_UP_PREFIXES", "_checked_give_up_prefix"})
+
+
+def _joined(node):
+    """The string that ``node`` builds from literals alone - a literal, a `+` chain of them, an
+    f-string whose fields are literals - or None."""
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _joined(node.left), _joined(node.right)
+        return left + right if left is not None and right is not None else None
+    if isinstance(node, ast.JoinedStr):
+        parts = [
+            _joined(value.value if isinstance(value, ast.FormattedValue) else value)
+            for value in node.values
+        ]
+        return "".join(parts) if None not in parts else None
+    return None
 
 
 def _give_up_uses(tree, home):
@@ -405,7 +424,9 @@ def _give_up_uses(tree, home):
     GIVE_UP. Only SshOutage.seen fills the template, with the prefix its setter checked; read
     anywhere else it takes any prefix, and assigned anywhere else it is another give-up's text
     (review RV14-03). Also strays: the name as a string, and a prefix written past the setter
-    (review RV15-03)."""
+    (review RV15-03); the name built from literals, and a write to GIVE_UP_PREFIXES or
+    _checked_give_up_prefix but the prefixes' own definition, or either name as a string, which
+    widens what the setter and seen() take (review RV16-07)."""
     definition, allowed = None, set()
     for cls in ast.walk(tree) if home else ():
         if not (isinstance(cls, ast.ClassDef) and cls.name == "SshOutage"):
@@ -426,8 +447,31 @@ def _give_up_uses(tree, home):
         and (
             (isinstance(node, ast.Name) and node.id == "GIVE_UP")
             or (isinstance(node, ast.Attribute) and node.attr == "GIVE_UP")
-            # the template read by its name as a string: getattr, vars(), __dict__ (RV15-03)
-            or (isinstance(node, ast.Constant) and node.value == "GIVE_UP")
+            # the template read by its name as a string: getattr, vars(), __dict__ (RV15-03),
+            # the name built from literals too (RV16-07)
+            or (isinstance(node, (ast.Constant, ast.BinOp, ast.JoinedStr)) and _joined(node) == "GIVE_UP")
+        )
+    ]
+    # the prefixes widened or their check replaced: any write to either name but the prefixes'
+    # definition in the home module, or the name as a string - setattr, vars(), mock (RV16-07)
+    definition_of_prefixes = next(
+        (
+            target for stmt in (tree.body if home else ()) if isinstance(stmt, ast.Assign)
+            for target in stmt.targets
+            if isinstance(target, ast.Name) and target.id == "GIVE_UP_PREFIXES"
+        ),
+        None,
+    )
+    strays += [
+        node for node in ast.walk(tree)
+        if node is not definition_of_prefixes
+        and (
+            (
+                isinstance(node, (ast.Name, ast.Attribute))
+                and (node.id if isinstance(node, ast.Name) else node.attr) in PREFIX_CHECKS
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+            )
+            or (isinstance(node, (ast.Constant, ast.BinOp, ast.JoinedStr)) and _joined(node) in PREFIX_CHECKS)
         )
     ]
     # a prefix written past the setter: _prefix outside SshOutage, or a subclass's own prefix -
@@ -463,7 +507,8 @@ def _give_up_uses(tree, home):
 
 def _unretried_give_ups(plugins):
     """(file, message) for each message under ``plugins`` that says a conversion host is
-    "unreachable over SSH" but starts with no GIVE_UP_PREFIXES member, the prefixes the control
+    "unreachable over" its transport - SSH in the text or passed to it, as by a wording helper's
+    text (review RV16-07) - but starts with no GIVE_UP_PREFIXES member, the prefixes the control
     plane retries, and (file, "GIVE_UP at line N") for each stray use of SshOutage's give-up.
     That give-up is exempt only where it is defined: its template, filled by SshOutage.seen,
     takes the prefix the setter checked - a copy of its text, or the template filled elsewhere,
@@ -475,7 +520,7 @@ def _unretried_give_ups(plugins):
         found += [(path.name, "a give-up built past its checks, line %d" % node.lineno) for node in strays]
         exempt = {id(definition)} if definition is not None else set()
         for text in _message_texts(tree, exempt):
-            if "unreachable over SSH" not in text:
+            if "unreachable over" not in text:
                 continue
             if text.split(":", 1)[0] not in volume_common.GIVE_UP_PREFIXES:
                 found.append((path.name, text))
@@ -499,6 +544,10 @@ IMPORT_SSH_OUTAGE = (
     "from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (\n"
     "    SshOutage,\n"
     ")\n"
+)
+#: and the one it would write to reach the module's names
+IMPORT_VOLUME_COMMON = (
+    "from ansible_collections.os_migrate.os_migrate.plugins.module_utils import volume_common\n"
 )
 
 
@@ -539,6 +588,27 @@ IMPORT_SSH_OUTAGE = (
          "    def prefix(self):\n"
          '        return "Port probe gave up"\n',
          True),
+        # review RV16-07: the transport as a %-argument, a wording helper, the template's name
+        # built from parts, the prefixes widened or their check replaced
+        ('M = "Port probe gave up: conversion host %s unreachable over %s, probing" % ("h", "SSH")\n',
+         True),
+        ('M = "SSH timeout: conversion host %s unreachable over %s, probing" % ("h", "SSH")\n',
+         False),
+        ("def _unreachable(host, transport):\n"
+         '    return "conversion host %s unreachable over %s, probing" % (host, transport)\n'
+         "\n"
+         "\n"
+         'M = "Port probe gave up: " + _unreachable("10.0.0.10", "SSH")\n',
+         True),
+        (IMPORT_SSH_OUTAGE
+         + 'M = vars(SshOutage)["GIVE" + "_UP"] % ("Port probe gave up", "10.0.0.10", 900, "a port")\n',
+         True),
+        (IMPORT_VOLUME_COMMON + 'volume_common.GIVE_UP_PREFIXES += ("Port probe gave up",)\n', True),
+        (IMPORT_VOLUME_COMMON
+         + 'setattr(volume_common, "GIVE_UP_PREFIXES", ("Lock timeout", "SSH timeout", "Port"))\n',
+         True),
+        (IMPORT_VOLUME_COMMON + "volume_common._checked_give_up_prefix = lambda prefix: prefix\n",
+         True),
     ],
     ids=[
         "a %s template with another prefix", "the phrase split by +", "an f-string, another prefix",
@@ -547,6 +617,9 @@ IMPORT_SSH_OUTAGE = (
         "an SshOutage of its own, outside volume_common",
         "getattr with the name as a string", "vars()", "_prefix written past the setter",
         "a subclass's own prefix property",
+        "the transport as a %-argument", "the transport as a %-argument, a retried prefix",
+        "a wording helper", "the template's name built from parts", "the prefixes widened",
+        "the prefixes replaced by setattr", "the prefix check replaced",
     ],
 )
 def test_the_give_up_guard_reads_each_message_whole(tmp_path, source, refused):
