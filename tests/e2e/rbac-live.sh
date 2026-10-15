@@ -42,19 +42,36 @@ check GET  /stats viewer;                      check GET  /advisor/status viewer
 check POST /advisor/similar-incidents operator
 
 # plan policy fields (require_approval, require_distinct_approver, auto_cutover, cutover_window) need approver,
-# also on POST /plans (SDD 12);
-# the 403 for an operator must win over any 400/404/422 of the same request
-policy() { # METHOD PATH JSON-BODY
+# also on POST /plans (SDD 12); the 403 for an operator must win over any 400/404/422 of the same request
+policy() { # METHOD OPERATOR-PATH APPROVER-PATH JSON-BODY
   local code
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" -d "$3" -H 'Content-Type: application/json' \
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" -d "$4" -H 'Content-Type: application/json' \
          -H "$OPERATOR_H" "$BASE$2")
-  [ "$code" = 403 ] || { echo "FAIL operator $1 $2 $3 -> $code (want 403)"; fail=1; }
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" -d "$3" -H 'Content-Type: application/json' \
-         -H "$APPROVER_H" "$BASE$2")
-  if [ "$code" = 401 ] || [ "$code" = 403 ]; then echo "FAIL approver $1 $2 $3 -> $code (want allowed)"; fail=1; fi
+  [ "$code" = 403 ] || { echo "FAIL operator $1 $2 $4 -> $code (want 403)"; fail=1; }
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" -d "$4" -H 'Content-Type: application/json' \
+         -H "$APPROVER_H" "$BASE$3")
+  if [ "$code" = 401 ] || [ "$code" = 403 ]; then echo "FAIL approver $1 $3 $4 -> $code (want allowed)"; fail=1; fi
 }
-policy POST  /plans      '{"name":"rbac-probe","source_provider_id":"nope","destination_provider_id":"nope","vm_ids":[],"auto_cutover":true}'
-policy PATCH /plans/nope '{"require_approval":false}'
-policy PATCH /plans/nope '{"require_distinct_approver":false}'
-policy PATCH /plans/nope '{"cutover_window":{"start":"2030-01-01T01:00:00Z","end":"2030-01-01T05:00:00Z"}}'
+policy POST /plans /plans '{"name":"rbac-probe","source_provider_id":"nope","destination_provider_id":"nope","vm_ids":[],"auto_cutover":true}'
+# PATCH: an operator may send a policy field at the plan's current value - only a change needs the approver
+# (SDD 12) - so the route reads the plan first, and a plan that does not exist is 404 to anyone. The
+# operator's probe goes to a real plan, read with the viewer's token, with a value that plan does not hold:
+# refused before anything is written. The approver's goes to a plan that does not exist: nothing changes.
+probes=$(curl -s -H "$VIEWER_H" "$BASE/plans" | python3 -c '
+import json, sys
+try:
+    plan = json.load(sys.stdin)[0]
+    window = {"start": "2030-01-01T01:00:00Z", "end": "2030-01-01T05:00:00Z"}
+    print(plan["id"])
+    for field in ("require_approval", "require_distinct_approver"):
+        print(json.dumps({field: not plan[field]}))
+    print(json.dumps({"cutover_window": None if plan.get("cutover_window") else window}))
+except Exception:
+    pass' 2>/dev/null)
+if [ -n "$probes" ]; then
+  plan_id=$(sed -n 1p <<<"$probes")
+  while IFS= read -r body; do policy PATCH "/plans/$plan_id" /plans/nope "$body"; done < <(sed 1d <<<"$probes")
+else
+  echo "SKIP PATCH policy probes: no plan on the stack to probe"
+fi
 if [ "$fail" = 0 ]; then echo "RBAC matrix OK"; else echo "RBAC matrix FAILED"; exit 1; fi
