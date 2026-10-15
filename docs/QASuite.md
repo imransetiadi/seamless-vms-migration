@@ -1045,6 +1045,9 @@ SEAMLESS_LIVE_JEV=1 SEAMLESS_LIVE_MEMORY=1 SEAMLESS_MEMORY_URL=http://127.0.0.1:
 ```
 
 `make seamless-test` runs `cd seamless && .venv/bin/pytest -q`; it passes `SEAMLESS_TEST_PG_URL` through when exported.
+`seamless/README.md` gives the same venv, test and lint commands, and
+`test_the_seamless_readme_gives_the_commands_the_makefile_and_ci_run` (`seamless/tests/test_build_context.py`) keeps
+them so: the extras `make seamless-check` asks for, CI's lint line (audit B-29).
 
 ### 14.4 Dashboard (Track C)
 
