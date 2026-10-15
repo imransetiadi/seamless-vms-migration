@@ -8,6 +8,7 @@ reaches local, remote and CI builders.
 """
 
 import http.server
+import json
 import os
 import re
 import shutil
@@ -691,3 +692,59 @@ def test_publish_warns_when_the_key_is_on_its_own_command_line(tmp_path):
     assert "export ANSIBLE_GALAXY_API_KEY" in run.stderr
     assert f"ANSIBLE_GALAXY_SERVER_RELEASE_GALAXY_TOKEN={GALAXY_KEY}" in lines
     assert "ansible-galaxy collection publish os_migrate-os_migrate-9.9.9.tar.gz" in lines
+
+
+def _agent_read_deny_patterns() -> list[re.Pattern[str]]:
+    """The ``Read(<glob>)`` rules of ``.claude/settings.json`` as regular expressions.
+
+    Claude Code resolves the glob against the project root (``./``); ``**`` spans directories,
+    ``*`` and ``?`` stay inside one path segment."""
+    settings = json.loads((ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    patterns = []
+    for rule in settings["permissions"]["deny"]:
+        match = re.fullmatch(r"Read\((.+)\)", rule)
+        assert match, f"not a Read rule: {rule}"
+        glob = match.group(1).removeprefix("./")
+        out, i = "", 0
+        while i < len(glob):
+            if glob.startswith("**/", i):
+                out, i = out + "(?:.*/)?", i + 3
+            elif glob.startswith("**", i):
+                out, i = out + ".*", i + 2
+            elif glob[i] == "*":
+                out, i = out + "[^/]*", i + 1
+            elif glob[i] == "?":
+                out, i = out + "[^/]", i + 1
+            else:
+                out, i = out + re.escape(glob[i]), i + 1
+        patterns.append(re.compile("^" + out + "$"))
+    return patterns
+
+
+def test_agent_read_deny_list_covers_every_secret_path():
+    """CLAUDE.md §7: the agent settings deny *reading* every local secret file a checkout can hold,
+    wherever it sits — the generated Compose files in a worktree too, since every worktree is a
+    full checkout (audit D-01). The samples are SECRET_PATHS, their worktree copies, and the
+    kubeconfig shapes CLAUDE.md names; source and config files must stay readable."""
+    patterns = _agent_read_deny_patterns()
+    samples = [
+        *SECRET_PATHS,
+        *(f".worktrees/track-b/{path}" for path in SECRET_PATHS),
+        "kubeconfig",
+        "deploy/kubeconfig.yaml",
+        ".kube/config",
+        "deploy/openshift/secrets/clouds.yaml",
+        "seamless/data/secrets/vcenter-dc2/password",
+        "seamless/seamless.db",
+    ]
+    readable = [path for path in samples if not any(rx.match(path) for rx in patterns)]
+    assert readable == [], f"the agent may read secret files: {readable}"
+    for code in (
+        "seamless/src/seamless_migrate/app.py",
+        "deploy/compose/compose.yaml",
+        "deploy/openshift/secret-example.yaml",
+        ".claude/settings.json",
+        "seamless/tests/test_build_context.py",
+        "README.md",
+    ):
+        assert not any(rx.match(code) for rx in patterns), code

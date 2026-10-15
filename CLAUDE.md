@@ -126,8 +126,9 @@ No API keys, passwords, tokens, `clouds.yaml`, kubeconfigs, `.env`, `tokens.yaml
 or real hostnames of customer systems — in code, tests, fixtures, docs, logs or commit messages. Use the
 placeholders already in `deploy/openshift/secret-example.yaml`. These files are git-ignored and must stay
 so: `deploy/compose/.env`, `deploy/compose/tokens.yaml`, `clouds.yaml`, `secure.yaml`, `*.pem`, `*.key`.
-Test fixtures are synthetic. `.claude/settings.json` denies *reading* those files from the agent; do not
-work around it with shell tricks. If a secret reaches a commit: **rotate it first**, then purge history,
+Test fixtures are synthetic. `.claude/settings.json` denies *reading* those files from the agent — wherever
+they sit, a worktree's generated `deploy/compose/.env` included (`seamless/tests/test_build_context.py`
+checks the deny list against every local secret path); do not work around it with shell tricks. If a secret reaches a commit: **rotate it first**, then purge history,
 then tell the user. Run `gitleaks dir -c .gitleaks-tree.toml --redact --no-banner .` (working tree: the tree config skips the
 git-ignored local secret files a checkout holds) and `gitleaks git --redact --no-banner .` (history: `.gitleaks.toml`, which
 allowlists no secret path, plus `.gitleaksignore`) before pushing.
