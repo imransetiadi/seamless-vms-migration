@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import random
 import time
 import weakref
 from collections import Counter, defaultdict
@@ -320,6 +321,19 @@ def _fmt_bytes(n: float) -> str:
     return f"{n:.1f} TiB"  # pragma: no cover
 
 
+#: a plan's read-modify-write (``_update_plan``) is tried this often, backing off between the
+#: attempts, before it answers 409: several drivers and the tick loop rewrite the same plan
+PLAN_UPDATE_ATTEMPTS = 20
+#: the longest backoff between two attempts, in seconds (5 ms doubling up to it, jittered)
+PLAN_UPDATE_BACKOFF_S = 0.25
+
+
+def _update_backoff(attempt: int) -> float:
+    """Seconds to wait before retry ``attempt`` (from 1): 5 ms doubling to the cap, jittered so
+    that writers which collided do not collide again in step."""
+    return min(PLAN_UPDATE_BACKOFF_S, 0.005 * 2**attempt) * random.uniform(0.5, 1.0)
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -447,10 +461,13 @@ class Orchestrator:
 
         Several drivers and the tick loop touch the same plan concurrently (ids rewritten by a
         rollback, status changes, strategy overrides): ``mutate`` runs on the freshest copy and
-        the write is retried when another writer got in between. ``mutate`` returns ``False``
-        to leave the plan untouched.
+        the write is retried, after a jittered backoff, when another writer got in between.
+        ``mutate`` returns ``False`` to leave the plan untouched. A plan rewritten under every
+        one of PLAN_UPDATE_ATTEMPTS raises ``ConflictError`` (the API's 409, SDD §12).
         """
-        for _ in range(8):
+        for attempt in range(PLAN_UPDATE_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_update_backoff(attempt))
             plan, version = await self.db.get_versioned("plan", plan_id, Plan)
             if mutate(plan) is False:
                 return plan
@@ -460,7 +477,7 @@ class Orchestrator:
                 return plan
             except ConflictError:
                 continue
-        raise RuntimeError(f"plan {plan_id} changed too often to update it")
+        raise ConflictError(f"plan {plan_id} changed too often to update it; run the action again")
 
     async def _provider(self, provider_id: str, role: ProviderRole) -> Provider:
         try:
