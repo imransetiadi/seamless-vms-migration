@@ -7,7 +7,7 @@ import hmac
 import logging
 import time
 from collections import defaultdict, deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -143,6 +143,16 @@ class ApiError(Exception):
 
 def services(request: Request) -> Services:
     return request.app.state.services
+
+
+def validation_message(errors: Sequence[Any], fallback: str = "invalid request") -> str:
+    """One line for a pydantic error list, as every 422 of SDD §12 carries it: the first five
+    ``location: message`` items (a request body's ``body`` prefix dropped), else ``fallback``."""
+    parts = []
+    for err in list(errors)[:5]:
+        location = ".".join(str(p) for p in err.get("loc", ()) if p != "body")
+        parts.append(f"{location}: {err.get('msg')}" if location else str(err.get("msg")))
+    return "; ".join(parts) or fallback
 
 
 def _client(request: Request) -> str:

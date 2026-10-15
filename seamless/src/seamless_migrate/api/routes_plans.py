@@ -23,7 +23,7 @@ from ..plan_checks import PlanSpecError, check_plan_spec
 from ..plan_status import derive_plan_status_from_phases
 from ..security.auth import Principal
 from ..store import NotFound
-from .deps import ApiError, _audit_denied, require_role, services
+from .deps import ApiError, _audit_denied, require_role, services, validation_message
 from .schemas import (
     CancelRequest,
     PlanFinalizeRequest,
@@ -206,7 +206,7 @@ async def update_plan(
                 {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body}
             )
         except ValidationError as exc:
-            raise ApiError(422, "validation_error", _summarize(exc)) from None
+            raise ApiError(422, "validation_error", validation_message(exc.errors())) from None
         _check_plan_spec(merged)
         updated = Plan.model_validate(
             {
@@ -297,11 +297,3 @@ async def finalize_plan(
         delete_source=body.delete_source,
     )
     return PlanFinalizeResult.model_validate(out)
-
-
-def _summarize(exc: ValidationError) -> str:
-    parts = []
-    for err in exc.errors()[:5]:
-        location = ".".join(str(p) for p in err.get("loc", ()))
-        parts.append(f"{location}: {err.get('msg')}" if location else str(err.get("msg")))
-    return "; ".join(parts) or "invalid request"

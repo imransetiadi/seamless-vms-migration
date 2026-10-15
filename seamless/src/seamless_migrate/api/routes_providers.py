@@ -32,7 +32,7 @@ from ..security.secret_store import (
 )
 from ..security.secrets import valid_secret_name
 from ..store import ConflictError, NotFound
-from .deps import ApiError, require_role, services
+from .deps import ApiError, require_role, services, validation_message
 from .schemas import ConversionKeyRequest, ProviderCredentialsRequest
 
 log = logging.getLogger(__name__)
@@ -62,14 +62,6 @@ _SERVER_OWNED = {
     "last_checked_at": None,
     "capabilities": {},
 }
-
-
-def _summarize(exc: ValidationError) -> str:
-    parts = []
-    for err in exc.errors()[:5]:
-        loc = ".".join(str(p) for p in err.get("loc", ()))
-        parts.append(f"{loc}: {err.get('msg')}" if loc else str(err.get("msg")))
-    return "; ".join(parts) or "invalid provider"
 
 
 async def _plans_using(request: Request, provider_id: str, statuses: frozenset[str]) -> list[str]:
@@ -240,7 +232,9 @@ async def update_provider(
             {**provider.model_dump(mode="json"), **body, **_SERVER_OWNED}
         )
     except ValidationError as exc:
-        raise ApiError(422, "validation_error", _summarize(exc)) from None
+        raise ApiError(
+            422, "validation_error", validation_message(exc.errors(), "invalid provider")
+        ) from None
     _check_secret_names(updated, set(body))
     await svc.db.put("provider", updated, expected_version=version)
     await emit(
