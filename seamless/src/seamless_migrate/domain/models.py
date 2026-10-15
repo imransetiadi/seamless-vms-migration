@@ -122,6 +122,8 @@ class Provider(_Model):
     status_message: str | None = None
     last_checked_at: UTCDateTime | None = None
     distribution: Distribution | None = None
+    #: the community series its operator declares, e.g. "2026.2" (SDD §4.2, §10.1, §21.3)
+    release: str | None = Field(default=None, pattern=r"^20[0-9]{2}\.[12]$")
     #: server-owned: when PUT …/credentials / …/conversion-key last wrote the secret store
     credentials_updated_at: UTCDateTime | None = None
     conversion_key_updated_at: UTCDateTime | None = None
@@ -132,6 +134,14 @@ class Provider(_Model):
             raise ValueError(
                 f"distribution {self.distribution} belongs to kind "
                 f"{DISTRIBUTION_KIND[self.distribution]}, not {self.kind}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _release_is_an_openstack_series(self) -> Provider:
+        if self.release is not None and self.kind == ProviderKind.vmware:
+            raise ValueError(
+                "release: an OpenStack series cannot be declared for a vmware provider"
             )
         return self
 

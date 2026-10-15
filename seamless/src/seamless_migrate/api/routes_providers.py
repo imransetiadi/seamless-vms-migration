@@ -54,6 +54,7 @@ PROVIDER_EDITABLE_FIELDS = frozenset(
         "ca_cert_path",
         "conversion_host",
         "distribution",
+        "release",
     }
 )
 _SERVER_OWNED = {

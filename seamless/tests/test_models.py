@@ -7,6 +7,8 @@ from pydantic import ValidationError
 from seamless_migrate.domain.enums import (
     Phase,
     PlanStatus,
+    ProviderKind,
+    ProviderRole,
     Role,
     Strategy,
     SyncPassKind,
@@ -114,6 +116,37 @@ def test_provider_id_regex_enforced():
     for bad in ("A", "-abc", "x", "has_underscore", "a" * 64):
         with pytest.raises(ValidationError):
             make_provider(id=bad)
+
+
+def test_provider_release_is_optional_and_validated_as_a_series():
+    """SDD §4.2: a provider declares no series unless its operator does, and a declared one reads
+    as releases.openstack.org names them - a year, a dot, 1 or 2 (§10.1, §21.3)."""
+    assert make_provider().release is None
+    for series in ("2023.1", "2024.2", "2026.2", "2027.1"):
+        assert make_provider(release=series).release == series
+    for bad in (
+        "2026.3",
+        "26.2",
+        "2026.2.1",
+        "2026",
+        "Hibiscus",
+        " 2026.2",
+        "2026.2 ",
+        "1999.1",
+        "",
+    ):
+        with pytest.raises(ValidationError, match="release"):
+            make_provider(release=bad)
+
+
+def test_a_release_on_a_vmware_provider_is_refused():
+    """SDD §4.2: an OpenStack series means nothing for vCenter - refused, never stored."""
+    vmware = {"id": "vc-01", "kind": ProviderKind.vmware, "endpoint": "https://vcenter.example"}
+    assert make_provider(**vmware).release is None
+    with pytest.raises(ValidationError, match="release"):
+        make_provider(**vmware, release="2026.2")
+    destination = {"id": "dst-hibiscus", "role": ProviderRole.destination, "release": "2026.2"}
+    assert make_provider(**destination).release == "2026.2"
 
 
 def test_plan_port_creation_mode_is_nova_unless_neutron_is_chosen():

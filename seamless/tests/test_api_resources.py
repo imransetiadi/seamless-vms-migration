@@ -552,6 +552,49 @@ def test_patch_plan_conflicts_while_a_migration_is_in_flight(api):
     assert allowed.status_code == 200, allowed.text
 
 
+def test_a_provider_is_created_and_patched_with_its_declared_release(api):
+    """SDD §4.2, §12: POST /providers and PATCH /providers/{id} take the series a community
+    destination's operator declares; a malformed one, or one on a vmware provider, is 422 and
+    stores nothing."""
+    community = {
+        **DESTINATION,
+        "id": "dst-hibiscus",
+        "name": "Community 2026.2",
+        "kind": "openstack",
+        "distribution": "kolla",
+        "release": "2026.2",
+    }
+    created = api.post("/api/v1/providers", json=community)
+    assert created.status_code == 201, created.text
+    assert created.json()["release"] == "2026.2"
+
+    def patch(body):
+        return api.client.patch(
+            "/api/v1/providers/dst-hibiscus", headers=api.h(Role.admin), json=body
+        )
+
+    patched = patch({"release": "2026.1"})
+    assert patched.status_code == 200, patched.text
+    assert api.get("/api/v1/providers/dst-hibiscus").json()["release"] == "2026.1"
+    assert patch({"release": "Hibiscus"}).status_code == 422
+    assert api.get("/api/v1/providers/dst-hibiscus").json()["release"] == "2026.1"
+    cleared = patch({"release": None})
+    assert cleared.status_code == 200 and cleared.json()["release"] is None
+    assert api.get("/api/v1/providers").json()[0]["release"] is None  # every provider shows it
+
+    vmware = {
+        "id": "vc-01",
+        "name": "vCenter",
+        "kind": "vmware",
+        "role": "source",
+        "endpoint": "https://vcenter.example",
+        "release": "2026.2",
+    }
+    refused = api.post("/api/v1/providers", json=vmware)
+    assert refused.status_code == 422 and "release" in refused.text
+    assert api.get("/api/v1/providers/vc-01").status_code == 404
+
+
 def test_a_plans_providers_cannot_change_while_one_of_its_migrations_is_failed(api):
     """SDD §12: a failed migration whose source runs keeps its plan editable — to fix the cause
     before a retry — but not its providers: its rollback acts on the clouds its attempt used (the
