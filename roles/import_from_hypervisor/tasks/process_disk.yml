@@ -110,9 +110,9 @@
 
 - name: "Check that the export port is free: {{ import_from_hypervisor_nbd_port }}"
   ansible.builtin.raw: |
-    if sudo netstat -tlnp | grep -Eq ':{{ import_from_hypervisor_nbd_port }}[[:space:]]'; then
+    if sudo ss -ltnp | grep -Eq ':{{ import_from_hypervisor_nbd_port }}[[:space:]]'; then
       echo "Port {{ import_from_hypervisor_nbd_port }} is in use by another process:"
-      sudo netstat -tlnp | grep -E ':{{ import_from_hypervisor_nbd_port }}[[:space:]]'
+      sudo ss -ltnp | grep -E ':{{ import_from_hypervisor_nbd_port }}[[:space:]]'
       exit 1
     fi
   delegate_to: "{{ import_from_hypervisor_host }}"
@@ -138,7 +138,7 @@
   ansible.builtin.raw: |
     i=0
     while [ "$i" -lt 30 ]; do
-      if sudo netstat -tlnp | grep -Eq ':{{ import_from_hypervisor_nbd_port }}[[:space:]]'; then
+      if sudo ss -ltnp | grep -Eq ':{{ import_from_hypervisor_nbd_port }}[[:space:]]'; then
         echo "Port {{ import_from_hypervisor_nbd_port }} is ready"
         exit 0
       fi

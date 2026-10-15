@@ -1,7 +1,7 @@
 """Runs the import_from_hypervisor role with ansible-playbook.
 
 The "hypervisor" is a local-connection inventory host; sudo, setsid,
-qemu-img, qemu-nbd and netstat are PATH shims. The fake qemu-nbd records
+qemu-img, qemu-nbd and ss are PATH shims. The fake qemu-nbd records
 its arguments, writes its PID file and pretends to listen until SIGTERM.
 """
 
@@ -93,10 +93,13 @@ while True:
     time.sleep(0.2)
 """
 
-NETSTAT = """#!%(python)s
+# iproute2's `ss -ltnp`, the listener check RHEL 9 ships (net-tools' netstat is not installed by
+# default there; audit A-10)
+SS = """#!%(python)s
 import os
+print("State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process")
 for port in sorted(os.listdir(%(listening)r)):
-    print("tcp        0      0 127.0.0.1:%%s        0.0.0.0:*    LISTEN   1/qemu-nbd" %% port)
+    print('LISTEN 0      1      127.0.0.1:%%s      0.0.0.0:*         users:(("qemu-nbd",pid=1,fd=3))' %% port)
 """
 
 
@@ -117,7 +120,7 @@ class Hypervisor:
         for path in (self.bin, self.listening):
             os.makedirs(path)
         scripts = {"sudo": SUDO, "setsid": SETSID, "qemu-img": QEMU_IMG,
-                   "qemu-nbd": QEMU_NBD, "netstat": NETSTAT}
+                   "qemu-nbd": QEMU_NBD, "ss": SS}
         for name, text in scripts.items():
             path = os.path.join(self.bin, name)
             with open(path, "w") as f:

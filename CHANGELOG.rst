@@ -404,3 +404,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ends the transfer with its own error: ssh's failure as ``SSH timeout: ...``,
   the give-up Seamless Migrate retries, any other as ``Unable to read the port
   map``. It ended in a Python ``UnboundLocalError`` before.
+- ``import_from_hypervisor`` checks the export port with ``ss`` (iproute2)
+  instead of ``netstat``, which RHEL 9 compute nodes do not install by
+  default: there every export timed out "waiting for port".
+- ``os_migrate_nbdkit_timeout`` and ``os_migrate_nbdkit_ip_allow`` are gone
+  from ``import_from_hypervisor``: nothing read them, so ``ip_allow`` promised
+  a restriction the export never had. ``os_migrate_nbdkit_bind_address`` is
+  the control over who can reach an export.
