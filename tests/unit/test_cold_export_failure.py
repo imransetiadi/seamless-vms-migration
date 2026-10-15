@@ -760,8 +760,9 @@ def test_an_export_never_serves_a_disk_whose_path_another_volume_took():
 @pytest.mark.parametrize("tool", ["nbdkit", "qemu-nbd"])
 def test_an_export_serves_each_disk_by_its_virtio_serial_link(tool):
     """Review RV12-03: each NBD export serves the disk's udev link of its virtio serial - the
-    volume id Nova gives it, cut to 20 characters - which goes with the volume, never the device
-    path the kernel gives the next disk attached (Seamless Migrate SDD 6.6)."""
+    volume id Nova gives it, cut to 20 characters - once that serial was checked. The link names
+    the volume when the server opens it; nbdkit resolves it once, at its start, so a volume taken
+    away after that is not caught (review RV13-01, Seamless Migrate SDD 6.6)."""
     src, data = _boot_from_volume_vm()
     host = SourceHost(src)
     if tool == "qemu-nbd":

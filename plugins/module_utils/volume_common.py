@@ -1282,8 +1282,9 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
     def _export_volumes_from_converter(self):
         """
         SSH to source conversion host and start an NBD export. Volume mapping
-        step 4: fill in the URL to the volume's matching NBD export. Each disk
-        is served by its identity where it shows one (_identified_path).
+        step 4: fill in the URL to the volume's matching NBD export. Each
+        disk's identity, where it shows one, is checked before its export
+        starts (_identified_path).
         """
         self.log.info("Exporting volumes from source conversion host...")
         for path, mapping in self.volume_map.items():
