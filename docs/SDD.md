@@ -2501,6 +2501,14 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`, `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | unset, unset, `seamless-migrate`, `false` | agentmemory |
 | `SEAMLESS_DASHBOARD_DIR`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | auto, `false`, `INFO`, `false` (`true` in the container and manifests) | misc; JSON logs for log forwarders (§18) |
 
+The numeric variables are bounded; a value outside its bounds refuses to start the control plane
+(`error: …`, exit 1): `SEAMLESS_PORT` 1…65535; `SEAMLESS_TICK_S` (0 would spin), `SEAMLESS_DEMO_SPEED` (a
+divisor) and `SEAMLESS_JEV_TIMEOUT_S` above 0; `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` and
+`SEAMLESS_MAX_CONCURRENT_CUTOVERS` at least 1; `SEAMLESS_MAX_STEP_RETRIES` (a negative count would silently
+disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE`
+0 or more, 0 keeping the meaning each row gives it; `SEAMLESS_DEMO_FAILURE_RATE` and
+`SEAMLESS_JEV_MIN_CONFIDENCE` 0…1.
+
 ---
 
 ## 16. Dashboard (`dashboard/`)
