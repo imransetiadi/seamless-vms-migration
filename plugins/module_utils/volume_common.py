@@ -1665,9 +1665,11 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                 self.log.info("nbdcopy stderr: %s", stderr)
 
             self.log.info("nbdcopy return code: %d", nbd_sub.returncode)
+            # after any exit: on RHEL 9's 4 MiB /dev a copy into the regular file nbdcopy made fails
+            # (Seamless Migrate SDD 6.6, review RV16-02)
+            self._check_still_a_disk(mapping["dest_id"], dest_dev)
             if nbd_sub.returncode != 0:
                 raise RuntimeError(f"Failed to copy volume with nbdcopy! Return code: {nbd_sub.returncode}")
-            self._check_still_a_disk(mapping["dest_id"], dest_dev)
 
             # Mark as 100% complete
             self._update_progress(path, 100.0)
@@ -1678,25 +1680,45 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         nbdcopy opens its destination again with O_CREAT when the first open
         fails (libnbd's open_local): a volume that left the host between its
         identity check and that open has its disk copied into a regular file
-        nbdcopy created at ``path``, and nbdcopy exits 0. The path must still be
-        a block device; a regular file there is removed, as it would keep udev
-        from making the link again, and the volume was not written (Seamless
-        Migrate SDD 6.6, review RV15-02).
+        nbdcopy created at ``path``, which on RHEL 9's 4 MiB /dev runs out of
+        room. Run after nbdcopy's exit, whatever it was: the path must still be
+        a block device. A regular file there is removed - udev 252 (RHEL 9) will
+        not make the volume's link over one, where udev 239 (RHEL 8) replaces
+        it - and the error says whether it was removed, could not be removed or
+        could not be checked (Seamless Migrate SDD 6.6, review RV15-02, RV16-02,
+        RV16-03).
         """
         found = self.shell.cmd_val(["test", "-b", path])
         if found == 0:
             return
+        address = getattr(self.shell, "address", "?")
         if found == SSH_FAILED:
             raise RuntimeError(
                 "SSH timeout: conversion host %s unreachable over SSH, checking that %s is still a disk"
-                % (getattr(self.shell, "address", "?"), path)
+                % (address, path)
             )
-        if self.shell.cmd_val(["test", "-f", path]) == 0:
-            self.shell.cmd_val(["sudo", "rm", "-f", path])
+        regular = self.shell.cmd_val(["test", "-f", path])
+        if regular == 0:
+            removed = self.shell.cmd_val(["sudo", "rm", "-f", path])
+            what = "left the host before nbdcopy opened it, and nbdcopy copied into a regular file in its place, "
+            if removed == 0:
+                what += "now removed; the volume was not written"
+            else:
+                what += (
+                    "which could not be removed (sudo rm -f exited %d): remove %s on %s by hand, as udev "
+                    "252 will not make the volume's link over it; the volume was not written"
+                    % (removed, path, address)
+                )
+        elif regular == SSH_FAILED:
+            what = (
+                "left the host, and whether nbdcopy left a regular file in its place could not be "
+                "checked (ssh failed): remove one found at %s on %s by hand; the volume was not "
+                "written whole" % (path, address)
+            )
+        else:
+            what = "left the host during the copy; the volume was not written whole"
         raise DiskIdentityError(
-            "%s on the conversion host is no longer a disk: volume %s left the host before "
-            "nbdcopy opened it, and nbdcopy copied into a regular file in its place, now "
-            "removed; the volume was not written" % (path, volume_id)
+            "%s on the conversion host is no longer a disk: volume %s %s" % (path, volume_id, what)
         )
 
     def _convert_destination_volumes(self):

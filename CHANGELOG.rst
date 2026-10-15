@@ -406,15 +406,19 @@ This project follows a simple changelog to satisfy collection metadata validatio
   Migrate fails it as permanent: the transfer let the error escape, and
   Ansible printed its cause, the serial read's ssh command line with its
   ConnectTimeout, which Seamless Migrate retried - two more whole cold copies
-  with the source VM stopped. After nbdcopy the transfer checks that the path
-  it wrote is still a block device: nbdcopy opens its destination again with
-  ``O_CREAT`` when the first open fails, so a volume that left the host
-  before that open had its disk copied into a regular file nbdcopy created in
-  ``/dev``, and the transfer reported success with the volume never written.
-  The regular file is removed, as it would keep udev from making the link
-  again, and the transfer fails. A volume taken away after the export started
-  is not caught: nbdkit resolves the path it serves, the disk's by-id link
-  included, once, at its start.
+  with the source VM stopped. After nbdcopy exits, whatever its exit, the
+  transfer checks that the path it wrote is still a block device: nbdcopy
+  opens its destination again with ``O_CREAT`` when the first open fails, so
+  a volume that left the host before that open had its disk copied into a
+  regular file nbdcopy created in ``/dev``. Where ``/dev`` had room the
+  transfer reported success with the volume never written; on RHEL 9's 4 MiB
+  ``/dev`` nbdcopy failed with an error that named nothing and left the file.
+  The regular file is removed - udev 252 (RHEL 9) will not make the volume's
+  link over one - and the transfer fails, saying whether the file was
+  removed, could not be removed or could not be checked; ssh failing at the
+  check gives up as ``SSH timeout: ...``. A volume taken away after the
+  export started is not caught: nbdkit resolves the path it serves, the
+  disk's by-id link included, once, at its start.
 - A wait for a conversion host's attach or port lock gives up once ssh to the
   host has failed for 15 minutes without a break, with ``Lock timeout:
   conversion host ADDRESS unreachable over SSH for N s, waiting for LOCK``,

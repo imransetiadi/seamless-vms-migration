@@ -1241,16 +1241,22 @@ def test_the_transfers_other_errors_still_escape_its_module(error):
 class LeavingDestination:
     """The destination conversion host of a cold transfer, its /dev on a real directory: the disk
     of the destination volume (a regular file standing for the block device /dev/vdb) and udev's
-    by-id link to it. The volume leaves the host right after the identity check's `test -b` of its
-    link - another actor detaches it - and udev removes the link; no other disk takes the path
-    (review RV15-02). The copy tools open their destination as their sources do: nbdcopy as libnbd's
+    by-id link to it. With ``leave`` "at the check" the volume leaves the host right after the
+    identity check's `test -b` of its link - another actor detaches it - and udev removes the link;
+    with "during the copy" it leaves once nbdcopy wrote into it; with None it stays (review RV15-02,
+    RV16-02). The copy tools open their destination as their sources do: nbdcopy as libnbd's
     open_local - open(O_WRONLY), and when that fails open(O_WRONLY | O_TRUNC | O_CREAT | O_EXCL,
-    0644) - and qemu-img's host_device with no O_CREAT. `test -b` holds for the disk alone; `test -f`
-    for a regular file at the path itself."""
+    0644) - and qemu-img's host_device with no O_CREAT. As on a real host `test -b` holds for the
+    disk alone and `test -f` for a regular file, both following links. ``failing`` names the command
+    whose ssh fails after the copy (exit 255) or, for "rm", whose sudo fails (exit 1); with
+    ``dev_full`` /dev is RHEL 9's 4 MiB devtmpfs, so nbdcopy's write into a file it made fails and it
+    exits 1, leaving the file, as libnbd's file_synch_write does; ``nbdcopy_exit`` makes it fail
+    anyway (review RV16-02, RV16-03, RV16-06)."""
 
     address = CONV
 
-    def __init__(self, root, volume_id):
+    def __init__(self, root, volume_id, leave="at the check", failing=None, dev_full=False,
+                 nbdcopy_exit=0):
         self.root = root
         self.serial = volume_id[:20]
         self.disk = root / "dev" / "vdb"
@@ -1258,11 +1264,18 @@ class LeavingDestination:
         self.link.parent.mkdir(parents=True)
         self.disk.write_bytes(bytes(4096))
         self.link.symlink_to("../../vdb")
+        self.leave, self.failing, self.dev_full, self.nbdcopy_exit = leave, failing, dev_full, nbdcopy_exit
         self.left = False
+        self.copied = False
         self.commands = []
 
     def _local(self, path):
         return self.root / path.lstrip("/")
+
+    def _leaves(self):
+        self.left = True
+        self.link.unlink()
+        self.disk.unlink()
 
     def cmd_out(self, command, **kwargs):
         self.commands.append(list(command))
@@ -1275,17 +1288,22 @@ class LeavingDestination:
     def cmd_val(self, command, **kwargs):
         self.commands.append(list(command))
         if command[:2] == ["test", "-b"]:
+            if self.copied and self.failing == "test -b":
+                return 255
             path = self._local(command[2])
             found = self.disk.exists() and os.path.realpath(path) == os.path.realpath(self.disk)
-            if not self.left:  # the volume leaves the host now: udev removes its link
-                self.left = True
-                self.link.unlink()
-                self.disk.unlink()
+            if not self.left and self.leave == "at the check":
+                self._leaves()
             return 0 if found else 1
         if command[:2] == ["test", "-f"]:
+            if self.failing == "test -f":
+                return 255
             path = self._local(command[2])
-            return 0 if path.is_file() and not path.is_symlink() else 1
+            regular = path.is_file() and os.path.realpath(path) != os.path.realpath(self.disk)
+            return 0 if regular else 1
         if command[:3] == ["sudo", "rm", "-f"]:
+            if self.failing == "rm":
+                return 1
             path = self._local(command[3])
             if path.exists() or path.is_symlink():
                 path.unlink()
@@ -1296,12 +1314,21 @@ class LeavingDestination:
         self.commands.append(list(command))
         if command[:2] == ["sudo", "nbdcopy"]:
             path = self._local(command[3])
+            made = False
             try:
                 fd = os.open(str(path), os.O_WRONLY)
             except OSError:
                 fd = os.open(str(path), os.O_WRONLY | os.O_TRUNC | os.O_CREAT | os.O_EXCL, 0o644)
+                made = True
             os.write(fd, b"the source volume's data")
             os.close(fd)
+            self.copied = True
+            if self.leave == "during the copy" and not self.left:
+                self._leaves()
+            if made and self.dev_full:
+                return FailedProcess(1, "%s: No space left on device\n" % command[3])
+            if self.nbdcopy_exit:
+                return FailedProcess(self.nbdcopy_exit, "nbdcopy: write: Input/output error\n")
             return DoneProcess()
         if command[:3] == ["sudo", "qemu-img", "convert"]:
             try:
@@ -1336,8 +1363,8 @@ class FailedProcess:
 LEAVING_ID = "3b7a57d7-8210-47f9-b592-a6627ae52d13"
 
 
-def _leaving_transfer(tmp_path):
-    host = LeavingDestination(tmp_path / "dst-conv", LEAVING_ID)
+def _leaving_transfer(tmp_path, **host_args):
+    host = LeavingDestination(tmp_path / "dst-conv", LEAVING_ID, **host_args)
     transfer = _copying_transfer(tmp_path, {})
     transfer.volume_map["/dev/vda"]["dest_id"] = LEAVING_ID
     transfer.shell = host
@@ -1371,3 +1398,81 @@ def test_qemu_img_fails_when_the_destination_volume_left_the_host(tmp_path):
 
     converts = [c for c in host.commands if c[:3] == ["sudo", "qemu-img", "convert"]]
     assert len(converts) == 2 and {c[-1] for c in converts} == {str("/dev/disk/by-id/virtio-" + LEAVING_ID[:20])}
+
+
+def _regular_file_stayed(host):
+    return host.link.is_file() and not host.link.is_symlink()
+
+
+def test_nbdcopy_failing_in_the_file_it_made_leaves_no_file_and_names_the_cause(tmp_path):
+    """Review RV16-02: on RHEL 9 /dev is a 4 MiB devtmpfs, so nbdcopy's copy into the regular file it
+    made where the volume's link was runs out of room and nbdcopy exits 1. The transfer raised
+    "Failed to copy volume with nbdcopy! Return code: 1" before its check ran: the file stayed in
+    /dev/disk/by-id, where udev 252 will not make the link, and the error named nothing. The check
+    now runs whatever nbdcopy's exit (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path, dev_full=True)
+
+    with pytest.raises(volume_common.DiskIdentityError, match=LEAVING_ID):
+        transfer._convert_destination_volumes_nbdcopy()
+
+    assert not _regular_file_stayed(host), "the regular file stayed"
+
+
+@pytest.mark.parametrize(
+    "failing, said",
+    [("test -f", "could not be checked"), ("rm", "could not be removed (sudo rm -f exited 1)")],
+    ids=["ssh fails at test -f", "sudo rm fails"],
+)
+def test_the_check_after_nbdcopy_never_says_it_removed_a_file_it_left(tmp_path, failing, said):
+    """Review RV16-03: the check ignored the results of its `test -f` and its `sudo rm -f`, and said
+    "now removed" all the same, while nbdcopy's copy of the disk stayed in /dev. It now says what
+    became of the file, and where to remove it by hand (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path, failing=failing)
+
+    with pytest.raises(volume_common.DiskIdentityError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    message = str(raised.value)
+    assert _regular_file_stayed(host)
+    assert "now removed" not in message and said in message, message
+    assert "/dev/disk/by-id/virtio-" + LEAVING_ID[:20] in message and CONV in message, message
+
+
+def test_ssh_failing_at_the_check_after_nbdcopy_gives_up_as_ssh_timeout(tmp_path):
+    """Review RV16-06: ssh failing (255) at the check after nbdcopy is no proof the volume left: the
+    check gives up as "SSH timeout: ...", which the control plane retries, and removes nothing - a
+    whole, good copy is never failed as permanent for an ssh blip (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path, leave=None, failing="test -b")
+
+    with pytest.raises(RuntimeError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    assert not isinstance(raised.value, volume_common.DiskIdentityError), raised.value
+    assert str(raised.value).startswith("SSH timeout:"), raised.value
+    assert not [c for c in host.commands if c[:3] == ["sudo", "rm", "-f"]]
+
+
+def test_a_failed_copy_onto_a_disk_still_there_keeps_nbdcopys_own_error(tmp_path):
+    """Review RV16-02: the check runs after a failed copy too, and a path that is still the volume's
+    disk leaves nbdcopy's own failure to stand (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path, leave=None, nbdcopy_exit=1)
+
+    with pytest.raises(RuntimeError, match="Failed to copy volume with nbdcopy! Return code: 1") as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    assert not isinstance(raised.value, volume_common.DiskIdentityError)
+    copy = next(i for i, c in enumerate(host.commands) if c[:2] == ["sudo", "nbdcopy"])
+    assert ["test", "-b", "/dev/disk/by-id/virtio-" + LEAVING_ID[:20]] in host.commands[copy:]
+
+
+def test_a_volume_that_left_during_the_copy_is_named_as_such(tmp_path):
+    """Review RV16-03: with no regular file at the path the volume left during the copy, after
+    nbdcopy opened it: the error says so, and claims no file (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path, leave="during the copy")
+
+    with pytest.raises(volume_common.DiskIdentityError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    message = str(raised.value)
+    assert "during the copy" in message and "regular file" not in message, message
+    assert not [c for c in host.commands if c[:3] == ["sudo", "rm", "-f"]]
