@@ -1895,6 +1895,45 @@ VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (
 across plans, §5.4) — and the VMware plan 12 of the 13 VMware VMs: `dc2-portal-02` stays unplanned,
 for the operator to plan warm (§7.4).
 
+### 10.1 Destination release series (`seamless_migrate.planning.platforms`)
+
+A pure module (no I/O) holding the series table of §21.1 and the detection and tier rules of §21.3 (plan task T1,
+0.2.0; the check reports them from T3).
+
+* `SERIES`: one entry per community series of the window, oldest first: `name` (`"2026.2"`), `codename`
+  (`"Hibiscus"`), `phase` (`"Maintained"`, `"Unmaintained"` or `"End of Life"`, as releases.openstack.org shows it),
+  `slurp` (bool), `tier` (`"tier1"`, `"tier2"` or `"tier3"`), `compute_max` (Nova's maximum microversion of the series)
+  and `block_storage_max` (Cinder's, or null where §21.3 has not confirmed it). `READ_ON` is the date the phases were
+  read (`"2026-10-16"`). §21.1's table and `SERIES` change in the same commit
+  (`test_the_sdd_support_table_matches_the_code_series_table`).
+* `maximum_microversion(document) -> str | null`: the maximum microversion a service's version document gives: its
+  `version` object, or in the root document the `versions` entry whose `status` is `CURRENT` (else the highest one);
+  null when it gives none.
+* `release_range(compute_max, block_storage_max=None) -> ReleaseRange {series: tuple[str, ...], outside: null | "older"
+  | "newer" | "not_detected"}`, `series` oldest first:
+  * a compute maximum equal to series' maxima is those series (`"2.96"` is 2024.1 or 2024.2);
+  * one between two series' maxima is the two series it falls between, the newest whose maximum is below it and the
+    oldest whose maximum is above it (`"2.98"` is 2024.2 or 2025.1): Nova's microversions are never backported, so
+    only a development snapshot shows one;
+  * one below the oldest series' maximum (2.95) is `outside: "older"` (Zed or older), one above the newest (2.104)
+    `outside: "newer"`, and a missing or unreadable one `outside: "not_detected"`, each with no series;
+  * a block-storage maximum keeps the series whose `block_storage_max` equals it or is null: it narrows the range, never
+    widens it, and a narrowing that would leave no series is not applied (Nova and Cinder of different series, as during
+    an upgrade).
+* `support_tier(release_range, declared=None) -> SupportTier {tier: "tier1" | "tier2" | "tier3" | "outside", reason:
+  null | "end_of_life" | "below_floor" | "newer_than_validated" | "not_detected", declared_outside_range: bool}`:
+  * a declared series (`Provider.release`, T2) among the range's series decides the tier;
+  * otherwise the range decides: the least favourable tier of its series (`tier1`, then `tier2`, then `tier3`), or
+    `outside` when it has none; a declared series not among them sets `declared_outside_range`, which the pre-flight
+    warns of (T4) - with nothing detected, any declared series is outside the range;
+  * `reason` is `end_of_life` for `tier3`, for `outside` the range's `outside` (`older` reads `below_floor`, `newer`
+    reads `newer_than_validated`, `not_detected` as is), and null for `tier1` and `tier2`.
+  RHOSO 18.0 (kind `rhoso`) is `validated` by its kind, never by detection (T3).
+* `REVIEWED_MICROVERSIONS = {"compute": "2.100", "block_storage": "3.71"}`: the newest microversions whose behaviour
+  Seamless's calls were checked against (§21.7). openstacksdk asks a cloud for the lower of a resource's cap and the
+  cloud's maximum; `test_the_sdk_never_asks_more_than_its_caps_of_any_series_of_the_window` fails when the installed
+  openstacksdk would ask any series of the window for more than these (raising the pin re-checks them).
+
 ---
 
 ## 11. Persistence (`seamless_migrate.store`)
@@ -3270,10 +3309,10 @@ Upstream phases as releases.openstack.org shows them on 2026-10-16:
   minor release of its GA (next: 2027.1 Indri, estimated 2027-03-24).
 * When upstream marks a series Unmaintained it moves to Tier 2 if it is SLURP, else to Tier 3; at its End of Life to
   Tier 3; the floor follows the oldest SLURP series not at its end of life.
-* §21.1's table and the code's series table (planned `planning/platforms.py`) change in the same commit, each with the
+* §21.1's table and the code's series table (`planning/platforms.py`, §10.1) change in the same commit, each with the
   date they were read.
 
-### 21.3 Release detection (planned, 0.2.0)
+### 21.3 Release detection (0.2.0: the rules are §10.1's since T1; the check reports them from T3)
 
 * The provider check reads the services' version documents: compute's maximum microversion (as `compute_microversion`
   today), block storage's, and Neutron's extension list.
@@ -3349,7 +3388,7 @@ Life upstream, below the floor, newer than validated, or not detected).
 
 | Item | Becomes binding in | Plan task |
 |---|---|---|
-| the series table, detection and tiers (§21.1–§21.3) | §10, a new `planning/platforms.py` | T1 |
+| the series table, detection and tiers (§21.1–§21.3) | §10.1, `planning/platforms.py` (binding) | T1 |
 | `Provider.release: str|null`, the declared series | §4.2, §12, §16 | T2 |
 | `check()` keys `release_range`, `release`, `support_tier`, `policy_profile`, `tls` | §10 | T3 |
 | findings `DST_CAPABILITY_MISSING` (blocker), `DST_RELEASE_OUTSIDE_SUPPORT` (warning) | §9.3 | T4 |
