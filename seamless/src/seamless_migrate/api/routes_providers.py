@@ -62,6 +62,9 @@ _SERVER_OWNED = {
     "last_checked_at": None,
     "capabilities": {},
 }
+#: versioned writes of a secret's record before the route gives up with 503 (SDD §13.3): each
+#: conflict is a check or another write that landed, so this many in a row is a hammered provider
+RECORD_SECRET_ATTEMPTS = 50
 
 
 async def _plans_using(request: Request, provider_id: str, statuses: frozenset[str]) -> list[str]:
@@ -264,16 +267,15 @@ async def _record_secret(
     """The provider records a secret already in the store (SDD §13.3): a versioned write, retried
     when a check or another write changed the provider meanwhile (they touch other fields) — the
     update is derived from the fresh copy each time, so no concurrent change is lost — and so a
-    written secret is always recorded; a provider deleted meanwhile answers 404 and the secret
+    written secret is recorded, unless the provider keeps changing for RECORD_SECRET_ATTEMPTS
+    writes (503 naming the secret); a provider deleted meanwhile answers 404 and the secret
     goes again."""
     svc = services(request)
-    attempt = 0
-    # until it lands: a conflict means another write landed, so each retry makes progress; giving up
-    # would leave a secret the store already holds unrecorded and unaudited (SDD §13.3)
-    while True:
+    # a conflict means another write landed, so each retry makes progress; giving up early would
+    # leave a secret the store already holds unrecorded and unaudited (SDD §13.3)
+    for attempt in range(RECORD_SECRET_ATTEMPTS):
         if attempt:
             await asyncio.sleep(min(0.5, 0.01 * 2**attempt) * random.uniform(0.5, 1.0))
-        attempt += 1
         try:
             provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
         except NotFound:
@@ -289,6 +291,13 @@ async def _record_secret(
         except ConflictError:
             continue
         return updated
+    # SDD §13.3: the store holds the value; the operator sends it again once the provider settles
+    raise ApiError(
+        503,
+        "unavailable",
+        f"secret {name} is stored, but provider {provider_id} changed {RECORD_SECRET_ATTEMPTS} "
+        "times while it was being recorded; send it again",
+    )
 
 
 @router.put("/providers/{provider_id}/credentials", response_model=Provider)
