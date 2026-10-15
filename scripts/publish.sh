@@ -24,7 +24,6 @@ check_command() {
 
 check_command "ansible-galaxy"
 check_command "curl"
-check_command "jq"
 check_command "yq" # Using yq as a more standard and powerful YAML processor
 
 # --- Argument Parsing ---
