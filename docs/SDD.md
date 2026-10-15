@@ -2025,6 +2025,8 @@ the tokens file refuses (empty, or longer than 128 characters) and the names the
 as actors itself — `anonymous`, `unauthenticated`, `cli`, `system`, in any letter case and with
 blanks around them too, and any name with a colon, the form of the actors the advisor records (`policy:<id>`,
 `user:<name>`, `system:fallback`, `system:advisor`, §14.4) — so no token's audit events pass for theirs.
+The tokens file is refused at start-up (the server does not start) when an entry carries such a name,
+so a hand-edited file cannot add one either.
 `SEAMLESS_AUTH_DISABLED=true` maps every request to principal `anonymous` with role `admin`; the CLI
 refuses to start with it unless the bind host is loopback (`127.0.0.1`, `::1`, `localhost`).
 Demo mode on loopback disables auth by default. Every request refused for its role emits
