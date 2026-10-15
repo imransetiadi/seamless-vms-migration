@@ -703,9 +703,11 @@ volume - the cold path never reuses a volume - unless a server holds it: one a s
 renamed rather than deleted) is that server's and only leaves the record, when the new volume of its device is
 recorded; one only the destination conversion host holds (a transfer cut short) is the migration's own and is detached
 from it. The re-run deletes each earlier volume it removes - one Cinder is already deleting (the boot volume Nova
-deletes with its server) is not deleted again - and waits, within the transfer's timeout, until Cinder no longer has
-it: an earlier volume stays recorded until it is gone, and no new volume waits unrecorded meanwhile. An earlier volume
-it cannot remove - its detach or delete fails, Cinder gives up deleting it, or it is still there at the timeout -
+deletes with its server) is not deleted again, and a delete Cinder refuses because the volume began going in between
+(Nova deleting it with its server after it read `available`) counts as that one - and waits, within the transfer's
+timeout, until Cinder no longer has it: an earlier volume stays recorded until it is gone, and no new volume waits
+unrecorded meanwhile. An earlier volume it cannot remove - its detach or delete fails otherwise, Cinder gives up
+deleting it, or it is still there at the timeout -
 fails the transfer before any volume is created, with the record unchanged (review RV3-02, RV4-02, RV4-05, RV5-01,
 RV5-02) - and `destination_server_id` as soon as Nova accepts the server. A cold
 rollback reads it (§7). The control plane writes the file, with no volume, pass or server, before a cold cutover's
