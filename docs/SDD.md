@@ -2524,10 +2524,13 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   hover, and at the bottom the live indicator, the theme and sign out as labelled icons). "Collapse navigation" /
   "Expand navigation" at the column's foot switches between the two at any width from 768 px and is remembered
   in the browser for that viewer (`localStorage`; without a stored choice the width decides, and a failing storage
-  only forgets it). The items stand in four labelled groups, in this order: Migrations — Overview (`/`), Plans
+  only forgets it). The items stand in five labelled groups, in this order: Migrations — Overview (`/`), Plans
   (`/plans`, also current on a migration's page); Clouds — Providers, Inventory; Activity — Events; Advisor —
   Recommendations (`/advisor`, also current on a recommendation's page), Policies (`/advisor/policies`), Audit
-  trail (`/advisor/audit`). The current item is marked `aria-current="page"`. Plans carries the count of failed
+  trail (`/advisor/audit`); Administration — Users (`/users`), for an admin alone: every other role's navigation
+  leaves the group out — the item is hidden, not kept in place unavailable with its reason as an action is
+  (whether it should instead stay, soft-disabled and saying why, is an open decision, tracked in §20). The
+  current item is marked `aria-current="page"`. Plans carries the count of failed
   migrations from `/stats` ("{n} failed", danger tone with its icon; the link's description, so its name stays
   "Plans"; nothing while it is 0 or while the stats are unknown). Below 768 px a header holds the menu button, the brand, the live indicator
   and the theme; the menu is a drawer sliding in from the left over the dimmed page (a modal dialog named
@@ -2833,6 +2836,24 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   nor cancelled, with its status, or a completed one with VMs not finalized, rolled back or cancelled, with their
   number — so nobody types its id to learn that; a cancelled migration's cleanup still under way, and a rolled-back VM keeping
   its copied data, which the plan list does not carry, are refused by the API alone, its 409 naming the plan; the dialog's Then says what stays: finished plans keep its id),
+  `/users` (Users, the Administration group's page — "Give each person their own dashboard access and role. Their
+  name identifies their actions in Events." — on `GET /users` and `POST /users` alone, §12, §13.1. For an admin,
+  two panels. Add user: User name, its hint the rule of §13.1 (1-128 letters, digits, dots, underscores, `@` or
+  hyphens, starting with a letter or digit; unique, ignoring case), Role (Viewer by default, each role's one-line
+  help under it), that it creates a login token to store securely before leaving the page, and Add user — unavailable,
+  saying why, while authentication is off (`/health` `auth_disabled`, as the API refuses it: "Enable authentication on
+  the control plane before adding users.") or while the health is not known yet (its failed load named with Retry);
+  a refused create — a name taken, ignoring case — keeps the typed name, shows the API's reason and issues no token.
+  Once created the panel reads "User {name} created": the one-time token in a read-only field that takes the focus
+  and selects itself, "Save this token now. It cannot be shown again after leaving this page or selecting Done.",
+  whom to share it with and for which access, Copy token (the clipboard; when the browser refuses, that the token is
+  to be selected and copied by hand) and Done, which clears the form and puts the focus on User name. The token is
+  the response's (`Cache-Control: no-store`, §12) and lives in the page alone, never in browser storage (§13.1),
+  until Done or a navigation drops it. Dashboard users: each user's name and role — the bootstrap tokens' and the
+  database's, as `GET /users` lists them, never a token or digest —, "No dashboard users configured." when there
+  are none, and Users are unavailable with Retry when the list cannot be loaded. Any other role, reaching the page by
+  its address, is told that managing dashboard users requires the admin role, and the page asks `GET /users` for
+  nobody else. Editing roles, rotating tokens and deleting users are not offered, §13.1),
   `/inventory/:providerId` — `/inventory` opens the first source provider's, or the first provider when there is no
   source —
   (its Provider select switches the inventory in place: focus stays on the select and the address is replaced, so
