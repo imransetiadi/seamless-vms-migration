@@ -1351,6 +1351,25 @@ def test_workload_file_stem_matches_the_collection():
     assert all("/" not in workload_file_stem(n) for n in names)
 
 
+def _ssh_outage_prefixes(source: str) -> set[str]:
+    """Every prefix a give-up of the collection's SshOutage can carry: its default and each
+    `prefix=` a call passes - a new one, whatever its words, joins this set."""
+    prefixes = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ClassDef) and node.name == "SshOutage":
+            init = next(f for f in node.body if getattr(f, "name", None) == "__init__")
+            names = [a.arg for a in init.args.args]
+            defaults = dict(
+                zip(names[len(names) - len(init.args.defaults) :], init.args.defaults, strict=True)
+            )
+            prefixes.add(ast.literal_eval(defaults["prefix"]))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "SshOutage":
+            prefixes.update(
+                ast.literal_eval(kw.value) for kw in node.keywords if kw.arg == "prefix"
+            )
+    return prefixes
+
+
 def test_the_collections_conversion_host_failures_are_classified_as_the_sdd_says():
     """SDD §6.6, QASuite R-07: a lock wait, the source cleanup's SSH check or a wait for the NBD
     exports that cannot reach the conversion host is retried - the host may be rebooting - and a
@@ -1363,8 +1382,7 @@ def test_the_collections_conversion_host_failures_are_classified_as_the_sdd_says
     templates = re.findall(r'"([^"]*%[sd][^"]*)"', source)
     unreachable = next(t for t in templates if "unreachable over SSH" in t)
     stuck = next(t for t in templates if "waiting to detach volume" in t)
-    # the SshOutage prefixes: one reworded away from "timeout" leaves this set, and the test
-    prefixes = sorted(set(re.findall(r'prefix="([^"]*timeout[^"]*)"', source)))
+    prefixes = sorted(_ssh_outage_prefixes(source))
     waits = {
         "Lock timeout": "/var/lock/v2v-source-volume-lock",
         "SSH timeout": "the source cleanup",
