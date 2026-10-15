@@ -148,6 +148,48 @@ def receive_commands(scenario):
 # --- WarmState ------------------------------------------------------------
 
 
+def test_the_warm_state_is_synced_before_and_after_its_rename(tmp_path):
+    """SDD 6.3: a rollback reads in the warm state what to delete, so its rename must outlive a
+    crash - the temporary file is synced before the rename and the directory after it, as the
+    control plane's workload record is (review RV4-07)."""
+    state = WarmState.load(str(tmp_path / "workload_warm"), "srv-1")
+    events = []
+    fsync, replace = os.fsync, os.replace
+
+    def synced(fd):
+        events.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+        return fsync(fd)
+
+    def renamed(source, target):
+        events.append("rename")
+        return replace(source, target)
+
+    with mock.patch.object(warm_migration.os, "fsync", synced), mock.patch.object(
+        warm_migration.os, "replace", renamed
+    ):
+        state.save()
+
+    assert events == ["file", "rename", "directory"]
+
+
+def test_a_state_directory_that_cannot_be_synced_still_gets_the_state(tmp_path):
+    """Some network or FUSE mounts refuse to sync a directory: the state is saved all the same."""
+    state_dir = str(tmp_path / "workload_warm")
+    state = WarmState.load(state_dir, "srv-1")
+    state.transfer_uuid = "uuid-1"
+    fsync = os.fsync
+
+    def refusing(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(22, "Invalid argument")
+        return fsync(fd)
+
+    with mock.patch.object(warm_migration.os, "fsync", refusing):
+        state.save()
+
+    assert WarmState.load(state_dir, "srv-1").transfer_uuid == "uuid-1"
+
+
 def test_warm_state_roundtrip_atomic(tmp_path):
     state_dir = str(tmp_path / "workload_warm")
     state = WarmState.load(state_dir, "srv-1")

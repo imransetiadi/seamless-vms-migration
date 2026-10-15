@@ -369,6 +369,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   wait for its NBD exports, and the transfer's waits for the forwarded exports
   and an nbdkit socket, give up the same way after the window (``SSH timeout:
   ...``), where they tried ``timeout`` times, about 5.5 hours by default.
+- The warm state file (``workload_warm/{server}.json``) is synced to disk, its
+  directory after the rename too, so the rename outlives a crash: a rollback
+  reads there which destination volumes and server to delete. A filesystem
+  that cannot sync a directory still gets the file.
 - The roles' loops over workloads (``import_workloads``,
   ``import_workloads_warm``, ``export_workloads``, ``import_from_hypervisor``)
   label each item with its id only. Ansible printed the whole workload, or

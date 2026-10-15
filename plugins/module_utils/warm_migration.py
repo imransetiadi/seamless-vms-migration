@@ -167,6 +167,19 @@ class WarmState:
             except OSError:
                 pass
             raise
+        # the directory too, so the rename outlives a crash: a rollback reads
+        # here what to delete (Seamless Migrate SDD 6.3); a filesystem that
+        # cannot sync a directory - some network or FUSE mounts - keeps the file
+        try:
+            directory = os.open(self.state_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as err:
+            logging.getLogger("osp-osp").warning(
+                "Could not sync %s after writing the warm state: %s", self.state_dir, err
+            )
 
     def delete(self):
         try:
