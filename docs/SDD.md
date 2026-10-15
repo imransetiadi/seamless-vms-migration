@@ -163,6 +163,8 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$), name: str, kind: Provider
            region: str|null, verify_tls: bool = true, ca_cert_path: str|null,
            conversion_host: ConversionHostConfig|null,
            distribution: Distribution|null,            # must match kind (see above); null = by kind
+           release: str|null (regex ^20[0-9]{2}\.[12]$), # the community series its operator declares, e.g.
+                                                       # "2026.2" (§10.1, §21.3); refused on kind vmware (422)
            credentials_updated_at: datetime|null,      # server-owned: set by PUT …/credentials
            conversion_key_updated_at: datetime|null,   # server-owned: set by PUT …/conversion-key
            capabilities: dict[str, Any] = {}, status: "unknown"|"ok"|"degraded"|"error" = "unknown",
@@ -2031,7 +2033,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/providers` | viewer | — | `Provider[]` |
 | POST | `/providers` | admin | `Provider` (status fields ignored; a field `Provider` does not have: 422) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set) |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, recorded `sync_passes` of a strategy other than `cold`) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
@@ -3320,7 +3322,7 @@ Upstream phases as releases.openstack.org shows them on 2026-10-16:
   is 2025.1 or 2025.2; 2.103 is 2026.1; 2.104 is 2026.2. A maximum between two of them reads as the range around it, one
   above 2.104 as "Outside (newer)". Block storage's maximum is 3.70 in 2023.1 and 2023.2 and 3.71 in 2024.1 and 2024.2
   (Cinder's history); later series `TODO(LAB): confirm`. It may narrow the range, never widen it.
-* A declared series (planned optional `Provider.release`, e.g. `2026.2`) inside the detected range decides the tier; one
+* A declared series (`Provider.release`, §4.2, e.g. `2026.2`) inside the detected range decides the tier; one
   outside it warns, and the range decides. With none declared, the tier is the least favourable one the range allows: a
   2.96 cloud is 2024.1 (Tier 2) or 2024.2 (Tier 3), so Tier 3, until its operator declares the series.
 * The check reports `release_range`, `release` and `support_tier` (planned keys of the `check()` report, §10).
@@ -3378,7 +3380,7 @@ Life upstream, below the floor, newer than validated, or not detected).
   attach answers 202), 2.102 (flavors lose `rxtx_factor` and `OS-FLV-DISABLED:disabled`) and 2.103 (`/os-volumes_boot`
   is gone) never reach Seamless's calls, and an older cloud gets its own maximum.
 * Raising the openstacksdk pin (the root `requirements.txt`, `aee/`, the image) re-checks those caps against the window:
-  the planned contract suite replays recorded version documents of every series (QASuite S-DST).
+  the contract suite (QASuite S-DST, since T1) runs openstacksdk's own negotiation against every series' maxima.
 * Networking is ML2/OVN or ML2/OVS, as the operator chose: the MTU checks (§9.3) apply as on RHOSO 18.0, no OVS- or
   OVN-specific binding is copied, and `ovn` in the check report is informational.
 * TLS is the operator's choice on a community cloud: `verify_tls` stays on by default, with a CA bundle per provider
@@ -3389,7 +3391,7 @@ Life upstream, below the floor, newer than validated, or not detected).
 | Item | Becomes binding in | Plan task |
 |---|---|---|
 | the series table, detection and tiers (§21.1–§21.3) | §10.1, `planning/platforms.py` (binding) | T1 |
-| `Provider.release: str|null`, the declared series | §4.2, §12, §16 | T2 |
+| `Provider.release: str|null`, the declared series | §4.2, §12 (binding); the dashboard's form, §16, with T8 | T2 |
 | `check()` keys `release_range`, `release`, `support_tier`, `policy_profile`, `tls` | §10 | T3 |
 | findings `DST_CAPABILITY_MISSING` (blocker), `DST_RELEASE_OUTSIDE_SUPPORT` (warning) | §9.3 | T4 |
 | `NET_PORT_NOT_PERMITTED` by the policy profile (§21.5) | §6.6, §9.3 | T5 |
@@ -3401,5 +3403,6 @@ Life upstream, below the floor, newer than validated, or not detected).
 
 ### 21.9 Validation
 
-QASuite §6.7 (AC-6, journey 6 of the PRD), §7.1 (matrices M7–M12), §7.2 (LAB-D01…LAB-D08), and the planned contract
-suite S-DST: recorded version documents per series, the detection and tier table, the policy-profile cases.
+QASuite §6.7 (AC-6, journey 6 of the PRD), §7.1 (matrices M7–M12), §7.2 (LAB-D01…LAB-D08), and the contract suite
+S-DST: version documents per series (synthetic until the lab records them), the detection and tier table (since T1), the
+policy-profile cases (planned, T5).
