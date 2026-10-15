@@ -126,6 +126,13 @@ class ConversionHostUnreachable(RuntimeError):
     without a break (Seamless Migrate SDD 6.6)."""
 
 
+class DiskIdentityError(RuntimeError):
+    """A disk failed its identity check: it is another volume's, or the volume
+    left the conversion host. Permanent: a module reports it by its own message,
+    which the control plane classifies, never by its cause (Seamless Migrate
+    SDD 6.6, review RV15-01)."""
+
+
 class SshOutage:
     """
     How long ssh to a conversion host has failed without a break, its own exit
@@ -873,7 +880,7 @@ class OpenStackVolumeBase:
             if err.returncode == SSH_FAILED:
                 raise
             if name.startswith("vd"):
-                raise RuntimeError(
+                raise DiskIdentityError(
                     "%s on the conversion host is gone: volume %s left the host"
                     % (device, volume_id)
                 ) from err
@@ -882,7 +889,7 @@ class OpenStackVolumeBase:
             self.log.warning("%s shows no virtio serial: using it by its path", device)
             return device
         if not volume_id.startswith(serial):
-            raise RuntimeError(
+            raise DiskIdentityError(
                 "%s on the conversion host is the disk of volume %s, not of volume %s: "
                 "the volume left the host" % (device, serial, volume_id)
             )

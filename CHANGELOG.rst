@@ -401,8 +401,13 @@ This project follows a simple changelog to satisfy collection metadata validatio
   failing at the check of the by-id link gives up with ``SSH timeout: ...``,
   which Seamless Migrate retries, as it does ssh failing at the serial read:
   the error quoted no ssh command line, so one blip there failed the
-  migration as permanent. A volume taken away after the export started is
-  not caught: nbdkit resolves the path it serves, the disk's by-id link
+  migration as permanent. A destination disk that fails the check fails the
+  transfer by its own message, as the export reports its own, so Seamless
+  Migrate fails it as permanent: the transfer let the error escape, and
+  Ansible printed its cause, the serial read's ssh command line with its
+  ConnectTimeout, which Seamless Migrate retried - two more whole cold copies
+  with the source VM stopped. A volume taken away after the export started
+  is not caught: nbdkit resolves the path it serves, the disk's by-id link
   included, once, at its start.
 - A wait for a conversion host's attach or port lock gives up once ssh to the
   host has failed for 15 minutes without a break, with ``Lock timeout:

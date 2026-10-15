@@ -1137,3 +1137,102 @@ def test_the_transfer_never_writes_a_destination_path_another_volume_took(tmp_pa
 
     assert not [c for c in transfer.shell.commands if c[:3] in (["sudo", "qemu-img", "convert"],)]
     assert not [c for c in transfer.shell.commands if c[:2] == ["sudo", "nbdcopy"]]
+
+
+class IdentityShell:
+    """A destination conversion host whose /dev/vdc fails its identity check: ``gone`` - the
+    volume left the host, so the serial read's ssh command fails with cat's exit status 1 - or
+    ``another volume`` - the disk there is another volume's."""
+
+    address = CONV
+
+    def __init__(self, failure):
+        self.failure = failure
+
+    def cmd_out(self, command, **kwargs):
+        if self.failure == "gone":
+            raise subprocess.CalledProcessError(
+                1, ["ssh", "-o", "ConnectTimeout=10", "cloud-user@" + CONV] + list(command)
+            )
+        return "other-volume-0123456"
+
+    def cmd_val(self, command, **kwargs):
+        return 0
+
+
+TRANSFER_ARGS = {
+    "data": fake.workload_data(),
+    "conversion_host": {"id": "dst-conv"},
+    "ssh_key_path": "/keys/k",
+    "ssh_user": "cloud-user",
+    "transfer_uuid": "uuid-1",
+    "src_conversion_host_address": "10.0.0.10",
+    "volume_map": {"/dev/vda": {"source_dev": "/dev/vdb", "url": "nbd://localhost:10809/uuid-1"}},
+}
+
+
+def _transfer_module_failing_with(transfer_exports):
+    """The transfer module's run, its transfer failing as ``transfer_exports`` does."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_transfer_volumes as transfer_module,
+    )
+
+    with mock.patch.object(transfer_module, "OpenStackDestinationVolume") as destination:
+        destination.return_value.transfer_exports.side_effect = transfer_exports
+        return fake.run_module(transfer_module, dict(TRANSFER_ARGS), fake.FakeCloud("dst"))
+
+
+@pytest.mark.parametrize(
+    "failure, message",
+    [
+        ("gone", "/dev/vdc on the conversion host is gone: volume dvol-1 left the host"),
+        ("another volume", "/dev/vdc on the conversion host is the disk of volume "
+                           "other-volume-0123456, not of volume dvol-1: the volume left the host"),
+    ],
+)
+def test_a_destination_disk_that_fails_its_identity_check_fails_the_transfer_by_its_own_message(
+    failure, message
+):
+    """Review RV15-01: the transfer module let the identity check's error escape, and Ansible
+    printed it with its cause - the serial read's ssh command line, ConnectTimeout and all - which
+    the control plane retries: two more whole cold copies with the source stopped, for a failure
+    SDD 6.6 calls permanent. The module now fails by the error's own message, as the export does;
+    the cause stays in the traceback for whoever reads the log."""
+    def transfer_exports():
+        check = object.__new__(volume_common.OpenstackVolumeTransfer)
+        check.log, check.shell = mock.Mock(), IdentityShell(failure)
+        check._identified_path("dvol-1", "/dev/vdc")
+
+    result = _transfer_module_failing_with(transfer_exports)
+
+    assert result["_exit_code"] == 1 and result.get("failed"), result
+    assert result["msg"] == message
+    # what Ansible shows at the default verbosity, which the control plane classifies: neither the
+    # traceback nor the module's arguments (its own `timeout` among them)
+    hidden = ("exception", "invocation", "_exit_code", "_connected")
+    shown = {key: value for key, value in result.items() if key not in hidden}
+    assert "timeout" not in json.dumps(shown).lower(), shown
+    if failure == "gone" and "exception" in result:
+        # the cause stays for whoever reads the log: ansible-core 2.18, the production pin, returns
+        # the traceback; 2.19 and later keep it for their own traceback display
+        assert "ConnectTimeout" in result["exception"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("SSH timeout: conversion host %s unreachable over SSH, checking the by-id "
+                     "link of /dev/vdc" % CONV),
+        subprocess.CalledProcessError(255, ["ssh", "-o", "ConnectTimeout=10", "cloud-user@" + CONV]),
+        RuntimeError("Failed to convert volume! qemu-img: error while writing"),
+    ],
+    ids=["an SSH give-up", "ssh failing", "a failed copy"],
+)
+def test_the_transfers_other_errors_still_escape_its_module(error):
+    """Review RV15-01: only an identity failure is caught. Every other error of the transfer
+    leaves the module as before - its classification is the owner's question 8 - so an ssh
+    give-up, or ssh's own failure, stays retried."""
+    with pytest.raises(type(error)) as raised:
+        _transfer_module_failing_with(error)
+
+    assert raised.value is error

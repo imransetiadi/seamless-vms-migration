@@ -268,11 +268,13 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
     OpenstackVolumeTransfer,
     DEFAULT_TIMEOUT,
+    DiskIdentityError,
     volume_or_none,
 )
 
 import re
 import time
+import traceback
 
 
 class OpenStackDestinationVolume(OpenstackVolumeTransfer):
@@ -628,7 +630,14 @@ def run_module():
         preserve_volume_type=module.params["preserve_volume_type"],
         warm_state_dir=module.params["warm_state_dir"],
     )
-    destination_host.transfer_exports()
+    try:
+        destination_host.transfer_exports()
+    except DiskIdentityError as err:
+        # by its own message, as the export reports its own: the message is what the control
+        # plane classifies, and the check's cause - ssh's command line, with its ConnectTimeout -
+        # would have this permanent failure retried; every other error leaves the module as
+        # before (Seamless Migrate SDD 6.6, review RV15-01)
+        module.fail_json(msg=str(err), exception=traceback.format_exc())
 
     block_device_mapping = []
     for path in sorted(destination_host.volume_map.keys()):
