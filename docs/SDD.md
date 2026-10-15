@@ -659,7 +659,9 @@ smaller than source.
 With `--expect-serial ID`, `send` and `receive` check the device they opened before they read or write a byte of it:
 the virtio-blk serial of the opened descriptor's own device (`/sys/dev/block/<major>:<minor>/serial`, the volume id
 Nova gives the disk, cut to 20 characters) must be a prefix of `ID`, else exit `3`. A device that shows no serial - a
-regular file, a disk that is not virtio-blk - is used as given. The warm sync passes the temporary volume's id to the
+regular file, a disk that is not virtio-blk, one whose serial cannot be read - is used as given, unchecked. The cold
+export takes a `vdX` without its serial file as gone (§6.6): it reads the serial by path before the disk is opened,
+where blocksync's open descriptor already holds the disk. The warm sync passes the temporary volume's id to the
 sender and the destination volume's id to the receiver: the kernel gives a freed `/dev/vdX` path to the next disk
 attached, and a path another volume took between the attach and the open would otherwise be read, or written into
 (the hazard of review RV12-03 on the warm path). The check reads the opened descriptor's device, so nothing can take
@@ -902,14 +904,16 @@ RV14-02). The export serves the disk's udev link `/dev/disk/by-id/virtio-<serial
 export runs: nbdkit resolves the path it serves once, at its start, and opens that
 device path on every later connection, so a volume taken off the host after the export started still has the transfer
 read whatever disk took its path, without an error - a residual the owner decides on (qemu-nbd keeps the descriptor it
-opened, and nbdkit 1.38's `fd=` mode would too; review RV13-01). A disk that shows no serial file (not virtio-blk,
-`sdX`) is served by its path, unchecked. The transfer writes each destination volume through the same check: qemu-img or
-nbdcopy is given the destination volume's by-id link, once its serial was checked on the destination conversion host,
-and opens it once, at its start - the link resolves then to the volume itself, so a destination path another volume took
-is never written, and a volume that left the host fails the open. Telling the two attachments apart needs
-this export's own Cinder attachment id, which a lost answer never gave it: Nova shows the id only from microversion
-2.89, newer than RHOSP 17.1, and Cinder's attachments API is not yet used. The cleanup re-attaches each data volume the
-source VM no longer holds; and it
+opened, and nbdkit 1.38's `fd=` mode would too; review RV13-01). A disk that shows no serial - no serial file (not
+virtio-blk, `sdX`), or an empty one, which Nova never gives a Cinder volume - is served by its path, unchecked, with a
+warning. A virtio-blk backend that refuses the serial request would fail the export as gone; QEMU always answers it, so
+a Nova conversion host never does (review 14). The transfer writes each destination volume through the same check:
+qemu-img or nbdcopy is given the destination volume's by-id link, once its serial was checked on the destination
+conversion host, and opens it once, at its start - the link resolves then to the volume itself, so a destination path
+another volume took is never written, and a volume that left the host fails the open. Telling the two attachments apart
+needs this export's own Cinder attachment id, which a lost answer never gave it: Nova shows the id only from
+microversion 2.89, newer than RHOSP 17.1, and Cinder's attachments API is not yet used. The cleanup re-attaches each
+data volume the source VM no longer holds; and it
 removes the root disk's copy, its snapshot and the image of an image-booted VM only when the export made them - never a
 volume the source VM holds, such as its own boot volume before a copy exists. The export creates the root snapshot, the
 root copy and the image without openstacksdk's own wait, records each id at once, then waits for each within the module's
