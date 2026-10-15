@@ -357,7 +357,16 @@ This project follows a simple changelog to satisfy collection metadata validatio
   try up to the 10 s connect timeout, about 5.5 hours, while a cold cutover's
   source stayed stopped. The window rides out a conversion host reboot or a
   network blip, and the step then completes. One failed connection, or a lock
-  another migration holds, starts the window again.
+  another migration holds, starts the window again. The source cleanup's own
+  SSH check rides out the same window, then fails with ``SSH timeout:
+  conversion host ADDRESS unreachable over SSH for N s, waiting for the source
+  cleanup``: a reboot that starts outside a lock wait, mid-export or
+  mid-transfer, left volumes on the conversion host that only the cleanup gives
+  back, and a cleanup that failed at once let the rollback start the source VM
+  without them. The other modules' checks still fail at once. The export's
+  wait for its NBD exports, and the transfer's waits for the forwarded exports
+  and an nbdkit socket, give up the same way after the window (``SSH timeout:
+  ...``), where they tried ``timeout`` times, about 5.5 hours by default.
 - The roles' loops over workloads (``import_workloads``,
   ``import_workloads_warm``, ``export_workloads``, ``import_from_hypervisor``)
   label each item with its id only. Ansible printed the whole workload, or

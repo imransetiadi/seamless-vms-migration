@@ -1352,18 +1352,28 @@ def test_workload_file_stem_matches_the_collection():
 
 
 def test_the_collections_conversion_host_failures_are_classified_as_the_sdd_says():
-    """SDD §6.6, QASuite R-07: a lock wait that cannot reach the conversion host is retried - the
-    host may be rebooting - and a detach that never ends is not (review RV6-01). The messages are
-    read from the collection's source, so rewording one cannot move it out of its class."""
+    """SDD §6.6, QASuite R-07: a lock wait, the source cleanup's SSH check or a wait for the NBD
+    exports that cannot reach the conversion host is retried - the host may be rebooting - and a
+    detach that never ends is not (review RV6-01, RV9-02, RV9-04). The messages are read from the
+    collection's source, each prefix its waits use included, so rewording one cannot move it out
+    of its class."""
     source = (
         Path(__file__).resolve().parents[2] / "plugins/module_utils/volume_common.py"
     ).read_text()
     templates = re.findall(r'"([^"]*%[sd][^"]*)"', source)
     unreachable = next(t for t in templates if "unreachable over SSH" in t)
     stuck = next(t for t in templates if "waiting to detach volume" in t)
+    # the SshOutage prefixes: one reworded away from "timeout" leaves this set, and the test
+    prefixes = sorted(set(re.findall(r'prefix="([^"]*timeout[^"]*)"', source)))
+    waits = {
+        "Lock timeout": "/var/lock/v2v-source-volume-lock",
+        "SSH timeout": "the source cleanup",
+    }
 
-    lock = "/var/lock/v2v-destination-volume-lock"
-    assert classify_failure(unreachable % ("10.1.0.10", 66, lock)) is TransientStepError
+    assert prefixes == sorted(waits)
+    for prefix, waiting_for in waits.items():
+        message = unreachable % (prefix, "10.1.0.10", 66, waiting_for)
+        assert classify_failure(message) is TransientStepError, message
     assert classify_failure(stuck % (1800, "vol-1", "srv-1")) is PermanentStepError
 
 

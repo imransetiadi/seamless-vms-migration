@@ -427,6 +427,54 @@ def test_a_transfer_failing_before_its_forwarding_starts_reports_why_and_frees_i
     assert not dst.calls_to("create_volume")
 
 
+class SilentHost(PortShell):
+    """A destination conversion host that stops answering once the transfer waits for its
+    exports: every `qemu-img info` over ssh fails as ssh does - exit status 255 - each try
+    costing the 10 s connect timeout."""
+
+    def __init__(self, clock):
+        super().__init__(free=2)
+        self.clock = clock
+        self.address = CONV
+
+    def cmd_out(self, command, **kwargs):
+        if command[:2] == ["qemu-img", "info"]:
+            self.clock.now += 10
+            raise subprocess.CalledProcessError(255, ["ssh", self.address] + list(command))
+        return super().cmd_out(command, **kwargs)
+
+
+@pytest.mark.parametrize("waits_for", ["the forwarded exports", "an nbdkit socket"])
+def test_a_transfers_wait_for_its_exports_gives_up_after_the_ssh_window(waits_for):
+    """Review RV9-04: the transfer's waits for the forwarded NBD exports and for an nbdkit socket
+    retried every failed `qemu-img info`, ssh's 255 too, `timeout` times - about 5.5 h with the
+    default while the destination conversion host could not be reached. They now give up once
+    ssh has failed for the window, as a lock wait does (SDD 6.6)."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_transfer_volumes as transfer_module,
+    )
+
+    src, dst = fake.FakeCloud("src"), cloud()
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    volume_map = {"/dev/vda": dict(cold_volume_map()["/dev/vda"], port=10809)}
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = transfer_module.OpenStackDestinationVolume(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1", "10.0.0.10", volume_map,
+            workload(), timeout=1800,
+        )
+    clock = Clock()
+    transfer.shell = SilentHost(clock)
+
+    with mock.patch.object(volume_common, "time", clock):
+        with pytest.raises(RuntimeError, match="SSH timeout: conversion host %s unreachable" % CONV):
+            if waits_for == "an nbdkit socket":
+                transfer._setup_nbdkit_direct_urls("nbd+unix:///?socket=/run/nbd.sock", "disk1")
+            else:
+                transfer._create_forwarding_process()
+
+    assert clock.now <= volume_common.SSH_UNREACHABLE_S + 60
+
+
 def test_the_destination_detach_takes_the_volumes_it_is_given_or_the_volume_maps():
     """SDD 6.3 (review RV4-05): given volume ids, the destination detach - under the conversion
     host's attach lock - detaches those and leaves the volume map's volumes attached; given none,

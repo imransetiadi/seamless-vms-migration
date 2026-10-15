@@ -1,8 +1,10 @@
 """A source conversion host that becomes unreachable mid-export (SDD 6.6, QASuite R-07, review
-RV8-01): a lock wait rides out an outage of up to 15 minutes, a reboot or a blip, and the step
-completes; an outage longer than that fails the export, which first attaches the data volumes it
-detached back to the source VM through the API alone - the source cleanup cannot run while the
-host is down, and the rollback that follows starts the source VM."""
+RV8-01, RV9-02, RV9-04): a lock wait, the source cleanup's SSH check and the waits for the NBD
+exports ride out an outage of up to 15 minutes, a reboot or a blip, and the step completes, or its
+rescue gives every disk back and the retry completes; an outage longer than that fails the export,
+which first attaches the data volumes it detached back to the source VM through the API alone -
+the source cleanup cannot run while the host is down, and the rollback that follows starts the
+source VM."""
 
 from __future__ import absolute_import, division, print_function
 
@@ -50,22 +52,47 @@ class Clock:
 
 
 class RebootingHost(SourceHost):
-    """The source conversion host goes down once ``armed``: from the next take of ``lock`` on,
-    for ``outage`` seconds of ``clock``, every ssh to it fails as ssh does - exit status 255 - and
-    each try costs the 10 s connect timeout (RemoteShell's ConnectTimeout=10)."""
+    """The source conversion host goes down once ``armed``: at the ``at``-th command ``starts``
+    matches - by default a take of ``lock`` - or at once on ``go_down()``, for ``outage`` seconds
+    of ``clock``. While it is down every ssh to it fails as ssh does - exit status 255 - and each
+    try costs the 10 s connect timeout (RemoteShell's ConnectTimeout=10). Back up, its /var/lock
+    (/run/lock, a tmpfs) is empty: a lock a module held when the host went down is gone."""
 
-    def __init__(self, cloud, clock, lock, outage):
+    def __init__(self, cloud, clock, lock, outage, starts=None, at=1):
         super().__init__(cloud)
+        self.cloud, self.addresses, self.rebooted = cloud, set(), False
         self.clock, self.lock, self.outage = clock, lock, outage
+        self.starts = starts or (
+            lambda command: command[:2] == ["sudo", "flock"] and command[6] == lock
+        )
+        self.at, self.seen = at, 0
         self.armed = False
         self.down_since = None
 
+    def go_down(self):
+        self.down_since = self.clock.now
+
     def down(self):
-        return self.down_since is not None and self.clock.now < self.down_since + self.outage
+        if self.down_since is None:
+            return False
+        if self.clock.now < self.down_since + self.outage:
+            return True
+        if not self.rebooted:
+            self.rebooted = True
+            for address in self.addresses:
+                self.cloud.held_locks.pop(address, None)
+        return False
+
+    def _watch(self, command):
+        if self.armed and self.down_since is None and self.starts(command):
+            self.seen += 1
+            if self.seen == self.at:
+                self.go_down()
 
     def __call__(self, address, ssh_user, key_path=None):
         shell = super().__call__(address, ssh_user, key_path)
         host = self
+        host.addresses.add(address)
         val, out, ping = shell.cmd_val, shell.cmd_out, shell.test_ssh_connection
 
         def unreachable(command):
@@ -75,15 +102,14 @@ class RebootingHost(SourceHost):
             )
 
         def cmd_val(command, **kwargs):
-            if (host.armed and host.down_since is None and command[:2] == ["sudo", "flock"]
-                    and command[6] == host.lock):
-                host.down_since = host.clock.now
+            host._watch(command)
             if host.down():
                 host.clock.now += 10
                 return 255
             return val(command, **kwargs)
 
         def cmd_out(command, **kwargs):
+            host._watch(command)
             if host.down():
                 raise unreachable(command)
             return out(command, **kwargs)
@@ -146,16 +172,69 @@ def test_a_two_minute_conversion_host_reboot_is_ridden_out(phase):
 
 
 def test_an_outage_past_the_window_leaves_the_data_volumes_on_the_source_vm():
-    """An outage of 20 minutes while the export waits for the attach lock, the data volumes
-    detached: the wait gives up, and the export attaches them back to the source VM through the
-    API before it fails - the rescue's cleanup cannot reach the host, and the rollback that follows
-    starts the source VM, which must have every data volume."""
-    src, _host, exported, _cleaned, rescued = _outage("export attach lock", outage=1200)
+    """An outage of 40 minutes that begins while the export waits for the attach lock, the data
+    volumes detached: the wait gives up after 15 minutes, and the export attaches them back to the
+    source VM through the API before it fails; the rescue's cleanup rides out 15 minutes more,
+    then gives up too, and the rollback that follows starts the source VM, which must have every
+    data volume."""
+    src, _host, exported, _cleaned, rescued = _outage("export attach lock", outage=2400)
 
     assert exported.get("failed") and "Lock timeout" in exported["msg"], exported
     assert rescued is not None and rescued.get("failed"), rescued  # the host is still down
+    assert "SSH timeout: conversion host 10.0.0.10 unreachable over SSH" in rescued["msg"], rescued
     for volume_id in DATA_VOLUMES:
         assert _holders(src, volume_id) == ["srv-1"], (volume_id, src.volumes[volume_id].attachments)
     # the source VM holds exactly its own disks: the root copy the export made is not one of them
     held = sorted(v.id for v in src.volumes.values() if "srv-1" in _holders(src, v.id))
     assert held == sorted(DISKS), held
+
+
+@pytest.mark.parametrize("phase", ["export, between two attaches", "transfer"])
+def test_a_reboot_outside_a_lock_wait_is_ridden_out_by_the_rescue(phase):
+    """Review RV9-02: a two-minute reboot that begins outside a lock wait, after the export
+    attached volumes to the conversion host - its lsblk between two attaches, or the transfer,
+    whose SSH forward dies with the host - fails the step at once. The rescue's cleanup failed at
+    once too, on its SSH check, as did the retries 2 s and 4 s later, and the rollback started the
+    source VM without the volumes the host held. The cleanup's check now rides out the outage, as
+    a lock wait does: the rescue gives every disk back, and the retry completes."""
+    src, data = _boot_from_volume_vm()
+    clock = Clock()
+    # lsblk 1-2 attach the root copy, 3-4 vol-data1: the 5th, before vol-data2, meets the reboot
+    host = RebootingHost(src, clock, None, 120, starts=lambda command: command[:1] == ["lsblk"], at=5)
+    host.armed = phase.startswith("export")
+    common = dict(COMMON, data=data)
+    with mock.patch.object(volume_common, "time", clock):
+        exported = _run(export_module, common, src, host)
+        if phase == "transfer":
+            assert not exported.get("failed"), exported
+            host.go_down()  # the transfer's SSH forward dies with the host, so the transfer fails
+        rescued = _run(cleanup_module, _cleanup_args(data, exported), src, host)
+        given_back = {volume_id: _holders(src, volume_id) for volume_id in DISKS}
+        left = sorted(set(src.volumes) - set(DISKS)) + sorted(src.snapshots)
+        clock.now += 2  # the step's first retry
+        retried = _run(export_module, common, src, host)
+
+    assert host.down_since is not None, "the reboot never started"
+    assert bool(exported.get("failed")) == (phase != "transfer"), exported
+    assert not rescued.get("failed"), rescued
+    assert given_back == {volume_id: ["srv-1"] for volume_id in DISKS}, given_back
+    assert left == [], left
+    assert not retried.get("failed"), retried
+
+
+def test_the_exports_wait_for_its_nbd_exports_gives_up_after_the_ssh_window():
+    """Review RV9-04: the export's wait for its NBD exports to answer retried every failed
+    `qemu-img info`, ssh's 255 too, `timeout` times, each try up to the connect timeout: a
+    conversion host that went down right after nbdkit started held the stopped source VM for
+    about 5.5 h. The wait now gives up once ssh has failed for the window, as a lock wait does."""
+    src, data = _boot_from_volume_vm()
+    clock = Clock()
+    host = RebootingHost(src, clock, None, 10 ** 9,
+                         starts=lambda command: command[:2] == ["qemu-img", "info"])
+    host.armed = True
+    with mock.patch.object(volume_common, "time", clock):
+        exported = _run(export_module, dict(COMMON, data=data, timeout=1800), src, host)
+
+    assert exported.get("failed"), exported
+    assert "SSH timeout: conversion host 10.0.0.10 unreachable over SSH" in exported["msg"], exported
+    assert clock.now - host.down_since <= volume_common.SSH_UNREACHABLE_S + 60

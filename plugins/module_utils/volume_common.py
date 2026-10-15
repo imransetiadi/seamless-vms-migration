@@ -107,6 +107,36 @@ SSH_FAILED = 255
 SSH_UNREACHABLE_S = 900
 
 
+class SshOutage:
+    """
+    How long ssh to a conversion host has failed without a break, its own exit
+    status 255: a wait that meets it gives up once that reaches
+    SSH_UNREACHABLE_S, with "{prefix}: conversion host {address} unreachable
+    over SSH for {n} s, waiting for {what}", which the control plane retries
+    (Seamless Migrate SDD 6.6, review RV8-01, RV9-02, RV9-04).
+    """
+
+    def __init__(self, address, waiting_for, prefix="SSH timeout"):
+        self.address = address
+        self.waiting_for = waiting_for
+        self.prefix = prefix
+        self.since = None
+
+    def seen(self, unreachable):
+        """One try: raise once ssh has failed for the window without a break."""
+        if not unreachable:
+            self.since = None
+            return
+        now = time.monotonic()
+        if self.since is None:
+            self.since = now
+        elif now - self.since >= SSH_UNREACHABLE_S:
+            raise RuntimeError(
+                "%s: conversion host %s unreachable over SSH for %d s, waiting for %s"
+                % (self.prefix, self.address, now - self.since, self.waiting_for)
+            )
+
+
 def use_lock(lock_file):
     """Boilerplate for functions that need to take a lock."""
 
@@ -114,7 +144,9 @@ def use_lock(lock_file):
         def wait_for_lock(self, *args, **kwargs):
             if self.check_and_cleanup_lockfiles():
                 self.log.info("Cleaned up unused lockfiles before start")
-            unreachable_since = None
+            outage = SshOutage(
+                getattr(self.shell, "address", "?"), lock_file, prefix="Lock timeout"
+            )
             for second in range(DEFAULT_TIMEOUT):
                 try:
                     self.log.info("Waiting for lock %s...", lock_file)
@@ -141,24 +173,10 @@ def use_lock(lock_file):
                         + '"',
                     ]
                     result = self.shell.cmd_val(cmd)
-                    if result == SSH_FAILED:
-                        # the conversion host cannot be reached: give up after 15 minutes
-                        # of that rather than try 1800 times; the control plane retries
-                        # a "timeout" (Seamless Migrate SDD 6.6, QASuite R-07)
-                        now = time.monotonic()
-                        if unreachable_since is None:
-                            unreachable_since = now
-                        elif now - unreachable_since >= SSH_UNREACHABLE_S:
-                            raise RuntimeError(
-                                "Lock timeout: conversion host %s unreachable over SSH for %d s, waiting for %s"
-                                % (
-                                    getattr(self.shell, "address", "?"),
-                                    now - unreachable_since,
-                                    lock_file,
-                                )
-                            )
-                    else:
-                        unreachable_since = None
+                    # the conversion host cannot be reached: give up after 15 minutes
+                    # of that rather than try 1800 times; the control plane retries
+                    # a "timeout" (Seamless Migrate SDD 6.6, QASuite R-07)
+                    outage.seen(result == SSH_FAILED)
                     if result == 16:
                         self.log.info("Another conversion has the lock.")
                     elif result == 17:
@@ -318,10 +336,14 @@ class OpenStackVolumeBase:
         self.shell = self.shell_factory(
             self._converter_address(), ssh_user, ssh_key_path
         )
-        self.shell.test_ssh_connection()
+        self._check_ssh()
 
         # Ports chosen for NBD export
         self.claimed_ports = []
+
+    def _check_ssh(self):
+        """Quick SSH check of the conversion host: a module fails at once."""
+        self.shell.test_ssh_connection()
 
     def _source_vm(self):
         """
@@ -1094,6 +1116,9 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
 
             # Check qemu-img info on this disk to make sure it is ready
             self.log.info("Waiting for valid qemu-img info on all exports...")
+            outage = SshOutage(
+                getattr(self.shell, "address", "?"), "the NBD export of " + disk
+            )
             for second in range(self.timeout):
                 try:
                     cmd = [
@@ -1104,6 +1129,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                     image_info = self.shell.cmd_out(cmd)
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                 except subprocess.CalledProcessError as error:
+                    outage.seen(error.returncode == SSH_FAILED)
                     self.log.info("Got exception: %s", error)
                     self.log.info("Trying again.")
                     time.sleep(1)
@@ -1146,6 +1172,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         # Verify connectivity to nbdkit socket
         self.log.info("Waiting for valid qemu-img info on nbdkit socket...")
         pending_disks = set(self.volume_map.keys())
+        outage = SshOutage(getattr(self.shell, "address", "?"), "the nbdkit socket")
         for second in range(self.timeout):
             try:
                 for disk in pending_disks.copy():
@@ -1156,6 +1183,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                     pending_disks.remove(disk)
             except subprocess.CalledProcessError as error:
+                outage.seen(error.returncode == SSH_FAILED)
                 self.log.info("Got exception: %s", error)
                 self.log.info("Trying again.")
                 time.sleep(1)
@@ -1191,6 +1219,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         # Check qemu-img info on all the disks to make sure everything is ready
         self.log.info("Waiting for valid qemu-img info on all exports...")
         pending_disks = set(self.volume_map.keys())
+        outage = SshOutage(getattr(self.shell, "address", "?"), "the forwarded NBD exports")
         for second in range(self.timeout):
             try:
                 for disk in pending_disks.copy():
@@ -1201,6 +1230,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                     pending_disks.remove(disk)
             except subprocess.CalledProcessError as error:
+                outage.seen(error.returncode == SSH_FAILED)
                 self.log.info("Got exception: %s", error)
                 self.log.info("Trying again.")
                 time.sleep(1)
@@ -1516,6 +1546,25 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
 
 
 class OpenstackVolumeClean(OpenStackVolumeBase):
+
+    def _check_ssh(self):
+        """
+        Ride out a conversion host that cannot be reached, as a lock wait does:
+        after a reboot mid-export or mid-transfer it holds volumes only this
+        cleanup gives back to the source VM. The other modules' checks fail at
+        once (Seamless Migrate SDD 6.6, review RV9-02).
+        """
+        outage = SshOutage(getattr(self.shell, "address", "?"), "the source cleanup")
+        for second in range(DEFAULT_TIMEOUT):
+            try:
+                return self.shell.test_ssh_connection()
+            except subprocess.CalledProcessError as err:
+                if err.returncode != SSH_FAILED:
+                    raise
+                outage.seen(True)
+                self.log.info("Conversion host unreachable, waiting: %s", err)
+                time.sleep(1)
+        return self.shell.test_ssh_connection()
 
     def close_exports(self):
         """Put the source VM's volumes back where they were."""
