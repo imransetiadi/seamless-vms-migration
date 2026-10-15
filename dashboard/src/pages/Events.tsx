@@ -61,8 +61,8 @@ const CATEGORIES: Array<{ value: string; label: string; match: (kind: string) =>
     match: (k) => k.startsWith('advisor.') || k.startsWith('memory.') || k.startsWith('recommendation.') || k.startsWith('decision.'),
   },
   { value: 'providers', label: 'Providers', match: (k) => k.startsWith('provider.') },
-  // a prune cuts the audit trail itself (SDD §15)
-  { value: 'security', label: 'Security', match: (k) => k.startsWith('auth.') || k === 'events.pruned' },
+  // a prune cuts the audit trail itself (SDD §15); a dashboard user created grants access (SDD §13.1)
+  { value: 'security', label: 'Security', match: (k) => k.startsWith('auth.') || k.startsWith('user.') || k === 'events.pruned' },
 ];
 
 function kindMeta(kind: string): { icon: LucideIcon; tone: Tone } {

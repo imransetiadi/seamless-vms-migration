@@ -227,6 +227,27 @@ describe('Events page', () => {
     for (const item of items) expect(item).toHaveTextContent(/auth\.denied|events\.pruned/);
   });
 
+  it('files a dashboard user created under Security: it grants access (SDD §4.3, §13.1, review RV12-04)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    server.emit({
+      kind: 'user.created',
+      plan_id: null,
+      migration_id: null,
+      actor: 'rina',
+      message: 'User mallory created',
+      data: { name: 'mallory', role: 'admin' },
+    });
+    renderWithApp(<Events />, { route: '/events', token: 'viewer', server });
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    await within(list).findByText('User mallory created');
+
+    await user.selectOptions(screen.getByLabelText('Category'), 'security');
+    const items = within(list).getAllByRole('listitem');
+    expect(items.filter((item) => item.textContent?.includes('user.created'))).toHaveLength(1);
+    for (const item of items) expect(item).toHaveTextContent(/auth\.denied|events\.pruned|user\.created/);
+  });
+
   it('moves focus to the list when its last Show older events button goes, never to the page (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
