@@ -2,7 +2,7 @@
 
 The control plane plans, validates, estimates, orchestrates and exposes (REST + SSE, RBAC) VM
 migrations from RHOSP 17.1, community OpenStack and VMware vSphere to Red Hat OpenStack Services
-on OpenShift (RHOSO) 18.0. The Ansible collection at the repository root (os-migrate, extended
+on OpenShift (RHOSO) 18.0 or community OpenStack 2023.1 Antelope – 2026.2 Hibiscus (SDD §21). The Ansible collection at the repository root (os-migrate, extended
 with the warm path) remains the data mover; the control plane drives it through
 `ansible-playbook`.
 

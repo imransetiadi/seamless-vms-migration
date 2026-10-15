@@ -3,8 +3,9 @@
 [![ci](https://github.com/imransetiadi/seamless-vms-migration/actions/workflows/ci.yml/badge.svg)](https://github.com/imransetiadi/seamless-vms-migration/actions/workflows/ci.yml)
 
 **Move virtual machines from Red Hat OpenStack Platform 17.1, community OpenStack or VMware vSphere into
-Red Hat OpenStack Services on OpenShift (RHOSO) 18.0 — with minutes of downtime, predictable before it
-starts, approved by the right people, and reversible until you finalize.**
+Red Hat OpenStack Services on OpenShift (RHOSO) 18.0 or community OpenStack 2023.1 Antelope – 2026.2 Hibiscus
+— with minutes of downtime, predictable before it starts, approved by the right people, and reversible until
+you finalize.**
 
 > **Independent project.** Seamless Migrate is not affiliated with, sponsored by, or endorsed by
 > Red Hat, Inc., the Open Infrastructure Foundation (OpenStack), or Broadcom Inc. (VMware).
@@ -59,15 +60,36 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
                                           │ snapshot ► tmp volume ► src conversion host
                                           │             blocksync ──SSH──► dst conversion host ► new volumes
                                           ▼                                                     ▼
-                         Source: RHOSP 17.1 / OpenStack / vCenter                  RHOSO 18.0 (boots the VM)
+                         Source: RHOSP 17.1 / OpenStack / vCenter                  RHOSO 18.0 or community OpenStack
+                                                                                   (boots the VM)
 ```
+
+## Destination platforms
+
+RHOSO 18.0 is the validated destination. Community OpenStack destinations run on the same code path — the
+OpenStack Community and Kolla-Ansible presets are offered for the destination role — and 0.2.0 validates them
+by the support tiers of [SDD §21](docs/SDD.md), which follow the upstream lifecycle on
+[releases.openstack.org](https://releases.openstack.org/):
+
+| Tier | Series | Upstream phase (2026-10-16) | What a Seamless release does |
+|---|---|---|---|
+| 1 | 2026.2 Hibiscus, 2026.1 Gazpacho, 2025.2 Flamingo, 2025.1 Epoxy | Maintained | the full destination lab matrix |
+| 2 | 2024.1 Caracal, 2023.1 Antelope | Unmaintained (SLURP) | a compatibility smoke run |
+| 3 | 2024.2 Dalmatian, 2023.2 Bobcat | End of Life | capability checks only, with a warning |
+| Outside | Zed and older; series newer than 2026.2 | — | capability checks only, with a warning |
+
+From 0.2.0 a missing capability blocks a plan whatever the tier ([SDD §21.4](docs/SDD.md)). Mind the policy
+defaults now: under the secure-RBAC defaults (upstream's default from 2023.2) a VM that keeps a fixed IP on another
+project's network needs the `service` or `admin` role on the destination — `advsvc` no longer does — while
+Seamless's validation judges the older rule until 0.2.0 ([SDD §21.5](docs/SDD.md)). Use a CentOS Stream 9 or
+RHEL 9 conversion host image until 0.2.0 adds others ([SDD §21.6](docs/SDD.md)).
 
 ## Guest OS support
 
 OpenStack sources (RHOSP 17.1, community, Kolla) move KVM guests to KVM: every guest that boots on the source
-boots on RHOSO, because the volumes keep their boot properties. VMware sources are converted by virt-v2v on the
-RHEL 9 conversion host, which is where vendor support differs ([SDD §9.5](docs/SDD.md), Red Hat's virt-v2v
-support matrix):
+boots on the destination, because the volumes keep their boot properties. VMware sources are converted by
+virt-v2v on the RHEL 9 conversion host, which is where vendor support differs ([SDD §9.5](docs/SDD.md), Red
+Hat's virt-v2v support matrix):
 
 | Guest | From OpenStack | From VMware (virt-v2v) | Lifecycle (2026-10) |
 |---|---|---|---|

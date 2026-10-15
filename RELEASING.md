@@ -55,8 +55,8 @@ A tag is cut only when every gate below holds, or a waiver recorded in the relea
 - [ ] `CHANGELOG.rst` has the collection's section when the collection changed, and the release notes
       (§6) are written.
 
-**Each release candidate** (QASuite §13.5): the lab matrix, data integrity, the G1 and G2 performance
-gates, the full resilience suite, DAST and manual accessibility run against the RC tag. Their result is
+**Each release candidate** (QASuite §13.5): the lab matrix — from 0.2.0 the Tier 1 community destinations
+too (QASuite §7.1 M7–M11, SDD §21.1) — data integrity, the G1 and G2 performance gates, the full resilience suite, DAST and manual accessibility run against the RC tag. Their result is
 a signed release report: environment descriptor, commit, result per case, defect list, waivers.
 
 **The final release** (QASuite §13.2): all exit criteria hold. That means the unit suites, coverage of
@@ -254,7 +254,8 @@ Save as `release-notes-X.Y.Z.md` (it is not committed), fill it from the merged 
 - <open defects with workaround; waivers from the release report>
 
 ### Tested with
-- <the source and destination platforms of the lab run (QASuite §7, e.g. M1 RHOSP 17.1 → RHOSO 18.0)>
+- <the source and destination platforms of the lab run (QASuite §7, e.g. M1 RHOSP 17.1 → RHOSO 18.0, M7 RHOSP 17.1 →
+  community 2026.2 Hibiscus), with each community destination's support tier (SDD §21.1)>
 - <the Python, ansible-core, openstacksdk, Node and PostgreSQL versions CI and the lab used>
 
 ### Verify
