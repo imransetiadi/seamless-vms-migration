@@ -399,13 +399,29 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
                 self._detach_volumes_from_destination_converter([earlier_id])
             if getattr(volume, "status", None) != "deleting":
                 # Nova deletes a boot volume with its server, and Cinder refuses a second delete
-                self.conn.delete_volume(name_or_id=earlier_id, wait=False)
+                self._delete_earlier_volume(earlier_id)
             self._wait_until_gone(earlier_id)
         except Exception as err:
             raise RuntimeError(
                 "Could not delete volume %s an earlier attempt left for %s: %s"
                 % (earlier_id, path, err)
             ) from err
+
+    def _delete_earlier_volume(self, volume_id):
+        """
+        Delete the earlier volume ``volume_id``. Nova, deleting a server whose
+        boot volume goes with it, removes the attachment and then deletes the
+        volume: one read `available` in between may begin going before this
+        delete lands, which Cinder then refuses - it is waited for as one found
+        `deleting` (Seamless Migrate SDD 6.3, review 6 lead).
+        """
+        try:
+            self.conn.delete_volume(name_or_id=volume_id, wait=False)
+        except Exception:  # pylint: disable=broad-except
+            volume = volume_or_none(self.conn, volume_id)
+            if volume is not None and getattr(volume, "status", None) != "deleting":
+                raise
+            self.log.info("Volume %s began going meanwhile", volume_id)
 
     def _wait_until_gone(self, volume_id):
         """

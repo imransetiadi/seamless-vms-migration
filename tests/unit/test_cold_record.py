@@ -766,6 +766,48 @@ def test_a_rerun_waits_until_the_earlier_boot_volume_nova_deletes_is_gone(tmp_pa
     assert not [c for c in dst.calls_to("delete_volume") if c[1]["name_or_id"] == "dvol-boot"]
 
 
+def test_a_rerun_waits_for_an_earlier_volume_nova_began_deleting_while_it_deleted_it(tmp_path):
+    """SDD 6.3 (review 6 lead): Nova, deleting the operator-deleted server S1, removes its boot
+    volume's attachment and then deletes the volume. The re-run read it `available` in between,
+    and Nova's delete landed before its own: Cinder refused that one - the volume no longer
+    `available` - and the transfer failed, although the volume was going all the same. The
+    re-run now waits until it is gone, as for a volume it found `deleting`."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    _record(state_dir, TRANSFERRED)
+    warm_migration.record_destination_server(state_dir, "srv-1", "dst-s1", "vm1")
+    dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True)  # detached by Nova, not yet going
+    dst.add_volume("dvol-data", "vm1-data", 10)
+    reads_left = {}
+    delete, get = dst.delete_volume, dst.get_volume_by_id
+
+    def nova_deletes_first(name_or_id=None, **kwargs):
+        if name_or_id == "dvol-boot":
+            dst.record("delete_volume", name_or_id=name_or_id)
+            dst.volumes["dvol-boot"].status = "deleting"
+            reads_left["dvol-boot"] = 2
+            raise RuntimeError("Invalid volume: Volume status must be available or error (HTTP 400)")
+        return delete(name_or_id=name_or_id, **kwargs)
+
+    def cinder_get(volume_id):
+        if volume_id in reads_left:
+            reads_left[volume_id] -= 1
+            if reads_left[volume_id] < 0:
+                del reads_left[volume_id]
+                dst.volumes.pop(volume_id, None)
+        return get(volume_id)
+
+    dst.delete_volume, dst.get_volume_by_id = nova_deletes_first, cinder_get
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+    with mock.patch.object(time, "sleep"):
+        transfer._create_destination_volumes()
+
+    assert not {"dvol-boot", "dvol-data"} & set(dst.volumes)
+    recorded = WarmState.load(state_dir, "srv-1").dest_volumes
+    assert not {"dvol-boot", "dvol-data"} & {entry["dest_id"] for entry in recorded.values()}
+
+
 def test_an_earlier_volume_cinder_gives_up_deleting_fails_the_rerun_with_its_record(tmp_path):
     """SDD 6.3 (review RV5-02): Cinder can give up deleting the boot volume Nova deletes - an RBD
     image still watched is busy, and Cinder puts it back to `available` - so the re-run fails before

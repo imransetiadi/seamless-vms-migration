@@ -284,7 +284,9 @@ This project follows a simple changelog to satisfy collection metadata validatio
   leaves the record. Each deleted volume is waited for until Cinder no longer
   has it, within the transfer's timeout; one Cinder is already deleting, such
   as the boot volume Nova deletes with its server, is not deleted a second
-  time. A volume the transfer cannot detach or delete, one that leaves
+  time, and one that began going while the transfer deleted it - Cinder
+  refusing that delete - is waited for the same way. A volume the transfer
+  cannot detach or delete otherwise, one that leaves
   ``deleting`` without going, or one still there at the timeout, fails the
   transfer before it creates a volume, with the record unchanged. Before, a
   re-run failed on every retry, with the source stopped, when it sent a
