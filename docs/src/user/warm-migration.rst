@@ -130,6 +130,20 @@ Variables
      - ``false``
      - rollback of a workload without a warm state: delete the only
        destination server named exactly like the workload
+   * - ``os_migrate_rollback_all``
+     - ``false``
+     - a rollback with the catch-all workload filter (``regex: .*``, every
+       workload of the data dir) is refused unless this is ``true``; an exact
+       filter rolls back one workload
+   * - ``os_migrate_rollback_start_source``
+     - ``true``
+     - the rollback's last step starts the source server; ``false`` leaves it
+       as it is (Seamless Migrate's cleanup before a cold cutover)
+   * - ``os_migrate_rollback_delete_ports``
+     - ``true``
+     - the rollback deletes the destination ports created for the workload's
+       source ports; ``false`` deletes none (Seamless Migrate's cleanup after
+       a cancel)
    * - ``os_migrate_warm_python_interpreter``
      - ``python3``
      - Python 3.6+ on the conversion hosts (``/usr/libexec/platform-python``

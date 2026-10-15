@@ -80,6 +80,7 @@ name with `%`, `/` and NUL written `%25`, `%2F` and `%00`
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | destination conversion host; the only server a rollback detaches destination volumes from |
 | `os_migrate_rollback_match_by_name` | `false` | rollback of a workload without a warm state file (e.g. one the cold import copied before it recorded its workload): delete the only destination server named exactly like the workload; with a state file, even an empty one, no server is taken by its name alone |
 | `os_migrate_rollback_start_source` | `true` | the rollback's last step starts the source server; `false` leaves it as it is (Seamless Migrate's cleanup before a cold cutover, when the source may stay stopped) |
+| `os_migrate_rollback_all` | `false` | a rollback with the catch-all workload filter (`regex: .*`, every workload of the data dir) is refused unless this is `true`; an exact filter rolls back one workload |
 | `os_migrate_rollback_delete_ports` | `true` | the rollback deletes the destination ports created through Neutron for the workload's source ports; `false` deletes none (Seamless Migrate's cleanup after a cancel, which made no port, where an unbound one may belong to another migration of the VM) |
 | `os_migrate_workloads_filter` | `[{regex: .*}]` | workloads to process (name filter, as for `import_workloads`) |
 | `os_migrate_workload_cleanup_on_failure` | `true` | remove the temporary snapshot when a pass fails |

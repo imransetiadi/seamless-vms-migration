@@ -411,3 +411,16 @@ This project follows a simple changelog to satisfy collection metadata validatio
   from ``import_from_hypervisor``: nothing read them, so ``ip_allow`` promised
   a restriction the export never had. ``os_migrate_nbdkit_bind_address`` is
   the control over who can reach an export.
+- ``rollback_workloads.yml`` with the role's catch-all workload filter
+  (``regex: .*``, every workload of the data dir) is refused unless
+  ``os_migrate_rollback_all: true``; an exact filter rolls back one workload.
+- ``import_from_hypervisor`` sizes a destination volume from qemu-img's exact
+  byte count, rounded up to GiB; it read the GiB figure with a regex and fell
+  back to 0, which Cinder refuses.
+- ``update_workload_nbdkit_uris`` takes typed ``nbdkit_disks`` suboptions, so
+  ``port`` and ``size`` stay integers on ansible-core before 2.19 (where
+  ``"{{ x | int }}"`` renders to a string).
+- A warm pre-copy pass records what the cutover will refuse
+  (``import_workload_dst_check``'s ``cutover_refusals``) beside the workload's
+  warm state as ``<server id>.refusals.json`` (mode 0600), replaced on every
+  pass and empty once the problems are fixed.
