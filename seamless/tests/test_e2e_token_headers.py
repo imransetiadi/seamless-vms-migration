@@ -61,8 +61,15 @@ def _tokens_on_command_lines(e2e: Path) -> list[str]:
         for n, line in _code_lines(path):
             written = path.name == HELPER and HELPER_WRITE.search(line)
             bearer = re.search("bearer", line, re.IGNORECASE) and not written
-            checked = re.match(r"\s*:\s", line) and "$(" not in line and "`" not in line
+            # the `:` builtin's check: its `$(...)` and backquotes must expand no token themselves
+            substituted = " ".join(
+                part for pair in re.findall(r"\$\(([^)]*)\)|`([^`]*)`", line) for part in pair
+            )
+            checked = re.match(r"\s*:\s", line) and not (expanded and expanded.search(substituted))
             rest = re.sub(r'\btoken_header \w+ "\$\{?\w+\}?"', "", line)
+            # a `[`, `[[` or `test` check keeps the token in the shell (review RV17-05)
+            rest = re.sub(r"\[\[?\s.*?\s\]\]?", "", rest)
+            rest = re.sub(r"(?:^|(?<=[;&|(]))\s*test\s[^;&|]*", "", rest)
             if bearer or (expanded and expanded.search(rest) and not checked):
                 offenders.append(f"{path.name}:{n}: {line.strip()}")
     return offenders
@@ -121,9 +128,39 @@ def _exit_traps(e2e: Path) -> list[str]:
     return offenders
 
 
+def _helper_bypasses(e2e: Path) -> list[str]:
+    """Lines of a script of ``e2e`` that sources the helper and then prints its tokens, reads a
+    header file back, or keeps the helper's EXIT trap from running (review RV17-02): xtrace on
+    (`set -x` in any option cluster, `set -o xtrace`, a `-x` in the shebang), a header path taken
+    out of token_header's "@FILE" (`${H#@}`), and `exec` of a command, which replaces the shell."""
+    offenders = []
+    for path in sorted(e2e.glob("*.sh")):
+        lines = _code_lines(path)
+        sourced = any(
+            re.match(rf"\s*(?:\.|source)\s.*{re.escape(HELPER)}", line) for _, line in lines
+        )
+        if path.name == HELPER or not sourced:
+            continue
+        shebang = path.read_text(encoding="utf-8").split("\n", 1)[0]
+        if shebang.startswith("#!") and re.search(r"\s-[A-Za-z]*x", shebang):
+            offenders.append(f"{path.name}:1: {shebang}")
+        for n, line in lines:
+            xtrace = re.search(r"(?:^|[\s;&|(])set\s+(?:-[A-Za-z]*x|-o\s+xtrace)", line)
+            readback = re.search(r"\$\{\w+#@\}", line)
+            replaced = re.search(r"(?:^|[\s;&|(])exec\s+(?![<>]|\d+[<>])\S", line)
+            if xtrace or readback or replaced:
+                offenders.append(f"{path.name}:{n}: {line.strip()}")
+    return offenders
+
+
 def _s30_offenders(e2e: Path) -> list[str]:
     """Everything the static S-30 guards flag in the scripts in ``e2e``."""
-    return _tokens_on_command_lines(e2e) + _fixed_names_in_shared_tmp(e2e) + _exit_traps(e2e)
+    return (
+        _tokens_on_command_lines(e2e)
+        + _fixed_names_in_shared_tmp(e2e)
+        + _exit_traps(e2e)
+        + _helper_bypasses(e2e)
+    )
 
 
 def test_no_e2e_script_puts_a_bearer_token_on_a_command_line():
@@ -140,6 +177,76 @@ def test_no_e2e_script_writes_a_fixed_name_in_the_shared_temporary_directory():
     assert _fixed_names_in_shared_tmp(E2E) == []
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        '[ -n "${TOKEN:-}" ] || { echo "export TOKEN=<admin token>" >&2; exit 2; }',
+        ': "${TOKEN:=$(cat "$HOME/.seamless-token")}"',
+    ],
+    ids=["a [ check that it is set", "a : default read from a file"],
+)
+def test_the_s30_guards_flag_no_line_that_keeps_the_token_in_the_shell(tmp_path, line):
+    """Review RV17-05: a `[` or `test` check and the `:` builtin's default keep the token in the
+    shell - no process gets it as an argument -, and a `$(...)` that expands no token puts none
+    there either: the guards flag neither line."""
+    copy = tmp_path / "e2e"
+    shutil.copytree(E2E, copy)
+    path = copy / "smoke-demo.sh"
+    text = path.read_text(encoding="utf-8")
+    assert text.count(SMOKE_SET) == 1
+    path.write_text(text.replace(SMOKE_SET, SMOKE_SET + line + "\n"), encoding="utf-8")
+
+    assert _s30_offenders(copy) == []
+
+
+SOURCE_HELPER = '. "$(dirname "$0")/token-headers.sh"\n'
+WRITE_HEADER = 'H=$(token_header admin "$TOKEN") || exit 3\n'
+
+
+@pytest.mark.parametrize(
+    "script, exit_code",
+    [
+        ("set -x\n" + SOURCE_HELPER + WRITE_HEADER, 2),  # the helper stops the script
+        (SOURCE_HELPER + "set -x\n" + WRITE_HEADER, 3),  # token_header refuses: the script's exit
+    ],
+    ids=["sourced with xtrace on", "xtrace on after it was sourced"],
+)
+def test_the_helper_writes_no_header_while_xtrace_is_on(tmp_path, script, exit_code):
+    """Review RV17-02: xtrace prints every expanded argument on stderr. The helper refuses to be
+    sourced, and token_header to write a header, while it is on - the script stops with no header
+    file and nothing left in the temporary directory (the static guard keeps `set -x` out of the
+    scripts themselves)."""
+    work, tmp = tmp_path / "work", tmp_path / "tmp"
+    work.mkdir()
+    tmp.mkdir()
+    (work / HELPER).write_text((E2E / HELPER).read_text(encoding="utf-8"), encoding="utf-8")
+    (work / "script.sh").write_text("#!/usr/bin/env bash\nset -u\n" + script, encoding="utf-8")
+    run = subprocess.run(
+        ["bash", str(work / "script.sh")],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "TMPDIR": str(tmp),
+            "TOKEN": "smg_" + secrets.token_urlsafe(24),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    said = (
+        f"exit {run.returncode}; xtrace named: {'xtrace' in run.stderr}"  # stderr holds the token
+    )
+    assert run.returncode == exit_code and "xtrace" in run.stderr, said
+    assert list(tmp.rglob("*.header")) == [] and list(tmp.iterdir()) == []
+
+
+def test_no_script_that_sources_the_helper_traces_reads_a_header_back_or_execs():
+    """Review RV17-02: xtrace prints every token on stderr, a header read back puts its token on
+    a command line, and `exec` replaces the shell before the helper's EXIT trap removes the header
+    files: no script that sources the helper does any of them."""
+    assert _helper_bypasses(E2E) == []
+
+
 def test_no_script_that_sources_the_helper_sets_or_clears_an_exit_trap():
     """token-headers.sh's EXIT trap removes the private directory and the header files in it; an
     EXIT trap a script sets after sourcing it replaces that one, and the files, each holding its
@@ -149,6 +256,10 @@ def test_no_script_that_sources_the_helper_sets_or_clears_an_exit_trap():
 
 
 SMOKE_ME = """me=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/me" || echo '{}')"""
+SMOKE_APPROVER_ME = """approver_me=$(curl -fsS -m 10 -H "$HA" "$BASE/api/v1/me" || echo '{}')"""
+SMOKE_SET = "set -u\nBASE=${BASE:-http://127.0.0.1:8080}\n"
+RBAC_SET = "set -u\nBASE=${BASE:-http://127.0.0.1:8080/api/v1}\n"
+RESTART_CHECK = """"$R/seamless/.venv/bin/python" - "$S/seamless-events.json" <<'EOF'"""
 SMOKE_H = 'H=$(token_header admin "$TOKEN") || exit 2\n'
 JOURNEY_HA = 'HA=$(token_header approver "$APPROVER_TOKEN")\n'
 
@@ -175,6 +286,16 @@ JOURNEY_HA = 'HA=$(token_header approver "$APPROVER_TOKEN")\n'
         ("smoke-demo.sh", SMOKE_H, SMOKE_H + "trap - EXIT\n"),
         (HELPER, "(umask 077 && printf ", "(umask 077 && /usr/bin/printf "),
         (HELPER, "(umask 077 && printf ", "(umask 077 && env printf "),
+        # review RV17-02: xtrace prints every token; a header read back onto curl's command line;
+        # exec replaces the shell, and the helper's EXIT trap never runs
+        ("rbac-live.sh", RBAC_SET, RBAC_SET.replace("set -u", "set -xu")),
+        ("smoke-demo.sh", SMOKE_SET, SMOKE_SET + '[ -z "${DEBUG:-}" ] || set -x\n'),
+        (
+            "smoke-demo.sh",
+            SMOKE_APPROVER_ME,
+            SMOKE_APPROVER_ME.replace('-H "$HA"', '-H "$(cat "${HA#@}")"'),
+        ),
+        ("demo-restart.sh", RESTART_CHECK, "exec " + RESTART_CHECK),
     ],
     ids=[
         "curl's --oauth2-bearer",
@@ -186,6 +307,10 @@ JOURNEY_HA = 'HA=$(token_header approver "$APPROVER_TOKEN")\n'
         "the helper's EXIT trap cleared",
         "the helper's printf an external one",
         "the helper's printf run through env",
+        "set -x",
+        "a DEBUG switch for set -x",
+        "a header file read back onto curl's command line",
+        "exec as the last command",
     ],
 )
 def test_the_s30_guards_catch_a_token_back_on_a_command_line_or_a_header_file_left_behind(
