@@ -1871,3 +1871,24 @@ def test_an_operator_may_resend_the_current_cutover_window_in_any_spelling(api):
     assert changed.status_code == 403
     malformed = api.client.patch(url, headers=api.h(Role.operator), json={"cutover_window": 5})
     assert malformed.status_code in (403, 422)
+
+
+def test_create_refuses_a_field_the_schema_does_not_have_like_patch(api):
+    """SDD §12: a misspelt field on POST /plans or POST /providers is refused with 422 naming
+    it, as PATCH refuses one - never dropped, which would store a plan without the guard it was
+    meant to carry or a provider verifying TLS it was told not to."""
+    plan = {
+        "name": "typo",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": ["vm-1"],
+        "requrie_approval": False,
+    }
+    refused = api.post("/api/v1/plans", Role.operator, json=plan)
+    assert refused.status_code == 422, refused.text
+    assert "requrie_approval" in refused.json()["error"]["message"]
+    assert api.get("/api/v1/plans").json() == []
+    refused = api.post("/api/v1/providers", json={**SOURCE, "id": "src-typo", "verify_tsl": False})
+    assert refused.status_code == 422, refused.text
+    assert "verify_tsl" in refused.json()["error"]["message"]
+    assert api.get("/api/v1/providers/src-typo").status_code == 404

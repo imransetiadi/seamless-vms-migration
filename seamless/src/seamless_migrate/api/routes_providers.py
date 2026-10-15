@@ -13,7 +13,14 @@ from fastapi import APIRouter, Body, Depends, Request, Response
 from pydantic import ValidationError
 
 from ..domain.enums import PlanStatus, ProviderKind, ProviderRole, Role
-from ..domain.models import ConversionHostConfig, Migration, Plan, Provider, utcnow
+from ..domain.models import (
+    ConversionHostConfig,
+    Migration,
+    Plan,
+    Provider,
+    ProviderCreate,
+    utcnow,
+)
 from ..events import emit
 from ..orchestrator import RELEASES_VM, cleanup_pending
 from ..security.auth import Principal
@@ -157,7 +164,9 @@ def _secret_names(provider: Provider) -> dict[str, str]:
 
 @router.post("/providers", response_model=Provider, status_code=201)
 async def create_provider(
-    body: Provider, request: Request, principal: Principal = Depends(require_role(Role.admin))
+    body: ProviderCreate,
+    request: Request,
+    principal: Principal = Depends(require_role(Role.admin)),
 ) -> Provider:
     svc = services(request)
     _check_secret_names(body, {"credentials_secret", "conversion_host"})

@@ -136,6 +136,13 @@ class Provider(_Model):
         return self
 
 
+class ProviderCreate(Provider):
+    """The ``POST /providers`` body (SDD §12): a field ``Provider`` does not have is refused
+    (422), never dropped; stored providers keep loading with later fields (``_Model``, §11)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 DiskKind = Literal["volume", "ephemeral", "image_root", "vmdk"]
 
 
@@ -372,7 +379,7 @@ PRESTAGE_RESOURCES = (
 
 
 class PlanSpec(_Model):
-    """Editable plan fields; this is the ``PlanCreate`` wire schema (SDD §12)."""
+    """Editable plan fields; ``PlanCreate``, the wire schema of SDD §12, refuses the rest."""
 
     name: str
     description: str | None = None
@@ -438,7 +445,13 @@ class PlanSpec(_Model):
         }
 
 
-PlanCreate = PlanSpec
+class PlanCreate(PlanSpec):
+    """The ``POST /plans`` body (SDD §12): a field ``PlanSpec`` does not have is refused (422),
+    never dropped — a misspelt guard would otherwise yield a plan without it; stored plans keep
+    loading with fields a later version added (``_Model``, §11)."""
+
+    model_config = ConfigDict(extra="forbid")
+
 
 #: SDD §12: what one probe list may hold, and the longest http(s) path
 MAX_PROBES_PER_VM = 10
