@@ -864,7 +864,7 @@ class OpenStackVolumeBase:
         tool is given udev's link of the serial, which resolves at its open to
         the volume itself; nbdkit resolves it once, at its start, so a swap
         after that is a known residual (Seamless Migrate SDD 6.6, review
-        RV12-03, RV13-01, RV13-02).
+        RV12-03, RV13-01, RV13-02, RV14-02).
         """
         name = device.rsplit("/", 1)[-1]
         try:
@@ -889,7 +889,11 @@ class OpenStackVolumeBase:
         link = "/dev/disk/by-id/virtio-" + serial
         found = self.shell.cmd_val(["test", "-b", link])
         if found == SSH_FAILED:
-            raise subprocess.CalledProcessError(SSH_FAILED, ["test", "-b", link])
+            # a give-up the control plane retries, as the serial read's own error is (RV14-02)
+            raise RuntimeError(
+                "SSH timeout: conversion host %s unreachable over SSH, checking the by-id link of %s"
+                % (getattr(self.shell, "address", "?"), device)
+            )
         if found != 0:
             self.log.warning("%s has no %s link: using it by its path", device, link)
             return device

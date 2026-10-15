@@ -397,9 +397,13 @@ This project follows a simple changelog to satisfy collection metadata validatio
   by-id link. The kernel gives a freed ``/dev/vdX`` path to the next disk
   attached, so a volume taken off the host could have the export serve
   another VM's disk, or the transfer write over one, without an error. A disk
-  with no serial file (not virtio-blk) is used by its path, unchecked. A
-  volume taken away after the export started is not caught: nbdkit resolves
-  the path it serves, the disk's by-id link included, once, at its start.
+  with no serial file (not virtio-blk) is used by its path, unchecked. ssh
+  failing at the check of the by-id link gives up with ``SSH timeout: ...``,
+  which Seamless Migrate retries, as it does ssh failing at the serial read:
+  the error quoted no ssh command line, so one blip there failed the
+  migration as permanent. A volume taken away after the export started is
+  not caught: nbdkit resolves the path it serves, the disk's by-id link
+  included, once, at its start.
 - A wait for a conversion host's attach or port lock gives up once ssh to the
   host has failed for 15 minutes without a break, with ``Lock timeout:
   conversion host ADDRESS unreachable over SSH for N s, waiting for LOCK``,

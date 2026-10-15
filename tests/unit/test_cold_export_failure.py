@@ -835,7 +835,7 @@ class SerialShell:
         (SerialShell(error=1), "/dev/sdb", "/dev/sdb"),  # not virtio-blk, no serial file
         (SerialShell(error=1), "/dev/vdb", RuntimeError),  # a vdX without its serial file is gone
         (SerialShell(error=255), "/dev/vdb", subprocess.CalledProcessError),  # ssh failed
-        (SerialShell("vol-data1", link=255), "/dev/vdb", subprocess.CalledProcessError),
+        (SerialShell("vol-data1", link=255), "/dev/vdb", RuntimeError),  # SSH timeout: retried
         (SerialShell("vol-c"), "/dev/vdb", RuntimeError),  # another volume's disk
     ],
     ids=[
@@ -1006,3 +1006,33 @@ def test_an_export_never_serves_the_path_its_gone_disk_left():
             a._export_volumes_from_converter()
 
     assert seen["read"], "A's export never read the serial of the shared volume's disk"
+
+
+@pytest.mark.parametrize("failing", ["the serial read", "the link check"])
+def test_ssh_failing_at_the_identity_check_is_retried(failing):
+    """Review RV14-02: ssh's 255 at the link check was raised as a CalledProcessError of
+    ["test", "-b", link] alone, which quotes no ssh command line - and so no ConnectTimeout, the
+    "timeout" that has the control plane retry the serial read's. One ssh blip there failed a cold
+    migration as permanent. It now gives up as the waits do, "SSH timeout: ..." (SDD 6.6)."""
+    export = object.__new__(export_module.OpenStackSourceVolume)
+    export.log = mock.Mock()
+    export.shell = volume_common.RemoteShell("10.0.0.10", "cloud-user", "/keys/k")
+
+    def check_output(args, **kwargs):
+        assert args[0] == "ssh", args
+        if failing == "the serial read":
+            raise subprocess.CalledProcessError(255, args)
+        return b"vol-data1"
+
+    def call(args, **kwargs):
+        assert args[0] == "ssh" and args[-3:-1] == ["test", "-b"], args
+        return 255
+
+    with mock.patch.object(volume_common.subprocess, "check_output", check_output), \
+            mock.patch.object(volume_common.subprocess, "call", call):
+        with pytest.raises(Exception) as raised:
+            export._identified_path("vol-data1", "/dev/vdb")
+
+    message = str(raised.value)
+    retried = message.split(":", 1)[0] in volume_common.GIVE_UP_PREFIXES or "ConnectTimeout" in message
+    assert retried, message
