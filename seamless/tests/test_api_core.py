@@ -663,6 +663,74 @@ def test_auth_lockout_after_repeated_failures(tmp_path):
     store2.dispose()
 
 
+def test_a_locked_out_client_costs_no_database_read(tmp_path, monkeypatch):
+    """Audit B-01 (SDD §13.1): once an address is locked out, a failed authentication is answered
+    429 before the database users are looked up - a flood costs no document read - while a valid
+    bootstrap token from the same address still passes; the users' digests are kept in memory and
+    read again only when the user kind's change stamp moved."""
+    settings, tokens = api_settings(tmp_path, auth_lockout_per_minute=2)
+    store = Store(f"sqlite:///{tmp_path / 'lock.db'}")
+    store.create_schema()
+    reads: list[str] = []
+    original_list, original_stamp = Store.list, Store.change_stamp
+
+    def counting_list(self, kind, *args, **kwargs):
+        if kind == "user":
+            reads.append("list")
+        return original_list(self, kind, *args, **kwargs)
+
+    def counting_stamp(self, kind):
+        if kind == "user":
+            reads.append("stamp")
+        return original_stamp(self, kind)
+
+    monkeypatch.setattr(Store, "list", counting_list)
+    monkeypatch.setattr(Store, "change_stamp", counting_stamp)
+    with TestClient(create_app(settings, store)) as client:
+        bad = {"Authorization": "Bearer smg_not_a_real_token"}
+        for _ in range(2):
+            assert client.get("/api/v1/me", headers=bad).status_code == 401
+        assert reads == ["stamp", "list", "stamp"], "the digests are kept while the stamp holds"
+        for _ in range(20):
+            assert client.get("/api/v1/me", headers=bad).status_code == 429
+        assert reads == ["stamp", "list", "stamp"], "a locked-out address never reaches the store"
+        good = {"Authorization": f"Bearer {tokens[Role.admin]}"}
+        assert client.get("/api/v1/me", headers=good).status_code == 200
+        assert reads == ["stamp", "list", "stamp"], "the bootstrap file answers without the store"
+        client.app.state.services._auth_failures.clear()
+        assert client.get("/api/v1/me", headers=bad).status_code == 401
+        assert reads == ["stamp", "list", "stamp", "stamp"]
+    store.dispose()
+
+
+def test_database_user_digests_are_read_again_after_their_max_age(tmp_path, monkeypatch):
+    """Audit B-01 (SDD §13.1): a deletion and a re-creation at the same version leave the change
+    stamp unchanged, so the kept digests are read again at the latest after their max age - a
+    rotated token then works and the replaced one does not."""
+    from seamless_migrate.api import deps
+    from seamless_migrate.security.auth import DashboardUser, generate_token, hash_token
+
+    settings, _ = api_settings(tmp_path)
+    store = Store(f"sqlite:///{tmp_path / 'users.db'}")
+    store.create_schema()
+    first, second = generate_token(), generate_token()
+
+    def alice(token: str) -> DashboardUser:
+        return DashboardUser(id="alice", name="alice", role=Role.viewer, sha256=hash_token(token))
+
+    def me(token: str) -> int:
+        return client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"}).status_code
+
+    with TestClient(create_app(settings, store)) as client:
+        store.create_user(alice(first), "admin-user")
+        assert me(first) == 200
+        store.delete("user", "alice")
+        store.create_user(alice(second), "admin-user")
+        monkeypatch.setattr(deps, "USER_DIGESTS_MAX_AGE_S", 0.0)
+        assert (me(second), me(first)) == (200, 401)
+    store.dispose()
+
+
 def test_security_headers_and_api_docs_exposure(tmp_path):
     # demo: docs are public; headers on API and SPA responses alike
     dist = tmp_path / "dist"
