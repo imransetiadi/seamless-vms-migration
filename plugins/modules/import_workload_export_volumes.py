@@ -182,7 +182,9 @@ volume_map:
       as it is claimed - so the role's rescue (import_workload_src_cleanup)
       puts back what it took - its NBD exports and ports, detached data
       volumes, attachments to the conversion host, the root copy, its
-      snapshot or image (Seamless Migrate SDD 6.6).
+      snapshot or image (Seamless Migrate SDD 6.6). Its entries lack C(name),
+      which the cleanup never reads, as Ansible prints a failed result and a
+      volume or VM name in it would steer how the failure is classified.
   returned: always
   type: dict
   sample:
@@ -390,7 +392,14 @@ def run_module():
             msg=str(err),
             exception=traceback.format_exc(),
             transfer_uuid=source_host.transfer_uuid,
-            volume_map=source_host.volume_map,
+            # without the names, which the rescue never reads: Ansible prints this
+            # result on the task's line, and a tenant's volume or VM name holding
+            # "timeout" would make the failure transient (Seamless Migrate SDD 6.6,
+            # 7.2, review RV8-05)
+            volume_map={
+                path: {key: value for key, value in mapping.items() if key != "name"}
+                for path, mapping in source_host.volume_map.items()
+            },
         )
 
     result["transfer_uuid"] = source_host.transfer_uuid

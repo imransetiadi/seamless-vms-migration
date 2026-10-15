@@ -346,7 +346,9 @@ This project follows a simple changelog to satisfy collection metadata validatio
   data volumes first and tries every step: a root copy Cinder will not
   delete no longer keeps the data volumes off the source VM, and the cleanup
   fails at the end with ``Source cleanup incomplete: ...`` naming each step
-  it could not do.
+  it could not do. The failure's map carries no volume or VM names, which the
+  cleanup never reads: Ansible prints the failed result, and Seamless Migrate
+  retried a stuck detach of a volume whose name held "timeout".
 - A wait for a conversion host's attach or port lock gives up once ssh to the
   host has failed for 15 minutes without a break, with ``Lock timeout:
   conversion host ADDRESS unreachable over SSH for N s, waiting for LOCK``,

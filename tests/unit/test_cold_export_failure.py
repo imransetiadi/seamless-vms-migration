@@ -8,6 +8,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import json
+import re
 import subprocess
 from unittest import mock
 
@@ -487,3 +488,38 @@ def test_a_root_copy_the_cleanup_cannot_delete_never_keeps_a_data_volume_off_the
         assert root["snap_id"] in message and root["snap_id"] in src.snapshots, message
     else:  # tried too: Glance removes the image all the same
         assert root["image_id"] not in src.images and root["image_id"] not in message, message
+
+
+def _printed(result):
+    """A failed module's result as Ansible's default callback prints it on the task's line, below
+    -vvv: without its module arguments (invocation) and its traceback (exception)."""
+    return json.dumps({key: value for key, value in result.items()
+                       if key not in ("invocation", "exception", "_exit_code", "_connected")})
+
+
+@pytest.mark.parametrize("vm", ["volume-booted", "image-booted"])
+def test_a_failed_exports_result_names_no_volume_and_no_vm(vm):
+    """Review RV8-05: Ansible prints a failed module's result on the task's line, and Seamless
+    Migrate classifies a failure by that output, "timeout" making it transient (its SDD 7.2). The
+    export failed with its whole volume map, so a data volume named "db-timeout-archive" - or an
+    image-booted VM's name, in its copy's - made a stuck detach, meant to be permanent, be retried.
+    The failure's map leaves out the names, which the rescue never reads, and the rescue still puts
+    every disk back (Seamless Migrate SDD 6.6)."""
+    src, data = _image_booted_vm() if vm == "image-booted" else _boot_from_volume_vm()
+    src.servers["srv-1"].name = "app-timeout"
+    src.volumes["vol-data1"].name = "db-timeout-archive"
+    volumes = set(src.volumes)
+    # the detach never ends: Cinder keeps the source VM's attachment
+    src.detach_volume = lambda server, volume, wait=True, timeout=None: None
+    host = SourceHost(src)
+
+    exported, cleaned = _export_then_rescue(src, host, data)
+
+    assert exported.get("failed"), exported
+    assert exported["msg"] == "Timed out after 3 s waiting to detach volume vol-data1 from server srv-1"
+    assert not re.search(r"(?i)timeout|app-|db-|vm1-", _printed(exported)), _printed(exported)
+    assert all("name" not in mapping for mapping in exported["volume_map"].values())
+    assert cleaned is not None and cleaned["_exit_code"] in (None, 0), cleaned
+    assert (set(src.volumes), src.snapshots, src.images) == (volumes, {}, {})
+    for volume_id in volumes:
+        assert _holders(src, volume_id) == ["srv-1"], volume_id
