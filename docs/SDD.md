@@ -4,7 +4,7 @@
 |---|---|
 | Product | Seamless Migrate (`seamless`) |
 | Version | 0.1.0 (design baseline) |
-| Status | Approved for implementation — binding spec for all tracks |
+| Status | Approved for implementation — binding spec for all tracks; amended 2026-10-16: destination platforms (§21) |
 | Date | 2026-10-08 |
 | Related | [PRD.md](PRD.md) · [MEMORY.md](MEMORY.md) · [QASuite.md](QASuite.md) · [Security.md](Security.md) · [Performance.md](Performance.md) · [Implementation plan](superpowers/plans/2026-10-08-seamless-rhoso-migration.md) |
 
@@ -17,7 +17,8 @@ are referenced from the plan (`SDD §n`).
 ## 1. Context and scope
 
 Seamless Migrate migrates virtual machines into **Red Hat OpenStack Services on OpenShift
-(RHOSO) 18.0** from three source families:
+(RHOSO) 18.0** — and, from 0.2.0, into **community OpenStack** of a release series in the support window,
+2023.1 Antelope to 2026.2 Hibiscus (§21) — from three source families:
 
 1. **Red Hat OpenStack Platform 17.1** (TripleO-based, "legacy").
 2. **Community OpenStack** (any release exposing Keystone v3, Nova ≥ 2.60, Cinder v3, Neutron v2).
@@ -41,6 +42,10 @@ Non-goals for 0.1.0: in-place adoption of a 17.1 control plane into RHOSO (Red H
 procedure covers that), live migration with zero downtime across clouds, Hyper-V/Nutanix sources,
 and migrating Heat stacks/Octavia load balancers (they are exported as findings, see §9.3).
 
+Naming: where a rule about the destination says "RHOSO" (a RHOSO network, flavor, volume type, credential), it
+means the destination cloud, RHOSO 18.0 or a community OpenStack destination (§21); a rule that holds for the Red Hat
+product alone says "RHOSO 18.0". User-facing texts name the destination provider instead (§21.8, PRD FR-34).
+
 ### 1.1 Why parallel (side-by-side) migration and not adoption
 
 RHOSO adoption converts an existing 17.1 deployment in place. Customers choose side-by-side
@@ -58,6 +63,15 @@ from VMware. Seamless serves those cases and is designed to coexist with adoptio
 | Cinder supports `manage`/`unmanage`; RBD driver supports manage-existing by image name. | Enables the storage-handover strategy on shared Ceph (§7.3). |
 | The NetApp ONTAP Cinder drivers (RHOSP 17.1 and RHOSO 18.0; NFS, iSCSI, FC) support manage-existing by share path (NFS) or LUN path (block) and rename the object to the new volume's name; their snapshots and volumes-from-snapshot are FlexClone clones. | Storage handover on a shared ONTAP SVM (§7.3.1). Cold and warm work unchanged on ONTAP; the warm path's snapshot clones need the FlexClone license. |
 
+### 1.3 Community OpenStack destination facts the design relies on
+
+| Fact | Design consequence |
+|---|---|
+| Upstream releases a series every six months; each moves through Maintained, Unmaintained and End of Life; every other series is SLURP (releases.openstack.org, read 2026-10-16). | Support tiers tied to that lifecycle, from a 2023.1 Antelope floor to 2026.2 Hibiscus; the window moves with each upstream release (§21.1, §21.2). |
+| Compute's maximum microversion is 2.95 in 2023.1 and 2023.2, 2.96 in 2024.1 and 2024.2, 2.100 in 2025.1 and 2025.2, 2.103 in 2026.1 and 2.104 in 2026.2 (Nova's API microversion history). | Every series of the window has what Seamless calls for (2.60; 2.85 for storage handover); the maximum detects the series range (§21.3). |
+| From 2023.2 oslo.policy defaults to the secure-RBAC rules (new defaults and scope); scope is always enforced from 2024.1; Neutron's `advsvc` is deprecated for the `service` role. | Permission checks follow the destination's policy profile (§21.5). |
+| Networking is ML2/OVN or ML2/OVS; TLS, the deployment tool (Kolla-Ansible, OpenStack-Ansible, DevStack) and the guest images are the operator's choice. | The MTU checks apply as on RHOSO 18.0; `verify_tls` stays on; conversion host images are part of the support statement (§21.6, §21.7). |
+
 ---
 
 ## 2. Architecture overview
@@ -73,7 +87,7 @@ from VMware. Seamless serves those cases and is designed to coexist with adoptio
                          │                         preflight, waves                                                    │
                          └──────────────────────────────────────────────────────────────────────────────────────────────┘
                                          │ OpenStack APIs / vCenter API (inventory, checks, verification)
-        ┌──────── Source cloud (RHOSP 17.1 / community) ────────┐          ┌──────── RHOSO 18.0 ────────┐
+        ┌──────── Source cloud (RHOSP 17.1 / community) ────────┐          ┌── RHOSO 18.0 / community ──┐
         │  VM ─ volumes ─► snapshot ─► tmp volume ─► src conv host│──SSH───►│ dst conv host ─► dst volumes│──► new VM
         │                               (blocksync send)          │ frames  │ (blocksync receive)        │
         └─────────────────────────────────────────────────────────┘          └────────────────────────────┘
@@ -97,8 +111,8 @@ Responsibilities:
 |---|---|---|---|---|
 | `cold` | OpenStack | os-migrate `import_workloads` (stop → snapshot/detach → NBD over SSH → create) | full copy of used data | conversion hosts in both clouds |
 | `warm` | OpenStack | N snapshot pre-copy passes while running, then stop + final `blocksync` delta pass (§6) | final delta + device scan | conversion hosts in both clouds; no multi-attach volumes |
-| `storage_handover` | OpenStack on shared Ceph or NetApp ONTAP (NFS, iSCSI, FC) | stop → Cinder `os-unmanage` at source → `manage` at RHOSO → boot (§7.3) | metadata operations (~minutes) | admin on both clouds; every volume type mapped to a RHOSO backend of the same driver family that sees the same pool (Ceph pool, ONTAP export or FlexVol, §7.3.1); all disks are Cinder volumes |
-| `vmware_cold` | VMware | vmware-migration-kit full copy + virt-v2v conversion | full copy + conversion | RHOSO conversion host with VDDK |
+| `storage_handover` | OpenStack on shared Ceph or NetApp ONTAP (NFS, iSCSI, FC) | stop → Cinder `os-unmanage` at source → `manage` at the destination → boot (§7.3) | metadata operations (~minutes) | admin on both clouds; every volume type mapped to a RHOSO backend of the same driver family that sees the same pool (Ceph pool, ONTAP export or FlexVol, §7.3.1); all disks are Cinder volumes |
+| `vmware_cold` | VMware | vmware-migration-kit full copy + virt-v2v conversion | full copy + conversion | destination conversion host with VDDK |
 | `vmware_warm` | VMware | vmware-migration-kit `cbt_sync` passes then `cutover` | final CBT delta + in-place conversion | CBT enabled; no independent disks |
 
 Strategy enum (wire format, lower-case): `cold | warm | storage_handover | vmware_cold | vmware_warm`.
@@ -1858,7 +1872,9 @@ credential sees, by network name and by the id of the network they belong to: wh
 §9.3; `id` is what a VMware NIC's `network_map` value names, §7.2)}`. `networks` keeps the name→MTU view; with two networks of one name its MTU is one of theirs.
 
 Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking calls wrapped with
-`asyncio.to_thread`; used for kinds `openstack` and `rhoso`; `check()` reports `{"admin": bool,
+`asyncio.to_thread`; used for kinds `openstack` and `rhoso`, as a source and as a destination - a community
+OpenStack destination (kind `openstack`, distribution `openstack_community` or `kolla`) takes the same code path as
+RHOSO 18.0, §21; `check()` reports `{"admin": bool,
 "roles": [the role names of the credential's token, sorted], "compute_microversion": str, "ovn": bool,
 "volume_backends": [pool names], "storage_backends": [{"pool": str, "vendor": str|null, "protocol": str|null,
 "family": "rbd"|"netapp_nfs"|"netapp_block"|"other"}]}`, both lists empty without admin (`roles` is what
@@ -3211,3 +3227,140 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D10 | The commit trailer's model name (CLAUDE.md §2.7) | fixed `Claude Opus 5.5` | owner decision (audit F-13) |
 | D11 | Product documents in the collection artifact (the SDD, PRD, QASuite, Security and Performance documents are packed; audit material and agent plans are not) | packed | owner decision (audit D-21) |
 | D12 | The `TODO(…): confirm` markers of this document — LAB, ADV-04, ADV-06, ADV-17, ADV-18, ADV-19 — each a default taken without the owner's word | the defaults as written | each is an owner decision; remove the marker when decided (audit D-20) |
+| D13 | Destination platforms: RHOSO 18.0 and community OpenStack | decided by the owner 2026-10-16: the window 2023.1 Antelope – 2026.2 Hibiscus with the tiers of §21.1 (Jev 0.93), the series detected from the version documents plus an optional declared one (§21.3, Jev 0.77) | each upstream release and end of life (§21.2) |
+| D14 | The policy profile RHOSO 18.0 ships: the legacy rules or the secure-RBAC defaults (§21.5) | judged as today: `admin` or `advsvc` for a port on another project's network | the lab run on RHOSO 18.0 (`TODO(LAB): confirm`) |
+| D15 | Conversion host images on community clouds beyond CentOS Stream 9 and RHEL 9: the RHEL family by `ansible_os_family` (Rocky Linux, AlmaLinux, CentOS Stream 10), then Ubuntu 24.04 LTS (§21.6) | CentOS Stream 9 and RHEL 9 only | 0.2.0 (plan task T7) |
+
+## 21. Destination platforms: RHOSO 18.0 and community OpenStack
+
+Status: the owner's goal of 2026-10-16 (D13). §21.1, §21.2 and §21.7 state the policy and what the code does today;
+§21.3–§21.6 and §21.8 are **planned for 0.2.0**. Each planned item becomes binding in §4, §6, §9.3, §10 or §16 in the
+commit that implements it, with its tests (plan `superpowers/plans/2026-10-16-community-openstack-destinations.md`).
+Until then a community OpenStack destination works but is not validated. The API accepts a destination provider of
+kind `openstack`, the dashboard offers the OpenStack Community and Kolla-Ansible presets for the destination role, and
+`OpenStackProvider` serves it on the same code path as RHOSO 18.0 (§10).
+
+### 21.1 Support window and tiers
+
+Upstream phases as releases.openstack.org shows them on 2026-10-16:
+
+| Destination | Upstream phase | SLURP | Tier | What a Seamless release does for it |
+|---|---|---|---|---|
+| RHOSO 18.0 (2023.1 based) | Red Hat's lifecycle | — | **Validated** | the lab matrix M1–M6 (QASuite §7.1) |
+| 2026.2 Hibiscus | Maintained (GA 2026-09-30) | | **Tier 1** | the lab matrix M7–M11 before the release |
+| 2026.1 Gazpacho | Maintained | yes | **Tier 1** | same |
+| 2025.2 Flamingo | Maintained | | **Tier 1** | same |
+| 2025.1 Epoxy | Maintained (Unmaintained estimated 2026-10-02) | yes | **Tier 1** | same; Tier 2 once upstream marks it Unmaintained |
+| 2024.1 Caracal | Unmaintained | yes | **Tier 2** | the compatibility run M12 (a smoke subset) |
+| 2023.1 Antelope | Unmaintained | yes | **Tier 2** | same; the API base RHOSO 18.0 already validates |
+| 2024.2 Dalmatian | End of Life (2026-04-29) | | **Tier 3** | the capability checks only; the pre-flight warns |
+| 2023.2 Bobcat | End of Life (2025-04-30) | | **Tier 3** | same |
+| Zed, Yoga and older; a series newer than 2026.2 (2027.1 Indri is in development) | Unmaintained, End of Life, unreleased | | **Outside** | the capability checks only; the pre-flight warns that no Seamless release validated it |
+
+* Behaviour follows capabilities (§21.4), never the series name: a missing capability blocks whatever the tier, and the
+  tier decides only what was validated and what the pre-flight warns.
+* The floor is 2023.1 Antelope: the oldest SLURP series not at its end of life, and the API surface RHOSO 18.0 already
+  validates. Tier 1 is what upstream maintains; Tier 2 an Unmaintained SLURP series of the window; Tier 3 an End of Life
+  series of the window.
+* A vendor build of a community series (other than RHOSO 18.0) counts as the series it ships; none is certified.
+
+### 21.2 How the window moves
+
+* A new upstream series is "Outside (newer)" until the lab matrix passes on it; it then joins Tier 1 within one Seamless
+  minor release of its GA (next: 2027.1 Indri, estimated 2027-03-24).
+* When upstream marks a series Unmaintained it moves to Tier 2 if it is SLURP, else to Tier 3; at its End of Life to
+  Tier 3; the floor follows the oldest SLURP series not at its end of life.
+* §21.1's table and the code's series table (planned `planning/platforms.py`) change in the same commit, each with the
+  date they were read.
+
+### 21.3 Release detection (planned, 0.2.0)
+
+* The provider check reads the services' version documents: compute's maximum microversion (as `compute_microversion`
+  today), block storage's, and Neutron's extension list.
+* Compute maxima by series (Nova's API microversion history): 2.95 is 2023.1 or 2023.2; 2.96 is 2024.1 or 2024.2; 2.100
+  is 2025.1 or 2025.2; 2.103 is 2026.1; 2.104 is 2026.2. A maximum between two of them reads as the range around it, one
+  above 2.104 as "Outside (newer)". Block storage's maximum is 3.70 in 2023.1 and 2023.2 and 3.71 in 2024.1 and 2024.2
+  (Cinder's history); later series `TODO(LAB): confirm`. It may narrow the range, never widen it.
+* A declared series (planned optional `Provider.release`, e.g. `2026.2`) inside the detected range decides the tier; one
+  outside it warns, and the range decides. With none declared, the tier is the least favourable one the range allows: a
+  2.96 cloud is 2024.1 (Tier 2) or 2024.2 (Tier 3), so Tier 3, until its operator declares the series.
+* The check reports `release_range`, `release` and `support_tier` (planned keys of the `check()` report, §10).
+
+### 21.4 Capability floor per strategy (planned pre-flight, 0.2.0)
+
+| Capability | Needed by | Floor | Checked by |
+|---|---|---|---|
+| Keystone v3, a project-scoped token | every strategy | — | the provider check (authentication) |
+| Compute API | every strategy | 2.60 (multi-attach); openstacksdk caps its calls (§21.7) | `compute_microversion` |
+| Compute 2.85 (`delete_on_termination` update) | `storage_handover` (§7.3 step 0) | 2.85 | the handover's step 0 (the source today; the destination, planned) |
+| Block Storage v3 | every strategy | 3.0 | the provider check |
+| Cinder manage and a mapped backend of the same driver family (§7.3.1) | `storage_handover` | the `admin` role | `storage_backends` (today) |
+| Glance v2 | an image-booted VM | — | the provider check |
+| Neutron ports with fixed IPs, MAC and port security | every strategy (§6.6) | — | Neutron's extensions (planned) |
+| A conversion host image the roles support (§21.6) | `cold`, `warm`, `vmware_cold`, `vmware_warm` | — | pre-staging |
+| VDDK on the destination conversion host | `vmware_cold`, `vmware_warm` | — | the vmware-migration-kit |
+
+Planned findings (§9.3 when implemented): `DST_CAPABILITY_MISSING` (blocker; it names the capability and the strategy
+that needs it) and `DST_RELEASE_OUTSIDE_SUPPORT` (warning: a Tier 3 or Outside destination, with the reason: End of
+Life upstream, below the floor, newer than validated, or not detected).
+
+### 21.5 Policy profiles and roles
+
+* Upstream: from 2023.2 oslo.policy defaults to `enforce_new_defaults` and `enforce_scope`; from 2024.1 scope is always
+  enforced, and 2025.2 removes the flag. The personas are `reader`, `member`, `manager` (project manager) and `admin`,
+  plus `service` for service-to-service calls. A deprecated rule alias applies only while an operator turns the new
+  defaults off.
+* Two profiles: **secure-RBAC** (the new defaults: every community series of the window, by default) and **legacy**
+  (an operator turned the new defaults off). RHOSO 18.0's profile is D14 (`TODO(LAB): confirm`).
+* Neutron under the new defaults: `create_port`, `create_port:mac_address` and `create_port:fixed_ips:ip_address` take
+  `admin`, `service`, or `member` of the network's project; a shared network takes `create_port` and fixed IPs by subnet
+  from any member. `advsvc` counts only under the legacy profile. Nova's `network:attach_external_network` stays
+  `admin`.
+* The destination credential (project-scoped) needs: `member` for `cold` and `warm` in its own project; `admin` for
+  pre-staging flavors, for `storage_handover` (volume manage) and for an external network that is not shared; `service`
+  or `admin` for a port with a fixed IP or MAC on another project's network. `manager` is never required.
+* Planned: the check reports `policy_profile` (declared, else secure-RBAC for a community series from 2023.2), and
+  `NET_PORT_NOT_PERMITTED` judges `service` under the secure-RBAC profile and `advsvc` only under the legacy one (§6.6,
+  §9.3 when implemented).
+
+### 21.6 Conversion hosts on community clouds
+
+* Today `conversion_host_content` installs the copy tools only when `ansible_distribution` is CentOS or RedHat: a
+  community cloud's conversion host image is CentOS Stream 9 (no subscription) or RHEL 9.
+* Planned (D15): the RHEL family by `ansible_os_family` (Rocky Linux 9, AlmaLinux 9, CentOS Stream 10), then Ubuntu
+  24.04 LTS (apt: `qemu-utils`, `nbdkit`, `libnbd-bin` for nbdcopy, `libguestfs-tools`). Every image keeps Python 3.6 or
+  later for blocksync (§6.2, D7).
+* VMware sources need VDDK on the destination conversion host, as on RHOSO 18.0.
+
+### 21.7 API changes the design absorbs (today)
+
+* openstacksdk sends at most its own per-resource microversion, negotiated down to each cloud's maximum
+  (openstacksdk 4.21: servers 2.100, flavors 2.61, volume attachments 2.89, block storage 3.71). Compute 2.101 (a volume
+  attach answers 202), 2.102 (flavors lose `rxtx_factor` and `OS-FLV-DISABLED:disabled`) and 2.103 (`/os-volumes_boot`
+  is gone) never reach Seamless's calls, and an older cloud gets its own maximum.
+* Raising the openstacksdk pin (the root `requirements.txt`, `aee/`, the image) re-checks those caps against the window:
+  the planned contract suite replays recorded version documents of every series (QASuite S-DST).
+* Networking is ML2/OVN or ML2/OVS, as the operator chose: the MTU checks (§9.3) apply as on RHOSO 18.0, no OVS- or
+  OVN-specific binding is copied, and `ovn` in the check report is informational.
+* TLS is the operator's choice on a community cloud: `verify_tls` stays on by default, with a CA bundle per provider
+  (§4.2). Planned: the check reports a plain-HTTP endpoint (Security.md).
+
+### 21.8 Planned contract changes (0.2.0; not binding until implemented)
+
+| Item | Becomes binding in | Plan task |
+|---|---|---|
+| the series table, detection and tiers (§21.1–§21.3) | §10, a new `planning/platforms.py` | T1 |
+| `Provider.release: str|null`, the declared series | §4.2, §12, §16 | T2 |
+| `check()` keys `release_range`, `release`, `support_tier`, `policy_profile`, `tls` | §10 | T3 |
+| findings `DST_CAPABILITY_MISSING` (blocker), `DST_RELEASE_OUTSIDE_SUPPORT` (warning) | §9.3 | T4 |
+| `NET_PORT_NOT_PERMITTED` by the policy profile (§21.5) | §6.6, §9.3 | T5 |
+| destination-neutral texts: findings, events, the CLI and the dashboard name the destination provider | §9.3, §16 | T6 |
+| conversion host images (§21.6) | §6.5, Performance.md | T7 |
+| the provider page shows series, tier and profile; the provider form takes the declared series | §16 | T8 |
+| the demo: a community destination (2026.2 Hibiscus, Kolla-Ansible preset) beside `rhoso18` | §10, §7.4 | T9 |
+| the lab matrix M7–M12 and the LAB-D cases | QASuite §6.7, §7 | T10 |
+
+### 21.9 Validation
+
+QASuite §6.7 (AC-6, journey 6 of the PRD), §7.1 (matrices M7–M12), §7.2 (LAB-D01…LAB-D08), and the planned contract
+suite S-DST: recorded version documents per series, the detection and tier table, the policy-profile cases.
