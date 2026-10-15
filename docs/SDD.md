@@ -678,7 +678,10 @@ in-order read-ahead hashing threads on each side (hashlib releases the GIL).
 ### 6.3 Warm state file
 
 `{os_migrate_data_dir}/workload_warm/{source_server_id}.json`, written atomically (temp + rename),
-mode 0600, owned by module_utils `warm_migration.WarmState`:
+mode 0600, owned by module_utils `warm_migration.WarmState`. The temporary file is synced before the rename and the
+directory after it, so the rename outlives a crash - a rollback reads here what to delete - as the control plane's
+workload record is (§7, review RV4-07); a filesystem that cannot sync a directory (some network or FUSE mounts) still
+gets the file:
 
 ```json
 { "server_id": "…", "server_name": "…", "transfer_uuid": "…",
