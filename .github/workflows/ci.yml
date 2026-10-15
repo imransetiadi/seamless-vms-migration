@@ -51,7 +51,9 @@ jobs:
         run: |
           # setuptools is upgraded too: the runner's default copy carries PYSEC-2026-3447 (S-18)
           python -m pip install --upgrade pip "setuptools>=83"
-          python -m pip install -e ".[dev,jev,openstack,vmware]" pytest-cov pip-audit
+          # ansible-core: tests/test_failure_classification.py runs the collection's real export module in a
+          # subprocess (review RV8-05); the same line the collection job and the image pin
+          python -m pip install -e ".[dev,jev,openstack,vmware]" "ansible-core>=2.16,<2.19" pytest-cov pip-audit
       - name: Lint (ruff)
         run: ruff check src tests && ruff format --check src tests
       - name: Unit and integration tests with the coverage gate (NFR-11)
