@@ -1,6 +1,7 @@
 import { LoaderCircle, type LucideIcon } from 'lucide-react';
-import { forwardRef, useEffect, useId, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type KeyboardEvent, type MouseEvent } from 'react';
+import { forwardRef, useId, type ButtonHTMLAttributes, type KeyboardEvent, type MouseEvent } from 'react';
 import { buttonClassName, type ButtonSize, type ButtonVariant } from '../lib/buttonStyles';
+import { useAnchoredNote } from '../lib/useAnchoredNote';
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant;
@@ -40,37 +41,12 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
 ) {
   const reasonId = useId();
   const softDisabled = Boolean(disabledReason);
-  // where the note about an unavailable action shows, under the button (viewport coordinates)
-  const [note, setNote] = useState<{ top: number; left: number } | null>(null);
-  const noteRef = useRef<HTMLSpanElement>(null);
-  const noteAnchorTop = useRef(0);
-  useLayoutEffect(() => {
-    if (!note || !noteRef.current) return;
-    const box = noteRef.current.getBoundingClientRect();
-    const top = Math.max(8, box.bottom > window.innerHeight - 8 ? noteAnchorTop.current - box.height - 6 : note.top);
-    const left = Math.max(8, Math.min(note.left, window.innerWidth - box.width - 8));
-    if (top !== note.top || left !== note.left) setNote({ top, left });
-  }, [note]);
-  useEffect(() => {
-    if (!note) return;
-    const hide = (event?: Event) => { if (event?.target !== noteRef.current) setNote(null); };
-    const timer = window.setTimeout(hide, 4000);
-    window.addEventListener('scroll', hide, true);
-    window.addEventListener('resize', hide);
-    return () => {
-      window.clearTimeout(timer);
-      window.removeEventListener('scroll', hide, true);
-      window.removeEventListener('resize', hide);
-    };
-  }, [note]);
+  // the note about an unavailable action, under the button for a few seconds (lib/useAnchoredNote)
+  const note = useAnchoredNote(4000);
   const handleClick = (event: MouseEvent<HTMLButtonElement>) => {
     if (softDisabled || loading) {
       event.preventDefault();
-      if (softDisabled) {
-        const rect = event.currentTarget.getBoundingClientRect();
-        noteAnchorTop.current = rect.top;
-        setNote({ top: rect.bottom + 6, left: Math.max(8, Math.min(rect.left, window.innerWidth - 296)) });
-      }
+      if (softDisabled) note.show(event.currentTarget);
       return;
     }
     onClick?.(event);
@@ -88,14 +64,14 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
         title={softDisabled ? (disabledReason ?? undefined) : title}
         onClick={handleClick}
         onBlur={(event) => {
-          setNote(null);
+          note.hide();
           onBlur?.(event);
         }}
         onKeyDown={(event: KeyboardEvent<HTMLButtonElement>) => {
           // Escape dismisses a shown note only: the dialog around it stays (WCAG 1.4.13, SDD §16)
-          if (event.key === 'Escape' && note) {
+          if (event.key === 'Escape' && note.at) {
             event.stopPropagation();
-            setNote(null);
+            note.hide();
           }
           onKeyDown?.(event);
         }}
@@ -111,13 +87,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
         {children}
       </button>
       {softDisabled && (
-        <span
-          ref={noteRef}
-          id={reasonId}
-          role={note ? 'note' : undefined}
-          className={note ? 'disabled-reason' : 'sr-only'}
-          style={note ? { top: note.top, left: note.left } : undefined}
-        >
+        <span ref={note.noteRef} id={reasonId} role={note.at ? 'note' : undefined} className={note.at ? 'anchored-note' : 'sr-only'} style={note.at ?? undefined}>
           {disabledReason}
         </span>
       )}

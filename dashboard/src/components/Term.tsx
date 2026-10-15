@@ -1,6 +1,7 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { cn } from '../lib/cn';
+import { useAnchoredNote } from '../lib/useAnchoredNote';
 
 /**
  * A term with its one-sentence definition, shown on hover and focus (WCAG 1.4.13: the pointer may move
@@ -12,8 +13,8 @@ export function Term({ children, definition, className }: { children: ReactNode;
   const id = useId();
   const ref = useRef<HTMLButtonElement>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const tooltipRef = useRef<HTMLSpanElement>(null);
-  const [at, setAt] = useState<{ top: number; left: number } | null>(null);
+  // under the term, kept inside the viewport (lib/useAnchoredNote)
+  const note = useAnchoredNote();
 
   const cancel = () => {
     if (timer.current) clearTimeout(timer.current);
@@ -21,38 +22,18 @@ export function Term({ children, definition, className }: { children: ReactNode;
   };
   const show = () => {
     cancel();
-    const rect = ref.current?.getBoundingClientRect();
-    if (rect) setAt({ top: rect.bottom + 6, left: Math.max(8, Math.min(rect.left, window.innerWidth - 296)) });
+    if (ref.current) note.show(ref.current);
   };
-  useLayoutEffect(() => {
-    if (!at || !tooltipRef.current) return;
-    const box = tooltipRef.current.getBoundingClientRect();
-    const top = Math.max(8, box.bottom > window.innerHeight - 8 ? (ref.current?.getBoundingClientRect().top ?? at.top) - box.height - 6 : at.top);
-    const left = Math.max(8, Math.min(at.left, window.innerWidth - box.width - 8));
-    if (top !== at.top || left !== at.left) setAt({ top, left });
-  }, [at]);
   const hide = () => {
     cancel();
-    setAt(null);
+    note.hide();
   };
   // leaving the term for the definition must not close it
   const hideSoon = () => {
     cancel();
-    timer.current = setTimeout(() => setAt(null), 150);
+    timer.current = setTimeout(() => note.hide(), 150);
   };
   useEffect(() => cancel, []);
-  useEffect(() => {
-    if (!at) return;
-    const dismiss = (event: Event) => {
-      if (event.target !== tooltipRef.current) setAt(null);
-    };
-    window.addEventListener('scroll', dismiss, true);
-    window.addEventListener('resize', dismiss);
-    return () => {
-      window.removeEventListener('scroll', dismiss, true);
-      window.removeEventListener('resize', dismiss);
-    };
-  }, [at]);
 
   return (
     <>
@@ -68,7 +49,7 @@ export function Term({ children, definition, className }: { children: ReactNode;
         onBlur={hide}
         onKeyDown={(event) => {
           // Escape dismisses a shown definition only: the dialog around it stays (WCAG 1.4.13, SDD §16)
-          if (event.key === 'Escape' && at) {
+          if (event.key === 'Escape' && note.at) {
             event.stopPropagation();
             hide();
           }
@@ -78,7 +59,7 @@ export function Term({ children, definition, className }: { children: ReactNode;
         {children}
       </button>
       {createPortal(
-        <span ref={tooltipRef} role="tooltip" id={id} hidden={!at} onMouseEnter={cancel} onMouseLeave={hide} className="tooltip-note" style={at ?? undefined}>
+        <span ref={note.noteRef} role="tooltip" id={id} hidden={!note.at} onMouseEnter={cancel} onMouseLeave={hide} className="anchored-note" style={note.at ?? undefined}>
           {definition}
         </span>,
         document.body,
