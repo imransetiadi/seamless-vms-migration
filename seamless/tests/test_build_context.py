@@ -544,7 +544,12 @@ def test_tree_gitleaks_config_skips_only_the_git_ignored_secret_files():
     paths = [re.compile(p) for p in config["allowlist"]["paths"]]
     reported = [path for path in SECRET_PATHS if not any(rx.search(path) for rx in paths)]
     assert reported == [], f"working-tree scans would report local secret files: {reported}"
-    samples = [*SECRET_PATHS, "seamless/tests/__pycache__/test_memory.cpython-313.pyc"]
+    samples = [
+        *SECRET_PATHS,
+        "seamless/tests/__pycache__/test_memory.cpython-313.pyc",
+        "seamless/.pytest_cache/v/cache/nodeids",  # test ids of the redaction tests (audit F-05)
+        ".worktrees/track-b/deploy/compose/.env",  # a worktree is a whole checkout
+    ]
     stray = [rx.pattern for rx in paths if not any(rx.search(path) for path in samples)]
     assert stray == [], f"patterns that match no kind of secret file: {stray}"
     for code in (

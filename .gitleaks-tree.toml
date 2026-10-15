@@ -21,4 +21,8 @@ paths = [
   '(^|/)tests/(.*/)?auth_[^/]*\.yml$',
   '(^|/)\.claude/settings\.local\.json$',
   '(^|/)seamless/data/',
+  # pytest caches hold the node ids of the redaction tests, synthetic PEM text included; a worktree is
+  # a whole checkout whose own secret files match the patterns above (audit F-05)
+  '(^|/)\.pytest_cache/',
+  '(^|/)\.worktrees/',
 ]
