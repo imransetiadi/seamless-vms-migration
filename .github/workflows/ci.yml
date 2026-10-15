@@ -224,6 +224,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_VERSION: "8.30.1" # the pre-commit hook's rev and the laptops' version (audit D-08)
           GITLEAKS_ENABLE_SUMMARY: "true"
       - name: trivy config on the deployment manifests
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
