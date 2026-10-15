@@ -2081,8 +2081,10 @@ provider then records only the name (`credentials_secret`, `conversion_host.ssh_
 time (`credentials_updated_at`, `conversion_key_updated_at`) with a versioned write, retried when a provider
 check or another write changed the provider meanwhile (they touch other fields): once the secret is written,
 the change is recorded, with its `provider.credentials_updated` event — a 409 after the store already holds the
-new secret would leave the change unaudited. A provider deleted meanwhile answers 404, and the secret just
-written is removed again. `SEAMLESS_SECRET_STORE` selects it:
+new secret would leave the change unaudited; when the provider keeps changing under the write (50 conflicts in a
+row, each a check or another write that landed), the route answers 503 `unavailable` naming the secret — the store
+holds the new value, the provider does not record it yet, and the operator sends the credentials again. A provider
+deleted meanwhile answers 404, and the secret just written is removed again. `SEAMLESS_SECRET_STORE` selects it:
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory,
   each key written to a temporary file and renamed; the directory must be writable (Compose mounts the
