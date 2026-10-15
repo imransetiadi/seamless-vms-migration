@@ -814,7 +814,10 @@ shared disk never reaches, holding the attach lock meanwhile; a detach still not
 (review 5, RV6-01).
 
 A cold export that fails puts back what it took (review RV6-01). `import_workload_export_volumes` fails with its volume
-map and transfer id, so the role's rescue runs `import_workload_src_cleanup`, which stops the transfer's NBD exports and
+map and transfer id - the map's entries without their `name`, which the rescue never reads: Ansible prints a failed
+result on the task's line, and a tenant's volume name, or the VM's in an image copy's, holding "timeout" would make the
+failure transient (§7.2; review RV8-05) - so the role's rescue runs `import_workload_src_cleanup`, which stops the
+transfer's NBD exports and
 frees the ports the map records - the export records each port as soon as it claims it, so the ports stay claimed until
 then. Before it fails, the export attaches each data volume of its map that no server holds again to the source VM: that
 needs only the OpenStack API, and the cleanup checks SSH before anything else, so a conversion host still unreachable
