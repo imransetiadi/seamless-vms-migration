@@ -349,11 +349,11 @@ def test_an_ssh_outage_takes_only_a_give_up_prefix_the_control_plane_retries(bui
         assert volume_common.SshOutage("10.0.0.10", "a free port", prefix).prefix == prefix
 
 
-def _message_texts(tree):
+def _message_texts(tree, exempt=frozenset()):
     """Every string a module can build as a message: each literal, an f-string with its fields
     as {}, a `+` chain of strings folded into one, a %-formatted part as its template - so a
-    message split across a concatenation is read whole (review RV13-06). Docstrings are left
-    out."""
+    message split across a concatenation is read whole (review RV13-06). Docstrings, and the
+    nodes whose ids are in ``exempt``, are left out."""
     docstrings = {
         id(node.body[0].value)
         for node in ast.walk(tree)
@@ -386,7 +386,7 @@ def _message_texts(tree):
 
     texts, taken = [], set()
     for node in ast.walk(tree):  # outermost first: a chain is read before its parts
-        if id(node) in taken or id(node) in docstrings:
+        if id(node) in taken or id(node) in docstrings or id(node) in exempt:
             continue
         folded = fold(node)
         if folded:
@@ -395,15 +395,56 @@ def _message_texts(tree):
     return texts
 
 
+#: where SshOutage, its give-up and the setter that checks the give-up's prefix live
+GIVE_UP_HOME = Path("module_utils") / "volume_common.py"
+
+
+def _give_up_uses(tree, home):
+    """(definition, strays) of SshOutage.GIVE_UP in ``tree``: the string node that defines it in
+    class SshOutage, when ``tree`` is its home module, and every other name or attribute
+    GIVE_UP. Only SshOutage.seen fills the template, with the prefix its setter checked; read
+    anywhere else it takes any prefix, and assigned anywhere else it is another give-up's text
+    (review RV14-03)."""
+    definition, allowed = None, set()
+    for cls in ast.walk(tree) if home else ():
+        if not (isinstance(cls, ast.ClassDef) and cls.name == "SshOutage"):
+            continue
+        for stmt in cls.body:
+            if (
+                isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == "GIVE_UP"
+                and isinstance(stmt.value, ast.Constant)
+            ):
+                definition = stmt.value
+                allowed.add(id(stmt.targets[0]))
+            elif isinstance(stmt, ast.FunctionDef) and stmt.name == "seen":
+                allowed |= {id(node) for node in ast.walk(stmt)}
+    strays = [
+        node for node in ast.walk(tree)
+        if id(node) not in allowed
+        and (
+            (isinstance(node, ast.Name) and node.id == "GIVE_UP")
+            or (isinstance(node, ast.Attribute) and node.attr == "GIVE_UP")
+        )
+    ]
+    return definition, strays
+
+
 def _unretried_give_ups(plugins):
     """(file, message) for each message under ``plugins`` that says a conversion host is
-    "unreachable over SSH" but carries no prefix the control plane retries: neither SshOutage's
-    own give-up, whose prefix its setter checks, nor one that starts with a GIVE_UP_PREFIXES
-    member."""
+    "unreachable over SSH" but starts with no GIVE_UP_PREFIXES member, the prefixes the control
+    plane retries, and (file, "GIVE_UP at line N") for each stray use of SshOutage's give-up.
+    That give-up is exempt only where it is defined: its template, filled by SshOutage.seen,
+    takes the prefix the setter checked - a copy of its text, or the template filled elsewhere,
+    takes any (review RV14-03)."""
     found = []
     for path in sorted(plugins.rglob("*.py")):
-        for text in _message_texts(ast.parse(path.read_text(encoding="utf-8"))):
-            if "unreachable over SSH" not in text or text == volume_common.SshOutage.GIVE_UP:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        definition, strays = _give_up_uses(tree, path.relative_to(plugins) == GIVE_UP_HOME)
+        found += [(path.name, "GIVE_UP at line %d" % node.lineno) for node in strays]
+        exempt = {id(definition)} if definition is not None else set()
+        for text in _message_texts(tree, exempt):
+            if "unreachable over SSH" not in text:
                 continue
             if text.split(":", 1)[0] not in volume_common.GIVE_UP_PREFIXES:
                 found.append((path.name, text))
@@ -415,12 +456,11 @@ def test_every_hand_built_give_up_carries_a_prefix_the_control_plane_retries():
     gives up so - escapes both SshOutage's prefix check and the control plane's guard, which reads
     only GIVE_UP_PREFIXES. Every such message starts with a GIVE_UP_PREFIXES member, or is
     SshOutage's own give-up (Seamless Migrate SDD 6.6)."""
-    plugins = Path(volume_common.__file__).resolve().parents[1]
-    assert any(
-        text == volume_common.SshOutage.GIVE_UP
-        for text in _message_texts(ast.parse(Path(volume_common.__file__).read_text(encoding="utf-8")))
-    )
-    assert _unretried_give_ups(plugins) == []
+    home = Path(volume_common.__file__).resolve()
+    definition = _give_up_uses(ast.parse(home.read_text(encoding="utf-8")), home=True)[0]
+    assert definition is not None and definition.value == volume_common.SshOutage.GIVE_UP
+    assert home.relative_to(home.parents[1]) == GIVE_UP_HOME
+    assert _unretried_give_ups(home.parents[1]) == []
 
 
 @pytest.mark.parametrize(
@@ -433,10 +473,24 @@ def test_every_hand_built_give_up_carries_a_prefix_the_control_plane_retries():
         ('M = f"SSH timeout: conversion host {ADDRESS} unreachable over SSH, reading the map"\n',
          False),
         ('M = "SSH timeout: conversion host %s unreachable " % "h" + "over SSH"\n', False),
+        ("from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (\n"
+         "    SshOutage,\n"
+         ")\n"
+         'M = SshOutage.GIVE_UP % ("Port probe gave up", "10.0.0.10", 900, "a free port")\n', True),
+        ('M = "%s: conversion host %s unreachable over SSH for %d s, waiting for %s" % (\n'
+         '    "Port probe gave up", "10.0.0.10", 900, "a free port")\n', True),
+        ("class SshOutage:\n"
+         '    GIVE_UP = "%s: conversion host %s unreachable over SSH for %d s, waiting for %s"\n'
+         "\n"
+         "    def seen(self):\n"
+         '        return self.GIVE_UP % ("Port probe gave up", "10.0.0.10", 900, "a free port")\n',
+         True),
     ],
     ids=[
         "a %s template with another prefix", "the phrase split by +", "an f-string, another prefix",
         "an f-string, a retried prefix", "split by +, a retried prefix",
+        "SshOutage.GIVE_UP filled outside SshOutage", "its text copied, another prefix",
+        "an SshOutage of its own, outside volume_common",
     ],
 )
 def test_the_give_up_guard_reads_each_message_whole(tmp_path, source, refused):
@@ -449,6 +503,31 @@ def test_the_give_up_guard_reads_each_message_whole(tmp_path, source, refused):
     (plugins / "modules" / "port_probe.py").write_text(source, encoding="utf-8")
 
     assert bool(_unretried_give_ups(plugins)) is refused
+
+
+def test_only_ssh_outage_seen_fills_its_give_up():
+    """Review RV14-03: in its home module too, the template is filled only by SshOutage.seen,
+    with the prefix the setter checked; another method that fills it, or a class that assigns a
+    GIVE_UP of its own, is a stray."""
+    tree = ast.parse(
+        "class SshOutage:\n"
+        '    GIVE_UP = "%s: conversion host %s unreachable over SSH for %d s, waiting for %s"\n'
+        "\n"
+        "    def seen(self):\n"
+        '        return self.GIVE_UP % (self.prefix, "10.0.0.10", 900, "a free port")\n'
+        "\n"
+        "    def given_up(self):\n"
+        '        return self.GIVE_UP % ("Port probe gave up", "10.0.0.10", 900, "a free port")\n'
+        "\n"
+        "\n"
+        "class PortOutage(SshOutage):\n"
+        '    GIVE_UP = "Port probe gave up for %s"\n'
+    )
+
+    definition, strays = _give_up_uses(tree, home=True)
+
+    assert definition.value.startswith("%s: conversion host %s unreachable over SSH")
+    assert sorted(node.lineno for node in strays) == [8, 12]
 
 
 class StalePortLock(SourceHost):
