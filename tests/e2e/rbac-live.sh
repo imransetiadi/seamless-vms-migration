@@ -57,8 +57,9 @@ policy POST /plans /plans '{"name":"rbac-probe","source_provider_id":"nope","des
 # (SDD 12) - so the route reads the plan first, and a plan that does not exist is 404 to an operator. The
 # operator's probe goes to a real plan, read with the viewer's token, with a value that plan does not hold,
 # and names a source provider that does not exist: with the role check in place it is refused 403; with the
-# check regressed it meets the provider check (400) before anything is written (review RV16-01). The
-# approver's goes to a plan that does not exist. A field the plan lacks is skipped by name (RV16-04).
+# check regressed it is refused before anything is written - 400 from the provider check on a draft plan, 409
+# on a running or cancelled one or one with failed migrations (reviews RV16-01, RV17). The approver's goes to
+# a plan that does not exist. A field the plan lacks is skipped by name (RV16-04).
 probes=$(curl -s -H "$VIEWER_H" "$BASE/plans" | python3 -c '
 import json, sys
 try:
