@@ -165,6 +165,8 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$), name: str, kind: Provider
            distribution: Distribution|null,            # must match kind (see above); null = by kind
            release: str|null (regex ^20[0-9]{2}\.[12]$), # the community series its operator declares, e.g.
                                                        # "2026.2" (§10.1, §21.3); refused on kind vmware (422)
+           policy_profile: "secure_rbac"|"legacy"|null, # the policy defaults its operator declares (§21.5):
+                                                       # null = by kind and series (§10.1); refused on vmware (422)
            credentials_updated_at: datetime|null,      # server-owned: set by PUT …/credentials
            conversion_key_updated_at: datetime|null,   # server-owned: set by PUT …/conversion-key
            capabilities: dict[str, Any] = {}, status: "unknown"|"ok"|"degraded"|"error" = "unknown",
@@ -1877,10 +1879,16 @@ Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking ca
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`, as a source and as a destination - a community
 OpenStack destination (kind `openstack`, distribution `openstack_community` or `kolla`) takes the same code path as
 RHOSO 18.0, §21; `check()` reports `{"admin": bool,
-"roles": [the role names of the credential's token, sorted], "compute_microversion": str, "ovn": bool,
+"roles": [the role names of the credential's token, sorted], "compute_microversion": str,
+"block_storage_microversion": str, "ovn": bool,
 "volume_backends": [pool names], "storage_backends": [{"pool": str, "vendor": str|null, "protocol": str|null,
-"family": "rbd"|"netapp_nfs"|"netapp_block"|"other"}]}`, both lists empty without admin (`roles` is what
-`NET_PORT_NOT_PERMITTED` judges, §9.3: Neutron's policy names roles, while `admin` is the compute probe);
+"family": "rbd"|"netapp_nfs"|"netapp_block"|"other"}], "tls": bool, "plain_http": [str]}`, both backend lists empty
+without admin (`roles` is what `NET_PORT_NOT_PERMITTED` judges, §9.3: Neutron's policy names roles, while `admin` is
+the compute probe); the microversions are each service's maximum, `""` when unreadable; `tls` is true when the
+provider's `endpoint` and the endpoint of each service Seamless calls (`identity`, `compute`, `block-storage`,
+`network`, `image`) use https, and `plain_http` names those that do not (`endpoint` for the provider's own; one that
+cannot be read counts neither way, Security.md); a destination's check adds §10.1's `destination_release` keys -
+`release_range`, `release`, `support_tier` and `policy_profile`;
 volume disks carry their Cinder `pool`;
 `os_type` is the most specific of the server metadata `os_type`/`os_distro`, the boot volume's
 `volume_image_metadata` or the boot image's properties (`os_distro` + `os_version`, then `os_type`)),
@@ -1931,6 +1939,19 @@ A pure module (no I/O) holding the series table of §21.1 and the detection and 
   * `reason` is `end_of_life` for `tier3`, for `outside` the range's `outside` (`older` reads `below_floor`, `newer`
     reads `newer_than_validated`, `not_detected` as is), and null for `tier1` and `tier2`.
   RHOSO 18.0 (kind `rhoso`) is `validated` by its kind, never by detection (T3).
+* `destination_release(kind, release, policy_profile, compute_max, block_storage_max) -> {release_range: [str],
+  release: str|null, support_tier: {tier, reason, declared_outside_range}, policy_profile: "secure_rbac" | "legacy" |
+  "unknown"}`, what a destination's check reports (§10; `release` and `policy_profile` as its provider declares them,
+  §4.2):
+  * `release_range` is the detected range's series; `release` the series the check settles on: the declared one when
+    the range holds it, else the range's only series, else null;
+  * `support_tier` is `support_tier(range, declared)` for kind `openstack`, and `{"tier": "validated", "reason": null,
+    "declared_outside_range": false}` for kind `rhoso`;
+  * `policy_profile` is the declared one; else `legacy` for kind `rhoso` (D14, until the lab confirms RHOSO 18.0's);
+    else by the settled series - `release` when set, else the range: `secure_rbac` when every series is 2023.2 or
+    later or the range is `newer`, `legacy` when every series is 2023.1 or the range is `older` (oslo.policy enforces
+    the new defaults from 2023.2), and `unknown` when the range straddles the two or nothing was detected. Under
+    `unknown` the permission checks count only roles that work under both profiles (§21.5, T5).
 * `REVIEWED_MICROVERSIONS = {"compute": "2.100", "block_storage": "3.71"}`: the newest microversions whose behaviour
   Seamless's calls were checked against (§21.7). openstacksdk asks a cloud for the lower of a resource's cap and the
   cloud's maximum; `test_the_sdk_never_asks_more_than_its_caps_of_any_series_of_the_window` fails when the installed
@@ -2033,7 +2054,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/providers` | viewer | — | `Provider[]` |
 | POST | `/providers` | admin | `Provider` (status fields ignored; a field `Provider` does not have: 422) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set) |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, recorded `sync_passes` of a strategy other than `cold`) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
@@ -3269,8 +3290,8 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D11 | Product documents in the collection artifact (the SDD, PRD, QASuite, Security and Performance documents are packed; audit material and agent plans are not) | packed | owner decision (audit D-21) |
 | D12 | The `TODO(…): confirm` markers of this document — LAB, ADV-04, ADV-06, ADV-17, ADV-18, ADV-19 — each a default taken without the owner's word | the defaults as written | each is an owner decision; remove the marker when decided (audit D-20) |
 | D13 | Destination platforms: RHOSO 18.0 and community OpenStack | decided by the owner 2026-10-16: the window 2023.1 Antelope – 2026.2 Hibiscus with the tiers of §21.1 (Jev 0.93), the series detected from the version documents plus an optional declared one (§21.3, Jev 0.77) | each upstream release and end of life (§21.2) |
-| D14 | The policy profile RHOSO 18.0 ships: the legacy rules or the secure-RBAC defaults (§21.5) | judged as today: `admin` or `advsvc` for a port on another project's network | the lab run on RHOSO 18.0 (`TODO(LAB): confirm`) |
-| D15 | Conversion host images on community clouds beyond CentOS Stream 9 and RHEL 9: the RHEL family by `ansible_os_family` (Rocky Linux, AlmaLinux, CentOS Stream 10), then Ubuntu 24.04 LTS (§21.6) | CentOS Stream 9 and RHEL 9 only | 0.2.0 (plan task T7) |
+| D14 | The policy profile RHOSO 18.0 ships: the legacy rules or the secure-RBAC defaults (§21.5) | judged as today: `admin` or `advsvc` for a port on another project's network; the check reports `legacy` for kind `rhoso` unless its provider declares a profile (§10.1) | the owner confirms it on the lab run on RHOSO 18.0 (owner, 2026-10-16; `TODO(LAB): confirm`) |
+| D15 | Conversion host images on community clouds beyond CentOS Stream 9 and RHEL 9: the RHEL family by `ansible_os_family` (Rocky Linux, AlmaLinux, CentOS Stream 10), then Ubuntu 24.04 LTS (§21.6) | CentOS Stream 9 and RHEL 9 only; the order approved by the owner 2026-10-16 (the RHEL family first, then Ubuntu 24.04) | 0.2.0 (plan task T7) |
 
 ## 21. Destination platforms: RHOSO 18.0 and community OpenStack
 
@@ -3314,7 +3335,7 @@ Upstream phases as releases.openstack.org shows them on 2026-10-16:
 * §21.1's table and the code's series table (`planning/platforms.py`, §10.1) change in the same commit, each with the
   date they were read.
 
-### 21.3 Release detection (0.2.0: the rules are §10.1's since T1; the check reports them from T3)
+### 21.3 Release detection (0.2.0: the rules are §10.1's since T1; the check reports them since T3)
 
 * The provider check reads the services' version documents: compute's maximum microversion (as `compute_microversion`
   today), block storage's, and Neutron's extension list.
@@ -3325,7 +3346,8 @@ Upstream phases as releases.openstack.org shows them on 2026-10-16:
 * A declared series (`Provider.release`, §4.2, e.g. `2026.2`) inside the detected range decides the tier; one
   outside it warns, and the range decides. With none declared, the tier is the least favourable one the range allows: a
   2.96 cloud is 2024.1 (Tier 2) or 2024.2 (Tier 3), so Tier 3, until its operator declares the series.
-* The check reports `release_range`, `release` and `support_tier` (planned keys of the `check()` report, §10).
+* A destination's check reports `release_range`, `release`, `support_tier` and `policy_profile` (§10, §10.1's
+  `destination_release`), and `block_storage_microversion` beside `compute_microversion`.
 
 ### 21.4 Capability floor per strategy (planned pre-flight, 0.2.0)
 
@@ -3360,9 +3382,10 @@ Life upstream, below the floor, newer than validated, or not detected).
 * The destination credential (project-scoped) needs: `member` for `cold` and `warm` in its own project; `admin` for
   pre-staging flavors, for `storage_handover` (volume manage) and for an external network that is not shared; `service`
   or `admin` for a port with a fixed IP or MAC on another project's network. `manager` is never required.
-* Planned: the check reports `policy_profile` (declared, else secure-RBAC for a community series from 2023.2), and
-  `NET_PORT_NOT_PERMITTED` judges `service` under the secure-RBAC profile and `advsvc` only under the legacy one (§6.6,
-  §9.3 when implemented).
+* The check reports `policy_profile`: the one its provider declares (`Provider.policy_profile`, §4.2), else by kind
+  and series (§10.1: `legacy` for RHOSO 18.0 until D14 is decided, `secure_rbac` from 2023.2, `unknown` when the
+  series cannot tell). Planned (T5): `NET_PORT_NOT_PERMITTED` judges `service` under the secure-RBAC profile,
+  `advsvc` only under the legacy one, and under `unknown` only the roles both count (§6.6, §9.3 when implemented).
 
 ### 21.6 Conversion hosts on community clouds
 
@@ -3384,7 +3407,7 @@ Life upstream, below the floor, newer than validated, or not detected).
 * Networking is ML2/OVN or ML2/OVS, as the operator chose: the MTU checks (§9.3) apply as on RHOSO 18.0, no OVS- or
   OVN-specific binding is copied, and `ovn` in the check report is informational.
 * TLS is the operator's choice on a community cloud: `verify_tls` stays on by default, with a CA bundle per provider
-  (§4.2). Planned: the check reports a plain-HTTP endpoint (Security.md).
+  (§4.2). The check reports `tls` and the endpoints that use plain HTTP (`plain_http`, §10; Security.md).
 
 ### 21.8 Planned contract changes (0.2.0; not binding until implemented)
 
@@ -3392,7 +3415,7 @@ Life upstream, below the floor, newer than validated, or not detected).
 |---|---|---|
 | the series table, detection and tiers (§21.1–§21.3) | §10.1, `planning/platforms.py` (binding) | T1 |
 | `Provider.release: str|null`, the declared series | §4.2, §12 (binding); the dashboard's form, §16, with T8 | T2 |
-| `check()` keys `release_range`, `release`, `support_tier`, `policy_profile`, `tls` | §10 | T3 |
+| `check()` keys `release_range`, `release`, `support_tier`, `policy_profile`, `tls`; `Provider.policy_profile` | §10, §10.1, §4.2, §12 (binding) | T3 |
 | findings `DST_CAPABILITY_MISSING` (blocker), `DST_RELEASE_OUTSIDE_SUPPORT` (warning) | §9.3 | T4 |
 | `NET_PORT_NOT_PERMITTED` by the policy profile (§21.5) | §6.6, §9.3 | T5 |
 | destination-neutral texts: findings, events, the CLI and the dashboard name the destination provider | §9.3, §16 | T6 |
