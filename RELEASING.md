@@ -17,7 +17,8 @@ the deployment the artifacts serve is in [SDD §17](docs/SDD.md).
 |---|---|---|
 | Control plane (`seamless/`) | `seamless/pyproject.toml` (`version`) and `seamless/src/seamless_migrate/__init__.py` (`__version__`, printed by `seamless --version` and returned by `GET /api/v1/health`) | container image `seamless-migrate:X.Y.Z`, built from `seamless/Containerfile` |
 | Dashboard (`dashboard/`) | `dashboard/package.json` and `dashboard/package-lock.json` | `dashboard/dist`, baked into the image |
-| Deployment (`deploy/`) | `deploy/compose/compose.yaml` (`${SEAMLESS_VERSION:-X.Y.Z}`, documented in `deploy/compose/README.md`), `newTag` in `deploy/openshift/kustomization.yaml` and `deploy/kubernetes/kustomization.yaml` | the manifests, in the release's source archive |
+| Deployment (`deploy/`) | `deploy/compose/compose.yaml` (`${SEAMLESS_VERSION:-X.Y.Z}`, documented in `deploy/compose/README.md`), `newTag` and the `app.kubernetes.io/version` label in `deploy/openshift/kustomization.yaml`, `newTag` in `deploy/kubernetes/kustomization.yaml` | the manifests, in the release's source archive |
+| Image labels | `org.opencontainers.image.version` in `seamless/Containerfile` | the label `docker inspect` shows on the image |
 | os-migrate collection (repository root) | `galaxy.yml` (`version`) and `plugins/module_utils/const.py` (`OS_MIGRATE_VERSION`); `tests/unit/test_version.py` keeps them equal | `os_migrate-os_migrate-<collection version>.tar.gz` from `make build` |
 
 The image carries the control plane, the built dashboard and this collection (SDD §17), so one image
@@ -81,10 +82,12 @@ perl -pi -e "s/^__version__ = \"\Q$OLD\E\"/__version__ = \"$NEW\"/" seamless/src
 (cd dashboard && npm version --no-git-tag-version "$NEW")
 perl -pi -e "s/SEAMLESS_VERSION:-\Q$OLD\E/SEAMLESS_VERSION:-$NEW/" deploy/compose/compose.yaml
 perl -pi -e "s/newTag: \Q$OLD\E/newTag: $NEW/" deploy/openshift/kustomization.yaml deploy/kubernetes/kustomization.yaml
+perl -pi -e "s{app.kubernetes.io/version: \Q$OLD\E}{app.kubernetes.io/version: $NEW}" deploy/openshift/kustomization.yaml
+perl -pi -e "s/image.version=\"\Q$OLD\E\"/image.version=\"$NEW\"/" seamless/Containerfile
 
 # what pins the version and must follow by hand: the health payload the control-plane tests expect,
 # the Compose README's table of defaults
-grep -n "$OLD" seamless/tests/test_api_core.py seamless/tests/test_build_context.py deploy/compose/README.md
+grep -n "$OLD" seamless/tests/test_api_core.py deploy/compose/README.md
 ```
 
 Then read every remaining `git grep -n "$OLD"` hit, and change only those that name the *current*
@@ -101,7 +104,9 @@ Check the result:
 ```bash
 make seamless-test                 # control plane
 make dashboard-build               # dashboard (npm ci + build); cd dashboard && npm test
-make test-ansible-units            # collection, as CI runs it
+# collection unit tests and ansible-test sanity, as CI runs them (QASuite §14.2; make test-ansible-units is upstream's podman path)
+PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest tests/unit -q -rs
+PATH="$PWD/.venv/bin:$PATH" scripts/collection-sanity.sh
 make seamless-check                # the full local gate
 ```
 
@@ -131,7 +136,7 @@ make build                                   # collection tarball: starts its ow
 ls os_migrate-os_migrate-*.tar.gz
 
 (cd dashboard && npm ci && npm run build)    # the image copies dashboard/dist
-docker build -f seamless/Containerfile -t seamless-migrate:$NEW .
+docker --context colima-seamless build -f seamless/Containerfile -t seamless-migrate:$NEW .
 docker run --rm seamless-migrate:$NEW --version  # prints $NEW: the image's entrypoint is the seamless CLI
 ```
 

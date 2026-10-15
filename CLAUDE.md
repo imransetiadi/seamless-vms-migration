@@ -1,7 +1,8 @@
 # CLAUDE.md — working agreement for agents on Seamless Migrate
 
 Seamless Migrate moves VMs from **RHOSP 17.1 / community OpenStack / VMware** into **RHOSO 18.0** with
-minimal downtime. The repository root is the **os-migrate 1.0.5 Ansible collection** (the data mover);
+minimal downtime. The repository root is a **fork of the os-migrate Ansible collection** (the data mover;
+upstream `main` after 1.0.5, versioned 1.1.0 here);
 `seamless/` is the Python control plane, `dashboard/` the React UI, `deploy/` the Compose and OpenShift
 deployment. Read this file fully before changing anything.
 
@@ -97,7 +98,7 @@ Server: the developer's host agentmemory at `http://localhost:3111` (`AGENTMEMOR
 
 ```bash
 # Collection (Track A)
-make test-ansible-units                      # CI path (podman container, ansible-test)
+make test-ansible-units                      # upstream's path (podman container); CI runs the pytest line below + scripts/collection-sanity.sh
 PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest tests/unit/test_blocksync.py -v   # blocksync engine; $COLL: QASuite §14.2
 python3 tests/perf/bench_blocksync.py --size-gib 1  # throughput benchmark
 

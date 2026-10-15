@@ -506,7 +506,8 @@ emptyDirs for the socket and data directories the SCL image writes).
 
 `.mcp.json` and `.claude/settings.json` cause commands (`npx …`) to run on contributors' machines, and
 `deploy/` and `scripts/` change what runs in clusters. Protect them with CODEOWNERS entries and mandatory
-review (**Rec**: the inherited `CODEOWNERS` lists the upstream maintainers only), and never accept an
+review (`CODEOWNERS` names the fork's maintainer for the tree and for these paths since audit D-09; **Rec**: enable
+"require review from code owners" in the `main` ruleset), and never accept an
 unreviewed change that adds an MCP server, a hook, a marketplace or a permission.
 
 ### 9.4 PostgreSQL
