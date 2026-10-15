@@ -914,9 +914,13 @@ RV15-01). qemu-img or nbdcopy is given the destination volume's by-id link, once
 destination conversion host; each open resolves the link to the volume itself - qemu-img opens its target twice, to
 create and to convert - so a destination path another volume took is never written. A volume that left the host fails
 qemu-img's open. nbdcopy instead opens its destination again with O_CREAT when the first open fails (libnbd's
-open_local) and copies into the regular file it created: the transfer then checks that the path it gave nbdcopy is still
-a block device, removes a regular file found there, which would block udev's link, and fails as permanent - the volume
-was not written (review RV15-02). Telling the two attachments apart
+open_local) and copies into the regular file it created - on RHEL 9, whose /dev is a 4 MiB devtmpfs, it then fails with
+ENOSPC. So after nbdcopy exits, whether it succeeded or not, the transfer checks that the path it gave nbdcopy is still
+a block device. If it is not, the transfer removes a regular file found there - udev 252 (RHEL 9) will not make the
+volume's link over one, where udev 239 (RHEL 8) replaces it - and fails as permanent, saying whether the file was
+removed, could not be removed or could not be checked; ssh failing at the check gives up as "SSH timeout: ..." and is
+retried (review RV15-02, RV16-02, RV16-03). A path that is still a disk leaves nbdcopy's own exit to decide. Telling the
+two attachments apart
 needs this export's own Cinder attachment id, which a lost answer never gave it: Nova shows the id only from
 microversion 2.89, newer than RHOSP 17.1, and Cinder's attachments API is not yet used. The cleanup re-attaches each
 data volume the source VM no longer holds; and it
