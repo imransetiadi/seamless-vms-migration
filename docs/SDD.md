@@ -846,8 +846,13 @@ and Cinder still lists there - the export marks a volume `source_attached` in it
 it, once openstacksdk's own checks pass (the volume `available` and not on that host), so a volume whose device was
 never recorded, or whose attach Nova carried out while its answer was lost, is detached too (review RV9-01), while a
 shared multi-attach volume another migration's export attached - one the SDK refuses to attach - is never (Cinder's
-attachment names the server, not the migration; review RV8-02); it re-attaches each data volume the source VM no
-longer holds; and it
+attachment names the server, not the migration; review RV8-02). When the attach call itself fails, the export, still
+holding the conversion host's attach lock so that no other export attaches the volume meanwhile, waits within its
+timeout while Cinder shows the volume `reserved` or `attaching` - Nova still at work, and Cinder lists an attachment
+only once it is attached - and keeps the mark only if Cinder then lists the conversion host, or still shows the attach
+under way: an attach Nova refused leaves no mark a later export's attach of the same volume could be taken for
+(review RV10-01, RV10-02). The cleanup waits the same way for a marked volume Cinder still shows `reserved` or
+`attaching` before it checks. It re-attaches each data volume the source VM no longer holds; and it
 removes the root disk's copy, its snapshot and the image of an image-booted VM only when the export made them - never a
 volume the source VM holds, such as its own boot volume before a copy exists. The export creates the root snapshot, the
 root copy and the image without openstacksdk's own wait, records each id at once, then waits for each within the module's
