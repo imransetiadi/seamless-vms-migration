@@ -880,6 +880,44 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                     err,
                 )
 
+    def remove_unheld_root_copy(self):
+        """
+        After a failed export, once the data volumes are back: delete the root
+        disk's copy when no server holds it, then the snapshot or the image it
+        was made from - through the OpenStack API alone, so an outage the
+        source cleanup cannot outlast leaves none of them behind (Seamless
+        Migrate SDD 6.6, review RV9-03). A copy the conversion host holds is the
+        cleanup's, and the source VM's own boot volume - what the root entry
+        names before a copy exists - is never deleted. Best effort: what cannot
+        be deleted is left to the source cleanup.
+        """
+        root = self.volume_map.get("/dev/vda")
+        if not root:
+            return
+        try:
+            volume = self._get_volume_maybe(root["source_id"])
+            if volume is not None:
+                holders = {a["server_id"] for a in getattr(volume, "attachments", None) or []}
+                if holders - {self.source_instance_id}:
+                    return  # the copy, on the conversion host: the cleanup's
+                if not holders:
+                    self.log.info("Removing copy %s of the root volume", volume.id)
+                    self.conn.delete_volume(
+                        name_or_id=volume.id, wait=True, timeout=self.timeout
+                    )
+            if root["snap_id"]:
+                self.log.info("Deleting temporary root device snapshot")
+                self.conn.delete_volume_snapshot(
+                    timeout=self.timeout, wait=True, name_or_id=root["snap_id"]
+                )
+            if root["image_id"]:
+                self.log.info("Deleting temporary root device image")
+                self.conn.delete_image(
+                    timeout=self.timeout, wait=True, name_or_id=root["image_id"]
+                )
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning("Could not remove the copy of the root volume: %s", err)
+
     def _get_root_and_data_volumes(self):
         """
         Volume mapping step one: get the IDs and sizes of all volumes.

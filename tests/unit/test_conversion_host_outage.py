@@ -30,6 +30,7 @@ from ansible_collections.os_migrate.os_migrate.tests.unit.test_cold_export_failu
     SourceHost,
     _boot_from_volume_vm,
     _holders,
+    _image_booted_vm,
 )
 
 DATA_VOLUMES = ("vol-data1", "vol-data2")
@@ -136,9 +137,9 @@ def _cleanup_args(data, exported):
                 volume_map=exported["volume_map"])
 
 
-def _outage(phase, outage):
+def _outage(phase, outage, vm="volume-booted"):
     """The export, then - as the role runs them - the block's final cleanup, or the rescue's."""
-    src, data = _boot_from_volume_vm()
+    src, data = _image_booted_vm() if vm == "image-booted" else _boot_from_volume_vm()
     clock = Clock()
     lock = (volume_common.ATTACH_LOCK_FILE_SOURCE if phase == "export attach lock"
             else volume_common.PORT_LOCK_FILE)
@@ -238,3 +239,41 @@ def test_the_exports_wait_for_its_nbd_exports_gives_up_after_the_ssh_window():
     assert exported.get("failed"), exported
     assert "SSH timeout: conversion host 10.0.0.10 unreachable over SSH" in exported["msg"], exported
     assert clock.now - host.down_since <= volume_common.SSH_UNREACHABLE_S + 60
+
+
+@pytest.mark.parametrize("vm", ["volume-booted", "image-booted"])
+def test_an_outage_past_both_windows_leaves_no_root_copy_behind(vm):
+    """Review RV9-03: after an outage the cleanup cannot outlast, the export's root copy and its
+    snapshot or image - which no server holds, and which the API alone can delete - stayed in the
+    source cloud, recorded nowhere (with Ceph a snapshot keeps the boot volume from being
+    deleted). The export now deletes them before it fails, as it attaches the data volumes back,
+    and never the source VM's own disks."""
+    own = set(DISKS) if vm == "volume-booted" else {"vol-data1"}
+
+    src, _host, exported, _cleaned, rescued = _outage("export attach lock", outage=2400, vm=vm)
+
+    assert exported.get("failed") and "Lock timeout" in exported["msg"], exported
+    assert rescued is not None and rescued.get("failed"), rescued  # the host is still down
+    assert (set(src.volumes), src.snapshots, src.images) == (own, {}, {})
+    for volume_id in own:
+        assert _holders(src, volume_id) == ["srv-1"], volume_id
+
+
+def test_a_failed_root_copy_leaves_its_snapshot_to_no_one_even_when_the_cleanup_cannot_run():
+    """Review RV9-03: the export failed making the root copy - the root entry still names the
+    source VM's own boot volume - and the conversion host is then gone for good, so the rescue
+    cannot run. The export deletes the snapshot it made, through the API, and keeps the boot
+    volume the source VM holds."""
+    src, data = _boot_from_volume_vm()
+    src.fail_on["create_volume"] = lambda call: call.get("snapshot_id") is not None
+    clock = Clock()
+    host = RebootingHost(src, clock, None, 10 ** 9)
+    with mock.patch.object(volume_common, "time", clock):
+        exported = _run(export_module, dict(COMMON, data=data), src, host)
+        host.go_down()
+        rescued = _run(cleanup_module, _cleanup_args(data, exported), src, host)
+
+    assert exported.get("failed") and rescued.get("failed"), (exported, rescued)
+    assert (set(src.volumes), src.snapshots) == (set(DISKS), {})
+    for volume_id in DISKS:
+        assert _holders(src, volume_id) == ["srv-1"], volume_id

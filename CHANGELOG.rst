@@ -328,7 +328,9 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``import_workload_src_cleanup``: it stops the transfer's NBD exports and
   frees those ports. Before it fails, the export attaches the data volumes
   it detached, and no server holds, back to the source VM through the API
-  alone, as a conversion host still unreachable stops the cleanup. Before,
+  alone, as a conversion host still unreachable stops the cleanup, then
+  deletes the root copy no server holds, and its snapshot or image, the same
+  way; never the source VM's own boot volume. Before,
   the export failed without the map, nothing was put back, and the rollback
   started the source VM without the data volumes the export had detached. The
   source cleanup
