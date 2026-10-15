@@ -5,7 +5,10 @@ This product builds on os-migrate (https://github.com/os-migrate/os-migrate),
 licensed under the Apache License, Version 2.0. Seamless Migrate is distributed
 under the same license; see LICENSE.
 
-Files from os-migrate 1.0.5 that this project modified carry the comment
+This project forked os-migrate's main branch after its 1.0.5 release (commit
+fbf3509; the import_from_hypervisor role and the update_workload_nbdkit_uris
+module exist there and not in the 1.0.5 tag). Files from os-migrate that this
+project modified carry the comment
 "Modified by the Seamless Migrate project, 2026." The following modified files
 cannot carry that comment; this notice states that they were changed:
 

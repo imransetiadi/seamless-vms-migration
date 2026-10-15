@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 ---
 # Process one disk: inspect it and export it with qemu-nbd (read-only,
 # bound to os_migrate_nbdkit_bind_address, one client at a time).

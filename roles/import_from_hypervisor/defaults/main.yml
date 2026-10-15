@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 ---
 # Defaults for import_from_hypervisor role.
 # The os_migrate_* names are the role's public interface, shared with the
