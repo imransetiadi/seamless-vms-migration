@@ -296,3 +296,32 @@ def test_the_exports_port_probe_gives_up_after_the_ssh_window():
     assert exported.get("failed"), exported
     assert "SSH timeout: conversion host 10.0.0.10 unreachable over SSH" in exported["msg"], exported
     assert clock.now - host.down_since <= volume_common.SSH_UNREACHABLE_S + 60
+
+
+class PortOutage(volume_common.SshOutage):
+    """An SshOutage subclass with a default prefix of its own."""
+
+    def __init__(self, address, waiting_for, prefix="Port probe gave up"):
+        super().__init__(address, waiting_for, prefix)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: volume_common.SshOutage("10.0.0.10", "a free port", "Port probe gave up"),
+        lambda: volume_common.SshOutage("10.0.0.10", "a free port", prefix="Port probe gave up"),
+        lambda: PortOutage("10.0.0.10", "a free port"),
+    ],
+    ids=["passed by position", "passed by keyword", "a subclass's default"],
+)
+def test_an_ssh_outage_takes_only_a_give_up_prefix_the_control_plane_retries(build):
+    """Review RV11-05: a give-up reads "{prefix}: conversion host ... unreachable over SSH ...",
+    and the control plane retries it by its "timeout" alone (Seamless Migrate SDD 6.6). Its guard
+    reads GIVE_UP_PREFIXES, and found a prefix only as the class default or a `prefix=` keyword of
+    a call spelled `SshOutage(...)`, so "Port probe gave up: ..." - permanent - slipped past it
+    passed by position, through the module or as a subclass's default. An SshOutage now takes no
+    prefix but those, whatever form passes it."""
+    with pytest.raises(ValueError, match="Port probe gave up"):
+        build()
+    for prefix in volume_common.GIVE_UP_PREFIXES:
+        assert volume_common.SshOutage("10.0.0.10", "a free port", prefix).prefix == prefix

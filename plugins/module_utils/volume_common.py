@@ -111,6 +111,10 @@ SSH_FAILED = 255
 # a lock wait gives up once ssh to the conversion host failed this long without a break: long
 # enough to ride out a reboot or a network blip (Seamless Migrate SDD 6.6, review RV8-01)
 SSH_UNREACHABLE_S = 900
+# the prefixes of a give-up, each the "timeout" the control plane retries as transient: an
+# SshOutage takes no other, and the control plane's tests read this tuple (Seamless Migrate SDD
+# 6.6, review RV11-05)
+GIVE_UP_PREFIXES = ("Lock timeout", "SSH timeout")
 
 
 class ConversionHostUnreachable(RuntimeError):
@@ -124,10 +128,15 @@ class SshOutage:
     status 255: a wait that meets it gives up once that reaches
     SSH_UNREACHABLE_S, with "{prefix}: conversion host {address} unreachable
     over SSH for {n} s, waiting for {what}", which the control plane retries
-    (Seamless Migrate SDD 6.6, review RV8-01, RV9-02, RV9-04).
+    (Seamless Migrate SDD 6.6, review RV8-01, RV9-02, RV9-04); the prefix is
+    one of GIVE_UP_PREFIXES (review RV11-05).
     """
 
     def __init__(self, address, waiting_for, prefix="SSH timeout"):
+        if prefix not in GIVE_UP_PREFIXES:
+            raise ValueError(
+                "A give-up prefix is one of %s, not %r" % (", ".join(GIVE_UP_PREFIXES), prefix)
+            )
         self.address = address
         self.waiting_for = waiting_for
         self.prefix = prefix
