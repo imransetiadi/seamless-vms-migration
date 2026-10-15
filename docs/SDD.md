@@ -828,7 +828,9 @@ probe for a free port, which read ssh's exit status 255 as a port in use and wal
 that fails at once - a refused connection, a dropped route - ends in the same give-up, not in "No free ports"
 (review RV11-03). A failed transfer releases its ports only if one ssh check then reaches the conversion host, and a
 release that fails never replaces the transfer's error: a host it cannot reach cannot update its port map, and a wait
-for its port lock held the stopped source VM another 15 minutes (review RV10-04, RV11-02). Each detach of a volume -
+for its port lock held the stopped source VM another 15 minutes (review RV10-04, RV11-02). One that claimed no port -
+its first wait for the port lock gave up, say - releases none: the release waited a second whole window for that lock to
+remove nothing, about 36 minutes more with the source stopped (review RV12-02). Each detach of a volume -
 from a conversion
 host or from the source VM - waits, within the module's timeout, until the volume no longer lists that server's
 attachment and, unless another server still holds it (a shared multi-attach disk stays `in-use`), until Cinder shows it
