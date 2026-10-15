@@ -850,9 +850,11 @@ it, once openstacksdk's own checks pass (the volume `available` and not on that 
 never recorded, or whose attach Nova carried out while its answer was lost, is detached too (review RV9-01), while a
 shared multi-attach volume another migration's export attached - one the SDK refuses to attach - is never (Cinder's
 attachment names the server, not the migration; review RV8-02). When the attach call itself fails, the export, still
-holding the conversion host's attach lock so that no other export attaches the volume meanwhile, waits within its
-timeout while Cinder shows the volume `reserved` or `attaching` - Nova still at work, and Cinder lists an attachment
-only once it is attached - and keeps the mark only if Cinder then lists the conversion host, or still shows the attach
+holding the conversion host's attach lock so that no other export attaches the volume meanwhile, waits - up to two
+minutes (`ATTACH_SETTLE_S`), ample for Nova to finish an attach: the module's timeout held the lock against every other
+migration on that host while a reservation Nova abandoned stayed `reserved` (review RV11-01) - while Cinder shows the
+volume `reserved` or `attaching` - Nova still at work, and Cinder lists an attachment only once it is attached - and
+keeps the mark only if Cinder then lists the conversion host, or still shows the attach
 under way: an attach Nova refused leaves no mark a later export's attach of the same volume could be taken for
 (review RV10-01, RV10-02). The cleanup waits the same way for a marked volume Cinder still shows `reserved` or
 `attaching` before it checks. It re-attaches each data volume the source VM no longer holds; and it
