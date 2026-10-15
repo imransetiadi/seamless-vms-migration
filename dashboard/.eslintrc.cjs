@@ -29,7 +29,7 @@ module.exports = {
       rules: { '@typescript-eslint/no-require-imports': 'off' },
     },
     {
-      files: ['vite.config.ts', 'tailwind.config.ts'],
+      files: ['vite.config.ts'],
       env: { node: true },
     },
     {
