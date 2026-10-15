@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 import time
 from collections import defaultdict, deque
@@ -15,7 +16,7 @@ from ..config import Settings
 from ..domain.enums import Role
 from ..events import EventBus, emit
 from ..orchestrator import Orchestrator
-from ..security.auth import ANONYMOUS_ADMIN, Principal, TokenStore
+from ..security.auth import ANONYMOUS_ADMIN, DashboardUser, Principal, TokenStore, hash_token
 from ..store import AsyncStore, Store, VersionedDocuments
 
 log = logging.getLogger(__name__)
@@ -137,14 +138,22 @@ async def _audit_denied(
     )
 
 
-def authenticate(request: Request) -> Principal | None:
+async def authenticate(request: Request) -> Principal | None:
     svc = services(request)
     if svc.settings.auth_disabled:
         return ANONYMOUS_ADMIN
     scheme, _, token = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not token.strip():
         return None
-    return svc.tokens.authenticate(token.strip())
+    principal = svc.tokens.authenticate(token.strip())
+    if principal is not None:
+        return principal
+    digest = hash_token(token.strip())
+    # shortcut: linear lookup like file tokens; index digests when user volume warrants it.
+    for user in await svc.db.list("user", DashboardUser):
+        if hmac.compare_digest(user.sha256, digest):
+            principal = Principal(user.name, user.role)
+    return principal
 
 
 #: Named permissions and the minimum role that holds each (SDD §13.2; TODO(ADV-04): confirm admin).
@@ -164,7 +173,7 @@ def require_role(role: Role) -> Callable[[Request], Awaitable[Principal]]:
 
     async def dependency(request: Request) -> Principal:
         svc = services(request)
-        principal = authenticate(request)
+        principal = await authenticate(request)
         if principal is None:
             client = request.client.host if request.client else "unknown"
             if svc.auth_locked(client):

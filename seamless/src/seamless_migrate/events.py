@@ -70,6 +70,7 @@ PERSISTED_KINDS = frozenset(
         "provider.deleted",
         "provider.checked",
         "auth.denied",
+        "user.created",
         "events.pruned",
         *AUDIT_KINDS,
     }

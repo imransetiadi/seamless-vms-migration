@@ -54,6 +54,7 @@ def test_kind_catalog_matches_sdd():
         "provider.deleted",
         "provider.checked",
         "auth.denied",
+        "user.created",
         "events.pruned",
         # audit events (SDD §14.5)
         "recommendation.created",

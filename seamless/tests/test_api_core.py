@@ -32,6 +32,7 @@ def test_health_public_reports_db(api, monkeypatch):
         "status": "ok",
         "version": "0.1.0",
         "demo": True,
+        "auth_disabled": False,
         "demo_speed": 1e7,
         "db": "ok",
     }
@@ -142,6 +143,8 @@ def test_me_and_forbidden_audit(api):
 
 ROUTES = [
     ("GET", "/api/v1/me", Role.viewer, None),
+    ("GET", "/api/v1/users", Role.admin, None),
+    ("POST", "/api/v1/users", Role.admin, {"name": "matrix-user"}),
     ("GET", "/api/v1/providers", Role.viewer, None),
     ("POST", "/api/v1/providers", Role.admin, {**SOURCE, "id": "matrix-src"}),
     ("GET", "/api/v1/providers/src-osp", Role.viewer, None),

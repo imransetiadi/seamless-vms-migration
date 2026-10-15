@@ -705,6 +705,7 @@ export const PERSISTED_EVENT_KINDS = [
   'provider.deleted',
   'provider.checked',
   'auth.denied',
+  'user.created',
   'events.pruned',
   // audit events (SDD §14.5)
   'recommendation.created',
@@ -834,6 +835,7 @@ export interface OrchestratorHealth {
 }
 
 export interface Health {
+  auth_disabled: boolean;
   status: 'ok' | 'degraded';
   version: string;
   demo: boolean;
@@ -846,6 +848,10 @@ export interface Health {
 export interface Me {
   name: string;
   role: Role;
+}
+
+export interface UserCreated extends Me {
+  token: string;
 }
 
 
