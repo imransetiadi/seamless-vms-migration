@@ -298,6 +298,19 @@ jobs:
             echo "OpenShift networks are left in the egress policies"; exit 1
           fi
           grep -q 'image: quay.io/sclorg/postgresql-16-c9s@sha256:' /tmp/k8s.yaml
+      - name: Render the optional backup overlay and validate it with the restore job (audit D-06)
+        run: |
+          kubectl kustomize deploy/openshift/backup > /tmp/backup.yaml
+          kubeconform -strict -summary -kubernetes-version 1.30.0 -schema-location default \
+            /tmp/backup.yaml deploy/openshift/backup/restore-job.yaml
+          grep -q '^kind: CronJob' /tmp/backup.yaml
+          [ "$(grep -c '^kind: NetworkPolicy' /tmp/backup.yaml)" -eq 2 ]
+      - name: Compose files parse with a dummy environment (QASuite §13.5 nightly validation, audit D-14)
+        run: |
+          dummy=$(mktemp) && printf 'POSTGRES_PASSWORD=x\nJEV_MCP_AUTH_TOKEN=x\n' > "$dummy"
+          docker compose -f deploy/compose/compose.yaml --env-file "$dummy" --profile '*' config -q
+          docker compose -f deploy/compose/compose.yaml -f deploy/compose/compose.linux-host.yaml \
+            --env-file "$dummy" --profile '*' config -q
       # static checks cannot see what an image writes when it starts: the PostgreSQL StatefulSet passed them
       # and still exited 1 under readOnlyRootFilesystem (QASuite §14.5)
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
