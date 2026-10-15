@@ -5,16 +5,19 @@
 | Product | Seamless Migrate |
 | Release | 0.1.0 (MVP) |
 | Date | 2026-10-08 |
-| Status | Approved; amended 2026-10-09 (NetApp ONTAP handover, Kubernetes and Podman, guest OS catalog) |
+| Status | Approved; amended 2026-10-09 (NetApp ONTAP handover, Kubernetes and Podman, guest OS catalog) and 2026-10-16 (destinations: community OpenStack 2023.1 Antelope – 2026.2 Hibiscus beside RHOSO 18.0, goal G7) |
 | Design | [SDD.md](SDD.md) |
 
 ## 1. Problem statement
 
 Organizations running **Red Hat OpenStack Platform 17.1**, **community OpenStack** or **VMware
-vSphere** must move their virtual machines to **Red Hat OpenStack Services on OpenShift (RHOSO)
-18.0**. RHOSP 17.1 is the last TripleO-based release; RHOSO 18.0 runs the OpenStack control plane
-on OpenShift. In-place *adoption* is not always possible (hardware refresh, new storage, network
-redesign, community or VMware sources), so tenants' workloads must be migrated side by side.
+vSphere** must move their virtual machines to a newer cloud: **Red Hat OpenStack Services on OpenShift
+(RHOSO) 18.0**, or a **community OpenStack** cloud of a current release series, from 2023.1 Antelope
+through 2026.2 Hibiscus. RHOSP 17.1 is the last TripleO-based release; RHOSO 18.0 runs the OpenStack
+control plane on OpenShift. In-place *adoption* is not always possible (hardware refresh, new storage,
+network redesign, community or VMware sources), so tenants' workloads must be migrated side by side.
+Community operators face the same move: a new Kolla-Ansible, OpenStack-Ansible or other upstream
+deployment on new hardware or storage is often safer than upgrading in place across many releases.
 
 Today's tooling forces painful trade-offs:
 
@@ -29,8 +32,8 @@ Today's tooling forces painful trade-offs:
 
 ## 2. Vision
 
-> One control plane that moves any VM from OpenStack or VMware into RHOSO 18.0 with **minutes of
-> downtime**, predictable before it starts, approved by the right people, reversible until it is
+> One control plane that moves any VM from OpenStack or VMware into RHOSO 18.0 or a current community
+> OpenStack release with **minutes of downtime**, predictable before it starts, approved by the right people, reversible until it is
 > finalized — and that gets smarter with every migration.
 
 ## 3. Goals and non-goals
@@ -45,6 +48,7 @@ Today's tooling forces painful trade-offs:
 | G4 | One workflow for all sources | RHOSP 17.1, community OpenStack and VMware handled by the same plan/wave/approval model |
 | G5 | Operability | Every action audited; live progress in the dashboard; Prometheus metrics |
 | G6 | Assisted decisions | Jev-based advisor for strategy ties, wave classification and post-cutover review; agentmemory recall of similar past incidents |
+| G7 | Destination choice (0.2.0) | Besides RHOSO 18.0, every community OpenStack release series from 2023.1 Antelope to 2026.2 Hibiscus is a destination, by the support tiers of SDD §21: each strategy a destination's capabilities allow runs as on RHOSO 18.0; each Tier 1 series (the upstream-Maintained 2025.1 Epoxy, 2025.2 Flamingo, 2026.1 Gazpacho and 2026.2 Hibiscus) passes the destination lab matrix before a release; every destination's series, tier and missing capabilities are shown before a plan runs |
 
 ### Non-goals (0.1.0)
 
@@ -54,6 +58,8 @@ Today's tooling forces painful trade-offs:
   findings; manual runbooks).
 * Network cut-over automation (DNS/FIP/BGP) — documented hooks only.
 * Hyper-V, Nutanix, KVM-without-OpenStack sources.
+* Destinations below 2023.1 Antelope, and clouds without the OpenStack APIs (SDD §21.1). Vendor builds of
+  community releases other than RHOSO are not certified; they count as the upstream series they ship.
 
 ## 4. Personas
 
@@ -64,6 +70,7 @@ Today's tooling forces painful trade-offs:
 | **Change approver** (Sari) | Approve cutovers inside the change window; see risk and evidence; finalize | Approve/Cutover/Finalize actions, audit log |
 | **Application owner** (Dimas) | Know when their VM is down and for how long; confirm it works afterwards | Plan view (read-only), notifications via events |
 | **Security officer** | Credentials never leak; every action attributable; AI use is bounded | Security.md, audit trail, RBAC |
+| **Community cloud operator** (Arif) | Move tenants from an old cloud to a new upstream release side by side, without a Red Hat stack; know before a plan runs whether the destination's release and policies fit | Providers (destination check: series, tier, roles), validation findings, Security.md roles |
 
 ## 5. Key user journeys
 
@@ -84,10 +91,17 @@ Today's tooling forces painful trade-offs:
 5. **Assisted planning** — for VMs without tags, the advisor classifies workloads (stateless web,
    middleware, infrastructure, database, legacy OS) to build risk-ordered waves; when two
    strategies tie, it recommends one with evidence, and the operator sees why.
+6. **Community cloud refresh** — Arif moves tenants from an old cloud (community Zed, or RHOSP 17.1)
+   to a new Kolla-Ansible cloud on 2026.2 Hibiscus. He registers the destination as community
+   OpenStack; its check shows the series it detected (Tier 1), the credential's roles and the
+   capabilities each strategy needs. Validation flags the one VM whose port goes to another project's
+   network: under the secure-RBAC defaults that needs the `service` or `admin` role, no longer
+   `advsvc`. He grants the role, revalidates, and runs the plan as in journey 1.
 
 ## 6. Functional requirements
 
-Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = could (later).
+Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = could (later), **M2** = must
+for 0.2.0 (goal G7).
 
 | ID | Requirement | P | Acceptance criteria |
 |---|---|---|---|
@@ -119,6 +133,12 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 | FR-26 | Changed-extent tracking to remove the scan floor: Ceph-direct `rbd diff` and hypervisor-assisted libvirt checkpoints | C | 0.2.0 |
 | FR-27 | HA control plane (leader election) | C | 0.2.0 |
 | FR-28 | Network cut-over hooks (DNS/FIP/BGP) | C | 0.3.0 |
+| FR-29 | Community OpenStack destinations: a destination provider of kind `openstack` (distribution `openstack_community` or `kolla`) of a series in the support window, beside RHOSO 18.0 | M2 | Every strategy the destination's capabilities allow passes the lab matrix on each Tier 1 series (QASuite §6.7 AC-6, §7.1 M7–M12, §7.2 LAB-D); SDD §21.1 |
+| FR-30 | Release detection and support tier per destination: the series range the API version documents fit, an optional declared series, and the tier | M2 | The provider check shows range, declared series and tier; a declared series outside the range warns; with none declared the tier is the least favourable one the range allows (SDD §21.3) |
+| FR-31 | Destination capability pre-flight: what each chosen strategy needs (compute and block-storage microversions, Cinder manage, Neutron extensions, roles) | M2 | A missing capability blocks the plan and names it; a series outside the tiers or EOL upstream warns (SDD §21.4) |
+| FR-32 | Permission checks follow the destination's policy profile: secure-RBAC defaults (`reader`/`member`/`manager`/`admin`, `service`) or the legacy defaults | M2 | A port on another project's network is judged with `admin`/`service` under the new defaults and `admin`/`advsvc` under the legacy ones (SDD §21.5) |
+| FR-33 | Conversion hosts on community clouds: CentOS Stream 9 and RHEL 9, then Rocky Linux and AlmaLinux 9 and Ubuntu 24.04 LTS images | M2 | The conversion-host roles install and verify the copy tools on each listed image (SDD §21.6) |
+| FR-34 | Destination-neutral wording: findings, events, the CLI and the dashboard name the destination provider, not "RHOSO" | M2 | No user-facing text assumes RHOSO when the destination is community OpenStack (SDD §21.8) |
 
 ## 7. Non-functional requirements
 
@@ -135,6 +155,7 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 | NFR-09 | Observability | Structured logs, events, metrics; every migration has a complete timeline |
 | NFR-10 | Portability | Runs on OpenShift 4.16+, Kubernetes 1.28+, Docker/Podman, macOS dev via Colima; Python 3.11+, Node 22 |
 | NFR-11 | Maintainability | Unit test coverage ≥ 85 % for control-plane core modules; collection additions unit-tested |
+| NFR-12 | Compatibility | The destination support window follows the upstream lifecycle (releases.openstack.org): Tier 1 is the series upstream maintains, validated in the lab before each Seamless release; a new series (next: 2027.1 Indri, estimated 2027-03-24) joins, and a series upstream ends moves down a tier, within one Seamless minor release (SDD §21.2) |
 
 ## 8. Success metrics
 
@@ -145,15 +166,17 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 * 0 incidents of source data loss.
 * Estimate accuracy (G2).
 * Time to plan a 100-VM migration (inventory → validated plan) ≤ 1 hour.
+* 0.2.0: every Tier 1 community series passes the destination lab matrix (QASuite §6.7, §7.1) with the
+  same downtime and success targets as RHOSO 18.0.
 
 ## 9. Release plan
 
 | Release | Scope |
 |---|---|
 | **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift, Kubernetes and Compose (Colima or Podman) deployment, docs |
-| 0.2.0 | Ceph-direct incremental diff, HA (PostgreSQL leader election), per-tenant credentials, notifications (email/Slack webhooks) |
+| 0.2.0 | Ceph-direct incremental diff, HA (PostgreSQL leader election), per-tenant credentials, notifications (email/Slack webhooks); community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34) |
 | 0.3.0 | Network cut-over hooks (DNS, FIP re-mapping, OVN BGP), Octavia/Heat migration helpers |
-| 1.0.0 | Certified on RHOSO 18.0.x FRs, scale test 5,000 VMs, signed releases |
+| 1.0.0 | Certified on RHOSO 18.0.x FRs, validated on every Tier 1 community series of the day, scale test 5,000 VMs, signed releases |
 
 ## 10. Dependencies and assumptions
 
@@ -163,8 +186,13 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
   handover and some pre-staging resources. At RHOSO a VM whose NIC goes to another project's shared or
   external network needs the `admin` or `advsvc` role (Neutron's port policy), and one whose NIC goes to an
   external network that is not shared, the project's own included, needs `admin` (Nova's policy on
-  attaching an external network; `advsvc` does not count there) (SDD §6.6).
-* VMware: VDDK available on the RHOSO conversion host; CBT enabled for warm.
+  attaching an external network; `advsvc` does not count there) (SDD §6.6). On a community destination
+  running the secure-RBAC defaults (the upstream default from 2023.2), Neutron counts `admin` or `service`
+  for such a port and `advsvc` no longer (SDD §21.5).
+* Community OpenStack destinations: Keystone v3 with project-scoped tokens (application credentials
+  recommended), compute microversion ≥ 2.60 (≥ 2.85 for storage handover), Cinder v3; a series of the
+  support window (SDD §21.1).
+* VMware: VDDK available on the destination's conversion host; CBT enabled for warm.
 * Jev requires a provider API key (TypeSafe direct by default); everything works with Jev off.
 * agentmemory is optional; when configured, it runs as the team's memory server.
 
@@ -177,11 +205,22 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 | Guest change rate higher than link | Warm never converges | `max_sync_passes` cap; estimate shows non-convergence; advisor suggests cold window or handover |
 | Network semantics differ (OVS→OVN, MTU) | Post-boot connectivity issues | MTU finding, verification probes, rollback |
 | AI advisor wrong | Suboptimal choice | Bounded to eligible tie set, confidence threshold, recorded with evidence, overridable |
+| Policy defaults differ by release (secure RBAC from 2023.2; `advsvc` deprecated for `service`) | A permission error late in a cutover, after the source stopped | Capability and role pre-flight per destination by its policy profile (SDD §21.4, §21.5); the lab matrix per Tier 1 series |
+| Upstream API changes in new series (compute 2.101–2.104 change attach status codes, drop flavor fields and `os-volumes_boot`) | A newer SDK or cloud breaks a call | openstacksdk's per-resource microversion caps (SDD §21.7); recorded version documents in contract tests; the window moves only after the lab matrix passes |
+| Community clouds without TLS, or with private CAs | Credentials or guest data in clear text | `verify_tls` on by default, CA bundle per provider; the check reports plain-HTTP endpoints (SDD §21.8, Security.md) |
 | Credentials exposure | Security incident | Secrets in mounted files or the platform secret store (written once through the API, never read back), 0600 temp files for playbooks; redaction; Security.md controls |
 
 ## 12. Glossary
 
 * **RHOSO** — Red Hat OpenStack Services on OpenShift.
+* **Community OpenStack** — upstream OpenStack releases (releases.openstack.org) deployed with
+  Kolla-Ansible, OpenStack-Ansible, DevStack or another upstream tool.
+* **Release series** — a six-monthly upstream release, `YYYY.N Name` (2026.2 Hibiscus); **SLURP** marks
+  the series between which upstream supports skip-level upgrades (2023.1, 2024.1, 2025.1, 2026.1).
+* **Maintained / Unmaintained / End of Life** — upstream's maintenance phases of a series; they decide
+  its support tier here (SDD §21.1).
+* **Secure RBAC** — upstream's policy defaults with project personas (`reader`, `member`, `manager`,
+  `admin`) and a `service` role; on by default from 2023.2.
 * **Conversion host** — helper VM in a cloud that attaches volumes and moves data.
 * **Pre-copy / delta pass** — copying data while the VM runs; later passes copy only changes.
 * **Cutover** — the downtime window: stop source, final sync, boot destination.
