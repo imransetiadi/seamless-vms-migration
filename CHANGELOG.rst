@@ -340,8 +340,9 @@ This project follows a simple changelog to satisfy collection metadata validatio
   the conversion host - marked before the export asked Nova to attach it, once
   openstacksdk's own checks passed, whether or not its device was recorded or
   the attach's answer was lost; when the attach call fails, the export, still
-  holding the attach lock, waits while Cinder shows the volume ``reserved`` or
-  ``attaching`` and keeps the mark only if Cinder then lists the conversion
+  holding the attach lock, waits up to two minutes while Cinder shows the volume
+  ``reserved`` or ``attaching`` and keeps the mark only if Cinder then lists the
+  conversion
   host or the attach is still under way; never a shared multi-attach volume
   another migration's export attached - re-attaches the data volumes, and
   removes the

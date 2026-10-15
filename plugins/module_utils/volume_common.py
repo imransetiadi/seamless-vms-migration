@@ -102,6 +102,9 @@ def _lock_host():
 
 # Cinder's statuses while Nova attaches a volume: it lists the attachment only once attached
 ATTACHING = ("reserved", "attaching")
+# how long a settle wait for them holds the attach lock: ample for Nova to finish an attach, and
+# far below what a lock wait queued behind it allows (Seamless Migrate SDD 6.6, review RV11-01)
+ATTACH_SETTLE_S = 120
 
 # ssh's own exit status when it cannot reach or log in to the host
 SSH_FAILED = 255
@@ -656,10 +659,12 @@ class OpenStackVolumeBase:
         """
         The volume ``volume_id`` once Cinder settled it - not `reserved` or
         `attaching`, where Nova is still at work and Cinder lists no attachment
-        yet - within the module's timeout, else as it is then; None when Cinder
-        no longer has it (Seamless Migrate SDD 6.6, review RV10-01, RV10-02).
+        yet - within ATTACH_SETTLE_S (or the module's timeout, if shorter), else
+        as it is then; None when Cinder no longer has it. It runs under the
+        attach lock: a reservation Nova abandoned never settles (Seamless
+        Migrate SDD 6.6, review RV10-01, RV10-02, RV11-01).
         """
-        for second in range(self.timeout):
+        for second in range(min(self.timeout, ATTACH_SETTLE_S)):
             volume = volume_or_none(conn, volume_id)
             if volume is None or getattr(volume, "status", None) not in ATTACHING:
                 return volume
