@@ -75,7 +75,9 @@ GITIGNORES = [".gitignore", "docs/src/.gitignore"]
 # a directory the artifact packs, for the patterns that match at any depth
 DEEPER = "roles/example/files"
 # the collection's own files: the artifact packs every tracked file under these
-OWN = ["plugins", "roles", "playbooks", "meta", "docs", "tests", "README.md", "LICENSE", "CHANGELOG.rst"]
+# docs/src is the collection's documentation; the product docs beside it are packed too, but the audit
+# material and agent plans under docs/audits, docs/advisor and docs/superpowers are not (audit D-21)
+OWN = ["plugins", "roles", "playbooks", "meta", "docs/src", "tests", "README.md", "LICENSE", "CHANGELOG.rst"]
 
 
 def _packed(tmp_path, files):
