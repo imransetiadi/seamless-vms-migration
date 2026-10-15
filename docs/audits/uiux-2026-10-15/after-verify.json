@@ -1,0 +1,132 @@
+{
+  "tabs": [
+    {
+      "theme": "dark",
+      "width": 320,
+      "tab": "Audit",
+      "violations": []
+    },
+    {
+      "theme": "dark",
+      "width": 320,
+      "tab": "Input",
+      "violations": []
+    },
+    {
+      "theme": "dark",
+      "width": 390,
+      "tab": "Audit",
+      "violations": []
+    },
+    {
+      "theme": "dark",
+      "width": 390,
+      "tab": "Input",
+      "violations": []
+    },
+    {
+      "theme": "dark",
+      "width": 768,
+      "tab": "Audit",
+      "violations": []
+    },
+    {
+      "theme": "dark",
+      "width": 768,
+      "tab": "Input",
+      "violations": []
+    },
+    {
+      "theme": "dark",
+      "width": 1280,
+      "tab": "Audit",
+      "violations": []
+    },
+    {
+      "theme": "dark",
+      "width": 1280,
+      "tab": "Input",
+      "violations": []
+    },
+    {
+      "theme": "light",
+      "width": 320,
+      "tab": "Audit",
+      "violations": []
+    },
+    {
+      "theme": "light",
+      "width": 320,
+      "tab": "Input",
+      "violations": []
+    },
+    {
+      "theme": "light",
+      "width": 390,
+      "tab": "Audit",
+      "violations": []
+    },
+    {
+      "theme": "light",
+      "width": 390,
+      "tab": "Input",
+      "violations": []
+    },
+    {
+      "theme": "light",
+      "width": 768,
+      "tab": "Audit",
+      "violations": []
+    },
+    {
+      "theme": "light",
+      "width": 768,
+      "tab": "Input",
+      "violations": []
+    },
+    {
+      "theme": "light",
+      "width": 1280,
+      "tab": "Audit",
+      "violations": []
+    },
+    {
+      "theme": "light",
+      "width": 1280,
+      "tab": "Input",
+      "violations": []
+    }
+  ],
+  "policy": [
+    {
+      "text": "Finance — approval required",
+      "width": 254,
+      "height": 24
+    },
+    {
+      "text": "Built-in default",
+      "width": 254,
+      "height": 24
+    }
+  ],
+  "spacing": {
+    "overflow": 0
+  },
+  "evidence": {
+    "width": 228,
+    "height": 40
+  },
+  "tooltip": {
+    "top": 683,
+    "bottom": 749,
+    "viewport": 800
+  },
+  "webkit": {
+    "version": "27.2",
+    "focus": {
+      "tag": "DIV",
+      "label": "NICs of app-billing-01",
+      "tabIndex": 0
+    }
+  }
+}

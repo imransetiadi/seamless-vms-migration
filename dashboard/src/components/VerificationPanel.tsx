@@ -13,6 +13,7 @@ import { ErrorBanner } from './ErrorBanner';
 import { Modal } from './Modal';
 import { ProbeListEditor } from './ProbeListEditor';
 import { StatusBadge } from './StatusBadge';
+import { ScrollRegion } from './ScrollRegion';
 
 /** The VM's application probes, the plan's or its own, with Edit (an operator; a plan edit, SDD §12). */
 function VmProbes({ m, plan, edit, onSaved }: { m: Migration; plan: Plan; edit: Availability; onSaved: (text: string) => void }) {
@@ -165,7 +166,7 @@ export function VerificationPanel({ migration: m, plan, role, onSaved }: { migra
             </time>
           </p>
           {record.probes.length > 0 && (
-            <div className="table-wrap rounded-md border border-border">
+            <ScrollRegion label="Application probes of the last verification" className="rounded-md border border-border">
               <table className="data-table" aria-labelledby={caption}>
                 <caption id={caption} className="sr-only">
                   Application probes of the last verification
@@ -205,7 +206,7 @@ export function VerificationPanel({ migration: m, plan, role, onSaved }: { migra
                   })}
                 </tbody>
               </table>
-            </div>
+            </ScrollRegion>
           )}
           <div>
             <h3 id={checksId} className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">

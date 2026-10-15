@@ -1,0 +1,164 @@
+{
+  "network": {
+    "tab": {
+      "tag": "DIV",
+      "text": "NICs of app-billing-01NICSourceIn RHOSOfa:16:3e:0a:0e:64tenant-app10.20.1.110tenant-app10.20.1.110",
+      "tabIndex": -1
+    },
+    "scroll": {
+      "left": 31,
+      "width": 322,
+      "total": 353
+    }
+  },
+  "recommendation-320-Details": {
+    "axe": [],
+    "overflow": 0
+  },
+  "recommendation-320-Audit": {
+    "axe": [
+      {
+        "id": "scrollable-region-focusable",
+        "nodes": [
+          {
+            "target": [
+              ".table-wrap"
+            ],
+            "summary": "Fix any of the following:\n  Element should have focusable content\n  Element should be focusable"
+          }
+        ]
+      }
+    ],
+    "overflow": 0
+  },
+  "recommendation-320-Input": {
+    "axe": [
+      {
+        "id": "scrollable-region-focusable",
+        "nodes": [
+          {
+            "target": [
+              "pre"
+            ],
+            "summary": "Fix any of the following:\n  Element should have focusable content\n  Element should be focusable"
+          }
+        ]
+      }
+    ],
+    "overflow": 0
+  },
+  "recommendation-390-Details": {
+    "axe": [],
+    "overflow": 0
+  },
+  "recommendation-390-Audit": {
+    "axe": [
+      {
+        "id": "scrollable-region-focusable",
+        "nodes": [
+          {
+            "target": [
+              ".table-wrap"
+            ],
+            "summary": "Fix any of the following:\n  Element should have focusable content\n  Element should be focusable"
+          }
+        ]
+      }
+    ],
+    "overflow": 0
+  },
+  "recommendation-390-Input": {
+    "axe": [
+      {
+        "id": "scrollable-region-focusable",
+        "nodes": [
+          {
+            "target": [
+              "pre"
+            ],
+            "summary": "Fix any of the following:\n  Element should have focusable content\n  Element should be focusable"
+          }
+        ]
+      }
+    ],
+    "overflow": 0
+  },
+  "recommendation-768-Details": {
+    "axe": [],
+    "overflow": 0
+  },
+  "recommendation-768-Audit": {
+    "axe": [
+      {
+        "id": "scrollable-region-focusable",
+        "nodes": [
+          {
+            "target": [
+              ".table-wrap"
+            ],
+            "summary": "Fix any of the following:\n  Element should have focusable content\n  Element should be focusable"
+          }
+        ]
+      }
+    ],
+    "overflow": 0
+  },
+  "recommendation-768-Input": {
+    "axe": [
+      {
+        "id": "scrollable-region-focusable",
+        "nodes": [
+          {
+            "target": [
+              "pre"
+            ],
+            "summary": "Fix any of the following:\n  Element should have focusable content\n  Element should be focusable"
+          }
+        ]
+      }
+    ],
+    "overflow": 0
+  },
+  "recommendation-1280-Details": {
+    "axe": [],
+    "overflow": 0
+  },
+  "recommendation-1280-Audit": {
+    "axe": [],
+    "overflow": 0
+  },
+  "recommendation-1280-Input": {
+    "axe": [
+      {
+        "id": "scrollable-region-focusable",
+        "nodes": [
+          {
+            "target": [
+              "pre"
+            ],
+            "summary": "Fix any of the following:\n  Element should have focusable content\n  Element should be focusable"
+          }
+        ]
+      }
+    ],
+    "overflow": 0
+  },
+  "policyTitles": [
+    {
+      "text": "Finance \u2014 approval required",
+      "width": 79.8125,
+      "height": 96,
+      "lineHeight": "24px"
+    },
+    {
+      "text": "Built-in default",
+      "width": 60.421875,
+      "height": 96,
+      "lineHeight": "24px"
+    }
+  ],
+  "planDialog": {
+    "axe": [],
+    "overflow": 0
+  }
+}

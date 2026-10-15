@@ -36,7 +36,7 @@ describe('Layout health notice', () => {
     // no token: the anonymous admin of auth-disabled demo mode, who never sees the sign-in page (SDD §13.1)
     renderWithApp(<Layout />, { route: '/', path: '/', server, token: null });
     expect(await screen.findByText(`Control plane ${version}`)).toBeInTheDocument();
-    expect(await screen.findByText('anonymous')).toBeInTheDocument();
+    expect(await within(screen.getByTestId('app-navigation')).findByText('anonymous')).toBeInTheDocument();
   });
 
   it('names the degraded parts: database and a stalled orchestrator', async () => {

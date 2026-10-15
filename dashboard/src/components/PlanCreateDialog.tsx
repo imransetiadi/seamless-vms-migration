@@ -1,5 +1,5 @@
 import { CircleAlert, TriangleAlert } from 'lucide-react';
-import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useCreatePlan, useInventory, useMigrations, usePatchPlan, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
@@ -13,6 +13,7 @@ import { FAMILY_LABELS, handoverTargets, resolveDestination, splitHost, storageB
 import { providerStatusMeta, STRATEGY_LABELS } from '../lib/status';
 import { Button } from './Button';
 import { Checkbox } from './Checkbox';
+import { ConfirmDialog } from './ConfirmDialog';
 import { ErrorBanner } from './ErrorBanner';
 import { SelectField, TextAreaField, TextField } from './Field';
 import { Modal } from './Modal';
@@ -282,6 +283,12 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   // the approval policy is approver-only (SDD §12): below it the form shows the plan's policy read-only
   const canSetPolicy = hasRole(useRole(), 'approver');
   const [form, setForm] = useState<FormState>(() => (plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds)));
+  const baseline = useRef('');
+  const [discarding, setDiscarding] = useState(false);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (open) returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  }, [open]);
   const [errors, setErrors] = useState<Errors>({});
   const summaryRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -292,7 +299,10 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
 
   useEffect(() => {
     if (!open) return;
-    setForm(plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds));
+    const initial = plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds);
+    baseline.current = stable({ ...initial, vmIds: [...initial.vmIds].sort() });
+    setForm(initial);
+    setDiscarding(false);
     setErrors({});
     create.reset();
     patch.reset();
@@ -565,9 +575,28 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
   const advancedHasErrors = ['keepWarm', 'finalizeReminder', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'appProbes', 'handover'].some((k) => k in errors);
+  const close = () => {
+    if (stable({ ...form, vmIds: [...form.vmIds].sort() }) !== baseline.current) setDiscarding(true);
+    else onClose();
+  };
+  if (discarding) {
+    return (
+      <ConfirmDialog
+        open={open}
+        title="Discard unsaved plan changes?"
+        description="Your changes have not been saved. Discard them or return to editing."
+        confirmLabel="Discard changes"
+        cancelLabel="Keep editing"
+        tone="danger"
+        returnFocusRef={returnFocusRef}
+        onConfirm={() => { setDiscarding(false); onClose(); }}
+        onCancel={() => setDiscarding(false)}
+      />
+    );
+  }
 
   return (
-    <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef}>
+    <Modal open={open} onClose={close} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef} returnFocusRef={returnFocusRef}>
       <form onSubmit={submit} noValidate className="flex min-h-0 flex-col">
         <div className="border-b border-border px-5 py-4">
           <h2 id={titleId} className="text-lg font-semibold text-foreground">
@@ -1161,7 +1190,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         </div>
 
         <div className="flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">
-          <Button size="lg" onClick={onClose} disabledReason={saving.isPending ? 'Wait for the request to finish.' : null}>
+          <Button size="lg" onClick={close} disabledReason={saving.isPending ? 'Wait for the request to finish.' : null}>
             Cancel
           </Button>
           <Button size="lg" type="submit" variant="primary" loading={saving.isPending}>

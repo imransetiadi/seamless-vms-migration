@@ -109,12 +109,12 @@
 /* why an action is unavailable, under it after a click or tap (Button, SDD §16); max-w-72 = the
    288 px Button.tsx keeps clear of the viewport edge */
 @utility disabled-reason {
-  @apply fixed z-toast max-w-72 rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground shadow-lg;
+  @apply fixed z-toast max-h-[calc(100dvh-1rem)] max-w-72 overflow-y-auto rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground shadow-lg;
 }
 
 /* a term's definition on hover and focus (components/Term.tsx), placed like disabled-reason */
 @utility tooltip-note {
-  @apply fixed z-toast max-w-72 rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground shadow-lg;
+  @apply fixed z-toast max-h-[calc(100dvh-1rem)] max-w-72 overflow-y-auto rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground shadow-lg;
 }
 
 /* relative: visually hidden text inside a wide table (sr-only is position: absolute) stays inside the

@@ -1,0 +1,2490 @@
+[
+  {
+    "route": "/",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Overview · Seamless Migrate",
+    "h1": [
+      "Overview"
+    ],
+    "tables": [
+      {
+        "width": 252,
+        "scroll": 389,
+        "caption": "Average downtime per strategy"
+      },
+      {
+        "width": 252,
+        "scroll": 252,
+        "caption": "Throughput per minute"
+      }
+    ],
+    "bodyHeight": 4813,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Plans · Seamless Migrate",
+    "h1": [
+      "Plans"
+    ],
+    "tables": [
+      {
+        "width": 286,
+        "scroll": 286,
+        "caption": "Migration plans"
+      }
+    ],
+    "bodyHeight": 1831,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans/plan-4f2a9c1e",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "DC1 → RHOSO production rollout · Seamless Migrate",
+    "h1": [
+      "DC1 → RHOSO production rollout"
+    ],
+    "tables": [
+      {
+        "width": 252,
+        "scroll": 617,
+        "caption": "Migrations in DC1 → RHOSO production rollout"
+      }
+    ],
+    "bodyHeight": 5372,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/migrations/mig-5d7e2b4a12",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "app-billing-01 · Awaiting cutover · Seamless Migrate",
+    "h1": [
+      "app-billing-01"
+    ],
+    "tables": [
+      {
+        "width": 252,
+        "scroll": 550,
+        "caption": "Sync passes"
+      },
+      {
+        "width": 252,
+        "scroll": 353,
+        "caption": "NICs of app-billing-01"
+      },
+      {
+        "width": 252,
+        "scroll": 470,
+        "caption": "Estimates per strategy"
+      }
+    ],
+    "bodyHeight": 5655,
+    "smallText": [],
+    "errors": [],
+    "violations": [
+      {
+        "id": "scrollable-region-focusable",
+        "impact": "serious",
+        "help": "Scrollable region must have keyboard access",
+        "nodes": [
+          {
+            "target": [
+              ".gap-3.flex-col > .table-wrap.rounded-md.border"
+            ],
+            "summary": "Fix any of the following:\n  Element should have focusable content\n  Element should be focusable"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "route": "/providers",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Providers · Seamless Migrate",
+    "h1": [
+      "Providers"
+    ],
+    "tables": [],
+    "bodyHeight": 4297,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 286,
+        "scroll": 721,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2554,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhosp17-dc1",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 286,
+        "scroll": 721,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2554,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhoso-prod",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 254,
+        "scroll": 254,
+        "caption": "Destination networks"
+      },
+      {
+        "width": 254,
+        "scroll": 430,
+        "caption": "Destination flavors"
+      },
+      {
+        "width": 254,
+        "scroll": 429,
+        "caption": "Free quota per destination project"
+      }
+    ],
+    "bodyHeight": 1827,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/events",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Events · Seamless Migrate",
+    "h1": [
+      "Events"
+    ],
+    "tables": [],
+    "bodyHeight": 31211,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor · Seamless Migrate",
+    "h1": [
+      "Advisor"
+    ],
+    "tables": [],
+    "bodyHeight": 6229,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/policies",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor policies · Seamless Migrate",
+    "h1": [
+      "Advisor policies"
+    ],
+    "tables": [],
+    "bodyHeight": 1175,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/audit",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor audit · Seamless Migrate",
+    "h1": [
+      "Advisor audit"
+    ],
+    "tables": [
+      {
+        "width": 252,
+        "scroll": 636,
+        "caption": "Advisor audit events, newest first"
+      }
+    ],
+    "bodyHeight": 2112,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/recommendations/rec-d4e6f8a09001",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Recommendation for static-cdn-01 · Seamless Migrate",
+    "h1": [
+      "Migration strategy: static-cdn-01"
+    ],
+    "tables": [
+      {
+        "width": 252,
+        "scroll": 252,
+        "caption": "Probability Jev gave each option, highest first"
+      }
+    ],
+    "bodyHeight": 2150,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/login",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Sign in · Seamless Migrate",
+    "h1": [
+      "Sign in"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/unknown",
+    "width": 320,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Not found · Seamless Migrate",
+    "h1": [
+      "Page not found"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Overview · Seamless Migrate",
+    "h1": [
+      "Overview"
+    ],
+    "tables": [
+      {
+        "width": 322,
+        "scroll": 389,
+        "caption": "Average downtime per strategy"
+      },
+      {
+        "width": 322,
+        "scroll": 322,
+        "caption": "Throughput per minute"
+      }
+    ],
+    "bodyHeight": 4549,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Plans · Seamless Migrate",
+    "h1": [
+      "Plans"
+    ],
+    "tables": [
+      {
+        "width": 356,
+        "scroll": 356,
+        "caption": "Migration plans"
+      }
+    ],
+    "bodyHeight": 1291,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans/plan-4f2a9c1e",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "DC1 → RHOSO production rollout · Seamless Migrate",
+    "h1": [
+      "DC1 → RHOSO production rollout"
+    ],
+    "tables": [
+      {
+        "width": 322,
+        "scroll": 617,
+        "caption": "Migrations in DC1 → RHOSO production rollout"
+      }
+    ],
+    "bodyHeight": 5010,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/migrations/mig-5d7e2b4a12",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "app-billing-01 · Awaiting cutover · Seamless Migrate",
+    "h1": [
+      "app-billing-01"
+    ],
+    "tables": [
+      {
+        "width": 322,
+        "scroll": 550,
+        "caption": "Sync passes"
+      },
+      {
+        "width": 322,
+        "scroll": 353,
+        "caption": "NICs of app-billing-01"
+      },
+      {
+        "width": 322,
+        "scroll": 470,
+        "caption": "Estimates per strategy"
+      }
+    ],
+    "bodyHeight": 5319,
+    "smallText": [],
+    "errors": [],
+    "violations": [
+      {
+        "id": "scrollable-region-focusable",
+        "impact": "serious",
+        "help": "Scrollable region must have keyboard access",
+        "nodes": [
+          {
+            "target": [
+              ".gap-3.flex-col > .table-wrap.rounded-md.border"
+            ],
+            "summary": "Fix any of the following:\n  Element should have focusable content\n  Element should be focusable"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "route": "/providers",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Providers · Seamless Migrate",
+    "h1": [
+      "Providers"
+    ],
+    "tables": [],
+    "bodyHeight": 3737,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 356,
+        "scroll": 721,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2534,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhosp17-dc1",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 356,
+        "scroll": 721,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2534,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhoso-prod",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 324,
+        "scroll": 324,
+        "caption": "Destination networks"
+      },
+      {
+        "width": 324,
+        "scroll": 430,
+        "caption": "Destination flavors"
+      },
+      {
+        "width": 324,
+        "scroll": 429,
+        "caption": "Free quota per destination project"
+      }
+    ],
+    "bodyHeight": 1795,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/events",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Events · Seamless Migrate",
+    "h1": [
+      "Events"
+    ],
+    "tables": [],
+    "bodyHeight": 26807,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor · Seamless Migrate",
+    "h1": [
+      "Advisor"
+    ],
+    "tables": [],
+    "bodyHeight": 5441,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/policies",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor policies · Seamless Migrate",
+    "h1": [
+      "Advisor policies"
+    ],
+    "tables": [],
+    "bodyHeight": 1027,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/audit",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor audit · Seamless Migrate",
+    "h1": [
+      "Advisor audit"
+    ],
+    "tables": [
+      {
+        "width": 322,
+        "scroll": 635,
+        "caption": "Advisor audit events, newest first"
+      }
+    ],
+    "bodyHeight": 2060,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/recommendations/rec-d4e6f8a09001",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Recommendation for static-cdn-01 · Seamless Migrate",
+    "h1": [
+      "Migration strategy: static-cdn-01"
+    ],
+    "tables": [
+      {
+        "width": 322,
+        "scroll": 322,
+        "caption": "Probability Jev gave each option, highest first"
+      }
+    ],
+    "bodyHeight": 1734,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/login",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Sign in · Seamless Migrate",
+    "h1": [
+      "Sign in"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/unknown",
+    "width": 390,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Not found · Seamless Migrate",
+    "h1": [
+      "Page not found"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Overview · Seamless Migrate",
+    "h1": [
+      "Overview"
+    ],
+    "tables": [
+      {
+        "width": 604,
+        "scroll": 604,
+        "caption": "Average downtime per strategy"
+      },
+      {
+        "width": 604,
+        "scroll": 604,
+        "caption": "Throughput per minute"
+      }
+    ],
+    "bodyHeight": 3667,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Plans · Seamless Migrate",
+    "h1": [
+      "Plans"
+    ],
+    "tables": [
+      {
+        "width": 638,
+        "scroll": 638,
+        "caption": "Migration plans"
+      }
+    ],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans/plan-4f2a9c1e",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "DC1 → RHOSO production rollout · Seamless Migrate",
+    "h1": [
+      "DC1 → RHOSO production rollout"
+    ],
+    "tables": [
+      {
+        "width": 604,
+        "scroll": 849,
+        "caption": "Migrations in DC1 → RHOSO production rollout"
+      }
+    ],
+    "bodyHeight": 3743,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/migrations/mig-5d7e2b4a12",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "app-billing-01 · Awaiting cutover · Seamless Migrate",
+    "h1": [
+      "app-billing-01"
+    ],
+    "tables": [
+      {
+        "width": 604,
+        "scroll": 604,
+        "caption": "Sync passes"
+      },
+      {
+        "width": 604,
+        "scroll": 604,
+        "caption": "NICs of app-billing-01"
+      },
+      {
+        "width": 604,
+        "scroll": 678,
+        "caption": "Estimates per strategy"
+      }
+    ],
+    "bodyHeight": 4234,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/providers",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Providers · Seamless Migrate",
+    "h1": [
+      "Providers"
+    ],
+    "tables": [],
+    "bodyHeight": 2634,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 638,
+        "scroll": 902,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2335,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhosp17-dc1",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 638,
+        "scroll": 902,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2335,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhoso-prod",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 606,
+        "scroll": 606,
+        "caption": "Destination networks"
+      },
+      {
+        "width": 606,
+        "scroll": 606,
+        "caption": "Destination flavors"
+      },
+      {
+        "width": 606,
+        "scroll": 606,
+        "caption": "Free quota per destination project"
+      }
+    ],
+    "bodyHeight": 1498,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/events",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Events · Seamless Migrate",
+    "h1": [
+      "Events"
+    ],
+    "tables": [],
+    "bodyHeight": 17397,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor · Seamless Migrate",
+    "h1": [
+      "Advisor"
+    ],
+    "tables": [],
+    "bodyHeight": 3732,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/policies",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor policies · Seamless Migrate",
+    "h1": [
+      "Advisor policies"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/audit",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor audit · Seamless Migrate",
+    "h1": [
+      "Advisor audit"
+    ],
+    "tables": [
+      {
+        "width": 604,
+        "scroll": 634,
+        "caption": "Advisor audit events, newest first"
+      }
+    ],
+    "bodyHeight": 1993,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/recommendations/rec-d4e6f8a09001",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Recommendation for static-cdn-01 · Seamless Migrate",
+    "h1": [
+      "Migration strategy: static-cdn-01"
+    ],
+    "tables": [
+      {
+        "width": 604,
+        "scroll": 604,
+        "caption": "Probability Jev gave each option, highest first"
+      }
+    ],
+    "bodyHeight": 1313,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/login",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Sign in · Seamless Migrate",
+    "h1": [
+      "Sign in"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/unknown",
+    "width": 768,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Not found · Seamless Migrate",
+    "h1": [
+      "Page not found"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Overview · Seamless Migrate",
+    "h1": [
+      "Overview"
+    ],
+    "tables": [
+      {
+        "width": 550,
+        "scroll": 550,
+        "caption": "Average downtime per strategy"
+      },
+      {
+        "width": 620,
+        "scroll": 620,
+        "caption": "Throughput per minute"
+      }
+    ],
+    "bodyHeight": 2373,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Plans · Seamless Migrate",
+    "h1": [
+      "Plans"
+    ],
+    "tables": [
+      {
+        "width": 990,
+        "scroll": 990,
+        "caption": "Migration plans"
+      }
+    ],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans/plan-4f2a9c1e",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "DC1 → RHOSO production rollout · Seamless Migrate",
+    "h1": [
+      "DC1 → RHOSO production rollout"
+    ],
+    "tables": [
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "Migrations in DC1 → RHOSO production rollout"
+      }
+    ],
+    "bodyHeight": 3347,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/migrations/mig-5d7e2b4a12",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "app-billing-01 · Awaiting cutover · Seamless Migrate",
+    "h1": [
+      "app-billing-01"
+    ],
+    "tables": [
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "Sync passes"
+      },
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "NICs of app-billing-01"
+      },
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "Estimates per strategy"
+      }
+    ],
+    "bodyHeight": 3132,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/providers",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Providers · Seamless Migrate",
+    "h1": [
+      "Providers"
+    ],
+    "tables": [],
+    "bodyHeight": 1824,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 990,
+        "scroll": 990,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2330,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhosp17-dc1",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 990,
+        "scroll": 990,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2330,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhoso-prod",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 454,
+        "scroll": 454,
+        "caption": "Destination networks"
+      },
+      {
+        "width": 454,
+        "scroll": 454,
+        "caption": "Destination flavors"
+      },
+      {
+        "width": 454,
+        "scroll": 454,
+        "caption": "Free quota per destination project"
+      }
+    ],
+    "bodyHeight": 1145,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/events",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Events · Seamless Migrate",
+    "h1": [
+      "Events"
+    ],
+    "tables": [],
+    "bodyHeight": 11841,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor · Seamless Migrate",
+    "h1": [
+      "Advisor"
+    ],
+    "tables": [],
+    "bodyHeight": 2548,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/policies",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor policies · Seamless Migrate",
+    "h1": [
+      "Advisor policies"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/audit",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Advisor audit · Seamless Migrate",
+    "h1": [
+      "Advisor audit"
+    ],
+    "tables": [
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "Advisor audit events, newest first"
+      }
+    ],
+    "bodyHeight": 1433,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/recommendations/rec-d4e6f8a09001",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Recommendation for static-cdn-01 · Seamless Migrate",
+    "h1": [
+      "Migration strategy: static-cdn-01"
+    ],
+    "tables": [
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "Probability Jev gave each option, highest first"
+      }
+    ],
+    "bodyHeight": 1293,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/login",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Sign in · Seamless Migrate",
+    "h1": [
+      "Sign in"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/unknown",
+    "width": 1280,
+    "theme": "dark",
+    "overflow": 0,
+    "title": "Not found · Seamless Migrate",
+    "h1": [
+      "Page not found"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Overview · Seamless Migrate",
+    "h1": [
+      "Overview"
+    ],
+    "tables": [
+      {
+        "width": 252,
+        "scroll": 389,
+        "caption": "Average downtime per strategy"
+      },
+      {
+        "width": 252,
+        "scroll": 252,
+        "caption": "Throughput per minute"
+      }
+    ],
+    "bodyHeight": 4813,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Plans · Seamless Migrate",
+    "h1": [
+      "Plans"
+    ],
+    "tables": [
+      {
+        "width": 286,
+        "scroll": 286,
+        "caption": "Migration plans"
+      }
+    ],
+    "bodyHeight": 1831,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans/plan-4f2a9c1e",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "DC1 → RHOSO production rollout · Seamless Migrate",
+    "h1": [
+      "DC1 → RHOSO production rollout"
+    ],
+    "tables": [
+      {
+        "width": 252,
+        "scroll": 617,
+        "caption": "Migrations in DC1 → RHOSO production rollout"
+      }
+    ],
+    "bodyHeight": 5372,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/migrations/mig-5d7e2b4a12",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "app-billing-01 · Awaiting cutover · Seamless Migrate",
+    "h1": [
+      "app-billing-01"
+    ],
+    "tables": [
+      {
+        "width": 252,
+        "scroll": 550,
+        "caption": "Sync passes"
+      },
+      {
+        "width": 252,
+        "scroll": 353,
+        "caption": "NICs of app-billing-01"
+      },
+      {
+        "width": 252,
+        "scroll": 470,
+        "caption": "Estimates per strategy"
+      }
+    ],
+    "bodyHeight": 5655,
+    "smallText": [],
+    "errors": [],
+    "violations": [
+      {
+        "id": "scrollable-region-focusable",
+        "impact": "serious",
+        "help": "Scrollable region must have keyboard access",
+        "nodes": [
+          {
+            "target": [
+              ".gap-3.flex-col > .table-wrap.rounded-md.border"
+            ],
+            "summary": "Fix any of the following:\n  Element should have focusable content\n  Element should be focusable"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "route": "/providers",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Providers · Seamless Migrate",
+    "h1": [
+      "Providers"
+    ],
+    "tables": [],
+    "bodyHeight": 4297,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 286,
+        "scroll": 721,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2554,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhosp17-dc1",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 286,
+        "scroll": 721,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2554,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhoso-prod",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 254,
+        "scroll": 254,
+        "caption": "Destination networks"
+      },
+      {
+        "width": 254,
+        "scroll": 430,
+        "caption": "Destination flavors"
+      },
+      {
+        "width": 254,
+        "scroll": 429,
+        "caption": "Free quota per destination project"
+      }
+    ],
+    "bodyHeight": 1827,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/events",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Events · Seamless Migrate",
+    "h1": [
+      "Events"
+    ],
+    "tables": [],
+    "bodyHeight": 31211,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor · Seamless Migrate",
+    "h1": [
+      "Advisor"
+    ],
+    "tables": [],
+    "bodyHeight": 6229,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/policies",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor policies · Seamless Migrate",
+    "h1": [
+      "Advisor policies"
+    ],
+    "tables": [],
+    "bodyHeight": 1175,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/audit",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor audit · Seamless Migrate",
+    "h1": [
+      "Advisor audit"
+    ],
+    "tables": [
+      {
+        "width": 252,
+        "scroll": 634,
+        "caption": "Advisor audit events, newest first"
+      }
+    ],
+    "bodyHeight": 2112,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/recommendations/rec-d4e6f8a09001",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Recommendation for static-cdn-01 · Seamless Migrate",
+    "h1": [
+      "Migration strategy: static-cdn-01"
+    ],
+    "tables": [
+      {
+        "width": 252,
+        "scroll": 252,
+        "caption": "Probability Jev gave each option, highest first"
+      }
+    ],
+    "bodyHeight": 2150,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/login",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Sign in · Seamless Migrate",
+    "h1": [
+      "Sign in"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/unknown",
+    "width": 320,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Not found · Seamless Migrate",
+    "h1": [
+      "Page not found"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Overview · Seamless Migrate",
+    "h1": [
+      "Overview"
+    ],
+    "tables": [
+      {
+        "width": 322,
+        "scroll": 389,
+        "caption": "Average downtime per strategy"
+      },
+      {
+        "width": 322,
+        "scroll": 322,
+        "caption": "Throughput per minute"
+      }
+    ],
+    "bodyHeight": 4549,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Plans · Seamless Migrate",
+    "h1": [
+      "Plans"
+    ],
+    "tables": [
+      {
+        "width": 356,
+        "scroll": 356,
+        "caption": "Migration plans"
+      }
+    ],
+    "bodyHeight": 1291,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans/plan-4f2a9c1e",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "DC1 → RHOSO production rollout · Seamless Migrate",
+    "h1": [
+      "DC1 → RHOSO production rollout"
+    ],
+    "tables": [
+      {
+        "width": 322,
+        "scroll": 617,
+        "caption": "Migrations in DC1 → RHOSO production rollout"
+      }
+    ],
+    "bodyHeight": 5010,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/migrations/mig-5d7e2b4a12",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "app-billing-01 · Awaiting cutover · Seamless Migrate",
+    "h1": [
+      "app-billing-01"
+    ],
+    "tables": [
+      {
+        "width": 322,
+        "scroll": 550,
+        "caption": "Sync passes"
+      },
+      {
+        "width": 322,
+        "scroll": 353,
+        "caption": "NICs of app-billing-01"
+      },
+      {
+        "width": 322,
+        "scroll": 470,
+        "caption": "Estimates per strategy"
+      }
+    ],
+    "bodyHeight": 5319,
+    "smallText": [],
+    "errors": [],
+    "violations": [
+      {
+        "id": "scrollable-region-focusable",
+        "impact": "serious",
+        "help": "Scrollable region must have keyboard access",
+        "nodes": [
+          {
+            "target": [
+              ".gap-3.flex-col > .table-wrap.rounded-md.border"
+            ],
+            "summary": "Fix any of the following:\n  Element should have focusable content\n  Element should be focusable"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "route": "/providers",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Providers · Seamless Migrate",
+    "h1": [
+      "Providers"
+    ],
+    "tables": [],
+    "bodyHeight": 3737,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 356,
+        "scroll": 721,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2534,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhosp17-dc1",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 356,
+        "scroll": 721,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2534,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhoso-prod",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 324,
+        "scroll": 324,
+        "caption": "Destination networks"
+      },
+      {
+        "width": 324,
+        "scroll": 430,
+        "caption": "Destination flavors"
+      },
+      {
+        "width": 324,
+        "scroll": 429,
+        "caption": "Free quota per destination project"
+      }
+    ],
+    "bodyHeight": 1795,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/events",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Events · Seamless Migrate",
+    "h1": [
+      "Events"
+    ],
+    "tables": [],
+    "bodyHeight": 26807,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor · Seamless Migrate",
+    "h1": [
+      "Advisor"
+    ],
+    "tables": [],
+    "bodyHeight": 5441,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/policies",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor policies · Seamless Migrate",
+    "h1": [
+      "Advisor policies"
+    ],
+    "tables": [],
+    "bodyHeight": 1027,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/audit",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor audit · Seamless Migrate",
+    "h1": [
+      "Advisor audit"
+    ],
+    "tables": [
+      {
+        "width": 322,
+        "scroll": 635,
+        "caption": "Advisor audit events, newest first"
+      }
+    ],
+    "bodyHeight": 2060,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/recommendations/rec-d4e6f8a09001",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Recommendation for static-cdn-01 · Seamless Migrate",
+    "h1": [
+      "Migration strategy: static-cdn-01"
+    ],
+    "tables": [
+      {
+        "width": 322,
+        "scroll": 322,
+        "caption": "Probability Jev gave each option, highest first"
+      }
+    ],
+    "bodyHeight": 1734,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/login",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Sign in · Seamless Migrate",
+    "h1": [
+      "Sign in"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/unknown",
+    "width": 390,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Not found · Seamless Migrate",
+    "h1": [
+      "Page not found"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Overview · Seamless Migrate",
+    "h1": [
+      "Overview"
+    ],
+    "tables": [
+      {
+        "width": 604,
+        "scroll": 604,
+        "caption": "Average downtime per strategy"
+      },
+      {
+        "width": 604,
+        "scroll": 604,
+        "caption": "Throughput per minute"
+      }
+    ],
+    "bodyHeight": 3667,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Plans · Seamless Migrate",
+    "h1": [
+      "Plans"
+    ],
+    "tables": [
+      {
+        "width": 638,
+        "scroll": 638,
+        "caption": "Migration plans"
+      }
+    ],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans/plan-4f2a9c1e",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "DC1 → RHOSO production rollout · Seamless Migrate",
+    "h1": [
+      "DC1 → RHOSO production rollout"
+    ],
+    "tables": [
+      {
+        "width": 604,
+        "scroll": 849,
+        "caption": "Migrations in DC1 → RHOSO production rollout"
+      }
+    ],
+    "bodyHeight": 3743,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/migrations/mig-5d7e2b4a12",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "app-billing-01 · Awaiting cutover · Seamless Migrate",
+    "h1": [
+      "app-billing-01"
+    ],
+    "tables": [
+      {
+        "width": 604,
+        "scroll": 604,
+        "caption": "Sync passes"
+      },
+      {
+        "width": 604,
+        "scroll": 604,
+        "caption": "NICs of app-billing-01"
+      },
+      {
+        "width": 604,
+        "scroll": 678,
+        "caption": "Estimates per strategy"
+      }
+    ],
+    "bodyHeight": 4234,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/providers",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Providers · Seamless Migrate",
+    "h1": [
+      "Providers"
+    ],
+    "tables": [],
+    "bodyHeight": 2634,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 638,
+        "scroll": 902,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2335,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhosp17-dc1",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 638,
+        "scroll": 902,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2335,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhoso-prod",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 606,
+        "scroll": 606,
+        "caption": "Destination networks"
+      },
+      {
+        "width": 606,
+        "scroll": 606,
+        "caption": "Destination flavors"
+      },
+      {
+        "width": 606,
+        "scroll": 606,
+        "caption": "Free quota per destination project"
+      }
+    ],
+    "bodyHeight": 1498,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/events",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Events · Seamless Migrate",
+    "h1": [
+      "Events"
+    ],
+    "tables": [],
+    "bodyHeight": 17397,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor · Seamless Migrate",
+    "h1": [
+      "Advisor"
+    ],
+    "tables": [],
+    "bodyHeight": 3732,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/policies",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor policies · Seamless Migrate",
+    "h1": [
+      "Advisor policies"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/audit",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor audit · Seamless Migrate",
+    "h1": [
+      "Advisor audit"
+    ],
+    "tables": [
+      {
+        "width": 604,
+        "scroll": 634,
+        "caption": "Advisor audit events, newest first"
+      }
+    ],
+    "bodyHeight": 1993,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/recommendations/rec-d4e6f8a09001",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Recommendation for static-cdn-01 · Seamless Migrate",
+    "h1": [
+      "Migration strategy: static-cdn-01"
+    ],
+    "tables": [
+      {
+        "width": 604,
+        "scroll": 604,
+        "caption": "Probability Jev gave each option, highest first"
+      }
+    ],
+    "bodyHeight": 1313,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/login",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Sign in · Seamless Migrate",
+    "h1": [
+      "Sign in"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/unknown",
+    "width": 768,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Not found · Seamless Migrate",
+    "h1": [
+      "Page not found"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Overview · Seamless Migrate",
+    "h1": [
+      "Overview"
+    ],
+    "tables": [
+      {
+        "width": 550,
+        "scroll": 550,
+        "caption": "Average downtime per strategy"
+      },
+      {
+        "width": 620,
+        "scroll": 620,
+        "caption": "Throughput per minute"
+      }
+    ],
+    "bodyHeight": 2373,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Plans · Seamless Migrate",
+    "h1": [
+      "Plans"
+    ],
+    "tables": [
+      {
+        "width": 990,
+        "scroll": 990,
+        "caption": "Migration plans"
+      }
+    ],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/plans/plan-4f2a9c1e",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "DC1 → RHOSO production rollout · Seamless Migrate",
+    "h1": [
+      "DC1 → RHOSO production rollout"
+    ],
+    "tables": [
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "Migrations in DC1 → RHOSO production rollout"
+      }
+    ],
+    "bodyHeight": 3347,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/migrations/mig-5d7e2b4a12",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "app-billing-01 · Awaiting cutover · Seamless Migrate",
+    "h1": [
+      "app-billing-01"
+    ],
+    "tables": [
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "Sync passes"
+      },
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "NICs of app-billing-01"
+      },
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "Estimates per strategy"
+      }
+    ],
+    "bodyHeight": 3132,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/providers",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Providers · Seamless Migrate",
+    "h1": [
+      "Providers"
+    ],
+    "tables": [],
+    "bodyHeight": 1824,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 990,
+        "scroll": 990,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2330,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhosp17-dc1",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 990,
+        "scroll": 990,
+        "caption": "VMs on RHOSP 17.1 — DC1"
+      }
+    ],
+    "bodyHeight": 2330,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/inventory/rhoso-prod",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Inventory · Seamless Migrate",
+    "h1": [
+      "Inventory"
+    ],
+    "tables": [
+      {
+        "width": 454,
+        "scroll": 454,
+        "caption": "Destination networks"
+      },
+      {
+        "width": 454,
+        "scroll": 454,
+        "caption": "Destination flavors"
+      },
+      {
+        "width": 454,
+        "scroll": 454,
+        "caption": "Free quota per destination project"
+      }
+    ],
+    "bodyHeight": 1145,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/events",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Events · Seamless Migrate",
+    "h1": [
+      "Events"
+    ],
+    "tables": [],
+    "bodyHeight": 11841,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor · Seamless Migrate",
+    "h1": [
+      "Advisor"
+    ],
+    "tables": [],
+    "bodyHeight": 2548,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/policies",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor policies · Seamless Migrate",
+    "h1": [
+      "Advisor policies"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/audit",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Advisor audit · Seamless Migrate",
+    "h1": [
+      "Advisor audit"
+    ],
+    "tables": [
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "Advisor audit events, newest first"
+      }
+    ],
+    "bodyHeight": 1433,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/advisor/recommendations/rec-d4e6f8a09001",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Recommendation for static-cdn-01 · Seamless Migrate",
+    "h1": [
+      "Migration strategy: static-cdn-01"
+    ],
+    "tables": [
+      {
+        "width": 956,
+        "scroll": 956,
+        "caption": "Probability Jev gave each option, highest first"
+      }
+    ],
+    "bodyHeight": 1293,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/login",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Sign in · Seamless Migrate",
+    "h1": [
+      "Sign in"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  },
+  {
+    "route": "/unknown",
+    "width": 1280,
+    "theme": "light",
+    "overflow": 0,
+    "title": "Not found · Seamless Migrate",
+    "h1": [
+      "Page not found"
+    ],
+    "tables": [],
+    "bodyHeight": 900,
+    "smallText": [],
+    "errors": [],
+    "violations": []
+  }
+]

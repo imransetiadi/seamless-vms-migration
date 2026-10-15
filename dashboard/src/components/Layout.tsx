@@ -311,6 +311,19 @@ function RailSession() {
   );
 }
 
+function CompactSession() {
+  const me = useMe();
+  const health = useHealth();
+  if (!me.data) return null;
+  return (
+    <div className="mb-1 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs md:mb-3">
+      <span className="min-w-0 wrap-anywhere font-medium text-foreground">{me.data.name}</span>
+      <span className="text-muted-foreground">{ROLE_LABELS[me.data.role] ?? me.data.role}</span>
+      {health.data?.demo && <span className="text-status-info">Demo</span>}
+    </div>
+  );
+}
+
 function SessionFooter() {
   const me = useMe();
   const health = useHealth();
@@ -503,10 +516,11 @@ export function Layout() {
           id="main"
           ref={mainRef}
           tabIndex={-1}
-          className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-4 outline-hidden md:px-6 md:py-6"
+          className="mx-auto w-full max-w-[1400px] flex-1 px-4 pb-4 pt-2 outline-hidden md:px-6 md:py-6"
         >
           <HealthNotice />
           <StreamNotice />
+          <div className={full ? 'md:hidden' : undefined}><CompactSession /></div>
           <Outlet />
         </main>
       </div>

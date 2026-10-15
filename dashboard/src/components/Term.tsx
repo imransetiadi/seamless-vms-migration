@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 
 /**
@@ -9,6 +9,7 @@ export function Term({ children, definition }: { children: ReactNode; definition
   const id = useId();
   const ref = useRef<HTMLButtonElement>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tooltipRef = useRef<HTMLSpanElement>(null);
   const [at, setAt] = useState<{ top: number; left: number } | null>(null);
 
   const cancel = () => {
@@ -20,6 +21,13 @@ export function Term({ children, definition }: { children: ReactNode; definition
     const rect = ref.current?.getBoundingClientRect();
     if (rect) setAt({ top: rect.bottom + 6, left: Math.max(8, Math.min(rect.left, window.innerWidth - 296)) });
   };
+  useLayoutEffect(() => {
+    if (!at || !tooltipRef.current) return;
+    const box = tooltipRef.current.getBoundingClientRect();
+    const top = Math.max(8, box.bottom > window.innerHeight - 8 ? (ref.current?.getBoundingClientRect().top ?? at.top) - box.height - 6 : at.top);
+    const left = Math.max(8, Math.min(at.left, window.innerWidth - box.width - 8));
+    if (top !== at.top || left !== at.left) setAt({ top, left });
+  }, [at]);
   const hide = () => {
     cancel();
     setAt(null);
@@ -30,6 +38,18 @@ export function Term({ children, definition }: { children: ReactNode; definition
     timer.current = setTimeout(() => setAt(null), 150);
   };
   useEffect(() => cancel, []);
+  useEffect(() => {
+    if (!at) return;
+    const dismiss = (event: Event) => {
+      if (event.target !== tooltipRef.current) setAt(null);
+    };
+    window.addEventListener('scroll', dismiss, true);
+    window.addEventListener('resize', dismiss);
+    return () => {
+      window.removeEventListener('scroll', dismiss, true);
+      window.removeEventListener('resize', dismiss);
+    };
+  }, [at]);
 
   return (
     <>
@@ -55,7 +75,7 @@ export function Term({ children, definition }: { children: ReactNode; definition
         {children}
       </button>
       {createPortal(
-        <span role="tooltip" id={id} hidden={!at} onMouseEnter={cancel} onMouseLeave={hide} className="tooltip-note" style={at ?? undefined}>
+        <span ref={tooltipRef} role="tooltip" id={id} hidden={!at} onMouseEnter={cancel} onMouseLeave={hide} className="tooltip-note" style={at ?? undefined}>
           {definition}
         </span>,
         document.body,

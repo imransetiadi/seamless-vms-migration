@@ -632,6 +632,14 @@ Stack commands (Compose): `C` as defined in §14.1 (pinned context, project and 
 
 ### 12.3 End-to-end UI (Playwright)
 
+The 2026-10-15 UI/UX audit adds `dashboard/e2e/audit.spec.ts`: a rejected route chunk keeps navigation and
+offers Reload page; named keyboard scrollers; definitions and disabled reasons stay in the viewport;
+mobile evidence and policy titles keep readable widths; Plans URL filters survive Back/reload and reject
+unknown enum values; changed plan input (VM selection too) asks before discard and restores focus; compact
+navigation retains identity, role and Demo. These regressions complement the existing first-screen downtime,
+dialog focus, role, font and reflow checks. Findings and before/after evidence are in
+`docs/UI-UX-AUDIT-2026-10-15.md`; its UI-xx labels belong to that report, not the journey IDs below.
+
 Two layers exist: `dashboard/e2e/` (`npm run test:e2e`, Chromium against the mock-mode build, CI job
 `dashboard-e2e`) — `smoke.spec.ts` (design tokens and themes, the main journey, viewer soft-disabled actions, adding
 a provider; UI-15 no page scrolls sideways on a 320 px wide screen — NFR-08, WCAG 2.2 reflow — it failed on the
