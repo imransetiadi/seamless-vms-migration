@@ -9,8 +9,12 @@ set -euo pipefail
 BASE=${BASE:-http://127.0.0.1:8080/api/v1}
 : "${TOKEN:?export TOKEN=<admin or approver token>}"
 : "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
-api() { curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' "$@"; }
-second() { curl -fsS -H "Authorization: Bearer $APPROVER_TOKEN" -H 'Content-Type: application/json' "$@"; }
+# shellcheck source=tests/e2e/token-headers.sh
+. "$(dirname "$0")/token-headers.sh"   # the tokens reach curl from header files, never argv
+H=$(token_header admin "$TOKEN")
+HA=$(token_header approver "$APPROVER_TOKEN")
+api() { curl -fsS -H "$H" -H 'Content-Type: application/json' "$@"; }
+second() { curl -fsS -H "$HA" -H 'Content-Type: application/json' "$@"; }
 
 echo "== health";   curl -fsS "$BASE/health" | jq -e '.status == "ok" and .db == "ok" and .demo == true'
 echo "== identity"; api "$BASE/me" | jq -e '.role == "admin" or .role == "approver"'

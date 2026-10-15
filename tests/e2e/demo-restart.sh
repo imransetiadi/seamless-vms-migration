@@ -10,12 +10,14 @@
 # shellcheck disable=SC2034
 set -u
 R=$(cd "$(dirname "$0")/../.." && pwd)
-S=${TMPDIR:-/tmp}
 BASE=${BASE:-http://127.0.0.1:8080}
 : "${TOKEN:?export TOKEN=<admin or approver token>}"
 : "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
-H="Authorization: Bearer $TOKEN"
-HA="Authorization: Bearer $APPROVER_TOKEN"
+# shellcheck source=tests/e2e/token-headers.sh
+. "$R/tests/e2e/token-headers.sh"   # the tokens reach curl from header files, never argv
+S=$E2E_TMP                         # private, removed on exit: the event dump goes here
+H=$(token_header admin "$TOKEN") || exit 2
+HA=$(token_header approver "$APPROVER_TOKEN") || exit 2
 C="docker --context colima-seamless compose -p seamless -f $R/deploy/compose/compose.yaml --env-file $R/deploy/compose/.env"
 seen=""
 restart_at=${RESTART_AT:-45}

@@ -5,7 +5,13 @@ set -u
 BASE=${BASE:-http://127.0.0.1:8080/api/v1}
 : "${VIEWER:?}" "${OPERATOR:?}" "${APPROVER:?}" "${ADMIN:?}"
 rank()  { case "$1" in viewer) echo 1 ;; operator) echo 2 ;; approver) echo 3 ;; admin) echo 4 ;; esac; }
-token() { case "$1" in viewer) echo "$VIEWER" ;; operator) echo "$OPERATOR" ;; approver) echo "$APPROVER" ;; admin) echo "$ADMIN" ;; esac; }
+# shellcheck source=tests/e2e/token-headers.sh
+. "$(dirname "$0")/token-headers.sh"   # the tokens reach curl from header files, never argv
+VIEWER_H=$(token_header viewer "$VIEWER") || exit 2
+OPERATOR_H=$(token_header operator "$OPERATOR") || exit 2
+APPROVER_H=$(token_header approver "$APPROVER") || exit 2
+ADMIN_H=$(token_header admin "$ADMIN") || exit 2
+header() { case "$1" in viewer) echo "$VIEWER_H" ;; operator) echo "$OPERATOR_H" ;; approver) echo "$APPROVER_H" ;; admin) echo "$ADMIN_H" ;; esac; }
 fail=0
 check() { # METHOD PATH MIN_ROLE
   local code want role
@@ -13,7 +19,7 @@ check() { # METHOD PATH MIN_ROLE
   [ "$code" = 401 ] || { echo "FAIL no token  $1 $2 -> $code (want 401)"; fail=1; }
   for role in viewer operator approver admin; do
     code=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" -d '{}' -H 'Content-Type: application/json' \
-           -H "Authorization: Bearer $(token "$role")" "$BASE$2")
+           -H "$(header "$role")" "$BASE$2")
     if [ "$(rank "$role")" -lt "$(rank "$3")" ]; then want="403"; else want="not 401/403"; fi
     if [ "$want" = 403 ] && [ "$code" != 403 ]; then echo "FAIL $role $1 $2 -> $code (want 403)"; fail=1; fi
     if [ "$want" != 403 ] && { [ "$code" = 401 ] || [ "$code" = 403 ]; }; then echo "FAIL $role $1 $2 -> $code (want allowed)"; fail=1; fi
@@ -41,10 +47,10 @@ check POST /advisor/similar-incidents operator
 policy() { # METHOD PATH JSON-BODY
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" -d "$3" -H 'Content-Type: application/json' \
-         -H "Authorization: Bearer $OPERATOR" "$BASE$2")
+         -H "$OPERATOR_H" "$BASE$2")
   [ "$code" = 403 ] || { echo "FAIL operator $1 $2 $3 -> $code (want 403)"; fail=1; }
   code=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" -d "$3" -H 'Content-Type: application/json' \
-         -H "Authorization: Bearer $APPROVER" "$BASE$2")
+         -H "$APPROVER_H" "$BASE$2")
   if [ "$code" = 401 ] || [ "$code" = 403 ]; then echo "FAIL approver $1 $2 $3 -> $code (want allowed)"; fail=1; fi
 }
 policy POST  /plans      '{"name":"rbac-probe","source_provider_id":"nope","destination_provider_id":"nope","vm_ids":[],"auto_cutover":true}'
