@@ -819,9 +819,11 @@ starts adds no wait. The export's wait for its NBD exports to answer, and the tr
 and the forwarded exports, give up the same way once ssh has failed for the window ("SSH timeout: ..."), where they
 tried `timeout` times, each try up to the connect timeout - about 5.5 h with the default (review RV9-04). So does the
 probe for a free port, which read ssh's exit status 255 as a port in use and walked all 16,383 ephemeral ports, about
-45 h with the port lock held (review RV10-03). A transfer that gave up so releases no port afterwards: the conversion
-host cannot be reached to update its port map, and a second wait for its port lock held the stopped source VM another
-15 minutes and replaced the error (review RV10-04). Each detach of a volume -
+45 h with the port lock held (review RV10-03); it tries the same port again once a second while ssh fails, so an ssh
+that fails at once - a refused connection, a dropped route - ends in the same give-up, not in "No free ports"
+(review RV11-03). A failed transfer releases its ports only if one ssh check then reaches the conversion host, and a
+release that fails never replaces the transfer's error: a host it cannot reach cannot update its port map, and a wait
+for its port lock held the stopped source VM another 15 minutes (review RV10-04, RV11-02). Each detach of a volume -
 from a conversion
 host or from the source VM - waits, within the module's timeout, until the volume no longer lists that server's
 attachment and, unless another server still holds it (a shared multi-attach disk stays `in-use`), until Cinder shows it
