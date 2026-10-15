@@ -415,10 +415,14 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``/dev`` nbdcopy failed with an error that named nothing and left the file.
   The regular file is removed - udev 252 (RHEL 9) will not make the volume's
   link over one - and the transfer fails, saying whether the file was
-  removed, could not be removed or could not be checked; ssh failing at the
-  check gives up as ``SSH timeout: ...``. A volume taken away after the
-  export started is not caught: nbdkit resolves the path it serves, the
-  disk's by-id link included, once, at its start.
+  removed, could not be removed (ssh failing at the removal is said as
+  such) or could not be checked, and naming nbdcopy's exit when the volume
+  left without a file. Ssh failing at the check gives up as ``SSH timeout:
+  ...`` after a finished copy or one ssh broke; after nbdcopy failed on its
+  own the transfer keeps that failure, permanent, and says the path could
+  not be checked. A volume taken away after the export started is not
+  caught: nbdkit resolves the path it serves, the disk's by-id link
+  included, once, at its start.
 - A wait for a conversion host's attach or port lock gives up once ssh to the
   host has failed for 15 minutes without a break, with ``Lock timeout:
   conversion host ADDRESS unreachable over SSH for N s, waiting for LOCK``,

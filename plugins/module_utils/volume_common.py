@@ -1669,7 +1669,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             self.log.info("nbdcopy return code: %d", nbd_sub.returncode)
             # after any exit: on RHEL 9's 4 MiB /dev a copy into the regular file nbdcopy made fails
             # (Seamless Migrate SDD 6.6, review RV16-02)
-            self._check_still_a_disk(mapping["dest_id"], dest_dev)
+            self._check_still_a_disk(mapping["dest_id"], dest_dev, nbd_sub.returncode)
             if nbd_sub.returncode != 0:
                 raise RuntimeError(f"Failed to copy volume with nbdcopy! Return code: {nbd_sub.returncode}")
 
@@ -1677,7 +1677,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             self._update_progress(path, 100.0)
             self.log.info("Successfully copied %s", path)
 
-    def _check_still_a_disk(self, volume_id, path):
+    def _check_still_a_disk(self, volume_id, path, nbdcopy_exit=0):
         """
         nbdcopy opens its destination again with O_CREAT when the first open
         fails (libnbd's open_local): a volume that left the host between its
@@ -1687,14 +1687,23 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         a block device. A regular file there is removed - udev 252 (RHEL 9) will
         not make the volume's link over one, where udev 239 (RHEL 8) replaces
         it - and the error says whether it was removed, could not be removed or
-        could not be checked (Seamless Migrate SDD 6.6, review RV15-02, RV16-02,
-        RV16-03).
+        could not be checked. Ssh failing at the check gives up as SSH timeout
+        after a whole copy (``nbdcopy_exit`` 0) or one ssh broke (255); after
+        nbdcopy failed on its own every answer would be permanent, so its
+        failure stays (Seamless Migrate SDD 6.6, review RV15-02, RV16-02,
+        RV16-03, RV17-01, RV17-04).
         """
         found = self.shell.cmd_val(["test", "-b", path])
         if found == 0:
             return
         address = getattr(self.shell, "address", "?")
         if found == SSH_FAILED:
+            if nbdcopy_exit not in (0, SSH_FAILED):
+                raise RuntimeError(
+                    "Failed to copy volume with nbdcopy! Return code: %d; whether %s on %s is still a "
+                    "disk could not be checked (ssh failed): look for a regular file there"
+                    % (nbdcopy_exit, path, address)
+                )
             raise RuntimeError(
                 "SSH timeout: conversion host %s unreachable over SSH, checking that %s is still a disk"
                 % (address, path)
@@ -1705,6 +1714,12 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             what = "left the host before nbdcopy opened it, and nbdcopy copied into a regular file in its place, "
             if removed == 0:
                 what += "now removed; the volume was not written"
+            elif removed == SSH_FAILED:
+                what += (
+                    "and ssh failed at the removal: check %s on %s and remove it by hand if it is "
+                    "there, as udev 252 will not make the volume's link over it; the volume was not "
+                    "written" % (path, address)
+                )
             else:
                 what += (
                     "which could not be removed (sudo rm -f exited %d): remove %s on %s by hand, as udev "
@@ -1717,8 +1732,11 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                 "checked (ssh failed): remove one found at %s on %s by hand; the volume was not "
                 "written whole" % (path, address)
             )
+        elif nbdcopy_exit == 0:
+            # every write succeeded: the volume left once nbdcopy had finished
+            what = "left the host after nbdcopy finished, before its disk could be confirmed"
         else:
-            what = "left the host during the copy; the volume was not written whole"
+            what = "left the host; nbdcopy exited %d and the volume was not written whole" % nbdcopy_exit
         raise DiskIdentityError(
             "%s on the conversion host is no longer a disk: volume %s %s" % (path, volume_id, what)
         )

@@ -1251,7 +1251,11 @@ class LeavingDestination:
     whose ssh fails after the copy (exit 255) or, for "rm", whose sudo fails (exit 1); with
     ``dev_full`` /dev is RHEL 9's 4 MiB devtmpfs, so nbdcopy's write into a file it made fails and it
     exits 1, leaving the file, as libnbd's file_synch_write does; ``nbdcopy_exit`` makes it fail
-    anyway (review RV16-02, RV16-03, RV16-06)."""
+    anyway (review RV16-02, RV16-03, RV16-06). ``leave="before the open"`` takes the disk at the
+    identity check while udev keeps its by-id link: nbdcopy's open fails ENOENT and its create
+    (O_CREAT | O_EXCL) EEXIST on the dangling link, so it exits 1 having written nothing, and udev
+    removes the link by the check; ``failing="rm ssh"`` has ssh fail at the removal (review
+    RV17-04)."""
 
     address = CONV
 
@@ -1274,7 +1278,8 @@ class LeavingDestination:
 
     def _leaves(self):
         self.left = True
-        self.link.unlink()
+        if self.leave != "before the open":  # udev has not yet removed the link
+            self.link.unlink()
         self.disk.unlink()
 
     def cmd_out(self, command, **kwargs):
@@ -1292,7 +1297,7 @@ class LeavingDestination:
                 return 255
             path = self._local(command[2])
             found = self.disk.exists() and os.path.realpath(path) == os.path.realpath(self.disk)
-            if not self.left and self.leave == "at the check":
+            if not self.left and self.leave in ("at the check", "before the open"):
                 self._leaves()
             return 0 if found else 1
         if command[:2] == ["test", "-f"]:
@@ -1304,6 +1309,8 @@ class LeavingDestination:
         if command[:3] == ["sudo", "rm", "-f"]:
             if self.failing == "rm":
                 return 1
+            if self.failing == "rm ssh":
+                return 255
             path = self._local(command[3])
             if path.exists() or path.is_symlink():
                 path.unlink()
@@ -1318,7 +1325,12 @@ class LeavingDestination:
             try:
                 fd = os.open(str(path), os.O_WRONLY)
             except OSError:
-                fd = os.open(str(path), os.O_WRONLY | os.O_TRUNC | os.O_CREAT | os.O_EXCL, 0o644)
+                try:
+                    fd = os.open(str(path), os.O_WRONLY | os.O_TRUNC | os.O_CREAT | os.O_EXCL, 0o644)
+                except OSError as err:  # the dangling link: nothing opened, nothing written
+                    self.copied = True
+                    self.link.unlink()  # udev catches up
+                    return FailedProcess(1, "nbdcopy: %s: %s\n" % (command[3], err.strerror))
                 made = True
             os.write(fd, b"the source volume's data")
             os.close(fd)
@@ -1438,11 +1450,15 @@ def test_the_check_after_nbdcopy_never_says_it_removed_a_file_it_left(tmp_path, 
     assert "/dev/disk/by-id/virtio-" + LEAVING_ID[:20] in message and CONV in message, message
 
 
-def test_ssh_failing_at_the_check_after_nbdcopy_gives_up_as_ssh_timeout(tmp_path):
+@pytest.mark.parametrize("nbdcopy_exit", [0, 255], ids=["a whole copy", "ssh broke the copy"])
+def test_ssh_failing_at_the_check_after_nbdcopy_gives_up_as_ssh_timeout(tmp_path, nbdcopy_exit):
     """Review RV16-06: ssh failing (255) at the check after nbdcopy is no proof the volume left: the
     check gives up as "SSH timeout: ...", which the control plane retries, and removes nothing - a
-    whole, good copy is never failed as permanent for an ssh blip (Seamless Migrate SDD 6.6)."""
-    transfer, host = _leaving_transfer(tmp_path, leave=None, failing="test -b")
+    whole, good copy is never failed as permanent for an ssh blip, nor a copy ssh broke (Seamless
+    Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(
+        tmp_path, leave=None, failing="test -b", nbdcopy_exit=nbdcopy_exit
+    )
 
     with pytest.raises(RuntimeError) as raised:
         transfer._convert_destination_volumes_nbdcopy()
@@ -1450,6 +1466,29 @@ def test_ssh_failing_at_the_check_after_nbdcopy_gives_up_as_ssh_timeout(tmp_path
     assert not isinstance(raised.value, volume_common.DiskIdentityError), raised.value
     assert str(raised.value).startswith("SSH timeout:"), raised.value
     assert not [c for c in host.commands if c[:3] == ["sudo", "rm", "-f"]]
+
+
+#: what Seamless Migrate's control plane retries (its classify_failure, executors/ansible.py)
+TRANSIENT = re.compile(r"(?i)timeout|http 503|connection reset")
+
+
+@pytest.mark.parametrize("leave", [None, "at the check"], ids=["the volume stays", "it left before the copy"])
+def test_a_failed_copy_stays_permanent_when_ssh_fails_at_the_check_after_it(tmp_path, leave):
+    """Review RV17-01: after nbdcopy failed on its own (exit 1) every answer the check could give is
+    permanent, yet an ssh failure at its `test -b` made the transfer "SSH timeout: ...", retried -
+    whole new copies, a cold source stopped meanwhile - with nbdcopy's failure named nowhere. The
+    transfer keeps nbdcopy's failure and says the path could not be checked (Seamless Migrate SDD
+    6.6)."""
+    transfer = _leaving_transfer(tmp_path, leave=leave, failing="test -b", nbdcopy_exit=1)[0]
+
+    with pytest.raises(RuntimeError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    message = str(raised.value)
+    assert not TRANSIENT.search(message), message
+    assert message.startswith("Failed to copy volume with nbdcopy! Return code: 1"), message
+    assert "could not be checked (ssh failed)" in message, message
+    assert "/dev/disk/by-id/virtio-" + LEAVING_ID[:20] in message and CONV in message, message
 
 
 def test_a_failed_copy_onto_a_disk_still_there_keeps_nbdcopys_own_error(tmp_path):
@@ -1465,14 +1504,45 @@ def test_a_failed_copy_onto_a_disk_still_there_keeps_nbdcopys_own_error(tmp_path
     assert ["test", "-b", "/dev/disk/by-id/virtio-" + LEAVING_ID[:20]] in host.commands[copy:]
 
 
-def test_a_volume_that_left_during_the_copy_is_named_as_such(tmp_path):
-    """Review RV16-03: with no regular file at the path the volume left during the copy, after
-    nbdcopy opened it: the error says so, and claims no file (Seamless Migrate SDD 6.6)."""
+def test_a_volume_that_left_after_nbdcopy_finished_is_named_as_such(tmp_path):
+    """Reviews RV16-03, RV17-04: with no regular file at the path and nbdcopy's exit 0, every write
+    succeeded and the volume left after the copy - the error says so, claims no file, and never
+    that the volume was not written whole (Seamless Migrate SDD 6.6)."""
     transfer, host = _leaving_transfer(tmp_path, leave="during the copy")
 
     with pytest.raises(volume_common.DiskIdentityError) as raised:
         transfer._convert_destination_volumes_nbdcopy()
 
     message = str(raised.value)
-    assert "during the copy" in message and "regular file" not in message, message
+    assert "left the host after nbdcopy finished" in message, message
+    assert "regular file" not in message and "not written whole" not in message, message
     assert not [c for c in host.commands if c[:3] == ["sudo", "rm", "-f"]]
+
+
+def test_a_volume_nbdcopy_never_opened_is_named_by_nbdcopys_exit(tmp_path):
+    """Review RV17-04: the volume left at the identity check while udev kept its by-id link;
+    nbdcopy opened nothing, wrote nothing and exited 1. The error names nbdcopy's exit and never a
+    copy that did not happen (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path, leave="before the open")
+
+    with pytest.raises(volume_common.DiskIdentityError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    message = str(raised.value)
+    assert "nbdcopy exited 1" in message and "during the copy" not in message, message
+    assert not TRANSIENT.search(message), message
+
+
+def test_an_ssh_failure_at_the_removal_is_not_reported_as_rms_own_exit(tmp_path):
+    """Review RV17-04: ssh's 255 at `sudo rm -f` says nothing of rm's own exit - the connection may
+    have dropped after rm ran: the error says ssh failed at the removal and asks to check the path,
+    never "sudo rm -f exited 255" (Seamless Migrate SDD 6.6)."""
+    transfer = _leaving_transfer(tmp_path, failing="rm ssh")[0]
+
+    with pytest.raises(volume_common.DiskIdentityError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    message = str(raised.value)
+    assert "exited 255" not in message, message
+    assert "ssh failed at the removal" in message, message
+    assert "/dev/disk/by-id/virtio-" + LEAVING_ID[:20] in message and CONV in message, message
