@@ -199,7 +199,8 @@ describe('Events page', () => {
     await user.selectOptions(screen.getByLabelText('Category'), 'security');
     const items = within(list).getAllByRole('listitem');
     expect(items.length).toBeGreaterThan(0);
-    for (const item of items) expect(item).toHaveTextContent(/auth\.denied/);
+    // Security: access refused, and the advisor policies' changes (review RV13-05)
+    for (const item of items) expect(item).toHaveTextContent(/auth\.denied|policy\.(created|updated|deleted)/);
 
     await user.selectOptions(screen.getByLabelText('Category'), 'all');
     await user.type(screen.getByRole('searchbox', { name: /search events/i }), 'legacy-rhel6-app');
@@ -224,7 +225,7 @@ describe('Events page', () => {
     await user.selectOptions(screen.getByLabelText('Category'), 'security');
     const items = within(list).getAllByRole('listitem');
     expect(items.some((item) => item.textContent?.includes('events.pruned'))).toBe(true);
-    for (const item of items) expect(item).toHaveTextContent(/auth\.denied|events\.pruned/);
+    for (const item of items) expect(item).toHaveTextContent(/auth\.denied|events\.pruned|policy\./);
   });
 
   it('files a dashboard user created under Security: it grants access (SDD §4.3, §13.1, review RV12-04)', async () => {
@@ -245,7 +246,7 @@ describe('Events page', () => {
     await user.selectOptions(screen.getByLabelText('Category'), 'security');
     const items = within(list).getAllByRole('listitem');
     expect(items.filter((item) => item.textContent?.includes('user.created'))).toHaveLength(1);
-    for (const item of items) expect(item).toHaveTextContent(/auth\.denied|events\.pruned|user\.created/);
+    for (const item of items) expect(item).toHaveTextContent(/auth\.denied|events\.pruned|user\.created|policy\./);
   });
 
   it('moves focus to the list when its last Show older events button goes, never to the page (SDD §16)', async () => {
@@ -369,7 +370,7 @@ describe('Events page', () => {
       });
       const lines = text.trim().split('\n').map((l) => JSON.parse(l) as { seq: number; kind: string });
       expect(lines).toHaveLength(shown);
-      expect(lines.every((e) => e.kind.startsWith('auth.'))).toBe(true);
+      expect(lines.every((e) => e.kind.startsWith('auth.') || e.kind.startsWith('policy.'))).toBe(true);
       expect(lines.map((e) => e.seq)).toEqual([...lines.map((e) => e.seq)].sort((a, b) => a - b));
       expect(blobs[0]!.type).toBe('application/x-ndjson');
     } finally {
