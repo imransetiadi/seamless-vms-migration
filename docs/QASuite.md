@@ -964,10 +964,10 @@ regression test (named in the defect) before it is closed.
 | Cadence | What | Output |
 |---|---|---|
 | every change | unit suites, lint | CI status |
-| nightly | PostgreSQL store tests, scans S-17…S-20, compose/kustomize validation | report with trend; failures open defects |
-| weekly | demo E2E, engine benchmark, resilience subset R-01/R-03/R-05 | `tests/perf/results-<host>.md`, E2E log |
+| nightly | PostgreSQL store tests, scans S-17…S-20, compose/kustomize validation (CI jobs `security` and `manifests`) | report with trend; failures open defects |
+| weekly (by hand: no weekly job yet, audit D-14) | demo E2E, engine benchmark, resilience subset R-01/R-03/R-05 | `tests/perf/results-<host>.md`, E2E log |
 | per release candidate | lab matrix, integrity, G1/G2, full resilience, DAST, manual accessibility | signed release report: environment descriptor, commit, per-case result, defect list, waivers |
-| quarterly | restore drill, secret rotation drill, incident-response rehearsal | drill report |
+| quarterly, and before every upgrade | restore drill (`deploy/openshift/backup/README.md`: the latest dump into a scratch namespace, `/stats` compared with production's), secret rotation drill, incident-response rehearsal | drill report: date, dump, result |
 
 ---
 

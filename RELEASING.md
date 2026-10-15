@@ -288,3 +288,24 @@ own reviewed change:
   image, attaches the tarball, the SBOM and `SHA256SUMS` to a draft release, and leaves publishing to
   the release manager. It needs `permissions: contents: write`, and registry credentials as repository
   secrets, never in the workflow file.
+
+## 9. Upgrading a deployment
+
+The schema is created and extended by the control plane itself (`Store.create_schema()` at every start adds
+only what is missing, SDD §11); there is no migration tool yet (audit B-04), so the order of operations is
+what protects the data. For every MINOR, and for a PATCH that touches `store.py`:
+
+1. **Back up first**: a run of the backup CronJob (`oc create job --from=cronjob/seamless-pg-backup pre-upgrade`,
+   `deploy/openshift/backup/README.md`) and a snapshot of the `seamless-data` PVC; on Compose the `pg_dump`
+   recipe of `deploy/compose/README.md`. Do the restore drill of that README before the first upgrade of a
+   production deployment.
+2. **Quiesce**: pause every running plan from the dashboard (no cutover in flight), then scale the control
+   plane to 0 (`Recreate` keeps a single writer; a rolling update would start the new version beside the old).
+3. **Roll the image**: set the new tag or digest in the kustomization (or `SEAMLESS_VERSION` on Compose) and
+   apply; with the two-role PostgreSQL setup of Security.md §9.4, start the new version once with the owner
+   role's URL so `create_schema()` can add indexes, then switch back to the application role.
+4. **Verify**: `GET /api/v1/health` reports the new `version` and `db: ok`; the dashboard lists the plans;
+   resume the paused plans.
+5. **Roll back** if step 4 fails: the previous tag plus the dump of step 1 (the restore runbook).
+
+Release notes of a MINOR say which step needs more than this (a new Secret key, a new NetworkPolicy rule).

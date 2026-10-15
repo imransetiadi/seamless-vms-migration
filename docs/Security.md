@@ -737,7 +737,7 @@ repository at commit `fbf3509` (os-migrate 1.0.5 baseline).
       takes the client address from `X-Forwarded-For` for the auth lockout and the audit log); never `*`
       on a network where pods can reach the Service directly.
 - [ ] Route certificate trusted; HSTS present on responses (the Route's `hsts_header`, or your ingress's); ingress rate/connection limits configured.
-- [ ] PostgreSQL TLS or managed DB; encrypted storage class; backups encrypted and restore-tested.
+- [ ] PostgreSQL TLS or managed DB; encrypted storage class; backups encrypted and restore-tested (`deploy/openshift/backup/`: the nightly CronJob and the restore runbook; the data PVC through volume snapshots or Velero/OADP).
 - [ ] `replicas: 1` and `strategy: Recreate` unchanged.
 
 **Conversion hosts and clouds**

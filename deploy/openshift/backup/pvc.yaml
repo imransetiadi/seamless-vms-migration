@@ -1,0 +1,17 @@
+# Where the dumps live. Choose a storage class backed by storage outside the database volume's failure
+# domain (another zone, or a class that replicates), and one that encrypts at rest: a dump holds every
+# plan, migration record and audit event (no credentials - those stay in Secrets).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seamless-backups
+  labels:
+    app.kubernetes.io/name: seamless-pg-backup
+    app.kubernetes.io/component: backup
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  # storageClassName: <an encrypted class outside the database's failure domain>   # omit for the default

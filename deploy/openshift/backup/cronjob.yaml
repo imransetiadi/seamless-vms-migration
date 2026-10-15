@@ -1,0 +1,96 @@
+# Nightly logical backup of the database - plans, migrations, events, the audit trail - with pg_dump's
+# custom format (-Fc: compressed, restorable table by table), written atomically into the seamless-backups
+# PVC; dumps older than BACKUP_KEEP_DAYS are deleted after each successful run. The credentials come from
+# the seamless-db Secret the StatefulSet uses; the pod runs under the restricted security context like
+# every workload of the namespace (Security.md C9) and never mounts a ServiceAccount token.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: seamless-pg-backup
+  labels:
+    app.kubernetes.io/name: seamless-pg-backup
+    app.kubernetes.io/component: backup
+spec:
+  schedule: "17 1 * * *"   # 01:17 UTC, a quiet hour; cutovers are not scheduled by this file
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: seamless-pg-backup
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: pg-dump
+              # the database's own image: pg_dump of the server's major version (kustomization.yaml pins the tag)
+              image: registry.redhat.io/rhel9/postgresql-16
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-euc"]
+              args:
+                - |
+                  umask 077
+                  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+                  out="/backups/seamless-${stamp}.dump"
+                  PGPASSWORD="$POSTGRESQL_PASSWORD" pg_dump -h "$POSTGRESQL_HOST" -U "$POSTGRESQL_USER" \
+                    -d "$POSTGRESQL_DATABASE" -Fc -f "${out}.part"
+                  mv "${out}.part" "$out"
+                  find /backups -name 'seamless-*.dump' -type f -mtime "+${BACKUP_KEEP_DAYS}" -delete
+                  echo "wrote $out"; ls -l /backups
+              env:
+                - name: POSTGRESQL_HOST
+                  value: seamless-postgres   # the Service of postgres-service.yaml; an external database: its address
+                - name: BACKUP_KEEP_DAYS
+                  value: "14"
+                - name: POSTGRESQL_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: seamless-db
+                      key: POSTGRES_USER
+                - name: POSTGRESQL_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: seamless-db
+                      key: POSTGRES_PASSWORD
+                - name: POSTGRESQL_DATABASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: seamless-db
+                      key: POSTGRES_DB
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: seamless-backups
+            - name: tmp
+              emptyDir: {}

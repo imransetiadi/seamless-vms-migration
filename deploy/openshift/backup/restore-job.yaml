@@ -1,0 +1,91 @@
+# A one-off restore of one dump from the seamless-backups PVC into the database (README.md, "Restore").
+# Applied by hand, never by the kustomization: set BACKUP_FILE to the dump's name, scale the control plane
+# to 0 first (the orchestrator must not write while rows are replaced), then:
+#
+#   oc -n seamless-migrate apply -f deploy/openshift/backup/restore-job.yaml
+#   oc -n seamless-migrate logs -f job/seamless-pg-restore
+#   oc -n seamless-migrate delete job seamless-pg-restore
+#
+# --clean --if-exists drops and recreates the objects of the dump; the roles stay as they are (--no-owner,
+# --no-privileges), so the application and owner roles of Security.md §9.4 keep their grants.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seamless-pg-restore
+  labels:
+    app.kubernetes.io/name: seamless-pg-backup
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: seamless-pg-backup
+        app.kubernetes.io/component: backup
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pg-restore
+          image: registry.redhat.io/rhel9/postgresql-16:1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-euc"]
+          args:
+            - |
+              test -f "/backups/${BACKUP_FILE}" || { echo "no such dump: ${BACKUP_FILE}"; ls -l /backups; exit 1; }
+              PGPASSWORD="$POSTGRESQL_PASSWORD" pg_restore -h "$POSTGRESQL_HOST" -U "$POSTGRESQL_USER" \
+                -d "$POSTGRESQL_DATABASE" --clean --if-exists --no-owner --no-privileges --exit-on-error \
+                "/backups/${BACKUP_FILE}"
+              echo "restored ${BACKUP_FILE}"
+          env:
+            - name: BACKUP_FILE
+              value: CHANGE-ME-seamless-YYYYMMDDTHHMMSSZ.dump
+            - name: POSTGRESQL_HOST
+              value: seamless-postgres
+            - name: POSTGRESQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: seamless-db
+                  key: POSTGRES_USER
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: seamless-db
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: seamless-db
+                  key: POSTGRES_DB
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: backups
+              mountPath: /backups
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: backups
+          persistentVolumeClaim:
+            claimName: seamless-backups
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,32 @@
+# Optional nightly backup of the Seamless Migrate database (SDD 17, Security.md §12, audit D-06): a CronJob
+# runs pg_dump from the database's own image into the seamless-backups PVC, under the same restricted
+# security context as the rest of the namespace, admitted by its own NetworkPolicies.
+#
+#   oc apply -k deploy/openshift/backup          # after deploy/openshift (the seamless-db Secret and the
+#                                                # seamless-postgres Service must exist)
+#   oc -n seamless-migrate get cronjob seamless-pg-backup
+#
+# Restore: README.md beside this file (restore-job.yaml is applied by hand, never by this kustomization).
+# On vanilla Kubernetes set the images: entry like deploy/kubernetes/kustomization.yaml does. With an
+# external PostgreSQL, patch POSTGRESQL_HOST in cronjob.yaml to its address.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: seamless-migrate
+
+resources:
+  - pvc.yaml
+  - cronjob.yaml
+  - networkpolicy.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: seamless-migrate
+    includeSelectors: false
+
+images:
+  - name: registry.redhat.io/rhel9/postgresql-16
+    # the same stream tag as deploy/openshift/kustomization.yaml: pg_dump never newer than the server
+    newTag: "1"
+    # production: pin by digest, as for the StatefulSet
+    # digest: sha256:<digest-of-the-postgresql-16-image>

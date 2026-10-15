@@ -1,0 +1,45 @@
+# The namespace is default-deny (deploy/openshift/networkpolicy.yaml) and the database admits the control
+# plane only: the backup pods need their egress to PostgreSQL and the database an ingress rule from them.
+# DNS egress is granted to every pod by seamless-allow-dns-egress.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seamless-backup-allow-egress-postgres
+  labels:
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: seamless-pg-backup
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: seamless-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seamless-postgres-allow-from-backup
+  labels:
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: seamless-postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: seamless-pg-backup
+      ports:
+        - protocol: TCP
+          port: 5432
