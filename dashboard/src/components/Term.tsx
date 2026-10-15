@@ -1,11 +1,14 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
+import { cn } from '../lib/cn';
 
 /**
  * A term with its one-sentence definition, shown on hover and focus (WCAG 1.4.13: the pointer may move
  * onto it, Escape dismisses it). The definition lives outside the sentence, so the sentence reads whole.
+ * `className` replaces the dotted underline of a term in a sentence - a status badge whose label is the term
+ * (the live indicator, SDD §16) keeps its own look.
  */
-export function Term({ children, definition }: { children: ReactNode; definition: string }) {
+export function Term({ children, definition, className }: { children: ReactNode; definition: string; className?: string }) {
   const id = useId();
   const ref = useRef<HTMLButtonElement>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -70,7 +73,7 @@ export function Term({ children, definition }: { children: ReactNode; definition
             hide();
           }
         }}
-        className="inline cursor-help rounded-sm border-0 bg-transparent p-0 font-[inherit] text-inherit underline decoration-dotted underline-offset-4"
+        className={cn('cursor-help rounded-sm border-0 bg-transparent p-0 font-[inherit] text-inherit', className ?? 'inline underline decoration-dotted underline-offset-4')}
       >
         {children}
       </button>
