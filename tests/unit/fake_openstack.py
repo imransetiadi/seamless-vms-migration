@@ -270,7 +270,11 @@ class FakeCloud:
         self.record("detach_volume", server=server.id, volume=volume.id)
         volume = self.volumes[volume.id]
         if not any(a["server_id"] == server.id for a in volume.attachments):
-            return
+            # as Nova and openstacksdk 4.x: deleting an attachment the server does not have is a
+            # 404 (compute.delete_volume_attachment(ignore_missing=False))
+            raise NotFoundException(
+                "Volume %s is not attached to server %s" % (volume.id, server.id)
+            )
         if self.detach_reads:
             # like Cinder: Nova accepted the detach, which ends a little later
             self._detaching.setdefault(volume.id, []).append([server.id, self.detach_reads])

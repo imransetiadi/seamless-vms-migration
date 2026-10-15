@@ -85,3 +85,13 @@ def test_the_fakes_detach_of_one_holder_leaves_a_shared_volume_in_use():
     assert volume.status == "in-use"
     with pytest.raises(fake.ResourceTimeout):  # it never becomes available
         cloud.block_storage.wait_for_status(volume, "available", wait=5)
+
+
+def test_the_fakes_detach_of_a_volume_the_server_does_not_hold_is_nova_s_404():
+    """openstacksdk 4.x's detach_volume deletes the server's volume attachment with
+    ignore_missing=False: Nova answers 404 for one the server does not have."""
+    cloud = _cloud()
+
+    with pytest.raises(fake.NotFoundException, match="not attached to server srv-2"):
+        cloud.detach_volume(cloud.servers["srv-2"], cloud.volumes["vol-1"], wait=False)
+    assert [a["server_id"] for a in cloud.volumes["vol-1"].attachments] == ["srv-1"]
