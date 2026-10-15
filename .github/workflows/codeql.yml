@@ -1,0 +1,52 @@
+# CodeQL static analysis of the control plane (Python) and the dashboard (JavaScript/TypeScript):
+# the semantic scanner the nightly dependency and configuration scans of ci.yml do not provide
+# (Security.md §9.2, audit F-04). Findings land in the repository's Security tab; the workflow
+# never blocks a pull request on its own.
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "41 3 * * 1" # weekly, after the nightly scans (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: python
+            paths: seamless/src
+          - language: javascript-typescript
+            paths: dashboard/src
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: github/codeql-action/init@9f759ee644a3e7c15c1390abf49868036c00067b # v3.38.3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+          # the analysed trees: the tests, fixtures and the inherited collection are scanned by their
+          # own linters and sanity jobs
+          config: |
+            paths:
+              - ${{ matrix.paths }}
+      - uses: github/codeql-action/analyze@9f759ee644a3e7c15c1390abf49868036c00067b # v3.38.3
+        with:
+          category: /language:${{ matrix.language }}
