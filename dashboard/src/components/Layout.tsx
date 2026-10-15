@@ -13,6 +13,7 @@ import {
   ScrollText,
   Server,
   SlidersHorizontal,
+  Users,
   X,
   type LucideIcon,
 } from 'lucide-react';
@@ -68,6 +69,10 @@ const NAV_GROUPS: NavGroup[] = [
       { to: '/advisor/policies', label: 'Policies', icon: SlidersHorizontal, match: (p) => p.startsWith('/advisor/policies') },
       { to: '/advisor/audit', label: 'Audit trail', icon: ScrollText, match: (p) => p.startsWith('/advisor/audit') },
     ],
+  },
+  {
+    label: 'Administration',
+    items: [{ to: '/users', label: 'Users', icon: Users, match: (p) => p === '/users' }],
   },
 ];
 
@@ -134,12 +139,14 @@ function Brand({ compact = false }: { compact?: boolean }) {
  */
 function NavGroups({ pathname, mode, onNavigate }: { pathname: string; mode: NavMode; onNavigate?: (to: string) => void }) {
   const prefix = useId();
+  const me = useMe();
   const stats = useStats();
   const failed = stats.data?.failed ?? 0;
   const rail = mode === 'rail';
   return (
     <div className={cn('flex flex-col', rail ? 'gap-2' : 'gap-4')}>
       {NAV_GROUPS.map((group, index) => {
+        if (group.label === 'Administration' && me.data?.role !== 'admin') return null;
         const headingId = `${prefix}-group-${index}`;
         return (
           <div key={group.label} role="group" aria-labelledby={headingId} className={cn(rail && index > 0 && 'border-t border-border pt-2')}>

@@ -153,6 +153,7 @@ class OrchestratorHealth(BaseModel):
 
 
 class Health(BaseModel):
+    auth_disabled: bool
     status: Literal["ok", "degraded"]
     version: str
     demo: bool

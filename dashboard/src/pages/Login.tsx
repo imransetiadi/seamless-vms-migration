@@ -69,7 +69,7 @@ export default function Login() {
           </div>
           <h1 className="text-xl font-semibold text-foreground">Sign in</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Paste the API token issued with <code>seamless token create</code>. It is kept in this browser tab only.
+            Paste the API token provided by your admin or issued with <code>seamless token create</code>. It is kept in this browser tab only.
           </p>
 
           <form onSubmit={submit} noValidate className="mt-5 flex flex-col gap-4">

@@ -69,6 +69,7 @@ async def _health(request: Request) -> Health:
     db_ok = await asyncio.to_thread(svc.store.ping)
     orchestrator = svc.orchestrator.health()
     return Health(
+        auth_disabled=svc.settings.auth_disabled,
         status="ok" if db_ok and orchestrator["healthy"] else "degraded",
         version=__version__,
         demo=svc.settings.demo,

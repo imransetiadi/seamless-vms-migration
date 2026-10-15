@@ -28,6 +28,7 @@ import type {
   ForceCutoverRequest,
   Health,
   Me,
+  UserCreated,
   Migration,
   MigrationAction,
   MigrationListQuery,
@@ -66,6 +67,7 @@ const enc = encodeURIComponent;
 
 export const queryKeys = {
   me: ['me'] as const,
+  users: ['users'] as const,
   health: ['health'] as const,
   providers: ['providers'] as const,
   provider: (id: string) => ['providers', id] as const,
@@ -111,6 +113,28 @@ export function useHealth() {
     queryFn: ({ signal }) => api.get<Health>('/health', { signal }),
     refetchInterval: 60_000,
     retry: false,
+  });
+}
+
+export function useUsers(enabled: boolean) {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.users,
+    queryFn: ({ signal }) => api.get<Me[]>('/users', { signal }),
+    enabled,
+    retry: noRetryOnClientErrors,
+  });
+}
+
+export function useCreateUser() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (user: Me) => api.post<UserCreated>('/users', user),
+    retry: false,
+    // The one-time token leaves the mutation cache when dismissed or the page unmounts.
+    gcTime: 0,
+    onSuccess: () => invalidateAll(queryClient, [queryKeys.users, ['events', 'tail']]),
   });
 }
 
