@@ -704,9 +704,15 @@ class OpenStackVolumeBase:
         attach lock: a reservation Nova abandoned never settles (Seamless
         Migrate SDD 6.6, review RV10-01, RV10-02, RV11-01).
         """
-        for second in range(min(self.timeout, ATTACH_SETTLE_S)):
+        limit = min(self.timeout, ATTACH_SETTLE_S)
+        # each poll is a Cinder GET as well as its 1 s sleep: the wait ends at its seconds,
+        # measured, not only at as many polls (review RV13-03)
+        deadline = time.monotonic() + limit
+        for second in range(limit):
             volume = volume_or_none(conn, volume_id)
             if volume is None or getattr(volume, "status", None) not in ATTACHING:
+                return volume
+            if time.monotonic() >= deadline:
                 return volume
             time.sleep(1)
         return volume_or_none(conn, volume_id)
@@ -744,7 +750,9 @@ class OpenStackVolumeBase:
         Migrate SDD 6.6, review RV12-01).
         """
         volume_id = volume.id
-        under_way = 0
+        # each poll is a Cinder GET as well as its 1 s sleep: the cap is seconds, measured, as well
+        # as polls (review RV13-03)
+        under_way, under_way_since = 0, None
         for second in range(timeout):
             volume = conn.get_volume_by_id(volume_id)
             if volume.attachments:
@@ -758,11 +766,15 @@ class OpenStackVolumeBase:
                         "Nova did not attach volume %s: Cinder shows it %s, attached nowhere"
                         % (volume_id, status)
                     )
+                now = time.monotonic()
+                if under_way_since is None:
+                    under_way_since = now
                 under_way += 1
-                if under_way >= ATTACH_UNDER_WAY_S:
+                waited = max(now - under_way_since, under_way)
+                if waited >= ATTACH_UNDER_WAY_S:
                     raise RuntimeError(
                         "Nova did not finish attaching volume %s: Cinder still shows it %s "
-                        "after %d s" % (volume_id, status, under_way)
+                        "after %d s" % (volume_id, status, waited)
                     )
             time.sleep(1)
         raise RuntimeError("Timed out waiting for volume device path!")

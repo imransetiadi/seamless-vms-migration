@@ -320,3 +320,73 @@ def test_a_transfer_whose_attach_nova_rolled_back_fails_at_once():
             transfer.transfer_exports()
 
     assert clock.now < 60, clock.now
+
+
+def _loaded_cinder(seconds, nova):
+    """``nova`` on the source cloud, and Cinder's API, loaded by the other migrations' polls,
+    answering each GET of a volume in ``seconds`` of the export's clock (review RV13-03)."""
+
+    def setup(src, clock):
+        nova(src, clock)
+        read = src.get_volume_by_id
+
+        def get_volume_by_id(volume_id):
+            clock.now += seconds
+            return read(volume_id)
+
+        src.get_volume_by_id = get_volume_by_id
+
+    return setup
+
+
+def _abandoned(src, clock):
+    _nova_compute_abandons_the_attach_of(src, "src-conv", "vol-data1")
+
+
+def test_an_attach_under_way_on_a_loaded_cinder_gives_up_after_ten_minutes_not_600_reads():
+    """Review RV13-03: the wait for an attach still `reserved` counted its polls - each a Cinder GET
+    and a 1 s sleep - not the ten minutes SDD 6.6 gives it: with a GET of 2 s the attach lock was
+    held three times as long, and the error still said "after 600 s"."""
+    exported, host = _accepted_export(_loaded_cinder(2.0, _abandoned), timeout=1800)
+
+    assert exported.get("failed") and "still shows it reserved" in exported["msg"], exported
+    holds = [released - taken for taken, released in host.held]
+    assert holds and all(hold <= volume_common.ATTACH_UNDER_WAY_S + 60 for hold in holds), (
+        holds, exported["msg"],
+    )
+
+
+def test_an_export_queued_behind_an_abandoned_attach_on_a_loaded_cinder_gets_the_lock():
+    """Review RV13-03, what that did to the others: with a GET of 3 s the hold - 600 polls, 2400 s -
+    outlasted a queued export's whole lock wait (1800 tries at a 0.2 s ssh round trip), which gave
+    up with "Unable to acquire lock ...", read as permanent."""
+    exported, host = _accepted_export(_loaded_cinder(3.0, _abandoned), timeout=3600)
+    assert exported.get("failed"), exported
+    taken, released = host.held[0]
+
+    other = fake.FakeCloud("src")
+    other.add_conversion_host("src-conv", "10.0.0.10")
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([other])):
+        queued = volume_common.OpenStackVolumeBase(other, "src-conv", "/keys/k", "cloud-user", "u2")
+    queued.shell = HeldLock(Clock(), until=released - taken, rtt=0.2)
+    attach = volume_common.use_lock(SOURCE_LOCK)(lambda self: "attached")
+    with mock.patch.object(volume_common, "time", queued.shell.clock):
+        outcome = attach(queued)
+
+    assert outcome == "attached"
+
+
+def test_a_settle_wait_on_a_loaded_cinder_holds_the_attach_lock_two_minutes_not_120_reads():
+    """Review RV13-03: the settle wait after a failed attach call counted its polls the same way:
+    with a GET of 3 s its "two minutes" (ATTACH_SETTLE_S) held the attach lock eight."""
+    src, data = _boot_from_volume_vm()
+    clock = Clock()
+    _loaded_cinder(3.0, lambda src, clock: _nova_api_fails_after_cinder_reserved(
+        src, "src-conv", "vol-data1"))(src, clock)
+    host = LockClock(src, clock)
+    with mock.patch.object(volume_common, "time", clock):
+        exported = _run(export_module, dict(COMMON, data=data, timeout=1800), src, host)
+
+    assert exported.get("failed") and "500" in exported["msg"], exported
+    holds = [released - taken for taken, released in host.held]
+    assert holds and all(hold <= volume_common.ATTACH_SETTLE_S + 60 for hold in holds), holds

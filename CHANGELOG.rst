@@ -372,7 +372,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   spent the module's whole timeout, 30 minutes by default, while every other
   migration on that host queued behind the lock. An attach rolled back so
   leaves no mark for the source cleanup. The transfer's attach to the
-  destination conversion host waits the same way.
+  destination conversion host waits the same way. This wait and the settle
+  wait after a failed call measure their minutes, however slowly Cinder
+  answers: they counted polls, each a Cinder GET as well as a second, so a
+  loaded Cinder stretched the ten minutes to thirty.
 - The cold export checks each disk's identity before it serves it. It reads
   the disk's virtio serial, the volume id Nova gives it cut to 20 characters,
   and fails if the serial names another volume, or if a virtio-blk disk
