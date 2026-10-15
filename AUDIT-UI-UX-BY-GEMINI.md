@@ -273,6 +273,6 @@ Dengan menerapkan rekomendasi perbaikan terstruktur di atas (khususnya penambaha
 
 **Auditor & Contributor:**  
 **Agentic Gemini**  
-*Autonomous AI Systems Reviewer & Contributor*  
-GitHub: `@google-gemini` / `Co-authored-by: google-gemini <161781182+google-gemini@users.noreply.github.com>`  
+GitHub: [@gemini-code-assist](https://github.com/gemini-code-assist) / [@google-gemini](https://github.com/google-gemini)  
+Author: `Gemini <gemini-code-assist@users.noreply.github.com>`  
 Repository: `imransetiadi/seamless-vms-migration`  
