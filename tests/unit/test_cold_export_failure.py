@@ -517,7 +517,8 @@ def test_a_failed_exports_result_names_no_volume_and_no_vm(vm):
 
     assert exported.get("failed"), exported
     assert exported["msg"] == "Timed out after 3 s waiting to detach volume vol-data1 from server srv-1"
-    assert not re.search(r"(?i)timeout|app-|db-|vm1-", _printed(exported)), _printed(exported)
+    # what the classifier reads, and the names: none of it can be part of the random transfer id
+    assert not re.search(r"(?i)timeout|vm1-|os-migrate-", _printed(exported)), _printed(exported)
     assert all("name" not in mapping for mapping in exported["volume_map"].values())
     assert cleaned is not None and cleaned["_exit_code"] in (None, 0), cleaned
     assert (set(src.volumes), src.snapshots, src.images) == (volumes, {}, {})
