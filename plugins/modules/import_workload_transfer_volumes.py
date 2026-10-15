@@ -529,7 +529,11 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         and a wait for its port lock would hold the stopped source another 15
         minutes. A release that fails is logged, never raised over the
         transfer's own error (Seamless Migrate SDD 6.6, review RV10-04, RV11-02).
+        One that claimed no port releases none: the release waited a second
+        whole window for a port lock whose wait just gave up (review RV12-02).
         """
+        if not self.claimed_ports:
+            return
         try:
             self.shell.test_ssh_connection()
         except Exception as err:  # pylint: disable=broad-except

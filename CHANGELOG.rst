@@ -403,9 +403,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
   check then reaches the conversion host, where a second wait for the port
   lock of a host it cannot reach held the source another 15 minutes and
   replaced its error; a release that fails is logged, never raised over the
-  transfer's error. A give-up reads ``Lock timeout`` or ``SSH timeout`` only:
-  the wait that would give up with any other prefix, which Seamless Migrate
-  would not retry, fails as it starts.
+  transfer's error; and one that claimed no port, its first wait for the port
+  lock having given up, releases none rather than wait that lock again. A
+  give-up reads ``Lock timeout`` or ``SSH timeout`` only: the wait that would
+  give up with any other prefix, which Seamless Migrate would not retry, fails
+  as it starts.
 - The warm state file (``workload_warm/{server}.json``) is synced to disk, its
   directory after the rename too, so the rename outlives a crash: a rollback
   reads there which destination volumes and server to delete. A filesystem

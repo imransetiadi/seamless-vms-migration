@@ -754,6 +754,68 @@ def test_a_port_map_read_that_fails_gives_up_with_its_own_error(status, message)
     assert not any(c[:4] == ["timeout", "1", "nc", "-l"] for c in transfer.shell.commands)
 
 
+class PortLockHeldElsewhere:
+    """The destination conversion host, reachable, whose port lock a live module of another
+    migrator holds (``check_process`` keeps another host's owner): every try for the port lock
+    answers 17 ("Another conversion is holding the lock") and costs ``rtt`` seconds of ``clock``."""
+
+    address = CONV
+    ssh_user = "cloud-user"
+
+    def __init__(self, clock, rtt=0.2):
+        self.clock, self.rtt = clock, rtt
+        self.lock_tries = 0
+
+    def test_ssh_connection(self):
+        """Reachable: the check answers."""
+
+    def cmd_out(self, command, **kwargs):
+        if command == ["sudo", "cat", volume_common.PORT_LOCK_FILE + ".lock"]:
+            return "migrator-2:4242"
+        if command[:2] == ["sudo", "cat"]:
+            raise subprocess.CalledProcessError(1, command)  # no such lock file
+        return ""
+
+    def cmd_val(self, command, **kwargs):
+        if command[:2] == ["sudo", "flock"] and command[6] == volume_common.PORT_LOCK_FILE:
+            self.lock_tries += 1
+            self.clock.now += self.rtt
+            return 17
+        return 0
+
+    def cmd_sub(self, command, **kwargs):
+        return fake.FakeProcess()
+
+
+def test_a_transfer_whose_port_lock_wait_gave_up_waits_no_second_window_to_release_no_port():
+    """Review RV12-02: a failed transfer releases its ports once one ssh check answers (RV11-02).
+    One whose first wait for the port lock gave up - another migrator's live module holds it -
+    claimed no port, yet its release waited a second whole window for the same lock, about 36
+    minutes more with a cold cutover's source stopped, to remove nothing (Seamless Migrate SDD
+    6.6)."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_transfer_volumes as transfer_module,
+    )
+
+    src, dst = fake.FakeCloud("src"), cloud()
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    volume_map = {"/dev/vda": dict(cold_volume_map()["/dev/vda"], port=10809)}
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = transfer_module.OpenStackDestinationVolume(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1", "10.0.0.10", volume_map,
+            workload(), timeout=1800,
+        )
+    clock = Clock()
+    transfer.shell = host = PortLockHeldElsewhere(clock)
+
+    with mock.patch.object(volume_common, "time", clock):
+        with pytest.raises(RuntimeError, match="Unable to acquire lock " + volume_common.PORT_LOCK_FILE):
+            transfer.transfer_exports()
+
+    assert transfer.claimed_ports == []
+    assert host.lock_tries == volume_common.DEFAULT_TIMEOUT, (host.lock_tries, clock.now)
+
+
 def test_the_destination_detach_takes_the_volumes_it_is_given_or_the_volume_maps():
     """SDD 6.3 (review RV4-05): given volume ids, the destination detach - under the conversion
     host's attach lock - detaches those and leaves the volume map's volumes attached; given none,
