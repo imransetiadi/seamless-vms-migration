@@ -23,8 +23,8 @@ Seamless Migrate migrates virtual machines into **Red Hat OpenStack Services on 
 2. **Community OpenStack** (any release exposing Keystone v3, Nova ≥ 2.60, Cinder v3, Neutron v2).
 3. **VMware vSphere** 7.0U3+/8.x (vCenter managed).
 
-It is built on the **os-migrate 1.0.5 Ansible collection** (`os_migrate.os_migrate`, this
-repository's root). os-migrate stays the *data mover* and resource exporter/importer. Seamless adds:
+It is built on a fork of the **os-migrate Ansible collection** (`os_migrate.os_migrate`, this
+repository's root; upstream `main` after the 1.0.5 release, versioned 1.1.0 here). os-migrate stays the *data mover* and resource exporter/importer. Seamless adds:
 
 * a **warm migration path** for OpenStack sources (snapshot pre-copy while the VM runs, then a
   hash-based delta sync after shutdown) so downtime is proportional to the *final delta*, not the
