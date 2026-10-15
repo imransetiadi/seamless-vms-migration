@@ -1,3 +1,5 @@
+import pytest
+
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Severity, Strategy
 from seamless_migrate.domain.models import (
     DEFAULT_PRESTAGE,
@@ -92,6 +94,8 @@ def test_catalog_is_complete():
         "MAP_VOLUME_TYPE_MISSING",
         "DST_QUOTA_INSUFFICIENT",
         "DST_PROJECT_MISSING",
+        "DST_CAPABILITY_MISSING",
+        "DST_RELEASE_OUTSIDE_SUPPORT",
         "NET_MTU_SHRINK",
         "NET_SRIOV_PORT",
         "NET_PORT_IPS",
@@ -1020,6 +1024,162 @@ def test_finding_net_address_refused_checks_a_nics_own_addresses_on_its_network(
     # a VMware NIC's IPv4 address is checked by the migration kit's rule (its own test)
     vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
     assert "NET_ADDRESS_REFUSED" in [x.code for x in check(vm, dst=gone, source=vmware)]
+
+
+COMMUNITY = make_provider(
+    id="dst-flamingo",
+    kind=ProviderKind.openstack,
+    role=ProviderRole.destination,
+    distribution="openstack_community",
+)
+
+
+def community_caps(**kw):
+    """A destination check report (SDD §10) of a Tier 1 community cloud, changed by ``kw``."""
+    caps = {
+        "admin": True,
+        "roles": ["admin", "member", "reader"],
+        "compute_microversion": "2.100",
+        "block_storage_microversion": "3.71",
+        "release_range": ["2025.1", "2025.2"],
+        "release": None,
+        "support_tier": {"tier": "tier1", "reason": None, "declared_outside_range": False},
+        "policy_profile": "secure_rbac",
+        "tls": True,
+        "plain_http": [],
+    }
+    caps.update(kw)
+    return caps
+
+
+def test_finding_dst_capability_missing():
+    """SDD §21.4: capabilities block, names never do. A maximum below the floor every strategy
+    needs - compute 2.60, block storage 3.0 - blocks whatever the series; one the check could not
+    read is not judged. A gap one strategy alone has is that strategy's eligibility reason
+    (test_storage_handover_needs_the_destinations_compute_2_85), never a finding."""
+
+    def found(destination=COMMUNITY, **caps):
+        findings = check(destination=destination, dst_caps=community_caps(**caps))
+        return [f for f in findings if f.code == "DST_CAPABILITY_MISSING"]
+
+    assert found() == []
+    every = found(compute_microversion="2.53", block_storage_microversion="2.0")
+    assert len(every) == 1 and every[0].severity == Severity.blocker and every[0].remediation
+    assert every[0].strategies == []  # every strategy
+    assert every[0].message == (
+        "Destination dst-flamingo lacks what every strategy needs: compute API 2.53, below 2.60 "
+        "(multi-attach); block storage API 2.0, below 3.0."
+    )
+    assert found(compute_microversion="2.79") == []  # storage_handover's own floor: the selector's
+    # a Tier 3 or Outside cloud with every capability runs (the tier only warns)
+    outside = {"tier": "outside", "reason": "newer_than_validated", "declared_outside_range": False}
+    assert found(compute_microversion="2.105", support_tier=outside) == []
+    # a maximum the check could not read is not judged; nor is a check report without them
+    assert found(compute_microversion="", block_storage_microversion="") == []
+    assert [
+        f for f in check(destination=COMMUNITY, dst_caps={}) if f.code == "DST_CAPABILITY_MISSING"
+    ] == []
+    assert [f for f in check(destination=COMMUNITY) if f.code == "DST_CAPABILITY_MISSING"] == []
+    # RHOSO 18.0 is judged by the same floor
+    assert (
+        found(destination=DST, compute_microversion="2.95", block_storage_microversion="3.70") == []
+    )
+
+
+TIER3 = {"tier": "tier3", "reason": "end_of_life", "declared_outside_range": False}
+
+
+@pytest.mark.parametrize(
+    "release_range, support_tier, release, message",
+    [
+        (
+            ["2024.1", "2024.2"],
+            TIER3,
+            None,
+            "Destination dst-flamingo runs 2024.1 – 2024.2, read as Tier 3 (End of Life "
+            "upstream): no Seamless release validated it there. The capability checks still "
+            "apply.",
+        ),
+        (
+            [],
+            {"tier": "outside", "reason": "below_floor", "declared_outside_range": False},
+            None,
+            "Destination dst-flamingo runs a series older than 2023.1, the support window's "
+            "floor: no Seamless release validated it. The capability checks still apply.",
+        ),
+        (
+            [],
+            {"tier": "outside", "reason": "newer_than_validated", "declared_outside_range": False},
+            None,
+            "Destination dst-flamingo runs a series newer than 2026.2, the newest a Seamless "
+            "release validated. The capability checks still apply.",
+        ),
+        (
+            [],
+            {"tier": "outside", "reason": "not_detected", "declared_outside_range": False},
+            None,
+            "Destination dst-flamingo's series could not be detected (its compute API maximum "
+            "was not read): no Seamless release can be said to have validated it. The capability "
+            "checks still apply.",
+        ),
+        (
+            ["2026.2"],
+            {"tier": "tier1", "reason": None, "declared_outside_range": True},
+            "2025.1",
+            "Destination dst-flamingo declares series 2025.1, but its APIs read as 2026.2: correct "
+            "the declared series; the tier is the one its APIs read (Tier 1).",
+        ),
+        (
+            ["2024.1", "2024.2"],
+            {**TIER3, "declared_outside_range": True},
+            "2026.2",
+            "Destination dst-flamingo runs 2024.1 – 2024.2, read as Tier 3 (End of Life "
+            "upstream): no Seamless release validated it there. The capability checks still "
+            "apply. It declares series 2026.2, which its APIs do not run: correct the declared "
+            "series.",
+        ),
+    ],
+    ids=[
+        "tier 3",
+        "below the floor",
+        "newer",
+        "not detected",
+        "a declared series outside",
+        "tier 3 and a declared series outside",
+    ],
+)
+def test_finding_dst_release_outside_support(release_range, support_tier, release, message):
+    """SDD §21.4, §10.1: a Tier 3 or Outside destination, or one whose declared series its APIs
+    contradict (QASuite LAB-D02), is warned of - never blocked."""
+    destination = COMMUNITY.model_copy(update={"release": release})
+    caps = community_caps(release_range=release_range, support_tier=support_tier)
+    f = only(check(destination=destination, dst_caps=caps), "DST_RELEASE_OUTSIDE_SUPPORT")
+    assert f.severity == Severity.warning and f.strategies == [] and f.remediation
+    assert f.message == message
+
+
+def test_no_release_warning_for_a_supported_or_validated_destination():
+    for tier in ("tier1", "tier2"):
+        caps = community_caps(
+            support_tier={"tier": tier, "reason": None, "declared_outside_range": False}
+        )
+        assert "DST_RELEASE_OUTSIDE_SUPPORT" not in [
+            f.code for f in check(destination=COMMUNITY, dst_caps=caps)
+        ]
+    validated = {"tier": "validated", "reason": None, "declared_outside_range": False}
+    assert "DST_RELEASE_OUTSIDE_SUPPORT" not in [
+        f.code for f in check(destination=DST, dst_caps=community_caps(support_tier=validated))
+    ]
+    # RHOSO 18.0 never, whatever series its provider declares (a report the check never makes)
+    declared = DST.model_copy(update={"release": "2026.2"})
+    stale = community_caps(support_tier={**validated, "declared_outside_range": True})
+    assert "DST_RELEASE_OUTSIDE_SUPPORT" not in [
+        f.code for f in check(destination=declared, dst_caps=stale)
+    ]
+    # a check report from before the series was reported (no support_tier) is not judged
+    assert "DST_RELEASE_OUTSIDE_SUPPORT" not in [
+        f.code for f in check(destination=COMMUNITY, dst_caps={"admin": True})
+    ]
 
 
 def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projects_network():

@@ -14,6 +14,11 @@ from ..domain.enums import (
 )
 from ..domain.models import Estimate, Finding, Plan, VMRef
 from ..storage import SUPPORTED, StorageError, resolve_destination, split_host
+from .platforms import parse_microversion
+
+#: the compute microversion the handover's step 0 updates delete_on_termination with (SDD §7.3,
+#: §21.4; executors.handover.KEEP_MICROVERSION): a destination below it cannot take a handover
+HANDOVER_COMPUTE_FLOOR = "2.85"
 
 #: Two downtimes tie when they differ by less than 10 % (of the smaller one) or less than 60 s.
 TIE_RELATIVE = 0.10
@@ -113,6 +118,13 @@ def eligibility(
             handover.append("admin rights are required on the source cloud")
         if not dst_caps.get("admin"):
             handover.append("admin rights are required on the destination cloud")
+        # a gap this strategy alone has is its eligibility reason, never a finding (SDD §21.4)
+        compute = parse_microversion(dst_caps.get("compute_microversion"))
+        if compute is not None and compute < parse_microversion(HANDOVER_COMPUTE_FLOOR):
+            handover.append(
+                f"the destination's compute API {dst_caps['compute_microversion']} is below "
+                f"{HANDOVER_COMPUTE_FLOOR} (the handover's delete_on_termination update)"
+            )
 
     for finding in findings:
         if finding.severity == Severity.blocker:

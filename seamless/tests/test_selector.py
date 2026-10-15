@@ -1,6 +1,12 @@
 from seamless_migrate.domain.enums import ProviderKind, Severity, Strategy
 from seamless_migrate.domain.models import Estimate, Finding, HandoverConfig
-from seamless_migrate.planning.selector import eligibility, select_strategy, tie_set
+from seamless_migrate.executors.handover import KEEP_MICROVERSION
+from seamless_migrate.planning.selector import (
+    HANDOVER_COMPUTE_FLOOR,
+    eligibility,
+    select_strategy,
+    tie_set,
+)
 from tests.factories import make_disk, make_plan, make_vm
 
 OK_CAPS = {"admin": True, "conversion_host": True}
@@ -18,6 +24,30 @@ def est(strategy: Strategy, downtime: float, eligible: bool = True, slo: float =
         final_delta_bytes=0,
         meets_slo=downtime <= slo,
     )
+
+
+def test_storage_handover_needs_the_destinations_compute_2_85():
+    """SDD §21.4, §7.3 step 0: the handover updates delete_on_termination with compute 2.85, so a
+    destination whose maximum is below it makes storage_handover ineligible - an eligibility reason,
+    never a finding, as a blocker would block the VM whatever its strategy. A maximum the check
+    could not read is not judged, and cold and warm keep their eligibility."""
+    plan = make_plan(handover=HandoverConfig(enabled=True, backend_map={"ceph-ssd": "h@rbd#pool"}))
+    vm = make_vm(disks=[make_disk(volume_type="ceph-ssd")])
+
+    def reasons(compute):
+        dst = {**OK_CAPS, "compute_microversion": compute}
+        return eligibility(vm, ProviderKind.openstack, plan, OK_CAPS, dst, [])
+
+    old = reasons("2.79")
+    assert old[Strategy.storage_handover] == [
+        "the destination's compute API 2.79 is below 2.85 (the handover's delete_on_termination "
+        "update)"
+    ]
+    assert old[Strategy.cold] == [] and old[Strategy.warm] == []
+    for compute in ("2.85", "2.104", "", None, "not a version"):
+        assert reasons(compute)[Strategy.storage_handover] == [], compute
+    # the floor is the microversion the handover's step 0 sends (SDD §7.3)
+    assert HANDOVER_COMPUTE_FLOOR == KEEP_MICROVERSION
 
 
 def test_ineligible_strategies_marked():

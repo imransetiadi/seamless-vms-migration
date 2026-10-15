@@ -12,6 +12,7 @@ from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRe
 from ..guest_os import identify
 from .ipam import address_refusal
 from .networks import kit_subnet, port_refusal, resolve_network
+from .platforms import SERIES, parse_microversion
 
 S = Strategy
 
@@ -247,6 +248,19 @@ CATALOG: dict[str, CatalogEntry] = {
     ),
     "VMW_TOOLS_MISSING": CatalogEntry(
         Severity.info, (), "Install or start VMware Tools for graceful shutdown and IP discovery."
+    ),
+    "DST_CAPABILITY_MISSING": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Use a destination whose APIs provide the capability (SDD §21.4) or a strategy that "
+        "does not need it; upgrading the destination's services raises their maxima.",
+    ),
+    "DST_RELEASE_OUTSIDE_SUPPORT": CatalogEntry(
+        Severity.warning,
+        (),
+        "Prefer a Tier 1 series for production (SDD §21.1); declare the destination's series on "
+        "the provider when its APIs cannot tell it, and run the destination lab matrix (QASuite "
+        "§7.1) before relying on it.",
     ),
     "CONV_HOST_MISSING": CatalogEntry(
         Severity.warning,
@@ -1106,6 +1120,10 @@ def run_preflight(
                 )
             )
 
+    if destination is not None and dst_caps:
+        out.extend(_destination_capabilities(destination, dst_caps))
+        out.extend(_release_outside_support(destination, dst_caps))
+
     if plan.handover.enabled:
         unmapped = [
             d.volume_type or "<default>"
@@ -1123,6 +1141,83 @@ def run_preflight(
     if missing is not None:
         out.append(missing)
     return out
+
+
+#: (service, check-report key, floor, why) every strategy needs (SDD §21.4); a gap one strategy
+#: alone has is that strategy's eligibility reason (planning.selector), never a finding
+_CAPABILITY_FLOOR: tuple[tuple[str, str, str, str], ...] = (
+    ("compute API", "compute_microversion", "2.60", " (multi-attach)"),
+    ("block storage API", "block_storage_microversion", "3.0", ""),
+)
+
+
+def _destination_capabilities(destination: Provider, caps: Mapping[str, Any]) -> list[Finding]:
+    """DST_CAPABILITY_MISSING (SDD §21.4): each maximum of the destination's check report below
+    the floor every strategy needs; one the check could not read is not judged."""
+    lacking = [
+        f"{service} {caps[key]}, below {floor}{why}"
+        for service, key, floor, why in _CAPABILITY_FLOOR
+        if (read := parse_microversion(caps.get(key))) is not None
+        and read < parse_microversion(floor)
+    ]
+    if not lacking:
+        return []
+    return [
+        finding(
+            "DST_CAPABILITY_MISSING",
+            f"Destination {destination.id} lacks what every strategy needs: {'; '.join(lacking)}.",
+        )
+    ]
+
+
+def _series_text(names: Sequence[str]) -> str:
+    return f"{names[0]} – {names[-1]}" if len(names) > 1 else (names[0] if names else "no series")
+
+
+def _release_outside_support(destination: Provider, caps: Mapping[str, Any]) -> list[Finding]:
+    """DST_RELEASE_OUTSIDE_SUPPORT (SDD §21.4, §10.1): a Tier 3 or Outside destination, or one
+    whose declared series its APIs contradict; a warning, never a block."""
+    tier = caps.get("support_tier")
+    if not isinstance(tier, Mapping) or tier.get("tier") == "validated":
+        return []
+    found = [str(name) for name in caps.get("release_range") or []]
+    sentences = []
+    reason = tier.get("reason")
+    if tier.get("tier") == "tier3":
+        sentences.append(
+            f"Destination {destination.id} runs {_series_text(found)}, read as Tier 3 (End of Life "
+            "upstream): no Seamless release validated it there. The capability checks still apply."
+        )
+    elif tier.get("tier") == "outside":
+        sentences.append(
+            {
+                "below_floor": f"Destination {destination.id} runs a series older than "
+                f"{SERIES[0].name}, the support window's floor: no Seamless release validated it.",
+                "newer_than_validated": f"Destination {destination.id} runs a series newer than "
+                f"{SERIES[-1].name}, the newest a Seamless release validated.",
+            }.get(
+                str(reason),
+                f"Destination {destination.id}'s series could not be detected (its compute API "
+                "maximum was not read): no Seamless release can be said to have validated it.",
+            )
+            + " The capability checks still apply."
+        )
+    if tier.get("declared_outside_range") and destination.release:
+        if sentences:
+            sentences.append(
+                f"It declares series {destination.release}, which its APIs do not run: correct "
+                "the declared series."
+            )
+        else:
+            label = str(tier.get("tier", "")).replace("tier", "Tier ")
+            sentences.append(
+                f"Destination {destination.id} declares series {destination.release}, but its APIs "
+                f"read as {_series_text(found)}: correct the declared series; the tier is the one "
+                f"its APIs read ({label})."
+            )
+    if not sentences:
+        return []
+    return [finding("DST_RELEASE_OUTSIDE_SUPPORT", " ".join(sentences))]
 
 
 def _app_probe_missing(vm: VMRef, plan: Plan) -> Finding | None:

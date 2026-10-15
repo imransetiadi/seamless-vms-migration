@@ -73,7 +73,7 @@ class SupportTier:
     declared_outside_range: bool = False
 
 
-def _microversion(value: Any) -> tuple[int, int] | None:
+def parse_microversion(value: Any) -> tuple[int, int] | None:
     """A microversion such as ``"2.100"`` as numbers - so 2.9 is below 2.95 - or None."""
     match = re.fullmatch(r"\s*(\d+)\.(\d+)\s*", value) if isinstance(value, str) else None
     return (int(match.group(1)), int(match.group(2))) if match else None
@@ -94,7 +94,7 @@ def maximum_microversion(document: Any) -> str | None:
     readable = [
         (version, entry)
         for entry in entries
-        if (version := _microversion(entry.get("version"))) is not None
+        if (version := parse_microversion(entry.get("version"))) is not None
     ]
     current = [item for item in readable if str(item[1].get("status", "")).upper() == "CURRENT"]
     if not readable:
@@ -111,10 +111,10 @@ def release_range(compute_max: Any, block_storage_max: Any = None) -> ReleaseRan
     snapshot shows one); one outside the window's maxima, or none readable, is no series. A
     block-storage maximum keeps the series whose maximum equals it or is not confirmed: it narrows
     the range, never widens it, and a narrowing to nothing is not applied."""
-    compute = _microversion(compute_max)
+    compute = parse_microversion(compute_max)
     if compute is None:
         return ReleaseRange((), "not_detected")
-    maxima = [(_microversion(series.compute_max), series) for series in SERIES]
+    maxima = [(parse_microversion(series.compute_max), series) for series in SERIES]
     if compute < maxima[0][0]:
         return ReleaseRange((), "older")
     if compute > maxima[-1][0]:
@@ -124,13 +124,13 @@ def release_range(compute_max: Any, block_storage_max: Any = None) -> ReleaseRan
         below = [series for maximum, series in maxima if maximum < compute][-1]
         above = next(series for maximum, series in maxima if maximum > compute)
         found = [below, above]
-    block_storage = _microversion(block_storage_max)
+    block_storage = parse_microversion(block_storage_max)
     if block_storage is not None:
         narrowed = [
             series
             for series in found
             if series.block_storage_max is None
-            or _microversion(series.block_storage_max) == block_storage
+            or parse_microversion(series.block_storage_max) == block_storage
         ]
         found = narrowed or found
     return ReleaseRange(tuple(series.name for series in found))
