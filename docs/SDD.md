@@ -2011,8 +2011,11 @@ Stats { total: int, by_phase: dict[Phase,int], completed: int, failed: int, in_p
 ```
 
 **SSE format**: each event is `id: <seq or 0 for ephemeral>\nevent: <kind>\ndata: <Event JSON>\n\n`;
-a `: heartbeat` comment every 15 s. Clients authenticate with the Authorization header (the
-dashboard uses `fetch` streaming, not `EventSource`), and resume with `?since=<last seq>`.
+a `: heartbeat` comment every 15 s. Clients authenticate with the Authorization header (the dashboard uses `fetch`
+streaming, not `EventSource`), and resume with `?since=<last seq>`. The stream checks its principal again at each
+heartbeat, and at least once per heartbeat interval while events flow: a principal no longer accepted - a database user
+whose row was deleted (§13.1) - ends the stream, and the client's reconnect gets 401; before, the check ran only when
+the stream started, so a revoked user kept receiving every event until it disconnected (review 12).
 A stream sends each persisted event once, in `seq` order, also those another process wrote to the store (the
 CLI beside a running server, §15): a stream given an event whose `seq` skips some first reads the store from the
 last `seq` it sent, so what was written in between comes before it, and each tick (`tick_s`, §8) the server
