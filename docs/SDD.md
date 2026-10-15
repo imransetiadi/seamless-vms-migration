@@ -873,8 +873,14 @@ attachment whose device has not shown yet waits the module's timeout: the module
 other migration on that host for an attach Cinder already showed rolled back (review RV12-01). A known residual remains
 (review RV11-04). Nova may fail an attach that was still under
 way when the two minutes ended, and another export may attach that shared multi-attach volume to the same host before
-this cleanup runs - a window of seconds. The cleanup then takes the volume from under that export, whose transfer fails
-loudly and is retried; the export only reads the volume, so no data is lost. Telling the two attachments apart needs
+this cleanup runs - a window of seconds. The cleanup then takes the volume from under that export, and the conversion
+host's kernel gives its freed device path to the next disk attached there. The export therefore serves each disk by its
+identity, not its path: before it starts a disk's NBD export it reads the disk's virtio serial - the volume id Nova
+gives it, cut to 20 characters - and fails if the serial names another volume, and it serves the disk's udev link
+`/dev/disk/by-id/virtio-<serial>`, which goes with the volume, so a volume taken off the host fails every later read
+instead of reading another disk; the taken export fails loudly, as permanent. A disk that shows no serial (not
+virtio-blk) is served by its path, where a copy of another disk stays possible: before, every disk was, and the transfer
+could copy another VM's disk without an error (review RV12-03). Telling the two attachments apart needs
 this export's own Cinder attachment id, which a lost answer never gave it: Nova shows the id only from microversion
 2.89, newer than RHOSP 17.1, and Cinder's attachments API is not yet used. The cleanup re-attaches each data volume the
 source VM no longer holds; and it
