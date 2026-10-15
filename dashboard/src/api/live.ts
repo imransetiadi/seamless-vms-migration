@@ -446,5 +446,8 @@ export function applyEventToCache(
     if (kind !== 'provider.checked' && kind !== 'provider.created' && typeof providerId === 'string') {
       invalidate(['inventory', providerId]);
     }
+    return;
   }
+  // a user added by another admin, or by the CLI (SDD §13.1): the Users page's list; auth.denied changes no list
+  if (kind.startsWith('user.')) invalidate(['users']);
 }

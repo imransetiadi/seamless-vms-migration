@@ -299,6 +299,29 @@ describe('applyEventToCache for providers', () => {
   });
 });
 
+describe('applyEventToCache for users', () => {
+  it('refreshes the users list when a user is created elsewhere - by another admin or the CLI (SDD §13.1, §16)', () => {
+    const { queryClient, invalidate } = setup();
+    applyEventToCache(
+      queryClient,
+      { ...progressEvent({ name: 'rina', role: 'operator' }), seq: 47, kind: 'user.created', actor: 'admin', migration_id: null, plan_id: null },
+      invalidate,
+    );
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    expect(invalidate).toHaveBeenCalledWith(['users']);
+  });
+
+  it('refreshes nothing on a refused request: auth.denied changes no list (SDD §13.1)', () => {
+    const { queryClient, invalidate } = setup();
+    applyEventToCache(
+      queryClient,
+      { ...progressEvent({ path: '/users', method: 'GET', reason: 'role viewer is below admin' }), seq: 48, kind: 'auth.denied', actor: 'rina', migration_id: null, plan_id: null },
+      invalidate,
+    );
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+});
+
 describe('createBatchedInvalidator', () => {
   function batched(delayMs = 400) {
     const queryClient = new QueryClient();
