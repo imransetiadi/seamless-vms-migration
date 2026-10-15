@@ -864,7 +864,14 @@ volume `reserved` or `attaching` - Nova still at work, and Cinder lists an attac
 keeps the mark only if Cinder then lists the conversion host, or still shows the attach
 under way: an attach Nova refused leaves no mark a later export's attach of the same volume could be taken for
 (review RV10-01, RV10-02). The cleanup waits the same way for a marked volume Cinder still shows `reserved` or
-`attaching` before it checks. A known residual remains (review RV11-04). Nova may fail an attach that was still under
+`attaching` before it checks. When the attach call succeeds, the attach - the export's to the source conversion host,
+the transfer's to the destination one - waits, still under the attach lock, until Cinder lists that host's attachment
+with its device path. nova-api reserves the volume before it answers the call, so a volume `available` again, or in
+`error`, without that attachment means nova-compute rolled the attach back: the wait fails at once. One still `reserved`
+or `attaching` after ten minutes (`ATTACH_UNDER_WAY_S`, ample for a slow Nova) fails it too, and only a listed
+attachment whose device has not shown yet waits the module's timeout: the module's timeout held the lock against every
+other migration on that host for an attach Cinder already showed rolled back (review RV12-01). A known residual remains
+(review RV11-04). Nova may fail an attach that was still under
 way when the two minutes ended, and another export may attach that shared multi-attach volume to the same host before
 this cleanup runs - a window of seconds. The cleanup then takes the volume from under that export, whose transfer fails
 loudly and is retried; the export only reads the volume, so no data is lost. Telling the two attachments apart needs
