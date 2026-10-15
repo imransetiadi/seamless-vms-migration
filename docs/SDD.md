@@ -348,7 +348,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
-`auth.denied`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
+`auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
 never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data.
@@ -1636,9 +1636,11 @@ migration the dashboard puts that migration into such lists, reading a list agai
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
-| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it |
+| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it |
 | GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness) |
 | GET | `/me` | viewer | — | `{"name":str,"role":Role}` |
+| GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
+| POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
 | GET | `/providers` | viewer | — | `Provider[]` |
 | POST | `/providers` | admin | `Provider` (status fields ignored) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
@@ -1744,6 +1746,19 @@ the principal's name (`unauthenticated` without one), `message` `METHOD path: re
 `{path, method, reason, required_role, client}`, never the token; at most 30 per client address and
 minute are recorded.
 
+Admins can add people from Dashboard **Users** (`POST /users`). Names are 1-128 ASCII letters,
+digits, dots, underscores, `@` or hyphens, starting with a letter or digit; surrounding whitespace
+is trimmed, reserved actor names are refused, and names are unique ignoring case across file
+tokens and database users. The default role is `viewer`. The response returns a freshly generated
+token once with `Cache-Control: no-store`; later listings expose only name and role. A `user`
+document stores the SHA-256 digest in the existing database, with its lowercase name as ID.
+Creation and `user.created` (actor, name, role; never token or digest) commit together, and duplicate
+creates cannot replace an existing token. Authentication reads database users on every request,
+so access survives restarts and changes are visible across processes. Adding users is refused
+while authentication is disabled. The bootstrap token file remains read-only.
+The dashboard holds the issued token only until Done or navigation; it never puts it in browser
+storage. Editing roles, rotating tokens and deleting users are not exposed by this screen.
+
 ### 13.2 Authorization
 
 Ordered roles `viewer < operator < approver < admin`; each route declares its minimum role (§12).
@@ -1753,7 +1768,7 @@ may choose, `TODO(ADV-04): confirm`).
 
 ### 13.3 Secrets
 
-The control plane never stores credentials in its database or returns them over the API.
+The control plane never stores provider credentials in its database or returns them over the API.
 OpenStack credentials come from `clouds.yaml` (`SEAMLESS_CLOUDS_YAML`, mounted from an OpenShift
 Secret) referenced by `Provider.cloud`. VMware credentials come from `credentials_secret`, resolved
 by `security.secrets.resolve(name) -> dict` from files `{SEAMLESS_SECRETS_DIR}/{name}/{username,
