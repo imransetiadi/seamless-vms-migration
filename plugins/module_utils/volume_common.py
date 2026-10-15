@@ -100,6 +100,9 @@ def _lock_host():
     return host if re.match(r"^[A-Za-z0-9._-]+$", host or "") else "unknown"
 
 
+# Cinder's statuses while Nova attaches a volume: it lists the attachment only once attached
+ATTACHING = ("reserved", "attaching")
+
 # ssh's own exit status when it cannot reach or log in to the host
 SSH_FAILED = 255
 # a lock wait gives up once ssh to the conversion host failed this long without a break: long
@@ -576,9 +579,24 @@ class OpenStackVolumeBase:
                 # attached, which the SDK refuses (Seamless Migrate SDD 6.6,
                 # review RV8-02, RV9-01)
                 mapping[mark] = True
-            conn.attach_volume(
-                volume=volume, wait=False, server=host, timeout=self.timeout
-            )
+            try:
+                conn.attach_volume(
+                    volume=volume, wait=False, server=host, timeout=self.timeout
+                )
+            except Exception:
+                if mark and mapping.get(mark):
+                    # Nova may have carried it out all the same, or be at it: the mark
+                    # stays only if Cinder, settled, lists this host or still shows the
+                    # attach under way - decided while this export holds the attach
+                    # lock, so no other export attached it meanwhile (Seamless Migrate
+                    # SDD 6.6, review RV10-01, RV10-02)
+                    settled = self._settled_volume(conn, volume["id"])
+                    if settled is None or not (
+                        self._volume_still_attached(settled, host)
+                        or getattr(settled, "status", None) in ATTACHING
+                    ):
+                        mapping.pop(mark, None)
+                raise
             self.log.info("Waiting for volume to appear in %s wrapper", name)
             self._wait_for_volume_dev_path(conn, volume, host_func(), self.timeout)
 
@@ -628,6 +646,20 @@ class OpenStackVolumeBase:
                     f"OpenStack: {dev_path}"
                 )
             self.volume_map[path] = update_func(mapping, dev_path)
+
+    def _settled_volume(self, conn, volume_id):
+        """
+        The volume ``volume_id`` once Cinder settled it - not `reserved` or
+        `attaching`, where Nova is still at work and Cinder lists no attachment
+        yet - within the module's timeout, else as it is then; None when Cinder
+        no longer has it (Seamless Migrate SDD 6.6, review RV10-01, RV10-02).
+        """
+        for second in range(self.timeout):
+            volume = volume_or_none(conn, volume_id)
+            if volume is None or getattr(volume, "status", None) not in ATTACHING:
+                return volume
+            time.sleep(1)
+        return volume_or_none(conn, volume_id)
 
     def _get_attachment(self, volume, vm):
         """
@@ -1626,7 +1658,12 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
         for path, mapping in self.volume_map.items():
             if not (mapping.get("source_attached") or mapping.get("source_dev")):
                 continue  # this transfer never attached it
-            volume = self._get_volume_maybe(mapping["source_id"])
+            # an attach Nova is still at shows on this host only once done (review RV10-02)
+            volume = (
+                self._settled_volume(self.conn, mapping["source_id"])
+                if mapping["source_id"]
+                else None
+            )
             if volume is None:
                 continue
             self.log.info("Inspecting volume %s", volume.id)

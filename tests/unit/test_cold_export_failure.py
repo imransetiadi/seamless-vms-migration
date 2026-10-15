@@ -558,3 +558,113 @@ def test_an_attach_whose_answer_was_lost_is_put_back_by_the_rescue():
     for volume_id in DISKS:
         assert _holders(src, volume_id) == ["srv-1"], volume_id
     assert set(src.volumes) == set(DISKS) and src.snapshots == {}
+
+
+def _nova_api_refuses(src, pairs):
+    """nova-api answers an attach of these (server, volume) pairs with a 503 while ``down`` holds -
+    a restarting or overloaded API: the request never reaches Nova, nothing is attached. The SDK's
+    own checks (available, not on that server) passed before it sent the request."""
+    attach = src.attach_volume
+    state = {"down": True}
+
+    def attach_volume(server, volume, device=None, wait=True, timeout=None):
+        if state["down"] and (server.id, volume.id) in pairs:
+            src.record("attach_volume_503", server=server.id, volume=volume.id)
+            raise fake.SDKException("HttpException: 503: Server Error for url: os-volume_attachments")
+        return attach(server, volume, device=device, wait=wait, timeout=timeout)
+
+    src.attach_volume = attach_volume
+    return state
+
+
+def test_a_rescue_never_takes_the_shared_volume_another_export_attached_after_its_own_failed():
+    """Review RV10-01: two cold cutovers share the source conversion host, and their VMs a
+    multi-attach volume. B takes the attach lock first and marks the volume before it asks Nova,
+    and nova-api answers 503: nothing was attached. A's export, next to take the lock, attaches
+    the volume. B's rescue saw B's mark and the volume on the conversion host, and took it from
+    under A's export. B now keeps the mark only if Cinder, settled, lists the conversion host -
+    decided while B still holds the lock (Seamless Migrate SDD 6.6)."""
+    src, data = _shared_volume_vms()
+    host = SourceHost(src)
+    with mock.patch.object(volume_common, "RemoteShell", host):
+        a, b = (
+            export_module.OpenStackSourceVolume(
+                src, "src-conv", "/keys/k", "cloud-user", server_id,
+                server_util.Server.from_data(data[server_id]), timeout=3,
+            )
+            for server_id in ("srv-a", "srv-b")
+        )
+    api = _nova_api_refuses(src, {("src-conv", "vol-shared"), ("srv-b", "vol-shared")})
+
+    with mock.patch.object(volume_common.time, "sleep"):
+        for export in (a, b):
+            export._test_source_vm_shutdown()
+            export._get_root_and_data_volumes()
+            export._validate_volumes_match_data()
+        for export in (a, b):
+            export._detach_data_volumes_from_source()
+        with pytest.raises(Exception, match="503"):
+            b._attach_volumes_to_converter()
+        b.reattach_detached_volumes()  # meets the same 503
+        b.remove_unheld_root_copy()
+        api["down"] = False
+        a._attach_volumes_to_converter()
+        with mock.patch.object(volume_common, "RemoteShell", host):
+            cleanup = cleanup_module.OpenStackSourceHostCleanup(
+                src, "src-conv", "/keys/k", "cloud-user", "srv-b", b.transfer_uuid, b.volume_map,
+                timeout=3,
+            )
+        with pytest.raises(Exception, match="vol-shared is not available"):
+            cleanup.close_exports()  # B cannot have it back while A's export holds it (RV8-02)
+
+    assert not b.volume_map["/dev/vdb"].get("source_attached"), b.volume_map["/dev/vdb"]
+    assert _holders(src, "vol-shared") == ["src-conv"], _holders(src, "vol-shared")
+    assert not [c for c in src.calls_to("detach_volume") if c[1]["volume"] == "vol-shared"
+                and c[1]["server"] == "src-conv"]
+
+
+def _answer_lost_while_nova_attaches(src, server_id, volume_id, reads):
+    """Nova accepted the attach of ``volume_id`` to ``server_id``, but its answer never reached
+    openstacksdk, and Nova carries the attach out a little later: Cinder shows the volume
+    `attaching`, and lists the attachment only once it is attached - here after ``reads`` reads
+    of the volume."""
+    attach, read = src.attach_volume, src.get_volume_by_id
+    pending = {}
+
+    def attach_volume(server, volume, device=None, wait=True, timeout=None):
+        if server.id == server_id and volume.id == volume_id and "reads" not in pending:
+            src.record("attach_volume", server=server.id, volume=volume.id)
+            src.volumes[volume.id].status = "attaching"
+            pending["reads"] = reads
+            raise fake.SDKException("Remote end closed connection without response")
+        return attach(server, volume, device=device, wait=wait, timeout=timeout)
+
+    def get_volume_by_id(volume_id_read):
+        volume = read(volume_id_read)
+        if volume_id_read == volume_id and pending.get("reads"):
+            pending["reads"] -= 1
+            if not pending["reads"]:  # Nova finished the attach
+                volume.status = "available"
+                attach(src.servers[server_id], volume)
+        return volume
+
+    src.attach_volume, src.get_volume_by_id = attach_volume, get_volume_by_id
+
+
+@pytest.mark.parametrize("reads", [3, 7], ids=["while the export waits", "while the cleanup waits"])
+def test_an_attach_nova_finishes_after_its_answer_was_lost_is_still_put_back_by_the_rescue(reads):
+    """Review RV10-02: the answer to the attach of a data volume was lost, and Nova carried the
+    attach out a few seconds later. Meanwhile Cinder showed the volume `attaching` and listed no
+    attachment, so the rescue skipped the volume, and the rollback started the source VM without
+    it. The export waits, within its timeout, for Cinder to settle the volume and keeps the mark of
+    an attach still under way; the cleanup waits the same way (Seamless Migrate SDD 6.6)."""
+    src, data = _boot_from_volume_vm()
+    _answer_lost_while_nova_attaches(src, "src-conv", "vol-data1", reads=reads)
+    host = SourceHost(src)
+
+    exported, cleaned = _export_then_rescue(src, host, data)
+
+    assert exported.get("failed") and exported["volume_map"]["/dev/vdb"].get("source_attached")
+    assert cleaned is not None and cleaned["_exit_code"] in (None, 0), cleaned
+    for volume_id in DISKS:
+        assert _holders(src, volume_id) == ["srv-1"], volume_id
