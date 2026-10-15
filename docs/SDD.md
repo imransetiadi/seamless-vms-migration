@@ -2270,6 +2270,19 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   state or a zero ("No VM is down", "Failed 0"). That stays while it is fetched again — by Retry, a live event or
   the window regaining focus: Retry is busy and keeps the focus, and nothing turns back into a loading placeholder
   until an answer replaces it.
+* UI audit remediation (2026-10-15): a failed lazy page import or render keeps the app navigation and shows
+  an announced recovery panel with an explicit Reload page action; changing route resets that panel.
+  Read-only scrolling tables and the recommendation's input JSON are named keyboard stops. Definitions and
+  disabled-action notes remain inside the viewport; moving or resizing the page dismisses an outdated note.
+  On narrow screens a recommendation's evidence value uses its own full-width row, and a policy's name is
+  above its mode badge. When the full sidebar is hidden or collapsed, the content shows the current user's
+  name, role and, only when `/health` says so, Demo; the first Overview downtime clock remains on the first
+  screen at 390 x 844. Plans keeps `q`, `status`, `sort` and `direction` in the URL, replacing history on input;
+  unknown status/sort/direction values fall back to defaults. Clear filters clears those choices and focuses
+  Search plans. Closing a changed plan form asks Discard changes or Keep editing, including changes to VM
+  selection; no draft or credentials are persisted in browser storage. An unchanged form closes directly,
+  and a successful save never asks to discard. These requirements close UI-01 through UI-08 in
+  `docs/UI-UX-AUDIT-2026-10-15.md` without changing the migration APIs or role policy.
 * Failed requests of a batch action (Check all on Providers): a request that fails is never left out as
   if it had not been asked — the result names each item whose request failed, with Retry for those
   items, which stay named while their Retry runs, and the announcement counts them ("Checked 2 of 3 providers: 2

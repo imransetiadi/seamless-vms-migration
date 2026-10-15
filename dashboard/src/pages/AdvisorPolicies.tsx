@@ -68,7 +68,7 @@ function PolicyCard({
         className="card flex h-full min-w-0 scroll-mt-20 flex-col gap-3 p-4 outline-offset-2 focus:outline-2 focus:outline-ring"
       >
         <header className="flex flex-wrap items-start gap-2">
-          <div className="min-w-0 flex-1">
+          <div className="min-w-0 flex-1 basis-full sm:basis-auto">
             <h3 id={headingId} className="text-base font-semibold text-foreground wrap-break-word">
               {builtIn ? 'Built-in default' : policy.name}
             </h3>

@@ -1,0 +1,47 @@
+{
+  "webkit": {
+    "version": "27.2",
+    "optionTabFromEditNetwork": {
+      "tag": "BUTTON",
+      "text": "Edit probes",
+      "tabIndex": 0
+    },
+    "note": "Option+Tab traverses all controls on this macOS WebKit build. Plain Tab was not used as evidence."
+  },
+  "spacing": [
+    {
+      "route": "/",
+      "overflow": 0
+    },
+    {
+      "route": "/plans",
+      "overflow": 0
+    },
+    {
+      "route": "/providers",
+      "overflow": 0
+    },
+    {
+      "route": "/advisor/policies",
+      "overflow": 0
+    },
+    {
+      "route": "/advisor/recommendations/rec-d4e6f8a09001",
+      "overflow": 0
+    },
+    {
+      "route": "/login",
+      "overflow": 0
+    }
+  ],
+  "disabled": {
+    "text": "Managing advisor policies requires the admin role.",
+    "top": 299,
+    "bottom": 349,
+    "viewport": 800
+  },
+  "reducedMotion": {
+    "animation": "1e-05s",
+    "transition": "1e-05s"
+  }
+}
