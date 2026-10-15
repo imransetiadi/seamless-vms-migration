@@ -15,7 +15,12 @@ import json
 import re
 
 try:
-    from openstack.exceptions import NotFoundException, SDKException
+    from openstack.exceptions import (
+        NotFoundException,
+        ResourceFailure,
+        ResourceTimeout,
+        SDKException,
+    )
 except ImportError:  # openstacksdk is optional for these tests
 
     class SDKException(Exception):
@@ -23,6 +28,12 @@ except ImportError:  # openstacksdk is optional for these tests
 
     class NotFoundException(SDKException):
         status_code = 404
+
+    class ResourceFailure(SDKException):
+        pass
+
+    class ResourceTimeout(SDKException):
+        pass
 
 GIB = 1024 ** 3
 
@@ -57,6 +68,10 @@ class FakeCloud:
         # the lock files each conversion host holds now, by its address (use_lock)
         self.held_locks = {}
         self.fail_on = {}
+        # reads of a volume Cinder takes to finish a detach Nova accepted: until then the volume
+        # stays `detaching`, its attachment still listed (0 finishes each detach at once)
+        self.detach_reads = 2
+        self._detaching = {}
         # the credential: its project, and the role names of its token (a member by default)
         self.current_project_id = "project-%s" % name
         self.roles = ["member", "reader"]
@@ -115,6 +130,8 @@ class FakeCloud:
             volumes=[],
             image=image,
         )
+        # an image-booted server's local root disk takes the first device
+        self.devices[server_id] = ["/dev/vda"] if image else []
         return self.servers[server_id]
 
     def add_volume(
@@ -143,6 +160,8 @@ class FakeCloud:
             )
             volume.status = "in-use"
             self.servers[server_id].volumes.append({"id": volume_id})
+            if device:
+                self.devices.setdefault(server_id, []).append(device)
         return volume
 
     # --- cloud layer -----------------------------------------------------
@@ -155,7 +174,33 @@ class FakeCloud:
         volume = self.volumes.get(volume_id)
         if volume is None:
             raise NotFoundException("No Volume found for %s" % volume_id)
+        self._read_detaching(volume)
         return volume
+
+    def _read_detaching(self, volume, settle=False):
+        """A read of ``volume``: each detach Cinder is finishing comes one read closer to its
+        end, or - ``settle``, a wait that lets the time pass - ends."""
+        pending = self._detaching.get(volume.id)
+        if not pending:
+            return
+        for entry in list(pending):
+            entry[1] = 0 if settle else entry[1] - 1
+            if entry[1] <= 0:
+                pending.remove(entry)
+                self._end_detach(volume, entry[0])
+        if pending:
+            volume.status = "detaching"
+        else:
+            del self._detaching[volume.id]
+
+    def _end_detach(self, volume, server_id):
+        for attachment in list(volume.attachments):
+            if attachment["server_id"] == server_id:
+                volume.attachments.remove(attachment)
+                devices = self.devices.get(server_id, [])
+                if attachment["device"] in devices:
+                    devices.remove(attachment["device"])
+        volume.status = "in-use" if volume.attachments else "available"
 
     def get_image_by_id(self, image_id):
         return self.images.get(image_id)
@@ -224,14 +269,14 @@ class FakeCloud:
             raise AssertionError("detach_volume(wait=True) waits without a bound in openstacksdk 4.x")
         self.record("detach_volume", server=server.id, volume=volume.id)
         volume = self.volumes[volume.id]
-        for attachment in list(volume.attachments):
-            if attachment["server_id"] == server.id:
-                volume.attachments.remove(attachment)
-                devices = self.devices.get(server.id, [])
-                if attachment["device"] in devices:
-                    devices.remove(attachment["device"])
-        if not volume.attachments:
-            volume.status = "available"
+        if not any(a["server_id"] == server.id for a in volume.attachments):
+            return
+        if self.detach_reads:
+            # like Cinder: Nova accepted the detach, which ends a little later
+            self._detaching.setdefault(volume.id, []).append([server.id, self.detach_reads])
+            volume.status = "detaching"
+        else:
+            self._end_detach(volume, server.id)
 
     def delete_volume(self, name_or_id=None, wait=True, timeout=None, force=False):
         self.record("delete_volume", name_or_id=name_or_id)
@@ -279,12 +324,30 @@ class _FakeBlockStorage:
     TRANSITIONAL = ("creating", "attaching", "detaching", "downloading", "extending")
 
     def wait_for_status(self, res, status="available", failures=None, interval=2, wait=None, **kwargs):
+        """As openstacksdk's block_storage proxy and resource.wait_for_status: a resource
+        already in ``status`` returns at once; else Cinder finishes a transitional status on
+        its own, a failure status (``error`` unless ``failures`` says otherwise) raises
+        ResourceFailure, as does a resource that went away, and any other status - one Cinder
+        will not leave on its own - never becomes ``status``: ResourceTimeout once ``wait``
+        ran out."""
         if wait is None:
             raise AssertionError("wait_for_status without a wait bound waits forever")
         self.cloud.record("wait_for_status", id=res.id, status=status)
-        found = self.cloud.volumes.get(res.id) or self.cloud.snapshots.get(res.id) or res
-        if found.get("status") in self.TRANSITIONAL:
+        if str(res.get("status") or "").lower() == status.lower():
+            return res
+        found = self.cloud.volumes.get(res.id) or self.cloud.snapshots.get(res.id)
+        if found is None:
+            raise ResourceFailure("%s went away while waiting for %s" % (res.id, status))
+        if res.id in self.cloud.volumes:
+            self.cloud._read_detaching(found, settle=True)
+        failures = ["error"] if failures is None else failures
+        current = str(found.get("status") or "").lower()
+        if current in self.TRANSITIONAL:
             found.status = status
+        elif current in [failure.lower() for failure in failures]:
+            raise ResourceFailure("%s transitioned to failure state %s" % (res.id, current))
+        elif current != status.lower():
+            raise ResourceTimeout("Timeout waiting for %s to transition to %s" % (res.id, status))
         return found
 
     def set_volume_bootable_status(self, volume, bootable):
@@ -346,7 +409,10 @@ class _FakeCompute:
             volume.attachments = [
                 a for a in volume.attachments if a["server_id"] != server_id
             ]
-            if not volume.attachments:
+            pending = [e for e in self.cloud._detaching.pop(volume.id, []) if e[0] != server_id]
+            if pending:
+                self.cloud._detaching[volume.id] = pending
+            elif not volume.attachments:
                 volume.status = "available"
 
     def wait_for_delete(self, res, interval=2, wait=120, callback=None):

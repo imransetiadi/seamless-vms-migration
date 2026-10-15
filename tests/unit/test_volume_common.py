@@ -531,6 +531,7 @@ def test_a_detach_waits_for_available_when_no_other_server_holds_the_volume():
     """SDD 6.6: with no other holder, the detach waits until Cinder shows the volume available -
     `detaching` first - as openstacksdk's own wait did, within the timeout."""
     dst = cloud()
+    dst.detach_reads = 0  # Cinder's timing is this test's own: the attachment goes at once
     dst.add_volume("vol-1", "vol-1", 1)
     conversion_host = dst.servers["dst-conv"]
     dst.attach_volume(conversion_host, dst.volumes["vol-1"])

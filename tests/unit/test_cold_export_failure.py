@@ -486,7 +486,7 @@ def test_a_root_copy_the_cleanup_cannot_delete_never_keeps_a_data_volume_off_the
     assert root["source_id"] in message and root["source_id"] in src.volumes, message
     if root["snap_id"]:  # tried too: Cinder keeps the snapshot of a copy it still has
         assert root["snap_id"] in message and root["snap_id"] in src.snapshots, message
-    else:  # tried too: Glance removes the image all the same
+    else:  # tried too: this fake's Glance, a file store, removes it (a Ceph one keeps a cloned image)
         assert root["image_id"] not in src.images and root["image_id"] not in message, message
 
 
