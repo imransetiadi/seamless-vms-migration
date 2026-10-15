@@ -1002,9 +1002,12 @@ way the import will after the stop:
   Another project's network only when it is shared with the credential's project or is external (Neutron's `shared`
   and `router:external`, as the credential sees them). An admin credential sees every project's networks, and a port
   on another project's private network would put the VM on that tenant's network. There, also only when the token
-  carries the `admin` or `advsvc` role (`credential_roles`: the role names of the credential's token). Neutron's
-  policy (2023.1 `create_port:fixed_ips:ip_address`, `create_port:mac_address`, `create_port:port_security_enabled`)
-  lets only those roles, or the network's own project, choose a port's address, MAC or port security. The import
+  carries a role the destination's policy profile counts (`credential_roles`: the role names of the credential's
+  token; the profile is `_migration_params.policy_profile`, §21.5). Neutron's policy
+  (`create_port:fixed_ips:ip_address`, `create_port:mac_address`, `create_port:port_security_enabled`) lets only
+  those roles, or the network's own project, choose a port's address, MAC or port security: `admin` or `advsvc`
+  under `legacy` (the 2023.1 rules; an export from before the param reads `legacy`), `admin` or `service` under
+  `secure_rbac` (the defaults from 2023.2), and `admin` alone under `unknown`, the role both count. The import
   chooses them for every port: through Nova it asks for the port's address, and Nova creates the port with the
   migration user's token; through Neutron it sends the MAC, every address and the port-security flag. An external
   network that is not shared (`router:external` without `shared`), the credential's own included, also needs the
@@ -1149,8 +1152,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   the cutover fails before the source stops (the owner's choice, 2026-10-14).
 * `os_migrate_workloads_preserve_volume_type: true` whenever `plan.mappings.volume_types` is non-empty
   (§6.4).
-* `port_creation_mode`: before every OpenStack playbook run of a migration, the executor writes
-  `plan.port_creation_mode` into the planned server's `_migration_params` in `workloads.yml`, after an export as
+* `port_creation_mode` and `policy_profile`: before every OpenStack playbook run of a migration, the executor writes
+  `plan.port_creation_mode`, and the destination's `policy_profile` as its check reports it (§10.1; `legacy` for a
+  report without one), into the planned server's `_migration_params` in `workloads.yml`, after an export as
   well. A mode chosen after a warm migration's export therefore applies at its cutover. In `neutron` mode, a warm
   cutover whose `workloads.yml` lists a port without `security_group_refs` (exported before §6.6's rule) exports the
   workload again first.
@@ -1174,7 +1178,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
     the networks the credential sees (a shared provider network that another project owns is found). Whether the
     credential may put a port there is the destination check's (§6.6): it refuses, before the source stops, another
     project's network that is neither shared with the credential's project nor external, and any network of
-    another project when the credential's token carries neither the `admin` nor the `advsvc` role.
+    another project when the credential's token carries no role its policy profile counts (§6.6).
   Every fixed IP reference of a port becomes address-only (§6.6), so Neutron finds the address in the resolved
   network's subnets whatever their names. A port's network name that does not resolve stops the cutover there,
   before the source stops: a permanent failure naming the port. A warm pre-copy or sync run, which makes no port,
@@ -1754,7 +1758,7 @@ Finding catalog (code — severity — condition):
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
 | `MAP_NETWORK_AMBIGUOUS` | blocker | a VM's NIC goes to a RHOSO network name (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name, §7.2) that the rule of §7.3 step 0 cannot resolve to one network: several networks of the destination credential's project carry it, or none of them does and several of other projects do (`DestinationInventory.network_details`). The cutover would refuse it before the stop. The message names the NIC's MAC, the name and the projects |
 | `NET_ADDRESS_REFUSED` | blocker | an OpenStack VM's NIC without a `plan.nic_overrides` entry keeps an address that Neutron would refuse on its resolved RHOSO network, by §6.6's rules: a host address of one of the network's subnets, and on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode and no address in `"nova"` mode, where a port keeps its first address only. A VMware NIC's IPv4 guest addresses (the migration kit sends only those, with one subnet per NIC, §7.2) must all be host addresses of one subnet of its resolved network. A network that pre-staging would create is not checked. The message names the NIC's MAC, the address and the network |
-| `NET_PORT_NOT_PERMITTED` | blocker | a VM's NIC resolves, by the rule of §7.3 step 0 (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name — the migration kit creates every port with the NIC's MAC, §7.2), to a network (`DestinationInventory.network_details`) where the destination credential may not put a port, by §6.6's rule. Either it is another project's network (`own` false) that is neither `shared` with the credential's project nor `external`, or using it needs a role the credential's token lacks: `admin` or `advsvc` for another project's network, and `admin` for any external network that is not `shared`, the credential's own included (the `roles` of the destination's capabilities, as validation's check reports them; when the destination reports no `roles`, the role half is not judged). The cutover recreates every port with its address or MAC, which Neutron's policy would refuse after the source stops, and Nova attaches no unshared external network for a token without `admin`; the destination check refuses both before the stop. The message names the NIC's MAC, the network, its project and the half of the rule that fails |
+| `NET_PORT_NOT_PERMITTED` | blocker | a VM's NIC resolves, by the rule of §7.3 step 0 (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name — the migration kit creates every port with the NIC's MAC, §7.2), to a network (`DestinationInventory.network_details`) where the destination credential may not put a port, by §6.6's rule. Either it is another project's network (`own` false) that is neither `shared` with the credential's project nor `external`, or using it needs a role the credential's token lacks: for another project's network one the destination's `policy_profile` counts (§6.6: `admin` or `advsvc` under `legacy`, also for a report that names no profile; `admin` or `service` under `secure_rbac`; `admin` under `unknown`), and `admin` for any external network that is not `shared`, the credential's own included (the `roles` and `policy_profile` of the destination's capabilities, as validation's check reports them; when the destination reports no `roles`, the role half is not judged). The cutover recreates every port with its address or MAC, which Neutron's policy would refuse after the source stops, and Nova attaches no unshared external network for a token without `admin`; the destination check refuses both before the stop. The message names the NIC's MAC, the network, its project and the half of the rule that fails |
 | `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
 | `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one, resolved by the rule of §7.3 step 0; its `DestinationInventory.subnets` by `network_id`) or is no host address there — as Neutron's `check_subnet_ip` rules for a port created with no owner, an IPv4 subnet's network address (at any prefix length) and its broadcast address below a /31 (a /31 or /32 has none), while an IPv6 subnet's first address is taken (§6.6); on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode, and no address in `"nova"` mode (§6.6); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
@@ -2924,8 +2928,9 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   a name only another project's network carries is marked "another project's", one the rule of §7.3 step 0 cannot
   resolve "several networks"; a network where the RHOSO credential may not put a port, by §6.6's rule — another
   project's that is neither shared with its project nor external, or one whose use needs a role missing from the
-  destination's `roles` (`admin` or `advsvc` for another project's, `admin` for an unshared external network, its
-  own included) — is marked "not allowed", and when selected a note under the field says why, as
+  destination's `roles` (`admin` or `advsvc` for another project's - the legacy rule, until plan task T8 brings
+  the policy profile here -, `admin` for an unshared external network, its own included) — is marked "not
+  allowed", and when selected a note under the field says why, as
   `NET_PORT_NOT_PERMITTED` does)
   and its addresses (comma separated; empty keeps its own), unavailable with the reason while the plan cannot be
   edited (its migrations, read as summaries while the plan is editable, say whether one is in flight, §12). A network an entry names that RHOSO no longer lists stays selected, marked "not in RHOSO". A refused
@@ -3399,8 +3404,9 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
   or `admin` for a port with a fixed IP or MAC on another project's network. `manager` is never required.
 * The check reports `policy_profile`: the one its provider declares (`Provider.policy_profile`, §4.2), else by kind
   and series (§10.1: `legacy` for RHOSO 18.0 until D14 is decided, `secure_rbac` from 2023.2, `unknown` when the
-  series cannot tell). Planned (T5): `NET_PORT_NOT_PERMITTED` judges `service` under the secure-RBAC profile,
-  `advsvc` only under the legacy one, and under `unknown` only the roles both count (§6.6, §9.3 when implemented).
+  series cannot tell). `NET_PORT_NOT_PERMITTED`, the executors' checks before the stop and the collection's
+  destination check count `service` under the secure-RBAC profile, `advsvc` only under the legacy one, and under
+  `unknown` only `admin`, the role both count (§6.6, §9.3; plan task T5).
 
 ### 21.6 Conversion hosts on community clouds
 
@@ -3432,7 +3438,7 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
 | `Provider.release: str|null`, the declared series | §4.2, §12 (binding); the dashboard's form, §16, with T8 | T2 |
 | `check()` keys `release_range`, `release`, `support_tier`, `policy_profile`, `tls`; `Provider.policy_profile` | §10, §10.1, §4.2, §12 (binding) | T3 |
 | findings `DST_CAPABILITY_MISSING` (blocker), `DST_RELEASE_OUTSIDE_SUPPORT` (warning) | §21.4 (binding); §9.3 with the catalog | T4 |
-| `NET_PORT_NOT_PERMITTED` by the policy profile (§21.5) | §6.6, §9.3 | T5 |
+| `NET_PORT_NOT_PERMITTED` by the policy profile (§21.5) | §6.6, §9.3 (binding); the dashboard's picker with T8 | T5 |
 | destination-neutral texts: findings, events, the CLI and the dashboard name the destination provider | §9.3, §16 | T6 |
 | conversion host images (§21.6) | §6.5, Performance.md | T7 |
 | the provider page shows series, tier and profile; the provider form takes the declared series | §16 | T8 |
