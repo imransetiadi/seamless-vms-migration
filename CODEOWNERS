@@ -1,1 +1,13 @@
-*       @rebtoor @davidjpeacock @matbu @cloudguruab @fdiazbra
+# Modified by the Seamless Migrate project, 2026.
+# Review requests for this fork (Security.md §9.3). Upstream os-migrate's maintainers are not involved
+# in this repository; the fork's maintainer owns everything, and the tooling, agent and deployment
+# paths are listed so that a second maintainer can be added for them alone.
+*                       @imransetiadi
+/.github/               @imransetiadi
+/.claude/               @imransetiadi
+/.mcp.json              @imransetiadi
+/CLAUDE.md              @imransetiadi
+/deploy/                @imransetiadi
+/scripts/               @imransetiadi
+/docs/SDD.md            @imransetiadi
+/docs/Security.md       @imransetiadi
