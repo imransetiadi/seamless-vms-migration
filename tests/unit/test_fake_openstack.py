@@ -95,3 +95,14 @@ def test_the_fakes_detach_of_a_volume_the_server_does_not_hold_is_nova_s_404():
     with pytest.raises(fake.NotFoundException, match="not attached to server srv-2"):
         cloud.detach_volume(cloud.servers["srv-2"], cloud.volumes["vol-1"], wait=False)
     assert [a["server_id"] for a in cloud.volumes["vol-1"].attachments] == ["srv-1"]
+
+
+def test_the_fakes_second_detach_while_one_is_pending_is_refused():
+    """Nova refuses to detach an attachment already detaching: the volume is no longer `in-use`."""
+    cloud = _cloud()
+    volume = cloud.volumes["vol-1"]
+    cloud.detach_volume(cloud.servers["srv-1"], volume, wait=False)
+
+    with pytest.raises(fake.SDKException, match="detaching from server srv-1 already"):
+        cloud.detach_volume(cloud.servers["srv-1"], volume, wait=False)
+    assert cloud.block_storage.wait_for_status(volume, "available", wait=5).attachments == []

@@ -275,6 +275,11 @@ class FakeCloud:
             raise NotFoundException(
                 "Volume %s is not attached to server %s" % (volume.id, server.id)
             )
+        if any(entry[0] == server.id for entry in self._detaching.get(volume.id, [])):
+            # as Nova: a detach of an attachment already detaching is refused
+            raise SDKException(
+                "Invalid volume: Volume %s is detaching from server %s already" % (volume.id, server.id)
+            )
         if self.detach_reads:
             # like Cinder: Nova accepted the detach, which ends a little later
             self._detaching.setdefault(volume.id, []).append([server.id, self.detach_reads])
