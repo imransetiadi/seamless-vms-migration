@@ -454,7 +454,8 @@ export function useCheckAllProviders() {
       }
       return result;
     },
-    onSettled: () => invalidateAll(queryClient, [queryKeys.providers]),
+    // each checked provider's inventory too, as one Check does: a check refreshes its capabilities
+    onSettled: (result) => invalidateAll(queryClient, [queryKeys.providers, ...(result?.checked ?? []).map((p) => queryKeys.inventory(p.id))]),
   });
 }
 
@@ -463,7 +464,11 @@ export function useDeleteProvider() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (providerId: string) => api.delete(`/providers/${enc(providerId)}`),
-    onSuccess: () => invalidateAll(queryClient, [queryKeys.providers]),
+    onSuccess: (_result, providerId) => {
+      // its cached inventory would otherwise outlive it
+      queryClient.removeQueries({ queryKey: queryKeys.inventory(providerId) });
+      invalidateAll(queryClient, [queryKeys.providers]);
+    },
   });
 }
 
@@ -544,7 +549,8 @@ export function useMigrationAction(migrationId: string) {
     },
     onSuccess: (migration) => {
       queryClient.setQueryData(queryKeys.migration(migration.id), migration);
-      invalidateAll(queryClient, [['migrations'], ['stats'], queryKeys.plan(migration.plan_id), ['events']]);
+      // the plan list too: a retry reopens a completed plan, a cancel changes its counts (SDD §5.1, §16)
+      invalidateAll(queryClient, [['migrations'], ['stats'], queryKeys.plan(migration.plan_id), queryKeys.plans, ['events']]);
     },
   });
 }
@@ -579,7 +585,9 @@ export function useSetStrategy(migrationId: string) {
     mutationFn: (strategy: Strategy) => api.put<Migration>(`/migrations/${enc(migrationId)}/strategy`, { strategy }),
     onSuccess: (migration) => {
       queryClient.setQueryData(queryKeys.migration(migration.id), migration);
-      invalidateAll(queryClient, [['migrations']]);
+      // the API records the choice in the plan's strategy_overrides and audits it: the plan page's override count, the
+      // plan list, the figures and the event lists follow (SDD §12, §16)
+      invalidateAll(queryClient, [['migrations'], queryKeys.plan(migration.plan_id), queryKeys.plans, ['stats'], ['events']]);
     },
   });
 }
