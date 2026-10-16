@@ -110,19 +110,32 @@ class Advisor:
         return redact(text, names)
 
     # -- strategy ----------------------------------------------------------------------------
+    def _for_strategy(
+        self, text: str, vm: VMRef, destination_name: str | None, destination: str
+    ) -> str:
+        """Secrets redacted, then the VM's name (when names are redacted) and the destination
+        provider's name - operator free text, in the eligibility reasons the operators read (T6) -
+        replaced in one pass, longest first, so neither replacement splits the other: the VM's name
+        blanked first left "jakarta-[vm]-prod" to send. The provider's name gives way to the
+        destination's kind and series whatever the redaction setting, and wins when the two names
+        are equal (SDD §1 naming, §13.4, reviews RV20-01, RV21-02)."""
+        names = {vm.name: "[vm]"} if self.settings.memory_redact_names else {}
+        if destination_name:
+            names[destination_name] = destination
+        return replace_names(redact(text), names)
+
     def _strategy_evidence(
-        self, vm: VMRef, estimates: Sequence[Estimate], plan: Plan, findings: Sequence[Finding]
+        self,
+        vm: VMRef,
+        estimates: Sequence[Estimate],
+        plan: Plan,
+        findings: Sequence[Finding],
+        destination_name: str | None = None,
+        destination: str = "the destination",
     ) -> str:
         # rendered from the declared field specs (SDD §13.4, ADV-06): nothing else is sent
         text = payloads.render_strategy(payloads.StrategyInput(vm, estimates, plan, findings))
-        return self._redact(text, [vm.name])
-
-    @staticmethod
-    def _without_provider(text: str, name: str | None, descriptor: str) -> str:
-        """The destination provider's name - operator free text, in the eligibility reasons the
-        operators read (T6) - replaced by the destination's kind and series before anything leaves
-        for Jev, whatever the redaction setting (SDD §1 naming, §13.4, review RV20-01)."""
-        return replace_names(text, {name: descriptor}) if name else text
+        return self._for_strategy(text, vm, destination_name, destination)
 
     async def recommend_strategy(
         self,
@@ -151,19 +164,15 @@ class Advisor:
             return None  # nothing to decide: jev_decide needs at least two candidates
         # the jev_decide arguments, built even when Jev is off: they are the input snapshot (§14.5)
         arguments: dict[str, Any] = {
-            "decision": self._without_provider(
-                self._redact(
-                    f"Which migration strategy should be used for VM {vm.name} moving to "
-                    f"{destination}?",
-                    [vm.name],
-                ),
+            "decision": self._for_strategy(
+                f"Which migration strategy should be used for VM {vm.name} moving to "
+                f"{destination}?",
+                vm,
                 destination_name,
                 destination,
             ),
-            "evidence": self._without_provider(
-                self._strategy_evidence(vm, estimates, plan, findings),
-                destination_name,
-                destination,
+            "evidence": self._strategy_evidence(
+                vm, estimates, plan, findings, destination_name, destination
             ),
             "priorities": (
                 f"Minimize downtime within the SLO of {plan.downtime_slo_s} s; prefer the "
