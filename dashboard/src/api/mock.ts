@@ -651,7 +651,9 @@ export class MockServer {
     this.rand = prng(options.seed ?? 42);
     const fixtures = buildFixtures(this.now());
     this.providers = fixtures.providers;
-    this.inventories = fixtures.inventories;
+    // by own key only: a provider id is any ^[a-z0-9][a-z0-9-]{1,62}$, "constructor" too, never Object.prototype's
+    // (SDD §4.2, review RV22-02)
+    this.inventories = Object.assign(Object.create(null) as Record<string, VMRef[] | DestinationInventory>, fixtures.inventories);
     this.plans = fixtures.plans;
     this.migrations = fixtures.migrations;
     this.recommendations = fixtures.recommendations;

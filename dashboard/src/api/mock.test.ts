@@ -269,6 +269,24 @@ describe('mock API', () => {
     expect(call('GET', '/providers/rhoso-staging/inventory').body).toEqual([]);
   });
 
+  it('keeps a provider whose id is an Object.prototype key apart from it, as any other id (SDD §4.2, review RV22-02)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const base = { name: 'Lab', kind: 'openstack', distribution: 'openstack_community', endpoint: 'https://keystone.example.invalid:5000/v3', cloud: 'x' };
+    const seen = ['brandnew', 'constructor'].map((id) => {
+      // "constructor" matches ^[a-z0-9][a-z0-9-]{1,62}$: the API stores it like any other id
+      const created = call('POST', '/providers', { ...base, id, role: 'source' }).status;
+      const inventory = call('GET', `/providers/${id}/inventory`).body;
+      const plan = call('POST', '/plans', { name: `p-${id}`, source_provider_id: id, destination_provider_id: 'rhoso-prod', vm_ids: [] });
+      const validated = call('POST', `/plans/${(plan.body as { id: string }).id}/validate`).status;
+      return { id, created, inventory, validated };
+    });
+    expect(seen).toEqual([
+      { id: 'brandnew', created: 201, inventory: [], validated: 200 },
+      { id: 'constructor', created: 201, inventory: [], validated: 200 },
+    ]);
+  });
+
   it('manages providers: PATCH, write-only credentials and conversion key (SDD §12)', async () => {
     const { server, client } = setup();
     const patched = await client.patch<Provider>('/providers/community-lab', { region: 'R2', distribution: 'kolla' });
