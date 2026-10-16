@@ -26,6 +26,7 @@ import { endedPassBytes } from '../lib/transfer';
 import { summaryOf } from '../lib/summary';
 import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
 import { destinationName, isBlank, providerLabel } from '../lib/providerUse';
+import { pyRepr, pyStrip } from '../lib/format';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -114,6 +115,60 @@ interface MockResponse {
   status: number;
   body?: unknown;
   text?: string;
+}
+
+/** A record the store lacks, worded as the API's NotFound: "provider 'ghost' not found" (review RV24-06). */
+function notFound(kind: string, id: string): HttpError {
+  return new HttpError(404, 'not_found', `${kind} ${pyRepr(id)} not found`);
+}
+
+/** The fields of PUT /providers/{id}/credentials, as the API's ProviderCredentialsRequest: in its order, each with its longest value. */
+const CREDENTIAL_FIELDS: ReadonlyArray<readonly [string, number | null]> = [
+  ['auth_url', 2048],
+  ['username', 256],
+  ['password', 4096],
+  ['project_name', 256],
+  ['user_domain_name', 256],
+  ['project_domain_name', 256],
+  ['application_credential_id', 256],
+  ['application_credential_secret', 4096],
+  ['interface', null],
+  ['datacenter', 256],
+];
+
+/**
+ * What a PUT of a provider's credentials or conversion key refuses from its body alone, before it looks the provider up, as the
+ * API's request models (extra fields forbidden): worded as its validation_message over pydantic's errors - the model's fields
+ * in their order, then the extra inputs, five at most; a length counts code points (SDD §12, §13.3, review RV23-03). Bodies
+ * no client sends stay as they are, the mock reading a parsed body: none or a JSON null, a non-object, a lone surrogate, and
+ * integer-like extra keys, which JavaScript lists first (review RV24-06).
+ */
+function refuseCredentialBody(route: 'credentials' | 'conversion-key', input: Record<string, unknown>): void {
+  const fields = route === 'credentials' ? CREDENTIAL_FIELDS : ([['private_key', 16384]] as const);
+  const problems: string[] = [];
+  for (const [key, longest] of fields) {
+    const value = input[key];
+    if (!Object.hasOwn(input, key)) {
+      // every credential is optional; the conversion key is not
+      if (route === 'conversion-key') problems.push(`${key}: Field required`);
+      continue;
+    }
+    if (value === null && route === 'credentials') continue;
+    if (key === 'interface') {
+      if (!['public', 'internal', 'admin'].includes(value as string)) problems.push("interface: Input should be 'public', 'internal' or 'admin'");
+      continue;
+    }
+    if (typeof value !== 'string') {
+      problems.push(`${key}: Input should be a valid string`);
+      continue;
+    }
+    const length = [...value].length;
+    if (route === 'conversion-key' && length < 64) problems.push(`${key}: String should have at least 64 characters`);
+    else if (longest !== null && length > longest) problems.push(`${key}: String should have at most ${longest} characters`);
+  }
+  const known = new Set(fields.map(([key]) => key));
+  for (const key of Object.keys(input)) if (!known.has(key)) problems.push(`${key}: Extra inputs are not permitted`);
+  if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
 }
 
 /** The secrets a provider reads, by name, for its audit events - never a value: the API's _secret_names (SDD §13.3). */
@@ -1070,13 +1125,13 @@ export class MockServer {
 
   private sourceFor(plan: Plan): Provider {
     const provider = this.providers.find((p) => p.id === plan.source_provider_id);
-    if (!provider) throw new HttpError(404, 'not_found', `Provider ${plan.source_provider_id} not found.`);
+    if (!provider) throw notFound('provider', plan.source_provider_id);
     return provider;
   }
 
   private destinationFor(plan: Plan): Provider {
     const provider = this.providers.find((p) => p.id === plan.destination_provider_id);
-    if (!provider) throw new HttpError(404, 'not_found', `Provider ${plan.destination_provider_id} not found.`);
+    if (!provider) throw notFound('provider', plan.destination_provider_id);
     return provider;
   }
 
@@ -1085,15 +1140,17 @@ export class MockServer {
     const destination = this.destinationFor(plan);
     const dst = this.inventories[destination.id];
     const networks = dst && !Array.isArray(dst) ? dst.networks : {};
-    const names = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm.name);
     const subnets = dst && !Array.isArray(dst) ? (dst.subnets ?? []) : [];
     const networkDetails = dst && !Array.isArray(dst) ? dst.network_details : undefined;
-    const selected = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm);
+    // the plan's VMs as the API's validation reads them, its vm_ids from the source's inventory: never its migrations,
+    // which a first validation has not all created yet and a VM taken out of the plan leaves behind (review RV25-01)
+    const inventory = this.inventories[plan.source_provider_id];
+    const selected = plan.vm_ids.flatMap((id) => (Array.isArray(inventory) ? inventory.filter((v) => v.source_id === id) : []));
     // the destination's token roles, as its check reported them, and its policy profile - a report that names none
     // reads the provider's declarations (SDD §9.3, §10, §21.5)
     const roles = capabilityRoles(destination.capabilities);
     const profile = policyProfileOf(destination.capabilities, destination);
-    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails, roles, profile, destination: providerLabel(destination) });
+    m.findings = preflight(m.vm, source.kind, plan, networks, { subnets, selected, networkDetails, roles, profile, destination: providerLabel(destination) });
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings);
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
@@ -1259,13 +1316,13 @@ export class MockServer {
 
   private plan(id: string): Plan {
     const plan = this.plans.find((p) => p.id === id);
-    if (!plan) throw new HttpError(404, 'not_found', `Plan ${id} not found.`);
+    if (!plan) throw notFound('plan', id);
     return plan;
   }
 
   private migration(id: string): Migration {
     const migration = this.migrations.find((m) => m.id === id);
-    if (!migration) throw new HttpError(404, 'not_found', `Migration ${id} not found.`);
+    if (!migration) throw notFound('migration', id);
     return migration;
   }
 
@@ -1313,7 +1370,9 @@ export class MockServer {
           this.require(token, writes ? 'admin' : sub === 'check' && method === 'POST' ? 'operator' : 'viewer', path);
           // a PATCH's body alone is judged before the lookup, as the API's update_provider (review RV22-07)
           if (!sub && method === 'PATCH') this.refusePatchBody(input);
-          throw new HttpError(404, 'not_found', `Provider ${id} not found.`);
+          // so is a PUT of credentials or a conversion key (review RV23-03)
+          if (method === 'PUT' && (sub === 'credentials' || sub === 'conversion-key')) refuseCredentialBody(sub, input);
+          throw notFound('provider', id);
         }
         if (!sub && method === 'GET') {
           this.require(token, 'viewer', path);
@@ -1473,7 +1532,7 @@ export class MockServer {
         this.require(token, 'viewer', path);
         if (!/^[0-9a-f]{64}$/.test(sub)) throw new HttpError(422, 'validation_error', "sha256: String should match pattern '^[0-9a-f]{64}$'");
         const snapshot = this.snapshots.get(sub);
-        if (!snapshot) throw new HttpError(404, 'not_found', `advisor_snapshot ${sub} not found`);
+        if (!snapshot) throw notFound('advisor_snapshot', sub);
         return ok(snapshot);
       }
       if (id === 'recommendations' && method === 'GET') {
@@ -1550,7 +1609,7 @@ export class MockServer {
 
   private replacePolicy(me: Me, id: string, input: Record<string, unknown>): MockResponse {
     const index = this.policies.findIndex((p) => p.id === id);
-    if (index < 0) throw new HttpError(404, 'not_found', `advisor_policy ${id} not found`);
+    if (index < 0) throw notFound('advisor_policy', id);
     const before = this.policies[index]!;
     const after: AdvisorPolicy = { ...this.policySpec(input), id, created_at: before.created_at, updated_at: new Date(this.now()).toISOString(), updated_by: me.name };
     this.policies[index] = after;
@@ -1560,7 +1619,7 @@ export class MockServer {
 
   private deletePolicy(me: Me, id: string): MockResponse {
     const index = this.policies.findIndex((p) => p.id === id);
-    if (index < 0) throw new HttpError(404, 'not_found', `advisor_policy ${id} not found`);
+    if (index < 0) throw notFound('advisor_policy', id);
     const [before] = this.policies.splice(index, 1);
     this.auditPolicy(me, 'policy.deleted', id, before!, null);
     return { status: 204 };
@@ -1570,7 +1629,7 @@ export class MockServer {
   private decideRecommendation(me: Me, recId: string, action: 'approve' | 'override', input: Record<string, unknown>): MockResponse {
     if (recId.startsWith('rec-legacy-')) throw new HttpError(409, 'conflict', 'a legacy entry is history: it cannot be approved or overridden');
     const index = this.recommendations.findIndex((r) => r.id === recId);
-    if (index < 0) throw new HttpError(404, 'not_found', `recommendation ${recId} not found`);
+    if (index < 0) throw notFound('recommendation', recId);
     const rec = this.recommendations[index]!;
     const m = this.migrations.find((x) => x.id === rec.migration_id);
     if (!m) throw new HttpError(409, 'conflict', `recommendation ${recId} decides nothing a person can change yet`);
@@ -1667,7 +1726,7 @@ export class MockServer {
 
   private recommendation(id: string): AdvisorRecommendation {
     const found = this.allRecommendations().find((r) => r.id === id);
-    if (!found) throw new HttpError(404, 'not_found', `recommendation ${id} not found`);
+    if (!found) throw notFound('recommendation', id);
     return found;
   }
 
@@ -1740,7 +1799,9 @@ export class MockServer {
 
   /** PUT /providers/{id}/credentials: the mock keeps no values, only the "stored" stamp. */
   private setCredentials(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
-    const values = Object.fromEntries(Object.entries(input).filter(([, v]) => typeof v === 'string' && v.trim())) as Record<string, string>;
+    refuseCredentialBody('credentials', input);
+    // blank as the API's Python strip judges it (review RV24-06)
+    const values = Object.fromEntries(Object.entries(input).filter(([, v]) => typeof v === 'string' && pyStrip(v))) as Record<string, string>;
     const vmware = provider.kind === 'vmware';
     const allowed = vmware ? ['username', 'password', 'datacenter'] : ['auth_url', 'username', 'password', 'project_name', 'user_domain_name', 'project_domain_name', 'application_credential_id', 'application_credential_secret', 'interface'];
     const extra = Object.keys(values).filter((k) => !allowed.includes(k)).sort();
@@ -1762,18 +1823,20 @@ export class MockServer {
   }
 
   private setConversionKey(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
-    const key = String(input.private_key ?? '').trim();
+    refuseCredentialBody('conversion-key', input);
+    const key = pyStrip(String(input.private_key ?? ''));
     if (!key.startsWith('-----BEGIN') || !key.includes('PRIVATE KEY-----')) throw new HttpError(422, 'validation_error', 'private_key must be an OpenSSH or PEM private key');
     const host = provider.conversion_host ?? { manage: false, name: null, flavor: null, external_network: null, image: null, ssh_user: 'cloud-user', address: null, ssh_allowed_cidr: null, ssh_key_secret: null };
+    const secret = `provider-${provider.id}-ssh`;
     Object.assign(provider, {
-      conversion_host: { ...host, ssh_key_secret: `provider-${provider.id}-ssh` },
+      conversion_host: { ...host, ssh_key_secret: secret },
       conversion_key_updated_at: new Date(this.now()).toISOString(),
       status: 'unknown',
       status_message: null,
       last_checked_at: null,
       capabilities: {},
     });
-    this.emit({ kind: 'provider.credentials_updated', plan_id: null, migration_id: null, actor: me.name, message: `conversion-host key of provider ${provider.id} updated`, data: { provider_id: provider.id, keys: ['private_key'] } });
+    this.emit({ kind: 'provider.credentials_updated', plan_id: null, migration_id: null, actor: me.name, message: `conversion-host key of provider ${provider.id} updated`, data: { provider_id: provider.id, secret, keys: ['private_key'] } });
     return ok(provider);
   }
 
@@ -1854,7 +1917,7 @@ export class MockServer {
   private finalizePlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
     const waveId = typeof input.wave_id === 'string' ? input.wave_id : null;
     const wave = waveId ? plan.waves.find((w) => w.id === waveId) : null;
-    if (waveId && !wave) throw new HttpError(404, 'not_found', `wave '${waveId}' not found`);
+    if (waveId && !wave) throw notFound('wave', waveId);
     const name = wave ? wave.name : plan.name;
     if (input.confirm !== name) throw new HttpError(400, 'bad_request', `confirm must equal the name '${name}'`);
     const scope = wave ? new Set(wave.vm_ids) : null;
@@ -1906,7 +1969,7 @@ export class MockServer {
     if (!this.health.demo) throw new HttpError(404, 'not_found', 'no such route outside demo mode');
     if (input.state !== 'on' && input.state !== 'off') throw new HttpError(422, 'validation_error', "state: Input should be 'on' or 'off'");
     const vm = Object.values(this.inventories).flatMap((inv) => (Array.isArray(inv) ? inv : [])).find((v) => v.source_id === sourceId);
-    if (!vm) throw new HttpError(404, 'not_found', `source VM '${sourceId}' not found`);
+    if (!vm) throw notFound('source VM', sourceId);
     this.power.set(sourceId, input.state === 'on' ? 'running' : 'stopped');
     return ok({ ...vm, power_state: this.sourcePower(sourceId) });
   }

@@ -5,6 +5,8 @@ import checkKeysRaw from '../../../seamless/tests/fixtures/check_report_keys.jso
 import nameRaw from '../../../seamless/tests/fixtures/provider_name_cases.json?raw';
 // what GET /advisor/data-sent lists: the API's own list, which the mock serves too (SDD §13.4)
 import dataSentRaw from '../../../seamless/tests/fixtures/data_sent.json?raw';
+// what PUT /providers/{id}/credentials and /conversion-key answer for a body: one case table for the API and the mock
+import credentialBodyRaw from '../../../seamless/tests/fixtures/credential_body_cases.json?raw';
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
@@ -41,6 +43,12 @@ const NOW = Date.parse('2026-10-08T12:00:00Z');
 const CHECK_KEYS = JSON.parse(checkKeysRaw) as { openstack: string[]; destination: string[] };
 const NAME_CASES = (
   JSON.parse(nameRaw) as { cases: Array<{ route: 'POST' | 'PATCH'; body: { name?: unknown }; status: number; message: string | null; note: string }> }
+).cases;
+
+const CREDENTIAL_BODY_CASES = (
+  JSON.parse(credentialBodyRaw) as {
+    cases: Array<{ note: string; route: 'credentials' | 'conversion-key'; provider: string; body: Record<string, unknown>; status: number; message: string | null }>;
+  }
 ).cases;
 
 function setup(token: string | null = 'admin') {
@@ -370,6 +378,95 @@ describe('mock API', () => {
     });
   });
 
+  describe("judges each VM against the plan's VMs, its vm_ids, as the API's validation (SDD §9.3, §16, review RV25-01)", () => {
+    /** Each migration of the plan: its phase and the messages of the findings whose code starts with `prefix`. */
+    const judged = (server: MockServer, planId: string, prefix: string) =>
+      Object.fromEntries(
+        server.migrations
+          .filter((m) => m.plan_id === planId)
+          .map((m) => [m.vm.source_id, [m.phase, m.findings.filter((f) => f.code.startsWith(prefix)).map((f) => `${f.code}: ${f.message}`)]]),
+      );
+    const twinsOf = (vm: VMRef, twin: VMRef) => [`SRC_VM_DUPLICATE_NAME: Another selected VM is also named '${vm.name}' (${twin.project}/${twin.source_id}); os-migrate selects workloads by name.`];
+
+    it('blocks both VMs of one name at the plan\'s first validation, before either has a migration', async () => {
+      const { server, client } = setup('operator');
+      const [a, b, c] = freeVms(server, 'rhosp17-dc1', 3);
+      b!.name = a!.name;
+      const plan = await client.post<Plan>('/plans', { name: 'Twins', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [a!.source_id, b!.source_id, c!.source_id] });
+      await client.post(`/plans/${plan.id}/validate`);
+      const found = judged(server, plan.id, 'SRC_VM_DUPLICATE_NAME');
+      expect([found[a!.source_id], found[b!.source_id]]).toEqual([
+        ['blocked', twinsOf(a!, b!)],
+        ['blocked', twinsOf(b!, a!)],
+      ]);
+    });
+
+    it('no longer counts a twin taken out of the plan, as the finding advises', async () => {
+      const { server, client } = setup('operator');
+      const [a, b, c] = freeVms(server, 'rhosp17-dc1', 3);
+      b!.name = a!.name;
+      const plan = await client.post<Plan>('/plans', { name: 'Twins', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [a!.source_id, b!.source_id, c!.source_id] });
+      await client.post(`/plans/${plan.id}/validate`);
+      await client.patch(`/plans/${plan.id}`, { vm_ids: [a!.source_id, c!.source_id] });
+      await client.post(`/plans/${plan.id}/validate`);
+      expect(judged(server, plan.id, 'SRC_VM_DUPLICATE_NAME')[a!.source_id]).toEqual(['ready', []]);
+    });
+
+    it('lets a NIC override take the address of a VM taken out of the plan', async () => {
+      const { server, client } = setup('operator');
+      const [a, b] = freeVms(server, 'rhosp17-dc1', 2);
+      const plan = await client.post<Plan>('/plans', { name: 'Holders', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [a!.source_id, b!.source_id] });
+      await client.post(`/plans/${plan.id}/validate`);
+      await client.patch(`/plans/${plan.id}`, { vm_ids: [a!.source_id] });
+      const [nic, theirs] = [a!.nics[0]!, b!.nics[0]!];
+      const mac = nic.mac!.toLowerCase();
+      await client.patch(`/plans/${plan.id}`, { nic_overrides: { [a!.source_id]: { [mac]: { network: theirs.network, fixed_ips: [theirs.fixed_ips[0]] } } } });
+      await client.post(`/plans/${plan.id}/validate`);
+      expect(judged(server, plan.id, 'MAP_NIC')[a!.source_id]).toEqual([
+        'ready',
+        [`MAP_NIC_OVERRIDE: NIC override(s): ${mac} (${nic.network}) -> ${theirs.network}: ${theirs.fixed_ips[0]}.`],
+      ]);
+    });
+  });
+
+  it("seeds an ok provider with no status message, nor its checked event, as the API's check leaves one (SDD §10, review RV23-04)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    expect(server.providers.filter((p) => p.status === 'ok').length).toBeGreaterThan(0);
+    expect(server.providers.filter((p) => p.status === 'ok' && p.status_message !== null).map((p) => p.id)).toEqual([]);
+    const checked = server.events.filter((e) => e.kind === 'provider.checked' && e.data.status === 'ok');
+    expect(checked.length).toBeGreaterThan(0);
+    expect(checked.filter((e) => e.data.message !== null).map((e) => e.data.provider_id)).toEqual([]);
+  });
+
+  it("gives the credential events the API's data: the provider, the secret written and its keys (SDD §4.3, §13.3, review RV23-02)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const id = server.providers.find((p) => p.kind === 'openstack')!.id;
+    const key = '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n-----END OPENSSH PRIVATE KEY-----\n'; // gitleaks:allow
+    expect(call('PUT', `/providers/${id}/credentials`, { username: 'u', password: 'p', project_name: 'x' }).status).toBe(200);
+    expect(call('PUT', `/providers/${id}/conversion-key`, { private_key: key }).status).toBe(200);
+    const data = server.events.filter((e) => e.kind === 'provider.credentials_updated' && e.data.provider_id === id).map((e) => e.data);
+    // what routes_providers.set_provider_credentials and set_conversion_key emit
+    expect(data).toEqual([
+      { provider_id: id, secret: `provider-${id}`, keys: ['password', 'project_name', 'username'] },
+      { provider_id: id, secret: `provider-${id}-ssh`, keys: ['private_key'] },
+    ]);
+  });
+
+  it.each(CREDENTIAL_BODY_CASES.map((c) => [`${c.route} ${c.provider}: ${c.note}`, c] as const))(
+    "judges a credential body before it looks the provider up, as the API: %s (SDD §12, §13.3, reviews RV23-03, RV24-06)",
+    (_name, c) => {
+      const server = new MockServer({ now: () => NOW, seed: 1 });
+      const id = c.provider === 'known' ? server.providers.find((p) => p.kind === 'openstack')!.id : c.provider;
+      // a case's "[pem]" stands for an OpenSSH key's header, no key material
+      const pem = '-----BEGIN OPENSSH PRIVATE KEY-----\n' + 'A'.repeat(64); // gitleaks:allow
+      const body = Object.fromEntries(Object.entries(c.body).map(([k, v]) => [k, k === 'private_key' && typeof v === 'string' ? v.replace('[pem]', pem) : v]));
+      const res = server.handle('PUT', `/providers/${id}/${c.route}`, new URLSearchParams(), body, 'admin');
+      const message = res.status < 300 ? null : (res.body as { error: { message: string } }).error.message;
+      expect({ status: res.status, message: c.message === null ? null : message }).toEqual({ status: c.status, message: c.message });
+    },
+  );
+
   it("answers a PATCH of an unknown provider in the API's order: what its body alone refuses before the 404 (SDD §4.2, §12, review RV22-07)", () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const answer = (body: unknown) => {
@@ -380,7 +477,7 @@ describe('mock API', () => {
     expect([answer({ name: '\u200b' }), answer({ id: 'x' }), answer({ region: 'R2' })]).toEqual([
       { status: 422, message: 'name: must not be blank' },
       { status: 422, message: 'fields cannot be changed: id' },
-      { status: 404, message: 'Provider ghost not found.' },
+      { status: 404, message: "provider 'ghost' not found" },
     ]);
   });
 

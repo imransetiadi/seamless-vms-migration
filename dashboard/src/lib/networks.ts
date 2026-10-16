@@ -37,13 +37,13 @@ export const PORT_ROLES_BY_PROFILE: Record<PolicyProfile, readonly string[]> = {
   unknown: ['admin'],
 };
 
-/** Why another project's network refuses the token's roles, by the profile: the API's _ROLE_RULE. */
-const ROLE_RULE: Record<PolicyProfile, string> = {
-  legacy: "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither",
-  secure_rbac:
+/** Why another project's network refuses the token's roles, by the profile: the API's _ROLE_RULE, naming the destination provider `where`. */
+const ROLE_RULE: Record<PolicyProfile, (where: string) => string> = {
+  legacy: () => "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither",
+  secure_rbac: () =>
     "Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither",
-  unknown:
-    "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check the provider so its series is detected, or declare its policy profile or series)",
+  unknown: (where) =>
+    `the policy profile of ${where} is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check ${where} so its series is detected, or declare its policy profile or series)`,
 };
 
 const knownProfile = (profile: string): PolicyProfile => (profile in PORT_ROLES_BY_PROFILE ? (profile as PolicyProfile) : 'unknown');
@@ -53,13 +53,15 @@ const knownProfile = (profile: string): PolicyProfile => (profile in PORT_ROLES_
  * project's network takes it only when shared with the credential's project or external (an admin sees every project's
  * networks), and only from a token with a role the destination's policy `profile` counts, since every recreated port asks
  * for its address or MAC. An external network that is not shared, the credential's own included, also needs the admin
- * role: Nova attaches no other to a server. `roles` undefined (not reported) leaves the role halves unjudged.
+ * role: Nova attaches no other to a server. `roles` undefined (not reported) leaves the role halves unjudged. `where` is the
+ * destination provider's label, which a text built for a plan names, as the API's (SDD §1 naming, review RV23-07); the
+ * dashboard's own copy may say "the destination".
  */
-export function portRefusal(network: DestinationNetwork, roles: readonly string[] | undefined, profile: string = 'legacy'): string | null {
+export function portRefusal(network: DestinationNetwork, roles: readonly string[] | undefined, profile: string = 'legacy', where = 'the destination'): string | null {
   const counted = knownProfile(profile);
   if (!network.own) {
     if (!(network.shared || network.external)) return "it is neither shared with the credential's project nor external";
-    if (roles !== undefined && !roles.some((role) => PORT_ROLES_BY_PROFILE[counted].includes(role))) return ROLE_RULE[counted];
+    if (roles !== undefined && !roles.some((role) => PORT_ROLES_BY_PROFILE[counted].includes(role))) return ROLE_RULE[counted](where);
   }
   // Nova's network:attach_external_network, admin only by default (2023.1): the credential's own network included
   if (network.external && !network.shared && roles !== undefined && !roles.includes('admin'))

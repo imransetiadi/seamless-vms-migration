@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { makeVm, buildFixtures } from '../api/mockData';
 import type { Plan } from '../api/types';
-import { addressRefusal, canonicalIp, eui64, isIpAddress, nicTarget, noHostAddress, parseNicDrafts, toNicDraft, withVmNicOverrides } from './nics';
+import { addressRefusal, canonicalIp, eui64, isIpAddress, mappedNetwork, nicTarget, noHostAddress, parseNicDrafts, toNicDraft, withVmNicOverrides } from './nics';
 
 const now = Date.parse('2026-10-09T12:00:00Z');
 const base: Plan = { ...buildFixtures(now).plans[0]!, mappings: { networks: { 'tenant-app': 'tenant-web' }, flavors: {}, volume_types: {}, projects: {} }, nic_overrides: {} };
@@ -66,6 +66,22 @@ describe('NIC overrides (SDD §4.2, §9.2)', () => {
   it('tells IP addresses apart', () => {
     for (const ok of ['10.0.0.5', '192.168.10.255', 'fd00::5', '::1', 'fe80::1:2']) expect(isIpAddress(ok), ok).toBe(true);
     for (const bad of ['10.0.0.256', '10.0.0', 'fd00:::5', 'host', '', '10.0.0.5/24']) expect(isIpAddress(bad), bad).toBe(false);
+  });
+});
+
+describe('a source network named like an Object.prototype key (SDD §9.2, review RV23-01)', () => {
+  const unmapped: Plan = { ...base, mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} } };
+
+  it.each(['constructor', 'toString', '__proto__'])('sends an unmapped NIC on %s to the same-named network, as the API', (network) => {
+    const odd = makeVm({ id: 'os-r23', name: 'r23-01', disks: [{ size_gb: 20 }], nics: [{ network, mac: 'fa:16:3e:00:00:23', fixed_ips: ['10.0.0.23'] }] });
+    // the API's plan.mappings.networks.get(nic.network, nic.network): the NIC's own network name
+    expect(nicTarget(unmapped, odd.source_id, odd.nics[0]!).network).toBe(network);
+    expect(mappedNetwork(unmapped.mappings.networks, network)).toBe(network);
+  });
+
+  it('maps such a network where the plan maps it, as the API sends it', () => {
+    const networks = JSON.parse('{"__proto__": "net-x", "constructor": "net-y"}') as Record<string, string>;
+    expect([mappedNetwork(networks, '__proto__'), mappedNetwork(networks, 'constructor')]).toEqual(['net-x', 'net-y']);
   });
 });
 

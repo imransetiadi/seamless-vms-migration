@@ -1,5 +1,5 @@
 {
- "_comment": "Application probe suggestions (SDD \u00a79.6, ADV-18), shared by seamless/tests/test_probes.py and dashboard/src/api/mockProbes.test.ts. Each case: a VM's name, tags and os_type -> the probes the rules suggest. A database that names no engine, an old OS or an unknown role gets none; the service must be of the VM's tier (ldap-db-01 is no LDAP server).",
+ "_comment": "Application probe suggestions (SDD §9.6, ADV-18), shared by seamless/tests/test_probes.py and dashboard/src/api/mockProbes.test.ts. Each case: a VM's name, tags and os_type -> the probes the rules suggest. A database that names no engine, an old OS or an unknown role gets none; the service must be of the VM's tier (ldap-db-01 is no LDAP server). An empty tier tag falls back to seamless/tier, as heuristic_tier reads them (review RV25-02).",
  "cases": [
   {
    "name": "ledger-db-01",
@@ -277,6 +277,31 @@
   {
    "name": "report-01",
    "tags": {},
+   "os_type": "rhel9",
+   "probes": []
+  },
+  {
+   "name": "pg-db-01",
+   "tags": {
+    "tier": "",
+    "seamless/tier": "stateless_web"
+   },
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "http",
+     "port": 80,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "cache-01",
+   "tags": {
+    "tier": "",
+    "seamless/tier": "stateful_database"
+   },
    "os_type": "rhel9",
    "probes": []
   }

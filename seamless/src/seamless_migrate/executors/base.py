@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from ..config import Settings
 from ..domain.enums import Strategy
 from ..domain.models import Migration, Plan, Provider, SyncPass
+
+T = TypeVar("T")
 
 
 class StepName(StrEnum):
@@ -59,6 +62,25 @@ class PermanentStepError(Exception):
         #: what the step reported before it failed, e.g. the simulator's ``downtime_model_s``
         #: (SDD §5.2, §7.1)
         self.details: dict[str, Any] = dict(details or {})
+
+
+async def outlive_cancel(work: Awaitable[T]) -> T:
+    """Await ``work`` to its end however often the step is cancelled, then re-raise the cancel:
+    what a step began and no cancel can undo - a provider call in flight, the downtime clock a stop
+    that may have happened opens - finishes before the step ends (SDD §7.2, §7.3; audit EX-01,
+    EX-02)."""
+    task = asyncio.ensure_future(work)
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError as exc:
+            cancelled = cancelled or exc
+    if cancelled is not None:
+        if not task.cancelled():
+            task.exception()  # retrieved: the cancelled step reports nothing of it
+        raise cancelled
+    return task.result()
 
 
 @runtime_checkable

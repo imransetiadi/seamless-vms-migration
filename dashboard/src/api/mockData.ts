@@ -37,13 +37,14 @@ import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { pyNames, pyRepr } from '../lib/format';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
-import { addressRefusal, canonicalIp, ipInCidr, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
+import { addressRefusal, canonicalIp, ipInCidr, mappedNetwork, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
 import { kitSubnet, networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
 import { destinationRelease, parseMicroversion, type PolicyProfile } from '../lib/platforms';
 import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { providerLabel } from '../lib/providerUse';
 import { buildStrategyEvidence } from './mockEvidence';
+import { FINDING_CATALOG } from './findingCatalog';
 import { derivePlanStatus } from './mockPlanStatus';
 import { isDatabase, suggestProbes } from './mockProbes';
 
@@ -579,7 +580,8 @@ export function buildProviders(now: number): Provider[] {
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
       capabilities: checkOf({ id: 'rhosp17-dc1', kind: 'openstack', role: 'source', release: null, policy_profile: null }),
       status: 'ok',
-      status_message: 'Keystone, Nova, Cinder, Neutron and Glance reachable.',
+      // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
+      status_message: null,
       last_checked_at: iso(now - 4 * 60_000),
       distribution: 'rhosp',
       release: null,
@@ -668,7 +670,8 @@ export function buildProviders(now: number): Provider[] {
       // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
       capabilities: checkOf({ id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null }),
       status: 'ok',
-      status_message: 'All services healthy; OVN networking.',
+      // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
+      status_message: null,
       last_checked_at: iso(now - 3 * 60_000),
       distribution: 'rhoso',
       release: null,
@@ -713,7 +716,8 @@ export function buildProviders(now: number): Provider[] {
       conversion_host: conversionHost('os-migrate-conv-dc3', '192.0.2.60'),
       capabilities: checkOf({ id: 'hibiscus-dc3', kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null }),
       status: 'ok',
-      status_message: 'All services reachable; series 2026.2 (Hibiscus) detected.',
+      // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
+      status_message: null,
       last_checked_at: iso(now - 6 * 60_000),
       distribution: 'kolla',
       release: '2026.2',
@@ -975,20 +979,6 @@ export function eligibility(
 // Pre-flight findings (subset of SDD §9.3)
 // -------------------------------------------------------------------------------------------
 
-const NIC_OVERRIDE_REMEDIATION: Record<string, string> = {
-  MAP_NIC_OVERRIDE_INVALID:
-    "Fix the VM's network overrides on its migration page: an existing destination network, addresses inside its subnets, each given once in the plan. VMware VMs take none.",
-  MAP_NIC_OVERRIDE: 'Nothing to do: each NIC goes where its override says.',
-};
-
-/** The API's catalog remediations of the network checks (SDD §9.3). */
-const NETWORK_REMEDIATION = {
-  MAP_NETWORK_AMBIGUOUS:
-    "Send the NIC to a name one destination network carries: one of the credential's project, or the only one of that name - map its network to such a name, or rename one of the networks.",
-  NET_ADDRESS_REFUSED:
-    'Give the NIC an address its destination network takes: map its network to one whose subnets hold it, or set the address in a NIC override; for a SLAAC address keep the MAC (port_creation_mode "neutron").',
-};
-
 /** What lets another project's shared network take the port, by the destination's policy profile: the API's _PORT_ROLE_ADVICE (SDD §21.5). */
 const PORT_ROLE_ADVICE: Record<PolicyProfile, string> = {
   secure_rbac: "the destination credential has the service role for the migration window (Neutron's secure-RBAC defaults); admin is not needed for this",
@@ -1040,7 +1030,7 @@ function nicOverrideFindings(
       continue;
     }
     const { network, addresses } = nicTarget(plan, vm.source_id, nic);
-    if (!(network in destinationNetworks)) {
+    if (!Object.hasOwn(destinationNetworks, network)) {
       problems.push(
         `${mac}: ${where} has no network ${pyRepr(network)}` +
           (entries[mac]?.network ? '' : ` yet: pre-staging would create it, but its subnets cannot be checked before; name an existing network of ${where}`),
@@ -1078,49 +1068,34 @@ export function preflight(
   sourceKind: ProviderKind,
   plan: Plan,
   destinationNetworks: Record<string, number | null>,
-  selectedNames: string[],
-  /** The destination's subnets, its networks with their owners, its token's roles and the plan's VMs, for the NIC checks (SDD §9.3). */
+  /** The destination's subnets, its networks with their owners, its token's roles, and the plan's selected VMs - `vm` alone
+   * when not given, as the API's all_vms (SDD §9.3). */
   context: { subnets?: DestinationSubnet[]; selected?: VMRef[]; networkDetails?: DestinationNetwork[]; roles?: string[]; profile?: string; destination?: string } = {},
 ): Finding[] {
   const findings: Finding[] = [];
   // the destination provider a message about the destination cloud names, as the API's (SDD §1 naming, §9.3)
   const where = context.destination ?? 'the destination';
-  const add = (code: string, severity: Finding['severity'], message: string, remediation: string | null, strategies: Strategy[] = []) =>
-    findings.push({ code, severity, message, remediation, strategies });
+  const add = (code: string, message: string, own: { remediation?: string } = {}) => {
+    // the catalog's severity, strategies and remediation, unless the finding gives its own: the API's finding() (SDD §9.3)
+    const entry = FINDING_CATALOG[code]!;
+    findings.push({ code, severity: entry.severity, message, remediation: own.remediation || entry.remediation, strategies: [...entry.strategies] });
+  };
 
-  if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', 'blocker', `${vm.name} is in ERROR state at the source.`, 'Repair or reset the source instance, then re-validate.');
-  if (vm.power_state === 'transitioning') add('SRC_VM_TRANSITIONAL_STATE', 'blocker', `${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot).`, 'Wait until the VM is ACTIVE or SHUTOFF, then re-validate.');
-  if (selectedNames.filter((n) => n === vm.name).length > 1)
-    add('SRC_VM_DUPLICATE_NAME', 'blocker', `Another selected VM is also named ${vm.name}; os-migrate filters workloads by name.`, 'Rename one of the instances or split them into separate plans.');
-  if (vm.disks.some((d) => d.multiattach))
-    add('SRC_VM_MULTIATTACH', 'warning', 'A multi-attach volume is attached; warm and storage handover are not possible.', 'Detach the shared volume or migrate cold during a window.', ['warm', 'storage_handover']);
-  if (vm.disks[0] && (vm.disks[0].kind === 'image_root' || vm.disks[0].kind === 'ephemeral'))
-    add('SRC_VM_EPHEMERAL_ROOT', 'info', 'Root disk is image-backed; each warm pass snapshots the server to Glance.', 'Expect slower pre-copy passes (boot_disk_copy).', ['warm']);
-  // every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); a VMware NIC's too: Seamless gives
-  // the migration kit the network it resolves (§7.2)
-  const seen = networkList({ networks: destinationNetworks, network_details: context.networkDetails });
-  const resolved = new Map<Nic, DestinationNetwork>();
-  const ambiguous: string[] = [];
-  for (const nic of vm.nics) {
-    // the VMware kit keeps the guest's network settings: no NIC override moves its NICs (SDD §7.2)
-    const target = sourceKind === 'vmware' ? (plan.mappings.networks[nic.network] ?? nic.network) : nicTarget(plan, vm.source_id, nic).network;
-    const { network, why } = resolveNetwork(seen, target);
-    if (network) resolved.set(nic, network);
-    else if (why) ambiguous.push(`${(nic.mac ?? '?').toLowerCase()} (${nic.network}): ${why}`);
-  }
-  if (ambiguous.length)
-    add('MAP_NETWORK_AMBIGUOUS', 'blocker', `The cutover cannot tell these networks of ${where} apart: ${ambiguous.join('; ')}.`, NETWORK_REMEDIATION.MAP_NETWORK_AMBIGUOUS);
-  // whether the credential may put each NIC's port on its resolved network, as the API (SDD §6.6, §9.3); the VMware
-  // migration kit creates every port with the NIC's MAC (§7.2)
-  const denied: string[] = [];
-  for (const nic of vm.nics) {
-    const network = resolved.get(nic);
-    const why = network ? portRefusal(network, context.roles, context.profile) : null;
-    if (network && why) denied.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)} (project ${network.project_id ?? 'None'}): ${why}`);
-  }
-  if (denied.length)
-    add('NET_PORT_NOT_PERMITTED', 'blocker', `The credential of ${where} may not put these NICs on their network: ${denied.join('; ')}.`, portRemediation(context.profile));
-  // a network RHOSO lacks, as the API words it (SDD §9.3): a NIC its override sends elsewhere is checked by
+  // every message below as the API words it, over the shared finding cases (SDD §9.3, §16)
+  if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', `Source VM ${vm.name} is in error state.`);
+  else if (vm.power_state === 'transitioning')
+    add('SRC_VM_TRANSITIONAL_STATE', `Source VM ${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot); a stop or snapshot would fail.`);
+  // the other selected VMs of that name, by their project and id, as the API words them (SDD §9.3)
+  const twins = (context.selected ?? [vm]).filter((v) => v.source_id !== vm.source_id && v.name === vm.name);
+  if (twins.length)
+    add('SRC_VM_DUPLICATE_NAME', `Another selected VM is also named ${pyRepr(vm.name)} (${pyNames(twins.map((t) => `${t.project || '-'}/${t.source_id}`))}); os-migrate selects workloads by name.`);
+  const multi = vm.disks.filter((d) => d.multiattach).map((d) => d.name || d.id);
+  if (multi.length) add('SRC_VM_MULTIATTACH', `Multi-attach disk(s): ${pyNames(multi)}.`);
+  // the boot disk: the first bootable disk, else the first, as the API's VMRef.root_disk
+  const root = vm.disks.find((d) => d.bootable) ?? vm.disks[0];
+  if (root && (root.kind === 'image_root' || root.kind === 'ephemeral')) add('SRC_VM_EPHEMERAL_ROOT', `The root disk is ${root.kind.replaceAll('_', ' ')}.`);
+  // a network RHOSO lacks, as the API words it and lists it - before the networks it resolves (SDD §9.3, review RV25-03):
+  // a NIC its override sends elsewhere is checked by
   // MAP_NIC_OVERRIDE_INVALID; pre-staging creates same-named networks for OpenStack sources only - the VMware kit has
   // no pre-stage step (§4.2, §7.2); nothing creates a network under a mapping's target name
   const has = (names: Record<string, unknown>, name: string) => Object.prototype.hasOwnProperty.call(names, name);
@@ -1133,44 +1108,51 @@ export function preflight(
     .map((nic) => `${nic.network} -> ${plan.mappings.networks[nic.network]}`);
   const prestaged = plan.prestage_resources.includes('networks') && sourceKind !== 'vmware';
   if (missingNets.length && prestaged)
-    add(
-      'MAP_NETWORK_PRESTAGED',
-      'info',
-      `Pre-staging creates same-named network(s) in ${where}: ${pyNames(missingNets)}.`,
-      'Nothing to do: pre-staging creates the network on the destination with the same name. Add a network mapping to use an existing destination network instead.',
-    );
+    add('MAP_NETWORK_PRESTAGED', `Pre-staging creates same-named network(s) in ${where}: ${pyNames(missingNets)}.`);
   else if (missingNets.length)
-    add(
-      'MAP_NETWORK_MISSING',
-      'blocker',
-      `No mapping or same-named network in ${where} for: ${pyNames(missingNets)}.` +
-        (sourceKind === 'vmware' ? ' VMware sources are not pre-staged: map every port group.' : ''),
-      'Add a network mapping or create a same-named network on the destination.',
-    );
+    add('MAP_NETWORK_MISSING', `No mapping or same-named network in ${where} for: ${pyNames(missingNets)}.` +
+        (sourceKind === 'vmware' ? ' VMware sources are not pre-staged: map every port group.' : ''));
   if (badNetTargets.length)
-    add('MAP_NETWORK_MISSING', 'blocker', `Network mapping target(s) do not exist in ${where}: ${pyNames(badNetTargets)}.`, 'Fix the mapping: the destination network must exist.');
+    add('MAP_NETWORK_MISSING', `Network mapping target(s) do not exist in ${where}: ${pyNames(badNetTargets)}.`, { remediation: 'Fix the mapping: the destination network must exist.' });
+  // every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); a VMware NIC's too: Seamless gives
+  // the migration kit the network it resolves (§7.2)
+  const seen = networkList({ networks: destinationNetworks, network_details: context.networkDetails });
+  const resolved = new Map<Nic, DestinationNetwork>();
+  const ambiguous: string[] = [];
+  for (const nic of vm.nics) {
+    // the VMware kit keeps the guest's network settings: no NIC override moves its NICs (SDD §7.2)
+    const target = sourceKind === 'vmware' ? mappedNetwork(plan.mappings.networks, nic.network) : nicTarget(plan, vm.source_id, nic).network;
+    const { network, why } = resolveNetwork(seen, target);
+    if (network) resolved.set(nic, network);
+    else if (why) ambiguous.push(`${(nic.mac ?? '?').toLowerCase()} (${nic.network}): ${why}`);
+  }
+  if (ambiguous.length)
+    add('MAP_NETWORK_AMBIGUOUS', `The cutover cannot tell these networks of ${where} apart: ${ambiguous.join('; ')}.`);
+  // whether the credential may put each NIC's port on its resolved network, as the API (SDD §6.6, §9.3); the VMware
+  // migration kit creates every port with the NIC's MAC (§7.2)
+  const denied: string[] = [];
+  for (const nic of vm.nics) {
+    const network = resolved.get(nic);
+    const why = network ? portRefusal(network, context.roles, context.profile, where) : null;
+    if (network && why) denied.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)} (project ${network.project_id ?? 'None'}): ${why}`);
+  }
+  if (denied.length)
+    add('NET_PORT_NOT_PERMITTED', `The credential of ${where} may not put these NICs on their network: ${denied.join('; ')}.`, { remediation: portRemediation(context.profile) });
   // one finding for every NIC whose network is smaller, worded as the API's (SDD §9.3, §16, review RV20-05)
   const shrinks: string[] = [];
   for (const nic of vm.nics) {
     const target = nicTarget(plan, vm.source_id, nic).network;
-    const dstMtu = resolved.has(nic) ? resolved.get(nic)!.mtu : destinationNetworks[target];
+    const dstMtu = resolved.has(nic) ? resolved.get(nic)!.mtu : has(destinationNetworks, target) ? destinationNetworks[target] : undefined;
     if (nic.mtu && dstMtu && dstMtu < nic.mtu)
-      shrinks.push(target === (plan.mappings.networks[nic.network] ?? nic.network) ? `${nic.network} ${nic.mtu} -> ${dstMtu}` : `${nic.network} ${nic.mtu} -> ${target} ${dstMtu}`);
+      shrinks.push(target === mappedNetwork(plan.mappings.networks, nic.network) ? `${nic.network} ${nic.mtu} -> ${dstMtu}` : `${nic.network} ${nic.mtu} -> ${target} ${dstMtu}`);
   }
   if (shrinks.length)
-    add('NET_MTU_SHRINK', 'warning', `The MTU in ${where} is smaller: ${pyNames(shrinks)}.`, 'Lower the guest MTU or map to a destination network with a larger MTU (ML2/OVN Geneve networks typically use 1442).');
-  for (const nic of vm.nics) {
-    if (['direct', 'direct-physical', 'macvtap'].includes(nic.vnic_type))
-      add('NET_SRIOV_PORT', 'warning', `Port on ${nic.network} uses vnic_type ${nic.vnic_type}.`, 'SR-IOV/macvtap ports need an equivalent physnet on the destination; map the network accordingly.');
-  }
+    add('NET_MTU_SHRINK', `The MTU in ${where} is smaller: ${pyNames(shrinks)}.`);
+  const sriov = vm.nics.filter((nic) => ['direct', 'direct-physical', 'macvtap'].includes(nic.vnic_type)).map((nic) => nic.network);
+  if (sriov.length) add('NET_SRIOV_PORT', `SR-IOV/macvtap port(s) on: ${pyNames(sriov)}.`);
   const oddPorts = portsWithoutOneFixedIp(withPlannedAddresses(plan, vm));
   if (sourceKind !== 'vmware' && oddPorts.length && plan.port_creation_mode !== 'neutron')
-    add(
-      'NET_PORT_IPS',
-      'warning',
-      `NIC(s) without exactly one fixed IP: ${describePorts(oddPorts)}. Cold and warm migration cannot recreate them; storage handover keeps one address per port.`,
-      'Turn on "Keep MAC addresses and every fixed IP" in the plan (port_creation_mode "neutron"), give each such port exactly one fixed IP before the cutover, or migrate the VM by storage handover when its ports have at most one address each.',
-    );
+    add('NET_PORT_IPS', `NIC(s) without exactly one fixed IP: ${describePorts(oddPorts)}. Cold and warm migration cannot recreate them; storage handover keeps one address per port.`);
   // a NIC without an override keeps its own addresses: Neutron must take them on its resolved network (SDD §9.3, §6.6)
   if (sourceKind !== 'vmware' && context.subnets?.length) {
     const neutron = plan.port_creation_mode === 'neutron';
@@ -1185,7 +1167,7 @@ export function preflight(
       }
     }
     if (refused.length)
-      add('NET_ADDRESS_REFUSED', 'blocker', `Neutron would refuse these addresses on their network in ${where}: ${refused.join('; ')}.`, NETWORK_REMEDIATION.NET_ADDRESS_REFUSED);
+      add('NET_ADDRESS_REFUSED', `Neutron would refuse these addresses on their network in ${where}: ${refused.join('; ')}.`);
   }
   // the VMware migration kit sends a NIC's IPv4 guest addresses only, all with one subnet of its network (SDD §7.2, §9.3)
   if (sourceKind === 'vmware' && context.subnets?.length) {
@@ -1196,49 +1178,42 @@ export function preflight(
       if (network && why) refused.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)}: ${why}`);
     }
     if (refused.length)
-      add('NET_ADDRESS_REFUSED', 'blocker', `Neutron would refuse these addresses on their network in ${where}: ${refused.join('; ')}.`, NETWORK_REMEDIATION.NET_ADDRESS_REFUSED);
+      add('NET_ADDRESS_REFUSED', `Neutron would refuse these addresses on their network in ${where}: ${refused.join('; ')}.`);
   }
   for (const [code, message] of nicOverrideFindings(vm, sourceKind, plan, destinationNetworks, context))
-    add(code, code === 'MAP_NIC_OVERRIDE' ? 'info' : 'blocker', message, NIC_OVERRIDE_REMEDIATION[code] ?? null);
+    add(code, message);
   if ('pci_passthrough:alias' in vm.flavor_extra_specs)
-    add('VM_PCI_PASSTHROUGH', 'blocker', 'Flavor requests PCI passthrough.', 'PCI passthrough devices cannot be migrated; rebuild the VM with an equivalent flavor.');
+    add('VM_PCI_PASSTHROUGH', `Flavor requests PCI passthrough (${vm.flavor_extra_specs['pci_passthrough:alias']}).`);
   if ('resources:VGPU' in vm.flavor_extra_specs)
-    add('VM_VGPU', 'blocker', 'Flavor requests a vGPU (resources:VGPU).', 'vGPU instances cannot be migrated; rebuild the VM with a vGPU flavor of the destination.');
+    add('VM_VGPU', 'Flavor requests a vGPU (resources:VGPU).');
   const encrypted = vm.disks.filter((d) => d.encrypted).map((d) => d.name || d.id);
   if (encrypted.length)
-    add('VOL_ENCRYPTED', 'warning', `Encrypted disk(s): ${pyNames(encrypted)}.`, 'The Barbican key must be re-created on the destination before the volume can be attached.');
+    add('VOL_ENCRYPTED', `Encrypted disk(s): ${pyNames(encrypted)}.`);
   const guest = guestOsOf(vm);
   if (guest.lifecycle === 'legacy')
-    add('GUEST_OS_LEGACY', 'warning', `Guest OS ${guest.label} is out of standard vendor support.`, 'Out of vendor support: it still migrates; test the application on the destination, check the virtio drivers and plan a longer verification.');
+    add('GUEST_OS_LEGACY', `Guest OS ${guest.label} is out of standard vendor support.`);
   if (guest.family === 'unknown')
-    add('GUEST_OS_UNKNOWN', 'info', `The guest OS is not identified${vm.os_type ? ` (${vm.os_type})` : ''}.`, 'Set the os_distro and os_version image properties or run VMware Tools; verification uses the Linux profile meanwhile.');
-  if (sourceKind === 'vmware' && (guest.v2v === 'tech_preview' || guest.v2v === 'unverified'))
-    add('GUEST_CONVERSION_UNVERIFIED', 'warning', `Converting ${guest.label} with virt-v2v is ${guest.v2v === 'tech_preview' ? 'a Technology Preview' : 'not supported by Red Hat'}.`, 'Run a test conversion of a copy first.', ['vmware_cold', 'vmware_warm']);
-  if (sourceKind === 'vmware' && guest.v2v === 'unsupported')
-    add('GUEST_CONVERSION_UNSUPPORTED', 'warning', `virt-v2v on the RHEL 9 conversion host cannot prepare ${guest.label}.`, 'Install the virtio storage and network drivers from an older virtio-win release inside the guest and test the conversion, or migrate the VM another way.', ['vmware_cold', 'vmware_warm']);
-  if (sourceKind === 'vmware') {
-    if (vm.cbt_enabled === false)
-      add('VMW_CBT_DISABLED', 'warning', 'Changed Block Tracking is disabled; only cold migration is possible.', 'Enable CBT (requires a power cycle) or accept a cold window.', ['vmware_warm']);
-    if (vm.disks.some((d) => d.independent))
-      add('VMW_INDEPENDENT_DISK', 'warning', 'An independent disk cannot be tracked by CBT.', 'Convert the disk to dependent mode or migrate cold.', ['vmware_warm']);
-    if (vm.snapshot_count > 0)
-      add('VMW_SNAPSHOTS_PRESENT', 'warning', `${vm.snapshot_count} VMware snapshots exist.`, 'Consolidate snapshots before migration.');
-    if (vm.tools_ok === false)
-      add('VMW_TOOLS_MISSING', 'info', 'VMware Tools are not running; graceful shutdown may time out.', 'Install or start VMware Tools.');
-  }
+    add('GUEST_OS_UNKNOWN', `The guest OS is not identified${vm.os_type ? ` (${vm.os_type})` : ''}.`);
+  // virt-v2v converts a VMware guest - the source's kind says so, or a VMDK disk does - as the API judges it
+  const converted = sourceKind === 'vmware' || vm.disks.some((d) => d.kind === 'vmdk');
+  if (converted && (guest.v2v === 'tech_preview' || guest.v2v === 'unverified'))
+    add('GUEST_CONVERSION_UNVERIFIED', `Converting ${guest.label} with virt-v2v is ${guest.v2v === 'tech_preview' ? 'a Technology Preview' : 'not supported by Red Hat'}.`);
+  if (converted && guest.v2v === 'unsupported')
+    add('GUEST_CONVERSION_UNSUPPORTED', `virt-v2v on the RHEL 9 conversion host cannot prepare ${guest.label}.`);
+  // by the VM's own fields, as the API's: only VMware's inventory sets them
+  if (vm.cbt_enabled === false) add('VMW_CBT_DISABLED', 'Changed Block Tracking is disabled.');
+  const independent = vm.disks.filter((d) => d.independent).map((d) => d.name || d.id);
+  if (independent.length) add('VMW_INDEPENDENT_DISK', `Independent disk(s): ${pyNames(independent)}.`);
+  if (vm.snapshot_count > 0) add('VMW_SNAPSHOTS_PRESENT', `The VM has ${vm.snapshot_count} snapshot(s).`);
+  if (vm.tools_ok === false) add('VMW_TOOLS_MISSING', 'VMware Tools are not running.');
   // as the API words it (SDD §9.3, §16, review RV20-08): every volume whose type handover cannot map
   const unmappedTypes = vm.disks.filter((d) => d.kind === 'volume' && !Object.hasOwn(plan.handover.backend_map, d.volume_type || '')).map((d) => d.volume_type || '<default>');
   if (plan.handover.enabled && unmappedTypes.length)
-    add('HANDOVER_BACKEND_UNMAPPED', 'info', `Volume type(s) without a handover backend: ${pyNames(unmappedTypes)}.`, 'Map the volume type to a Cinder backend of the destination in handover.backend_map.', ['storage_handover']);
+    add('HANDOVER_BACKEND_UNMAPPED', `Volume type(s) without a handover backend: ${pyNames(unmappedTypes)}.`);
   // like the API (SDD §9.3, ADV-18): a database VM verified only by its boot
   if (isDatabase(vm) && probesFor(vm.source_id, plan).probes.length === 0) {
     const suggested = suggestProbes(vm);
-    add(
-      'APP_PROBE_MISSING',
-      'warning',
-      `${vm.name} is a database VM without an application probe: verification would check only that it booted.${suggested.length ? ` Suggested: ${describeProbes(suggested)}.` : ''}`,
-      "Add an application probe for its service to the plan, for every VM or for this one (probe_overrides), or use the suggested probe on the plan page.",
-    );
+    add('APP_PROBE_MISSING', `${vm.name} is a database VM without an application probe: verification would check only that it booted.${suggested.length ? ` Suggested: ${describeProbes(suggested)}.` : ''}`);
   }
   return findings;
 }
@@ -1788,11 +1763,11 @@ export function buildFixtures(now: number): Fixtures {
     plans.push(plan);
     emit({ ts: iso(createdAt), kind: 'plan.created', plan_id: plan.id, migration_id: null, actor: 'rina', message: `Plan "${plan.name}" created with ${plan.vm_ids.length} VMs`, data: { status: 'draft' } });
 
-    const selectedNames = plan.vm_ids.map((id) => vms.find((v) => v.source_id === id)?.name ?? id);
+    const selected = plan.vm_ids.flatMap((id) => vms.filter((v) => v.source_id === id));
     for (const m of spec.migrations) {
       const vm = vms.find((v) => v.source_id === m.vm);
       if (!vm) continue;
-      const findings = preflight(vm, source.kind, plan, dstInventory.networks, selectedNames, { destination: providerLabel(destination) });
+      const findings = preflight(vm, source.kind, plan, dstInventory.networks, { selected, destination: providerLabel(destination) });
       const elig = eligibility(vm, source.kind, plan, source, destination, findings);
       const estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(vm, s, plan, elig[s] ?? []));
       const chosen = estimates.find((e) => e.strategy === m.strategy) ?? null;

@@ -1,6 +1,7 @@
 import ast
 import json
 import re
+import string
 from pathlib import Path
 
 import pytest
@@ -89,6 +90,23 @@ def only(findings, code):
     return matches[0]
 
 
+def test_the_finding_catalog_is_the_one_the_dashboards_mock_reads():
+    """SDD §9.3, §16: each code's severity, strategies and default remediation, as the shared
+    finding_catalog.json holds them for the dashboard's offline mock - a remediation changed here
+    fails this test until the fixture, and with it the mock, says the same."""
+    shared = json.loads(
+        (Path(__file__).parent / "fixtures" / "finding_catalog.json").read_text(encoding="utf-8")
+    )["catalog"]
+    assert {
+        code: {
+            "severity": entry.severity.value,
+            "strategies": [strategy.value for strategy in entry.strategies],
+            "remediation": entry.remediation,
+        }
+        for code, entry in CATALOG.items()
+    } == shared
+
+
 def test_catalog_is_complete():
     assert set(CATALOG) == {
         "SRC_VM_ERROR_STATE",
@@ -159,6 +177,19 @@ def test_duplicate_names_blocked():
     for vm in (a, b):
         assert only(check(vm, all_vms=vms), "SRC_VM_DUPLICATE_NAME").severity == Severity.blocker
     assert all(f.code != "SRC_VM_DUPLICATE_NAME" for f in check(c, all_vms=vms))
+
+
+def test_a_vm_with_a_same_named_twin_still_names_the_destination_provider():
+    """SDD §1 naming: the duplicate-name finding named the other VMs with the variable every later
+    message names the destination provider by, so for a VM with a same-named twin each finding
+    about the destination cloud named the twins ("in 'hr/vm-2'") instead of the provider."""
+    vm = make_vm(nics=[Nic(network="db-net", mtu=9000)])
+    twin = make_vm(source_id="vm-2", project="hr")
+    found = check(vm, plan=make_plan(prestage_resources=["subnets"]), all_vms=[vm, twin])
+    assert "(hr/vm-2)" in only(found, "SRC_VM_DUPLICATE_NAME").message
+    assert only(found, "MAP_NETWORK_MISSING").message == (
+        "No mapping or same-named network in RHOSO 18.0 for: db-net."
+    )
 
 
 def test_finding_src_vm_multiattach():
@@ -232,6 +263,32 @@ def test_finding_map_network_missing():
     assert all(x.code != "MAP_NETWORK_PRESTAGED" for x in check(vm, plan=no_prestage))
     mapped = make_plan(mappings=Mappings(networks={"db-net": "app-net"}), prestage_resources=[])
     assert all(not x.code.startswith("MAP_NETWORK") for x in check(vm, plan=mapped))
+
+
+def test_a_missing_network_comes_before_a_port_its_credential_may_not_place():
+    """SDD §9.3, §16 (review RV25-03): the findings come in one order - a network the destination
+    lacks before the ports of a resolved network - the order the dashboard's mock gives too
+    (mockData.test.ts, the same VM and inventory)."""
+    nics = [
+        Nic(network="gone-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5"], mtu=1500),
+        Nic(network="other-net", mac="fa:16:3e:00:00:02", fixed_ips=["10.0.0.6"], mtu=1500),
+    ]
+    vm = make_vm(nics=nics)
+    other = {"id": "n1", "name": "other-net", "mtu": 1500, "project_id": "p-other"}
+    details = [{**other, "own": False, "shared": False, "external": False}]
+    dst = dst_inv(networks={"other-net": 1500}, network_details=details)
+    found = check(vm, plan=make_plan(prestage_resources=[]), src=SourceInventory(), dst=dst)
+    assert [
+        (f.code, f.message) for f in found if f.code.startswith(("MAP_NETWORK", "NET_PORT"))
+    ] == [
+        ("MAP_NETWORK_MISSING", "No mapping or same-named network in RHOSO 18.0 for: gone-net."),
+        (
+            "NET_PORT_NOT_PERMITTED",
+            "The credential of RHOSO 18.0 may not put these NICs on their network: "
+            "fa:16:3e:00:00:02 on 'other-net' (project p-other): it is neither shared with the "
+            "credential's project nor external.",
+        ),
+    ]
 
 
 def test_finding_map_network_prestaged():
@@ -1209,7 +1266,7 @@ def test_declaring_the_series_settles_the_unknown_profile_the_refusal_asks_about
     )
     # a check is allowed while a plan runs, a PATCH that declares is not (SDD §12, §21.5)
     assert (
-        "check the provider so its series is detected, or declare its policy profile or series"
+        "check RHOSO 18.0 so its series is detected, or declare its policy profile or series"
         in before.message
     )
     after = _another_projects_port(
@@ -1303,11 +1360,31 @@ def test_finding_net_port_not_permitted_counts_advsvc_only_under_the_legacy_prof
     for roles in (["advsvc"], ["service"]):
         refused = _another_projects_port({**unknown, "roles": roles})
         assert refused is not None, roles
-        assert "the destination's policy profile is unknown, so only the admin role" in (
+        assert "the policy profile of RHOSO 18.0 is unknown, so only the admin role" in (
             refused.message
         ), roles
     # a value the check never reports counts as unknown: admin alone
     assert _another_projects_port({"policy_profile": "strict", "roles": ["advsvc"]}) is not None
+
+
+def test_net_port_not_permitted_names_the_provider_whose_policy_profile_is_unknown():
+    """SDD §1 naming (review RV23-07): a finding's message names the destination provider by its
+    label - the provider whose policy profile is unknown and the one to check - never "the
+    destination"; by its id when the stored name is blank."""
+    dc3 = DST.model_copy(update={"name": "DC3 Jakarta"})
+    refused = _another_projects_port({"policy_profile": "unknown", "roles": ["advsvc"]}, dc3)
+    assert refused is not None and refused.message == (
+        "The credential of DC3 Jakarta may not put these NICs on their network: "
+        "fa:16:3e:00:00:01 on 'rhoso-net' (project project-admin): the policy profile of DC3 "
+        "Jakarta is unknown, so only the admin role, or that project, may choose a port's address "
+        "or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is "
+        "detected, or declare its policy profile or series)."
+    )
+    blank = DST.model_copy(update={"name": " "})
+    refused = _another_projects_port({"policy_profile": "unknown", "roles": ["advsvc"]}, blank)
+    assert refused is not None
+    assert "the policy profile of dst-rhoso is unknown" in refused.message
+    assert "(check dst-rhoso so its series is detected" in refused.message
 
 
 async def _real_check(tmp_path, **cloud):
@@ -1759,47 +1836,187 @@ def test_every_planning_text_about_the_destination_cloud_names_its_provider():
     assert blocker.message.endswith(f"so the default volume type of {name} cannot be used.")
 
 
+#: the control plane's fixed texts, which SDD §1 naming lets say "the destination": the catalog's
+#: remediations and the role advice they are built from, and the generic texts the advisor gives
+#: Jev, which no provider's name may reach (§13.4)
+FIXED_TEXTS = {
+    ("planning/preflight.py", "CATALOG"),
+    ("planning/preflight.py", "_PORT_ROLE_ADVICE"),
+    ("ai/advisor.py", "STRATEGY_DESCRIPTIONS"),
+    ("ai/payloads.py", "STRATEGY_REQUEST_FIELDS"),
+}
+
+
 def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
-    """SDD §1 naming (review RV21-05): a text built for a plan or a migration - a finding's
-    message, an eligibility reason, an executor's refusal, failure or log line - names the
-    destination provider by its label; "the destination" is for the fixed texts (a catalog
-    remediation, the dashboard's copy). Every f-string is read, and every plain string given, at
-    any place among its arguments, to an error raised or named so, a finding, a reason list, a
-    log line, the handover's _call or an event (review RV22-05)."""
+    """SDD §1 naming (reviews RV21-05, RV22-05, RV23-06, RV24-04, RV25-05): a text built for a plan
+    or a migration - a finding's message, an eligibility reason, an executor's refusal, failure or
+    log line, an event, a transition's reason - names the destination provider by its label; "the
+    destination" is for the fixed texts (a catalog remediation, the dashboard's copy). Every text
+    of the control plane is read - each string literal, and what a + chain, a %-template (given a
+    tuple or a mapping), str.format, str.format_map, a join of literals, a logging call or an
+    f-string builds from literals - but a docstring, the fixed texts of FIXED_TEXTS, a
+    remediation= value, and the bare "the destination" where a text built without a provider falls
+    back to it: a parameter's default, an if-else's else, the right of an or, an assignment in an
+    except handler, a returned value, a get or getattr default. It reads expressions, not data
+    flow: a text completed with += or carried through a variable, an argument or a call's return
+    is out of its reach."""
     root = Path(__file__).parents[1] / "src" / "seamless_migrate"
     words = re.compile(r"the destination\b|destination's|destination provider", re.I)
+    logging = {"debug", "info", "warning", "warn", "error", "exception", "critical"}
 
-    def text(node):
+    def mapping(node):
+        """A dict literal's string keys with their folded values ("{}" unknown); {} for another."""
+        if not isinstance(node, ast.Dict):
+            return {}
+        return {
+            k.value: fold(v) or "{}"
+            for k, v in zip(node.keys, node.values, strict=True)
+            if isinstance(k, ast.Constant) and isinstance(k.value, str)
+        }
+
+    def fields(template, args, kwargs):
+        """``template`` with each replacement field filled from ``args``/``kwargs``, "{}" for a
+        field the guard cannot know - an attribute, an index, a name it was not given - never an
+        error."""
+        try:
+            parsed = list(string.Formatter().parse(template))
+        except ValueError:
+            return template
+        out, auto = [], 0
+        for literal, field, _spec, _conversion in parsed:
+            out.append(literal)
+            if field is None:
+                continue
+            if field == "":
+                out.append(args[auto] if auto < len(args) else "{}")
+                auto += 1
+            elif field.isdigit():
+                out.append(args[int(field)] if int(field) < len(args) else "{}")
+            else:
+                out.append(kwargs.get(field, "{}"))
+        return "".join(out)
+
+    def percent(template, values):
+        """``template % values``, or the template and the values side by side when they do not
+        fit."""
+        try:
+            return template % values
+        except (TypeError, ValueError, KeyError):
+            given = values.values() if isinstance(values, dict) else values
+            return template + " " + " ".join(given)
+
+    def fold(node):
+        """The text ``node`` builds from literals, "{}" for each part it cannot know; None when it
+        builds no text."""
+        if isinstance(node, ast.Constant):
+            return node.value if isinstance(node.value, str) else None
         if isinstance(node, ast.JoinedStr):
-            return "".join(v.value for v in node.values if isinstance(v, ast.Constant))
-        return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else ""
+            return "".join(
+                (fold(part.value) or "{}") if isinstance(part, ast.FormattedValue) else fold(part)
+                for part in node.values
+            )
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+            left, right = fold(node.left), fold(node.right)
+            if isinstance(node.op, ast.Add):
+                return None if left is None and right is None else (left or "{}") + (right or "{}")
+            if left is None:
+                return None
+            if isinstance(node.right, ast.Dict):
+                return percent(left, mapping(node.right))
+            args = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+            return percent(left, tuple(fold(arg) or "{}" for arg in args))
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return None
+        method, receiver = node.func.attr, fold(node.func.value)
+        if method in ("format", "format_map") and receiver is not None:
+            if method == "format_map":
+                return fields(receiver, [], mapping(node.args[0]) if node.args else {})
+            args = [fold(arg) or "{}" for arg in node.args]
+            return fields(
+                receiver, args, {k.arg: fold(k.value) or "{}" for k in node.keywords if k.arg}
+            )
+        if method == "join" and receiver is not None and node.args:
+            items = node.args[0]
+            if isinstance(items, (ast.Tuple, ast.List)):
+                return receiver.join(fold(item) or "{}" for item in items.elts)
+            return None
+        # a log line: log.warning(template, *args), log.log(level, template, *args)
+        given = node.args[1:] if method == "log" else node.args
+        if (method in logging or method == "log") and given and fold(given[0]) is not None:
+            values = tuple(fold(arg) or "{}" for arg in given[1:])
+            return percent(fold(given[0]), values) if values else fold(given[0])
+        return None
 
-    #: what a text built for a migration is given to, beside an error raised or named so
-    takers = {"_call", "append", "log", "finding", "_emit", "emit", "new_event", "_save_with_event"}
+    def fallback(node, parents):
+        """Whether the bare words stand where a text built without a provider falls back to them."""
+        parent = parents.get(id(node))
+        return (
+            isinstance(parent, ast.arguments)
+            or (isinstance(parent, ast.IfExp) and parent.orelse is node)
+            or (
+                isinstance(parent, ast.BoolOp)
+                and isinstance(parent.op, ast.Or)
+                and parent.values[-1] is node
+            )
+            or (
+                isinstance(parent, ast.Assign)
+                and parent.value is node
+                and isinstance(parents.get(id(parent)), ast.ExceptHandler)
+            )
+            or (isinstance(parent, ast.Return) and parent.value is node)
+            or (
+                isinstance(parent, ast.Call)
+                and (
+                    (
+                        isinstance(parent.func, ast.Attribute)
+                        and parent.func.attr == "get"
+                        and parent.args[1:2] == [node]
+                    )
+                    or (
+                        isinstance(parent.func, ast.Name)
+                        and parent.func.id == "getattr"
+                        and parent.args[2:3] == [node]
+                    )
+                )
+            )
+        )
 
-    def messages(tree):
-        raised = {
-            id(node.exc)
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
+    def fixed(tree, path):
+        """The ids of the nodes the rule lets say "the destination"."""
+        skip = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                first = node.body[0] if node.body else None
+                if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                    skip.add(id(first.value))
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names = {(path, t.id) for t in targets if isinstance(t, ast.Name)}
+                if names & FIXED_TEXTS:
+                    skip.update(id(n) for n in ast.walk(node.value))
+            elif isinstance(node, ast.keyword) and node.arg == "remediation":
+                skip.update(id(n) for n in ast.walk(node.value))
+        return skip
+
+    found = []
+    for path in sorted(root.rglob("*.py")):
+        name = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        skip = fixed(tree, name)
+        parents = {
+            id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
         }
         for node in ast.walk(tree):
-            if isinstance(node, ast.JoinedStr):
-                yield node
-            elif isinstance(node, ast.Call):
-                func = node.func
-                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-                # the plain ones, wherever they stand among its arguments (ApiError's message is its
-                # third): the walk meets every f-string
-                if id(node) in raised or name.endswith("Error") or name in takers:
-                    yield from (a for a in node.args if isinstance(a, ast.Constant))
-
-    found = [
-        f"{path.relative_to(root)}:{node.lineno}: {text(node)}"
-        for path in sorted(root.rglob("*.py"))
-        for node in messages(ast.parse(path.read_text(encoding="utf-8")))
-        if words.search(text(node))
-    ]
+            text = None if id(node) in skip else fold(node)
+            if text is None or not words.search(text):
+                continue
+            if (
+                text == "the destination"
+                and isinstance(node, ast.Constant)
+                and fallback(node, parents)
+            ):
+                continue
+            found.append(f"{name}:{node.lineno}: {text}")
     assert found == []
 
 
@@ -1842,6 +2059,193 @@ def test_the_wording_guard_reads_every_plain_message_given_to_an_error_or_an_eve
         test_no_text_built_for_a_migration_calls_its_destination_the_destination()
 
 
+#: texts the guard missed (review RV23-06) and the shape RV23-07 had: injected into orchestrator.py
+INJECTED_RV23 = {
+    "_emit by keyword": (
+        "\n\nasync def _rv23(self, m):\n"
+        "    await self._emit(\n"
+        "        'migration.error', message='the destination refused it', migration=m\n"
+        "    )\n"
+    ),
+    "new_event by keyword": (
+        "\n\ndef _rv23(m):\n"
+        "    return new_event('migration.error', message='the destination refused it')\n"
+    ),
+    "a module constant given to an error": (
+        "\n\nREFUSED_RV23 = 'the destination refused it'\n\n\n"
+        "def _rv23():\n    raise NotAllowed(REFUSED_RV23)\n"
+    ),
+    # the migration.phase event's message: "{vm}: a -> b (reason)"
+    "a transition's reason": (
+        "\n\nasync def _rv23(self, m, v):\n"
+        "    await self._transition(m, v, P.failed, 'the destination refused it')\n"
+    ),
+    # RV23-07: a rule's text a function hands on, which a caller puts in a refusal
+    "a module constant a function returns": (
+        "\n\n_RULE_RV23 = {'unknown': \"the destination's policy profile is unknown\"}\n\n\n"
+        "def _rv23(profile):\n    return _RULE_RV23[profile]\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(INJECTED_RV23))
+def test_the_wording_guard_reads_every_literal_of_the_control_plane(case, monkeypatch):
+    """SDD §1 naming (reviews RV23-06, RV23-07): the guard reads every string literal, wherever it
+    stands - a keyword argument, a module constant an error is given or a function returns, a
+    transition's reason - not only the plain strings a call takes by position."""
+    target = Path(__file__).parents[1] / "src" / "seamless_migrate" / "orchestrator.py"
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        return text + INJECTED_RV23[case] if Path(self) == target else text
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match="orchestrator.py"):
+        test_no_text_built_for_a_migration_calls_its_destination_the_destination()
+
+
+#: texts built from several literals that say "the destination" (review RV24-04): injected into
+#: orchestrator.py
+INJECTED_RV24 = {
+    "a text split over +": (
+        "\n\ndef _rv24():\n    raise NotAllowed('check the ' + 'destination, then retry')\n"
+    ),
+    "the bare literal in a %-template": (
+        "\n\ndef _rv24():\n    raise NotAllowed('%s refused the port' % 'the destination')\n"
+    ),
+    "the bare literal given to str.format": (
+        "\n\ndef _rv24():\n    raise NotAllowed('{} refused the port'.format('the destination'))\n"
+    ),
+    "the bare literal in an f-string": (
+        "\n\ndef _rv24():\n    raise NotAllowed(f\"{'the destination'} refused the port\")\n"
+    ),
+    "the bare literal + a literal": (
+        "\n\ndef _rv24(m):\n"
+        "    return new_event('migration.error', 'the destination' + ' refused the port')\n"
+    ),
+    # the bare words as a whole message, where no text falls back to them
+    "the bare words given to an error": (
+        "\n\ndef _rv24():\n    raise NotAllowed('the destination')\n"
+    ),
+    # the words in no literal of their own: only the text the template builds says them
+    "words a %-template builds": (
+        "\n\ndef _rv24():\n    raise NotAllowed('check the %s, then retry' % 'destination')\n"
+    ),
+    "words str.format builds": (
+        "\n\ndef _rv24():\n    raise NotAllowed('check the {}, then retry'.format('destination'))\n"
+    ),
+    "words an f-string builds": (
+        "\n\ndef _rv24():\n    raise NotAllowed(f\"check the {'destination'}, then retry\")\n"
+    ),
+}
+
+
+#: words a logging call, a mapping, a join or format_map gives a text built for a migration
+#: (review RV25-05): injected into orchestrator.py
+INJECTED_RV25 = {
+    "a log line given its words by the logging call": (
+        "\n\ndef _rv25():\n"
+        "    log.warning('could not reach the %s: %s', 'destination', 'timeout')\n"
+    ),
+    "a %-template given its words by a mapping": (
+        "\n\ndef _rv25():\n"
+        "    raise NotAllowed('check the %(side)s, then retry' % {'side': 'destination'})\n"
+    ),
+    "a text joined from its words": (
+        "\n\ndef _rv25():\n"
+        "    raise NotAllowed(' '.join(('check the', 'destination', 'then retry')))\n"
+    ),
+    "str.format_map": (
+        "\n\ndef _rv25():\n"
+        "    raise NotAllowed('check the {side}, then retry'.format_map({'side': 'destination'}))\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(INJECTED_RV25))
+def test_the_wording_guard_reads_the_words_a_call_gives_a_text(case, monkeypatch):
+    """SDD §1 naming (review RV25-05): a log line, a %-template given a mapping, a join of
+    literals and str.format_map say "the destination" as plainly as a literal does."""
+    target = Path(__file__).parents[1] / "src" / "seamless_migrate" / "orchestrator.py"
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        return text + INJECTED_RV25[case] if Path(self) == target else text
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match="orchestrator.py"):
+        test_no_text_built_for_a_migration_calls_its_destination_the_destination()
+
+
+@pytest.mark.parametrize("case", list(INJECTED_RV24))
+def test_the_wording_guard_reads_a_text_built_from_several_literals(case, monkeypatch):
+    """SDD §1 naming (review RV24-04): a refusal or an event that says "the destination" is found
+    however its text is put together - a + chain, a %-template, str.format, an f-string - and the
+    bare "the destination" passes only where a text built without a provider falls back to it."""
+    target = Path(__file__).parents[1] / "src" / "seamless_migrate" / "orchestrator.py"
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        return text + INJECTED_RV24[case] if Path(self) == target else text
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match="orchestrator.py"):
+        test_no_text_built_for_a_migration_calls_its_destination_the_destination()
+
+
+#: the texts SDD §1 naming lets say "the destination", injected into orchestrator.py
+FIXED_RV23 = {
+    "a docstring": '\n\ndef _rv23():\n    """What the destination is given."""\n',
+    "a remediation": (
+        "\n\ndef _rv23():\n    return finding('X', 'msg', remediation='Ask the destination.')\n"
+    ),
+    "the fallback when no provider is known": (
+        "\n\ndef _rv23(cloud: str = 'the destination'):\n    return cloud\n"
+    ),
+    # where else a text built without a provider falls back to the bare words (review RV24-04)
+    "the fallback of an if-else": (
+        "\n\ndef _rv23(p):\n    return p.label if p is not None else 'the destination'\n"
+    ),
+    "the fallback after or": "\n\ndef _rv23(label):\n    return label or 'the destination'\n",
+    "the fallback of an except handler": (
+        "\n\ndef _rv23(names, p):\n    try:\n        names[p] = p.label\n"
+        "    except AttributeError:\n        names[p] = 'the destination'\n"
+    ),
+    # review RV25-05: a format field the guard cannot know never errors, and two more fallbacks
+    "a str.format field reading the label": (
+        "\n\ndef _rv23(p):\n    return '{p.label} refused the port'.format(p=p)\n"
+    ),
+    "a str.format field reading an index": (
+        "\n\ndef _rv23(names):\n    return '{n[dst]} refused the port'.format(n=names)\n"
+    ),
+    "the fallback a function returns": (
+        "\n\ndef _rv23(p):\n    if p is None:\n        return 'the destination'\n"
+        "    return p.label\n"
+    ),
+    "the fallback given to dict.get": (
+        "\n\ndef _rv23(names, pid):\n    return names.get(pid, 'the destination')\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(FIXED_RV23))
+def test_the_wording_guard_leaves_the_fixed_texts_alone(case, monkeypatch):
+    """SDD §1 naming (review RV23-06): a docstring, a catalog remediation and the bare fallback a
+    text built without a provider uses say "the destination" - the guard lets them."""
+    target = Path(__file__).parents[1] / "src" / "seamless_migrate" / "orchestrator.py"
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        return text + FIXED_RV23[case] if Path(self) == target else text
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    test_no_text_built_for_a_migration_calls_its_destination_the_destination()
+
+
 ELIGIBILITY_CASES = json.loads(
     (Path(__file__).parent / "fixtures" / "eligibility_cases.json").read_text(encoding="utf-8")
 )
@@ -1849,8 +2253,12 @@ ELIGIBILITY_CASES = json.loads(
 
 @pytest.mark.parametrize("case", ELIGIBILITY_CASES["finding_cases"], ids=lambda case: case["why"])
 def test_the_shared_handover_finding_cases(case):
-    """SDD §9.3, §16 (review RV20-08): VOL_ENCRYPTED and HANDOVER_BACKEND_UNMAPPED as the API
-    words them, which the dashboard's mock words the same way (mockData.test.ts)."""
+    """SDD §9.3, §16 (review RV20-08): the findings as the API words them, which the dashboard's
+    mock words the same way (mockData.test.ts); `others` are the plan's other selected VMs,
+    `source_kind` the source provider's kind."""
     plan = make_plan(handover=HandoverConfig(**case["plan"]["handover"]))
-    found = check(VMRef.model_validate(case["vm"]), plan=plan)
+    vm = VMRef.model_validate(case["vm"])
+    others = [VMRef.model_validate(other) for other in case.get("others", [])]
+    source = VMWARE if case.get("source_kind") == "vmware" else SRC
+    found = check(vm, plan=plan, all_vms=[vm, *others], source=source)
     assert {f.code: f.message for f in found if f.code in case["expected"]} == case["expected"]

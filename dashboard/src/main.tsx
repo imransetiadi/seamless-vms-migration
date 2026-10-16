@@ -1,10 +1,10 @@
-import { QueryClient } from '@tanstack/react-query';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
 import { endSession, getStoredToken } from './api/auth';
 import { ApiClient, DEFAULT_API_BASE, setDefaultClient } from './api/client';
 import { queryKeys } from './api/hooks';
+import { createQueryClient } from './api/queryClient';
 // SDD §16 fonts, bundled (Latin, the weights in use): an air-gapped install loads nothing from another host
 import '@fontsource/fira-code/latin-400.css';
 import '@fontsource/fira-code/latin-500.css';
@@ -16,11 +16,7 @@ import '@fontsource/fira-sans/latin-700.css';
 import './index.css';
 
 async function bootstrap() {
-  const queryClient = new QueryClient({
-    defaultOptions: {
-      queries: { staleTime: 5_000, refetchOnWindowFocus: true },
-    },
-  });
+  const queryClient = createQueryClient({ queries: { staleTime: 5_000, refetchOnWindowFocus: true } });
 
   let fetchImpl: typeof fetch | undefined;
   if (import.meta.env.VITE_SEAMLESS_MOCK === '1') {

@@ -1,6 +1,10 @@
 import ast
+import asyncio
+import gc
 import json
 import re
+import threading
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -9,6 +13,7 @@ import pytest
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy
 from seamless_migrate.domain.models import HandoverConfig, Mappings
+from seamless_migrate.executors import handover as handover_module
 from seamless_migrate.executors.base import PermanentStepError, StepName, TransientStepError
 from seamless_migrate.executors.handover import (
     JOURNAL_FILE,
@@ -537,6 +542,58 @@ def ops(calls):
     return [(cloud, op, arg) for cloud, op, arg in calls]
 
 
+def shared_pool(clouds):
+    """The two clouds share one Ceph pool, as SDD §7.3 has them: a manage finds the object by its
+    source-name and the driver renames it ``volume-<new id>`` (step 6), an unmanage keeps it, and
+    Nova refuses a server on a volume its Cinder does not know or another server holds (audit
+    EX-17: the plain fakes manage any name)."""
+    images = {f"volume-{vid}" for vid in clouds["src"].volumes}
+    for cloud in clouds.values():
+        post = cloud.block_storage.post
+
+        def manage(url, json=None, _post=post, **kw):
+            if url == "/manageable_volumes":
+                name = json["volume"]["ref"]["source-name"]
+                if name not in images:
+                    return refused(f"Manage existing volume failed: image {name} not found")
+                response = _post(url, json=json, **kw)
+                images.discard(name)
+                images.add(f"volume-{response.json()['volume']['id']}")
+                return response
+            return _post(url, json=json, **kw)
+
+        cloud.block_storage.post = manage
+        create = cloud.compute.create_server
+
+        def create_server(_create=create, _cloud=cloud, **params):
+            for b in params.get("block_device_mapping") or []:
+                if b["uuid"] not in _cloud.volumes:
+                    raise HTTPError(f"HTTP 400: Block Device Mapping is Invalid: {b['uuid']}")
+                if _cloud.volumes[b["uuid"]].status != "available":
+                    raise HTTPError(f"HTTP 400: Invalid volume: {b['uuid']} must be available")
+            return _create(**params)
+
+        cloud.compute.create_server = create_server
+    return images
+
+
+def held_manage(cloud, source_name):
+    """A slow cinder-api: it accepts the manage of ``source_name``, but its answer waits until the
+    test sets the second event (the first is set once the call waits)."""
+    held, release = threading.Event(), threading.Event()
+    post = cloud.block_storage.post
+
+    def answer(url, json=None, **kw):
+        response = post(url, json=json, **kw)
+        if url == "/manageable_volumes" and json["volume"]["ref"]["source-name"] == source_name:
+            held.set()
+            release.wait(30)
+        return response
+
+    cloud.block_storage.post = answer
+    return held, release
+
+
 async def test_handover_cutover_order_and_bdm(tmp_path):
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)
     assert executor.supports(Strategy.storage_handover) and not executor.supports(Strategy.warm)
@@ -692,6 +749,130 @@ async def test_handover_journal_resume_skips_done_steps(tmp_path):
     assert calls == [] and again.destination_server_id == result.destination_server_id
 
 
+async def test_a_cancelled_handover_step_ends_only_after_its_call_returned(tmp_path):
+    """SDD §7.3: a handover call runs in a worker thread, which no cancel stops. A cancelled step -
+    cancelled twice, as a step timeout and then a rollback request do - ends only once its call
+    returned and journaled the manage it sent, so the rollback that follows unmanages that volume
+    at RHOSO and manages the renamed object back (audit EX-01)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    shared_pool(clouds)
+    held, release = held_manage(clouds["dst"], "volume-vol-root")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    step = asyncio.create_task(executor.run(StepName.CUTOVER, ctx))
+    try:
+        assert await asyncio.to_thread(held.wait, 10)
+        step.cancel()
+        await asyncio.sleep(0.2)
+        step.cancel()
+        await asyncio.sleep(0.2)
+        assert not step.done(), "the step ended while its manage still ran"
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await step
+    journal = json.loads((executor.run_dir(ctx) / JOURNAL_FILE).read_text())
+    assert journal["done"]["sent:manage_dst:vol-root"]["volume_id"] == "dst-vol-2"
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls) == [
+        ("dst", "unmanage", "dst-vol-2"),
+        ("dst", "unmanage", "dst-vol-1"),
+        ("src", "manage", "volume-dst-vol-2"),
+        ("src", "manage", "volume-dst-vol-1"),
+        ("src", "create_port", "fa:16:3e:00:00:01"),
+        ("src", "create_server", "web-01"),
+    ]
+    assert result.details["vm"]["source_id"] == "src-new-1"
+
+
+async def test_a_handover_step_cancelled_while_it_journals_ends_after_the_write(
+    tmp_path, monkeypatch
+):
+    """SDD §7.3: a journal write is a call in flight too. A step cancelled while it journals the
+    manage that completed ends only once the write landed (audit EX-01)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    held, release = threading.Event(), threading.Event()
+    write = handover_module._write_json
+
+    def slow_write(path, data):
+        if "manage_dst:vol-root" in data.get("done", {}) and not held.is_set():
+            held.set()
+            release.wait(30)
+        write(path, data)
+
+    monkeypatch.setattr(handover_module, "_write_json", slow_write)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    step = asyncio.create_task(executor.run(StepName.CUTOVER, ctx))
+    try:
+        assert await asyncio.to_thread(held.wait, 10)
+        step.cancel()
+        await asyncio.sleep(0.2)
+        assert not step.done(), "the step ended while its journal write still ran"
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await step
+    journal = json.loads((executor.run_dir(ctx) / JOURNAL_FILE).read_text())
+    assert journal["done"]["manage_dst:vol-root"]["dest_id"] == "dst-vol-2"
+
+
+async def test_a_cancelled_handover_calls_own_failure_never_reaches_the_log_unredacted(tmp_path):
+    """SDD §13: the error of a call that a cancelled step waited for is the step's to drop, not
+    asyncio's to log raw as "Task exception was never retrieved" (audit EX-01)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    held, release = threading.Event(), threading.Event()
+    post = clouds["dst"].block_storage.post
+
+    def failing(url, json=None, **kw):
+        if url == "/manageable_volumes":
+            held.set()
+            release.wait(30)
+            raise HTTPError("HTTP 503 Service Unavailable")
+        return post(url, json=json, **kw)
+
+    clouds["dst"].block_storage.post = failing
+    loop = asyncio.get_running_loop()
+    reported = []
+    loop.set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+    try:
+        step = asyncio.create_task(
+            executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        )
+        assert await asyncio.to_thread(held.wait, 10)
+        step.cancel()
+        await asyncio.sleep(0.1)
+        release.set()
+        try:
+            await step
+        except asyncio.CancelledError:
+            pass
+        del step
+        for _ in range(3):  # the loop lets go of the finished step before it can be collected
+            await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+        loop.set_exception_handler(None)
+    assert reported == []
+
+
+def test_every_handover_call_in_a_thread_outlives_a_cancel():
+    """SDD §7.3: the handover hands no call to a thread that a cancel would leave running
+    unawaited - each goes through _in_thread, so a new one cannot bring back audit EX-01."""
+    tree = ast.parse(Path(handover_module.__file__).read_text())
+    helper = next(n for n in tree.body if getattr(n, "name", None) == "_in_thread")
+    inside = {id(n) for n in ast.walk(helper)}
+    direct = [
+        n.lineno
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute)
+        and n.attr in {"to_thread", "run_in_executor"}
+        and id(n) not in inside
+    ]
+    assert direct == []
+
+
 async def test_handover_rollback_reverses_order(tmp_path):
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
@@ -770,6 +951,84 @@ async def test_handover_rollback_starts_a_source_whose_stop_was_sent(tmp_path):
     calls.clear()
     result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert ops(calls) == [] and result.details["note"] == "nothing to roll back"
+
+
+async def test_a_handover_stop_never_confirmed_opens_the_clock_at_its_request(tmp_path):
+    """SDD §7.3 step 1: Nova accepted the stop, then the wait for SHUTOFF failed. The source may be
+    stopped, so the clock opens at the time the stop was journaled as sent - the automatic
+    rollback (§8) and the cancel refusal (§5.1) need it - and the step still fails (audit
+    EX-02). A stop call that itself fails sent nothing and opens no clock."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].crash_wait = "server"
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    journal = json.loads((executor.run_dir(ctx) / JOURNAL_FILE).read_text())
+    assert rec.downtime_at == [datetime.fromisoformat(journal["done"]["sent:stop_source"]["at"])]
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "sent", crash_on="stop_server")
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert rec.downtime_at == []
+
+
+async def test_a_handover_cancelled_while_its_stop_waits_opens_the_clock_at_its_request(tmp_path):
+    """SDD §7.3 step 1: a step cancelled while the stop it sent waits for SHUTOFF (the step timeout,
+    a rollback request) opens the clock at the stop's request before it ends - also when a second
+    cancel comes while it does (audit EX-02)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    held, release = threading.Event(), threading.Event()
+    wait = clouds["src"].compute.wait_for_server
+
+    def slow_wait(server, status="ACTIVE", **kw):
+        if status == "SHUTOFF":
+            held.set()
+            release.wait(30)
+        return wait(server, status=status, **kw)
+
+    clouds["src"].compute.wait_for_server = slow_wait
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    record = rec.mark_downtime_start
+
+    async def slow_mark(at=None):
+        await asyncio.sleep(0.3)  # the orchestrator waits for the migration's lock, then saves
+        await record(at)
+
+    ctx.mark_downtime_start = slow_mark
+    step = asyncio.create_task(executor.run(StepName.CUTOVER, ctx))
+    try:
+        assert await asyncio.to_thread(held.wait, 10)
+        step.cancel()
+    finally:
+        release.set()
+    await asyncio.sleep(0.1)
+    step.cancel()  # while the clock is being opened
+    with pytest.raises(asyncio.CancelledError):
+        await step
+    journal = json.loads((executor.run_dir(ctx) / JOURNAL_FILE).read_text())
+    assert rec.downtime_at == [datetime.fromisoformat(journal["done"]["sent:stop_source"]["at"])]
+
+
+async def test_a_handover_cancelled_while_it_opens_the_clock_still_opens_it(tmp_path):
+    """SDD §7.3 step 1: the stop was confirmed and the clock is being opened when the step is
+    cancelled - the clock still opens before the step ends (audit EX-02)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    entered = asyncio.Event()
+    record = rec.mark_downtime_start
+
+    async def slow_mark(at=None):
+        entered.set()
+        await asyncio.sleep(0.3)  # the orchestrator waits for the migration's lock, then saves
+        await record(at)
+
+    ctx.mark_downtime_start = slow_mark
+    step = asyncio.create_task(executor.run(StepName.CUTOVER, ctx))
+    await asyncio.wait_for(entered.wait(), 10)
+    step.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await step
+    assert rec.downtime_marks == 1
 
 
 async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):
@@ -2188,7 +2447,7 @@ async def test_the_handover_port_check_follows_the_policy_profile(tmp_path):
             "secure-RBAC defaults let only the admin or service role",
         ),
         ("legacy service", ["service"], "legacy", "Neutron lets only the admin or advsvc role"),
-        ("unknown service", ["service"], "unknown", "the destination's policy profile is unknown"),
+        ("unknown service", ["service"], "unknown", "the policy profile of RHOSO 18.0 is unknown"),
     ):
         executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
         clouds["dst"].network_list = [shared]
@@ -2258,13 +2517,14 @@ async def test_the_handover_judges_unreadable_token_roles_as_the_kit_does(tmp_pa
         if listed is not None:
             clouds["dst"].network_list = listed
         clouds["dst"].session = NS(auth=NS(get_access=unreadable))
-        destination = DST.model_copy(update={"capabilities": capabilities})
+        destination = DST.model_copy(update={"name": "DC3 Jakarta", "capabilities": capabilities})
         ctx = make_ctx(plan, mig, SRC, destination, settings)[0]
         return executor, calls, clouds, ctx
 
+    # it names the provider to check (SDD §1 naming, review RV23-07)
     unread = (
         "the credential's token roles could not be read, and a port there needs a role: check "
-        "the destination provider, then retry"
+        "DC3 Jakarta, then retry"
     )
     for name, listed, capabilities in (
         ("reset report", [shared], {}),

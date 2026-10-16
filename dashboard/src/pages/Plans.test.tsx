@@ -1,9 +1,19 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
+import type { MockServer } from '../api/mock';
+import { makeVm } from '../api/mockData';
+import type { VMRef } from '../api/types';
 import { phaseMeta } from '../lib/phase';
 import { createTestServer, recordScrolls, renderWithApp } from '../test/utils';
 import Plans from './Plans';
+
+
+/** A source VM whose one volume has volume type `type` on `pool`, listed first in the source's inventory. */
+function withVolumeType(server: MockServer, id: string, type: string, pool: string): void {
+  const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['rhosp17-dc1']!;
+  inventory.unshift(makeVm({ id, name: 'odd-01', project: 'shop', disks: [{ size_gb: 20, used_gb: 2, volume_type: type, pool }] }));
+}
 
 describe('Plans page', () => {
   it('lists plans with status in text', async () => {
@@ -821,4 +831,27 @@ describe('Plans page', () => {
       backend_map: { 'netapp-nfs': 'hostgroup@ontap-nfs', 'tripleo-ceph': 'hostgroup@ceph-ssd#volumes-ssd' },
     });
   });
+
+  it.each(['constructor', 'toString', '__proto__'])(
+    'maps a volume type named %s to its one compatible backend, as any other type (SDD §7.3.1, §16, review RV24-01)',
+    async (type) => {
+      const user = userEvent.setup({ delay: null });
+      const server = createTestServer();
+      withVolumeType(server, 'os-r24a', type, 'overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1');
+      renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+      await user.click(await screen.findByRole('button', { name: /new plan/i }));
+      const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+      await user.type(within(dialog).getByLabelText(/^name/i), 'Odd type');
+      await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+      await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+      await user.click(await within(dialog).findByRole('checkbox', { name: 'Select odd-01' }));
+      await user.click(within(dialog).getByText(/^advanced/i));
+      await user.click(within(dialog).getByRole('checkbox', { name: /hand volumes over without copying/i }));
+      // the type's name is read by own key, as the API's dict: its one compatible backend, not an inherited member
+      expect(within(dialog).getByLabelText(new RegExp(`^${type}`))).toHaveValue('hostgroup@ontap-nfs');
+      await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+      await waitFor(() => expect(server.plans.some((p) => p.name === 'Odd type')).toBe(true));
+      expect(Object.entries(server.plans.find((p) => p.name === 'Odd type')!.handover.backend_map)).toEqual([[type, 'hostgroup@ontap-nfs']]);
+    },
+  );
 });

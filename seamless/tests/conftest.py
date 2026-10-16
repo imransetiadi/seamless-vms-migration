@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pytest
+import sqlalchemy as sa
 
 from seamless_migrate.store import Store
 
@@ -46,3 +47,63 @@ def store(tmp_path) -> Iterator[Store]:
     store = _make_store("sqlite", tmp_path)
     yield store
     store.dispose()
+
+
+@pytest.fixture
+def refuse_write() -> Iterator[Callable[[Store, str, str], list[str]]]:
+    """``refuse(store, write, kind)``: the store refuses the next ``write`` - "INSERT INTO events"
+    or "UPDATE documents" - of a row of ``kind`` (an event's kind, a document's) when it RUNS:
+    inside its transaction, after whatever ran there before it, as a store fails (a lost
+    connection, a lock timeout), never when the statement is built. Refusing each half in turn
+    fails a write split over two transactions, whichever half it writes first (reviews RV23-08,
+    RV24-03). It returns what it refused."""
+    listening = []
+
+    def refuse(store: Store, write: str, kind: str) -> list[str]:
+        refused: list[str] = []
+
+        def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+            if refused or not statement.lstrip().upper().startswith(write.upper()):
+                return
+            # the event's kind is its `kind` value, the document's its key's (`kind_1`)
+            if kind in context.compiled_parameters[0].values():
+                refused.append(f"{write} {kind}")
+                raise RuntimeError("the store was briefly unavailable")
+
+        sa.event.listen(store.engine, "before_cursor_execute", before_cursor_execute)
+        listening.append((store.engine, before_cursor_execute))
+        return refused
+
+    yield refuse
+    for engine, listener in listening:
+        sa.event.remove(engine, "before_cursor_execute", listener)
+
+
+@pytest.fixture
+def land_first() -> Iterator[Callable[[Store, str, str, Callable[[], object]], list[object]]]:
+    """``land(store, write, kind, other)``: just before the next ``write`` ("UPDATE documents",
+    "INSERT INTO events") of a row of ``kind`` runs, another writer's ``other()`` commits on a
+    connection of its own - a concurrent change landing between a caller's read and its write, as
+    the CLI beside the server or a second replica makes one (review RV25-04). It returns what
+    ``other`` returned."""
+    listening = []
+
+    def land(store: Store, write: str, kind: str, other: Callable[[], object]) -> list[object]:
+        started: list[str] = []
+        landed: list[object] = []
+
+        def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+            if started or not statement.lstrip().upper().startswith(write.upper()):
+                return
+            if kind in context.compiled_parameters[0].values():
+                # once: the other writer's own statements run through this listener too
+                started.append(statement)
+                landed.append(other())
+
+        sa.event.listen(store.engine, "before_cursor_execute", before_cursor_execute)
+        listening.append((store.engine, before_cursor_execute))
+        return landed
+
+    yield land
+    for engine, listener in listening:
+        sa.event.remove(engine, "before_cursor_execute", listener)

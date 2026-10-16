@@ -36,7 +36,8 @@ function readName(line: string, start: number): [string, number] | null {
  * cannot read unambiguously, so every mapping the API accepts round-trips through the form.
  */
 export function parseMappings(text: string): Record<string, string> | null {
-  const out: Record<string, string> = {};
+  // own keys only: a source named "__proto__" is a mapping like any other, never Object.prototype's setter (review RV23-01)
+  const out = Object.create(null) as Record<string, string>;
   for (const raw of text.split('\n')) {
     const line = raw.trim();
     if (!line) continue;

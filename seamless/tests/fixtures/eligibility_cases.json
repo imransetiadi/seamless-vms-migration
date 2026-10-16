@@ -1,5 +1,5 @@
 {
-  "_comment": "The API's eligibility reasons per strategy (planning/selector.py) and its VOL_ENCRYPTED and HANDOVER_BACKEND_UNMAPPED messages (planning/preflight.py) for each case: test_selector.py and test_preflight.py run them against the API, mockData.test.ts against the dashboard's mock, which words them as the API does (SDD §9.2, §9.3, §16, review RV20-08). source/destination give a provider's capabilities and whether it has a conversion host, as provider_caps reads them.",
+  "_comment": "The API's eligibility reasons per strategy (planning/selector.py) and its finding messages (planning/preflight.py) for each finding case - `others` are the plan's other selected VMs, `source_kind` the source provider's kind (openstack when not given): test_selector.py and test_preflight.py run them against the API, mockData.test.ts against the dashboard's mock, which words them as the API does (SDD §9.2, §9.3, §16, review RV20-08). source/destination give a provider's capabilities and whether it has a conversion host, as provider_caps reads them.",
   "cases": [
     {
       "why": "an OpenStack VM every strategy takes",
@@ -918,6 +918,1441 @@
       "expected": {
         "VOL_ENCRYPTED": "Encrypted disk(s): enc-01-data1.",
         "HANDOVER_BACKEND_UNMAPPED": "Volume type(s) without a handover backend: <default>, ceph-hdd."
+      }
+    },
+    {
+      "why": "a VM other selected VMs share its name with: the name quoted, the others by project and id - '-' for none - sorted",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "others": [
+        {
+          "source_id": "vm-3",
+          "name": "web-01",
+          "project": "hr",
+          "flavor": "m1.small",
+          "vcpus": 2,
+          "ram_mb": 4096,
+          "disks": [
+            {
+              "id": "vol-1",
+              "name": null,
+              "size_gb": 20,
+              "used_gb": 10.0,
+              "bootable": true,
+              "volume_type": "ceph-ssd",
+              "device": "/dev/vda",
+              "kind": "volume",
+              "multiattach": false,
+              "encrypted": false,
+              "independent": false,
+              "pool": null
+            }
+          ],
+          "nics": [
+            {
+              "network": "app-net",
+              "mac": "fa:16:3e:00:00:01",
+              "fixed_ips": [
+                "10.0.0.5"
+              ],
+              "vnic_type": "normal",
+              "mtu": 1500,
+              "network_key": null
+            }
+          ],
+          "power_state": "running",
+          "os_type": "rhel9",
+          "host": null,
+          "tags": {},
+          "flavor_extra_specs": {},
+          "cbt_enabled": null,
+          "snapshot_count": 0,
+          "tools_ok": null,
+          "change_rate_bps": null,
+          "key_name": null,
+          "disk_bytes": 21474836480,
+          "used_bytes": 10737418240,
+          "guest_os": {
+            "family": "linux",
+            "distro": "rhel",
+            "version": "9",
+            "label": "RHEL 9",
+            "lifecycle": "current",
+            "v2v": "supported"
+          }
+        },
+        {
+          "source_id": "vm-2",
+          "name": "web-01",
+          "project": null,
+          "flavor": "m1.small",
+          "vcpus": 2,
+          "ram_mb": 4096,
+          "disks": [
+            {
+              "id": "vol-1",
+              "name": null,
+              "size_gb": 20,
+              "used_gb": 10.0,
+              "bootable": true,
+              "volume_type": "ceph-ssd",
+              "device": "/dev/vda",
+              "kind": "volume",
+              "multiattach": false,
+              "encrypted": false,
+              "independent": false,
+              "pool": null
+            }
+          ],
+          "nics": [
+            {
+              "network": "app-net",
+              "mac": "fa:16:3e:00:00:01",
+              "fixed_ips": [
+                "10.0.0.5"
+              ],
+              "vnic_type": "normal",
+              "mtu": 1500,
+              "network_key": null
+            }
+          ],
+          "power_state": "running",
+          "os_type": "rhel9",
+          "host": null,
+          "tags": {},
+          "flavor_extra_specs": {},
+          "cbt_enabled": null,
+          "snapshot_count": 0,
+          "tools_ok": null,
+          "change_rate_bps": null,
+          "key_name": null,
+          "disk_bytes": 21474836480,
+          "used_bytes": 10737418240,
+          "guest_os": {
+            "family": "linux",
+            "distro": "rhel",
+            "version": "9",
+            "label": "RHEL 9",
+            "lifecycle": "current",
+            "v2v": "supported"
+          }
+        }
+      ],
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "SRC_VM_DUPLICATE_NAME": "Another selected VM is also named 'web-01' (-/vm-2, hr/vm-3); os-migrate selects workloads by name."
+      }
+    },
+    {
+      "why": "a VM in error state",
+      "vm": {
+        "source_id": "vm-e",
+        "name": "err-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "error",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "SRC_VM_ERROR_STATE": "Source VM err-01 is in error state."
+      }
+    },
+    {
+      "why": "a VM with a Nova task in flight",
+      "vm": {
+        "source_id": "vm-t",
+        "name": "busy-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "transitioning",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "SRC_VM_TRANSITIONAL_STATE": "Source VM busy-01 has a Nova task in flight (resize, migration, rescue, rebuild or reboot); a stop or snapshot would fail."
+      }
+    },
+    {
+      "why": "multi-attach disks, and a root the first bootable disk is - a data disk listed before it",
+      "vm": {
+        "source_id": "vm-m",
+        "name": "multi-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-d",
+            "name": "multi-01-data",
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": false,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": true,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          },
+          {
+            "id": "vol-r",
+            "name": "multi-01-root",
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "image_root",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          },
+          {
+            "id": "vol-s",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": false,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": true,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 64424509440,
+        "used_bytes": 32212254720,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "SRC_VM_MULTIATTACH": "Multi-attach disk(s): multi-01-data, vol-s.",
+        "SRC_VM_EPHEMERAL_ROOT": "The root disk is image root."
+      }
+    },
+    {
+      "why": "SR-IOV and macvtap ports, one finding naming their networks",
+      "vm": {
+        "source_id": "vm-s",
+        "name": "sriov-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "net-b",
+            "mac": "fa:16:3e:00:00:0b",
+            "fixed_ips": [],
+            "vnic_type": "macvtap",
+            "mtu": null,
+            "network_key": null
+          },
+          {
+            "network": "net-a",
+            "mac": "fa:16:3e:00:00:0a",
+            "fixed_ips": [],
+            "vnic_type": "direct",
+            "mtu": null,
+            "network_key": null
+          },
+          {
+            "network": "net-c",
+            "mac": "fa:16:3e:00:00:0c",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "NET_SRIOV_PORT": "SR-IOV/macvtap port(s) on: net-a, net-b."
+      }
+    },
+    {
+      "why": "a flavor asking PCI passthrough and a vGPU",
+      "vm": {
+        "source_id": "vm-p",
+        "name": "gpu-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {
+          "pci_passthrough:alias": "a1:2",
+          "resources:VGPU": "1"
+        },
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "VM_PCI_PASSTHROUGH": "Flavor requests PCI passthrough (a1:2).",
+        "VM_VGPU": "Flavor requests a vGPU (resources:VGPU)."
+      }
+    },
+    {
+      "why": "a VMware VM without CBT or tools, with snapshots and independent disks",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-w",
+        "name": "vmw-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "disk-1",
+            "name": "vmw-01-root",
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          },
+          {
+            "id": "disk-2",
+            "name": "vmw-01-scratch",
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": false,
+            "volume_type": null,
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": true,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": false,
+        "snapshot_count": 2,
+        "tools_ok": false,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 42949672960,
+        "used_bytes": 21474836480,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "VMW_CBT_DISABLED": "Changed Block Tracking is disabled.",
+        "VMW_INDEPENDENT_DISK": "Independent disk(s): vmw-01-scratch.",
+        "VMW_SNAPSHOTS_PRESENT": "The VM has 2 snapshot(s).",
+        "VMW_TOOLS_MISSING": "VMware Tools are not running."
+      }
+    },
+    {
+      "why": "the VMware checks read the VM's own fields, whatever the source's kind",
+      "vm": {
+        "source_id": "vm-o",
+        "name": "osp-snap-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 1,
+        "tools_ok": false,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "VMW_SNAPSHOTS_PRESENT": "The VM has 1 snapshot(s).",
+        "VMW_TOOLS_MISSING": "VMware Tools are not running."
+      }
+    },
+    {
+      "why": "an unidentified guest, its os_type shown",
+      "vm": {
+        "source_id": "vm-g1",
+        "name": "odd-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "Plan 9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "unknown",
+          "distro": null,
+          "version": null,
+          "label": "Plan 9",
+          "lifecycle": "unknown",
+          "v2v": "unknown"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "GUEST_OS_UNKNOWN": "The guest OS is not identified (Plan 9)."
+      }
+    },
+    {
+      "why": "an unidentified guest without an os_type",
+      "vm": {
+        "source_id": "vm-g2",
+        "name": "odd-02",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": null,
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "unknown",
+          "distro": null,
+          "version": null,
+          "label": "Unknown OS",
+          "lifecycle": "unknown",
+          "v2v": "unknown"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "GUEST_OS_UNKNOWN": "The guest OS is not identified."
+      }
+    },
+    {
+      "why": "a legacy VMware guest virt-v2v cannot prepare",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g3",
+        "name": "win-08",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "windows2008",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "windows",
+          "distro": "windows-server",
+          "version": "2008",
+          "label": "Windows Server 2008",
+          "lifecycle": "legacy",
+          "v2v": "unsupported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "GUEST_OS_LEGACY": "Guest OS Windows Server 2008 is out of standard vendor support.",
+        "GUEST_CONVERSION_UNSUPPORTED": "virt-v2v on the RHEL 9 conversion host cannot prepare Windows Server 2008."
+      }
+    },
+    {
+      "why": "a VMware guest Red Hat does not support converting",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g4",
+        "name": "rocky-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rocky 9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rocky",
+          "version": "9",
+          "label": "Rocky Linux 9",
+          "lifecycle": "current",
+          "v2v": "unverified"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "GUEST_CONVERSION_UNVERIFIED": "Converting Rocky Linux 9 with virt-v2v is not supported by Red Hat."
+      }
+    },
+    {
+      "why": "a VMware guest whose conversion is a Technology Preview",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g5",
+        "name": "ubu-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "ubuntu 24.04",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "ubuntu",
+          "version": "24.04",
+          "label": "Ubuntu 24.04",
+          "lifecycle": "current",
+          "v2v": "tech_preview"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "GUEST_CONVERSION_UNVERIFIED": "Converting Ubuntu 24.04 with virt-v2v is a Technology Preview."
+      }
+    },
+    {
+      "why": "a VMDK disk makes the conversion findings apply, whatever the source's kind",
+      "vm": {
+        "source_id": "vm-g6",
+        "name": "rocky-02",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rocky 9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rocky",
+          "version": "9",
+          "label": "Rocky Linux 9",
+          "lifecycle": "current",
+          "v2v": "unverified"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "GUEST_CONVERSION_UNVERIFIED": "Converting Rocky Linux 9 with virt-v2v is not supported by Red Hat."
+      }
+    },
+    {
+      "why": "NICs without exactly one fixed IP, each with its addresses or none",
+      "vm": {
+        "source_id": "vm-n",
+        "name": "ips-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:01:01",
+            "fixed_ips": [
+              "10.0.0.5",
+              "10.0.0.6"
+            ],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          },
+          {
+            "network": "db-net",
+            "mac": "fa:16:3e:00:01:02",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          },
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:01:03",
+            "fixed_ips": [
+              "10.0.0.7"
+            ],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "NET_PORT_IPS": "NIC(s) without exactly one fixed IP: app-net (10.0.0.5, 10.0.0.6), db-net (no fixed IP). Cold and warm migration cannot recreate them; storage handover keeps one address per port."
+      }
+    },
+    {
+      "why": "a database VM without a probe, the suggested probes named",
+      "vm": {
+        "source_id": "vm-db",
+        "name": "pg-db-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {
+          "tier": "database",
+          "app": "postgres"
+        },
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "APP_PROBE_MISSING": "pg-db-01 is a database VM without an application probe: verification would check only that it booted. Suggested: TCP 5432."
+      }
+    },
+    {
+      "why": "a database VM without a probe and nothing to suggest",
+      "vm": {
+        "source_id": "vm-db2",
+        "name": "db-02",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {
+          "tier": "database"
+        },
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "APP_PROBE_MISSING": "db-02 is a database VM without an application probe: verification would check only that it booted."
+      }
+    },
+    {
+      "why": "an empty tier tag falls back to seamless/tier, an explicit tier before a legacy guest",
+      "vm": {
+        "source_id": "vm-t",
+        "name": "report-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel6",
+        "host": null,
+        "tags": {
+          "tier": "",
+          "seamless/tier": "stateful_database"
+        },
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "6",
+          "label": "RHEL 6",
+          "lifecycle": "legacy",
+          "v2v": "unverified"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "APP_PROBE_MISSING": "report-01 is a database VM without an application probe: verification would check only that it booted."
       }
     }
   ]

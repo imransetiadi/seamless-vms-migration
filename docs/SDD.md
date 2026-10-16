@@ -1148,7 +1148,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   time the playbook output showed the source-stop task starting, once the task's result line confirms
   it ran (a `skipping:` result, e.g. `data_copy: false`, starts no clock) (`TASK [... : Stop the source server]` for the
   warm role, `TASK [... : Perform workload stop if os_migrate_workload_stop_before_migration is true]`
-  for the cold role, the kit's power-off task for VMware); at the latest when the cutover step starts.
+  for the cold role, the kit's power-off task for VMware); at the latest when the cutover step starts. A step
+  cancelled while that task runs, before its result line (the step timeout, a rollback request, a shutdown),
+  opens the clock at the task's start too: the source may be stopped, so the automatic rollback (§8) runs and a
+  cancel is refused (§5.1) (audit EX-02).
 * Progress: the executor reads the os-migrate progress file `{run dir}/osm/workload_logs/{stem}.state`, which
   `import_workload_prelim` names, with its `.log`, after the VM: the stem is the VM name with `%` written `%25`,
   `/` written `%2F` and NUL written `%00` — both sides apply the same rule, so a tenant's VM name (`../x`, `/etc/x`)
@@ -1368,7 +1371,10 @@ volumes with their server, so the order is:
    count (§9.1) and an Ansible-driven cutover's clock does (§7.2): `TODO(LAB): confirm` whether the handover's clock
    starts at the stop request instead. The stop is journaled as sent once Nova
    accepted it (`sent:stop_source`), before the wait for `SHUTOFF`, so a step that fails while waiting leaves a
-   journal the rollback starts the source from; a stop call that itself fails leaves the journal empty.
+   journal the rollback starts the source from; a stop call that itself fails leaves the journal empty. A step
+   that ends without `SHUTOFF` once the stop was journaled as sent — a failure, or a cancel (the step timeout, a
+   rollback request, a shutdown) — opens the clock at that mark's time: the source may be stopped, so the
+   automatic rollback (§8) runs and a cancel is refused (§5.1) (audit EX-02).
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
    `plan.port_creation_mode` `"neutron"` also its security groups by name), and the volume attachments in device
@@ -1429,7 +1435,12 @@ itself (§6.6): sent, that address is refused, or allocated twice. Then recreate
 source server from the journaled definition with the volumes in device order and their journaled
 `delete_on_termination`; start it. Every step is
 a metadata operation — data never moves — and each sub-step is journaled
-(`handover-journal.json`, 0600) so a crash resumes at the first incomplete sub-step. An unmanage and a
+(`handover-journal.json`, 0600) so a crash resumes at the first incomplete sub-step. Each call is a blocking
+openstacksdk call in a worker thread, which no cancel stops: a step cancelled by the step timeout (§15.1), a
+rollback requested during the cutover (§5.1) or a shutdown (§8) ends only once its call in flight has returned and
+journaled what it did — within that call's own bound, the provider API timeout or the ceiling of the wait it is
+in — so the rollback that follows starts from the whole journal and no two runs ever write it (audit EX-01). A
+shutdown whose grace period ends first leaves the journal a crash leaves. An unmanage and a
 manage are journaled as *sent* as soon as Cinder accepts them — a manage with the new volume id — and
 again when their wait ends: a crash during the wait resumes by waiting for that call instead of
 repeating it (a volume Cinder no longer knows has been unmanaged; a second manage would find the
@@ -2720,7 +2731,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` | `false` | whether the playbooks verify the SSH host keys of the conversion hosts (`ANSIBLE_HOST_KEY_CHECKING` of every run; the control plane's own environment no longer decides it). Off until SEC-02 lands (Security.md §6.3: a per-run `known_hosts` with pinned keys — still open): a host made for the migration has no key to compare with, so `true` works only with hosts whose keys the control plane's `known_hosts` already holds. The executor logs a warning once per run while it is off |
 | `SEAMLESS_MAX_CONCURRENT_MIGRATIONS`, `SEAMLESS_MAX_CONCURRENT_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
 | `SEAMLESS_SOURCE_WATCH_S` | `300` | how often a completed migration's source VM is checked for running again (§8.1; ÷ `demo_speed` in demo mode) |
-| `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§8) |
+| `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook; a storage handover's call in flight returns first, §7.3), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§8) |
 | `SEAMLESS_JEV_MODE`, `SEAMLESS_JEV_COMMAND`, `SEAMLESS_JEV_URL`, `SEAMLESS_JEV_TOKEN`, `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `off`, `npx -y @jkudish/jev-mcp@0.14.1`, unset, unset, `20`, `0.6` | Jev |
 | `SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` | `remote`, unset, `false` | Where the model runs and whether the console excerpt may go there (§13.4, ADV-06) |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`, `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | unset, unset, `seamless-migrate`, `false` | agentmemory |

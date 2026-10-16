@@ -713,6 +713,34 @@ describe('MigrationDetail', () => {
     await waitFor(() => expect(m.vm.source_id in plan.nic_overrides).toBe(false));
   });
 
+  it('shows where a NIC on a network named __proto__ goes, and never crashes (SDD §9.2, §16, review RV23-01)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    m.vm.nics[0]!.network = '__proto__';
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' }, { timeout: 5000 });
+    const table = within(panel).getByRole('table', { name: `NICs of ${m.vm.name}` });
+    const row = within(table).getByRole('row', { name: new RegExp(m.vm.nics[0]!.mac!) });
+    // "Source" and "On the destination" both read the network's name
+    await waitFor(() => expect(row.textContent!.split('__proto__').length - 1).toBe(2));
+    // and the editor offers the plan's mapping of it by that name
+    await user.click(within(panel).getByRole('button', { name: 'Edit network' }));
+    const dialog = await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` });
+    expect(within(dialog).getByRole('option', { name: 'As the plan maps it (__proto__)' })).toBeInTheDocument();
+  });
+
+  it('names an unmapped VMware NIC on a network named constructor by that name (SDD §7.2, review RV23-01)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.strategy?.startsWith('vmware'))!;
+    m.vm.nics[0]!.network = 'constructor';
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await waitFor(() => expect(panel).toHaveTextContent("The migration kit keeps the guest's network settings"));
+    const [row] = within(panel).getAllByRole('row').slice(1);
+    expect(within(row!).getAllByRole('cell').at(-1)).toHaveTextContent('constructor');
+  });
+
   it('says a VMware VM keeps its network settings, with no editor, and names where each NIC goes (SDD §16, §7.2)', async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.strategy?.startsWith('vmware'))!;
@@ -880,6 +908,24 @@ describe('MigrationDetail', () => {
     await user.selectOptions(select, 'provider-ext');
     expect(select).toHaveAccessibleDescription(
       "The credential of RHOSO 18.0 — Production may not put a port on provider-ext (project admin): Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither. Validation refuses it.",
+    );
+  });
+
+  it('names the provider whose policy profile is unknown in the picker\'s refusal (SDD §1 naming, review RV23-07)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const destination = server.providers.find((p) => p.id === 'rhoso-prod')!;
+    destination.capabilities = { ...destination.capabilities, policy_profile: 'unknown', roles: ['service', 'member'] };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
+    const select = within(await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` })).getAllByRole('combobox')[0]!;
+    await user.selectOptions(select, await within(select).findByRole('option', { name: 'provider-ext (not allowed)' }));
+    expect(select).toHaveAccessibleDescription(
+      'The credential of RHOSO 18.0 — Production may not put a port on provider-ext (project admin): the policy profile of RHOSO 18.0 — Production is unknown, ' +
+        "so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it " +
+        '(check RHOSO 18.0 — Production so its series is detected, or declare its policy profile or series). Validation refuses it.',
     );
   });
 

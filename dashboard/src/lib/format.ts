@@ -181,6 +181,16 @@ function pyEscape(code: number): string {
   return `\\U${hex.padStart(8, '0')}`;
 }
 
+/** Python's whitespace, str.isspace's 29 code points (the same in Python 3.11 and 3.13): what str.strip removes. JavaScript's
+ * trim differs - it keeps U+001C..U+001F and U+0085 and removes U+FEFF. */
+const PY_SPACE = '\\t\\n\\v\\f\\r\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000';
+const PY_STRIP = new RegExp(`^[${PY_SPACE}]+|[${PY_SPACE}]+$`, 'g');
+
+/** A text stripped as the API's Python strips it (str.strip): what the API judges blank is blank here too (review RV24-06). */
+export function pyStrip(text: string): string {
+  return text.replace(PY_STRIP, '');
+}
+
 /**
  * A name quoted as the API's messages quote it, Python's `repr` of a str: in single quotes, in double quotes when it
  * holds a single quote and no double one, with backslashes escaped and what Python does not print written as an escape.

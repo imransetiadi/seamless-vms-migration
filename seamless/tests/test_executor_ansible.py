@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import copy
 import importlib
 import json
@@ -540,7 +541,7 @@ async def test_the_cutover_port_refusal_follows_the_policy_profile(env):
             "secure-RBAC defaults let only the admin or service role",
         ),
         (["service", "member"], "legacy", "Neutron lets only the admin or advsvc role"),
-        (["service", "member"], "unknown", "the destination's policy profile is unknown"),
+        (["service", "member"], "unknown", "the policy profile of RHOSO 18.0 is unknown"),
     ):
         ran = len(read_log(env.log))
         with pytest.raises(PermanentStepError, match=rule):
@@ -563,6 +564,7 @@ def _kit_cutover_to_another_projects_network(env, capabilities):
     mig = make_migration(id="mig-00000000ab", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_warm)
     secure = DST.model_copy(
         update={
+            "name": "DC3 Jakarta",
             "kind": ProviderKind.openstack,
             "policy_profile": "secure_rbac",
             "capabilities": capabilities,
@@ -609,6 +611,8 @@ async def test_the_kits_map_refuses_a_nic_that_needs_a_role_when_no_roles_can_be
     with pytest.raises(PermanentStepError, match="roles could not be read") as refused:
         await env.executor.run(StepName.CUTOVER, ctx)
     assert "shared-net" in str(refused.value) and read_log(env.log) == []
+    # it names the provider to check (SDD §1 naming, review RV23-07)
+    assert "a port there needs a role: check DC3 Jakarta, then retry" in str(refused.value)
     # a report that still names the roles is judged by them, as before
     env.registry.networks.pop()
     ctx = _kit_cutover_to_another_projects_network(env, {"roles": ["service"]})
@@ -1856,6 +1860,39 @@ async def test_downtime_clock_starts_at_the_stop_task(env, monkeypatch):
     assert marks[0] <= printed_at + 0.2
     # pre-copy prints no stop task: the only candidate was the cutover playbook
     assert [c["playbook"] for c in read_log(env.log)][-1] == "import_workloads_cutover.yml"
+
+
+async def test_a_cutover_cancelled_while_its_stop_task_runs_opens_the_clock_at_its_start(
+    env, monkeypatch
+):
+    """SDD §7.2: a cutover cancelled while its stop task runs, before the task's result line (the
+    step timeout, a rollback request), opens the downtime clock at the task's start - the source
+    may be stopped, so the automatic rollback runs and a cancel is refused - and still ends
+    cancelled (audit EX-02)."""
+    monkeypatch.setenv("ANSIBLE_FAKE_STOP_HANG", "30")  # Nova took the stop; the guest shuts down
+    ctx, rec = ctx_for(env, strategy=Strategy.cold)
+    record = rec.mark_downtime_start
+
+    async def slow_mark(at=None):
+        await asyncio.sleep(0.3)  # the orchestrator waits for the migration's lock, then saves
+        await record(at)
+
+    ctx.mark_downtime_start = slow_mark
+    began = utcnow()
+    step = asyncio.create_task(env.executor.run(StepName.CUTOVER, ctx))
+    for _ in range(500):
+        if any(STOP_TASK.match(line) for line in rec.logs):
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError(rec.logs)
+    seen = utcnow()
+    step.cancel()
+    await asyncio.sleep(0.1)
+    step.cancel()  # while the clock is being opened
+    with pytest.raises(asyncio.CancelledError):
+        await step
+    assert len(rec.downtime_at) == 1 and began <= rec.downtime_at[0] <= seen
 
 
 async def test_vmware_conversion_host_key_secret(env, monkeypatch):

@@ -719,11 +719,12 @@ def run_preflight(
 
     twins = [v for v in selected if v.source_id != vm.source_id and v.name == vm.name]
     if twins:
-        where = _names(f"{t.project or '-'}/{t.source_id}" for t in twins)
+        # never `where`: every later message names the destination provider by it (§1 naming)
+        others = _names(f"{t.project or '-'}/{t.source_id}" for t in twins)
         out.append(
             finding(
                 "SRC_VM_DUPLICATE_NAME",
-                f"Another selected VM is also named {vm.name!r} ({where}); os-migrate selects "
+                f"Another selected VM is also named {vm.name!r} ({others}); os-migrate selects "
                 "workloads by name.",
             )
         )
@@ -826,7 +827,7 @@ def run_preflight(
     denied = []
     for nic in vm.nics:
         network = resolved.get(id(nic))
-        why = None if network is None else port_refusal(network, roles, profile)
+        why = None if network is None else port_refusal(network, roles, profile, where=where)
         if network is not None and why:
             denied.append(
                 f"{(nic.mac or '?').lower()} on {network['name']!r} "
