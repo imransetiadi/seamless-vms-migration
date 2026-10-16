@@ -127,7 +127,7 @@ export default function Plans() {
     <>
       <PageHeader
         title="Plans"
-        description="Each plan moves a set of VMs from one source to RHOSO with its own mappings, waves, downtime SLO and approval rules."
+        description="Each plan moves a set of VMs from one source to one destination with its own mappings, waves, downtime SLO and approval rules."
         actions={
           <Button
             size="lg"
@@ -174,7 +174,7 @@ export default function Plans() {
         <EmptyState
           icon={ClipboardList}
           title="No plans yet"
-          description="Create a plan: pick a source, the VMs and the RHOSO destination, then validate it."
+          description="Create a plan: pick a source, the VMs and the destination, then validate it."
           action={
             canCreate ? (
               <Button size="lg" variant="primary" icon={Plus} onClick={() => setDialog({ open: true })}>

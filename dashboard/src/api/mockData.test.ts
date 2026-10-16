@@ -149,7 +149,7 @@ describe('mock preflight checks NIC overrides like the API (SDD §9.3)', () => {
     const quoted = "bob's-web";
     const missing = preflight(vm, 'openstack', plan({ network: quoted }), nets, [vm.name], { subnets, selected: [vm] });
     expect(missing.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toBe(
-      'NIC override(s) of nic-01 cannot be applied: fa:16:3e:00:00:01: RHOSO has no network "bob\'s-web".',
+      'NIC override(s) of nic-01 cannot be applied: fa:16:3e:00:00:01: the destination has no network "bob\'s-web".',
     );
     const outside = preflight(vm, 'openstack', plan({ network: quoted }), { ...nets, [quoted]: 1442 }, [vm.name], {
       subnets: [...subnets, { name: 'q', network: quoted, cidr: '10.40.0.0/16' }],
@@ -182,11 +182,11 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const twoOwn = [net('a', 'tenant-web', true, 'shop'), net('b', 'tenant-web', true, 'shop')];
     const found = preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: twoOwn });
     expect(found.find((f) => f.code === 'MAP_NETWORK_AMBIGUOUS')?.message).toBe(
-      "The cutover cannot tell these RHOSO networks apart: fa:16:3e:00:00:01 (tenant-app): 2 networks of the credential's project are named 'tenant-web'.",
+      "The cutover cannot tell these networks of the destination apart: fa:16:3e:00:00:01 (tenant-app): 2 networks of the credential's project are named 'tenant-web'.",
     );
     const twoOther = [net('a', 'tenant-web', false, 'p1'), net('b', 'tenant-web', false, 'p2')];
     expect(preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: twoOther }).find((f) => f.code === 'MAP_NETWORK_AMBIGUOUS')?.message).toBe(
-      "The cutover cannot tell these RHOSO networks apart: fa:16:3e:00:00:01 (tenant-app): 2 networks of other projects are named 'tenant-web' (p1, p2), none of the credential's project.",
+      "The cutover cannot tell these networks of the destination apart: fa:16:3e:00:00:01 (tenant-app): 2 networks of other projects are named 'tenant-web' (p1, p2), none of the credential's project.",
     );
     // the credential's own among others, or another project's alone, resolves; a VMware NIC is judged too (SDD §7.2)
     for (const details of [[net('x', 'tenant-web', false, 'p1'), net('a', 'tenant-web', true, 'shop')], [net('x', 'tenant-web', false, 'p1')]])
@@ -202,10 +202,10 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const refused = found.find((f) => f.code === 'NET_ADDRESS_REFUSED');
     expect(refused?.severity).toBe('blocker');
     expect(refused?.message).toBe(
-      "Neutron would refuse these addresses on their RHOSO network: fa:16:3e:00:00:01 on 'tenant-app': 10.20.1.5 is no host address of any subnet of the port's network.",
+      "Neutron would refuse these addresses on their network in the destination: fa:16:3e:00:00:01 on 'tenant-app': 10.20.1.5 is no host address of any subnet of the port's network.",
     );
     expect(refused?.remediation).toBe(
-      'Give the NIC an address its RHOSO network takes: map its network to one whose subnets hold it, or set the address in a NIC override; for a SLAAC address keep the MAC (port_creation_mode "neutron").',
+      'Give the NIC an address its destination network takes: map its network to one whose subnets hold it, or set the address in a NIC override; for a SLAAC address keep the MAC (port_creation_mode "neutron").',
     );
     const fits = [{ ...subnets[0]!, cidr: '10.20.0.0/16' }];
     expect(codes(preflight(vm, 'openstack', plan, { 'tenant-app': 1442 }, [vm.name], { selected: [vm], networkDetails: details, subnets: fits }))).not.toContain('NET_ADDRESS_REFUSED');
@@ -231,7 +231,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const denied = run(shared, member).find((f) => f.code === 'NET_PORT_NOT_PERMITTED');
     expect(denied?.severity).toBe('blocker');
     expect(denied?.message).toBe(
-      "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on 'tenant-web' (project project-admin): Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither.",
+      "The credential of the destination may not put these NICs on their network: fa:16:3e:00:00:01 on 'tenant-web' (project project-admin): Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither.",
     );
     expect(denied?.remediation).toBe(
       "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared network takes it once the destination credential has the advsvc role (Neutron's legacy rules). An external network that is not shared needs the admin role: Nova attaches it for no other.",
@@ -240,7 +240,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     // another tenant's private network, whatever the roles
     for (const roles of [['admin'], undefined])
       expect(run(tenant, roles).find((f) => f.code === 'NET_PORT_NOT_PERMITTED')?.message).toBe(
-        "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on 'tenant-web' (project project-b): it is neither shared with the credential's project nor external.",
+        "The credential of the destination may not put these NICs on their network: fa:16:3e:00:00:01 on 'tenant-web' (project project-b): it is neither shared with the credential's project nor external.",
       );
     for (const roles of [['admin', 'member', 'reader'], ['advsvc'], undefined]) expect(codes(run(shared, roles))).not.toContain('NET_PORT_NOT_PERMITTED');
     // a VMware NIC too: the migration kit creates every port with the NIC's MAC (SDD §7.2)
@@ -250,7 +250,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     expect(run(external, ['advsvc']).find((f) => f.code === 'NET_PORT_NOT_PERMITTED')?.message).toContain(nova);
     const ownExternal = { ...net('x', 'tenant-web', true, 'shop'), shared: false, external: true };
     expect(run(ownExternal, member).find((f) => f.code === 'NET_PORT_NOT_PERMITTED')?.message).toBe(
-      `The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on 'tenant-web' (project shop): ${nova}`,
+      `The credential of the destination may not put these NICs on their network: fa:16:3e:00:00:01 on 'tenant-web' (project shop): ${nova}`,
     );
     expect(codes(run(ownExternal, ['admin']))).not.toContain('NET_PORT_NOT_PERMITTED');
   });
@@ -281,10 +281,10 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const subnets = [{ name: 's', network: quoted, network_id: 'q', cidr: '10.30.0.0/16', ipv6_address_mode: null, ipv6_ra_mode: null }];
     const found = preflight(vm, 'openstack', plan, { [quoted]: 1442 }, [vm.name], { selected: [vm], networkDetails: [unowned], subnets, roles: ['member'] });
     expect(found.find((f) => f.code === 'NET_PORT_NOT_PERMITTED')?.message).toBe(
-      'The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "bob\'s-web" (project None): it is neither shared with the credential\'s project nor external.',
+      'The credential of the destination may not put these NICs on their network: fa:16:3e:00:00:01 on "bob\'s-web" (project None): it is neither shared with the credential\'s project nor external.',
     );
     expect(found.find((f) => f.code === 'NET_ADDRESS_REFUSED')?.message).toBe(
-      'Neutron would refuse these addresses on their RHOSO network: fa:16:3e:00:00:01 on "bob\'s-web": 10.20.1.5 is no host address of any subnet of the port\'s network.',
+      'Neutron would refuse these addresses on their network in the destination: fa:16:3e:00:00:01 on "bob\'s-web": 10.20.1.5 is no host address of any subnet of the port\'s network.',
     );
   });
 
@@ -299,7 +299,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     // one subnet holds them; an IPv6 address the kit never sends is not judged
     expect(codes(found('10.2.1.5', '10.2.1.6', 'fd00::5'))).not.toContain('NET_ADDRESS_REFUSED');
     expect(found('10.2.0.5', '10.2.1.5').find((f) => f.code === 'NET_ADDRESS_REFUSED')?.message).toBe(
-      "Neutron would refuse these addresses on their RHOSO network: 00:50:56:aa:bb:cc on 'dc2-prod': 10.2.0.5, 10.2.1.5 lie in different subnets of the port's network: the migration kit gives a NIC's IPv4 addresses one subnet.",
+      "Neutron would refuse these addresses on their network in the destination: 00:50:56:aa:bb:cc on 'dc2-prod': 10.2.0.5, 10.2.1.5 lie in different subnets of the port's network: the migration kit gives a NIC's IPv4 addresses one subnet.",
     );
     expect(found('10.2.0.255').find((f) => f.code === 'NET_ADDRESS_REFUSED')?.message).toContain("00:50:56:aa:bb:cc on 'dc2-prod': 10.2.0.255 is no host address of any subnet");
     expect(codes(found('fe80::1'))).not.toContain('NET_ADDRESS_REFUSED');
@@ -397,8 +397,26 @@ describe('mock preflight reports a network RHOSO lacks like the API (SDD §9.3 M
     mappings: { networks, flavors: {}, volume_types: {}, projects: {} },
   });
   const nets = { 'tenant-web': 1500 };
-  const networkFindings = (found: { code: string }[]) => found.filter((f) => f.code.startsWith('MAP_NETWORK_'));
-  const MISSING = 'Add a network mapping or create a same-named network in RHOSO.';
+  const networkFindings = <T extends { code: string }>(found: T[]) => found.filter((f) => f.code.startsWith('MAP_NETWORK_'));
+  const MISSING = 'Add a network mapping or create a same-named network on the destination.';
+
+  it('names the destination provider where a message means the destination cloud, as the API does (SDD §1 naming, plan T6)', () => {
+    const vm = makeVm({
+      id: 'os-t6',
+      name: 'app-01',
+      disks: [{ size_gb: 20 }],
+      nics: [
+        { network: 'lab-a', mac: 'fa:16:3e:00:00:09', fixed_ips: ['10.9.0.9'] },
+        { network: 'lab-b', mac: 'fa:16:3e:00:00:0a', fixed_ips: ['10.9.1.9'] },
+      ],
+    });
+    const found = preflight(vm, 'openstack', plan([], { 'lab-b': 'gone-net' }), nets, [vm.name], { destination: 'OpenStack 2026.2 Hibiscus (DC3)' });
+    expect(networkFindings(found).map((f) => f.message)).toEqual([
+      'No mapping or same-named network in OpenStack 2026.2 Hibiscus (DC3) for: lab-a.',
+      'Network mapping target(s) do not exist in OpenStack 2026.2 Hibiscus (DC3): lab-b -> gone-net.',
+    ]);
+    expect(JSON.stringify(found)).not.toContain('RHOSO');
+  });
 
   it('blocks an unmapped VMware port group, which nothing pre-stages (review RT-07)', () => {
     const vm = makeVm({ id: 'vm-x1', name: 'vmw-01', disks: [{ size_gb: 20 }], nics: [{ network: 'DC9-Unmapped', mac: '00:50:56:00:00:01', fixed_ips: ['10.9.0.5'] }] });
@@ -407,7 +425,7 @@ describe('mock preflight reports a network RHOSO lacks like the API (SDD §9.3 M
         {
           code: 'MAP_NETWORK_MISSING',
           severity: 'blocker',
-          message: 'No mapping or same-named RHOSO network for: DC9-Unmapped. VMware sources are not pre-staged: map every port group.',
+          message: 'No mapping or same-named network in the destination for: DC9-Unmapped. VMware sources are not pre-staged: map every port group.',
           remediation: MISSING,
           strategies: [],
         },
@@ -427,14 +445,14 @@ describe('mock preflight reports a network RHOSO lacks like the API (SDD §9.3 M
       ],
     });
     expect(networkFindings(preflight(vm, 'openstack', plan([]), nets, [vm.name]))).toEqual([
-      { code: 'MAP_NETWORK_MISSING', severity: 'blocker', message: 'No mapping or same-named RHOSO network for: lab-a, lab-b.', remediation: MISSING, strategies: [] },
+      { code: 'MAP_NETWORK_MISSING', severity: 'blocker', message: 'No mapping or same-named network in the destination for: lab-a, lab-b.', remediation: MISSING, strategies: [] },
     ]);
     expect(networkFindings(preflight(vm, 'openstack', plan(['networks']), nets, [vm.name]))).toEqual([
       {
         code: 'MAP_NETWORK_PRESTAGED',
         severity: 'info',
-        message: 'Pre-staging creates same-named RHOSO network(s): lab-a, lab-b.',
-        remediation: 'Nothing to do: pre-staging creates the network in RHOSO with the same name. Add a network mapping to use an existing RHOSO network instead.',
+        message: 'Pre-staging creates same-named network(s) in the destination: lab-a, lab-b.',
+        remediation: 'Nothing to do: pre-staging creates the network on the destination with the same name. Add a network mapping to use an existing destination network instead.',
         strategies: [],
       },
     ]);
@@ -453,7 +471,7 @@ describe('mock preflight reports a network RHOSO lacks like the API (SDD §9.3 M
         {
           code: 'MAP_NETWORK_MISSING',
           severity: 'blocker',
-          message: 'Network mapping target(s) do not exist in RHOSO: lab-a -> gone-net.',
+          message: 'Network mapping target(s) do not exist in the destination: lab-a -> gone-net.',
           remediation: 'Fix the mapping: the destination network must exist.',
           strategies: [],
         },

@@ -203,8 +203,11 @@ export interface NextStep {
   action: MigrationActionKey | null;
 }
 
-/** One sentence that tells the operator what happens next, and the action that moves it on. */
-export function nextStep(m: Migration, plan: Plan | null | undefined, now: number = Date.now()): NextStep {
+/**
+ * One sentence that tells the operator what happens next, and the action that moves it on; `destination` is the plan's
+ * destination provider by name, else "the destination" (SDD §1 naming, plan T6).
+ */
+export function nextStep(m: Migration, plan: Plan | null | undefined, now: number = Date.now(), destination = 'the destination'): NextStep {
   switch (m.phase) {
     case 'pending':
       return { text: 'Waiting for plan validation.', action: null };
@@ -293,13 +296,13 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
       if (m.source_running_at) {
         // the source watch saw it running (SDD §8.1): finalizing now would keep a diverged source
         return {
-          text: 'The source VM runs again, so its data diverges from RHOSO. Next: stop it in the source cloud, or roll it back; finalize once it is stopped.',
+          text: `The source VM runs again, so its data diverges from ${destination}. Next: stop it in the source cloud, or roll it back; finalize once it is stopped.`,
           action: null,
         };
       }
       // its time in the finalize queue, flagged past the plan's reminder (SDD §8.1, ADV-19)
       const since = completedSince(m);
-      const verified = `Verified on RHOSO${since ? ` ${formatRelative(since, now)}` : ''}.`;
+      const verified = `Verified on ${destination}${since ? ` ${formatRelative(since, now)}` : ''}.`;
       if (plan && isOverdue(m, plan.finalize_warning_h, now)) {
         return { text: `${verified} It has waited in Completed longer than the plan allows (${plan.finalize_warning_h} h): finalize it or roll it back.`, action: 'finalize' };
       }

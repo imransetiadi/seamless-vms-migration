@@ -23,6 +23,8 @@ function vms(n: number): string {
 
 export interface FinalizeQueueProps {
   plan: Plan;
+  /** The plan's destination provider by name, else "the destination" (SDD §1 naming, plan T6). */
+  destination?: string;
   migrations: readonly MigrationLike[];
   /** The plan's Finalize availability (approver, a VM awaiting finalize; SDD §8.1). */
   gate: Availability;
@@ -36,7 +38,7 @@ export interface FinalizeQueueProps {
  * each with its time in Completed, "Finalize overdue" past the plan's `finalize_warning_h` and
  * "Source VM running" while the source watch sees it running; Finalize wave per wave.
  */
-export function FinalizeQueue({ plan, migrations, gate, allInHeader, onFinalize }: FinalizeQueueProps) {
+export function FinalizeQueue({ plan, destination = 'the destination', migrations, gate, allInHeader, onFinalize }: FinalizeQueueProps) {
   const now = useNow(60_000);
   const groups = queueByWave(plan, migrations);
   if (groups.length === 0) return null;
@@ -47,7 +49,7 @@ export function FinalizeQueue({ plan, migrations, gate, allInHeader, onFinalize 
   return (
     <Panel
       title="Awaiting finalize"
-      description="Verified on RHOSO. Finalize cleans up each source VM (approver); until then a rollback can restart it."
+      description={`Verified on ${destination}. Finalize cleans up each source VM (approver); until then a rollback can restart it.`}
       actions={
         showAll ? (
           <Button size="sm" icon={BadgeCheck} disabledReason={gate.reason} onClick={() => onFinalize({ wave: null })}>
@@ -106,7 +108,7 @@ export function FinalizeQueue({ plan, migrations, gate, allInHeader, onFinalize 
                           tone="danger"
                           icon={Power}
                           label="Source VM running"
-                          detail={`Running again since ${formatDateTime(m.source_running_at)}: its data diverges from RHOSO`}
+                          detail={`Running again since ${formatDateTime(m.source_running_at)}: its data diverges from ${destination}`}
                         />
                       )}
                       {isOverdue(m, plan.finalize_warning_h, now) && (

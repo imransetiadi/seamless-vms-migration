@@ -1,5 +1,5 @@
 /** Which plans still need a provider, as the API decides it before a delete (SDD §12, §16). */
-import type { Plan } from '../api/types';
+import type { Plan, Provider } from '../api/types';
 import { planStatusMeta } from './status';
 
 /** Phases that release a VM (SDD §5.4): a plan needs its providers for no such migration any more. */
@@ -40,4 +40,12 @@ export function deleteRefusal(users: readonly ProviderUser[], shown = 3): string
     .join(', ');
   const more = users.length > shown ? ` and ${users.length - shown} more` : '';
   return `${users.length === 1 ? 'A plan still needs' : 'Plans still need'} it: ${names}${more}. A plan needs its providers until it completes and its VMs are finalized.`;
+}
+
+/**
+ * The name a text about the destination cloud gives it where a plan or a migration is shown: the plan's destination
+ * provider's, else "the destination" (SDD §1 naming, §16, plan T6).
+ */
+export function destinationName(providers: readonly Provider[] | undefined, plan: Pick<Plan, 'destination_provider_id'> | null | undefined): string {
+  return (plan && providers?.find((p) => p.id === plan.destination_provider_id)?.name) || 'the destination';
 }

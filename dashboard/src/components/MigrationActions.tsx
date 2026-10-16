@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import { useId, useLayoutEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useMe, useMigrationAction, type MigrationActionRequest } from '../api/hooks';
+import { useMe, useMigrationAction, useProviders, type MigrationActionRequest } from '../api/hooks';
 import { ACTION_TEXT_MAX, FORCE_REASON_MIN, type Migration, type Plan, type Role } from '../api/types';
 import { waitingDecision } from '../lib/advisor';
 import { buttonClassName } from '../lib/buttonStyles';
@@ -22,6 +22,7 @@ import { formatBytes, formatDateTime, formatDuration } from '../lib/format';
 import { hasDataPath } from '../lib/fsm';
 import { isWarmStrategy } from '../lib/phase';
 import { approveDialog, MIGRATION_ACTION_ORDER, migrationActions, nextStep, requestWaitsForApprover, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
+import { destinationName } from '../lib/providerUse';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { TextAreaField } from './Field';
@@ -100,7 +101,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const early = isWarmStrategy(m.strategy) && m.phase !== 'awaiting_cutover';
   // maker-checker with no other approval: the request waits for another approver, it starts nothing (SDD §16)
   const waitsForApprover = requestWaitsForApprover(m, plan, me);
-  const step = nextStep(m, plan);
+  const providers = useProviders();
+  const step = nextStep(m, plan, Date.now(), destinationName(providers.data, plan));
   // the advisor's decision that holds the migration, when one does (SDD §14.6)
   const waiting = waitingDecision(m);
   const action = useMigrationAction(m.id);
@@ -396,7 +398,7 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         subject={`Migration ${m.id}`}
         tone="danger"
         title={`Roll back ${m.vm.name}?`}
-        description="Deletes the RHOSO instance (volumes are kept) and starts the source VM again. Downtime ends when the source is running."
+        description="Deletes the destination instance (volumes are kept) and starts the source VM again. Downtime ends when the source is running."
         confirmLabel="Roll back"
         canConfirm={reason.trim().length > 0}
         confirmReason="Enter a reason first."

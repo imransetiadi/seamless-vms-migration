@@ -6,6 +6,7 @@ import { ApiError, errorMessage } from '../api/client';
 import { useHealth } from '../api/hooks';
 import { useSignIn } from '../api/session';
 import { BrandMark } from '../components/BrandMark';
+import { DESTINATIONS } from '../lib/platforms';
 import { Button } from '../components/Button';
 import { ThemeToggle } from '../components/ThemeToggle';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -68,7 +69,7 @@ export default function Login() {
             <BrandMark className="size-9" />
             <div>
               <p className="font-mono text-sm font-semibold text-foreground">Seamless Migrate</p>
-              <p className="text-xs text-muted-foreground">VM migrations to RHOSO 18.0</p>
+              <p className="text-xs text-muted-foreground">VM migrations to {DESTINATIONS}</p>
             </div>
           </div>
           <h1 className="text-xl font-semibold text-foreground">Sign in</h1>

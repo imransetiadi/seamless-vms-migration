@@ -1079,7 +1079,7 @@ export class MockServer {
     // reads the provider's declarations (SDD §9.3, §10, §21.5)
     const roles = capabilityRoles(destination.capabilities);
     const profile = policyProfileOf(destination.capabilities, destination);
-    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails, roles, profile });
+    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails, roles, profile, destination: destination.name });
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings);
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
@@ -1146,7 +1146,7 @@ export class MockServer {
     const at = new Date(this.now()).toISOString();
     const recorded = this.recommendations.filter((r) => r.migration_id === m.id).length;
     // the advisor's input, named by the SHA-256 of its canonical JSON and written once (SDD §14.5)
-    const snapshot = strategySnapshot({ vm: m.vm, plan, estimates: m.estimates, findings: m.findings, scope, deterministic: m.strategy, at });
+    const snapshot = strategySnapshot({ vm: m.vm, plan, estimates: m.estimates, findings: m.findings, scope, deterministic: m.strategy, at, destination: this.destinationFor(plan).name });
     if (!this.snapshots.has(snapshot.sha256)) this.snapshots.set(snapshot.sha256, snapshot);
     const rec = strategyRecommendation({
       id: `rec-${m.id.slice(4)}${(recorded + 1).toString(16).padStart(2, '0')}`,
@@ -1883,13 +1883,16 @@ export class MockServer {
       const running = this.sourcePower(m.vm.source_id) === 'running';
       if (running === (m.source_running_at !== null)) continue;
       m.source_running_at = running ? new Date(this.now()).toISOString() : null;
+      // the event names the plan's destination provider, as the API's (SDD §1 naming)
+      const plan = this.plans.find((p) => p.id === m.plan_id);
+      const destination = (plan && this.providers.find((p) => p.id === plan.destination_provider_id)?.name) ?? 'the destination';
       this.emit({
         kind: running ? 'migration.source_running' : 'migration.source_stopped',
         plan_id: m.plan_id,
         migration_id: m.id,
         actor: 'orchestrator',
         message: running
-          ? `${m.vm.name}: the source VM runs again - its data diverges from RHOSO; stop it, or roll back`
+          ? `${m.vm.name}: the source VM runs again - its data diverges from ${destination}; stop it, or roll back`
           : `${m.vm.name}: the source VM is stopped again`,
         data: { power_state: running ? 'running' : 'stopped' },
       });

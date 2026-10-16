@@ -84,7 +84,7 @@ test('storage handover on NetApp NFS names the RHOSO pool each volume type lands
   const dialog = page.getByRole('dialog', { name: /new migration plan/i });
   await dialog.getByLabel(/^name/i).fill('NetApp handover');
   await dialog.getByLabel(/source provider/i).selectOption('rhosp17-dc1');
-  await dialog.getByLabel(/destination/i).selectOption('rhoso-prod');
+  await dialog.getByLabel(/destination provider/i).selectOption('rhoso-prod');
   await dialog.getByRole('checkbox', { name: 'Select report-gen-01' }).click();
   await dialog.getByText(/^advanced/i).click();
   await dialog.getByRole('checkbox', { name: /hand volumes over without copying/i }).click();
@@ -145,7 +145,7 @@ test('powering a finished migration source VM on in demo mode raises the alert o
   await expect(step.getByRole('button', { name: 'Power off the source VM (demo)' })).toBeVisible();
   // the in-browser mock watches every second (the API every SEAMLESS_SOURCE_WATCH_S ÷ demo_speed)
   const alert = page.getByRole('alert', { name: 'Source VM running' });
-  await expect(alert).toContainText('its data diverges from RHOSO: stop it, or roll back.');
+  await expect(alert).toContainText('its data diverges from RHOSO 18.0 — Production: stop it, or roll back.');
 
   await step.getByRole('button', { name: 'Power off the source VM (demo)' }).click();
   // migration.source_stopped refreshes the page: no reload

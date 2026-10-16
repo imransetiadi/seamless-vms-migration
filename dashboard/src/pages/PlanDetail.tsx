@@ -50,6 +50,7 @@ import { resolvePolicy } from '../lib/policies';
 import { preflightRan } from '../lib/phase';
 import { planActions } from '../lib/planActions';
 import { NOTHING_MIGRATED_NEXT, nothingMigrated } from '../lib/planDone';
+import { destinationName } from '../lib/providerUse';
 import { leftOutText } from '../lib/stats';
 import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -498,7 +499,7 @@ export default function PlanDetail() {
             }}
           />
         )}
-        <FinalizeQueue plan={p} migrations={list} gate={actions.finalize} allInHeader={p.derived_status === 'completed'} onFinalize={askFinalize} />
+        <FinalizeQueue plan={p} destination={destinationName(providers.data, p)} migrations={list} gate={actions.finalize} allInHeader={p.derived_status === 'completed'} onFinalize={askFinalize} />
         <ProbeWarnings plan={p} migrations={migrations.data ?? []} edit={actions.edit} onSaved={setAnnouncement} focusAfterRef={headingRef} />
 
         <Panel title="Settings" description="What the orchestrator will do for every VM in this plan">

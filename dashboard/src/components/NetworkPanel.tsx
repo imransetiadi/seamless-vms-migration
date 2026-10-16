@@ -5,6 +5,7 @@ import type { Migration, Plan, Role } from '../api/types';
 import { capabilityRoles, policyProfileOf, portRefusal, resolveNetwork } from '../lib/networks';
 import { nicTarget, parseNicDrafts, toNicDraft, withVmNicOverrides, type NicDraft } from '../lib/nics';
 import { planActions } from '../lib/planActions';
+import { destinationName } from '../lib/providerUse';
 import { Button } from './Button';
 import { ScrollRegion } from './ScrollRegion';
 import { ErrorBanner } from './ErrorBanner';
@@ -46,6 +47,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
   // the destination token's roles, as its check reported them, and the roles its policy profile counts: whether it may put
   // a port on another project's network (SDD §6.6, §21.5)
   const destination = providers.data?.find((p) => p.id === plan.destination_provider_id);
+  const where = destinationName(providers.data, plan);
   const roles = capabilityRoles(destination?.capabilities);
   const profile = policyProfileOf(destination?.capabilities, destination);
   // a name only another project's network carries, one the credential may not use, or one the cutover cannot resolve (SDD §16, §7.3 step 0)
@@ -128,7 +130,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
               <tr>
                 <th scope="col">NIC</th>
                 <th scope="col">Source</th>
-                <th scope="col">In RHOSO</th>
+                <th scope="col">On the destination</th>
               </tr>
             </thead>
             <tbody>
@@ -185,13 +187,13 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
               const notAllowed = chosen?.network ? portRefusal(chosen.network, roles, profile) : null;
               const said =
                 unlisted && listed
-                  ? { warn: true, text: `RHOSO does not list ${draft.network}: validation refuses it.` }
+                  ? { warn: true, text: `${draft.network} does not exist in ${where}: validation refuses it.` }
                   : chosen?.why
-                    ? { warn: true, text: `Several RHOSO networks are named ${draft.network}: validation refuses it.` }
+                    ? { warn: true, text: `Several networks of ${where} are named ${draft.network}: validation refuses it.` }
                     : chosen?.network && notAllowed
                       ? {
                           warn: true,
-                          text: `The RHOSO credential may not put a port on ${draft.network} (project ${chosen.network.project_id}): ${notAllowed}. Validation refuses it.`,
+                          text: `The credential of ${where} may not put a port on ${draft.network} (project ${chosen.network.project_id}): ${notAllowed}. Validation refuses it.`,
                         }
                       : chosen?.network && !chosen.network.own
                         ? { warn: false, text: `${draft.network} is another project's network: the cutover finds it by its name.` }
@@ -204,7 +206,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div>
                       <label htmlFor={`${titleId}-net-${i}`} className="field-label">
-                        RHOSO network <span className="sr-only">of {draft.mac}</span>
+                        Destination network <span className="sr-only">of {draft.mac}</span>
                       </label>
                       <select
                         id={`${titleId}-net-${i}`}
@@ -214,7 +216,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
                         onChange={(e) => setDraft(i, { network: e.target.value })}
                       >
                         <option value="">As the plan maps it ({mapped})</option>
-                        {unlisted && <option value={draft.network}>{listed ? `${draft.network} (not in RHOSO)` : draft.network}</option>}
+                        {unlisted && <option value={draft.network}>{listed ? `${draft.network} (not on the destination)` : draft.network}</option>}
                         {networks.map((name) => (
                           <option key={name} value={name}>
                             {networkLabel(name)}
@@ -262,7 +264,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
                 </fieldset>
               );
             })}
-            <p className="text-xs text-muted-foreground">Validation checks each address against the subnets of its RHOSO network, before anything stops.</p>
+            <p className="text-xs text-muted-foreground">Validation checks each address against the subnets of its destination network, before anything stops.</p>
           </div>
           <div className="flex flex-col-reverse gap-2 border-t border-border px-5 py-3 sm:flex-row sm:justify-end">
             <Button type="button" size="lg" onClick={() => setDrafts(null)}>

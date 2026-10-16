@@ -82,7 +82,7 @@ const PHASE_META: Record<Phase, PhaseMeta> = {
     label: 'Cutover',
     tone: 'progress',
     icon: Zap,
-    description: 'Source VM stopped: final sync and boot on RHOSO. The downtime clock is running.',
+    description: 'Source VM stopped: final sync and boot on the destination. The downtime clock is running.',
   },
   verifying: {
     label: 'Verifying',
@@ -94,7 +94,7 @@ const PHASE_META: Record<Phase, PhaseMeta> = {
     label: 'Completed',
     tone: 'success',
     icon: CircleCheck,
-    description: 'Running on RHOSO; still reversible until finalized.',
+    description: 'Running on the destination; still reversible until finalized.',
   },
   finalized: {
     label: 'Finalized',

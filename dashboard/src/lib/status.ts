@@ -117,9 +117,9 @@ export const STRATEGY_LABELS: Record<Strategy, string> = {
 };
 
 export const STRATEGY_DESCRIPTIONS: Record<Strategy, string> = {
-  cold: 'Stop, copy everything over NBD/SSH, boot on RHOSO. Downtime grows with used data.',
+  cold: 'Stop, copy everything over NBD/SSH, boot on the destination. Downtime grows with used data.',
   warm: 'Snapshot pre-copy while running, then a final delta sync after shutdown.',
-  storage_handover: 'Shared Ceph: Cinder unmanage at the source, manage at RHOSO. Metadata only.',
+  storage_handover: 'Shared Ceph: Cinder unmanage at the source, manage at the destination. Metadata only.',
   vmware_cold: 'vmware-migration-kit full copy plus virt-v2v conversion.',
   vmware_warm: 'vmware-migration-kit CBT passes, then cutover with in-place conversion.',
 };

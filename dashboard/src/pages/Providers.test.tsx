@@ -49,6 +49,24 @@ describe('Providers page', () => {
     expect(within(rhosp).getByRole('button', { name: /^edit /i })).toHaveAttribute('aria-disabled', 'true');
   });
 
+  it('names RHOSO 18.0 and community OpenStack as destinations (SDD §16, plan T6)', async () => {
+    renderPage('viewer');
+    const header = await screen.findByRole('heading', { level: 1, name: 'Providers' });
+    const description = header.parentElement!.textContent ?? '';
+    expect(description).toContain('RHOSO 18.0 and community OpenStack 2023.1 Antelope – 2026.2 Hibiscus as destinations');
+    expect(description).not.toContain('RHOSO 18.0 as the destination');
+  });
+
+  it('names the destinations in its empty state too (SDD §16, plan T6)', async () => {
+    const server = createTestServer();
+    server.providers.splice(0);
+    renderPage('admin', server);
+    expect(await screen.findByText('Connect your first cloud')).toBeInTheDocument();
+    expect(screen.getByText(/^Add the source you migrate from/)).toHaveTextContent(
+      'Add the source you migrate from and the destination you migrate to. Destinations are RHOSO 18.0 and community OpenStack 2023.1 Antelope – 2026.2 Hibiscus. Sign-in details go to the secret store, never to the database.',
+    );
+  });
+
   it("shows a destination's series, tier and policy profile", async () => {
     renderPage('viewer');
     const to = await screen.findByRole('region', { name: 'Migrate to' });

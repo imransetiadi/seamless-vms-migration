@@ -222,7 +222,7 @@ describe('Overview page (mock data)', () => {
     expect(link).toHaveAttribute('href', '/migrations/mig-3c1a0f9e23');
     // what each one waits for: the final copy of the cutover, the boot check while verifying
     expect(link.closest('li')).toHaveTextContent(/final copy 62/i);
-    expect(within(down).getByRole('link', { name: 'web-02' }).closest('li')).toHaveTextContent(/checking the boot on rhoso/i);
+    expect(within(down).getByRole('link', { name: 'web-02' }).closest('li')).toHaveTextContent(/checking the boot on the destination/i);
     const meter = within(down).getByRole('meter', { name: /web-03 downtime against the slo/i });
     expect(Number(meter.getAttribute('aria-valuemax'))).toBeGreaterThan(0);
     expect(down).toHaveTextContent(/left in the .* slo|over the slo by/i);

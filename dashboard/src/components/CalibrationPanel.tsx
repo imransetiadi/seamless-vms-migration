@@ -104,7 +104,7 @@ export function ResolvedMappings({ migration: m }: ResolvedMappingsProps) {
         <tr className="text-left text-xs text-muted-foreground">
           <th scope="col" className="py-1 pr-3 font-medium">Kind</th>
           <th scope="col" className="py-1 pr-3 font-medium">Source</th>
-          <th scope="col" className="py-1 font-medium">RHOSO</th>
+          <th scope="col" className="py-1 font-medium">Destination</th>
         </tr>
       </thead>
       <tbody>

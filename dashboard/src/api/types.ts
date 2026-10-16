@@ -855,6 +855,8 @@ export interface DestinationInventory {
   subnets?: DestinationSubnet[];
   /** Every network the destination credential sees, with its owner: what a NIC's network name resolves to (SDD §10). */
   network_details?: DestinationNetwork[];
+  /** The role names of the destination credential's token, read live with the inventory; null when unreadable (SDD §10, RV19-01). */
+  roles?: string[] | null;
 }
 
 export interface DestinationSubnet {

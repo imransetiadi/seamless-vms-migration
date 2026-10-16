@@ -2,7 +2,7 @@ import { Ban, Bot, CalendarClock, CircleCheck, CircleX, ClipboardX, Hourglass, P
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
-import { useDemoSpeed, useEventTail, useMigration, usePlan, useRecommendations, useSetStrategy } from '../api/hooks';
+import { useDemoSpeed, useEventTail, useMigration, usePlan, useProviders, useRecommendations, useSetStrategy } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import { useRole } from '../api/session';
 import { RECOMMENDATION_LIMIT_MAX, type Event, type GuestOS, type Migration, type Phase, type Plan, type Role, type Strategy, type VerificationConfig } from '../api/types';
@@ -36,6 +36,7 @@ import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative 
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
 import { clearedByStrategyChange, countedApprovals, uncountedReason } from '../lib/migrationActions';
 import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan, runningStep } from '../lib/phase';
+import { destinationName } from '../lib/providerUse';
 import { can, hasRole, PERMISSIONS } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
 import { useHashLanding } from '../lib/useHashLanding';
@@ -76,7 +77,7 @@ function splitIssue(issue: string): { code: string | null; text: string } {
 /** Phases a retried cutover passes through while its source is still stopped (SDD §5.2). */
 const BEFORE_CUTOVER: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
 
-function Alerts({ m }: { m: Migration }) {
+function Alerts({ m, destination }: { m: Migration; destination: string }) {
   const clockOpen = Boolean(m.downtime_started_at) && !m.downtime_ended_at;
   const sourceStopped = m.phase === 'failed' && clockOpen;
   // the recommendation the migration waits on, while it can still take it (SDD §14.6)
@@ -89,8 +90,8 @@ function Alerts({ m }: { m: Migration }) {
         <div role="alert" aria-label="Source VM running" className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
           <Power aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
           <p className="text-foreground">
-            <strong className="font-semibold">The source VM runs again</strong> since {formatDateTime(m.source_running_at)}, so its data diverges from RHOSO: stop it,
-            or roll back.
+            <strong className="font-semibold">The source VM runs again</strong> since {formatDateTime(m.source_running_at)}, so its data diverges from {destination}:
+            stop it, or roll back.
           </p>
         </div>
       )}
@@ -631,6 +632,7 @@ export default function MigrationDetail() {
   const migration = useMigration(migrationId);
   const m = migration.data;
   const plan = usePlan(m?.plan_id);
+  const providers = useProviders();
   const history = useEventTail({ migration_id: migrationId }, 300);
   const role = useRole();
   const demoSpeed = useDemoSpeed();
@@ -707,7 +709,7 @@ export default function MigrationDetail() {
         {planUnavailable && (
           <ErrorBanner error={plan.error} title="The plan of this migration is unavailable" onRetry={() => void plan.refetch()} />
         )}
-        <Alerts m={m} />
+        <Alerts m={m} destination={destinationName(providers.data, p)} />
 
         <Panel title="Next step">
           <MigrationActions migration={m} plan={p} role={role} planUnavailable={planUnavailable} planLoading={planLoading} />
@@ -720,7 +722,7 @@ export default function MigrationDetail() {
 
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           <ProgressPanel m={m} />
-          <Panel title="Downtime" description="From source stop to verified boot on RHOSO">
+          <Panel title="Downtime" description="From source stop to verified boot on the destination">
             <DowntimeClock
               startedAt={m.downtime_started_at}
               endedAt={m.downtime_ended_at}
@@ -757,7 +759,7 @@ export default function MigrationDetail() {
           </Panel>
         )}
 
-        <Panel title="Network" description="Where each NIC goes in RHOSO: the plan's mapping, or this VM's override (SDD §9.3)">
+        <Panel title="Network" description="Where each NIC goes on the destination: the plan's mapping, or this VM's override (SDD §9.3)">
           <NetworkPanel migration={m} plan={p} role={role} onSaved={setProbeAnnouncement} />
         </Panel>
         <Panel title="Verification" description="What verification probes after the cutover, and what it found last (SDD §7.5)">

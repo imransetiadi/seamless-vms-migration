@@ -19,7 +19,7 @@ import { deleteRefusal, plansThatNeed } from '../lib/providerUse';
 import { hasRole } from '../lib/roles';
 import { presetFor } from '../lib/distributions';
 import { policyProfileOf } from '../lib/networks';
-import { plainHttpText, profileText, rangeText, seriesText, tierText, type SupportTier } from '../lib/platforms';
+import { DESTINATION_PLATFORMS, plainHttpText, profileText, rangeText, seriesText, tierText, type SupportTier } from '../lib/platforms';
 import { storageBackends, storageSummary } from '../lib/storage';
 import { providerStatusMeta } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -502,7 +502,7 @@ export default function Providers() {
     <>
       <PageHeader
         title="Providers"
-        description="Every cloud Seamless migrates between: OpenStack Community, Kolla-Ansible, Red Hat OpenStack 17.1 and VMware vCenter as sources, RHOSO 18.0 as the destination."
+        description={`Every cloud Seamless migrates between: OpenStack Community, Kolla-Ansible, Red Hat OpenStack 17.1 and VMware vCenter as sources, ${DESTINATION_PLATFORMS} as destinations.`}
         actions={
           <Button size="lg" variant="primary" icon={Plus} onClick={openCreate} disabledReason={canEdit ? null : 'Adding a provider requires the admin role.'}>
             Add provider
@@ -518,7 +518,7 @@ export default function Providers() {
         <EmptyState
           icon={Server}
           title="Connect your first cloud"
-          description="Add the source you migrate from and the RHOSO destination you migrate to. Sign-in details go to the secret store, never to the database."
+          description={`Add the source you migrate from and the destination you migrate to. Destinations are ${DESTINATION_PLATFORMS}. Sign-in details go to the secret store, never to the database.`}
           action={
             <Button size="lg" variant="primary" icon={Plus} onClick={openCreate} disabledReason={canEdit ? null : 'Adding a provider requires the admin role.'}>
               Add provider

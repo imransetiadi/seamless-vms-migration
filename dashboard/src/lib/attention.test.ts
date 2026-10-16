@@ -36,9 +36,9 @@ describe('attentionItems', () => {
     expect(find()).toBeUndefined();
     expect(attentionItems(fx.migrations, new Map(), NOW, { plansUnknown: true }).find((i) => i.migration === cache)).toBeUndefined();
 
-    // a source VM running again: its data diverges from RHOSO, plan or not
+    // a source VM running again: its data diverges from the destination, plan or not
     cache.source_running_at = '2026-10-08T11:00:00Z';
-    const running = { tone: 'danger', reason: 'The source VM runs again: its data diverges from RHOSO', nextAction: 'Stop the source VM, or roll it back (operator)', rank: 1 };
+    const running = { tone: 'danger', reason: 'The source VM runs again: its data diverges from the destination', nextAction: 'Stop the source VM, or roll it back (operator)', rank: 1 };
     expect(find()).toMatchObject(running);
     expect(attentionItems(fx.migrations, new Map(), NOW, { plansUnknown: true }).find((i) => i.migration === cache)).toMatchObject(running);
     // only while it waits in Completed

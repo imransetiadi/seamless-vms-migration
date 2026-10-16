@@ -206,3 +206,10 @@ export function plainHttpText(names: readonly string[]): string {
   const words = names.map((name) => PLAIN_HTTP_WORDS[name] ?? name);
   return words.length > 1 ? `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}` : (words[0] ?? '');
 }
+
+/** The destinations, where the dashboard lists platforms (SDD §16, §21; plan T6): the sign-in page names them so. */
+export const DESTINATIONS = 'RHOSO 18.0 and community OpenStack';
+/** The same with the window's series, oldest to newest: the Providers page and its empty state. */
+export const DESTINATION_PLATFORMS = `${DESTINATIONS} ${rangeText(SERIES.map((series) => series.name))}`;
+/** The destinations in a few words, where the sidebar has room for no more: the brand line under the product's name. */
+export const BRAND_DESTINATIONS = 'RHOSO 18.0 or OpenStack';

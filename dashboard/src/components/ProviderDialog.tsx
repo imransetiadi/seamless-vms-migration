@@ -545,7 +545,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
           <p className="text-sm text-muted-foreground">
             {editing
               ? 'Changes apply to new runs; a running or paused plan keeps the provider locked.'
-              : 'Register a source to migrate from or the RHOSO destination to migrate to.'}
+              : 'Register a source to migrate from or a destination to migrate to.'}
           </p>
         </div>
 

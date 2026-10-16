@@ -540,7 +540,12 @@ describe('PlanDetail', () => {
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
     const queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
     const row = within(queue).getByRole('listitem', { name: 'web-cache-01' });
-    expect(within(row).getByRole('button', { name: 'Source VM running' })).toHaveAccessibleDescription(/^Running again since .+: its data diverges from RHOSO$/);
+    // the plan's destination provider by name, once the providers are loaded (SDD §1 naming, plan T6)
+    await waitFor(() =>
+      expect(within(row).getByRole('button', { name: 'Source VM running' })).toHaveAccessibleDescription(
+        /^Running again since .+: its data diverges from RHOSO 18\.0 — Production$/,
+      ),
+    );
     expect(within(row).getByRole('button', { name: 'Finalize overdue' })).toHaveAccessibleDescription(`In Completed longer than the plan's ${plan.finalize_warning_h} h`);
     expect(row.querySelector('[title]')).toBeNull();
   });
