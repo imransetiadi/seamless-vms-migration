@@ -2036,6 +2036,27 @@ async def test_the_handover_port_check_follows_the_policy_profile(tmp_path):
         assert clouds["dst"].created[0]["networks"][0]["uuid"] == "shared-net", name
 
 
+async def test_the_handover_judges_the_declared_profile_after_the_report_was_reset(tmp_path):
+    """Review RV18-04: with the destination's check report reset to {} (new credentials, allowed
+    while a plan runs), step 0 judged it legacy and let an advsvc-only token put the port on
+    another project's network of a declared secure-RBAC cloud - refused by Neutron after the
+    source stopped. It reads the provider's declarations (SDD §7.3 step 0, §21.5)."""
+    shared = NS(
+        id="shared-net",
+        name="rhoso-app",
+        project_id="admin-project",
+        is_shared=True,
+        is_router_external=False,
+    )
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].network_list = [shared]
+    clouds["dst"].roles = ["advsvc"]
+    destination = DST.model_copy(update={"policy_profile": "secure_rbac", "capabilities": {}})
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, destination, settings)[0])
+    assert "secure-RBAC defaults let only the admin or service role" in str(refused.value)
+
+
 async def test_handover_step_0_refuses_an_address_neutron_would_refuse(tmp_path):
     """SDD §7.3 step 0 and §6.6: each address step 8 gives a port must be one Neutron takes on
     that network - a host address of its subnets; on a SLAAC subnet only the kept MAC's EUI-64

@@ -456,8 +456,9 @@ async def test_the_destinations_policy_profile_reaches_workloads_before_the_impo
     env, monkeypatch, capabilities, profile
 ):
     """SDD §6.6, §21.5: the executor writes the destination's policy profile - as its check
-    reports it, legacy for a report without one - into the planned server's _migration_params
-    before every OpenStack run, where the collection's destination check reads it."""
+    reports it; for a report without one as its declarations give it, RHOSO 18.0's legacy by its
+    kind - into the planned server's _migration_params before every OpenStack run, where the
+    collection's destination check reads it."""
     monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
     destination = DST.model_copy(update={"capabilities": capabilities})
     plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS, port_creation_mode="neutron")
@@ -466,6 +467,34 @@ async def test_the_destinations_policy_profile_reaches_workloads_before_the_impo
     ctx, _ = make_ctx(plan, mig, SRC, destination, env.settings)
     await env.executor.run(StepName.CUTOVER, ctx)
     assert read_log(env.log)[-1]["playbook"] == "import_workloads.yml"
+    assert exported_server(env)["_migration_params"]["policy_profile"] == profile
+
+
+@pytest.mark.parametrize(
+    "declared, profile",
+    [
+        ({"policy_profile": "secure_rbac"}, "secure_rbac"),
+        ({"release": "2026.2"}, "secure_rbac"),
+        ({}, "unknown"),
+    ],
+    ids=["a declared profile", "a declared series", "nothing declared"],
+)
+async def test_a_reset_report_writes_the_profile_the_destination_declares(
+    env, monkeypatch, declared, profile
+):
+    """Review RV18-04: new credentials (allowed while a plan runs) or a provider change reset the
+    check report to {}, and the executor wrote legacy for it - the collection then counted advsvc
+    on a declared secure-RBAC cloud, and Neutron refused the port after the source stopped. A
+    report that names no profile reads as the provider's declarations alone (SDD §21.5)."""
+    monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
+    destination = DST.model_copy(
+        update={"kind": ProviderKind.openstack, "capabilities": {}, **declared}
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS, port_creation_mode="neutron")
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.cold)
+    ctx, _ = make_ctx(plan, mig, SRC, destination, env.settings)
+    await env.executor.run(StepName.CUTOVER, ctx)
     assert exported_server(env)["_migration_params"]["policy_profile"] == profile
 
 
@@ -512,6 +541,51 @@ async def test_the_cutover_port_refusal_follows_the_policy_profile(env):
         with pytest.raises(PermanentStepError, match=rule):
             await env.executor.run(StepName.CUTOVER, token(roles, profile)[0])
         assert len(read_log(env.log)) == ran, (roles, profile)
+
+
+async def test_a_warm_cutover_after_new_credentials_writes_the_declared_profile(env, monkeypatch):
+    """Review RV18-04's case: a warm migration's pre-copy exports with the check's secure-RBAC
+    report; new credentials then reset the report to {} - allowed while the plan runs - and the
+    cutover, which does not export again, wrote legacy before the import: the collection counted
+    advsvc, and Neutron refused the port after the source stopped. It writes the declared profile
+    (SDD §7.2, §21.5)."""
+    monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS, port_creation_mode="neutron")
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.warm)
+    declared = DST.model_copy(update={"kind": ProviderKind.openstack, "release": "2026.2"})
+    checked = declared.model_copy(update={"capabilities": {"policy_profile": "secure_rbac"}})
+    await env.executor.run(StepName.PRECOPY, make_ctx(plan, mig, SRC, checked, env.settings)[0])
+    reset = declared.model_copy(update={"capabilities": {}})
+    await env.executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, reset, env.settings)[0])
+    assert [c["playbook"] for c in read_log(env.log)][-1] == "import_workloads_cutover.yml"
+    assert "export_workloads.yml" not in [c["playbook"] for c in read_log(env.log)][2:]
+    assert exported_server(env)["_migration_params"]["policy_profile"] == "secure_rbac"
+
+
+async def test_the_kits_map_reads_the_declared_profile_from_a_report_without_one(env):
+    """Review RV18-04: a check report kept from before 0.2.0 names the token's roles but no
+    profile, and read legacy - the kit's map let advsvc put the port on another project's network
+    of a declared secure-RBAC destination. It reads the provider's declarations (SDD §21.5)."""
+    env.registry.networks.append(dst_net("shared-net", own=False))
+    shared = Nic(
+        network="shared-net",
+        mac="00:50:56:00:00:04",
+        fixed_ips=["10.0.0.7"],
+        network_key="dvportgroup-9",
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=Mappings())
+    vm = make_vm(source_id="srv-1", name="web-01", nics=[shared])
+    mig = make_migration(id="mig-00000000ab", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_warm)
+    old_report = {"roles": ["advsvc", "member"]}
+    secure = DST.model_copy(update={"policy_profile": "secure_rbac", "capabilities": old_report})
+    with pytest.raises(PermanentStepError, match="secure-RBAC defaults let only the admin or ser"):
+        await env.executor.run(
+            StepName.CUTOVER, make_ctx(plan, mig, VCENTER, secure, env.settings)[0]
+        )
+    # RHOSO 18.0 without a declaration: legacy by its kind, as before (D14)
+    rhoso = DST.model_copy(update={"capabilities": old_report})
+    await env.executor.run(StepName.CUTOVER, make_ctx(plan, mig, VCENTER, rhoso, env.settings)[0])
 
 
 async def test_a_neutron_warm_cutover_exports_again_a_workload_without_port_security_groups(

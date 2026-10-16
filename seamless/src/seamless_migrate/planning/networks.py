@@ -15,6 +15,7 @@ from typing import Any
 
 from ..domain.models import Nic
 from .ipam import address_refusal
+from .platforms import destination_release
 
 # the roles Neutron's policy (create_port:fixed_ips:ip_address, :mac_address,
 # :port_security_enabled) lets choose a port's address, MAC or port security on another project's
@@ -37,13 +38,17 @@ _ROLE_RULE = {
 }
 
 
-def policy_profile_of(capabilities: Mapping[str, Any] | None) -> str:
-    """The destination's policy profile as its check reports it (SDD §10.1, §21.5): ``legacy``
-    for a report without one - from before the profile was reported -, ``unknown`` for a value
-    no rule knows."""
+def policy_profile_of(capabilities: Mapping[str, Any] | None, destination: Any) -> str:
+    """The policy profile of ``destination`` (a Provider) as its check report ``capabilities``
+    gives it (SDD §10.1, §21.5). A report that names none - reset by a provider change or new
+    credentials, or kept from before 0.2.0 - reads as the provider's declarations alone
+    (``destination_release`` with no maximum read), never legacy by default (review RV18-04);
+    ``unknown`` for a value no rule knows, and without a provider."""
     profile = (capabilities or {}).get("policy_profile")
-    if profile is None:
-        return "legacy"
+    if profile is None and destination is not None:
+        profile = destination_release(
+            destination.kind, destination.release, destination.policy_profile, "", ""
+        )["policy_profile"]
     return profile if profile in PORT_ROLES_BY_PROFILE else "unknown"
 
 
@@ -54,7 +59,7 @@ def port_refusal(
     entry), or None (SDD §6.6). Another project's network takes it only when shared with the
     credential's project or external - an admin sees every project's networks - and only from a
     token with a role the destination's policy ``profile`` counts (``PORT_ROLES_BY_PROFILE``;
-    ``policy_profile_of`` reads it from the check report): every recreated port asks for its
+    ``policy_profile_of`` reads it): every recreated port asks for its
     address or MAC. An external network that is not shared, the credential's own included, also
     needs the admin role: Nova attaches no other to a server. ``roles`` None (not reported)
     leaves the role halves unjudged."""

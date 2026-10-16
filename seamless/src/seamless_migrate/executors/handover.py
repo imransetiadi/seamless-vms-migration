@@ -510,7 +510,7 @@ class HandoverExecutor:
                 backend_map,
                 plan,
                 mappings,
-                policy_profile_of(destination.capabilities),
+                policy_profile_of(destination.capabilities, destination),
             ),
         )
 

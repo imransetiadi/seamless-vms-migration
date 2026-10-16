@@ -970,7 +970,7 @@ class AnsibleExecutor:
                 export_record(mappings, nics, ctx.migration.vm.name) if judged else None,
                 any(p.name == "export_workloads.yml" for p in self._playbooks(step, strategy, osm)),
                 deferred,
-                policy_profile_of(ctx.destination.capabilities),
+                policy_profile_of(ctx.destination.capabilities, ctx.destination),
             )
             await self._log_deferred(ctx, deferred)
         leftover = (
@@ -1203,7 +1203,8 @@ class AnsibleExecutor:
                     + (why or f"there is no network named {name!r}")
                 )
                 continue
-            refused = port_refusal(network, roles, policy_profile_of(ctx.destination.capabilities))
+            profile = policy_profile_of(ctx.destination.capabilities, ctx.destination)
+            refused = port_refusal(network, roles, profile)
             if refused:
                 problem = (
                     f"{what} cannot go to RHOSO network {name!r} "
@@ -1467,9 +1468,7 @@ class AnsibleExecutor:
                         networks,
                         deferred,
                         volumes,
-                        policy_profile_of(ctx.destination.capabilities)
-                        if ctx is not None
-                        else "legacy",
+                        policy_profile_of(destination.capabilities, destination),
                     )
                     if ctx is not None:
                         await self._log_deferred(ctx, deferred)

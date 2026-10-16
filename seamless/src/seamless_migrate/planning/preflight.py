@@ -781,7 +781,7 @@ def run_preflight(
     # counts (SDD §6.6, §9.3, §21.5); the VMware migration kit creates every port with the NIC's
     # MAC (§7.2)
     roles = (dst_caps or {}).get("roles")
-    profile = policy_profile_of(dst_caps)
+    profile = policy_profile_of(dst_caps, destination)
     denied = []
     for nic in vm.nics:
         network = resolved.get(id(nic))

@@ -1219,9 +1219,9 @@ def test_no_release_warning_for_a_supported_or_validated_destination():
     ]
 
 
-def _another_projects_port(caps):
+def _another_projects_port(caps, destination=DST):
     """NET_PORT_NOT_PERMITTED, or None, for a NIC that keeps its address on another project's
-    shared network, judged with the destination's check report ``caps`` (SDD §6.6, §9.3)."""
+    shared network, judged with ``destination``'s check report ``caps`` (SDD §6.6, §9.3)."""
     vm = make_vm(
         source_id="vm-1",
         nics=[Nic(network="app-net", mac="FA:16:3E:00:00:01", fixed_ips=["10.0.0.5"])],
@@ -1231,7 +1231,7 @@ def _another_projects_port(caps):
     dst = resolved_dst([shared], [subnet_of("p", "rhoso-net", "10.0.0.0/24")])
     found = [
         f
-        for f in check(vm, plan=plan, dst=dst, dst_caps=caps)
+        for f in check(vm, plan=plan, dst=dst, destination=destination, dst_caps=caps)
         if f.code == "NET_PORT_NOT_PERMITTED"
     ]
     return found[0] if found else None
@@ -1256,9 +1256,9 @@ def test_finding_net_port_not_permitted_counts_service_under_secure_rbac():
 
 
 def test_finding_net_port_not_permitted_counts_advsvc_only_under_the_legacy_profile():
-    """SDD §21.5, §6.6: advsvc counts under the legacy rules alone - also for a check report from
-    before the profile was reported -, and an unknown profile counts only admin, the role both
-    count."""
+    """SDD §21.5, §6.6: advsvc counts under the legacy rules alone - also for an RHOSO 18.0
+    report that names no profile, legacy by its kind -, and an unknown profile counts only admin,
+    the role both count."""
     for caps in ({"policy_profile": "legacy"}, {}):
         assert _another_projects_port({**caps, "roles": ["advsvc"]}) is None, caps
         refused = _another_projects_port({**caps, "roles": ["service", "member"]})
@@ -1306,6 +1306,31 @@ async def test_a_real_destination_below_the_compute_floor_is_blocked(tmp_path):
 
     found = only(check(destination=COMMUNITY, dst_caps=caps), "DST_CAPABILITY_MISSING")
     assert "compute API 2.53, below 2.60" in found.message, found.message
+
+
+@pytest.mark.parametrize(
+    "declared, roles, refused",
+    [
+        ({"policy_profile": "secure_rbac"}, ["advsvc"], True),
+        ({"policy_profile": "secure_rbac"}, ["service"], False),
+        ({"release": "2026.2"}, ["advsvc"], True),  # its series' profile: secure-RBAC
+        ({"release": "2023.1"}, ["advsvc"], False),  # legacy
+        ({}, ["advsvc"], True),  # nothing declared: unknown, admin alone
+        ({}, ["admin"], False),
+    ],
+)
+def test_a_report_that_names_no_profile_reads_as_the_destinations_declarations(
+    declared, roles, refused
+):
+    """Review RV18-04: a check report that names no profile - reset by new credentials or a
+    provider change, or from before 0.2.0 - read legacy, so advsvc took a port on another
+    project's network of a declared secure-RBAC destination. It reads as the provider's
+    declarations alone (SDD §21.5)."""
+    destination = COMMUNITY.model_copy(update=declared)
+    found = _another_projects_port({"roles": roles}, destination)
+    assert (found is not None) is refused, found and found.message
+    # RHOSO 18.0: legacy by its kind, as before (D14)
+    assert _another_projects_port({"roles": ["advsvc"]}) is None
 
 
 def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projects_network():
