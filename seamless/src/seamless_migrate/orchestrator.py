@@ -99,6 +99,7 @@ from .planning.estimator import (
     observed_scan_rate,
     params_for_plan,
 )
+from .planning.platforms import destination_descriptor
 from .planning.preflight import (
     flavor_prestaged,
     has_blocker,
@@ -764,8 +765,15 @@ class Orchestrator:
             chooses = current is None or current.phase in (*REVALIDATABLE, P.validating)
             advice = None
             if self.advisor is not None and automatic and chooses:
+                # the destination by kind and series: its provider's name never leaves for Jev
+                # (SDD §1 naming, §13.4)
                 advice = await self.advisor.recommend_strategy(
-                    vm, estimates, plan, findings, destination.name
+                    vm,
+                    estimates,
+                    plan,
+                    findings,
+                    destination_descriptor(destination),
+                    destination.name,
                 )
             decision = None
             rec_id = new_recommendation_id()

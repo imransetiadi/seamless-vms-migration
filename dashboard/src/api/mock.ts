@@ -41,6 +41,7 @@ import {
   humanDecision,
   strategyRecommendation,
   strategySnapshot,
+  destinationDescriptor,
   type StrategyDecision,
   checkOf,
   vmwareCheck,
@@ -1146,7 +1147,12 @@ export class MockServer {
     const at = new Date(this.now()).toISOString();
     const recorded = this.recommendations.filter((r) => r.migration_id === m.id).length;
     // the advisor's input, named by the SHA-256 of its canonical JSON and written once (SDD §14.5)
-    const snapshot = strategySnapshot({ vm: m.vm, plan, estimates: m.estimates, findings: m.findings, scope, deterministic: m.strategy, at, destination: this.destinationFor(plan).name });
+    // the destination by kind and series: its provider's name never leaves for Jev (SDD §1 naming, §13.4)
+    const destination = this.destinationFor(plan);
+    const snapshot = strategySnapshot({
+      vm: m.vm, plan, estimates: m.estimates, findings: m.findings, scope, deterministic: m.strategy, at,
+      destination: destinationDescriptor(destination), destinationName: destination.name,
+    });
     if (!this.snapshots.has(snapshot.sha256)) this.snapshots.set(snapshot.sha256, snapshot);
     const rec = strategyRecommendation({
       id: `rec-${m.id.slice(4)}${(recorded + 1).toString(16).padStart(2, '0')}`,

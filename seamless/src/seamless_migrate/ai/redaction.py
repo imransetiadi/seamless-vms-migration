@@ -73,10 +73,18 @@ def redact(text: str, redact_names: Sequence[str] | None = None) -> str:
     out = str(text)
     for pattern, replacement in _PATTERNS:
         out = pattern.sub(replacement, out)
-    for name in sorted({n for n in (redact_names or []) if n}, key=len, reverse=True):
-        # SDD §13.4: a name stands between characters that are not letters or digits ([^\W_]),
-        # so web-01-data, web-01_root and data-web-01 lose it while web-010 (another VM) stays
-        out = re.sub(rf"(?<![^\W_]){re.escape(name)}(?![^\W_])", "[vm]", out)
+    return replace_names(out, {name: "[vm]" for name in redact_names or []})
+
+
+def replace_names(text: str, replacements: dict[str, str]) -> str:
+    r"""Replace each name by its replacement wherever it stands as a word (SDD §13.4): between
+    characters that are not letters or digits ([^\W_]), so web-01-data, web-01_root and data-web-01
+    lose web-01 while web-010 (another VM) keeps it; the longest name first."""
+    out = str(text)
+    for name in sorted({n for n in replacements if n}, key=len, reverse=True):
+        out = re.sub(
+            rf"(?<![^\W_]){re.escape(name)}(?![^\W_])", lambda _m, n=name: replacements[n], out
+        )
     return out
 
 

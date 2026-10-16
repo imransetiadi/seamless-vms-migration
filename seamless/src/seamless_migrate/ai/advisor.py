@@ -20,7 +20,7 @@ from ..planning.waves import TIERS, heuristic_tier
 from . import payloads
 from .decision import Advice
 from .jev import JevClient, JevUnavailable
-from .redaction import redact
+from .redaction import redact, replace_names
 
 log = logging.getLogger(__name__)
 GIB = 2**30
@@ -117,6 +117,13 @@ class Advisor:
         text = payloads.render_strategy(payloads.StrategyInput(vm, estimates, plan, findings))
         return self._redact(text, [vm.name])
 
+    @staticmethod
+    def _without_provider(text: str, name: str | None, descriptor: str) -> str:
+        """The destination provider's name - operator free text, in the eligibility reasons the
+        operators read (T6) - replaced by the destination's kind and series before anything leaves
+        for Jev, whatever the redaction setting (SDD §1 naming, §13.4, review RV20-01)."""
+        return replace_names(text, {name: descriptor}) if name else text
+
     async def recommend_strategy(
         self,
         vm: VMRef,
@@ -124,10 +131,13 @@ class Advisor:
         plan: Plan,
         findings: Sequence[Finding] = (),
         destination: str = "the destination",
+        destination_name: str | None = None,
     ) -> Advice | None:
         """Ask Jev to break a tie (or pick when nothing meets the SLO); ``None`` when no advice is
-        needed; the question names the ``destination`` provider (SDD §1 naming). Returns the
-        advice - or why Jev gave none; ``decide()`` takes the decision (SDD §14.2, §14.4)."""
+        needed. ``destination`` describes the destination by kind and series
+        (``destination_descriptor``), and ``destination_name``, the provider's own name, never
+        leaves (SDD §1 naming, §13.4). Returns the advice - or why Jev gave none; ``decide()``
+        takes the decision (SDD §14.2, §14.4)."""
         scope = advisor_scope(estimates, plan.selection_policy)
         if not scope:
             return None
@@ -141,12 +151,20 @@ class Advisor:
             return None  # nothing to decide: jev_decide needs at least two candidates
         # the jev_decide arguments, built even when Jev is off: they are the input snapshot (§14.5)
         arguments: dict[str, Any] = {
-            "decision": self._redact(
-                f"Which migration strategy should be used for VM {vm.name} moving to "
-                f"{destination}?",
-                [vm.name],
+            "decision": self._without_provider(
+                self._redact(
+                    f"Which migration strategy should be used for VM {vm.name} moving to "
+                    f"{destination}?",
+                    [vm.name],
+                ),
+                destination_name,
+                destination,
             ),
-            "evidence": self._strategy_evidence(vm, estimates, plan, findings),
+            "evidence": self._without_provider(
+                self._strategy_evidence(vm, estimates, plan, findings),
+                destination_name,
+                destination,
+            ),
             "priorities": (
                 f"Minimize downtime within the SLO of {plan.downtime_slo_s} s; prefer the "
                 "simpler strategy when downtimes differ by less than 10 %; never pick an "

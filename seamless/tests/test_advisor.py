@@ -7,11 +7,13 @@ import pytest
 from seamless_migrate.ai.advisor import TIER_CLASSES, VERIFICATION_CLAIMS, Advisor
 from seamless_migrate.ai.decision import decide, default_policy
 from seamless_migrate.ai.jev import JevClient
+from seamless_migrate.ai.payloads import data_sent
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import DecisionStatus, Strategy
 from seamless_migrate.domain.models import Estimate
+from seamless_migrate.planning.selector import eligibility
 from seamless_migrate.planning.waves import TIERS
-from tests.factories import make_plan, make_vm
+from tests.factories import make_disk, make_plan, make_vm
 from tests.jev_fakes import fixture_responder, load_fixture, session_factory
 
 ON = Settings(jev_mode="stdio")
@@ -441,3 +443,35 @@ async def test_the_console_excerpt_leaves_only_for_an_on_prem_model_or_when_allo
     assert note.data["console_sent"] is sent
     if not sent:
         assert "console excerpt stayed in this installation" in note.summary
+
+
+@pytest.mark.parametrize("redact_names", [False, True])
+async def test_nothing_the_advisor_sends_to_jev_carries_the_destination_providers_name(
+    redact_names,
+):
+    """SDD §1 naming, §13.4 (review RV20-01): a provider's name is operator free text. The
+    question names the destination by kind and series, and the evidence - which quotes the
+    eligibility reasons that name the provider for the operators who read them (T6) - has the name
+    replaced, whatever SEAMLESS_MEMORY_REDACT_NAMES says; data-sent declares it so."""
+    name = "ACME Bank - Jakarta DC3 (prod)"
+    descriptor = "a community OpenStack 2026.2 destination"
+    vm = make_vm(disks=[make_disk(id="vol-1", volume_type="ceph-ssd")])
+    plan = make_plan(downtime_slo_s=900)
+    caps = {"conversion_host": True, "admin": True}
+    reasons = eligibility(vm, "openstack", plan, caps, caps, (), name)[Strategy.storage_handover]
+    assert any(name in reason for reason in reasons)  # what an operator reads names it (T6)
+    handover = est(Strategy.storage_handover, 100, eligible=False).model_copy(
+        update={"reasons": reasons}
+    )
+    estimates = [est(Strategy.cold, 1000, slo=900), est(Strategy.warm, 950, slo=900), handover]
+    settings = Settings(jev_mode="http", memory_redact_names=redact_names)
+    advice = await Advisor(None, settings).recommend_strategy(
+        vm, estimates, plan, [], descriptor, name
+    )
+    assert advice is not None and advice.request is not None
+    assert name not in json.dumps(advice.request)
+    assert advice.request["decision"].endswith(f"moving to {descriptor}?")
+    assert f"without a backend of {descriptor}" in advice.request["evidence"]
+    listed = next(i for i in data_sent(settings) if i["decision_type"] == "migration_strategy")
+    label = next(f["label"] for f in listed["fields"] if f["key"] == "decision")
+    assert "kind and series" in label

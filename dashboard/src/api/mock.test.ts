@@ -1636,6 +1636,21 @@ describe('mock validation decides like the API (SDD §14.4)', () => {
     expect(snapshot.payload).toMatchObject({ tool: 'jev_decide', scope: ['cold', 'warm'], deterministic: 'warm' });
   });
 
+  it('sends Jev the destination by kind and series, never its provider name (SDD §1 naming, §13.4, review RV20-01)', async () => {
+    const { server, client, plan, before } = validating({ option: 'cold', confidence: 0.8 });
+    const name = 'ACME Bank - Jakarta DC3 (prod)';
+    const destination = server.providers.find((p) => p.id === plan.destination_provider_id)!;
+    destination.name = name;
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    const snapshot = server.snapshots.get(rec!.input_snapshot_sha256!)!;
+    expect(JSON.stringify(snapshot.payload)).not.toContain('ACME');
+    expect(snapshot.payload).toMatchObject({ arguments: { decision: expect.stringMatching(/ moving to RHOSO 18\.0\?$/) } });
+    // the eligibility reasons the operators read name the provider (T6); what Jev gets names the kind
+    expect(server.migrations.some((m) => m.plan_id === plan.id && m.estimates.some((e) => e.reasons.some((r) => r.includes(name))))).toBe(true);
+    expect(snapshot.payload).toMatchObject({ arguments: { evidence: expect.stringContaining('without a backend of RHOSO 18.0') } });
+  });
+
   it('keeps the deterministic choice when the confidence is below the threshold', async () => {
     const { server, client, plan, db, before } = validating({ option: 'cold', confidence: 0.57 });
     await client.post(`/plans/${plan.id}/validate`);

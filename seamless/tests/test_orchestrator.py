@@ -3666,6 +3666,24 @@ async def test_a_recommendation_is_audited_once_with_its_redacted_input(
     )
 
 
+async def test_the_question_to_jev_names_the_destination_by_kind_never_its_providers_name(
+    tmp_path, store
+):
+    """SDD §1 naming, §13.4 (review RV20-01): validation asks the advisor with the destination's
+    kind and series; its provider's name, operator free text, reaches neither the call to Jev nor
+    the stored input snapshot."""
+    advisor, session = _tie_advisor("warm", 0.9)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    store.put("provider", DST_PROVIDER.model_copy(update={"name": "ACME Bank - Jakarta DC3"}))
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    snapshot = store.get("advisor_snapshot", rec.input_snapshot_sha256, AdvisorSnapshot)
+    assert snapshot.payload["arguments"]["decision"].endswith(" moving to RHOSO 18.0?")
+    assert "ACME" not in json.dumps(snapshot.payload)
+    assert session.calls and session.calls[0][0] == "jev_decide"
+    assert "ACME" not in json.dumps(session.calls, default=str)
+
+
 def _finance(plan) -> AdvisorPolicy:
     return AdvisorPolicy(
         id="pol-finance",

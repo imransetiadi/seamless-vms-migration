@@ -1464,14 +1464,19 @@ def test_no_user_facing_text_assumes_rhoso_for_a_community_destination():
 
 #: the control plane's texts that are about the Red Hat product itself (SDD §1 naming): the demo's
 #: RHOSO 18.0 provider and the plan that moves to it
-PRODUCT_TEXTS = {("demo.py", "Finance apps (RHOSP 17.1 → RHOSO)"), ("demo.py", "RHOSO 18.0")}
+PRODUCT_TEXTS = {
+    ("demo.py", "Finance apps (RHOSP 17.1 → RHOSO)"),
+    ("demo.py", "RHOSO 18.0"),
+    # what leaves for Jev names an RHOSO destination by the product itself (SDD §13.4, RV20-01)
+    ("planning/platforms.py", "RHOSO 18.0"),
+}
 
 
 def test_no_control_plane_text_says_rhoso_but_the_products_own():
-    """SDD §1 naming, plan T6: beside the findings, an executor's refusal or failure, an event and
-    the advisor's question name the destination provider, and fixed texts say "the destination":
-    of the control plane's string literals - docstrings and comments aside - only the Red Hat
-    product's own say RHOSO."""
+    """SDD §1 naming, plan T6: beside the findings, an executor's refusal or failure and an event
+    name the destination provider, the advisor's question names its kind and series (RV20-01), and
+    fixed texts say "the destination": of the control plane's string literals - docstrings and
+    comments aside - only the Red Hat product's own say RHOSO."""
     root = Path(__file__).parents[1] / "src" / "seamless_migrate"
     said = set()
     for path in sorted(root.rglob("*.py")):

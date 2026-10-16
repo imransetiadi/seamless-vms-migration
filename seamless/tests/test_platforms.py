@@ -15,6 +15,7 @@ from seamless_migrate.planning.platforms import (
     SERIES,
     ReleaseRange,
     SupportTier,
+    destination_descriptor,
     destination_release,
     maximum_microversion,
     release_range,
@@ -471,3 +472,26 @@ def test_the_shared_destination_release_cases(case):
         case["block_storage_max"],
     )
     assert found == case["expected"]
+
+
+def test_the_destination_descriptor_names_the_kind_and_series_never_the_providers_name():
+    """SDD §1 naming, §13.4 (review RV20-01): what the advisor sends to Jev names the destination
+    by kind and series - the check's settled series, else the declared one - never by the
+    provider's name, which is operator free text."""
+    from seamless_migrate.domain.enums import ProviderKind, ProviderRole
+    from tests.factories import make_provider
+
+    rhoso = make_provider(kind=ProviderKind.rhoso, role=ProviderRole.destination, name="ACME prod")
+    assert destination_descriptor(rhoso) == "RHOSO 18.0"
+    dc3 = make_provider(
+        kind=ProviderKind.openstack,
+        role=ProviderRole.destination,
+        name="ACME Bank - Jakarta DC3 (prod)",
+        capabilities={"release": "2026.2"},
+    )
+    assert destination_descriptor(dc3) == "a community OpenStack 2026.2 destination"
+    declared = dc3.model_copy(update={"capabilities": {}, "release": "2025.2"})
+    assert destination_descriptor(declared) == "a community OpenStack 2025.2 destination"
+    for unsettled in ({"release": None}, {"release": "ACME's own build"}, {}):
+        bare = dc3.model_copy(update={"capabilities": unsettled, "release": None})
+        assert destination_descriptor(bare) == "a community OpenStack destination"

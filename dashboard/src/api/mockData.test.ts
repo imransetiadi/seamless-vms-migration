@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildFixtures, buildInventories, buildProviders, eligibility, makeVm, preflight } from './mockData';
+import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, makeVm, preflight, replaceNames } from './mockData';
 import { capabilityRoles } from '../lib/networks';
 import type { DestinationInventory, DestinationNetwork, Plan, ProviderKind, VMRef } from './types';
 
@@ -482,6 +482,36 @@ describe('mock preflight reports a network RHOSO lacks like the API (SDD §9.3 M
           strategies: [],
         },
       ]);
+    }
+  });
+});
+
+describe('the mock advisor names the destination to Jev like the API (SDD §1 naming, §13.4, review RV20-01)', () => {
+  it('names the destination by kind and series: the settled series, else the declared one, never the name', () => {
+    const dc3 = { kind: 'openstack' as ProviderKind, name: 'ACME Bank - Jakarta DC3 (prod)', capabilities: { release: '2026.2' } as Record<string, unknown>, release: null as string | null };
+    expect(destinationDescriptor({ ...dc3, kind: 'rhoso' })).toBe('RHOSO 18.0');
+    expect(destinationDescriptor(dc3)).toBe('a community OpenStack 2026.2 destination');
+    expect(destinationDescriptor({ ...dc3, capabilities: {}, release: '2025.2' })).toBe('a community OpenStack 2025.2 destination');
+    for (const unsettled of [{ release: null }, { release: "ACME's own build" }, {}]) {
+      expect(destinationDescriptor({ ...dc3, capabilities: unsettled, release: null })).toBe('a community OpenStack destination');
+    }
+  });
+
+  it('replaces a name wherever it stands as a word, the longest name first, as the API does', () => {
+    const vm = { 'web-01': '[vm]' };
+    expect(replaceNames('web-01-data, web-01_root, data-web-01 and web-010', vm)).toBe('[vm]-data, [vm]_root, data-[vm] and web-010');
+    expect(replaceNames('ACME prod and ACME', { ACME: 'x', 'ACME prod': 'RHOSO 18.0' })).toBe('RHOSO 18.0 and x');
+    expect(replaceNames('a cost of $1 (approx.)', { '$1 (approx.)': 'y' })).toBe('a cost of y');
+  });
+
+  it('seeds no advisor snapshot that names a destination provider', () => {
+    const fixtures = buildFixtures(Date.parse('2026-10-16T08:00:00Z'));
+    const names = fixtures.providers.filter((p) => p.role === 'destination').map((p) => p.name);
+    expect(names.length).toBeGreaterThan(0);
+    expect(fixtures.snapshots.length).toBeGreaterThan(0);
+    for (const snapshot of fixtures.snapshots) {
+      const sent = JSON.stringify(snapshot.payload);
+      expect(names.filter((name) => sent.includes(name))).toEqual([]);
     }
   });
 });

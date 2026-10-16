@@ -233,6 +233,34 @@ const CANDIDATE_DESCRIPTIONS: Record<Strategy, string> = {
   vmware_warm: 'Copy with CBT while the VMware VM runs, then a final delta after shutdown.',
 };
 
+const SERIES_NAME = /^\d{4}\.[12]$/;
+
+/**
+ * The destination by kind and series, as the API names it to Jev (`destination_descriptor`; SDD §1 naming, §13.4,
+ * review RV20-01): "RHOSO 18.0", the community series the check settled, else the declared one - never the
+ * provider's name, which is operator free text.
+ */
+export function destinationDescriptor(destination: Pick<Provider, 'kind' | 'capabilities' | 'release'>): string {
+  if (destination.kind === 'rhoso') return 'RHOSO 18.0';
+  for (const series of [destination.capabilities.release, destination.release]) {
+    if (typeof series === 'string' && SERIES_NAME.test(series)) return `a community OpenStack ${series} destination`;
+  }
+  return 'a community OpenStack destination';
+}
+
+/**
+ * The API's `replace_names` (SDD §13.4): each name replaced wherever it stands as a word - between characters that
+ * are not letters or digits, so web-01-data loses web-01 while web-010 keeps it - the longest name first.
+ */
+export function replaceNames(text: string, replacements: Record<string, string>): string {
+  let out = text;
+  for (const name of Object.keys(replacements).filter(Boolean).sort((a, b) => b.length - a.length)) {
+    const word = new RegExp(`(?<![\\p{L}\\p{N}])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\p{L}\\p{N}])`, 'gu');
+    out = out.replace(word, () => replacements[name]!);
+  }
+  return out;
+}
+
 /** The advisor's input for a strategy choice, as the API snapshots it (SDD §14.5): the jev_decide arguments and the scope. */
 export function strategySnapshot(input: {
   vm: VMRef;
@@ -242,10 +270,14 @@ export function strategySnapshot(input: {
   scope: readonly string[];
   deterministic: Strategy;
   at: string;
-  /** The plan's destination provider, by name: the question names it (SDD §1 naming). */
+  /** The plan's destination by kind and series (`destinationDescriptor`): the question names it (SDD §1 naming). */
   destination?: string;
+  /** Its provider's own name: replaced by the descriptor in the question and the evidence, never sent (SDD §13.4). */
+  destinationName?: string;
 }): AdvisorSnapshot {
   const { vm, plan, estimates, findings } = input;
+  const where = input.destination ?? 'the destination';
+  const withoutProvider = (text: string) => (input.destinationName ? replaceNames(text, { [input.destinationName]: where }) : text);
   const gib = (bytes: number) => `${(bytes / GiB).toFixed(1)} GiB`;
   const disks = vm.disks
     .map((d) => `${d.kind} ${d.size_gb} GiB${d.volume_type ? ` type ${d.volume_type}` : ''}${d.multiattach ? ' multi-attach' : ''}${d.encrypted ? ' encrypted' : ''}${d.independent ? ' independent' : ''}`)
@@ -258,11 +290,12 @@ export function strategySnapshot(input: {
   const payload = {
     tool: 'jev_decide',
     arguments: {
-      decision: `Which migration strategy should be used for VM ${vm.name} moving to ${input.destination ?? 'the destination'}?`,
-      evidence:
+      decision: withoutProvider(`Which migration strategy should be used for VM ${vm.name} moving to ${where}?`),
+      evidence: withoutProvider(
         `VM ${vm.name}: ${vm.vcpus} vCPU, ${vm.ram_mb} MB RAM, ${vm.disks.length} disk(s) [${disks}], provisioned ${gib(vm.disk_bytes)}, used ${gib(vm.used_bytes)}. ` +
-        `Guest write rate ${rate}. Downtime SLO ${plan.downtime_slo_s} s. Link ${Math.round(plan.link_bps / MiB)} MiB/s. ` +
-        `Findings: ${findings.map((f) => `${f.code} (${f.severity})`).join(', ') || 'none'}. Estimates: ${estimateText}.`,
+          `Guest write rate ${rate}. Downtime SLO ${plan.downtime_slo_s} s. Link ${Math.round(plan.link_bps / MiB)} MiB/s. ` +
+          `Findings: ${findings.map((f) => `${f.code} (${f.severity})`).join(', ') || 'none'}. Estimates: ${estimateText}.`,
+      ),
       priorities: `Minimize downtime within the SLO of ${plan.downtime_slo_s} s; prefer the simpler strategy when downtimes differ by less than 10 %; never pick an ineligible strategy`,
       candidates: eligible.map((e) => ({ id: e.strategy, description: CANDIDATE_DESCRIPTIONS[e.strategy] })),
       requirements: STRATEGY_REQUIREMENTS,
@@ -1831,8 +1864,11 @@ export function buildFixtures(now: number): Fixtures {
       if (m.rec) {
         // recorded when the validation ended (SDD §14.4)
         const validated = history.find((c) => c.from_phase === 'validating')?.at ?? iso(migCreatedAt);
-        const destination = providers.find((p) => p.id === plan.destination_provider_id)?.name;
-        const snapshot = strategySnapshot({ vm, plan, estimates, findings, scope: estimates.filter((e) => e.eligible).map((e) => e.strategy), deterministic: m.rec.deterministic, at: validated, destination });
+        const destination = providers.find((p) => p.id === plan.destination_provider_id);
+        const snapshot = strategySnapshot({
+          vm, plan, estimates, findings, scope: estimates.filter((e) => e.eligible).map((e) => e.strategy), deterministic: m.rec.deterministic, at: validated,
+          destination: destination && destinationDescriptor(destination), destinationName: destination?.name,
+        });
         snapshots.push(snapshot);
         const eligible = estimates.filter((e) => e.eligible).map((e) => e.strategy);
         const evidenceOption = m.rec.option && eligible.includes(m.rec.option as Strategy) ? m.rec.option : m.rec.deterministic;

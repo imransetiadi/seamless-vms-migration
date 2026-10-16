@@ -233,3 +233,20 @@ def support_tier(found: ReleaseRange, declared: str | None = None) -> SupportTie
         return SupportTier("outside", reason, outside_range)
     tier = max((tiers[name] for name in found.series), key=TIERS.index)
     return SupportTier(tier, "end_of_life" if tier == "tier3" else None, outside_range)
+
+
+_SERIES_NAME = re.compile(r"\d{4}\.[12]")
+
+
+def destination_descriptor(destination: Any) -> str:
+    """The destination by kind and series, for what leaves for the Jev service (SDD §1 naming,
+    §13.4, review RV20-01): "RHOSO 18.0", "a community OpenStack 2026.2 destination" by the check's
+    settled series, else the declared one, or "a community OpenStack destination" - never the
+    provider's name, which is operator free text."""
+    if str(getattr(destination, "kind", "")) == "rhoso":
+        return "RHOSO 18.0"
+    capabilities = getattr(destination, "capabilities", None) or {}
+    for series in (capabilities.get("release"), getattr(destination, "release", None)):
+        if isinstance(series, str) and _SERIES_NAME.fullmatch(series):
+            return f"a community OpenStack {series} destination"
+    return "a community OpenStack destination"
