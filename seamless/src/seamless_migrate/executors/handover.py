@@ -26,7 +26,7 @@ from typing import Any, TypeVar
 from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import Strategy
-from ..domain.models import Mappings, Plan, Provider, utcnow
+from ..domain.models import Mappings, Plan, Provider, VMRef, utcnow
 from ..planning.ipam import address_refusal, requested_ips
 from ..planning.networks import policy_profile_of, port_refusal_at_run
 from ..providers.base import microversion_text
@@ -208,6 +208,13 @@ async def _in_thread(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     stopped, so a cancelled step ends only once its call returned and journaled what it did, and
     the rollback that follows reads the whole journal (audit EX-01)."""
     return await outlive_cancel(asyncio.to_thread(fn, *args, **kwargs))
+
+
+def _recreated_vm(vm: VMRef, server_id: str, new_ids: dict[str, str]) -> dict[str, Any]:
+    """``vm`` as the rollback recreated it: the new server's id, each disk managed back by its new
+    volume id (SDD §7.3)."""
+    disks = [d.model_copy(update={"id": new_ids.get(d.id, d.id)}) for d in vm.disks]
+    return vm.model_copy(update={"source_id": server_id, "disks": disks}).model_dump(mode="json")
 
 
 class _Journal:
@@ -1232,6 +1239,11 @@ class HandoverExecutor:
         server_id = ctx.migration.vm.source_id
         definition_path = rdir / DEFINITION_FILE
         if not journal.data["order"]:
+            # a rollback that archived its journal before the migration recorded what it did - a
+            # stop or a failed save in between - reports the VM it recreated again (audit EX-04)
+            recreated = await _in_thread(self._archived_outcome, rdir, ctx.migration.vm)
+            if recreated is not None:
+                return StepResult(details={"source_running": True, "vm": recreated})
             return StepResult(details={"source_running": True, "note": "nothing to roll back"})
         if not await _in_thread(definition_path.exists):
             # stopped but nothing else happened yet: just start the source again
@@ -1420,13 +1432,30 @@ class HandoverExecutor:
 
         details: dict[str, Any] = {"source_running": True}
         if new_server_id != server_id or any(k != v for k, v in new_ids.items()):
-            vm = ctx.migration.vm
-            disks = [d.model_copy(update={"id": new_ids.get(d.id, d.id)}) for d in vm.disks]
-            details["vm"] = vm.model_copy(
-                update={"source_id": new_server_id, "disks": disks}
-            ).model_dump(mode="json")
+            details["vm"] = _recreated_vm(ctx.migration.vm, new_server_id, new_ids)
         await _in_thread(journal.archive, "rolled-back")
         return StepResult(details=details)
+
+    @staticmethod
+    def _archived_outcome(rdir: Path, vm: VMRef) -> dict[str, Any] | None:
+        """The VM the newest archived rollback recreated, while the migration still names the
+        server that rollback replaced (the one its definition recorded, SDD §7.3); None once the
+        migration follows it, or when no rollback recreated one."""
+        definition_path = rdir / DEFINITION_FILE
+        archives = sorted(rdir.glob("handover-journal.rolled-back-*.json"))
+        if not archives or not definition_path.exists():
+            return None
+        definition = _read_json(definition_path)
+        done = _read_json(archives[-1]).get("done") or {}
+        created = done.get("rb:create_source")
+        if definition.get("server_id") != vm.source_id or not created:
+            return None
+        new_ids = {
+            a["volume_id"]: str(done.get(f"rb:manage_src:{a['volume_id']}", {}).get("volume_id"))
+            for a in definition["attachments"]
+            if f"rb:manage_src:{a['volume_id']}" in done
+        }
+        return _recreated_vm(vm, str(created["server_id"]), new_ids)
 
     def _start(self, conn: Any, server_id: str) -> None:
         server = conn.compute.get_server(server_id)

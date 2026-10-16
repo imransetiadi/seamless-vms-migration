@@ -13,7 +13,7 @@ import pytest
 
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy
-from seamless_migrate.domain.models import HandoverConfig, Mappings, utcnow
+from seamless_migrate.domain.models import HandoverConfig, Mappings, VMRef, utcnow
 from seamless_migrate.executors import handover as handover_module
 from seamless_migrate.executors.base import PermanentStepError, StepName, TransientStepError
 from seamless_migrate.executors.handover import (
@@ -1809,10 +1809,59 @@ async def test_handover_rollback_after_unmanage_manages_back_and_recreates(tmp_p
     new_vm = result.details["vm"]
     assert new_vm["source_id"] == "src-new-1"
     assert {d["id"] for d in new_vm["disks"]} == {"src-vol-1", "src-vol-2"}
-    # a second rollback finds the archived journal gone and does nothing
+    # a second rollback while the migration still names the replaced server (a stop or a failed
+    # save after the first, SDD §7.3) changes nothing and reports the same VM again (audit EX-04)
     calls.clear()
     again = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
-    assert calls == [] and again.details["note"] == "nothing to roll back"
+    assert calls == [] and again.details["vm"] == new_vm
+    # once the migration follows the recreated VM, there is nothing to roll back
+    followed = mig.model_copy(update={"vm": VMRef.model_validate(new_vm)})
+    done = await executor.run(StepName.ROLLBACK, make_ctx(plan, followed, SRC, DST, settings)[0])
+    assert calls == [] and done.details["note"] == "nothing to roll back"
+
+
+async def test_a_rollback_resumed_after_two_cycles_reports_the_newest_recreated_vm(tmp_path):
+    """SDD §7.3: a migration rolled back twice - each cycle recreating its source - reads, when its
+    second rollback's outcome was not recorded, the newest archived journal, never an older
+    cycle's (audit EX-04)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    rdir = executor.run_dir(ctx)
+    rdir.mkdir(parents=True)
+    (rdir / "source-server.json").write_text(
+        json.dumps({"server_id": "srv-1", "attachments": [{"volume_id": "vol-root"}]})
+    )
+    for stamp, server, volume in (
+        ("20261017T040000", "src-old", "src-vol-old"),
+        ("20261017T050000", "src-newest", "src-vol-newest"),
+    ):
+        done = {"rb:create_source": {"server_id": server}}
+        done["rb:manage_src:vol-root"] = {"volume_id": volume}
+        (rdir / f"handover-journal.rolled-back-{stamp}.json").write_text(
+            json.dumps({"done": done, "order": list(done)})
+        )
+    result = await executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["vm"]["source_id"] == "src-newest" and calls == []
+    assert "src-vol-newest" in {d["id"] for d in result.details["vm"]["disks"]}
+
+
+async def test_a_second_rollback_after_one_that_kept_the_source_has_nothing_to_roll_back(
+    tmp_path,
+):
+    """SDD §7.3: a rollback before the source server was deleted keeps the server and its id, so
+    a second one - its journal archived - has nothing to roll back and reports no VM (audit
+    EX-04)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="delete_server")
+    with pytest.raises(PermanentStepError, match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    first = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "vm" not in first.details
+    calls.clear()
+    again = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert calls == [] and again.details == {
+        "source_running": True,
+        "note": "nothing to roll back",
+    }
 
 
 @pytest.mark.parametrize(

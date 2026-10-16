@@ -170,3 +170,32 @@ async def test_a_handover_cut_off_while_its_stop_waits_is_rolled_back(tmp_path, 
         assert ("src", "start_server", "srv-1") in calls
     finally:
         await h.orch.stop()
+
+
+async def test_a_rollback_resumed_after_it_archived_its_journal_still_reports_the_recreated_vm(
+    tmp_path, store, refuse_write
+):
+    """SDD §7.3, §8: the rollback recreated the source server - a new id - and archived its
+    journal, then the migration's save after the plan's rewrite failed (a store error: the driver
+    is relaunched). The resumed rollback reports the recreated VM again from the archived journal,
+    so the migration and its plan name the same, existing server (audit EX-04)."""
+    h, calls, clouds, mig = handover_harness(tmp_path, store)
+    clouds["dst"].crash_on = "create_server"  # step 8 fails once the source server was deleted
+    create = clouds["src"].compute.create_server
+    refused = []
+
+    def recreate(**params):
+        # the next save of the migration - the one after the plan's rewrite - fails
+        refused.append(refuse_write(store, "UPDATE documents", "migration"))
+        return create(**params)
+
+    clouds["src"].compute.create_server = recreate
+    await h.orch.start()
+    try:
+        final = await h.wait_phase(mig.id, P.rolled_back, P.failed, timeout=20)
+        assert refused and refused[0], "the save after the plan's rewrite was refused"
+        plan = await h.plan(mig.plan_id)
+        assert final.phase == P.rolled_back, final.error
+        assert final.vm.source_id == plan.vm_ids[0] == "src-new-1", (final.vm, plan.vm_ids)
+    finally:
+        await h.orch.stop()
