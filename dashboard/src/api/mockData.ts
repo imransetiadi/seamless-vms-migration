@@ -1081,8 +1081,8 @@ export function preflight(
   sourceKind: ProviderKind,
   plan: Plan,
   destinationNetworks: Record<string, number | null>,
-  selectedNames: string[],
-  /** The destination's subnets, its networks with their owners, its token's roles and the plan's VMs, for the NIC checks (SDD §9.3). */
+  /** The destination's subnets, its networks with their owners, its token's roles, and the plan's selected VMs - `vm` alone
+   * when not given, as the API's all_vms (SDD §9.3). */
   context: { subnets?: DestinationSubnet[]; selected?: VMRef[]; networkDetails?: DestinationNetwork[]; roles?: string[]; profile?: string; destination?: string } = {},
 ): Finding[] {
   const findings: Finding[] = [];
@@ -1093,8 +1093,15 @@ export function preflight(
 
   if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', 'blocker', `${vm.name} is in ERROR state at the source.`, 'Repair or reset the source instance, then re-validate.');
   if (vm.power_state === 'transitioning') add('SRC_VM_TRANSITIONAL_STATE', 'blocker', `${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot).`, 'Wait until the VM is ACTIVE or SHUTOFF, then re-validate.');
-  if (selectedNames.filter((n) => n === vm.name).length > 1)
-    add('SRC_VM_DUPLICATE_NAME', 'blocker', `Another selected VM is also named ${vm.name}; os-migrate filters workloads by name.`, 'Rename one of the instances or split them into separate plans.');
+  // the other selected VMs of that name, by their project and id, as the API words them (SDD §9.3)
+  const twins = (context.selected ?? [vm]).filter((v) => v.source_id !== vm.source_id && v.name === vm.name);
+  if (twins.length)
+    add(
+      'SRC_VM_DUPLICATE_NAME',
+      'blocker',
+      `Another selected VM is also named ${pyRepr(vm.name)} (${pyNames(twins.map((t) => `${t.project || '-'}/${t.source_id}`))}); os-migrate selects workloads by name.`,
+      'Rename one of the instances or split them into separate plans.',
+    );
   if (vm.disks.some((d) => d.multiattach))
     add('SRC_VM_MULTIATTACH', 'warning', 'A multi-attach volume is attached; warm and storage handover are not possible.', 'Detach the shared volume or migrate cold during a window.', ['warm', 'storage_handover']);
   if (vm.disks[0] && (vm.disks[0].kind === 'image_root' || vm.disks[0].kind === 'ephemeral'))
@@ -1791,11 +1798,11 @@ export function buildFixtures(now: number): Fixtures {
     plans.push(plan);
     emit({ ts: iso(createdAt), kind: 'plan.created', plan_id: plan.id, migration_id: null, actor: 'rina', message: `Plan "${plan.name}" created with ${plan.vm_ids.length} VMs`, data: { status: 'draft' } });
 
-    const selectedNames = plan.vm_ids.map((id) => vms.find((v) => v.source_id === id)?.name ?? id);
+    const selected = plan.vm_ids.flatMap((id) => vms.filter((v) => v.source_id === id));
     for (const m of spec.migrations) {
       const vm = vms.find((v) => v.source_id === m.vm);
       if (!vm) continue;
-      const findings = preflight(vm, source.kind, plan, dstInventory.networks, selectedNames, { destination: providerLabel(destination) });
+      const findings = preflight(vm, source.kind, plan, dstInventory.networks, { selected, destination: providerLabel(destination) });
       const elig = eligibility(vm, source.kind, plan, source, destination, findings);
       const estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(vm, s, plan, elig[s] ?? []));
       const chosen = estimates.find((e) => e.strategy === m.strategy) ?? null;

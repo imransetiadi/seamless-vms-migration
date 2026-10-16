@@ -65,12 +65,12 @@ describe('mock eligibility and preflight mirror SDD §9.2/§9.3 for ports withou
         { network: 'app-net', fixed_ips: ['10.0.0.6'] },
       ],
     });
-    const found = preflight(vm, 'openstack', plan, nets, [vm.name]).filter((f) => f.code === 'NET_PORT_IPS');
+    const found = preflight(vm, 'openstack', plan, nets).filter((f) => f.code === 'NET_PORT_IPS');
     expect(found).toHaveLength(1);
     expect(found[0]!.severity).toBe('warning');
     expect(found[0]!.message).toContain('app-net (10.0.0.5, fd00::5), l2-net (no fixed IP)');
     expect(found[0]!.message).not.toContain('10.0.0.6');
-    expect(preflight(vm, 'vmware', plan, nets, [vm.name]).some((f) => f.code === 'NET_PORT_IPS')).toBe(false);
+    expect(preflight(vm, 'vmware', plan, nets).some((f) => f.code === 'NET_PORT_IPS')).toBe(false);
   });
 });
 
@@ -90,8 +90,8 @@ describe('mock eligibility and preflight follow port_creation_mode (SDD §9.2/§
     expect(reasons.warm).toEqual([]);
     expect(reasons.storage_handover).toEqual([]);
     expect(eligibility(dual, 'openstack', base, source, destination, []).storage_handover?.some((r) => r.includes('app-net (10.0.0.5, fd00::5)'))).toBe(true);
-    expect(preflight(dual, 'openstack', neutron, { 'app-net': 1450 }, [dual.name]).some((f) => f.code === 'NET_PORT_IPS')).toBe(false);
-    const nova = preflight(dual, 'openstack', base, { 'app-net': 1450 }, [dual.name]).find((f) => f.code === 'NET_PORT_IPS');
+    expect(preflight(dual, 'openstack', neutron, { 'app-net': 1450 }).some((f) => f.code === 'NET_PORT_IPS')).toBe(false);
+    const nova = preflight(dual, 'openstack', base, { 'app-net': 1450 }).find((f) => f.code === 'NET_PORT_IPS');
     expect(nova?.remediation).toMatch(/keep mac addresses and every fixed ip/i);
   });
 });
@@ -116,19 +116,19 @@ describe('mock preflight checks NIC overrides like the API (SDD §9.3)', () => {
   const codes = (found: { code: string }[]) => found.map((f) => f.code);
 
   it('names where an applicable override sends the NIC', () => {
-    const found = preflight(vm, 'openstack', plan({ network: 'tenant-web', fixed_ips: ['10.30.1.5'] }), nets, [vm.name], { subnets, selected: [vm, other] });
+    const found = preflight(vm, 'openstack', plan({ network: 'tenant-web', fixed_ips: ['10.30.1.5'] }), nets, { subnets, selected: [vm, other] });
     expect(found.find((f) => f.code === 'MAP_NIC_OVERRIDE')?.message).toBe('NIC override(s): fa:16:3e:00:00:01 (tenant-app) -> tenant-web: 10.30.1.5.');
     expect(codes(found)).not.toContain('MAP_NIC_OVERRIDE_INVALID');
   });
 
   it('blocks an address outside the target subnets, one another NIC gets, and any override on VMware', () => {
-    const outside = preflight(vm, 'openstack', plan({ network: 'tenant-web' }), nets, [vm.name], { subnets, selected: [vm] });
+    const outside = preflight(vm, 'openstack', plan({ network: 'tenant-web' }), nets, { subnets, selected: [vm] });
     expect(outside.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toBe(
       "NIC override(s) of nic-01 cannot be applied: fa:16:3e:00:00:01: 10.20.1.5 lies in no subnet of 'tenant-web'.",
     );
-    const twice = preflight(vm, 'openstack', plan({ fixed_ips: ['10.20.1.6'] }), nets, [vm.name], { subnets, selected: [vm, other] });
+    const twice = preflight(vm, 'openstack', plan({ fixed_ips: ['10.20.1.6'] }), nets, { subnets, selected: [vm, other] });
     expect(twice.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toContain('fa:16:3e:00:00:01: 10.20.1.6 also goes to nic-02 (fa:16:3e:00:00:02)');
-    const vmw = preflight(vm, 'vmware', plan({ network: 'tenant-web' }), nets, [vm.name], { subnets, selected: [vm] });
+    const vmw = preflight(vm, 'vmware', plan({ network: 'tenant-web' }), nets, { subnets, selected: [vm] });
     expect(vmw.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toContain("the migration kit keeps the guest's network settings");
     expect(eligibility(vm, 'vmware', plan({ network: 'tenant-web' }), vcenter, destination, vmw).vmware_cold?.some((r) => r.includes('MAP_NIC_OVERRIDE_INVALID'))).toBe(true);
   });
@@ -136,7 +136,7 @@ describe('mock preflight checks NIC overrides like the API (SDD §9.3)', () => {
   it('blocks an address Neutron gives no VM, as the API words it', () => {
     // an IPv6 subnet's first address is a port's (review NC-08)
     const dual = [...subnets, { name: 'web-v6', network: 'tenant-web', cidr: 'fd00:30::/64' }];
-    const found = preflight(vm, 'openstack', plan({ network: 'tenant-web', fixed_ips: ['10.30.0.0', '10.30.255.255', '10.30.1.5', 'fd00:30::'] }), nets, [vm.name], {
+    const found = preflight(vm, 'openstack', plan({ network: 'tenant-web', fixed_ips: ['10.30.0.0', '10.30.255.255', '10.30.1.5', 'fd00:30::'] }), nets, {
       subnets: dual,
       selected: [vm],
     });
@@ -147,7 +147,7 @@ describe('mock preflight checks NIC overrides like the API (SDD §9.3)', () => {
   });
 
   it.each(['constructor', 'toString', '__proto__'])('refuses an override to %s, a network the destination lacks, as the API (review RV23-01)', (name) => {
-    const found = preflight(vm, 'openstack', plan({ network: name }), nets, [vm.name], { subnets, selected: [vm] });
+    const found = preflight(vm, 'openstack', plan({ network: name }), nets, { subnets, selected: [vm] });
     expect(found.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toBe(
       `NIC override(s) of nic-01 cannot be applied: fa:16:3e:00:00:01: the destination has no network '${name}'.`,
     );
@@ -155,11 +155,11 @@ describe('mock preflight checks NIC overrides like the API (SDD §9.3)', () => {
 
   it("writes the target network's name as the API's messages do (review NC-11)", () => {
     const quoted = "bob's-web";
-    const missing = preflight(vm, 'openstack', plan({ network: quoted }), nets, [vm.name], { subnets, selected: [vm] });
+    const missing = preflight(vm, 'openstack', plan({ network: quoted }), nets, { subnets, selected: [vm] });
     expect(missing.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toBe(
       'NIC override(s) of nic-01 cannot be applied: fa:16:3e:00:00:01: the destination has no network "bob\'s-web".',
     );
-    const outside = preflight(vm, 'openstack', plan({ network: quoted }), { ...nets, [quoted]: 1442 }, [vm.name], {
+    const outside = preflight(vm, 'openstack', plan({ network: quoted }), { ...nets, [quoted]: 1442 }, {
       subnets: [...subnets, { name: 'q', network: quoted, cidr: '10.40.0.0/16' }],
       selected: [vm],
     });
@@ -170,7 +170,7 @@ describe('mock preflight checks NIC overrides like the API (SDD §9.3)', () => {
 
   it('finds an address another NIC gets whatever way it is written', () => {
     const v6 = makeVm({ id: 'os-o2', name: 'nic-02', disks: [{ size_gb: 20 }], nics: [{ network: 'tenant-app', mac: 'fa:16:3e:00:00:02', fixed_ips: ['FD00:0::0005'] }] });
-    const found = preflight(vm, 'openstack', plan({ fixed_ips: ['fd00::5'] }), nets, [vm.name], { subnets: [...subnets, { name: 'app-v6', network: 'tenant-app', cidr: 'fd00::/64' }], selected: [vm, v6] });
+    const found = preflight(vm, 'openstack', plan({ fixed_ips: ['fd00::5'] }), nets, { subnets: [...subnets, { name: 'app-v6', network: 'tenant-app', cidr: 'fd00::/64' }], selected: [vm, v6] });
     expect(found.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toContain('fa:16:3e:00:00:01: fd00::5 also goes to nic-02 (fa:16:3e:00:00:02)');
   });
 
@@ -188,25 +188,25 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
 
   it('blocks a name the cutover cannot resolve, with the API\'s message', () => {
     const twoOwn = [net('a', 'tenant-web', true, 'shop'), net('b', 'tenant-web', true, 'shop')];
-    const found = preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: twoOwn });
+    const found = preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, { selected: [vm], networkDetails: twoOwn });
     expect(found.find((f) => f.code === 'MAP_NETWORK_AMBIGUOUS')?.message).toBe(
       "The cutover cannot tell these networks of the destination apart: fa:16:3e:00:00:01 (tenant-app): 2 networks of the credential's project are named 'tenant-web'.",
     );
     const twoOther = [net('a', 'tenant-web', false, 'p1'), net('b', 'tenant-web', false, 'p2')];
-    expect(preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: twoOther }).find((f) => f.code === 'MAP_NETWORK_AMBIGUOUS')?.message).toBe(
+    expect(preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, { selected: [vm], networkDetails: twoOther }).find((f) => f.code === 'MAP_NETWORK_AMBIGUOUS')?.message).toBe(
       "The cutover cannot tell these networks of the destination apart: fa:16:3e:00:00:01 (tenant-app): 2 networks of other projects are named 'tenant-web' (p1, p2), none of the credential's project.",
     );
     // the credential's own among others, or another project's alone, resolves; a VMware NIC is judged too (SDD §7.2)
     for (const details of [[net('x', 'tenant-web', false, 'p1'), net('a', 'tenant-web', true, 'shop')], [net('x', 'tenant-web', false, 'p1')]])
-      expect(codes(preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: details }))).not.toContain('MAP_NETWORK_AMBIGUOUS');
-    expect(codes(preflight(vm, 'vmware', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: twoOther }))).toContain('MAP_NETWORK_AMBIGUOUS');
+      expect(codes(preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, { selected: [vm], networkDetails: details }))).not.toContain('MAP_NETWORK_AMBIGUOUS');
+    expect(codes(preflight(vm, 'vmware', base, { 'tenant-web': 1442 }, { selected: [vm], networkDetails: twoOther }))).toContain('MAP_NETWORK_AMBIGUOUS');
   });
 
   it.each(['openstack', 'vmware'] as const)('resolves a %s NIC on a network named like an Object.prototype key by that name (review RV23-01)', (kind) => {
     const nic = makeVm({ id: 'os-o3', name: 'nic-03', disks: [{ size_gb: 20 }], nics: [{ network: 'constructor', mac: 'fa:16:3e:00:00:03', fixed_ips: ['10.20.1.7'] }] });
     const plan = { ...base, mappings: { ...base.mappings, networks: {} } };
     const twoOwn = [net('a', 'constructor', true, 'shop'), net('b', 'constructor', true, 'shop')];
-    const found = preflight(nic, kind, plan, { constructor: 1442 }, [nic.name], { selected: [nic], networkDetails: twoOwn });
+    const found = preflight(nic, kind, plan, { constructor: 1442 }, { selected: [nic], networkDetails: twoOwn });
     expect(found.find((f) => f.code === 'MAP_NETWORK_AMBIGUOUS')?.message).toBe(
       "The cutover cannot tell these networks of the destination apart: fa:16:3e:00:00:03 (constructor): 2 networks of the credential's project are named 'constructor'.",
     );
@@ -216,7 +216,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const plan = { ...base, mappings: { ...base.mappings, networks: {} } };
     const details = [net('app', 'tenant-app', true, 'shop')];
     const subnets = [{ name: 's', network: 'tenant-app', network_id: 'app', cidr: '10.30.0.0/16', ipv6_address_mode: null, ipv6_ra_mode: null }];
-    const found = preflight(vm, 'openstack', plan, { 'tenant-app': 1442 }, [vm.name], { selected: [vm], networkDetails: details, subnets });
+    const found = preflight(vm, 'openstack', plan, { 'tenant-app': 1442 }, { selected: [vm], networkDetails: details, subnets });
     const refused = found.find((f) => f.code === 'NET_ADDRESS_REFUSED');
     expect(refused?.severity).toBe('blocker');
     expect(refused?.message).toBe(
@@ -226,12 +226,12 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
       'Give the NIC an address its destination network takes: map its network to one whose subnets hold it, or set the address in a NIC override; for a SLAAC address keep the MAC (port_creation_mode "neutron").',
     );
     const fits = [{ ...subnets[0]!, cidr: '10.20.0.0/16' }];
-    expect(codes(preflight(vm, 'openstack', plan, { 'tenant-app': 1442 }, [vm.name], { selected: [vm], networkDetails: details, subnets: fits }))).not.toContain('NET_ADDRESS_REFUSED');
+    expect(codes(preflight(vm, 'openstack', plan, { 'tenant-app': 1442 }, { selected: [vm], networkDetails: details, subnets: fits }))).not.toContain('NET_ADDRESS_REFUSED');
     // Nova creates the port with no owner: an IPv6 subnet's first address is taken (review NC-08)
     const first = makeVm({ id: 'os-o1', name: 'nic-01', disks: [{ size_gb: 20 }], nics: [{ network: 'tenant-app', mac: 'fa:16:3e:00:00:01', fixed_ips: ['fd00:30::'] }] });
     const v6 = [{ ...subnets[0]!, cidr: 'fd00:30::/64' }];
     const nova = { ...plan, port_creation_mode: 'nova' as const };
-    expect(codes(preflight(first, 'openstack', nova, { 'tenant-app': 1442 }, [first.name], { selected: [first], networkDetails: details, subnets: v6 }))).not.toContain('NET_ADDRESS_REFUSED');
+    expect(codes(preflight(first, 'openstack', nova, { 'tenant-app': 1442 }, { selected: [first], networkDetails: details, subnets: v6 }))).not.toContain('NET_ADDRESS_REFUSED');
   });
 
   it("blocks a NIC on another project's network the credential may not use, with the API's message (SDD §9.3, §6.6)", () => {
@@ -240,7 +240,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const tenant = { ...net('b', 'tenant-web', false, 'project-b'), shared: false };
     const member = ['member', 'reader'];
     const run = (network: DestinationNetwork, roles: string[] | undefined, kind: ProviderKind = 'openstack') =>
-      preflight(vm, kind, base, { 'tenant-web': 1442 }, [vm.name], {
+      preflight(vm, kind, base, { 'tenant-web': 1442 }, {
         selected: [vm],
         networkDetails: [network],
         subnets: [{ name: 's', network: 'tenant-web', network_id: network.id!, cidr: '10.20.0.0/16', ipv6_address_mode: null, ipv6_ra_mode: null }],
@@ -276,7 +276,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
   it("judges another project's network by the destination's policy profile, naming the least role that clears it (SDD §21.5, review RV18-10)", () => {
     const shared = net('p', 'tenant-web', false, 'project-admin');
     const run = (roles: string[], profile: string) =>
-      preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, [vm.name], {
+      preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, {
         selected: [vm],
         networkDetails: [shared],
         subnets: [{ name: 's', network: 'tenant-web', network_id: shared.id!, cidr: '10.20.0.0/16', ipv6_address_mode: null, ipv6_ra_mode: null }],
@@ -305,7 +305,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const plan = { ...base, mappings: { ...base.mappings, networks: { 'tenant-app': quoted } } };
     const unowned = { ...net('q', quoted, false, 'x'), project_id: null, shared: false };
     const subnets = [{ name: 's', network: quoted, network_id: 'q', cidr: '10.30.0.0/16', ipv6_address_mode: null, ipv6_ra_mode: null }];
-    const found = preflight(vm, 'openstack', plan, { [quoted]: 1442 }, [vm.name], { selected: [vm], networkDetails: [unowned], subnets, roles: ['member'] });
+    const found = preflight(vm, 'openstack', plan, { [quoted]: 1442 }, { selected: [vm], networkDetails: [unowned], subnets, roles: ['member'] });
     expect(found.find((f) => f.code === 'NET_PORT_NOT_PERMITTED')?.message).toBe(
       'The credential of the destination may not put these NICs on their network: fa:16:3e:00:00:01 on "bob\'s-web" (project None): it is neither shared with the credential\'s project nor external.',
     );
@@ -320,7 +320,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const subnets = ['10.2.0.0/24', '10.2.1.0/24'].map((cidr, i) => ({ id: `sub-${i}`, name: `s${i}`, network: 'dc2-prod', network_id: 'prod', cidr, ipv6_address_mode: null, ipv6_ra_mode: null }));
     const found = (...fixed_ips: string[]) => {
       const v = makeVm({ id: 'vm-x1', name: 'vmw-01', disks: [{ size_gb: 20 }], nics: [{ network: 'DC2-Prod', mac: '00:50:56:AA:BB:CC', fixed_ips }] });
-      return preflight(v, 'vmware', plan, { 'dc2-prod': 1500 }, [v.name], { selected: [v], networkDetails: details, subnets });
+      return preflight(v, 'vmware', plan, { 'dc2-prod': 1500 }, { selected: [v], networkDetails: details, subnets });
     };
     // one subnet holds them; an IPv6 address the kit never sends is not judged
     expect(codes(found('10.2.1.5', '10.2.1.6', 'fd00::5'))).not.toContain('NET_ADDRESS_REFUSED');
@@ -333,7 +333,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const v = makeVm({ id: 'vm-x1', name: 'vmw-01', disks: [{ size_gb: 20 }], nics: [{ network: 'DC2-Prod', mac: '00:50:56:aa:bb:cc', fixed_ips: ['10.2.0.5'] }] });
     const moved = { ...plan, nic_overrides: { 'vm-x1': { '00:50:56:aa:bb:cc': { network: 'twice', fixed_ips: null } } } };
     const twice = [...details, net('t1', 'twice', true, 'shop'), net('t2', 'twice', true, 'shop')];
-    const all = codes(preflight(v, 'vmware', moved, { 'dc2-prod': 1500, twice: 1500 }, [v.name], { selected: [v], networkDetails: twice, subnets }));
+    const all = codes(preflight(v, 'vmware', moved, { 'dc2-prod': 1500, twice: 1500 }, { selected: [v], networkDetails: twice, subnets }));
     expect(all).toContain('MAP_NIC_OVERRIDE_INVALID');
     expect(all).not.toContain('MAP_NETWORK_AMBIGUOUS');
   });
@@ -347,9 +347,9 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
       { name: 'other-v4', network: 'tenant-web', network_id: 'other', cidr: '10.40.0.0/16', ipv6_address_mode: null, ipv6_ra_mode: null },
     ];
     const context = { selected: [tall], networkDetails: [own, other], subnets };
-    expect(codes(preflight(tall, 'openstack', base, { 'tenant-web': 1400 }, [tall.name], context))).not.toContain('NET_MTU_SHRINK');
+    expect(codes(preflight(tall, 'openstack', base, { 'tenant-web': 1400 }, context))).not.toContain('NET_MTU_SHRINK');
     const elsewhere = { ...base, nic_overrides: { 'os-o1': { 'fa:16:3e:00:00:01': { network: 'tenant-web', fixed_ips: ['10.40.1.9'] } } } };
-    expect(preflight(tall, 'openstack', elsewhere, { 'tenant-web': 1400 }, [tall.name], context).find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toContain(
+    expect(preflight(tall, 'openstack', elsewhere, { 'tenant-web': 1400 }, context).find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toContain(
       "fa:16:3e:00:00:01: 10.40.1.9 lies in no subnet of 'tenant-web'",
     );
   });
@@ -358,7 +358,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const plan = { ...base, mappings: { ...base.mappings, networks: {} } };
     const details = [net('app', 'tenant-app', true, 'shop')];
     for (const subnets of [[], undefined])
-      expect(codes(preflight(vm, 'openstack', plan, { 'tenant-app': 1442 }, [vm.name], { selected: [vm], networkDetails: details, subnets }))).not.toContain(
+      expect(codes(preflight(vm, 'openstack', plan, { 'tenant-app': 1442 }, { selected: [vm], networkDetails: details, subnets }))).not.toContain(
         'NET_ADDRESS_REFUSED',
       );
   });
@@ -376,7 +376,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
       nic_overrides: { 'os-o1': { 'fa:16:3e:00:00:01': { network: null, fixed_ips: ['10.20.1.6', address] } } },
     });
     const message = (plan: Plan) =>
-      preflight(vm, 'openstack', plan, { 'tenant-app': 1442 }, [vm.name], { selected: [vm], networkDetails: details, subnets }).find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message;
+      preflight(vm, 'openstack', plan, { 'tenant-app': 1442 }, { selected: [vm], networkDetails: details, subnets }).find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message;
     expect(message(entry('fd00:20::f816:3eff:fe00:1', 'neutron'))).toBeUndefined();
     expect(message(entry('fd00:20::5', 'neutron'))).toBe(
       'NIC override(s) of nic-01 cannot be applied: fa:16:3e:00:00:01: fd00:20::5 is not fd00:20::f816:3eff:fe00:1, the address the SLAAC or DHCPv6-stateless subnet fd00:20::/64 gives MAC fa:16:3e:00:00:01.',
@@ -396,7 +396,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     for (const mode of ['nova', 'neutron'] as const) {
       const plan = { ...base, mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} }, port_creation_mode: mode };
       for (const v of vms) {
-        const found = codes(preflight(v, 'openstack', plan, dst.networks, [v.name], { selected: vms, subnets: dst.subnets, networkDetails: dst.network_details, roles }));
+        const found = codes(preflight(v, 'openstack', plan, dst.networks, { selected: vms, subnets: dst.subnets, networkDetails: dst.network_details, roles }));
         expect(found, v.name).not.toContain('MAP_NETWORK_AMBIGUOUS');
         expect(found, `${v.name} ${mode}`).not.toContain('NET_ADDRESS_REFUSED');
         expect(found, `${v.name} ${mode}`).not.toContain('NET_PORT_NOT_PERMITTED');
@@ -406,12 +406,12 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const vmware = inventories['vcenter-hq'] as VMRef[];
     const erp = { ...base, mappings: { networks: { 'VM Network ERP': 'erp-net' }, flavors: {}, volume_types: {}, projects: {} } };
     for (const v of vmware) {
-      const found = codes(preflight(v, 'vmware', erp, dst.networks, [v.name], { selected: vmware, subnets: dst.subnets, networkDetails: dst.network_details, roles }));
+      const found = codes(preflight(v, 'vmware', erp, dst.networks, { selected: vmware, subnets: dst.subnets, networkDetails: dst.network_details, roles }));
       for (const code of ['MAP_NETWORK_AMBIGUOUS', 'NET_ADDRESS_REFUSED', 'NET_PORT_NOT_PERMITTED']) expect(found, `${v.name} ${code}`).not.toContain(code);
     }
     // a member's token could not keep it there
     const jump = vms.find((v) => v.name === 'jump-host-01')!;
-    expect(codes(preflight(jump, 'openstack', base, dst.networks, [jump.name], { selected: vms, subnets: dst.subnets, networkDetails: dst.network_details, roles: ['member'] }))).toContain('NET_PORT_NOT_PERMITTED');
+    expect(codes(preflight(jump, 'openstack', base, dst.networks, { selected: vms, subnets: dst.subnets, networkDetails: dst.network_details, roles: ['member'] }))).toContain('NET_PORT_NOT_PERMITTED');
   });
 });
 
@@ -436,7 +436,7 @@ describe('mock preflight reports a network RHOSO lacks like the API (SDD §9.3 M
         { network: 'lab-b', mac: 'fa:16:3e:00:00:0a', fixed_ips: ['10.9.1.9'] },
       ],
     });
-    const found = preflight(vm, 'openstack', plan([], { 'lab-b': 'gone-net' }), nets, [vm.name], { destination: 'OpenStack 2026.2 Hibiscus (DC3)' });
+    const found = preflight(vm, 'openstack', plan([], { 'lab-b': 'gone-net' }), nets, { destination: 'OpenStack 2026.2 Hibiscus (DC3)' });
     expect(networkFindings(found).map((f) => f.message)).toEqual([
       'No mapping or same-named network in OpenStack 2026.2 Hibiscus (DC3) for: lab-a.',
       'Network mapping target(s) do not exist in OpenStack 2026.2 Hibiscus (DC3): lab-b -> gone-net.',
@@ -447,7 +447,7 @@ describe('mock preflight reports a network RHOSO lacks like the API (SDD §9.3 M
   it('blocks an unmapped VMware port group, which nothing pre-stages (review RT-07)', () => {
     const vm = makeVm({ id: 'vm-x1', name: 'vmw-01', disks: [{ size_gb: 20 }], nics: [{ network: 'DC9-Unmapped', mac: '00:50:56:00:00:01', fixed_ips: ['10.9.0.5'] }] });
     for (const prestage of [[], ['networks']]) {
-      expect(networkFindings(preflight(vm, 'vmware', plan(prestage), nets, [vm.name]))).toEqual([
+      expect(networkFindings(preflight(vm, 'vmware', plan(prestage), nets))).toEqual([
         {
           code: 'MAP_NETWORK_MISSING',
           severity: 'blocker',
@@ -470,10 +470,10 @@ describe('mock preflight reports a network RHOSO lacks like the API (SDD §9.3 M
         { network: 'lab-a', mac: 'fa:16:3e:00:00:03', fixed_ips: ['10.9.1.6'] },
       ],
     });
-    expect(networkFindings(preflight(vm, 'openstack', plan([]), nets, [vm.name]))).toEqual([
+    expect(networkFindings(preflight(vm, 'openstack', plan([]), nets))).toEqual([
       { code: 'MAP_NETWORK_MISSING', severity: 'blocker', message: 'No mapping or same-named network in the destination for: lab-a, lab-b.', remediation: MISSING, strategies: [] },
     ]);
-    expect(networkFindings(preflight(vm, 'openstack', plan(['networks']), nets, [vm.name]))).toEqual([
+    expect(networkFindings(preflight(vm, 'openstack', plan(['networks']), nets))).toEqual([
       {
         code: 'MAP_NETWORK_PRESTAGED',
         severity: 'info',
@@ -487,13 +487,13 @@ describe('mock preflight reports a network RHOSO lacks like the API (SDD §9.3 M
   it('leaves a NIC its override sends to another network to MAP_NIC_OVERRIDE_INVALID', () => {
     const vm = makeVm({ id: 'os-n3', name: 'net-03', disks: [{ size_gb: 20 }], nics: [{ network: 'lab-a', mac: 'fa:16:3e:00:00:05', fixed_ips: ['10.9.0.5'] }] });
     const moved = { ...plan([]), nic_overrides: { 'os-n3': { 'fa:16:3e:00:00:05': { network: 'tenant-web', fixed_ips: null } } } };
-    expect(networkFindings(preflight(vm, 'openstack', moved, nets, [vm.name]))).toEqual([]);
+    expect(networkFindings(preflight(vm, 'openstack', moved, nets))).toEqual([]);
   });
 
   it('blocks a mapping whose target RHOSO lacks, also when networks are pre-staged', () => {
     const vm = makeVm({ id: 'os-n2', name: 'net-02', disks: [{ size_gb: 20 }], nics: [{ network: 'lab-a', mac: 'fa:16:3e:00:00:04', fixed_ips: ['10.9.0.5'] }] });
     for (const prestage of [[], ['networks']]) {
-      expect(networkFindings(preflight(vm, 'openstack', plan(prestage, { 'lab-a': 'gone-net' }), nets, [vm.name]))).toEqual([
+      expect(networkFindings(preflight(vm, 'openstack', plan(prestage, { 'lab-a': 'gone-net' }), nets))).toEqual([
         {
           code: 'MAP_NETWORK_MISSING',
           severity: 'blocker',
@@ -568,7 +568,7 @@ describe('the mock names the destination provider where the API does (SDD §1 na
         { network: 'tenant-db', mac: 'fa:16:3e:00:00:0a', fixed_ips: [], mtu: 9000 },
       ],
     });
-    const found = preflight(vm, 'openstack', plan, { 'tenant-web': 1500, 'tenant-db': 1450 }, [vm.name], { selected: [vm], destination: name });
+    const found = preflight(vm, 'openstack', plan, { 'tenant-web': 1500, 'tenant-db': 1450 }, { selected: [vm], destination: name });
     expect(found.filter((f) => f.code === 'NET_MTU_SHRINK')).toEqual([
       expect.objectContaining({
         message: `The MTU in ${name} is smaller: tenant-db 9000 -> 1450, tenant-web 9000 -> 1500.`,
@@ -581,7 +581,7 @@ describe('the mock names the destination provider where the API does (SDD §1 na
     const base = buildFixtures(now).plans[0]!;
     const plan = { ...base, mappings: { ...base.mappings, networks: {} }, nic_overrides: {} };
     const vm = makeVm({ id: 'os-m2', name: 'mtu-02', disks: [{ size_gb: 20 }], nics: [{ network: 'constructor', mac: 'fa:16:3e:00:00:0b', fixed_ips: [], mtu: 9000 }] });
-    const found = preflight(vm, kind, plan, { constructor: 1500 }, [vm.name], { selected: [vm], destination: name });
+    const found = preflight(vm, kind, plan, { constructor: 1500 }, { selected: [vm], destination: name });
     expect(found.filter((f) => f.code === 'NET_MTU_SHRINK').map((f) => f.message)).toEqual([`The MTU in ${name} is smaller: constructor 9000 -> 1500.`]);
   });
 });
@@ -606,6 +606,8 @@ interface EligibilityCase {
 interface FindingCase {
   why: string;
   vm: VMRef;
+  /** the plan's other selected VMs */
+  others?: VMRef[];
   plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'>;
   expected: Record<string, string>;
 }
@@ -628,7 +630,8 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
 
   it.each(ELIGIBILITY.finding_cases)('$why', (c) => {
     const plan = { ...base, ...c.plan } as Plan;
-    const found = preflight(c.vm, 'openstack', plan, {}, [c.vm.name], { selected: [c.vm] });
+    const selected = [c.vm, ...(c.others ?? [])];
+    const found = preflight(c.vm, 'openstack', plan, {}, { selected });
     expect(Object.fromEntries(found.filter((f) => f.code in c.expected).map((f) => [f.code, f.message]))).toEqual(c.expected);
   });
 });

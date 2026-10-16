@@ -1967,8 +1967,11 @@ ELIGIBILITY_CASES = json.loads(
 
 @pytest.mark.parametrize("case", ELIGIBILITY_CASES["finding_cases"], ids=lambda case: case["why"])
 def test_the_shared_handover_finding_cases(case):
-    """SDD §9.3, §16 (review RV20-08): VOL_ENCRYPTED and HANDOVER_BACKEND_UNMAPPED as the API
-    words them, which the dashboard's mock words the same way (mockData.test.ts)."""
+    """SDD §9.3, §16 (review RV20-08): VOL_ENCRYPTED, HANDOVER_BACKEND_UNMAPPED and
+    SRC_VM_DUPLICATE_NAME as the API words them, which the dashboard's mock words the same way
+    (mockData.test.ts); `others` are the plan's other selected VMs."""
     plan = make_plan(handover=HandoverConfig(**case["plan"]["handover"]))
-    found = check(VMRef.model_validate(case["vm"]), plan=plan)
+    vm = VMRef.model_validate(case["vm"])
+    others = [VMRef.model_validate(other) for other in case.get("others", [])]
+    found = check(vm, plan=plan, all_vms=[vm, *others])
     assert {f.code: f.message for f in found if f.code in case["expected"]} == case["expected"]
