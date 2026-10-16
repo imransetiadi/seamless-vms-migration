@@ -837,6 +837,16 @@ Any other OS fails the role with a message that names it and the supported ones,
 the transfer then failed for want of nbdkit. An Ubuntu cloud image logs in as `ubuntu`: the provider's
 `conversion_host.ssh_user` (default `cloud-user`, §4.2) names it.
 
+Each conversion host is reached as its own provider's user, so a RHEL source host (`cloud-user`) works with an Ubuntu
+destination host (`ubuntu`). The control plane sets `os_migrate_src_conversion_host_ssh_user` and
+`os_migrate_dst_conversion_host_ssh_user` from each provider's `conversion_host.ssh_user`; the collection gives each
+deployed host its side's user in the inventory, passes the source's to the modules that work on the source host
+(`ssh_user` of the export, the source cleanup and the warm snapshot) and the destination's to those that work on
+the destination host, which also take the source's as `src_ssh_user`: the destination host's own user runs the link key,
+and the hop to the source host — the transfer's port forward, the warm sync's sender and its copy of blocksync —
+logs in as the source's. Both variables default to upstream's single `os_migrate_conversion_host_ssh_user`, and
+`src_ssh_user` to `ssh_user`, so a run that sets only that one works as before (audit EX-08).
+
 ### 6.6 Hardening of existing code (required)
 
 `roles/import_from_hypervisor/tasks/process_disk.yml` exports hypervisor disks with `qemu-nbd`
