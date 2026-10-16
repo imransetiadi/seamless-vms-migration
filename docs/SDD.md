@@ -2304,7 +2304,10 @@ the change is recorded, with its `provider.credentials_updated` event — a 409 
 new secret would leave the change unaudited; when the provider keeps changing under the write (50 conflicts in a
 row, each a check or another write that landed), the route answers 503 `unavailable` naming the secret — the store
 holds the new value, the provider does not record it yet, and the operator sends the credentials again. A provider
-deleted meanwhile answers 404, and the secret just written is removed again. `SEAMLESS_SECRET_STORE` selects it:
+deleted meanwhile answers 404, and the secret just written is removed again. A connection to a provider is built
+again once its document (its state fields aside) or the mounted `clouds.yaml` changed — the provider registry's and
+the storage handover's alike — and the replaced one is closed, so the step after a rotation signs in with the new
+credentials, a running plan's rollback included (audit EX-14). `SEAMLESS_SECRET_STORE` selects it:
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory,
   each key written to a temporary file and renamed; the directory must be writable (Compose mounts the
