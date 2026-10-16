@@ -1821,18 +1821,73 @@ FIXED_TEXTS = {
 
 
 def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
-    """SDD §1 naming (reviews RV21-05, RV22-05, RV23-06): a text built for a plan or a migration - a
-    finding's message, an eligibility reason, an executor's refusal, failure or log line, an event,
-    a transition's reason - names the destination provider by its label; "the destination" is for
-    the fixed texts (a catalog remediation, the dashboard's copy). Every string literal of the
-    control plane is read - f-string parts, keyword arguments, a module constant whatever takes
-    it (RV23-07) - but a docstring, the fixed texts of FIXED_TEXTS, a remediation= value, and the
-    bare "the destination" a text built without a provider falls back to."""
+    """SDD §1 naming (reviews RV21-05, RV22-05, RV23-06, RV24-04): a text built for a plan or a
+    migration - a finding's message, an eligibility reason, an executor's refusal, failure or log
+    line, an event, a transition's reason - names the destination provider by its label; "the
+    destination" is for the fixed texts (a catalog remediation, the dashboard's copy). Every text
+    of the control plane is read - each string literal, and what a + chain, a %-template,
+    str.format or an f-string builds from literals - but a docstring, the fixed texts of
+    FIXED_TEXTS, a remediation= value, and the bare "the destination" where a text built without a
+    provider falls back to it: a parameter's default, an if-else's else, the right of an or, an
+    assignment in an except handler."""
     root = Path(__file__).parents[1] / "src" / "seamless_migrate"
     words = re.compile(r"the destination\b|destination's|destination provider", re.I)
 
+    def fold(node):
+        """The text ``node`` builds from literals, "{}" for each part it cannot know; None when it
+        builds no text."""
+        if isinstance(node, ast.Constant):
+            return node.value if isinstance(node.value, str) else None
+        if isinstance(node, ast.JoinedStr):
+            return "".join(
+                (fold(part.value) or "{}") if isinstance(part, ast.FormattedValue) else fold(part)
+                for part in node.values
+            )
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+            left, right = fold(node.left), fold(node.right)
+            if isinstance(node.op, ast.Add):
+                return None if left is None and right is None else (left or "{}") + (right or "{}")
+            if left is None:
+                return None
+            args = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+            try:
+                return left % tuple(fold(arg) or "{}" for arg in args)
+            except (TypeError, ValueError):
+                return left + " " + (right or "{}")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "format"
+            and fold(node.func.value) is not None
+        ):
+            args = [fold(arg) or "{}" for arg in node.args]
+            kwargs = {k.arg: fold(k.value) or "{}" for k in node.keywords if k.arg}
+            try:
+                return fold(node.func.value).format(*args, **kwargs)
+            except (IndexError, KeyError, ValueError):
+                return fold(node.func.value) + " " + " ".join(args)
+        return None
+
+    def fallback(node, parents):
+        """Whether the bare words stand where a text built without a provider falls back to them."""
+        parent = parents.get(id(node))
+        return (
+            isinstance(parent, ast.arguments)
+            or (isinstance(parent, ast.IfExp) and parent.orelse is node)
+            or (
+                isinstance(parent, ast.BoolOp)
+                and isinstance(parent.op, ast.Or)
+                and parent.values[-1] is node
+            )
+            or (
+                isinstance(parent, ast.Assign)
+                and parent.value is node
+                and isinstance(parents.get(id(parent)), ast.ExceptHandler)
+            )
+        )
+
     def fixed(tree, path):
-        """The ids of the literals the rule lets say "the destination"."""
+        """The ids of the nodes the rule lets say "the destination"."""
         skip = set()
         for node in ast.walk(tree):
             if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1853,15 +1908,20 @@ def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
         name = path.relative_to(root).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"))
         skip = fixed(tree, name)
-        found += [
-            f"{name}:{node.lineno}: {node.value}"
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and id(node) not in skip
-            and node.value != "the destination"
-            and words.search(node.value)
-        ]
+        parents = {
+            id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+        }
+        for node in ast.walk(tree):
+            text = None if id(node) in skip else fold(node)
+            if text is None or not words.search(text):
+                continue
+            if (
+                text == "the destination"
+                and isinstance(node, ast.Constant)
+                and fallback(node, parents)
+            ):
+                continue
+            found.append(f"{name}:{node.lineno}: {text}")
     assert found == []
 
 
@@ -1950,6 +2010,59 @@ def test_the_wording_guard_reads_every_literal_of_the_control_plane(case, monkey
         test_no_text_built_for_a_migration_calls_its_destination_the_destination()
 
 
+#: texts built from several literals that say "the destination" (review RV24-04): injected into
+#: orchestrator.py
+INJECTED_RV24 = {
+    "a text split over +": (
+        "\n\ndef _rv24():\n    raise NotAllowed('check the ' + 'destination, then retry')\n"
+    ),
+    "the bare literal in a %-template": (
+        "\n\ndef _rv24():\n    raise NotAllowed('%s refused the port' % 'the destination')\n"
+    ),
+    "the bare literal given to str.format": (
+        "\n\ndef _rv24():\n    raise NotAllowed('{} refused the port'.format('the destination'))\n"
+    ),
+    "the bare literal in an f-string": (
+        "\n\ndef _rv24():\n    raise NotAllowed(f\"{'the destination'} refused the port\")\n"
+    ),
+    "the bare literal + a literal": (
+        "\n\ndef _rv24(m):\n"
+        "    return new_event('migration.error', 'the destination' + ' refused the port')\n"
+    ),
+    # the bare words as a whole message, where no text falls back to them
+    "the bare words given to an error": (
+        "\n\ndef _rv24():\n    raise NotAllowed('the destination')\n"
+    ),
+    # the words in no literal of their own: only the text the template builds says them
+    "words a %-template builds": (
+        "\n\ndef _rv24():\n    raise NotAllowed('check the %s, then retry' % 'destination')\n"
+    ),
+    "words str.format builds": (
+        "\n\ndef _rv24():\n    raise NotAllowed('check the {}, then retry'.format('destination'))\n"
+    ),
+    "words an f-string builds": (
+        "\n\ndef _rv24():\n    raise NotAllowed(f\"check the {'destination'}, then retry\")\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(INJECTED_RV24))
+def test_the_wording_guard_reads_a_text_built_from_several_literals(case, monkeypatch):
+    """SDD §1 naming (review RV24-04): a refusal or an event that says "the destination" is found
+    however its text is put together - a + chain, a %-template, str.format, an f-string - and the
+    bare "the destination" passes only where a text built without a provider falls back to it."""
+    target = Path(__file__).parents[1] / "src" / "seamless_migrate" / "orchestrator.py"
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        return text + INJECTED_RV24[case] if Path(self) == target else text
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match="orchestrator.py"):
+        test_no_text_built_for_a_migration_calls_its_destination_the_destination()
+
+
 #: the texts SDD §1 naming lets say "the destination", injected into orchestrator.py
 FIXED_RV23 = {
     "a docstring": '\n\ndef _rv23():\n    """What the destination is given."""\n',
@@ -1958,6 +2071,15 @@ FIXED_RV23 = {
     ),
     "the fallback when no provider is known": (
         "\n\ndef _rv23(cloud: str = 'the destination'):\n    return cloud\n"
+    ),
+    # where else a text built without a provider falls back to the bare words (review RV24-04)
+    "the fallback of an if-else": (
+        "\n\ndef _rv23(p):\n    return p.label if p is not None else 'the destination'\n"
+    ),
+    "the fallback after or": "\n\ndef _rv23(label):\n    return label or 'the destination'\n",
+    "the fallback of an except handler": (
+        "\n\ndef _rv23(names, p):\n    try:\n        names[p] = p.label\n"
+        "    except AttributeError:\n        names[p] = 'the destination'\n"
     ),
 }
 
