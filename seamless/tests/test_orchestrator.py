@@ -6248,6 +6248,42 @@ async def test_a_store_error_writing_the_stopped_event_never_clears_the_flag_wit
     assert len(stops()) == 1
 
 
+async def test_a_source_watch_racing_another_write_never_overwrites_it(
+    tmp_path, store, land_first, caplog
+):
+    """SDD §8.1, §11 (review RV25-04): another write to the migration that lands between the source
+    watch's read and its write - an operator's, the CLI's - makes the watch's write a conflict: it
+    keeps that write, writes no flag and no alert, and the next pass writes both over it."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+
+    def other():
+        current, version = store.get_versioned("migration", m.id, Migration)
+        theirs = current.model_copy(update={"review_reason": "an operator wrote this"})
+        return store.put("migration", theirs, version)
+
+    landed = land_first(store, "UPDATE documents", "migration", other)
+
+    def alerts():
+        events = store.events(since_seq=0, limit=100000)
+        return [e for e in events if e.kind == "migration.source_running"]
+
+    await h.orch._watch_sources()
+    assert len(landed) == 1
+    seen = await h.migration(m.id)
+    assert (seen.review_reason, seen.source_running_at, alerts()) == (
+        "an operator wrote this",
+        None,
+        [],
+    )
+    assert "the source watch failed" in caplog.text
+    await h.orch._watch_sources()
+    seen = await h.migration(m.id)
+    assert seen.review_reason == "an operator wrote this" and seen.source_running_at is not None
+    assert len(alerts()) == 1
+
+
 async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_path, store):
     h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
     del h.source.vms["vm-1"]  # finalized with delete_source, or rebuilt by a handover

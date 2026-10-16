@@ -77,3 +77,33 @@ def refuse_write() -> Iterator[Callable[[Store, str, str], list[str]]]:
     yield refuse
     for engine, listener in listening:
         sa.event.remove(engine, "before_cursor_execute", listener)
+
+
+@pytest.fixture
+def land_first() -> Iterator[Callable[[Store, str, str, Callable[[], object]], list[object]]]:
+    """``land(store, write, kind, other)``: just before the next ``write`` ("UPDATE documents",
+    "INSERT INTO events") of a row of ``kind`` runs, another writer's ``other()`` commits on a
+    connection of its own - a concurrent change landing between a caller's read and its write, as
+    the CLI beside the server or a second replica makes one (review RV25-04). It returns what
+    ``other`` returned."""
+    listening = []
+
+    def land(store: Store, write: str, kind: str, other: Callable[[], object]) -> list[object]:
+        started: list[str] = []
+        landed: list[object] = []
+
+        def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+            if started or not statement.lstrip().upper().startswith(write.upper()):
+                return
+            if kind in context.compiled_parameters[0].values():
+                # once: the other writer's own statements run through this listener too
+                started.append(statement)
+                landed.append(other())
+
+        sa.event.listen(store.engine, "before_cursor_execute", before_cursor_execute)
+        listening.append((store.engine, before_cursor_execute))
+        return landed
+
+    yield land
+    for engine, listener in listening:
+        sa.event.remove(engine, "before_cursor_execute", listener)

@@ -69,6 +69,37 @@ def test_put_with_event_writes_the_document_and_its_event_together(any_store: St
     assert [e.seq for e in any_store.events(kinds=["migration.source_running"])] == [written.seq]
 
 
+def test_put_with_event_refuses_a_write_that_landed_after_its_read(any_store: Store, land_first):
+    """SDD §11 (review RV25-04): a versioned update is conditional in its own statement - another
+    process's write landing between the caller's read and the update makes it a conflict, which
+    keeps that write and appends no event; never an update by key over it."""
+    mig = make_migration()
+    version = any_store.put("migration", mig)
+    flagged = mig.model_copy(
+        update={"source_running_at": datetime(2026, 10, 17, 12, 0, tzinfo=UTC)}
+    )
+    theirs = mig.model_copy(update={"review_reason": "another process wrote this"})
+    event = Event(
+        kind="migration.source_running",
+        plan_id=mig.plan_id,
+        migration_id=mig.id,
+        message="web-01: the source VM runs again",
+        data={"power_state": "running"},
+    )
+    landed = land_first(
+        any_store,
+        "UPDATE documents",
+        "migration",
+        lambda: any_store.put("migration", theirs, version),
+    )
+    with pytest.raises(ConflictError, match=f"is at version {version + 1}, expected {version}"):
+        any_store.put_with_event("migration", flagged, event, version)
+    assert landed == [version + 1]
+    kept = any_store.get("migration", mig.id, Migration)
+    assert (kept.review_reason, kept.source_running_at) == ("another process wrote this", None)
+    assert any_store.events(kinds=[event.kind]) == []
+
+
 def test_optimistic_conflict_raises(any_store: Store):
     mig = make_migration()
     assert any_store.put("migration", mig, expected_version=0) == 1
