@@ -1656,7 +1656,10 @@ someone deleted the source after it ran again — is not running: while `source_
 and emits `migration.source_stopped` (data `{"power_state": null, "gone": true}`), so Finalize works again, with no
 source left to keep or delete (the owner's choice, 2026-10-14) — deleting a diverged source in its cloud is a way out
 too; without the flag it is skipped. A provider error is skipped (logged), never a failure, and leaves the flag as it
-is: only a cloud that answers can say the VM is gone. In demo mode, `POST /demo/vms/{source_id}/power {"state": "on"|"off"}` (operator; 404
+is: only a cloud that answers can say the VM is gone. Each change of the flag
+is written with its event in one store transaction (`put_with_event`, §11) and the event published after it commits:
+a store error leaves neither, never a flag without its alert, and the next watch tries again (the owner's choice,
+2026-10-16, review RV21-04). In demo mode, `POST /demo/vms/{source_id}/power {"state": "on"|"off"}` (operator; 404
 outside demo mode) sets a fake source VM's power state, so the alert shows on the next watch.
 
 **Bulk finalize.** `POST /plans/{id}/finalize {"wave_id": str|null, "confirm": str, "delete_source": bool = false}`
@@ -2069,7 +2072,9 @@ a value that only grows), `versions(kind) -> [(id, version)]` (in creation order
 `SELECT … GROUP BY` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
 `derived_status` and `migration_counts` from it, §8.1), `delete(kind, id)`,
 `get_versioned(kind, id, model_cls) -> (model, version)` (one read that returns the version too: `plan apply`'s
-compare-and-write, §15), `create_user(user, actor) -> Event` (§13.1: the `user` document and its `user.created` event in
+compare-and-write, §15), `put_with_event(kind, model, event, expected_version) -> (version, Event)` (a versioned
+update and its event in one transaction, a `ConflictError` as `put`'s: the source watch's flag and alert, §8.1),
+`create_user(user, actor) -> Event` (§13.1: the `user` document and its `user.created` event in
 one transaction; a `ConflictError` for a name that exists in any case), `delete_events_before(before) -> int` (`events
 prune`, §15),
 `append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500, kinds=None, tail=False,
