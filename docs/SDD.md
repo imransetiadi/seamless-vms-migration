@@ -1906,12 +1906,13 @@ RHOSO 18.0, §21; `check()` reports `{"admin": bool,
 "volume_backends": [pool names], "storage_backends": [{"pool": str, "vendor": str|null, "protocol": str|null,
 "family": "rbd"|"netapp_nfs"|"netapp_block"|"other"}], "tls": bool, "plain_http": [str]}`, both backend lists empty
 without admin (`roles` is what `NET_PORT_NOT_PERMITTED` judges, §9.3: Neutron's policy names roles, while `admin` is
-the compute probe); the microversions are each service's maximum, `""` when unreadable; `tls` is true when the
-provider's `endpoint`, the auth URL its credential is posted to (the `auth_url` of its `clouds.yaml` entry or of its
-credentials secret, §13.3) and the endpoint of each service Seamless calls (`identity`, `compute`, `block-storage`,
-`network`, `image`, each as keystoneauth reads it from the catalog) use https, and `plain_http` names those that do
-not (`endpoint` for the provider's own, `auth_url` for the credential's; one that cannot be read counts neither way,
-Security.md); a destination's check adds §10.1's `destination_release` keys -
+the compute probe); the microversions are each service's maximum as `major.minor` text (keystoneauth hands a parsed
+version tuple, `(2, 104)`, reported as `"2.104"`), `""` when unreadable; `tls` is true when the provider's `endpoint`,
+the auth URL its credential is posted to (the `auth_url` of its `clouds.yaml` entry or of its credentials secret,
+§13.3) and the endpoint of each service Seamless calls (`identity`, `compute`, `block-storage`, `network`, `image`,
+each as keystoneauth reads it from the catalog) use https, and `plain_http` names those that do not (`endpoint` for
+the provider's own, `auth_url` for the credential's; one that cannot be read counts neither way, Security.md); a
+destination's check adds §10.1's `destination_release` keys -
 `release_range`, `release`, `support_tier` and `policy_profile`;
 volume disks carry their Cinder `pool`;
 `os_type` is the most specific of the server metadata `os_type`/`os_distro`, the boot volume's
@@ -3338,9 +3339,12 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 ## 21. Destination platforms: RHOSO 18.0 and community OpenStack
 
 Status: the owner's goal of 2026-10-16 (D13). §21.1, §21.2 and §21.7 state the policy and what the code does today;
-§21.3–§21.6 and §21.8 are **planned for 0.2.0**. Each planned item becomes binding in §4, §6, §9.3, §10 or §16 in the
-commit that implements it, with its tests (plan `superpowers/plans/2026-10-16-community-openstack-destinations.md`).
-Until then a community OpenStack destination works but is not validated. The API accepts a destination provider of
+§21.3 (T1, T3), §21.4 (T4), §21.5 (T5) and §21.6 (T7) are binding in the sections §21.8 names, as are the declared
+series (T2) and the demo's community destination (T9); T6 (destination-neutral texts), T8 (the provider page and form,
+whose §16 text leads its dashboard) and T10 (the lab) are **planned for 0.2.0**. Each planned item becomes binding in
+§4, §6, §9.3, §10 or §16 in the commit that implements it, with its tests (plan
+`superpowers/plans/2026-10-16-community-openstack-destinations.md`). Until T10 a community OpenStack destination works
+but is not validated. The API accepts a destination provider of
 kind `openstack`, the dashboard offers the OpenStack Community and Kolla-Ansible presets for the destination role, and
 `OpenStackProvider` serves it on the same code path as RHOSO 18.0 (§10).
 
@@ -3464,14 +3468,16 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
   (openstacksdk 4.21: servers 2.100, flavors 2.61, volume attachments 2.89, block storage 3.71). Compute 2.101 (a volume
   attach answers 202), 2.102 (flavors lose `rxtx_factor` and `OS-FLV-DISABLED:disabled`) and 2.103 (`/os-volumes_boot`
   is gone) never reach Seamless's calls, and an older cloud gets its own maximum.
-* Raising the openstacksdk pin (the root `requirements.txt`, `aee/`, the image) re-checks those caps against the window:
-  the contract suite (QASuite S-DST, since T1) runs openstacksdk's own negotiation against every series' maxima.
+* The collection pins openstacksdk (the root `requirements.txt`, `aee/`), and raising that pin re-checks those caps
+  against the window; the control plane's image and CI install the newest openstacksdk `seamless/pyproject.toml`
+  allows (`>=4.5`), so every CI run re-checks them: the contract suite (QASuite S-DST, since T1) runs openstacksdk's own
+  negotiation against every series' maxima.
 * Networking is ML2/OVN or ML2/OVS, as the operator chose: the MTU checks (§9.3) apply as on RHOSO 18.0, no OVS- or
   OVN-specific binding is copied, and `ovn` in the check report is informational.
 * TLS is the operator's choice on a community cloud: `verify_tls` stays on by default, with a CA bundle per provider
   (§4.2). The check reports `tls` and the endpoints that use plain HTTP (`plain_http`, §10; Security.md).
 
-### 21.8 Planned contract changes (0.2.0; not binding until implemented)
+### 21.8 Contract changes of 0.2.0 (each binding from its plan task)
 
 | Item | Becomes binding in | Plan task |
 |---|---|---|
@@ -3489,5 +3495,6 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
 ### 21.9 Validation
 
 QASuite §6.7 (AC-6, journey 6 of the PRD), §7.1 (matrices M7–M12), §7.2 (LAB-D01…LAB-D08), and the contract suite
-S-DST: version documents per series (synthetic until the lab records them), the detection and tier table (since T1), the
-policy-profile cases (planned, T5).
+S-DST: version documents per series (synthetic until the lab records them), the detection and tier table (since T1),
+and each series read through a real keystoneauth session (review 18); the policy-profile cases are QASuite FR-32's
+(since T5).
