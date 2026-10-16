@@ -1763,8 +1763,9 @@ def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
     """SDD §1 naming (review RV21-05): a text built for a plan or a migration - a finding's
     message, an eligibility reason, an executor's refusal, failure or log line - names the
     destination provider by its label; "the destination" is for the fixed texts (a catalog
-    remediation, the dashboard's copy). Every f-string is read, and every plain message given to
-    an error, a finding, a reason list or the handover's _call."""
+    remediation, the dashboard's copy). Every f-string is read, and every plain string given, at
+    any place among its arguments, to an error raised or named so, a finding, a reason list, a
+    log line, the handover's _call or an event (review RV22-05)."""
     root = Path(__file__).parents[1] / "src" / "seamless_migrate"
     words = re.compile(r"the destination\b|destination's|destination provider", re.I)
 
@@ -1773,18 +1774,25 @@ def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
             return "".join(v.value for v in node.values if isinstance(v, ast.Constant))
         return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else ""
 
+    #: what a text built for a migration is given to, beside an error raised or named so
+    takers = {"_call", "append", "log", "finding", "_emit", "emit", "new_event", "_save_with_event"}
+
     def messages(tree):
+        raised = {
+            id(node.exc)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
+        }
         for node in ast.walk(tree):
             if isinstance(node, ast.JoinedStr):
                 yield node
             elif isinstance(node, ast.Call):
                 func = node.func
                 name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-                # the plain ones: the walk meets every f-string
-                if name.endswith("Error") or name in ("_call", "append", "log"):
-                    yield from (a for a in node.args[:1] if isinstance(a, ast.Constant))
-                elif name == "finding":
-                    yield from (a for a in node.args[1:2] if isinstance(a, ast.Constant))
+                # the plain ones, wherever they stand among its arguments (ApiError's message is its
+                # third): the walk meets every f-string
+                if id(node) in raised or name.endswith("Error") or name in takers:
+                    yield from (a for a in node.args if isinstance(a, ast.Constant))
 
     found = [
         f"{path.relative_to(root)}:{node.lineno}: {text(node)}"
@@ -1793,6 +1801,45 @@ def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
         if words.search(text(node))
     ]
     assert found == []
+
+
+#: one line saying "the destination", injected into orchestrator.py for the guard to find
+INJECTED = {
+    # the control: a plain message given to an error named *Error
+    "PermanentStepError": (
+        "\n\ndef _rv22():\n    raise PermanentStepError('the destination refused it')\n"
+    ),
+    # an error of the control plane whose name does not end in Error
+    "NotAllowed": "\n\ndef _rv22():\n    raise NotAllowed('the destination refused it')\n",
+    # an error whose message is not its first argument (api.deps.ApiError)
+    "ApiError": (
+        "\n\ndef _rv22():\n    raise ApiError(409, 'conflict', 'the destination refused it')\n"
+    ),
+    # an event built for a migration (SDD §1 naming), its message the second argument
+    "_emit": (
+        "\n\nasync def _rv22(self, m):\n"
+        "    await self._emit('migration.error', 'the destination refused it', migration=m)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(INJECTED))
+def test_the_wording_guard_reads_every_plain_message_given_to_an_error_or_an_event(
+    case, monkeypatch
+):
+    """SDD §1 naming (review RV22-05): the guard reads a plain message wherever an error or an
+    event takes it - an error raised under any name, ApiError's third argument, _emit's second -
+    not only the first argument of a call named *Error."""
+    target = Path(__file__).parents[1] / "src" / "seamless_migrate" / "orchestrator.py"
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        return text + INJECTED[case] if Path(self) == target else text
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match="orchestrator.py"):
+        test_no_text_built_for_a_migration_calls_its_destination_the_destination()
 
 
 ELIGIBILITY_CASES = json.loads(
