@@ -46,9 +46,12 @@ Naming: where a rule about the destination says "RHOSO" (a RHOSO network, flavor
 means the destination cloud, RHOSO 18.0 or a community OpenStack destination (§21); a rule that holds for the Red Hat
 product alone says "RHOSO 18.0". User-facing texts never say "RHOSO" for the destination (§21.8, PRD FR-34, plan
 T6, the owner's choice of 2026-10-16): a text built for a plan or a migration - a finding's message, an executor's
-refusal or failure, an event, the advisor's question - names the destination provider by its `name` ("do not exist in
-OpenStack 2026.2 Hibiscus (DC3)"); a fixed text - a catalog remediation, the dashboard's copy - says "the destination".
-A text about the Red Hat product itself (the RHOSO 18.0 preset, its `validated` tier) keeps its name.
+refusal or failure, an event - names the destination provider by its `name` ("do not exist in OpenStack 2026.2
+Hibiscus (DC3)"); a fixed text - a catalog remediation, the dashboard's copy - says "the destination". A text about the
+Red Hat product itself (the RHOSO 18.0 preset, its `validated` tier) keeps its name. Nothing the advisor sends to Jev
+carries a provider's name, which is operator free text (§13.4, review RV20-01). Its question names the destination by
+kind and series, as "RHOSO 18.0" or "a community OpenStack 2026.2 destination". The evidence it sends has the name
+replaced the same way.
 
 ### 1.1 Why parallel (side-by-side) migration and not adoption
 
@@ -2328,6 +2331,13 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
   `SEAMLESS_MEMORY_REDACT_NAMES` — wherever a name stands between characters that are not letters or digits, so a
   name inside another word stays (`web-010` is another VM than `web-01`) while names built from it are covered:
   `web-01-data`, `web-01_root`, `data-web-01` become `[vm]-data`, `[vm]_root`, `data-[vm]`.
+
+The destination provider's name never reaches Jev, whatever `SEAMLESS_MEMORY_REDACT_NAMES` says (§1 naming). The
+advisor's strategy question names the destination by kind and series (`planning/platforms.destination_descriptor`, by
+§10.1's settled series: "RHOSO 18.0", "a community OpenStack 2026.2 destination", "a community OpenStack destination"
+when no series is settled). In the evidence it sends, which quotes eligibility reasons that name the provider, the
+name is replaced by that descriptor wherever it stands as a word, by the rule VM names follow (`replace_names`). The
+input snapshot (§14.5) is what is sent.
 
 The control plane uses the same `redact` for the text it publishes from outside sources: step and
 provider error messages and every `migration.log` line (§4). Where it cuts such text, it redacts first,
