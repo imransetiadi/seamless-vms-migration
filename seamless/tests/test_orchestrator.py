@@ -6108,6 +6108,43 @@ async def test_the_source_watch_reads_each_plan_once_per_pass(tmp_path, store, m
     assert asked == [plan.id]
 
 
+async def test_a_store_error_reading_the_destination_never_loses_the_source_running_alert(
+    tmp_path, store, monkeypatch, caplog
+):
+    """SDD §8.1 (review RV20-03): the alert names the destination provider (T6), read before the
+    flag is saved. A store error on that read leaves the flag unsaved for this pass, logged, and
+    the next pass records the flag and emits migration.source_running together: never a flag
+    without its alert."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    real_get = h.orch.db.get
+    failed: list[str] = []
+
+    async def flaky_get(kind, key, *args, **kwargs):
+        if (kind, key) == ("provider", plan.destination_provider_id) and not failed:
+            failed.append(key)
+            raise RuntimeError("the store was briefly unavailable")
+        return await real_get(kind, key, *args, **kwargs)
+
+    monkeypatch.setattr(h.orch.db, "get", flaky_get)
+
+    def alerts():
+        events = store.events(since_seq=0, limit=100000)
+        return [e for e in events if e.kind == "migration.source_running"]
+
+    await h.orch._watch_sources()
+    assert failed == [plan.destination_provider_id]
+    assert (await h.migration(m.id)).source_running_at is None
+    assert alerts() == []
+    assert f"source watch failed for {m.id}" in caplog.text
+    await h.orch._watch_sources()
+    assert (await h.migration(m.id)).source_running_at is not None
+    [alert] = alerts()
+    assert (alert.migration_id, alert.data) == (m.id, {"power_state": "running"})
+    assert f"its data diverges from {DST_PROVIDER.name};" in alert.message
+
+
 async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_path, store):
     h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
     del h.source.vms["vm-1"]  # finalized with delete_source, or rebuilt by a handover

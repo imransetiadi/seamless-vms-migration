@@ -1877,6 +1877,18 @@ class Orchestrator:
             running = state == "running"
             if running == (m.source_running_at is not None):
                 continue
+            if running and plan.destination_provider_id not in destinations:
+                # the alert names the destination provider (T6), read before the flag is saved: a
+                # store error leaves both to the next pass, never a flag without its alert (SDD
+                # §8.1, review RV20-03)
+                try:
+                    provider = await self.db.get("provider", plan.destination_provider_id, Provider)
+                    destinations[plan.destination_provider_id] = provider.name
+                except NotFound:
+                    destinations[plan.destination_provider_id] = "the destination"
+                except Exception:
+                    log.warning("source watch failed for %s", m.id, exc_info=True)
+                    continue
             async with self._lock(m.id):
                 cur, v = await self._load(m.id)
                 if cur.phase != P.completed or running == (cur.source_running_at is not None):
@@ -1884,14 +1896,6 @@ class Orchestrator:
                 cur.source_running_at = seen if running else None
                 await self._save(cur, v)
             if running:
-                if plan.destination_provider_id not in destinations:
-                    try:
-                        provider = await self.db.get(
-                            "provider", plan.destination_provider_id, Provider
-                        )
-                        destinations[plan.destination_provider_id] = provider.name
-                    except NotFound:
-                        destinations[plan.destination_provider_id] = "the destination"
                 await self._emit(
                     "migration.source_running",
                     f"{cur.vm.name}: the source VM runs again - its data diverges from "
