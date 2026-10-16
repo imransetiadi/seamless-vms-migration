@@ -322,6 +322,40 @@ def test_the_docker_checks_say_how_to_fix_the_host_they_run_on(tmp_path):
         assert ok.returncode == 0, (version, ok.stdout, ok.stderr)
 
 
+def _init_next_steps(tmp_path: Path, host_os: str) -> str:
+    """What scripts/compose-init.sh tells to do next on this host (its stderr; the token goes to
+    stdout and is never read here). It writes into a scratch directory, never the checkout."""
+    import subprocess
+
+    fakebin = tmp_path / f"bin-{host_os}"
+    fakebin.mkdir()
+    (fakebin / "uname").write_text(f"#!/bin/sh\necho {host_os}\n")
+    (fakebin / "uname").chmod(0o755)
+    target = tmp_path / f"compose-{host_os}"
+    target.mkdir()
+    run = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "compose-init.sh"), "--dir", str(target)],
+        env=_clean_env(path=f"{fakebin}:/usr/bin:/bin"),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return run.stderr[run.stderr.index("Next steps") :]
+
+
+def test_compose_init_names_the_next_steps_of_the_host_it_runs_on(tmp_path):
+    """SDD §17.1: on Linux there is no Colima to start and no `open`; the dashboard is reached on
+    the host's loopback, through an SSH tunnel from a workstation."""
+    linux = _init_next_steps(tmp_path, "Linux")
+    assert "make seamless-up" in linux
+    assert "colima" not in linux.lower()
+    assert "open http" not in linux
+    assert "ssh -L 8080:127.0.0.1:8080" in linux
+    mac = _init_next_steps(tmp_path, "Darwin")
+    assert "make seamless-colima-up" in mac
+    assert "open http://127.0.0.1:8080/" in mac
+
+
 # --- the optional backup overlay (SDD §17, Security.md §12 "restore-tested", audit D-06) ---
 
 BACKUP = ROOT / "deploy" / "openshift" / "backup"

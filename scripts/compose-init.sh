@@ -37,7 +37,8 @@
 #   SEAMLESS_MEMORY_URL    agentmemory URL as seen from the containers
 #                          (default http://host.docker.internal:3111)
 #   TOKENS_FILE_MODE       mode of tokens.yaml (default 644: it holds only SHA-256 hashes and must be
-#                          readable by the container's non-root user through the Colima bind mount)
+#                          readable by the container's non-root user, another uid than yours, through the
+#                          bind mount)
 
 set -euo pipefail
 set +o xtrace   # never trace secrets, even when invoked as 'bash -x compose-init.sh'
@@ -183,7 +184,8 @@ else
   [ -n "$memory_secret" ] || memory_secret=$(env_get "$ENV_FILE" SEAMLESS_MEMORY_SECRET)
 
   # agentmemory URL: your environment wins; otherwise a previous .env decides (a removed line means "memory
-  # disabled" and stays that way); a first run uses the Colima host address
+  # disabled" and stays that way); a first run uses host.docker.internal (Colima and Docker Desktop resolve it; on a
+  # Linux machine's own engine the Make targets map it with compose.linux-host.yaml, SDD 17.1)
   if [ -n "${SEAMLESS_MEMORY_URL:-}" ]; then
     memory_url=$SEAMLESS_MEMORY_URL
   elif [ "$previous" -eq 1 ]; then
@@ -297,10 +299,23 @@ EOF
 fi
 
 host_port=$(env_get "$ENV_FILE" SEAMLESS_HOST_PORT)
-cat >&2 <<EOF
+port=${host_port:-8080}
+# the next steps of the host this runs on (SDD 17.1): Linux has its own Docker Engine, macOS the Colima profile
+if [ "$(uname -s)" = Linux ]; then
+  cat >&2 <<EOF
+
+Next steps (this machine's Docker Engine):
+  make seamless-up            # or: make seamless-demo   (simulated clouds)
+  curl -fsS http://127.0.0.1:${port}/api/v1/health
+  # the dashboard listens on this host's 127.0.0.1 only; from your workstation:
+  #   ssh -L ${port}:127.0.0.1:${port} <you>@<this host>    and browse to http://127.0.0.1:${port}/
+EOF
+else
+  cat >&2 <<EOF
 
 Next steps:
   make seamless-colima-up     # dedicated Colima profile "seamless" (once; keeps your active Docker context)
   make seamless-up            # or: make seamless-demo   (simulated clouds)
-  open http://127.0.0.1:${host_port:-8080}/
+  open http://127.0.0.1:${port}/
 EOF
+fi
