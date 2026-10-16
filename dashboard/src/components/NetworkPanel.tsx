@@ -3,7 +3,7 @@ import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { useInventory, useMigrationSummaries, usePatchPlan, useProviders } from '../api/hooks';
 import type { Migration, Plan, Role } from '../api/types';
 import { capabilityRoles, policyProfileOf, portRefusal, resolveNetwork } from '../lib/networks';
-import { nicTarget, parseNicDrafts, toNicDraft, withVmNicOverrides, type NicDraft } from '../lib/nics';
+import { mappedNetwork, nicTarget, parseNicDrafts, toNicDraft, withVmNicOverrides, type NicDraft } from '../lib/nics';
 import { planActions } from '../lib/planActions';
 import { destinationName } from '../lib/providerUse';
 import { Button } from './Button';
@@ -138,7 +138,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
                 // a VMware NIC goes where the plan maps its port group, with the guest's addresses: the migration kit keeps
                 // the guest's network settings, so no override moves it (SDD §7.2)
                 const target = vmware
-                  ? { network: plan.mappings.networks[nic.network] ?? nic.network, addresses: nic.fixed_ips, overridden: false }
+                  ? { network: mappedNetwork(plan.mappings.networks, nic.network), addresses: nic.fixed_ips, overridden: false }
                   : nicTarget(plan, m.vm.source_id, nic);
                 return (
                   <tr key={nic.mac ?? i}>
@@ -175,7 +175,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
             {patch.error && <ErrorBanner error={patch.error} title="The network was not saved" />}
             {(drafts ?? []).map((draft, i) => {
               const nic = nics[i]!;
-              const mapped = plan.mappings.networks[nic.network] ?? nic.network;
+              const mapped = mappedNetwork(plan.mappings.networks, nic.network);
               const refused = problems[draft.mac] ?? [];
               const hint = `${titleId}-ips-${i}-hint`;
               const error = `${titleId}-ips-${i}-error`;

@@ -27,3 +27,15 @@ describe('mappings text (SDD §16: the form accepts what the API accepts)', () =
     }
   });
 });
+
+describe('a source named like an Object.prototype key (review RV23-01)', () => {
+  it('keeps a "__proto__ = net-x" mapping the API accepts through the form, as any other', () => {
+    const parsed = parseMappings('__proto__ = net-x\nweb = net-y')!;
+    expect(Object.entries(parsed)).toEqual([
+      ['__proto__', 'net-x'],
+      ['web', 'net-y'],
+    ]);
+    expect(formatMappings(parsed)).toBe('__proto__ = net-x\nweb = net-y');
+    expect(JSON.parse(JSON.stringify(parsed))).toEqual(JSON.parse('{"__proto__": "net-x", "web": "net-y"}'));
+  });
+});

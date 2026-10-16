@@ -37,7 +37,7 @@ import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { pyNames, pyRepr } from '../lib/format';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
-import { addressRefusal, canonicalIp, ipInCidr, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
+import { addressRefusal, canonicalIp, ipInCidr, mappedNetwork, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
 import { kitSubnet, networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
 import { destinationRelease, parseMicroversion, type PolicyProfile } from '../lib/platforms';
 import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
@@ -1040,7 +1040,7 @@ function nicOverrideFindings(
       continue;
     }
     const { network, addresses } = nicTarget(plan, vm.source_id, nic);
-    if (!(network in destinationNetworks)) {
+    if (!Object.hasOwn(destinationNetworks, network)) {
       problems.push(
         `${mac}: ${where} has no network ${pyRepr(network)}` +
           (entries[mac]?.network ? '' : ` yet: pre-staging would create it, but its subnets cannot be checked before; name an existing network of ${where}`),
@@ -1103,7 +1103,7 @@ export function preflight(
   const ambiguous: string[] = [];
   for (const nic of vm.nics) {
     // the VMware kit keeps the guest's network settings: no NIC override moves its NICs (SDD §7.2)
-    const target = sourceKind === 'vmware' ? (plan.mappings.networks[nic.network] ?? nic.network) : nicTarget(plan, vm.source_id, nic).network;
+    const target = sourceKind === 'vmware' ? mappedNetwork(plan.mappings.networks, nic.network) : nicTarget(plan, vm.source_id, nic).network;
     const { network, why } = resolveNetwork(seen, target);
     if (network) resolved.set(nic, network);
     else if (why) ambiguous.push(`${(nic.mac ?? '?').toLowerCase()} (${nic.network}): ${why}`);
@@ -1153,9 +1153,9 @@ export function preflight(
   const shrinks: string[] = [];
   for (const nic of vm.nics) {
     const target = nicTarget(plan, vm.source_id, nic).network;
-    const dstMtu = resolved.has(nic) ? resolved.get(nic)!.mtu : destinationNetworks[target];
+    const dstMtu = resolved.has(nic) ? resolved.get(nic)!.mtu : has(destinationNetworks, target) ? destinationNetworks[target] : undefined;
     if (nic.mtu && dstMtu && dstMtu < nic.mtu)
-      shrinks.push(target === (plan.mappings.networks[nic.network] ?? nic.network) ? `${nic.network} ${nic.mtu} -> ${dstMtu}` : `${nic.network} ${nic.mtu} -> ${target} ${dstMtu}`);
+      shrinks.push(target === mappedNetwork(plan.mappings.networks, nic.network) ? `${nic.network} ${nic.mtu} -> ${dstMtu}` : `${nic.network} ${nic.mtu} -> ${target} ${dstMtu}`);
   }
   if (shrinks.length)
     add('NET_MTU_SHRINK', 'warning', `The MTU in ${where} is smaller: ${pyNames(shrinks)}.`, 'Lower the guest MTU or map to a destination network with a larger MTU (ML2/OVN Geneve networks typically use 1442).');

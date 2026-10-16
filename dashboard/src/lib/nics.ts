@@ -7,13 +7,22 @@ export function nicOverride(plan: Plan, vmId: string, mac: string | null): NicOv
 }
 
 /**
+ * Where the plan maps a source network - by its own key only, else the same name - as the API's dict.get (SDD §9.2): a
+ * tenant's network named like an Object.prototype key ("constructor", "__proto__") is a name like any other (review
+ * RV23-01).
+ */
+export function mappedNetwork(networks: Readonly<Record<string, string>>, name: string): string {
+  return Object.hasOwn(networks, name) ? networks[name]! : name;
+}
+
+/**
  * Where a VM's NIC goes at RHOSO (SDD §9.2, §9.3): its override's network, else the plan's mapping of its network;
  * its override's addresses, else its own.
  */
 export function nicTarget(plan: Plan, vmId: string, nic: Nic): { network: string; addresses: string[]; overridden: boolean } {
   const entry = nicOverride(plan, vmId, nic.mac);
   return {
-    network: entry?.network || (plan.mappings.networks[nic.network] ?? nic.network),
+    network: entry?.network || mappedNetwork(plan.mappings.networks, nic.network),
     addresses: entry?.fixed_ips ?? nic.fixed_ips,
     overridden: entry !== null,
   };

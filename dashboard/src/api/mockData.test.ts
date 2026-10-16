@@ -146,6 +146,13 @@ describe('mock preflight checks NIC overrides like the API (SDD §9.3)', () => {
     );
   });
 
+  it.each(['constructor', 'toString', '__proto__'])('refuses an override to %s, a network the destination lacks, as the API (review RV23-01)', (name) => {
+    const found = preflight(vm, 'openstack', plan({ network: name }), nets, [vm.name], { subnets, selected: [vm] });
+    expect(found.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toBe(
+      `NIC override(s) of nic-01 cannot be applied: fa:16:3e:00:00:01: the destination has no network '${name}'.`,
+    );
+  });
+
   it("writes the target network's name as the API's messages do (review NC-11)", () => {
     const quoted = "bob's-web";
     const missing = preflight(vm, 'openstack', plan({ network: quoted }), nets, [vm.name], { subnets, selected: [vm] });
@@ -193,6 +200,16 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     for (const details of [[net('x', 'tenant-web', false, 'p1'), net('a', 'tenant-web', true, 'shop')], [net('x', 'tenant-web', false, 'p1')]])
       expect(codes(preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: details }))).not.toContain('MAP_NETWORK_AMBIGUOUS');
     expect(codes(preflight(vm, 'vmware', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: twoOther }))).toContain('MAP_NETWORK_AMBIGUOUS');
+  });
+
+  it.each(['openstack', 'vmware'] as const)('resolves a %s NIC on a network named like an Object.prototype key by that name (review RV23-01)', (kind) => {
+    const nic = makeVm({ id: 'os-o3', name: 'nic-03', disks: [{ size_gb: 20 }], nics: [{ network: 'constructor', mac: 'fa:16:3e:00:00:03', fixed_ips: ['10.20.1.7'] }] });
+    const plan = { ...base, mappings: { ...base.mappings, networks: {} } };
+    const twoOwn = [net('a', 'constructor', true, 'shop'), net('b', 'constructor', true, 'shop')];
+    const found = preflight(nic, kind, plan, { constructor: 1442 }, [nic.name], { selected: [nic], networkDetails: twoOwn });
+    expect(found.find((f) => f.code === 'MAP_NETWORK_AMBIGUOUS')?.message).toBe(
+      "The cutover cannot tell these networks of the destination apart: fa:16:3e:00:00:03 (constructor): 2 networks of the credential's project are named 'constructor'.",
+    );
   });
 
   it('blocks an own address Neutron would refuse on the resolved network, with the API\'s message', () => {
@@ -556,6 +573,14 @@ describe('the mock names the destination provider where the API does (SDD §1 na
         remediation: 'Lower the guest MTU or map to a destination network with a larger MTU (ML2/OVN Geneve networks typically use 1442).',
       }),
     ]);
+  });
+
+  it.each(['openstack', 'vmware'] as const)('judges a %s NIC on a network named like an Object.prototype key by that name (review RV23-01)', (kind) => {
+    const base = buildFixtures(now).plans[0]!;
+    const plan = { ...base, mappings: { ...base.mappings, networks: {} }, nic_overrides: {} };
+    const vm = makeVm({ id: 'os-m2', name: 'mtu-02', disks: [{ size_gb: 20 }], nics: [{ network: 'constructor', mac: 'fa:16:3e:00:00:0b', fixed_ips: [], mtu: 9000 }] });
+    const found = preflight(vm, kind, plan, { constructor: 1500 }, [vm.name], { selected: [vm], destination: name });
+    expect(found.filter((f) => f.code === 'NET_MTU_SHRINK').map((f) => f.message)).toEqual([`The MTU in ${name} is smaller: constructor 9000 -> 1500.`]);
   });
 });
 

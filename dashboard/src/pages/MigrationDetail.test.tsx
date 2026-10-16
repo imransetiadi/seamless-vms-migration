@@ -713,6 +713,34 @@ describe('MigrationDetail', () => {
     await waitFor(() => expect(m.vm.source_id in plan.nic_overrides).toBe(false));
   });
 
+  it('shows where a NIC on a network named __proto__ goes, and never crashes (SDD §9.2, §16, review RV23-01)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    m.vm.nics[0]!.network = '__proto__';
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' }, { timeout: 5000 });
+    const table = within(panel).getByRole('table', { name: `NICs of ${m.vm.name}` });
+    const row = within(table).getByRole('row', { name: new RegExp(m.vm.nics[0]!.mac!) });
+    // "Source" and "On the destination" both read the network's name
+    await waitFor(() => expect(row.textContent!.split('__proto__').length - 1).toBe(2));
+    // and the editor offers the plan's mapping of it by that name
+    await user.click(within(panel).getByRole('button', { name: 'Edit network' }));
+    const dialog = await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` });
+    expect(within(dialog).getByRole('option', { name: 'As the plan maps it (__proto__)' })).toBeInTheDocument();
+  });
+
+  it('names an unmapped VMware NIC on a network named constructor by that name (SDD §7.2, review RV23-01)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.strategy?.startsWith('vmware'))!;
+    m.vm.nics[0]!.network = 'constructor';
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await waitFor(() => expect(panel).toHaveTextContent("The migration kit keeps the guest's network settings"));
+    const [row] = within(panel).getAllByRole('row').slice(1);
+    expect(within(row!).getAllByRole('cell').at(-1)).toHaveTextContent('constructor');
+  });
+
   it('says a VMware VM keeps its network settings, with no editor, and names where each NIC goes (SDD §16, §7.2)', async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.strategy?.startsWith('vmware'))!;
