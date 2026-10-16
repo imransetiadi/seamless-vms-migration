@@ -13,8 +13,9 @@ import { describe, expect, it } from 'vitest';
 // into a dev-server URL. The type checker's file names use "/" too.
 const root = decodeURIComponent(import.meta.url.replace(/^file:\/\//, '')).replace(/\/src\/test\/[^/]+$/, '');
 
-/** The reads that are not texts: the label itself, and the edit form's name field, which edits the stored name. */
-const RAW = new Set(['src/lib/providerUse.ts: provider.name', 'src/components/ProviderDialog.tsx: provider?.name']);
+/** The reads that are not texts, by file and the function they stand in: the label itself, and the edit form's name
+ * field, which edits the stored name (review RV25-06: a further read in either file is found). */
+const RAW = new Set(['src/lib/providerUse.ts#providerLabel: provider.name', 'src/components/ProviderDialog.tsx#initialState: provider?.name']);
 
 function config(): ts.ParsedCommandLine {
   const parsed = ts.getParsedCommandLineOfConfigFile(`${root}/tsconfig.json`, {}, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: () => undefined });
@@ -40,23 +41,57 @@ function probe(text: string): ts.Program {
   return ts.createProgram([file], options, host);
 }
 
+/** The dashboard's program with `extra` appended to its file `relative`, in memory. */
+function appended(relative: string, extra: string): ts.Program {
+  const { fileNames, options } = config();
+  const file = `${root}/${relative}`;
+  const text = `${ts.sys.readFile(file)}\n${extra}\n`;
+  const host = ts.createCompilerHost(options);
+  const read = host.getSourceFile.bind(host);
+  host.getSourceFile = (name, version, ...rest) => (name === file ? ts.createSourceFile(name, text, version) : read(name, version, ...rest));
+  host.readFile = (name) => (name === file ? text : ts.sys.readFile(name));
+  return ts.createProgram(fileNames, options, host);
+}
+
 /** Each read of a provider's bare name for a text in `program`'s sources under src/ (tests aside). */
 function bareNames(program: ts.Program): string[] {
   const checker = program.getTypeChecker();
   const found: string[] = [];
   const isProviders = (node: ts.Node | undefined) => node !== undefined && ts.isInterfaceDeclaration(node) && node.name.text === 'Provider';
-  /** The type is a Provider, a list of them, a union holding one, or one of TypeScript's own over it (Pick<Provider, …>). */
-  const holdsProviders = (type: ts.Type): boolean => {
-    if (type.isUnion()) return type.types.some(holdsProviders);
-    if ((type.aliasTypeArguments ?? []).some(holdsProviders)) return true;
-    const element = checker.isArrayType(type) ? checker.getTypeArguments(type as ts.TypeReference)[0] : undefined;
-    if (element) return holdsProviders(element);
-    return (type.getSymbol()?.declarations ?? []).some(isProviders) || (type.aliasSymbol?.declarations ?? []).some((d) => isProviders(d));
+  /** The types a type carries: a list's, a Map's or a Set's type arguments, a record's values (review RV25-06). */
+  const carried = (type: ts.Type): ts.Type[] => [
+    ...(((type as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.Reference ? checker.getTypeArguments(type as ts.TypeReference) : []),
+    ...checker.getIndexInfosOfType(type).map((info) => info.type),
+  ];
+  /** The type is a Provider, a union holding one, one of TypeScript's own over it (Pick<Provider, …>), or carries one: a
+   * list, a Map or a record of them. */
+  const holdsProviders = (type: ts.Type, depth = 0): boolean => {
+    if (depth > 8) return false;
+    if (type.isUnion()) return type.types.some((t) => holdsProviders(t, depth + 1));
+    if ((type.aliasTypeArguments ?? []).some((t) => holdsProviders(t, depth + 1))) return true;
+    if ((type.getSymbol()?.declarations ?? []).some(isProviders) || (type.aliasSymbol?.declarations ?? []).some((d) => isProviders(d))) return true;
+    return carried(type).some((t) => holdsProviders(t, depth + 1));
   };
-  /** The type, or the type of its items, has a `name` of its own. */
+  /** The type has a `name` of its own, or the types it carries do: a list's items, a Map's or a record's values. */
   const readsName = (type: ts.Type): boolean => {
-    const element = checker.isArrayType(type) ? checker.getTypeArguments(type as ts.TypeReference)[0] : undefined;
-    return (element ?? type).getProperty('name') !== undefined;
+    const items = carried(type);
+    return items.length ? items.some((t) => t.getProperty('name') !== undefined) : type.getProperty('name') !== undefined;
+  };
+  /** The function a node stands in, by name: a declaration's, a method's, or the variable an arrow function is given to. */
+  const owner = (node: ts.Node): string => {
+    for (let n: ts.Node | undefined = node.parent; n; n = n.parent) {
+      if ((ts.isFunctionDeclaration(n) || ts.isMethodDeclaration(n)) && n.name) return n.name.getText();
+      if ((ts.isArrowFunction(n) || ts.isFunctionExpression(n)) && ts.isVariableDeclaration(n.parent)) return n.parent.name.getText();
+    }
+    return '';
+  };
+  /** An object literal's member that writes `name`: `name:`, `'name':`, `['name']:`, a shorthand, or a spread object holding one. */
+  const writesName = (member: ts.ObjectLiteralElementLike): boolean => {
+    if (ts.isSpreadAssignment(member)) return ts.isObjectLiteralExpression(member.expression) && member.expression.properties.some(writesName);
+    const key = member.name;
+    if (key === undefined) return false;
+    if (ts.isIdentifier(key) || ts.isStringLiteralLike(key)) return key.text === 'name';
+    return ts.isComputedPropertyName(key) && ts.isStringLiteralLike(key.expression) && key.expression.text === 'name';
   };
   for (const source of program.getSourceFiles()) {
     const file = source.fileName.startsWith(`${root}/`) ? source.fileName.slice(root.length + 1) : source.fileName;
@@ -66,7 +101,8 @@ function bareNames(program: ts.Program): string[] {
       // a read of Provider.name - any declaration counts: for `x: Provider | Plan` it is Plan's or Provider's (review RV22-01)
       if (ts.isPropertyAccessExpression(node) && node.name.text === 'name') {
         const read = checker.getSymbolAtLocation(node.name)?.declarations?.some((d) => isProviders(d.parent)) ?? false;
-        if (read && !RAW.has(`${file}: ${node.getText()}`)) found.push(where(node));
+        // the label's own read and the edit form's field are exempt by the function they stand in, not by their text
+        if (read && !RAW.has(`${file}#${owner(node)}: ${node.getText()}`)) found.push(where(node));
       }
       // the same read by element access, `provider['name']`, or by destructuring a Provider - a callback's parameter, a
       // component's props, a variable - `{ name }` or `{ name: shown }` (review RV24-05)
@@ -85,7 +121,7 @@ function bareNames(program: ts.Program): string[] {
         node.parent !== undefined &&
         ts.isSpreadAssignment(node.parent) &&
         ts.isObjectLiteralExpression(node.parent.parent) &&
-        node.parent.parent.properties.slice(node.parent.parent.properties.indexOf(node.parent) + 1).some((p) => p.name?.getText() === 'name');
+        node.parent.parent.properties.slice(node.parent.parent.properties.indexOf(node.parent) + 1).some(writesName);
       if (ts.isExpression(node) && !naming && !renamed) {
         const expected = checker.getContextualType(node);
         const given = checker.getTypeAtLocation(node);
@@ -109,7 +145,10 @@ function bareNames(program: ts.Program): string[] {
         node.arguments.forEach((arg, i) => {
           const param = declared && 'parameters' in declared ? declared.parameters[i] : undefined;
           const type = param?.type ? checker.getTypeFromTypeNode(param.type) : undefined;
-          const constraint = type?.isTypeParameter() ? checker.getBaseConstraintOfType(type) : undefined;
+          // the parameter itself, or the items of a list of it - `items: readonly T[]` (review RV25-06); a type parameter
+          // deeper in an object, `{ item: T }`, or a keyed accessor `pluck(provider, 'name')` stay out of reach
+          const subject = type && checker.isArrayType(type) ? checker.getTypeArguments(type as ts.TypeReference)[0] : type;
+          const constraint = subject?.isTypeParameter() ? checker.getBaseConstraintOfType(subject) : undefined;
           if (constraint && !holdsProviders(constraint) && readsName(constraint) && holdsProviders(checker.getTypeAtLocation(arg))) found.push(where(arg));
         });
       }
@@ -149,6 +188,35 @@ describe('every text names a provider by its label (SDD §1 naming, §4.2, revie
       'src/components/Probe.tsx:9: item',
       'src/components/Probe.tsx:10: provider',
     ]);
+  }, 30_000);
+
+  it('finds a further bare-name read in the two files whose one raw read it exempts (review RV25-06)', () => {
+    const found = [
+      ...bareNames(appended('src/components/ProviderDialog.tsx', 'export const dialogTitle = (provider?: Provider) => `Edit ${provider?.name}`;')),
+      ...bareNames(appended('src/lib/providerUse.ts', 'export const heading = (provider: Provider) => `Provider ${provider.name}`;')),
+    ];
+    expect(found).toEqual([expect.stringMatching(/^src\/components\/ProviderDialog\.tsx:\d+: provider\?\.name$/), expect.stringMatching(/^src\/lib\/providerUse\.ts:\d+: provider\.name$/)]);
+  }, 120_000);
+
+  it('finds Providers handed over in a Record, a Map or to a generic over a list, and lets the label written over a spread pass however it is keyed (review RV25-06)', () => {
+    const component = [
+      "import type { Provider } from '../api/types';",
+      "import { providerLabel } from '../lib/providerUse';",
+      'type Named = { id: string; name: string };',
+      'export const nameOf = (item: Named) => item.name;',
+      'export const labels = (byId: Record<string, Named>) => Object.values(byId).map((x) => x.name);',
+      'export const fromMap = (byId: Map<string, Named>) => [...byId.values()].map((x) => x.name);',
+      "export const joinNames = <T extends { name: string }>(items: readonly T[]) => items.map((i) => i.name).join(', ');",
+      'export const viaRecord = (byId: Record<string, Provider>) => labels(byId);',
+      'export const viaMap = (byId: Map<string, Provider>) => fromMap(byId);',
+      'export const viaGenericList = (providers: Provider[]) => joinNames(providers);',
+      // the label written over the name - by a quoted key, a computed key, a spread object: none of these
+      "export const quoted = (provider: Provider) => nameOf({ ...provider, 'name': providerLabel(provider) });",
+      "export const computed = (provider: Provider) => nameOf({ ...provider, ['name']: providerLabel(provider) });",
+      'export const spreadObject = (provider: Provider) => nameOf({ ...provider, ...{ name: providerLabel(provider) } });',
+      '',
+    ].join('\n');
+    expect(bareNames(probe(component))).toEqual(['src/components/Probe.tsx:8: byId', 'src/components/Probe.tsx:9: byId', 'src/components/Probe.tsx:10: providers']);
   }, 30_000);
 
   it("finds the other shapes that read a Provider's name, and lets the label written over it pass (review RV24-05)", () => {
