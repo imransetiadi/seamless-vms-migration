@@ -575,6 +575,7 @@ class HandoverExecutor:
                 },
                 roles,
                 profile,
+                where=cloud,
             )
             if why_not:
                 problems.append(f"{where} on {target!r} of {cloud} (project {project}): {why_not}")

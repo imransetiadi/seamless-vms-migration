@@ -282,6 +282,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
         subnets: [{ name: 's', network: 'tenant-web', network_id: shared.id!, cidr: '10.20.0.0/16', ipv6_address_mode: null, ipv6_ra_mode: null }],
         roles,
         profile,
+        destination: 'DC3 Jakarta',
       }).find((f) => f.code === 'NET_PORT_NOT_PERMITTED');
     expect(run(['service'], 'secure_rbac')).toBeUndefined();
     const refused = run(['advsvc'], 'secure_rbac');
@@ -291,8 +292,9 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     );
     // unknown: the advice names the provider's check beside declaring, as the API's does (SDD §21.5, review 19)
     const unknown = run(['service'], 'unknown');
-    expect(unknown?.message).toContain("the destination's policy profile is unknown");
-    expect(unknown?.message).toContain('(check the provider so its series is detected, or declare its policy profile or series)');
+    // naming the provider, as the API (SDD §1 naming, review RV23-07)
+    expect(unknown?.message).toContain('the policy profile of DC3 Jakarta is unknown');
+    expect(unknown?.message).toContain('(check DC3 Jakarta so its series is detected, or declare its policy profile or series)');
     expect(unknown?.remediation).toBe(
       "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared network takes it once a check of the provider detects its series, or the provider declares its policy profile or series, so the check counts that profile's role: service under secure-RBAC, advsvc under the legacy rules. An external network that is not shared needs the admin role: Nova attaches it for no other.",
     );

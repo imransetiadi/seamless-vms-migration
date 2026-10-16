@@ -1209,7 +1209,7 @@ def test_declaring_the_series_settles_the_unknown_profile_the_refusal_asks_about
     )
     # a check is allowed while a plan runs, a PATCH that declares is not (SDD §12, §21.5)
     assert (
-        "check the provider so its series is detected, or declare its policy profile or series"
+        "check RHOSO 18.0 so its series is detected, or declare its policy profile or series"
         in before.message
     )
     after = _another_projects_port(
@@ -1303,11 +1303,31 @@ def test_finding_net_port_not_permitted_counts_advsvc_only_under_the_legacy_prof
     for roles in (["advsvc"], ["service"]):
         refused = _another_projects_port({**unknown, "roles": roles})
         assert refused is not None, roles
-        assert "the destination's policy profile is unknown, so only the admin role" in (
+        assert "the policy profile of RHOSO 18.0 is unknown, so only the admin role" in (
             refused.message
         ), roles
     # a value the check never reports counts as unknown: admin alone
     assert _another_projects_port({"policy_profile": "strict", "roles": ["advsvc"]}) is not None
+
+
+def test_net_port_not_permitted_names_the_provider_whose_policy_profile_is_unknown():
+    """SDD §1 naming (review RV23-07): a finding's message names the destination provider by its
+    label - the provider whose policy profile is unknown and the one to check - never "the
+    destination"; by its id when the stored name is blank."""
+    dc3 = DST.model_copy(update={"name": "DC3 Jakarta"})
+    refused = _another_projects_port({"policy_profile": "unknown", "roles": ["advsvc"]}, dc3)
+    assert refused is not None and refused.message == (
+        "The credential of DC3 Jakarta may not put these NICs on their network: "
+        "fa:16:3e:00:00:01 on 'rhoso-net' (project project-admin): the policy profile of DC3 "
+        "Jakarta is unknown, so only the admin role, or that project, may choose a port's address "
+        "or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is "
+        "detected, or declare its policy profile or series)."
+    )
+    blank = DST.model_copy(update={"name": " "})
+    refused = _another_projects_port({"policy_profile": "unknown", "roles": ["advsvc"]}, blank)
+    assert refused is not None
+    assert "the policy profile of dst-rhoso is unknown" in refused.message
+    assert "(check dst-rhoso so its series is detected" in refused.message
 
 
 async def _real_check(tmp_path, **cloud):

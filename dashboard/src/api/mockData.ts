@@ -1115,7 +1115,7 @@ export function preflight(
   const denied: string[] = [];
   for (const nic of vm.nics) {
     const network = resolved.get(nic);
-    const why = network ? portRefusal(network, context.roles, context.profile) : null;
+    const why = network ? portRefusal(network, context.roles, context.profile, where) : null;
     if (network && why) denied.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)} (project ${network.project_id ?? 'None'}): ${why}`);
   }
   if (denied.length)

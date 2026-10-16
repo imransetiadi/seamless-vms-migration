@@ -826,7 +826,7 @@ def run_preflight(
     denied = []
     for nic in vm.nics:
         network = resolved.get(id(nic))
-        why = None if network is None else port_refusal(network, roles, profile)
+        why = None if network is None else port_refusal(network, roles, profile, where=where)
         if network is not None and why:
             denied.append(
                 f"{(nic.mac or '?').lower()} on {network['name']!r} "

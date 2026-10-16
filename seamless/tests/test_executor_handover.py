@@ -2188,7 +2188,7 @@ async def test_the_handover_port_check_follows_the_policy_profile(tmp_path):
             "secure-RBAC defaults let only the admin or service role",
         ),
         ("legacy service", ["service"], "legacy", "Neutron lets only the admin or advsvc role"),
-        ("unknown service", ["service"], "unknown", "the destination's policy profile is unknown"),
+        ("unknown service", ["service"], "unknown", "the policy profile of RHOSO 18.0 is unknown"),
     ):
         executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
         clouds["dst"].network_list = [shared]
@@ -2258,13 +2258,14 @@ async def test_the_handover_judges_unreadable_token_roles_as_the_kit_does(tmp_pa
         if listed is not None:
             clouds["dst"].network_list = listed
         clouds["dst"].session = NS(auth=NS(get_access=unreadable))
-        destination = DST.model_copy(update={"capabilities": capabilities})
+        destination = DST.model_copy(update={"name": "DC3 Jakarta", "capabilities": capabilities})
         ctx = make_ctx(plan, mig, SRC, destination, settings)[0]
         return executor, calls, clouds, ctx
 
+    # it names the provider to check (SDD §1 naming, review RV23-07)
     unread = (
         "the credential's token roles could not be read, and a port there needs a role: check "
-        "the destination provider, then retry"
+        "DC3 Jakarta, then retry"
     )
     for name, listed, capabilities in (
         ("reset report", [shared], {}),

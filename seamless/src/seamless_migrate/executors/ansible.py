@@ -1220,7 +1220,7 @@ class AnsibleExecutor:
                 continue
             profile = policy_profile_of(ctx.destination.capabilities, ctx.destination)
             # no roles to judge, and a port there needs one: never let through (RV19-01)
-            refused = port_refusal_at_run(network, roles, profile)
+            refused = port_refusal_at_run(network, roles, profile, where=ctx.destination.label)
             if refused:
                 problem = (
                     f"{what} cannot go to network {name!r} of {ctx.destination.label} "

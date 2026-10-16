@@ -540,7 +540,7 @@ async def test_the_cutover_port_refusal_follows_the_policy_profile(env):
             "secure-RBAC defaults let only the admin or service role",
         ),
         (["service", "member"], "legacy", "Neutron lets only the admin or advsvc role"),
-        (["service", "member"], "unknown", "the destination's policy profile is unknown"),
+        (["service", "member"], "unknown", "the policy profile of RHOSO 18.0 is unknown"),
     ):
         ran = len(read_log(env.log))
         with pytest.raises(PermanentStepError, match=rule):
@@ -563,6 +563,7 @@ def _kit_cutover_to_another_projects_network(env, capabilities):
     mig = make_migration(id="mig-00000000ab", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_warm)
     secure = DST.model_copy(
         update={
+            "name": "DC3 Jakarta",
             "kind": ProviderKind.openstack,
             "policy_profile": "secure_rbac",
             "capabilities": capabilities,
@@ -609,6 +610,8 @@ async def test_the_kits_map_refuses_a_nic_that_needs_a_role_when_no_roles_can_be
     with pytest.raises(PermanentStepError, match="roles could not be read") as refused:
         await env.executor.run(StepName.CUTOVER, ctx)
     assert "shared-net" in str(refused.value) and read_log(env.log) == []
+    # it names the provider to check (SDD §1 naming, review RV23-07)
+    assert "a port there needs a role: check DC3 Jakarta, then retry" in str(refused.value)
     # a report that still names the roles is judged by them, as before
     env.registry.networks.pop()
     ctx = _kit_cutover_to_another_projects_network(env, {"roles": ["service"]})

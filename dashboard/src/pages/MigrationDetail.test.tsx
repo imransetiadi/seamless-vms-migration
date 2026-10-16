@@ -911,6 +911,24 @@ describe('MigrationDetail', () => {
     );
   });
 
+  it('names the provider whose policy profile is unknown in the picker\'s refusal (SDD §1 naming, review RV23-07)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const destination = server.providers.find((p) => p.id === 'rhoso-prod')!;
+    destination.capabilities = { ...destination.capabilities, policy_profile: 'unknown', roles: ['service', 'member'] };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
+    const select = within(await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` })).getAllByRole('combobox')[0]!;
+    await user.selectOptions(select, await within(select).findByRole('option', { name: 'provider-ext (not allowed)' }));
+    expect(select).toHaveAccessibleDescription(
+      'The credential of RHOSO 18.0 — Production may not put a port on provider-ext (project admin): the policy profile of RHOSO 18.0 — Production is unknown, ' +
+        "so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it " +
+        '(check RHOSO 18.0 — Production so its series is detected, or declare its policy profile or series). Validation refuses it.',
+    );
+  });
+
   it("keeps an override's network that RHOSO no longer lists selected, marked so (SDD §16)", async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

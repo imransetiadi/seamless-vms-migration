@@ -184,7 +184,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
               const note = `${titleId}-net-${i}-note`;
               // said under the field too: a narrow select cuts its option's text
               const chosen = draft.network && details.length ? resolveNetwork(details, draft.network) : null;
-              const notAllowed = chosen?.network ? portRefusal(chosen.network, roles, profile) : null;
+              const notAllowed = chosen?.network ? portRefusal(chosen.network, roles, profile, where) : null;
               const said =
                 unlisted && listed
                   ? { warn: true, text: `${draft.network} does not exist in ${where}: validation refuses it.` }

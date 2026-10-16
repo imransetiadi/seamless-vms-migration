@@ -1,5 +1,6 @@
 {
- "_comment": "planning.networks.port_refusal and policy_profile_of (SDD §6.6, §21.5): whether the destination credential may put a port on a network, by its token's roles and the destination's policy profile (roles null: not reported, the role halves unjudged), and the profile a check report gives - for a report that names none, the provider's declarations (RV18-04). Shared by seamless/tests/test_planning_networks.py and dashboard/src/lib/networks.test.ts (the NIC-override picker and the mock's pre-flight).",
+ "_comment": "planning.networks.port_refusal and policy_profile_of (SDD §6.6, §21.5): whether the destination credential may put a port on a network, by its token's roles and the destination's policy profile (roles null: not reported, the role halves unjudged), and the profile a check report gives - for a report that names none, the provider's declarations (RV18-04). Shared by seamless/tests/test_planning_networks.py and dashboard/src/lib/networks.test.ts (the NIC-override picker and the mock's pre-flight). `where` is the destination provider's label: a refusal built for a migration names it (SDD §1 naming, review RV23-07).",
+ "where": "DC3 Jakarta",
  "networks": {
   "own": {
    "own": true,
@@ -229,7 +230,7 @@
    "roles": [
     "member"
    ],
-   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check the provider so its series is detected, or declare its policy profile or series)"
+   "expected": "the policy profile of DC3 Jakarta is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is detected, or declare its policy profile or series)"
   },
   {
    "network": "another project's shared",
@@ -237,7 +238,7 @@
    "roles": [
     "advsvc"
    ],
-   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check the provider so its series is detected, or declare its policy profile or series)"
+   "expected": "the policy profile of DC3 Jakarta is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is detected, or declare its policy profile or series)"
   },
   {
    "network": "another project's shared",
@@ -245,7 +246,7 @@
    "roles": [
     "service"
    ],
-   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check the provider so its series is detected, or declare its policy profile or series)"
+   "expected": "the policy profile of DC3 Jakarta is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is detected, or declare its policy profile or series)"
   },
   {
    "network": "another project's shared",
@@ -343,7 +344,7 @@
    "roles": [
     "member"
    ],
-   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check the provider so its series is detected, or declare its policy profile or series)"
+   "expected": "the policy profile of DC3 Jakarta is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is detected, or declare its policy profile or series)"
   },
   {
    "network": "another project's external",
@@ -351,7 +352,7 @@
    "roles": [
     "advsvc"
    ],
-   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check the provider so its series is detected, or declare its policy profile or series)"
+   "expected": "the policy profile of DC3 Jakarta is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is detected, or declare its policy profile or series)"
   },
   {
    "network": "another project's external",
@@ -359,7 +360,7 @@
    "roles": [
     "service"
    ],
-   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check the provider so its series is detected, or declare its policy profile or series)"
+   "expected": "the policy profile of DC3 Jakarta is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is detected, or declare its policy profile or series)"
   },
   {
    "network": "another project's external",
@@ -685,7 +686,7 @@
    "roles": [
     "member"
    ],
-   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check the provider so its series is detected, or declare its policy profile or series)"
+   "expected": "the policy profile of DC3 Jakarta is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is detected, or declare its policy profile or series)"
   },
   {
    "network": "another project's external and shared",
@@ -693,7 +694,7 @@
    "roles": [
     "advsvc"
    ],
-   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check the provider so its series is detected, or declare its policy profile or series)"
+   "expected": "the policy profile of DC3 Jakarta is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is detected, or declare its policy profile or series)"
   },
   {
    "network": "another project's external and shared",
@@ -701,7 +702,7 @@
    "roles": [
     "service"
    ],
-   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check the provider so its series is detected, or declare its policy profile or series)"
+   "expected": "the policy profile of DC3 Jakarta is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is detected, or declare its policy profile or series)"
   },
   {
    "network": "another project's external and shared",

@@ -112,6 +112,7 @@ describe('the VMware migration kit (SDD §7.2)', () => {
 });
 
 const shared = JSON.parse(raw) as {
+  where: string;
   networks: Record<string, Pick<DestinationNetwork, 'own' | 'shared' | 'external'>>;
   cases: Array<{ network: string; profile: string; roles: string[] | null; expected: string | null }>;
   profile_cases: Array<{
@@ -125,7 +126,8 @@ const shared = JSON.parse(raw) as {
 describe('the port rule by the policy profile, like the control plane (SDD §6.6, §21.5)', () => {
   it.each(shared.cases.map((c) => [`${c.network}, ${c.profile}, ${JSON.stringify(c.roles)}`, c] as const))('%s', (_name, c) => {
     const network: DestinationNetwork = { id: 'n', name: 'n', mtu: 1500, project_id: 'p', ...shared.networks[c.network]! };
-    expect(portRefusal(network, c.roles ?? undefined, c.profile)).toBe(c.expected);
+    // the mock's pre-flight names the destination provider, as the API (SDD §1 naming, review RV23-07)
+    expect(portRefusal(network, c.roles ?? undefined, c.profile, shared.where)).toBe(c.expected);
   });
 
   it.each(shared.profile_cases.map((c) => [c.why, c] as const))('the profile: %s', (_why, c) => {
