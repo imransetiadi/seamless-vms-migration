@@ -32,9 +32,14 @@ const CAPABILITY_LABELS: Record<string, string> = {
   ovn: 'OVN networking',
   volume_backends: 'Volume backends',
   storage_backends: 'Storage',
-  cbt: 'CBT support',
+  // a vCenter's check (SDD §10): its version and its VMs counted
+  api_version: 'vSphere API',
   version: 'Version',
-  datastores: 'Datastores',
+  vm_count: 'VMs',
+  cbt_enabled_vms: 'VMs with CBT',
+  vms_with_snapshots: 'VMs with snapshots',
+  vms_with_independent_disks: 'VMs with independent disks',
+  vms_without_tools: 'VMs without VMware Tools',
 };
 
 /** The check-report keys the card shows in its own rows: a destination's series, tier and profile, and TLS (SDD §10, §16). */

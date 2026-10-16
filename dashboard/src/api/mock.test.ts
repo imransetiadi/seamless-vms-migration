@@ -2523,6 +2523,25 @@ describe('providers of community destinations, like the API (SDD §4.2, §10, §
     expect((source.storage_backends as { pool: string }[]).map((b) => b.pool)).toContain('overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1');
   });
 
+  it("a vCenter's check reports the API demo's VMware keys, never an OpenStack service (review RV19-05)", () => {
+    const { server } = setup('admin');
+    const vcenter = { ...base, id: 'vc-9', name: 'vCenter 9', kind: 'vmware', role: 'source', distribution: 'vmware' };
+    expect(call(server, 'POST', '/providers', vcenter).status).toBe(201);
+    // FakeSourceProvider.check for vmware: its VMs counted; no Nova, OVN or Cinder
+    const VMWARE_KEYS = ['admin', 'api_version', 'cbt_enabled_vms', 'vms_with_independent_disks', 'vms_with_snapshots', 'vms_without_tools'];
+    expect(keysOf((call(server, 'POST', '/providers/vc-9/check').body as Provider).capabilities)).toEqual(VMWARE_KEYS);
+    // the seeded vCenter reports what a check of it reads, counted from its VMs
+    const hq = server.providers.find((p) => p.id === 'vcenter-hq')!.capabilities;
+    expect(keysOf(hq)).toEqual(VMWARE_KEYS);
+    expect(hq).toMatchObject({ admin: true, api_version: '8.0.2.0' });
+    expect(hq.cbt_enabled_vms).toBeGreaterThan(0);
+    // an OpenStack declaration on vmware: the API's message, pydantic's "Value error, " included
+    expect(call(server, 'POST', '/providers', { ...vcenter, id: 'vc-8', release: '2026.2' })).toMatchObject({
+      status: 422,
+      body: { error: { message: 'Value error, release: an OpenStack release cannot be declared for vmware' } },
+    });
+  });
+
   it('takes a declared series and policy profile, and refuses them where the API does (SDD §4.2, §12)', () => {
     const { server } = setup('admin');
     const dst = { ...base, id: 'dc4', name: 'DC4', kind: 'openstack', role: 'destination', distribution: 'openstack_community' };

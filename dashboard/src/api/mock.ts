@@ -43,6 +43,7 @@ import {
   strategySnapshot,
   type StrategyDecision,
   checkOf,
+  vmwareCheck,
 } from './mockData';
 import { buildStrategyEvidence, evidenceCount } from './mockEvidence';
 import { derivePlanStatus } from './mockPlanStatus';
@@ -596,7 +597,7 @@ function checkDeclarations(input: Record<string, unknown> | Provider) {
   }
   if (fields.kind === 'vmware') {
     for (const name of ['release', 'policy_profile']) {
-      if (fields[name] !== undefined && fields[name] !== null) throw new HttpError(422, 'validation_error', `${name}: an OpenStack ${name} cannot be declared for vmware`);
+      if (fields[name] !== undefined && fields[name] !== null) throw new HttpError(422, 'validation_error', `Value error, ${name}: an OpenStack ${name} cannot be declared for vmware`);
     }
   }
 }
@@ -1327,12 +1328,10 @@ export class MockServer {
             } else {
               provider.status = 'ok';
               provider.status_message = 'All services reachable.';
-              // an OpenStack check reports the API's keys: its token's roles, its maxima, TLS, and a destination's
-              // series, tier and policy profile by what it declares (SDD §10, §10.1)
-              provider.capabilities =
-                provider.kind === 'vmware'
-                  ? { admin: true, compute_microversion: '2.95', ovn: true, volume_backends: ['ceph-ssd'] }
-                  : checkOf(provider);
+              // the API's keys: a vCenter's VMs counted; an OpenStack cloud's token roles, maxima, pools and TLS, and a
+              // destination's series, tier and policy profile by what it declares (SDD §10, §10.1)
+              const inventory = this.inventories[provider.id];
+              provider.capabilities = provider.kind === 'vmware' ? vmwareCheck(Array.isArray(inventory) ? inventory : []) : checkOf(provider);
             }
           }
           this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name}: ${provider.status}`, data: { status: provider.status } });

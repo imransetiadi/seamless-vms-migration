@@ -396,6 +396,21 @@ const CLOUDS: Record<string, { storage: ReturnType<typeof backend>[]; extra?: Re
   'hibiscus-dc3': { storage: DC3_STORAGE },
 };
 
+/**
+ * A vCenter's check report, with the keys the API demo's VMware check reports (FakeSourceProvider): its VMs counted, and
+ * no OpenStack service - no Nova, OVN or Cinder (SDD §10; review RV19-05).
+ */
+export function vmwareCheck(vms: readonly VMRef[]): Record<string, unknown> {
+  return {
+    admin: true,
+    api_version: '8.0.2.0',
+    cbt_enabled_vms: vms.filter((v) => v.cbt_enabled).length,
+    vms_with_snapshots: vms.filter((v) => v.snapshot_count).length,
+    vms_with_independent_disks: vms.filter((v) => v.disks.some((d) => d.independent)).length,
+    vms_without_tools: vms.filter((v) => v.tools_ok === false).length,
+  };
+}
+
 /** An OpenStack or RHOSO provider's check report, as the mock's check reads its cloud: the seeded cloud's own pools, else CHECKED_STORAGE. */
 export function checkOf(provider: Pick<Provider, 'id' | 'kind' | 'role' | 'release' | 'policy_profile'>): Record<string, unknown> {
   const cloud = CLOUDS[provider.id];
@@ -542,7 +557,7 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: null,
       conversion_host: { manage: false, name: 'conv-vddk-hq', flavor: null, external_network: null, image: null, ssh_user: 'cloud-user', address: '198.51.100.40', ssh_allowed_cidr: null, ssh_key_secret: 'provider-vcenter-hq-ssh' },
-      capabilities: { version: '8.0.2', cbt: true, datastores: ['vsanDatastore', 'nfs-archive'] },
+      capabilities: vmwareCheck(VMW_VMS.map(makeVm)),
       status: 'degraded',
       status_message: 'Two ESXi hosts in maintenance mode; CBT queries are slow.',
       last_checked_at: iso(now - 11 * 60_000),

@@ -156,6 +156,17 @@ describe('Providers page', () => {
     }
   });
 
+  it("says a vCenter's check in words, with no OpenStack service (review RV19-05)", async () => {
+    renderPage('viewer');
+    const card = await screen.findByRole('article', { name: 'vCenter HQ' });
+    const chips = within(card).getByRole('list', { name: 'Capabilities' });
+    const chip = (label: string) => within(chips).getByText(label).closest('li');
+    expect(chip('vSphere API')).toHaveTextContent(/^vSphere API\s*8\.0\.2\.0$/);
+    expect(chip('VMs with CBT')).toHaveTextContent(/^VMs with CBT\s*\d+$/);
+    expect(chip('VMs without VMware Tools')).toHaveTextContent(/^VMs without VMware Tools\s*\d+$/);
+    expect(chips).not.toHaveTextContent(/Compute API|OVN networking|Volume backends|_/);
+  });
+
   it('keeps Cancel focusable while the provider is saved, saying why (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Providers />, {
