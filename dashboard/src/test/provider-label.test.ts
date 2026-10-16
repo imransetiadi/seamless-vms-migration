@@ -4,8 +4,10 @@ import { describe, expect, it } from 'vitest';
 // Every text that names a provider reads its label - its name, else its id - as the API's Provider.label (SDD §1
 // naming, §4.2): a provider stored with a blank name before the API refused one (review RV20-11) never reads blank.
 // The type checker finds each read of Provider.name, whatever the variable holding the provider is called (review
-// RV21-06: a page-local helper, `p.name` in a list, the mock's events), and a Provider given where a shape of its own
-// that reads `name` is expected - a call's argument, an object member, a JSX prop (reviews RV22-01, RV23-05).
+// RV21-06: a page-local helper, `p.name` in a list, the mock's events), by element access or destructuring, a Provider
+// given where a shape of its own that reads `name` is expected - a call's argument, an object member, a JSX prop, a
+// generic constrained to a name - and a function that reads one handed over to be called with Providers (reviews
+// RV22-01, RV23-05, RV24-05).
 
 // the dashboard's directory, from this file's URL (src/test/) - as a string: Vite rewrites `new URL(…, import.meta.url)`
 // into a dev-server URL. The type checker's file names use "/" too.
@@ -66,13 +68,50 @@ function bareNames(program: ts.Program): string[] {
         const read = checker.getSymbolAtLocation(node.name)?.declarations?.some((d) => isProviders(d.parent)) ?? false;
         if (read && !RAW.has(`${file}: ${node.getText()}`)) found.push(where(node));
       }
+      // the same read by element access, `provider['name']`, or by destructuring a Provider - a callback's parameter, a
+      // component's props, a variable - `{ name }` or `{ name: shown }` (review RV24-05)
+      if (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === 'name') {
+        if (holdsProviders(checker.getTypeAtLocation(node.expression))) found.push(where(node));
+      }
+      if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent) && (node.propertyName ?? node.name).getText() === 'name') {
+        if (holdsProviders(checker.getTypeAtLocation(node.parent))) found.push(where(node));
+      }
       // a Provider given where a shape of its own that reads `name` is expected, as `{ id: string; name: string }`: a
       // call's argument, a member of an object literal, a JSX prop, a return value - its contextual type (reviews
-      // RV22-01, RV23-05). An identifier that only names a declaration or a member is no value; a shorthand member is.
+      // RV22-01, RV23-05). An identifier that only names a declaration or a member is no value; a shorthand member is;
+      // a spread whose object writes its own `name` after it reads none (review RV24-05).
       const naming = ts.isIdentifier(node) && !ts.isShorthandPropertyAssignment(node.parent) && (node.parent as { name?: ts.Node }).name === node;
-      if (ts.isExpression(node) && !naming) {
+      const renamed =
+        node.parent !== undefined &&
+        ts.isSpreadAssignment(node.parent) &&
+        ts.isObjectLiteralExpression(node.parent.parent) &&
+        node.parent.parent.properties.slice(node.parent.parent.properties.indexOf(node.parent) + 1).some((p) => p.name?.getText() === 'name');
+      if (ts.isExpression(node) && !naming && !renamed) {
         const expected = checker.getContextualType(node);
-        if (expected && !holdsProviders(expected) && readsName(expected) && holdsProviders(checker.getTypeAtLocation(node))) found.push(where(node));
+        const given = checker.getTypeAtLocation(node);
+        if (expected && !holdsProviders(expected) && readsName(expected) && holdsProviders(given)) found.push(where(node));
+        // a function handed over where it is called with Providers, whose own parameter reads a shape's `name`:
+        // `providers.map(nameOf)`, `providers.map((item: Named) => item.name)` (review RV24-05)
+        const [want, have] = [expected?.getCallSignatures()[0], given.getCallSignatures()[0]];
+        if (want && have) {
+          const reads = have.parameters.some((param, i) => {
+            const called = want.parameters[i];
+            const own = checker.getTypeOfSymbolAtLocation(param, node);
+            return called !== undefined && holdsProviders(checker.getTypeOfSymbolAtLocation(called, node)) && !holdsProviders(own) && readsName(own);
+          });
+          if (reads) found.push(where(node));
+        }
+      }
+      // a Provider given to a generic parameter constrained to a shape that reads `name`, `<T extends { name: string }>`:
+      // its contextual type is the Provider the call infers, so the constraint is read (review RV24-05)
+      if (ts.isCallExpression(node)) {
+        const declared = checker.getResolvedSignature(node)?.getDeclaration();
+        node.arguments.forEach((arg, i) => {
+          const param = declared && 'parameters' in declared ? declared.parameters[i] : undefined;
+          const type = param?.type ? checker.getTypeFromTypeNode(param.type) : undefined;
+          const constraint = type?.isTypeParameter() ? checker.getBaseConstraintOfType(type) : undefined;
+          if (constraint && !holdsProviders(constraint) && readsName(constraint) && holdsProviders(checker.getTypeAtLocation(arg))) found.push(where(arg));
+        });
       }
       ts.forEachChild(node, visit);
     };
@@ -109,6 +148,38 @@ describe('every text names a provider by its label (SDD §1 naming, §4.2, revie
       'src/components/Probe.tsx:8: provider',
       'src/components/Probe.tsx:9: item',
       'src/components/Probe.tsx:10: provider',
+    ]);
+  }, 30_000);
+
+  it("finds the other shapes that read a Provider's name, and lets the label written over it pass (review RV24-05)", () => {
+    const component = [
+      "import type { Provider } from '../api/types';",
+      "import { providerLabel } from '../lib/providerUse';",
+      'type Named = { id: string; name: string };',
+      'export const nameOf = (item: Named) => item.name;',
+      'export const generic = <T extends { name: string }>(item: T) => item.name;',
+      // a callback's destructured parameter, element access, a name-reading function handed over as a callback, a
+      // Provider given where a generic constrained to a name is expected, destructured props, a renamed binding
+      'export const viaCallbackParam = (providers: Provider[]) => providers.map(({ name }) => <li key={name}>{name}</li>);',
+      "export const viaElement = (provider: Provider) => <span>{provider['name']}</span>;",
+      'export const viaCallback = (providers: Provider[]) => providers.map(nameOf);',
+      'export const viaGeneric = (provider: Provider) => generic(provider);',
+      'export const ViaProps = ({ name }: Provider) => <span>{name}</span>;',
+      'export const viaRenamed = ({ name: shown }: Provider) => shown;',
+      'export const viaAnnotated = (providers: Provider[]) => providers.map((item: Named) => item.name);',
+      // the label written over the name, and another member: none of these
+      'export const viaSpreadLabelled = (provider: Provider) => nameOf({ ...provider, name: providerLabel(provider) });',
+      'export const viaId = (providers: Provider[]) => providers.map(({ id }) => id);',
+      '',
+    ].join('\n');
+    expect(bareNames(probe(component))).toEqual([
+      'src/components/Probe.tsx:6: name',
+      "src/components/Probe.tsx:7: provider['name']",
+      'src/components/Probe.tsx:8: nameOf',
+      'src/components/Probe.tsx:9: provider',
+      'src/components/Probe.tsx:10: name',
+      'src/components/Probe.tsx:11: name: shown',
+      'src/components/Probe.tsx:12: (item: Named) => item.name',
     ]);
   }, 30_000);
 });
