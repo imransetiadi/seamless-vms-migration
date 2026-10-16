@@ -489,6 +489,8 @@ def test_a_secret_managed_outside_seamless_can_be_named(api):
 CREDENTIAL_BODY_CASES = json.loads(
     (Path(__file__).parent / "fixtures" / "credential_body_cases.json").read_text(encoding="utf-8")
 )["cases"]
+#: what a case's "[pem]" stands for: an OpenSSH key's header, no key material
+PEM = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "A" * 64  # gitleaks:allow (a header, filler)
 
 
 @pytest.mark.parametrize(
@@ -497,12 +499,16 @@ CREDENTIAL_BODY_CASES = json.loads(
     ids=[f"{c['route']} {c['provider']}: {c['note']}" for c in CREDENTIAL_BODY_CASES],
 )
 def test_a_credential_body_is_judged_before_the_provider_is_looked_up(api, case):
-    """SDD §12, §13.3 (review RV23-03): PUT /providers/{id}/credentials and /conversion-key refuse
-    what their body alone gets wrong (422) before they look the provider up (404), for a provider
-    they do not know too - the cases the dashboard's mock answers the same way
-    (credential_body_cases.json)."""
+    """SDD §12, §13.3 (reviews RV23-03, RV24-06): PUT /providers/{id}/credentials and
+    /conversion-key refuse what their body alone gets wrong (422) before they look the provider up
+    (404), for a provider they do not know too, and strip as Python's str.strip - the cases the
+    dashboard's mock answers the same way (credential_body_cases.json)."""
     provider = "src-osp" if case["provider"] == "known" else case["provider"]
-    answer = put(api, f"/api/v1/providers/{provider}/{case['route']}", case["body"])
+    body = {
+        k: v.replace("[pem]", PEM) if k == "private_key" and isinstance(v, str) else v
+        for k, v in case["body"].items()
+    }
+    answer = put(api, f"/api/v1/providers/{provider}/{case['route']}", body)
     assert answer.status_code == case["status"], answer.text
     if case["message"] is not None:
         assert answer.json()["error"]["message"] == case["message"]

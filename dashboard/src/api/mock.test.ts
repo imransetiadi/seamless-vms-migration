@@ -403,11 +403,14 @@ describe('mock API', () => {
   });
 
   it.each(CREDENTIAL_BODY_CASES.map((c) => [`${c.route} ${c.provider}: ${c.note}`, c] as const))(
-    "judges a credential body before it looks the provider up, as the API: %s (SDD §12, §13.3, review RV23-03)",
+    "judges a credential body before it looks the provider up, as the API: %s (SDD §12, §13.3, reviews RV23-03, RV24-06)",
     (_name, c) => {
       const server = new MockServer({ now: () => NOW, seed: 1 });
       const id = c.provider === 'known' ? server.providers.find((p) => p.kind === 'openstack')!.id : c.provider;
-      const res = server.handle('PUT', `/providers/${id}/${c.route}`, new URLSearchParams(), c.body, 'admin');
+      // a case's "[pem]" stands for an OpenSSH key's header, no key material
+      const pem = '-----BEGIN OPENSSH PRIVATE KEY-----\n' + 'A'.repeat(64); // gitleaks:allow
+      const body = Object.fromEntries(Object.entries(c.body).map(([k, v]) => [k, k === 'private_key' && typeof v === 'string' ? v.replace('[pem]', pem) : v]));
+      const res = server.handle('PUT', `/providers/${id}/${c.route}`, new URLSearchParams(), body, 'admin');
       const message = res.status < 300 ? null : (res.body as { error: { message: string } }).error.message;
       expect({ status: res.status, message: c.message === null ? null : message }).toEqual({ status: c.status, message: c.message });
     },
@@ -423,7 +426,7 @@ describe('mock API', () => {
     expect([answer({ name: '\u200b' }), answer({ id: 'x' }), answer({ region: 'R2' })]).toEqual([
       { status: 422, message: 'name: must not be blank' },
       { status: 422, message: 'fields cannot be changed: id' },
-      { status: 404, message: 'Provider ghost not found.' },
+      { status: 404, message: "provider 'ghost' not found" },
     ]);
   });
 

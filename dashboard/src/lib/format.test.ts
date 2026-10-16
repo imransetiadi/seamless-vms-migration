@@ -10,6 +10,7 @@ import {
   formatRelative,
   pyNames,
   pyRepr,
+  pyStrip,
 } from './format';
 
 describe('pyRepr', () => {
@@ -208,5 +209,18 @@ describe('pyNames', () => {
     // JavaScript's default sort puts U+1F600 (a surrogate pair) before U+E000; Python puts it after
     expect(pyNames(['\u{1F600}', '\uE000'])).toBe('\uE000, \u{1F600}');
     expect(pyNames(['B', 'a', '\u00e9'])).toBe('B, a, \u00e9');
+  });
+});
+
+describe('pyStrip (review RV24-06)', () => {
+  // str.isspace's code points, as Python 3.11 and 3.13 list them: [c for c in range(0x110000) if chr(c).isspace()]
+  const PYTHON_SPACE = [0x9, 0xa, 0xb, 0xc, 0xd, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x85, 0xa0, 0x1680, ...Array.from({ length: 11 }, (_, i) => 0x2000 + i), 0x2028, 0x2029, 0x202f, 0x205f, 0x3000];
+
+  it("strips Python's whitespace from both ends, and only it, as the API's str.strip", () => {
+    expect(PYTHON_SPACE).toHaveLength(29);
+    for (const code of PYTHON_SPACE) expect(pyStrip(`${String.fromCodePoint(code)}x${String.fromCodePoint(code)}`)).toBe('x');
+    // what JavaScript's trim takes that Python keeps, and a space inside
+    for (const kept of ['\ufeff', '\u200b', '\u180e']) expect(pyStrip(kept)).toBe(kept);
+    expect(pyStrip('  a b  ')).toBe('a b');
   });
 });
