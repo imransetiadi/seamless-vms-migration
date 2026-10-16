@@ -1338,7 +1338,12 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 
 ### 7.3 HandoverExecutor (`executors/handover.py`) — `storage_handover`
 
-Uses openstacksdk sessions (raw REST through `conn.compute` / `conn.block_storage`). Cinder
+Uses openstacksdk sessions (raw REST through `conn.compute` / `conn.block_storage`). A call that fails is retried
+(`TransientStepError`, §7.1, §8) when its answer is HTTP 502, 503 or 504 — openstacksdk's `HttpException`, keystoneauth's
+HTTP errors, or a raw call's status — or keystoneauth reports a retriable connection failure (`ConnectTimeout`:
+"Request to … timed out"; `ConnectFailure`: "Unable to establish connection to …"); any other error is judged by
+its own text as §7.2 judges a playbook's output, never by the provider's name the message adds (review RV20-12,
+audit EX-12). Cinder
 refuses `os-unmanage` on an attached (`in-use`) volume, and Nova deletes `delete_on_termination`
 volumes with their server, so the order is:
 
