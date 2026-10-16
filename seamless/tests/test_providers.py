@@ -662,6 +662,24 @@ async def test_a_real_destination_of_each_series_is_read_as_that_series(tmp_path
     assert reported | {"policy_profile": caps["policy_profile"]} == expected
 
 
+async def test_every_openstack_check_reports_the_shared_keys(tmp_path):
+    """SDD §10, §10.1: the real check through keystoneauth and the demo's fakes report the keys of
+    check_report_keys.json - a destination's adds the destination_release keys -, the file the
+    dashboard's mock check is held to (plan T8)."""
+    keys = json.loads((VERSIONS.parent / "check_report_keys.json").read_text(encoding="utf-8"))
+    source, destination = sorted(keys["openstack"]), sorted(keys["openstack"] + keys["destination"])
+    cloud = InProcessCloud(tmp_path, compute="2.104", block_storage="3.71")
+    for role, expected in ((ProviderRole.source, source), (ProviderRole.destination, destination)):
+        provider = make_provider(endpoint=AUTH_URL, cloud="dst", role=role)
+        caps = await OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect).check()
+        assert sorted(caps) == expected, role
+    assert sorted(await FakeSourceProvider(ProviderKind.openstack).check()) == source
+    community = make_provider(id="dst-dc3", role=ProviderRole.destination, release="2026.2")
+    for provider in (community, community.model_copy(update={"kind": ProviderKind.rhoso})):
+        caps = await FakeDestinationProvider(provider=provider).check()
+        assert sorted(caps) == destination, provider.kind
+
+
 def _versions(conn, compute, block_storage):
     conn.compute.get_endpoint_data = lambda: NS(max_microversion=compute)
     conn.block_storage.get_endpoint_data = lambda: NS(max_microversion=block_storage)

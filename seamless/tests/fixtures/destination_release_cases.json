@@ -1,0 +1,458 @@
+{
+ "_comment": "planning.platforms.destination_release (SDD §10.1): a destination's kind, declared series and profile and its services' maxima -> the range, the settled series, the support tier and the policy profile. Shared by seamless/tests/test_platforms.py and dashboard/src/lib/platforms.test.ts (the mock's check and the provider card read them so).",
+ "cases": [
+  {
+   "why": "a series' own maximum",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.104",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [
+     "2026.2"
+    ],
+    "release": "2026.2",
+    "support_tier": {
+     "tier": "tier1",
+     "reason": null,
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "two series share the maximum: the least favourable tier",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.96",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [
+     "2024.1",
+     "2024.2"
+    ],
+    "release": null,
+    "support_tier": {
+     "tier": "tier3",
+     "reason": "end_of_life",
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "equal maxima of two tier 1 series",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.100",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [
+     "2025.1",
+     "2025.2"
+    ],
+    "release": null,
+    "support_tier": {
+     "tier": "tier1",
+     "reason": null,
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "between two series' maxima (a development snapshot)",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.98",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [
+     "2024.2",
+     "2025.1"
+    ],
+    "release": null,
+    "support_tier": {
+     "tier": "tier3",
+     "reason": "end_of_life",
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "block storage narrows to the newer series",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.98",
+   "block_storage_max": "3.72",
+   "expected": {
+    "release_range": [
+     "2025.1"
+    ],
+    "release": "2025.1",
+    "support_tier": {
+     "tier": "tier1",
+     "reason": null,
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "block storage equal to the older series keeps both",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.98",
+   "block_storage_max": "3.71",
+   "expected": {
+    "release_range": [
+     "2024.2",
+     "2025.1"
+    ],
+    "release": null,
+    "support_tier": {
+     "tier": "tier3",
+     "reason": "end_of_life",
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "a Cinder below an older series' maximum never reads as a newer series (RV18-05)",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.98",
+   "block_storage_max": "3.70",
+   "expected": {
+    "release_range": [
+     "2024.2",
+     "2025.1"
+    ],
+    "release": null,
+    "support_tier": {
+     "tier": "tier3",
+     "reason": "end_of_life",
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "a narrowing to nothing is not applied",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.96",
+   "block_storage_max": "3.70",
+   "expected": {
+    "release_range": [
+     "2024.1",
+     "2024.2"
+    ],
+    "release": null,
+    "support_tier": {
+     "tier": "tier3",
+     "reason": "end_of_life",
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "above the window",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.105",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [],
+    "release": null,
+    "support_tier": {
+     "tier": "outside",
+     "reason": "newer_than_validated",
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "below the window",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.93",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [],
+    "release": null,
+    "support_tier": {
+     "tier": "outside",
+     "reason": "below_floor",
+     "declared_outside_range": false
+    },
+    "policy_profile": "legacy"
+   }
+  },
+  {
+   "why": "nothing readable",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "",
+   "block_storage_max": "",
+   "expected": {
+    "release_range": [],
+    "release": null,
+    "support_tier": {
+     "tier": "outside",
+     "reason": "not_detected",
+     "declared_outside_range": false
+    },
+    "policy_profile": "unknown"
+   }
+  },
+  {
+   "why": "2023.1 or 2023.2 straddle the profiles",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.95",
+   "block_storage_max": "3.70",
+   "expected": {
+    "release_range": [
+     "2023.1",
+     "2023.2"
+    ],
+    "release": null,
+    "support_tier": {
+     "tier": "tier3",
+     "reason": "end_of_life",
+     "declared_outside_range": false
+    },
+    "policy_profile": "unknown"
+   }
+  },
+  {
+   "why": "a declared series inside the range decides",
+   "kind": "openstack",
+   "release": "2024.2",
+   "policy_profile": null,
+   "compute_max": "2.96",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [
+     "2024.1",
+     "2024.2"
+    ],
+    "release": "2024.2",
+    "support_tier": {
+     "tier": "tier3",
+     "reason": "end_of_life",
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "a declared series the range contradicts: flagged, the range decides",
+   "kind": "openstack",
+   "release": "2026.2",
+   "policy_profile": null,
+   "compute_max": "2.96",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [
+     "2024.1",
+     "2024.2"
+    ],
+    "release": null,
+    "support_tier": {
+     "tier": "tier3",
+     "reason": "end_of_life",
+     "declared_outside_range": true
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "nothing detected: the declared series decides (RV18-06)",
+   "kind": "openstack",
+   "release": "2026.2",
+   "policy_profile": null,
+   "compute_max": "",
+   "block_storage_max": "",
+   "expected": {
+    "release_range": [],
+    "release": "2026.2",
+    "support_tier": {
+     "tier": "tier1",
+     "reason": null,
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "below the window: a declared older series decides (RV18-06)",
+   "kind": "openstack",
+   "release": "2022.2",
+   "policy_profile": null,
+   "compute_max": "2.93",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [],
+    "release": "2022.2",
+    "support_tier": {
+     "tier": "outside",
+     "reason": "below_floor",
+     "declared_outside_range": false
+    },
+    "policy_profile": "legacy"
+   }
+  },
+  {
+   "why": "above the window: a declared newer series decides (RV18-06)",
+   "kind": "openstack",
+   "release": "2027.1",
+   "policy_profile": null,
+   "compute_max": "2.105",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [],
+    "release": "2027.1",
+    "support_tier": {
+     "tier": "outside",
+     "reason": "newer_than_validated",
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "below the window contradicts a series of the window",
+   "kind": "openstack",
+   "release": "2026.2",
+   "policy_profile": null,
+   "compute_max": "2.53",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [],
+    "release": null,
+    "support_tier": {
+     "tier": "outside",
+     "reason": "below_floor",
+     "declared_outside_range": true
+    },
+    "policy_profile": "legacy"
+   }
+  },
+  {
+   "why": "a declared profile wins",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": "legacy",
+   "compute_max": "2.104",
+   "block_storage_max": null,
+   "expected": {
+    "release_range": [
+     "2026.2"
+    ],
+    "release": "2026.2",
+    "support_tier": {
+     "tier": "tier1",
+     "reason": null,
+     "declared_outside_range": false
+    },
+    "policy_profile": "legacy"
+   }
+  },
+  {
+   "why": "RHOSO 18.0: validated and legacy by its kind (D14)",
+   "kind": "rhoso",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "2.95",
+   "block_storage_max": "3.70",
+   "expected": {
+    "release_range": [
+     "2023.1",
+     "2023.2"
+    ],
+    "release": null,
+    "support_tier": {
+     "tier": "validated",
+     "reason": null,
+     "declared_outside_range": false
+    },
+    "policy_profile": "legacy"
+   }
+  },
+  {
+   "why": "RHOSO 18.0 with a declared profile",
+   "kind": "rhoso",
+   "release": null,
+   "policy_profile": "secure_rbac",
+   "compute_max": "2.95",
+   "block_storage_max": "3.70",
+   "expected": {
+    "release_range": [
+     "2023.1",
+     "2023.2"
+    ],
+    "release": null,
+    "support_tier": {
+     "tier": "validated",
+     "reason": null,
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "a report reset to the declarations alone: a declared series (RV18-04)",
+   "kind": "openstack",
+   "release": "2026.2",
+   "policy_profile": null,
+   "compute_max": "",
+   "block_storage_max": "",
+   "expected": {
+    "release_range": [],
+    "release": "2026.2",
+    "support_tier": {
+     "tier": "tier1",
+     "reason": null,
+     "declared_outside_range": false
+    },
+    "policy_profile": "secure_rbac"
+   }
+  },
+  {
+   "why": "a report reset to the declarations alone: nothing declared",
+   "kind": "openstack",
+   "release": null,
+   "policy_profile": null,
+   "compute_max": "",
+   "block_storage_max": "",
+   "expected": {
+    "release_range": [],
+    "release": null,
+    "support_tier": {
+     "tier": "outside",
+     "reason": "not_detected",
+     "declared_outside_range": false
+    },
+    "policy_profile": "unknown"
+   }
+  }
+ ]
+}

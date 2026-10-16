@@ -432,3 +432,42 @@ def test_the_sdk_never_asks_more_than_its_caps_of_any_series_of_the_window(serie
         assert _version(version) <= _version(REVIEWED_MICROVERSIONS[service]), (name, cap, version)
         assert _version(version) <= _version(maximum), (name, cap, version)
     assert asked.get("Server"), asked
+
+
+SHARED_RELEASE_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "destination_release_cases.json").read_text(
+        encoding="utf-8"
+    )
+)["cases"]
+
+
+def test_the_shared_series_table_is_the_code_series_table():
+    """SDD §21.1, §10.1: the dashboard's series table (dashboard/src/lib/platforms.ts, plan T8) is
+    checked against the same file, so a codename or tier the card shows is the code's."""
+    shared = json.loads((VERSIONS.parent / "release_series.json").read_text(encoding="utf-8"))
+    assert shared["series"] == [
+        {
+            "name": s.name,
+            "codename": s.codename,
+            "phase": s.phase,
+            "slurp": s.slurp,
+            "tier": s.tier,
+            "compute_max": s.compute_max,
+            "block_storage_max": s.block_storage_max,
+        }
+        for s in SERIES
+    ]
+
+
+@pytest.mark.parametrize("case", SHARED_RELEASE_CASES, ids=lambda case: case["why"])
+def test_the_shared_destination_release_cases(case):
+    """SDD §10.1: the case table the dashboard's port of destination_release runs too (the mock's
+    check and the provider card, plan T8): range, settled series, tier and profile."""
+    found = destination_release(
+        case["kind"],
+        case["release"],
+        case["policy_profile"],
+        case["compute_max"],
+        case["block_storage_max"],
+    )
+    assert found == case["expected"]

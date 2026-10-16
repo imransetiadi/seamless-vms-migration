@@ -1,0 +1,811 @@
+{
+ "_comment": "planning.networks.port_refusal and policy_profile_of (SDD §6.6, §21.5): whether the destination credential may put a port on a network, by its token's roles and the destination's policy profile (roles null: not reported, the role halves unjudged), and the profile a check report gives - for a report that names none, the provider's declarations (RV18-04). Shared by seamless/tests/test_planning_networks.py and dashboard/src/lib/networks.test.ts (the NIC-override picker and the mock's pre-flight).",
+ "networks": {
+  "own": {
+   "own": true,
+   "shared": false,
+   "external": false
+  },
+  "another project's shared": {
+   "own": false,
+   "shared": true,
+   "external": false
+  },
+  "another project's external": {
+   "own": false,
+   "shared": false,
+   "external": true
+  },
+  "another project's private": {
+   "own": false,
+   "shared": false,
+   "external": false
+  },
+  "own external, not shared": {
+   "own": true,
+   "shared": false,
+   "external": true
+  },
+  "another project's external and shared": {
+   "own": false,
+   "shared": true,
+   "external": true
+  }
+ },
+ "cases": [
+  {
+   "network": "own",
+   "profile": "legacy",
+   "roles": [
+    "member"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "legacy",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "legacy",
+   "roles": [
+    "service"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "legacy",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "legacy",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "secure_rbac",
+   "roles": [
+    "member"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "secure_rbac",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "secure_rbac",
+   "roles": [
+    "service"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "secure_rbac",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "secure_rbac",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "unknown",
+   "roles": [
+    "member"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "unknown",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "unknown",
+   "roles": [
+    "service"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "unknown",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own",
+   "profile": "unknown",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "another project's shared",
+   "profile": "legacy",
+   "roles": [
+    "member"
+   ],
+   "expected": "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's shared",
+   "profile": "legacy",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's shared",
+   "profile": "legacy",
+   "roles": [
+    "service"
+   ],
+   "expected": "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's shared",
+   "profile": "legacy",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's shared",
+   "profile": "legacy",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "another project's shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "member"
+   ],
+   "expected": "Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "service"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's shared",
+   "profile": "secure_rbac",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "another project's shared",
+   "profile": "unknown",
+   "roles": [
+    "member"
+   ],
+   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (declare the provider's policy profile or series)"
+  },
+  {
+   "network": "another project's shared",
+   "profile": "unknown",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (declare the provider's policy profile or series)"
+  },
+  {
+   "network": "another project's shared",
+   "profile": "unknown",
+   "roles": [
+    "service"
+   ],
+   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (declare the provider's policy profile or series)"
+  },
+  {
+   "network": "another project's shared",
+   "profile": "unknown",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's shared",
+   "profile": "unknown",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "another project's external",
+   "profile": "legacy",
+   "roles": [
+    "member"
+   ],
+   "expected": "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's external",
+   "profile": "legacy",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it"
+  },
+  {
+   "network": "another project's external",
+   "profile": "legacy",
+   "roles": [
+    "service"
+   ],
+   "expected": "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's external",
+   "profile": "legacy",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's external",
+   "profile": "legacy",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "another project's external",
+   "profile": "secure_rbac",
+   "roles": [
+    "member"
+   ],
+   "expected": "Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's external",
+   "profile": "secure_rbac",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's external",
+   "profile": "secure_rbac",
+   "roles": [
+    "service"
+   ],
+   "expected": "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it"
+  },
+  {
+   "network": "another project's external",
+   "profile": "secure_rbac",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's external",
+   "profile": "secure_rbac",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "another project's external",
+   "profile": "unknown",
+   "roles": [
+    "member"
+   ],
+   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (declare the provider's policy profile or series)"
+  },
+  {
+   "network": "another project's external",
+   "profile": "unknown",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (declare the provider's policy profile or series)"
+  },
+  {
+   "network": "another project's external",
+   "profile": "unknown",
+   "roles": [
+    "service"
+   ],
+   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (declare the provider's policy profile or series)"
+  },
+  {
+   "network": "another project's external",
+   "profile": "unknown",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's external",
+   "profile": "unknown",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "another project's private",
+   "profile": "legacy",
+   "roles": [
+    "member"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "legacy",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "legacy",
+   "roles": [
+    "service"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "legacy",
+   "roles": [
+    "admin"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "legacy",
+   "roles": null,
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "secure_rbac",
+   "roles": [
+    "member"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "secure_rbac",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "secure_rbac",
+   "roles": [
+    "service"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "secure_rbac",
+   "roles": [
+    "admin"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "secure_rbac",
+   "roles": null,
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "unknown",
+   "roles": [
+    "member"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "unknown",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "unknown",
+   "roles": [
+    "service"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "unknown",
+   "roles": [
+    "admin"
+   ],
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "another project's private",
+   "profile": "unknown",
+   "roles": null,
+   "expected": "it is neither shared with the credential's project nor external"
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "legacy",
+   "roles": [
+    "member"
+   ],
+   "expected": "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it"
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "legacy",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it"
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "legacy",
+   "roles": [
+    "service"
+   ],
+   "expected": "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it"
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "legacy",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "legacy",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "member"
+   ],
+   "expected": "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it"
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it"
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "service"
+   ],
+   "expected": "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it"
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "secure_rbac",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "unknown",
+   "roles": [
+    "member"
+   ],
+   "expected": "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it"
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "unknown",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it"
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "unknown",
+   "roles": [
+    "service"
+   ],
+   "expected": "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it"
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "unknown",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "own external, not shared",
+   "profile": "unknown",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "legacy",
+   "roles": [
+    "member"
+   ],
+   "expected": "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "legacy",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "legacy",
+   "roles": [
+    "service"
+   ],
+   "expected": "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "legacy",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "legacy",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "member"
+   ],
+   "expected": "Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither"
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "service"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "secure_rbac",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "secure_rbac",
+   "roles": null,
+   "expected": null
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "unknown",
+   "roles": [
+    "member"
+   ],
+   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (declare the provider's policy profile or series)"
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "unknown",
+   "roles": [
+    "advsvc"
+   ],
+   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (declare the provider's policy profile or series)"
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "unknown",
+   "roles": [
+    "service"
+   ],
+   "expected": "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (declare the provider's policy profile or series)"
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "unknown",
+   "roles": [
+    "admin"
+   ],
+   "expected": null
+  },
+  {
+   "network": "another project's external and shared",
+   "profile": "unknown",
+   "roles": null,
+   "expected": null
+  }
+ ],
+ "profile_cases": [
+  {
+   "why": "the report names it",
+   "capabilities": {
+    "policy_profile": "secure_rbac"
+   },
+   "provider": {
+    "kind": "openstack",
+    "release": null,
+    "policy_profile": null
+   },
+   "expected": "secure_rbac"
+  },
+  {
+   "why": "a value no rule knows reads unknown",
+   "capabilities": {
+    "policy_profile": "strict"
+   },
+   "provider": {
+    "kind": "openstack",
+    "release": null,
+    "policy_profile": null
+   },
+   "expected": "unknown"
+  },
+  {
+   "why": "a reset report: the declared profile",
+   "capabilities": {},
+   "provider": {
+    "kind": "openstack",
+    "release": null,
+    "policy_profile": "secure_rbac"
+   },
+   "expected": "secure_rbac"
+  },
+  {
+   "why": "a reset report: the declared series' profile",
+   "capabilities": {},
+   "provider": {
+    "kind": "openstack",
+    "release": "2026.2",
+    "policy_profile": null
+   },
+   "expected": "secure_rbac"
+  },
+  {
+   "why": "a reset report: an older declared series",
+   "capabilities": {},
+   "provider": {
+    "kind": "openstack",
+    "release": "2023.1",
+    "policy_profile": null
+   },
+   "expected": "legacy"
+  },
+  {
+   "why": "a reset report of RHOSO 18.0: legacy by its kind",
+   "capabilities": {},
+   "provider": {
+    "kind": "rhoso",
+    "release": null,
+    "policy_profile": null
+   },
+   "expected": "legacy"
+  },
+  {
+   "why": "a reset report with nothing declared: unknown",
+   "capabilities": {},
+   "provider": {
+    "kind": "openstack",
+    "release": null,
+    "policy_profile": null
+   },
+   "expected": "unknown"
+  },
+  {
+   "why": "a report from before 0.2.0 (roles, no profile)",
+   "capabilities": {
+    "roles": [
+     "advsvc"
+    ]
+   },
+   "provider": {
+    "kind": "openstack",
+    "release": "2024.1",
+    "policy_profile": null
+   },
+   "expected": "secure_rbac"
+  }
+ ]
+}
