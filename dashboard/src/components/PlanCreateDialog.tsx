@@ -368,7 +368,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const targetsFor = (type: string) => handoverTargets(typeFamilies.get(type) ?? null, destinationStorage);
   const chosenTarget = (type: string, f: FormState = form): string => {
     const targets = targetsFor(type);
-    return f.handoverMap[type] ?? (targets.length === 1 ? targets[0]! : '');
+    // by own key, as the API's dict: a source's volume type named "constructor" or "__proto__" is a name like any other (review RV24-01)
+    return Object.hasOwn(f.handoverMap, type) ? f.handoverMap[type]! : targets.length === 1 ? targets[0]! : '';
   };
   /** Destination pools (or the reasons a volume cannot be handed over) for one volume type. */
   const landing = (type: string, f: FormState = form): { pools: string[]; errors: string[] } => {
@@ -461,14 +462,15 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     // like the API (SDD §12): what it refuses, the first problem at a time
     const appProbes = parseDrafts(f.appProbes);
     if (appProbes.problems.length) e.appProbes = appProbes.problems[0];
-    const backendMap: Record<string, string> = {};
+    let backendMap: Record<string, string> = {};
     if (f.handoverEnabled && source?.kind !== 'vmware') {
       const missing = handoverTypes.filter((t) => !chosenTarget(t, f));
       const problems = handoverTypes.flatMap((t) => landing(t, f).errors);
       // a new plan maps every type; an existing one may keep unmapped types (those VMs are not eligible)
       if (missing.length && !plan) e.handover = `Choose a destination backend for ${missing.join(', ')}.`;
       else if (problems.length) e.handover = problems[0];
-      for (const t of handoverTypes) if (chosenTarget(t, f)) backendMap[t] = chosenTarget(t, f);
+      // own keys, never an assignment: "__proto__" would set the prototype and drop the mapping (review RV24-01)
+      backendMap = Object.fromEntries(handoverTypes.filter((t) => chosenTarget(t, f)).map((t) => [t, chosenTarget(t, f)]));
     }
     if (Object.keys(e).length) return { errors: e, body: null };
     return {

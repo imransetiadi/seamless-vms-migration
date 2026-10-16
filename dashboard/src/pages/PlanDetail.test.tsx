@@ -1,7 +1,9 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import type { Plan } from '../api/types';
+import type { MockServer } from '../api/mock';
+import { makeVm } from '../api/mockData';
+import type { Plan, VMRef } from '../api/types';
 import { createTestClient, createTestServer, renderWithApp } from '../test/utils';
 import PlanDetail from './PlanDetail';
 
@@ -21,6 +23,13 @@ function recordingReads(reads: string[]) {
       if ((init?.method ?? 'GET').toUpperCase() === 'GET') reads.push(String(input).replace(/^.*\/api\/v1/, ''));
       return mock(input, init);
     };
+}
+
+
+/** A source VM whose one volume has volume type `type` on `pool`, listed first in the source's inventory. */
+function withVolumeType(server: MockServer, id: string, type: string, pool: string): void {
+  const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['rhosp17-dc1']!;
+  inventory.unshift(makeVm({ id, name: 'odd-01', project: 'shop', disks: [{ size_gb: 20, used_gb: 2, volume_type: type, pool }] }));
 }
 
 describe('PlanDetail', () => {
@@ -1460,5 +1469,52 @@ describe('PlanDetail', () => {
     expect(server.plans.find((p) => p.id === 'plan-c81d44a0')?.require_distinct_approver).toBe(false);
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['require_distinct_approver'] });
     expect(await screen.findByText('Yes — an approver must approve each cutover')).toBeInTheDocument();
+  });
+  it('offers a volume type named constructor that a plan does not map its one backend in the editor (SDD §7.3.1, §16, review RV24-01)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    withVolumeType(server, 'os-r24c', 'constructor', 'overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1');
+    // the API takes such a plan: an unmapped type only leaves its VM ineligible for the handover (HANDOVER_BACKEND_UNMAPPED)
+    const plan = await createTestClient(server, 'operator').post<Plan>('/plans', {
+      name: 'Odd unmapped',
+      source_provider_id: 'rhosp17-dc1',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: ['os-r24c'],
+      handover: { enabled: true, backend_map: {} },
+    });
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    const actions = await screen.findByRole('group', { name: /plan actions/i });
+    await user.click(within(actions).getByRole('button', { name: /^edit plan$/i }));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced/i));
+    expect(await within(dialog).findByLabelText(/^constructor/)).toHaveValue('hostgroup@ontap-nfs');
+  });
+
+  it('keeps a mapping of a volume type named __proto__ when another handover choice changes (SDD §7.3.1, §16, review RV24-01)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    withVolumeType(server, 'os-r24b', '__proto__', 'overcloud@tripleo_ceph#ceph-ssd');
+    const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['rhosp17-dc1']!;
+    const gateway = inventory.find((v) => v.name === 'api-gw-01')!; // a tripleo-ceph volume, in no plan
+    const plan = await createTestClient(server, 'operator').post<Plan>('/plans', {
+      name: 'Odd edit',
+      source_provider_id: 'rhosp17-dc1',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: ['os-r24b', gateway.source_id],
+      // as the API stores and serves it: JSON with "__proto__" as an own key, which the API's dict takes
+      handover: { enabled: true, backend_map: JSON.parse('{"__proto__": "hostgroup@ceph-ssd#volumes-ssd", "tripleo-ceph": "hostgroup@ceph-ssd#volumes-ssd"}') },
+    });
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    const actions = await screen.findByRole('group', { name: /plan actions/i });
+    await user.click(within(actions).getByRole('button', { name: /^edit plan$/i }));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced/i));
+    await user.selectOptions(within(dialog).getByLabelText(/^tripleo-ceph/i), 'hostgroup@ceph-hdd#volumes-hdd');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(Object.entries(server.plans.find((p) => p.id === plan.id)!.handover.backend_map)).toEqual([
+      ['__proto__', 'hostgroup@ceph-ssd#volumes-ssd'],
+      ['tripleo-ceph', 'hostgroup@ceph-hdd#volumes-hdd'],
+    ]);
   });
 });
