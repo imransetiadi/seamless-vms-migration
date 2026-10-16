@@ -79,6 +79,20 @@ def test_a_compute_maximum_reads_as_the_series_range_it_fits(
     assert release_range(compute_max, block_storage_max) == ReleaseRange(series)
 
 
+def test_a_cinder_maximum_below_an_older_series_maximum_never_reads_as_a_newer_series():
+    """Review RV18-05: a series whose Cinder maximum is unconfirmed (null) kept any Cinder, so a
+    Cinder below 2024.2's confirmed 3.71 narrowed 2.98 (2024.2 or 2025.1) to 2025.1 alone - Tier 1
+    on evidence that rules 2025.1 out, as Cinder's microversions only grow. It keeps a null one
+    only from the older series' greatest confirmed maximum on (SDD §10.1)."""
+    straddling = release_range("2.98", "3.70")
+    assert straddling == ReleaseRange(("2024.2", "2025.1"))  # narrowed to nothing: not applied
+    assert support_tier(straddling).tier == "tier3"
+    # from the older series' maximum on, a null one is kept; an equal confirmed one still decides
+    assert release_range("2.98", "3.71").series == ("2024.2", "2025.1")
+    assert release_range("2.98", "3.72").series == ("2025.1",)
+    assert release_range("2.101", "3.70").series == ("2025.2", "2026.1")
+
+
 @pytest.mark.parametrize("compute_max", ["2.105", "2.200", "2.1000"])
 def test_a_maximum_above_the_newest_known_reads_as_outside_newer(compute_max):
     """Above 2026.2's 2.104 is a series no Seamless release validated (2027.1 Indri is in

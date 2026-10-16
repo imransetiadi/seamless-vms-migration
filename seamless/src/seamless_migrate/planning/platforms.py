@@ -109,8 +109,8 @@ def release_range(compute_max: Any, block_storage_max: Any = None) -> ReleaseRan
     A compute maximum equal to series' maxima is those series; one between two series' maxima the
     two series it falls between (Nova never backports a microversion, so only a development
     snapshot shows one); one outside the window's maxima, or none readable, is no series. A
-    block-storage maximum keeps the series whose maximum equals it or is not confirmed: it narrows
-    the range, never widens it, and a narrowing to nothing is not applied."""
+    block-storage maximum keeps the series it fits (``_cinder_fits``): it narrows the range, never
+    widens it, and a narrowing to nothing is not applied."""
     compute = parse_microversion(compute_max)
     if compute is None:
         return ReleaseRange((), "not_detected")
@@ -126,14 +126,24 @@ def release_range(compute_max: Any, block_storage_max: Any = None) -> ReleaseRan
         found = [below, above]
     block_storage = parse_microversion(block_storage_max)
     if block_storage is not None:
-        narrowed = [
-            series
-            for series in found
-            if series.block_storage_max is None
-            or parse_microversion(series.block_storage_max) == block_storage
-        ]
+        narrowed = [series for series in found if _cinder_fits(series, block_storage)]
         found = narrowed or found
     return ReleaseRange(tuple(series.name for series in found))
+
+
+def _cinder_fits(series: Series, block_storage: tuple[int, int]) -> bool:
+    """Whether a cloud whose Cinder maximum is ``block_storage`` may run ``series`` (SDD §10.1):
+    the series' confirmed maximum equals it; an unconfirmed one is at least the greatest confirmed
+    maximum of the older series, as Cinder's microversions only grow (review RV18-05)."""
+    if series.block_storage_max is not None:
+        return parse_microversion(series.block_storage_max) == block_storage
+    older = [
+        parse_microversion(older.block_storage_max)
+        for older in SERIES[: SERIES.index(series)]
+        if older.block_storage_max is not None
+    ]
+    floor = max((maximum for maximum in older if maximum is not None), default=None)
+    return floor is None or block_storage >= floor
 
 
 def _series_number(name: str) -> tuple[int, int]:
