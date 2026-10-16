@@ -157,7 +157,7 @@ The "Automated tests" column uses the plan's test names; §4 maps every name to 
 | FR-22 | CLI; `plan apply` runs the checks of `POST /plans` and updates a plan under PATCH's rules, never overwriting a change it did not see (SDD §15) | `test_token_create_prints_token_and_yaml_hash`, `test_plan_apply_from_yaml`, `test_plan_apply_refuses_an_update_while_a_migration_is_in_flight`, `test_plan_apply_never_overwrites_a_change_it_did_not_see`, `test_plan_apply_refuses_what_the_api_refuses`, `test_plan_checks_answer_like_plan_apply`, `test_plan_apply_keeps_what_the_file_leaves_out_like_patch`, `test_plan_apply_checks_the_merged_plan_like_patch`, `test_plan_apply_refuses_an_update_naming_unknown_fields_like_patch`, `test_cli_prints_a_provider_error_redacted_and_cut`, `test_cli_reports_a_lost_race_as_one_line_not_a_traceback`, `test_token_create_refuses_names_the_file_or_the_audit_trail_own`, `test_estimate_refuses_what_a_plan_refuses`, `test_events_prune_refuses_a_cutoff_after_now`, `test_estimate_table`, `test_serve_refuses_auth_disabled_on_public_bind`, `test_demo_seed_idempotent` | — |
 | FR-23 | Prometheus metrics; a gauge of the migrations whose cutover will refuse (SDD §18) | `test_metrics_format`, `test_the_cutover_refusals_gauge_counts_the_migrations_dashboard_lists_so` | metric names against SDD §18 in the E2E script |
 | FR-24 | Demo mode exercises every phase including rollback | `test_simulated_warm_pass_deltas_shrink`, `test_simulated_cutover_marks_downtime`, `test_simulated_failure_rate_seeded`, `test_fake_openstack_inventory_has_required_traits`, `test_registry_returns_fake_in_demo`, `test_demo_seed_idempotent`, `test_a_demo_vm_tagged_for_it_meets_what_the_cutover_will_refuse_until_its_third_pass`, `test_its_cutover_refuses_before_the_source_stops_until_its_third_pass_ran`, `test_the_demo_fault_refuses_the_cutover_before_the_stop_until_a_pass_finds_it_fixed`, `test_the_cutover_refusal_demo_vm_is_left_for_the_operator_to_plan` | DEMO-01…DEMO-04, DEMO-07 (§6.6) |
-| FR-25 | Deploy on OpenShift and Compose (Colima) with PostgreSQL | `test_settings_pg_url_from_env`; store tests on `postgres` | §14.5 deploy checks, §14.6 smoke test, S-20, S-21 |
+| FR-25 | Deploy on OpenShift, Kubernetes and Compose (Docker Engine on Linux, Colima on macOS, Podman) with PostgreSQL | `test_settings_pg_url_from_env`; store tests on `postgres`; the Linux host (SDD §17.1): `test_a_linux_host_runs_the_stack_on_its_own_docker_engine`, `test_seamless_colima_up_on_linux_says_that_colima_is_not_needed`, `test_the_docker_checks_say_how_to_fix_the_host_they_run_on`, `test_compose_init_names_the_next_steps_of_the_host_it_runs_on`, `test_the_image_builds_its_dashboard_when_the_build_context_has_none`, `test_the_image_copies_a_built_dashboard_as_it_is`, `test_the_image_refuses_a_context_with_no_dashboard_at_all`, `test_the_build_context_holds_the_dashboard_sources_but_not_their_modules` | §14.5 deploy checks (CI `deploy-scripts`, `compose-linux`), §14.6 smoke test, S-20, S-21 |
 | FR-29 | Community OpenStack destinations of the support window (SDD §21.1) | planned (T9): `test_demo_seeds_a_community_destination_beside_rhoso`; today a community destination takes the RHOSO 18.0 path (SDD §10) | §6.7 AC-6; §7.1 M7–M12 |
 | FR-30 | Release detection and support tier (SDD §21.3) | planned (T1–T3): the S-DST tests, `test_openstack_check_reports_release_range_tier_profile_and_tls`, `test_provider_release_is_optional_and_validated_as_a_series` | LAB-D01, LAB-D02 |
 | FR-31 | Destination capability pre-flight (SDD §21.4) | planned (T4): `test_finding_dst_capability_missing`, `test_finding_dst_release_outside_support` | LAB-D04, LAB-D08 |
@@ -1130,6 +1130,7 @@ python3 -m json.tool .mcp.json >/dev/null && python3 -m json.tool .claude/settin
 DUMMY=$(mktemp) && printf 'POSTGRES_PASSWORD=x\nJEV_MCP_AUTH_TOKEN=x\n' > "$DUMMY"      # not real values
 env -u TYPESAFE_API_KEY docker --context colima-seamless compose -f deploy/compose/compose.yaml \
   --env-file "$DUMMY" --profile '*' config -q                                          # never print `config` output
+# on a Linux host: the same with plain `docker compose`, and `-f deploy/compose/compose.linux-host.yaml` added
 python3 -c 'import yaml,sys; [list(yaml.safe_load_all(open(f))) for f in sys.argv[1:]]' deploy/openshift/*.yaml
 
 # as CI's `manifests` job: render both kustomizations, validate them against the Kubernetes 1.30 schemas
@@ -1166,6 +1167,22 @@ before 2026-10-09) both PostgreSQL runs exit 1 with `common.sh: line 184: /var/l
 file system`: the start script writes its `passwd` (nss_wrapper) and the generated `openshift-custom-*.conf`
 under `HOME=/var/lib/pgsql` for every UID (`test_postgres_gets_a_writable_home_under_its_read_only_root`).
 A Deployment without its `/data` mount fails the control-plane runs (`unable to open database file`).
+
+A Linux host's own Docker Engine, with no Colima (SDD §17.1). These checks run on every pull request and in CI:
+* The control-plane suite runs the Make targets' dry runs for Linux and macOS, the Docker checks against a fake
+  `docker`, the init script's next steps, and `scripts/image-dashboard.sh` with a fake `npm` (the FR-25 row names
+  the tests).
+* CI's `deploy-scripts` job (pull requests too) runs `scripts/compose-init.sh` and `make -n seamless-up` /
+  `make seamless-colima-up` in Rocky Linux 9, AlmaLinux 9, Fedora 42, Debian 12 and Ubuntu 24.04 containers.
+  Debian and Ubuntu run without `openssl`, so the init script's `/dev/urandom` fallback runs too.
+* CI's `compose-linux` job (main, nightly, manual) runs `scripts/compose-init.sh`, `make seamless-demo` and the
+  §14.6 smoke test on an Ubuntu runner's Docker Engine, with no context variable. With no `dashboard/dist` in the
+  checkout, it also checks that the image built the dashboard it serves at `/`.
+
+By hand, on a Linux server: the README's "Quick start — Linux server with Docker" steps, then §14.6. Expected:
+* `make seamless-colima-up` says that Colima is not needed;
+* `make seamless-up` builds and waits until the stack is healthy;
+* `curl -fsS http://127.0.0.1:8080/` returns the dashboard's HTML.
 
 ### 14.6 Compose smoke test (E2)
 

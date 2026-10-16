@@ -116,15 +116,17 @@ cd seamless && .venv/bin/ruff check src tests && .venv/bin/ruff format --check s
 # Dashboard (Track C)
 make dashboard-build                         # npm ci + npm run build  (cd dashboard && npm test / npm run typecheck)
 
-# Local stack on the dedicated Colima profile "seamless" (Track D)
-make seamless-colima-up && scripts/compose-init.sh && make seamless-up     # or: make seamless-demo
+# Single-host stack (Track D): on Linux the machine's own Docker Engine, on macOS the Colima profile "seamless" (SDD §17.1)
+make seamless-colima-up                      # macOS only; on Linux it says that Colima is not needed
+scripts/compose-init.sh && make seamless-up  # or: make seamless-demo
 make seamless-logs                           # follow logs;  make seamless-down  # stop (keeps data)
 ```
 
-Docker rules: **always** target the context `colima-seamless` (the Make targets do; for manual commands use
-`docker --context colima-seamless …`). Never start, stop, delete or reconfigure the developer's `default`
-Colima profile or the `seamless-pg-test` container. Containers reach the host's agentmemory at
-`http://host.docker.internal:3111`.
+Docker rules on the developer's Mac: **always** target the context `colima-seamless` (the Make targets do; for
+manual commands use `docker --context colima-seamless …`). Never start, stop, delete or reconfigure the developer's
+`default` Colima profile or the `seamless-pg-test` container. Containers reach the host's agentmemory at
+`http://host.docker.internal:3111`. On a Linux host (a server, CI) the targets use the machine's own Docker Engine
+(context `default`), and `compose.linux-host.yaml` maps that name to the host.
 
 ## 7. Secrets — never commit them
 
