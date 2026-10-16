@@ -212,6 +212,29 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     );
   });
 
+  it('lists a missing network before a port its credential may not place, in the API\'s order (review RV25-03)', () => {
+    // test_preflight.py's test_a_missing_network_comes_before_a_port_its_credential_may_not_place, the same VM and inventory
+    const plan = { ...base, mappings: { ...base.mappings, networks: {} }, nic_overrides: {}, prestage_resources: [] } as Plan;
+    const two = makeVm({
+      id: 'os-r25c',
+      name: 'web-01',
+      disks: [{ size_gb: 20 }],
+      nics: [
+        { network: 'gone-net', mac: 'fa:16:3e:00:00:01', fixed_ips: ['10.0.0.5'], mtu: 1500 },
+        { network: 'other-net', mac: 'fa:16:3e:00:00:02', fixed_ips: ['10.0.0.6'], mtu: 1500 },
+      ],
+    });
+    const other = { ...net('n1', 'other-net', false, 'p-other'), mtu: 1500, shared: false, external: false };
+    const found = preflight(two, 'openstack', plan, { 'other-net': 1500 }, { selected: [two], networkDetails: [other], destination: 'RHOSO 18.0' });
+    expect(found.filter((f) => f.code.startsWith('MAP_NETWORK') || f.code.startsWith('NET_PORT')).map((f) => [f.code, f.message])).toEqual([
+      ['MAP_NETWORK_MISSING', 'No mapping or same-named network in RHOSO 18.0 for: gone-net.'],
+      [
+        'NET_PORT_NOT_PERMITTED',
+        "The credential of RHOSO 18.0 may not put these NICs on their network: fa:16:3e:00:00:02 on 'other-net' (project p-other): it is neither shared with the credential's project nor external.",
+      ],
+    ]);
+  });
+
   it('blocks an own address Neutron would refuse on the resolved network, with the API\'s message', () => {
     const plan = { ...base, mappings: { ...base.mappings, networks: {} } };
     const details = [net('app', 'tenant-app', true, 'shop')];

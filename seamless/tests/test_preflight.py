@@ -265,6 +265,32 @@ def test_finding_map_network_missing():
     assert all(not x.code.startswith("MAP_NETWORK") for x in check(vm, plan=mapped))
 
 
+def test_a_missing_network_comes_before_a_port_its_credential_may_not_place():
+    """SDD §9.3, §16 (review RV25-03): the findings come in one order - a network the destination
+    lacks before the ports of a resolved network - the order the dashboard's mock gives too
+    (mockData.test.ts, the same VM and inventory)."""
+    nics = [
+        Nic(network="gone-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5"], mtu=1500),
+        Nic(network="other-net", mac="fa:16:3e:00:00:02", fixed_ips=["10.0.0.6"], mtu=1500),
+    ]
+    vm = make_vm(nics=nics)
+    other = {"id": "n1", "name": "other-net", "mtu": 1500, "project_id": "p-other"}
+    details = [{**other, "own": False, "shared": False, "external": False}]
+    dst = dst_inv(networks={"other-net": 1500}, network_details=details)
+    found = check(vm, plan=make_plan(prestage_resources=[]), src=SourceInventory(), dst=dst)
+    assert [
+        (f.code, f.message) for f in found if f.code.startswith(("MAP_NETWORK", "NET_PORT"))
+    ] == [
+        ("MAP_NETWORK_MISSING", "No mapping or same-named network in RHOSO 18.0 for: gone-net."),
+        (
+            "NET_PORT_NOT_PERMITTED",
+            "The credential of RHOSO 18.0 may not put these NICs on their network: "
+            "fa:16:3e:00:00:02 on 'other-net' (project p-other): it is neither shared with the "
+            "credential's project nor external.",
+        ),
+    ]
+
+
 def test_finding_map_network_prestaged():
     # the default plan pre-stages networks: they are created with the same name (info)
     vm = make_vm(nics=[Nic(network="db-net", mtu=9000)])

@@ -1094,6 +1094,26 @@ export function preflight(
   // the boot disk: the first bootable disk, else the first, as the API's VMRef.root_disk
   const root = vm.disks.find((d) => d.bootable) ?? vm.disks[0];
   if (root && (root.kind === 'image_root' || root.kind === 'ephemeral')) add('SRC_VM_EPHEMERAL_ROOT', `The root disk is ${root.kind.replaceAll('_', ' ')}.`);
+  // a network RHOSO lacks, as the API words it and lists it - before the networks it resolves (SDD §9.3, review RV25-03):
+  // a NIC its override sends elsewhere is checked by
+  // MAP_NIC_OVERRIDE_INVALID; pre-staging creates same-named networks for OpenStack sources only - the VMware kit has
+  // no pre-stage step (§4.2, §7.2); nothing creates a network under a mapping's target name
+  const has = (names: Record<string, unknown>, name: string) => Object.prototype.hasOwnProperty.call(names, name);
+  const mappedNics = vm.nics.filter((nic) => !nicOverride(plan, vm.source_id, nic.mac)?.network);
+  const missingNets = mappedNics
+    .filter((nic) => !has(plan.mappings.networks, nic.network) && !has(destinationNetworks, nic.network))
+    .map((nic) => nic.network);
+  const badNetTargets = mappedNics
+    .filter((nic) => has(plan.mappings.networks, nic.network) && !has(destinationNetworks, plan.mappings.networks[nic.network]!))
+    .map((nic) => `${nic.network} -> ${plan.mappings.networks[nic.network]}`);
+  const prestaged = plan.prestage_resources.includes('networks') && sourceKind !== 'vmware';
+  if (missingNets.length && prestaged)
+    add('MAP_NETWORK_PRESTAGED', `Pre-staging creates same-named network(s) in ${where}: ${pyNames(missingNets)}.`);
+  else if (missingNets.length)
+    add('MAP_NETWORK_MISSING', `No mapping or same-named network in ${where} for: ${pyNames(missingNets)}.` +
+        (sourceKind === 'vmware' ? ' VMware sources are not pre-staged: map every port group.' : ''));
+  if (badNetTargets.length)
+    add('MAP_NETWORK_MISSING', `Network mapping target(s) do not exist in ${where}: ${pyNames(badNetTargets)}.`, { remediation: 'Fix the mapping: the destination network must exist.' });
   // every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); a VMware NIC's too: Seamless gives
   // the migration kit the network it resolves (§7.2)
   const seen = networkList({ networks: destinationNetworks, network_details: context.networkDetails });
@@ -1118,25 +1138,6 @@ export function preflight(
   }
   if (denied.length)
     add('NET_PORT_NOT_PERMITTED', `The credential of ${where} may not put these NICs on their network: ${denied.join('; ')}.`, { remediation: portRemediation(context.profile) });
-  // a network RHOSO lacks, as the API words it (SDD §9.3): a NIC its override sends elsewhere is checked by
-  // MAP_NIC_OVERRIDE_INVALID; pre-staging creates same-named networks for OpenStack sources only - the VMware kit has
-  // no pre-stage step (§4.2, §7.2); nothing creates a network under a mapping's target name
-  const has = (names: Record<string, unknown>, name: string) => Object.prototype.hasOwnProperty.call(names, name);
-  const mappedNics = vm.nics.filter((nic) => !nicOverride(plan, vm.source_id, nic.mac)?.network);
-  const missingNets = mappedNics
-    .filter((nic) => !has(plan.mappings.networks, nic.network) && !has(destinationNetworks, nic.network))
-    .map((nic) => nic.network);
-  const badNetTargets = mappedNics
-    .filter((nic) => has(plan.mappings.networks, nic.network) && !has(destinationNetworks, plan.mappings.networks[nic.network]!))
-    .map((nic) => `${nic.network} -> ${plan.mappings.networks[nic.network]}`);
-  const prestaged = plan.prestage_resources.includes('networks') && sourceKind !== 'vmware';
-  if (missingNets.length && prestaged)
-    add('MAP_NETWORK_PRESTAGED', `Pre-staging creates same-named network(s) in ${where}: ${pyNames(missingNets)}.`);
-  else if (missingNets.length)
-    add('MAP_NETWORK_MISSING', `No mapping or same-named network in ${where} for: ${pyNames(missingNets)}.` +
-        (sourceKind === 'vmware' ? ' VMware sources are not pre-staged: map every port group.' : ''));
-  if (badNetTargets.length)
-    add('MAP_NETWORK_MISSING', `Network mapping target(s) do not exist in ${where}: ${pyNames(badNetTargets)}.`, { remediation: 'Fix the mapping: the destination network must exist.' });
   // one finding for every NIC whose network is smaller, worded as the API's (SDD §9.3, §16, review RV20-05)
   const shrinks: string[] = [];
   for (const nic of vm.nics) {
