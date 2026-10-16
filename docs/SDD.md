@@ -1905,9 +1905,11 @@ RHOSO 18.0, §21; `check()` reports `{"admin": bool,
 "family": "rbd"|"netapp_nfs"|"netapp_block"|"other"}], "tls": bool, "plain_http": [str]}`, both backend lists empty
 without admin (`roles` is what `NET_PORT_NOT_PERMITTED` judges, §9.3: Neutron's policy names roles, while `admin` is
 the compute probe); the microversions are each service's maximum, `""` when unreadable; `tls` is true when the
-provider's `endpoint` and the endpoint of each service Seamless calls (`identity`, `compute`, `block-storage`,
-`network`, `image`) use https, and `plain_http` names those that do not (`endpoint` for the provider's own; one that
-cannot be read counts neither way, Security.md); a destination's check adds §10.1's `destination_release` keys -
+provider's `endpoint`, the auth URL its credential is posted to (the `auth_url` of its `clouds.yaml` entry or of its
+credentials secret, §13.3) and the endpoint of each service Seamless calls (`identity`, `compute`, `block-storage`,
+`network`, `image`, each as keystoneauth reads it from the catalog) use https, and `plain_http` names those that do
+not (`endpoint` for the provider's own, `auth_url` for the credential's; one that cannot be read counts neither way,
+Security.md); a destination's check adds §10.1's `destination_release` keys -
 `release_range`, `release`, `support_tier` and `policy_profile`;
 volume disks carry their Cinder `pool`;
 `os_type` is the most specific of the server metadata `os_type`/`os_distro`, the boot volume's
