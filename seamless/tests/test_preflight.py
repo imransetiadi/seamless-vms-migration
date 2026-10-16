@@ -1792,47 +1792,59 @@ def test_every_planning_text_about_the_destination_cloud_names_its_provider():
     assert blocker.message.endswith(f"so the default volume type of {name} cannot be used.")
 
 
+#: the control plane's fixed texts, which SDD §1 naming lets say "the destination": the catalog's
+#: remediations and the role advice they are built from, and the generic texts the advisor gives
+#: Jev, which no provider's name may reach (§13.4)
+FIXED_TEXTS = {
+    ("planning/preflight.py", "CATALOG"),
+    ("planning/preflight.py", "_PORT_ROLE_ADVICE"),
+    ("ai/advisor.py", "STRATEGY_DESCRIPTIONS"),
+    ("ai/payloads.py", "STRATEGY_REQUEST_FIELDS"),
+}
+
+
 def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
-    """SDD §1 naming (review RV21-05): a text built for a plan or a migration - a finding's
-    message, an eligibility reason, an executor's refusal, failure or log line - names the
-    destination provider by its label; "the destination" is for the fixed texts (a catalog
-    remediation, the dashboard's copy). Every f-string is read, and every plain string given, at
-    any place among its arguments, to an error raised or named so, a finding, a reason list, a
-    log line, the handover's _call or an event (review RV22-05)."""
+    """SDD §1 naming (reviews RV21-05, RV22-05, RV23-06): a text built for a plan or a migration - a
+    finding's message, an eligibility reason, an executor's refusal, failure or log line, an event,
+    a transition's reason - names the destination provider by its label; "the destination" is for
+    the fixed texts (a catalog remediation, the dashboard's copy). Every string literal of the
+    control plane is read - f-string parts, keyword arguments, a module constant whatever takes
+    it (RV23-07) - but a docstring, the fixed texts of FIXED_TEXTS, a remediation= value, and the
+    bare "the destination" a text built without a provider falls back to."""
     root = Path(__file__).parents[1] / "src" / "seamless_migrate"
     words = re.compile(r"the destination\b|destination's|destination provider", re.I)
 
-    def text(node):
-        if isinstance(node, ast.JoinedStr):
-            return "".join(v.value for v in node.values if isinstance(v, ast.Constant))
-        return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else ""
-
-    #: what a text built for a migration is given to, beside an error raised or named so
-    takers = {"_call", "append", "log", "finding", "_emit", "emit", "new_event", "_save_with_event"}
-
-    def messages(tree):
-        raised = {
-            id(node.exc)
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
-        }
+    def fixed(tree, path):
+        """The ids of the literals the rule lets say "the destination"."""
+        skip = set()
         for node in ast.walk(tree):
-            if isinstance(node, ast.JoinedStr):
-                yield node
-            elif isinstance(node, ast.Call):
-                func = node.func
-                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-                # the plain ones, wherever they stand among its arguments (ApiError's message is its
-                # third): the walk meets every f-string
-                if id(node) in raised or name.endswith("Error") or name in takers:
-                    yield from (a for a in node.args if isinstance(a, ast.Constant))
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                first = node.body[0] if node.body else None
+                if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                    skip.add(id(first.value))
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names = {(path, t.id) for t in targets if isinstance(t, ast.Name)}
+                if names & FIXED_TEXTS:
+                    skip.update(id(n) for n in ast.walk(node.value))
+            elif isinstance(node, ast.keyword) and node.arg == "remediation":
+                skip.update(id(n) for n in ast.walk(node.value))
+        return skip
 
-    found = [
-        f"{path.relative_to(root)}:{node.lineno}: {text(node)}"
-        for path in sorted(root.rglob("*.py"))
-        for node in messages(ast.parse(path.read_text(encoding="utf-8")))
-        if words.search(text(node))
-    ]
+    found = []
+    for path in sorted(root.rglob("*.py")):
+        name = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        skip = fixed(tree, name)
+        found += [
+            f"{name}:{node.lineno}: {node.value}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in skip
+            and node.value != "the destination"
+            and words.search(node.value)
+        ]
     assert found == []
 
 
@@ -1873,6 +1885,79 @@ def test_the_wording_guard_reads_every_plain_message_given_to_an_error_or_an_eve
     monkeypatch.setattr(Path, "read_text", read_text)
     with pytest.raises(AssertionError, match="orchestrator.py"):
         test_no_text_built_for_a_migration_calls_its_destination_the_destination()
+
+
+#: texts the guard missed (review RV23-06) and the shape RV23-07 had: injected into orchestrator.py
+INJECTED_RV23 = {
+    "_emit by keyword": (
+        "\n\nasync def _rv23(self, m):\n"
+        "    await self._emit(\n"
+        "        'migration.error', message='the destination refused it', migration=m\n"
+        "    )\n"
+    ),
+    "new_event by keyword": (
+        "\n\ndef _rv23(m):\n"
+        "    return new_event('migration.error', message='the destination refused it')\n"
+    ),
+    "a module constant given to an error": (
+        "\n\nREFUSED_RV23 = 'the destination refused it'\n\n\n"
+        "def _rv23():\n    raise NotAllowed(REFUSED_RV23)\n"
+    ),
+    # the migration.phase event's message: "{vm}: a -> b (reason)"
+    "a transition's reason": (
+        "\n\nasync def _rv23(self, m, v):\n"
+        "    await self._transition(m, v, P.failed, 'the destination refused it')\n"
+    ),
+    # RV23-07: a rule's text a function hands on, which a caller puts in a refusal
+    "a module constant a function returns": (
+        "\n\n_RULE_RV23 = {'unknown': \"the destination's policy profile is unknown\"}\n\n\n"
+        "def _rv23(profile):\n    return _RULE_RV23[profile]\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(INJECTED_RV23))
+def test_the_wording_guard_reads_every_literal_of_the_control_plane(case, monkeypatch):
+    """SDD §1 naming (reviews RV23-06, RV23-07): the guard reads every string literal, wherever it
+    stands - a keyword argument, a module constant an error is given or a function returns, a
+    transition's reason - not only the plain strings a call takes by position."""
+    target = Path(__file__).parents[1] / "src" / "seamless_migrate" / "orchestrator.py"
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        return text + INJECTED_RV23[case] if Path(self) == target else text
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match="orchestrator.py"):
+        test_no_text_built_for_a_migration_calls_its_destination_the_destination()
+
+
+#: the texts SDD §1 naming lets say "the destination", injected into orchestrator.py
+FIXED_RV23 = {
+    "a docstring": '\n\ndef _rv23():\n    """What the destination is given."""\n',
+    "a remediation": (
+        "\n\ndef _rv23():\n    return finding('X', 'msg', remediation='Ask the destination.')\n"
+    ),
+    "the fallback when no provider is known": (
+        "\n\ndef _rv23(cloud: str = 'the destination'):\n    return cloud\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(FIXED_RV23))
+def test_the_wording_guard_leaves_the_fixed_texts_alone(case, monkeypatch):
+    """SDD §1 naming (review RV23-06): a docstring, a catalog remediation and the bare fallback a
+    text built without a provider uses say "the destination" - the guard lets them."""
+    target = Path(__file__).parents[1] / "src" / "seamless_migrate" / "orchestrator.py"
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        return text + FIXED_RV23[case] if Path(self) == target else text
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    test_no_text_built_for_a_migration_calls_its_destination_the_destination()
 
 
 ELIGIBILITY_CASES = json.loads(
