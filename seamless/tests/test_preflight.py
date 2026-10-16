@@ -1,4 +1,5 @@
 import ast
+import json
 import re
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from seamless_migrate.domain.models import (
     Mappings,
     Nic,
     VerificationConfig,
+    VMRef,
 )
 from seamless_migrate.planning.platforms import destination_release
 from seamless_migrate.planning.preflight import (
@@ -1725,3 +1727,17 @@ def test_every_text_names_the_destination_provider_by_its_label():
         if bare.search(line)
     ]
     assert found == []
+
+
+ELIGIBILITY_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "eligibility_cases.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("case", ELIGIBILITY_CASES["finding_cases"], ids=lambda case: case["why"])
+def test_the_shared_handover_finding_cases(case):
+    """SDD §9.3, §16 (review RV20-08): VOL_ENCRYPTED and HANDOVER_BACKEND_UNMAPPED as the API
+    words them, which the dashboard's mock words the same way (mockData.test.ts)."""
+    plan = make_plan(handover=HandoverConfig(**case["plan"]["handover"]))
+    found = check(VMRef.model_validate(case["vm"]), plan=plan)
+    assert {f.code: f.message for f in found if f.code in case["expected"]} == case["expected"]

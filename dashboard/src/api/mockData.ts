@@ -38,7 +38,7 @@ import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { addressRefusal, canonicalIp, ipInCidr, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
 import { kitSubnet, networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
-import { destinationRelease, type PolicyProfile } from '../lib/platforms';
+import { destinationRelease, parseMicroversion, type PolicyProfile } from '../lib/platforms';
 import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { providerLabel } from '../lib/providerUse';
@@ -876,7 +876,7 @@ function storageReasons(vm: VMRef, plan: Plan, source: Provider, destination: Pr
     const target = plan.handover.backend_map[disk.volume_type ?? ''];
     if (family !== 'other' && (!target || dst.length === 0)) continue;
     const { error } = resolveDestination(family, splitHost(disk.pool)[1], target ?? '', dst, providerLabel(destination));
-    if (error) reasons.push(`${disk.name ?? disk.id}: ${error}`);
+    if (error) reasons.push(`${disk.name || disk.id}: ${error}`);
   }
   return reasons;
 }
@@ -887,6 +887,17 @@ function withPlannedAddresses(plan: Plan, vm: VMRef): VMRef {
   return { ...vm, nics: vm.nics.map((nic) => ({ ...nic, fixed_ips: nicTarget(plan, vm.source_id, nic).addresses })) };
 }
 
+/** The source's compute floor of a storage handover: its delete_on_termination update of the source server (the API's
+ * planning/selector.HANDOVER_COMPUTE_FLOOR, SDD §9.2, §21.4). */
+const HANDOVER_COMPUTE_FLOOR = '2.85';
+
+/** Disks by name, else id, in their order: the API's `_ids`. */
+const diskIds = (disks: VMRef['disks']) => disks.map((d) => d.name || d.id).join(', ');
+
+/**
+ * Every strategy of the source's family with its ineligibility reasons, word for word as the API's
+ * planning/selector.eligibility (SDD §9.2, §16): the shared eligibility_cases.json pins both (review RV20-08).
+ */
 export function eligibility(
   vm: VMRef,
   sourceKind: ProviderKind,
@@ -896,41 +907,54 @@ export function eligibility(
   findings: Finding[],
 ): Partial<Record<Strategy, string[]>> {
   const result: Partial<Record<Strategy, string[]>> = {};
-  const blockers = findings.filter((f) => f.severity === 'blocker').map((f) => `Blocker finding ${f.code}`);
-  const multiattach = vm.disks.some((d) => d.multiattach);
+  const multiattach = vm.disks.filter((d) => d.multiattach);
+  const inError = vm.power_state === 'error' || vm.power_state === 'transitioning';
   if (sourceKind === 'vmware') {
-    result.vmware_cold = vm.power_state === 'error' ? ['Source VM is in error state'] : [];
+    result.vmware_cold = inError ? [`source VM is in ${vm.power_state} state`] : [];
     const warm: string[] = [];
-    if (vm.cbt_enabled !== true) warm.push('Changed Block Tracking is not enabled');
-    if (vm.disks.some((d) => d.independent)) warm.push('VM has an independent disk');
+    if (vm.cbt_enabled !== true) warm.push('Changed Block Tracking (CBT) is not enabled');
+    const independent = vm.disks.filter((d) => d.independent);
+    if (independent.length) warm.push(`independent disk(s): ${diskIds(independent)}`);
     result.vmware_warm = warm;
   } else {
-    const cold: string[] = [];
-    if (vm.power_state === 'error') cold.push('Source VM is in error state');
-    if (!source.conversion_host || !destination.conversion_host) cold.push('No conversion host configured on both clouds');
+    const copy: string[] = [];
+    if (inError) copy.push(`source VM is in ${vm.power_state} state`);
+    if (!source.conversion_host) copy.push('no conversion host configured on the source provider');
+    if (!destination.conversion_host) copy.push('no conversion host configured on the destination provider');
     // through Nova os-migrate recreates each port with exactly one fixed IP; through Neutron every one (SDD §9.2)
     const planned = withPlannedAddresses(plan, vm);
     const oddPorts = portsWithoutOneFixedIp(planned);
-    if (oddPorts.length && plan.port_creation_mode !== 'neutron') cold.push(`Port(s) without exactly one fixed IP, which Nova cannot recreate: ${describePorts(oddPorts)}`);
-    result.cold = cold;
-    result.warm = [...cold, ...(multiattach ? ['VM has a multi-attach volume'] : [])];
+    if (oddPorts.length && plan.port_creation_mode === 'nova') copy.push(`port(s) without exactly one fixed IP, which Nova cannot recreate: ${describePorts(oddPorts)}`);
+    result.cold = [...copy];
+    result.warm = [...copy, ...(multiattach.length ? [`multi-attach disk(s): ${diskIds(multiattach)}`] : [])];
     const handover: string[] = [];
-    if (!plan.handover.enabled) handover.push('Storage handover is not enabled for this plan');
-    if (vm.disks.some((d) => d.kind !== 'volume')) handover.push('Not every disk is a Cinder volume');
-    const unmapped = vm.disks.filter((d) => !d.volume_type || !(d.volume_type in plan.handover.backend_map));
-    if (plan.handover.enabled && unmapped.length)
-      handover.push(`volume type(s) without a backend of ${providerLabel(destination)} in handover.backend_map: ${[...new Set(unmapped.map((d) => d.volume_type ?? '<default>'))].sort().join(', ')}`);
-    if (multiattach) handover.push('VM has a multi-attach volume');
+    if (!plan.handover.enabled) handover.push('storage handover is not enabled for this plan');
+    const notVolumes = vm.disks.filter((d) => d.kind !== 'volume');
+    if (notVolumes.length) handover.push(`disk(s) not backed by Cinder volumes: ${diskIds(notVolumes)}`);
+    const unmapped = vm.disks.filter((d) => d.kind === 'volume' && !Object.hasOwn(plan.handover.backend_map, d.volume_type || ''));
+    if (unmapped.length) handover.push(`volume type(s) without a backend of ${providerLabel(destination)} in handover.backend_map: ${pyNames(unmapped.map((d) => d.volume_type || '<default>'))}`);
+    if (multiattach.length) handover.push(`multi-attach disk(s): ${diskIds(multiattach)}`);
     // through Nova the destination keeps one address per port; through Neutron every one (SDD §7.3 step 8)
     const several = planned.nics.filter((n) => n.fixed_ips.length > 1);
-    if (several.length && plan.port_creation_mode !== 'neutron') handover.push(`Port(s) with several fixed IPs, of which one would be kept: ${describePorts(several)}`);
-    if (vm.disks.some((d) => d.encrypted)) handover.push('Encrypted volumes cannot be unmanaged by Cinder');
+    if (several.length && plan.port_creation_mode === 'nova') handover.push(`port(s) with several fixed IPs, of which one would be kept: ${describePorts(several)}`);
+    const encrypted = vm.disks.filter((d) => d.encrypted);
+    if (encrypted.length) handover.push(`encrypted disk(s), which Cinder cannot unmanage: ${diskIds(encrypted)}`);
     handover.push(...storageReasons(vm, plan, source, destination));
-    if (!source.capabilities.admin || !destination.capabilities.admin) handover.push('Admin access is required on both clouds');
+    if (!source.capabilities.admin) handover.push('admin rights are required on the source cloud');
+    if (!destination.capabilities.admin) handover.push(`admin rights are required on ${providerLabel(destination)}`);
+    // a gap this strategy alone has is its reason, never a finding: the update goes to the source server (SDD §9.2, §21.4)
+    const compute = parseMicroversion(source.capabilities.compute_microversion);
+    const floor = parseMicroversion(HANDOVER_COMPUTE_FLOOR)!;
+    if (compute && (compute[0] - floor[0] || compute[1] - floor[1]) < 0) {
+      handover.push(
+        `the source's compute API ${String(source.capabilities.compute_microversion)} is below ${HANDOVER_COMPUTE_FLOOR} (the handover's delete_on_termination update of the source server)`,
+      );
+    }
     result.storage_handover = handover;
   }
-  if (blockers.length) {
-    for (const key of Object.keys(result) as Strategy[]) result[key] = [...(result[key] ?? []), ...blockers];
+  for (const finding of findings) {
+    if (finding.severity !== 'blocker') continue;
+    for (const reasons of Object.values(result)) reasons.push(`blocked by finding ${finding.code}`);
   }
   return result;
 }
@@ -1168,8 +1192,9 @@ export function preflight(
     add('VM_PCI_PASSTHROUGH', 'blocker', 'Flavor requests PCI passthrough.', 'PCI passthrough devices cannot be migrated; rebuild the VM with an equivalent flavor.');
   if ('resources:VGPU' in vm.flavor_extra_specs)
     add('VM_VGPU', 'blocker', 'Flavor requests a vGPU (resources:VGPU).', 'vGPU instances cannot be migrated; rebuild the VM with a vGPU flavor of the destination.');
-  if (vm.disks.some((d) => d.encrypted))
-    add('VOL_ENCRYPTED', 'warning', 'An encrypted volume is attached; its Barbican key must be re-created on the destination.', 'The Barbican key must be re-created on the destination before the volume can be attached.');
+  const encrypted = vm.disks.filter((d) => d.encrypted).map((d) => d.name || d.id);
+  if (encrypted.length)
+    add('VOL_ENCRYPTED', 'warning', `Encrypted disk(s): ${pyNames(encrypted)}.`, 'The Barbican key must be re-created on the destination before the volume can be attached.');
   const guest = guestOsOf(vm);
   if (guest.lifecycle === 'legacy')
     add('GUEST_OS_LEGACY', 'warning', `Guest OS ${guest.label} is out of standard vendor support.`, 'Out of vendor support: it still migrates; test the application on the destination, check the virtio drivers and plan a longer verification.');
@@ -1189,8 +1214,10 @@ export function preflight(
     if (vm.tools_ok === false)
       add('VMW_TOOLS_MISSING', 'info', 'VMware Tools are not running; graceful shutdown may time out.', 'Install or start VMware Tools.');
   }
-  if (plan.handover.enabled && sourceKind !== 'vmware' && vm.disks.some((d) => !d.volume_type || !(d.volume_type in plan.handover.backend_map)))
-    add('HANDOVER_BACKEND_UNMAPPED', 'info', `Handover is enabled but a volume type has no backend of ${where} mapped.`, 'Map the volume type to a Cinder backend of the destination in handover.backend_map.', ['storage_handover']);
+  // as the API words it (SDD §9.3, §16, review RV20-08): every volume whose type handover cannot map
+  const unmappedTypes = vm.disks.filter((d) => d.kind === 'volume' && !Object.hasOwn(plan.handover.backend_map, d.volume_type || '')).map((d) => d.volume_type || '<default>');
+  if (plan.handover.enabled && unmappedTypes.length)
+    add('HANDOVER_BACKEND_UNMAPPED', 'info', `Volume type(s) without a handover backend: ${pyNames(unmappedTypes)}.`, 'Map the volume type to a Cinder backend of the destination in handover.backend_map.', ['storage_handover']);
   // like the API (SDD §9.3, ADV-18): a database VM verified only by its boot
   if (isDatabase(vm) && probesFor(vm.source_id, plan).probes.length === 0) {
     const suggested = suggestProbes(vm);

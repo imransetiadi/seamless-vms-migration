@@ -1,5 +1,10 @@
+import json
+from pathlib import Path
+
+import pytest
+
 from seamless_migrate.domain.enums import ProviderKind, Severity, Strategy
-from seamless_migrate.domain.models import Estimate, Finding, HandoverConfig
+from seamless_migrate.domain.models import Estimate, Finding, HandoverConfig, NicOverride, VMRef
 from seamless_migrate.executors.handover import KEEP_MICROVERSION
 from seamless_migrate.planning.selector import (
     HANDOVER_COMPUTE_FLOOR,
@@ -405,3 +410,39 @@ def test_the_handover_reasons_name_the_destination_provider_one_way():
     ) in reasons
     assert f"admin rights are required on {name}" in reasons
     assert [r for r in reasons if "the destination" in r] == [], reasons
+
+
+ELIGIBILITY_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "eligibility_cases.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("case", ELIGIBILITY_CASES["cases"], ids=lambda case: case["why"])
+def test_the_shared_eligibility_cases(case):
+    """SDD §9.2, §16 (review RV20-08): the API's reasons per strategy, which the dashboard's mock
+    words the same way (mockData.test.ts runs these cases too)."""
+    plan = make_plan(
+        handover=HandoverConfig(**case["plan"]["handover"]),
+        port_creation_mode=case["plan"]["port_creation_mode"],
+        nic_overrides={
+            vm: {mac: NicOverride(**o) for mac, o in nics.items()}
+            for vm, nics in case["plan"]["nic_overrides"].items()
+        },
+    )
+
+    def caps(side):
+        return {**side["capabilities"], "conversion_host": side["conversion_host"]}
+
+    findings = [
+        Finding(code=f["code"], severity=f["severity"], message="") for f in case["findings"]
+    ]
+    reasons = eligibility(
+        VMRef.model_validate(case["vm"]),
+        case["source_kind"],
+        plan,
+        caps(case["source"]),
+        caps(case["destination"]),
+        findings,
+        case["destination"]["name"],
+    )
+    assert {str(strategy): r for strategy, r in reasons.items()} == case["expected"]

@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import eligibilityRaw from '../../../seamless/tests/fixtures/eligibility_cases.json?raw';
 import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, makeVm, preflight, replaceNames } from './mockData';
 import { capabilityRoles } from '../lib/networks';
-import type { DestinationInventory, DestinationNetwork, Plan, ProviderKind, VMRef } from './types';
+import type { DestinationInventory, DestinationNetwork, Finding, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
 
 const now = Date.parse('2026-10-09T12:00:00Z');
 
@@ -549,5 +550,52 @@ describe('the mock names the destination provider where the API does (SDD §1 na
         remediation: 'Lower the guest MTU or map to a destination network with a larger MTU (ML2/OVN Geneve networks typically use 1442).',
       }),
     ]);
+  });
+});
+
+interface ProviderSide {
+  conversion_host: boolean;
+  capabilities: Record<string, unknown>;
+  name?: string;
+}
+
+interface EligibilityCase {
+  why: string;
+  source_kind: ProviderKind;
+  vm: VMRef;
+  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'>;
+  source: ProviderSide;
+  destination: ProviderSide;
+  findings: { code: string; severity: Severity }[];
+  expected: Record<string, string[]>;
+}
+
+interface FindingCase {
+  why: string;
+  vm: VMRef;
+  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'>;
+  expected: Record<string, string>;
+}
+
+/** The API's reasons and finding texts, case by case: seamless/tests/fixtures/eligibility_cases.json. */
+const ELIGIBILITY = JSON.parse(eligibilityRaw) as { cases: EligibilityCase[]; finding_cases: FindingCase[] };
+
+describe('the mock words eligibility and the handover findings as the API (SDD §9.2, §9.3, §16, review RV20-08)', () => {
+  const base = buildFixtures(now).plans[0]!;
+  const provider = (id: string, kind: ProviderKind, side: ProviderSide) =>
+    ({ id, name: side.name ?? id, kind, capabilities: side.capabilities, conversion_host: side.conversion_host ? { manage: true, name: 'conv', flavor: null } : null }) as Provider;
+
+  it.each(ELIGIBILITY.cases)('$why', (c) => {
+    const plan = { ...base, ...c.plan } as Plan;
+    const findings = c.findings.map((f) => ({ code: f.code, severity: f.severity, message: '', remediation: null, strategies: [] }) as Finding);
+    const destinationKind: ProviderKind = c.source_kind === 'vmware' ? 'rhoso' : 'openstack';
+    const reasons = eligibility(c.vm, c.source_kind, plan, provider('src', c.source_kind, c.source), provider('dst', destinationKind, c.destination), findings);
+    expect(reasons).toEqual(c.expected);
+  });
+
+  it.each(ELIGIBILITY.finding_cases)('$why', (c) => {
+    const plan = { ...base, ...c.plan } as Plan;
+    const found = preflight(c.vm, 'openstack', plan, {}, [c.vm.name], { selected: [c.vm] });
+    expect(Object.fromEntries(found.filter((f) => f.code in c.expected).map((f) => [f.code, f.message]))).toEqual(c.expected);
   });
 });
