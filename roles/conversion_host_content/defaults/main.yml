@@ -1,4 +1,16 @@
+# Modified by the Seamless Migrate project, 2026.
 os_migrate_conversion_host_content_install: true
+# The task file that sets up the conversion host's OS, '' for one the role cannot set up
+# (Seamless Migrate SDD 6.5, 21.6): RHEL with its subscription; CentOS Stream, Rocky Linux and
+# AlmaLinux 9 or later with EPEL; Ubuntu 24.04 or later with apt.
+os_migrate_conversion_host_content_tasks: >-
+  {{ 'rhel.yml' if ansible_distribution == 'RedHat'
+     else 'centos.yml' if ansible_os_family == 'RedHat'
+                          and ansible_distribution in ['CentOS', 'Rocky', 'AlmaLinux']
+                          and ansible_distribution_major_version is version('9', '>=')
+     else 'ubuntu.yml' if ansible_distribution == 'Ubuntu'
+                          and ansible_distribution_version is version('24.04', '>=')
+     else '' }}
 # The following two variables must be
 # configured to set up properly the RHSM
 # os_migrate_conversion_rhsm_username: username

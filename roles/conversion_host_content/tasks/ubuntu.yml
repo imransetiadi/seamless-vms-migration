@@ -1,0 +1,12 @@
+# Ubuntu 24.04 LTS or later (Seamless Migrate SDD 6.5, 21.6): the copy tools from Ubuntu's
+# archive - qemu-img in qemu-utils, nbdcopy in libnbd-bin, virt-sparsify in libguestfs-tools.
+- name: Install content
+  ansible.builtin.apt:
+    name:
+      - qemu-utils
+      - nbdkit
+      - libnbd-bin
+      - libguestfs-tools
+    state: present
+    update_cache: true
+    cache_valid_time: 3600

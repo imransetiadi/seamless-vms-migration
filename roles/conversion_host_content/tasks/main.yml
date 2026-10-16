@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: Conversion host content tasks
   block:
     - name: Display host os
@@ -13,13 +14,18 @@
       changed_when: false
       when: os_migrate_conversion_host_pre_content_hook is string
 
-    - name: Include CentOS tasks
-      ansible.builtin.include_tasks: centos.yml
-      when: ansible_distribution in ['CentOS']
+    - name: Fail on a conversion host OS the role cannot set up
+      ansible.builtin.fail:
+        msg: >-
+          The conversion host runs {{ ansible_distribution }}
+          {{ ansible_distribution_version }} (ansible_distribution), which
+          conversion_host_content cannot set up: it supports RHEL, CentOS Stream 9
+          and 10, Rocky Linux 9, AlmaLinux 9 and Ubuntu 24.04 or later
+          (Seamless Migrate SDD 6.5).
+      when: not os_migrate_conversion_host_content_tasks
 
-    - name: Include RHEL tasks
-      ansible.builtin.include_tasks: rhel.yml
-      when: ansible_distribution in ['RedHat']
+    - name: Include the tasks of the conversion host's OS
+      ansible.builtin.include_tasks: "{{ os_migrate_conversion_host_content_tasks }}"
 
     - name: Running post content hook
       ansible.builtin.shell: "{{ os_migrate_conversion_host_post_content_hook }}"

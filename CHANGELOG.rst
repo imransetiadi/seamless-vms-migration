@@ -496,3 +496,13 @@ This project follows a simple changelog to satisfy collection metadata validatio
   (``import_workload_dst_check``'s ``cutover_refusals``) beside the workload's
   warm state as ``<server id>.refusals.json`` (mode 0600), replaced on every
   pass and empty once the problems are fixed.
+- ``conversion_host_content`` sets up a conversion host by its OS: RHEL
+  with its subscription tasks; CentOS Stream 9 and 10, Rocky Linux 9 and
+  AlmaLinux 9 with EPEL (before, only an ``ansible_distribution`` of CentOS
+  ran these tasks, and a Rocky or AlmaLinux host installed nothing); Ubuntu
+  24.04 LTS or later with apt and fresh package lists (``qemu-utils``,
+  ``nbdkit``, ``libnbd-bin``, ``libguestfs-tools``). The defaults' variable
+  ``os_migrate_conversion_host_content_tasks`` names the task file. Any
+  other OS fails the role with a message naming it, where it used to install
+  nothing and the transfer then failed for want of nbdkit. An Ubuntu cloud
+  image logs in as ``ubuntu``, not ``cloud-user``.
