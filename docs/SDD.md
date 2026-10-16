@@ -1280,7 +1280,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   its record has no `network_key` (a VM validated before the key was recorded: the kit would look a NIC on a
   distributed port group up by its key and drop it, so the plan is validated again, after a retry if the migration
   failed), when the network does not resolve, when the credential may not put a port there (§6.6's rule, with the
-  roles of the destination's capabilities), when the NIC's IPv4 addresses are not all host addresses of one subnet of
+  roles the destination's inventory reads live for the run, as the handover's step 0 and the collection read them -
+  the destination's check report's when the inventory cannot read them; when neither names any, a NIC that needs a
+  role is refused: a reset report never lets a token through, review RV19-01), when the NIC's IPv4 addresses are not
+  all host addresses of one subnet of
   that network, when two NICs share a key but need different values, or when another port of that network holds
   the NIC's MAC or one of its IPv4 addresses (`DestinationProvider.ports`): the kit asks Neutron for both, which
   refuses them (`MacAddressInUse`, `IpAddressAlreadyAllocated`) after the power-off. The failure names the port.
@@ -1901,7 +1904,10 @@ sees; `own` when the credential's project owns it: what a NIC's RHOSO network na
 port on another project's network, §6.6),
 subnets: list[{id, name, network, network_id, cidr, ipv6_address_mode, ipv6_ra_mode}] (the subnets the destination
 credential sees, by network name and by the id of the network they belong to: where a NIC's addresses must lie,
-§9.3; `id` is what a VMware NIC's `network_map` value names, §7.2)}`. `networks` keeps the name→MTU view; with two networks of one name its MTU is one of theirs.
+§9.3; `id` is what a VMware NIC's `network_map` value names, §7.2), roles: list[str]|null (the role names of the
+destination credential's token, read with the inventory - live for every run -, null when they cannot be read: what
+the VMware kit's network map judges, §7.2, review RV19-01)}`. `networks` keeps the name→MTU view; with two networks of
+one name its MTU is one of theirs.
 
 Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking calls wrapped with
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`, as a source and as a destination - a community
