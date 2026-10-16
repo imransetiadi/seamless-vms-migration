@@ -1,11 +1,14 @@
 import builtins
+import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
 
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole
+from seamless_migrate.planning.platforms import destination_release
 from seamless_migrate.planning.preflight import DestinationInventory, SourceInventory, is_legacy_os
 from seamless_migrate.providers import registry
 from seamless_migrate.providers.base import ProviderError, VMNotFound, provider_caps
@@ -620,6 +623,43 @@ async def test_the_check_reports_a_real_clouds_compute_maximum_as_major_minor(tm
     # what keystoneauth hands the check: a tuple, never the text a stub hands
     conn = cloud.connect(provider, cloud.settings)
     assert conn.compute.get_endpoint_data().max_microversion == (2, 96)
+
+
+VERSIONS = Path(__file__).parent / "fixtures" / "openstack_versions"
+
+
+def _current(document):
+    """The maximum of a recorded version document's CURRENT version; None without a document."""
+    if not document:
+        return None
+    return next(v["version"] for v in document["versions"] if v["status"] == "CURRENT")
+
+
+@pytest.mark.parametrize("path", sorted(VERSIONS.glob("*.json")), ids=lambda path: path.stem)
+async def test_a_real_destination_of_each_series_is_read_as_that_series(tmp_path, path):
+    """Review RV18-01: on a real cloud every destination read "not detected" - Outside, its
+    profile unknown - since the check wrote keystoneauth's tuples as text. Through a real
+    keystoneauth session each series' recorded maxima read as SDD §10.1 reads their text: both
+    maxima as major.minor, the series' range, and the tier and profile of that range (SDD §10,
+    §21.3)."""
+    documents = json.loads(path.read_text(encoding="utf-8"))
+    compute, block_storage = _current(documents["compute"]), _current(documents["block_storage"])
+    cloud = InProcessCloud(tmp_path, compute=compute, block_storage=block_storage)
+    provider = make_provider(
+        id="dst-community",
+        role=ProviderRole.destination,
+        distribution="openstack_community",
+        endpoint=AUTH_URL,
+        cloud="dst",
+    )
+    caps = await OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect).check()
+
+    maxima = (caps["compute_microversion"], caps["block_storage_microversion"])
+    assert maxima == (compute, block_storage or "")
+    assert caps["release_range"] == documents["expected_range"]
+    reported = {key: caps[key] for key in ("release_range", "release", "support_tier")}
+    expected = destination_release("openstack", None, None, compute, block_storage or "")
+    assert reported | {"policy_profile": caps["policy_profile"]} == expected
 
 
 def _versions(conn, compute, block_storage):

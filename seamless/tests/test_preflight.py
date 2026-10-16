@@ -18,6 +18,8 @@ from seamless_migrate.planning.preflight import (
     resource_demand,
     run_preflight,
 )
+from seamless_migrate.providers.openstack import OpenStackProvider
+from tests.cloud_support import AUTH_URL, InProcessCloud
 from tests.factories import make_disk, make_plan, make_provider, make_vm
 
 SRC = make_provider()
@@ -1236,6 +1238,39 @@ def test_finding_net_port_not_permitted_counts_advsvc_only_under_the_legacy_prof
         ), roles
     # a value the check never reports counts as unknown: admin alone
     assert _another_projects_port({"policy_profile": "strict", "roles": ["advsvc"]}) is not None
+
+
+async def _real_check(tmp_path, **cloud):
+    """The check report of a community destination on an in-process cloud: Seamless's own
+    connect() over a real keystoneauth session (tests/cloud_support.py)."""
+    real = InProcessCloud(tmp_path, **cloud)
+    provider = COMMUNITY.model_copy(update={"endpoint": AUTH_URL, "cloud": "dst"})
+    report = await OpenStackProvider(provider, real.settings, connect_fn=real.connect).check()
+    return {**report, "conversion_host": True}
+
+
+async def test_a_real_tier_1_destination_is_not_warned_and_its_service_role_takes_the_port(
+    tmp_path,
+):
+    """Review RV18-01: a real 2026.2 cloud read "not detected" - DST_RELEASE_OUTSIDE_SUPPORT on
+    every VM, and its profile unknown, so NET_PORT_NOT_PERMITTED refused the service role SDD
+    §21.5 and Security.md C4-06 prescribe. Read through a real keystoneauth session, it is Tier 1
+    and secure-RBAC (SDD §21.3, §21.4, §21.5)."""
+    caps = await _real_check(tmp_path, compute="2.104", block_storage=None, roles=("service",))
+
+    findings = check(destination=COMMUNITY, dst_caps=caps)
+    assert [f.message for f in findings if f.code == "DST_RELEASE_OUTSIDE_SUPPORT"] == []
+    refused = _another_projects_port({**caps, "roles": ["service", "member"]})
+    assert refused is None, refused.message
+
+
+async def test_a_real_destination_below_the_compute_floor_is_blocked(tmp_path):
+    """Review RV18-01: a real cloud's compute maximum never parsed, so one below 2.60 was never
+    blocked (SDD §21.4)."""
+    caps = await _real_check(tmp_path, compute="2.53", block_storage="3.70")
+
+    found = only(check(destination=COMMUNITY, dst_caps=caps), "DST_CAPABILITY_MISSING")
+    assert "compute API 2.53, below 2.60" in found.message, found.message
 
 
 def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projects_network():

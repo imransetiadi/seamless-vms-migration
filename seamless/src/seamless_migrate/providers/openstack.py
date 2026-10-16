@@ -229,7 +229,7 @@ class OpenStackProvider:
             lambda: microversion_text(conn.compute.get_endpoint_data().max_microversion), ""
         )
         block_storage_microversion = _try(
-            lambda: str(conn.block_storage.get_endpoint_data().max_microversion or ""), ""
+            lambda: microversion_text(conn.block_storage.get_endpoint_data().max_microversion), ""
         )
         agents = _try(lambda: list(conn.network.agents()), [])
         ovn = any(
