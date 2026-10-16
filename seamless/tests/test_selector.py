@@ -26,26 +26,31 @@ def est(strategy: Strategy, downtime: float, eligible: bool = True, slo: float =
     )
 
 
-def test_storage_handover_needs_the_destinations_compute_2_85():
-    """SDD §21.4, §7.3 step 0: the handover updates delete_on_termination with compute 2.85, so a
-    destination whose maximum is below it makes storage_handover ineligible - an eligibility reason,
-    never a finding, as a blocker would block the VM whatever its strategy. A maximum the check
-    could not read is not judged, and cold and warm keep their eligibility."""
+def test_storage_handover_needs_the_sources_compute_2_85():
+    """SDD §9.2, §21.4, §7.3: the handover updates the source server's delete_on_termination with
+    compute 2.85, so a source whose maximum is below it makes storage_handover ineligible - an
+    eligibility reason, never a finding, as a blocker would block the VM whatever its strategy.
+    The destination never receives that call, so its maximum is not judged (review RV18-07: a
+    2.79 source stayed eligible and failed at its cutover's step 0). A maximum the check could not
+    read is not judged, and cold and warm keep their eligibility."""
     plan = make_plan(handover=HandoverConfig(enabled=True, backend_map={"ceph-ssd": "h@rbd#pool"}))
     vm = make_vm(disks=[make_disk(volume_type="ceph-ssd")])
 
-    def reasons(compute):
-        dst = {**OK_CAPS, "compute_microversion": compute}
-        return eligibility(vm, ProviderKind.openstack, plan, OK_CAPS, dst, [])
+    def reasons(source, destination="2.95"):
+        src = {**OK_CAPS, "compute_microversion": source}
+        dst = {**OK_CAPS, "compute_microversion": destination}
+        return eligibility(vm, ProviderKind.openstack, plan, src, dst, [])
 
-    old = reasons("2.79")
-    assert old[Strategy.storage_handover] == [
-        "the destination's compute API 2.79 is below 2.85 (the handover's delete_on_termination "
-        "update)"
+    train = reasons("2.79")
+    assert train[Strategy.storage_handover] == [
+        "the source's compute API 2.79 is below 2.85 (the handover's delete_on_termination "
+        "update of the source server)"
     ]
-    assert old[Strategy.cold] == [] and old[Strategy.warm] == []
-    for compute in ("2.85", "2.104", "", None, "not a version"):
+    assert train[Strategy.cold] == [] and train[Strategy.warm] == []
+    for compute in ("2.85", "2.96", "", None, "not a version"):
         assert reasons(compute)[Strategy.storage_handover] == [], compute
+    # the destination never receives the update: its maximum is not judged
+    assert reasons("2.96", destination="2.79")[Strategy.storage_handover] == []
     # the floor is the microversion the handover's step 0 sends (SDD §7.3)
     assert HANDOVER_COMPUTE_FLOOR == KEEP_MICROVERSION
 

@@ -1059,7 +1059,7 @@ def test_finding_dst_capability_missing():
     """SDD §21.4: capabilities block, names never do. A maximum below the floor every strategy
     needs - compute 2.60, block storage 3.0 - blocks whatever the series; one the check could not
     read is not judged. A gap one strategy alone has is that strategy's eligibility reason
-    (test_storage_handover_needs_the_destinations_compute_2_85), never a finding."""
+    (test_storage_handover_needs_the_sources_compute_2_85), never a finding."""
 
     def found(destination=COMMUNITY, **caps):
         findings = check(destination=destination, dst_caps=community_caps(**caps))
@@ -1073,7 +1073,8 @@ def test_finding_dst_capability_missing():
         "Destination dst-flamingo lacks what every strategy needs: compute API 2.53, below 2.60 "
         "(multi-attach); block storage API 2.0, below 3.0."
     )
-    assert found(compute_microversion="2.79") == []  # storage_handover's own floor: the selector's
+    # the handover's 2.85 is the source's, the selector's eligibility reason (SDD §21.4)
+    assert found(compute_microversion="2.79") == []
     # a Tier 3 or Outside cloud with every capability runs (the tier only warns)
     outside = {"tier": "outside", "reason": "newer_than_validated", "declared_outside_range": False}
     assert found(compute_microversion="2.105", support_tier=outside) == []
