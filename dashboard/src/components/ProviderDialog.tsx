@@ -6,6 +6,7 @@ import type { ConversionHostConfig, Distribution, Provider, ProviderCredentials,
 import { cn } from '../lib/cn';
 import { DISTRIBUTION_PRESETS, presetFor, slugify, type CredentialMode, type DistributionPreset } from '../lib/distributions';
 import { formatRelative } from '../lib/format';
+import { RELEASE_CHOICES, seriesText } from '../lib/platforms';
 import { providerStatusMeta } from '../lib/status';
 import { Button } from './Button';
 import { ErrorBanner } from './ErrorBanner';
@@ -52,6 +53,10 @@ interface FormState {
   secretName: string;
   keySource: 'upload' | 'external';
   keySecretName: string;
+  /** The series an OpenStack destination declares; '' detects it (SDD §4.2, §10.1). */
+  release: string;
+  /** The policy defaults an OpenStack or RHOSO destination declares; '' = by kind and series (SDD §4.2, §21.5). */
+  policyProfile: '' | 'secure_rbac' | 'legacy';
 }
 
 type FieldKey = 'name' | 'id' | 'endpoint' | 'cloud' | 'username' | 'password' | 'projectName' | 'appId' | 'appSecret' | 'hostName' | 'hostAddress' | 'privateKey' | 'secretName' | 'keySecretName';
@@ -124,6 +129,8 @@ function initialState(provider: Provider | undefined): FormState {
     secretName: secretName ?? '',
     keySource: keySecretName ? 'external' : 'upload',
     keySecretName: keySecretName ?? '',
+    release: provider?.release ?? '',
+    policyProfile: provider?.policy_profile ?? '',
   };
 }
 
@@ -304,6 +311,9 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
 
   const preset = presetFor(form.distribution);
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((f) => ({ ...f, [key]: value }));
+  // a destination declares its series (OpenStack: RHOSO 18.0 is validated by its kind) and its policy profile (SDD §16)
+  const declaresRelease = form.role === 'destination' && preset.kind === 'openstack';
+  const declaresProfile = form.role === 'destination' && preset.kind !== 'vmware';
   const id = (key: string) => `provider-dialog-${key}`;
 
   const choosePreset = (next: DistributionPreset) =>
@@ -416,6 +426,8 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         ...(form.mode === 'external_secret' ? { credentials_secret: form.secretName.trim() } : {}),
         distribution: form.distribution,
         conversion_host: conversionHost(),
+        ...(declaresRelease ? { release: form.release || null } : {}),
+        ...(declaresProfile ? { policy_profile: form.policyProfile || null } : {}),
       };
       // every step that succeeded is kept: a later failure never makes Save add the provider again
       const keep = (step: Provider): Provider => {
@@ -662,6 +674,37 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                 <TriangleAlert aria-hidden className="mt-0.5 size-3.5 shrink-0" />
                 Certificate verification is off for this provider; the control plane logs a warning on every connection.
               </p>
+            )}
+            {(declaresRelease || declaresProfile) && (
+              <div className="grid gap-3 sm:grid-cols-2">
+                {declaresRelease && (
+                  <SelectField
+                    id={id('release')}
+                    label="Release series"
+                    value={form.release}
+                    onChange={(e) => set('release', e.target.value)}
+                    hint="Leave it to the check, which reads the series from the APIs; declare it when they cannot tell it."
+                    options={[
+                      { value: '', label: 'Detect it from the APIs' },
+                      // a series declared outside the window through the API stays selectable
+                      ...(form.release && !RELEASE_CHOICES.some((c) => c.value === form.release) ? [{ value: form.release, label: seriesText(form.release) }] : []),
+                      ...RELEASE_CHOICES,
+                    ]}
+                  />
+                )}
+                <SelectField
+                  id={id('policyProfile')}
+                  label="Policy profile"
+                  value={form.policyProfile}
+                  onChange={(e) => set('policyProfile', e.target.value as FormState['policyProfile'])}
+                  hint="Which roles Neutron counts for a port on another project's network. Declare Legacy rules only if the cloud turned the secure-RBAC defaults off."
+                  options={[
+                    { value: '', label: 'By kind and series' },
+                    { value: 'secure_rbac', label: 'Secure RBAC defaults' },
+                    { value: 'legacy', label: 'Legacy rules' },
+                  ]}
+                />
+              </div>
             )}
           </Section>
 

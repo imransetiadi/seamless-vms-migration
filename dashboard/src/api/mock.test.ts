@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+// the keys an OpenStack or RHOSO check reports, as the API's (SDD §10; plan T8)
+import checkKeysRaw from '../../../seamless/tests/fixtures/check_report_keys.json?raw';
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
@@ -32,6 +34,7 @@ import {
 } from './types';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
+const CHECK_KEYS = JSON.parse(checkKeysRaw) as { openstack: string[]; destination: string[] };
 
 function setup(token: string | null = 'admin') {
   const server = new MockServer({ now: () => NOW, seed: 1 });
@@ -2467,3 +2470,48 @@ describe('mock plans: nic_overrides (SDD §4.2, §12)', () => {
     });
   });
 });
+
+describe('providers of community destinations, like the API (SDD §4.2, §10, §10.1, §12; plan T8)', () => {
+  const call = (server: MockServer, method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+  const keysOf = (o: object) => Object.keys(o).sort();
+  const base = { endpoint: 'https://keystone.example.org/v3', cloud: 'x' };
+
+  it('the mock check reports the same keys', () => {
+    const { server } = setup('admin');
+    expect(call(server, 'POST', '/providers', { ...base, id: 'src-x', name: 'Source X', kind: 'openstack', role: 'source', distribution: 'openstack_community' }).status).toBe(201);
+    const declared = { ...base, id: 'dc3', name: 'Hibiscus DC3', kind: 'openstack', role: 'destination', distribution: 'kolla', release: '2026.2', policy_profile: 'legacy' };
+    expect(call(server, 'POST', '/providers', declared).status).toBe(201);
+    expect(call(server, 'POST', '/providers', { ...base, id: 'rhoso-x', name: 'RHOSO X', kind: 'rhoso', role: 'destination', distribution: 'rhoso' }).status).toBe(201);
+    const source = (call(server, 'POST', '/providers/src-x/check').body as Provider).capabilities;
+    expect(keysOf(source)).toEqual([...CHECK_KEYS.openstack].sort());
+    const dc3 = (call(server, 'POST', '/providers/dc3/check').body as Provider).capabilities;
+    expect(keysOf(dc3)).toEqual([...CHECK_KEYS.openstack, ...CHECK_KEYS.destination].sort());
+    // its series by its maxima, and the profile it declares (SDD §10.1)
+    expect(dc3).toMatchObject({ compute_microversion: '2.104', release_range: ['2026.2'], release: '2026.2', support_tier: { tier: 'tier1' }, policy_profile: 'legacy' });
+    const rhoso = (call(server, 'POST', '/providers/rhoso-x/check').body as Provider).capabilities;
+    expect(rhoso).toMatchObject({ support_tier: { tier: 'validated', reason: null }, policy_profile: 'legacy', tls: true, plain_http: [] });
+    // the seeded providers a check reported on carry them too
+    const checked = server.providers.filter((p) => p.kind !== 'vmware' && Object.keys(p.capabilities).length);
+    expect(checked.map((p) => p.id)).toEqual(expect.arrayContaining(['rhosp17-dc1', 'rhoso-prod', 'hibiscus-dc3']));
+    for (const p of checked) expect(keysOf(p.capabilities)).toEqual([...CHECK_KEYS.openstack, ...(p.role === 'destination' ? CHECK_KEYS.destination : [])].sort());
+  });
+
+  it('takes a declared series and policy profile, and refuses them where the API does (SDD §4.2, §12)', () => {
+    const { server } = setup('admin');
+    const dst = { ...base, id: 'dc4', name: 'DC4', kind: 'openstack', role: 'destination', distribution: 'openstack_community' };
+    expect(call(server, 'POST', '/providers', { ...dst, release: '2026.3' })).toMatchObject({ status: 422 });
+    expect(call(server, 'POST', '/providers', { ...dst, policy_profile: 'unknown' })).toMatchObject({ status: 422 });
+    const vcenter = { ...base, id: 'vc-9', name: 'vCenter 9', kind: 'vmware', role: 'source', distribution: 'vmware' };
+    expect(call(server, 'POST', '/providers', { ...vcenter, release: '2026.2' })).toMatchObject({ status: 422 });
+    expect(call(server, 'POST', '/providers', dst)).toMatchObject({ status: 201, body: { release: null, policy_profile: null } });
+    // a declaration is a provider change: the check report is reset (SDD §12)
+    expect(call(server, 'POST', '/providers/dc4/check').status).toBe(200);
+    const patched = call(server, 'PATCH', '/providers/dc4', { release: '2025.2', policy_profile: 'secure_rbac' });
+    expect(patched).toMatchObject({ status: 200, body: { release: '2025.2', policy_profile: 'secure_rbac', status: 'unknown', capabilities: {} } });
+    expect(call(server, 'PATCH', '/providers/dc4', { release: '2025' })).toMatchObject({ status: 422 });
+    expect(call(server, 'PATCH', '/providers/dc4', { release: null, policy_profile: null })).toMatchObject({ status: 200, body: { release: null, policy_profile: null } });
+    expect(call(server, 'POST', '/providers', vcenter).status).toBe(201);
+    expect(call(server, 'PATCH', '/providers/vc-9', { policy_profile: 'legacy' })).toMatchObject({ status: 422 });
+  });
+});
+

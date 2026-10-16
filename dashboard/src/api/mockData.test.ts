@@ -255,6 +255,25 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     expect(codes(run(ownExternal, ['admin']))).not.toContain('NET_PORT_NOT_PERMITTED');
   });
 
+  it("judges another project's network by the destination's policy profile, naming the least role that clears it (SDD §21.5, review RV18-10)", () => {
+    const shared = net('p', 'tenant-web', false, 'project-admin');
+    const run = (roles: string[], profile: string) =>
+      preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, [vm.name], {
+        selected: [vm],
+        networkDetails: [shared],
+        subnets: [{ name: 's', network: 'tenant-web', network_id: shared.id!, cidr: '10.20.0.0/16', ipv6_address_mode: null, ipv6_ra_mode: null }],
+        roles,
+        profile,
+      }).find((f) => f.code === 'NET_PORT_NOT_PERMITTED');
+    expect(run(['service'], 'secure_rbac')).toBeUndefined();
+    const refused = run(['advsvc'], 'secure_rbac');
+    expect(refused?.message).toContain("Neutron's secure-RBAC defaults let only the admin or service role");
+    expect(refused?.remediation).toBe(
+      "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared network takes it once the destination credential has the service role for the migration window (Neutron's secure-RBAC defaults); admin is not needed for this. An external network that is not shared needs the admin role: Nova attaches it for no other.",
+    );
+    expect(run(['service'], 'unknown')?.message).toContain("the destination's policy profile is unknown");
+  });
+
   it("writes a network's name and a missing project as the API's messages do (review NC-11)", () => {
     const quoted = "bob's-web";
     const plan = { ...base, mappings: { ...base.mappings, networks: { 'tenant-app': quoted } } };

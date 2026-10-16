@@ -38,6 +38,7 @@ import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { addressRefusal, canonicalIp, ipInCidr, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
 import { kitSubnet, networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
+import { destinationRelease, type PolicyProfile } from '../lib/platforms';
 import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { buildStrategyEvidence } from './mockEvidence';
@@ -347,6 +348,41 @@ const PROD_STORAGE = [
   backend('hostgroup@ontap-nfs#198.51.100.60:/cinder_dc1', 'netapp_nfs'),
 ];
 
+const DC3_STORAGE = [backend('kolla@rbd-1#volumes', 'rbd')];
+
+/** The maxima the demo's clouds report, as the API's fakes do (FakeSourceProvider; FakeDestinationProvider by kind). */
+const MAXIMA = { source: ['2.88', '3.64'], rhoso: ['2.95', '3.70'], openstack: ['2.104', '3.71'] } as const;
+
+/**
+ * An OpenStack or RHOSO provider's check report, with the keys the API's check reports (SDD §10; check_report_keys.json):
+ * its token's roles, its services' maxima, its storage pools and TLS; a destination's adds its series, support tier and
+ * policy profile, by its maxima and what it declares (§10.1).
+ */
+export function openstackCheck(
+  provider: Pick<Provider, 'kind' | 'role' | 'release' | 'policy_profile'>,
+  storage: ReturnType<typeof backend>[],
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const [compute, blockStorage] = provider.role === 'source' ? MAXIMA.source : MAXIMA[provider.kind === 'rhoso' ? 'rhoso' : 'openstack'];
+  return {
+    admin: true,
+    // an admin token (SDD §10): the demo's shared provider network takes its ports (§6.6)
+    roles: ['admin', 'member', 'reader'],
+    compute_microversion: compute,
+    block_storage_microversion: blockStorage,
+    ovn: true,
+    volume_backends: storage.map((b) => b.pool),
+    storage_backends: storage,
+    tls: true,
+    plain_http: [],
+    ...(provider.role === 'destination' ? destinationRelease(provider.kind, provider.release, provider.policy_profile, compute, blockStorage) : {}),
+    ...extra,
+  };
+}
+
+/** The storage pools a provider the mock's check reports on first lists (SDD §7.3.1). */
+export const CHECKED_STORAGE = [backend('hostgroup@ceph-ssd#ceph-ssd', 'rbd')];
+
 export function makeVm(spec: VmSpec): VMRef {
   const disks: Disk[] = spec.disks.map((d, i) => {
     const kind = d.kind ?? 'volume';
@@ -465,11 +501,13 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/dc1-ca.pem',
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
-      capabilities: { admin: true, roles: ['admin', 'member', 'reader'], compute_microversion: '2.79', ovn: false, volume_backends: DC1_STORAGE.map((b) => b.pool), storage_backends: DC1_STORAGE },
+      capabilities: openstackCheck({ kind: 'openstack', role: 'source', release: null, policy_profile: null }, DC1_STORAGE, { ovn: false }),
       status: 'ok',
       status_message: 'Keystone, Nova, Cinder, Neutron and Glance reachable.',
       last_checked_at: iso(now - 4 * 60_000),
       distribution: 'rhosp',
+      release: null,
+      policy_profile: null,
       credentials_updated_at: iso(now - 3 * 3600_000),
       conversion_key_updated_at: null,
     },
@@ -490,6 +528,8 @@ export function buildProviders(now: number): Provider[] {
       status_message: 'Two ESXi hosts in maintenance mode; CBT queries are slow.',
       last_checked_at: iso(now - 11 * 60_000),
       distribution: 'vmware',
+      release: null,
+      policy_profile: null,
       credentials_updated_at: iso(now - 26 * 3600_000),
       conversion_key_updated_at: iso(now - 26 * 3600_000),
     },
@@ -510,6 +550,8 @@ export function buildProviders(now: number): Provider[] {
       status_message: 'Keystone returned HTTP 503 Service Unavailable.',
       last_checked_at: iso(now - 26 * 60_000),
       distribution: 'openstack_community',
+      release: null,
+      policy_profile: null,
       credentials_updated_at: null,
       conversion_key_updated_at: null,
     },
@@ -530,6 +572,8 @@ export function buildProviders(now: number): Provider[] {
       status_message: null,
       last_checked_at: null,
       distribution: 'kolla',
+      release: null,
+      policy_profile: null,
       credentials_updated_at: null,
       conversion_key_updated_at: null,
     },
@@ -545,19 +589,14 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/ocp-ingress-ca.pem',
       conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31'),
-      capabilities: {
-        admin: true,
-        // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
-        roles: ['admin', 'member', 'reader'],
-        compute_microversion: '2.95',
-        ovn: true,
-        volume_backends: PROD_STORAGE.map((b) => b.pool),
-        storage_backends: PROD_STORAGE,
-      },
+      // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
+      capabilities: openstackCheck({ kind: 'rhoso', role: 'destination', release: null, policy_profile: null }, PROD_STORAGE),
       status: 'ok',
       status_message: 'All services healthy; OVN networking.',
       last_checked_at: iso(now - 3 * 60_000),
       distribution: 'rhoso',
+      release: null,
+      policy_profile: null,
       credentials_updated_at: null,
       conversion_key_updated_at: null,
     },
@@ -578,6 +617,31 @@ export function buildProviders(now: number): Provider[] {
       status_message: null,
       last_checked_at: null,
       distribution: 'rhoso',
+      release: null,
+      policy_profile: null,
+      credentials_updated_at: null,
+      conversion_key_updated_at: null,
+    },
+    {
+      // the API demo's community destination (SDD §10, plan T9): a Kolla-Ansible 2026.2 cloud
+      id: 'hibiscus-dc3',
+      name: 'OpenStack 2026.2 Hibiscus (DC3)',
+      kind: 'openstack',
+      role: 'destination',
+      endpoint: 'https://keystone.dc3.example.com:5000/v3',
+      cloud: 'hibiscus',
+      credentials_secret: null,
+      region: 'RegionOne',
+      verify_tls: true,
+      ca_cert_path: null,
+      conversion_host: conversionHost('os-migrate-conv-dc3', '192.0.2.60'),
+      capabilities: openstackCheck({ kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null }, DC3_STORAGE),
+      status: 'ok',
+      status_message: 'All services reachable; series 2026.2 (Hibiscus) detected.',
+      last_checked_at: iso(now - 6 * 60_000),
+      distribution: 'kolla',
+      release: '2026.2',
+      policy_profile: null,
       credentials_updated_at: null,
       conversion_key_updated_at: null,
     },
@@ -818,10 +882,24 @@ const NETWORK_REMEDIATION = {
     "Send the NIC to a name one RHOSO network carries: one of the credential's project, or the only one of that name - map its network to such a name, or rename one of the networks.",
   NET_ADDRESS_REFUSED:
     'Give the NIC an address its RHOSO network takes: map its network to one whose subnets hold it, or set the address in a NIC override; for a SLAAC address keep the MAC (port_creation_mode "neutron").',
-  // the API's remediation under the legacy profile, the rule this mock judges by (until T8)
-  NET_PORT_NOT_PERMITTED:
-    "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared network takes it once the destination credential has the advsvc role (Neutron's legacy rules). An external network that is not shared needs the admin role: Nova attaches it for no other.",
 };
+
+/** What lets another project's shared network take the port, by the destination's policy profile: the API's _PORT_ROLE_ADVICE (SDD §21.5). */
+const PORT_ROLE_ADVICE: Record<PolicyProfile, string> = {
+  secure_rbac: "the destination credential has the service role for the migration window (Neutron's secure-RBAC defaults); admin is not needed for this",
+  legacy: "the destination credential has the advsvc role (Neutron's legacy rules)",
+  unknown: "the provider declares its policy profile or series, so the check counts that profile's role: service under secure-RBAC, advsvc under the legacy rules",
+};
+
+/** NET_PORT_NOT_PERMITTED's remediation for the destination's policy profile: the API's _port_remediation (review RV18-10). */
+function portRemediation(profile: string | undefined): string {
+  const counted: PolicyProfile = profile === undefined ? 'legacy' : profile in PORT_ROLE_ADVICE ? (profile as PolicyProfile) : 'unknown';
+  return (
+    "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. " +
+    `Another project's shared network takes it once ${PORT_ROLE_ADVICE[counted]}. ` +
+    'An external network that is not shared needs the admin role: Nova attaches it for no other.'
+  );
+}
 
 /** Like the API (SDD §9.3): every entry of the VM checked before anything stops, with the API's messages. */
 function nicOverrideFindings(
@@ -895,7 +973,7 @@ export function preflight(
   destinationNetworks: Record<string, number | null>,
   selectedNames: string[],
   /** The destination's subnets, its networks with their owners, its token's roles and the plan's VMs, for the NIC checks (SDD §9.3). */
-  context: { subnets?: DestinationSubnet[]; selected?: VMRef[]; networkDetails?: DestinationNetwork[]; roles?: string[] } = {},
+  context: { subnets?: DestinationSubnet[]; selected?: VMRef[]; networkDetails?: DestinationNetwork[]; roles?: string[]; profile?: string } = {},
 ): Finding[] {
   const findings: Finding[] = [];
   const add = (code: string, severity: Finding['severity'], message: string, remediation: string | null, strategies: Strategy[] = []) =>
@@ -928,11 +1006,11 @@ export function preflight(
   const denied: string[] = [];
   for (const nic of vm.nics) {
     const network = resolved.get(nic);
-    const why = network ? portRefusal(network, context.roles) : null;
+    const why = network ? portRefusal(network, context.roles, context.profile) : null;
     if (network && why) denied.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)} (project ${network.project_id ?? 'None'}): ${why}`);
   }
   if (denied.length)
-    add('NET_PORT_NOT_PERMITTED', 'blocker', `The RHOSO credential may not put these NICs on their network: ${denied.join('; ')}.`, NETWORK_REMEDIATION.NET_PORT_NOT_PERMITTED);
+    add('NET_PORT_NOT_PERMITTED', 'blocker', `The RHOSO credential may not put these NICs on their network: ${denied.join('; ')}.`, portRemediation(context.profile));
   // a network RHOSO lacks, as the API words it (SDD §9.3): a NIC its override sends elsewhere is checked by
   // MAP_NIC_OVERRIDE_INVALID; pre-staging creates same-named networks for OpenStack sources only - the VMware kit has
   // no pre-stage step (§4.2, §7.2); nothing creates a network under a mapping's target name

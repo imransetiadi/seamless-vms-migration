@@ -857,6 +857,31 @@ describe('MigrationDetail', () => {
     );
   });
 
+  it("judges another project's network by the destination's policy profile, as the API does (SDD §16, §21.5; plan T8)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const destination = server.providers.find((p) => p.id === 'rhoso-prod')!;
+    // a secure-RBAC destination: the service role takes the port, advsvc no longer
+    destination.capabilities = { ...destination.capabilities, policy_profile: 'secure_rbac', roles: ['service', 'member'] };
+    const view = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    let panel = await screen.findByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
+    let select = within(await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` })).getAllByRole('combobox')[0]!;
+    expect(await within(select).findByRole('option', { name: "provider-ext (another project's)" })).toBeInTheDocument();
+    view.unmount();
+    destination.capabilities = { ...destination.capabilities, roles: ['advsvc', 'member'] };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    panel = await screen.findByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
+    select = within(await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` })).getAllByRole('combobox')[0]!;
+    expect(await within(select).findByRole('option', { name: 'provider-ext (not allowed)' })).toBeInTheDocument();
+    await user.selectOptions(select, 'provider-ext');
+    expect(select).toHaveAccessibleDescription(
+      "The RHOSO credential may not put a port on provider-ext (project admin): Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither. Validation refuses it.",
+    );
+  });
+
   it("keeps an override's network that RHOSO no longer lists selected, marked so (SDD §16)", async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

@@ -1,4 +1,4 @@
-import { ArrowRight, Check, HardDrive, KeyRound, Minus, Pencil, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react';
+import { ArrowRight, Check, HardDrive, KeyRound, Minus, Pencil, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useCheckAllProviders, useCheckProvider, useDeleteProvider, usePlans, useProviders } from '../api/hooks';
@@ -18,13 +18,17 @@ import { formatDateTime, formatRelative } from '../lib/format';
 import { deleteRefusal, plansThatNeed } from '../lib/providerUse';
 import { hasRole } from '../lib/roles';
 import { presetFor } from '../lib/distributions';
+import { policyProfileOf } from '../lib/networks';
+import { plainHttpText, profileText, rangeText, seriesText, tierText, type SupportTier } from '../lib/platforms';
 import { storageBackends, storageSummary } from '../lib/storage';
 import { providerStatusMeta } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 
 const CAPABILITY_LABELS: Record<string, string> = {
   admin: 'Admin access',
+  roles: 'Token roles',
   compute_microversion: 'Compute API',
+  block_storage_microversion: 'Block storage API',
   ovn: 'OVN networking',
   volume_backends: 'Volume backends',
   storage_backends: 'Storage',
@@ -33,10 +37,21 @@ const CAPABILITY_LABELS: Record<string, string> = {
   datastores: 'Datastores',
 };
 
+/** The check-report keys the card shows in its own rows: a destination's series, tier and profile, and TLS (SDD §10, §16). */
+const SHOWN_IN_ROWS = new Set(['release_range', 'release', 'support_tier', 'policy_profile', 'tls', 'plain_http']);
+
 function Capabilities({ capabilities }: { capabilities: Record<string, unknown> }) {
-  // storage_backends (SDD §10) supersedes the plain pool-name list and is shown by driver family
+  // storage_backends (SDD §10) supersedes the plain pool-name list and is shown by driver family; a value the card
+  // cannot say in words - an object, or none - is left out, never printed as "[object Object]" or "null" (RV18-08)
   const hasStorage = Array.isArray(capabilities.storage_backends);
-  const entries = Object.entries(capabilities).filter(([key]) => !(hasStorage && key === 'volume_backends'));
+  const entries = Object.entries(capabilities).filter(
+    ([key, value]) =>
+      !(hasStorage && key === 'volume_backends') &&
+      !SHOWN_IN_ROWS.has(key) &&
+      value !== null &&
+      value !== undefined &&
+      (key === 'storage_backends' || Array.isArray(value) || typeof value !== 'object'),
+  );
   if (entries.length === 0) {
     return <p className="text-sm text-muted-foreground">No capabilities reported yet. Run a check to see them.</p>;
   }
@@ -69,6 +84,87 @@ function Capabilities({ capabilities }: { capabilities: Record<string, unknown> 
         );
       })}
     </ul>
+  );
+}
+
+/** A warning under a card row, in the row's words (SDD §16). */
+function RowWarning({ children }: { children: string }) {
+  return (
+    <span className="mt-0.5 flex items-start gap-1 text-xs text-status-warning">
+      <TriangleAlert aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+      <span>{children}</span>
+    </span>
+  );
+}
+
+/** The support tier the check reports, when it reports one (since 0.2.0, SDD §10.1). */
+function reportedTier(capabilities: Record<string, unknown>): SupportTier | null {
+  const tier = capabilities.support_tier;
+  return tier && typeof tier === 'object' && typeof (tier as SupportTier).tier === 'string' ? (tier as SupportTier) : null;
+}
+
+/**
+ * A destination's series, support tier and policy profile, as its check reports them (SDD §10.1, §16): the declared
+ * series, else the detected range, with codenames; the tier in words; and a warning when the APIs contradict the
+ * declared series or the profile is unknown.
+ */
+function DestinationRows({ provider }: { provider: Provider }) {
+  const caps = provider.capabilities;
+  const tier = reportedTier(caps);
+  if (!tier) {
+    return (
+      <>
+        <dt className="text-muted-foreground">Series</dt>
+        <dd>
+          {provider.release ? (
+            <>
+              {seriesText(provider.release)} <span className="text-xs text-muted-foreground">declared, not checked yet</span>
+            </>
+          ) : (
+            <span className="text-muted-foreground">Run a check to detect it</span>
+          )}
+        </dd>
+      </>
+    );
+  }
+  const settled = typeof caps.release === 'string' ? caps.release : null;
+  const range = Array.isArray(caps.release_range) ? caps.release_range.map(String) : [];
+  const detected = settled === null ? rangeText(range) : null;
+  const profile = policyProfileOf(caps, provider);
+  const warn = tier.tier === 'tier3' || tier.tier === 'outside';
+  return (
+    <>
+      <dt className="text-muted-foreground">Series</dt>
+      <dd className="min-w-0 wrap-break-word">
+        {settled !== null ? (
+          <>
+            {seriesText(settled)} <span className="text-xs text-muted-foreground">{settled === provider.release ? 'declared' : 'detected'}</span>
+          </>
+        ) : detected !== null ? (
+          <>
+            {detected} <span className="text-xs text-muted-foreground">detected</span>
+          </>
+        ) : (
+          <span className="text-muted-foreground">Not detected</span>
+        )}
+        {tier.declared_outside_range && provider.release && (
+          <RowWarning>{`Declared ${seriesText(provider.release)}, which its APIs contradict: correct the declared series, or clear it so the check detects the series.`}</RowWarning>
+        )}
+      </dd>
+      <dt className="text-muted-foreground">Support tier</dt>
+      <dd className={cn(warn && 'text-status-warning')}>{tierText(tier)}</dd>
+      <dt className="text-muted-foreground">Policy profile</dt>
+      <dd className="min-w-0 wrap-break-word">
+        {profile === 'unknown' ? (
+          <>
+            <span className="text-status-warning">{profileText(profile)}.</span>{' '}
+            <RowWarning>Declare the policy profile or the series: until then only the admin role may put a port on another project&apos;s network.</RowWarning>
+          </>
+        ) : (
+          profileText(profile)
+        )}
+      </dd>
+    </>
   );
 }
 
@@ -155,7 +251,7 @@ function ProviderCard({
           <CredentialState provider={provider} />
         </dd>
         <dt className="text-muted-foreground">TLS</dt>
-        <dd>
+        <dd className="min-w-0 wrap-break-word">
           {provider.verify_tls ? (
             <span className="inline-flex items-center gap-1">
               <ShieldCheck aria-hidden className="size-3.5 text-status-success" />
@@ -167,7 +263,12 @@ function ProviderCard({
               Verification off
             </span>
           )}
+          {/* the endpoints the check found on plain HTTP (SDD §10, Security.md) */}
+          {Array.isArray(provider.capabilities.plain_http) && provider.capabilities.plain_http.length > 0 && (
+            <RowWarning>{`Plain HTTP: ${plainHttpText(provider.capabilities.plain_http.map(String))}. Credentials travel unencrypted: use HTTPS outside a lab.`}</RowWarning>
+          )}
         </dd>
+        {provider.role === 'destination' && provider.kind !== 'vmware' && <DestinationRows provider={provider} />}
         <dt className="text-muted-foreground">Conversion host</dt>
         <dd className="min-w-0 wrap-break-word">
           {ch ? (

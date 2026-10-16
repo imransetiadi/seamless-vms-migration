@@ -14,7 +14,7 @@ import { DEFAULT_API_BASE } from './client';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { canTransition, hasDataPath } from '../lib/fsm';
 import { guestOsOf } from '../lib/guestOs';
-import { capabilityRoles } from '../lib/networks';
+import { capabilityRoles, policyProfileOf } from '../lib/networks';
 import { canonicalIp, isIpAddress } from '../lib/nics';
 import { blocksPlanChange, inFlightRefusal } from '../lib/inFlight';
 import { countedApprovals } from '../lib/migrationActions';
@@ -42,6 +42,8 @@ import {
   strategyRecommendation,
   strategySnapshot,
   type StrategyDecision,
+  CHECKED_STORAGE,
+  openstackCheck,
 } from './mockData';
 import { buildStrategyEvidence, evidenceCount } from './mockEvidence';
 import { derivePlanStatus } from './mockPlanStatus';
@@ -571,7 +573,7 @@ function checkSecretNames(input: Record<string, unknown>, fields: Set<string>, p
   }
 }
 
-const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution']);
+const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile']);
 const DISTRIBUTION_KIND: Record<string, string> = { openstack_community: 'openstack', kolla: 'openstack', rhosp: 'openstack', rhoso: 'rhoso', vmware: 'vmware' };
 
 function checkDistribution(input: Record<string, unknown> | Provider) {
@@ -579,6 +581,24 @@ function checkDistribution(input: Record<string, unknown> | Provider) {
   const kind = (input as Record<string, unknown>).kind;
   if (distribution && DISTRIBUTION_KIND[String(distribution)] !== kind) {
     throw new HttpError(422, 'validation_error', `distribution ${String(distribution)} belongs to kind ${DISTRIBUTION_KIND[String(distribution)] ?? 'unknown'}, not ${String(kind)}`);
+  }
+}
+
+/** A declared series and policy profile, as the API's Provider validates them (SDD §4.2): OpenStack's alone. */
+function checkDeclarations(input: Record<string, unknown> | Provider) {
+  const fields = input as Record<string, unknown>;
+  const release = fields.release;
+  if (release !== undefined && release !== null && !(typeof release === 'string' && /^20[0-9]{2}\.[12]$/.test(release))) {
+    throw new HttpError(422, 'validation_error', "release: String should match pattern '^20[0-9]{2}\\.[12]$'");
+  }
+  const profile = fields.policy_profile;
+  if (profile !== undefined && profile !== null && profile !== 'secure_rbac' && profile !== 'legacy') {
+    throw new HttpError(422, 'validation_error', "policy_profile: Input should be 'secure_rbac' or 'legacy'");
+  }
+  if (fields.kind === 'vmware') {
+    for (const name of ['release', 'policy_profile']) {
+      if (fields[name] !== undefined && fields[name] !== null) throw new HttpError(422, 'validation_error', `${name}: an OpenStack ${name} cannot be declared for vmware`);
+    }
   }
 }
 
@@ -1055,9 +1075,11 @@ export class MockServer {
     const subnets = dst && !Array.isArray(dst) ? (dst.subnets ?? []) : [];
     const networkDetails = dst && !Array.isArray(dst) ? dst.network_details : undefined;
     const selected = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm);
-    // the destination's token roles, as its check reported them (SDD §9.3, §10)
+    // the destination's token roles, as its check reported them, and its policy profile - a report that names none
+    // reads the provider's declarations (SDD §9.3, §10, §21.5)
     const roles = capabilityRoles(destination.capabilities);
-    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails, roles });
+    const profile = policyProfileOf(destination.capabilities, destination);
+    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails, roles, profile });
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings);
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
@@ -1306,8 +1328,12 @@ export class MockServer {
             } else {
               provider.status = 'ok';
               provider.status_message = 'All services reachable.';
-              // an OpenStack check also reports its token's roles (SDD §10)
-              provider.capabilities = { admin: true, ...(provider.kind === 'vmware' ? {} : { roles: ['admin', 'member', 'reader'] }), compute_microversion: '2.95', ovn: true, volume_backends: ['ceph-ssd'] };
+              // an OpenStack check reports the API's keys: its token's roles, its maxima, TLS, and a destination's
+              // series, tier and policy profile by what it declares (SDD §10, §10.1)
+              provider.capabilities =
+                provider.kind === 'vmware'
+                  ? { admin: true, compute_microversion: '2.95', ovn: true, volume_backends: ['ceph-ssd'] }
+                  : openstackCheck(provider, CHECKED_STORAGE);
             }
           }
           this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name}: ${provider.status}`, data: { status: provider.status } });
@@ -1632,6 +1658,7 @@ export class MockServer {
       throw new HttpError(409, 'conflict', `provider id '${id}' would share a secret with provider '${clash.id}': Seamless stores a provider's secrets as provider-<id> and provider-<id>-ssh`);
     }
     checkDistribution(input);
+    checkDeclarations(input);
     checkSecretNames(input, new Set(['credentials_secret', 'conversion_host']), id);
     const defaults: Partial<Provider> = {
       cloud: null,
@@ -1641,6 +1668,8 @@ export class MockServer {
       ca_cert_path: null,
       conversion_host: null,
       distribution: null,
+      release: null,
+      policy_profile: null,
     };
     const provider = {
       ...defaults,
@@ -1666,6 +1695,7 @@ export class MockServer {
     );
     if (users.length) throw new HttpError(409, 'conflict', `provider is used by running or paused plan(s): ${users.map((p) => p.id).join(', ')}`);
     checkDistribution({ ...provider, ...input });
+    checkDeclarations({ ...provider, ...input });
     checkSecretNames(input, new Set(Object.keys(input)), provider.id);
     Object.assign(provider, input, { status: 'unknown', status_message: null, last_checked_at: null, capabilities: {} });
     this.emit({ kind: 'provider.updated', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} updated`, data: { provider_id: provider.id, fields: Object.keys(input).sort() } });

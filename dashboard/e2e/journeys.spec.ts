@@ -277,6 +277,24 @@ for (const [width, height] of [
   });
 }
 
+test("a community destination shows its series, tier and profile; a declared series its APIs contradict is flagged (SDD §16; plan T8)", async ({ page }) => {
+  await signIn(page, 'admin');
+  await page.goto('/providers');
+  const card = page.getByRole('article', { name: 'OpenStack 2026.2 Hibiscus (DC3)' });
+  const row = (term: string) => card.locator('dt', { hasText: term }).locator('xpath=following-sibling::dd[1]');
+  await expect(row('Series')).toHaveText(/^2026\.2 Hibiscus\s*declared$/);
+  await expect(row('Support tier')).toHaveText('Tier 1');
+  await expect(row('Policy profile')).toHaveText('Secure RBAC defaults');
+  // the operator declares a series its APIs do not run, then checks: the card says so, and the tier stays the APIs'
+  await card.getByRole('button', { name: /^edit /i }).click();
+  const dialog = page.getByRole('dialog', { name: /^edit openstack 2026\.2 hibiscus/i });
+  await dialog.getByLabel('Release series').selectOption('2024.1');
+  await dialog.getByRole('button', { name: 'Save and test connection' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: /^done$/i }).click();
+  await expect(row('Series')).toContainText('Declared 2024.1 Caracal, which its APIs contradict');
+  await expect(row('Support tier')).toHaveText('Tier 1');
+});
+
 test('on a phone the lifecycle reads down two columns, half the height of one (SDD §16)', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await signIn(page, 'viewer');
