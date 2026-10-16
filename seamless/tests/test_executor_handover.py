@@ -4,6 +4,7 @@ import gc
 import json
 import re
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -12,7 +13,7 @@ import pytest
 
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy
-from seamless_migrate.domain.models import HandoverConfig, Mappings
+from seamless_migrate.domain.models import HandoverConfig, Mappings, utcnow
 from seamless_migrate.executors import handover as handover_module
 from seamless_migrate.executors.base import PermanentStepError, StepName, TransientStepError
 from seamless_migrate.executors.handover import (
@@ -871,6 +872,85 @@ def test_every_handover_call_in_a_thread_outlives_a_cancel():
         and id(n) not in inside
     ]
     assert direct == []
+
+
+class Credentialed:
+    """A cloud reached with one credential: once it is revoked, every call is refused, as Keystone
+    refuses to authenticate a rotated password again."""
+
+    def __init__(self, cloud, secret, revoked):
+        self.cloud, self.secret, self.revoked, self.closed = cloud, secret, revoked, False
+
+    def close(self):
+        self.closed = True
+
+    def __getattr__(self, name):
+        target = getattr(self.cloud, name)
+        if name not in ("compute", "block_storage", "network"):
+            return target
+        session = self
+
+        class Service:
+            def __getattr__(self, attr):
+                call = getattr(target, attr)
+
+                def guarded(*args, **kwargs):
+                    if session.secret in session.revoked:
+                        raise HTTPError("HTTP 401 Unauthorized: authentication required")
+                    return call(*args, **kwargs)
+
+                return guarded
+
+        return Service()
+
+
+async def test_a_handover_reconnects_once_its_providers_credentials_were_rotated(tmp_path):
+    """SDD §10, §13.3: credentials are rotated while a plan runs (PUT .../credentials, the old
+    password revoked). The handover's next step connects with the new ones, as the provider
+    registry does, and closes the old connection - so the rollback of a cutover that failed after
+    it deleted the source still rebuilds it. A change of state alone reconnects nothing (audit
+    EX-14)."""
+    _, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
+    revoked: set[str] = set()
+    built: list[Credentialed] = []
+
+    def connect(provider):
+        built.append(Credentialed(clouds[provider.cloud], provider.credentials_secret, revoked))
+        return built[-1]
+
+    executor = HandoverExecutor(settings, conn_factory=connect, poll_s=0)
+    old_src, old_dst = (
+        SRC.model_copy(update={"credentials_secret": "v1"}),
+        DST.model_copy(update={"credentials_secret": "v1"}),
+    )
+    with pytest.raises(PermanentStepError, match="create the server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, old_src, old_dst, settings)[0])
+    assert ("src", "delete_server", "srv-1") in calls and len(built) == 2
+    checked = {"status": "ok", "last_checked_at": utcnow()}
+    await executor._conn(old_src.model_copy(update=checked))
+    assert len(built) == 2, "a provider's state is not how it is reached"
+    revoked.add("v1")
+    rotated = {"credentials_secret": "v2", "credentials_updated_at": utcnow()}
+    src, dst = old_src.model_copy(update=rotated), old_dst.model_copy(update=rotated)
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, src, dst, settings)[0])
+    assert result.details["vm"]["source_id"] == "src-new-1"
+    assert [c.secret for c in built] == ["v1", "v1", "v2", "v2"]
+    assert [c.closed for c in built] == [True, True, False, False]
+
+
+async def test_two_handover_steps_reaching_a_provider_at_once_share_one_connection(tmp_path):
+    """Two migrations' steps reach the same provider at once: one connection is built and both use
+    it - none is built twice and left open (audit EX-14)."""
+    built = []
+
+    def connect(provider):
+        time.sleep(0.1)  # keystoneauth signs in
+        built.append(provider.id)
+        return NS(close=lambda: None)
+
+    executor = HandoverExecutor(Settings(data_dir=tmp_path), conn_factory=connect, poll_s=0)
+    first, second = await asyncio.gather(executor._conn(SRC), executor._conn(SRC))
+    assert first is second and built == [SRC.id]
 
 
 async def test_handover_rollback_reverses_order(tmp_path):

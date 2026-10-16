@@ -13,6 +13,7 @@ No data is copied in either direction.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from ..domain.models import Mappings, Plan, Provider, utcnow
 from ..planning.ipam import address_refusal, requested_ips
 from ..planning.networks import policy_profile_of, port_refusal_at_run
 from ..providers.base import microversion_text
+from ..providers.registry import connection_fingerprint
 from ..storage import (
     StorageError,
     manage_reference,
@@ -246,7 +248,9 @@ class HandoverExecutor:
     ) -> None:
         self.settings = settings
         self._conn_factory = conn_factory or self._default_conn
-        self._conns: dict[str, Any] = {}
+        #: per provider id: the fingerprint a connection was built for, and the connection
+        self._conns: dict[str, tuple[str, Any]] = {}
+        self._conns_lock = asyncio.Lock()
         self.poll_s = poll_s
         self.wait_s = wait_s
 
@@ -265,9 +269,20 @@ class HandoverExecutor:
         return run_dir(self.settings, ctx.plan.id, ctx.migration.id)
 
     async def _conn(self, provider: Provider) -> Any:
-        if provider.id not in self._conns:
-            self._conns[provider.id] = await _in_thread(self._conn_factory, provider)
-        return self._conns[provider.id]
+        """The provider's connection, built again once how it is reached changed - a credential
+        rotated while a plan runs (SDD §13.3) - as the provider registry does (audit EX-14)."""
+        fingerprint = connection_fingerprint(provider, self.settings)
+        async with self._conns_lock:
+            cached = self._conns.get(provider.id)
+            if cached is not None and cached[0] == fingerprint:
+                return cached[1]
+            conn = await _in_thread(self._conn_factory, provider)
+            self._conns[provider.id] = (fingerprint, conn)
+        close = getattr(cached[1], "close", None) if cached is not None else None
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()  # the replaced connection must not keep its session
+        return conn
 
     async def _call(self, what: str, fn: Callable[[], T]) -> T:
         try:
