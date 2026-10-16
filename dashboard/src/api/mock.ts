@@ -42,8 +42,7 @@ import {
   strategyRecommendation,
   strategySnapshot,
   type StrategyDecision,
-  CHECKED_STORAGE,
-  openstackCheck,
+  checkOf,
 } from './mockData';
 import { buildStrategyEvidence, evidenceCount } from './mockEvidence';
 import { derivePlanStatus } from './mockPlanStatus';
@@ -1333,7 +1332,7 @@ export class MockServer {
               provider.capabilities =
                 provider.kind === 'vmware'
                   ? { admin: true, compute_microversion: '2.95', ovn: true, volume_backends: ['ceph-ssd'] }
-                  : openstackCheck(provider, CHECKED_STORAGE);
+                  : checkOf(provider);
             }
           }
           this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name}: ${provider.status}`, data: { status: provider.status } });

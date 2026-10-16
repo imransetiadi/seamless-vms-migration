@@ -360,7 +360,7 @@ const MAXIMA = { source: ['2.88', '3.64'], rhoso: ['2.95', '3.70'], openstack: [
  * its token's roles, its services' maxima, its storage pools and TLS; a destination's adds its series, support tier and
  * policy profile, by its maxima and what it declares (§10.1).
  */
-export function openstackCheck(
+function openstackCheck(
   provider: Pick<Provider, 'kind' | 'role' | 'release' | 'policy_profile'>,
   storage: ReturnType<typeof backend>[],
   extra: Record<string, unknown> = {},
@@ -382,8 +382,25 @@ export function openstackCheck(
   };
 }
 
-/** The storage pools a provider the mock's check reports on first lists (SDD §7.3.1). */
+/** The storage pools a provider the demo did not seed lists when the mock's check reads it (SDD §7.3.1). */
 export const CHECKED_STORAGE = [backend('hostgroup@ceph-ssd#ceph-ssd', 'rbd')];
+
+/**
+ * What the mock's check reads from each seeded cloud: its pools, and any key it reports otherwise. The seed and every
+ * later check report the same, as the API demo's fakes do, so a report a reset cleared reads back unchanged (SDD §10, §12;
+ * review RV19-02).
+ */
+const CLOUDS: Record<string, { storage: ReturnType<typeof backend>[]; extra?: Record<string, unknown> }> = {
+  'rhosp17-dc1': { storage: DC1_STORAGE, extra: { ovn: false } },
+  'rhoso-prod': { storage: PROD_STORAGE },
+  'hibiscus-dc3': { storage: DC3_STORAGE },
+};
+
+/** An OpenStack or RHOSO provider's check report, as the mock's check reads its cloud: the seeded cloud's own pools, else CHECKED_STORAGE. */
+export function checkOf(provider: Pick<Provider, 'id' | 'kind' | 'role' | 'release' | 'policy_profile'>): Record<string, unknown> {
+  const cloud = CLOUDS[provider.id];
+  return openstackCheck(provider, cloud?.storage ?? CHECKED_STORAGE, cloud?.extra);
+}
 
 export function makeVm(spec: VmSpec): VMRef {
   const disks: Disk[] = spec.disks.map((d, i) => {
@@ -503,7 +520,7 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/dc1-ca.pem',
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
-      capabilities: openstackCheck({ kind: 'openstack', role: 'source', release: null, policy_profile: null }, DC1_STORAGE, { ovn: false }),
+      capabilities: checkOf({ id: 'rhosp17-dc1', kind: 'openstack', role: 'source', release: null, policy_profile: null }),
       status: 'ok',
       status_message: 'Keystone, Nova, Cinder, Neutron and Glance reachable.',
       last_checked_at: iso(now - 4 * 60_000),
@@ -592,7 +609,7 @@ export function buildProviders(now: number): Provider[] {
       ca_cert_path: '/etc/pki/seamless/ocp-ingress-ca.pem',
       conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31'),
       // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
-      capabilities: openstackCheck({ kind: 'rhoso', role: 'destination', release: null, policy_profile: null }, PROD_STORAGE),
+      capabilities: checkOf({ id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null }),
       status: 'ok',
       status_message: 'All services healthy; OVN networking.',
       last_checked_at: iso(now - 3 * 60_000),
@@ -637,7 +654,7 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: null,
       conversion_host: conversionHost('os-migrate-conv-dc3', '192.0.2.60'),
-      capabilities: openstackCheck({ kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null }, DC3_STORAGE),
+      capabilities: checkOf({ id: 'hibiscus-dc3', kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null }),
       status: 'ok',
       status_message: 'All services reachable; series 2026.2 (Hibiscus) detected.',
       last_checked_at: iso(now - 6 * 60_000),

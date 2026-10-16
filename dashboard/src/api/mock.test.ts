@@ -2496,6 +2496,33 @@ describe('providers of community destinations, like the API (SDD §4.2, §10, §
     for (const p of checked) expect(keysOf(p.capabilities)).toEqual([...CHECK_KEYS.openstack, ...(p.role === 'destination' ? CHECK_KEYS.destination : [])].sort());
   });
 
+  it("a check after new credentials reports the pools the provider's cloud has, as the API demo does (review RV19-02)", () => {
+    const { server } = setup('admin');
+    const rhoso = () => server.providers.find((p) => p.id === 'rhoso-prod')!;
+    const seeded = rhoso().capabilities.storage_backends;
+    // the analytics plan's Spark nodes, handed over to rhoso-prod's pools (SDD §7.3.1)
+    const spark = () =>
+      server.migrations
+        .filter((m) => m.plan_id === 'plan-c81d44a0' && m.vm.name !== 'analytics-db')
+        .map((m) => [m.vm.name, m.estimates.find((e) => e.strategy === 'storage_handover')?.reasons ?? ['no estimate']] as const);
+    // new credentials reset the report (SDD §12); the check reads the cloud again, whose pools did not change
+    expect(call(server, 'PUT', '/providers/rhoso-prod/credentials', { username: 'u', password: 'p', project_name: 'x' })).toMatchObject({
+      status: 200,
+      body: { status: 'unknown', capabilities: {} },
+    });
+    expect(call(server, 'POST', '/providers/rhoso-prod/check').status).toBe(200);
+    expect(rhoso().capabilities.storage_backends).toEqual(seeded);
+    expect(call(server, 'POST', '/plans/plan-c81d44a0/validate').status).toBe(200);
+    expect(spark().length).toBeGreaterThan(0);
+    expect(spark().filter(([, reasons]) => reasons.length)).toEqual([]);
+    // the source keeps its own report too: its pools, and OVN off
+    expect(call(server, 'PUT', '/providers/rhosp17-dc1/credentials', { username: 'u', password: 'p', project_name: 'x' }).status).toBe(200);
+    expect(call(server, 'POST', '/providers/rhosp17-dc1/check').status).toBe(200);
+    const source = server.providers.find((p) => p.id === 'rhosp17-dc1')!.capabilities;
+    expect(source).toMatchObject({ ovn: false });
+    expect((source.storage_backends as { pool: string }[]).map((b) => b.pool)).toContain('overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1');
+  });
+
   it('takes a declared series and policy profile, and refuses them where the API does (SDD §4.2, §12)', () => {
     const { server } = setup('admin');
     const dst = { ...base, id: 'dc4', name: 'DC4', kind: 'openstack', role: 'destination', distribution: 'openstack_community' };
