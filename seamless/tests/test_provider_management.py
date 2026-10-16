@@ -8,6 +8,7 @@ import logging
 import os
 import stat
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 import pytest
@@ -483,6 +484,28 @@ def test_a_secret_managed_outside_seamless_can_be_named(api):
     assert patched.status_code == 200, patched.text
     assert patched.json()["conversion_host"]["ssh_key_secret"] == "conv-key"
     assert patched.json()["credentials_secret"] == "osp-src"
+
+
+CREDENTIAL_BODY_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "credential_body_cases.json").read_text(encoding="utf-8")
+)["cases"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    CREDENTIAL_BODY_CASES,
+    ids=[f"{c['route']} {c['provider']}: {c['note']}" for c in CREDENTIAL_BODY_CASES],
+)
+def test_a_credential_body_is_judged_before_the_provider_is_looked_up(api, case):
+    """SDD §12, §13.3 (review RV23-03): PUT /providers/{id}/credentials and /conversion-key refuse
+    what their body alone gets wrong (422) before they look the provider up (404), for a provider
+    they do not know too - the cases the dashboard's mock answers the same way
+    (credential_body_cases.json)."""
+    provider = "src-osp" if case["provider"] == "known" else case["provider"]
+    answer = put(api, f"/api/v1/providers/{provider}/{case['route']}", case["body"])
+    assert answer.status_code == case["status"], answer.text
+    if case["message"] is not None:
+        assert answer.json()["error"]["message"] == case["message"]
 
 
 def test_conversion_key_is_write_only(api):

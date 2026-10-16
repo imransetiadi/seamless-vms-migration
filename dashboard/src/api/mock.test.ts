@@ -5,6 +5,8 @@ import checkKeysRaw from '../../../seamless/tests/fixtures/check_report_keys.jso
 import nameRaw from '../../../seamless/tests/fixtures/provider_name_cases.json?raw';
 // what GET /advisor/data-sent lists: the API's own list, which the mock serves too (SDD §13.4)
 import dataSentRaw from '../../../seamless/tests/fixtures/data_sent.json?raw';
+// what PUT /providers/{id}/credentials and /conversion-key answer for a body: one case table for the API and the mock
+import credentialBodyRaw from '../../../seamless/tests/fixtures/credential_body_cases.json?raw';
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
@@ -41,6 +43,12 @@ const NOW = Date.parse('2026-10-08T12:00:00Z');
 const CHECK_KEYS = JSON.parse(checkKeysRaw) as { openstack: string[]; destination: string[] };
 const NAME_CASES = (
   JSON.parse(nameRaw) as { cases: Array<{ route: 'POST' | 'PATCH'; body: { name?: unknown }; status: number; message: string | null; note: string }> }
+).cases;
+
+const CREDENTIAL_BODY_CASES = (
+  JSON.parse(credentialBodyRaw) as {
+    cases: Array<{ note: string; route: 'credentials' | 'conversion-key'; provider: string; body: Record<string, unknown>; status: number; message: string | null }>;
+  }
 ).cases;
 
 function setup(token: string | null = 'admin') {
@@ -384,6 +392,17 @@ describe('mock API', () => {
       { provider_id: id, secret: `provider-${id}-ssh`, keys: ['private_key'] },
     ]);
   });
+
+  it.each(CREDENTIAL_BODY_CASES.map((c) => [`${c.route} ${c.provider}: ${c.note}`, c] as const))(
+    "judges a credential body before it looks the provider up, as the API: %s (SDD §12, §13.3, review RV23-03)",
+    (_name, c) => {
+      const server = new MockServer({ now: () => NOW, seed: 1 });
+      const id = c.provider === 'known' ? server.providers.find((p) => p.kind === 'openstack')!.id : c.provider;
+      const res = server.handle('PUT', `/providers/${id}/${c.route}`, new URLSearchParams(), c.body, 'admin');
+      const message = res.status < 300 ? null : (res.body as { error: { message: string } }).error.message;
+      expect({ status: res.status, message: c.message === null ? null : message }).toEqual({ status: c.status, message: c.message });
+    },
+  );
 
   it("answers a PATCH of an unknown provider in the API's order: what its body alone refuses before the 404 (SDD §4.2, §12, review RV22-07)", () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });

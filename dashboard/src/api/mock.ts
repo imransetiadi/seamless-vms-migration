@@ -116,6 +116,53 @@ interface MockResponse {
   text?: string;
 }
 
+/** The fields of PUT /providers/{id}/credentials, as the API's ProviderCredentialsRequest: in its order, each with its longest value. */
+const CREDENTIAL_FIELDS: ReadonlyArray<readonly [string, number | null]> = [
+  ['auth_url', 2048],
+  ['username', 256],
+  ['password', 4096],
+  ['project_name', 256],
+  ['user_domain_name', 256],
+  ['project_domain_name', 256],
+  ['application_credential_id', 256],
+  ['application_credential_secret', 4096],
+  ['interface', null],
+  ['datacenter', 256],
+];
+
+/**
+ * What a PUT of a provider's credentials or conversion key refuses from its body alone, before it looks the provider up, as the
+ * API's request models (extra fields forbidden): worded as its validation_message over pydantic's errors - the model's fields
+ * in their order, then the extra inputs, five at most; a length counts code points (SDD §12, §13.3, review RV23-03).
+ */
+function refuseCredentialBody(route: 'credentials' | 'conversion-key', input: Record<string, unknown>): void {
+  const fields = route === 'credentials' ? CREDENTIAL_FIELDS : ([['private_key', 16384]] as const);
+  const problems: string[] = [];
+  for (const [key, longest] of fields) {
+    const value = input[key];
+    if (!Object.hasOwn(input, key)) {
+      // every credential is optional; the conversion key is not
+      if (route === 'conversion-key') problems.push(`${key}: Field required`);
+      continue;
+    }
+    if (value === null && route === 'credentials') continue;
+    if (key === 'interface') {
+      if (!['public', 'internal', 'admin'].includes(value as string)) problems.push("interface: Input should be 'public', 'internal' or 'admin'");
+      continue;
+    }
+    if (typeof value !== 'string') {
+      problems.push(`${key}: Input should be a valid string`);
+      continue;
+    }
+    const length = [...value].length;
+    if (route === 'conversion-key' && length < 64) problems.push(`${key}: String should have at least 64 characters`);
+    else if (longest !== null && length > longest) problems.push(`${key}: String should have at most ${longest} characters`);
+  }
+  const known = new Set(fields.map(([key]) => key));
+  for (const key of Object.keys(input)) if (!known.has(key)) problems.push(`${key}: Extra inputs are not permitted`);
+  if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
+}
+
 /** The secrets a provider reads, by name, for its audit events - never a value: the API's _secret_names (SDD §13.3). */
 function secretNames(provider: Provider): Record<string, string> {
   return {
@@ -1313,6 +1360,8 @@ export class MockServer {
           this.require(token, writes ? 'admin' : sub === 'check' && method === 'POST' ? 'operator' : 'viewer', path);
           // a PATCH's body alone is judged before the lookup, as the API's update_provider (review RV22-07)
           if (!sub && method === 'PATCH') this.refusePatchBody(input);
+          // so is a PUT of credentials or a conversion key (review RV23-03)
+          if (method === 'PUT' && (sub === 'credentials' || sub === 'conversion-key')) refuseCredentialBody(sub, input);
           throw new HttpError(404, 'not_found', `Provider ${id} not found.`);
         }
         if (!sub && method === 'GET') {
@@ -1740,6 +1789,7 @@ export class MockServer {
 
   /** PUT /providers/{id}/credentials: the mock keeps no values, only the "stored" stamp. */
   private setCredentials(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+    refuseCredentialBody('credentials', input);
     const values = Object.fromEntries(Object.entries(input).filter(([, v]) => typeof v === 'string' && v.trim())) as Record<string, string>;
     const vmware = provider.kind === 'vmware';
     const allowed = vmware ? ['username', 'password', 'datacenter'] : ['auth_url', 'username', 'password', 'project_name', 'user_domain_name', 'project_domain_name', 'application_credential_id', 'application_credential_secret', 'interface'];
@@ -1762,6 +1812,7 @@ export class MockServer {
   }
 
   private setConversionKey(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+    refuseCredentialBody('conversion-key', input);
     const key = String(input.private_key ?? '').trim();
     if (!key.startsWith('-----BEGIN') || !key.includes('PRIVATE KEY-----')) throw new HttpError(422, 'validation_error', 'private_key must be an OpenSSH or PEM private key');
     const host = provider.conversion_host ?? { manage: false, name: null, flavor: null, external_network: null, image: null, ssh_user: 'cloud-user', address: null, ssh_allowed_cidr: null, ssh_key_secret: null };
