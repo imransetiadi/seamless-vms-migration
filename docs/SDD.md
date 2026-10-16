@@ -2946,9 +2946,9 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   a name only another project's network carries is marked "another project's", one the rule of §7.3 step 0 cannot
   resolve "several networks"; a network where the RHOSO credential may not put a port, by §6.6's rule — another
   project's that is neither shared with its project nor external, or one whose use needs a role missing from the
-  destination's `roles` (`admin` or `advsvc` for another project's - the legacy rule, until plan task T8 brings
-  the policy profile here -, `admin` for an unshared external network, its own included) — is marked "not
-  allowed", and when selected a note under the field says why, as
+  destination's `roles` (for another project's, a role its `policy_profile` counts, §6.6 - `admin` or `advsvc`
+  under legacy, `admin` or `service` under secure-RBAC, `admin` under unknown -; `admin` for an unshared external
+  network, its own included) — is marked "not allowed", and when selected a note under the field says why, as
   `NET_PORT_NOT_PERMITTED` does)
   and its addresses (comma separated; empty keeps its own), unavailable with the reason while the plan cannot be
   edited (its migrations, read as summaries while the plan is editable, say whether one is in flight, §12). A network an entry names that RHOSO no longer lists stays selected, marked "not in RHOSO". A refused
@@ -3012,7 +3012,13 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   recommendation" link to it, ahead of the migration's own actions, so its first control is the decision its text
   asks for, not the cutover's Approve), `/providers` (status cards + Check,
   each card summarizing the storage backends by driver family —
-  `storage_backends`, §7.3.1; admins add and edit providers with a distribution preset —
+  `storage_backends`, §7.3.1 —; a destination's card shows its release series - the declared one, else the detected
+  range, with codenames (§10.1) -, its support tier (Validated, Tier 1, 2 or 3, or Outside, with the reason in words)
+  and its policy profile, and warns when its declared series lies outside the detected range or its profile is
+  unknown (declare it); a provider whose check reports plain HTTP says so, naming `plain_http`'s endpoints; the form
+  takes, for an OpenStack destination, the declared release series (blank: detect it, the window's series offered
+  newest first) and, for an OpenStack or RHOSO destination, the declared policy profile (blank: by kind and series,
+  §4.2); admins add and edit providers with a distribution preset —
   OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
   enter write-only credentials and the conversion-host SSH key, or name instead a secret managed outside Seamless
   (`credentials_secret`, `conversion_host.ssh_key_secret`, §13.3: mounted files, the Kubernetes store or
@@ -3458,7 +3464,7 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
 | `NET_PORT_NOT_PERMITTED` by the policy profile (§21.5) | §6.6, §9.3 (binding); the dashboard's picker with T8 | T5 |
 | destination-neutral texts: findings, events, the CLI and the dashboard name the destination provider | §9.3, §16 | T6 |
 | conversion host images (§21.6) | §6.5 (binding), Performance.md | T7 |
-| the provider page shows series, tier and profile; the provider form takes the declared series | §16 | T8 |
+| the provider page shows series, tier and profile; the provider form takes the declared series | §16 (binding) | T8 |
 | the demo: a community destination (2026.2 Hibiscus, Kolla-Ansible preset) beside `rhoso18` | §10 (binding) | T9 |
 | the lab matrix M7–M12 and the LAB-D cases | QASuite §6.7, §7 | T10 |
 
