@@ -108,8 +108,10 @@ describe('Providers page', () => {
       'Declared 2026.2 Hibiscus, which its APIs contradict: correct the declared series, or clear it so the check detects the series.',
     );
     expect(detail('Support tier')).toHaveTextContent('Tier 3 · End of Life upstream');
+    // both ways out, as the API's refusals: a check is allowed while a plan runs, a PATCH that declares is not (SDD §16,
+    // §21.5, review RV20-09)
     expect(detail('Policy profile')).toHaveTextContent(
-      "Unknown. Declare the policy profile or the series: until then only the admin role may put a port on another project's network.",
+      "Unknown. Check the provider so its series is detected, or declare its policy profile or series: until then only the admin role may put a port on another project's network.",
     );
     expect(detail('TLS')).toHaveTextContent('Plain HTTP: the auth URL and compute. Credentials travel unencrypted: use HTTPS outside a lab.');
   });

@@ -167,7 +167,12 @@ function DestinationRows({ provider }: { provider: Provider }) {
         {profile === 'unknown' ? (
           <>
             <span className="text-status-warning">{profileText(profile)}.</span>{' '}
-            <RowWarning>Declare the policy profile or the series: until then only the admin role may put a port on another project&apos;s network.</RowWarning>
+            {/* both ways out, as the API's refusals: a check is allowed while a plan runs, a PATCH that declares is not
+                (SDD §16, §21.5, review RV20-09) */}
+            <RowWarning>
+              Check the provider so its series is detected, or declare its policy profile or series: until then only the admin
+              role may put a port on another project&apos;s network.
+            </RowWarning>
           </>
         ) : (
           profileText(profile)
