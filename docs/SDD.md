@@ -2345,7 +2345,8 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 The destination provider's name never reaches Jev, whatever `SEAMLESS_MEMORY_REDACT_NAMES` says (§1 naming). The
 advisor's strategy question names the destination by kind and series (`planning/platforms.destination_descriptor`, by
 §10.1's settled series: "RHOSO 18.0", "a community OpenStack 2026.2 destination", "a community OpenStack destination"
-when no series is settled). In the evidence it sends, which quotes eligibility reasons that name the provider, the
+when no series is settled - a declared series the APIs contradict included; before any check reported one, the
+declared series, which a first check settles unless the APIs contradict it). In the evidence it sends, which quotes eligibility reasons that name the provider, the
 name is replaced by that descriptor wherever it stands as a word, by the rule VM names follow (`replace_names`). The
 question and the evidence go through the secret patterns first, then through one `replace_names` pass that holds the
 provider's name and, when names are redacted, the VM's: the longer name first, so neither replacement splits the
