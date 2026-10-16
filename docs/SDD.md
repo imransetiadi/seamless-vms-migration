@@ -1767,7 +1767,7 @@ Finding catalog (code — severity — condition):
 | `MAP_KEYPAIR_PRESTAGED` | info | `"keypairs"` is pre-staged and the VM's `key_name`, owned by the source credential, has no keypair of the destination credential: pre-staging imports it (the same name and public key) |
 | `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
 | `DST_CAPABILITY_MISSING` | blocker | the destination's check report (§10) gives a maximum below the floor every strategy needs (§21.4): `compute_microversion` below 2.60 or `block_storage_microversion` below 3.0; the finding names each capability, the floor and the maximum read; a maximum the check could not read is not judged; a gap one strategy alone has - compute below 2.85 for `storage_handover` - is that strategy's eligibility reason instead |
-| `DST_RELEASE_OUTSIDE_SUPPORT` | warning | the destination's `support_tier` (§10.1) is `tier3` (End of Life upstream) or `outside` (below the floor, newer than validated, not detected), or its declared `release` is outside the detected range (`declared_outside_range`; the tier is the range's); RHOSO 18.0 (`validated`) never; it blocks nothing - capabilities do (§21.4) |
+| `DST_RELEASE_OUTSIDE_SUPPORT` | warning | the destination's `support_tier` (§10.1) is `tier3` (End of Life upstream) or `outside` (below the floor, newer than validated, not detected), or the detected range contradicts its declared `release` (`declared_outside_range`, §10.1; the tier is the range's); RHOSO 18.0 (`validated`) never; it blocks nothing - capabilities do (§21.4) |
 | `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU (the destination network: the NIC's `plan.nic_overrides` entry's network, else the mapped one, as the rule of §7.3 step 0 resolves it) |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
 | `MAP_NETWORK_AMBIGUOUS` | blocker | a VM's NIC goes to a RHOSO network name (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name, §7.2) that the rule of §7.3 step 0 cannot resolve to one network: several networks of the destination credential's project carry it, or none of them does and several of other projects do (`DestinationInventory.network_details`). The cutover would refuse it before the stop. The message names the NIC's MAC, the name and the projects |
@@ -1960,10 +1960,14 @@ A pure module (no I/O) holding the series table of §21.1 and the detection and 
     applied (Nova and Cinder of different series, as during an upgrade).
 * `support_tier(release_range, declared=None) -> SupportTier {tier: "tier1" | "tier2" | "tier3" | "outside", reason:
   null | "end_of_life" | "below_floor" | "newer_than_validated" | "not_detected", declared_outside_range: bool}`:
-  * a declared series (`Provider.release`, T2) among the range's series decides the tier;
+  * a declared series (`Provider.release`, T2) decides the tier when the range holds it, and when the range is empty
+    and does not contradict it - any series when nothing was detected, one older than the window's oldest series
+    when the range is `older`, one newer than its newest when `newer` -: where the APIs cannot tell the series, the
+    declaration does (review RV18-06). A declared series of the window decides its own tier; one outside the window
+    reads `outside` with the reason its place gives (`below_floor` older, `newer_than_validated` newer);
   * otherwise the range decides: the least favourable tier of its series (`tier1`, then `tier2`, then `tier3`), or
-    `outside` when it has none; a declared series not among them sets `declared_outside_range`, which the pre-flight
-    warns of (T4) - with nothing detected, any declared series is outside the range;
+    `outside` when it has none; a declared series the range contradicts sets `declared_outside_range`, which the
+    pre-flight warns of (T4);
   * `reason` is `end_of_life` for `tier3`, for `outside` the range's `outside` (`older` reads `below_floor`, `newer`
     reads `newer_than_validated`, `not_detected` as is), and null for `tier1` and `tier2`.
   RHOSO 18.0 (kind `rhoso`) is `validated` by its kind, never by detection (T3).
@@ -1972,7 +1976,8 @@ A pure module (no I/O) holding the series table of §21.1 and the detection and 
   "unknown"}`, what a destination's check reports (§10; `release` and `policy_profile` as its provider declares them,
   §4.2):
   * `release_range` is the detected range's series; `release` the series the check settles on: the declared one when
-    the range holds it, else the range's only series, else null;
+    it decides the tier (above: the range holds it or, empty, does not contradict it), else the range's only series,
+    else null;
   * `support_tier` is `support_tier(range, declared)` for kind `openstack`, and `{"tier": "validated", "reason": null,
     "declared_outside_range": false}` for kind `rhoso`;
   * `policy_profile` is the declared one; else `legacy` for kind `rhoso` (D14, until the lab confirms RHOSO 18.0's);
@@ -3018,7 +3023,7 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   each card summarizing the storage backends by driver family —
   `storage_backends`, §7.3.1 —; a destination's card shows its release series - the declared one, else the detected
   range, with codenames (§10.1) -, its support tier (Validated, Tier 1, 2 or 3, or Outside, with the reason in words)
-  and its policy profile, and warns when its declared series lies outside the detected range or its profile is
+  and its policy profile, and warns when the detected range contradicts its declared series or its profile is
   unknown (declare it); a provider whose check reports plain HTTP says so, naming `plain_http`'s endpoints; the form
   takes, for an OpenStack destination, the declared release series (blank: detect it, the window's series offered
   newest first) and, for an OpenStack or RHOSO destination, the declared policy profile (blank: by kind and series,
