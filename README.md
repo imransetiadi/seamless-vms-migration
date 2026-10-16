@@ -15,8 +15,9 @@ you finalize.**
 Seamless Migrate 0.1.0 extends the [os-migrate](#collection-reference-os-migrate) Ansible collection (this
 repository's root, which stays the *data mover*) with a warm migration path, a control plane with a REST/SSE
 API and CLI, a dashboard, and optional AI assistance (Jev for bounded judgments, agentmemory for lessons
-learned). It runs on OpenShift or, for development and demos, on Docker Compose with a dedicated
-[Colima](https://github.com/abiosoft/colima) profile.
+learned). It runs on OpenShift or Kubernetes, or on a single host with Docker Compose: a Linux server's own
+Docker Engine (Ubuntu, Debian, RHEL, Rocky Linux, AlmaLinux, Fedora; no Colima needed), a Mac with a dedicated
+[Colima](https://github.com/abiosoft/colima) profile, or Podman.
 
 ## What you get
 
@@ -105,7 +106,70 @@ Hat's virt-v2v support matrix):
 Legacy releases are flagged (`GUEST_OS_LEGACY`), never blocked. Set `os_distro`/`os_version` image properties
 or run VMware Tools so every guest is identified (`GUEST_OS_UNKNOWN` otherwise).
 
-## Quick start — local stack on Docker Compose (Colima profile `seamless`)
+## Quick start — Linux server with Docker (Ubuntu, Debian, RHEL, Rocky Linux, AlmaLinux)
+
+On Linux the stack runs on the machine's own Docker Engine: no Colima and no Node.js (the image builds the
+dashboard itself). You need Docker Engine 20.10+ with the Compose plugin v2.20+, `git`, `make`, `curl` and
+`openssl`, and about 4 CPUs, 6 GiB of RAM and 20 GiB of disk for the images and the database.
+
+**1. Install Docker Engine** from Docker's own repository (the distributions' own packages often lack the
+Compose v2 plugin):
+
+```bash
+# RHEL 8/9/10, Rocky Linux, AlmaLinux - Docker's RHEL repository
+sudo dnf -y install dnf-plugins-core git make openssl   # curl is there already (curl or RHEL 9's curl-minimal)
+sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Ubuntu 22.04/24.04/26.04 or Debian: set up Docker's apt repository as Docker's guide shows
+# (https://docs.docker.com/engine/install/ubuntu/ or /debian/), then:
+sudo apt-get install -y git make curl openssl docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+Other distributions (Fedora, SLES, …): [Docker's install guides](https://docs.docker.com/engine/install/). Remove
+Podman's `podman-docker` shim first if it is installed, since it takes the `docker` command.
+
+**2. Start Docker now and at every boot, and use it without sudo:**
+
+```bash
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"     # then log out and back in; check with: docker info
+docker compose version              # v2.20 or newer
+```
+
+The `docker` group grants root-level rights on the machine: add only the account that runs Seamless. Run every
+`make` target as that account, not with sudo, because the files `compose-init.sh` writes belong to it.
+
+**3. Start Seamless:**
+
+```bash
+git clone https://github.com/imransetiadi/seamless-vms-migration.git
+cd seamless-vms-migration
+scripts/compose-init.sh          # writes deploy/compose/.env and tokens.yaml; prints the admin API token ONCE - store it now
+make seamless-up                 # builds the image and starts PostgreSQL and the control plane (bring your own clouds)
+# make seamless-demo             # the same stack with simulated clouds and seeded plans, to try it first
+curl -fsS http://127.0.0.1:8080/api/v1/health
+```
+
+The first `make seamless-up` builds the image (several minutes: OS errata, Python packages, the Ansible
+collections and the dashboard). Every container restarts with Docker after a reboot (`restart: unless-stopped`).
+`make seamless-logs` follows the logs, `make seamless-down` stops the stack and keeps its data.
+
+**4. Open the dashboard.** The control plane listens on the server's `127.0.0.1:8080` only, never on its network
+interfaces. From your workstation, tunnel to it and sign in with the admin token:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 you@your-server   # then open http://127.0.0.1:8080/ on the workstation
+```
+
+* SELinux (RHEL, Rocky Linux, AlmaLinux, Fedora) can stay enforcing: the token file mount is relabelled
+  (`selinux: z`). A `clouds.yaml` you mount for real clouds needs the same: see
+  [Using real clouds](deploy/compose/README.md#using-real-clouds).
+* No firewall port has to be opened, since nothing listens on the network.
+* A rootless Docker Engine: export `DOCKER_HOST` as its setup tool prints; the targets honour it (not tested in CI).
+* Podman instead of Docker: see [Other container hosts](#other-container-hosts-podman-docker-desktop).
+
+## Quick start — macOS (Colima profile `seamless`)
 
 Prerequisites: [Colima](https://github.com/abiosoft/colima), the Docker CLI with the Compose plugin, GNU
 `make`, `openssl`. The stack only ever talks to the Docker context `colima-seamless`, and Colima is started with
@@ -113,7 +177,7 @@ Prerequisites: [Colima](https://github.com/abiosoft/colima), the Docker CLI with
 
 ```bash
 make seamless-colima-up          # start profile "seamless" (4 CPU / 6 GiB / 40 GiB), idempotent, keeps your Docker context
-make dashboard-build             # optional: build the UI so the image serves it at /
+make dashboard-build             # optional: the image builds the UI itself; a build here is reused (faster)
 
 # Generate .env + tokens.yaml once. TYPESAFE_API_KEY (Jev) and AGENTMEMORY_SECRET are optional and are
 # read from the environment of your shell (never typed on a command line); they are written only to the
@@ -147,13 +211,14 @@ is reachable only from the control plane. The stack reaches your host's agentmem
 `http://host.docker.internal:3111`. Details, troubleshooting and the full variable list:
 [deploy/compose/README.md](deploy/compose/README.md).
 
-### Other container hosts: any Docker host, Podman
+### Other container hosts: Podman, Docker Desktop
 
-The same Compose stack runs on every engine; the Make targets take the engine as a variable.
+The same Compose stack runs on every engine. The Make targets pick one by the host: on Linux the machine's own
+Docker Engine, on macOS the Colima profile `seamless`. Variables choose another.
 
 ```bash
-# Docker on Linux, Docker Desktop or another context instead of Colima
-make seamless-demo SEAMLESS_DOCKER_CONTEXT=default
+# Docker Desktop, or any other Docker context
+make seamless-demo SEAMLESS_DOCKER_CONTEXT=desktop-linux
 
 # Podman 4.7+ (Linux, or macOS/Windows with `podman machine start`): `podman compose` drives the stack,
 # with docker-compose as its provider when installed (recommended) or podman-compose
@@ -214,7 +279,8 @@ them against the Kubernetes 1.30 schemas.
 
 | Platform | Where | Command |
 |---|---|---|
-| Docker (Colima, Docker Desktop, Linux) | `deploy/compose/` | `make seamless-up` (`SEAMLESS_DOCKER_CONTEXT=…` for other hosts) |
+| Docker Engine on Linux (Ubuntu, Debian, RHEL, Rocky Linux, AlmaLinux, Fedora) | `deploy/compose/` | `make seamless-up` (this machine's engine; no Colima) |
+| Docker on macOS (Colima), Docker Desktop | `deploy/compose/` | `make seamless-colima-up && make seamless-up` (`SEAMLESS_DOCKER_CONTEXT=…` for Docker Desktop) |
 | Podman 4.7+ | `deploy/compose/` | `make seamless-up SEAMLESS_ENGINE=podman` |
 | Kubernetes 1.28+ | `deploy/kubernetes/` | `kubectl apply -k deploy/kubernetes` |
 | OpenShift 4.16+ | `deploy/openshift/` | `oc apply -k deploy/openshift` |
@@ -239,7 +305,7 @@ them against the Kubernetes 1.30 schemas.
 plugins/ roles/ playbooks/   os-migrate collection + warm path (blocksync, warm modules, warm role)
 seamless/                    control plane: src/seamless_migrate/, tests/, Containerfile
 dashboard/                   React 18 + Vite + TypeScript dashboard (design tokens: SDD §16)
-deploy/compose/              Docker Compose stack for the Colima profile "seamless"
+deploy/compose/              Docker Compose stack: a Linux host's Docker Engine, Colima on macOS, or Podman
 deploy/openshift/            kustomize manifests (OpenShift 4.16+)
 deploy/kubernetes/           kustomize overlay of those manifests for vanilla Kubernetes 1.28+
 scripts/compose-init.sh      generates .env and tokens.yaml for the Compose stack

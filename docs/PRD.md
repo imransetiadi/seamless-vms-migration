@@ -129,7 +129,7 @@ for 0.2.0 (goal G7).
 | FR-22 | CLI for plan apply/validate/start/status/estimate and token management | M | SDD §15 commands |
 | FR-23 | Prometheus metrics | S | SDD §18 metric names |
 | FR-24 | Demo mode with simulated providers and executor | M | `seamless serve --demo` exercises every phase including rollback |
-| FR-25 | Deploy on OpenShift, Kubernetes and Docker Compose (Docker/Colima or Podman) with PostgreSQL | M | Manifests in `deploy/openshift` and its overlay `deploy/kubernetes`, compose stack in `deploy/compose` |
+| FR-25 | Deploy on OpenShift, Kubernetes and Docker Compose (Docker Engine on a Linux host, Colima on macOS, or Podman) with PostgreSQL | M | Manifests in `deploy/openshift` and its overlay `deploy/kubernetes`, compose stack in `deploy/compose` |
 | FR-26 | Changed-extent tracking to remove the scan floor: Ceph-direct `rbd diff` and hypervisor-assisted libvirt checkpoints | C | 0.2.0 |
 | FR-27 | HA control plane (leader election) | C | 0.2.0 |
 | FR-28 | Network cut-over hooks (DNS/FIP/BGP) | C | 0.3.0 |
@@ -153,7 +153,7 @@ for 0.2.0 (goal G7).
 | NFR-07 | AI safety | AI outputs advisory, bounded, logged with source and confidence; untrusted text screened; secrets redacted |
 | NFR-08 | Usability | Dashboard WCAG 2.2 AA; dense ops layout; live updates ≤ 2 s latency |
 | NFR-09 | Observability | Structured logs, events, metrics; every migration has a complete timeline |
-| NFR-10 | Portability | Runs on OpenShift 4.16+, Kubernetes 1.28+, Docker/Podman, macOS dev via Colima; Python 3.11+, Node 22 |
+| NFR-10 | Portability | Runs on OpenShift 4.16+, Kubernetes 1.28+, Docker Engine 20.10+ with Compose v2.20+ on Linux (Ubuntu, Debian, RHEL, Rocky Linux, AlmaLinux, Fedora; no Colima), Podman 4.7+, macOS via Colima; Python 3.11+, Node 22 |
 | NFR-11 | Maintainability | Unit test coverage ≥ 85 % for control-plane core modules; collection additions unit-tested |
 | NFR-12 | Compatibility | The destination support window follows the upstream lifecycle (releases.openstack.org): Tier 1 is the series upstream maintains, validated in the lab before each Seamless release; a new series (next: 2027.1 Indri, estimated 2027-03-24) joins, and a series upstream ends moves down a tier, within one Seamless minor release (SDD §21.2) |
 
@@ -173,7 +173,7 @@ for 0.2.0 (goal G7).
 
 | Release | Scope |
 |---|---|
-| **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift, Kubernetes and Compose (Colima or Podman) deployment, docs |
+| **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift, Kubernetes and Compose (Docker on Linux, Colima on macOS, or Podman) deployment, docs |
 | 0.2.0 | Ceph-direct incremental diff, HA (PostgreSQL leader election), per-tenant credentials, notifications (email/Slack webhooks); community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34) |
 | 0.3.0 | Network cut-over hooks (DNS, FIP re-mapping, OVN BGP), Octavia/Heat migration helpers |
 | 1.0.0 | Certified on RHOSO 18.0.x FRs, validated on every Tier 1 community series of the day, scale test 5,000 VMs, signed releases |

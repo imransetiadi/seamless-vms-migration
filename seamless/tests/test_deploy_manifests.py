@@ -196,6 +196,260 @@ def test_a_linux_docker_engine_maps_host_docker_internal_to_the_host():
     assert hosts == ["host.docker.internal:host-gateway"]
 
 
+# --- a Linux host's own Docker Engine, with no Colima (SDD §17.1; the owner, 2026-10-16) ---
+
+
+def _clean_env(path: str | None = None) -> dict[str, str]:
+    """The test's environment without what would steer the targets (SEAMLESS_*, DOCKER_*)."""
+    import os
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("SEAMLESS_", "DOCKER_", "COMPOSE_", "MAKE"))
+    }
+    if path is not None:
+        env["PATH"] = path
+    return env
+
+
+def _dry_run(target: str, **make_vars: str) -> str:
+    """`make -n target` with these Make variables and a clean environment."""
+    import shutil
+    import subprocess
+
+    make = shutil.which("make")
+    assert make, "make is not installed"
+    args = [make, "-n", "--no-print-directory", target]
+    args += [f"{name}={value}" for name, value in make_vars.items()]
+    return subprocess.run(
+        args, cwd=ROOT, env=_clean_env(), capture_output=True, text=True, check=True
+    ).stdout
+
+
+def _up_line(**make_vars: str) -> str:
+    out = _dry_run("seamless-up", **make_vars)
+    return next(line for line in out.splitlines() if " up -d " in line)
+
+
+def test_a_linux_host_runs_the_stack_on_its_own_docker_engine():
+    """SDD §17.1: on Linux the targets use the machine's own Docker Engine with no variable (the
+    context `default`, DOCKER_HOST honoured for a rootless engine, host.docker.internal mapped); on
+    macOS they keep to colima-seamless with DOCKER_HOST unset; an explicit context wins."""
+    linux = _up_line(SEAMLESS_HOST_OS="Linux")
+    assert "docker --context default " in linux
+    assert "-u DOCKER_HOST" not in linux
+    assert "compose.linux-host.yaml" in linux
+    mac = _up_line(SEAMLESS_HOST_OS="Darwin")
+    assert "docker --context colima-seamless " in mac
+    assert "-u DOCKER_HOST" in mac
+    assert "compose.linux-host.yaml" not in mac
+    remote = _up_line(SEAMLESS_HOST_OS="Linux", SEAMLESS_DOCKER_CONTEXT="lab-remote")
+    assert "docker --context lab-remote " in remote
+    assert "-u DOCKER_HOST" in remote
+    assert "compose.linux-host.yaml" not in remote
+
+
+def test_the_host_decides_the_engine_when_no_variable_says_so(tmp_path):
+    """SDD §17.1: with neither SEAMLESS_HOST_OS nor SEAMLESS_DOCKER_CONTEXT set, the targets ask
+    `uname -s` - this machine's own engine on Linux, the Colima profile's context on macOS - so a
+    Linux host needs no variable at all."""
+    import os
+    import shutil
+    import subprocess
+
+    make = shutil.which("make")
+    assert make, "make is not installed"
+    for host_os, context in (("Linux", "default"), ("Darwin", "colima-seamless")):
+        fakebin = tmp_path / host_os
+        fakebin.mkdir()
+        (fakebin / "uname").write_text(f"#!/bin/sh\necho {host_os}\n")
+        (fakebin / "uname").chmod(0o755)
+        out = subprocess.run(
+            [make, "-n", "--no-print-directory", "seamless-up"],
+            cwd=ROOT,
+            env=_clean_env(path=f"{fakebin}:{os.environ['PATH']}"),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        up = next(line for line in out.splitlines() if " up -d " in line)
+        assert f"docker --context {context} " in up, (host_os, up)
+
+
+def test_seamless_colima_up_on_linux_says_that_colima_is_not_needed():
+    """SDD §17.1: on a Linux machine's own engine, seamless-colima-up starts nothing; on macOS it
+    starts the dedicated profile without activating its context."""
+    linux = _dry_run("seamless-colima-up", SEAMLESS_HOST_OS="Linux")
+    assert "colima start" not in linux
+    assert "Colima is not needed on Linux" in linux
+    mac = _dry_run("seamless-colima-up", SEAMLESS_HOST_OS="Darwin")
+    assert "colima start seamless --activate=false" in mac
+
+
+_FAKE_DOCKER = """#!/bin/bash
+# a docker CLI for the tests: answers what seamless-check-context asks
+case " $* " in
+  *" compose version --short "*) [ -n "${FAKE_COMPOSE:-}" ] && echo "$FAKE_COMPOSE" ;;
+  *" context inspect "*) [ "${FAKE_CONTEXT:-found}" = found ] ;;
+  *" info "*) [ "${FAKE_ENGINE:-up}" = up ] ;;
+  *) exit 0 ;;
+esac
+"""
+
+
+def _tools(tmp_path: Path) -> Path:
+    """A bin directory holding only the tools the Makefile reads at parse time and its check recipe
+    runs - never a real docker, wherever this machine keeps one (CI's runner: /usr/bin/docker)."""
+    import shutil
+
+    tools = tmp_path / "tools"
+    if not tools.exists():
+        tools.mkdir()
+        for name in ("sh", "bash", "env", "grep", "sed", "awk", "uname", "cat", "head", "tr"):
+            found = shutil.which(name)
+            if found:
+                (tools / name).symlink_to(found)
+    return tools
+
+
+def _check_context(tmp_path: Path, host_os: str, docker: bool = True, **fake: str):
+    """Run `make seamless-check-context` for real, with a fake docker (or none) on PATH."""
+    import shutil
+    import subprocess
+
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir(exist_ok=True)
+    (fakebin / "docker").unlink(missing_ok=True)
+    if docker:
+        (fakebin / "docker").write_text(_FAKE_DOCKER)
+        (fakebin / "docker").chmod(0o755)
+    env = _clean_env(path=f"{fakebin}:{_tools(tmp_path)}")
+    env.update(fake)
+    make = shutil.which("make")
+    assert make, "make is not installed"
+    return subprocess.run(
+        [make, "--no-print-directory", "seamless-check-context", f"SEAMLESS_HOST_OS={host_os}"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_the_docker_checks_say_how_to_fix_the_host_they_run_on(tmp_path):
+    """SDD §17.1: the targets check that Docker answers and that its Compose plugin is v2.20+
+    (depends_on.required), and word the fix for the host: systemctl and the docker group on Linux,
+    the Colima profile on macOS."""
+    missing = _check_context(tmp_path, "Linux", docker=False)
+    assert missing.returncode != 0
+    assert "install Docker Engine" in missing.stdout
+    assert "https://download.docker.com/linux/rhel/docker-ce.repo" in missing.stdout
+    down = _check_context(tmp_path, "Linux", FAKE_ENGINE="down", FAKE_COMPOSE="2.29.7")
+    assert down.returncode != 0
+    assert "sudo systemctl enable --now docker" in down.stdout
+    assert "docker group" in down.stdout
+    assert "colima" not in down.stdout.lower()
+    mac = _check_context(tmp_path, "Darwin", FAKE_ENGINE="down", FAKE_COMPOSE="2.29.7")
+    assert mac.returncode != 0
+    assert "make seamless-colima-up" in mac.stdout
+    no_compose = _check_context(tmp_path, "Linux", FAKE_COMPOSE="")
+    assert no_compose.returncode != 0
+    assert "docker-compose-plugin" in no_compose.stdout
+    old = _check_context(tmp_path, "Linux", FAKE_COMPOSE="2.19.1")
+    assert old.returncode != 0
+    assert "older than 2.20" in old.stdout
+    for version in ("2.20.0", "v2.29.7", "2.40.3-desktop.1", "10.0.1"):
+        ok = _check_context(tmp_path, "Linux", FAKE_COMPOSE=version)
+        assert ok.returncode == 0, (version, ok.stdout, ok.stderr)
+
+
+def _init_next_steps(tmp_path: Path, host_os: str, host_port: str | None = None) -> str:
+    """What scripts/compose-init.sh tells to do next on this host (its stderr; the token goes to
+    stdout and is never read here). It writes into a scratch directory, never the checkout. With a
+    host port, the port is kept in .env as an operator sets it by hand, and the script runs
+    again."""
+    import subprocess
+
+    fakebin = tmp_path / f"bin-{host_os}"
+    fakebin.mkdir()
+    (fakebin / "uname").write_text(f"#!/bin/sh\necho {host_os}\n")
+    (fakebin / "uname").chmod(0o755)
+    target = tmp_path / f"compose-{host_os}"
+    target.mkdir()
+
+    def init() -> str:
+        return subprocess.run(
+            ["bash", str(ROOT / "scripts" / "compose-init.sh"), "--dir", str(target)],
+            env=_clean_env(path=f"{fakebin}:/usr/bin:/bin"),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stderr
+
+    err = init()
+    if host_port is not None:
+        with (target / ".env").open("a", encoding="utf-8") as env_file:
+            env_file.write(f"SEAMLESS_HOST_PORT={host_port}\n")
+        err = init()
+    return err[err.index("Next steps") :]
+
+
+def test_compose_init_names_the_next_steps_of_the_host_it_runs_on(tmp_path):
+    """SDD §17.1: on Linux there is no Colima to start and no `open`; the dashboard is reached on
+    the host's loopback, through an SSH tunnel from a workstation."""
+    linux = _init_next_steps(tmp_path, "Linux")
+    assert "make seamless-up" in linux
+    assert "colima" not in linux.lower()
+    assert "open http" not in linux
+    assert "ssh -L 8080:127.0.0.1:8080" in linux
+    mac = _init_next_steps(tmp_path, "Darwin")
+    assert "make seamless-colima-up" in mac
+    assert "open http://127.0.0.1:8080/" in mac
+
+
+def test_compose_init_names_the_port_the_stack_listens_on(tmp_path):
+    """SDD §17.1: a SEAMLESS_HOST_PORT kept in .env is the port of every next step - the health
+    check and both ends of the SSH tunnel on Linux, the browser on macOS."""
+    linux = _init_next_steps(tmp_path, "Linux", host_port="18089")
+    assert "curl -fsS http://127.0.0.1:18089/api/v1/health" in linux
+    assert "ssh -L 18089:127.0.0.1:18089 " in linux
+    assert "browse to http://127.0.0.1:18089/" in linux
+    assert "8080" not in linux
+    mac = _init_next_steps(tmp_path, "Darwin", host_port="18089")
+    assert "open http://127.0.0.1:18089/" in mac
+
+
+def test_the_docker_checks_name_the_fix_for_a_missing_context_and_for_macos(tmp_path):
+    """SDD §17.1: the other hints of the checks - a context that does not exist (the Colima
+    profile's on macOS; a named one on Linux, which can be left unset for the machine's own
+    engine), a named context whose engine does not answer, and the macOS install lines."""
+    compose = {"FAKE_COMPOSE": "2.29.7"}
+    gone_mac = _check_context(tmp_path, "Darwin", FAKE_CONTEXT="missing", **compose)
+    assert gone_mac.returncode != 0
+    assert (
+        "Docker context 'colima-seamless' not found. Run: make seamless-colima-up"
+        in gone_mac.stdout
+    )
+    named = {"SEAMLESS_DOCKER_CONTEXT": "lab-remote", **compose}
+    gone_named = _check_context(tmp_path, "Linux", FAKE_CONTEXT="missing", **named)
+    assert gone_named.returncode != 0
+    assert "Docker context 'lab-remote' not found. Create it, or leave" in gone_named.stdout
+    assert "SEAMLESS_DOCKER_CONTEXT unset to use this machine's own engine" in gone_named.stdout
+    named_down = _check_context(tmp_path, "Linux", FAKE_ENGINE="down", **named)
+    assert named_down.returncode != 0
+    assert "Docker context 'lab-remote' does not answer: start its engine" in named_down.stdout
+    assert "systemctl" not in named_down.stdout
+    assert "colima" not in named_down.stdout.lower()
+    no_docker_mac = _check_context(tmp_path, "Darwin", docker=False)
+    assert no_docker_mac.returncode != 0
+    assert "docker not found: brew install colima docker docker-compose" in no_docker_mac.stdout
+    no_compose_mac = _check_context(tmp_path, "Darwin", FAKE_COMPOSE="")
+    assert no_compose_mac.returncode != 0
+    assert "Compose plugin v2.20+: brew install docker-compose" in no_compose_mac.stdout
+
+
 # --- the optional backup overlay (SDD §17, Security.md §12 "restore-tested", audit D-06) ---
 
 BACKUP = ROOT / "deploy" / "openshift" / "backup"

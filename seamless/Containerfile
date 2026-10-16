@@ -5,8 +5,9 @@
 #   podman build --ignorefile seamless/.containerignore -f seamless/Containerfile -t seamless:0.1.0 .
 #   docker build -f seamless/Containerfile -t seamless:0.1.0 .   # uses Containerfile.dockerignore
 #
-# The built dashboard (dashboard/dist) is copied when present; build it first to include it, or
-# point DASHBOARD_DIST elsewhere: --build-arg DASHBOARD_DIST=path/to/dist
+# The dashboard (SDD §17.1): the built one in the context (dashboard/dist, or --build-arg
+# DASHBOARD_DIST=path/to/dist) is copied when present, else it is built here from dashboard/ with the
+# image's own Node 22 (scripts/image-dashboard.sh), so a host needs no Node.js.
 
 # Pinned by digest (Security.md §12): the manifest list of ubi9/python-311:latest as of 2026-10-08.
 # Dependabot (docker, /seamless) proposes digest bumps; `dnf update` below still applies errata
@@ -82,12 +83,9 @@ RUN python3 -m pip uninstall -y pip \
            /opt/app-root/lib64/python3.11/site-packages/pip* \
            /opt/app-root/bin/pip /opt/app-root/bin/pip3 /opt/app-root/bin/pip3.11
 
-# Dashboard build, only when it exists in the build context.
+# The dashboard: the context's built one, else built from its sources in a scratch copy (SDD §17.1).
 RUN --mount=type=bind,source=.,target=/ctx \
-    mkdir -p /opt/seamless/dashboard \
- && if [ -f "/ctx/${DASHBOARD_DIST}/index.html" ]; then \
-        cp -r "/ctx/${DASHBOARD_DIST}/." /opt/seamless/dashboard/; \
-    else echo "dashboard build not found at ${DASHBOARD_DIST}; serving the API only"; fi
+    bash /ctx/scripts/image-dashboard.sh /ctx "${DASHBOARD_DIST}" /opt/seamless/dashboard
 
 # /var/lib/seamless is the default data dir; /data is the mount point the Compose stack uses
 # (a fresh named volume takes the ownership of its mount point, so the non-root user owns it).
