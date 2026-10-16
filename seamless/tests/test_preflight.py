@@ -1,6 +1,7 @@
 import ast
 import json
 import re
+import string
 from pathlib import Path
 
 import pytest
@@ -1821,17 +1822,62 @@ FIXED_TEXTS = {
 
 
 def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
-    """SDD §1 naming (reviews RV21-05, RV22-05, RV23-06, RV24-04): a text built for a plan or a
-    migration - a finding's message, an eligibility reason, an executor's refusal, failure or log
-    line, an event, a transition's reason - names the destination provider by its label; "the
+    """SDD §1 naming (reviews RV21-05, RV22-05, RV23-06, RV24-04, RV25-05): a text built for a plan
+    or a migration - a finding's message, an eligibility reason, an executor's refusal, failure or
+    log line, an event, a transition's reason - names the destination provider by its label; "the
     destination" is for the fixed texts (a catalog remediation, the dashboard's copy). Every text
-    of the control plane is read - each string literal, and what a + chain, a %-template,
-    str.format or an f-string builds from literals - but a docstring, the fixed texts of
-    FIXED_TEXTS, a remediation= value, and the bare "the destination" where a text built without a
-    provider falls back to it: a parameter's default, an if-else's else, the right of an or, an
-    assignment in an except handler."""
+    of the control plane is read - each string literal, and what a + chain, a %-template (given a
+    tuple or a mapping), str.format, str.format_map, a join of literals, a logging call or an
+    f-string builds from literals - but a docstring, the fixed texts of FIXED_TEXTS, a
+    remediation= value, and the bare "the destination" where a text built without a provider falls
+    back to it: a parameter's default, an if-else's else, the right of an or, an assignment in an
+    except handler, a returned value, a get or getattr default. It reads expressions, not data
+    flow: a text completed with += or carried through a variable, an argument or a call's return
+    is out of its reach."""
     root = Path(__file__).parents[1] / "src" / "seamless_migrate"
     words = re.compile(r"the destination\b|destination's|destination provider", re.I)
+    logging = {"debug", "info", "warning", "warn", "error", "exception", "critical"}
+
+    def mapping(node):
+        """A dict literal's string keys with their folded values ("{}" unknown); {} for another."""
+        if not isinstance(node, ast.Dict):
+            return {}
+        return {
+            k.value: fold(v) or "{}"
+            for k, v in zip(node.keys, node.values, strict=True)
+            if isinstance(k, ast.Constant) and isinstance(k.value, str)
+        }
+
+    def fields(template, args, kwargs):
+        """``template`` with each replacement field filled from ``args``/``kwargs``, "{}" for a
+        field the guard cannot know - an attribute, an index, a name it was not given - never an
+        error."""
+        try:
+            parsed = list(string.Formatter().parse(template))
+        except ValueError:
+            return template
+        out, auto = [], 0
+        for literal, field, _spec, _conversion in parsed:
+            out.append(literal)
+            if field is None:
+                continue
+            if field == "":
+                out.append(args[auto] if auto < len(args) else "{}")
+                auto += 1
+            elif field.isdigit():
+                out.append(args[int(field)] if int(field) < len(args) else "{}")
+            else:
+                out.append(kwargs.get(field, "{}"))
+        return "".join(out)
+
+    def percent(template, values):
+        """``template % values``, or the template and the values side by side when they do not
+        fit."""
+        try:
+            return template % values
+        except (TypeError, ValueError, KeyError):
+            given = values.values() if isinstance(values, dict) else values
+            return template + " " + " ".join(given)
 
     def fold(node):
         """The text ``node`` builds from literals, "{}" for each part it cannot know; None when it
@@ -1849,23 +1895,30 @@ def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
                 return None if left is None and right is None else (left or "{}") + (right or "{}")
             if left is None:
                 return None
+            if isinstance(node.right, ast.Dict):
+                return percent(left, mapping(node.right))
             args = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
-            try:
-                return left % tuple(fold(arg) or "{}" for arg in args)
-            except (TypeError, ValueError):
-                return left + " " + (right or "{}")
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "format"
-            and fold(node.func.value) is not None
-        ):
+            return percent(left, tuple(fold(arg) or "{}" for arg in args))
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return None
+        method, receiver = node.func.attr, fold(node.func.value)
+        if method in ("format", "format_map") and receiver is not None:
+            if method == "format_map":
+                return fields(receiver, [], mapping(node.args[0]) if node.args else {})
             args = [fold(arg) or "{}" for arg in node.args]
-            kwargs = {k.arg: fold(k.value) or "{}" for k in node.keywords if k.arg}
-            try:
-                return fold(node.func.value).format(*args, **kwargs)
-            except (IndexError, KeyError, ValueError):
-                return fold(node.func.value) + " " + " ".join(args)
+            return fields(
+                receiver, args, {k.arg: fold(k.value) or "{}" for k in node.keywords if k.arg}
+            )
+        if method == "join" and receiver is not None and node.args:
+            items = node.args[0]
+            if isinstance(items, (ast.Tuple, ast.List)):
+                return receiver.join(fold(item) or "{}" for item in items.elts)
+            return None
+        # a log line: log.warning(template, *args), log.log(level, template, *args)
+        given = node.args[1:] if method == "log" else node.args
+        if (method in logging or method == "log") and given and fold(given[0]) is not None:
+            values = tuple(fold(arg) or "{}" for arg in given[1:])
+            return percent(fold(given[0]), values) if values else fold(given[0])
         return None
 
     def fallback(node, parents):
@@ -1883,6 +1936,22 @@ def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
                 isinstance(parent, ast.Assign)
                 and parent.value is node
                 and isinstance(parents.get(id(parent)), ast.ExceptHandler)
+            )
+            or (isinstance(parent, ast.Return) and parent.value is node)
+            or (
+                isinstance(parent, ast.Call)
+                and (
+                    (
+                        isinstance(parent.func, ast.Attribute)
+                        and parent.func.attr == "get"
+                        and parent.args[1:2] == [node]
+                    )
+                    or (
+                        isinstance(parent.func, ast.Name)
+                        and parent.func.id == "getattr"
+                        and parent.args[2:3] == [node]
+                    )
+                )
             )
         )
 
@@ -2046,6 +2115,44 @@ INJECTED_RV24 = {
 }
 
 
+#: words a logging call, a mapping, a join or format_map gives a text built for a migration
+#: (review RV25-05): injected into orchestrator.py
+INJECTED_RV25 = {
+    "a log line given its words by the logging call": (
+        "\n\ndef _rv25():\n"
+        "    log.warning('could not reach the %s: %s', 'destination', 'timeout')\n"
+    ),
+    "a %-template given its words by a mapping": (
+        "\n\ndef _rv25():\n"
+        "    raise NotAllowed('check the %(side)s, then retry' % {'side': 'destination'})\n"
+    ),
+    "a text joined from its words": (
+        "\n\ndef _rv25():\n"
+        "    raise NotAllowed(' '.join(('check the', 'destination', 'then retry')))\n"
+    ),
+    "str.format_map": (
+        "\n\ndef _rv25():\n"
+        "    raise NotAllowed('check the {side}, then retry'.format_map({'side': 'destination'}))\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(INJECTED_RV25))
+def test_the_wording_guard_reads_the_words_a_call_gives_a_text(case, monkeypatch):
+    """SDD §1 naming (review RV25-05): a log line, a %-template given a mapping, a join of
+    literals and str.format_map say "the destination" as plainly as a literal does."""
+    target = Path(__file__).parents[1] / "src" / "seamless_migrate" / "orchestrator.py"
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        return text + INJECTED_RV25[case] if Path(self) == target else text
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match="orchestrator.py"):
+        test_no_text_built_for_a_migration_calls_its_destination_the_destination()
+
+
 @pytest.mark.parametrize("case", list(INJECTED_RV24))
 def test_the_wording_guard_reads_a_text_built_from_several_literals(case, monkeypatch):
     """SDD §1 naming (review RV24-04): a refusal or an event that says "the destination" is found
@@ -2080,6 +2187,20 @@ FIXED_RV23 = {
     "the fallback of an except handler": (
         "\n\ndef _rv23(names, p):\n    try:\n        names[p] = p.label\n"
         "    except AttributeError:\n        names[p] = 'the destination'\n"
+    ),
+    # review RV25-05: a format field the guard cannot know never errors, and two more fallbacks
+    "a str.format field reading the label": (
+        "\n\ndef _rv23(p):\n    return '{p.label} refused the port'.format(p=p)\n"
+    ),
+    "a str.format field reading an index": (
+        "\n\ndef _rv23(names):\n    return '{n[dst]} refused the port'.format(n=names)\n"
+    ),
+    "the fallback a function returns": (
+        "\n\ndef _rv23(p):\n    if p is None:\n        return 'the destination'\n"
+        "    return p.label\n"
+    ),
+    "the fallback given to dict.get": (
+        "\n\ndef _rv23(names, pid):\n    return names.get(pid, 'the destination')\n"
     ),
 }
 
