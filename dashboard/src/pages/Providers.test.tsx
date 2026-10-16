@@ -1,6 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
+import { destinationRelease } from '../lib/platforms';
 import { createTestServer, recordScrolls, renderWithApp } from '../test/utils';
 import Providers from './Providers';
 
@@ -126,6 +127,33 @@ describe('Providers page', () => {
     expect(chip('Token roles')).toHaveTextContent(/^Token roles\s*none$/);
     // a value the check read is said as it was read
     expect(chip('Storage')).toHaveTextContent(/^Storage\s*Ceph RBD/);
+  });
+
+  it('says why a read range is empty: older or newer than the window, "Not detected" only when nothing was read (SDD §16, review RV19-04)', async () => {
+    const cases = [
+      { id: 'hibiscus-dc3', kind: 'openstack', compute: '2.93', blockStorage: '3.70', series: 'Older than the window', tier: 'Outside · older than 2023.1' },
+      { id: 'hibiscus-dc3', kind: 'openstack', compute: '2.105', blockStorage: '3.71', series: 'Newer than the window', tier: 'Outside · newer than 2026.2' },
+      { id: 'hibiscus-dc3', kind: 'openstack', compute: '', blockStorage: '', series: 'Not detected', tier: 'Outside · series not detected' },
+      // RHOSO 18.0 is validated by its kind: its maxima, not its tier, say why its range is empty
+      { id: 'rhoso-prod', kind: 'rhoso', compute: '2.93', blockStorage: '3.70', series: 'Older than the window', tier: 'Validated' },
+    ] as const;
+    for (const c of cases) {
+      const server = createTestServer();
+      const provider = server.providers.find((p) => p.id === c.id)!;
+      provider.release = null;
+      provider.capabilities = {
+        ...provider.capabilities,
+        compute_microversion: c.compute,
+        block_storage_microversion: c.blockStorage,
+        ...destinationRelease(c.kind, null, null, c.compute, c.blockStorage),
+      };
+      const view = renderPage('viewer', server);
+      const card = await screen.findByRole('article', { name: provider.name });
+      const detail = (term: string) => within(card).getByText(term, { selector: 'dt' }).nextElementSibling as HTMLElement;
+      expect(detail('Series')).toHaveTextContent(new RegExp(`^${c.series}$`));
+      expect(detail('Support tier')).toHaveTextContent(c.tier);
+      view.unmount();
+    }
   });
 
   it('keeps Cancel focusable while the provider is saved, saying why (SDD §16)', async () => {

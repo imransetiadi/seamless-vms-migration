@@ -19,7 +19,7 @@ import { deleteRefusal, plansThatNeed } from '../lib/providerUse';
 import { hasRole } from '../lib/roles';
 import { presetFor } from '../lib/distributions';
 import { policyProfileOf } from '../lib/networks';
-import { DESTINATION_PLATFORMS, plainHttpText, profileText, rangeText, seriesText, tierText, type SupportTier } from '../lib/platforms';
+import { DESTINATION_PLATFORMS, plainHttpText, profileText, rangeText, releaseRange, seriesText, tierText, type SupportTier } from '../lib/platforms';
 import { storageBackends, storageSummary } from '../lib/storage';
 import { providerStatusMeta } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -131,6 +131,9 @@ function DestinationRows({ provider }: { provider: Provider }) {
   const settled = typeof caps.release === 'string' ? caps.release : null;
   const range = Array.isArray(caps.release_range) ? caps.release_range.map(String) : [];
   const detected = settled === null ? rangeText(range) : null;
+  // an empty range says why, by the maxima the check read: older or newer than the window, or nothing read (RV19-04);
+  // RHOSO 18.0's tier is Validated by its kind, so the tier's reason cannot say it
+  const outside = range.length ? null : releaseRange(caps.compute_microversion, caps.block_storage_microversion).outside;
   const profile = policyProfileOf(caps, provider);
   const warn = tier.tier === 'tier3' || tier.tier === 'outside';
   return (
@@ -146,7 +149,7 @@ function DestinationRows({ provider }: { provider: Provider }) {
             {detected} <span className="text-xs text-muted-foreground">detected</span>
           </>
         ) : (
-          <span className="text-muted-foreground">Not detected</span>
+          <span className="text-muted-foreground">{outside === 'older' ? 'Older than the window' : outside === 'newer' ? 'Newer than the window' : 'Not detected'}</span>
         )}
         {tier.declared_outside_range && provider.release && (
           <RowWarning>{`Declared ${seriesText(provider.release)}, which its APIs contradict: correct the declared series, or clear it so the check detects the series.`}</RowWarning>
