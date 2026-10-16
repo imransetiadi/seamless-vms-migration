@@ -386,3 +386,81 @@ def test_the_rbac_matrix_hands_curl_each_token_from_a_private_header_file(tmp_pa
         assert len(sent) >= len(plain), (role, len(sent), len(plain))
     assert len(headers) == len(argv) - len(plain)
     assert list(tmp.iterdir()) == [], "the private header directory outlived the script"
+
+
+# --- optional integrations in the smoke test (SDD §14.2, §14.3; QASuite §14.6) ---
+
+
+def _smoke_gates(advisor: str, call: str) -> str:
+    """Run smoke-demo.sh's needs_jev/needs_memory with this advisor status and stub checks."""
+    script = (ROOT / "tests" / "e2e" / "smoke-demo.sh").read_text(encoding="utf-8")
+    start = script.index("# optional integrations")
+    end = script.index("\n\n", start)
+    gates = script[start:end]
+    prelude = (
+        'check() { if eval "$2"; then echo "PASS  $1"; else echo "FAIL  $1"; fi; }\n'
+        'skip() { echo "SKIP  $1"; }\n'
+    )
+    run = subprocess.run(
+        ["bash", "-c", prelude + gates + "\n" + call],
+        env={"PATH": "/usr/bin:/bin", "advisor": advisor},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return run.stdout
+
+
+def test_the_smoke_skips_an_optional_integration_that_is_not_configured():
+    """SDD §14.2, §14.3: without TYPESAFE_API_KEY Jev is off and the advisor falls back to rules;
+    without SEAMLESS_MEMORY_URL memory is disabled - so a fresh Linux host or CI runner smokes
+    green. A configured integration that does not answer still fails its check."""
+    off = '{"jev":{"mode":"off","available":false},"memory":{"enabled":false,"available":false}}'
+    out = _smoke_gates(off, 'needs_jev "jev up" false; needs_memory "memory up" false')
+    assert out.startswith("SKIP  jev up (Jev is off")
+    assert "SKIP  memory up (memory is disabled" in out
+    down = '{"jev":{"mode":"http","available":false},"memory":{"enabled":true,"available":false}}'
+    out = _smoke_gates(down, 'needs_jev "jev up" false; needs_memory "memory up" false')
+    assert out.splitlines() == ["FAIL  jev up", "FAIL  memory up"]
+    up = '{"jev":{"mode":"http","available":true},"memory":{"enabled":true,"available":true}}'
+    out = _smoke_gates(up, 'needs_jev "jev up" true; needs_memory "memory up" true')
+    assert out.splitlines() == ["PASS  jev up", "PASS  memory up"]
+
+
+def test_the_smoke_skips_the_jev_recommendation_check_when_jev_is_off():
+    """SDD §14.4: with Jev off the rules decide the strategy, so the check that Jev's
+    recommendation was recorded is skipped, saying why; with Jev on it still runs and can fail."""
+    script = (ROOT / "tests" / "e2e" / "smoke-demo.sh").read_text(encoding="utf-8")
+    start = script.index("\nif jev_on; then\n") + 1  # the block, not needs_jev's body
+    block = script[start : script.index("\nfi\n", start) + 3]
+    stub = 'needs_plan() { check "$1" "$2"; }\n'
+    recorded = stub + 'advice=\'{"model":"jev"}\'\n' + block
+    by_rules = stub + 'advice=\'{"model":"rules"}\'\n' + block
+    name = "jev strategy recommendation recorded (SDD §14.4)"
+    off = '{"jev":{"mode":"off","available":false}}'
+    assert _smoke_gates(off, by_rules).splitlines() == [
+        f"SKIP  {name} (Jev is off: the rules decide)"
+    ]
+    on = '{"jev":{"mode":"http","available":true}}'
+    assert _smoke_gates(on, recorded).splitlines() == [f"PASS  {name}"]
+    assert _smoke_gates(on, by_rules).splitlines() == [f"FAIL  {name}"]
+
+
+def test_the_smoke_waits_up_to_smoke_wait_s_for_the_demo_to_settle():
+    """QASuite §14.6: the wait for a fresh demo to settle is SMOKE_WAIT_S seconds, 600 unless set:
+    a fresh stack on a small or busy host needs more than the 300 s it used to be."""
+    script = (ROOT / "tests" / "e2e" / "smoke-demo.sh").read_text(encoding="utf-8")
+    line = next(text for text in script.splitlines() if text.startswith("deadline="))
+
+    def deadline(**env: str) -> int:
+        run = subprocess.run(
+            ["bash", "-c", f'SECONDS=0; {line}; echo "$deadline"'],
+            env={"PATH": "/usr/bin:/bin", **env},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return int(run.stdout)
+
+    assert deadline() == 600
+    assert deadline(SMOKE_WAIT_S="1200") == 1200
