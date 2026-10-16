@@ -586,6 +586,22 @@ async def test_after_a_reset_report_the_kits_map_judges_the_tokens_live_roles(en
     assert read_log(env.log)[-1]["playbook"] == "os_migrate.vmware_migration_kit.migration"
 
 
+async def test_the_kits_map_judges_the_live_roles_over_a_report_that_still_names_roles(env):
+    """Review RV20-13: the roles the destination inventory reads live win over a check report that
+    still names roles - one from before new credentials: a member token is refused although the
+    report names admin, and a service token passes although the report names member (SDD §7.2)."""
+    ctx = _kit_cutover_to_another_projects_network(env, {"roles": ["admin"]})
+    env.registry.roles = ["member"]
+    with pytest.raises(PermanentStepError, match="secure-RBAC defaults let only the admin or ser"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []  # refused before the kit powers the VM off
+    env.registry.networks.pop()
+    ctx = _kit_cutover_to_another_projects_network(env, {"roles": ["member"]})
+    env.registry.roles = ["service", "member"]
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["playbook"] == "os_migrate.vmware_migration_kit.migration"
+
+
 async def test_the_kits_map_refuses_a_nic_that_needs_a_role_when_no_roles_can_be_read(env):
     """Review RV19-01: neither the inventory nor the check report names the token's roles: a NIC
     that needs one is refused before the power-off, never let through (SDD §7.2)."""
