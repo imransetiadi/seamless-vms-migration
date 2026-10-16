@@ -36,6 +36,7 @@ import { strategyLabel, TONE_CLASSES } from '../lib/status';
 import { nothingMigrated, phaseCounts, planDone } from '../lib/planDone';
 import { usePageTitle } from '../lib/usePageTitle';
 import { useNow } from '../lib/useNow';
+import { DESTINATIONS } from '../lib/platforms';
 
 const ATTENTION_ICONS: Record<'danger' | 'warning' | 'info', LucideIcon> = {
   danger: CircleX,
@@ -305,7 +306,7 @@ export default function Overview() {
     <>
       <PageHeader
         title="Overview"
-        description="Live state of VM migrations into Red Hat OpenStack Services on OpenShift 18.0."
+        description={`Live state of VM migrations into ${DESTINATIONS}.`}
         actions={
           <SelectField
             label="Plan"

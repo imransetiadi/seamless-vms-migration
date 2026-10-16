@@ -79,7 +79,7 @@ export const DISTRIBUTION_PRESETS: DistributionPreset[] = [
     id: 'rhoso',
     mark: 'RO',
     label: 'RHOSO 18.0',
-    summary: 'Red Hat OpenStack Services on OpenShift, the destination; Keystone published as a route.',
+    summary: 'Red Hat OpenStack Services on OpenShift; Keystone published as a route.',
     kind: 'rhoso',
     roles: ['destination'],
     endpointExample: 'https://keystone-public-openstack.apps.cluster.example.com/v3',
