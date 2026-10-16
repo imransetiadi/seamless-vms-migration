@@ -929,7 +929,7 @@ export function eligibility(
     const copy: string[] = [];
     if (inError) copy.push(`source VM is in ${vm.power_state} state`);
     if (!source.conversion_host) copy.push('no conversion host configured on the source provider');
-    if (!destination.conversion_host) copy.push('no conversion host configured on the destination provider');
+    if (!destination.conversion_host) copy.push(`no conversion host configured on ${providerLabel(destination)}`);
     // through Nova os-migrate recreates each port with exactly one fixed IP; through Neutron every one (SDD §9.2)
     const planned = withPlannedAddresses(plan, vm);
     const oddPorts = portsWithoutOneFixedIp(planned);

@@ -25,6 +25,7 @@ from seamless_migrate.planning.preflight import (
     resource_demand,
     run_preflight,
 )
+from seamless_migrate.planning.selector import eligibility
 from seamless_migrate.providers.openstack import OpenStackProvider
 from tests.cloud_support import AUTH_URL, InProcessCloud
 from tests.factories import make_disk, make_plan, make_provider, make_vm
@@ -1727,6 +1728,69 @@ def test_every_text_names_the_destination_provider_by_its_label():
         for path in sorted(root.rglob("*.py"))
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
         if bare.search(line)
+    ]
+    assert found == []
+
+
+def test_every_planning_text_about_the_destination_cloud_names_its_provider():
+    """SDD §1 naming (review RV21-05): the conversion-host reason, CONV_HOST_MISSING and the
+    blocking MAP_VOLUME_TYPE_MISSING name the destination provider by its label, as the
+    admin-rights reason does - never "the destination provider", nor its id."""
+    name = "OpenStack 2026.2 Hibiscus (DC3)"
+    src_caps = {"conversion_host": True, "admin": True}
+    dst_caps = {"conversion_host": False, "admin": True}
+    reasons = eligibility(make_vm(), "openstack", make_plan(), src_caps, dst_caps, (), name)
+    assert f"no conversion host configured on {name}" in reasons[Strategy.cold]
+    dst = make_provider(
+        id="dst-dc3",
+        name=name,
+        kind=ProviderKind.openstack,
+        role=ProviderRole.destination,
+        conversion_host=None,
+    )
+    conv = only(check(destination=dst), "CONV_HOST_MISSING")
+    assert conv.message == f"No conversion host configured on: destination {name}."
+    vcenter = make_provider(id="vcenter", kind=ProviderKind.vmware)
+    conv = only(check(source=vcenter, destination=dst), "CONV_HOST_MISSING")
+    assert conv.message == f"No conversion host configured on: destination {name}."
+    mapped = make_plan(mappings=Mappings(volume_types={"ceph-hdd": "ceph-ssd"}))
+    other = make_vm(disks=[make_disk(volume_type="ceph-nvme")])
+    blocker = only(check(other, plan=mapped, destination=dst), "MAP_VOLUME_TYPE_MISSING")
+    assert blocker.message.endswith(f"so the default volume type of {name} cannot be used.")
+
+
+def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
+    """SDD §1 naming (review RV21-05): a text built for a plan or a migration - a finding's
+    message, an eligibility reason, an executor's refusal, failure or log line - names the
+    destination provider by its label; "the destination" is for the fixed texts (a catalog
+    remediation, the dashboard's copy). Every f-string is read, and every plain message given to
+    an error, a finding, a reason list or the handover's _call."""
+    root = Path(__file__).parents[1] / "src" / "seamless_migrate"
+    words = re.compile(r"the destination\b|destination's|destination provider", re.I)
+
+    def text(node):
+        if isinstance(node, ast.JoinedStr):
+            return "".join(v.value for v in node.values if isinstance(v, ast.Constant))
+        return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else ""
+
+    def messages(tree):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                yield node
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                # the plain ones: the walk meets every f-string
+                if name.endswith("Error") or name in ("_call", "append", "log"):
+                    yield from (a for a in node.args[:1] if isinstance(a, ast.Constant))
+                elif name == "finding":
+                    yield from (a for a in node.args[1:2] if isinstance(a, ast.Constant))
+
+    found = [
+        f"{path.relative_to(root)}:{node.lineno}: {text(node)}"
+        for path in sorted(root.rglob("*.py"))
+        for node in messages(ast.parse(path.read_text(encoding="utf-8")))
+        if words.search(text(node))
     ]
     assert found == []
 

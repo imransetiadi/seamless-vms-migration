@@ -68,7 +68,7 @@ def eligibility(
         if not src_caps.get("conversion_host"):
             copy_reasons.append("no conversion host configured on the source provider")
         if not dst_caps.get("conversion_host"):
-            copy_reasons.append("no conversion host configured on the destination provider")
+            copy_reasons.append(f"no conversion host configured on {destination}")
         # through Nova os-migrate recreates each port with exactly one fixed IP and raises for any
         # other count, after the source is stopped (SDD §9.2); a dual-stack port is two addresses.
         # Through Neutron every port keeps all its fixed IPs, none included (§6.6).

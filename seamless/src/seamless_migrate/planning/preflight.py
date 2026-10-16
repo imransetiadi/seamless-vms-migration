@@ -957,7 +957,8 @@ def run_preflight(
             finding(
                 "MAP_VOLUME_TYPE_MISSING",
                 f"No mapping or same-named volume type in {where} for: {_names(missing_types)}; "
-                "the plan maps volume types, so the destination default cannot be used.",
+                f"the plan maps volume types, so the default volume type of {where} cannot be "
+                "used.",
                 severity=Severity.blocker,
                 remediation="Add a volume type mapping for it (the plan preserves volume types).",
             )
@@ -1154,12 +1155,12 @@ def run_preflight(
         lacking: list[str] = []
         if source.kind == ProviderKind.vmware:
             if destination.conversion_host is None:
-                lacking.append(f"destination {destination.id}")
+                lacking.append(f"destination {destination.label}")
         else:
             if source.conversion_host is None:
                 lacking.append(f"source {source.id}")
             if destination.conversion_host is None:
-                lacking.append(f"destination {destination.id}")
+                lacking.append(f"destination {destination.label}")
         if lacking:
             out.append(
                 finding(
