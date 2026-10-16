@@ -378,6 +378,15 @@ describe('mock API', () => {
     });
   });
 
+  it("seeds an ok provider with no status message, nor its checked event, as the API's check leaves one (SDD §10, review RV23-04)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    expect(server.providers.filter((p) => p.status === 'ok').length).toBeGreaterThan(0);
+    expect(server.providers.filter((p) => p.status === 'ok' && p.status_message !== null).map((p) => p.id)).toEqual([]);
+    const checked = server.events.filter((e) => e.kind === 'provider.checked' && e.data.status === 'ok');
+    expect(checked.length).toBeGreaterThan(0);
+    expect(checked.filter((e) => e.data.message !== null).map((e) => e.data.provider_id)).toEqual([]);
+  });
+
   it("gives the credential events the API's data: the provider, the secret written and its keys (SDD §4.3, §13.3, review RV23-02)", () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const call = (method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');

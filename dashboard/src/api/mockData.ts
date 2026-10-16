@@ -579,7 +579,8 @@ export function buildProviders(now: number): Provider[] {
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
       capabilities: checkOf({ id: 'rhosp17-dc1', kind: 'openstack', role: 'source', release: null, policy_profile: null }),
       status: 'ok',
-      status_message: 'Keystone, Nova, Cinder, Neutron and Glance reachable.',
+      // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
+      status_message: null,
       last_checked_at: iso(now - 4 * 60_000),
       distribution: 'rhosp',
       release: null,
@@ -668,7 +669,8 @@ export function buildProviders(now: number): Provider[] {
       // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
       capabilities: checkOf({ id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null }),
       status: 'ok',
-      status_message: 'All services healthy; OVN networking.',
+      // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
+      status_message: null,
       last_checked_at: iso(now - 3 * 60_000),
       distribution: 'rhoso',
       release: null,
@@ -713,7 +715,8 @@ export function buildProviders(now: number): Provider[] {
       conversion_host: conversionHost('os-migrate-conv-dc3', '192.0.2.60'),
       capabilities: checkOf({ id: 'hibiscus-dc3', kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null }),
       status: 'ok',
-      status_message: 'All services reachable; series 2026.2 (Hibiscus) detected.',
+      // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
+      status_message: null,
       last_checked_at: iso(now - 6 * 60_000),
       distribution: 'kolla',
       release: '2026.2',
