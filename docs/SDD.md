@@ -1379,7 +1379,10 @@ volumes with their server, so the order is:
    * the flavor step 8 creates the server with is not a RHOSO flavor (`find_flavor`, as step 8 looks it up);
    * a volume type step 6 manages a volume into is not one of RHOSO's volume types. §9.3's `MAP_VOLUME_TYPE_MISSING`
      is only a warning when the plan maps no volume type, and step 6, like step 8, runs after the source server was
-     deleted.
+     deleted;
+   * that volume type asks for a backend — `volume_backend_name`, or `capabilities:volume_backend_name`, in its extra
+     specs — other than the backend of the pool step 6 manages the volume on, as the pool reports it
+     (`get_pools`): Cinder's scheduler (`CapabilitiesFilter`) refuses that manage (audit EX-10).
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()` — after the shutdown, which the estimate's parts
    count (§9.1) and an Ansible-driven cutover's clock does (§7.2): `TODO(LAB): confirm` whether the handover's clock
    starts at the stop request instead. The stop is journaled as sent once Nova
