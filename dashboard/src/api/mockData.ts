@@ -882,7 +882,9 @@ function storageReasons(vm: VMRef, plan: Plan, source: Provider, destination: Pr
   for (const disk of vm.disks) {
     if (disk.kind !== 'volume' || !disk.pool || !families.has(disk.pool)) continue;
     const family = families.get(disk.pool)!;
-    const target = plan.handover.backend_map[disk.volume_type ?? ''];
+    // its own key only, as eligibility and HANDOVER_BACKEND_UNMAPPED read it: a type named "constructor" is no backend (review RV21-11)
+    const type = disk.volume_type ?? '';
+    const target = Object.hasOwn(plan.handover.backend_map, type) ? plan.handover.backend_map[type] : undefined;
     if (family !== 'other' && (!target || dst.length === 0)) continue;
     const { error } = resolveDestination(family, splitHost(disk.pool)[1], target ?? '', dst, providerLabel(destination));
     if (error) reasons.push(`${disk.name || disk.id}: ${error}`);

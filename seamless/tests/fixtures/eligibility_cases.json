@@ -380,6 +380,115 @@
       }
     },
     {
+      "why": "an unmapped volume type named like an Object.prototype key, on a listed pool, with destination pools (review RV21-11)",
+      "source_kind": "openstack",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "constructor",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": "overcloud@ceph#ssd"
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": true,
+          "backend_map": {
+            "ceph-ssd": "hostgroup@ceph#gold"
+          }
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {
+          "admin": true,
+          "compute_microversion": "2.95",
+          "storage_backends": [
+            {
+              "pool": "overcloud@ceph#ssd",
+              "family": "rbd"
+            },
+            {
+              "pool": "overcloud@ceph#hdd",
+              "family": "rbd"
+            }
+          ]
+        }
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {
+          "admin": true,
+          "compute_microversion": "2.95",
+          "storage_backends": [
+            {
+              "pool": "hostgroup@ceph#gold",
+              "family": "rbd"
+            }
+          ]
+        },
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "cold": [],
+        "warm": [],
+        "storage_handover": [
+          "volume type(s) without a backend of OpenStack 2026.2 Hibiscus (DC3) in handover.backend_map: constructor"
+        ]
+      }
+    },
+    {
       "why": "a port with several fixed IPs through Nova, one an override gives",
       "source_kind": "openstack",
       "vm": {
