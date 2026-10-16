@@ -12,13 +12,15 @@
 # retry per rolled-back migration), SSE replay, stats, Jev through the sidecar and agentmemory,
 # then validates a plan whose SLO nothing meets so Jev is asked for a strategy: the smoke plan of an
 # earlier run, or a new one on a VM no plan holds (SDD §5.4), so a re-run adds no plan.
-# Never prints the token. Exit code = number of failed checks.
+# Never prints the tokens, nor puts them on a command line. Exit code = number of failed checks.
 set -u
 BASE=${BASE:-http://127.0.0.1:8080}
 : "${TOKEN:?export TOKEN=<admin token from compose-init.sh>}"
 : "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
-H="Authorization: Bearer $TOKEN"
-HA="Authorization: Bearer $APPROVER_TOKEN"
+# shellcheck source=tests/e2e/token-headers.sh
+. "$(dirname "$0")/token-headers.sh"   # the tokens reach curl from header files, never argv
+H=$(token_header admin "$TOKEN") || exit 2
+HA=$(token_header approver "$APPROVER_TOKEN") || exit 2
 pass=0; fail=0; skipped=0
 ok()   { pass=$((pass+1)); echo "PASS  $1"; }
 bad()  { fail=$((fail+1)); echo "FAIL  $1"; }

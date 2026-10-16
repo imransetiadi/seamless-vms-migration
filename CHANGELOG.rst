@@ -359,7 +359,70 @@ This project follows a simple changelog to satisfy collection metadata validatio
   fails at the end with ``Source cleanup incomplete: ...`` naming each step
   it could not do. The failure's map carries no volume or VM names, which the
   cleanup never reads: Ansible prints the failed result, and Seamless Migrate
-  retried a stuck detach of a volume whose name held "timeout".
+  retried a stuck detach of a volume whose name held "timeout". The source
+  cleanup puts the volumes back before it frees the transfer's ports, logs a
+  release that fails, and takes no port lock for a map that records no port:
+  a port lock another migrator holds made it give up before the handback, and
+  the rollback started the source VM without its data volumes. It frees them
+  only if one ssh check then reaches the conversion host, as a failed transfer
+  does: a host that went down during the handback had the release wait another
+  15 minutes for its port lock, the source VM stopped meanwhile.
+- The warm sync has blocksync check each device it opens. ``blocksync send``
+  and ``receive`` take ``--expect-serial ID`` and fail with exit 3, before
+  they read or write a byte, when the virtio serial of the device they opened
+  names another volume. The warm sync passes the temporary volume's id to the
+  sender and the destination volume's id to the receiver. The kernel gives a
+  freed ``/dev/vdX`` path to the next disk attached, so a path another volume
+  took after the attach was read, or written into. The check reads the opened
+  descriptor's own device, so nothing can take the path in between. A device
+  without a serial (a regular file, a disk not virtio-blk) is used as given.
+- After an attach call that succeeded, the wait for the volume's device path,
+  which holds the conversion host's attach lock, fails at once when Cinder
+  shows the volume ``available`` again or in ``error`` with no attachment:
+  nova-compute rolled the attach back. One still ``reserved`` or
+  ``attaching`` gives up after ten minutes, ample for a slow Nova. The wait
+  spent the module's whole timeout, 30 minutes by default, while every other
+  migration on that host queued behind the lock. An attach rolled back so
+  leaves no mark for the source cleanup. The transfer's attach to the
+  destination conversion host waits the same way. This wait and the settle
+  wait after a failed call measure their minutes, however slowly Cinder
+  answers: they counted polls, each a Cinder GET as well as a second, so a
+  loaded Cinder stretched the ten minutes to thirty.
+- The cold export checks each disk's identity before it serves it, and the
+  cold transfer each destination volume's before qemu-img or nbdcopy writes
+  it. The check reads the disk's virtio serial, the volume id Nova gives it
+  cut to 20 characters, and fails if the serial names another volume, or if a
+  virtio-blk disk (``vdX``) no longer has a serial file, having left the
+  conversion host; the NBD server, qemu-img or nbdcopy is given the disk's
+  by-id link. The kernel gives a freed ``/dev/vdX`` path to the next disk
+  attached, so a volume taken off the host could have the export serve
+  another VM's disk, or the transfer write over one, without an error. A disk
+  with no serial file (not virtio-blk) is used by its path, unchecked. ssh
+  failing at the check of the by-id link gives up with ``SSH timeout: ...``,
+  which Seamless Migrate retries, as it does ssh failing at the serial read:
+  the error quoted no ssh command line, so one blip there failed the
+  migration as permanent. A destination disk that fails the check fails the
+  transfer by its own message, as the export reports its own, so Seamless
+  Migrate fails it as permanent: the transfer let the error escape, and
+  Ansible printed its cause, the serial read's ssh command line with its
+  ConnectTimeout, which Seamless Migrate retried - two more whole cold copies
+  with the source VM stopped. After nbdcopy exits, whatever its exit, the
+  transfer checks that the path it wrote is still a block device: nbdcopy
+  opens its destination again with ``O_CREAT`` when the first open fails, so
+  a volume that left the host before that open had its disk copied into a
+  regular file nbdcopy created in ``/dev``. Where ``/dev`` had room the
+  transfer reported success with the volume never written; on RHEL 9's 4 MiB
+  ``/dev`` nbdcopy failed with an error that named nothing and left the file.
+  The regular file is removed - udev 252 (RHEL 9) will not make the volume's
+  link over one - and the transfer fails, saying whether the file was
+  removed, could not be removed (ssh failing at the removal is said as
+  such) or could not be checked, and naming nbdcopy's exit when the volume
+  left without a file. Ssh failing at the check gives up as ``SSH timeout:
+  ...`` after a finished copy or one ssh broke; after nbdcopy failed on its
+  own the transfer keeps that failure, permanent, and says the path could
+  not be checked. A volume taken away after the export started is not
+  caught: nbdkit resolves the path it serves, the disk's by-id link
+  included, once, at its start.
 - A wait for a conversion host's attach or port lock gives up once ssh to the
   host has failed for 15 minutes without a break, with ``Lock timeout:
   conversion host ADDRESS unreachable over SSH for N s, waiting for LOCK``,
@@ -385,9 +448,12 @@ This project follows a simple changelog to satisfy collection metadata validatio
   check then reaches the conversion host, where a second wait for the port
   lock of a host it cannot reach held the source another 15 minutes and
   replaced its error; a release that fails is logged, never raised over the
-  transfer's error. A give-up reads ``Lock timeout`` or ``SSH timeout`` only:
-  the wait that would give up with any other prefix, which Seamless Migrate
-  would not retry, fails as it starts.
+  transfer's error; and one that claimed no port, its first wait for the port
+  lock having given up, releases none rather than wait that lock again. A
+  give-up reads ``Lock timeout`` or ``SSH timeout`` only: the wait that would
+  give up with any other prefix, which Seamless Migrate would not retry, fails
+  as it starts, and so does setting such a prefix later, or giving one past
+  the setter: the give-up checks its prefix again as it is built.
 - The warm state file (``workload_warm/{server}.json``) is synced to disk, its
   directory after the rename too, so the rename outlives a crash: a rollback
   reads there which destination volumes and server to delete. A filesystem

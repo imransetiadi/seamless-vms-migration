@@ -1,7 +1,8 @@
 # Contributing to Seamless Migrate
 
 Thank you for helping! Seamless Migrate moves virtual machines from Red Hat OpenStack Platform 17.1,
-community OpenStack and VMware vSphere into Red Hat OpenStack Services on OpenShift (RHOSO) 18.0.
+community OpenStack and VMware vSphere into Red Hat OpenStack Services on OpenShift (RHOSO) 18.0 or community
+OpenStack 2023.1 Antelope – 2026.2 Hibiscus (docs/SDD.md §21).
 People run it against production workloads, so we value correctness, safety and clear evidence over
 speed. Every contribution counts: bug reports, documentation, tests, reviews and code.
 
@@ -138,7 +139,8 @@ Search the existing issues first. A good bug report includes:
 
 - the Seamless Migrate version or commit;
 - the source platform (Red Hat OpenStack Platform 17.1, community OpenStack, Kolla-Ansible or
-  VMware vCenter) and the destination (RHOSO 18.0);
+  VMware vCenter) and the destination (RHOSO 18.0, or community OpenStack with its release series and
+  deployment tool, e.g. 2026.2 Hibiscus on Kolla-Ansible);
 - the migration strategy: `cold`, `warm`, `storage_handover`, `vmware_cold` or `vmware_warm`;
 - the guest OS and its version;
 - what you expected, what happened, and the steps to reproduce it;

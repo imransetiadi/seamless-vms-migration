@@ -13,6 +13,7 @@ import io
 import itertools
 import json
 import re
+import subprocess
 
 try:
     from openstack.exceptions import (
@@ -579,6 +580,16 @@ class FakeShell:
     def test_ssh_connection(self):
         self.commands.append(["echo connected"])
 
+    def _volumes_held(self):
+        """{device: volume} of the volumes this conversion host holds."""
+        server_id = self.cloud.addresses[self.address]
+        return {
+            attachment["device"]: volume
+            for volume in self.cloud.volumes.values()
+            for attachment in volume.attachments
+            if attachment["server_id"] == server_id
+        }
+
     def cmd_out(self, command, **kwargs):
         self.commands.append(list(command))
         if command[:3] == ["sudo", "rm", "-vf"]:  # use_lock releases its lock
@@ -586,6 +597,17 @@ class FakeShell:
         if command and command[0] == "lsblk":
             server_id = self.cloud.addresses[self.address]
             return "\n".join(self.cloud.devices[server_id])
+        if len(command) == 2 and command[0] == "cat" and command[1].startswith("/sys/block/"):
+            # as virtio-blk: a volume's disk shows the serial Nova gives it, the volume id cut to
+            # 20 characters; a disk no volume backs shows none; a gone disk has no such file
+            device = "/dev/" + command[1].split("/")[3]
+            volume = self._volumes_held().get(device)
+            if volume is not None:
+                return volume.id[:20]
+            server_id = self.cloud.addresses[self.address]
+            if device in self.cloud.devices.get(server_id, []):
+                return ""
+            raise subprocess.CalledProcessError(1, command)
         return ""
 
     def cmd_val(self, command, **kwargs):
@@ -596,6 +618,10 @@ class FakeShell:
                 return rc
         if command[:2] == ["timeout", "1"]:
             return 124  # "timeout 1 nc -l PORT" timed out: the port is free
+        if command[:2] == ["test", "-b"] and command[2].startswith("/dev/disk/by-id/virtio-"):
+            # udev's link of a virtio serial exists while the volume is on this host
+            serial = command[2][len("/dev/disk/by-id/virtio-"):]
+            return 0 if any(v.id[:20] == serial for v in self._volumes_held().values()) else 1
         if command[:2] == ["sudo", "flock"]:
             # use_lock takes the lock file; on a real conversion host a holder taking it again
             # waits for itself until it times out - here the test fails at once

@@ -245,6 +245,9 @@ for (const [width, height] of [
   [375, 700],
 ] as const) {
   test(`at ${width}×${height} the plan, policy and provider dialogs keep the focused control clear of their actions (WCAG 2.4.11, SDD §16)`, async ({ page }) => {
+    // up to 120 Tab presses, each checked for a covered focus: seconds alone, but 33.5 s - past the 30 s
+    // budget - while other suites shared the machine (audit F-09), a failure for the wrong reason
+    test.slow();
     await page.setViewportSize({ width, height });
     await signIn(page, 'admin');
     await page.goto('/plans');

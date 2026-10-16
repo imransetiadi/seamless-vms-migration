@@ -12,6 +12,7 @@ from seamless_migrate.providers.base import ProviderError, VMNotFound, provider_
 from seamless_migrate.providers.fake import FakeDestinationProvider, FakeSourceProvider
 from seamless_migrate.providers.openstack import OpenStackProvider
 from seamless_migrate.providers.vmware import VMwareProvider
+from tests.cloud_support import AUTH_URL, InProcessCloud
 from tests.factories import make_provider
 
 GIB = 2**30
@@ -600,6 +601,20 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
     caps = await OpenStackProvider(make_provider(), settings()).check()
     assert caps["admin"] is False and caps["ovn"] is False
     assert caps["roles"] == ["member", "reader"]
+
+
+async def test_the_check_reports_a_real_clouds_compute_maximum_as_major_minor(tmp_path):
+    """Review RV18-01: keystoneauth hands openstacksdk a service's maximum microversion as a
+    parsed tuple, (2, 96), and the check wrote it as text - "(2, 96)", which nothing reads as a
+    microversion and the providers page showed as such. It reports "2.96" (SDD §10)."""
+    cloud = InProcessCloud(tmp_path, compute="2.96")
+    provider = make_provider(endpoint=AUTH_URL, cloud="dst")
+    caps = await OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect).check()
+
+    assert caps["compute_microversion"] == "2.96"
+    # what keystoneauth hands the check: a tuple, never the text a stub hands
+    conn = cloud.connect(provider, cloud.settings)
+    assert conn.compute.get_endpoint_data().max_microversion == (2, 96)
 
 
 async def test_openstack_check_leaves_out_roles_it_cannot_read(stub_openstack):

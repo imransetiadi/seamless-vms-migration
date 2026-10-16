@@ -6,6 +6,8 @@ from __future__ import absolute_import, division, print_function
 
 __metaclass__ = type
 
+import subprocess
+
 import pytest
 
 from ansible_collections.os_migrate.os_migrate.tests.unit import fake_openstack as fake
@@ -106,3 +108,28 @@ def test_the_fakes_second_detach_while_one_is_pending_is_refused():
     with pytest.raises(fake.SDKException, match="detaching from server srv-1 already"):
         cloud.detach_volume(cloud.servers["srv-1"], volume, wait=False)
     assert cloud.block_storage.wait_for_status(volume, "available", wait=5).attachments == []
+
+
+def test_the_conversion_host_shows_each_held_volumes_virtio_serial_and_its_by_id_link():
+    """As a virtio-blk conversion host: a volume's disk shows the serial Nova gives it - the volume
+    id cut to 20 characters - and udev's /dev/disk/by-id/virtio-<serial> link exists while the
+    volume is attached; the host's own disk shows no serial, and a gone disk has no serial file
+    (review RV12-03)."""
+    cloud = fake.FakeCloud("src")
+    conv = cloud.add_conversion_host("conv", "10.0.0.10")
+    volume = cloud.add_volume("0123456789abcdefghij-tail", "long", 10)
+    shell = fake.ShellFactory([cloud])("10.0.0.10", "cloud-user")
+    cloud.attach_volume(conv, volume)
+    name = volume.attachments[0]["device"].rsplit("/", 1)[-1]
+    link = ["test", "-b", "/dev/disk/by-id/virtio-0123456789abcdefghij"]
+
+    assert shell.cmd_out(["cat", "/sys/block/%s/serial" % name]) == "0123456789abcdefghij"
+    assert shell.cmd_val(link) == 0
+    assert shell.cmd_out(["cat", "/sys/block/vda/serial"]) == ""  # the host's own disk
+
+    cloud.detach_volume(conv, volume, wait=False)
+    cloud.block_storage.wait_for_status(volume, "available", wait=5)
+
+    assert shell.cmd_val(link) == 1
+    with pytest.raises(subprocess.CalledProcessError):
+        shell.cmd_out(["cat", "/sys/block/%s/serial" % name])

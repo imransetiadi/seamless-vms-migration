@@ -171,7 +171,8 @@ words that appear in an error message — treat the memory server as an internal
 | Outcome (runtime lessons) | `completed`, `rollback` | written by `KnowledgeService`; failure lessons carry the step instead |
 | Size bucket (runtime completion lessons) | `<50G`, `50-200G`, `200-500G`, `>500G` | privacy by coarsening; written by `KnowledgeService` |
 | Step (when relevant) | `prestage`, `precopy`, `sync`, `cutover`, `rollback`, `finalize`, `verify` | the SDD `StepName` values plus `verify` |
-| Platform family | `rhosp-17-1`, `community-openstack`, `vmware`, `rhoso-18` | source/destination specifics |
+| Platform family | `rhosp-17-1`, `community-openstack`, `vmware`, `rhoso-18` | source/destination specifics; `community-openstack` serves a source and a destination (SDD §21) |
+| Release series (when relevant) | the upstream series name in lower case: `antelope`, `bobcat`, `caracal`, `dalmatian`, `epoxy`, `flamingo`, `gazpacho`, `hibiscus` (the next ones as upstream names them) | a community cloud's series, beside `community-openstack` (SDD §21.1) |
 | Kind (optional) | `decision`, `incident`, `gotcha`, `benchmark`, `runbook` | how to read it |
 | References (optional) | `fr-07`, `nfr-02`, `sdd-6-2` (SDD section as `sdd-<n>-<m>`) | traceability |
 

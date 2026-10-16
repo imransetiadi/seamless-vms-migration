@@ -268,11 +268,13 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
     OpenstackVolumeTransfer,
     DEFAULT_TIMEOUT,
+    DiskIdentityError,
     volume_or_none,
 )
 
 import re
 import time
+import traceback
 
 
 class OpenStackDestinationVolume(OpenstackVolumeTransfer):
@@ -529,7 +531,11 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         and a wait for its port lock would hold the stopped source another 15
         minutes. A release that fails is logged, never raised over the
         transfer's own error (Seamless Migrate SDD 6.6, review RV10-04, RV11-02).
+        One that claimed no port releases none: the release waited a second
+        whole window for a port lock whose wait just gave up (review RV12-02).
         """
+        if not self.claimed_ports:
+            return
         try:
             self.shell.test_ssh_connection()
         except Exception as err:  # pylint: disable=broad-except
@@ -624,7 +630,14 @@ def run_module():
         preserve_volume_type=module.params["preserve_volume_type"],
         warm_state_dir=module.params["warm_state_dir"],
     )
-    destination_host.transfer_exports()
+    try:
+        destination_host.transfer_exports()
+    except DiskIdentityError as err:
+        # by its own message, as the export reports its own: the message is what the control
+        # plane classifies, and the check's cause - ssh's command line, with its ConnectTimeout -
+        # would have this permanent failure retried; every other error leaves the module as
+        # before (Seamless Migrate SDD 6.6, review RV15-01)
+        module.fail_json(msg=str(err), exception=traceback.format_exc())
 
     block_device_mapping = []
     for path in sorted(destination_host.volume_map.keys()):

@@ -657,6 +657,39 @@ def test_sync_runs_blocksync_between_attached_devices(tmp_path):
     assert all(dev.startswith("/dev/vd") and dev != "/dev/vda" for dev in used.values())
 
 
+def test_sync_has_each_blocksync_end_check_its_volume(tmp_path):
+    """SDD 6.2: the kernel gives a freed /dev/vdX path to the next disk attached, so the warm sync
+    has blocksync check the device it opens: the sender expects the temporary volume attached at
+    its source_dev, the receiver the destination volume attached at its dest_dev."""
+    dst_at = {}  # what the destination conversion host holds while blocksync runs
+
+    def receive(command):
+        dst_at.update(
+            (attachment["device"], volume.id)
+            for volume in scenario.dst.volumes.values()
+            for attachment in volume.attachments
+            if attachment["server_id"] == "dst-conv"
+        )
+        return fake.receive_process()
+
+    scenario = Scenario(tmp_path, receive=receive)
+    source_map = scenario.snapshot("uuid-1").create()
+
+    scenario.sync("uuid-1").sync("auto")
+
+    tmp_at = {entry["source_dev"]: entry["tmp_volume_id"] for entry in source_map.values()}
+    commands = receive_commands(scenario)
+    assert len(commands) == 2
+    for argv in commands:
+        receiver = argv[:argv.index("--")]
+        sender = argv[argv.index("--") + 1:]
+        remote = shlex.split(" ".join(sender[sender.index("cloud-user@" + SRC_CONV) + 1:]))
+        dest_dev = receiver[receiver.index("--device") + 1]
+        source_dev = remote[remote.index("--device") + 1]
+        assert receiver[receiver.index("--expect-serial") + 1] == dst_at[dest_dev]
+        assert remote[remote.index("--expect-serial") + 1] == tmp_at[source_dev]
+
+
 def test_sync_assume_zero_only_for_new_volumes(tmp_path):
     scenario = Scenario(tmp_path)
 

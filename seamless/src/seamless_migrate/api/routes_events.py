@@ -2,12 +2,15 @@
 
 Each SSE frame is ``id: <seq or 0>\\nevent: <kind>\\ndata: <Event JSON>\\n\\n``; a
 ``: heartbeat`` comment is sent after ``sse_heartbeat_s`` (15 s) without events. Clients resume
-with ``?since=<last seq>``; without ``since`` only live events are streamed.
+with ``?since=<last seq>``; without ``since`` only live events are streamed. The stream checks its
+principal again at each heartbeat, and at least once per heartbeat interval while events flow,
+and ends once it is no longer accepted (a database user revoked, SDD §13.1).
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -17,7 +20,7 @@ from ..domain.enums import Role
 from ..domain.models import Event
 from ..events import AUDIT_KINDS, Subscription
 from ..security.auth import Principal
-from .deps import require_role, services
+from .deps import authenticate, require_role, services
 
 #: Largest sequence/offset the database integer columns hold (a bigger value is a 422, not a 500).
 MAX_SEQ = 2**63 - 1
@@ -34,7 +37,12 @@ async def sse_frames(
     subscription: Subscription,
     heartbeat_s: float,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
+    still_allowed: Callable[[], Awaitable[bool]] | None = None,
 ) -> AsyncIterator[str]:
+    """The stream's frames. ``still_allowed`` runs at each heartbeat, and before an event once a
+    heartbeat interval has passed since it last ran: a principal no longer accepted - a database
+    user whose row was deleted - ends the stream, whose reconnect gets 401 (SDD §12, §13.1)."""
+    checked = time.monotonic()
     try:
         while True:
             try:
@@ -42,10 +50,18 @@ async def sse_frames(
             except TimeoutError:
                 if is_disconnected is not None and await is_disconnected():
                     return
+                if still_allowed is not None:
+                    checked = time.monotonic()
+                    if not await still_allowed():
+                        return
                 yield HEARTBEAT
                 continue
             except StopAsyncIteration:
                 return
+            if still_allowed is not None and time.monotonic() - checked >= heartbeat_s:
+                checked = time.monotonic()
+                if not await still_allowed():
+                    return
             yield format_sse(event)
     finally:
         await subscription.aclose()
@@ -86,8 +102,12 @@ async def stream_events(
     svc = services(request)
     start = since if since is not None else await svc.db.max_seq()
     subscription = svc.bus.subscribe(since=start)
+
+    async def still_allowed() -> bool:
+        return await authenticate(request) is not None
+
     return StreamingResponse(
-        sse_frames(subscription, svc.sse_heartbeat_s, request.is_disconnected),
+        sse_frames(subscription, svc.sse_heartbeat_s, request.is_disconnected, still_allowed),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

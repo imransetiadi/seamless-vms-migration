@@ -2,9 +2,11 @@ from __future__ import absolute_import, division, print_function
 
 __metaclass__ = type
 
+import io
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from unittest import mock
@@ -135,7 +137,10 @@ def test_update_progress_replaces_state_file_atomically(tmp_path):
 
 def _exporter(nbdkit_installed):
     src = fake.FakeCloud("src")
-    src.add_conversion_host("src-conv", "10.0.0.10")
+    conv = src.add_conversion_host("src-conv", "10.0.0.10")
+    # the volume the map names is on the conversion host, at /dev/vdb: the export checks the
+    # disk's identity before it serves it (Seamless Migrate SDD 6.6, review RV13-02)
+    src.attach_volume(conv, src.add_volume("vol-1", "vm1-root", 10))
 
     def which(command):
         if command[0] == "which":
@@ -754,6 +759,68 @@ def test_a_port_map_read_that_fails_gives_up_with_its_own_error(status, message)
     assert not any(c[:4] == ["timeout", "1", "nc", "-l"] for c in transfer.shell.commands)
 
 
+class PortLockHeldElsewhere:
+    """The destination conversion host, reachable, whose port lock a live module of another
+    migrator holds (``check_process`` keeps another host's owner): every try for the port lock
+    answers 17 ("Another conversion is holding the lock") and costs ``rtt`` seconds of ``clock``."""
+
+    address = CONV
+    ssh_user = "cloud-user"
+
+    def __init__(self, clock, rtt=0.2):
+        self.clock, self.rtt = clock, rtt
+        self.lock_tries = 0
+
+    def test_ssh_connection(self):
+        """Reachable: the check answers."""
+
+    def cmd_out(self, command, **kwargs):
+        if command == ["sudo", "cat", volume_common.PORT_LOCK_FILE + ".lock"]:
+            return "migrator-2:4242"
+        if command[:2] == ["sudo", "cat"]:
+            raise subprocess.CalledProcessError(1, command)  # no such lock file
+        return ""
+
+    def cmd_val(self, command, **kwargs):
+        if command[:2] == ["sudo", "flock"] and command[6] == volume_common.PORT_LOCK_FILE:
+            self.lock_tries += 1
+            self.clock.now += self.rtt
+            return 17
+        return 0
+
+    def cmd_sub(self, command, **kwargs):
+        return fake.FakeProcess()
+
+
+def test_a_transfer_whose_port_lock_wait_gave_up_waits_no_second_window_to_release_no_port():
+    """Review RV12-02: a failed transfer releases its ports once one ssh check answers (RV11-02).
+    One whose first wait for the port lock gave up - another migrator's live module holds it -
+    claimed no port, yet its release waited a second whole window for the same lock, about 36
+    minutes more with a cold cutover's source stopped, to remove nothing (Seamless Migrate SDD
+    6.6)."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_transfer_volumes as transfer_module,
+    )
+
+    src, dst = fake.FakeCloud("src"), cloud()
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    volume_map = {"/dev/vda": dict(cold_volume_map()["/dev/vda"], port=10809)}
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = transfer_module.OpenStackDestinationVolume(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1", "10.0.0.10", volume_map,
+            workload(), timeout=1800,
+        )
+    clock = Clock()
+    transfer.shell = host = PortLockHeldElsewhere(clock)
+
+    with mock.patch.object(volume_common, "time", clock):
+        with pytest.raises(RuntimeError, match="Unable to acquire lock " + volume_common.PORT_LOCK_FILE):
+            transfer.transfer_exports()
+
+    assert transfer.claimed_ports == []
+    assert host.lock_tries == volume_common.DEFAULT_TIMEOUT, (host.lock_tries, clock.now)
+
+
 def test_the_destination_detach_takes_the_volumes_it_is_given_or_the_volume_maps():
     """SDD 6.3 (review RV4-05): given volume ids, the destination detach - under the conversion
     host's attach lock - detaches those and leaves the volume map's volumes attached; given none,
@@ -971,3 +1038,511 @@ def test_a_volume_cinder_no_longer_has_reads_as_none():
     dst.get_volume_by_id = mock.Mock(side_effect=ServerError("Service Unavailable"))
     with pytest.raises(ServerError):
         volume_common.volume_or_none(dst, "vol-1")
+
+
+class ConvertShell:
+    """A destination conversion host for the transfer's copy: its disks show the virtio serials of
+    the volumes in ``held`` ({device: volume id}) and their by-id links; qemu-img, virt-sparsify and
+    nbdcopy end at once."""
+
+    address = CONV
+
+    def __init__(self, held):
+        self.held, self.commands = held, []
+
+    def cmd_out(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:1] == ["cat"] and command[1].startswith("/sys/block/"):
+            device = "/dev/" + command[1].split("/")[3]
+            if device not in self.held:
+                raise subprocess.CalledProcessError(1, command)
+            return self.held[device][:20]
+        return ""
+
+    def cmd_val(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:2] == ["test", "-b"]:
+            serial = command[2][len("/dev/disk/by-id/virtio-"):]
+            return 0 if any(volume_id[:20] == serial for volume_id in self.held.values()) else 1
+        return 0
+
+    def cmd_sub(self, command, **kwargs):
+        self.commands.append(list(command))
+        return DoneProcess()
+
+
+class DoneProcess:
+    """A process that has ended well, its output already read."""
+
+    returncode = 0
+
+    def __init__(self):
+        read, write = os.pipe()
+        os.close(write)
+        self.stdout = os.fdopen(read, "rb")
+        self.stderr = io.StringIO()
+
+    def poll(self):
+        return 0
+
+    def wait(self):
+        return 0
+
+    def communicate(self, data=None, timeout=None):
+        return "", ""
+
+
+def _copying_transfer(tmp_path, held):
+    transfer = object.__new__(volume_common.OpenstackVolumeTransfer)
+    transfer.log, transfer.log_file, transfer.state_file = mock.Mock(), str(tmp_path / "log"), None
+    transfer.transfer_uuid = "uuid-1"
+    transfer.qemu_progress_re = re.compile(r"\((\d+\.\d+)/100%\)")
+    transfer.volume_map = {
+        "/dev/vda": {"dest_id": "dvol-boot-0123456789-tail", "dest_dev": "/dev/vdb",
+                     "url": "nbd://localhost:10809/uuid-1", "progress": 0.0},
+    }
+    transfer.shell = ConvertShell(held)
+    return transfer
+
+
+@pytest.mark.parametrize("copy", ["qemu-img", "nbdcopy"])
+def test_the_transfer_writes_each_destination_volume_through_its_by_id_link(tmp_path, copy):
+    """Seamless Migrate SDD 6.6 (the RV12-03 hazard on the destination): qemu-img and nbdcopy wrote
+    each destination volume through the /dev/vdX recorded at attach - a path another volume took
+    before their open was written into. They are now given the volume's by-id link, once its serial
+    was checked, which resolves at their open to the volume itself."""
+    transfer = _copying_transfer(tmp_path, {"/dev/vdb": "dvol-boot-0123456789-tail"})
+
+    if copy == "qemu-img":
+        transfer._convert_destination_volumes()
+        writes = [c[-1] for c in transfer.shell.commands if c[:3] == ["sudo", "qemu-img", "convert"]]
+    else:
+        transfer._convert_destination_volumes_nbdcopy()
+        writes = [c[3] for c in transfer.shell.commands if c[:2] == ["sudo", "nbdcopy"]]
+
+    assert writes and set(writes) == {"/dev/disk/by-id/virtio-dvol-boot-0123456789"}, writes
+
+
+@pytest.mark.parametrize("copy", ["qemu-img", "nbdcopy"])
+def test_the_transfer_never_writes_a_destination_path_another_volume_took(tmp_path, copy):
+    """Seamless Migrate SDD 6.6: the destination volume left the conversion host, and the kernel gave
+    its /dev/vdX to another volume's disk - the copy fails before anything is written."""
+    transfer = _copying_transfer(tmp_path, {"/dev/vdb": "other-volume-0123456789"})
+
+    with pytest.raises(RuntimeError, match="not of volume dvol-boot"):
+        if copy == "qemu-img":
+            transfer._convert_destination_volumes()
+        else:
+            transfer._convert_destination_volumes_nbdcopy()
+
+    assert not [c for c in transfer.shell.commands if c[:3] in (["sudo", "qemu-img", "convert"],)]
+    assert not [c for c in transfer.shell.commands if c[:2] == ["sudo", "nbdcopy"]]
+
+
+class IdentityShell:
+    """A destination conversion host whose /dev/vdc fails its identity check: ``gone`` - the
+    volume left the host, so the serial read's ssh command fails with cat's exit status 1 - or
+    ``another volume`` - the disk there is another volume's."""
+
+    address = CONV
+
+    def __init__(self, failure):
+        self.failure = failure
+
+    def cmd_out(self, command, **kwargs):
+        if self.failure == "gone":
+            raise subprocess.CalledProcessError(
+                1, ["ssh", "-o", "ConnectTimeout=10", "cloud-user@" + CONV] + list(command)
+            )
+        return "other-volume-0123456"
+
+    def cmd_val(self, command, **kwargs):
+        return 0
+
+
+TRANSFER_ARGS = {
+    "data": fake.workload_data(),
+    "conversion_host": {"id": "dst-conv"},
+    "ssh_key_path": "/keys/k",
+    "ssh_user": "cloud-user",
+    "transfer_uuid": "uuid-1",
+    "src_conversion_host_address": "10.0.0.10",
+    "volume_map": {"/dev/vda": {"source_dev": "/dev/vdb", "url": "nbd://localhost:10809/uuid-1"}},
+}
+
+
+def _transfer_module_failing_with(transfer_exports):
+    """The transfer module's run, its transfer failing as ``transfer_exports`` does."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_transfer_volumes as transfer_module,
+    )
+
+    with mock.patch.object(transfer_module, "OpenStackDestinationVolume") as destination:
+        destination.return_value.transfer_exports.side_effect = transfer_exports
+        return fake.run_module(transfer_module, dict(TRANSFER_ARGS), fake.FakeCloud("dst"))
+
+
+@pytest.mark.parametrize(
+    "failure, message",
+    [
+        ("gone", "/dev/vdc on the conversion host is gone: volume dvol-1 left the host"),
+        ("another volume", "/dev/vdc on the conversion host is the disk of volume "
+                           "other-volume-0123456, not of volume dvol-1: the volume left the host"),
+    ],
+)
+def test_a_destination_disk_that_fails_its_identity_check_fails_the_transfer_by_its_own_message(
+    failure, message
+):
+    """Review RV15-01: the transfer module let the identity check's error escape, and Ansible
+    printed it with its cause - the serial read's ssh command line, ConnectTimeout and all - which
+    the control plane retries: two more whole cold copies with the source stopped, for a failure
+    SDD 6.6 calls permanent. The module now fails by the error's own message, as the export does;
+    the cause stays in the traceback for whoever reads the log."""
+    def transfer_exports():
+        check = object.__new__(volume_common.OpenstackVolumeTransfer)
+        check.log, check.shell = mock.Mock(), IdentityShell(failure)
+        check._identified_path("dvol-1", "/dev/vdc")
+
+    result = _transfer_module_failing_with(transfer_exports)
+
+    assert result["_exit_code"] == 1 and result.get("failed"), result
+    assert result["msg"] == message
+    # what Ansible shows at the default verbosity, which the control plane classifies: neither the
+    # traceback nor the module's arguments (its own `timeout` among them)
+    hidden = ("exception", "invocation", "_exit_code", "_connected")
+    shown = {key: value for key, value in result.items() if key not in hidden}
+    assert "timeout" not in json.dumps(shown).lower(), shown
+    if failure == "gone" and "exception" in result:
+        # the cause stays for whoever reads the log: ansible-core 2.18, the production pin, returns
+        # the traceback; 2.19 and later keep it for their own traceback display
+        assert "ConnectTimeout" in result["exception"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("SSH timeout: conversion host %s unreachable over SSH, checking the by-id "
+                     "link of /dev/vdc" % CONV),
+        subprocess.CalledProcessError(255, ["ssh", "-o", "ConnectTimeout=10", "cloud-user@" + CONV]),
+        RuntimeError("Failed to convert volume! qemu-img: error while writing"),
+    ],
+    ids=["an SSH give-up", "ssh failing", "a failed copy"],
+)
+def test_the_transfers_other_errors_still_escape_its_module(error):
+    """Review RV15-01: only an identity failure is caught. Every other error of the transfer
+    leaves the module as before - its classification is the owner's question 8 - so an ssh
+    give-up, or ssh's own failure, stays retried."""
+    with pytest.raises(type(error)) as raised:
+        _transfer_module_failing_with(error)
+
+    assert raised.value is error
+
+
+class LeavingDestination:
+    """The destination conversion host of a cold transfer, its /dev on a real directory: the disk
+    of the destination volume (a regular file standing for the block device /dev/vdb) and udev's
+    by-id link to it. With ``leave`` "at the check" the volume leaves the host right after the
+    identity check's `test -b` of its link - another actor detaches it - and udev removes the link;
+    with "during the copy" it leaves once nbdcopy wrote into it; with None it stays (review RV15-02,
+    RV16-02). The copy tools open their destination as their sources do: nbdcopy as libnbd's
+    open_local - open(O_WRONLY), and when that fails open(O_WRONLY | O_TRUNC | O_CREAT | O_EXCL,
+    0644) - and qemu-img's host_device with no O_CREAT. As on a real host `test -b` holds for the
+    disk alone and `test -f` for a regular file, both following links. ``failing`` names the command
+    whose ssh fails after the copy (exit 255) or, for "rm", whose sudo fails (exit 1); with
+    ``dev_full`` /dev is RHEL 9's 4 MiB devtmpfs, so nbdcopy's write into a file it made fails and it
+    exits 1, leaving the file, as libnbd's file_synch_write does; ``nbdcopy_exit`` makes it fail
+    anyway (review RV16-02, RV16-03, RV16-06). ``leave="before the open"`` takes the disk at the
+    identity check while udev keeps its by-id link: nbdcopy's open fails ENOENT and its create
+    (O_CREAT | O_EXCL) EEXIST on the dangling link, so it exits 1 having written nothing, and udev
+    removes the link by the check; ``failing="rm ssh"`` has ssh fail at the removal (review
+    RV17-04)."""
+
+    address = CONV
+
+    def __init__(self, root, volume_id, leave="at the check", failing=None, dev_full=False,
+                 nbdcopy_exit=0):
+        self.root = root
+        self.serial = volume_id[:20]
+        self.disk = root / "dev" / "vdb"
+        self.link = root / "dev" / "disk" / "by-id" / ("virtio-" + self.serial)
+        self.link.parent.mkdir(parents=True)
+        self.disk.write_bytes(bytes(4096))
+        self.link.symlink_to("../../vdb")
+        self.leave, self.failing, self.dev_full, self.nbdcopy_exit = leave, failing, dev_full, nbdcopy_exit
+        self.left = False
+        self.copied = False
+        self.commands = []
+
+    def _local(self, path):
+        return self.root / path.lstrip("/")
+
+    def _leaves(self):
+        self.left = True
+        if self.leave != "before the open":  # udev has not yet removed the link
+            self.link.unlink()
+        self.disk.unlink()
+
+    def cmd_out(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command == ["cat", "/sys/block/vdb/serial"]:
+            if self.left:
+                raise subprocess.CalledProcessError(1, command)
+            return self.serial
+        return ""  # qemu-img create of the overlay
+
+    def cmd_val(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:2] == ["test", "-b"]:
+            if self.copied and self.failing == "test -b":
+                return 255
+            path = self._local(command[2])
+            found = self.disk.exists() and os.path.realpath(path) == os.path.realpath(self.disk)
+            if not self.left and self.leave in ("at the check", "before the open"):
+                self._leaves()
+            return 0 if found else 1
+        if command[:2] == ["test", "-f"]:
+            if self.failing == "test -f":
+                return 255
+            path = self._local(command[2])
+            regular = path.is_file() and os.path.realpath(path) != os.path.realpath(self.disk)
+            return 0 if regular else 1
+        if command[:3] == ["sudo", "rm", "-f"]:
+            if self.failing == "rm":
+                return 1
+            if self.failing == "rm ssh":
+                return 255
+            path = self._local(command[3])
+            if path.exists() or path.is_symlink():
+                path.unlink()
+            return 0
+        return 0  # rm -f of the overlay
+
+    def cmd_sub(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:2] == ["sudo", "nbdcopy"]:
+            path = self._local(command[3])
+            made = False
+            try:
+                fd = os.open(str(path), os.O_WRONLY)
+            except OSError:
+                try:
+                    fd = os.open(str(path), os.O_WRONLY | os.O_TRUNC | os.O_CREAT | os.O_EXCL, 0o644)
+                except OSError as err:  # the dangling link: nothing opened, nothing written
+                    self.copied = True
+                    self.link.unlink()  # udev catches up
+                    return FailedProcess(1, "nbdcopy: %s: %s\n" % (command[3], err.strerror))
+                made = True
+            os.write(fd, b"the source volume's data")
+            os.close(fd)
+            self.copied = True
+            if self.leave == "during the copy" and not self.left:
+                self._leaves()
+            if made and self.dev_full:
+                return FailedProcess(1, "%s: No space left on device\n" % command[3])
+            if self.nbdcopy_exit:
+                return FailedProcess(self.nbdcopy_exit, "nbdcopy: write: Input/output error\n")
+            return DoneProcess()
+        if command[:3] == ["sudo", "qemu-img", "convert"]:
+            try:
+                os.close(os.open(str(self._local(command[-1])), os.O_RDWR))
+            except OSError as err:
+                return FailedProcess(1, "qemu-img: Could not open '%s': %s" % (command[-1], err))
+            return DoneProcess()
+        return DoneProcess()  # virt-sparsify
+
+
+class FailedProcess:
+    """A process that has ended with ``returncode``, ``output`` on its stdout."""
+
+    def __init__(self, returncode, output):
+        self.returncode = returncode
+        read, write = os.pipe()
+        os.write(write, output.encode())
+        os.close(write)
+        self.stdout = os.fdopen(read, "r")
+        self.stderr = self.stdout
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self):
+        return self.returncode
+
+    def communicate(self, data=None, timeout=None):
+        return self.stdout.read(), ""
+
+
+LEAVING_ID = "3b7a57d7-8210-47f9-b592-a6627ae52d13"
+
+
+def _leaving_transfer(tmp_path, **host_args):
+    host = LeavingDestination(tmp_path / "dst-conv", LEAVING_ID, **host_args)
+    transfer = _copying_transfer(tmp_path, {})
+    transfer.volume_map["/dev/vda"]["dest_id"] = LEAVING_ID
+    transfer.shell = host
+    return transfer, host
+
+
+def test_nbdcopy_never_reports_a_destination_volume_that_left_the_host_as_written(tmp_path):
+    """Review RV15-02: nbdcopy opens its destination again with O_CREAT when the first open fails,
+    so a volume that left the host between the identity check and that open had its disk copied
+    into a regular file nbdcopy created at the link's path, and the transfer reported success with
+    the volume never written - on RHEL 8, whose devtmpfs takes half the RAM. The transfer now checks
+    that the path is still a disk, removes the regular file, which would block udev's link, and
+    fails as permanent (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path)
+
+    with pytest.raises(volume_common.DiskIdentityError, match=LEAVING_ID):
+        transfer._convert_destination_volumes_nbdcopy()
+
+    assert not host.link.exists() and not host.link.is_symlink(), "the regular file stayed"
+    assert transfer.volume_map["/dev/vda"]["progress"] != 100.0
+
+
+def test_qemu_img_fails_when_the_destination_volume_left_the_host(tmp_path):
+    """Control (review RV15-02): qemu-img's host_device opens its target with no O_CREAT, so the
+    same sequence fails both converts - the sparsify attempt's and the whole-device fallback's -
+    given the same checked link."""
+    transfer, host = _leaving_transfer(tmp_path)
+
+    with pytest.raises(RuntimeError, match="Could not open"):
+        transfer._convert_destination_volumes()
+
+    converts = [c for c in host.commands if c[:3] == ["sudo", "qemu-img", "convert"]]
+    assert len(converts) == 2 and {c[-1] for c in converts} == {str("/dev/disk/by-id/virtio-" + LEAVING_ID[:20])}
+
+
+def _regular_file_stayed(host):
+    return host.link.is_file() and not host.link.is_symlink()
+
+
+def test_nbdcopy_failing_in_the_file_it_made_leaves_no_file_and_names_the_cause(tmp_path):
+    """Review RV16-02: on RHEL 9 /dev is a 4 MiB devtmpfs, so nbdcopy's copy into the regular file it
+    made where the volume's link was runs out of room and nbdcopy exits 1. The transfer raised
+    "Failed to copy volume with nbdcopy! Return code: 1" before its check ran: the file stayed in
+    /dev/disk/by-id, where udev 252 will not make the link, and the error named nothing. The check
+    now runs whatever nbdcopy's exit (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path, dev_full=True)
+
+    with pytest.raises(volume_common.DiskIdentityError, match=LEAVING_ID):
+        transfer._convert_destination_volumes_nbdcopy()
+
+    assert not _regular_file_stayed(host), "the regular file stayed"
+
+
+@pytest.mark.parametrize(
+    "failing, said",
+    [("test -f", "could not be checked"), ("rm", "could not be removed (sudo rm -f exited 1)")],
+    ids=["ssh fails at test -f", "sudo rm fails"],
+)
+def test_the_check_after_nbdcopy_never_says_it_removed_a_file_it_left(tmp_path, failing, said):
+    """Review RV16-03: the check ignored the results of its `test -f` and its `sudo rm -f`, and said
+    "now removed" all the same, while nbdcopy's copy of the disk stayed in /dev. It now says what
+    became of the file, and where to remove it by hand (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path, failing=failing)
+
+    with pytest.raises(volume_common.DiskIdentityError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    message = str(raised.value)
+    assert _regular_file_stayed(host)
+    assert "now removed" not in message and said in message, message
+    assert "/dev/disk/by-id/virtio-" + LEAVING_ID[:20] in message and CONV in message, message
+
+
+@pytest.mark.parametrize("nbdcopy_exit", [0, 255], ids=["a whole copy", "ssh broke the copy"])
+def test_ssh_failing_at_the_check_after_nbdcopy_gives_up_as_ssh_timeout(tmp_path, nbdcopy_exit):
+    """Review RV16-06: ssh failing (255) at the check after nbdcopy is no proof the volume left: the
+    check gives up as "SSH timeout: ...", which the control plane retries, and removes nothing - a
+    whole, good copy is never failed as permanent for an ssh blip, nor a copy ssh broke (Seamless
+    Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(
+        tmp_path, leave=None, failing="test -b", nbdcopy_exit=nbdcopy_exit
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    assert not isinstance(raised.value, volume_common.DiskIdentityError), raised.value
+    assert str(raised.value).startswith("SSH timeout:"), raised.value
+    assert not [c for c in host.commands if c[:3] == ["sudo", "rm", "-f"]]
+
+
+#: what Seamless Migrate's control plane retries (its classify_failure, executors/ansible.py)
+TRANSIENT = re.compile(r"(?i)timeout|http 503|connection reset")
+
+
+@pytest.mark.parametrize("leave", [None, "at the check"], ids=["the volume stays", "it left before the copy"])
+def test_a_failed_copy_stays_permanent_when_ssh_fails_at_the_check_after_it(tmp_path, leave):
+    """Review RV17-01: after nbdcopy failed on its own (exit 1) every answer the check could give is
+    permanent, yet an ssh failure at its `test -b` made the transfer "SSH timeout: ...", retried -
+    whole new copies, a cold source stopped meanwhile - with nbdcopy's failure named nowhere. The
+    transfer keeps nbdcopy's failure and says the path could not be checked (Seamless Migrate SDD
+    6.6)."""
+    transfer = _leaving_transfer(tmp_path, leave=leave, failing="test -b", nbdcopy_exit=1)[0]
+
+    with pytest.raises(RuntimeError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    message = str(raised.value)
+    assert not TRANSIENT.search(message), message
+    assert message.startswith("Failed to copy volume with nbdcopy! Return code: 1"), message
+    assert "could not be checked (ssh failed)" in message, message
+    assert "/dev/disk/by-id/virtio-" + LEAVING_ID[:20] in message and CONV in message, message
+
+
+def test_a_failed_copy_onto_a_disk_still_there_keeps_nbdcopys_own_error(tmp_path):
+    """Review RV16-02: the check runs after a failed copy too, and a path that is still the volume's
+    disk leaves nbdcopy's own failure to stand (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path, leave=None, nbdcopy_exit=1)
+
+    with pytest.raises(RuntimeError, match="Failed to copy volume with nbdcopy! Return code: 1") as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    assert not isinstance(raised.value, volume_common.DiskIdentityError)
+    copy = next(i for i, c in enumerate(host.commands) if c[:2] == ["sudo", "nbdcopy"])
+    assert ["test", "-b", "/dev/disk/by-id/virtio-" + LEAVING_ID[:20]] in host.commands[copy:]
+
+
+def test_a_volume_that_left_after_nbdcopy_finished_is_named_as_such(tmp_path):
+    """Reviews RV16-03, RV17-04: with no regular file at the path and nbdcopy's exit 0, every write
+    succeeded and the volume left after the copy - the error says so, claims no file, and never
+    that the volume was not written whole (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path, leave="during the copy")
+
+    with pytest.raises(volume_common.DiskIdentityError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    message = str(raised.value)
+    assert "left the host after nbdcopy finished" in message, message
+    assert "regular file" not in message and "not written whole" not in message, message
+    assert not [c for c in host.commands if c[:3] == ["sudo", "rm", "-f"]]
+
+
+def test_a_volume_nbdcopy_never_opened_is_named_by_nbdcopys_exit(tmp_path):
+    """Review RV17-04: the volume left at the identity check while udev kept its by-id link;
+    nbdcopy opened nothing, wrote nothing and exited 1. The error names nbdcopy's exit and never a
+    copy that did not happen (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path, leave="before the open")
+
+    with pytest.raises(volume_common.DiskIdentityError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    message = str(raised.value)
+    assert "nbdcopy exited 1" in message and "during the copy" not in message, message
+    assert not TRANSIENT.search(message), message
+
+
+def test_an_ssh_failure_at_the_removal_is_not_reported_as_rms_own_exit(tmp_path):
+    """Review RV17-04: ssh's 255 at `sudo rm -f` says nothing of rm's own exit - the connection may
+    have dropped after rm ran: the error says ssh failed at the removal and asks to check the path,
+    never "sudo rm -f exited 255" (Seamless Migrate SDD 6.6)."""
+    transfer = _leaving_transfer(tmp_path, failing="rm ssh")[0]
+
+    with pytest.raises(volume_common.DiskIdentityError) as raised:
+        transfer._convert_destination_volumes_nbdcopy()
+
+    message = str(raised.value)
+    assert "exited 255" not in message, message
+    assert "ssh failed at the removal" in message, message
+    assert "/dev/disk/by-id/virtio-" + LEAVING_ID[:20] in message and CONV in message, message

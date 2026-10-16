@@ -5,9 +5,9 @@ import pytest
 import yaml
 
 from seamless_migrate import __version__, cli
-from seamless_migrate.domain.enums import Phase, PlanStatus, ProviderKind, ProviderRole
+from seamless_migrate.domain.enums import Phase, PlanStatus, ProviderKind, ProviderRole, Role
 from seamless_migrate.domain.models import Plan
-from seamless_migrate.security.auth import hash_token
+from seamless_migrate.security.auth import DashboardUser, hash_token
 from seamless_migrate.store import Store
 from tests.factories import make_migration, make_provider, make_vm
 
@@ -73,6 +73,42 @@ def test_token_create_refuses_names_the_file_or_the_audit_trail_own(env, capsys,
     assert captured.out == "", "no token is printed"
     assert captured.err.startswith("error: ")
     assert cli.main(["token", "create", "--name", "n" * 128, "--role", "viewer"]) == 0
+
+
+@pytest.mark.parametrize("name", ["dimas", "Dimas", " DIMAS "])
+def test_token_create_refuses_a_name_a_dashboard_user_has(env, capsys, name):
+    """SDD §13.1 (review 12): POST /users keeps names unique ignoring case across file tokens and
+    database users, but `token create` checked only what the tokens file refuses - a file token and
+    a dashboard user could share a name, which the audit trail cannot tell apart."""
+    store = store_for(env)
+    try:
+        store.create_user(
+            DashboardUser(id="dimas", name="Dimas", role=Role.viewer, sha256=hash_token("x")),
+            actor="admin-user",
+        )
+    finally:
+        store.dispose()
+
+    assert cli.main(["token", "create", "--name", name, "--role", "admin"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "", "no token is printed"
+    assert captured.err.startswith("error: ") and "dashboard user" in captured.err
+
+
+def test_token_create_warns_and_prints_the_entry_when_the_database_cannot_be_read(
+    env, capsys, monkeypatch
+):
+    """SDD §13.1 (review 12): a first admin's token is made before anything else - with no
+    database to read, `token create` says it could not check and prints the entry all the same."""
+    blocker = env / "not-a-dir"  # the database's directory is a file: no store can open
+    blocker.write_text("")
+    monkeypatch.setenv("SEAMLESS_DB_URL", f"sqlite:///{blocker / 'cli.db'}")
+
+    assert cli.main(["token", "create", "--name", "first-admin", "--role", "admin"]) == 0
+    captured = capsys.readouterr()
+    assert re.fullmatch(r"smg_[A-Za-z0-9_-]{43}", captured.out.splitlines()[0].strip())
+    assert "could not check" in captured.err and "first-admin" in captured.err, captured.err
+    assert "not-a-dir" not in captured.err  # the database URL is never printed
 
 
 @pytest.mark.parametrize("knob", [["--slo", "0"], ["--slo", "-5"], ["--max-passes", "0"]])

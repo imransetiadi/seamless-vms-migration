@@ -38,6 +38,7 @@ import { LiveIndicator } from '../components/LiveIndicator';
 import { PageHeader } from '../components/PageHeader';
 import { LoadingBlock } from '../components/Skeleton';
 import { cn } from '../lib/cn';
+import { EVENT_CATEGORIES } from '../lib/eventCategories';
 import { formatDateTime, formatNumber, formatTime } from '../lib/format';
 import type { Tone } from '../lib/phase';
 import { createSeenSeqs } from '../lib/seen';
@@ -50,20 +51,6 @@ const PAGE = 200;
 const HISTORY = 500;
 const NO_ITEMS: Item[] = [];
 
-const CATEGORIES: Array<{ value: string; label: string; match: (kind: string) => boolean }> = [
-  { value: 'all', label: 'All', match: () => true },
-  { value: 'migrations', label: 'Migrations', match: (k) => k.startsWith('migration.') },
-  { value: 'plans', label: 'Plans and waves', match: (k) => k.startsWith('plan.') || k.startsWith('wave.') },
-  {
-    value: 'advisor',
-    label: 'Advisor and memory',
-    // the advisor's audit events (SDD §14.5) are advisor activity too
-    match: (k) => k.startsWith('advisor.') || k.startsWith('memory.') || k.startsWith('recommendation.') || k.startsWith('decision.'),
-  },
-  { value: 'providers', label: 'Providers', match: (k) => k.startsWith('provider.') },
-  // a prune cuts the audit trail itself (SDD §15)
-  { value: 'security', label: 'Security', match: (k) => k.startsWith('auth.') || k === 'events.pruned' },
-];
 
 function kindMeta(kind: string): { icon: LucideIcon; tone: Tone } {
   switch (kind) {
@@ -232,7 +219,7 @@ export default function Events() {
   }, [olderItems, historyItems, live]);
 
   const filtered = useMemo(() => {
-    const match = CATEGORIES.find((c) => c.value === category)?.match ?? (() => true);
+    const match = EVENT_CATEGORIES.find((c) => c.value === category)?.match ?? (() => true);
     const q = query.trim().toLowerCase();
     return items.filter(({ event }) => {
       if (planId && event.plan_id !== planId) return false;
@@ -399,7 +386,7 @@ export default function Events() {
             setCategory(e.target.value);
             setLimit(PAGE);
           }}
-          options={CATEGORIES.map((c) => ({ value: c.value, label: c.label }))}
+          options={EVENT_CATEGORIES.map((c) => ({ value: c.value, label: c.label }))}
         />
         <SelectField
           label="Plan"

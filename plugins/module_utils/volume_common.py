@@ -105,6 +105,10 @@ ATTACHING = ("reserved", "attaching")
 # how long a settle wait for them holds the attach lock: ample for Nova to finish an attach, and
 # far below what a lock wait queued behind it allows (Seamless Migrate SDD 6.6, review RV11-01)
 ATTACH_SETTLE_S = 120
+# how long an attach Nova accepted may stay under way while the wait for its device path holds the
+# attach lock: ample for a slow Nova, and it bounds a reservation nova-compute abandoned (Seamless
+# Migrate SDD 6.6, review RV12-01)
+ATTACH_UNDER_WAY_S = 600
 
 # ssh's own exit status when it cannot reach or log in to the host
 SSH_FAILED = 255
@@ -122,6 +126,24 @@ class ConversionHostUnreachable(RuntimeError):
     without a break (Seamless Migrate SDD 6.6)."""
 
 
+class DiskIdentityError(RuntimeError):
+    """A disk failed its identity check: it is another volume's, or the volume
+    left the conversion host. Permanent: import_workload_transfer_volumes, the
+    transfer Seamless Migrate runs, reports it by its own message, which the
+    control plane classifies, never by its cause; upstream's
+    import_volumes_transfer lets it escape (Seamless Migrate SDD 6.6, review
+    RV15-01)."""
+
+
+def _checked_give_up_prefix(prefix):
+    """``prefix``, one of GIVE_UP_PREFIXES, which the control plane retries."""
+    if prefix not in GIVE_UP_PREFIXES:
+        raise ValueError(
+            "A give-up prefix is one of %s, not %r" % (", ".join(GIVE_UP_PREFIXES), prefix)
+        )
+    return prefix
+
+
 class SshOutage:
     """
     How long ssh to a conversion host has failed without a break, its own exit
@@ -129,18 +151,27 @@ class SshOutage:
     SSH_UNREACHABLE_S, with "{prefix}: conversion host {address} unreachable
     over SSH for {n} s, waiting for {what}", which the control plane retries
     (Seamless Migrate SDD 6.6, review RV8-01, RV9-02, RV9-04); the prefix is
-    one of GIVE_UP_PREFIXES (review RV11-05).
+    one of GIVE_UP_PREFIXES, checked whenever it is set and again when the
+    give-up is built (review RV11-05, RV12-07, RV15-03).
     """
 
+    #: the give-up: its prefix, the host, the seconds ssh failed and what the wait was for
+    GIVE_UP = "%s: conversion host %s unreachable over SSH for %d s, waiting for %s"
+
     def __init__(self, address, waiting_for, prefix="SSH timeout"):
-        if prefix not in GIVE_UP_PREFIXES:
-            raise ValueError(
-                "A give-up prefix is one of %s, not %r" % (", ".join(GIVE_UP_PREFIXES), prefix)
-            )
+        self.prefix = prefix
         self.address = address
         self.waiting_for = waiting_for
-        self.prefix = prefix
         self.since = None
+
+    @property
+    def prefix(self):
+        """The give-up's prefix: one of GIVE_UP_PREFIXES."""
+        return self._prefix
+
+    @prefix.setter
+    def prefix(self, prefix):
+        self._prefix = _checked_give_up_prefix(prefix)
 
     @property
     def failing(self):
@@ -156,9 +187,11 @@ class SshOutage:
         if self.since is None:
             self.since = now
         elif now - self.since >= SSH_UNREACHABLE_S:
+            # checked again as the template is filled: a prefix written past the setter -
+            # _prefix itself, a subclass's own property - never reaches the give-up (review RV15-03)
+            prefix = _checked_give_up_prefix(self.prefix)
             raise ConversionHostUnreachable(
-                "%s: conversion host %s unreachable over SSH for %d s, waiting for %s"
-                % (self.prefix, self.address, now - self.since, self.waiting_for)
+                self.GIVE_UP % (prefix, self.address, now - self.since, self.waiting_for)
             )
 
 
@@ -438,6 +471,14 @@ class OpenStackVolumeBase:
 
     def _converter_close_exports(self):
         """
+        SSH to source conversion host, close the NBD export process and free
+        the transfer's ports.
+        """
+        self._stop_exports()
+        self._release_ports()
+
+    def _stop_exports(self):
+        """
         SSH to source conversion host and close the NBD export process.
         """
         self.log.info("Stopping exports from source conversion host...")
@@ -452,8 +493,6 @@ class OpenStackVolumeBase:
                     self.log.debug("Error stopping exports! %s", str(err))
         except subprocess.CalledProcessError as err:
             self.log.debug("Unable to get remote NBD PID! %s", str(err))
-
-        self._release_ports()
 
     def _delete_volumes(self):
         """Delete destination volumes."""
@@ -613,14 +652,20 @@ class OpenStackVolumeBase:
                     # lock, so no other export attached it meanwhile (Seamless Migrate
                     # SDD 6.6, review RV10-01, RV10-02)
                     settled = self._settled_volume(conn, volume["id"])
-                    if settled is None or not (
-                        self._volume_still_attached(settled, host)
-                        or getattr(settled, "status", None) in ATTACHING
-                    ):
+                    if not self._attach_may_be_ours(settled, host):
                         mapping.pop(mark, None)
                 raise
             self.log.info("Waiting for volume to appear in %s wrapper", name)
-            self._wait_for_volume_dev_path(conn, volume, host_func(), self.timeout)
+            try:
+                self._wait_for_volume_dev_path(conn, volume, host_func(), self.timeout)
+            except Exception:
+                if mark and mapping.get(mark):
+                    # an attach Nova rolled back leaves no mark either; one still under
+                    # way keeps it (Seamless Migrate SDD 6.6, review RV12-01)
+                    now = volume_or_none(conn, volume["id"])
+                    if not self._attach_may_be_ours(now, host):
+                        mapping.pop(mark, None)
+                raise
 
             disks_after = ssh_func(
                 [
@@ -678,9 +723,15 @@ class OpenStackVolumeBase:
         attach lock: a reservation Nova abandoned never settles (Seamless
         Migrate SDD 6.6, review RV10-01, RV10-02, RV11-01).
         """
-        for second in range(min(self.timeout, ATTACH_SETTLE_S)):
+        limit = min(self.timeout, ATTACH_SETTLE_S)
+        # each poll is a Cinder GET as well as its 1 s sleep: the wait ends at its seconds,
+        # measured, not only at as many polls (review RV13-03)
+        deadline = time.monotonic() + limit
+        for second in range(limit):
             volume = volume_or_none(conn, volume_id)
             if volume is None or getattr(volume, "status", None) not in ATTACHING:
+                return volume
+            if time.monotonic() >= deadline:
                 return volume
             time.sleep(1)
         return volume_or_none(conn, volume_id)
@@ -695,14 +746,55 @@ class OpenStackVolumeBase:
                 return attachment
         raise RuntimeError("Volume is not attached to the specified instance!")
 
+    def _attach_may_be_ours(self, volume, host):
+        """
+        Whether an attach of ``volume`` to ``host`` whose outcome this module
+        did not see may be its own: Cinder lists the host, or still shows the
+        attach under way (Seamless Migrate SDD 6.6, review RV10-01, RV10-02).
+        """
+        return volume is not None and (
+            self._volume_still_attached(volume, host)
+            or getattr(volume, "status", None) in ATTACHING
+        )
+
     def _wait_for_volume_dev_path(self, conn, volume, vm, timeout):
+        """
+        After an attach call that succeeded, wait until Cinder lists ``vm``'s
+        attachment of the volume with its device path. nova-api reserves the
+        volume before it answers, so one `available` again, or in `error`,
+        with no attachment means nova-compute rolled the attach back: that
+        fails at once. One still `reserved` or `attaching` fails after
+        ATTACH_UNDER_WAY_S, and only a listed attachment whose device has not
+        shown waits ``timeout``: the wait holds the attach lock (Seamless
+        Migrate SDD 6.6, review RV12-01).
+        """
         volume_id = volume.id
+        # each poll is a Cinder GET as well as its 1 s sleep: the cap is seconds, measured, as well
+        # as polls (review RV13-03)
+        under_way, under_way_since = 0, None
         for second in range(timeout):
             volume = conn.get_volume_by_id(volume_id)
             if volume.attachments:
                 attachment = self._get_attachment(volume, vm)
                 if attachment["device"].startswith("/dev/"):
                     return
+            else:
+                status = getattr(volume, "status", None)
+                if status in ("available", "error"):
+                    raise RuntimeError(
+                        "Nova did not attach volume %s: Cinder shows it %s, attached nowhere"
+                        % (volume_id, status)
+                    )
+                now = time.monotonic()
+                if under_way_since is None:
+                    under_way_since = now
+                under_way += 1
+                waited = max(now - under_way_since, under_way)
+                if waited >= ATTACH_UNDER_WAY_S:
+                    raise RuntimeError(
+                        "Nova did not finish attaching volume %s: Cinder still shows it %s "
+                        "after %d s" % (volume_id, status, waited)
+                    )
             time.sleep(1)
         raise RuntimeError("Timed out waiting for volume device path!")
 
@@ -774,6 +866,55 @@ class OpenStackVolumeBase:
                 "Unable to write port map to conversion host! Error was: %s",
                 str(err),
             )
+
+    def _identified_path(self, volume_id, device):
+        """
+        The path a tool that opens the disk of volume ``volume_id``, attached
+        at ``device``, is given, once that disk's identity is checked: the
+        export's NBD server, the transfer's qemu-img or nbdcopy. The kernel
+        gives a freed device path to the next disk attached, so a volume taken
+        off the host would have the tool read, or write, another disk without
+        an error. The disk's virtio serial - the volume id Nova gives it, cut to
+        20 characters - must not name another volume, and a virtio-blk disk
+        (vdX), which always shows a serial file, must still have one; a disk
+        with no serial file (not virtio-blk, sdX) is given by its path. The
+        tool is given udev's link of the serial, which resolves at its open to
+        the volume itself; nbdkit resolves it once, at its start, so a swap
+        after that is a known residual (Seamless Migrate SDD 6.6, review
+        RV12-03, RV13-01, RV13-02, RV14-02).
+        """
+        name = device.rsplit("/", 1)[-1]
+        try:
+            serial = self.shell.cmd_out(["cat", "/sys/block/%s/serial" % name]).strip()
+        except subprocess.CalledProcessError as err:
+            if err.returncode == SSH_FAILED:
+                raise
+            if name.startswith("vd"):
+                raise DiskIdentityError(
+                    "%s on the conversion host is gone: volume %s left the host"
+                    % (device, volume_id)
+                ) from err
+            serial = ""  # not virtio-blk: no serial file to check
+        if not serial:
+            self.log.warning("%s shows no virtio serial: using it by its path", device)
+            return device
+        if not volume_id.startswith(serial):
+            raise DiskIdentityError(
+                "%s on the conversion host is the disk of volume %s, not of volume %s: "
+                "the volume left the host" % (device, serial, volume_id)
+            )
+        link = "/dev/disk/by-id/virtio-" + serial
+        found = self.shell.cmd_val(["test", "-b", link])
+        if found == SSH_FAILED:
+            # a give-up the control plane retries, as the serial read's own error is (RV14-02)
+            raise RuntimeError(
+                "SSH timeout: conversion host %s unreachable over SSH, checking the by-id link of %s"
+                % (getattr(self.shell, "address", "?"), device)
+            )
+        if found != 0:
+            self.log.warning("%s has no %s link: using it by its path", device, link)
+            return device
+        return link
 
     @use_lock(PORT_LOCK_FILE)
     def _find_free_port(self):
@@ -1158,7 +1299,9 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
     def _export_volumes_from_converter(self):
         """
         SSH to source conversion host and start an NBD export. Volume mapping
-        step 4: fill in the URL to the volume's matching NBD export.
+        step 4: fill in the URL to the volume's matching NBD export. Each
+        disk's identity, where it shows one, is checked before its export
+        starts (_identified_path).
         """
         self.log.info("Exporting volumes from source conversion host...")
         for path, mapping in self.volume_map.items():
@@ -1168,7 +1311,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             # SDD 6.6, review RV6-01)
             mapping["port"] = port
             volume_id = mapping["source_id"]
-            disk = mapping["source_dev"]
+            disk = self._identified_path(volume_id, mapping["source_dev"])
             self.log.info("Exporting %s from volume %s", disk, volume_id)
 
             # Fall back to qemu-nbd if nbdkit is not present
@@ -1470,7 +1613,8 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         for path, mapping in self.volume_map.items():
             self.log.info("Copying source VM's %s: %s", path, str(mapping))
             url = mapping["url"]
-            dest_dev = mapping["dest_dev"]
+            # the volume itself, never a path another volume took (Seamless Migrate SDD 6.6)
+            dest_dev = self._identified_path(mapping["dest_id"], mapping["dest_dev"])
 
             self.log.info("Using nbdcopy from %s to %s", url, dest_dev)
             cmd = [
@@ -1523,12 +1667,79 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                 self.log.info("nbdcopy stderr: %s", stderr)
 
             self.log.info("nbdcopy return code: %d", nbd_sub.returncode)
+            # after any exit: on RHEL 9's 4 MiB /dev a copy into the regular file nbdcopy made fails
+            # (Seamless Migrate SDD 6.6, review RV16-02)
+            self._check_still_a_disk(mapping["dest_id"], dest_dev, nbd_sub.returncode)
             if nbd_sub.returncode != 0:
                 raise RuntimeError(f"Failed to copy volume with nbdcopy! Return code: {nbd_sub.returncode}")
 
             # Mark as 100% complete
             self._update_progress(path, 100.0)
             self.log.info("Successfully copied %s", path)
+
+    def _check_still_a_disk(self, volume_id, path, nbdcopy_exit=0):
+        """
+        nbdcopy opens its destination again with O_CREAT when the first open
+        fails (libnbd's open_local): a volume that left the host between its
+        identity check and that open has its disk copied into a regular file
+        nbdcopy created at ``path``, which on RHEL 9's 4 MiB /dev runs out of
+        room. Run after nbdcopy's exit, whatever it was: the path must still be
+        a block device. A regular file there is removed - udev 252 (RHEL 9) will
+        not make the volume's link over one, where udev 239 (RHEL 8) replaces
+        it - and the error says whether it was removed, could not be removed or
+        could not be checked. Ssh failing at the check gives up as SSH timeout
+        after a whole copy (``nbdcopy_exit`` 0) or one ssh broke (255); after
+        nbdcopy failed on its own every answer would be permanent, so its
+        failure stays (Seamless Migrate SDD 6.6, review RV15-02, RV16-02,
+        RV16-03, RV17-01, RV17-04).
+        """
+        found = self.shell.cmd_val(["test", "-b", path])
+        if found == 0:
+            return
+        address = getattr(self.shell, "address", "?")
+        if found == SSH_FAILED:
+            if nbdcopy_exit not in (0, SSH_FAILED):
+                raise RuntimeError(
+                    "Failed to copy volume with nbdcopy! Return code: %d; whether %s on %s is still a "
+                    "disk could not be checked (ssh failed): look for a regular file there"
+                    % (nbdcopy_exit, path, address)
+                )
+            raise RuntimeError(
+                "SSH timeout: conversion host %s unreachable over SSH, checking that %s is still a disk"
+                % (address, path)
+            )
+        regular = self.shell.cmd_val(["test", "-f", path])
+        if regular == 0:
+            removed = self.shell.cmd_val(["sudo", "rm", "-f", path])
+            what = "left the host before nbdcopy opened it, and nbdcopy copied into a regular file in its place, "
+            if removed == 0:
+                what += "now removed; the volume was not written"
+            elif removed == SSH_FAILED:
+                what += (
+                    "and ssh failed at the removal: check %s on %s and remove it by hand if it is "
+                    "there, as udev 252 will not make the volume's link over it; the volume was not "
+                    "written" % (path, address)
+                )
+            else:
+                what += (
+                    "which could not be removed (sudo rm -f exited %d): remove %s on %s by hand, as udev "
+                    "252 will not make the volume's link over it; the volume was not written"
+                    % (removed, path, address)
+                )
+        elif regular == SSH_FAILED:
+            what = (
+                "left the host, and whether nbdcopy left a regular file in its place could not be "
+                "checked (ssh failed): remove one found at %s on %s by hand; the volume was not "
+                "written whole" % (path, address)
+            )
+        elif nbdcopy_exit == 0:
+            # every write succeeded: the volume left once nbdcopy had finished
+            what = "left the host after nbdcopy finished, before its disk could be confirmed"
+        else:
+            what = "left the host; nbdcopy exited %d and the volume was not written whole" % nbdcopy_exit
+        raise DiskIdentityError(
+            "%s on the conversion host is no longer a disk: volume %s %s" % (path, volume_id, what)
+        )
 
     def _convert_destination_volumes(self):
         """
@@ -1541,6 +1752,8 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             self.log.info("Converting source VM's %s: %s", path, str(mapping))
             devname = os.path.basename(mapping["dest_dev"])
             overlay = "/tmp/" + devname + "-" + self.transfer_uuid + ".qcow2"
+            # the volume itself, never a path another volume took (Seamless Migrate SDD 6.6)
+            target = self._identified_path(mapping["dest_id"], mapping["dest_dev"])
 
             def _log_convert(source_disk, source_format, mapping):
                 """Write qemu-img convert progress to the wrapper log."""
@@ -1555,7 +1768,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     "-O",
                     "host_device",
                     source_disk,
-                    mapping["dest_dev"],
+                    target,
                 ]
                 # Non-blocking output processing stolen from pre_copy.py
                 img_sub = self.shell.cmd_sub(
@@ -1677,10 +1890,41 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
         return self.shell.test_ssh_connection()
 
     def close_exports(self):
-        """Put the source VM's volumes back where they were."""
-        self._converter_close_exports()
-        self._detach_volumes_from_source_converter()
-        self._attach_data_volumes_to_source()
+        """
+        Put the source VM's volumes back where they were: stop the NBD
+        exports, give the volumes back - the attach lock and the API are all
+        that needs - and only then free the ports the map records. A port lock
+        another migrator holds so never keeps the volumes off the source VM; a
+        release that fails is logged, never raised over the handback, and a map
+        that records no port takes no port lock (Seamless Migrate SDD 6.6,
+        review RV13-04).
+        """
+        self._stop_exports()
+        try:
+            self._detach_volumes_from_source_converter()
+            self._attach_data_volumes_to_source()
+        finally:
+            self._release_claimed_ports()
+
+    def _release_claimed_ports(self):
+        if not self.claimed_ports:
+            return
+        try:
+            # as a failed transfer's release: a host it cannot reach cannot update its port
+            # map, and a wait for its port lock would hold the stopped source VM another
+            # window (Seamless Migrate SDD 6.6, review RV14-01)
+            self.shell.test_ssh_connection()
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning(
+                "Ports %s stay claimed on the conversion host it cannot reach: %s",
+                self.claimed_ports,
+                err,
+            )
+            return
+        try:
+            self._release_ports()
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning("Could not release ports %s: %s", self.claimed_ports, err)
 
     @use_lock(ATTACH_LOCK_FILE_SOURCE)
     def _detach_volumes_from_source_converter(self):

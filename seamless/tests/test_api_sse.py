@@ -12,6 +12,7 @@ from seamless_migrate.api.routes_events import format_sse
 from seamless_migrate.domain.enums import Role
 from seamless_migrate.domain.models import Event
 from seamless_migrate.events import emit
+from seamless_migrate.security.auth import DashboardUser, hash_token
 from seamless_migrate.store import Store
 from tests.api_support import api_settings
 
@@ -121,3 +122,45 @@ async def test_event_stream_is_never_compressed(server):
             live = await emit(store, bus, "plan.updated", "live", plan_id="p")
             frames = await asyncio.wait_for(frames_task, timeout=3)
     assert parse(frames[0])["id"] == str(live.seq)
+
+
+@pytest.mark.parametrize("busy", [False, True], ids=["idle", "events flowing"])
+async def test_a_revoked_database_users_open_stream_ends(server, busy):
+    """SDD §12, §13.1 (review 12's lead): the stream checked its role once, when it started, so a
+    database user revoked by deleting its row kept receiving every event until it disconnected.
+    The stream checks its principal again at each heartbeat - and at least once per heartbeat
+    interval while events flow - and ends; the reconnect gets 401."""
+    base, _tokens, app, store = server
+    token = "stream-user-token"
+    store.create_user(
+        DashboardUser(
+            id="stream.user", name="stream.user", role=Role.viewer, sha256=hash_token(token)
+        ),
+        actor="admin-user",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    bus = app.state.services.bus
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        async with client.stream("GET", f"{base}/api/v1/events/stream", headers=headers) as res:
+            assert res.status_code == 200
+            chunks = res.aiter_text()  # one iterator: a response streams once
+            assert ": heartbeat" in await asyncio.wait_for(chunks.__anext__(), timeout=5)
+            store.delete("user", "stream.user")
+
+            async def drain():
+                async for _chunk in chunks:
+                    pass
+
+            ended = asyncio.ensure_future(drain())
+            if busy:
+                for _ in range(60):  # an event every 0.05 s for 3 s, well inside the heartbeat
+                    if ended.done():
+                        break
+                    await emit(
+                        store, bus, "migration.progress", "1%", migration_id="m", persist=False
+                    )
+                    await asyncio.sleep(0.05)
+                assert ended.done(), "the stream outlived its principal while events flowed"
+            await asyncio.wait_for(ended, timeout=3)
+        assert (await client.get(f"{base}/api/v1/me", headers=headers)).status_code == 401

@@ -1,7 +1,8 @@
 # CLAUDE.md — working agreement for agents on Seamless Migrate
 
-Seamless Migrate moves VMs from **RHOSP 17.1 / community OpenStack / VMware** into **RHOSO 18.0** with
-minimal downtime. The repository root is a **fork of the os-migrate Ansible collection** (the data mover;
+Seamless Migrate moves VMs from **RHOSP 17.1 / community OpenStack / VMware** into **RHOSO 18.0** or
+**community OpenStack 2023.1 Antelope – 2026.2 Hibiscus** (the support tiers of SDD §21) with minimal
+downtime. The repository root is a **fork of the os-migrate Ansible collection** (the data mover;
 upstream `main` after 1.0.5, versioned 1.1.0 here);
 `seamless/` is the Python control plane, `dashboard/` the React UI, `deploy/` the Compose and OpenShift
 deployment. Read this file fully before changing anything.
@@ -13,6 +14,7 @@ deployment. Read this file fully before changing anything.
 | `docs/SDD.md` | **Binding spec.** Wire formats, enums, field names, routes, roles, env vars, event kinds, finding codes (§3–§16). When code and SDD disagree, the SDD wins until it is amended. |
 | `docs/PRD.md` | Requirements (`FR-xx`, `NFR-xx`), personas, journeys, release scope. |
 | `docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md` | Task list, interfaces and the **concrete test names** each task must make pass. |
+| `docs/superpowers/plans/2026-10-16-community-openstack-destinations.md` | The 0.2.0 tasks T1–T10 for community OpenStack destinations (SDD §21), with their test names. |
 | `docs/MEMORY.md` · `docs/QASuite.md` · `docs/Security.md` · `docs/Performance.md` | Memory architecture, test strategy and exact commands, threat model, performance model. |
 
 Rules: never invent a field, route, enum value or env var that is not in the SDD; reference SDD sections

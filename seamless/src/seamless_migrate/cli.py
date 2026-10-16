@@ -244,10 +244,31 @@ def cmd_token_create(args: argparse.Namespace, settings: Settings) -> int:
     if ":" in args.name:
         # the form of the advisor's actors and deciders: policy:<id>, user:<name>, system:… (§14.4)
         raise CliError(f"{args.name!r} has a colon, the form of the advisor's actors; pick another")
+    if _dashboard_user_named(settings, args.name):
+        raise CliError(f"{args.name!r} is a dashboard user's name, ignoring case; pick another")
     token = generate_token()
     print(token)
     print(TokenStore.yaml_entry(args.name, Role(args.role), token), end="")
     return 0
+
+
+def _dashboard_user_named(settings: Settings, name: str) -> bool:
+    """Whether a dashboard user (a ``user`` document) has ``name``, ignoring case: a file token
+    and a database user never share a name in the audit trail (SDD §13.1). A database that
+    cannot be read - a first admin's bootstrap - is said on stderr, never its URL, and passes."""
+    from .security.auth import DashboardUser
+
+    try:
+        users = _store(settings).list("user", DashboardUser)
+    except Exception as exc:  # any failure to read: the check cannot be made, the token can
+        print(
+            f"warning: could not check the dashboard users ({type(exc).__name__}); "
+            f"make sure none is named {name.strip()!r}",
+            file=sys.stderr,
+        )
+        return False
+    wanted = name.strip().casefold()
+    return any(user.name.strip().casefold() == wanted for user in users)
 
 
 def _resolve_providers(store: Any, spec: PlanCreate) -> None:
