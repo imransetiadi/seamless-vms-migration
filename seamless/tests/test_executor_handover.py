@@ -2249,6 +2249,89 @@ async def test_a_providers_name_never_decides_whether_a_failure_is_retried(tmp_p
         await executor._call("manage vol-1 in DC3", busy)
 
 
+def sdk_error(status, reason, body=b""):
+    """The exception openstacksdk itself raises for an HTTP error answer (raise_from_response)."""
+    import requests
+    from openstack import exceptions
+
+    request = requests.Request("POST", "https://cinder.dc3.example:8776/v3/volumes").prepare()
+    response = requests.models.Response()
+    response.status_code, response.reason, response._content = status, reason, body
+    response.request, response.url = request, request.url
+    try:
+        exceptions.raise_from_response(response)
+    except exceptions.HttpException as exc:
+        return exc
+    raise AssertionError("no exception")
+
+
+def sdk_errors():
+    """What openstacksdk and keystoneauth raise themselves (the installed versions), by name."""
+    from keystoneauth1 import exceptions as ksa
+
+    url = "https://cinder.dc3.example:8776/v3/volumes"
+    return {
+        "sdk 503": sdk_error(503, "Service Unavailable"),
+        "sdk 504": sdk_error(504, "Gateway Time-out"),
+        "sdk 502": sdk_error(502, "Bad Gateway"),
+        "keystoneauth 503": ksa.ServiceUnavailable(),
+        "keystoneauth 502": ksa.BadGateway(),
+        "connect timeout": ksa.ConnectTimeout(f"Request to {url} timed out"),
+        "connect failure": ksa.ConnectFailure(
+            f"Unable to establish connection to {url}: RemoteDisconnected('closed')"
+        ),
+        "sdk 400": sdk_error(400, "Bad Request", b'{"badRequest": {"message": "Invalid volume"}}'),
+        "sdk 404": sdk_error(404, "Not Found"),
+        "sdk 409": sdk_error(409, "Conflict"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "retried"),
+    [
+        ("sdk 503", True),
+        ("sdk 504", True),
+        ("sdk 502", True),
+        ("keystoneauth 503", True),
+        ("keystoneauth 502", True),
+        ("connect timeout", True),
+        ("connect failure", True),
+        ("sdk 400", False),
+        ("sdk 404", False),
+        ("sdk 409", False),
+    ],
+)
+async def test_a_handover_call_is_retried_on_the_sdks_own_transient_errors(tmp_path, name, retried):
+    """SDD §7.3: a call answered 502, 503 or 504 - the SDK's HttpException, keystoneauth's HTTP
+    error - or failing with keystoneauth's retriable connection failures is retried, as the SDK and
+    keystoneauth word them; refusals are not (audit EX-12)."""
+    executor, *_ = setup(tmp_path)
+    error = sdk_errors()[name]
+
+    def call():
+        raise error
+
+    with pytest.raises((TransientStepError, PermanentStepError)) as failed:
+        await executor._call("manage vol-1 in RHOSO 18.0", call)
+    assert type(failed.value) is (TransientStepError if retried else PermanentStepError)
+
+
+@pytest.mark.parametrize(
+    ("status", "retried"), [(502, True), (503, True), (504, True), (500, False)]
+)
+async def test_a_raw_handover_call_is_retried_on_its_answers_status(tmp_path, status, retried):
+    """SDD §7.3: a raw call (Proxy.post, put) answered 502, 503 or 504 is retried by its status,
+    whatever its text says (audit EX-12)."""
+    executor, *_ = setup(tmp_path)
+
+    def call():
+        handover_module._checked(FakeResponse("Gateway Time-out", status), "Cinder refused")
+
+    with pytest.raises((TransientStepError, PermanentStepError)) as failed:
+        await executor._call("manage vol-1 in RHOSO 18.0", call)
+    assert type(failed.value) is (TransientStepError if retried else PermanentStepError)
+
+
 async def test_handover_rollback_netapp_manages_back_with_the_source_share(tmp_path):
     executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)

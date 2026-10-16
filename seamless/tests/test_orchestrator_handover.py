@@ -12,7 +12,7 @@ from seamless_migrate.domain.enums import Phase, PlanStatus
 from seamless_migrate.executors.handover import HandoverExecutor
 from seamless_migrate.orchestrator import NotAllowed
 from tests.orch_support import build_harness, make_settings
-from tests.test_executor_handover import HTTPError, held_manage, setup, shared_pool
+from tests.test_executor_handover import HTTPError, held_manage, sdk_error, setup, shared_pool
 
 P = Phase
 
@@ -197,5 +197,29 @@ async def test_a_rollback_resumed_after_it_archived_its_journal_still_reports_th
         plan = await h.plan(mig.plan_id)
         assert final.phase == P.rolled_back, final.error
         assert final.vm.source_id == plan.vm_ids[0] == "src-new-1", (final.vm, plan.vm_ids)
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_handover_retries_a_manage_cinder_answered_503_and_completes(tmp_path, store):
+    """SDD §7.3, §8: after the source server was deleted, Cinder answers one manage with 503 - the
+    SDK's own HttpException. The step is retried from its journal and the handover completes,
+    instead of rolling the VM back for a blip (audit EX-12)."""
+    h, calls, clouds, mig = handover_harness(tmp_path, store)
+    post = clouds["dst"].block_storage.post
+    blips = []
+
+    def blip(url, json=None, **kw):
+        if url == "/manageable_volumes" and not blips:
+            blips.append(url)
+            raise sdk_error(503, "Service Unavailable")
+        return post(url, json=json, **kw)
+
+    clouds["dst"].block_storage.post = blip
+    await h.orch.start()
+    try:
+        final = await h.wait_phase(mig.id, P.completed, P.failed, P.rolled_back, timeout=20)
+        assert blips and final.phase == P.completed, (h.history(final), final.error)
+        assert P.rolling_back not in h.history(final)
     finally:
         await h.orch.stop()

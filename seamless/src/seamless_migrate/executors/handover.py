@@ -39,7 +39,14 @@ from ..storage import (
     storage_family,
 )
 from .ansible import classify_failure, effective_mappings, run_dir
-from .base import PermanentStepError, StepContext, StepName, StepResult, outlive_cancel
+from .base import (
+    PermanentStepError,
+    StepContext,
+    StepName,
+    StepResult,
+    TransientStepError,
+    outlive_cancel,
+)
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -54,6 +61,18 @@ OTHER_ROOT_DEVICES = ("/dev/sda", "/dev/hda", "/dev/xvda")
 KEEP_MICROVERSION = "2.85"
 
 
+#: the answers a retry may outlive - a gateway or a service down for a moment (SDD §7.3)
+TRANSIENT_STATUS = frozenset({502, 503, 504})
+
+
+class HttpAnswerError(RuntimeError):
+    """An error answer to a raw call, with its status - as openstacksdk's HttpException has it."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def _checked(response: Any, what: str) -> Any:
     """Raise for an error answer: openstacksdk's raw Proxy calls (post/put/get) do not
     (``Proxy.request(raise_exc=False)``), so a refusal would otherwise pass silently."""
@@ -61,8 +80,25 @@ def _checked(response: Any, what: str) -> Any:
     if status >= 400:
         detail = redact_cut(str(getattr(response, "text", "") or "").strip(), 300)
         detail = detail.replace("\n", " ")
-        raise RuntimeError(f"{what}: HTTP {status}: {detail}")
+        raise HttpAnswerError(f"{what}: HTTP {status}: {detail}", status)
     return response
+
+
+def _failure_kind(exc: Exception) -> type[Exception]:
+    """Retried or not by the error itself (SDD §7.3): an answer of 502, 503 or 504 - openstacksdk's
+    HttpException, keystoneauth's HTTP error, a raw call's - and keystoneauth's retriable
+    connection failures (a connect timeout, a connection that failed) are transient, as the SDK
+    and keystoneauth word them; any other error by its own text (audit EX-12)."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+    if status in TRANSIENT_STATUS:
+        return TransientStepError
+    try:
+        from keystoneauth1.exceptions import RetriableConnectionFailure
+    except ImportError:  # without openstacksdk no keystoneauth error can arise
+        RetriableConnectionFailure = ()  # noqa: N806
+    if isinstance(exc, RetriableConnectionFailure):
+        return TransientStepError
+    return classify_failure(str(exc))
 
 
 def _microversion(value: Any) -> tuple[int, int]:
@@ -309,7 +345,7 @@ class HandoverExecutor:
             message = f"{what}: {exc}"
             # retried or not by the error alone: the label names the destination provider, whose
             # name could hold a transient pattern ("... Timeout DC", review RV20-12)
-            raise classify_failure(str(exc))(message) from exc
+            raise _failure_kind(exc)(message) from exc
 
     async def run(self, step: StepName, ctx: StepContext) -> StepResult:
         step = StepName(step)
