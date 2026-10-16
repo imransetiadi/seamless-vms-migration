@@ -376,3 +376,77 @@ jobs:
           name: sbom
           path: sbom.cdx.json
           retention-days: 30
+
+  deploy-scripts:
+    name: deploy scripts on ${{ matrix.image }} (compose-init.sh, the Make targets on Linux)
+    # SDD §17.1: a Linux host runs the stack on its own Docker Engine with no Colima. These distributions' tools
+    # (bash, coreutils, make, openssl) run the init script and the targets' dry runs; Debian and Ubuntu leave
+    # openssl out, so the init script's /dev/urandom fallback runs too
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["rockylinux:9", "almalinux:9", "fedora:42", "debian:12", "ubuntu:24.04"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Init and dry runs as the README's Linux quick start runs them
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD:/src:ro" "$IMAGE" bash -euo pipefail -c '
+            if command -v dnf >/dev/null; then dnf -y -q install make openssl findutils >/dev/null
+            else apt-get update -qq && apt-get install -y -qq make >/dev/null; fi
+            cp -r /src /work && cd /work
+            # the admin token stays in a file of this throwaway container, never in the log
+            scripts/compose-init.sh > /tmp/init.out 2> /tmp/init.err
+            grep -q "^POSTGRES_PASSWORD=" deploy/compose/.env
+            [ "$(stat -c %a deploy/compose/.env)" = 600 ] && [ "$(stat -c %a deploy/compose/tokens.yaml)" = 644 ]
+            grep -q "sha256: [0-9a-f]\{64\}$" deploy/compose/tokens.yaml
+            grep -q "Next steps (this machine'"'"'s Docker Engine)" /tmp/init.err
+            make -n --no-print-directory seamless-up > /tmp/up.txt
+            grep -q -- "docker --context default " /tmp/up.txt
+            grep -q "compose.linux-host.yaml" /tmp/up.txt
+            make --no-print-directory seamless-colima-up | grep -q "Colima is not needed on Linux"
+            echo "ok on $(. /etc/os-release && echo "$PRETTY_NAME")"
+          '
+
+  compose-linux:
+    name: Compose stack on a Linux Docker host (make seamless-demo, no Colima)
+    # SDD §17.1: the Make targets on an Ubuntu runner's own Docker Engine with no context variable; the image builds
+    # its dashboard (no dashboard/dist in the checkout). Heavy like the image job: main, nightly and manual runs only
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Docker Engine and its Compose plugin
+        run: docker version --format 'Docker Engine {{.Server.Version}}' && docker compose version
+      - name: compose-init.sh (the admin token goes to a private file and is masked)
+        run: |
+          umask 077
+          scripts/compose-init.sh > "$RUNNER_TEMP/init.out"
+          echo "::add-mask::$(grep -o 'smg_[A-Za-z0-9_-]*' "$RUNNER_TEMP/init.out" | head -1)"
+      - name: make seamless-demo
+        run: make seamless-demo
+      - name: The dashboard the image built is served at /
+        run: curl -fsS http://127.0.0.1:8080/ | grep -q '<div id="root">'
+      - name: An approver of another user (maker-checker), then the demo smoke test (QASuite §14.6)
+        run: |
+          docker exec seamless-seamless-1 seamless token create --name approver2 --role approver \
+            > "$RUNNER_TEMP/approver.out"
+          echo "::add-mask::$(head -1 "$RUNNER_TEMP/approver.out")"
+          # the CLI prints the token, then a tokens: document; the file indents its entries by two spaces
+          tail -n +3 "$RUNNER_TEMP/approver.out" | sed 's/^/  /' >> deploy/compose/tokens.yaml
+          docker restart seamless-seamless-1 > /dev/null
+          for _ in $(seq 1 90); do curl -fsS -o /dev/null http://127.0.0.1:8080/api/v1/ready && break; sleep 2; done
+          TOKEN=$(grep -o 'smg_[A-Za-z0-9_-]*' "$RUNNER_TEMP/init.out" | head -1) \
+            APPROVER_TOKEN=$(head -1 "$RUNNER_TEMP/approver.out") tests/e2e/smoke-demo.sh
+      - name: The stack's state and logs
+        if: failure()
+        run: |
+          make seamless-ps || true
+          docker logs --tail 200 seamless-seamless-1 || true
+      - name: make seamless-down
+        if: always()
+        run: make seamless-down
