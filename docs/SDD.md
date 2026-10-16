@@ -1953,9 +1953,11 @@ A pure module (no I/O) holding the series table of §21.1 and the detection and 
     only a development snapshot shows one;
   * one below the oldest series' maximum (2.95) is `outside: "older"` (Zed or older), one above the newest (2.104)
     `outside: "newer"`, and a missing or unreadable one `outside: "not_detected"`, each with no series;
-  * a block-storage maximum keeps the series whose `block_storage_max` equals it or is null: it narrows the range, never
-    widens it, and a narrowing that would leave no series is not applied (Nova and Cinder of different series, as during
-    an upgrade).
+  * a block-storage maximum keeps the series whose `block_storage_max` equals it, and a series whose `block_storage_max`
+    is null when it is at least the greatest confirmed maximum of the series older than it (Cinder's microversions only
+    grow: a Cinder below an older series' maximum is no newer series' Cinder; `"2.98"` with `"3.70"` keeps neither
+    2024.2 nor 2025.1); it narrows the range, never widens it, and a narrowing that would leave no series is not
+    applied (Nova and Cinder of different series, as during an upgrade).
 * `support_tier(release_range, declared=None) -> SupportTier {tier: "tier1" | "tier2" | "tier3" | "outside", reason:
   null | "end_of_life" | "below_floor" | "newer_than_validated" | "not_detected", declared_outside_range: bool}`:
   * a declared series (`Provider.release`, T2) among the range's series decides the tier;
