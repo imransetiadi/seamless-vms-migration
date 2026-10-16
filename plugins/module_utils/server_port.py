@@ -89,7 +89,7 @@ _ROLE_RULE = {
     "unknown": (
         "the destination's policy profile is unknown, so only the admin role, or that project, "
         "may choose a port's address or MAC there; the destination credential's token lacks it "
-        "(declare the provider's policy profile or series)"
+        "(check the provider so its series is detected, or declare its policy profile or series)"
     ),
 }
 

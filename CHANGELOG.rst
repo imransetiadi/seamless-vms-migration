@@ -153,7 +153,9 @@ This project follows a simple changelog to satisfy collection metadata validatio
   network's own project, choose a port's address, MAC or port security:
   ``admin`` or ``advsvc`` under the legacy rules (2023.1), ``admin`` or
   ``service`` under the secure-RBAC defaults (from 2023.2), and ``admin``
-  alone when the profile is unknown. The profile is the server's
+  alone when the profile is unknown. That refusal advises checking the
+  provider, so its series is detected, or declaring its policy profile or
+  series: a check is allowed while a plan runs. The profile is the server's
   ``_migration_params.policy_profile``, which Seamless Migrate writes before
   each run; an export without it reads ``legacy``, and a value the check
   does not know counts ``admin`` alone. The import chooses them for every
