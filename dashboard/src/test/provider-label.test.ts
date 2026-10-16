@@ -4,8 +4,8 @@ import { describe, expect, it } from 'vitest';
 // Every text that names a provider reads its label - its name, else its id - as the API's Provider.label (SDD §1
 // naming, §4.2): a provider stored with a blank name before the API refused one (review RV20-11) never reads blank.
 // The type checker finds each read of Provider.name, whatever the variable holding the provider is called (review
-// RV21-06: a page-local helper, `p.name` in a list, the mock's events), and a Provider handed to a function that reads
-// the `name` of a shape of its own (review RV22-01).
+// RV21-06: a page-local helper, `p.name` in a list, the mock's events), and a Provider given where a shape of its own
+// that reads `name` is expected - a call's argument, an object member, a JSX prop (reviews RV22-01, RV23-05).
 
 // the dashboard's directory, from this file's URL (src/test/) - as a string: Vite rewrites `new URL(…, import.meta.url)`
 // into a dev-server URL. The type checker's file names use "/" too.
@@ -14,10 +14,32 @@ const root = decodeURIComponent(import.meta.url.replace(/^file:\/\//, '')).repla
 /** The reads that are not texts: the label itself, and the edit form's name field, which edits the stored name. */
 const RAW = new Set(['src/lib/providerUse.ts: provider.name', 'src/components/ProviderDialog.tsx: provider?.name']);
 
-function bareNames(): string[] {
+function config(): ts.ParsedCommandLine {
   const parsed = ts.getParsedCommandLineOfConfigFile(`${root}/tsconfig.json`, {}, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: () => undefined });
   if (!parsed) throw new Error('tsconfig.json cannot be read');
-  const program = ts.createProgram(parsed.fileNames, parsed.options);
+  return parsed;
+}
+
+/** The dashboard's program, as tsconfig.json builds it. */
+function dashboard(): ts.Program {
+  const parsed = config();
+  return ts.createProgram(parsed.fileNames, parsed.options);
+}
+
+/** A program of one probe component, src/components/Probe.tsx, held in memory, beside the dashboard's own files. */
+function probe(text: string): ts.Program {
+  const { options } = config();
+  const file = `${root}/src/components/Probe.tsx`;
+  const host = ts.createCompilerHost(options);
+  const read = host.getSourceFile.bind(host);
+  host.getSourceFile = (name, version, ...rest) => (name === file ? ts.createSourceFile(name, text, version) : read(name, version, ...rest));
+  host.fileExists = (name) => name === file || ts.sys.fileExists(name);
+  host.readFile = (name) => (name === file ? text : ts.sys.readFile(name));
+  return ts.createProgram([file], options, host);
+}
+
+/** Each read of a provider's bare name for a text in `program`'s sources under src/ (tests aside). */
+function bareNames(program: ts.Program): string[] {
   const checker = program.getTypeChecker();
   const found: string[] = [];
   const isProviders = (node: ts.Node | undefined) => node !== undefined && ts.isInterfaceDeclaration(node) && node.name.text === 'Provider';
@@ -44,15 +66,13 @@ function bareNames(): string[] {
         const read = checker.getSymbolAtLocation(node.name)?.declarations?.some((d) => isProviders(d.parent)) ?? false;
         if (read && !RAW.has(`${file}: ${node.getText()}`)) found.push(where(node));
       }
-      // a Provider handed to a parameter that reads `name` from a shape of its own, as `{ id: string; name: string }`
-      if (ts.isCallExpression(node)) {
-        const signature = checker.getResolvedSignature(node);
-        node.arguments.forEach((arg, i) => {
-          const parameter = signature?.parameters[Math.min(i, (signature?.parameters.length ?? 1) - 1)];
-          if (!parameter || !holdsProviders(checker.getTypeAtLocation(arg))) return;
-          const expected = checker.getTypeOfSymbolAtLocation(parameter, node);
-          if (!holdsProviders(expected) && readsName(expected)) found.push(where(arg));
-        });
+      // a Provider given where a shape of its own that reads `name` is expected, as `{ id: string; name: string }`: a
+      // call's argument, a member of an object literal, a JSX prop, a return value - its contextual type (reviews
+      // RV22-01, RV23-05). An identifier that only names a declaration or a member is no value; a shorthand member is.
+      const naming = ts.isIdentifier(node) && !ts.isShorthandPropertyAssignment(node.parent) && (node.parent as { name?: ts.Node }).name === node;
+      if (ts.isExpression(node) && !naming) {
+        const expected = checker.getContextualType(node);
+        if (expected && !holdsProviders(expected) && readsName(expected) && holdsProviders(checker.getTypeAtLocation(node))) found.push(where(node));
       }
       ts.forEachChild(node, visit);
     };
@@ -63,6 +83,32 @@ function bareNames(): string[] {
 
 describe('every text names a provider by its label (SDD §1 naming, §4.2, review RV21-06)', () => {
   it("never reads a provider's bare name for a text", () => {
-    expect(bareNames()).toEqual([]);
+    expect(bareNames(dashboard())).toEqual([]);
+  }, 30_000);
+
+  it("finds a Provider given wherever a shape of its own that reads `name` is expected (review RV23-05)", () => {
+    const component = [
+      "import type { Provider } from '../api/types';",
+      'type Named = { id: string; name: string };',
+      'export const nameOf = (item: Named) => item.name;',
+      'export const render = (props: { item: Named }) => props.item.name;',
+      'export const Name = ({ item }: { item: Named }) => <span>{item.name}</span>;',
+      // a call's argument (the guard's control), a member of an argument object, a JSX prop, a shorthand member, a return
+      'export const viaCall = (provider: Provider) => nameOf(provider);',
+      'export const viaObject = (provider: Provider) => render({ item: provider });',
+      'export const viaJsx = ({ provider }: { provider: Provider }) => <Name item={provider} />;',
+      'export const viaShorthand = (item: Provider) => render({ item });',
+      'export const viaReturn = (provider: Provider): Named => provider;',
+      // a Provider where a Provider is expected reads its label as the dashboard does: none of these
+      'export const itself = (providers: Provider[]) => providers.filter((p) => p.id).map((p) => <Name item={{ id: p.id, name: p.id }} />);',
+      '',
+    ].join('\n');
+    expect(bareNames(probe(component))).toEqual([
+      'src/components/Probe.tsx:6: provider',
+      'src/components/Probe.tsx:7: provider',
+      'src/components/Probe.tsx:8: provider',
+      'src/components/Probe.tsx:9: item',
+      'src/components/Probe.tsx:10: provider',
+    ]);
   }, 30_000);
 });
