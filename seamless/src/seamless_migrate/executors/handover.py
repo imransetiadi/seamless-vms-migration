@@ -367,9 +367,15 @@ class HandoverExecutor:
         return {str(_attr(p, "name")): dict(_attr(p, "capabilities") or {}) for p in pools}
 
     def _resolve_storage(
-        self, src: Any, dst: Any, attachments: list[dict[str, Any]], backend_map: dict[str, str]
+        self,
+        src: Any,
+        dst: Any,
+        attachments: list[dict[str, Any]],
+        backend_map: dict[str, str],
+        cloud: str = "the destination",
     ) -> dict[str, dict[str, Any]]:
-        """Family, source pool and destination host of every volume (§7.3 step 0, §7.3.1)."""
+        """Family, source pool and destination host of every volume (§7.3 step 0, §7.3.1); a
+        refusal names the destination provider, ``cloud`` (SDD §1 naming)."""
         missing = sorted(
             {
                 a["volume_type"] or "<default>"
@@ -396,7 +402,7 @@ class HandoverExecutor:
             src_pool = split_host(host)[1]
             try:
                 dst_host = resolve_destination(
-                    family, src_pool, backend_map[att["volume_type"] or ""], dst_backends
+                    family, src_pool, backend_map[att["volume_type"] or ""], dst_backends, cloud
                 )
             except StorageError as exc:
                 raise PermanentStepError(f"volume {vid}: {exc}") from None
@@ -482,7 +488,7 @@ class HandoverExecutor:
                     entry["family"] = family
                     try:
                         dst_host = resolve_destination(
-                            family, split_host(host)[1], target, dst_backends
+                            family, split_host(host)[1], target, dst_backends, cloud
                         )
                         entry["destination_host"] = dst_host
                         entry["reference"] = manage_reference(
@@ -1041,7 +1047,12 @@ class HandoverExecutor:
                 lambda: self._capture_definition(src, server_id, mode),
             )
             definition["storage"] = await asyncio.to_thread(
-                self._resolve_storage, src, dst, definition["attachments"], backend_map
+                self._resolve_storage,
+                src,
+                dst,
+                definition["attachments"],
+                backend_map,
+                ctx.destination.name,
             )
             await asyncio.to_thread(_write_json, definition_path, definition)
             await asyncio.to_thread(journal.mark, "save_definition")

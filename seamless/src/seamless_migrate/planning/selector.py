@@ -115,11 +115,11 @@ def eligibility(
         encrypted = [d for d in vm.disks if d.encrypted]
         if encrypted:
             handover.append(f"encrypted disk(s), which Cinder cannot unmanage: {_ids(encrypted)}")
-        handover.extend(_storage_reasons(vm, plan, src_caps, dst_caps))
+        handover.extend(_storage_reasons(vm, plan, src_caps, dst_caps, destination))
         if not src_caps.get("admin"):
             handover.append("admin rights are required on the source cloud")
         if not dst_caps.get("admin"):
-            handover.append("admin rights are required on the destination cloud")
+            handover.append(f"admin rights are required on {destination}")
         # a gap this strategy alone has is its eligibility reason, never a finding; the update goes
         # to the source server, the destination never receives it (SDD §9.2, §21.4, RV18-07)
         compute = parse_microversion(src_caps.get("compute_microversion"))
@@ -143,9 +143,14 @@ def _ports(nics: Sequence[tuple[str, list[str]]]) -> str:
 
 
 def _storage_reasons(
-    vm: VMRef, plan: Plan, src_caps: Mapping[str, Any], dst_caps: Mapping[str, Any]
+    vm: VMRef,
+    plan: Plan,
+    src_caps: Mapping[str, Any],
+    dst_caps: Mapping[str, Any],
+    destination: str = "the destination",
 ) -> list[str]:
-    """Per-volume driver-family checks of a handover (SDD §7.3.1), where the pools are known.
+    """Per-volume driver-family checks of a handover (SDD §7.3.1), where the pools are known;
+    a reason about the destination cloud names its provider, ``destination`` (SDD §1 naming).
 
     A disk whose pool the source does not list is left to the executor's check before the stop.
     """
@@ -165,7 +170,9 @@ def _storage_reasons(
             if family not in SUPPORTED:
                 resolve_destination(family, None, target or "", [])
             elif target and dst_backends:
-                resolve_destination(family, split_host(disk.pool)[1], target, dst_backends)
+                resolve_destination(
+                    family, split_host(disk.pool)[1], target, dst_backends, destination
+                )
         except StorageError as exc:
             reasons.append(f"{disk.name or disk.id}: {exc}")
     return reasons

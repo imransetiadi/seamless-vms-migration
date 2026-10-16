@@ -204,9 +204,11 @@ def test_finding_dst_project_missing_and_image_root_quota():
     bad = make_plan(mappings=Mappings(projects={"finance": "fin-rhoso"}))
     f = only(check(vm, plan=bad, dst=dst), "DST_PROJECT_MISSING")
     assert f.severity == Severity.blocker and "fin-rhoso" in f.message
+    # both messages name the destination provider (SDD §1 naming, §9.3, review RV20-05)
+    assert "which RHOSO 18.0 does not list" in f.message
     # unmapped, no same-named project, several destination projects: nothing to charge
     f = only(check(vm, dst=dst), "DST_PROJECT_MISSING")
-    assert "2 projects" in f.message
+    assert "and RHOSO 18.0 has 2 projects" in f.message
     # a mapping to an existing project, or a single destination project, is fine
     good = make_plan(mappings=Mappings(projects={"finance": "finance-rhoso"}))
     assert all(x.code != "DST_PROJECT_MISSING" for x in check(vm, plan=good, dst=dst))
@@ -1037,6 +1039,7 @@ def test_finding_net_address_refused_checks_a_nics_own_addresses_on_its_network(
 
 COMMUNITY = make_provider(
     id="dst-flamingo",
+    name="OpenStack 2026.1 Flamingo (DC2)",
     kind=ProviderKind.openstack,
     role=ProviderRole.destination,
     distribution="openstack_community",
@@ -1078,8 +1081,8 @@ def test_finding_dst_capability_missing():
     # no strategy avoids a floor every strategy needs: none is offered (review 18, nit 7)
     assert "strategy" not in every[0].remediation, every[0].remediation
     assert every[0].message == (
-        "Destination dst-flamingo lacks what every strategy needs: compute API 2.53, below 2.60 "
-        "(multi-attach); block storage API 2.0, below 3.0."
+        "OpenStack 2026.1 Flamingo (DC2) lacks what every strategy needs: compute API 2.53, "
+        "below 2.60 (multi-attach); block storage API 2.0, below 3.0."
     )
     # the handover's 2.85 is the source's, the selector's eligibility reason (SDD §21.4)
     assert found(compute_microversion="2.79") == []
@@ -1108,7 +1111,7 @@ TIER3 = {"tier": "tier3", "reason": "end_of_life", "declared_outside_range": Fal
             ["2024.1", "2024.2"],
             TIER3,
             None,
-            "Destination dst-flamingo runs 2024.1 – 2024.2, read as Tier 3 (End of Life "
+            "OpenStack 2026.1 Flamingo (DC2) runs 2024.1 – 2024.2, read as Tier 3 (End of Life "
             "upstream): no Seamless release validated it there. The capability checks still "
             "apply.",
         ),
@@ -1116,7 +1119,7 @@ TIER3 = {"tier": "tier3", "reason": "end_of_life", "declared_outside_range": Fal
             [],
             {"tier": "outside", "reason": "below_floor", "declared_outside_range": False},
             None,
-            "Destination dst-flamingo runs a series older than 2023.1, the support window's "
+            "OpenStack 2026.1 Flamingo (DC2) runs a series older than 2023.1, the support window's "
             "floor: no Seamless release validated it. The capability checks still apply.",
         ),
         (
@@ -1124,29 +1127,30 @@ TIER3 = {"tier": "tier3", "reason": "end_of_life", "declared_outside_range": Fal
             {"tier": "outside", "reason": "newer_than_validated", "declared_outside_range": False},
             None,
             # no Seamless release validated 2026.2 yet: it is the window's newest (review 18, nit 8)
-            "Destination dst-flamingo runs a series newer than 2026.2, the newest series of the "
-            "support window: no Seamless release validated it. The capability checks still apply.",
+            "OpenStack 2026.1 Flamingo (DC2) runs a series newer than 2026.2, the newest series "
+            "of the support window: no Seamless release validated it. The capability checks still "
+            "apply.",
         ),
         (
             [],
             {"tier": "outside", "reason": "not_detected", "declared_outside_range": False},
             None,
-            "Destination dst-flamingo's series could not be detected (its compute API maximum "
-            "was not read): no Seamless release can be said to have validated it. The capability "
-            "checks still apply.",
+            "The series of OpenStack 2026.1 Flamingo (DC2) could not be detected (its compute API "
+            "maximum was not read): no Seamless release can be said to have validated it. The "
+            "capability checks still apply.",
         ),
         (
             ["2026.2"],
             {"tier": "tier1", "reason": None, "declared_outside_range": True},
             "2025.1",
-            "Destination dst-flamingo declares series 2025.1, but its APIs read as 2026.2: correct "
-            "the declared series; the tier is the one its APIs read (Tier 1).",
+            "OpenStack 2026.1 Flamingo (DC2) declares series 2025.1, but its APIs read as 2026.2: "
+            "correct the declared series; the tier is the one its APIs read (Tier 1).",
         ),
         (
             ["2024.1", "2024.2"],
             {**TIER3, "declared_outside_range": True},
             "2026.2",
-            "Destination dst-flamingo runs 2024.1 – 2024.2, read as Tier 3 (End of Life "
+            "OpenStack 2026.1 Flamingo (DC2) runs 2024.1 – 2024.2, read as Tier 3 (End of Life "
             "upstream): no Seamless release validated it there. The capability checks still "
             "apply. It declares series 2026.2, which its APIs do not run: correct the declared "
             "series.",
@@ -1218,7 +1222,7 @@ def test_a_tier_3_warning_names_the_series_the_check_settled_on():
     caps = destination_release("openstack", "2024.2", None, "2.96", "")
     found = only(check(destination=declared, dst_caps=caps), "DST_RELEASE_OUTSIDE_SUPPORT")
     assert found.message.startswith(
-        "Destination dst-flamingo runs 2024.2, read as Tier 3 (End of Life upstream)"
+        "OpenStack 2026.1 Flamingo (DC2) runs 2024.2, read as Tier 3 (End of Life upstream)"
     ), found.message
 
 
@@ -1411,6 +1415,12 @@ DESTINATION_FINDINGS = {
     "MAP_VOLUME_TYPE_MISSING",
     "DST_KEYPAIR_MISSING",
     "NET_PORT_NOT_PERMITTED",
+    # review RV20-05
+    "DST_PROJECT_MISSING",
+    "DST_QUOTA_INSUFFICIENT",
+    "NET_MTU_SHRINK",
+    "DST_CAPABILITY_MISSING",
+    "DST_RELEASE_OUTSIDE_SUPPORT",
 }
 
 
@@ -1439,6 +1449,19 @@ def _destination_findings(destination):
     mapped = make_plan(mappings=Mappings(flavors={"m1.custom": "nope"}))
     found += check(make_vm(flavor="m1.custom"), plan=mapped, destination=destination)
     found.append(_another_projects_port({"roles": ["member"]}, destination))
+    # a project the destination does not list, one it lacks quota in, a smaller MTU (RV20-05)
+    found += check(
+        plan=make_plan(mappings=Mappings(projects={"finance": "finance-prod"})),
+        destination=destination,
+    )
+    big = make_vm(vcpus=4096, ram_mb=2**24)
+    found += check(big, dst=dst_inv(networks={"app-net": 1400}), destination=destination)
+    # capabilities below every strategy's floor, and a series no Seamless release validated
+    found += check(destination=destination, dst_caps=community_caps(compute_microversion="2.53"))
+    found += check(
+        destination=destination,
+        dst_caps=community_caps(release_range=["2024.1", "2024.2"], support_tier=TIER3),
+    )
     return [f for f in found if f is not None]
 
 

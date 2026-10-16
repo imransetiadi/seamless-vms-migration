@@ -1596,6 +1596,56 @@ async def test_handover_refuses_before_stop_when_a_pool_cannot_be_resolved(
     assert result.details["note"] == "nothing to roll back"
 
 
+async def test_the_handovers_pool_refusal_names_the_destination_provider(tmp_path):
+    """SDD §1 naming, §7.3.1 (review RV20-05): a refusal built for a migration names the
+    destination provider - in the run's step 0 and in the read-only readiness report."""
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
+    clouds["dst"].pools = [("hostgroup@ceph#gold", CEPH)]
+    named = DST.model_copy(update={"name": "OpenStack 2026.2 Hibiscus (DC3)"})
+    ctx, _ = make_ctx(plan, mig, SRC, named, settings)
+    with pytest.raises(PermanentStepError) as refused:
+        await executor.run(StepName.CUTOVER, ctx)
+    assert "OpenStack 2026.2 Hibiscus (DC3) lists no pools for hostgroup@ontap_nfs" in str(
+        refused.value
+    )
+    assert "the destination lists" not in str(refused.value)
+    assert calls == [], "nothing changed: the VM keeps running"
+
+
+def test_the_runs_storage_resolution_names_the_destination_provider(tmp_path):
+    """SDD §1 naming, §7.3.1 (review RV20-05): the run resolves each volume's destination host
+    again when it records the source definition, after the stop; a refusal there names the
+    destination provider too."""
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
+    clouds["dst"].pools = [("hostgroup@ceph#gold", CEPH)]
+    src, dst = clouds["src"], clouds["dst"]
+    attachments = [{"volume_id": "vol-data", "volume_type": "ceph-ssd", "host": NFS_SRC}]
+    with pytest.raises(PermanentStepError) as refused:
+        executor._resolve_storage(
+            src, dst, attachments, plan.handover.backend_map, "OpenStack 2026.2 Hibiscus (DC3)"
+        )
+    assert str(refused.value).startswith(
+        "volume vol-data: OpenStack 2026.2 Hibiscus (DC3) lists no pools for hostgroup@ontap_nfs"
+    ), str(refused.value)
+
+
+async def test_the_run_resolves_storage_with_the_destination_providers_name(tmp_path, monkeypatch):
+    """SDD §1 naming, §7.3.1 (review RV20-05): the run passes the destination provider's name to
+    the storage resolution it records with the source definition."""
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
+    real = executor._resolve_storage
+    named: list[str] = []
+
+    def spy(*args):
+        named.append(args[-1])
+        return real(*args)
+
+    monkeypatch.setattr(executor, "_resolve_storage", spy)
+    destination = DST.model_copy(update={"name": "OpenStack 2026.2 Hibiscus (DC3)"})
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, destination, settings)[0])
+    assert named == ["OpenStack 2026.2 Hibiscus (DC3)"]
+
+
 async def test_handover_rollback_netapp_manages_back_with_the_source_share(tmp_path):
     executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)

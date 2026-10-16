@@ -976,8 +976,8 @@ def run_preflight(
             out.append(
                 finding(
                     "DST_PROJECT_MISSING",
-                    f"Project {vm.project!r} is mapped to {mapped_project!r}, which the "
-                    "destination does not list.",
+                    f"Project {vm.project!r} is mapped to {mapped_project!r}, which {where} "
+                    "does not list.",
                 )
             )
         elif (
@@ -990,7 +990,7 @@ def run_preflight(
                 finding(
                     "DST_PROJECT_MISSING",
                     f"No destination project for {vm.project!r}: no mapping, no same-named "
-                    f"project, and the destination has {len(dst_inv.quotas)} projects.",
+                    f"project, and {where} has {len(dst_inv.quotas)} projects.",
                 )
             )
     shortfall = _quota_shortfall(vm, plan, dst_inv, selected)
@@ -999,7 +999,7 @@ def run_preflight(
         out.append(
             finding(
                 "DST_QUOTA_INSUFFICIENT",
-                f"Destination project {project!r} lacks quota for the plan's VMs: "
+                f"Project {project!r} of {where} lacks quota for the plan's VMs: "
                 + "; ".join(short)
                 + ".",
             )
@@ -1019,7 +1019,7 @@ def run_preflight(
                 else f"{nic.network} {src_mtu} -> {target} {dst_mtu}"
             )
     if shrinks:
-        out.append(finding("NET_MTU_SHRINK", f"Destination MTU is smaller: {_names(shrinks)}."))
+        out.append(finding("NET_MTU_SHRINK", f"The MTU in {where} is smaller: {_names(shrinks)}."))
 
     sriov = [nic.network for nic in vm.nics if nic.vnic_type in _SRIOV_VNIC_TYPES]
     if sriov:
@@ -1213,7 +1213,7 @@ def _destination_capabilities(destination: Provider, caps: Mapping[str, Any]) ->
     return [
         finding(
             "DST_CAPABILITY_MISSING",
-            f"Destination {destination.id} lacks what every strategy needs: {'; '.join(lacking)}.",
+            f"{destination.name} lacks what every strategy needs: {'; '.join(lacking)}.",
         )
     ]
 
@@ -1235,20 +1235,20 @@ def _release_outside_support(destination: Provider, caps: Mapping[str, Any]) -> 
         # the series the check settled on, else the range (review RV18-11)
         runs = str(caps.get("release") or _series_text(found))
         sentences.append(
-            f"Destination {destination.id} runs {runs}, read as Tier 3 (End of Life upstream): no "
+            f"{destination.name} runs {runs}, read as Tier 3 (End of Life upstream): no "
             "Seamless release validated it there. The capability checks still apply."
         )
     elif tier.get("tier") == "outside":
         sentences.append(
             {
-                "below_floor": f"Destination {destination.id} runs a series older than "
+                "below_floor": f"{destination.name} runs a series older than "
                 f"{SERIES[0].name}, the support window's floor: no Seamless release validated it.",
-                "newer_than_validated": f"Destination {destination.id} runs a series newer than "
+                "newer_than_validated": f"{destination.name} runs a series newer than "
                 f"{SERIES[-1].name}, the newest series of the support window: no Seamless release "
                 "validated it.",
             }.get(
                 str(reason),
-                f"Destination {destination.id}'s series could not be detected (its compute API "
+                f"The series of {destination.name} could not be detected (its compute API "
                 "maximum was not read): no Seamless release can be said to have validated it.",
             )
             + " The capability checks still apply."
@@ -1262,7 +1262,7 @@ def _release_outside_support(destination: Provider, caps: Mapping[str, Any]) -> 
         else:
             label = str(tier.get("tier", "")).replace("tier", "Tier ")
             sentences.append(
-                f"Destination {destination.id} declares series {destination.release}, but its APIs "
+                f"{destination.name} declares series {destination.release}, but its APIs "
                 f"read as {_series_text(found)}: correct the declared series; the tier is the one "
                 f"its APIs read ({label})."
             )

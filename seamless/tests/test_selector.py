@@ -357,3 +357,51 @@ def test_a_nic_override_decides_the_address_count_the_port_rules_see():
     reasons = eligibility(single, ProviderKind.openstack, two, OK_CAPS, OK_CAPS)
     for strategy in (Strategy.cold, Strategy.warm, Strategy.storage_handover):
         assert any("10.0.0.5, 10.0.0.8" in r for r in reasons[strategy]), (strategy, reasons)
+
+
+def test_the_handover_reasons_name_the_destination_provider_one_way():
+    """SDD §1 naming, §9.2 (review RV20-05): a reason about the destination cloud names its
+    provider - the backend map's, a pool the destination does not list, its admin rights - so one
+    storage_handover reasons list never mixes the provider's name with "the destination"."""
+    name = "OpenStack 2026.2 Hibiscus (DC3)"
+    vm = make_vm(
+        disks=[
+            make_disk(id="vol-1", volume_type="ceph-ssd", pool="overcloud@ceph#ssd"),
+            make_disk(id="vol-2", volume_type="ceph-hdd", pool="overcloud@ceph#hdd"),
+            make_disk(id="vol-3", volume_type="ceph-gold", pool="overcloud@ceph#gold"),
+        ]
+    )
+    plan = make_plan(
+        handover=HandoverConfig(
+            enabled=True,
+            backend_map={"ceph-ssd": "hostgroup@ceph#gold", "ceph-gold": "hostgroup@other#p"},
+        )
+    )
+    src_caps = {
+        "admin": True,
+        "conversion_host": True,
+        "storage_backends": [
+            {"pool": pool, "family": "rbd"}
+            for pool in ("overcloud@ceph#ssd", "overcloud@ceph#hdd", "overcloud@ceph#gold")
+        ],
+    }
+    dst_caps = {
+        "admin": False,
+        "conversion_host": True,
+        "storage_backends": [{"pool": "hostgroup@ceph#silver", "family": "rbd"}],
+    }
+    reasons = eligibility(vm, "openstack", plan, src_caps, dst_caps, (), name)[
+        Strategy.storage_handover
+    ]
+    assert f"volume type(s) without a backend of {name} in handover.backend_map: ceph-hdd" in (
+        reasons
+    )
+    assert (
+        f"vol-1: {name} lists no pool hostgroup@ceph#gold (RBD pools of hostgroup@ceph: "
+        "hostgroup@ceph#silver)"
+    ) in reasons
+    assert (
+        f"vol-3: {name} lists no pools for hostgroup@other: the RBD pool cannot be checked"
+    ) in reasons
+    assert f"admin rights are required on {name}" in reasons
+    assert [r for r in reasons if "the destination" in r] == [], reasons

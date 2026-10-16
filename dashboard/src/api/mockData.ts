@@ -874,7 +874,7 @@ function storageReasons(vm: VMRef, plan: Plan, source: Provider, destination: Pr
     const family = families.get(disk.pool)!;
     const target = plan.handover.backend_map[disk.volume_type ?? ''];
     if (family !== 'other' && (!target || dst.length === 0)) continue;
-    const { error } = resolveDestination(family, splitHost(disk.pool)[1], target ?? '', dst);
+    const { error } = resolveDestination(family, splitHost(disk.pool)[1], target ?? '', dst, destination.name);
     if (error) reasons.push(`${disk.name ?? disk.id}: ${error}`);
   }
   return reasons;
@@ -1112,10 +1112,17 @@ export function preflight(
     );
   if (badNetTargets.length)
     add('MAP_NETWORK_MISSING', 'blocker', `Network mapping target(s) do not exist in ${where}: ${pyNames(badNetTargets)}.`, 'Fix the mapping: the destination network must exist.');
+  // one finding for every NIC whose network is smaller, worded as the API's (SDD §9.3, §16, review RV20-05)
+  const shrinks: string[] = [];
   for (const nic of vm.nics) {
-    const dstMtu = resolved.has(nic) ? resolved.get(nic)!.mtu : destinationNetworks[nicTarget(plan, vm.source_id, nic).network];
+    const target = nicTarget(plan, vm.source_id, nic).network;
+    const dstMtu = resolved.has(nic) ? resolved.get(nic)!.mtu : destinationNetworks[target];
     if (nic.mtu && dstMtu && dstMtu < nic.mtu)
-      add('NET_MTU_SHRINK', 'warning', `Destination MTU ${dstMtu} is smaller than the source NIC MTU ${nic.mtu} on ${nic.network}.`, 'Lower the guest MTU or enable jumbo frames on the OVN underlay.');
+      shrinks.push(target === (plan.mappings.networks[nic.network] ?? nic.network) ? `${nic.network} ${nic.mtu} -> ${dstMtu}` : `${nic.network} ${nic.mtu} -> ${target} ${dstMtu}`);
+  }
+  if (shrinks.length)
+    add('NET_MTU_SHRINK', 'warning', `The MTU in ${where} is smaller: ${pyNames(shrinks)}.`, 'Lower the guest MTU or map to a destination network with a larger MTU (ML2/OVN Geneve networks typically use 1442).');
+  for (const nic of vm.nics) {
     if (['direct', 'direct-physical', 'macvtap'].includes(nic.vnic_type))
       add('NET_SRIOV_PORT', 'warning', `Port on ${nic.network} uses vnic_type ${nic.vnic_type}.`, 'SR-IOV/macvtap ports need an equivalent physnet on the destination; map the network accordingly.');
   }

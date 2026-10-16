@@ -63,11 +63,13 @@ def resolve_destination(
     source_pool: str | None,
     target: str,
     destination_backends: Iterable[Mapping[str, Any]],
+    destination: str = "the destination",
 ) -> str:
     """Destination Cinder host (``host@backend#pool``) for a volume of ``family``.
 
     ``target`` is ``plan.handover.backend_map[type]``; ``destination_backends`` the destination's
-    ``storage_backends`` capability (``pool`` and ``family`` per entry).
+    ``storage_backends`` capability (``pool`` and ``family`` per entry); a refusal about the
+    destination cloud names its provider, ``destination`` (SDD §1 naming).
     """
     if family not in SUPPORTED:
         raise StorageError(
@@ -83,7 +85,7 @@ def resolve_destination(
     if not pools:
         what = "RBD" if family == "rbd" else "NetApp"
         raise StorageError(
-            f"the destination lists no pools for {backend}: the {what} pool cannot be checked"
+            f"{destination} lists no pools for {backend}: the {what} pool cannot be checked"
         )
     families = sorted({f for _, f in pools})
     candidates = [p for p, f in pools if f == family]
@@ -99,7 +101,7 @@ def resolve_destination(
             if target in candidates:
                 return target
             raise StorageError(
-                f"the destination lists no pool {target} (RBD pools of {backend}: "
+                f"{destination} lists no pool {target} (RBD pools of {backend}: "
                 f"{', '.join(candidates)})"
             )
         if len(candidates) == 1:

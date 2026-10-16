@@ -73,4 +73,11 @@ describe('storage backends (SDD §7.3.1, §10)', () => {
     expect(resolveDestination('rbd', 'x', 'hostgroup@other#p', []).error).toMatch(/lists no pools for hostgroup@other/);
     expect(resolveDestination('rbd', 'x', 'hostgroup@ontap-iscsi', DST).error).toMatch(/netapp_block/);
   });
+
+  it('names the destination provider it is given, "the destination" without one (SDD §1 naming, review RV20-05)', () => {
+    const name = 'OpenStack 2026.2 Hibiscus (DC3)';
+    expect(resolveDestination('rbd', 'x', 'hostgroup@ceph#typo', DST, name).error?.startsWith(`${name} lists no pool hostgroup@ceph#typo (RBD pools of hostgroup@ceph: `)).toBe(true);
+    expect(resolveDestination('netapp_nfs', 'x:/v', 'hostgroup@other', DST, name).error).toBe(`${name} lists no pools for hostgroup@other: the NetApp pool cannot be checked`);
+    expect(resolveDestination('rbd', 'x', 'hostgroup@other#p', []).error).toBe('the destination lists no pools for hostgroup@other: the RBD pool cannot be checked');
+  });
 });

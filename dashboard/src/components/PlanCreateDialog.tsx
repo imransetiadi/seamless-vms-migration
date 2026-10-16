@@ -379,7 +379,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     for (const vm of selectedVms) {
       for (const disk of vm.disks) {
         if (disk.kind !== 'volume' || disk.volume_type !== type || !disk.pool || !families.has(disk.pool)) continue;
-        const { host, error } = resolveDestination(families.get(disk.pool)!, splitHost(disk.pool)[1], target, destinationStorage);
+        const { host, error } = resolveDestination(families.get(disk.pool)!, splitHost(disk.pool)[1], target, destinationStorage, destination?.name || 'the destination');
         if (host) pools.add(host);
         if (error) problems.add(`${vm.name}: ${error}`);
       }

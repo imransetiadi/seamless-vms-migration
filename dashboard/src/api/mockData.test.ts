@@ -515,3 +515,39 @@ describe('the mock advisor names the destination to Jev like the API (SDD §1 na
     }
   });
 });
+
+describe('the mock names the destination provider where the API does (SDD §1 naming, §9.3, review RV20-05)', () => {
+  const name = 'OpenStack 2026.2 Hibiscus (DC3)';
+  const providers = buildProviders(now);
+  const source = providers.find((p) => p.id === 'rhosp17-dc1')!;
+  const destination = { ...providers.find((p) => p.id === 'rhoso-prod')!, name };
+
+  it('in a handover storage reason', () => {
+    const plan = { ...buildFixtures(now).plans[0]!, handover: { enabled: true, backend_map: { 'tripleo-ceph': 'hostgroup@ceph-ssd#typo' } } };
+    const vm = makeVm({ id: 'os-x9', name: 'rbd-09', disks: [{ size_gb: 20, volume_type: 'tripleo-ceph' }] });
+    const reasons = eligibility(vm, 'openstack', plan, source, destination, []).storage_handover ?? [];
+    expect(reasons.some((r) => r.includes(`${name} lists no pool hostgroup@ceph-ssd#typo`))).toBe(true);
+    expect(reasons.filter((r) => r.includes('the destination'))).toEqual([]);
+  });
+
+  it('in NET_MTU_SHRINK, one finding worded as the API words it', () => {
+    const base = buildFixtures(now).plans[0]!;
+    const plan = { ...base, mappings: { ...base.mappings, networks: {} }, nic_overrides: {} };
+    const vm = makeVm({
+      id: 'os-m1',
+      name: 'mtu-01',
+      disks: [{ size_gb: 20 }],
+      nics: [
+        { network: 'tenant-web', mac: 'fa:16:3e:00:00:09', fixed_ips: [], mtu: 9000 },
+        { network: 'tenant-db', mac: 'fa:16:3e:00:00:0a', fixed_ips: [], mtu: 9000 },
+      ],
+    });
+    const found = preflight(vm, 'openstack', plan, { 'tenant-web': 1500, 'tenant-db': 1450 }, [vm.name], { selected: [vm], destination: name });
+    expect(found.filter((f) => f.code === 'NET_MTU_SHRINK')).toEqual([
+      expect.objectContaining({
+        message: `The MTU in ${name} is smaller: tenant-db 9000 -> 1450, tenant-web 9000 -> 1500.`,
+        remediation: 'Lower the guest MTU or map to a destination network with a larger MTU (ML2/OVN Geneve networks typically use 1442).',
+      }),
+    ]);
+  });
+});
