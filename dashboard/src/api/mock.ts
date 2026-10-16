@@ -25,6 +25,7 @@ import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
 import { summaryOf } from '../lib/summary';
 import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
+import { destinationName, providerLabel } from '../lib/providerUse';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -1080,7 +1081,7 @@ export class MockServer {
     // reads the provider's declarations (SDD §9.3, §10, §21.5)
     const roles = capabilityRoles(destination.capabilities);
     const profile = policyProfileOf(destination.capabilities, destination);
-    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails, roles, profile, destination: destination.name });
+    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails, roles, profile, destination: providerLabel(destination) });
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings);
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
@@ -1151,7 +1152,7 @@ export class MockServer {
     const destination = this.destinationFor(plan);
     const snapshot = strategySnapshot({
       vm: m.vm, plan, estimates: m.estimates, findings: m.findings, scope, deterministic: m.strategy, at,
-      destination: destinationDescriptor(destination), destinationName: destination.name,
+      destination: destinationDescriptor(destination), destinationName: providerLabel(destination),
     });
     if (!this.snapshots.has(snapshot.sha256)) this.snapshots.set(snapshot.sha256, snapshot);
     const rec = strategyRecommendation({
@@ -1655,6 +1656,7 @@ export class MockServer {
   private createProvider(me: Me, input: Record<string, unknown>): MockResponse {
     const id = String(input.id ?? '');
     if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) throw new HttpError(422, 'validation_error', 'id: must match ^[a-z0-9][a-z0-9-]{1,62}$.');
+    if (typeof input.name === 'string' && !input.name.trim()) throw new HttpError(422, 'validation_error', 'name: must not be blank');
     if (this.providers.some((p) => p.id === id)) throw new HttpError(409, 'conflict', `provider '${id}' already exists`);
     // like the API: provider-{id} and provider-{id}-ssh must stay apart from every other provider's (SDD §13.3)
     const clash = this.providers.find((p) => id === `${p.id}-ssh` || p.id === `${id}-ssh`);
@@ -1694,6 +1696,8 @@ export class MockServer {
   private patchProvider(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
     const unknown = Object.keys(input).filter((k) => !PROVIDER_EDITABLE.has(k)).sort();
     if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);
+    // a blank name is refused, as the API refuses it (SDD §4.2, review RV20-11)
+    if (typeof input.name === 'string' && !input.name.trim()) throw new HttpError(422, 'validation_error', 'name: must not be blank');
     const users = this.plans.filter(
       (p) => ['running', 'paused'].includes(p.status) && (p.source_provider_id === provider.id || p.destination_provider_id === provider.id),
     );
@@ -1889,7 +1893,7 @@ export class MockServer {
       m.source_running_at = running ? new Date(this.now()).toISOString() : null;
       // the event names the plan's destination provider, as the API's (SDD §1 naming)
       const plan = this.plans.find((p) => p.id === m.plan_id);
-      const destination = (plan && this.providers.find((p) => p.id === plan.destination_provider_id)?.name) ?? 'the destination';
+      const destination = destinationName(this.providers, plan);
       this.emit({
         kind: running ? 'migration.source_running' : 'migration.source_stopped',
         plan_id: m.plan_id,

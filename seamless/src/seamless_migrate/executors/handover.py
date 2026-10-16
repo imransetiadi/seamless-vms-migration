@@ -524,7 +524,7 @@ class HandoverExecutor:
                 plan,
                 mappings,
                 policy_profile_of(destination.capabilities, destination),
-                destination.name,
+                destination.label,
                 destination.capabilities.get("roles"),
             ),
         )
@@ -1052,7 +1052,7 @@ class HandoverExecutor:
                 dst,
                 definition["attachments"],
                 backend_map,
-                ctx.destination.name,
+                ctx.destination.label,
             )
             await asyncio.to_thread(_write_json, definition_path, definition)
             await asyncio.to_thread(journal.mark, "save_definition")
@@ -1123,7 +1123,7 @@ class HandoverExecutor:
                     host = backend_map[vtype]
                     manage_ref = {"source-name": f"volume-{att['volume_id']}"}
                 dest_id = await self._call(
-                    f"manage {att['volume_id']} in {ctx.destination.name}",
+                    f"manage {att['volume_id']} in {ctx.destination.label}",
                     lambda a=att, t=vtype, h=host, r=manage_ref: self._manage(
                         dst,
                         h,
@@ -1143,7 +1143,7 @@ class HandoverExecutor:
             key = f"meta_dst:{att['volume_id']}"
             if metadata and not journal.done(key):
                 await self._call(
-                    f"restore the boot properties of {att['volume_id']} in {ctx.destination.name}",
+                    f"restore the boot properties of {att['volume_id']} in {ctx.destination.label}",
                     lambda v=dest_ids[att["volume_id"]], m=metadata: self._set_boot_properties(
                         dst, v, m
                     ),
@@ -1157,13 +1157,13 @@ class HandoverExecutor:
                 vm_id = ctx.migration.vm.source_id
                 if definition.get("port_creation_mode") == "neutron":
                     networks = self._destination_ports(
-                        dst, definition, ctx.plan, vm_id, journal, ctx.destination.name
+                        dst, definition, ctx.plan, vm_id, journal, ctx.destination.label
                     )
                 else:
                     networks = []
                     for n in definition["networks"]:
                         target, addresses = self._destination_nic(ctx.plan, vm_id, n)
-                        network = _destination_network(dst, target, ctx.destination.name)
+                        network = _destination_network(dst, target, ctx.destination.label)
                         net = {"uuid": _attr(network, "id")}
                         # Nova keeps one address per port: its override's, else its first
                         if addresses:
@@ -1262,7 +1262,7 @@ class HandoverExecutor:
             key = f"rb:unmanage_dst:{att['volume_id']}"
             if dest_id and not journal.done(key):
                 await self._call(
-                    f"unmanage {dest_id} in {ctx.destination.name}",
+                    f"unmanage {dest_id} in {ctx.destination.label}",
                     lambda v=dest_id, k=key: self._unmanage(dst, v, journal, f"sent:{k}"),
                 )
                 await asyncio.to_thread(journal.mark, key)

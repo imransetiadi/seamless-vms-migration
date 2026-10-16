@@ -630,6 +630,30 @@ def test_a_provider_declares_its_policy_profile(api):
     assert api.post("/api/v1/providers", json=vmware).status_code == 422
 
 
+def test_a_providers_name_is_never_blank(api):
+    """SDD §4.2 (review RV20-11): every text that names the destination provider reads its name,
+    so POST /providers and PATCH /providers/{id} refuse an empty or whitespace-only one (422) and
+    store nothing."""
+    for name in ("", "   "):
+        refused = api.post(
+            "/api/v1/providers", json={**DESTINATION, "id": "dst-blank", "name": name}
+        )
+        assert refused.status_code == 422, (name, refused.text)
+        assert refused.json()["error"]["message"] == "name: must not be blank"
+    missing = api.client.get("/api/v1/providers/dst-blank", headers=api.h(Role.viewer))
+    assert missing.status_code == 404
+
+    def patch(body):
+        return api.client.patch("/api/v1/providers/dst-rhoso", headers=api.h(Role.admin), json=body)
+
+    blank = patch({"name": " \t "})
+    assert (
+        blank.status_code == 422 and blank.json()["error"]["message"] == "name: must not be blank"
+    )
+    assert api.get("/api/v1/providers/dst-rhoso").json()["name"] == DESTINATION["name"]
+    assert patch({"name": "RHOSO 18.0 (prod)"}).json()["name"] == "RHOSO 18.0 (prod)"
+
+
 def test_a_plans_providers_cannot_change_while_one_of_its_migrations_is_failed(api):
     """SDD §12: a failed migration whose source runs keeps its plan editable — to fix the cause
     before a retry — but not its providers: its rollback acts on the clouds its attempt used (the

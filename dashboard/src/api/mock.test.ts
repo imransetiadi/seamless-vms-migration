@@ -229,6 +229,11 @@ describe('mock API', () => {
     await expect(client.patch('/providers/community-lab', { kind: 'vmware' })).rejects.toMatchObject({ status: 422 });
     await expect(client.patch('/providers/community-lab', { distribution: 'vmware' })).rejects.toMatchObject({ status: 422 });
     await expect(setup('operator').client.patch('/providers/community-lab', { region: 'x' })).rejects.toMatchObject({ status: 403 });
+    // a blank name is refused, as the API refuses it (SDD §4.2, review RV20-11)
+    await expect(client.patch('/providers/community-lab', { name: ' \t ' })).rejects.toMatchObject({ status: 422, message: 'name: must not be blank' });
+    const vcenter = server.providers.find((p) => p.id === 'vcenter-hq')!;
+    await expect(client.post('/providers', { ...vcenter, id: 'vc-blank', name: '' })).rejects.toMatchObject({ status: 422, message: 'name: must not be blank' });
+    expect(server.providers.some((p) => p.id === 'vc-blank')).toBe(false);
     const stored = await client.put<Provider>('/providers/community-lab/credentials', { username: 'u', password: 'p', project_name: 'x' });
     expect(stored.credentials_secret).toBe('provider-community-lab');
     expect(JSON.stringify(stored)).not.toContain('"p"');

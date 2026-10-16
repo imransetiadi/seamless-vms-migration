@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from ..domain.enums import PlanStatus, ProviderKind, ProviderRole, Role
 from ..domain.models import (
+    BLANK_NAME,
     ConversionHostConfig,
     Migration,
     Plan,
@@ -226,6 +227,9 @@ async def update_provider(
     unknown = sorted(set(body) - PROVIDER_EDITABLE_FIELDS)
     if unknown:
         raise ApiError(422, "validation_error", f"fields cannot be changed: {', '.join(unknown)}")
+    if isinstance(body.get("name"), str) and not body["name"].strip():
+        # at the request boundary: a provider stored blank before keeps loading (RV20-11)
+        raise ApiError(422, "validation_error", f"name: {BLANK_NAME}")
     provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
     users = await _plans_using(request, provider_id, ACTIVE_PLAN_STATUSES)
     if users:

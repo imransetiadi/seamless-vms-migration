@@ -978,7 +978,7 @@ class AnsibleExecutor:
                 any(p.name == "export_workloads.yml" for p in self._playbooks(step, strategy, osm)),
                 deferred,
                 policy_profile_of(ctx.destination.capabilities, ctx.destination),
-                ctx.destination.name,
+                ctx.destination.label,
             )
             await self._log_deferred(ctx, deferred)
         leftover = (
@@ -1211,7 +1211,7 @@ class AnsibleExecutor:
             network, why = resolve_network(networks, name)
             if network is None:
                 problems.append(
-                    f"{what} cannot go to network {name!r} of {ctx.destination.name}: "
+                    f"{what} cannot go to network {name!r} of {ctx.destination.label}: "
                     + (why or f"there is no network named {name!r}")
                 )
                 continue
@@ -1220,7 +1220,7 @@ class AnsibleExecutor:
             refused = port_refusal_at_run(network, roles, profile)
             if refused:
                 problem = (
-                    f"{what} cannot go to network {name!r} of {ctx.destination.name} "
+                    f"{what} cannot go to network {name!r} of {ctx.destination.label} "
                     f"(project {network.get('project_id')}): {refused}"
                 )
                 if deferred is None:
@@ -1482,7 +1482,7 @@ class AnsibleExecutor:
                         deferred,
                         volumes,
                         policy_profile_of(destination.capabilities, destination),
-                        destination.name,
+                        destination.label,
                     )
                     if ctx is not None:
                         await self._log_deferred(ctx, deferred)

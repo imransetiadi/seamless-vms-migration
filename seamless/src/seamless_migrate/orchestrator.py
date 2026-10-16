@@ -747,7 +747,7 @@ class Orchestrator:
             )
             resolved = resolve_mappings(vm, plan, dst_inv)
             reasons = eligibility(
-                vm, source.kind, plan, src_caps, dst_caps, findings, destination.name
+                vm, source.kind, plan, src_caps, dst_caps, findings, destination.label
             )
             estimates = [
                 estimate(vm, strategy, params, plan.downtime_slo_s).model_copy(
@@ -773,7 +773,7 @@ class Orchestrator:
                     plan,
                     findings,
                     destination_descriptor(destination),
-                    destination.name,
+                    destination.label,
                 )
             decision = None
             rec_id = new_recommendation_id()
@@ -1883,7 +1883,7 @@ class Orchestrator:
                 # §8.1, review RV20-03)
                 try:
                     provider = await self.db.get("provider", plan.destination_provider_id, Provider)
-                    destinations[plan.destination_provider_id] = provider.name
+                    destinations[plan.destination_provider_id] = provider.label
                 except NotFound:
                     destinations[plan.destination_provider_id] = "the destination"
                 except Exception:

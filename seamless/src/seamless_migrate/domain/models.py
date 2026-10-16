@@ -24,6 +24,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from ..guest_os import GuestOS, identify
 from .enums import (
@@ -148,12 +149,31 @@ class Provider(_Model):
                     raise ValueError(f"{name}: an OpenStack {name} cannot be declared for vmware")
         return self
 
+    @property
+    def label(self) -> str:
+        """The name a text gives the provider (SDD §1 naming): its name, else its id - a name stored
+        blank before the API refused one (review RV20-11) never reads "in : ..."."""
+        return self.name if self.name.strip() else self.id
+
 
 class ProviderCreate(Provider):
     """The ``POST /providers`` body (SDD §12): a field ``Provider`` does not have is refused
     (422), never dropped; stored providers keep loading with later fields (``_Model``, §11)."""
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, name: str) -> str:
+        """A blank name is refused here, at the request boundary: a provider stored blank before
+        keeps loading (SDD §4.2, review RV20-11)."""
+        if not name.strip():
+            raise PydanticCustomError("blank", BLANK_NAME)
+        return name
+
+
+#: why POST and PATCH /providers refuse a name (SDD §4.2, review RV20-11)
+BLANK_NAME = "must not be blank"
 
 
 DiskKind = Literal["volume", "ephemeral", "image_root", "vmdk"]

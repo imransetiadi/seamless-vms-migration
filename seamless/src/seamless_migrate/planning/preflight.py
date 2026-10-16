@@ -704,7 +704,7 @@ def run_preflight(
     out: list[Finding] = []
     maps = plan.mappings
     # the destination provider a message about the destination cloud names (SDD §1 naming, §9.3)
-    where = destination.name if destination is not None else "the destination"
+    where = destination.label if destination is not None else "the destination"
 
     if vm.power_state == "error":
         out.append(finding("SRC_VM_ERROR_STATE", f"Source VM {vm.name} is in error state."))
@@ -1213,7 +1213,7 @@ def _destination_capabilities(destination: Provider, caps: Mapping[str, Any]) ->
     return [
         finding(
             "DST_CAPABILITY_MISSING",
-            f"{destination.name} lacks what every strategy needs: {'; '.join(lacking)}.",
+            f"{destination.label} lacks what every strategy needs: {'; '.join(lacking)}.",
         )
     ]
 
@@ -1235,20 +1235,20 @@ def _release_outside_support(destination: Provider, caps: Mapping[str, Any]) -> 
         # the series the check settled on, else the range (review RV18-11)
         runs = str(caps.get("release") or _series_text(found))
         sentences.append(
-            f"{destination.name} runs {runs}, read as Tier 3 (End of Life upstream): no "
+            f"{destination.label} runs {runs}, read as Tier 3 (End of Life upstream): no "
             "Seamless release validated it there. The capability checks still apply."
         )
     elif tier.get("tier") == "outside":
         sentences.append(
             {
-                "below_floor": f"{destination.name} runs a series older than "
+                "below_floor": f"{destination.label} runs a series older than "
                 f"{SERIES[0].name}, the support window's floor: no Seamless release validated it.",
-                "newer_than_validated": f"{destination.name} runs a series newer than "
+                "newer_than_validated": f"{destination.label} runs a series newer than "
                 f"{SERIES[-1].name}, the newest series of the support window: no Seamless release "
                 "validated it.",
             }.get(
                 str(reason),
-                f"The series of {destination.name} could not be detected (its compute API "
+                f"The series of {destination.label} could not be detected (its compute API "
                 "maximum was not read): no Seamless release can be said to have validated it.",
             )
             + " The capability checks still apply."
@@ -1262,7 +1262,7 @@ def _release_outside_support(destination: Provider, caps: Mapping[str, Any]) -> 
         else:
             label = str(tier.get("tier", "")).replace("tier", "Tier ")
             sentences.append(
-                f"{destination.name} declares series {destination.release}, but its APIs "
+                f"{destination.label} declares series {destination.release}, but its APIs "
                 f"read as {_series_text(found)}: correct the declared series; the tier is the one "
                 f"its APIs read ({label})."
             )

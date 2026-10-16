@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { MockServer } from '../api/mock';
 import type { Plan, Provider } from '../api/types';
-import { deleteRefusal, plansThatNeed } from './providerUse';
+import { deleteRefusal, destinationName, plansThatNeed, providerLabel } from './providerUse';
 
 const plan = (id: string, status: Plan['status'], counts: Plan['migration_counts'] = {}, derived = status as Plan['derived_status']) =>
   ({ id, name: `Plan ${id}`, status, derived_status: derived, migration_counts: counts, source_provider_id: 'src', destination_provider_id: 'dst' }) as Plan;
@@ -62,3 +62,38 @@ describe('plansThatNeed agrees with the API the mock mirrors (SDD §12)', () => 
     }
   });
 });
+
+describe('a provider stored with a blank name is named by its id (SDD §1 naming, review RV20-11)', () => {
+  it('in a text, as the API names it', () => {
+    expect(providerLabel({ id: 'dst-blank', name: '' })).toBe('dst-blank');
+    expect(providerLabel({ id: 'dst-blank', name: '   ' })).toBe('dst-blank');
+    expect(providerLabel({ id: 'dst-dc3', name: 'OpenStack 2026.2 (DC3)' })).toBe('OpenStack 2026.2 (DC3)');
+  });
+
+  it("where a plan's destination is named, else 'the destination'", () => {
+    const providers = [{ id: 'dst', name: '  ' }, { id: 'src', name: 'RHOSP 17.1' }] as Provider[];
+    expect(destinationName(providers, plan('a', 'draft'))).toBe('dst');
+    expect(destinationName(providers, null)).toBe('the destination');
+    expect(destinationName([], plan('a', 'draft'))).toBe('the destination');
+  });
+});
+
+describe("the offline mock names a plan's destination by its label, as the API's texts (SDD §1 naming, review RV20-11)", () => {
+  const mocks = import.meta.glob(['../api/mock*.ts', '!../api/*.test.ts'], { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
+
+  it('reads the mock sources', () => {
+    expect(Object.keys(mocks)).toEqual(expect.arrayContaining(['../api/mock.ts', '../api/mockData.ts']));
+  });
+
+  it('never reads a destination provider\'s bare name for a text', () => {
+    const bare = Object.entries(mocks).flatMap(([file, text]) =>
+      text
+        .split('\n')
+        .map((line, index) => [index + 1, line] as const)
+        .filter(([, line]) => /\bdestination\??\.name\b/.test(line))
+        .map(([number, line]) => `${file}:${number}: ${line.trim()}`),
+    );
+    expect(bare).toEqual([]);
+  });
+});
+

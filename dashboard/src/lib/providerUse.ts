@@ -43,9 +43,18 @@ export function deleteRefusal(users: readonly ProviderUser[], shown = 3): string
 }
 
 /**
+ * The name a text gives a provider, as the API's Provider.label (SDD §1 naming): its name, else its id - a name stored
+ * blank before the API refused one (review RV20-11) never reads "in : ...".
+ */
+export function providerLabel(provider: Pick<Provider, 'id' | 'name'>): string {
+  return provider.name.trim() ? provider.name : provider.id;
+}
+
+/**
  * The name a text about the destination cloud gives it where a plan or a migration is shown: the plan's destination
- * provider's, else "the destination" (SDD §1 naming, §16, plan T6).
+ * provider's label, else "the destination" (SDD §1 naming, §16, plan T6).
  */
 export function destinationName(providers: readonly Provider[] | undefined, plan: Pick<Plan, 'destination_provider_id'> | null | undefined): string {
-  return (plan && providers?.find((p) => p.id === plan.destination_provider_id)?.name) || 'the destination';
+  const destination = plan ? providers?.find((p) => p.id === plan.destination_provider_id) : undefined;
+  return destination ? providerLabel(destination) : 'the destination';
 }

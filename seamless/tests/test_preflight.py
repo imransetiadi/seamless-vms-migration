@@ -1,4 +1,5 @@
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -1700,3 +1701,27 @@ def test_finding_map_nic_override_invalid_follows_neutron_on_slaac_subnets():
     assert f"fa:16:3e:00:00:01: fd00:20::5 is not {eui}" in f.message
     f = only(check(vm, plan=entry(eui, "nova"), dst=dst), "MAP_NIC_OVERRIDE_INVALID")
     assert "SLAAC or DHCPv6-stateless" in f.message
+
+
+def test_a_blank_destination_name_never_reaches_a_message():
+    """SDD §1 naming (review RV20-11): a destination provider stored with a blank name, before the
+    API refused one, is named by its id - never "do not exist in : ..."."""
+    blank = HIBISCUS.model_copy(update={"id": "blank-dst", "name": "  "})
+    plan = make_plan(mappings=Mappings(networks={"app-net": "gone-net"}))
+    [found] = [f for f in check(plan=plan, destination=blank) if f.code == "MAP_NETWORK_MISSING"]
+    assert "do not exist in blank-dst: app-net -> gone-net." in found.message, found.message
+
+
+def test_every_text_names_the_destination_provider_by_its_label():
+    """SDD §1 naming (review RV20-11): a text that names the destination provider reads its label -
+    its name, else its id - never its bare name, which a provider stored before the API refused a
+    blank one may lack."""
+    root = Path(__file__).parents[1] / "src" / "seamless_migrate"
+    bare = re.compile(r"\b(?:destination|provider)\.name\b")
+    found = [
+        f"{path.relative_to(root)}:{number}: {line.strip()}"
+        for path in sorted(root.rglob("*.py"))
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if bare.search(line)
+    ]
+    assert found == []

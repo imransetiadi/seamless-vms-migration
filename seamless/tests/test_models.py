@@ -21,6 +21,7 @@ from seamless_migrate.domain.models import (
     Finding,
     Migration,
     Plan,
+    Provider,
     SyncPass,
     new_migration_id,
     new_plan_id,
@@ -319,3 +320,15 @@ def test_prestage_resources_are_the_playbook_pairs_of_the_collection():
         if (playbooks / ("import_" + p.stem.removeprefix("export_") + ".yml")).exists()
     }
     assert set(PRESTAGE_RESOURCES) == pairs - {"workloads"}
+
+
+def test_a_provider_stored_with_a_blank_name_loads_and_is_named_by_its_id():
+    """SDD §1 naming, §4.2 (review RV20-11): the API refuses a blank name at the request
+    boundary, so a provider stored blank before keeps loading; a text names it by its id."""
+    for name in ("", "   "):
+        stored = make_provider(id="dst-blank", name="RHOSO").model_dump(mode="json")
+        loaded = Provider.model_validate({**stored, "name": name})
+        assert loaded.name == name and loaded.label == "dst-blank"
+    assert (
+        make_provider(id="dst-dc3", name="OpenStack 2026.2 (DC3)").label == "OpenStack 2026.2 (DC3)"
+    )

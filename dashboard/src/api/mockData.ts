@@ -41,6 +41,7 @@ import { kitSubnet, networkList, portRefusal, resolveNetwork, subnetsOf } from '
 import { destinationRelease, type PolicyProfile } from '../lib/platforms';
 import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
+import { providerLabel } from '../lib/providerUse';
 import { buildStrategyEvidence } from './mockEvidence';
 import { derivePlanStatus } from './mockPlanStatus';
 import { isDatabase, suggestProbes } from './mockProbes';
@@ -874,7 +875,7 @@ function storageReasons(vm: VMRef, plan: Plan, source: Provider, destination: Pr
     const family = families.get(disk.pool)!;
     const target = plan.handover.backend_map[disk.volume_type ?? ''];
     if (family !== 'other' && (!target || dst.length === 0)) continue;
-    const { error } = resolveDestination(family, splitHost(disk.pool)[1], target ?? '', dst, destination.name);
+    const { error } = resolveDestination(family, splitHost(disk.pool)[1], target ?? '', dst, providerLabel(destination));
     if (error) reasons.push(`${disk.name ?? disk.id}: ${error}`);
   }
   return reasons;
@@ -918,7 +919,7 @@ export function eligibility(
     if (vm.disks.some((d) => d.kind !== 'volume')) handover.push('Not every disk is a Cinder volume');
     const unmapped = vm.disks.filter((d) => !d.volume_type || !(d.volume_type in plan.handover.backend_map));
     if (plan.handover.enabled && unmapped.length)
-      handover.push(`volume type(s) without a backend of ${destination.name} in handover.backend_map: ${[...new Set(unmapped.map((d) => d.volume_type ?? '<default>'))].sort().join(', ')}`);
+      handover.push(`volume type(s) without a backend of ${providerLabel(destination)} in handover.backend_map: ${[...new Set(unmapped.map((d) => d.volume_type ?? '<default>'))].sort().join(', ')}`);
     if (multiattach) handover.push('VM has a multi-attach volume');
     // through Nova the destination keeps one address per port; through Neutron every one (SDD §7.3 step 8)
     const several = planned.nics.filter((n) => n.fixed_ips.length > 1);
@@ -1752,7 +1753,7 @@ export function buildFixtures(now: number): Fixtures {
     for (const m of spec.migrations) {
       const vm = vms.find((v) => v.source_id === m.vm);
       if (!vm) continue;
-      const findings = preflight(vm, source.kind, plan, dstInventory.networks, selectedNames, { destination: destination.name });
+      const findings = preflight(vm, source.kind, plan, dstInventory.networks, selectedNames, { destination: providerLabel(destination) });
       const elig = eligibility(vm, source.kind, plan, source, destination, findings);
       const estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(vm, s, plan, elig[s] ?? []));
       const chosen = estimates.find((e) => e.strategy === m.strategy) ?? null;
@@ -1874,7 +1875,7 @@ export function buildFixtures(now: number): Fixtures {
         const destination = providers.find((p) => p.id === plan.destination_provider_id);
         const snapshot = strategySnapshot({
           vm, plan, estimates, findings, scope: estimates.filter((e) => e.eligible).map((e) => e.strategy), deterministic: m.rec.deterministic, at: validated,
-          destination: destination && destinationDescriptor(destination), destinationName: destination?.name,
+          destination: destination && destinationDescriptor(destination), destinationName: destination && providerLabel(destination),
         });
         snapshots.push(snapshot);
         const eligible = estimates.filter((e) => e.eligible).map((e) => e.strategy);
