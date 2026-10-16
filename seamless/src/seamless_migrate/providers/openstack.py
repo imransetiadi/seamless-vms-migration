@@ -128,12 +128,31 @@ _SERVICES = (
 )
 
 
+def _catalog_url(adapter: Any) -> Any:
+    """A service's endpoint as keystoneauth reads it from the catalog. openstacksdk's identity
+    proxy overrides get_endpoint() - it fetches a Keystone endpoint record -, so keystoneauth's
+    own method is asked of any of its adapters (SDD §10, review RV18-03)."""
+    try:
+        from keystoneauth1.adapter import Adapter
+    except ImportError:  # a test double, without openstacksdk installed
+        return adapter.get_endpoint()
+    if isinstance(adapter, Adapter):
+        return Adapter.get_endpoint(adapter)
+    return adapter.get_endpoint()
+
+
 def _plain_http(endpoint: str, conn: Any) -> list[str]:
-    """The provider's own endpoint (``endpoint``) and the services whose endpoint uses plain HTTP
-    (SDD §10, Security.md); an endpoint that cannot be read counts neither way."""
-    found = ["endpoint"] if str(endpoint).strip().lower().startswith("http://") else []
-    for name, proxy in _SERVICES:
-        url = _try(lambda proxy=proxy: getattr(conn, proxy).get_endpoint(), None)
+    """The provider's own endpoint (``endpoint``), the auth URL its credential is posted to
+    (``auth_url``) and the services whose endpoint uses plain HTTP (SDD §10, Security.md); an
+    endpoint that cannot be read counts neither way."""
+    urls: list[tuple[str, Callable[[], Any]]] = [
+        ("endpoint", lambda: endpoint),
+        ("auth_url", lambda: conn.session.auth.auth_url),
+    ]
+    urls += [(name, lambda p=proxy: _catalog_url(getattr(conn, p))) for name, proxy in _SERVICES]
+    found = []
+    for name, read in urls:
+        url = _try(read, None)
         if isinstance(url, str) and url.strip().lower().startswith("http://"):
             found.append(name)
     return found

@@ -761,6 +761,36 @@ async def test_a_plain_http_endpoint_is_reported(stub_openstack):
     assert caps["tls"] is True and caps["plain_http"] == []
 
 
+async def test_the_check_reads_a_real_clouds_identity_endpoint(tmp_path):
+    """Review RV18-03: openstacksdk's identity proxy overrides get_endpoint() - it fetches a
+    Keystone endpoint record -, so the check never read identity's endpoint, and a plain-HTTP one
+    counted neither way. It is read as keystoneauth reads every service's from the catalog (SDD
+    §10, Security.md)."""
+    provider = make_provider(endpoint=AUTH_URL, cloud="dst")
+    secure = InProcessCloud(tmp_path / "secure")
+    caps = await OpenStackProvider(provider, secure.settings, connect_fn=secure.connect).check()
+    assert (caps["tls"], caps["plain_http"]) == (True, [])
+
+    plain = InProcessCloud(
+        tmp_path / "plain", catalog={"identity": "http://identity.example.org/v3"}
+    )
+    caps = await OpenStackProvider(provider, plain.settings, connect_fn=plain.connect).check()
+    assert (caps["tls"], caps["plain_http"]) == (False, ["identity"])
+
+
+async def test_the_check_reports_the_plain_http_auth_url_the_credential_is_posted_to(tmp_path):
+    """Review RV18-03: the credential is posted to the auth URL of its clouds.yaml entry or
+    credentials secret, which need not be the provider's endpoint - a plain-HTTP one sent the
+    password in clear text while the check reported tls. It is named `auth_url` (SDD §10, §13.3,
+    Security.md)."""
+    cloud = InProcessCloud(tmp_path, auth_url="http://identity.example.org/v3")
+    provider = make_provider(endpoint=AUTH_URL, cloud="dst")
+    caps = await OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect).check()
+
+    assert ("POST", "http://identity.example.org/v3/auth/tokens") in cloud.seen
+    assert (caps["tls"], caps["plain_http"]) == (False, ["auth_url"])
+
+
 async def test_the_demo_destination_reports_rhoso_validated_and_legacy():
     """The demo's RHOSO 18.0 destination reports the keys a real destination's check does (SDD
     §10, §10.1), so the dashboard shows them in the demo too."""
