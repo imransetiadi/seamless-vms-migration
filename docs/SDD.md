@@ -3097,7 +3097,8 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
 
 * Container: `seamless/Containerfile` (UBI 9 Python 3.11 base; installs the control plane with
   `[openstack,vmware,jev]` extras, `ansible-core`, this collection with the `openstack.cloud` modules the roles call as `os_migrate.os_migrate.<module>` vendored from the pinned Galaxy release (`scripts/vendor-openstack-cloud.sh`, `OS_CLOUD_VERSION` 2.6.0 — 2.5.0 crashes with openstacksdk 4.x (`openstack.version`) — the checkout uses `make vendor-links` instead), `os_migrate.vmware_migration_kit`,
-  Node 22 runtime for `npx`-launched Jev, and the built dashboard). Runs as non-root UID.
+  Node 22 runtime for `npx`-launched Jev, and the dashboard: the build context's built one, else built in the image,
+  §17.1). Runs as non-root UID.
 * OpenShift manifests (`deploy/openshift/`, kustomize): Namespace, ServiceAccount, PVC (data dir),
   ConfigMap (non-secret settings), Secret references (clouds.yaml, tokens, VMware credentials,
   Jev/agentmemory keys — example file with placeholders only), Deployment (1 replica,
@@ -3134,10 +3135,12 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   (Ansible run directories, the recorded warm state) is backed up by the cluster's volume snapshots or
   Velero/OADP; the Compose stack keeps its `pg_dump` recipe in `deploy/compose/README.md`.
 
-### 17.1 Local stack: Docker Compose on a dedicated Colima profile
+### 17.1 Single-host stack: Docker Compose on Linux, macOS (Colima) or Podman
 
-`deploy/compose/compose.yaml` runs the stack on the Colima profile **`seamless`** (Docker context
-`colima-seamless`; the developer's other profiles are left untouched):
+`deploy/compose/compose.yaml` runs the stack on one host: a Linux machine's own Docker Engine (Ubuntu, Debian, RHEL,
+Rocky Linux, AlmaLinux, Fedora; Docker Engine 20.10+ with the Compose plugin v2.20+, no Colima), on macOS the Colima
+profile **`seamless`** (Docker context `colima-seamless`; the developer's other profiles are left untouched), or
+Podman:
 
 | Service | Image | Notes |
 |---|---|---|
@@ -3151,18 +3154,25 @@ the plaintext token is printed once). `.env` and `tokens.yaml` are git-ignored; 
 read from the developer's environment (`TYPESAFE_API_KEY`) at init time and never committed.
 `tokens.yaml` holds only SHA-256 hashes and is written 0644 so the container user can read the
 bind mount; `.env` is 0600.
-`Makefile` targets: `seamless-colima-up` (`colima start seamless --activate=false --cpu 4 --memory 6
+`Makefile` targets: `seamless-colima-up` (macOS: `colima start seamless --activate=false --cpu 4 --memory 6
 --disk 40` — `--activate=false` keeps the developer's current Docker context),
 `seamless-init`, `seamless-up` / `seamless-down` / `seamless-ps` / `seamless-logs` / `seamless-reset`
-(all with `DOCKER_CONTEXT=colima-seamless`), `seamless-demo` (control plane started with `SEAMLESS_DEMO=true`
+(all through the engine and context below), `seamless-demo` (control plane started with `SEAMLESS_DEMO=true`
 against PostgreSQL), `seamless-test` and `seamless-check` (the CI checks that need only the venv and the
 dashboard's `node_modules`: the control plane with its coverage gate, ruff and DEMO-07, the collection, the
 scanners that are installed, the dashboard's unit tests and build; its comment, `make seamless-help` and the README
 name what it leaves out — the Playwright suite and the browser journeys, the PostgreSQL store tests, the dependency
 audits, trivy's configuration scan, the manifest and image jobs — and how to run each).
 
-Other hosts: `SEAMLESS_DOCKER_CONTEXT=default` runs the same targets on any Docker host — on a Linux machine's own
-Docker Engine, which defines no `host.docker.internal`, the targets add `deploy/compose/compose.linux-host.yaml`,
+Engine and context, by the host the targets run on (`SEAMLESS_HOST_OS`, from `uname -s`): on **Linux**
+`SEAMLESS_DOCKER_CONTEXT` defaults to `default`, the machine's own Docker Engine, and `DOCKER_HOST` is honoured (a
+rootless engine); `seamless-colima-up` there only says that Colima is not needed. On **macOS** it defaults to
+`colima-seamless`, with `DOCKER_HOST` unset so that nothing else is addressed. An explicit `SEAMLESS_DOCKER_CONTEXT`
+wins (Docker Desktop, a remote context). Before a target uses Docker, it checks that the engine answers and that its
+Compose plugin is v2.20 or newer (`depends_on.required`). Its error says how to fix that on that host: on Linux,
+start the engine with `systemctl` and join the `docker` group; on macOS, `make seamless-colima-up`. On a Linux
+machine's own Docker Engine (`default`), which defines no `host.docker.internal`, the targets add
+`deploy/compose/compose.linux-host.yaml`,
 mapping that name to the host gateway so the default agentmemory URL reaches the host — where agentmemory must then
 listen on an address the containers reach, the bridge's (`172.17.0.1` by default) or all addresses behind a firewall,
 not on loopback only (Colima and Docker Desktop resolve the name to the developer's machine themselves, where the host
@@ -3170,6 +3180,18 @@ gateway would be their VM) — and
 `SEAMLESS_ENGINE=podman` runs them with `podman compose` (Podman 4.7+; it drives docker-compose when
 installed, podman-compose otherwise). Without `--wait` there, the targets poll `/api/v1/health` for up to
 300 s. The read-only token-file bind mount sets `selinux: z`, so SELinux hosts (RHEL, Fedora) relabel it.
+
+The host needs no Node.js. When the build context holds no built dashboard (`dashboard/dist/index.html`), the
+Containerfile builds it (`npm ci`, `npm run build`) with the image's own Node 22 and keeps only `dist`. A built one
+(CI's artifact, `make dashboard-build`) is copied as it is. A Linux host thus needs the engine, `git`, `make`, `curl`
+and `openssl`. On every host only `seamless` is published, and only on `127.0.0.1`; another machine reaches it through
+an SSH tunnel.
+
+CI (QASuite §14.5) proves the Linux path:
+* The `compose-linux` job runs `make seamless-init` and `make seamless-demo` with no context variable on an Ubuntu
+  runner's Docker Engine. It then runs the demo smoke test and checks that `/` serves the dashboard the image built.
+* A pull-request job runs `scripts/compose-init.sh` and the targets' dry runs in Rocky Linux 9, AlmaLinux 9,
+  Debian 12, Ubuntu 24.04 and Fedora containers.
 
 ---
 
