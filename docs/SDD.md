@@ -171,7 +171,10 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
                                                        # (Cc) and format characters (Cf) - empty, spaces,
                                                        # U+200B, U+FEFF - (422); a provider stored blank before
                                                        # is named by its id in texts, by the same rule (§1
-                                                       # naming, RV20-11, RV21-08)
+                                                       # naming, RV20-11, RV21-08). The categories are those of
+                                                       # Unicode 15.1, one pinned list of code points both
+                                                       # sides read - never the runtime's database, which
+                                                       # differs between Python 3.11 and newer (RV22-06)
            kind: ProviderKind,
            role: ProviderRole, endpoint: str, cloud: str|null, credentials_secret: str|null,
            region: str|null, verify_tls: bool = true, ca_cert_path: str|null,
