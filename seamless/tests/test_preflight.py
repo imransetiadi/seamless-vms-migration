@@ -1471,8 +1471,10 @@ def _destination_findings(destination):
 def test_no_user_facing_text_assumes_rhoso_for_a_community_destination():
     """SDD §1 naming, §9.3, plan T6 (PRD FR-34): a finding's message names the destination
     provider where it means the destination cloud - "do not exist in OpenStack 2026.2 Hibiscus
-    (DC3)" -, and its remediation, fixed by the catalog, says "the destination": no text says
-    RHOSO for a community destination."""
+    (DC3)" -, and its remediation, fixed by the catalog, says "the destination": no finding says
+    RHOSO for a community destination. This test covers the pre-flight's findings; the other texts
+    are guarded by test_every_text_names_the_destination_provider_by_its_label (the executors,
+    the orchestrator) and the dashboard's destination-wording.test.ts (review 20 docs nit)."""
     assert [code for code, entry in CATALOG.items() if "RHOSO" in entry.remediation] == []
     found = _destination_findings(HIBISCUS)
     assert DESTINATION_FINDINGS <= {f.code for f in found}, sorted(
