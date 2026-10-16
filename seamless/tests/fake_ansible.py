@@ -135,6 +135,9 @@ SCRIPT = textwrap.dedent(
         stop_task = "os_migrate.vmware_migration_kit.migration : Power off the VM"
     if stop_task:
         print("TASK [" + stop_task + "] ****")
+        sys.stdout.flush()
+        # the guest shuts down: the task's result line comes this much later
+        time.sleep(float(os.environ.get("ANSIBLE_FAKE_STOP_HANG", "0")))
         skipped = os.environ.get("ANSIBLE_FAKE_STOP_SKIPPED")
         print("skipping: [localhost]" if skipped else "ok: [localhost]")
         sys.stdout.flush()

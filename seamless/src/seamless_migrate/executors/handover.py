@@ -18,6 +18,7 @@ import logging
 import os
 import tempfile
 from collections.abc import Callable, Collection
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -36,7 +37,7 @@ from ..storage import (
     storage_family,
 )
 from .ansible import classify_failure, effective_mappings, run_dir
-from .base import PermanentStepError, StepContext, StepName, StepResult
+from .base import PermanentStepError, StepContext, StepName, StepResult, outlive_cancel
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -204,18 +205,7 @@ async def _in_thread(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """``asyncio.to_thread`` that no cancel cuts short (SDD §7.3): a call in flight cannot be
     stopped, so a cancelled step ends only once its call returned and journaled what it did, and
     the rollback that follows reads the whole journal (audit EX-01)."""
-    call = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
-    cancelled: asyncio.CancelledError | None = None
-    while not call.done():
-        try:
-            await asyncio.wait({call})
-        except asyncio.CancelledError as exc:
-            cancelled = cancelled or exc
-    if cancelled is not None:
-        if not call.cancelled():
-            call.exception()  # retrieved: the cancelled step reports nothing of it
-        raise cancelled
-    return call.result()
+    return await outlive_cancel(asyncio.to_thread(fn, *args, **kwargs))
 
 
 class _Journal:
@@ -1046,21 +1036,30 @@ class HandoverExecutor:
                     "storage handover refused: " + "; ".join(report["problems"])
                 )
 
-        if not journal.done("stop_source"):
+        try:
+            if not journal.done("stop_source"):
 
-            def stop() -> None:
-                server = src.compute.get_server(server_id)
-                if str(_attr(server, "status", "")).upper() != "SHUTOFF":
-                    src.compute.stop_server(server)
-                    # Nova accepted it: should the wait fail, a rollback starts the source (§7.3)
-                    journal.mark("sent:stop_source")
-                src.compute.wait_for_server(
-                    server, status="SHUTOFF", interval=self.poll_s, wait=self.wait_s
-                )
+                def stop() -> None:
+                    server = src.compute.get_server(server_id)
+                    if str(_attr(server, "status", "")).upper() != "SHUTOFF":
+                        src.compute.stop_server(server)
+                        # Nova accepted it: should the wait fail, a rollback starts the source
+                        journal.mark("sent:stop_source")
+                    src.compute.wait_for_server(
+                        server, status="SHUTOFF", interval=self.poll_s, wait=self.wait_s
+                    )
 
-            await self._call("stop source server", stop)
-            await _in_thread(journal.mark, "stop_source")
-        await ctx.mark_downtime_start()
+                await self._call("stop source server", stop)
+                await _in_thread(journal.mark, "stop_source")
+        except (Exception, asyncio.CancelledError):
+            # SDD §7.3 step 1: the stop Nova accepted may have stopped the source - the clock opens
+            # at its request, so the rollback starts the source again and a cancel is refused
+            sent = journal.get("sent:stop_source")
+            if sent:
+                at = datetime.fromisoformat(sent["at"])
+                await outlive_cancel(ctx.mark_downtime_start(at=at))
+            raise
+        await outlive_cancel(ctx.mark_downtime_start())
 
         definition_path = rdir / DEFINITION_FILE
         if not journal.done("save_definition"):

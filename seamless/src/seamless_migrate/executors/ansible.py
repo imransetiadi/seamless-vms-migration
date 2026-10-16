@@ -59,7 +59,14 @@ from ..security.secrets import (
     resolve_private_key,
     write_secret_file,
 )
-from .base import PermanentStepError, StepContext, StepName, StepResult, TransientStepError
+from .base import (
+    PermanentStepError,
+    StepContext,
+    StepName,
+    StepResult,
+    TransientStepError,
+    outlive_cancel,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1670,6 +1677,12 @@ class AnsibleExecutor:
             if stop_seen_at is not None and ctx is not None:
                 # the playbook ended without a result line for the task: assume it ran
                 await ctx.mark_downtime_start(at=stop_seen_at)
+        except asyncio.CancelledError:
+            if stop_seen_at is not None and ctx is not None:
+                # SDD §7.2: cancelled while the stop task ran - the source may be stopped, so the
+                # clock opens at the task's start (the rollback starts it, a cancel is refused)
+                await outlive_cancel(ctx.mark_downtime_start(at=stop_seen_at))
+            raise
         finally:
             if tail is not None:
                 tail.cancel()

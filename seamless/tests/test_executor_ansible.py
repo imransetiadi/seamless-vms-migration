@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import copy
 import importlib
 import json
@@ -1859,6 +1860,39 @@ async def test_downtime_clock_starts_at_the_stop_task(env, monkeypatch):
     assert marks[0] <= printed_at + 0.2
     # pre-copy prints no stop task: the only candidate was the cutover playbook
     assert [c["playbook"] for c in read_log(env.log)][-1] == "import_workloads_cutover.yml"
+
+
+async def test_a_cutover_cancelled_while_its_stop_task_runs_opens_the_clock_at_its_start(
+    env, monkeypatch
+):
+    """SDD §7.2: a cutover cancelled while its stop task runs, before the task's result line (the
+    step timeout, a rollback request), opens the downtime clock at the task's start - the source
+    may be stopped, so the automatic rollback runs and a cancel is refused - and still ends
+    cancelled (audit EX-02)."""
+    monkeypatch.setenv("ANSIBLE_FAKE_STOP_HANG", "30")  # Nova took the stop; the guest shuts down
+    ctx, rec = ctx_for(env, strategy=Strategy.cold)
+    record = rec.mark_downtime_start
+
+    async def slow_mark(at=None):
+        await asyncio.sleep(0.3)  # the orchestrator waits for the migration's lock, then saves
+        await record(at)
+
+    ctx.mark_downtime_start = slow_mark
+    began = utcnow()
+    step = asyncio.create_task(env.executor.run(StepName.CUTOVER, ctx))
+    for _ in range(500):
+        if any(STOP_TASK.match(line) for line in rec.logs):
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError(rec.logs)
+    seen = utcnow()
+    step.cancel()
+    await asyncio.sleep(0.1)
+    step.cancel()  # while the clock is being opened
+    with pytest.raises(asyncio.CancelledError):
+        await step
+    assert len(rec.downtime_at) == 1 and began <= rec.downtime_at[0] <= seen
 
 
 async def test_vmware_conversion_host_key_secret(env, monkeypatch):

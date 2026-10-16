@@ -4,6 +4,7 @@ import gc
 import json
 import re
 import threading
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -950,6 +951,84 @@ async def test_handover_rollback_starts_a_source_whose_stop_was_sent(tmp_path):
     calls.clear()
     result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert ops(calls) == [] and result.details["note"] == "nothing to roll back"
+
+
+async def test_a_handover_stop_never_confirmed_opens_the_clock_at_its_request(tmp_path):
+    """SDD §7.3 step 1: Nova accepted the stop, then the wait for SHUTOFF failed. The source may be
+    stopped, so the clock opens at the time the stop was journaled as sent - the automatic
+    rollback (§8) and the cancel refusal (§5.1) need it - and the step still fails (audit
+    EX-02). A stop call that itself fails sent nothing and opens no clock."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].crash_wait = "server"
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    journal = json.loads((executor.run_dir(ctx) / JOURNAL_FILE).read_text())
+    assert rec.downtime_at == [datetime.fromisoformat(journal["done"]["sent:stop_source"]["at"])]
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "sent", crash_on="stop_server")
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert rec.downtime_at == []
+
+
+async def test_a_handover_cancelled_while_its_stop_waits_opens_the_clock_at_its_request(tmp_path):
+    """SDD §7.3 step 1: a step cancelled while the stop it sent waits for SHUTOFF (the step timeout,
+    a rollback request) opens the clock at the stop's request before it ends - also when a second
+    cancel comes while it does (audit EX-02)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    held, release = threading.Event(), threading.Event()
+    wait = clouds["src"].compute.wait_for_server
+
+    def slow_wait(server, status="ACTIVE", **kw):
+        if status == "SHUTOFF":
+            held.set()
+            release.wait(30)
+        return wait(server, status=status, **kw)
+
+    clouds["src"].compute.wait_for_server = slow_wait
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    record = rec.mark_downtime_start
+
+    async def slow_mark(at=None):
+        await asyncio.sleep(0.3)  # the orchestrator waits for the migration's lock, then saves
+        await record(at)
+
+    ctx.mark_downtime_start = slow_mark
+    step = asyncio.create_task(executor.run(StepName.CUTOVER, ctx))
+    try:
+        assert await asyncio.to_thread(held.wait, 10)
+        step.cancel()
+    finally:
+        release.set()
+    await asyncio.sleep(0.1)
+    step.cancel()  # while the clock is being opened
+    with pytest.raises(asyncio.CancelledError):
+        await step
+    journal = json.loads((executor.run_dir(ctx) / JOURNAL_FILE).read_text())
+    assert rec.downtime_at == [datetime.fromisoformat(journal["done"]["sent:stop_source"]["at"])]
+
+
+async def test_a_handover_cancelled_while_it_opens_the_clock_still_opens_it(tmp_path):
+    """SDD §7.3 step 1: the stop was confirmed and the clock is being opened when the step is
+    cancelled - the clock still opens before the step ends (audit EX-02)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    entered = asyncio.Event()
+    record = rec.mark_downtime_start
+
+    async def slow_mark(at=None):
+        entered.set()
+        await asyncio.sleep(0.3)  # the orchestrator waits for the migration's lock, then saves
+        await record(at)
+
+    ctx.mark_downtime_start = slow_mark
+    step = asyncio.create_task(executor.run(StepName.CUTOVER, ctx))
+    await asyncio.wait_for(entered.wait(), 10)
+    step.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await step
+    assert rec.downtime_marks == 1
 
 
 async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):

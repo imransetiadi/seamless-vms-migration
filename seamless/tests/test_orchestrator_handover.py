@@ -4,19 +4,24 @@ test_executor_handover (SDD §7.3, §8): what shows only when both run together 
 from __future__ import annotations
 
 import asyncio
+import time
+
+import pytest
 
 from seamless_migrate.domain.enums import Phase, PlanStatus
 from seamless_migrate.executors.handover import HandoverExecutor
+from seamless_migrate.orchestrator import NotAllowed
 from tests.orch_support import build_harness, make_settings
-from tests.test_executor_handover import held_manage, setup, shared_pool
+from tests.test_executor_handover import HTTPError, held_manage, setup, shared_pool
 
 P = Phase
 
 
-def handover_harness(tmp_path, store, **settings_kw):
+def handover_harness(tmp_path, store, auto_rollback=True, **settings_kw):
     """A running plan that cuts its one VM over by itself, by storage handover between clouds that
     share one Ceph pool."""
     _, calls, clouds, plan, mig, _ = setup(tmp_path / "clouds")
+    verification = plan.verification.model_copy(update={"auto_rollback": auto_rollback})
     shared_pool(clouds)
     settings = make_settings(tmp_path, **settings_kw)
     executor = HandoverExecutor(settings, conn_factory=lambda p: clouds[p.cloud], poll_s=0)
@@ -29,11 +34,27 @@ def handover_harness(tmp_path, store, **settings_kw):
                 "require_approval": False,
                 "auto_cutover": True,
                 "vm_ids": [mig.vm.source_id],
+                "verification": verification,
             }
         ),
     )
     store.put("migration", mig.model_copy(update={"phase": P.ready}))
     return h, calls, clouds, mig
+
+
+def shutoff_never_confirmed(clouds, delay=None):
+    """Nova accepts the stop; the wait for SHUTOFF then meets nova-api answering 503 (a restart),
+    on every attempt - or, with ``delay``, ends only after that many seconds (a slow guest)."""
+    wait = clouds["src"].compute.wait_for_server
+
+    def wait_for_server(server, status="ACTIVE", **kw):
+        if status == "SHUTOFF":
+            if delay is None:
+                raise HTTPError("HTTP 503 Service Unavailable: nova-api is restarting")
+            time.sleep(delay)
+        return wait(server, status=status, **kw)
+
+    clouds["src"].compute.wait_for_server = wait_for_server
 
 
 def assert_rolled_back(clouds):
@@ -94,4 +115,58 @@ async def test_a_rollback_requested_during_a_handover_call_starts_after_that_cal
         assert_rolled_back(clouds)
     finally:
         release.set()
+        await h.orch.stop()
+
+
+async def test_a_handover_whose_stop_was_accepted_but_never_confirmed_is_rolled_back(
+    tmp_path, store
+):
+    """SDD §7.3 step 1, §8: Nova accepted the stop, then the wait for SHUTOFF failed through the
+    step's retries. The clock opened at the stop's request, so the plan's automatic rollback starts
+    the source again instead of leaving it stopped in failed (audit EX-02)."""
+    h, calls, clouds, mig = handover_harness(tmp_path, store)
+    shutoff_never_confirmed(clouds)
+    await h.orch.start()
+    try:
+        final = await h.wait_phase(mig.id, P.rolled_back, P.failed)
+        assert h.history(final)[-3:] == [P.failed, P.rolling_back, P.rolled_back], final.error
+        assert ("src", "start_server", "srv-1") in calls
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_failed_handover_whose_stop_was_sent_is_not_cancelled(tmp_path, store):
+    """SDD §5.1: without the automatic rollback the failed handover keeps its clock open, so a
+    cancel - which would leave the source stopped with nothing to restart it - is refused, and a
+    rollback starts the source (audit EX-02)."""
+    h, calls, clouds, mig = handover_harness(tmp_path, store, auto_rollback=False)
+    shutoff_never_confirmed(clouds)
+    await h.orch.start()
+    try:
+        failed = await h.wait_phase(mig.id, P.failed)
+        assert failed.downtime_started_at is not None
+        with pytest.raises(NotAllowed):
+            await h.orch.cancel(mig.id, "rina", "give up on this VM")
+        await h.orch.rollback(mig.id, "rina", "start the source again")
+        final = await h.wait_phase(mig.id, P.rolled_back, P.failed)
+        assert final.phase == P.rolled_back, final.error
+        assert ("src", "start_server", "srv-1") in calls
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_handover_cut_off_while_its_stop_waits_is_rolled_back(tmp_path, store):
+    """SDD §7.3 step 1, §15.1: the step timeout cuts the cutover off while the stop it sent waits
+    for a slow guest. The clock opens at the stop's request, so the automatic rollback starts the
+    source again (audit EX-02)."""
+    h, calls, clouds, mig = handover_harness(
+        tmp_path, store, step_timeout_s=1.0, max_step_retries=0
+    )
+    shutoff_never_confirmed(clouds, delay=2.0)
+    await h.orch.start()
+    try:
+        final = await h.wait_phase(mig.id, P.rolled_back, P.failed, timeout=15)
+        assert h.history(final)[-3:] == [P.failed, P.rolling_back, P.rolled_back], final.error
+        assert ("src", "start_server", "srv-1") in calls
+    finally:
         await h.orch.stop()
