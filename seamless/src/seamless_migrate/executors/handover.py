@@ -200,6 +200,24 @@ def _write_json(path: Path, data: Any) -> None:
         raise
 
 
+async def _in_thread(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """``asyncio.to_thread`` that no cancel cuts short (SDD §7.3): a call in flight cannot be
+    stopped, so a cancelled step ends only once its call returned and journaled what it did, and
+    the rollback that follows reads the whole journal (audit EX-01)."""
+    call = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    cancelled: asyncio.CancelledError | None = None
+    while not call.done():
+        try:
+            await asyncio.wait({call})
+        except asyncio.CancelledError as exc:
+            cancelled = cancelled or exc
+    if cancelled is not None:
+        if not call.cancelled():
+            call.exception()  # retrieved: the cancelled step reports nothing of it
+        raise cancelled
+    return call.result()
+
+
 class _Journal:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -258,12 +276,12 @@ class HandoverExecutor:
 
     async def _conn(self, provider: Provider) -> Any:
         if provider.id not in self._conns:
-            self._conns[provider.id] = await asyncio.to_thread(self._conn_factory, provider)
+            self._conns[provider.id] = await _in_thread(self._conn_factory, provider)
         return self._conns[provider.id]
 
     async def _call(self, what: str, fn: Callable[[], T]) -> T:
         try:
-            return await asyncio.to_thread(fn)
+            return await _in_thread(fn)
         except (PermanentStepError, asyncio.CancelledError):
             raise
         except Exception as exc:
@@ -1009,7 +1027,7 @@ class HandoverExecutor:
 
     async def _cutover(self, ctx: StepContext) -> StepResult:
         rdir = self.run_dir(ctx)
-        journal = await asyncio.to_thread(_Journal, rdir / JOURNAL_FILE)
+        journal = await _in_thread(_Journal, rdir / JOURNAL_FILE)
         src = await self._conn(ctx.source)
         dst = await self._conn(ctx.destination)
         # the plan's mappings overlaid with the flavor preflight matched: what steps 6 and 8 apply
@@ -1041,7 +1059,7 @@ class HandoverExecutor:
                 )
 
             await self._call("stop source server", stop)
-            await asyncio.to_thread(journal.mark, "stop_source")
+            await _in_thread(journal.mark, "stop_source")
         await ctx.mark_downtime_start()
 
         definition_path = rdir / DEFINITION_FILE
@@ -1051,7 +1069,7 @@ class HandoverExecutor:
                 "record source definition",
                 lambda: self._capture_definition(src, server_id, mode),
             )
-            definition["storage"] = await asyncio.to_thread(
+            definition["storage"] = await _in_thread(
                 self._resolve_storage,
                 src,
                 dst,
@@ -1059,9 +1077,9 @@ class HandoverExecutor:
                 backend_map,
                 ctx.destination.label,
             )
-            await asyncio.to_thread(_write_json, definition_path, definition)
-            await asyncio.to_thread(journal.mark, "save_definition")
-        definition = await asyncio.to_thread(_read_json, definition_path)
+            await _in_thread(_write_json, definition_path, definition)
+            await _in_thread(journal.mark, "save_definition")
+        definition = await _in_thread(_read_json, definition_path)
         attachments: list[dict[str, Any]] = definition["attachments"]
 
         # step 3: keep every volume when the server is deleted (runs journaled before this order
@@ -1076,7 +1094,7 @@ class HandoverExecutor:
                     f"keep {vid} when the source server is deleted",
                     lambda v=vid: self._set_delete_on_termination(src, server_id, v, False),
                 )
-                await asyncio.to_thread(journal.mark, key)
+                await _in_thread(journal.mark, key)
 
         # step 4: delete the source server; its volumes become available
         if not journal.done("delete_source"):
@@ -1098,7 +1116,7 @@ class HandoverExecutor:
                     )
 
             await self._call("delete the source server", delete_source)
-            await asyncio.to_thread(journal.mark, "delete_source")
+            await _in_thread(journal.mark, "delete_source")
 
         # step 5: unmanage at the source (Cinder refuses attached volumes)
         for att in attachments:
@@ -1110,7 +1128,7 @@ class HandoverExecutor:
                         src, vid, journal, f"sent:unmanage_src:{vid}"
                     ),
                 )
-                await asyncio.to_thread(journal.mark, key)
+                await _in_thread(journal.mark, key)
 
         storage: dict[str, dict[str, Any]] = definition.get("storage") or {}
         dest_ids: dict[str, str] = {}
@@ -1140,7 +1158,7 @@ class HandoverExecutor:
                         f"sent:manage_dst:{a['volume_id']}",
                     ),
                 )
-                await asyncio.to_thread(journal.mark, key, dest_id=dest_id)
+                await _in_thread(journal.mark, key, dest_id=dest_id)
             dest_ids[att["volume_id"]] = journal.get(key)["dest_id"]
 
         for att in attachments:
@@ -1153,7 +1171,7 @@ class HandoverExecutor:
                         dst, v, m
                     ),
                 )
-                await asyncio.to_thread(journal.mark, key)
+                await _in_thread(journal.mark, key)
 
         if not journal.done("create_server"):
 
@@ -1186,7 +1204,7 @@ class HandoverExecutor:
                 )
 
             new_id = await self._call(f"create the server in {ctx.destination.label}", create)
-            await asyncio.to_thread(journal.mark, "create_server", server_id=new_id)
+            await _in_thread(journal.mark, "create_server", server_id=new_id)
         return StepResult(
             destination_server_id=journal.get("create_server")["server_id"],
             details={"journal": list(journal.data["order"])},
@@ -1195,22 +1213,22 @@ class HandoverExecutor:
     # -- rollback --------------------------------------------------------------------------------
     async def _rollback(self, ctx: StepContext) -> StepResult:
         rdir = self.run_dir(ctx)
-        journal = await asyncio.to_thread(_Journal, rdir / JOURNAL_FILE)
+        journal = await _in_thread(_Journal, rdir / JOURNAL_FILE)
         src = await self._conn(ctx.source)
         server_id = ctx.migration.vm.source_id
         definition_path = rdir / DEFINITION_FILE
         if not journal.data["order"]:
             return StepResult(details={"source_running": True, "note": "nothing to roll back"})
-        if not await asyncio.to_thread(definition_path.exists):
+        if not await _in_thread(definition_path.exists):
             # stopped but nothing else happened yet: just start the source again
             if not journal.done("rb:start_source"):
                 await self._call("start the source server", lambda: self._start(src, server_id))
-                await asyncio.to_thread(journal.mark, "rb:start_source")
-            await asyncio.to_thread(journal.archive, "rolled-back")
+                await _in_thread(journal.mark, "rb:start_source")
+            await _in_thread(journal.archive, "rolled-back")
             return StepResult(details={"source_running": True})
 
         dst = await self._conn(ctx.destination)
-        definition = await asyncio.to_thread(_read_json, definition_path)
+        definition = await _in_thread(_read_json, definition_path)
         attachments: list[dict[str, Any]] = definition["attachments"]
 
         # a create only sent before a crash or a timeout left a server too (SDD §7.3)
@@ -1225,7 +1243,7 @@ class HandoverExecutor:
                     dst.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
 
             await self._call(f"delete the server in {ctx.destination.label}", delete_destination)
-            await asyncio.to_thread(journal.mark, "rb:delete_destination")
+            await _in_thread(journal.mark, "rb:delete_destination")
 
         if definition.get("port_creation_mode") == "neutron":
             # step 8's ports through Neutron: Nova keeps them when it deletes their server, and a
@@ -1255,7 +1273,7 @@ class HandoverExecutor:
                     f"delete the port made for {n['port_id']} in {ctx.destination.label}",
                     delete_ports,
                 )
-                await asyncio.to_thread(journal.mark, key)
+                await _in_thread(journal.mark, key)
 
         def managed_at_rhoso(vid: str) -> str | None:
             """The RHOSO volume a manage created, confirmed or only sent before a crash (§7.3)."""
@@ -1273,7 +1291,7 @@ class HandoverExecutor:
                     f"unmanage {dest_id} in {ctx.destination.label}",
                     lambda v=dest_id, k=key: self._unmanage(dst, v, journal, f"sent:{k}"),
                 )
-                await asyncio.to_thread(journal.mark, key)
+                await _in_thread(journal.mark, key)
 
         new_ids: dict[str, str] = {}
         for att in reversed(attachments):
@@ -1287,7 +1305,7 @@ class HandoverExecutor:
                     f"finish the unmanage of {vid} at the source",
                     lambda v=vid: self._unmanage(src, v, journal, f"sent:unmanage_src:{v}"),
                 )
-                await asyncio.to_thread(journal.mark, f"unmanage_src:{vid}")
+                await _in_thread(journal.mark, f"unmanage_src:{vid}")
             key = f"rb:manage_src:{vid}"
             if not journal.done(key):
                 dest_id = managed_at_rhoso(vid)
@@ -1311,7 +1329,7 @@ class HandoverExecutor:
                         f"sent:{k}",
                     ),
                 )
-                await asyncio.to_thread(journal.mark, key, volume_id=new_id)
+                await _in_thread(journal.mark, key, volume_id=new_id)
             new_ids[vid] = journal.get(key)["volume_id"]
             metadata = att.get("image_metadata") or {}
             meta_key = f"rb:meta_src:{vid}"
@@ -1320,11 +1338,11 @@ class HandoverExecutor:
                     f"restore the boot properties of {new_ids[vid]} at the source",
                     lambda v=new_ids[vid], m=metadata: self._set_boot_properties(src, v, m),
                 )
-                await asyncio.to_thread(journal.mark, meta_key)
+                await _in_thread(journal.mark, meta_key)
 
         any_unmanaged = any(journal.done(f"unmanage_src:{a['volume_id']}") for a in attachments)
         source_gone = journal.done("delete_source") or (
-            await asyncio.to_thread(_existing_server, src, server_id) is None
+            await _in_thread(_existing_server, src, server_id) is None
         )
         new_server_id = server_id
         if any_unmanaged or source_gone:
@@ -1337,7 +1355,7 @@ class HandoverExecutor:
                         src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
 
                 await self._call("delete the stale source server", delete_stale)
-                await asyncio.to_thread(journal.mark, "rb:delete_stale_source")
+                await _in_thread(journal.mark, "rb:delete_stale_source")
             if not journal.done("rb:create_source"):
                 networks = await self._call(
                     "recreate the source ports",
@@ -1355,7 +1373,7 @@ class HandoverExecutor:
                         "sent:rb:create_source",
                     ),
                 )
-                await asyncio.to_thread(journal.mark, "rb:create_source", server_id=created)
+                await _in_thread(journal.mark, "rb:create_source", server_id=created)
             new_server_id = journal.get("rb:create_source")["server_id"]
         else:
             # the server still exists: give back the delete_on_termination step 3 changed
@@ -1371,7 +1389,7 @@ class HandoverExecutor:
                         f"restore delete_on_termination of {vid}",
                         lambda v=vid: self._set_delete_on_termination(src, server_id, v, True),
                     )
-                    await asyncio.to_thread(journal.mark, key)
+                    await _in_thread(journal.mark, key)
             for att in attachments:
                 key = f"rb:attach:{att['volume_id']}"
                 if journal.done(f"detach:{att['volume_id']}") and not journal.done(key):
@@ -1381,10 +1399,10 @@ class HandoverExecutor:
                             server_id, volume_id=a["volume_id"], device=a["device"]
                         ),
                     )
-                    await asyncio.to_thread(journal.mark, key)
+                    await _in_thread(journal.mark, key)
             if not journal.done("rb:start_source"):
                 await self._call("start the source server", lambda: self._start(src, server_id))
-                await asyncio.to_thread(journal.mark, "rb:start_source")
+                await _in_thread(journal.mark, "rb:start_source")
 
         details: dict[str, Any] = {"source_running": True}
         if new_server_id != server_id or any(k != v for k, v in new_ids.items()):
@@ -1393,7 +1411,7 @@ class HandoverExecutor:
             details["vm"] = vm.model_copy(
                 update={"source_id": new_server_id, "disks": disks}
             ).model_dump(mode="json")
-        await asyncio.to_thread(journal.archive, "rolled-back")
+        await _in_thread(journal.archive, "rolled-back")
         return StepResult(details=details)
 
     def _start(self, conn: Any, server_id: str) -> None:
