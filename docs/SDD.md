@@ -47,11 +47,11 @@ means the destination cloud, RHOSO 18.0 or a community OpenStack destination (§
 product alone says "RHOSO 18.0". User-facing texts never say "RHOSO" for the destination (§21.8, PRD FR-34, plan
 T6, the owner's choice of 2026-10-16): a text built for a plan or a migration - a finding's message, an executor's
 refusal or failure, an event - names the destination provider by its `name` ("do not exist in OpenStack 2026.2
-Hibiscus (DC3)"); a fixed text - a catalog remediation, the dashboard's copy - says "the destination". A text about the
-Red Hat product itself (the RHOSO 18.0 preset, its `validated` tier) keeps its name. Nothing the advisor sends to Jev
-carries a provider's name, which is operator free text (§13.4, review RV20-01). Its question names the destination by
-kind and series, as "RHOSO 18.0" or "a community OpenStack 2026.2 destination". The evidence it sends has the name
-replaced the same way.
+Hibiscus (DC3)"), by its `id` when the stored name is blank (review RV20-11); a fixed text - a catalog remediation,
+the dashboard's copy - says "the destination". A text about the Red Hat product itself (the RHOSO 18.0 preset, its
+`validated` tier) keeps its name. Nothing the advisor sends to Jev carries a provider's name, which is operator free
+text (§13.4, review RV20-01). Its question names the destination by kind and series, as "RHOSO 18.0" or "a community
+OpenStack 2026.2 destination". The evidence it sends has the name replaced the same way.
 
 ### 1.1 Why parallel (side-by-side) migration and not adoption
 
@@ -165,7 +165,11 @@ ConversionHostConfig { manage: bool = true, name: str|null, flavor: str|null,
         # ssh_key_secret: secret holding the private key used to reach an existing conversion
         # host (required for VMware sources, whose kit has no prestage step)
 
-Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$), name: str, kind: ProviderKind,
+Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
+           name: str,                                  # not blank: POST and PATCH refuse an empty or
+                                                       # whitespace-only name (422); a provider stored blank
+                                                       # before is named by its id in texts (§1 naming, RV20-11)
+           kind: ProviderKind,
            role: ProviderRole, endpoint: str, cloud: str|null, credentials_secret: str|null,
            region: str|null, verify_tls: bool = true, ca_cert_path: str|null,
            conversion_host: ConversionHostConfig|null,
