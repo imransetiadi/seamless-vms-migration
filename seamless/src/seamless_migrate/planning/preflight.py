@@ -178,9 +178,12 @@ CATALOG: dict[str, CatalogEntry] = {
     "NET_PORT_NOT_PERMITTED": CatalogEntry(
         Severity.blocker,
         (),
+        # each finding names the role of the destination's own profile (_port_remediation)
         "Send the NIC to a network of the credential's project: map its network to one, or set "
-        "a NIC override on the VM's migration page. Another project's shared or external "
-        "network takes it once the RHOSO credential has the admin role.",
+        "a NIC override on the VM's migration page. Another project's shared network takes it "
+        "once the destination credential has the role its policy profile counts: service under "
+        "secure-RBAC, advsvc under the legacy rules. An external network that is not shared "
+        "needs the admin role: Nova attaches it for no other.",
     ),
     "MAP_NIC_OVERRIDE_INVALID": CatalogEntry(
         Severity.blocker,
@@ -308,6 +311,28 @@ def keep_detached_volumes(previous: VMRef, current: VMRef) -> tuple[VMRef, list[
             "longer attached to it",
         )
     ]
+
+
+#: what lets another project's shared network take the port, by the destination's policy profile:
+#: the least role that profile counts, never admin for this alone (SDD §21.5, Security.md C4-06)
+_PORT_ROLE_ADVICE = {
+    "secure_rbac": "the destination credential has the service role for the migration window "
+    "(Neutron's secure-RBAC defaults); admin is not needed for this",
+    "legacy": "the destination credential has the advsvc role (Neutron's legacy rules)",
+    "unknown": "the provider declares its policy profile or series, so the check counts that "
+    "profile's role: service under secure-RBAC, advsvc under the legacy rules",
+}
+
+
+def _port_remediation(profile: str) -> str:
+    """NET_PORT_NOT_PERMITTED's remediation for the destination's policy ``profile`` (review
+    RV18-10: it sent every operator to the admin role)."""
+    return (
+        "Send the NIC to a network of the credential's project: map its network to one, or set a "
+        "NIC override on the VM's migration page. Another project's shared network takes it once "
+        f"{_PORT_ROLE_ADVICE[profile]}. An external network that is not shared needs the admin "
+        "role: Nova attaches it for no other."
+    )
 
 
 def finding(
@@ -798,6 +823,7 @@ def run_preflight(
                 "The RHOSO credential may not put these NICs on their network: "
                 + "; ".join(denied)
                 + ".",
+                remediation=_port_remediation(profile),
             )
         )
 
@@ -1186,9 +1212,11 @@ def _release_outside_support(destination: Provider, caps: Mapping[str, Any]) -> 
     sentences = []
     reason = tier.get("reason")
     if tier.get("tier") == "tier3":
+        # the series the check settled on, else the range (review RV18-11)
+        runs = str(caps.get("release") or _series_text(found))
         sentences.append(
-            f"Destination {destination.id} runs {_series_text(found)}, read as Tier 3 (End of Life "
-            "upstream): no Seamless release validated it there. The capability checks still apply."
+            f"Destination {destination.id} runs {runs}, read as Tier 3 (End of Life upstream): no "
+            "Seamless release validated it there. The capability checks still apply."
         )
     elif tier.get("tier") == "outside":
         sentences.append(

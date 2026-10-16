@@ -234,7 +234,7 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
       "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on 'tenant-web' (project project-admin): Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither.",
     );
     expect(denied?.remediation).toBe(
-      "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared or external network takes it once the RHOSO credential has the admin role.",
+      "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared network takes it once the destination credential has the advsvc role (Neutron's legacy rules). An external network that is not shared needs the admin role: Nova attaches it for no other.",
     );
     expect(run(external, member).find((f) => f.code === 'NET_PORT_NOT_PERMITTED')?.message).toBe(denied?.message);
     // another tenant's private network, whatever the roles

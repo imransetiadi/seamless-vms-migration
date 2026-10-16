@@ -1196,6 +1196,18 @@ def test_declaring_the_series_settles_the_unknown_profile_the_refusal_asks_about
     assert after is None, after.message
 
 
+def test_a_tier_3_warning_names_the_series_the_check_settled_on():
+    """Review RV18-11: a declared series inside the range is the series the check settles on
+    (release) and decides the tier, yet the Tier 3 sentence named the range - "runs 2024.1 –
+    2024.2" for a declared 2024.2, though 2024.1 is Tier 2, not End of Life (SDD §10.1)."""
+    declared = COMMUNITY.model_copy(update={"release": "2024.2"})
+    caps = destination_release("openstack", "2024.2", None, "2.96", "")
+    found = only(check(destination=declared, dst_caps=caps), "DST_RELEASE_OUTSIDE_SUPPORT")
+    assert found.message.startswith(
+        "Destination dst-flamingo runs 2024.2, read as Tier 3 (End of Life upstream)"
+    ), found.message
+
+
 def test_no_release_warning_for_a_supported_or_validated_destination():
     for tier in ("tier1", "tier2"):
         caps = community_caps(
@@ -1332,6 +1344,38 @@ def test_a_report_that_names_no_profile_reads_as_the_destinations_declarations(
     assert (found is not None) is refused, found and found.message
     # RHOSO 18.0: legacy by its kind, as before (D14)
     assert _another_projects_port({"roles": ["advsvc"]}) is None
+
+
+PORT_REMEDIATION = (
+    "Send the NIC to a network of the credential's project: map its network to one, or set a NIC "
+    "override on the VM's migration page. Another project's shared network takes it once {role}. "
+    "An external network that is not shared needs the admin role: Nova attaches it for no other."
+)
+
+
+@pytest.mark.parametrize(
+    "profile, role",
+    [
+        (
+            "secure_rbac",
+            "the destination credential has the service role for the migration window "
+            "(Neutron's secure-RBAC defaults); admin is not needed for this",
+        ),
+        ("legacy", "the destination credential has the advsvc role (Neutron's legacy rules)"),
+        (
+            "unknown",
+            "the provider declares its policy profile or series, so the check counts that "
+            "profile's role: service under secure-RBAC, advsvc under the legacy rules",
+        ),
+    ],
+    ids=["secure_rbac", "legacy", "unknown"],
+)
+def test_the_port_refusals_remediation_names_the_least_role_its_profile_counts(profile, role):
+    """Review RV18-10: the remediation sent every operator to the admin role, the over-privilege
+    Security.md C4-06 rules out ("never admin for this alone"): under secure-RBAC the service role
+    clears it. It names the least role the destination's policy profile counts (SDD §21.5)."""
+    refused = _another_projects_port({"policy_profile": profile, "roles": ["member"]})
+    assert refused.remediation == PORT_REMEDIATION.format(role=role)
 
 
 def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projects_network():

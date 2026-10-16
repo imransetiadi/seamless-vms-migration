@@ -818,8 +818,9 @@ const NETWORK_REMEDIATION = {
     "Send the NIC to a name one RHOSO network carries: one of the credential's project, or the only one of that name - map its network to such a name, or rename one of the networks.",
   NET_ADDRESS_REFUSED:
     'Give the NIC an address its RHOSO network takes: map its network to one whose subnets hold it, or set the address in a NIC override; for a SLAAC address keep the MAC (port_creation_mode "neutron").',
+  // the API's remediation under the legacy profile, the rule this mock judges by (until T8)
   NET_PORT_NOT_PERMITTED:
-    "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared or external network takes it once the RHOSO credential has the admin role.",
+    "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared network takes it once the destination credential has the advsvc role (Neutron's legacy rules). An external network that is not shared needs the admin role: Nova attaches it for no other.",
 };
 
 /** Like the API (SDD §9.3): every entry of the VM checked before anything stops, with the API's messages. */
