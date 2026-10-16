@@ -1919,11 +1919,15 @@ name when Tools report one, else the configured guest id), `FakeSourceProvider`/
 one vGPU flavor, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+ disks;
 13 VMware VMs with mixed CBT/snapshot/independent-disk states, `dc2-portal-02` among them tagged
 `demo-fault: cutover-refusal` (§7.4); a RHOSO destination with networks, flavors, volume types and
-quotas). `providers.registry.build(provider, settings)` returns the right implementation (fake when
-`settings.demo`). The demo seeds two running plans: the finance plan takes 22 of the 24 OpenStack
+quotas; and a community OpenStack destination, `hibiscus-dc3` - kind `openstack`, distribution `kolla`, declared
+`release` `2026.2` - that shares that inventory and whose check reports 2026.2's maxima, compute 2.104 and block
+storage 3.71 (a plausible value: §21.3 has not confirmed 2026.2's), so Tier 1 and the secure-RBAC profile, §10.1).
+`providers.registry.build(provider, settings)` returns the right implementation (fake when `settings.demo`; a fake
+destination is given its provider and reports by its kind). The demo seeds two running plans, both to `rhoso18`:
+the finance plan takes 22 of the 24 OpenStack
 VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (one VM, one migration
 across plans, §5.4) — and the VMware plan 12 of the 13 VMware VMs: `dc2-portal-02` stays unplanned,
-for the operator to plan warm (§7.4).
+for the operator to plan warm (§7.4). No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
 
 ### 10.1 Destination release series (`seamless_migrate.planning.platforms`)
 
@@ -3455,7 +3459,7 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
 | destination-neutral texts: findings, events, the CLI and the dashboard name the destination provider | §9.3, §16 | T6 |
 | conversion host images (§21.6) | §6.5 (binding), Performance.md | T7 |
 | the provider page shows series, tier and profile; the provider form takes the declared series | §16 | T8 |
-| the demo: a community destination (2026.2 Hibiscus, Kolla-Ansible preset) beside `rhoso18` | §10, §7.4 | T9 |
+| the demo: a community destination (2026.2 Hibiscus, Kolla-Ansible preset) beside `rhoso18` | §10 (binding) | T9 |
 | the lab matrix M7–M12 and the LAB-D cases | QASuite §6.7, §7 | T10 |
 
 ### 21.9 Validation
