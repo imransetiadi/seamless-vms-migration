@@ -20,7 +20,7 @@ from ..guest_os import identify
 from ..planning.preflight import DestinationInventory, SourceInventory
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
 from ..storage import storage_family
-from .base import ProviderError, VMNotFound, missing_dependency
+from .base import ProviderError, VMNotFound, microversion_text, missing_dependency
 
 log = logging.getLogger(__name__)
 
@@ -202,8 +202,9 @@ class OpenStackProvider:
     def _check(self) -> dict[str, Any]:
         conn = self._connection()
         admin = _try(lambda: list(conn.compute.hypervisors()), None) is not None
+        # keystoneauth hands a parsed tuple: reported as "2.96" (review RV18-01)
         microversion = _try(
-            lambda: str(conn.compute.get_endpoint_data().max_microversion or ""), ""
+            lambda: microversion_text(conn.compute.get_endpoint_data().max_microversion), ""
         )
         agents = _try(lambda: list(conn.network.agents()), [])
         ovn = any(

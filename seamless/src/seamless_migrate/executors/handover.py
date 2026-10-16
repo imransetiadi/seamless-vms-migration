@@ -27,6 +27,7 @@ from ..domain.enums import Strategy
 from ..domain.models import Mappings, Plan, Provider, utcnow
 from ..planning.ipam import address_refusal, requested_ips
 from ..planning.networks import port_refusal
+from ..providers.base import microversion_text
 from ..storage import (
     StorageError,
     manage_reference,
@@ -62,8 +63,10 @@ def _checked(response: Any, what: str) -> Any:
 
 
 def _microversion(value: Any) -> tuple[int, int]:
+    """A microversion as (major, minor): keystoneauth's parsed tuple, (2, 96), or text, "2.96";
+    (0, 0) when it is neither (review RV18-02)."""
     try:
-        major, minor = str(value).split(".")[:2]
+        major, minor = microversion_text(value).split(".")[:2]
         return int(major), int(minor)
     except ValueError:
         return (0, 0)
@@ -633,8 +636,9 @@ class HandoverExecutor:
         version = _attr(src.compute.get_endpoint_data(), "max_microversion")
         if _microversion(version) < _microversion(KEEP_MICROVERSION):
             problems.append(
-                f"the source compute API supports microversion {version or 'unknown'}; keeping the "
-                f"volumes when the source server is deleted needs {KEEP_MICROVERSION}"
+                "the source compute API supports microversion "
+                f"{microversion_text(version) or 'unknown'}; keeping the volumes when the source "
+                f"server is deleted needs {KEEP_MICROVERSION}"
             )
         for att in attachments:
             vid = att["volume_id"]

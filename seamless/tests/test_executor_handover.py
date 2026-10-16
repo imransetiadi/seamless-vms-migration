@@ -16,6 +16,7 @@ from seamless_migrate.executors.handover import (
     _mark_boot,
     port_description,
 )
+from tests.cloud_support import InProcessCloud
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_plan, make_provider, make_vm
 
@@ -1914,6 +1915,23 @@ async def test_handover_step_8_uses_the_network_step_0_resolved(tmp_path):
         await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
         [attrs] = clouds["dst"].port_attrs
         assert attrs["network_id"] == expected, name
+
+
+def test_handover_step_0_reads_a_real_sources_microversion(tmp_path):
+    """Review RV18-02: step 0 split str(max_microversion) on "." - keystoneauth's tuple (2, 96)
+    read as (0, 0) - and refused every real source as below 2.85, so storage handover could not
+    run on a real cloud. It reads the tuple; a source below 2.85 is still refused, its maximum
+    named as major.minor (SDD §7.3 step 0)."""
+    caracal = InProcessCloud(tmp_path / "caracal", compute="2.96")
+    conn = caracal.connect(make_provider(cloud="dst"), caracal.settings)
+    assert HandoverExecutor._unmanage_blockers(conn, []) == []
+
+    train = InProcessCloud(tmp_path / "train", compute="2.79")
+    conn = train.connect(make_provider(cloud="dst"), train.settings)
+    assert HandoverExecutor._unmanage_blockers(conn, []) == [
+        "the source compute API supports microversion 2.79; keeping the volumes when the source "
+        "server is deleted needs 2.85"
+    ]
 
 
 async def test_handover_step_0_refuses_a_network_the_credential_may_not_put_a_port_on(tmp_path):

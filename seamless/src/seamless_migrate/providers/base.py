@@ -68,6 +68,19 @@ def provider_caps(provider: Provider) -> dict[str, Any]:
     return caps
 
 
+def microversion_text(value: Any) -> str:
+    """A service's maximum microversion as ``major.minor`` text, ``""`` when there is none.
+
+    keystoneauth hands openstacksdk's ``get_endpoint_data().max_microversion`` a parsed version
+    tuple, ``(2, 96)``; ``str()`` of it is "(2, 96)", which nothing reads as a microversion (review
+    RV18-01, RV18-02). Text, as a test double may hand it, is kept as it is (SDD §10).
+    """
+    if isinstance(value, (tuple, list)):
+        parts = [part for part in value[:2] if isinstance(part, int) and not isinstance(part, bool)]
+        return f"{parts[0]}.{parts[1]}" if len(parts) == 2 else ""
+    return str(value or "")
+
+
 def missing_dependency(extra: str, module: str) -> ProviderError:
     return ProviderError(
         f"the {module!r} Python package is not installed; install seamless-migrate[{extra}]"
