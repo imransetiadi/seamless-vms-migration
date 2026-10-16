@@ -41,6 +41,9 @@ test('network, audit and input scrollers have named keyboard access', async ({ p
 test('a definition near the viewport bottom stays fully visible', async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 800 });
   await signIn(page, '/advisor');
+  // the demo's first tick finishes api-gw-02's validation and lists its recommendation at the top: wait for it, so the
+  // list has stopped moving before the term is measured and hovered (it moved from under the pointer now and then)
+  await expect(page.getByRole('link', { name: 'Details for api-gw-02' })).toBeVisible();
   const term = page.getByRole('button', { name: 'confidence', exact: true }).nth(3);
   await term.evaluate((el) => {
     el.scrollIntoView({ block: 'center' });
