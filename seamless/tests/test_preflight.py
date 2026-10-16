@@ -161,6 +161,19 @@ def test_duplicate_names_blocked():
     assert all(f.code != "SRC_VM_DUPLICATE_NAME" for f in check(c, all_vms=vms))
 
 
+def test_a_vm_with_a_same_named_twin_still_names_the_destination_provider():
+    """SDD §1 naming: the duplicate-name finding named the other VMs with the variable every later
+    message names the destination provider by, so for a VM with a same-named twin each finding
+    about the destination cloud named the twins ("in 'hr/vm-2'") instead of the provider."""
+    vm = make_vm(nics=[Nic(network="db-net", mtu=9000)])
+    twin = make_vm(source_id="vm-2", project="hr")
+    found = check(vm, plan=make_plan(prestage_resources=["subnets"]), all_vms=[vm, twin])
+    assert "(hr/vm-2)" in only(found, "SRC_VM_DUPLICATE_NAME").message
+    assert only(found, "MAP_NETWORK_MISSING").message == (
+        "No mapping or same-named network in RHOSO 18.0 for: db-net."
+    )
+
+
 def test_finding_src_vm_multiattach():
     f = only(check(make_vm(disks=[make_disk(multiattach=True)])), "SRC_VM_MULTIATTACH")
     assert f.severity == Severity.warning
