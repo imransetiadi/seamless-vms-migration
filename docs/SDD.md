@@ -1351,6 +1351,10 @@ volumes with their server, so the order is:
      consistency group (Cinder `volume.api.delete(unmanage_only=True)`, Wallaby and later);
    * no attachment is the boot volume (step 2): the destination server could not be created, nor the
      source again on rollback;
+   * the server has a disk on its hypervisor — a root disk from an image, its flavor's ephemeral or swap disk, read as
+     the inventory reads them (§4.2): step 4 deletes the server, and the disk with it, while no handover moves
+     anything but Cinder volumes. Validation rules the strategy out for such a VM (§9.2), but a resize since
+     then is seen here only (audit EX-15);
    * a port's RHOSO network (its NIC override's, else the mapped one) does not resolve with step 8's lookup. That
      lookup takes the credential's own network of that name, else the only network of that name it sees. It fails
      when there is no such network, when there are several in the credential's project, or when there are several
