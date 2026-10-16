@@ -1152,7 +1152,7 @@ async def test_vmware_runs_give_the_kit_every_nic_by_its_key_and_refuse_before_i
     }
     # the destination's networks cannot be read: transient, before the kit
     env.registry.inventory_error = True
-    assert "could not read the destination's networks" in await refused(
+    assert "could not read the networks of RHOSO 18.0" in await refused(
         [std], error=TransientStepError
     )
     assert rec.downtime_marks == 1
@@ -1370,7 +1370,7 @@ async def test_vmware_runs_refuse_a_nic_whose_mac_or_address_another_port_holds(
     )
     # ports that cannot be read: transient, before the kit
     env.registry.ports_error = True
-    assert "could not read the destination's ports" in await refused(TransientStepError)
+    assert "could not read the ports of RHOSO 18.0" in await refused(TransientStepError)
     env.registry.ports_error = False
     # a port of another network holds nothing the kit asks this network for
     held.update(network_id="net-elsewhere", mac_address="00:50:56:00:00:01")
@@ -1478,12 +1478,12 @@ async def test_a_vmware_warm_pass_logs_what_only_the_cutovers_ports_meet(env):
     ctx, rec = ctx_for(env, nics=[nic], **kit)
     await env.executor.run(StepName.SYNC, ctx)
     assert (
-        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': could not read the destination's "
-        "ports: ports: HTTP 503; the cutover reads them again before the power-off"
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': could not read the ports of RHOSO "
+        "18.0: ports: HTTP 503; the cutover reads them again before the power-off"
     ) in rec.logs
     assert not any(ln.startswith(later) for ln in rec.logs)
     ctx, _ = ctx_for(env, nics=[nic], **kit)
-    with pytest.raises(TransientStepError, match="could not read the destination's ports"):
+    with pytest.raises(TransientStepError, match="could not read the ports of RHOSO 18.0"):
         await env.executor.run(StepName.CUTOVER, ctx)
     env.registry.ports_error = False
 
@@ -2011,7 +2011,7 @@ async def test_cutover_refuses_a_pre_existing_destination_server(env):
     )
     for strategy, source in ((Strategy.cold, SRC), (Strategy.vmware_cold, VCENTER)):
         ctx, rec = ctx_for(env, strategy=strategy, source=source)
-        with pytest.raises(PermanentStepError, match="already exists in the destination"):
+        with pytest.raises(PermanentStepError, match="already exists in RHOSO 18.0"):
             await executor.run(StepName.CUTOVER, ctx)
         assert rec.downtime_marks == 0
     assert read_log(env.log) == []  # no playbook ran
@@ -2547,7 +2547,7 @@ async def test_warm_cutover_rerun_without_a_recorded_server_stays_a_permanent_fa
     _finished_cutover_state(env, record_server=False)
     monkeypatch.setenv("ANSIBLE_FAKE_SKIP_PASS", "1")
     retry, _ = ctx_for(env, strategy=Strategy.warm, sync_passes=[first.sync_pass])
-    with pytest.raises(PermanentStepError, match="recorded no new pass"):
+    with pytest.raises(PermanentStepError, match="check RHOSO 18.0 for a same-named server"):
         await env.executor.run(StepName.CUTOVER, retry)
 
 
@@ -2728,7 +2728,9 @@ async def test_vmware_rollback_and_lookup_failures(env):
     cold, rec = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
     result = await failing.run(StepName.CUTOVER, cold)
     assert result.destination_server_id is None
-    assert any("could not look up the destination server" in line for line in rec.logs)
+    assert any(
+        "could not look up the server named web-01 in RHOSO 18.0" in line for line in rec.logs
+    )
 
 
 async def test_cutover_refused_when_destination_lookup_fails(env):
@@ -2738,7 +2740,9 @@ async def test_cutover_refused_when_destination_lookup_fails(env):
     failing = AnsibleExecutor(env.settings, providers=FailingRegistry(), poll_s=0.02)
     for strategy, source in ((Strategy.vmware_cold, VCENTER), (Strategy.cold, SRC)):
         ctx, rec = ctx_for(env, strategy=strategy, source=source)
-        with pytest.raises(TransientStepError, match="could not check the destination"):
+        with pytest.raises(
+            TransientStepError, match="could not check RHOSO 18.0 for a server named web-01"
+        ):
             await failing.run(StepName.CUTOVER, ctx)
         assert rec.downtime_marks == 0
     assert read_log(env.log) == []  # no playbook ran
@@ -2825,7 +2829,9 @@ async def test_skipped_stop_task_starts_no_downtime_clock(env, monkeypatch):
     ctx, rec = ctx_for(env, strategy=Strategy.cold)
     # the cold role skips everything when the destination already has the server: nothing was
     # migrated, so the step fails instead of returning the same-named server as the result
-    with pytest.raises(PermanentStepError, match="nothing was migrated"):
+    with pytest.raises(
+        PermanentStepError, match="RHOSO 18.0 already has a server with that name and nothing was"
+    ):
         await env.executor.run(StepName.CUTOVER, ctx)
     assert rec.downtime_marks == 0, "a skipped stop task does not stop the source"
     monkeypatch.delenv("ANSIBLE_FAKE_STOP_SKIPPED")
@@ -3123,7 +3129,7 @@ async def test_an_unreadable_destination_keeps_the_exported_network_references(e
     await env.executor.run(StepName.CUTOVER, cold)
     [port] = exported_server(env)["params"]["ports"]
     assert port["params"]["fixed_ips_refs"][0]["subnet_ref"]["name"] == "app-subnet"
-    assert any("could not read the destination's networks" in line for line in rec.logs)
+    assert any("could not read the networks of RHOSO 18.0" in line for line in rec.logs)
 
 
 async def test_a_rollback_never_resolves_network_references(env):

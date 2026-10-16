@@ -1028,9 +1028,9 @@ class AnsibleExecutor:
             # the cold role skips every task (the stop included) when the destination already
             # has a server with the workload's name: nothing was migrated
             raise PermanentStepError(
-                f"import_workloads.yml skipped {ctx.migration.vm.name}: the destination already "
-                "has a server with that name and nothing was migrated; delete or rename it, "
-                "or roll the migration back"
+                f"import_workloads.yml skipped {ctx.migration.vm.name}: "
+                f"{ctx.destination.label} already has a server with that name and nothing was "
+                "migrated; delete or rename it, or roll the migration back"
             )
         result = await self._result(step, strategy, ctx, osm, started, passes_before)
         if deferred is not None:
@@ -1059,12 +1059,13 @@ class AnsibleExecutor:
             # an unanswered lookup is not "no such server": refuse before anything is stopped
             # (a duplicate name is a lookup error too)
             raise TransientStepError(
-                f"could not check the destination for a server named {m.vm.name}: {exc}"
+                f"could not check {ctx.destination.label} for a server named {m.vm.name}: {exc}"
             ) from exc
         if existing:
             raise PermanentStepError(
-                f"a server named {m.vm.name} already exists in the destination ({existing}) and "
-                "this migration did not create it; delete or rename it before the cutover"
+                f"a server named {m.vm.name} already exists in {ctx.destination.label} "
+                f"({existing}) and this migration did not create it; delete or rename it before "
+                "the cutover"
             )
 
     async def _result(
@@ -1104,7 +1105,7 @@ class AnsibleExecutor:
                 # previous pass would feed a phantom pass into convergence and the estimate
                 raise PermanentStepError(
                     f"the playbook recorded no new pass for {m.vm.name} (the workload was "
-                    "skipped); check the destination for a same-named server"
+                    f"skipped); check {ctx.destination.label} for a same-named server"
                 )
             sync_pass = _warm_sync_pass(state["passes"][-1], m, started)
             if step == StepName.CUTOVER:
@@ -1154,8 +1155,8 @@ class AnsibleExecutor:
             inventory = await self.providers.get(ctx.destination).inventory()
         except ProviderError as exc:
             await ctx.log(
-                f"could not read the destination's networks ({exc}): the network references "
-                "stay as exported"
+                f"could not read the networks of {ctx.destination.label} ({exc}): the network "
+                "references stay as exported"
             )
             return None
         # none listed (an older provider): nothing to resolve against
@@ -1179,7 +1180,9 @@ class AnsibleExecutor:
         try:
             inventory = await dst.inventory()
         except ProviderError as exc:
-            raise TransientStepError(f"could not read the destination's networks: {exc}") from exc
+            raise TransientStepError(
+                f"could not read the networks of {ctx.destination.label}: {exc}"
+            ) from exc
         networks = list(getattr(inventory, "network_details", None) or [])
         subnets = list(getattr(inventory, "subnets", None) or [])
         # the token's roles read now with the inventory, as the handover's step 0 and the
@@ -1234,7 +1237,9 @@ class AnsibleExecutor:
                 problems.append(f"{what} on {name!r}: {why}")
                 continue
             try:
-                held = await self._held_by_another_port(dst, str(network["id"]), nic)
+                held = await self._held_by_another_port(
+                    dst, str(network["id"]), nic, ctx.destination.label
+                )
             except TransientStepError as exc:
                 if deferred is None:
                     raise
@@ -1276,9 +1281,12 @@ class AnsibleExecutor:
         deferred.logged = len(deferred)
 
     @staticmethod
-    async def _held_by_another_port(dst: Any, network_id: str, nic: Nic) -> str | None:
+    async def _held_by_another_port(
+        dst: Any, network_id: str, nic: Nic, where: str = "the destination"
+    ) -> str | None:
         """What another port of the network holds of what the kit asks Neutron for after the
-        power-off: the NIC's MAC, else one of its IPv4 addresses (SDD §7.2)."""
+        power-off: the NIC's MAC, else one of its IPv4 addresses (SDD §7.2); a failed read names
+        the destination provider, ``where`` (SDD §1 naming)."""
         try:
             if nic.mac:
                 for port in await dst.ports(network_id=network_id, mac_address=nic.mac.lower()):
@@ -1287,7 +1295,7 @@ class AnsibleExecutor:
                 for port in await dst.ports(network_id=network_id, ip_address=address):
                     return f"port {port['id']} holds {address}"
         except ProviderError as exc:
-            raise TransientStepError(f"could not read the destination's ports: {exc}") from exc
+            raise TransientStepError(f"could not read the ports of {where}: {exc}") from exc
         return None
 
     @staticmethod
@@ -1309,7 +1317,10 @@ class AnsibleExecutor:
         try:
             return await self.providers.get(ctx.destination).find_server(ctx.migration.vm.name)
         except ProviderError as exc:
-            await ctx.log(f"could not look up the destination server: {exc}")
+            await ctx.log(
+                f"could not look up the server named {ctx.migration.vm.name} in "
+                f"{ctx.destination.label}: {exc}"
+            )
             return None
 
     async def _vmware_rollback(self, ctx: StepContext) -> StepResult:
