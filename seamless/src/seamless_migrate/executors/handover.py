@@ -210,6 +210,15 @@ async def _in_thread(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     return await outlive_cancel(asyncio.to_thread(fn, *args, **kwargs))
 
 
+def _backend_name(extra_specs: dict[str, Any]) -> str | None:
+    """The backend a Cinder volume type asks for in its extra specs, as the scheduler's
+    CapabilitiesFilter reads it: ``volume_backend_name``, also scoped ``capabilities:``."""
+    name = extra_specs.get("volume_backend_name") or extra_specs.get(
+        "capabilities:volume_backend_name"
+    )
+    return str(name) if name else None
+
+
 def _recreated_vm(vm: VMRef, server_id: str, new_ids: dict[str, str]) -> dict[str, Any]:
     """``vm`` as the rollback recreated it: the new server's id, each disk managed back by its new
     volume id (SDD §7.3)."""
@@ -498,15 +507,25 @@ class HandoverExecutor:
         if missing:
             problems.append(f"no handover backend for volume type(s): {missing}")
         src_pools: dict[str, dict[str, Any]] | None = None
+        dst_pools: dict[str, dict[str, Any]] = {}
         dst_backends: list[dict[str, Any]] = []
         try:
             src_pools = self._pools(src, "the source")
+            dst_pools = self._pools(dst, cloud)
             dst_backends = [
-                {"pool": name, "family": storage_family(caps)}
-                for name, caps in self._pools(dst, cloud).items()
+                {"pool": name, "family": storage_family(caps)} for name, caps in dst_pools.items()
             ]
         except PermanentStepError as exc:
             problems.append(str(exc))
+        # the backend each destination volume type asks for (step 6's manage, audit EX-10)
+        type_backends = (
+            {
+                str(_attr(t, "name")): _backend_name(_attr(t, "extra_specs", default={}) or {})
+                for t in dst.block_storage.types()
+            }
+            if plan is not None
+            else {}
+        )
         volumes: list[dict[str, Any]] = []
         for att in attachments:
             vid, host = att["volume_id"], att.get("host")
@@ -536,6 +555,20 @@ class HandoverExecutor:
                         entry["reference"] = manage_reference(
                             family, split_host(dst_host)[1], f"volume-{vid}"
                         )
+                        if plan is not None:
+                            vtype = (mappings or plan.mappings).volume_types.get(
+                                att["volume_type"] or "", att["volume_type"]
+                            )
+                            wanted = type_backends.get(vtype or "")
+                            have = (dst_pools.get(dst_host) or {}).get("volume_backend_name")
+                            if wanted and have and wanted != have:
+                                problems.append(
+                                    f"volume {vid}: {cloud}'s volume type {vtype!r} asks for the "
+                                    f"backend {wanted!r}, but step 6 manages the volume on "
+                                    f"{dst_host}, whose backend is {have!r}: Cinder's scheduler "
+                                    "would refuse it - map the volume type to a type of that "
+                                    "backend, or its backend to the type's"
+                                )
                     except StorageError as exc:
                         problems.append(f"volume {vid}: {exc}")
             volumes.append(entry)

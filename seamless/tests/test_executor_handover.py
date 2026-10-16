@@ -227,7 +227,10 @@ class FakeBlockStorage:
         return res
 
     def types(self):
-        return [NS(id=f"type-{name}", name=name) for name in self.c.type_names]
+        return [
+            NS(id=f"type-{name}", name=name, extra_specs=dict(self.c.type_specs.get(name, {})))
+            for name in self.c.type_names
+        ]
 
     def backend_pools(self):
         if self.c.pools is None:
@@ -422,6 +425,8 @@ class FakeCloud:
         # the flavors get_flavor reports by id: ephemeral (GiB), swap (MiB)
         self.flavor_details = {}
         self.type_names = ("ceph-ssd", "ceph-hdd", "rbd-hdd")
+        # each type's extra specs (by name), e.g. the backend it asks for
+        self.type_specs = {}
         self.current_project_id = f"{name}-project"
         # keystoneauth: the role names of the token (the handover's admin credential)
         self.roles = ["admin", "member", "reader"]
@@ -1941,6 +1946,45 @@ async def test_handover_refuses_before_stop_a_volume_another_server_holds_too(tm
     volume.attachments = [{"server_id": "srv-1"}]
     result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert result.destination_server_id == "dst-new-1"
+
+
+@pytest.mark.parametrize(
+    ("specs", "reported", "refused"),
+    [
+        ({"volume_backend_name": "ceph-ssd"}, True, True),
+        ({"capabilities:volume_backend_name": "ceph-ssd"}, True, True),
+        ({"volume_backend_name": "ceph-hdd"}, True, False),
+        ({}, True, False),
+        ({"volume_backend_name": "ceph-ssd"}, False, False),
+    ],
+)
+async def test_handover_refuses_before_stop_a_volume_type_the_pool_cannot_hold(
+    tmp_path, specs, reported, refused
+):
+    """SDD §7.3 step 0: vol-data is managed on hostgroup@ceph-hdd#hdd, whose backend is ceph-hdd,
+    as the mapped type rbd-hdd. A type asking for another backend is refused by Cinder's scheduler
+    at step 6, after the source server was deleted - so step 0 refuses it while the VM runs; a
+    type asking for that backend, or for none, passes, as does one whose pool reports no backend
+    to compare with (audit EX-10)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].pools = [
+        ("hostgroup@ceph-ssd#ssd", {**CEPH, "volume_backend_name": "ceph-ssd"}),
+        ("hostgroup@ceph-hdd#hdd", {**CEPH, "volume_backend_name": "ceph-hdd"}),
+    ]
+    if not reported:
+        clouds["dst"].pools = [(name, CEPH) for name, _ in clouds["dst"].pools]
+    clouds["dst"].type_specs = {"rbd-hdd": specs}
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    if not refused:
+        assert (await executor.run(StepName.CUTOVER, ctx)).destination_server_id
+        return
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refusal:
+        await executor.run(StepName.CUTOVER, ctx)
+    assert (
+        "volume vol-data: RHOSO 18.0's volume type 'rbd-hdd' asks for the backend 'ceph-ssd', but "
+        "step 6 manages the volume on hostgroup@ceph-hdd#hdd, whose backend is 'ceph-hdd'"
+    ) in str(refusal.value)
+    assert calls == [] and rec.downtime_marks == 0
 
 
 async def test_handover_refuses_before_stop_without_compute_microversion_2_85(tmp_path):
