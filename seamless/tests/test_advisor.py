@@ -1,5 +1,9 @@
 import json
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -550,3 +554,54 @@ async def test_the_question_names_the_destination_once_whatever_its_provider_is_
     assert advice.request["decision"] == (
         f"Which migration strategy should be used for VM web-01 moving to {descriptor}?"
     )
+
+
+@pytest.mark.parametrize(
+    ("vm_name", "provider", "descriptor"),
+    [
+        ("RHOSO", "RHOSO prod (Jakarta)", "RHOSO 18.0"),
+        ("OpenStack", "Hibiscus DC3 (Jakarta)", "a community OpenStack 2026.2 destination"),
+    ],
+)
+async def test_the_vms_redaction_never_splits_the_descriptor_the_providers_name_became(
+    vm_name, provider, descriptor
+):
+    """SDD §13.4 (review RV22-04): with names redacted, a VM named like a word of the descriptor
+    never reaches into it - Jev was told the destination is "[vm] 18.0"."""
+    vm = make_vm(name=vm_name)
+    plan = make_plan(downtime_slo_s=900, handover=HandoverConfig(enabled=True, backend_map={}))
+    caps = {"conversion_host": True, "admin": False}
+    reasons = eligibility(vm, "openstack", plan, caps, caps, (), provider)
+    handover = est(Strategy.storage_handover, 100, eligible=False).model_copy(
+        update={"reasons": reasons[Strategy.storage_handover]}
+    )
+    estimates = [est(Strategy.cold, 1000, slo=900), est(Strategy.warm, 950, slo=900), handover]
+    settings = Settings(jev_mode="http", memory_redact_names=True)
+    advice = await Advisor(None, settings).recommend_strategy(
+        vm, estimates, plan, [], descriptor, provider
+    )
+    assert advice is not None and advice.request is not None
+    assert f"admin rights are required on {descriptor})" in advice.request["evidence"]
+
+
+def test_the_strategy_request_is_the_same_whatever_the_processs_hash_seed():
+    """SDD §13.4, §14.5 (review RV22-04): the input snapshot is what is sent, content-addressed -
+    two names of equal length were ordered by the process's string hash seed, so VM "RHOSO" and
+    provider "DC-03" sent "[vm] 18.0" from one process and "RHOSO 18.0" from another."""
+    script = (
+        "from seamless_migrate.ai.advisor import Advisor\n"
+        "from seamless_migrate.config import Settings\n"
+        "from tests.factories import make_vm\n"
+        "advisor = Advisor(None, Settings(jev_mode='http', memory_redact_names=True))\n"
+        "print(advisor._for_strategy('admin rights are required on DC-03', make_vm(name='RHOSO'),"
+        " 'DC-03', 'RHOSO 18.0'))\n"
+    )
+    root = Path(__file__).parents[1]
+    seen = set()
+    for seed in ("0", "1"):
+        env = {**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": f"{root / 'src'}:{root}"}
+        run = subprocess.run(
+            [sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True
+        )
+        seen.add(run.stdout.strip())
+    assert seen == {"admin rights are required on RHOSO 18.0"}, seen

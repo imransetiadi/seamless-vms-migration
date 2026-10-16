@@ -79,13 +79,14 @@ def redact(text: str, redact_names: Sequence[str] | None = None) -> str:
 def replace_names(text: str, replacements: dict[str, str]) -> str:
     r"""Replace each name by its replacement wherever it stands as a word (SDD §13.4): between
     characters that are not letters or digits ([^\W_]), so web-01-data, web-01_root and data-web-01
-    lose web-01 while web-010 (another VM) keeps it; the longest name first."""
-    out = str(text)
-    for name in sorted({n for n in replacements if n}, key=len, reverse=True):
-        out = re.sub(
-            rf"(?<![^\W_]){re.escape(name)}(?![^\W_])", lambda _m, n=name: replacements[n], out
-        )
-    return out
+    lose web-01 while web-010 (another VM) keeps it. One pass over every name - the longest first
+    where two start at the same place -, so what a replacement wrote is never searched again, and
+    the text is the same in every process, whatever its string hash seed (review RV22-04)."""
+    names = sorted({n for n in replacements if n}, key=lambda n: (-len(n), n))
+    if not names:
+        return str(text)
+    words = re.compile(rf"(?<![^\W_])(?:{'|'.join(map(re.escape, names))})(?![^\W_])")
+    return words.sub(lambda m: replacements[m.group(0)], str(text))
 
 
 def redact_cut(text: str, limit: int, redact_names: Sequence[str] | None = None) -> str:

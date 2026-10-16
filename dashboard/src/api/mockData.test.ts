@@ -506,6 +506,9 @@ describe('the mock advisor names the destination to Jev like the API (SDD §1 na
     expect(replaceNames('web-01-data, web-01_root, data-web-01 and web-010', vm)).toBe('[vm]-data, [vm]_root, data-[vm] and web-010');
     expect(replaceNames('ACME prod and ACME', { ACME: 'x', 'ACME prod': 'RHOSO 18.0' })).toBe('RHOSO 18.0 and x');
     expect(replaceNames('a cost of $1 (approx.)', { '$1 (approx.)': 'y' })).toBe('a cost of y');
+    // one pass: what a replacement wrote is never searched again, as the API's (review RV22-04)
+    expect(replaceNames('required on RHOSO prod (Jakarta); VM RHOSO', { 'RHOSO prod (Jakarta)': 'RHOSO 18.0', RHOSO: '[vm]' })).toBe('required on RHOSO 18.0; VM [vm]');
+    expect(replaceNames('web-01 and vm', { 'web-01': '[vm]', vm: '[vm]' })).toBe('[vm] and [vm]');
   });
 
   it('seeds no advisor snapshot that names a destination provider', () => {

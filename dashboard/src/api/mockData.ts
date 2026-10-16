@@ -251,15 +251,16 @@ export function destinationDescriptor(destination: Pick<Provider, 'kind' | 'capa
 
 /**
  * The API's `replace_names` (SDD §13.4): each name replaced wherever it stands as a word - between characters that
- * are not letters or digits, so web-01-data loses web-01 while web-010 keeps it - the longest name first.
+ * are not letters or digits, so web-01-data loses web-01 while web-010 keeps it - in one pass over every name, the
+ * longest first where two start at the same place, so what a replacement wrote is never searched again (review RV22-04).
  */
 export function replaceNames(text: string, replacements: Record<string, string>): string {
-  let out = text;
-  for (const name of Object.keys(replacements).filter(Boolean).sort((a, b) => b.length - a.length)) {
-    const word = new RegExp(`(?<![\\p{L}\\p{N}])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\p{L}\\p{N}])`, 'gu');
-    out = out.replace(word, () => replacements[name]!);
-  }
-  return out;
+  const names = Object.keys(replacements)
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
+  if (!names.length) return text;
+  const words = new RegExp(`(?<![\\p{L}\\p{N}])(?:${names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})(?![\\p{L}\\p{N}])`, 'gu');
+  return text.replace(words, (found) => replacements[found]!);
 }
 
 /** The advisor's input for a strategy choice, as the API snapshots it (SDD §14.5): the jev_decide arguments and the scope. */
