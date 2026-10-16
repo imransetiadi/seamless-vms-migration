@@ -230,6 +230,41 @@ class EventBus:
         return Subscription(self, since, self.max_queue)
 
 
+def new_event(
+    kind: str,
+    message: str,
+    *,
+    plan_id: str | None = None,
+    migration_id: str | None = None,
+    actor: str = "system",
+    data: dict[str, Any] | None = None,
+) -> Event:
+    """An event of a known kind, its data made JSON-ready (SDD §4)."""
+    if kind not in PERSISTED_KINDS and kind not in EPHEMERAL_KINDS:
+        raise ValueError(f"unknown event kind {kind!r}")
+    return Event(
+        kind=kind,
+        plan_id=plan_id,
+        migration_id=migration_id,
+        actor=actor,
+        message=message,
+        data=to_jsonable_python(data or {}),
+    )
+
+
+async def put_and_emit(
+    store: Store, bus: EventBus, kind: str, model: Any, expected_version: int, event: Event
+) -> int:
+    """Write ``model`` and ``event`` in one store transaction, then publish the event, in seq order
+    with every other (SDD §8.1, §11, review RV21-04): a store error leaves neither."""
+    async with bus.emit_lock:
+        version, event = await asyncio.to_thread(
+            store.put_with_event, kind, model, event, expected_version
+        )
+        bus.publish(event, persist=True)
+    return version
+
+
 async def emit(
     store: Store | None,
     bus: EventBus,
@@ -243,15 +278,8 @@ async def emit(
     persist: bool = True,
 ) -> Event:
     """Build an event, persist it (unless ephemeral) and publish it."""
-    if kind not in PERSISTED_KINDS and kind not in EPHEMERAL_KINDS:
-        raise ValueError(f"unknown event kind {kind!r}")
-    event = Event(
-        kind=kind,
-        plan_id=plan_id,
-        migration_id=migration_id,
-        actor=actor,
-        message=message,
-        data=to_jsonable_python(data or {}),
+    event = new_event(
+        kind, message, plan_id=plan_id, migration_id=migration_id, actor=actor, data=data
     )
     if persist and kind in PERSISTED_KINDS and store is not None:
         # Serialize persist+publish so live delivery order equals seq order.

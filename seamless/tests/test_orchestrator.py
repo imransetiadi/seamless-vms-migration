@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from seamless_migrate import store as store_module
 from seamless_migrate.ai.advisor import Advisor
 from seamless_migrate.ai.jev import JevClient
 from seamless_migrate.ai.knowledge import KnowledgeService
@@ -6180,6 +6181,83 @@ async def test_a_store_error_reading_the_destination_never_loses_the_source_runn
     [alert] = alerts()
     assert (alert.migration_id, alert.data) == (m.id, {"power_state": "running"})
     assert f"its data diverges from {DST_PROVIDER.name};" in alert.message
+
+
+def _refuse_event_once(monkeypatch, kind: str) -> list[str]:
+    """The events table's insert refusing one row of ``kind``, once - in whatever transaction the
+    store writes it (review RV21-04); the list names what it refused."""
+    real_insert = store_module.events.insert
+    failed: list[str] = []
+
+    class RefusedOnce:
+        def __init__(self):
+            self.statement = real_insert()
+
+        def values(self, **row):
+            if row.get("kind") == kind and not failed:
+                failed.append(kind)
+                raise RuntimeError("the store was briefly unavailable")
+            return self.statement.values(**row)
+
+    monkeypatch.setattr(store_module.events, "insert", RefusedOnce)
+    return failed
+
+
+async def test_a_store_error_writing_the_alert_never_leaves_the_flag_without_it(
+    tmp_path, store, monkeypatch, caplog
+):
+    """SDD §8.1 (review RV21-04, the owner's choice): the flag and its migration.source_running
+    alert are one store transaction. An alert the store cannot append leaves neither, logged, and
+    the next pass writes both - never a flag without its alert (finalize answering 409 while no
+    page shows why)."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    failed = _refuse_event_once(monkeypatch, "migration.source_running")
+
+    def alerts():
+        events = store.events(since_seq=0, limit=100000)
+        return [e for e in events if e.kind == "migration.source_running"]
+
+    await h.orch._watch_sources()
+    assert failed == ["migration.source_running"]
+    assert (await h.migration(m.id)).source_running_at is None
+    assert alerts() == []
+    assert "the source watch failed" in caplog.text
+    await h.orch._watch_sources()
+    assert (await h.migration(m.id)).source_running_at is not None
+    assert len(alerts()) == 1
+
+
+@pytest.mark.parametrize("seen", ["stopped", "gone"])
+async def test_a_store_error_writing_the_stopped_event_never_clears_the_flag_without_it(
+    tmp_path, store, monkeypatch, seen
+):
+    """SDD §8.1 (review RV21-04): clearing the flag and its migration.source_stopped event are one
+    store transaction too, for a source seen stopped or gone - an event the store cannot append
+    leaves the flag set, and the next pass clears it with its event."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    await h.orch._watch_sources()
+    assert (await h.migration(m.id)).source_running_at is not None
+    if seen == "stopped":
+        h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "stopped"})
+    else:
+        del h.source.vms["vm-1"]
+    failed = _refuse_event_once(monkeypatch, "migration.source_stopped")
+
+    def stops():
+        events = store.events(since_seq=0, limit=100000)
+        return [e for e in events if e.kind == "migration.source_stopped"]
+
+    await h.orch._watch_sources()
+    assert failed == ["migration.source_stopped"]
+    assert (await h.migration(m.id)).source_running_at is not None
+    assert stops() == []
+    await h.orch._watch_sources()
+    assert (await h.migration(m.id)).source_running_at is None
+    assert len(stops()) == 1
 
 
 async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_path, store):

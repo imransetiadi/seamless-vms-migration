@@ -328,6 +328,46 @@ class Store:
         except IntegrityError as exc:
             raise ConflictError(f"{kind} {doc_id!r} already exists") from exc
 
+    def put_with_event(
+        self, kind: str, model: BaseModel, event: Event, expected_version: int
+    ) -> tuple[int, Event]:
+        """Update ``model`` at ``expected_version`` and append ``event`` in one transaction (SDD
+        §11): both are written, or neither - a ``ConflictError`` as ``put``'s, or the store's own
+        error. The source watch's flag and its alert (§8.1, review RV21-04)."""
+        doc_id = str(model.id)  # type: ignore[attr-defined]
+        key = (documents.c.kind == kind) & (documents.c.id == doc_id)
+        payload = event.model_dump(mode="json")
+        with self.engine.begin() as conn:
+            updated = conn.execute(
+                documents.update()
+                .where(key & (documents.c.version == expected_version))
+                .values(
+                    version=expected_version + 1,
+                    data=model.model_dump(mode="json"),
+                    updated_at=_now(),
+                )
+            )
+            seq = (
+                int(
+                    conn.execute(
+                        events.insert().values(
+                            ts=event.ts,
+                            kind=event.kind,
+                            plan_id=event.plan_id,
+                            migration_id=event.migration_id,
+                            actor=event.actor,
+                            message=event.message,
+                            data=payload["data"],
+                        )
+                    ).inserted_primary_key[0]
+                )
+                if updated.rowcount == 1
+                else None
+            )
+        if seq is None:
+            raise self._refused(kind, doc_id, expected_version)
+        return expected_version + 1, event.model_copy(update={"seq": seq})
+
     def _refused(self, kind: str, doc_id: str, expected_version: int) -> ConflictError:
         """Why a versioned write found no row to write: the document is missing, or at another
         version (SDD §11)."""

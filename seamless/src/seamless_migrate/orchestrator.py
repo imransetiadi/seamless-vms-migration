@@ -79,7 +79,7 @@ from .domain.models import (
     repeated_vm_ids,
     utcnow,
 )
-from .events import EventBus, emit
+from .events import EventBus, emit, new_event, put_and_emit
 from .executors.ansible import recorded_copied_data
 from .executors.base import (
     PermanentStepError,
@@ -449,6 +449,15 @@ class Orchestrator:
     async def _save(self, m: Migration, version: int) -> int:
         m.updated_at = self._now()
         return await self.db.put("migration", m, expected_version=version)
+
+    async def _save_with_event(
+        self, m: Migration, version: int, kind: str, message: str, data: dict[str, Any]
+    ) -> int:
+        """``_save`` and the event that announces it in one store transaction, the event published
+        after it commits (SDD §8.1, §11, review RV21-04): a store error leaves neither."""
+        m.updated_at = self._now()
+        event = new_event(kind, message, plan_id=m.plan_id, migration_id=m.id, data=data)
+        return await put_and_emit(self.store, self.bus, "migration", m, version, event)
 
     async def _plan(self, plan_id: str) -> Plan:
         return await self.db.get("plan", plan_id, Plan)
@@ -1896,22 +1905,25 @@ class Orchestrator:
                 if cur.phase != P.completed or running == (cur.source_running_at is not None):
                     continue
                 cur.source_running_at = seen if running else None
-                await self._save(cur, v)
-            if running:
-                await self._emit(
-                    "migration.source_running",
-                    f"{cur.vm.name}: the source VM runs again - its data diverges from "
-                    f"{destinations[plan.destination_provider_id]}; stop it, or roll back",
-                    migration=cur,
-                    data={"power_state": str(vm.power_state)},
-                )
-            else:
-                await self._emit(
-                    "migration.source_stopped",
-                    f"{cur.vm.name}: the source VM is stopped again",
-                    migration=cur,
-                    data={"power_state": str(vm.power_state)},
-                )
+                # the flag and its event in one store transaction: a store error leaves neither,
+                # and the next pass tries again (SDD §8.1, review RV21-04)
+                if running:
+                    await self._save_with_event(
+                        cur,
+                        v,
+                        "migration.source_running",
+                        f"{cur.vm.name}: the source VM runs again - its data diverges from "
+                        f"{destinations[plan.destination_provider_id]}; stop it, or roll back",
+                        {"power_state": str(vm.power_state)},
+                    )
+                else:
+                    await self._save_with_event(
+                        cur,
+                        v,
+                        "migration.source_stopped",
+                        f"{cur.vm.name}: the source VM is stopped again",
+                        {"power_state": str(vm.power_state)},
+                    )
 
     async def _source_gone(self, mid: str) -> None:
         """Clear source_running_at of a completed migration whose source VM its cloud no longer
@@ -1921,13 +1933,14 @@ class Orchestrator:
             if cur.phase != P.completed or cur.source_running_at is None:
                 return
             cur.source_running_at = None
-            await self._save(cur, v)
-        await self._emit(
-            "migration.source_stopped",
-            f"{cur.vm.name}: the source VM no longer exists - nothing left to keep or roll back to",
-            migration=cur,
-            data={"power_state": None, "gone": True},
-        )
+            await self._save_with_event(
+                cur,
+                v,
+                "migration.source_stopped",
+                f"{cur.vm.name}: the source VM no longer exists - nothing left to keep or roll "
+                "back to",
+                {"power_state": None, "gone": True},
+            )
 
     async def set_strategy(self, mid: str, strategy: Strategy | str, actor: str) -> Migration:
         strategy = Strategy(strategy)
