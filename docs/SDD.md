@@ -3357,13 +3357,12 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 
 Status: the owner's goal of 2026-10-16 (D13). §21.1, §21.2 and §21.7 state the policy and what the code does today;
 §21.3 (T1, T3), §21.4 (T4), §21.5 (T5) and §21.6 (T7) are binding in the sections §21.8 names, as are the declared
-series (T2), the demo's community destination (T9) and the provider page, form and NIC picker (T8, §16); T6
-(destination-neutral texts) and T10 (the lab) are **planned for 0.2.0**. Each planned item becomes binding in §4, §6,
-§9.3, §10 or §16 in the commit that implements it, with its tests (plan
+series (T2), the destination-neutral texts (T6, §1, §9.3, §16), the demo's community destination (T9) and the
+provider page, form and NIC picker (T8, §16); T10 (the lab, §21.9) is **planned for 0.2.0** (plan
 `superpowers/plans/2026-10-16-community-openstack-destinations.md`). Until T10 a community OpenStack destination works
-but is not validated. The API accepts a destination provider of kind `openstack`, the dashboard offers the OpenStack
-Community and Kolla-Ansible presets for the destination role, and `OpenStackProvider` serves it on the same code path
-as RHOSO 18.0 (§10).
+but is not validated. The API accepts a destination provider of kind `openstack`, the dashboard offers the
+OpenStack Community and Kolla-Ansible presets for the destination role, and `OpenStackProvider` serves it on the same
+code path as RHOSO 18.0 (§10).
 
 ### 21.1 Support window and tiers
 
