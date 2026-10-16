@@ -268,7 +268,9 @@ class HandoverExecutor:
             raise
         except Exception as exc:
             message = f"{what}: {exc}"
-            raise classify_failure(message)(message) from exc
+            # retried or not by the error alone: the label names the destination provider, whose
+            # name could hold a transient pattern ("... Timeout DC", review RV20-12)
+            raise classify_failure(str(exc))(message) from exc
 
     async def run(self, step: StepName, ctx: StepContext) -> StepResult:
         step = StepName(step)

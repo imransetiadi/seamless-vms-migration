@@ -8,7 +8,7 @@ import pytest
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy
 from seamless_migrate.domain.models import HandoverConfig, Mappings
-from seamless_migrate.executors.base import PermanentStepError, StepName
+from seamless_migrate.executors.base import PermanentStepError, StepName, TransientStepError
 from seamless_migrate.executors.handover import (
     JOURNAL_FILE,
     HandoverExecutor,
@@ -1644,6 +1644,27 @@ async def test_the_run_resolves_storage_with_the_destination_providers_name(tmp_
     destination = DST.model_copy(update={"name": "OpenStack 2026.2 Hibiscus (DC3)"})
     await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, destination, settings)[0])
     assert named == ["OpenStack 2026.2 Hibiscus (DC3)"]
+
+
+async def test_a_providers_name_never_decides_whether_a_failure_is_retried(tmp_path):
+    """Review RV20-12: a failed call is retried or not by what failed - the error - never by the
+    label naming it, which carries the destination provider's name (T6): a provider named "Lab
+    Timeout DC" must not turn a permanent failure into a retried one."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+
+    def in_use():
+        raise RuntimeError("volume vol-1 is in use")
+
+    with pytest.raises(PermanentStepError) as permanent:
+        await executor._call("manage vol-1 in Lab Timeout DC", in_use)
+    assert type(permanent.value) is PermanentStepError
+    assert str(permanent.value) == "manage vol-1 in Lab Timeout DC: volume vol-1 is in use"
+
+    def busy():
+        raise RuntimeError("HTTP 503 Service Unavailable")
+
+    with pytest.raises(TransientStepError):
+        await executor._call("manage vol-1 in DC3", busy)
 
 
 async def test_handover_rollback_netapp_manages_back_with_the_source_share(tmp_path):
