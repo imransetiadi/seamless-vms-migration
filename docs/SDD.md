@@ -1148,7 +1148,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   time the playbook output showed the source-stop task starting, once the task's result line confirms
   it ran (a `skipping:` result, e.g. `data_copy: false`, starts no clock) (`TASK [... : Stop the source server]` for the
   warm role, `TASK [... : Perform workload stop if os_migrate_workload_stop_before_migration is true]`
-  for the cold role, the kit's power-off task for VMware); at the latest when the cutover step starts.
+  for the cold role, the kit's power-off task for VMware); at the latest when the cutover step starts. A step
+  cancelled while that task runs, before its result line (the step timeout, a rollback request, a shutdown),
+  opens the clock at the task's start too: the source may be stopped, so the automatic rollback (§8) runs and a
+  cancel is refused (§5.1) (audit EX-02).
 * Progress: the executor reads the os-migrate progress file `{run dir}/osm/workload_logs/{stem}.state`, which
   `import_workload_prelim` names, with its `.log`, after the VM: the stem is the VM name with `%` written `%25`,
   `/` written `%2F` and NUL written `%00` — both sides apply the same rule, so a tenant's VM name (`../x`, `/etc/x`)
@@ -1368,7 +1371,10 @@ volumes with their server, so the order is:
    count (§9.1) and an Ansible-driven cutover's clock does (§7.2): `TODO(LAB): confirm` whether the handover's clock
    starts at the stop request instead. The stop is journaled as sent once Nova
    accepted it (`sent:stop_source`), before the wait for `SHUTOFF`, so a step that fails while waiting leaves a
-   journal the rollback starts the source from; a stop call that itself fails leaves the journal empty.
+   journal the rollback starts the source from; a stop call that itself fails leaves the journal empty. A step
+   that ends without `SHUTOFF` once the stop was journaled as sent — a failure, or a cancel (the step timeout, a
+   rollback request, a shutdown) — opens the clock at that mark's time: the source may be stopped, so the
+   automatic rollback (§8) runs and a cancel is refused (§5.1) (audit EX-02).
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
    `plan.port_creation_mode` `"neutron"` also its security groups by name), and the volume attachments in device
