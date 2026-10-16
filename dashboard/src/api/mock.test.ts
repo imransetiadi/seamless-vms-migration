@@ -232,6 +232,26 @@ describe('mock API', () => {
     }
   });
 
+  it("checks a provider re-created under a seeded id by its own role and kind, never the deleted cloud's pools (review RV20-14)", () => {
+    const { server } = setup();
+    const call = (method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const backends = (id: string) => (call('POST', `/providers/${id}/check`).body as { capabilities: { volume_backends?: string[] } }).capabilities.volume_backends;
+    expect(backends('hibiscus-dc3')).toEqual(['kolla@rbd-1#volumes']);
+    expect(call('DELETE', '/providers/hibiscus-dc3').status).toBe(204);
+    const base = { name: 'DC3 again', kind: 'openstack', distribution: 'openstack_community', endpoint: 'https://keystone.example.invalid:5000/v3', cloud: 'x' };
+    // another role under the id: the generic pools, never the deleted destination's
+    expect(call('POST', '/providers', { ...base, id: 'hibiscus-dc3', role: 'source' }).status).toBe(201);
+    expect(backends('hibiscus-dc3')).not.toContain('kolla@rbd-1#volumes');
+    // another kind of destination under the id: the generic pools too
+    expect(call('DELETE', '/providers/hibiscus-dc3').status).toBe(204);
+    expect(call('POST', '/providers', { ...base, id: 'hibiscus-dc3', role: 'destination', kind: 'rhoso', distribution: 'rhoso' }).status).toBe(201);
+    expect(backends('hibiscus-dc3')).not.toContain('kolla@rbd-1#volumes');
+    // the same role and kind again is the same cloud added back: its pools
+    expect(call('DELETE', '/providers/hibiscus-dc3').status).toBe(204);
+    expect(call('POST', '/providers', { ...base, id: 'hibiscus-dc3', role: 'destination' }).status).toBe(201);
+    expect(backends('hibiscus-dc3')).toEqual(['kolla@rbd-1#volumes']);
+  });
+
   it('manages providers: PATCH, write-only credentials and conversion key (SDD §12)', async () => {
     const { server, client } = setup();
     const patched = await client.patch<Provider>('/providers/community-lab', { region: 'R2', distribution: 'kolla' });

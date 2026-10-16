@@ -25,6 +25,7 @@ import type {
   Plan,
   Provider,
   ProviderKind,
+  ProviderRole,
   ReasonCode,
   SimilarIncident,
   Strategy,
@@ -427,10 +428,10 @@ export const CHECKED_STORAGE = [backend('hostgroup@ceph-ssd#ceph-ssd', 'rbd')];
  * later check report the same, as the API demo's fakes do, so a report a reset cleared reads back unchanged (SDD §10, §12;
  * review RV19-02).
  */
-const CLOUDS: Record<string, { storage: ReturnType<typeof backend>[]; extra?: Record<string, unknown> }> = {
-  'rhosp17-dc1': { storage: DC1_STORAGE, extra: { ovn: false } },
-  'rhoso-prod': { storage: PROD_STORAGE },
-  'hibiscus-dc3': { storage: DC3_STORAGE },
+const CLOUDS: Record<string, { role: ProviderRole; kind: ProviderKind; storage: ReturnType<typeof backend>[]; extra?: Record<string, unknown> }> = {
+  'rhosp17-dc1': { role: 'source', kind: 'openstack', storage: DC1_STORAGE, extra: { ovn: false } },
+  'rhoso-prod': { role: 'destination', kind: 'rhoso', storage: PROD_STORAGE },
+  'hibiscus-dc3': { role: 'destination', kind: 'openstack', storage: DC3_STORAGE },
 };
 
 /**
@@ -450,7 +451,10 @@ export function vmwareCheck(vms: readonly VMRef[]): Record<string, unknown> {
 
 /** An OpenStack or RHOSO provider's check report, as the mock's check reads its cloud: the seeded cloud's own pools, else CHECKED_STORAGE. */
 export function checkOf(provider: Pick<Provider, 'id' | 'kind' | 'role' | 'release' | 'policy_profile'>): Record<string, unknown> {
-  const cloud = CLOUDS[provider.id];
+  // a seeded cloud's own pools only for a provider of its role and kind: one re-created under its id as another
+  // provider reads the generic pools, never the deleted cloud's (review RV20-14)
+  const seeded = CLOUDS[provider.id];
+  const cloud = seeded && seeded.role === provider.role && seeded.kind === provider.kind ? seeded : undefined;
   return openstackCheck(provider, cloud?.storage ?? CHECKED_STORAGE, cloud?.extra);
 }
 
