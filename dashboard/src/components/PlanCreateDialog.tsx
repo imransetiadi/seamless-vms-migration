@@ -6,6 +6,7 @@ import { useRole } from '../api/session';
 import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
 import { heldElsewhere, holdersOf } from '../lib/holds';
 import { parseDrafts, toDraft, type ProbeDraft } from '../lib/probes';
+import { providerLabel } from '../lib/providerUse';
 import { formatMappings, parseMappings } from '../lib/mappings';
 import { hasRole } from '../lib/roles';
 import { stable } from '../lib/stable';
@@ -379,7 +380,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     for (const vm of selectedVms) {
       for (const disk of vm.disks) {
         if (disk.kind !== 'volume' || disk.volume_type !== type || !disk.pool || !families.has(disk.pool)) continue;
-        const { host, error } = resolveDestination(families.get(disk.pool)!, splitHost(disk.pool)[1], target, destinationStorage, destination?.name || 'the destination');
+        const { host, error } = resolveDestination(families.get(disk.pool)!, splitHost(disk.pool)[1], target, destinationStorage, destination ? providerLabel(destination) : 'the destination');
         if (host) pools.add(host);
         if (error) problems.add(`${vm.name}: ${error}`);
       }
@@ -664,7 +665,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 error={errors.source}
                 options={[
                   { value: '', label: 'Choose a source…' },
-                  ...sources.map((p) => ({ value: p.id, label: `${p.name} · ${providerStatusMeta(p.status).label}` })),
+                  ...sources.map((p) => ({ value: p.id, label: `${providerLabel(p)} · ${providerStatusMeta(p.status).label}` })),
                 ]}
               />
               <SelectField
@@ -678,7 +679,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 error={errors.destination}
                 options={[
                   { value: '', label: 'Choose a destination…' },
-                  ...destinations.map((p) => ({ value: p.id, label: `${p.name} · ${providerStatusMeta(p.status).label}` })),
+                  ...destinations.map((p) => ({ value: p.id, label: `${providerLabel(p)} · ${providerStatusMeta(p.status).label}` })),
                 ]}
               />
             </div>
@@ -703,7 +704,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 providerKind={source.kind}
                 selected={form.vmIds}
                 onSelectedChange={(next) => set('vmIds', next)}
-                caption={`VMs on ${source.name}`}
+                caption={`VMs on ${providerLabel(source)}`}
                 pageSize={25}
                 holders={holders}
               />

@@ -294,6 +294,25 @@ describe('mock API', () => {
     expect(stored?.name).toBe(c.message === null ? c.body.name : c.route === 'POST' ? undefined : before);
   });
 
+  it("words a provider's events and an unreachable provider's error by its id, as the API does (SDD §4, §12, review RV21-06)", async () => {
+    const { server, client } = setup();
+    // a name the texts must not read bare: the API's events and provider errors name the provider by id
+    const body = { kind: 'openstack', role: 'destination', distribution: 'openstack_community', endpoint: 'https://unreachable.example.invalid:5000/v3', cloud: 'x', id: 'dst-dc4', name: 'DC4' };
+    await client.post('/providers', body);
+    await client.post('/providers/dst-dc4/check');
+    await expect(client.get('/providers/dst-dc4/inventory')).rejects.toMatchObject({ status: 502, message: 'dst-dc4: The endpoint did not answer (connection timed out).' });
+    await client.delete('/providers/dst-dc4');
+    const mine = server.events.filter((e) => e.kind.startsWith('provider.') && e.message.includes('dst-dc4')).map((e) => [e.kind, e.message]);
+    expect(mine).toEqual([
+      ['provider.created', 'provider dst-dc4 created'],
+      ['provider.checked', 'provider dst-dc4: error'],
+      ['provider.deleted', 'provider dst-dc4 deleted'],
+    ]);
+    // the demo's seeded checks too
+    const seeded = server.events.filter((e) => e.kind === 'provider.checked').map((e) => e.message);
+    expect(seeded.filter((m) => !/^provider [a-z0-9-]+: (ok|degraded|error|unknown)$/.test(m))).toEqual([]);
+  });
+
   it('answers a PATCH of a name that is not a string with its 409 first while a running plan uses the provider, as the API does (review RV21-07)', async () => {
     const { server, client } = setup();
     const busy = server.plans.find((p) => p.status === 'running')!.destination_provider_id;

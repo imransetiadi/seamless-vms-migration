@@ -15,7 +15,7 @@ import { ProviderStatusBadge } from '../components/StatusBadge';
 import { buttonClassName } from '../lib/buttonStyles';
 import { cn } from '../lib/cn';
 import { formatDateTime, formatRelative } from '../lib/format';
-import { deleteRefusal, plansThatNeed } from '../lib/providerUse';
+import { deleteRefusal, plansThatNeed, providerLabel } from '../lib/providerUse';
 import { hasRole } from '../lib/roles';
 import { presetFor } from '../lib/distributions';
 import { policyProfileOf } from '../lib/networks';
@@ -240,7 +240,7 @@ function ProviderCard({
         <PlatformMark preset={preset} />
         <div className="min-w-0 flex-1">
           <h3 id={headingId} className="text-base font-semibold text-foreground">
-            {provider.name}
+            {providerLabel(provider)}
           </h3>
           <p className="text-xs text-muted-foreground">
             {preset.label} <span aria-hidden>/</span> <code>{provider.id}</code>
@@ -318,19 +318,19 @@ function ProviderCard({
           disabledReason={canCheck ? null : 'Checking a provider requires the operator role.'}
           onClick={() =>
             check.mutate(provider.id, {
-              onSuccess: (p) => onAnnounce(`${p.name} checked: ${providerStatusMeta(p.status).label}.`),
+              onSuccess: (p) => onAnnounce(`${providerLabel(p)} checked: ${providerStatusMeta(p.status).label}.`),
             })
           }
         >
           {/* the card's heading shows the provider: it is named for assistive technology only (SDD §16) */}
-          Check<span className="sr-only"> {provider.name}</span>
+          Check<span className="sr-only"> {providerLabel(provider)}</span>
         </Button>
         <Link to={`/inventory/${provider.id}`} className={buttonClassName('ghost', 'md')}>
           <HardDrive aria-hidden className="size-4" />
-          Inventory<span className="sr-only"> of {provider.name}</span>
+          Inventory<span className="sr-only"> of {providerLabel(provider)}</span>
         </Link>
         <Button variant="ghost" icon={Pencil} onClick={onEdit} disabledReason={canEdit ? null : 'Editing a provider requires the admin role.'}>
-          Edit<span className="sr-only"> {provider.name}</span>
+          Edit<span className="sr-only"> {providerLabel(provider)}</span>
         </Button>
         <Button
           variant="ghost"
@@ -339,7 +339,7 @@ function ProviderCard({
           className="ml-auto"
           disabledReason={canEdit ? refusal : 'Deleting a provider requires the admin role.'}
         >
-          Delete<span className="sr-only"> {provider.name}</span>
+          Delete<span className="sr-only"> {providerLabel(provider)}</span>
         </Button>
       </footer>
 
@@ -347,7 +347,7 @@ function ProviderCard({
         open={confirmDelete}
         tone="danger"
         icon={Trash2}
-        title={`Delete ${provider.name}?`}
+        title={`Delete ${providerLabel(provider)}?`}
         subject={`Provider ${provider.id}`}
         consequences={[
           { kind: 'removed', text: 'the provider in Seamless, with the sign-in details and SSH key stored for it' },
@@ -362,7 +362,7 @@ function ProviderCard({
           remove.mutate(provider.id, {
             onSuccess: () => {
               setConfirmDelete(false);
-              onAnnounce(`${provider.name} deleted.`);
+              onAnnounce(`${providerLabel(provider)} deleted.`);
               onDeleted();
             },
           })
@@ -436,7 +436,7 @@ function FleetSummary({ providers, canCheck, onAnnounce }: { providers: Provider
       {failed.length > 0 && (
         <ErrorBanner
           error={failed[0]!.error}
-          title={`Could not check ${namesText(failed.map((f) => providers.find((p) => p.id === f.id)?.name ?? f.id))}`}
+          title={`Could not check ${namesText(failed.map((f) => providerLabel(providers.find((p) => p.id === f.id) ?? { id: f.id, name: '' })))}`}
           onRetry={() => check(failed.map((f) => f.id))}
         />
       )}

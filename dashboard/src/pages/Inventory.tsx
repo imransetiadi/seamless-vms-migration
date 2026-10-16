@@ -16,6 +16,7 @@ import { ProviderStatusBadge } from '../components/StatusBadge';
 import { VmTable } from '../components/VmTable';
 import { formatBytes, formatNumber } from '../lib/format';
 import { holdersOf } from '../lib/holds';
+import { providerLabel } from '../lib/providerUse';
 import { KEEP_FOCUS } from '../lib/navigation';
 import { hasRole } from '../lib/roles';
 import { PROVIDER_KIND_LABELS } from '../lib/status';
@@ -182,8 +183,8 @@ function DestinationInventoryView({ inventory }: { inventory: DestinationInvento
   );
 }
 
-function providerLabel(p: Provider): string {
-  return `${p.name} (${p.role === 'source' ? 'source' : 'destination'})`;
+function providerOption(p: Provider): string {
+  return `${providerLabel(p)} (${p.role === 'source' ? 'source' : 'destination'})`;
 }
 
 export default function Inventory() {
@@ -243,7 +244,7 @@ export default function Inventory() {
             value={providerId}
             // switches the inventory in place: focus stays here and the address is replaced (WCAG 3.2.2, SDD §16)
             onChange={(e) => navigate(`/inventory/${e.target.value}`, { replace: true, state: KEEP_FOCUS })}
-            options={(providers.data ?? []).map((p) => ({ value: p.id, label: providerLabel(p) }))}
+            options={(providers.data ?? []).map((p) => ({ value: p.id, label: providerOption(p) }))}
           />
         }
       />
@@ -255,7 +256,7 @@ export default function Inventory() {
       )}
       {(providers.isPending || (inventory.isPending && provider)) && <LoadingBlock label="Reading inventory…" rows={6} />}
       {inventory.error && (
-        <ErrorBanner error={inventory.error} title={`Cannot read the inventory of ${provider?.name ?? providerId}`} onRetry={() => void inventory.refetch()} />
+        <ErrorBanner error={inventory.error} title={`Cannot read the inventory of ${provider ? providerLabel(provider) : providerId}`} onRetry={() => void inventory.refetch()} />
       )}
       {data && provider && !isDestinationInventory(data) && (
         data.length === 0 ? (
@@ -284,7 +285,7 @@ export default function Inventory() {
               initialQuery={wanted ? (data.find((vm) => vm.source_id === wanted)?.name ?? wanted) : ''}
               vms={data}
               providerKind={provider.kind}
-              caption={`VMs on ${provider.name}`}
+              caption={`VMs on ${providerLabel(provider)}`}
               selected={canPlan ? selection : undefined}
               onSelectedChange={canPlan ? (ids) => setSelected({ providerId: provider.id, ids }) : undefined}
               holders={holders}

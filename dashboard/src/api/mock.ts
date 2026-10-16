@@ -1322,7 +1322,7 @@ export class MockServer {
             );
           }
           this.providers.splice(this.providers.indexOf(provider), 1);
-          this.emit({ kind: 'provider.deleted', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name} deleted`, data: {} });
+          this.emit({ kind: 'provider.deleted', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} deleted`, data: {} });
           return { status: 204 };
         }
         if (sub === 'check' && method === 'POST') {
@@ -1342,12 +1342,12 @@ export class MockServer {
               provider.capabilities = provider.kind === 'vmware' ? vmwareCheck(Array.isArray(inventory) ? inventory : []) : checkOf(provider);
             }
           }
-          this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name}: ${provider.status}`, data: { status: provider.status } });
+          this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id}: ${provider.status}`, data: { status: provider.status } });
           return ok(provider);
         }
         if (sub === 'inventory' && method === 'GET') {
           this.require(token, 'viewer', path);
-          if (provider.status === 'error') throw new HttpError(502, 'provider_error', `${provider.name}: ${provider.status_message ?? 'unreachable'}`);
+          if (provider.status === 'error') throw new HttpError(502, 'provider_error', `${provider.id}: ${provider.status_message ?? 'unreachable'}`);
           // a destination's answer names its token's roles, as the API demo's (SDD §10, review RV20-10)
           return ok(this.inventories[provider.id] ?? (provider.role === 'source' ? [] : { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [], roles: [...DEMO_TOKEN_ROLES] }));
         }
@@ -1693,7 +1693,7 @@ export class MockServer {
       conversion_key_updated_at: null,
     } as Provider;
     this.providers.push(provider);
-    this.emit({ kind: 'provider.created', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name} registered`, data: {} });
+    this.emit({ kind: 'provider.created', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} created`, data: {} });
     return ok(provider, 201);
   }
 

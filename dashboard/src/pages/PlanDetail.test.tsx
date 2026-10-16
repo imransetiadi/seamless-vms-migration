@@ -49,6 +49,15 @@ describe('PlanDetail', () => {
     expect(within(table).getAllByRole('row')).toHaveLength(11);
   });
 
+  it("names a destination stored with a blank name by its id in the plan's settings (SDD §1 naming, §4.2, review RV21-06)", async () => {
+    const server = createTestServer();
+    server.providers.find((p) => p.id === 'rhoso-prod')!.name = '   ';
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-4f2a9c1e', path: '/plans/:planId', token: 'operator', server });
+    const settings = await screen.findByRole('region', { name: /settings/i });
+    const term = within(settings).getByText('Destination', { selector: 'dt' });
+    expect(term.nextElementSibling).toHaveTextContent('rhoso-prod');
+  });
+
   it('never names the plan being edited as holding its own VMs in the VM picker (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

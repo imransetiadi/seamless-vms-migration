@@ -15,6 +15,7 @@ import { LoadingBlock } from '../components/Skeleton';
 import { SortableHeader } from '../components/SortableHeader';
 import { PlanStatusBadge } from '../components/StatusBadge';
 import { formatDateTime, formatDuration, formatNumber, formatRelative } from '../lib/format';
+import { providerLabel } from '../lib/providerUse';
 import { hasRole } from '../lib/roles';
 import { nextSort, sortBy, type SortState } from '../lib/sort';
 import { planStatusMeta } from '../lib/status';
@@ -91,7 +92,7 @@ export default function Plans() {
     }
   }, [location.state, location.pathname, navigate, canCreate]);
 
-  const providerName = useMemo(() => new Map((providers.data ?? []).map((p) => [p.id, p.name])), [providers.data]);
+  const providerName = useMemo(() => new Map((providers.data ?? []).map((p) => [p.id, providerLabel(p)])), [providers.data]);
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();

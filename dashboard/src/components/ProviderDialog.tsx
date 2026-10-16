@@ -7,6 +7,7 @@ import { cn } from '../lib/cn';
 import { DISTRIBUTION_PRESETS, presetFor, slugify, type CredentialMode, type DistributionPreset } from '../lib/distributions';
 import { formatRelative } from '../lib/format';
 import { RELEASE_CHOICES, seriesText } from '../lib/platforms';
+import { providerLabel } from '../lib/providerUse';
 import { providerStatusMeta } from '../lib/status';
 import { Button } from './Button';
 import { ErrorBanner } from './ErrorBanner';
@@ -453,7 +454,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         setOutcome({ provider: saved, checked: true });
         requestAnimationFrame(() => outcomeRef.current?.focus());
       } else {
-        onSaved?.(saved, `${saved.name} ${provider ? 'saved' : 'added'}.`);
+        onSaved?.(saved, `${providerLabel(saved)} ${provider ? 'saved' : 'added'}.`);
         onClose();
       }
     } catch (error) {
@@ -494,7 +495,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
             <PlatformMark preset={preset} size="lg" />
             <div className="min-w-0">
               <h2 ref={outcomeRef} id={titleId} tabIndex={-1} className="text-lg font-semibold text-foreground outline-hidden">
-                {ok ? `${outcome.provider.name} is connected` : `${outcome.provider.name} was saved, but the connection test did not pass`}
+                {ok ? `${providerLabel(outcome.provider)} is connected` : `${providerLabel(outcome.provider)} was saved, but the connection test did not pass`}
               </h2>
               <p className="text-sm text-muted-foreground">Connection test result: {meta.label}.</p>
             </div>
@@ -523,7 +524,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
               size="lg"
               variant="primary"
               onClick={() => {
-                onSaved?.(outcome.provider, `${outcome.provider.name}: connection ${meta.label.toLowerCase()}.`);
+                onSaved?.(outcome.provider, `${providerLabel(outcome.provider)}: connection ${meta.label.toLowerCase()}.`);
                 onClose();
               }}
             >
@@ -540,7 +541,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       <form noValidate onSubmit={submit} className="flex max-h-[85vh] flex-col">
         <div className="border-b border-border px-5 py-4">
           <h2 id={titleId} className="text-lg font-semibold text-foreground">
-            {editing ? `Edit ${current?.name}` : 'Add provider'}
+            {editing ? `Edit ${current ? providerLabel(current) : ''}` : 'Add provider'}
           </h2>
           <p className="text-sm text-muted-foreground">
             {editing

@@ -50,7 +50,7 @@ import { resolvePolicy } from '../lib/policies';
 import { preflightRan } from '../lib/phase';
 import { planActions } from '../lib/planActions';
 import { NOTHING_MIGRATED_NEXT, nothingMigrated } from '../lib/planDone';
-import { destinationName } from '../lib/providerUse';
+import { destinationName, providerLabel } from '../lib/providerUse';
 import { leftOutText } from '../lib/stats';
 import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -84,11 +84,11 @@ function MappingList({ title, map }: { title: string; map: Record<string, string
   );
 }
 
-function providerLabel(provider: Provider | undefined, id: string) {
+function providerLink(provider: Provider | undefined, id: string) {
   if (!provider) return <code>{id}</code>;
   return (
     <Link to={`/inventory/${provider.id}`} className="underline underline-offset-4">
-      {provider.name}
+      {providerLabel(provider)}
     </Link>
   );
 }
@@ -139,10 +139,10 @@ function SettingsSummary({
   return (
     <dl className="grid gap-x-6 gap-y-3 sm:grid-cols-2 xl:grid-cols-4">
       <Setting label="Source">
-        {providerLabel(source, plan.source_provider_id)}
+        {providerLink(source, plan.source_provider_id)}
         {source && <span className="block text-xs text-muted-foreground">{PROVIDER_KIND_LABELS[source.kind]}</span>}
       </Setting>
-      <Setting label="Destination">{providerLabel(destination, plan.destination_provider_id)}</Setting>
+      <Setting label="Destination">{providerLink(destination, plan.destination_provider_id)}</Setting>
       <Setting label="Downtime SLO">
         <span className="num">{formatDuration(plan.downtime_slo_s)}</span> per VM
       </Setting>

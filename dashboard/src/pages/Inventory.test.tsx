@@ -80,6 +80,15 @@ describe('Inventory', () => {
     expect(screen.getByRole('main')).toHaveFocus();
   });
 
+  it('offers a provider stored with a blank name by its id, with its role, and names its table so (SDD §1 naming, §4.2, review RV21-06)', async () => {
+    const server = createTestServer();
+    server.providers.find((p) => p.id === 'rhosp17-dc1')!.name = '   ';
+    renderWithApp(<Inventory />, { route: '/inventory/rhosp17-dc1', path: '/inventory/:providerId', server });
+    const select = await screen.findByRole('combobox', { name: 'Provider' });
+    expect(await within(select).findByRole('option', { name: 'rhosp17-dc1 (source)' })).toBeInTheDocument();
+    await screen.findByRole('table', { name: /^VMs on rhosp17-dc1/ });
+  });
+
   it('names a failed provider load with Retry instead of showing a blank page (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
