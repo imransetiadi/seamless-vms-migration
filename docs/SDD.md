@@ -44,7 +44,11 @@ and migrating Heat stacks/Octavia load balancers (they are exported as findings,
 
 Naming: where a rule about the destination says "RHOSO" (a RHOSO network, flavor, volume type, credential), it
 means the destination cloud, RHOSO 18.0 or a community OpenStack destination (§21); a rule that holds for the Red Hat
-product alone says "RHOSO 18.0". User-facing texts name the destination provider instead (§21.8, PRD FR-34).
+product alone says "RHOSO 18.0". User-facing texts never say "RHOSO" for the destination (§21.8, PRD FR-34, plan
+T6, the owner's choice of 2026-10-16): a text built for a plan or a migration - a finding's message, an executor's
+refusal or failure, an event, the advisor's question - names the destination provider by its `name` ("do not exist in
+OpenStack 2026.2 Hibiscus (DC3)"); a fixed text - a catalog remediation, the dashboard's copy - says "the destination".
+A text about the Red Hat product itself (the RHOSO 18.0 preset, its `validated` tier) keeps its name.
 
 ### 1.1 Why parallel (side-by-side) migration and not adoption
 
@@ -1749,7 +1753,9 @@ tie, so the advisor keeps out of it unless no eligible strategy meets the SLO.
 
 `run_preflight(vm, plan, src_inv: SourceInventory, dst_inv: DestinationInventory, all_vms=None, *,
 source=None, destination=None) -> list[Finding]` — `all_vms` are the plan's selected VMs (duplicate
-names, cumulative quotas), `source`/`destination` the providers (conversion-host check).
+names, cumulative quotas), `source`/`destination` the providers (conversion-host check). Where a finding's message
+means the destination cloud it names the destination provider (`destination.name`, "the destination" when
+`run_preflight` has none); its remediation, fixed by the catalog, says "the destination" (§1 naming, plan T6).
 Finding catalog (code — severity — condition):
 
 | Code | Severity | Condition |
@@ -2735,6 +2741,10 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   "Navigation": the focus stays in it, Escape or a tap on the dimmed page closes it and returns the focus to the
   menu button; a choice closes it, and the page already shown puts the focus on the page, as a navigation does),
   holding the full sidebar's groups and session; without motion when `prefers-reduced-motion` asks.
+* Destination wording (§1 naming, plan T6): the dashboard names RHOSO 18.0 and community OpenStack as destinations
+  where it lists platforms (the Providers page, its empty state, the sign-in page), and wherever it means the
+  destination cloud it says "the destination" - or the destination provider's name where a plan or a migration is
+  shown, as the API's messages do; the offline mock mirrors the API's messages word for word.
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
   when the caller names it, the object it acts on under it (its kind and id); a close button (×, "Close") in the
@@ -3486,7 +3496,7 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
 | `check()` keys `release_range`, `release`, `support_tier`, `policy_profile`, `tls`; `Provider.policy_profile` | §10, §10.1, §4.2, §12 (binding) | T3 |
 | findings `DST_CAPABILITY_MISSING` (blocker), `DST_RELEASE_OUTSIDE_SUPPORT` (warning) | §21.4 (binding); §9.3 with the catalog | T4 |
 | `NET_PORT_NOT_PERMITTED` by the policy profile (§21.5) | §6.6, §9.3 (binding); the dashboard's picker with T8 | T5 |
-| destination-neutral texts: findings, events, the CLI and the dashboard name the destination provider | §9.3, §16 | T6 |
+| destination-neutral texts: a text built for a plan or migration names the destination provider, a fixed text says "the destination" | §1, §9.3, §16 (binding) | T6 |
 | conversion host images (§21.6) | §6.5 (binding), Performance.md | T7 |
 | the provider page shows series, tier and profile; the provider form takes the declared series | §16 (binding) | T8 |
 | the demo: a community destination (2026.2 Hibiscus, Kolla-Ansible preset) beside `rhoso18` | §10 (binding) | T9 |
