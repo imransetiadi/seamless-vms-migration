@@ -6,6 +6,7 @@ serialize as ISO-8601 strings ending in ``Z``; naive inputs are interpreted as U
 
 from __future__ import annotations
 
+import bisect
 import ipaddress
 import math
 import re
@@ -24,6 +25,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from ..guest_os import GuestOS, identify
 from .enums import (
@@ -122,6 +124,10 @@ class Provider(_Model):
     status_message: str | None = None
     last_checked_at: UTCDateTime | None = None
     distribution: Distribution | None = None
+    #: the community series its operator declares, e.g. "2026.2" (SDD §4.2, §10.1, §21.3)
+    release: str | None = Field(default=None, pattern=r"^20[0-9]{2}\.[12]$")
+    #: the policy defaults its operator declares; None = by kind and series (SDD §4.2, §21.5)
+    policy_profile: Literal["secure_rbac", "legacy"] | None = None
     #: server-owned: when PUT …/credentials / …/conversion-key last wrote the secret store
     credentials_updated_at: UTCDateTime | None = None
     conversion_key_updated_at: UTCDateTime | None = None
@@ -135,12 +141,84 @@ class Provider(_Model):
             )
         return self
 
+    @model_validator(mode="after")
+    def _openstack_declarations(self) -> Provider:
+        """A series and a policy profile are OpenStack's: a vmware provider declares neither."""
+        if self.kind == ProviderKind.vmware:
+            for name in ("release", "policy_profile"):
+                if getattr(self, name) is not None:
+                    raise ValueError(f"{name}: an OpenStack {name} cannot be declared for vmware")
+        return self
+
+    @property
+    def label(self) -> str:
+        """The name a text gives the provider (SDD §1 naming): its name, else its id - a name stored
+        blank before the API refused one (review RV20-11) never reads "in : ..."."""
+        return self.id if is_blank(self.name) else self.name
+
 
 class ProviderCreate(Provider):
     """The ``POST /providers`` body (SDD §12): a field ``Provider`` does not have is refused
     (422), never dropped; stored providers keep loading with later fields (``_Model``, §11)."""
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, name: str) -> str:
+        """A blank name is refused here, at the request boundary: a provider stored blank before
+        keeps loading (SDD §4.2, review RV20-11)."""
+        if is_blank(name):
+            raise PydanticCustomError("blank", BLANK_NAME)
+        return name
+
+
+#: why POST and PATCH /providers refuse a name (SDD §4.2, review RV20-11)
+BLANK_NAME = "must not be blank"
+
+#: the code points a blank name holds only - Unicode 15.1's separators (Z), controls (Cc) and
+#: format characters (Cf) - pinned, as the dashboard's BLANK_RANGES, so every runtime answers
+#: alike whatever its own Unicode database (SDD §4.2, review RV22-06); tests/fixtures/
+#: blank_ranges.json holds both to the same list
+BLANK_RANGES: tuple[tuple[int, int], ...] = (
+    (0x0000, 0x0020),
+    (0x007F, 0x00A0),
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x1680, 0x1680),
+    (0x180E, 0x180E),
+    (0x2000, 0x200F),
+    (0x2028, 0x202F),
+    (0x205F, 0x2064),
+    (0x2066, 0x206F),
+    (0x3000, 0x3000),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+)
+_BLANK_STARTS = tuple(first for first, _ in BLANK_RANGES)
+
+
+def is_blank(name: str) -> bool:
+    """No character outside BLANK_RANGES - empty, spaces, U+200B, U+FEFF -: the rule the dashboard
+    shares, read from the pinned list alone (SDD §4.2, reviews RV21-08, RV22-06)."""
+    for ch in name:
+        cp = ord(ch)
+        at = bisect.bisect_right(_BLANK_STARTS, cp) - 1
+        if at < 0 or cp > BLANK_RANGES[at][1]:
+            return False
+    return True
 
 
 DiskKind = Literal["volume", "ephemeral", "image_root", "vmdk"]

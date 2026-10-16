@@ -146,16 +146,23 @@ export interface Provider {
   status_message: string | null;
   last_checked_at: Timestamp | null;
   distribution: Distribution | null;
+  /** The community series its operator declares, e.g. "2026.2" (`^20[0-9]{2}\.[12]$`; SDD §4.2, §10.1); null = detected. Refused on vmware. */
+  release: string | null;
+  /** The policy defaults its operator declares (SDD §4.2, §21.5); null = by kind and series. Refused on vmware. */
+  policy_profile: 'secure_rbac' | 'legacy' | null;
   /** Server-owned: when the write-only credentials / conversion key were last stored. */
   credentials_updated_at: Timestamp | null;
   conversion_key_updated_at: Timestamp | null;
 }
 
 /** `POST /providers` body (status and server-owned fields are ignored by the API). */
-export type ProviderCreate = Pick<Provider, 'id' | 'name' | 'kind' | 'role' | 'endpoint' | 'cloud' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'credentials_secret'>;
+export type ProviderCreate = Pick<Provider, 'id' | 'name' | 'kind' | 'role' | 'endpoint' | 'cloud' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'credentials_secret'> &
+  Partial<Pick<Provider, 'release' | 'policy_profile'>>;
 
 /** `PATCH /providers/{id}`: the editable fields (SDD §12). */
-export type ProviderPatch = Partial<Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution'>>;
+export type ProviderPatch = Partial<
+  Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'release' | 'policy_profile'>
+>;
 
 /** `PUT /providers/{id}/credentials`: write-only; never returned (SDD §13.3). */
 export interface ProviderCredentials {
@@ -848,6 +855,8 @@ export interface DestinationInventory {
   subnets?: DestinationSubnet[];
   /** Every network the destination credential sees, with its owner: what a NIC's network name resolves to (SDD §10). */
   network_details?: DestinationNetwork[];
+  /** The role names of the destination credential's token, read live with the inventory; null when unreadable (SDD §10, RV19-01). */
+  roles?: string[] | null;
 }
 
 export interface DestinationSubnet {

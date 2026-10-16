@@ -43,6 +43,7 @@ from tests.fake_ansible import install, read_log
 SRC = make_provider(cloud="src")
 DST = make_provider(
     id="dst-rhoso",
+    name="RHOSO 18.0",
     kind=ProviderKind.rhoso,
     role=ProviderRole.destination,
     cloud="dst",
@@ -124,6 +125,7 @@ class FakeImpl:
         return DestinationInventory(
             network_details=list(self.registry.networks),
             subnets=[dst_subnet(n) for n in self.registry.networks] + self.registry.subnets,
+            roles=self.registry.roles,
         )
 
 
@@ -163,6 +165,9 @@ class FakeRegistry:
         # the destination's ports (SDD §10 DestinationProvider.ports)
         self.ports: list[dict] = []
         self.ports_error = False
+        # the token's role names the destination inventory reads live; None: it could not
+        # (SDD §10, review RV19-01)
+        self.roles: list[str] | None = None
 
     def get(self, provider):
         return FakeImpl(self)
@@ -441,6 +446,219 @@ async def test_the_plans_port_creation_mode_reaches_workloads_before_the_import(
     sync_call = read_log(env.log)[-1]
     assert sync_call["playbook"] == "import_workloads_precopy.yml"  # no new export
     assert sync_call["port_creation_mode"] == ["neutron"]
+
+
+@pytest.mark.parametrize(
+    "capabilities, profile",
+    [
+        ({"policy_profile": "secure_rbac"}, "secure_rbac"),
+        ({"policy_profile": "unknown"}, "unknown"),
+        ({}, "legacy"),
+    ],
+    ids=["secure_rbac", "unknown", "a report without one"],
+)
+async def test_the_destinations_policy_profile_reaches_workloads_before_the_import(
+    env, monkeypatch, capabilities, profile
+):
+    """SDD §6.6, §21.5: the executor writes the destination's policy profile - as its check
+    reports it; for a report without one as its declarations give it, RHOSO 18.0's legacy by its
+    kind - into the planned server's _migration_params before every OpenStack run, where the
+    collection's destination check reads it."""
+    monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
+    destination = DST.model_copy(update={"capabilities": capabilities})
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS, port_creation_mode="neutron")
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.cold)
+    ctx, _ = make_ctx(plan, mig, SRC, destination, env.settings)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["playbook"] == "import_workloads.yml"
+    assert exported_server(env)["_migration_params"]["policy_profile"] == profile
+
+
+@pytest.mark.parametrize(
+    "declared, profile",
+    [
+        ({"policy_profile": "secure_rbac"}, "secure_rbac"),
+        ({"release": "2026.2"}, "secure_rbac"),
+        ({}, "unknown"),
+    ],
+    ids=["a declared profile", "a declared series", "nothing declared"],
+)
+async def test_a_reset_report_writes_the_profile_the_destination_declares(
+    env, monkeypatch, declared, profile
+):
+    """Review RV18-04: new credentials (allowed while a plan runs) or a provider change reset the
+    check report to {}, and the executor wrote legacy for it - the collection then counted advsvc
+    on a declared secure-RBAC cloud, and Neutron refused the port after the source stopped. A
+    report that names no profile reads as the provider's declarations alone (SDD §21.5)."""
+    monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
+    destination = DST.model_copy(
+        update={"kind": ProviderKind.openstack, "capabilities": {}, **declared}
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS, port_creation_mode="neutron")
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.cold)
+    ctx, _ = make_ctx(plan, mig, SRC, destination, env.settings)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert exported_server(env)["_migration_params"]["policy_profile"] == profile
+
+
+async def test_the_cutover_port_refusal_follows_the_policy_profile(env):
+    """SDD §6.6, §21.5: the VMware kit's network map judges another project's network by the
+    destination's policy profile before the kit runs - service under secure-RBAC, advsvc only
+    under the legacy rules; the OpenStack import's own check reads the profile the executor
+    writes (test_the_destinations_policy_profile_reaches_workloads_before_the_import)."""
+    # the kit's map: another project's shared network from a service token under secure-RBAC
+    env.registry.networks.append(dst_net("shared-net", own=False))
+    shared = Nic(
+        network="shared-net",
+        mac="00:50:56:00:00:04",
+        fixed_ips=["10.0.0.7"],
+        network_key="dvportgroup-9",
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=Mappings())
+    vm = make_vm(source_id="srv-1", name="web-01", nics=[shared])
+    mig = make_migration(id="mig-00000000ab", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_warm)
+
+    def token(roles, profile):
+        caps = {"roles": roles, "policy_profile": profile}
+        destination = DST.model_copy(update={"capabilities": caps})
+        return make_ctx(plan, mig, VCENTER, destination, env.settings)
+
+    # a pass maps the NIC and logs nothing when the profile counts the token's role
+    ctx, rec = token(["service", "member"], "secure_rbac")
+    await env.executor.run(StepName.PRECOPY, ctx)
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {
+        "dvportgroup-9": "net-shared-net-theirs,sub-net-shared-net-theirs"
+    }
+    assert not [line for line in rec.logs if "cannot go to network" in line]
+    # the cutover refuses before the kit runs when it does not
+    for roles, profile, rule in (
+        (
+            ["advsvc", "member"],
+            "secure_rbac",
+            "secure-RBAC defaults let only the admin or service role",
+        ),
+        (["service", "member"], "legacy", "Neutron lets only the admin or advsvc role"),
+        (["service", "member"], "unknown", "the destination's policy profile is unknown"),
+    ):
+        ran = len(read_log(env.log))
+        with pytest.raises(PermanentStepError, match=rule):
+            await env.executor.run(StepName.CUTOVER, token(roles, profile)[0])
+        assert len(read_log(env.log)) == ran, (roles, profile)
+
+
+def _kit_cutover_to_another_projects_network(env, capabilities):
+    """A VMware cutover of a NIC on another project's shared network, to a declared secure-RBAC
+    community destination whose check report is ``capabilities``."""
+    env.registry.networks.append(dst_net("shared-net", own=False))
+    shared = Nic(
+        network="shared-net",
+        mac="00:50:56:00:00:04",
+        fixed_ips=["10.0.0.7"],
+        network_key="dvportgroup-9",
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=Mappings())
+    vm = make_vm(source_id="srv-1", name="web-01", nics=[shared])
+    mig = make_migration(id="mig-00000000ab", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_warm)
+    secure = DST.model_copy(
+        update={
+            "kind": ProviderKind.openstack,
+            "policy_profile": "secure_rbac",
+            "capabilities": capabilities,
+        }
+    )
+    return make_ctx(plan, mig, VCENTER, secure, env.settings)[0]
+
+
+async def test_after_a_reset_report_the_kits_map_judges_the_tokens_live_roles(env):
+    """Review RV19-01: the kit's map judged the roles of the stored check report, and a report reset
+    to {} - new credentials, allowed while a plan runs - names none, so every token passed and
+    Neutron refused the port after the kit powered the VM off. It judges the roles the destination
+    inventory reads live, as the handover's step 0 and the collection do (SDD §7.2, §10)."""
+    ctx = _kit_cutover_to_another_projects_network(env, {})
+    env.registry.roles = ["advsvc", "member"]  # the new credential's token
+    with pytest.raises(PermanentStepError, match="secure-RBAC defaults let only the admin or ser"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []  # refused before the kit powers the VM off
+    env.registry.roles = ["service", "member"]
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["playbook"] == "os_migrate.vmware_migration_kit.migration"
+
+
+async def test_the_kits_map_judges_the_live_roles_over_a_report_that_still_names_roles(env):
+    """Review RV20-13: the roles the destination inventory reads live win over a check report that
+    still names roles - one from before new credentials: a member token is refused although the
+    report names admin, and a service token passes although the report names member (SDD §7.2)."""
+    ctx = _kit_cutover_to_another_projects_network(env, {"roles": ["admin"]})
+    env.registry.roles = ["member"]
+    with pytest.raises(PermanentStepError, match="secure-RBAC defaults let only the admin or ser"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []  # refused before the kit powers the VM off
+    env.registry.networks.pop()
+    ctx = _kit_cutover_to_another_projects_network(env, {"roles": ["member"]})
+    env.registry.roles = ["service", "member"]
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["playbook"] == "os_migrate.vmware_migration_kit.migration"
+
+
+async def test_the_kits_map_refuses_a_nic_that_needs_a_role_when_no_roles_can_be_read(env):
+    """Review RV19-01: neither the inventory nor the check report names the token's roles: a NIC
+    that needs one is refused before the power-off, never let through (SDD §7.2)."""
+    ctx = _kit_cutover_to_another_projects_network(env, {})
+    with pytest.raises(PermanentStepError, match="roles could not be read") as refused:
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert "shared-net" in str(refused.value) and read_log(env.log) == []
+    # a report that still names the roles is judged by them, as before
+    env.registry.networks.pop()
+    ctx = _kit_cutover_to_another_projects_network(env, {"roles": ["service"]})
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["playbook"] == "os_migrate.vmware_migration_kit.migration"
+
+
+async def test_a_warm_cutover_after_new_credentials_writes_the_declared_profile(env, monkeypatch):
+    """Review RV18-04's case: a warm migration's pre-copy exports with the check's secure-RBAC
+    report; new credentials then reset the report to {} - allowed while the plan runs - and the
+    cutover, which does not export again, wrote legacy before the import: the collection counted
+    advsvc, and Neutron refused the port after the source stopped. It writes the declared profile
+    (SDD §7.2, §21.5)."""
+    monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS, port_creation_mode="neutron")
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.warm)
+    declared = DST.model_copy(update={"kind": ProviderKind.openstack, "release": "2026.2"})
+    checked = declared.model_copy(update={"capabilities": {"policy_profile": "secure_rbac"}})
+    await env.executor.run(StepName.PRECOPY, make_ctx(plan, mig, SRC, checked, env.settings)[0])
+    reset = declared.model_copy(update={"capabilities": {}})
+    await env.executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, reset, env.settings)[0])
+    assert [c["playbook"] for c in read_log(env.log)][-1] == "import_workloads_cutover.yml"
+    assert "export_workloads.yml" not in [c["playbook"] for c in read_log(env.log)][2:]
+    assert exported_server(env)["_migration_params"]["policy_profile"] == "secure_rbac"
+
+
+async def test_the_kits_map_reads_the_declared_profile_from_a_report_without_one(env):
+    """Review RV18-04: a check report kept from before 0.2.0 names the token's roles but no
+    profile, and read legacy - the kit's map let advsvc put the port on another project's network
+    of a declared secure-RBAC destination. It reads the provider's declarations (SDD §21.5)."""
+    env.registry.networks.append(dst_net("shared-net", own=False))
+    shared = Nic(
+        network="shared-net",
+        mac="00:50:56:00:00:04",
+        fixed_ips=["10.0.0.7"],
+        network_key="dvportgroup-9",
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=Mappings())
+    vm = make_vm(source_id="srv-1", name="web-01", nics=[shared])
+    mig = make_migration(id="mig-00000000ab", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_warm)
+    old_report = {"roles": ["advsvc", "member"]}
+    secure = DST.model_copy(update={"policy_profile": "secure_rbac", "capabilities": old_report})
+    with pytest.raises(PermanentStepError, match="secure-RBAC defaults let only the admin or ser"):
+        await env.executor.run(
+            StepName.CUTOVER, make_ctx(plan, mig, VCENTER, secure, env.settings)[0]
+        )
+    # RHOSO 18.0 without a declaration: legacy by its kind, as before (D14)
+    rhoso = DST.model_copy(update={"capabilities": old_report})
+    await env.executor.run(StepName.CUTOVER, make_ctx(plan, mig, VCENTER, rhoso, env.settings)[0])
 
 
 async def test_a_neutron_warm_cutover_exports_again_a_workload_without_port_security_groups(
@@ -894,8 +1112,8 @@ async def test_vmware_runs_give_the_kit_every_nic_by_its_key_and_refuse_before_i
 
     gone = Nic(network="gone-net", mac="00:50:56:00:00:09", fixed_ips=["10.0.0.9"])
     assert await refused([std, gone]) == (
-        "the NIC 00:50:56:00:00:09 of db-01 cannot go to RHOSO network 'gone-net': there is no "
-        "network named 'gone-net'"
+        "the NIC 00:50:56:00:00:09 of db-01 cannot go to network 'gone-net' of RHOSO 18.0: there "
+        "is no network named 'gone-net'"
     )
     outside = std.model_copy(update={"fixed_ips": ["192.0.2.5"]})
     assert await refused([outside]) == (
@@ -934,7 +1152,7 @@ async def test_vmware_runs_give_the_kit_every_nic_by_its_key_and_refuse_before_i
     }
     # the destination's networks cannot be read: transient, before the kit
     env.registry.inventory_error = True
-    assert "could not read the destination's networks" in await refused(
+    assert "could not read the networks of RHOSO 18.0" in await refused(
         [std], error=TransientStepError
     )
     assert rec.downtime_marks == 1
@@ -1152,7 +1370,7 @@ async def test_vmware_runs_refuse_a_nic_whose_mac_or_address_another_port_holds(
     )
     # ports that cannot be read: transient, before the kit
     env.registry.ports_error = True
-    assert "could not read the destination's ports" in await refused(TransientStepError)
+    assert "could not read the ports of RHOSO 18.0" in await refused(TransientStepError)
     env.registry.ports_error = False
     # a port of another network holds nothing the kit asks this network for
     held.update(network_id="net-elsewhere", mac_address="00:50:56:00:00:01")
@@ -1260,12 +1478,12 @@ async def test_a_vmware_warm_pass_logs_what_only_the_cutovers_ports_meet(env):
     ctx, rec = ctx_for(env, nics=[nic], **kit)
     await env.executor.run(StepName.SYNC, ctx)
     assert (
-        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': could not read the destination's "
-        "ports: ports: HTTP 503; the cutover reads them again before the power-off"
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': could not read the ports of RHOSO "
+        "18.0: ports: HTTP 503; the cutover reads them again before the power-off"
     ) in rec.logs
     assert not any(ln.startswith(later) for ln in rec.logs)
     ctx, _ = ctx_for(env, nics=[nic], **kit)
-    with pytest.raises(TransientStepError, match="could not read the destination's ports"):
+    with pytest.raises(TransientStepError, match="could not read the ports of RHOSO 18.0"):
         await env.executor.run(StepName.CUTOVER, ctx)
     env.registry.ports_error = False
 
@@ -1288,7 +1506,8 @@ async def test_a_vmware_warm_pass_logs_what_only_the_cutovers_ports_meet(env):
     }
     [refused] = [ln for ln in rec.logs if ln.startswith(later)]
     assert refused.startswith(
-        later + "the NIC 00:50:56:00:00:04 of web-01 cannot go to RHOSO network 'shared-net' "
+        later
+        + "the NIC 00:50:56:00:00:04 of web-01 cannot go to network 'shared-net' of RHOSO 18.0 "
         "(project admin): "
     )
     assert "Neutron lets only the admin or advsvc role" in refused
@@ -1305,8 +1524,8 @@ async def test_a_vmware_warm_pass_logs_what_only_the_cutovers_ports_meet(env):
     with pytest.raises(PermanentStepError) as exc:
         await env.executor.run(StepName.PRECOPY, ctx)
     assert str(exc.value) == (
-        "the NIC 00:50:56:00:00:09 of web-01 cannot go to RHOSO network 'gone-net': there is no "
-        "network named 'gone-net'"
+        "the NIC 00:50:56:00:00:09 of web-01 cannot go to network 'gone-net' of RHOSO 18.0: there "
+        "is no network named 'gone-net'"
     )
     assert len(read_log(env.log)) == ran
 
@@ -1792,7 +2011,7 @@ async def test_cutover_refuses_a_pre_existing_destination_server(env):
     )
     for strategy, source in ((Strategy.cold, SRC), (Strategy.vmware_cold, VCENTER)):
         ctx, rec = ctx_for(env, strategy=strategy, source=source)
-        with pytest.raises(PermanentStepError, match="already exists in the destination"):
+        with pytest.raises(PermanentStepError, match="already exists in RHOSO 18.0"):
             await executor.run(StepName.CUTOVER, ctx)
         assert rec.downtime_marks == 0
     assert read_log(env.log) == []  # no playbook ran
@@ -2328,7 +2547,7 @@ async def test_warm_cutover_rerun_without_a_recorded_server_stays_a_permanent_fa
     _finished_cutover_state(env, record_server=False)
     monkeypatch.setenv("ANSIBLE_FAKE_SKIP_PASS", "1")
     retry, _ = ctx_for(env, strategy=Strategy.warm, sync_passes=[first.sync_pass])
-    with pytest.raises(PermanentStepError, match="recorded no new pass"):
+    with pytest.raises(PermanentStepError, match="check RHOSO 18.0 for a same-named server"):
         await env.executor.run(StepName.CUTOVER, retry)
 
 
@@ -2509,7 +2728,9 @@ async def test_vmware_rollback_and_lookup_failures(env):
     cold, rec = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
     result = await failing.run(StepName.CUTOVER, cold)
     assert result.destination_server_id is None
-    assert any("could not look up the destination server" in line for line in rec.logs)
+    assert any(
+        "could not look up the server named web-01 in RHOSO 18.0" in line for line in rec.logs
+    )
 
 
 async def test_cutover_refused_when_destination_lookup_fails(env):
@@ -2519,7 +2740,9 @@ async def test_cutover_refused_when_destination_lookup_fails(env):
     failing = AnsibleExecutor(env.settings, providers=FailingRegistry(), poll_s=0.02)
     for strategy, source in ((Strategy.vmware_cold, VCENTER), (Strategy.cold, SRC)):
         ctx, rec = ctx_for(env, strategy=strategy, source=source)
-        with pytest.raises(TransientStepError, match="could not check the destination"):
+        with pytest.raises(
+            TransientStepError, match="could not check RHOSO 18.0 for a server named web-01"
+        ):
             await failing.run(StepName.CUTOVER, ctx)
         assert rec.downtime_marks == 0
     assert read_log(env.log) == []  # no playbook ran
@@ -2606,7 +2829,9 @@ async def test_skipped_stop_task_starts_no_downtime_clock(env, monkeypatch):
     ctx, rec = ctx_for(env, strategy=Strategy.cold)
     # the cold role skips everything when the destination already has the server: nothing was
     # migrated, so the step fails instead of returning the same-named server as the result
-    with pytest.raises(PermanentStepError, match="nothing was migrated"):
+    with pytest.raises(
+        PermanentStepError, match="RHOSO 18.0 already has a server with that name and nothing was"
+    ):
         await env.executor.run(StepName.CUTOVER, ctx)
     assert rec.downtime_marks == 0, "a skipped stop task does not stop the source"
     monkeypatch.delenv("ANSIBLE_FAKE_STOP_SKIPPED")
@@ -2746,7 +2971,7 @@ def test_resolve_network_refs_keeps_a_floating_network_it_cannot_resolve():
 
 
 async def test_a_cutover_keeps_a_floating_network_it_cannot_resolve(env, monkeypatch):
-    """SDD §7.2, review NC-10: RHOSO has no network named like the floating IP's - the cutover
+    """SDD §7.2, review NC-10: RHOSO 18.0 has no network named like the floating IP's - the cutover
     runs with the reference as exported, for the destination check to judge by the mode."""
     monkeypatch.setenv("ANSIBLE_FAKE_FLOATING", "203.0.113.7@public")
     cold, _ = ctx_for(env, strategy=Strategy.cold)
@@ -2818,7 +3043,7 @@ async def test_a_warm_pass_logs_a_port_network_it_cannot_resolve_and_the_cutover
     env.registry.networks[1]["id"] = "net-rhoso-app-second"
     problem = (
         "the cutover will refuse this before the source stops: the port fa:16:3e:00:00:01 of "
-        "web-01 cannot go to RHOSO network 'rhoso-app': "
+        "web-01 cannot go to network 'rhoso-app' of RHOSO 18.0: "
     )
     precopy, rec = ctx_for(env)
     result = await env.executor.run(StepName.PRECOPY, precopy)
@@ -2881,7 +3106,7 @@ async def test_a_pass_logs_each_problem_it_defers_once():
         logged.append(line)
 
     ctx = SimpleNamespace(log=log)
-    problem = "the port fa:16:3e:00:00:01 of web-01 cannot go to RHOSO network 'gone'"
+    problem = "the port fa:16:3e:00:00:01 of web-01 cannot go to network 'gone' of RHOSO 18.0"
     deferred = Deferred()
     deferred.append(problem)
     await AnsibleExecutor._log_deferred(ctx, deferred)
@@ -2890,7 +3115,7 @@ async def test_a_pass_logs_each_problem_it_defers_once():
     await AnsibleExecutor._log_deferred(ctx, None)
     assert logged == [
         "the cutover will refuse this before the source stops: the port fa:16:3e:00:00:01 of "
-        "web-01 cannot go to RHOSO network 'gone'"
+        "web-01 cannot go to network 'gone' of RHOSO 18.0"
     ]
     # logged once, and kept for the pass's cutover_refusals (SDD §7.2)
     assert list(deferred) == [problem]
@@ -2904,7 +3129,7 @@ async def test_an_unreadable_destination_keeps_the_exported_network_references(e
     await env.executor.run(StepName.CUTOVER, cold)
     [port] = exported_server(env)["params"]["ports"]
     assert port["params"]["fixed_ips_refs"][0]["subnet_ref"]["name"] == "app-subnet"
-    assert any("could not read the destination's networks" in line for line in rec.logs)
+    assert any("could not read the networks of RHOSO 18.0" in line for line in rec.logs)
 
 
 async def test_a_rollback_never_resolves_network_references(env):

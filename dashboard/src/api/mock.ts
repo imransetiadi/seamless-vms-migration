@@ -14,7 +14,7 @@ import { DEFAULT_API_BASE } from './client';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { canTransition, hasDataPath } from '../lib/fsm';
 import { guestOsOf } from '../lib/guestOs';
-import { capabilityRoles } from '../lib/networks';
+import { capabilityRoles, policyProfileOf } from '../lib/networks';
 import { canonicalIp, isIpAddress } from '../lib/nics';
 import { blocksPlanChange, inFlightRefusal } from '../lib/inFlight';
 import { countedApprovals } from '../lib/migrationActions';
@@ -25,6 +25,7 @@ import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
 import { summaryOf } from '../lib/summary';
 import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
+import { destinationName, isBlank, providerLabel } from '../lib/providerUse';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -41,7 +42,11 @@ import {
   humanDecision,
   strategyRecommendation,
   strategySnapshot,
+  destinationDescriptor,
+  DEMO_TOKEN_ROLES,
   type StrategyDecision,
+  checkOf,
+  vmwareCheck,
 } from './mockData';
 import { buildStrategyEvidence, evidenceCount } from './mockEvidence';
 import { derivePlanStatus } from './mockPlanStatus';
@@ -109,6 +114,14 @@ interface MockResponse {
   status: number;
   body?: unknown;
   text?: string;
+}
+
+/** The secrets a provider reads, by name, for its audit events - never a value: the API's _secret_names (SDD §13.3). */
+function secretNames(provider: Provider): Record<string, string> {
+  return {
+    ...(provider.credentials_secret ? { credentials_secret: provider.credentials_secret } : {}),
+    ...(provider.conversion_host?.ssh_key_secret ? { ssh_key_secret: provider.conversion_host.ssh_key_secret } : {}),
+  };
 }
 
 class HttpError extends Error {
@@ -194,7 +207,8 @@ function advisorScope(estimates: readonly Estimate[], policy: Plan['selection_po
 
 /**
  * What the API's serializers send (GET /advisor/data-sent, SDD §13.4): the server generates it from its field
- * specs; the mock repeats it for a remote model whose console stays local.
+ * specs; the mock repeats it for a remote model whose console stays local - word for word, as mock.test.ts holds it to
+ * the API's own list (seamless/tests/fixtures/data_sent.json, review RV21-03).
  */
 const LOCAL_CONSOLE = 'The console excerpt stays in this installation: the advisor is remote and SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE is off.';
 const DATA_SENT: DataSentItem[] = [
@@ -202,7 +216,7 @@ const DATA_SENT: DataSentItem[] = [
     decision_type: 'migration_strategy',
     tool: 'jev_decide',
     fields: [
-      { key: 'decision', label: 'The question, naming the VM' },
+      { key: 'decision', label: "The question, naming the VM and the destination's kind and series (never a provider's name)" },
       { key: 'vm', label: 'VM name, vCPU, RAM and number of disks' },
       { key: 'disks', label: 'Each disk: kind, size, volume type, multi-attach, encrypted, independent' },
       { key: 'size', label: 'Provisioned and used size' },
@@ -571,7 +585,7 @@ function checkSecretNames(input: Record<string, unknown>, fields: Set<string>, p
   }
 }
 
-const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution']);
+const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile']);
 const DISTRIBUTION_KIND: Record<string, string> = { openstack_community: 'openstack', kolla: 'openstack', rhosp: 'openstack', rhoso: 'rhoso', vmware: 'vmware' };
 
 function checkDistribution(input: Record<string, unknown> | Provider) {
@@ -579,6 +593,24 @@ function checkDistribution(input: Record<string, unknown> | Provider) {
   const kind = (input as Record<string, unknown>).kind;
   if (distribution && DISTRIBUTION_KIND[String(distribution)] !== kind) {
     throw new HttpError(422, 'validation_error', `distribution ${String(distribution)} belongs to kind ${DISTRIBUTION_KIND[String(distribution)] ?? 'unknown'}, not ${String(kind)}`);
+  }
+}
+
+/** A declared series and policy profile, as the API's Provider validates them (SDD §4.2): OpenStack's alone. */
+function checkDeclarations(input: Record<string, unknown> | Provider) {
+  const fields = input as Record<string, unknown>;
+  const release = fields.release;
+  if (release !== undefined && release !== null && !(typeof release === 'string' && /^20[0-9]{2}\.[12]$/.test(release))) {
+    throw new HttpError(422, 'validation_error', "release: String should match pattern '^20[0-9]{2}\\.[12]$'");
+  }
+  const profile = fields.policy_profile;
+  if (profile !== undefined && profile !== null && profile !== 'secure_rbac' && profile !== 'legacy') {
+    throw new HttpError(422, 'validation_error', "policy_profile: Input should be 'secure_rbac' or 'legacy'");
+  }
+  if (fields.kind === 'vmware') {
+    for (const name of ['release', 'policy_profile']) {
+      if (fields[name] !== undefined && fields[name] !== null) throw new HttpError(422, 'validation_error', `Value error, ${name}: an OpenStack ${name} cannot be declared for vmware`);
+    }
   }
 }
 
@@ -627,7 +659,9 @@ export class MockServer {
     this.rand = prng(options.seed ?? 42);
     const fixtures = buildFixtures(this.now());
     this.providers = fixtures.providers;
-    this.inventories = fixtures.inventories;
+    // by own key only: a provider id is any ^[a-z0-9][a-z0-9-]{1,62}$, "constructor" too, never Object.prototype's
+    // (SDD §4.2, review RV22-02)
+    this.inventories = Object.assign(Object.create(null) as Record<string, VMRef[] | DestinationInventory>, fixtures.inventories);
     this.plans = fixtures.plans;
     this.migrations = fixtures.migrations;
     this.recommendations = fixtures.recommendations;
@@ -1055,9 +1089,11 @@ export class MockServer {
     const subnets = dst && !Array.isArray(dst) ? (dst.subnets ?? []) : [];
     const networkDetails = dst && !Array.isArray(dst) ? dst.network_details : undefined;
     const selected = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm);
-    // the destination's token roles, as its check reported them (SDD §9.3, §10)
+    // the destination's token roles, as its check reported them, and its policy profile - a report that names none
+    // reads the provider's declarations (SDD §9.3, §10, §21.5)
     const roles = capabilityRoles(destination.capabilities);
-    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails, roles });
+    const profile = policyProfileOf(destination.capabilities, destination);
+    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails, roles, profile, destination: providerLabel(destination) });
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings);
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
@@ -1124,7 +1160,12 @@ export class MockServer {
     const at = new Date(this.now()).toISOString();
     const recorded = this.recommendations.filter((r) => r.migration_id === m.id).length;
     // the advisor's input, named by the SHA-256 of its canonical JSON and written once (SDD §14.5)
-    const snapshot = strategySnapshot({ vm: m.vm, plan, estimates: m.estimates, findings: m.findings, scope, deterministic: m.strategy, at });
+    // the destination by kind and series: its provider's name never leaves for Jev (SDD §1 naming, §13.4)
+    const destination = this.destinationFor(plan);
+    const snapshot = strategySnapshot({
+      vm: m.vm, plan, estimates: m.estimates, findings: m.findings, scope, deterministic: m.strategy, at,
+      destination: destinationDescriptor(destination), destinationName: providerLabel(destination),
+    });
     if (!this.snapshots.has(snapshot.sha256)) this.snapshots.set(snapshot.sha256, snapshot);
     const rec = strategyRecommendation({
       id: `rec-${m.id.slice(4)}${(recorded + 1).toString(16).padStart(2, '0')}`,
@@ -1270,6 +1311,8 @@ export class MockServer {
           // like the API (SDD §12, §13.2): the route's role first, then the lookup
           const writes = (!sub && (method === 'PATCH' || method === 'DELETE')) || ((sub === 'credentials' || sub === 'conversion-key') && method === 'PUT');
           this.require(token, writes ? 'admin' : sub === 'check' && method === 'POST' ? 'operator' : 'viewer', path);
+          // a PATCH's body alone is judged before the lookup, as the API's update_provider (review RV22-07)
+          if (!sub && method === 'PATCH') this.refusePatchBody(input);
           throw new HttpError(404, 'not_found', `Provider ${id} not found.`);
         }
         if (!sub && method === 'GET') {
@@ -1292,7 +1335,9 @@ export class MockServer {
             );
           }
           this.providers.splice(this.providers.indexOf(provider), 1);
-          this.emit({ kind: 'provider.deleted', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name} deleted`, data: {} });
+          // its inventory goes with it: a provider created again under the id never reads it (review RV21-12)
+          delete this.inventories[provider.id];
+          this.emit({ kind: 'provider.deleted', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} deleted`, data: { provider_id: provider.id } });
           return { status: 204 };
         }
         if (sub === 'check' && method === 'POST') {
@@ -1305,18 +1350,22 @@ export class MockServer {
               provider.status_message = 'The endpoint did not answer (connection timed out).';
             } else {
               provider.status = 'ok';
-              provider.status_message = 'All services reachable.';
-              // an OpenStack check also reports its token's roles (SDD §10)
-              provider.capabilities = { admin: true, ...(provider.kind === 'vmware' ? {} : { roles: ['admin', 'member', 'reader'] }), compute_microversion: '2.95', ovn: true, volume_backends: ['ceph-ssd'] };
+              // as the API's check: a provider that answers has no status message (SDD §10, review RV22-03)
+              provider.status_message = null;
+              // the API's keys: a vCenter's VMs counted; an OpenStack cloud's token roles, maxima, pools and TLS, and a
+              // destination's series, tier and policy profile by what it declares (SDD §10, §10.1)
+              const inventory = this.inventories[provider.id];
+              provider.capabilities = provider.kind === 'vmware' ? vmwareCheck(Array.isArray(inventory) ? inventory : []) : checkOf(provider);
             }
           }
-          this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name}: ${provider.status}`, data: { status: provider.status } });
+          this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id}: ${provider.status}`, data: { provider_id: provider.id, status: provider.status, message: provider.status_message } });
           return ok(provider);
         }
         if (sub === 'inventory' && method === 'GET') {
           this.require(token, 'viewer', path);
-          if (provider.status === 'error') throw new HttpError(502, 'provider_error', `${provider.name}: ${provider.status_message ?? 'unreachable'}`);
-          return ok(this.inventories[provider.id] ?? (provider.role === 'source' ? [] : { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [] }));
+          if (provider.status === 'error') throw new HttpError(502, 'provider_error', `${provider.id}: ${provider.status_message ?? 'unreachable'}`);
+          // a destination's answer names its token's roles, as the API demo's (SDD §10, review RV20-10)
+          return ok(this.inventories[provider.id] ?? (provider.role === 'source' ? [] : { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [], roles: [...DEMO_TOKEN_ROLES] }));
         }
       }
     }
@@ -1625,6 +1674,10 @@ export class MockServer {
   private createProvider(me: Me, input: Record<string, unknown>): MockResponse {
     const id = String(input.id ?? '');
     if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) throw new HttpError(422, 'validation_error', 'id: must match ^[a-z0-9][a-z0-9-]{1,62}$.');
+    // a name missing or not a string is refused in pydantic's words, as the API's model refuses it: stored, every text
+    // that names the provider would read it (SDD §4.2, review RV21-07)
+    if (typeof input.name !== 'string') throw new HttpError(422, 'validation_error', input.name === undefined ? 'name: Field required' : 'name: Input should be a valid string');
+    if (isBlank(input.name)) throw new HttpError(422, 'validation_error', 'name: must not be blank');
     if (this.providers.some((p) => p.id === id)) throw new HttpError(409, 'conflict', `provider '${id}' already exists`);
     // like the API: provider-{id} and provider-{id}-ssh must stay apart from every other provider's (SDD §13.3)
     const clash = this.providers.find((p) => id === `${p.id}-ssh` || p.id === `${id}-ssh`);
@@ -1632,6 +1685,7 @@ export class MockServer {
       throw new HttpError(409, 'conflict', `provider id '${id}' would share a secret with provider '${clash.id}': Seamless stores a provider's secrets as provider-<id> and provider-<id>-ssh`);
     }
     checkDistribution(input);
+    checkDeclarations(input);
     checkSecretNames(input, new Set(['credentials_secret', 'conversion_host']), id);
     const defaults: Partial<Provider> = {
       cloud: null,
@@ -1641,6 +1695,8 @@ export class MockServer {
       ca_cert_path: null,
       conversion_host: null,
       distribution: null,
+      release: null,
+      policy_profile: null,
     };
     const provider = {
       ...defaults,
@@ -1653,22 +1709,32 @@ export class MockServer {
       conversion_key_updated_at: null,
     } as Provider;
     this.providers.push(provider);
-    this.emit({ kind: 'provider.created', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name} registered`, data: {} });
+    this.emit({ kind: 'provider.created', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} created`, data: { provider_id: provider.id, kind: provider.kind, role: provider.role, ...secretNames(provider) } });
     return ok(provider, 201);
   }
 
   /** PATCH /providers/{id}: editable fields only, 409 while a running/paused plan uses it. */
-  private patchProvider(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+  /** What PATCH /providers/{id} refuses from its body alone, before it looks the provider up, as the API (SDD §4.2, §12). */
+  private refusePatchBody(input: Record<string, unknown>): void {
     const unknown = Object.keys(input).filter((k) => !PROVIDER_EDITABLE.has(k)).sort();
     if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);
+    // a blank name is refused, as the API refuses it (SDD §4.2, review RV20-11)
+    if (typeof input.name === 'string' && isBlank(input.name)) throw new HttpError(422, 'validation_error', 'name: must not be blank');
+  }
+
+  private patchProvider(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+    this.refusePatchBody(input);
     const users = this.plans.filter(
       (p) => ['running', 'paused'].includes(p.status) && (p.source_provider_id === provider.id || p.destination_provider_id === provider.id),
     );
     if (users.length) throw new HttpError(409, 'conflict', `provider is used by running or paused plan(s): ${users.map((p) => p.id).join(', ')}`);
+    // the API validates the merged provider after its 409: a name that is not a string answers 422 (review RV21-07)
+    if ('name' in input && typeof input.name !== 'string') throw new HttpError(422, 'validation_error', 'name: Input should be a valid string');
     checkDistribution({ ...provider, ...input });
+    checkDeclarations({ ...provider, ...input });
     checkSecretNames(input, new Set(Object.keys(input)), provider.id);
     Object.assign(provider, input, { status: 'unknown', status_message: null, last_checked_at: null, capabilities: {} });
-    this.emit({ kind: 'provider.updated', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} updated`, data: { provider_id: provider.id, fields: Object.keys(input).sort() } });
+    this.emit({ kind: 'provider.updated', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} updated`, data: { provider_id: provider.id, fields: Object.keys(input).sort(), ...secretNames(provider) } });
     return ok(provider);
   }
 
@@ -1853,13 +1919,16 @@ export class MockServer {
       const running = this.sourcePower(m.vm.source_id) === 'running';
       if (running === (m.source_running_at !== null)) continue;
       m.source_running_at = running ? new Date(this.now()).toISOString() : null;
+      // the event names the plan's destination provider, as the API's (SDD §1 naming)
+      const plan = this.plans.find((p) => p.id === m.plan_id);
+      const destination = destinationName(this.providers, plan);
       this.emit({
         kind: running ? 'migration.source_running' : 'migration.source_stopped',
         plan_id: m.plan_id,
         migration_id: m.id,
         actor: 'orchestrator',
         message: running
-          ? `${m.vm.name}: the source VM runs again - its data diverges from RHOSO; stop it, or roll back`
+          ? `${m.vm.name}: the source VM runs again - its data diverges from ${destination}; stop it, or roll back`
           : `${m.vm.name}: the source VM is stopped again`,
         data: { power_state: running ? 'running' : 'stopped' },
       });

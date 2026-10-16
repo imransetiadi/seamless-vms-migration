@@ -189,7 +189,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Wave test');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByRole('checkbox', { name: 'Select web-02' }));
     await user.click(within(dialog).getByRole('button', { name: /create plan with 2 vms/i }));
@@ -217,7 +217,7 @@ describe('Plans page', () => {
       const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
       await user.type(within(dialog).getByLabelText(/^name/i), 'Not created');
       await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-      await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+      await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
       await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
       await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
       const alert = await within(dialog).findByText('The plan was not created');
@@ -236,7 +236,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Write rate test');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     await user.type(within(dialog).getByLabelText(/guest write rate/i), '8');
@@ -256,7 +256,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Step times');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     // empty fields keep the planning defaults, which the placeholders show
@@ -279,7 +279,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Bad step times');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     await user.type(within(dialog).getByLabelText(/source shutdown/i), '0');
@@ -299,7 +299,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Bad rates');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     await user.type(within(dialog).getByLabelText(/guest write rate/i), '0');
@@ -318,7 +318,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'API bounds');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     for (const [label, value] of [
@@ -343,7 +343,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Below the bounds');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     for (const [label, value] of [
@@ -555,7 +555,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Verified wave');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     await user.type(within(dialog).getByLabelText(/^project mappings/i), 'shop = shop-prod');
@@ -588,7 +588,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Warm wave');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     const keepWarm = within(dialog).getByLabelText(/^keep-warm interval/i);
@@ -618,15 +618,15 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Flavors too');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     const prestage = within(dialog).getByRole('group', { name: /pre-staged at the destination/i });
     const flavors = within(prestage).getByRole('checkbox', { name: /^flavors/i });
-    expect(flavors).toHaveAccessibleDescription(/flavors of the plan's vms that rhoso lacks/i);
+    expect(flavors).toHaveAccessibleDescription(/flavors of the plan's vms that the destination lacks/i);
     await user.click(flavors);
     const keypairs = within(prestage).getByRole('checkbox', { name: /^keypairs/i });
-    expect(keypairs).toHaveAccessibleDescription(/keypairs the migration user lacks at rhoso/i);
+    expect(keypairs).toHaveAccessibleDescription(/keypairs the migration user lacks on the destination/i);
     await user.click(keypairs);
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
 
@@ -644,7 +644,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Override wave');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByRole('checkbox', { name: 'Select web-02' }));
     const overrides = within(dialog).getByRole('group', { name: /per-vm strategy/i });
@@ -739,7 +739,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Ports kept');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     const ports = within(dialog).getByRole('group', { name: /^ports$/i });
@@ -797,7 +797,7 @@ describe('Plans page', () => {
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.type(within(dialog).getByLabelText(/^name/i), 'Handover test');
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByRole('checkbox', { name: 'Select report-gen-01' }));
     await user.click(within(dialog).getByText(/^advanced/i));
@@ -811,7 +811,7 @@ describe('Plans page', () => {
     const ceph = within(dialog).getByLabelText(/^tripleo-ceph/i);
     expect(ceph).toHaveValue('');
     await user.click(within(dialog).getByRole('button', { name: /create plan with 2 vms/i }));
-    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/choose a rhoso backend for tripleo-ceph/i);
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/choose a destination backend for tripleo-ceph/i);
 
     await user.selectOptions(ceph, 'hostgroup@ceph-ssd#volumes-ssd');
     await user.click(within(dialog).getByRole('button', { name: /create plan with 2 vms/i }));

@@ -101,13 +101,13 @@ describe('VmTable', () => {
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
     const row = bodyRows().find((r) => r.textContent?.includes('db-pg-01'))!;
     const flag = within(row).getByRole('button', { name: 'Encrypted volume' });
-    expect(flag).toHaveAccessibleDescription('VOL_ENCRYPTED: The Barbican key must be re-created at RHOSO.');
+    expect(flag).toHaveAccessibleDescription('VOL_ENCRYPTED: The Barbican key must be re-created on the destination.');
     expect(within(row).queryByTitle(/VOL_ENCRYPTED/)).not.toBeInTheDocument();
     // no truncating ancestor: its overflow would clip the focus ring (WCAG 2.4.7)
     expect(flag.closest('.truncate')).toBeNull();
     // a tap shows it too: touch screens have no hover
     await user.click(flag);
-    expect(screen.getByRole('tooltip')).toHaveTextContent('VOL_ENCRYPTED: The Barbican key must be re-created at RHOSO.');
+    expect(screen.getByRole('tooltip')).toHaveTextContent('VOL_ENCRYPTED: The Barbican key must be re-created on the destination.');
   });
 
   it('sorts by disk size with aria-sort', async () => {

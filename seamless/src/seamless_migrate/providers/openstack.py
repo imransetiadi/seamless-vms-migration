@@ -17,6 +17,7 @@ from ..config import Settings
 from ..domain.enums import ProviderRole
 from ..domain.models import Disk, Nic, Provider, VMRef
 from ..guest_os import identify
+from ..planning.platforms import destination_release
 from ..planning.preflight import DestinationInventory, SourceInventory
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
 from ..storage import storage_family
@@ -117,6 +118,46 @@ def _try(fn: Callable[[], T], default: T) -> T:
         return default
 
 
+#: the services Seamless calls, with the connection's proxy for each (SDD §10)
+_SERVICES = (
+    ("identity", "identity"),
+    ("compute", "compute"),
+    ("block-storage", "block_storage"),
+    ("network", "network"),
+    ("image", "image"),
+)
+
+
+def _catalog_url(adapter: Any) -> Any:
+    """A service's endpoint as keystoneauth reads it from the catalog. openstacksdk's identity
+    proxy overrides get_endpoint() - it fetches a Keystone endpoint record -, so keystoneauth's
+    own method is asked of any of its adapters (SDD §10, review RV18-03)."""
+    try:
+        from keystoneauth1.adapter import Adapter
+    except ImportError:  # a test double, without openstacksdk installed
+        return adapter.get_endpoint()
+    if isinstance(adapter, Adapter):
+        return Adapter.get_endpoint(adapter)
+    return adapter.get_endpoint()
+
+
+def _plain_http(endpoint: str, conn: Any) -> list[str]:
+    """The provider's own endpoint (``endpoint``), the auth URL its credential is posted to
+    (``auth_url``) and the services whose endpoint uses plain HTTP (SDD §10, Security.md); an
+    endpoint that cannot be read counts neither way."""
+    urls: list[tuple[str, Callable[[], Any]]] = [
+        ("endpoint", lambda: endpoint),
+        ("auth_url", lambda: conn.session.auth.auth_url),
+    ]
+    urls += [(name, lambda p=proxy: _catalog_url(getattr(conn, p))) for name, proxy in _SERVICES]
+    found = []
+    for name, read in urls:
+        url = _try(read, None)
+        if isinstance(url, str) and url.strip().lower().startswith("http://"):
+            found.append(name)
+    return found
+
+
 class OpenStackProvider:
     """Source and destination provider for kinds ``openstack`` and ``rhoso``."""
 
@@ -206,6 +247,9 @@ class OpenStackProvider:
         microversion = _try(
             lambda: microversion_text(conn.compute.get_endpoint_data().max_microversion), ""
         )
+        block_storage_microversion = _try(
+            lambda: microversion_text(conn.block_storage.get_endpoint_data().max_microversion), ""
+        )
         agents = _try(lambda: list(conn.network.agents()), [])
         ovn = any(
             "ovn" in str(_attr(a, "agent_type", default="")).lower()
@@ -230,14 +274,30 @@ class OpenStackProvider:
         roles = _try(
             lambda: sorted(set(conn.session.auth.get_access(conn.session).role_names or [])), None
         )
-        return {
+        plain_http = _plain_http(self.provider.endpoint, conn)
+        report = {
             "admin": admin,
             **({"roles": roles} if roles is not None else {}),
             "compute_microversion": microversion,
+            "block_storage_microversion": block_storage_microversion,
             "ovn": ovn,
             "volume_backends": [b["pool"] for b in storage],
             "storage_backends": storage,
+            "tls": not plain_http,
+            "plain_http": plain_http,
         }
+        if self.provider.role == ProviderRole.destination:
+            # the series it runs, its support tier and its policy profile (SDD §10.1, §21)
+            report.update(
+                destination_release(
+                    self.provider.kind,
+                    self.provider.release,
+                    self.provider.policy_profile,
+                    microversion,
+                    block_storage_microversion,
+                )
+            )
+        return report
 
     def _list_vms(self) -> list[VMRef]:
         conn = self._connection()
@@ -315,6 +375,11 @@ class OpenStackProvider:
             for s in conn.network.subnets()
             if _attr(s, "network_id") in names
         ]
+        # the token's role names, read now: a check report new credentials reset names none
+        # (SDD §10, §7.2, review RV19-01)
+        roles = _try(
+            lambda: sorted(set(conn.session.auth.get_access(conn.session).role_names or [])), None
+        )
         return DestinationInventory(
             networks=networks,
             flavors=flavors,
@@ -324,6 +389,7 @@ class OpenStackProvider:
             keypairs=keypairs,
             subnets=subnets,
             network_details=network_details,
+            roles=roles,
         )
 
     @staticmethod

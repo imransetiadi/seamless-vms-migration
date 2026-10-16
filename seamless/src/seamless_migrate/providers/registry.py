@@ -21,7 +21,7 @@ def build(provider: Provider, settings: Settings) -> Any:
     """Return the implementation for ``provider`` (demo fakes when ``settings.demo``)."""
     if settings.demo:
         if provider.role == ProviderRole.destination:
-            return FakeDestinationProvider(seed=settings.demo_seed)
+            return FakeDestinationProvider(seed=settings.demo_seed, provider=provider)
         return FakeSourceProvider(provider.kind, seed=settings.demo_seed)
     if provider.kind == ProviderKind.vmware:
         return VMwareProvider(provider, settings)

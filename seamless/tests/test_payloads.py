@@ -1,6 +1,9 @@
 """What leaves the installation is declared (SDD §13.4, ADV-06): the serializers render field specs,
 and GET /advisor/data-sent lists the same specs."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from seamless_migrate.ai import payloads
@@ -186,3 +189,11 @@ def test_the_console_excerpt_leaves_only_for_an_on_prem_model_or_when_allowed(se
 
 def test_nothing_is_sent_while_jev_is_off():
     assert all(i["sent"] is False for i in data_sent(Settings(jev_mode="off")))
+
+
+def test_the_data_sent_list_is_the_one_the_dashboards_mock_serves():
+    """SDD §13.4 (review RV21-03): the fixture the dashboard's offline mock is held to is the
+    API's own list, for a remote model whose console stays local - a label changed here fails
+    this test until data_sent.json, and with it the mock, says the same."""
+    shared = json.loads((Path(__file__).parent / "fixtures" / "data_sent.json").read_text())
+    assert data_sent(Settings(jev_mode="http")) == shared["items"]

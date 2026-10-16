@@ -20,18 +20,18 @@ from ..planning.waves import TIERS, heuristic_tier
 from . import payloads
 from .decision import Advice
 from .jev import JevClient, JevUnavailable
-from .redaction import redact
+from .redaction import redact, replace_names
 
 log = logging.getLogger(__name__)
 GIB = 2**30
 MIB = 2**20
 
 STRATEGY_DESCRIPTIONS = {
-    Strategy.cold: "Stop the VM, copy all used data over the network, boot on RHOSO.",
+    Strategy.cold: "Stop the VM, copy all used data over the network, boot on the destination.",
     Strategy.warm: "Pre-copy snapshots while the VM runs, then stop it and sync only changed "
     "blocks (the whole device is scanned).",
     Strategy.storage_handover: "Stop the VM and hand its Ceph-backed volumes from the source "
-    "Cinder to RHOSO Cinder via unmanage/manage; no data is copied.",
+    "Cinder to the destination's Cinder via unmanage/manage; no data is copied.",
     Strategy.vmware_cold: "Power off the VM, copy all used data with vmware-migration-kit and "
     "convert it with virt-v2v.",
     Strategy.vmware_warm: "Copy the VM with CBT-based passes while it runs, then power it off, "
@@ -110,12 +110,33 @@ class Advisor:
         return redact(text, names)
 
     # -- strategy ----------------------------------------------------------------------------
+    def _for_strategy(
+        self, text: str, vm: VMRef, destination_name: str | None, destination: str
+    ) -> str:
+        """The evidence, or the VM's name the question carries: secrets redacted, then the VM's name
+        (when names are redacted) and the destination provider's name - operator free text, in the
+        eligibility reasons the operators read (T6) - replaced in one pass, longest first, so
+        neither replacement splits the other: the VM's name blanked first left "jakarta-[vm]-prod"
+        to send. The provider's name gives way to the destination's kind and series whatever the
+        redaction setting, and wins when the two names are equal (SDD §1 naming, §13.4, reviews
+        RV20-01, RV21-02, RV21-10)."""
+        names = {vm.name: "[vm]"} if self.settings.memory_redact_names else {}
+        if destination_name:
+            names[destination_name] = destination
+        return replace_names(redact(text), names)
+
     def _strategy_evidence(
-        self, vm: VMRef, estimates: Sequence[Estimate], plan: Plan, findings: Sequence[Finding]
+        self,
+        vm: VMRef,
+        estimates: Sequence[Estimate],
+        plan: Plan,
+        findings: Sequence[Finding],
+        destination_name: str | None = None,
+        destination: str = "the destination",
     ) -> str:
         # rendered from the declared field specs (SDD §13.4, ADV-06): nothing else is sent
         text = payloads.render_strategy(payloads.StrategyInput(vm, estimates, plan, findings))
-        return self._redact(text, [vm.name])
+        return self._for_strategy(text, vm, destination_name, destination)
 
     async def recommend_strategy(
         self,
@@ -123,10 +144,14 @@ class Advisor:
         estimates: Sequence[Estimate],
         plan: Plan,
         findings: Sequence[Finding] = (),
+        destination: str = "the destination",
+        destination_name: str | None = None,
     ) -> Advice | None:
         """Ask Jev to break a tie (or pick when nothing meets the SLO); ``None`` when no advice is
-        needed. Returns the advice - or why Jev gave none; ``decide()`` takes the decision
-        (SDD §14.2, §14.4)."""
+        needed. ``destination`` describes the destination by kind and series
+        (``destination_descriptor``), and ``destination_name``, the provider's own name, never
+        leaves (SDD §1 naming, §13.4). Returns the advice - or why Jev gave none; ``decide()``
+        takes the decision (SDD §14.2, §14.4)."""
         scope = advisor_scope(estimates, plan.selection_policy)
         if not scope:
             return None
@@ -140,11 +165,16 @@ class Advisor:
             return None  # nothing to decide: jev_decide needs at least two candidates
         # the jev_decide arguments, built even when Jev is off: they are the input snapshot (§14.5)
         arguments: dict[str, Any] = {
-            "decision": self._redact(
-                f"Which migration strategy should be used for VM {vm.name} moving to RHOSO 18.0?",
-                [vm.name],
+            # the VM's name alone through the replacement: never the descriptor the question holds
+            # ("moving to RHOSO 18.0 18.0?" for a provider named RHOSO, review RV21-10)
+            "decision": (
+                "Which migration strategy should be used for VM "
+                f"{self._for_strategy(vm.name, vm, destination_name, destination)} moving to "
+                f"{destination}?"
             ),
-            "evidence": self._strategy_evidence(vm, estimates, plan, findings),
+            "evidence": self._strategy_evidence(
+                vm, estimates, plan, findings, destination_name, destination
+            ),
             "priorities": (
                 f"Minimize downtime within the SLO of {plan.downtime_slo_s} s; prefer the "
                 "simpler strategy when downtimes differ by less than 10 %; never pick an "

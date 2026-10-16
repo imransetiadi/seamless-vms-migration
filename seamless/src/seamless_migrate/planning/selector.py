@@ -14,6 +14,11 @@ from ..domain.enums import (
 )
 from ..domain.models import Estimate, Finding, Plan, VMRef
 from ..storage import SUPPORTED, StorageError, resolve_destination, split_host
+from .platforms import parse_microversion
+
+#: the compute microversion the handover updates the source server's delete_on_termination with
+#: (SDD §7.3, §21.4; executors.handover.KEEP_MICROVERSION): a source below it cannot hand over
+HANDOVER_COMPUTE_FLOOR = "2.85"
 
 #: Two downtimes tie when they differ by less than 10 % (of the smaller one) or less than 60 s.
 TIE_RELATIVE = 0.10
@@ -35,11 +40,13 @@ def eligibility(
     src_caps: Mapping[str, Any],
     dst_caps: Mapping[str, Any],
     findings: Sequence[Finding] = (),
+    destination: str = "the destination",
 ) -> dict[Strategy, list[str]]:
     """Map every strategy applicable to the source family to its ineligibility reasons.
 
     An empty list means eligible. ``src_caps``/``dst_caps`` are the providers' capabilities plus
-    ``conversion_host`` (truthy when the provider has a conversion host configured).
+    ``conversion_host`` (truthy when the provider has a conversion host configured); a reason
+    about the destination cloud names its provider, ``destination`` (SDD §1 naming).
     """
     kind = ProviderKind(source_kind)
     out: dict[Strategy, list[str]] = {s: [] for s in strategies_for(kind)}
@@ -61,7 +68,7 @@ def eligibility(
         if not src_caps.get("conversion_host"):
             copy_reasons.append("no conversion host configured on the source provider")
         if not dst_caps.get("conversion_host"):
-            copy_reasons.append("no conversion host configured on the destination provider")
+            copy_reasons.append(f"no conversion host configured on {destination}")
         # through Nova os-migrate recreates each port with exactly one fixed IP and raises for any
         # other count, after the source is stopped (SDD §9.2); a dual-stack port is two addresses.
         # Through Neutron every port keeps all its fixed IPs, none included (§6.6).
@@ -93,7 +100,7 @@ def eligibility(
         )
         if unmapped:
             handover.append(
-                "volume type(s) without a RHOSO backend in handover.backend_map: "
+                f"volume type(s) without a backend of {destination} in handover.backend_map: "
                 + ", ".join(unmapped)
             )
         if multiattach:
@@ -108,11 +115,20 @@ def eligibility(
         encrypted = [d for d in vm.disks if d.encrypted]
         if encrypted:
             handover.append(f"encrypted disk(s), which Cinder cannot unmanage: {_ids(encrypted)}")
-        handover.extend(_storage_reasons(vm, plan, src_caps, dst_caps))
+        handover.extend(_storage_reasons(vm, plan, src_caps, dst_caps, destination))
         if not src_caps.get("admin"):
             handover.append("admin rights are required on the source cloud")
         if not dst_caps.get("admin"):
-            handover.append("admin rights are required on the destination cloud")
+            handover.append(f"admin rights are required on {destination}")
+        # a gap this strategy alone has is its eligibility reason, never a finding; the update goes
+        # to the source server, the destination never receives it (SDD §9.2, §21.4, RV18-07)
+        compute = parse_microversion(src_caps.get("compute_microversion"))
+        if compute is not None and compute < parse_microversion(HANDOVER_COMPUTE_FLOOR):
+            handover.append(
+                f"the source's compute API {src_caps['compute_microversion']} is below "
+                f"{HANDOVER_COMPUTE_FLOOR} (the handover's delete_on_termination update of the "
+                "source server)"
+            )
 
     for finding in findings:
         if finding.severity == Severity.blocker:
@@ -127,9 +143,14 @@ def _ports(nics: Sequence[tuple[str, list[str]]]) -> str:
 
 
 def _storage_reasons(
-    vm: VMRef, plan: Plan, src_caps: Mapping[str, Any], dst_caps: Mapping[str, Any]
+    vm: VMRef,
+    plan: Plan,
+    src_caps: Mapping[str, Any],
+    dst_caps: Mapping[str, Any],
+    destination: str = "the destination",
 ) -> list[str]:
-    """Per-volume driver-family checks of a handover (SDD §7.3.1), where the pools are known.
+    """Per-volume driver-family checks of a handover (SDD §7.3.1), where the pools are known;
+    a reason about the destination cloud names its provider, ``destination`` (SDD §1 naming).
 
     A disk whose pool the source does not list is left to the executor's check before the stop.
     """
@@ -149,7 +170,9 @@ def _storage_reasons(
             if family not in SUPPORTED:
                 resolve_destination(family, None, target or "", [])
             elif target and dst_backends:
-                resolve_destination(family, split_host(disk.pool)[1], target, dst_backends)
+                resolve_destination(
+                    family, split_host(disk.pool)[1], target, dst_backends, destination
+                )
         except StorageError as exc:
             reasons.append(f"{disk.name or disk.id}: {exc}")
     return reasons

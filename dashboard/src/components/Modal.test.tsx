@@ -116,7 +116,7 @@ describe('Modal (SDD §16)', () => {
       <Modal open onClose={onClose} labelledBy="title">
         <h2 id="title">New plan</h2>
         <p>
-          <Term definition="VOL_ENCRYPTED: The Barbican key must be re-created at RHOSO.">Encrypted volume</Term>
+          <Term definition="VOL_ENCRYPTED: The Barbican key must be re-created on the destination.">Encrypted volume</Term>
         </p>
         <Button disabledReason="Select VMs in the table first.">Create plan</Button>
       </Modal>,
@@ -134,7 +134,7 @@ describe('Modal (SDD §16)', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
     // a term's definition, shown by a tap
     await user.click(screen.getByRole('button', { name: 'Encrypted volume' }));
-    expect(screen.getByRole('tooltip')).toHaveTextContent('VOL_ENCRYPTED: The Barbican key must be re-created at RHOSO.');
+    expect(screen.getByRole('tooltip')).toHaveTextContent('VOL_ENCRYPTED: The Barbican key must be re-created on the destination.');
     await user.keyboard('{Escape}');
     expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
     expect(onClose).toHaveBeenCalledTimes(1);

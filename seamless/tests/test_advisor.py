@@ -1,5 +1,9 @@
 import json
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -7,11 +11,13 @@ import pytest
 from seamless_migrate.ai.advisor import TIER_CLASSES, VERIFICATION_CLAIMS, Advisor
 from seamless_migrate.ai.decision import decide, default_policy
 from seamless_migrate.ai.jev import JevClient
+from seamless_migrate.ai.payloads import data_sent
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import DecisionStatus, Strategy
-from seamless_migrate.domain.models import Estimate
+from seamless_migrate.domain.models import Estimate, HandoverConfig
+from seamless_migrate.planning.selector import eligibility
 from seamless_migrate.planning.waves import TIERS
-from tests.factories import make_plan, make_vm
+from tests.factories import make_disk, make_plan, make_vm
 from tests.jev_fakes import fixture_responder, load_fixture, session_factory
 
 ON = Settings(jev_mode="stdio")
@@ -441,3 +447,161 @@ async def test_the_console_excerpt_leaves_only_for_an_on_prem_model_or_when_allo
     assert note.data["console_sent"] is sent
     if not sent:
         assert "console excerpt stayed in this installation" in note.summary
+
+
+@pytest.mark.parametrize("redact_names", [False, True])
+async def test_nothing_the_advisor_sends_to_jev_carries_the_destination_providers_name(
+    redact_names,
+):
+    """SDD §1 naming, §13.4 (review RV20-01): a provider's name is operator free text. The
+    question names the destination by kind and series, and the evidence - which quotes the
+    eligibility reasons that name the provider for the operators who read them (T6) - has the name
+    replaced, whatever SEAMLESS_MEMORY_REDACT_NAMES says; data-sent declares it so."""
+    name = "ACME Bank - Jakarta DC3 (prod)"
+    descriptor = "a community OpenStack 2026.2 destination"
+    vm = make_vm(disks=[make_disk(id="vol-1", volume_type="ceph-ssd")])
+    plan = make_plan(downtime_slo_s=900)
+    caps = {"conversion_host": True, "admin": True}
+    reasons = eligibility(vm, "openstack", plan, caps, caps, (), name)[Strategy.storage_handover]
+    assert any(name in reason for reason in reasons)  # what an operator reads names it (T6)
+    handover = est(Strategy.storage_handover, 100, eligible=False).model_copy(
+        update={"reasons": reasons}
+    )
+    estimates = [est(Strategy.cold, 1000, slo=900), est(Strategy.warm, 950, slo=900), handover]
+    settings = Settings(jev_mode="http", memory_redact_names=redact_names)
+    advice = await Advisor(None, settings).recommend_strategy(
+        vm, estimates, plan, [], descriptor, name
+    )
+    assert advice is not None and advice.request is not None
+    assert name not in json.dumps(advice.request)
+    assert advice.request["decision"].endswith(f"moving to {descriptor}?")
+    assert f"without a backend of {descriptor}" in advice.request["evidence"]
+    listed = next(i for i in data_sent(settings) if i["decision_type"] == "migration_strategy")
+    label = next(f["label"] for f in listed["fields"] if f["key"] == "decision")
+    assert "kind and series" in label
+
+
+@pytest.mark.parametrize(
+    ("vm_name", "provider", "redact_names"),
+    [
+        ("dc3", "jakarta-dc3-prod", True),  # the VM's name is a word of the provider's
+        ("jakarta-dc3-prod", "jakarta-dc3-prod", False),  # the VM bears the provider's very name
+        ("jakarta-dc3-prod", "jakarta-dc3-prod", True),  # equal names: the provider's wins
+    ],
+)
+async def test_no_part_of_the_providers_name_reaches_jev_beside_the_vms(
+    vm_name, provider, redact_names
+):
+    """SDD §13.4 (review RV21-02): the VM's and the destination provider's names are replaced in
+    one pass, longest first - a VM name redacted first left "jakarta-[vm]-prod" to send - and the
+    provider's wins: its name never leaves, as the VM's name either."""
+    vm = make_vm(name=vm_name)
+    plan = make_plan(downtime_slo_s=900, handover=HandoverConfig(enabled=True, backend_map={}))
+    caps = {"conversion_host": True, "admin": False}
+    reasons = eligibility(vm, "openstack", plan, caps, caps, (), provider)
+    handover = est(Strategy.storage_handover, 100, eligible=False).model_copy(
+        update={"reasons": reasons[Strategy.storage_handover]}
+    )
+    estimates = [est(Strategy.cold, 1000, slo=900), est(Strategy.warm, 950, slo=900), handover]
+    settings = Settings(jev_mode="http", memory_redact_names=redact_names)
+    descriptor = "a community OpenStack 2026.2 destination"
+    advice = await Advisor(None, settings).recommend_strategy(
+        vm, estimates, plan, [], descriptor, provider
+    )
+    assert advice is not None and advice.request is not None
+    sent = json.dumps(advice.request)
+    assert "jakarta" not in sent, advice.request
+    assert f"admin rights are required on {descriptor}" in advice.request["evidence"]
+
+
+@pytest.mark.parametrize("redact_names", [True, False])
+async def test_the_strategy_request_drops_secrets_and_keeps_the_vms_name_only_unredacted(
+    redact_names,
+):
+    """SDD §13.4: the strategy request leaves through the secret patterns whatever the setting,
+    and with the VM's name replaced only while SEAMLESS_MEMORY_REDACT_NAMES is on - the one pass
+    of review RV21-02 keeps both."""
+    leaky = est(Strategy.storage_handover, 100, eligible=False).model_copy(
+        update={"reasons": ["probe said password=FakePass-Alpha1"]}
+    )
+    estimates = [est(Strategy.cold, 1000, slo=900), est(Strategy.warm, 950, slo=900), leaky]
+    settings = Settings(jev_mode="http", memory_redact_names=redact_names)
+    advice = await Advisor(None, settings).recommend_strategy(
+        make_vm(name="web-01"), estimates, make_plan(downtime_slo_s=900), []
+    )
+    assert advice is not None and advice.request is not None
+    sent = json.dumps(advice.request)
+    assert "FakePass-Alpha1" not in sent
+    assert "probe said password=[REDACTED]" in advice.request["evidence"]
+    assert ("web-01" in sent) is not redact_names
+    assert ("for VM [vm] moving" in advice.request["decision"]) is redact_names
+
+
+@pytest.mark.parametrize(
+    ("provider", "descriptor"),
+    [("RHOSO", "RHOSO 18.0"), ("OpenStack", "a community OpenStack 2026.2 destination")],
+)
+async def test_the_question_names_the_destination_once_whatever_its_provider_is_called(
+    provider, descriptor
+):
+    """SDD §1 naming, §13.4 (review RV21-10): the provider's name is replaced in the VM's name the
+    question carries, never in the descriptor it puts there - a provider named "RHOSO" gave
+    "moving to RHOSO 18.0 18.0?"."""
+    advice = await Advisor(None, Settings(jev_mode="http")).recommend_strategy(
+        make_vm(name="web-01"), TIE, make_plan(downtime_slo_s=1200), [], descriptor, provider
+    )
+    assert advice is not None and advice.request is not None
+    assert advice.request["decision"] == (
+        f"Which migration strategy should be used for VM web-01 moving to {descriptor}?"
+    )
+
+
+@pytest.mark.parametrize(
+    ("vm_name", "provider", "descriptor"),
+    [
+        ("RHOSO", "RHOSO prod (Jakarta)", "RHOSO 18.0"),
+        ("OpenStack", "Hibiscus DC3 (Jakarta)", "a community OpenStack 2026.2 destination"),
+    ],
+)
+async def test_the_vms_redaction_never_splits_the_descriptor_the_providers_name_became(
+    vm_name, provider, descriptor
+):
+    """SDD §13.4 (review RV22-04): with names redacted, a VM named like a word of the descriptor
+    never reaches into it - Jev was told the destination is "[vm] 18.0"."""
+    vm = make_vm(name=vm_name)
+    plan = make_plan(downtime_slo_s=900, handover=HandoverConfig(enabled=True, backend_map={}))
+    caps = {"conversion_host": True, "admin": False}
+    reasons = eligibility(vm, "openstack", plan, caps, caps, (), provider)
+    handover = est(Strategy.storage_handover, 100, eligible=False).model_copy(
+        update={"reasons": reasons[Strategy.storage_handover]}
+    )
+    estimates = [est(Strategy.cold, 1000, slo=900), est(Strategy.warm, 950, slo=900), handover]
+    settings = Settings(jev_mode="http", memory_redact_names=True)
+    advice = await Advisor(None, settings).recommend_strategy(
+        vm, estimates, plan, [], descriptor, provider
+    )
+    assert advice is not None and advice.request is not None
+    assert f"admin rights are required on {descriptor})" in advice.request["evidence"]
+
+
+def test_the_strategy_request_is_the_same_whatever_the_processs_hash_seed():
+    """SDD §13.4, §14.5 (review RV22-04): the input snapshot is what is sent, content-addressed -
+    two names of equal length were ordered by the process's string hash seed, so VM "RHOSO" and
+    provider "DC-03" sent "[vm] 18.0" from one process and "RHOSO 18.0" from another."""
+    script = (
+        "from seamless_migrate.ai.advisor import Advisor\n"
+        "from seamless_migrate.config import Settings\n"
+        "from tests.factories import make_vm\n"
+        "advisor = Advisor(None, Settings(jev_mode='http', memory_redact_names=True))\n"
+        "print(advisor._for_strategy('admin rights are required on DC-03', make_vm(name='RHOSO'),"
+        " 'DC-03', 'RHOSO 18.0'))\n"
+    )
+    root = Path(__file__).parents[1]
+    seen = set()
+    for seed in ("0", "1"):
+        env = {**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": f"{root / 'src'}:{root}"}
+        run = subprocess.run(
+            [sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True
+        )
+        seen.add(run.stdout.strip())
+    assert seen == {"admin rights are required on RHOSO 18.0"}, seen

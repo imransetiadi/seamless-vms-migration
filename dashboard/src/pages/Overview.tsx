@@ -36,6 +36,7 @@ import { strategyLabel, TONE_CLASSES } from '../lib/status';
 import { nothingMigrated, phaseCounts, planDone } from '../lib/planDone';
 import { usePageTitle } from '../lib/usePageTitle';
 import { useNow } from '../lib/useNow';
+import { DESTINATIONS } from '../lib/platforms';
 
 const ATTENTION_ICONS: Record<'danger' | 'warning' | 'info', LucideIcon> = {
   danger: CircleX,
@@ -59,7 +60,7 @@ function isDown(m: MigrationSummary): boolean {
 
 /** What the VM is waiting for while it is down, after the strategy and plan. */
 const DOWN_DETAIL: Partial<Record<Phase, string>> = {
-  verifying: ', checking the boot on RHOSO',
+  verifying: ', checking the boot on the destination',
   rolling_back: ', rolling back, restarting the source VM',
   failed: ', failed with the source stopped: roll back or retry',
 };
@@ -83,7 +84,7 @@ function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migratio
       title="Downtime now"
       description={
         active.length
-          ? `${active.length} VM${active.length === 1 ? ' is' : 's are'} down; each clock stops when the VM boots verified on RHOSO or its source runs again.${demoNote ? ` ${demoNote}.` : ''}`
+          ? `${active.length} VM${active.length === 1 ? ' is' : 's are'} down; each clock stops when the VM boots verified on the destination or its source runs again.${demoNote ? ` ${demoNote}.` : ''}`
           : 'VMs whose source is stopped appear here with a running clock.'
       }
     >
@@ -305,7 +306,7 @@ export default function Overview() {
     <>
       <PageHeader
         title="Overview"
-        description="Live state of VM migrations into Red Hat OpenStack Services on OpenShift 18.0."
+        description={`Live state of VM migrations into ${DESTINATIONS}.`}
         actions={
           <SelectField
             label="Plan"

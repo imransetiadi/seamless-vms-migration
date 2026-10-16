@@ -1,3 +1,10 @@
+import ast
+import json
+import re
+from pathlib import Path
+
+import pytest
+
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Severity, Strategy
 from seamless_migrate.domain.models import (
     DEFAULT_PRESTAGE,
@@ -6,7 +13,9 @@ from seamless_migrate.domain.models import (
     Mappings,
     Nic,
     VerificationConfig,
+    VMRef,
 )
+from seamless_migrate.planning.platforms import destination_release
 from seamless_migrate.planning.preflight import (
     CATALOG,
     DestinationInventory,
@@ -16,10 +25,16 @@ from seamless_migrate.planning.preflight import (
     resource_demand,
     run_preflight,
 )
+from seamless_migrate.planning.selector import eligibility
+from seamless_migrate.providers.openstack import OpenStackProvider
+from tests.cloud_support import AUTH_URL, InProcessCloud
 from tests.factories import make_disk, make_plan, make_provider, make_vm
 
 SRC = make_provider()
-DST = make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination)
+# the destination provider a message about the destination cloud names (SDD §1 naming, plan T6)
+DST = make_provider(
+    id="dst-rhoso", name="RHOSO 18.0", kind=ProviderKind.rhoso, role=ProviderRole.destination
+)
 
 
 def src_inv(**kw) -> SourceInventory:
@@ -92,6 +107,8 @@ def test_catalog_is_complete():
         "MAP_VOLUME_TYPE_MISSING",
         "DST_QUOTA_INSUFFICIENT",
         "DST_PROJECT_MISSING",
+        "DST_CAPABILITY_MISSING",
+        "DST_RELEASE_OUTSIDE_SUPPORT",
         "NET_MTU_SHRINK",
         "NET_SRIOV_PORT",
         "NET_PORT_IPS",
@@ -191,9 +208,11 @@ def test_finding_dst_project_missing_and_image_root_quota():
     bad = make_plan(mappings=Mappings(projects={"finance": "fin-rhoso"}))
     f = only(check(vm, plan=bad, dst=dst), "DST_PROJECT_MISSING")
     assert f.severity == Severity.blocker and "fin-rhoso" in f.message
+    # both messages name the destination provider (SDD §1 naming, §9.3, review RV20-05)
+    assert "which RHOSO 18.0 does not list" in f.message
     # unmapped, no same-named project, several destination projects: nothing to charge
     f = only(check(vm, dst=dst), "DST_PROJECT_MISSING")
-    assert "2 projects" in f.message
+    assert "and RHOSO 18.0 has 2 projects" in f.message
     # a mapping to an existing project, or a single destination project, is fine
     good = make_plan(mappings=Mappings(projects={"finance": "finance-rhoso"}))
     assert all(x.code != "DST_PROJECT_MISSING" for x in check(vm, plan=good, dst=dst))
@@ -479,7 +498,7 @@ def test_finding_map_nic_override_invalid_names_each_problem():
     )
     assert f.severity == Severity.blocker
     assert "fa:16:3e:00:00:99: the VM has no NIC with this MAC" in f.message
-    assert "fa:16:3e:00:00:01: RHOSO has no network 'rhoso-missing'" in f.message
+    assert "fa:16:3e:00:00:01: RHOSO 18.0 has no network 'rhoso-missing'" in f.message
     assert "fa:16:3e:00:00:02: 172.16.0.9 lies in no subnet of 'app-net'" in f.message
     assert "fa:16:3e:00:00:03: 10.0.0.5 also goes to db-01" in f.message
     # addresses only, on a network pre-staging would create: its subnets cannot be checked yet
@@ -489,8 +508,8 @@ def test_finding_map_nic_override_invalid_names_each_problem():
     )
     later = make_plan(nic_overrides={"vm-3": {"fa:16:3e:00:00:05": {"fixed_ips": ["10.9.0.6"]}}})
     f = only(check(lost, plan=later, dst=override_dst()), "MAP_NIC_OVERRIDE_INVALID")
-    assert "fa:16:3e:00:00:05: RHOSO has no network 'lost-net' yet" in f.message
-    assert "name an existing RHOSO network" in f.message
+    assert "fa:16:3e:00:00:05: RHOSO 18.0 has no network 'lost-net' yet" in f.message
+    assert "name an existing network of RHOSO 18.0" in f.message
     vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
     vmw = only(check(vm, plan=plan, dst=override_dst(), source=vmware), "MAP_NIC_OVERRIDE_INVALID")
     assert "migration kit keeps the guest's network settings" in vmw.message
@@ -1022,6 +1041,488 @@ def test_finding_net_address_refused_checks_a_nics_own_addresses_on_its_network(
     assert "NET_ADDRESS_REFUSED" in [x.code for x in check(vm, dst=gone, source=vmware)]
 
 
+COMMUNITY = make_provider(
+    id="dst-flamingo",
+    name="OpenStack 2026.1 Flamingo (DC2)",
+    kind=ProviderKind.openstack,
+    role=ProviderRole.destination,
+    distribution="openstack_community",
+)
+
+
+def community_caps(**kw):
+    """A destination check report (SDD §10) of a Tier 1 community cloud, changed by ``kw``."""
+    caps = {
+        "admin": True,
+        "roles": ["admin", "member", "reader"],
+        "compute_microversion": "2.100",
+        "block_storage_microversion": "3.71",
+        "release_range": ["2025.1", "2025.2"],
+        "release": None,
+        "support_tier": {"tier": "tier1", "reason": None, "declared_outside_range": False},
+        "policy_profile": "secure_rbac",
+        "tls": True,
+        "plain_http": [],
+    }
+    caps.update(kw)
+    return caps
+
+
+def test_finding_dst_capability_missing():
+    """SDD §21.4: capabilities block, names never do. A maximum below the floor every strategy
+    needs - compute 2.60, block storage 3.0 - blocks whatever the series; one the check could not
+    read is not judged. A gap one strategy alone has is that strategy's eligibility reason
+    (test_storage_handover_needs_the_sources_compute_2_85), never a finding."""
+
+    def found(destination=COMMUNITY, **caps):
+        findings = check(destination=destination, dst_caps=community_caps(**caps))
+        return [f for f in findings if f.code == "DST_CAPABILITY_MISSING"]
+
+    assert found() == []
+    every = found(compute_microversion="2.53", block_storage_microversion="2.0")
+    assert len(every) == 1 and every[0].severity == Severity.blocker and every[0].remediation
+    assert every[0].strategies == []  # every strategy
+    # no strategy avoids a floor every strategy needs: none is offered (review 18, nit 7)
+    assert "strategy" not in every[0].remediation, every[0].remediation
+    assert every[0].message == (
+        "OpenStack 2026.1 Flamingo (DC2) lacks what every strategy needs: compute API 2.53, "
+        "below 2.60 (multi-attach); block storage API 2.0, below 3.0."
+    )
+    # the handover's 2.85 is the source's, the selector's eligibility reason (SDD §21.4)
+    assert found(compute_microversion="2.79") == []
+    # a Tier 3 or Outside cloud with every capability runs (the tier only warns)
+    outside = {"tier": "outside", "reason": "newer_than_validated", "declared_outside_range": False}
+    assert found(compute_microversion="2.105", support_tier=outside) == []
+    # a maximum the check could not read is not judged; nor is a check report without them
+    assert found(compute_microversion="", block_storage_microversion="") == []
+    assert [
+        f for f in check(destination=COMMUNITY, dst_caps={}) if f.code == "DST_CAPABILITY_MISSING"
+    ] == []
+    assert [f for f in check(destination=COMMUNITY) if f.code == "DST_CAPABILITY_MISSING"] == []
+    # RHOSO 18.0 is judged by the same floor
+    assert (
+        found(destination=DST, compute_microversion="2.95", block_storage_microversion="3.70") == []
+    )
+
+
+TIER3 = {"tier": "tier3", "reason": "end_of_life", "declared_outside_range": False}
+
+
+@pytest.mark.parametrize(
+    "release_range, support_tier, release, message",
+    [
+        (
+            ["2024.1", "2024.2"],
+            TIER3,
+            None,
+            "OpenStack 2026.1 Flamingo (DC2) runs 2024.1 – 2024.2, read as Tier 3 (End of Life "
+            "upstream): no Seamless release validated it there. The capability checks still "
+            "apply.",
+        ),
+        (
+            [],
+            {"tier": "outside", "reason": "below_floor", "declared_outside_range": False},
+            None,
+            "OpenStack 2026.1 Flamingo (DC2) runs a series older than 2023.1, the support window's "
+            "floor: no Seamless release validated it. The capability checks still apply.",
+        ),
+        (
+            [],
+            {"tier": "outside", "reason": "newer_than_validated", "declared_outside_range": False},
+            None,
+            # no Seamless release validated 2026.2 yet: it is the window's newest (review 18, nit 8)
+            "OpenStack 2026.1 Flamingo (DC2) runs a series newer than 2026.2, the newest series "
+            "of the support window: no Seamless release validated it. The capability checks still "
+            "apply.",
+        ),
+        (
+            [],
+            {"tier": "outside", "reason": "not_detected", "declared_outside_range": False},
+            None,
+            "The series of OpenStack 2026.1 Flamingo (DC2) could not be detected (its compute API "
+            "maximum was not read): no Seamless release can be said to have validated it. The "
+            "capability checks still apply.",
+        ),
+        (
+            ["2026.2"],
+            {"tier": "tier1", "reason": None, "declared_outside_range": True},
+            "2025.1",
+            "OpenStack 2026.1 Flamingo (DC2) declares series 2025.1, but its APIs read as 2026.2: "
+            "correct the declared series; the tier is the one its APIs read (Tier 1).",
+        ),
+        (
+            ["2024.1", "2024.2"],
+            {**TIER3, "declared_outside_range": True},
+            "2026.2",
+            "OpenStack 2026.1 Flamingo (DC2) runs 2024.1 – 2024.2, read as Tier 3 (End of Life "
+            "upstream): no Seamless release validated it there. The capability checks still "
+            "apply. It declares series 2026.2, which its APIs do not run: correct the declared "
+            "series.",
+        ),
+    ],
+    ids=[
+        "tier 3",
+        "below the floor",
+        "newer",
+        "not detected",
+        "a declared series outside",
+        "tier 3 and a declared series outside",
+    ],
+)
+def test_finding_dst_release_outside_support(release_range, support_tier, release, message):
+    """SDD §21.4, §10.1: a Tier 3 or Outside destination, or one whose declared series its APIs
+    contradict (QASuite LAB-D02), is warned of - never blocked."""
+    destination = COMMUNITY.model_copy(update={"release": release})
+    caps = community_caps(release_range=release_range, support_tier=support_tier)
+    f = only(check(destination=destination, dst_caps=caps), "DST_RELEASE_OUTSIDE_SUPPORT")
+    assert f.severity == Severity.warning and f.strategies == [] and f.remediation
+    assert f.message == message
+
+
+@pytest.mark.parametrize(
+    "release, compute", [("2026.2", ""), ("2022.2", "2.93"), ("2027.1", "2.105")]
+)
+def test_following_the_remediation_never_asks_to_correct_a_series_nothing_contradicts(
+    release, compute
+):
+    """Review RV18-06: the warning's remediation asks for the series when the APIs cannot tell
+    it; declared so - with nothing detected, or a correct series below or above the window -, the
+    next validation told the operator its APIs do not run it: "correct the declared series"."""
+    declared = COMMUNITY.model_copy(update={"release": release})
+    caps = destination_release("openstack", release, None, compute, "")
+    told = [
+        f.message
+        for f in check(destination=declared, dst_caps=caps)
+        if f.code == "DST_RELEASE_OUTSIDE_SUPPORT" and "correct the declared series" in f.message
+    ]
+    assert told == []
+
+
+def test_declaring_the_series_settles_the_unknown_profile_the_refusal_asks_about():
+    """Review RV18-06: under the unknown profile NET_PORT_NOT_PERMITTED asks to check the provider
+    or declare its policy profile or series (review 19); with nothing detected a declared series
+    was ignored, so the service role stayed refused. Declared, 2026.2 reads secure-RBAC (SDD
+    §10.1, §21.5)."""
+    service = {"roles": ["service", "member"]}
+    before = _another_projects_port(
+        {**destination_release("openstack", None, None, "", ""), **service}
+    )
+    # a check is allowed while a plan runs, a PATCH that declares is not (SDD §12, §21.5)
+    assert (
+        "check the provider so its series is detected, or declare its policy profile or series"
+        in before.message
+    )
+    after = _another_projects_port(
+        {**destination_release("openstack", "2026.2", None, "", ""), **service}
+    )
+    assert after is None, after.message
+
+
+def test_a_tier_3_warning_names_the_series_the_check_settled_on():
+    """Review RV18-11: a declared series inside the range is the series the check settles on
+    (release) and decides the tier, yet the Tier 3 sentence named the range - "runs 2024.1 –
+    2024.2" for a declared 2024.2, though 2024.1 is Tier 2, not End of Life (SDD §10.1)."""
+    declared = COMMUNITY.model_copy(update={"release": "2024.2"})
+    caps = destination_release("openstack", "2024.2", None, "2.96", "")
+    found = only(check(destination=declared, dst_caps=caps), "DST_RELEASE_OUTSIDE_SUPPORT")
+    assert found.message.startswith(
+        "OpenStack 2026.1 Flamingo (DC2) runs 2024.2, read as Tier 3 (End of Life upstream)"
+    ), found.message
+
+
+def test_no_release_warning_for_a_supported_or_validated_destination():
+    for tier in ("tier1", "tier2"):
+        caps = community_caps(
+            support_tier={"tier": tier, "reason": None, "declared_outside_range": False}
+        )
+        assert "DST_RELEASE_OUTSIDE_SUPPORT" not in [
+            f.code for f in check(destination=COMMUNITY, dst_caps=caps)
+        ]
+    validated = {"tier": "validated", "reason": None, "declared_outside_range": False}
+    assert "DST_RELEASE_OUTSIDE_SUPPORT" not in [
+        f.code for f in check(destination=DST, dst_caps=community_caps(support_tier=validated))
+    ]
+    # RHOSO 18.0 never, whatever series its provider declares (a report the check never makes)
+    declared = DST.model_copy(update={"release": "2026.2"})
+    stale = community_caps(support_tier={**validated, "declared_outside_range": True})
+    assert "DST_RELEASE_OUTSIDE_SUPPORT" not in [
+        f.code for f in check(destination=declared, dst_caps=stale)
+    ]
+    # a check report from before the series was reported (no support_tier) is not judged
+    assert "DST_RELEASE_OUTSIDE_SUPPORT" not in [
+        f.code for f in check(destination=COMMUNITY, dst_caps={"admin": True})
+    ]
+
+
+def _another_projects_port(caps, destination=DST):
+    """NET_PORT_NOT_PERMITTED, or None, for a NIC that keeps its address on another project's
+    shared network, judged with ``destination``'s check report ``caps`` (SDD §6.6, §9.3)."""
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[Nic(network="app-net", mac="FA:16:3E:00:00:01", fixed_ips=["10.0.0.5"])],
+    )
+    plan = make_plan(mappings=Mappings(networks={"app-net": "rhoso-net"}))
+    shared = net("p", "rhoso-net", own=False, project_id="project-admin")
+    dst = resolved_dst([shared], [subnet_of("p", "rhoso-net", "10.0.0.0/24")])
+    found = [
+        f
+        for f in check(vm, plan=plan, dst=dst, destination=destination, dst_caps=caps)
+        if f.code == "NET_PORT_NOT_PERMITTED"
+    ]
+    return found[0] if found else None
+
+
+def test_finding_net_port_not_permitted_counts_service_under_secure_rbac():
+    """SDD §21.5, §6.6: under the secure-RBAC defaults (2023.2 on) Neutron lets the admin or
+    service role, or the network's project, choose a port's address on another project's network
+    - and advsvc no longer."""
+    secure = {"policy_profile": "secure_rbac"}
+    for roles in (["service", "member"], ["admin"]):
+        assert _another_projects_port({**secure, "roles": roles}) is None, roles
+    for roles in (["advsvc", "member"], ["member", "reader"]):
+        refused = _another_projects_port({**secure, "roles": roles})
+        assert refused is not None and refused.severity == Severity.blocker, roles
+        assert refused.message == (
+            "The credential of RHOSO 18.0 may not put these NICs on their network: "
+            "fa:16:3e:00:00:01 on 'rhoso-net' (project project-admin): Neutron's secure-RBAC "
+            "defaults let only the admin or service role, or that project, choose a port's address "
+            "or MAC there, and the credential's token has neither."
+        )
+
+
+def test_finding_net_port_not_permitted_counts_advsvc_only_under_the_legacy_profile():
+    """SDD §21.5, §6.6: advsvc counts under the legacy rules alone - also for an RHOSO 18.0
+    report that names no profile, legacy by its kind -, and an unknown profile counts only admin,
+    the role both count."""
+    for caps in ({"policy_profile": "legacy"}, {}):
+        assert _another_projects_port({**caps, "roles": ["advsvc"]}) is None, caps
+        refused = _another_projects_port({**caps, "roles": ["service", "member"]})
+        assert "Neutron lets only the admin or advsvc role" in refused.message, caps
+    unknown = {"policy_profile": "unknown"}
+    assert _another_projects_port({**unknown, "roles": ["admin"]}) is None
+    for roles in (["advsvc"], ["service"]):
+        refused = _another_projects_port({**unknown, "roles": roles})
+        assert refused is not None, roles
+        assert "the destination's policy profile is unknown, so only the admin role" in (
+            refused.message
+        ), roles
+    # a value the check never reports counts as unknown: admin alone
+    assert _another_projects_port({"policy_profile": "strict", "roles": ["advsvc"]}) is not None
+
+
+async def _real_check(tmp_path, **cloud):
+    """The check report of a community destination on an in-process cloud: Seamless's own
+    connect() over a real keystoneauth session (tests/cloud_support.py)."""
+    real = InProcessCloud(tmp_path, **cloud)
+    provider = COMMUNITY.model_copy(update={"endpoint": AUTH_URL, "cloud": "dst"})
+    report = await OpenStackProvider(provider, real.settings, connect_fn=real.connect).check()
+    return {**report, "conversion_host": True}
+
+
+async def test_a_real_tier_1_destination_is_not_warned_and_its_service_role_takes_the_port(
+    tmp_path,
+):
+    """Review RV18-01: a real 2026.2 cloud read "not detected" - DST_RELEASE_OUTSIDE_SUPPORT on
+    every VM, and its profile unknown, so NET_PORT_NOT_PERMITTED refused the service role SDD
+    §21.5 and Security.md C4-06 prescribe. Read through a real keystoneauth session, it is Tier 1
+    and secure-RBAC (SDD §21.3, §21.4, §21.5)."""
+    caps = await _real_check(tmp_path, compute="2.104", block_storage=None, roles=("service",))
+
+    findings = check(destination=COMMUNITY, dst_caps=caps)
+    assert [f.message for f in findings if f.code == "DST_RELEASE_OUTSIDE_SUPPORT"] == []
+    refused = _another_projects_port({**caps, "roles": ["service", "member"]})
+    assert refused is None, refused.message
+
+
+async def test_a_real_destination_below_the_compute_floor_is_blocked(tmp_path):
+    """Review RV18-01: a real cloud's compute maximum never parsed, so one below 2.60 was never
+    blocked (SDD §21.4)."""
+    caps = await _real_check(tmp_path, compute="2.53", block_storage="3.70")
+
+    found = only(check(destination=COMMUNITY, dst_caps=caps), "DST_CAPABILITY_MISSING")
+    assert "compute API 2.53, below 2.60" in found.message, found.message
+
+
+@pytest.mark.parametrize(
+    "declared, roles, refused",
+    [
+        ({"policy_profile": "secure_rbac"}, ["advsvc"], True),
+        ({"policy_profile": "secure_rbac"}, ["service"], False),
+        ({"release": "2026.2"}, ["advsvc"], True),  # its series' profile: secure-RBAC
+        ({"release": "2023.1"}, ["advsvc"], False),  # legacy
+        ({}, ["advsvc"], True),  # nothing declared: unknown, admin alone
+        ({}, ["admin"], False),
+    ],
+)
+def test_a_report_that_names_no_profile_reads_as_the_destinations_declarations(
+    declared, roles, refused
+):
+    """Review RV18-04: a check report that names no profile - reset by new credentials or a
+    provider change, or from before 0.2.0 - read legacy, so advsvc took a port on another
+    project's network of a declared secure-RBAC destination. It reads as the provider's
+    declarations alone (SDD §21.5)."""
+    destination = COMMUNITY.model_copy(update=declared)
+    found = _another_projects_port({"roles": roles}, destination)
+    assert (found is not None) is refused, found and found.message
+    # RHOSO 18.0: legacy by its kind, as before (D14)
+    assert _another_projects_port({"roles": ["advsvc"]}) is None
+
+
+PORT_REMEDIATION = (
+    "Send the NIC to a network of the credential's project: map its network to one, or set a NIC "
+    "override on the VM's migration page. Another project's shared network takes it once {role}. "
+    "An external network that is not shared needs the admin role: Nova attaches it for no other."
+)
+
+
+@pytest.mark.parametrize(
+    "profile, role",
+    [
+        (
+            "secure_rbac",
+            "the destination credential has the service role for the migration window "
+            "(Neutron's secure-RBAC defaults); admin is not needed for this",
+        ),
+        ("legacy", "the destination credential has the advsvc role (Neutron's legacy rules)"),
+        (
+            "unknown",
+            "a check of the provider detects its series, or the provider declares its policy "
+            "profile or series, so the check counts that profile's role: service under "
+            "secure-RBAC, advsvc under the legacy rules",
+        ),
+    ],
+    ids=["secure_rbac", "legacy", "unknown"],
+)
+def test_the_port_refusals_remediation_names_the_least_role_its_profile_counts(profile, role):
+    """Review RV18-10: the remediation sent every operator to the admin role, the over-privilege
+    Security.md C4-06 rules out ("never admin for this alone"): under secure-RBAC the service role
+    clears it. It names the least role the destination's policy profile counts (SDD §21.5)."""
+    refused = _another_projects_port({"policy_profile": profile, "roles": ["member"]})
+    assert refused.remediation == PORT_REMEDIATION.format(role=role)
+
+
+HIBISCUS = make_provider(
+    id="hibiscus-dc3",
+    name="OpenStack 2026.2 Hibiscus (DC3)",
+    kind=ProviderKind.openstack,
+    role=ProviderRole.destination,
+    distribution="kolla",
+)
+
+#: the findings whose message means the destination cloud, and whose message names its provider
+DESTINATION_FINDINGS = {
+    "MAP_NETWORK_PRESTAGED",
+    "MAP_FLAVOR_PRESTAGED",
+    "MAP_KEYPAIR_PRESTAGED",
+    "MAP_NETWORK_MISSING",
+    "MAP_FLAVOR_MISSING",
+    "MAP_VOLUME_TYPE_MISSING",
+    "DST_KEYPAIR_MISSING",
+    "NET_PORT_NOT_PERMITTED",
+    # review RV20-05
+    "DST_PROJECT_MISSING",
+    "DST_QUOTA_INSUFFICIENT",
+    "NET_MTU_SHRINK",
+    "DST_CAPABILITY_MISSING",
+    "DST_RELEASE_OUTSIDE_SUPPORT",
+}
+
+
+def _destination_findings(destination):
+    """Findings about ``destination``'s cloud, for VMs and plans that meet them (SDD §9.3)."""
+    found = []
+    # pre-staging creates a network and a flavor and imports a keypair
+    prestage = make_plan(prestage_resources=[*DEFAULT_PRESTAGE, "flavors", "keypairs"])
+    vm = make_vm(nics=[Nic(network="db-net", mtu=9000)], flavor="m1.custom", key_name="ops-key")
+    found += check(vm, plan=prestage, src=src_inv(keypairs=["ops-key"]), destination=destination)
+    # nothing pre-staged: a network, flavor, keypair and volume type the destination lacks
+    bare = make_plan(
+        prestage_resources=[],
+        mappings=Mappings(networks={"app-net": "nope-net"}, volume_types={"ceph-ssd": "nope"}),
+    )
+    vm = make_vm(
+        nics=[Nic(network="app-net"), Nic(network="db-net")],
+        flavor="m1.huge",
+        vcpus=64,
+        ram_mb=262144,
+        key_name="ops-key",
+        disks=[make_disk(volume_type="ceph-ssd"), make_disk(volume_type="ceph-hdd")],
+    )
+    found += check(vm, plan=bare, destination=destination)
+    # a flavor mapped to one the destination lacks
+    mapped = make_plan(mappings=Mappings(flavors={"m1.custom": "nope"}))
+    found += check(make_vm(flavor="m1.custom"), plan=mapped, destination=destination)
+    found.append(_another_projects_port({"roles": ["member"]}, destination))
+    # a project the destination does not list, one it lacks quota in, a smaller MTU (RV20-05)
+    found += check(
+        plan=make_plan(mappings=Mappings(projects={"finance": "finance-prod"})),
+        destination=destination,
+    )
+    big = make_vm(vcpus=4096, ram_mb=2**24)
+    found += check(big, dst=dst_inv(networks={"app-net": 1400}), destination=destination)
+    # capabilities below every strategy's floor, and a series no Seamless release validated
+    found += check(destination=destination, dst_caps=community_caps(compute_microversion="2.53"))
+    found += check(
+        destination=destination,
+        dst_caps=community_caps(release_range=["2024.1", "2024.2"], support_tier=TIER3),
+    )
+    return [f for f in found if f is not None]
+
+
+def test_no_user_facing_text_assumes_rhoso_for_a_community_destination():
+    """SDD §1 naming, §9.3, plan T6 (PRD FR-34): a finding's message names the destination
+    provider where it means the destination cloud - "do not exist in OpenStack 2026.2 Hibiscus
+    (DC3)" -, and its remediation, fixed by the catalog, says "the destination": no finding says
+    RHOSO for a community destination. This test covers the pre-flight's findings; the other texts
+    are guarded by test_every_text_names_the_destination_provider_by_its_label (the executors,
+    the orchestrator) and the dashboard's destination-wording.test.ts (review 20 docs nit)."""
+    assert [code for code, entry in CATALOG.items() if "RHOSO" in entry.remediation] == []
+    found = _destination_findings(HIBISCUS)
+    assert DESTINATION_FINDINGS <= {f.code for f in found}, sorted(
+        DESTINATION_FINDINGS - {f.code for f in found}
+    )
+    said = [
+        f"{f.code}: {f.message} {f.remediation or ''}"
+        for f in found
+        if "RHOSO" in (f.message + (f.remediation or ""))
+    ]
+    assert said == []
+    named = {f.code for f in found if HIBISCUS.name in f.message}
+    assert DESTINATION_FINDINGS <= named, sorted(DESTINATION_FINDINGS - named)
+
+
+#: the control plane's texts that are about the Red Hat product itself (SDD §1 naming): the demo's
+#: RHOSO 18.0 provider and the plan that moves to it
+PRODUCT_TEXTS = {
+    ("demo.py", "Finance apps (RHOSP 17.1 → RHOSO)"),
+    ("demo.py", "RHOSO 18.0"),
+    # what leaves for Jev names an RHOSO destination by the product itself (SDD §13.4, RV20-01)
+    ("planning/platforms.py", "RHOSO 18.0"),
+}
+
+
+def test_no_control_plane_text_says_rhoso_but_the_products_own():
+    """SDD §1 naming, plan T6: beside the findings, an executor's refusal or failure and an event
+    name the destination provider, the advisor's question names its kind and series (RV20-01), and
+    fixed texts say "the destination": of the control plane's string literals - docstrings and
+    comments aside - only the Red Hat product's own say RHOSO."""
+    root = Path(__file__).parents[1] / "src" / "seamless_migrate"
+    said = set()
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docstrings = {
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and ast.get_docstring(node, clean=False) is not None
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if "RHOSO" in node.value and id(node) not in docstrings:
+                    said.add((str(path.relative_to(root)), node.value))
+    assert said <= PRODUCT_TEXTS, sorted(said - PRODUCT_TEXTS)
+
+
 def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projects_network():
     """SDD §9.3, §6.6: another project's network takes a NIC only when it is shared with the
     credential's project or external, and from a token with the admin or advsvc role - Neutron's
@@ -1046,9 +1547,10 @@ def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projec
     f = only(found(shared, member), "NET_PORT_NOT_PERMITTED")
     assert f.severity == Severity.blocker and f.remediation
     assert f.message == (
-        "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
-        "'rhoso-net' (project project-admin): Neutron lets only the admin or advsvc role, or that "
-        "project, choose a port's address or MAC there, and the credential's token has neither."
+        "The credential of RHOSO 18.0 may not put these NICs on their network: "
+        "fa:16:3e:00:00:01 on 'rhoso-net' (project project-admin): Neutron lets only the admin or "
+        "advsvc role, or that project, choose a port's address or MAC there, and the credential's "
+        "token has neither."
     )
     assert only(found(external, member), "NET_PORT_NOT_PERMITTED").message == f.message
     # with the admin or advsvc role a shared network takes it, an unshared external one only from
@@ -1065,9 +1567,9 @@ def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projec
     for caps in (member, {"admin": True, "roles": ["admin"]}, None, {}):
         f = only(found(private, caps), "NET_PORT_NOT_PERMITTED")
         assert f.message == (
-            "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
-            "'rhoso-net' (project project-b): it is neither shared with the credential's project "
-            "nor external."
+            "The credential of RHOSO 18.0 may not put these NICs on their network: "
+            "fa:16:3e:00:00:01 on 'rhoso-net' (project project-b): it is neither shared with the "
+            "credential's project nor external."
         )
     # no reported roles (a destination checked by another implementation): that half is not judged
     for caps in (None, {"admin": True}):
@@ -1077,9 +1579,10 @@ def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projec
     assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(own, member)]
     own_external = net("x", "rhoso-net", project_id="project-me", shared=False, external=True)
     assert only(found(own_external, member), "NET_PORT_NOT_PERMITTED").message == (
-        "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
-        "'rhoso-net' (project project-me): it is external and not shared, and Nova lets only the "
-        "admin role attach such a network to a server; the credential's token lacks it."
+        "The credential of RHOSO 18.0 may not put these NICs on their network: "
+        "fa:16:3e:00:00:01 on 'rhoso-net' (project project-me): it is external and not shared, and "
+        "Nova lets only the admin role attach such a network to a server; the credential's token "
+        "lacks it."
     )
     assert "NET_PORT_NOT_PERMITTED" not in [
         x.code for x in found(own_external, {"roles": ["admin"]})
@@ -1114,7 +1617,7 @@ def test_finding_net_address_refused_checks_a_vmware_nic_by_the_migration_kits_r
     assert "NET_ADDRESS_REFUSED" not in [x.code for x in found("10.2.1.5", "10.2.1.6", "fd00::5")]
     f = only(found("10.2.0.5", "10.2.1.5"), "NET_ADDRESS_REFUSED")
     assert f.message == (
-        "Neutron would refuse these addresses on their RHOSO network: 00:50:56:aa:bb:cc on "
+        "Neutron would refuse these addresses on their network in RHOSO 18.0: 00:50:56:aa:bb:cc on "
         "'dc2-prod': 10.2.0.5, 10.2.1.5 lie in different subnets of the port's network: the "
         "migration kit gives a NIC's IPv4 addresses one subnet."
     )
@@ -1203,3 +1706,151 @@ def test_finding_map_nic_override_invalid_follows_neutron_on_slaac_subnets():
     assert f"fa:16:3e:00:00:01: fd00:20::5 is not {eui}" in f.message
     f = only(check(vm, plan=entry(eui, "nova"), dst=dst), "MAP_NIC_OVERRIDE_INVALID")
     assert "SLAAC or DHCPv6-stateless" in f.message
+
+
+def test_a_blank_destination_name_never_reaches_a_message():
+    """SDD §1 naming (review RV20-11): a destination provider stored with a blank name, before the
+    API refused one, is named by its id - never "do not exist in : ..."."""
+    blank = HIBISCUS.model_copy(update={"id": "blank-dst", "name": "  "})
+    plan = make_plan(mappings=Mappings(networks={"app-net": "gone-net"}))
+    [found] = [f for f in check(plan=plan, destination=blank) if f.code == "MAP_NETWORK_MISSING"]
+    assert "do not exist in blank-dst: app-net -> gone-net." in found.message, found.message
+
+
+def test_every_text_names_the_destination_provider_by_its_label():
+    """SDD §1 naming (review RV20-11): a text that names the destination provider reads its label -
+    its name, else its id - never its bare name, which a provider stored before the API refused a
+    blank one may lack."""
+    root = Path(__file__).parents[1] / "src" / "seamless_migrate"
+    bare = re.compile(r"\b(?:destination|provider)\.name\b")
+    found = [
+        f"{path.relative_to(root)}:{number}: {line.strip()}"
+        for path in sorted(root.rglob("*.py"))
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if bare.search(line)
+    ]
+    assert found == []
+
+
+def test_every_planning_text_about_the_destination_cloud_names_its_provider():
+    """SDD §1 naming (review RV21-05): the conversion-host reason, CONV_HOST_MISSING and the
+    blocking MAP_VOLUME_TYPE_MISSING name the destination provider by its label, as the
+    admin-rights reason does - never "the destination provider", nor its id."""
+    name = "OpenStack 2026.2 Hibiscus (DC3)"
+    src_caps = {"conversion_host": True, "admin": True}
+    dst_caps = {"conversion_host": False, "admin": True}
+    reasons = eligibility(make_vm(), "openstack", make_plan(), src_caps, dst_caps, (), name)
+    assert f"no conversion host configured on {name}" in reasons[Strategy.cold]
+    dst = make_provider(
+        id="dst-dc3",
+        name=name,
+        kind=ProviderKind.openstack,
+        role=ProviderRole.destination,
+        conversion_host=None,
+    )
+    conv = only(check(destination=dst), "CONV_HOST_MISSING")
+    assert conv.message == f"No conversion host configured on: destination {name}."
+    vcenter = make_provider(id="vcenter", kind=ProviderKind.vmware)
+    conv = only(check(source=vcenter, destination=dst), "CONV_HOST_MISSING")
+    assert conv.message == f"No conversion host configured on: destination {name}."
+    mapped = make_plan(mappings=Mappings(volume_types={"ceph-hdd": "ceph-ssd"}))
+    other = make_vm(disks=[make_disk(volume_type="ceph-nvme")])
+    blocker = only(check(other, plan=mapped, destination=dst), "MAP_VOLUME_TYPE_MISSING")
+    assert blocker.message.endswith(f"so the default volume type of {name} cannot be used.")
+
+
+def test_no_text_built_for_a_migration_calls_its_destination_the_destination():
+    """SDD §1 naming (review RV21-05): a text built for a plan or a migration - a finding's
+    message, an eligibility reason, an executor's refusal, failure or log line - names the
+    destination provider by its label; "the destination" is for the fixed texts (a catalog
+    remediation, the dashboard's copy). Every f-string is read, and every plain string given, at
+    any place among its arguments, to an error raised or named so, a finding, a reason list, a
+    log line, the handover's _call or an event (review RV22-05)."""
+    root = Path(__file__).parents[1] / "src" / "seamless_migrate"
+    words = re.compile(r"the destination\b|destination's|destination provider", re.I)
+
+    def text(node):
+        if isinstance(node, ast.JoinedStr):
+            return "".join(v.value for v in node.values if isinstance(v, ast.Constant))
+        return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else ""
+
+    #: what a text built for a migration is given to, beside an error raised or named so
+    takers = {"_call", "append", "log", "finding", "_emit", "emit", "new_event", "_save_with_event"}
+
+    def messages(tree):
+        raised = {
+            id(node.exc)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                yield node
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                # the plain ones, wherever they stand among its arguments (ApiError's message is its
+                # third): the walk meets every f-string
+                if id(node) in raised or name.endswith("Error") or name in takers:
+                    yield from (a for a in node.args if isinstance(a, ast.Constant))
+
+    found = [
+        f"{path.relative_to(root)}:{node.lineno}: {text(node)}"
+        for path in sorted(root.rglob("*.py"))
+        for node in messages(ast.parse(path.read_text(encoding="utf-8")))
+        if words.search(text(node))
+    ]
+    assert found == []
+
+
+#: one line saying "the destination", injected into orchestrator.py for the guard to find
+INJECTED = {
+    # the control: a plain message given to an error named *Error
+    "PermanentStepError": (
+        "\n\ndef _rv22():\n    raise PermanentStepError('the destination refused it')\n"
+    ),
+    # an error of the control plane whose name does not end in Error
+    "NotAllowed": "\n\ndef _rv22():\n    raise NotAllowed('the destination refused it')\n",
+    # an error whose message is not its first argument (api.deps.ApiError)
+    "ApiError": (
+        "\n\ndef _rv22():\n    raise ApiError(409, 'conflict', 'the destination refused it')\n"
+    ),
+    # an event built for a migration (SDD §1 naming), its message the second argument
+    "_emit": (
+        "\n\nasync def _rv22(self, m):\n"
+        "    await self._emit('migration.error', 'the destination refused it', migration=m)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(INJECTED))
+def test_the_wording_guard_reads_every_plain_message_given_to_an_error_or_an_event(
+    case, monkeypatch
+):
+    """SDD §1 naming (review RV22-05): the guard reads a plain message wherever an error or an
+    event takes it - an error raised under any name, ApiError's third argument, _emit's second -
+    not only the first argument of a call named *Error."""
+    target = Path(__file__).parents[1] / "src" / "seamless_migrate" / "orchestrator.py"
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        text = real(self, *args, **kwargs)
+        return text + INJECTED[case] if Path(self) == target else text
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match="orchestrator.py"):
+        test_no_text_built_for_a_migration_calls_its_destination_the_destination()
+
+
+ELIGIBILITY_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "eligibility_cases.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("case", ELIGIBILITY_CASES["finding_cases"], ids=lambda case: case["why"])
+def test_the_shared_handover_finding_cases(case):
+    """SDD §9.3, §16 (review RV20-08): VOL_ENCRYPTED and HANDOVER_BACKEND_UNMAPPED as the API
+    words them, which the dashboard's mock words the same way (mockData.test.ts)."""
+    plan = make_plan(handover=HandoverConfig(**case["plan"]["handover"]))
+    found = check(VMRef.model_validate(case["vm"]), plan=plan)
+    assert {f.code: f.message for f in found if f.code in case["expected"]} == case["expected"]

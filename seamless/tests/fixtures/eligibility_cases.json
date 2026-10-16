@@ -1,0 +1,924 @@
+{
+  "_comment": "The API's eligibility reasons per strategy (planning/selector.py) and its VOL_ENCRYPTED and HANDOVER_BACKEND_UNMAPPED messages (planning/preflight.py) for each case: test_selector.py and test_preflight.py run them against the API, mockData.test.ts against the dashboard's mock, which words them as the API does (SDD §9.2, §9.3, §16, review RV20-08). source/destination give a provider's capabilities and whether it has a conversion host, as provider_caps reads them.",
+  "cases": [
+    {
+      "why": "an OpenStack VM every strategy takes",
+      "source_kind": "openstack",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": "web-01-root",
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": "overcloud@ceph#ssd"
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": true,
+          "backend_map": {
+            "ceph-ssd": "hostgroup@ceph#gold"
+          }
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {
+          "admin": true,
+          "compute_microversion": "2.95",
+          "storage_backends": [
+            {
+              "pool": "overcloud@ceph#ssd",
+              "family": "rbd"
+            },
+            {
+              "pool": "overcloud@ceph#hdd",
+              "family": "rbd"
+            }
+          ]
+        }
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {
+          "admin": true,
+          "compute_microversion": "2.95",
+          "storage_backends": [
+            {
+              "pool": "hostgroup@ceph#gold",
+              "family": "rbd"
+            }
+          ]
+        },
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "cold": [],
+        "warm": [],
+        "storage_handover": []
+      }
+    },
+    {
+      "why": "an OpenStack VM in error, without conversion hosts or admin rights, a source compute below 2.85, ports Nova cannot recreate, a multi-attach, an image-backed, an encrypted and an unmapped disk, handover off, and a blocker",
+      "source_kind": "openstack",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "root",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "/dev/vda",
+            "kind": "image_root",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          },
+          {
+            "id": "vol-2",
+            "name": "data-2",
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-hdd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": true,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          },
+          {
+            "id": "vol-3",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": true,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": null,
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          },
+          {
+            "network": "db-net",
+            "mac": null,
+            "fixed_ips": [
+              "10.0.0.5",
+              "fd00::5"
+            ],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "error",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 64424509440,
+        "used_bytes": 32212254720,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": false,
+        "capabilities": {
+          "admin": false,
+          "compute_microversion": "2.79"
+        }
+      },
+      "destination": {
+        "conversion_host": false,
+        "capabilities": {
+          "admin": false
+        },
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [
+        {
+          "code": "VM_VGPU",
+          "severity": "blocker"
+        },
+        {
+          "code": "NET_MTU_SHRINK",
+          "severity": "warning"
+        }
+      ],
+      "expected": {
+        "cold": [
+          "source VM is in error state",
+          "no conversion host configured on the source provider",
+          "no conversion host configured on OpenStack 2026.2 Hibiscus (DC3)",
+          "port(s) without exactly one fixed IP, which Nova cannot recreate: app-net (no fixed IP), db-net (10.0.0.5, fd00::5)",
+          "blocked by finding VM_VGPU"
+        ],
+        "warm": [
+          "source VM is in error state",
+          "no conversion host configured on the source provider",
+          "no conversion host configured on OpenStack 2026.2 Hibiscus (DC3)",
+          "port(s) without exactly one fixed IP, which Nova cannot recreate: app-net (no fixed IP), db-net (10.0.0.5, fd00::5)",
+          "multi-attach disk(s): data-2",
+          "blocked by finding VM_VGPU"
+        ],
+        "storage_handover": [
+          "storage handover is not enabled for this plan",
+          "disk(s) not backed by Cinder volumes: root",
+          "volume type(s) without a backend of OpenStack 2026.2 Hibiscus (DC3) in handover.backend_map: <default>, ceph-hdd",
+          "multi-attach disk(s): data-2",
+          "port(s) with several fixed IPs, of which one would be kept: db-net (10.0.0.5, fd00::5)",
+          "encrypted disk(s), which Cinder cannot unmanage: vol-3",
+          "admin rights are required on the source cloud",
+          "admin rights are required on OpenStack 2026.2 Hibiscus (DC3)",
+          "the source's compute API 2.79 is below 2.85 (the handover's delete_on_termination update of the source server)",
+          "blocked by finding VM_VGPU"
+        ]
+      }
+    },
+    {
+      "why": "a transitioning OpenStack VM through Neutron (every address kept), a pool the destination does not list",
+      "source_kind": "openstack",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": "overcloud@ceph#ssd"
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": null,
+            "fixed_ips": [
+              "10.0.0.5",
+              "10.0.0.6"
+            ],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "transitioning",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": true,
+          "backend_map": {
+            "ceph-ssd": "hostgroup@ceph#gold"
+          }
+        },
+        "port_creation_mode": "neutron",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {
+          "admin": true,
+          "compute_microversion": "2.95",
+          "storage_backends": [
+            {
+              "pool": "overcloud@ceph#ssd",
+              "family": "rbd"
+            },
+            {
+              "pool": "overcloud@ceph#hdd",
+              "family": "rbd"
+            }
+          ]
+        }
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {
+          "admin": true,
+          "storage_backends": [
+            {
+              "pool": "hostgroup@ceph#silver",
+              "family": "rbd"
+            }
+          ]
+        },
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "cold": [
+          "source VM is in transitioning state"
+        ],
+        "warm": [
+          "source VM is in transitioning state"
+        ],
+        "storage_handover": [
+          "vol-1: OpenStack 2026.2 Hibiscus (DC3) lists no pool hostgroup@ceph#gold (RBD pools of hostgroup@ceph: hostgroup@ceph#silver)"
+        ]
+      }
+    },
+    {
+      "why": "an unmapped volume type named like an Object.prototype key, on a listed pool, with destination pools (review RV21-11)",
+      "source_kind": "openstack",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "constructor",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": "overcloud@ceph#ssd"
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": true,
+          "backend_map": {
+            "ceph-ssd": "hostgroup@ceph#gold"
+          }
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {
+          "admin": true,
+          "compute_microversion": "2.95",
+          "storage_backends": [
+            {
+              "pool": "overcloud@ceph#ssd",
+              "family": "rbd"
+            },
+            {
+              "pool": "overcloud@ceph#hdd",
+              "family": "rbd"
+            }
+          ]
+        }
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {
+          "admin": true,
+          "compute_microversion": "2.95",
+          "storage_backends": [
+            {
+              "pool": "hostgroup@ceph#gold",
+              "family": "rbd"
+            }
+          ]
+        },
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "cold": [],
+        "warm": [],
+        "storage_handover": [
+          "volume type(s) without a backend of OpenStack 2026.2 Hibiscus (DC3) in handover.backend_map: constructor"
+        ]
+      }
+    },
+    {
+      "why": "a port with several fixed IPs through Nova, one an override gives",
+      "source_kind": "openstack",
+      "vm": {
+        "source_id": "vm-7",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": "overcloud@ceph#ssd"
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:07",
+            "fixed_ips": [
+              "10.0.0.7"
+            ],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": true,
+          "backend_map": {
+            "ceph-ssd": "hostgroup@ceph#gold"
+          }
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {
+          "vm-7": {
+            "fa:16:3e:00:00:07": {
+              "network": null,
+              "fixed_ips": [
+                "10.0.0.7",
+                "10.0.0.8"
+              ]
+            }
+          }
+        }
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {
+          "admin": true,
+          "compute_microversion": "2.95",
+          "storage_backends": [
+            {
+              "pool": "overcloud@ceph#ssd",
+              "family": "rbd"
+            },
+            {
+              "pool": "overcloud@ceph#hdd",
+              "family": "rbd"
+            }
+          ]
+        }
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {
+          "admin": true,
+          "compute_microversion": "2.95",
+          "storage_backends": [
+            {
+              "pool": "hostgroup@ceph#gold",
+              "family": "rbd"
+            }
+          ]
+        },
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "cold": [
+          "port(s) without exactly one fixed IP, which Nova cannot recreate: app-net (10.0.0.7, 10.0.0.8)"
+        ],
+        "warm": [
+          "port(s) without exactly one fixed IP, which Nova cannot recreate: app-net (10.0.0.7, 10.0.0.8)"
+        ],
+        "storage_handover": [
+          "port(s) with several fixed IPs, of which one would be kept: app-net (10.0.0.7, 10.0.0.8)"
+        ]
+      }
+    },
+    {
+      "why": "a VMware VM in error without CBT, with an independent disk, and a blocker",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": "vmdk-1",
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": true,
+            "pool": null
+          },
+          {
+            "id": "d2",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "error",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": false,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 42949672960,
+        "used_bytes": 21474836480,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {}
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {},
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [
+        {
+          "code": "VM_VGPU",
+          "severity": "blocker"
+        }
+      ],
+      "expected": {
+        "vmware_cold": [
+          "source VM is in error state",
+          "blocked by finding VM_VGPU"
+        ],
+        "vmware_warm": [
+          "Changed Block Tracking (CBT) is not enabled",
+          "independent disk(s): vmdk-1",
+          "blocked by finding VM_VGPU"
+        ]
+      }
+    },
+    {
+      "why": "a transitioning VMware VM with CBT on",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "transitioning",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {}
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {},
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "vmware_cold": [
+          "source VM is in transitioning state"
+        ],
+        "vmware_warm": []
+      }
+    }
+  ],
+  "finding_cases": [
+    {
+      "why": "an encrypted volume, and volume types handover cannot map (a typed and an untyped volume; an ephemeral disk is no volume)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "enc-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": "enc-01-root",
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          },
+          {
+            "id": "vol-2",
+            "name": "enc-01-data1",
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-hdd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": true,
+            "independent": false,
+            "pool": null
+          },
+          {
+            "id": "vol-3",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          },
+          {
+            "id": "eph",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "local-nvme",
+            "device": "/dev/vda",
+            "kind": "ephemeral",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 85899345920,
+        "used_bytes": 42949672960,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": true,
+          "backend_map": {
+            "ceph-ssd": "hostgroup@ceph#gold"
+          }
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "expected": {
+        "VOL_ENCRYPTED": "Encrypted disk(s): enc-01-data1.",
+        "HANDOVER_BACKEND_UNMAPPED": "Volume type(s) without a handover backend: <default>, ceph-hdd."
+      }
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
+import { destinationRelease } from '../lib/platforms';
 import { createTestServer, recordScrolls, renderWithApp } from '../test/utils';
 import Providers from './Providers';
 
@@ -33,18 +34,139 @@ describe('Providers page', () => {
     expect(within(from).getByRole('heading', { name: 'RHOSP 17.1 — DC1' })).toBeInTheDocument();
     expect(within(from).getByRole('heading', { name: 'Kolla Edge (Bobcat)' })).toBeInTheDocument();
     expect(within(to).getByRole('heading', { name: 'RHOSO 18.0 — Production' })).toBeInTheDocument();
+    // a community OpenStack destination beside RHOSO 18.0, as in the API's demo (SDD §10, plan T9)
+    expect(within(to).getByRole('heading', { name: 'OpenStack 2026.2 Hibiscus (DC3)' })).toBeInTheDocument();
     const rhosp = within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' });
     expect(rhosp).toHaveTextContent('Red Hat OpenStack 17.1');
     expect(rhosp).toHaveTextContent(/stored .* ago/i);
     expect(within(from).getByRole('article', { name: 'Kolla Edge (Bobcat)' })).toHaveTextContent(/not set\. edit the provider to add sign-in details/i);
     // the fleet summary counts every provider by status and those without sign-in details
     const summary = screen.getByRole('list', { name: /providers by status/i });
-    expect(summary).toHaveTextContent(/healthy\s*2/i);
+    expect(summary).toHaveTextContent(/healthy\s*3/i);
     expect(screen.getByText(/1 without sign-in details/i)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /check all/i })).toHaveAttribute('aria-disabled', 'true');
     // viewers learn the actions exist but cannot use them
     expect(screen.getByRole('button', { name: /^add provider$/i })).toHaveAttribute('aria-disabled', 'true');
     expect(within(rhosp).getByRole('button', { name: /^edit /i })).toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('names RHOSO 18.0 and community OpenStack as destinations (SDD §16, plan T6)', async () => {
+    renderPage('viewer');
+    const header = await screen.findByRole('heading', { level: 1, name: 'Providers' });
+    const description = header.parentElement!.textContent ?? '';
+    expect(description).toContain('RHOSO 18.0 and community OpenStack 2023.1 Antelope – 2026.2 Hibiscus as destinations');
+    expect(description).not.toContain('RHOSO 18.0 as the destination');
+  });
+
+  it('names the destinations in its empty state too (SDD §16, plan T6)', async () => {
+    const server = createTestServer();
+    server.providers.splice(0);
+    renderPage('admin', server);
+    expect(await screen.findByText('Connect your first cloud')).toBeInTheDocument();
+    expect(screen.getByText(/^Add the source you migrate from/)).toHaveTextContent(
+      'Add the source you migrate from and the destination you migrate to. Destinations are RHOSO 18.0 and community OpenStack 2023.1 Antelope – 2026.2 Hibiscus. Sign-in details go to the secret store, never to the database.',
+    );
+  });
+
+  it("shows a destination's series, tier and policy profile", async () => {
+    renderPage('viewer');
+    const to = await screen.findByRole('region', { name: 'Migrate to' });
+    const detail = (card: HTMLElement, term: string) => within(card).getByText(term, { selector: 'dt' }).nextElementSibling as HTMLElement;
+    // a community destination: its declared series, the tier of that series and the profile it implies (SDD §10.1, §16)
+    const hibiscus = within(to).getByRole('article', { name: 'OpenStack 2026.2 Hibiscus (DC3)' });
+    expect(detail(hibiscus, 'Series')).toHaveTextContent(/^2026\.2 Hibiscus\s*declared$/);
+    expect(detail(hibiscus, 'Support tier')).toHaveTextContent(/^Tier 1$/);
+    expect(detail(hibiscus, 'Policy profile')).toHaveTextContent(/^Secure RBAC defaults$/);
+    // RHOSO 18.0: validated and legacy by its kind; the range its APIs read (D14)
+    const rhoso = within(to).getByRole('article', { name: 'RHOSO 18.0 — Production' });
+    expect(detail(rhoso, 'Series')).toHaveTextContent(/^2023\.1 Antelope – 2023\.2 Bobcat\s*detected$/);
+    expect(detail(rhoso, 'Support tier')).toHaveTextContent(/^Validated$/);
+    expect(detail(rhoso, 'Policy profile')).toHaveTextContent(/^Legacy rules$/);
+    // a source has no series to show
+    expect(within(screen.getByRole('article', { name: 'RHOSP 17.1 — DC1' })).queryByText('Series', { selector: 'dt' })).toBeNull();
+    // review RV18-08: every reported value is printed in words, never "[object Object]" or "null"
+    for (const card of screen.getAllByRole('article')) expect(card.textContent).not.toMatch(/\[object Object\]|\bnull\b/);
+  });
+
+  it('warns of a series its APIs contradict, an unknown profile and endpoints on plain HTTP (SDD §16)', async () => {
+    const server = createTestServer();
+    const hibiscus = server.providers.find((p) => p.id === 'hibiscus-dc3')!;
+    hibiscus.capabilities = {
+      ...hibiscus.capabilities,
+      release_range: ['2024.1', '2024.2'],
+      release: null,
+      support_tier: { tier: 'tier3', reason: 'end_of_life', declared_outside_range: true },
+      policy_profile: 'unknown',
+      tls: false,
+      plain_http: ['auth_url', 'compute'],
+    };
+    renderPage('viewer', server);
+    const card = await screen.findByRole('article', { name: 'OpenStack 2026.2 Hibiscus (DC3)' });
+    const detail = (term: string) => within(card).getByText(term, { selector: 'dt' }).nextElementSibling as HTMLElement;
+    expect(detail('Series')).toHaveTextContent('2024.1 Caracal – 2024.2 Dalmatian');
+    expect(detail('Series')).toHaveTextContent(
+      'Declared 2026.2 Hibiscus, which its APIs contradict: correct the declared series, or clear it so the check detects the series.',
+    );
+    expect(detail('Support tier')).toHaveTextContent('Tier 3 · End of Life upstream');
+    // both ways out, as the API's refusals: a check is allowed while a plan runs, a PATCH that declares is not (SDD §16,
+    // §21.5, review RV20-09)
+    expect(detail('Policy profile')).toHaveTextContent(
+      "Unknown. Check the provider so its series is detected, or declare its policy profile or series: until then only the admin role may put a port on another project's network.",
+    );
+    expect(detail('TLS')).toHaveTextContent('Plain HTTP: the auth URL and compute. Credentials travel unencrypted: use HTTPS outside a lab.');
+  });
+
+  it('says a maximum the check could not read "not read" and an empty list "none", never a bare label (SDD §16, review RV19-03)', async () => {
+    const server = createTestServer();
+    const hibiscus = server.providers.find((p) => p.id === 'hibiscus-dc3')!;
+    // SDD §10: a maximum the check could not read is "" - DST_CAPABILITY_MISSING then judges nothing
+    hibiscus.capabilities = { ...hibiscus.capabilities, compute_microversion: '', block_storage_microversion: '', roles: [] };
+    renderPage('viewer', server);
+    const card = await screen.findByRole('article', { name: 'OpenStack 2026.2 Hibiscus (DC3)' });
+    const chip = (label: string) => within(within(card).getByRole('list', { name: 'Capabilities' })).getByText(label).closest('li');
+    expect(chip('Compute API')).toHaveTextContent(/^Compute API\s*not read$/);
+    expect(chip('Block storage API')).toHaveTextContent(/^Block storage API\s*not read$/);
+    expect(chip('Token roles')).toHaveTextContent(/^Token roles\s*none$/);
+    // a value the check read is said as it was read
+    expect(chip('Storage')).toHaveTextContent(/^Storage\s*Ceph RBD/);
+  });
+
+  it('says why a read range is empty: older or newer than the window, "Not detected" only when nothing was read (SDD §16, review RV19-04)', async () => {
+    const cases = [
+      { id: 'hibiscus-dc3', kind: 'openstack', compute: '2.93', blockStorage: '3.70', series: 'Older than the window', tier: 'Outside · older than 2023.1' },
+      { id: 'hibiscus-dc3', kind: 'openstack', compute: '2.105', blockStorage: '3.71', series: 'Newer than the window', tier: 'Outside · newer than 2026.2' },
+      { id: 'hibiscus-dc3', kind: 'openstack', compute: '', blockStorage: '', series: 'Not detected', tier: 'Outside · series not detected' },
+      // RHOSO 18.0 is validated by its kind: its maxima, not its tier, say why its range is empty
+      { id: 'rhoso-prod', kind: 'rhoso', compute: '2.93', blockStorage: '3.70', series: 'Older than the window', tier: 'Validated' },
+    ] as const;
+    for (const c of cases) {
+      const server = createTestServer();
+      const provider = server.providers.find((p) => p.id === c.id)!;
+      provider.release = null;
+      provider.capabilities = {
+        ...provider.capabilities,
+        compute_microversion: c.compute,
+        block_storage_microversion: c.blockStorage,
+        ...destinationRelease(c.kind, null, null, c.compute, c.blockStorage),
+      };
+      const view = renderPage('viewer', server);
+      const card = await screen.findByRole('article', { name: provider.name });
+      const detail = (term: string) => within(card).getByText(term, { selector: 'dt' }).nextElementSibling as HTMLElement;
+      expect(detail('Series')).toHaveTextContent(new RegExp(`^${c.series}$`));
+      expect(detail('Support tier')).toHaveTextContent(c.tier);
+      view.unmount();
+    }
+  });
+
+  it("says a vCenter's check in words, with no OpenStack service (review RV19-05)", async () => {
+    renderPage('viewer');
+    const card = await screen.findByRole('article', { name: 'vCenter HQ' });
+    const chips = within(card).getByRole('list', { name: 'Capabilities' });
+    const chip = (label: string) => within(chips).getByText(label).closest('li');
+    expect(chip('vSphere API')).toHaveTextContent(/^vSphere API\s*8\.0\.2\.0$/);
+    expect(chip('VMs with CBT')).toHaveTextContent(/^VMs with CBT\s*\d+$/);
+    expect(chip('VMs without VMware Tools')).toHaveTextContent(/^VMs without VMware Tools\s*\d+$/);
+    expect(chips).not.toHaveTextContent(/Compute API|OVN networking|Volume backends|_/);
   });
 
   it('keeps Cancel focusable while the provider is saved, saying why (SDD §16)', async () => {
@@ -110,9 +232,10 @@ describe('Providers page', () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderPage('operator');
     const before = server.events.filter((e) => e.kind === 'provider.checked').length;
+    const total = server.providers.length;
     await user.click(await screen.findByRole('button', { name: /check all/i }));
-    await waitFor(() => expect(screen.getByText(/checked 6 providers/i)).toBeInTheDocument());
-    expect(server.events.filter((e) => e.kind === 'provider.checked')).toHaveLength(before + 6);
+    await waitFor(() => expect(screen.getByText(new RegExp(`checked ${total} providers`, 'i'))).toBeInTheDocument());
+    expect(server.events.filter((e) => e.kind === 'provider.checked')).toHaveLength(before + total);
   });
 
   it('names a provider whose check request failed, counts it, and retries only that one (SDD §16)', async () => {
@@ -215,6 +338,15 @@ describe('Providers page', () => {
     expect(within(dialog).getByLabelText(/keystone url/i)).toHaveFocus();
   });
 
+  it('asks for a name when it has no visible character, as the API refuses it (SDD §4.2, review RV21-08)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage();
+    const dialog = await openAdd(user);
+    await user.type(within(dialog).getByLabelText(/^name/i), '\u200b');
+    await user.click(within(dialog).getByRole('button', { name: /add and test connection/i }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/recognise/i);
+  });
+
   it('connects a Kolla-Ansible source: the preset fills the form, credentials stay write-only', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderPage();
@@ -231,7 +363,9 @@ describe('Providers page', () => {
     await user.click(within(dialog).getByRole('button', { name: /add and test connection/i }));
 
     const result = await screen.findByRole('dialog', { name: /kolla lab b is connected/i });
-    expect(result).toHaveTextContent(/all services reachable/i);
+    // the API's check gives a provider that answers no status message (review RV22-03): the result says what it is
+    expect(result).toHaveTextContent(/connection test result: /i);
+    expect(result).not.toHaveTextContent(/did not pass/i);
     const created = server.providers.find((p) => p.id === 'kolla-lab-b');
     expect(created).toMatchObject({ kind: 'openstack', role: 'source', distribution: 'kolla', credentials_secret: 'provider-kolla-lab-b', status: 'ok' });
     expect(created?.credentials_updated_at).not.toBeNull();

@@ -14,6 +14,7 @@ import { LoadingBlock } from '../components/Skeleton';
 import { auditActionLabel, auditCsv } from '../lib/audit';
 import { formatDateTime, formatNumber } from '../lib/format';
 import { policyChanges } from '../lib/policies';
+import { providerLabel } from '../lib/providerUse';
 import { usePageTitle } from '../lib/usePageTitle';
 
 /** The newest audit events one request returns (SDD §12). */
@@ -89,7 +90,12 @@ export default function AdvisorAudit() {
   const plans = usePlans();
   const providers = useProviders();
   const scopeNames = useMemo(
-    () => new Map([...(providers.data ?? []), ...(plans.data ?? [])].map((x) => [x.id, x.name] as [string, string])),
+    // a provider by its label - its name, else its id (SDD §4.2, review RV22-01) -, a plan by its name
+    () =>
+      new Map([
+        ...(providers.data ?? []).map((p) => [p.id, providerLabel(p)] as [string, string]),
+        ...(plans.data ?? []).map((p) => [p.id, p.name] as [string, string]),
+      ]),
     [providers.data, plans.data],
   );
   // the policies that still exist: a policy event links to its card, a deleted one's name is marked (SDD §14.5)

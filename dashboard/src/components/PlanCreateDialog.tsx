@@ -6,6 +6,7 @@ import { useRole } from '../api/session';
 import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
 import { heldElsewhere, holdersOf } from '../lib/holds';
 import { parseDrafts, toDraft, type ProbeDraft } from '../lib/probes';
+import { providerLabel } from '../lib/providerUse';
 import { formatMappings, parseMappings } from '../lib/mappings';
 import { hasRole } from '../lib/roles';
 import { stable } from '../lib/stable';
@@ -168,9 +169,9 @@ const PRESTAGE_LABEL: Record<string, string> = {
 /** Offered as well but off by default, each scoped to the plan (SDD §7.2, §16), with what it does. */
 const OPTIONAL_PRESTAGE_NOTE: Record<string, string> = {
   flavors:
-    "Off by default. Creates the flavors of the plan's VMs that RHOSO lacks, with the same size and extra specs, instead of matching the smallest fitting one; a RHOSO flavor is never changed.",
+    "Off by default. Creates the flavors of the plan's VMs that the destination lacks, with the same size and extra specs, instead of matching the smallest fitting one; a destination flavor is never changed.",
   keypairs:
-    "Off by default. Imports the VMs' keypairs the migration user lacks at RHOSO (name and public key), when the source migration user owns them; otherwise the VM is blocked until the keypair exists.",
+    "Off by default. Imports the VMs' keypairs the migration user lacks on the destination (name and public key), when the source migration user owns them; otherwise the VM is blocked until the keypair exists.",
 };
 const OPTIONAL_PRESTAGE = Object.keys(OPTIONAL_PRESTAGE_NOTE);
 /** Every resource the form offers, in the order they are created. */
@@ -379,7 +380,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     for (const vm of selectedVms) {
       for (const disk of vm.disks) {
         if (disk.kind !== 'volume' || disk.volume_type !== type || !disk.pool || !families.has(disk.pool)) continue;
-        const { host, error } = resolveDestination(families.get(disk.pool)!, splitHost(disk.pool)[1], target, destinationStorage);
+        const { host, error } = resolveDestination(families.get(disk.pool)!, splitHost(disk.pool)[1], target, destinationStorage, destination ? providerLabel(destination) : 'the destination');
         if (host) pools.add(host);
         if (error) problems.add(`${vm.name}: ${error}`);
       }
@@ -391,7 +392,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     const e: Errors = {};
     if (!f.name.trim()) e.name = 'Enter a plan name.';
     if (!f.sourceId) e.source = 'Choose the source provider.';
-    if (!f.destinationId) e.destination = 'Choose the RHOSO destination.';
+    if (!f.destinationId) e.destination = 'Choose the destination.';
     if (f.vmIds.size === 0) e.vms = 'Select at least one VM.';
     const slo = Number(f.sloMinutes);
     if (!(slo > 0)) e.slo = 'Enter the downtime SLO in minutes (more than 0).';
@@ -465,7 +466,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
       const missing = handoverTypes.filter((t) => !chosenTarget(t, f));
       const problems = handoverTypes.flatMap((t) => landing(t, f).errors);
       // a new plan maps every type; an existing one may keep unmapped types (those VMs are not eligible)
-      if (missing.length && !plan) e.handover = `Choose a RHOSO backend for ${missing.join(', ')}.`;
+      if (missing.length && !plan) e.handover = `Choose a destination backend for ${missing.join(', ')}.`;
       else if (problems.length) e.handover = problems[0];
       for (const t of handoverTypes) if (chosenTarget(t, f)) backendMap[t] = chosenTarget(t, f);
     }
@@ -664,12 +665,12 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 error={errors.source}
                 options={[
                   { value: '', label: 'Choose a source…' },
-                  ...sources.map((p) => ({ value: p.id, label: `${p.name} · ${providerStatusMeta(p.status).label}` })),
+                  ...sources.map((p) => ({ value: p.id, label: `${providerLabel(p)} · ${providerStatusMeta(p.status).label}` })),
                 ]}
               />
               <SelectField
                 id={id('destination')}
-                label="Destination (RHOSO 18.0)"
+                label="Destination provider"
                 required
                 value={form.destinationId}
                 onChange={(e) => set('destinationId', e.target.value)}
@@ -678,7 +679,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 error={errors.destination}
                 options={[
                   { value: '', label: 'Choose a destination…' },
-                  ...destinations.map((p) => ({ value: p.id, label: `${p.name} · ${providerStatusMeta(p.status).label}` })),
+                  ...destinations.map((p) => ({ value: p.id, label: `${providerLabel(p)} · ${providerStatusMeta(p.status).label}` })),
                 ]}
               />
             </div>
@@ -703,7 +704,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 providerKind={source.kind}
                 selected={form.vmIds}
                 onSelectedChange={(next) => set('vmIds', next)}
-                caption={`VMs on ${source.name}`}
+                caption={`VMs on ${providerLabel(source)}`}
                 pageSize={25}
                 holders={holders}
               />
@@ -925,7 +926,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   value={form.projects}
                   onChange={(e) => set('projects', e.target.value)}
                   error={errors.projects}
-                  hint="Source project = RHOSO project; unmapped projects keep their name."
+                  hint="Source project = destination project; unmapped projects keep their name."
                 />
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
@@ -1025,7 +1026,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 <p id={id('prestage-note')} className="-mt-2 text-xs text-muted-foreground">
                   {source?.kind === 'vmware'
                     ? 'VMware sources pre-stage nothing: the migration kit prepares its own conversion host.'
-                    : 'Created in RHOSO before the first migration, in this order. Without networks, an unmapped network blocks the plan.'}
+                    : 'Created on the destination before the first migration, in this order. Without networks, an unmapped network blocks the plan.'}
                 </p>
                 <div className="grid sm:grid-cols-3">
                   {DEFAULT_PRESTAGE.map((resource) => (
@@ -1153,7 +1154,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                     checked={form.handoverEnabled}
                     onChange={(v) => set('handoverEnabled', v)}
                     label="Hand volumes over without copying"
-                    hint="RHOSO takes over the volumes where they are (Cinder unmanage and manage). Both clouds need admin rights and must reach the same Ceph pool or NetApp ONTAP SVM."
+                    hint="The destination takes over the volumes where they are (Cinder unmanage and manage). Both clouds need admin rights and must reach the same Ceph pool or NetApp ONTAP SVM."
                   />
                   {form.handoverEnabled &&
                     (handoverTypes.length === 0 ? (
@@ -1180,7 +1181,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                               label={`${type}${family ? ` on ${FAMILY_LABELS[family]}` : ''}`}
                               value={chosenTarget(type)}
                               onChange={(e) => set('handoverMap', { ...form.handoverMap, [type]: e.target.value })}
-                              options={[{ value: '', label: 'Choose a RHOSO backend' }, ...targets.map((t) => ({ value: t, label: t }))]}
+                              options={[{ value: '', label: 'Choose a destination backend' }, ...targets.map((t) => ({ value: t, label: t }))]}
                               hint={hint}
                               error={index === 0 ? errors.handover : undefined}
                             />

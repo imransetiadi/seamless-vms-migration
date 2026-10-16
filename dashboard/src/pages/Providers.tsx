@@ -1,4 +1,4 @@
-import { ArrowRight, Check, HardDrive, KeyRound, Minus, Pencil, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react';
+import { ArrowRight, Check, HardDrive, KeyRound, Minus, Pencil, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useCheckAllProviders, useCheckProvider, useDeleteProvider, usePlans, useProviders } from '../api/hooks';
@@ -15,28 +15,48 @@ import { ProviderStatusBadge } from '../components/StatusBadge';
 import { buttonClassName } from '../lib/buttonStyles';
 import { cn } from '../lib/cn';
 import { formatDateTime, formatRelative } from '../lib/format';
-import { deleteRefusal, plansThatNeed } from '../lib/providerUse';
+import { deleteRefusal, plansThatNeed, providerLabel } from '../lib/providerUse';
 import { hasRole } from '../lib/roles';
 import { presetFor } from '../lib/distributions';
+import { policyProfileOf } from '../lib/networks';
+import { DESTINATION_PLATFORMS, plainHttpText, profileText, rangeText, releaseRange, seriesText, tierText, type SupportTier } from '../lib/platforms';
 import { storageBackends, storageSummary } from '../lib/storage';
 import { providerStatusMeta } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 
 const CAPABILITY_LABELS: Record<string, string> = {
   admin: 'Admin access',
+  roles: 'Token roles',
   compute_microversion: 'Compute API',
+  block_storage_microversion: 'Block storage API',
   ovn: 'OVN networking',
   volume_backends: 'Volume backends',
   storage_backends: 'Storage',
-  cbt: 'CBT support',
+  // a vCenter's check (SDD §10): its version and its VMs counted
+  api_version: 'vSphere API',
   version: 'Version',
-  datastores: 'Datastores',
+  vm_count: 'VMs',
+  cbt_enabled_vms: 'VMs with CBT',
+  vms_with_snapshots: 'VMs with snapshots',
+  vms_with_independent_disks: 'VMs with independent disks',
+  vms_without_tools: 'VMs without VMware Tools',
 };
 
+/** The check-report keys the card shows in its own rows: a destination's series, tier and profile, and TLS (SDD §10, §16). */
+const SHOWN_IN_ROWS = new Set(['release_range', 'release', 'support_tier', 'policy_profile', 'tls', 'plain_http']);
+
 function Capabilities({ capabilities }: { capabilities: Record<string, unknown> }) {
-  // storage_backends (SDD §10) supersedes the plain pool-name list and is shown by driver family
+  // storage_backends (SDD §10) supersedes the plain pool-name list and is shown by driver family; a value the card
+  // cannot say in words - an object, or none - is left out, never printed as "[object Object]" or "null" (RV18-08)
   const hasStorage = Array.isArray(capabilities.storage_backends);
-  const entries = Object.entries(capabilities).filter(([key]) => !(hasStorage && key === 'volume_backends'));
+  const entries = Object.entries(capabilities).filter(
+    ([key, value]) =>
+      !(hasStorage && key === 'volume_backends') &&
+      !SHOWN_IN_ROWS.has(key) &&
+      value !== null &&
+      value !== undefined &&
+      (key === 'storage_backends' || Array.isArray(value) || typeof value !== 'object'),
+  );
   if (entries.length === 0) {
     return <p className="text-sm text-muted-foreground">No capabilities reported yet. Run a check to see them.</p>;
   }
@@ -54,12 +74,13 @@ function Capabilities({ capabilities }: { capabilities: Record<string, unknown> 
             </li>
           );
         }
+        // a maximum the check could not read is "" (SDD §10) and an empty list lists nothing: said so, never a bare label (RV19-03)
         const text =
           key === 'storage_backends'
             ? storageSummary(storageBackends(capabilities)) || 'no pools listed'
             : Array.isArray(value)
-              ? value.join(', ')
-              : String(value);
+              ? value.join(', ') || 'none'
+              : String(value) || 'not read';
         return (
           <li key={key} className="inline-flex max-w-full items-baseline gap-1 rounded-sm border border-border px-1.5 py-0.5 text-xs text-foreground">
             <span className="text-muted-foreground">{label}</span>
@@ -69,6 +90,95 @@ function Capabilities({ capabilities }: { capabilities: Record<string, unknown> 
         );
       })}
     </ul>
+  );
+}
+
+/** A warning under a card row, in the row's words (SDD §16). */
+function RowWarning({ children }: { children: string }) {
+  return (
+    <span className="mt-0.5 flex items-start gap-1 text-xs text-status-warning">
+      <TriangleAlert aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+      <span>{children}</span>
+    </span>
+  );
+}
+
+/** The support tier the check reports, when it reports one (since 0.2.0, SDD §10.1). */
+function reportedTier(capabilities: Record<string, unknown>): SupportTier | null {
+  const tier = capabilities.support_tier;
+  return tier && typeof tier === 'object' && typeof (tier as SupportTier).tier === 'string' ? (tier as SupportTier) : null;
+}
+
+/**
+ * A destination's series, support tier and policy profile, as its check reports them (SDD §10.1, §16): the declared
+ * series, else the detected range, with codenames; the tier in words; and a warning when the APIs contradict the
+ * declared series or the profile is unknown.
+ */
+function DestinationRows({ provider }: { provider: Provider }) {
+  const caps = provider.capabilities;
+  const tier = reportedTier(caps);
+  if (!tier) {
+    return (
+      <>
+        <dt className="text-muted-foreground">Series</dt>
+        <dd>
+          {provider.release ? (
+            <>
+              {seriesText(provider.release)} <span className="text-xs text-muted-foreground">declared, not checked yet</span>
+            </>
+          ) : (
+            <span className="text-muted-foreground">Run a check to detect it</span>
+          )}
+        </dd>
+      </>
+    );
+  }
+  const settled = typeof caps.release === 'string' ? caps.release : null;
+  const range = Array.isArray(caps.release_range) ? caps.release_range.map(String) : [];
+  const detected = settled === null ? rangeText(range) : null;
+  // an empty range says why, by the maxima the check read: older or newer than the window, or nothing read (RV19-04);
+  // RHOSO 18.0's tier is Validated by its kind, so the tier's reason cannot say it
+  const outside = range.length ? null : releaseRange(caps.compute_microversion, caps.block_storage_microversion).outside;
+  const profile = policyProfileOf(caps, provider);
+  const warn = tier.tier === 'tier3' || tier.tier === 'outside';
+  return (
+    <>
+      <dt className="text-muted-foreground">Series</dt>
+      <dd className="min-w-0 wrap-break-word">
+        {settled !== null ? (
+          <>
+            {seriesText(settled)} <span className="text-xs text-muted-foreground">{settled === provider.release ? 'declared' : 'detected'}</span>
+          </>
+        ) : detected !== null ? (
+          <>
+            {detected} <span className="text-xs text-muted-foreground">detected</span>
+          </>
+        ) : (
+          <span className="text-muted-foreground">{outside === 'older' ? 'Older than the window' : outside === 'newer' ? 'Newer than the window' : 'Not detected'}</span>
+        )}
+        {tier.declared_outside_range && provider.release && (
+          <RowWarning>{`Declared ${seriesText(provider.release)}, which its APIs contradict: correct the declared series, or clear it so the check detects the series.`}</RowWarning>
+        )}
+      </dd>
+      <dt className="text-muted-foreground">Support tier</dt>
+      <dd className={cn(warn && 'text-status-warning')}>{tierText(tier)}</dd>
+      <dt className="text-muted-foreground">Policy profile</dt>
+      <dd className="min-w-0 wrap-break-word">
+        {profile === 'unknown' ? (
+          <>
+            <span className="text-status-warning">{profileText(profile)}.</span>{' '}
+            {/* both ways out, as the API's refusals: a check is allowed while a plan runs, a PATCH that declares is not
+                (SDD §16, §21.5, review RV20-09) */}
+            <RowWarning>
+              Check the provider so its series is detected, or declare its policy profile or series: until then only the admin
+              role may put a port on another project&apos;s network.
+            </RowWarning>
+          </>
+        ) : (
+          profileText(profile)
+        )}
+      </dd>
+    </>
   );
 }
 
@@ -130,7 +240,7 @@ function ProviderCard({
         <PlatformMark preset={preset} />
         <div className="min-w-0 flex-1">
           <h3 id={headingId} className="text-base font-semibold text-foreground">
-            {provider.name}
+            {providerLabel(provider)}
           </h3>
           <p className="text-xs text-muted-foreground">
             {preset.label} <span aria-hidden>/</span> <code>{provider.id}</code>
@@ -155,7 +265,7 @@ function ProviderCard({
           <CredentialState provider={provider} />
         </dd>
         <dt className="text-muted-foreground">TLS</dt>
-        <dd>
+        <dd className="min-w-0 wrap-break-word">
           {provider.verify_tls ? (
             <span className="inline-flex items-center gap-1">
               <ShieldCheck aria-hidden className="size-3.5 text-status-success" />
@@ -167,7 +277,12 @@ function ProviderCard({
               Verification off
             </span>
           )}
+          {/* the endpoints the check found on plain HTTP (SDD §10, Security.md) */}
+          {Array.isArray(provider.capabilities.plain_http) && provider.capabilities.plain_http.length > 0 && (
+            <RowWarning>{`Plain HTTP: ${plainHttpText(provider.capabilities.plain_http.map(String))}. Credentials travel unencrypted: use HTTPS outside a lab.`}</RowWarning>
+          )}
         </dd>
+        {provider.role === 'destination' && provider.kind !== 'vmware' && <DestinationRows provider={provider} />}
         <dt className="text-muted-foreground">Conversion host</dt>
         <dd className="min-w-0 wrap-break-word">
           {ch ? (
@@ -203,19 +318,19 @@ function ProviderCard({
           disabledReason={canCheck ? null : 'Checking a provider requires the operator role.'}
           onClick={() =>
             check.mutate(provider.id, {
-              onSuccess: (p) => onAnnounce(`${p.name} checked: ${providerStatusMeta(p.status).label}.`),
+              onSuccess: (p) => onAnnounce(`${providerLabel(p)} checked: ${providerStatusMeta(p.status).label}.`),
             })
           }
         >
           {/* the card's heading shows the provider: it is named for assistive technology only (SDD §16) */}
-          Check<span className="sr-only"> {provider.name}</span>
+          Check<span className="sr-only"> {providerLabel(provider)}</span>
         </Button>
         <Link to={`/inventory/${provider.id}`} className={buttonClassName('ghost', 'md')}>
           <HardDrive aria-hidden className="size-4" />
-          Inventory<span className="sr-only"> of {provider.name}</span>
+          Inventory<span className="sr-only"> of {providerLabel(provider)}</span>
         </Link>
         <Button variant="ghost" icon={Pencil} onClick={onEdit} disabledReason={canEdit ? null : 'Editing a provider requires the admin role.'}>
-          Edit<span className="sr-only"> {provider.name}</span>
+          Edit<span className="sr-only"> {providerLabel(provider)}</span>
         </Button>
         <Button
           variant="ghost"
@@ -224,7 +339,7 @@ function ProviderCard({
           className="ml-auto"
           disabledReason={canEdit ? refusal : 'Deleting a provider requires the admin role.'}
         >
-          Delete<span className="sr-only"> {provider.name}</span>
+          Delete<span className="sr-only"> {providerLabel(provider)}</span>
         </Button>
       </footer>
 
@@ -232,7 +347,7 @@ function ProviderCard({
         open={confirmDelete}
         tone="danger"
         icon={Trash2}
-        title={`Delete ${provider.name}?`}
+        title={`Delete ${providerLabel(provider)}?`}
         subject={`Provider ${provider.id}`}
         consequences={[
           { kind: 'removed', text: 'the provider in Seamless, with the sign-in details and SSH key stored for it' },
@@ -247,7 +362,7 @@ function ProviderCard({
           remove.mutate(provider.id, {
             onSuccess: () => {
               setConfirmDelete(false);
-              onAnnounce(`${provider.name} deleted.`);
+              onAnnounce(`${providerLabel(provider)} deleted.`);
               onDeleted();
             },
           })
@@ -321,7 +436,7 @@ function FleetSummary({ providers, canCheck, onAnnounce }: { providers: Provider
       {failed.length > 0 && (
         <ErrorBanner
           error={failed[0]!.error}
-          title={`Could not check ${namesText(failed.map((f) => providers.find((p) => p.id === f.id)?.name ?? f.id))}`}
+          title={`Could not check ${namesText(failed.map((f) => providerLabel(providers.find((p) => p.id === f.id) ?? { id: f.id, name: '' })))}`}
           onRetry={() => check(failed.map((f) => f.id))}
         />
       )}
@@ -401,7 +516,7 @@ export default function Providers() {
     <>
       <PageHeader
         title="Providers"
-        description="Every cloud Seamless migrates between: OpenStack Community, Kolla-Ansible, Red Hat OpenStack 17.1 and VMware vCenter as sources, RHOSO 18.0 as the destination."
+        description={`Every cloud Seamless migrates between: OpenStack Community, Kolla-Ansible, Red Hat OpenStack 17.1 and VMware vCenter as sources, ${DESTINATION_PLATFORMS} as destinations.`}
         actions={
           <Button size="lg" variant="primary" icon={Plus} onClick={openCreate} disabledReason={canEdit ? null : 'Adding a provider requires the admin role.'}>
             Add provider
@@ -417,7 +532,7 @@ export default function Providers() {
         <EmptyState
           icon={Server}
           title="Connect your first cloud"
-          description="Add the source you migrate from and the RHOSO destination you migrate to. Sign-in details go to the secret store, never to the database."
+          description={`Add the source you migrate from and the destination you migrate to. Destinations are ${DESTINATION_PLATFORMS}. Sign-in details go to the secret store, never to the database.`}
           action={
             <Button size="lg" variant="primary" icon={Plus} onClick={openCreate} disabledReason={canEdit ? null : 'Adding a provider requires the admin role.'}>
               Add provider

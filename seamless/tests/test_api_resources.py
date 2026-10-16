@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import json
 import time
+from pathlib import Path
 
 import fastapi.routing
 import httpx
@@ -86,6 +87,7 @@ def test_provider_crud(api):
         "keypairs",  # SDD §11
         "subnets",  # SDD §11: where a NIC's addresses must lie
         "network_details",  # SDD §11: what a NIC's network name resolves to
+        "roles",  # SDD §10: the token's role names, read live (review RV19-01)
     }
 
     # a provider used by a non-terminal plan cannot be deleted
@@ -550,6 +552,113 @@ def test_patch_plan_conflicts_while_a_migration_is_in_flight(api):
         f"/api/v1/plans/{plan['id']}", headers=api.h(Role.operator), json=patch
     )
     assert allowed.status_code == 200, allowed.text
+
+
+def test_a_provider_is_created_and_patched_with_its_declared_release(api):
+    """SDD §4.2, §12: POST /providers and PATCH /providers/{id} take the series a community
+    destination's operator declares; a malformed one, or one on a vmware provider, is 422 and
+    stores nothing."""
+    community = {
+        **DESTINATION,
+        "id": "dst-hibiscus",
+        "name": "Community 2026.2",
+        "kind": "openstack",
+        "distribution": "kolla",
+        "release": "2026.2",
+    }
+    created = api.post("/api/v1/providers", json=community)
+    assert created.status_code == 201, created.text
+    assert created.json()["release"] == "2026.2"
+
+    def patch(body):
+        return api.client.patch(
+            "/api/v1/providers/dst-hibiscus", headers=api.h(Role.admin), json=body
+        )
+
+    patched = patch({"release": "2026.1"})
+    assert patched.status_code == 200, patched.text
+    assert api.get("/api/v1/providers/dst-hibiscus").json()["release"] == "2026.1"
+    assert patch({"release": "Hibiscus"}).status_code == 422
+    assert api.get("/api/v1/providers/dst-hibiscus").json()["release"] == "2026.1"
+    cleared = patch({"release": None})
+    assert cleared.status_code == 200 and cleared.json()["release"] is None
+    assert api.get("/api/v1/providers").json()[0]["release"] is None  # every provider shows it
+
+    vmware = {
+        "id": "vc-01",
+        "name": "vCenter",
+        "kind": "vmware",
+        "role": "source",
+        "endpoint": "https://vcenter.example",
+        "release": "2026.2",
+    }
+    refused = api.post("/api/v1/providers", json=vmware)
+    assert refused.status_code == 422 and "release" in refused.text
+    assert api.get("/api/v1/providers/vc-01").status_code == 404
+
+
+def test_a_provider_declares_its_policy_profile(api):
+    """SDD §4.2, §12: POST /providers and PATCH /providers/{id} take the declared policy profile;
+    another value, or one on a vmware provider, is 422 and stores nothing."""
+    community = {
+        **DESTINATION,
+        "id": "dst-flamingo",
+        "kind": "openstack",
+        "distribution": "openstack_community",
+        "policy_profile": "legacy",
+    }
+    created = api.post("/api/v1/providers", json=community)
+    assert created.status_code == 201, created.text
+    assert created.json()["policy_profile"] == "legacy"
+
+    def patch(body):
+        return api.client.patch(
+            "/api/v1/providers/dst-flamingo", headers=api.h(Role.admin), json=body
+        )
+
+    assert patch({"policy_profile": "secure_rbac"}).status_code == 200
+    assert patch({"policy_profile": "unknown"}).status_code == 422  # reported, never declared
+    assert api.get("/api/v1/providers/dst-flamingo").json()["policy_profile"] == "secure_rbac"
+    assert patch({"policy_profile": None}).json()["policy_profile"] is None
+    vmware = {
+        "id": "vc-02",
+        "name": "vCenter",
+        "kind": "vmware",
+        "role": "source",
+        "endpoint": "https://vcenter.example",
+        "policy_profile": "legacy",
+    }
+    assert api.post("/api/v1/providers", json=vmware).status_code == 422
+
+
+NAME_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "provider_name_cases.json").read_text()
+)["cases"]
+
+
+@pytest.mark.parametrize("case", NAME_CASES, ids=[c["note"].split(".")[0] for c in NAME_CASES])
+def test_a_providers_name_is_never_blank(api, case):
+    """SDD §4.2 (reviews RV20-11, RV21-07): every text that names the destination provider reads
+    its name, so POST /providers and PATCH /providers/{id} refuse one that is missing, not a
+    string, empty or whitespace-only (422) and store nothing - the cases the dashboard's mock
+    answers too (provider_name_cases.json)."""
+    if case["route"] == "POST":
+        body = {k: v for k, v in DESTINATION.items() if k != "name"}
+        answer = api.post("/api/v1/providers", json={**body, "id": "dst-case", **case["body"]})
+        path = "/api/v1/providers/dst-case"
+    else:
+        path = "/api/v1/providers/dst-rhoso"
+        answer = api.client.patch(path, headers=api.h(Role.admin), json=case["body"])
+    assert answer.status_code == case["status"], answer.text
+    stored = api.client.get(path, headers=api.h(Role.viewer))
+    if case["message"] is None:
+        assert stored.json()["name"] == case["body"]["name"]
+        return
+    assert answer.json()["error"]["message"] == case["message"]
+    if case["route"] == "POST":
+        assert stored.status_code == 404
+    else:
+        assert stored.json()["name"] == DESTINATION["name"]
 
 
 def test_a_plans_providers_cannot_change_while_one_of_its_migrations_is_failed(api):

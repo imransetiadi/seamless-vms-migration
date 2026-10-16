@@ -26,6 +26,7 @@ import { cn } from '../lib/cn';
 import { keepsFocus } from '../lib/navigation';
 import { ROLE_LABELS } from '../lib/roles';
 import { BrandMark } from './BrandMark';
+import { BRAND_DESTINATIONS } from '../lib/platforms';
 import { LiveIndicator } from './LiveIndicator';
 import { Modal } from './Modal';
 import { ThemeToggle } from './ThemeToggle';
@@ -127,7 +128,7 @@ function Brand({ compact = false }: { compact?: boolean }) {
       <BrandMark className="size-7 shrink-0" />
       <span className={cn('flex flex-col leading-tight', compact && 'sr-only')}>
         <span className="font-mono text-sm font-semibold text-foreground">Seamless Migrate</span>
-        <span className="text-xs text-muted-foreground">to RHOSO 18.0</span>
+        <span className="text-xs text-muted-foreground">to {BRAND_DESTINATIONS}</span>
       </span>
     </Link>
   );

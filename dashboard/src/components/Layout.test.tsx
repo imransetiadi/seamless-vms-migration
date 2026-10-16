@@ -19,7 +19,7 @@ describe('Layout health notice', () => {
   it('shows the brand mark beside the product name, which names the link (SDD §16)', async () => {
     renderWithApp(<Layout />, { route: '/', path: '/' });
     await screen.findByRole('navigation', { name: /primary/i });
-    const links = screen.getAllByRole('link', { name: 'Seamless Migrate to RHOSO 18.0' });
+    const links = screen.getAllByRole('link', { name: 'Seamless Migrate to RHOSO 18.0 or OpenStack' });
     expect(links.length).toBeGreaterThan(0);
     for (const link of links) expect(link.querySelector('svg[data-brand-mark]')).toHaveAttribute('aria-hidden', 'true');
   });

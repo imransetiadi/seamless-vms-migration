@@ -97,19 +97,21 @@ const exportPath = (share: string | null): string => {
 
 /**
  * Destination `host@backend#pool` for a volume, or the reason the handover refuses it — the same
- * rules as `seamless_migrate.storage.resolve_destination` (SDD §7.3.1).
+ * rules as `seamless_migrate.storage.resolve_destination` (SDD §7.3.1); a refusal about the destination cloud names
+ * its provider, `destinationName` (SDD §1 naming).
  */
 export function resolveDestination(
   family: StorageFamily,
   sourcePool: string | null,
   target: string,
   destination: StorageBackend[],
+  destinationName = 'the destination',
 ): { host?: string; error?: string } {
   if (!SUPPORTED.includes(family)) return { error: `unsupported storage family '${family}': handover supports Ceph RBD and NetApp ONTAP (NFS, iSCSI, FC)` };
   const [backend, wanted] = splitHost(target);
   const pools = destination.filter((b) => splitHost(b.pool)[0] === backend);
   if (pools.length === 0) {
-    return { error: `the destination lists no pools for ${backend}: the ${family === 'rbd' ? 'RBD' : 'NetApp'} pool cannot be checked` };
+    return { error: `${destinationName} lists no pools for ${backend}: the ${family === 'rbd' ? 'RBD' : 'NetApp'} pool cannot be checked` };
   }
   const candidates = pools.filter((b) => b.family === family);
   if (candidates.length === 0) {
@@ -121,7 +123,7 @@ export function resolveDestination(
     if (wanted) {
       return candidates.some((b) => b.pool === target)
         ? { host: target }
-        : { error: `the destination lists no pool ${target} (RBD pools of ${backend}: ${candidates.map((b) => b.pool).join(', ')})` };
+        : { error: `${destinationName} lists no pool ${target} (RBD pools of ${backend}: ${candidates.map((b) => b.pool).join(', ')})` };
     }
     if (candidates.length === 1) return { host: candidates[0]!.pool };
     return { error: `${backend} has ${candidates.length} pools: name the pool in backend_map` };

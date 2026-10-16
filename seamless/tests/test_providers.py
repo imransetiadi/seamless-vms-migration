@@ -1,11 +1,14 @@
 import builtins
+import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
 
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole
+from seamless_migrate.planning.platforms import destination_release
 from seamless_migrate.planning.preflight import DestinationInventory, SourceInventory, is_legacy_os
 from seamless_migrate.providers import registry
 from seamless_migrate.providers.base import ProviderError, VMNotFound, provider_caps
@@ -74,7 +77,9 @@ async def test_fake_destination_inventory_and_servers():
     inv = await dst.inventory()
     assert isinstance(inv, DestinationInventory)
     assert inv.flavors and inv.volume_types and inv.quotas and inv.networks
+    # the demo's token, read with the inventory as its check reports it (SDD §10, RV19-01)
     caps = await dst.check()
+    assert inv.roles == caps["roles"] == ["admin", "member", "reader"]
     assert caps["admin"] is True and caps["ovn"] is True
     server = await dst.get_server("srv-1")
     assert server["status"] == "ACTIVE" and server["ports"][0]["status"] == "ACTIVE"
@@ -586,6 +591,8 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
         "admin": True,
         "roles": ["admin", "member", "reader"],
         "compute_microversion": "2.95",
+        # the stub's block-storage proxy has no version document: unreadable (SDD §10)
+        "block_storage_microversion": "",
         "ovn": True,
         "volume_backends": ["hostgroup@ceph#ssd"],
         "storage_backends": [
@@ -596,6 +603,9 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
                 "family": "rbd",
             }
         ],
+        # an https endpoint, and no service endpoint the stub can tell (SDD §10, Security.md)
+        "tls": True,
+        "plain_http": [],
     }
     stub_openstack(fake_conn(admin=False, ovn=False))
     caps = await OpenStackProvider(make_provider(), settings()).check()
@@ -615,6 +625,205 @@ async def test_the_check_reports_a_real_clouds_compute_maximum_as_major_minor(tm
     # what keystoneauth hands the check: a tuple, never the text a stub hands
     conn = cloud.connect(provider, cloud.settings)
     assert conn.compute.get_endpoint_data().max_microversion == (2, 96)
+
+
+VERSIONS = Path(__file__).parent / "fixtures" / "openstack_versions"
+
+
+def _current(document):
+    """The maximum of a recorded version document's CURRENT version; None without a document."""
+    if not document:
+        return None
+    return next(v["version"] for v in document["versions"] if v["status"] == "CURRENT")
+
+
+@pytest.mark.parametrize("path", sorted(VERSIONS.glob("*.json")), ids=lambda path: path.stem)
+async def test_a_real_destination_of_each_series_is_read_as_that_series(tmp_path, path):
+    """Review RV18-01: on a real cloud every destination read "not detected" - Outside, its
+    profile unknown - since the check wrote keystoneauth's tuples as text. Through a real
+    keystoneauth session each series' recorded maxima read as SDD §10.1 reads their text: both
+    maxima as major.minor, the series' range, and the tier and profile of that range (SDD §10,
+    §21.3)."""
+    documents = json.loads(path.read_text(encoding="utf-8"))
+    compute, block_storage = _current(documents["compute"]), _current(documents["block_storage"])
+    cloud = InProcessCloud(tmp_path, compute=compute, block_storage=block_storage)
+    provider = make_provider(
+        id="dst-community",
+        role=ProviderRole.destination,
+        distribution="openstack_community",
+        endpoint=AUTH_URL,
+        cloud="dst",
+    )
+    caps = await OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect).check()
+
+    maxima = (caps["compute_microversion"], caps["block_storage_microversion"])
+    assert maxima == (compute, block_storage or "")
+    assert caps["release_range"] == documents["expected_range"]
+    reported = {key: caps[key] for key in ("release_range", "release", "support_tier")}
+    expected = destination_release("openstack", None, None, compute, block_storage or "")
+    assert reported | {"policy_profile": caps["policy_profile"]} == expected
+
+
+async def test_every_openstack_check_reports_the_shared_keys(tmp_path):
+    """SDD §10, §10.1: the real check through keystoneauth and the demo's fakes report the keys of
+    check_report_keys.json - a destination's adds the destination_release keys -, the file the
+    dashboard's mock check is held to (plan T8)."""
+    keys = json.loads((VERSIONS.parent / "check_report_keys.json").read_text(encoding="utf-8"))
+    source, destination = sorted(keys["openstack"]), sorted(keys["openstack"] + keys["destination"])
+    cloud = InProcessCloud(tmp_path, compute="2.104", block_storage="3.71")
+    for role, expected in ((ProviderRole.source, source), (ProviderRole.destination, destination)):
+        provider = make_provider(endpoint=AUTH_URL, cloud="dst", role=role)
+        caps = await OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect).check()
+        assert sorted(caps) == expected, role
+    assert sorted(await FakeSourceProvider(ProviderKind.openstack).check()) == source
+    community = make_provider(id="dst-dc3", role=ProviderRole.destination, release="2026.2")
+    for provider in (community, community.model_copy(update={"kind": ProviderKind.rhoso})):
+        caps = await FakeDestinationProvider(provider=provider).check()
+        assert sorted(caps) == destination, provider.kind
+
+
+def _versions(conn, compute, block_storage):
+    conn.compute.get_endpoint_data = lambda: NS(max_microversion=compute)
+    conn.block_storage.get_endpoint_data = lambda: NS(max_microversion=block_storage)
+    return conn
+
+
+async def test_openstack_check_reports_release_range_tier_profile_and_tls(stub_openstack):
+    """SDD §10, §10.1, §21.3, §21.5: a destination's check reports the series its maxima read as,
+    the series it settles on, its support tier and its policy profile, and TLS; a source's check
+    reports TLS but no destination keys."""
+    hibiscus = make_provider(
+        id="dst-hibiscus",
+        role=ProviderRole.destination,
+        distribution="kolla",
+        endpoint="https://keystone.dst.example:5000/v3",
+    )
+    stub_openstack(_versions(fake_conn(), "2.104", "3.71"))
+    caps = await OpenStackProvider(hibiscus, settings()).check()
+    assert caps["compute_microversion"] == "2.104" and caps["block_storage_microversion"] == "3.71"
+    assert {
+        key: caps[key] for key in ("release_range", "release", "support_tier", "policy_profile")
+    } == {
+        "release_range": ["2026.2"],
+        "release": "2026.2",
+        "support_tier": {"tier": "tier1", "reason": None, "declared_outside_range": False},
+        "policy_profile": "secure_rbac",
+    }
+    assert caps["tls"] is True and caps["plain_http"] == []
+
+    # 2.96 is 2024.1 or 2024.2: Tier 3 until the operator declares the series; a declared series
+    # the range does not hold warns, and a declared profile wins
+    stub_openstack(_versions(fake_conn(), "2.96", "3.71"))
+    caps = await OpenStackProvider(
+        hibiscus.model_copy(update={"release": "2026.2"}), settings()
+    ).check()
+    assert caps["release_range"] == ["2024.1", "2024.2"] and caps["release"] is None
+    assert caps["support_tier"] == {
+        "tier": "tier3",
+        "reason": "end_of_life",
+        "declared_outside_range": True,
+    }
+    declared = hibiscus.model_copy(update={"release": "2024.1", "policy_profile": "legacy"})
+    caps = await OpenStackProvider(declared, settings()).check()
+    assert caps["release"] == "2024.1" and caps["support_tier"]["tier"] == "tier2"
+    assert caps["policy_profile"] == "legacy"
+
+    # Cinder's maximum reaches the detection: 2.98 alone is 2024.2 or 2025.1, and 3.72 is no
+    # 2024.2 Cinder (SDD §10.1)
+    stub_openstack(_versions(fake_conn(), "2.98", "3.72"))
+    caps = await OpenStackProvider(hibiscus, settings()).check()
+    assert caps["release_range"] == ["2025.1"] and caps["release"] == "2025.1"
+
+    # RHOSO 18.0 is validated by its kind, and legacy until D14 is decided
+    rhoso = make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination)
+    stub_openstack(_versions(fake_conn(), "2.95", "3.70"))
+    caps = await OpenStackProvider(rhoso, settings()).check()
+    assert caps["support_tier"] == {
+        "tier": "validated",
+        "reason": None,
+        "declared_outside_range": False,
+    }
+    assert caps["policy_profile"] == "legacy" and caps["release_range"] == ["2023.1", "2023.2"]
+
+    # a source reports none of a destination's keys
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    assert not {"release_range", "release", "support_tier", "policy_profile"} & set(caps)
+    assert caps["tls"] is True
+
+
+async def test_a_plain_http_endpoint_is_reported(stub_openstack):
+    """SDD §10, §21.7, Security.md: the check names the provider's own endpoint and each service
+    endpoint that uses plain HTTP; an endpoint it cannot read counts neither way."""
+    conn = fake_conn()
+    conn.compute.get_endpoint = lambda: "http://nova.dst.example:8774/v2.1"
+    conn.network = NS(**vars(conn.network), get_endpoint=lambda: "HTTP://neutron.dst.example:9696")
+    conn.identity = NS(
+        **vars(conn.identity), get_endpoint=lambda: "https://keystone.dst.example/v3"
+    )
+
+    def unreadable():
+        raise RuntimeError("the catalog has no block-storage endpoint for this region")
+
+    conn.block_storage.get_endpoint = unreadable
+    stub_openstack(conn)
+    plain = make_provider(endpoint="http://keystone.dst.example:5000/v3")
+    caps = await OpenStackProvider(plain, settings()).check()
+    assert caps["tls"] is False
+    assert caps["plain_http"] == ["endpoint", "compute", "network"]
+
+    secure = make_provider(endpoint="https://keystone.dst.example:5000/v3")
+    caps = await OpenStackProvider(secure, settings()).check()
+    assert caps["tls"] is False and caps["plain_http"] == ["compute", "network"]
+
+    conn.compute.get_endpoint = lambda: "https://nova.dst.example:8774/v2.1"
+    conn.network = NS(**{**vars(conn.network), "get_endpoint": lambda: "https://neutron.example"})
+    caps = await OpenStackProvider(secure, settings()).check()
+    assert caps["tls"] is True and caps["plain_http"] == []
+
+
+async def test_the_check_reads_a_real_clouds_identity_endpoint(tmp_path):
+    """Review RV18-03: openstacksdk's identity proxy overrides get_endpoint() - it fetches a
+    Keystone endpoint record -, so the check never read identity's endpoint, and a plain-HTTP one
+    counted neither way. It is read as keystoneauth reads every service's from the catalog (SDD
+    §10, Security.md)."""
+    provider = make_provider(endpoint=AUTH_URL, cloud="dst")
+    secure = InProcessCloud(tmp_path / "secure")
+    caps = await OpenStackProvider(provider, secure.settings, connect_fn=secure.connect).check()
+    assert (caps["tls"], caps["plain_http"]) == (True, [])
+
+    plain = InProcessCloud(
+        tmp_path / "plain", catalog={"identity": "http://identity.example.org/v3"}
+    )
+    caps = await OpenStackProvider(provider, plain.settings, connect_fn=plain.connect).check()
+    assert (caps["tls"], caps["plain_http"]) == (False, ["identity"])
+
+
+async def test_the_check_reports_the_plain_http_auth_url_the_credential_is_posted_to(tmp_path):
+    """Review RV18-03: the credential is posted to the auth URL of its clouds.yaml entry or
+    credentials secret, which need not be the provider's endpoint - a plain-HTTP one sent the
+    password in clear text while the check reported tls. It is named `auth_url` (SDD §10, §13.3,
+    Security.md)."""
+    cloud = InProcessCloud(tmp_path, auth_url="http://identity.example.org/v3")
+    provider = make_provider(endpoint=AUTH_URL, cloud="dst")
+    caps = await OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect).check()
+
+    assert ("POST", "http://identity.example.org/v3/auth/tokens") in cloud.seen
+    assert (caps["tls"], caps["plain_http"]) == (False, ["auth_url"])
+
+
+async def test_the_demo_destination_reports_rhoso_validated_and_legacy():
+    """The demo's RHOSO 18.0 destination reports the keys a real destination's check does (SDD
+    §10, §10.1), so the dashboard shows them in the demo too."""
+    caps = await FakeDestinationProvider(seed=42).check()
+    assert caps["release_range"] == ["2023.1", "2023.2"] and caps["release"] is None
+    assert caps["support_tier"] == {
+        "tier": "validated",
+        "reason": None,
+        "declared_outside_range": False,
+    }
+    assert caps["policy_profile"] == "legacy"
+    assert caps["tls"] is True and caps["plain_http"] == []
+    assert caps["compute_microversion"] == "2.95" and caps["block_storage_microversion"] == "3.70"
 
 
 async def test_openstack_check_leaves_out_roles_it_cannot_read(stub_openstack):
@@ -677,6 +886,26 @@ async def test_openstack_volume_disks_carry_their_cinder_pool(stub_openstack):
     root, data = vm.disks
     assert root.pool == "overcloud@ontap_nfs#192.0.2.5:/cinder_vol"
     assert data.pool is None  # host attribute hidden from non-admin credentials
+
+
+async def test_a_destinations_inventory_reads_its_tokens_roles_live(stub_openstack):
+    """Review RV19-01, SDD §10: the destination inventory carries its token's role names, read with
+    it for every run - what the VMware kit's map judges, not a check report new credentials may
+    have reset. A token whose roles cannot be read gives None; a source inventory has none."""
+    conn = fake_conn(admin=False)
+    stub_openstack(conn)
+    destination = make_provider(id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination)
+    assert (await OpenStackProvider(destination, settings()).inventory()).roles == [
+        "member",
+        "reader",
+    ]
+
+    def unreadable(session):
+        raise RuntimeError("the token has expired")
+
+    conn.session = NS(auth=NS(get_access=unreadable))
+    assert (await OpenStackProvider(destination, settings()).inventory()).roles is None
+    assert not hasattr(await OpenStackProvider(make_provider(), settings()).inventory(), "roles")
 
 
 async def test_openstack_destination_inventory(stub_openstack):

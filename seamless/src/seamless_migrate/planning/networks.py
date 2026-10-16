@@ -10,34 +10,67 @@ VMware migration kit's network_map (``kit_network_value``), before each run.
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any
 
 from ..domain.models import Nic
 from .ipam import address_refusal
+from .platforms import destination_release
 
-# the roles Neutron's policy (2023.1 create_port:fixed_ips:ip_address, :mac_address,
+# the roles Neutron's policy (create_port:fixed_ips:ip_address, :mac_address,
 # :port_security_enabled) lets choose a port's address, MAC or port security on another project's
-# network; the collection's server_port.PORT_ROLES (SDD §6.6)
-PORT_ROLES = ("admin", "advsvc")
+# network, by the destination's policy profile: the 2023.1 rules, the defaults from 2023.2, and
+# the role both count; the collection's server_port.PORT_ROLES_BY_PROFILE (SDD §6.6, §21.5)
+PORT_ROLES_BY_PROFILE = {
+    "legacy": ("admin", "advsvc"),
+    "secure_rbac": ("admin", "service"),
+    "unknown": ("admin",),
+}
+# what each profile's rule says when the token has none of its roles
+_ROLE_RULE = {
+    "legacy": "Neutron lets only the admin or advsvc role, or that project, choose a port's "
+    "address or MAC there, and the credential's token has neither",
+    "secure_rbac": "Neutron's secure-RBAC defaults let only the admin or service role, or that "
+    "project, choose a port's address or MAC there, and the credential's token has neither",
+    # a check is allowed while a plan runs, a PATCH that declares is not (SDD §12, §21.5)
+    "unknown": "the destination's policy profile is unknown, so only the admin role, or that "
+    "project, may choose a port's address or MAC there, and the credential's token lacks it "
+    "(check the provider so its series is detected, or declare its policy profile or series)",
+}
 
 
-def port_refusal(network: dict[str, Any], roles: Collection[str] | None) -> str | None:
+def policy_profile_of(capabilities: Mapping[str, Any] | None, destination: Any) -> str:
+    """The policy profile of ``destination`` (a Provider) as its check report ``capabilities``
+    gives it (SDD §10.1, §21.5). A report that names none - reset by a provider change or new
+    credentials, or kept from before 0.2.0 - reads as the provider's declarations alone
+    (``destination_release`` with no maximum read), never legacy by default (review RV18-04);
+    ``unknown`` for a value no rule knows, and without a provider."""
+    profile = (capabilities or {}).get("policy_profile")
+    if profile is None and destination is not None:
+        profile = destination_release(
+            destination.kind, destination.release, destination.policy_profile, "", ""
+        )["policy_profile"]
+    return profile if profile in PORT_ROLES_BY_PROFILE else "unknown"
+
+
+def port_refusal(
+    network: dict[str, Any], roles: Collection[str] | None, profile: str = "legacy"
+) -> str | None:
     """Why the destination credential may not put a port on ``network`` (a ``network_details``
     entry), or None (SDD §6.6). Another project's network takes it only when shared with the
     credential's project or external - an admin sees every project's networks - and only from a
-    token with one of ``PORT_ROLES``: every recreated port asks for its address or MAC. An
-    external network that is not shared, the credential's own included, also needs the admin
-    role: Nova attaches no other to a server. ``roles`` None (not reported) leaves the role
-    halves unjudged."""
+    token with a role the destination's policy ``profile`` counts (``PORT_ROLES_BY_PROFILE``;
+    ``policy_profile_of`` reads it): every recreated port asks for its
+    address or MAC. An external network that is not shared, the credential's own included, also
+    needs the admin role: Nova attaches no other to a server. ``roles`` None (not reported)
+    leaves the role halves unjudged."""
+    if profile not in PORT_ROLES_BY_PROFILE:
+        profile = "unknown"
     if not network.get("own"):
         if not (network.get("shared") or network.get("external")):
             return "it is neither shared with the credential's project nor external"
-        if roles is not None and not set(roles) & set(PORT_ROLES):
-            return (
-                "Neutron lets only the admin or advsvc role, or that project, choose a port's "
-                "address or MAC there, and the credential's token has neither"
-            )
+        if roles is not None and not set(roles) & set(PORT_ROLES_BY_PROFILE[profile]):
+            return _ROLE_RULE[profile]
     # Nova's network:attach_external_network, admin only by default (2023.1)
     if network.get("external") and not network.get("shared"):
         if roles is not None and "admin" not in roles:
@@ -46,6 +79,27 @@ def port_refusal(network: dict[str, Any], roles: Collection[str] | None) -> str 
                 "network to a server; the credential's token lacks it"
             )
     return None
+
+
+#: why a run refuses a port that needs a role when neither the token nor the destination's check
+#: report names one (SDD §7.2, §7.3 step 0; reviews RV19-01, RV20-07)
+ROLES_UNREADABLE = (
+    "the credential's token roles could not be read, and a port there needs a role: check the "
+    "destination provider, then retry"
+)
+
+
+def port_refusal_at_run(
+    network: dict[str, Any], roles: Collection[str] | None, profile: str = "legacy"
+) -> str | None:
+    """§6.6's rule as a run judges it before the source stops (SDD §7.2, §7.3 step 0): ``roles``
+    None - neither the token nor the destination's check report names any - refuses a port that
+    needs a role, where ``port_refusal`` leaves that half unjudged: a report new credentials reset
+    never lets a token through."""
+    refused = port_refusal(network, roles, profile)
+    if refused is None and roles is None and port_refusal(network, [], profile):
+        return ROLES_UNREADABLE
+    return refused
 
 
 def resolve_network(

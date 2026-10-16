@@ -1,0 +1,77 @@
+{
+ "_comment": "The community series table of SDD §21.1 and §10.1 (planning.platforms.SERIES), oldest first. Shared by seamless/tests/test_platforms.py (it is the code's table) and dashboard/src/lib/platforms.test.ts (it is the dashboard's table). It changes with SDD §21.1's table, in the same commit.",
+ "series": [
+  {
+   "name": "2023.1",
+   "codename": "Antelope",
+   "phase": "Unmaintained",
+   "slurp": true,
+   "tier": "tier2",
+   "compute_max": "2.95",
+   "block_storage_max": "3.70"
+  },
+  {
+   "name": "2023.2",
+   "codename": "Bobcat",
+   "phase": "End of Life",
+   "slurp": false,
+   "tier": "tier3",
+   "compute_max": "2.95",
+   "block_storage_max": "3.70"
+  },
+  {
+   "name": "2024.1",
+   "codename": "Caracal",
+   "phase": "Unmaintained",
+   "slurp": true,
+   "tier": "tier2",
+   "compute_max": "2.96",
+   "block_storage_max": "3.71"
+  },
+  {
+   "name": "2024.2",
+   "codename": "Dalmatian",
+   "phase": "End of Life",
+   "slurp": false,
+   "tier": "tier3",
+   "compute_max": "2.96",
+   "block_storage_max": "3.71"
+  },
+  {
+   "name": "2025.1",
+   "codename": "Epoxy",
+   "phase": "Maintained",
+   "slurp": true,
+   "tier": "tier1",
+   "compute_max": "2.100",
+   "block_storage_max": null
+  },
+  {
+   "name": "2025.2",
+   "codename": "Flamingo",
+   "phase": "Maintained",
+   "slurp": false,
+   "tier": "tier1",
+   "compute_max": "2.100",
+   "block_storage_max": null
+  },
+  {
+   "name": "2026.1",
+   "codename": "Gazpacho",
+   "phase": "Maintained",
+   "slurp": true,
+   "tier": "tier1",
+   "compute_max": "2.103",
+   "block_storage_max": null
+  },
+  {
+   "name": "2026.2",
+   "codename": "Hibiscus",
+   "phase": "Maintained",
+   "slurp": false,
+   "tier": "tier1",
+   "compute_max": "2.104",
+   "block_storage_max": null
+  }
+ ]
+}

@@ -107,6 +107,25 @@ def test_resolve_destination_refuses_unlisted_or_non_rbd_pool():
         resolve_destination("rbd", "x", "hostgroup@ontap-iscsi", dst)
 
 
+def test_resolve_destination_names_the_destination_provider():
+    """SDD §1 naming, §7.3.1 (review RV20-05): a refusal built for a plan names the destination
+    provider; "the destination" when none is given."""
+    dst = [backend("hostgroup@ceph#a", "rbd")]
+    name = "OpenStack 2026.2 Hibiscus (DC3)"
+    with pytest.raises(StorageError) as unlisted:
+        resolve_destination("rbd", "x", "hostgroup@ceph#typo", dst, name)
+    assert str(unlisted.value) == (
+        f"{name} lists no pool hostgroup@ceph#typo (RBD pools of hostgroup@ceph: hostgroup@ceph#a)"
+    )
+    with pytest.raises(StorageError) as none:
+        resolve_destination("netapp_nfs", "x:/v", "hostgroup@other", dst, name)
+    assert str(none.value) == (
+        f"{name} lists no pools for hostgroup@other: the NetApp pool cannot be checked"
+    )
+    with pytest.raises(StorageError, match="^the destination lists no pool "):
+        resolve_destination("rbd", "x", "hostgroup@ceph#typo", dst)
+
+
 def test_resolve_destination_refuses_mismatch_missing_pool_and_other():
     dst = [
         backend("hostgroup@ontap-nfs#10.20.0.5:/cinder_vol", "netapp_nfs"),

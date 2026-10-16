@@ -350,12 +350,13 @@ describe('migrationActions rules', () => {
         ],
       });
     const plan = { ...(fx.plans[0] as Plan), finalize_warning_h: 72 };
-    expect(nextStep(completed(10), plan, now)).toEqual({
-      text: 'Verified on RHOSO 10 h ago. Next: finalize to clean up the source (approver), or roll back if needed.',
+    // the plan's destination provider by name where the page knows it, else "the destination" (SDD §1 naming, plan T6)
+    expect(nextStep(completed(10), plan, now, 'OpenStack 2026.2 Hibiscus (DC3)')).toEqual({
+      text: 'Verified on OpenStack 2026.2 Hibiscus (DC3) 10 h ago. Next: finalize to clean up the source (approver), or roll back if needed.',
       action: 'finalize',
     });
     expect(nextStep(completed(80), plan, now)).toEqual({
-      text: 'Verified on RHOSO 3 d ago. It has waited in Completed longer than the plan allows (72 h): finalize it or roll it back.',
+      text: 'Verified on the destination 3 d ago. It has waited in Completed longer than the plan allows (72 h): finalize it or roll it back.',
       action: 'finalize',
     });
     // longer than, not as long as; the plan sets the reminder
@@ -365,13 +366,13 @@ describe('migrationActions rules', () => {
     // without its plan the reminder is unknown, so nothing is claimed
     expect(nextStep(completed(80), null, now).text).not.toMatch(/longer than/);
     // the source runs again: no finalize advice until it is stopped (SDD §8.1)
-    expect(nextStep({ ...completed(80), source_running_at: '2026-10-08T11:00:00Z' }, plan, now)).toEqual({
-      text: 'The source VM runs again, so its data diverges from RHOSO. Next: stop it in the source cloud, or roll it back; finalize once it is stopped.',
+    expect(nextStep({ ...completed(80), source_running_at: '2026-10-08T11:00:00Z' }, plan, now, 'OpenStack 2026.2 Hibiscus (DC3)')).toEqual({
+      text: 'The source VM runs again, so its data diverges from OpenStack 2026.2 Hibiscus (DC3). Next: stop it in the source cloud, or roll it back; finalize once it is stopped.',
       action: null,
     });
     // no transition into Completed recorded: no time is claimed either
     expect(nextStep(migration('completed', { phase_history: [] }), plan, now).text).toBe(
-      'Verified on RHOSO. Next: finalize to clean up the source (approver), or roll back if needed.',
+      'Verified on the destination. Next: finalize to clean up the source (approver), or roll back if needed.',
     );
     // its finalize began deleting the source: finalizing again is the way out, never a rollback - also while the source
     // runs again (SDD §8.1)

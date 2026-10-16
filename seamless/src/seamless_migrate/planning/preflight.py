@@ -11,7 +11,8 @@ from ..domain.enums import ProviderKind, Severity, Strategy
 from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
 from .ipam import address_refusal
-from .networks import kit_subnet, port_refusal, resolve_network
+from .networks import kit_subnet, policy_profile_of, port_refusal, resolve_network
+from .platforms import SERIES, parse_microversion
 
 S = Strategy
 
@@ -45,6 +46,9 @@ class DestinationInventory:
     #: [{id, name, mtu, project_id, own, shared, external}]: every network the credential sees, what
     #: a NIC's network name resolves to (SDD §10, §7.3 step 0)
     network_details: list[dict[str, Any]] = field(default_factory=list)
+    #: the role names of the credential's token, read with the inventory - live for every run -;
+    #: None when they cannot be read: what the VMware kit's map judges (SDD §10, §7.2, RV19-01)
+    roles: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -94,31 +98,34 @@ CATALOG: dict[str, CatalogEntry] = {
         "which makes passes slower.",
     ),
     "MAP_NETWORK_MISSING": CatalogEntry(
-        Severity.blocker, (), "Add a network mapping or create a same-named network in RHOSO."
+        Severity.blocker,
+        (),
+        "Add a network mapping or create a same-named network on the destination.",
     ),
     "MAP_NETWORK_PRESTAGED": CatalogEntry(
         Severity.info,
         (),
-        "Nothing to do: pre-staging creates the network in RHOSO with the same name. Add a "
-        "network mapping to use an existing RHOSO network instead.",
+        "Nothing to do: pre-staging creates the network on the destination with the same name. "
+        "Add a network mapping to use an existing destination network instead.",
     ),
     "MAP_FLAVOR_PRESTAGED": CatalogEntry(
         Severity.info,
         (),
-        "Nothing to do: pre-staging creates the flavor in RHOSO with the same name, size and "
-        "extra specs. Add a flavor mapping to use an existing RHOSO flavor instead.",
+        "Nothing to do: pre-staging creates the flavor on the destination with the same name, "
+        "size and extra specs. Add a flavor mapping to use an existing destination flavor instead.",
     ),
     "DST_KEYPAIR_MISSING": CatalogEntry(
         Severity.blocker,
         (),
-        "Create the keypair (its public key) for the RHOSO migration user, or pre-stage keypairs "
+        "Create the keypair (its public key) for the destination's migration user, or pre-stage "
+        "keypairs "
         "when the source migration user owns it.",
     ),
     "MAP_KEYPAIR_PRESTAGED": CatalogEntry(
         Severity.info,
         (),
-        "Nothing to do: pre-staging imports the keypair (name and public key) for the RHOSO "
-        "migration user.",
+        "Nothing to do: pre-staging imports the keypair (name and public key) for the "
+        "destination's migration user.",
     ),
     "MAP_FLAVOR_MISSING": CatalogEntry(
         Severity.blocker,
@@ -152,7 +159,8 @@ CATALOG: dict[str, CatalogEntry] = {
     "NET_SRIOV_PORT": CatalogEntry(
         Severity.warning,
         (),
-        "SR-IOV/macvtap ports need an equivalent physnet in RHOSO; map the network accordingly.",
+        "SR-IOV/macvtap ports need an equivalent physnet on the destination; map the network "
+        "accordingly.",
     ),
     "NET_PORT_IPS": CatalogEntry(
         Severity.warning,
@@ -164,27 +172,32 @@ CATALOG: dict[str, CatalogEntry] = {
     "MAP_NETWORK_AMBIGUOUS": CatalogEntry(
         Severity.blocker,
         (),
-        "Send the NIC to a name one RHOSO network carries: one of the credential's project, or the "
+        "Send the NIC to a name one destination network carries: one of the credential's "
+        "project, or the "
         "only one of that name - map its network to such a name, or rename one of the networks.",
     ),
     "NET_ADDRESS_REFUSED": CatalogEntry(
         Severity.blocker,
         (),
-        "Give the NIC an address its RHOSO network takes: map its network to one whose subnets "
+        "Give the NIC an address its destination network takes: map its network to one whose "
+        "subnets "
         "hold it, or set the address in a NIC override; for a SLAAC address keep the MAC "
         '(port_creation_mode "neutron").',
     ),
     "NET_PORT_NOT_PERMITTED": CatalogEntry(
         Severity.blocker,
         (),
+        # each finding names the role of the destination's own profile (_port_remediation)
         "Send the NIC to a network of the credential's project: map its network to one, or set "
-        "a NIC override on the VM's migration page. Another project's shared or external "
-        "network takes it once the RHOSO credential has the admin role.",
+        "a NIC override on the VM's migration page. Another project's shared network takes it "
+        "once the destination credential has the role its policy profile counts: service under "
+        "secure-RBAC, advsvc under the legacy rules. An external network that is not shared "
+        "needs the admin role: Nova attaches it for no other.",
     ),
     "MAP_NIC_OVERRIDE_INVALID": CatalogEntry(
         Severity.blocker,
         (),
-        "Fix the VM's network overrides on its migration page: an existing RHOSO network, "
+        "Fix the VM's network overrides on its migration page: an existing destination network, "
         "addresses inside its subnets, each given once in the plan. VMware VMs take none.",
     ),
     "MAP_NIC_OVERRIDE": CatalogEntry(
@@ -200,17 +213,18 @@ CATALOG: dict[str, CatalogEntry] = {
     "VM_VGPU": CatalogEntry(
         Severity.blocker,
         (),
-        "vGPU instances cannot be migrated; rebuild the VM with a RHOSO vGPU flavor.",
+        "vGPU instances cannot be migrated; rebuild the VM with a vGPU flavor of the destination.",
     ),
     "VOL_ENCRYPTED": CatalogEntry(
         Severity.warning,
         (),
-        "The Barbican key must be re-created in RHOSO before the volume can be attached.",
+        "The Barbican key must be re-created on the destination before the volume can be attached.",
     ),
     "GUEST_OS_LEGACY": CatalogEntry(
         Severity.warning,
         (),
-        "Out of vendor support: it still migrates; test the application on RHOSO, check the "
+        "Out of vendor support: it still migrates; test the application on the destination, "
+        "check the "
         "virtio drivers and plan a longer verification.",
     ),
     "GUEST_OS_UNKNOWN": CatalogEntry(
@@ -248,6 +262,19 @@ CATALOG: dict[str, CatalogEntry] = {
     "VMW_TOOLS_MISSING": CatalogEntry(
         Severity.info, (), "Install or start VMware Tools for graceful shutdown and IP discovery."
     ),
+    "DST_CAPABILITY_MISSING": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Use a destination whose APIs provide the capability (SDD §21.4); upgrading the "
+        "destination's services raises their maxima.",
+    ),
+    "DST_RELEASE_OUTSIDE_SUPPORT": CatalogEntry(
+        Severity.warning,
+        (),
+        "Prefer a Tier 1 series for production (SDD §21.1); declare the destination's series on "
+        "the provider when its APIs cannot tell it, and run the destination lab matrix (QASuite "
+        "§7.1) before relying on it.",
+    ),
     "CONV_HOST_MISSING": CatalogEntry(
         Severity.warning,
         (S.cold, S.warm, S.vmware_cold, S.vmware_warm),
@@ -256,7 +283,7 @@ CATALOG: dict[str, CatalogEntry] = {
     "HANDOVER_BACKEND_UNMAPPED": CatalogEntry(
         Severity.info,
         (S.storage_handover,),
-        "Map the volume type to a RHOSO Cinder backend in handover.backend_map.",
+        "Map the volume type to a Cinder backend of the destination in handover.backend_map.",
     ),
     "APP_PROBE_MISSING": CatalogEntry(
         Severity.warning,
@@ -294,6 +321,29 @@ def keep_detached_volumes(previous: VMRef, current: VMRef) -> tuple[VMRef, list[
             "longer attached to it",
         )
     ]
+
+
+#: what lets another project's shared network take the port, by the destination's policy profile:
+#: the least role that profile counts, never admin for this alone (SDD §21.5, Security.md C4-06)
+_PORT_ROLE_ADVICE = {
+    "secure_rbac": "the destination credential has the service role for the migration window "
+    "(Neutron's secure-RBAC defaults); admin is not needed for this",
+    "legacy": "the destination credential has the advsvc role (Neutron's legacy rules)",
+    "unknown": "a check of the provider detects its series, or the provider declares its policy "
+    "profile or series, so the check counts that profile's role: service under secure-RBAC, "
+    "advsvc under the legacy rules",
+}
+
+
+def _port_remediation(profile: str) -> str:
+    """NET_PORT_NOT_PERMITTED's remediation for the destination's policy ``profile`` (review
+    RV18-10: it sent every operator to the admin role)."""
+    return (
+        "Send the NIC to a network of the credential's project: map its network to one, or set a "
+        "NIC override on the VM's migration page. Another project's shared network takes it once "
+        f"{_PORT_ROLE_ADVICE[profile]}. An external network that is not shared needs the admin "
+        "role: Nova attaches it for no other."
+    )
 
 
 def finding(
@@ -548,6 +598,7 @@ def _nic_override_findings(
     dst_inv: DestinationInventory,
     selected: Sequence[VMRef],
     source: Provider | None,
+    where: str = "the destination",
 ) -> list[Finding]:
     """MAP_NIC_OVERRIDE_INVALID / MAP_NIC_OVERRIDE (SDD §9.3): every entry checked before
     anything stops - its MAC, its network, its addresses host addresses of the target network's
@@ -586,12 +637,12 @@ def _nic_override_findings(
             # the entry's network, or the mapped one pre-staging would create later: its subnets
             # cannot be checked before anything stops
             problems.append(
-                f"{mac}: RHOSO has no network {network!r}"
+                f"{mac}: {where} has no network {network!r}"
                 + (
                     ""
                     if entries[mac].network
                     else " yet: pre-staging would create it, but its subnets cannot be checked "
-                    "before; name an existing RHOSO network"
+                    f"before; name an existing network of {where}"
                 )
             )
             continue
@@ -652,6 +703,8 @@ def run_preflight(
     selected = list(all_vms) if all_vms is not None else [vm]
     out: list[Finding] = []
     maps = plan.mappings
+    # the destination provider a message about the destination cloud names (SDD §1 naming, §9.3)
+    where = destination.label if destination is not None else "the destination"
 
     if vm.power_state == "error":
         out.append(finding("SRC_VM_ERROR_STATE", f"Source VM {vm.name} is in error state."))
@@ -711,14 +764,14 @@ def run_preflight(
         out.append(
             finding(
                 "MAP_NETWORK_PRESTAGED",
-                f"Pre-staging creates same-named RHOSO network(s): {_names(missing_nets)}.",
+                f"Pre-staging creates same-named network(s) in {where}: {_names(missing_nets)}.",
             )
         )
     elif missing_nets:
         out.append(
             finding(
                 "MAP_NETWORK_MISSING",
-                f"No mapping or same-named RHOSO network for: {_names(missing_nets)}."
+                f"No mapping or same-named network in {where} for: {_names(missing_nets)}."
                 + ("" if prestaged or "networks" not in plan.prestage_resources else "")
                 + (
                     " VMware sources are not pre-staged: map every port group."
@@ -731,7 +784,7 @@ def run_preflight(
         out.append(
             finding(
                 "MAP_NETWORK_MISSING",
-                f"Network mapping target(s) do not exist in RHOSO: {_names(bad_net_targets)}.",
+                f"Network mapping target(s) do not exist in {where}: {_names(bad_net_targets)}.",
                 remediation="Fix the mapping: the destination network must exist.",
             )
         )
@@ -758,18 +811,22 @@ def run_preflight(
         out.append(
             finding(
                 "MAP_NETWORK_AMBIGUOUS",
-                "The cutover cannot tell these RHOSO networks apart: " + "; ".join(ambiguous) + ".",
+                f"The cutover cannot tell these networks of {where} apart: "
+                + "; ".join(ambiguous)
+                + ".",
             )
         )
 
     # whether the credential may put each NIC's port on its resolved network: another project's
-    # takes it only when shared or external, and from the admin or advsvc role (SDD §6.6, §9.3);
-    # the VMware migration kit creates every port with the NIC's MAC (§7.2)
+    # takes it only when shared or external, and from a role the destination's policy profile
+    # counts (SDD §6.6, §9.3, §21.5); the VMware migration kit creates every port with the NIC's
+    # MAC (§7.2)
     roles = (dst_caps or {}).get("roles")
+    profile = policy_profile_of(dst_caps, destination)
     denied = []
     for nic in vm.nics:
         network = resolved.get(id(nic))
-        why = None if network is None else port_refusal(network, roles)
+        why = None if network is None else port_refusal(network, roles, profile)
         if network is not None and why:
             denied.append(
                 f"{(nic.mac or '?').lower()} on {network['name']!r} "
@@ -779,9 +836,10 @@ def run_preflight(
         out.append(
             finding(
                 "NET_PORT_NOT_PERMITTED",
-                "The RHOSO credential may not put these NICs on their network: "
+                f"The credential of {where} may not put these NICs on their network: "
                 + "; ".join(denied)
                 + ".",
+                remediation=_port_remediation(profile),
             )
         )
 
@@ -789,7 +847,7 @@ def run_preflight(
         out.append(
             finding(
                 "MAP_KEYPAIR_PRESTAGED",
-                f"Pre-staging imports keypair {vm.key_name!r} for the RHOSO migration user.",
+                f"Pre-staging imports keypair {vm.key_name!r} for the migration user of {where}.",
             )
         )
     elif keypair_missing(vm, dst_inv):
@@ -797,13 +855,14 @@ def run_preflight(
         out.append(
             finding(
                 "DST_KEYPAIR_MISSING",
-                f"The VM boots with keypair {vm.key_name!r}, which the RHOSO migration user does "
+                f"The VM boots with keypair {vm.key_name!r}, which the migration user of {where} "
+                "does "
                 "not have: the cutover would stop at its destination check."
                 + (
                     " Pre-stage keypairs to import it."
                     if owned
                     else " Another user owns it at the source, so pre-staging cannot export it: "
-                    "create it, its public key, for the RHOSO migration user."
+                    f"create it, its public key, for the migration user of {where}."
                 ),
             )
         )
@@ -815,7 +874,7 @@ def run_preflight(
         out.append(
             finding(
                 "MAP_FLAVOR_PRESTAGED",
-                f"Pre-staging creates RHOSO flavor {vm.flavor!r} with the source's size and "
+                f"Pre-staging creates flavor {vm.flavor!r} in {where} with the source's size and "
                 "extra specs.",
             )
         )
@@ -825,7 +884,8 @@ def run_preflight(
             out.append(
                 finding(
                     "MAP_FLAVOR_MISSING",
-                    f"Flavor {vm.flavor!r} is mapped to {target!r}, which does not exist in RHOSO.",
+                    f"Flavor {vm.flavor!r} is mapped to {target!r}, which does not exist in "
+                    f"{where}.",
                     remediation="Fix the mapping: the destination flavor must exist.",
                 )
             )
@@ -836,7 +896,8 @@ def run_preflight(
             out.append(
                 finding(
                     "MAP_FLAVOR_MISSING",
-                    f"No mapping for flavor {vm.flavor!r} and no RHOSO flavor with >= {vm.vcpus} "
+                    f"No mapping for flavor {vm.flavor!r} and no flavor of {where} with "
+                    f">= {vm.vcpus} "
                     f"vCPUs, >= {vm.ram_mb} MB RAM and >= {root_gb} GB root disk (flavors with "
                     "PCI, vGPU, trait or aggregate extra specs are never matched automatically).",
                 )
@@ -849,8 +910,8 @@ def run_preflight(
             out.append(
                 finding(
                     "MAP_FLAVOR_AUTO",
-                    f"No mapping for flavor {vm.flavor!r}: the smallest fitting RHOSO flavor "
-                    f"{name!r} ({vcpus} vCPUs, {ram_mb} MB RAM, {disk_gb} GB disk) will be used"
+                    f"No mapping for flavor {vm.flavor!r}: the smallest fitting flavor of {where}, "
+                    f"{name!r} ({vcpus} vCPUs, {ram_mb} MB RAM, {disk_gb} GB disk), will be used"
                     + (
                         f"; the source flavor's {', '.join(dropped)} are not carried over."
                         if dropped
@@ -858,7 +919,7 @@ def run_preflight(
                     ),
                     severity=Severity.warning if dropped else None,
                     remediation=(
-                        "Map the flavor to a RHOSO flavor with the same hw:* extra specs."
+                        "Map the flavor to a destination flavor with the same hw:* extra specs."
                         if dropped
                         else None
                     ),
@@ -883,7 +944,8 @@ def run_preflight(
         out.append(
             finding(
                 "MAP_VOLUME_TYPE_MISSING",
-                f"Volume type mapping target(s) do not exist in RHOSO: {_names(bad_type_targets)}.",
+                f"Volume type mapping target(s) do not exist in {where}: "
+                f"{_names(bad_type_targets)}.",
                 severity=Severity.blocker,
                 remediation="Fix the mapping: the destination volume type must exist.",
             )
@@ -894,8 +956,9 @@ def run_preflight(
         out.append(
             finding(
                 "MAP_VOLUME_TYPE_MISSING",
-                f"No mapping or same-named RHOSO volume type for: {_names(missing_types)}; "
-                "the plan maps volume types, so the destination default cannot be used.",
+                f"No mapping or same-named volume type in {where} for: {_names(missing_types)}; "
+                f"the plan maps volume types, so the default volume type of {where} cannot be "
+                "used.",
                 severity=Severity.blocker,
                 remediation="Add a volume type mapping for it (the plan preserves volume types).",
             )
@@ -904,7 +967,7 @@ def run_preflight(
         out.append(
             finding(
                 "MAP_VOLUME_TYPE_MISSING",
-                f"No mapping or same-named RHOSO volume type for: {_names(missing_types)}.",
+                f"No mapping or same-named volume type in {where} for: {_names(missing_types)}.",
             )
         )
 
@@ -914,8 +977,8 @@ def run_preflight(
             out.append(
                 finding(
                     "DST_PROJECT_MISSING",
-                    f"Project {vm.project!r} is mapped to {mapped_project!r}, which the "
-                    "destination does not list.",
+                    f"Project {vm.project!r} is mapped to {mapped_project!r}, which {where} "
+                    "does not list.",
                 )
             )
         elif (
@@ -928,7 +991,7 @@ def run_preflight(
                 finding(
                     "DST_PROJECT_MISSING",
                     f"No destination project for {vm.project!r}: no mapping, no same-named "
-                    f"project, and the destination has {len(dst_inv.quotas)} projects.",
+                    f"project, and {where} has {len(dst_inv.quotas)} projects.",
                 )
             )
     shortfall = _quota_shortfall(vm, plan, dst_inv, selected)
@@ -937,7 +1000,7 @@ def run_preflight(
         out.append(
             finding(
                 "DST_QUOTA_INSUFFICIENT",
-                f"Destination project {project!r} lacks quota for the plan's VMs: "
+                f"Project {project!r} of {where} lacks quota for the plan's VMs: "
                 + "; ".join(short)
                 + ".",
             )
@@ -957,7 +1020,7 @@ def run_preflight(
                 else f"{nic.network} {src_mtu} -> {target} {dst_mtu}"
             )
     if shrinks:
-        out.append(finding("NET_MTU_SHRINK", f"Destination MTU is smaller: {_names(shrinks)}."))
+        out.append(finding("NET_MTU_SHRINK", f"The MTU in {where} is smaller: {_names(shrinks)}."))
 
     sriov = [nic.network for nic in vm.nics if nic.vnic_type in _SRIOV_VNIC_TYPES]
     if sriov:
@@ -1006,7 +1069,7 @@ def run_preflight(
             out.append(
                 finding(
                     "NET_ADDRESS_REFUSED",
-                    "Neutron would refuse these addresses on their RHOSO network: "
+                    f"Neutron would refuse these addresses on their network in {where}: "
                     + "; ".join(refused)
                     + ".",
                 )
@@ -1026,13 +1089,13 @@ def run_preflight(
             out.append(
                 finding(
                     "NET_ADDRESS_REFUSED",
-                    "Neutron would refuse these addresses on their RHOSO network: "
+                    f"Neutron would refuse these addresses on their network in {where}: "
                     + "; ".join(refused)
                     + ".",
                 )
             )
 
-    out.extend(_nic_override_findings(vm, plan, dst_inv, selected, source))
+    out.extend(_nic_override_findings(vm, plan, dst_inv, selected, source, where))
 
     if "pci_passthrough:alias" in vm.flavor_extra_specs:
         out.append(
@@ -1092,12 +1155,12 @@ def run_preflight(
         lacking: list[str] = []
         if source.kind == ProviderKind.vmware:
             if destination.conversion_host is None:
-                lacking.append(f"destination {destination.id}")
+                lacking.append(f"destination {destination.label}")
         else:
             if source.conversion_host is None:
                 lacking.append(f"source {source.id}")
             if destination.conversion_host is None:
-                lacking.append(f"destination {destination.id}")
+                lacking.append(f"destination {destination.label}")
         if lacking:
             out.append(
                 finding(
@@ -1105,6 +1168,10 @@ def run_preflight(
                     f"No conversion host configured on: {', '.join(lacking)}.",
                 )
             )
+
+    if destination is not None and dst_caps:
+        out.extend(_destination_capabilities(destination, dst_caps))
+        out.extend(_release_outside_support(destination, dst_caps))
 
     if plan.handover.enabled:
         unmapped = [
@@ -1123,6 +1190,86 @@ def run_preflight(
     if missing is not None:
         out.append(missing)
     return out
+
+
+#: (service, check-report key, floor, why) every strategy needs (SDD §21.4); a gap one strategy
+#: alone has is that strategy's eligibility reason (planning.selector), never a finding
+_CAPABILITY_FLOOR: tuple[tuple[str, str, str, str], ...] = (
+    ("compute API", "compute_microversion", "2.60", " (multi-attach)"),
+    ("block storage API", "block_storage_microversion", "3.0", ""),
+)
+
+
+def _destination_capabilities(destination: Provider, caps: Mapping[str, Any]) -> list[Finding]:
+    """DST_CAPABILITY_MISSING (SDD §21.4): each maximum of the destination's check report below
+    the floor every strategy needs; one the check could not read is not judged."""
+    lacking = [
+        f"{service} {caps[key]}, below {floor}{why}"
+        for service, key, floor, why in _CAPABILITY_FLOOR
+        if (read := parse_microversion(caps.get(key))) is not None
+        and read < parse_microversion(floor)
+    ]
+    if not lacking:
+        return []
+    return [
+        finding(
+            "DST_CAPABILITY_MISSING",
+            f"{destination.label} lacks what every strategy needs: {'; '.join(lacking)}.",
+        )
+    ]
+
+
+def _series_text(names: Sequence[str]) -> str:
+    return f"{names[0]} – {names[-1]}" if len(names) > 1 else (names[0] if names else "no series")
+
+
+def _release_outside_support(destination: Provider, caps: Mapping[str, Any]) -> list[Finding]:
+    """DST_RELEASE_OUTSIDE_SUPPORT (SDD §21.4, §10.1): a Tier 3 or Outside destination, or one
+    whose declared series its APIs contradict; a warning, never a block."""
+    tier = caps.get("support_tier")
+    if not isinstance(tier, Mapping) or tier.get("tier") == "validated":
+        return []
+    found = [str(name) for name in caps.get("release_range") or []]
+    sentences = []
+    reason = tier.get("reason")
+    if tier.get("tier") == "tier3":
+        # the series the check settled on, else the range (review RV18-11)
+        runs = str(caps.get("release") or _series_text(found))
+        sentences.append(
+            f"{destination.label} runs {runs}, read as Tier 3 (End of Life upstream): no "
+            "Seamless release validated it there. The capability checks still apply."
+        )
+    elif tier.get("tier") == "outside":
+        sentences.append(
+            {
+                "below_floor": f"{destination.label} runs a series older than "
+                f"{SERIES[0].name}, the support window's floor: no Seamless release validated it.",
+                "newer_than_validated": f"{destination.label} runs a series newer than "
+                f"{SERIES[-1].name}, the newest series of the support window: no Seamless release "
+                "validated it.",
+            }.get(
+                str(reason),
+                f"The series of {destination.label} could not be detected (its compute API "
+                "maximum was not read): no Seamless release can be said to have validated it.",
+            )
+            + " The capability checks still apply."
+        )
+    if tier.get("declared_outside_range") and destination.release:
+        if sentences:
+            sentences.append(
+                f"It declares series {destination.release}, which its APIs do not run: correct "
+                "the declared series."
+            )
+        else:
+            label = str(tier.get("tier", "")).replace("tier", "Tier ")
+            sentences.append(
+                f"{destination.label} declares series {destination.release}, but its APIs "
+                f"read as {_series_text(found)}: correct the declared series; the tier is the one "
+                f"its APIs read ({label})."
+            )
+    if not sentences:
+        return []
+    return [finding("DST_RELEASE_OUTSIDE_SUPPORT", " ".join(sentences))]
 
 
 def _app_probe_missing(vm: VMRef, plan: Plan) -> Finding | None:

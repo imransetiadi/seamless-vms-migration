@@ -1,6 +1,17 @@
+import json
+from pathlib import Path
+
+import pytest
+
 from seamless_migrate.domain.enums import ProviderKind, Severity, Strategy
-from seamless_migrate.domain.models import Estimate, Finding, HandoverConfig
-from seamless_migrate.planning.selector import eligibility, select_strategy, tie_set
+from seamless_migrate.domain.models import Estimate, Finding, HandoverConfig, NicOverride, VMRef
+from seamless_migrate.executors.handover import KEEP_MICROVERSION
+from seamless_migrate.planning.selector import (
+    HANDOVER_COMPUTE_FLOOR,
+    eligibility,
+    select_strategy,
+    tie_set,
+)
 from tests.factories import make_disk, make_plan, make_vm
 
 OK_CAPS = {"admin": True, "conversion_host": True}
@@ -18,6 +29,35 @@ def est(strategy: Strategy, downtime: float, eligible: bool = True, slo: float =
         final_delta_bytes=0,
         meets_slo=downtime <= slo,
     )
+
+
+def test_storage_handover_needs_the_sources_compute_2_85():
+    """SDD §9.2, §21.4, §7.3: the handover updates the source server's delete_on_termination with
+    compute 2.85, so a source whose maximum is below it makes storage_handover ineligible - an
+    eligibility reason, never a finding, as a blocker would block the VM whatever its strategy.
+    The destination never receives that call, so its maximum is not judged (review RV18-07: a
+    2.79 source stayed eligible and failed at its cutover's step 0). A maximum the check could not
+    read is not judged, and cold and warm keep their eligibility."""
+    plan = make_plan(handover=HandoverConfig(enabled=True, backend_map={"ceph-ssd": "h@rbd#pool"}))
+    vm = make_vm(disks=[make_disk(volume_type="ceph-ssd")])
+
+    def reasons(source, destination="2.95"):
+        src = {**OK_CAPS, "compute_microversion": source}
+        dst = {**OK_CAPS, "compute_microversion": destination}
+        return eligibility(vm, ProviderKind.openstack, plan, src, dst, [])
+
+    train = reasons("2.79")
+    assert train[Strategy.storage_handover] == [
+        "the source's compute API 2.79 is below 2.85 (the handover's delete_on_termination "
+        "update of the source server)"
+    ]
+    assert train[Strategy.cold] == [] and train[Strategy.warm] == []
+    for compute in ("2.85", "2.96", "", None, "not a version"):
+        assert reasons(compute)[Strategy.storage_handover] == [], compute
+    # the destination never receives the update: its maximum is not judged
+    assert reasons("2.96", destination="2.79")[Strategy.storage_handover] == []
+    # the floor is the microversion the handover's step 0 sends (SDD §7.3)
+    assert HANDOVER_COMPUTE_FLOOR == KEEP_MICROVERSION
 
 
 def test_ineligible_strategies_marked():
@@ -322,3 +362,87 @@ def test_a_nic_override_decides_the_address_count_the_port_rules_see():
     reasons = eligibility(single, ProviderKind.openstack, two, OK_CAPS, OK_CAPS)
     for strategy in (Strategy.cold, Strategy.warm, Strategy.storage_handover):
         assert any("10.0.0.5, 10.0.0.8" in r for r in reasons[strategy]), (strategy, reasons)
+
+
+def test_the_handover_reasons_name_the_destination_provider_one_way():
+    """SDD §1 naming, §9.2 (review RV20-05): a reason about the destination cloud names its
+    provider - the backend map's, a pool the destination does not list, its admin rights - so one
+    storage_handover reasons list never mixes the provider's name with "the destination"."""
+    name = "OpenStack 2026.2 Hibiscus (DC3)"
+    vm = make_vm(
+        disks=[
+            make_disk(id="vol-1", volume_type="ceph-ssd", pool="overcloud@ceph#ssd"),
+            make_disk(id="vol-2", volume_type="ceph-hdd", pool="overcloud@ceph#hdd"),
+            make_disk(id="vol-3", volume_type="ceph-gold", pool="overcloud@ceph#gold"),
+        ]
+    )
+    plan = make_plan(
+        handover=HandoverConfig(
+            enabled=True,
+            backend_map={"ceph-ssd": "hostgroup@ceph#gold", "ceph-gold": "hostgroup@other#p"},
+        )
+    )
+    src_caps = {
+        "admin": True,
+        "conversion_host": True,
+        "storage_backends": [
+            {"pool": pool, "family": "rbd"}
+            for pool in ("overcloud@ceph#ssd", "overcloud@ceph#hdd", "overcloud@ceph#gold")
+        ],
+    }
+    dst_caps = {
+        "admin": False,
+        "conversion_host": True,
+        "storage_backends": [{"pool": "hostgroup@ceph#silver", "family": "rbd"}],
+    }
+    reasons = eligibility(vm, "openstack", plan, src_caps, dst_caps, (), name)[
+        Strategy.storage_handover
+    ]
+    assert f"volume type(s) without a backend of {name} in handover.backend_map: ceph-hdd" in (
+        reasons
+    )
+    assert (
+        f"vol-1: {name} lists no pool hostgroup@ceph#gold (RBD pools of hostgroup@ceph: "
+        "hostgroup@ceph#silver)"
+    ) in reasons
+    assert (
+        f"vol-3: {name} lists no pools for hostgroup@other: the RBD pool cannot be checked"
+    ) in reasons
+    assert f"admin rights are required on {name}" in reasons
+    assert [r for r in reasons if "the destination" in r] == [], reasons
+
+
+ELIGIBILITY_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "eligibility_cases.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("case", ELIGIBILITY_CASES["cases"], ids=lambda case: case["why"])
+def test_the_shared_eligibility_cases(case):
+    """SDD §9.2, §16 (review RV20-08): the API's reasons per strategy, which the dashboard's mock
+    words the same way (mockData.test.ts runs these cases too)."""
+    plan = make_plan(
+        handover=HandoverConfig(**case["plan"]["handover"]),
+        port_creation_mode=case["plan"]["port_creation_mode"],
+        nic_overrides={
+            vm: {mac: NicOverride(**o) for mac, o in nics.items()}
+            for vm, nics in case["plan"]["nic_overrides"].items()
+        },
+    )
+
+    def caps(side):
+        return {**side["capabilities"], "conversion_host": side["conversion_host"]}
+
+    findings = [
+        Finding(code=f["code"], severity=f["severity"], message="") for f in case["findings"]
+    ]
+    reasons = eligibility(
+        VMRef.model_validate(case["vm"]),
+        case["source_kind"],
+        plan,
+        caps(case["source"]),
+        caps(case["destination"]),
+        findings,
+        case["destination"]["name"],
+    )
+    assert {str(strategy): r for strategy, r in reasons.items()} == case["expected"]

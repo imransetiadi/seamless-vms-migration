@@ -117,7 +117,10 @@ STRATEGY_FIELDS: tuple[FieldSpec, ...] = (
 
 #: the other jev_decide arguments of a strategy decision ("evidence" renders STRATEGY_FIELDS)
 STRATEGY_REQUEST_FIELDS: dict[str, str] = {
-    "decision": "The question, naming the VM",
+    "decision": (
+        "The question, naming the VM and the destination's kind and series "
+        "(never a provider's name)"
+    ),
     "evidence": "",
     "priorities": "Minimize downtime within the plan's SLO; the simpler strategy on near ties",
     "candidates": "The eligible strategies with their descriptions",

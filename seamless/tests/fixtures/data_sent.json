@@ -1,0 +1,121 @@
+{
+ "_comment": "What GET /advisor/data-sent lists for a remote model whose console stays local (SDD §13.4): payloads.data_sent(Settings(jev_mode='http')), the API's own words. Shared by seamless/tests/test_payloads.py, which keeps it equal to the API's field specs, and dashboard/src/api/mock.test.ts, which keeps the offline mock's list equal to it (review RV21-03).",
+ "items": [
+  {
+   "decision_type": "migration_strategy",
+   "tool": "jev_decide",
+   "fields": [
+    {
+     "key": "decision",
+     "label": "The question, naming the VM and the destination's kind and series (never a provider's name)"
+    },
+    {
+     "key": "vm",
+     "label": "VM name, vCPU, RAM and number of disks"
+    },
+    {
+     "key": "disks",
+     "label": "Each disk: kind, size, volume type, multi-attach, encrypted, independent"
+    },
+    {
+     "key": "size",
+     "label": "Provisioned and used size"
+    },
+    {
+     "key": "write_rate",
+     "label": "Guest write rate, measured or assumed"
+    },
+    {
+     "key": "slo",
+     "label": "The plan's downtime SLO"
+    },
+    {
+     "key": "link",
+     "label": "The plan's link bandwidth"
+    },
+    {
+     "key": "findings",
+     "label": "Pre-flight finding codes and severities"
+    },
+    {
+     "key": "estimates",
+     "label": "Per strategy: downtime, pre-copy, passes and eligibility with its reasons"
+    },
+    {
+     "key": "priorities",
+     "label": "Minimize downtime within the plan's SLO; the simpler strategy on near ties"
+    },
+    {
+     "key": "candidates",
+     "label": "The eligible strategies with their descriptions"
+    },
+    {
+     "key": "requirements",
+     "label": "The two requirements every strategy must meet"
+    }
+   ],
+   "sent": true,
+   "note": null
+  },
+  {
+   "decision_type": "workload_tier",
+   "tool": "jev_classify",
+   "fields": [
+    {
+     "key": "id",
+     "label": "The item's place in the batch (item-1, item-2 …), not the VM's id"
+    },
+    {
+     "key": "name",
+     "label": "VM name"
+    },
+    {
+     "key": "os",
+     "label": "Guest OS"
+    },
+    {
+     "key": "tags",
+     "label": "Tags"
+    },
+    {
+     "key": "disks",
+     "label": "Disk sizes"
+    },
+    {
+     "key": "flavor",
+     "label": "Flavor, or vCPU and RAM"
+    }
+   ],
+   "sent": true,
+   "note": null
+  },
+  {
+   "decision_type": "verification_review",
+   "tool": "jev_verify",
+   "fields": [
+    {
+     "key": "claims",
+     "label": "The two boot claims to verify"
+    },
+    {
+     "key": "checks",
+     "label": "Each verification check: name, result and detail"
+    }
+   ],
+   "sent": true,
+   "note": "The console excerpt stays in this installation: the advisor is remote and SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE is off."
+  },
+  {
+   "decision_type": "console_screening",
+   "tool": "jev_screen",
+   "fields": [
+    {
+     "key": "console",
+     "label": "The last 6,000 characters of the console, redacted"
+    }
+   ],
+   "sent": false,
+   "note": "The console excerpt stays in this installation: the advisor is remote and SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE is off."
+  }
+ ]
+}

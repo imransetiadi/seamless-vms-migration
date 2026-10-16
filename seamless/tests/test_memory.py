@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from seamless_migrate.ai.memory import MemoryClient, MemoryHit, parse_hits
-from seamless_migrate.ai.redaction import redact
+from seamless_migrate.ai.redaction import redact, replace_names
 from seamless_migrate.config import Settings
 
 
@@ -76,6 +76,18 @@ def test_redact_names_covers_names_built_from_the_vm_name():
         "disk [vm]-data, boot [vm]_root, nic data-[vm], host [vm].lab; "
         "web-010 and xweb-01 are other VMs"
     )
+
+
+def test_names_are_replaced_in_one_pass_whose_replacements_are_never_searched_again():
+    """SDD §13.4 (review RV22-04): one pass over every name, the longest first where two start at
+    the same place; what a replacement wrote is never searched again - a VM named like a word of
+    the descriptor the provider's name became leaves the descriptor whole, and "[vm]" is no VM
+    named "vm"."""
+    names = {"RHOSO prod (Jakarta)": "RHOSO 18.0", "RHOSO": "[vm]"}
+    assert replace_names("required on RHOSO prod (Jakarta); VM RHOSO", names) == (
+        "required on RHOSO 18.0; VM [vm]"
+    )
+    assert redact("web-01 and vm", ["web-01", "vm"]) == "[vm] and [vm]"
 
 
 def captured(handler_result, seen):

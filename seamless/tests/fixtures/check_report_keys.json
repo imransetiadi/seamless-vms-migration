@@ -1,0 +1,20 @@
+{
+ "_comment": "The keys an OpenStack or RHOSO provider's check reports (SDD §10): a destination's adds §10.1's destination_release keys. Shared by seamless/tests/test_providers.py (the real check through keystoneauth and the demo's fakes report these; the real check leaves roles out when it cannot read the token's roles, and NET_PORT_NOT_PERMITTED then judges no role half, SDD §9.3) and dashboard/src/api/mock.test.ts (the mock's check reports them too, plan T8).",
+ "openstack": [
+  "admin",
+  "block_storage_microversion",
+  "compute_microversion",
+  "ovn",
+  "plain_http",
+  "roles",
+  "storage_backends",
+  "tls",
+  "volume_backends"
+ ],
+ "destination": [
+  "policy_profile",
+  "release",
+  "release_range",
+  "support_tier"
+ ]
+}

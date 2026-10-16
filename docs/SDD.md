@@ -44,7 +44,14 @@ and migrating Heat stacks/Octavia load balancers (they are exported as findings,
 
 Naming: where a rule about the destination says "RHOSO" (a RHOSO network, flavor, volume type, credential), it
 means the destination cloud, RHOSO 18.0 or a community OpenStack destination (§21); a rule that holds for the Red Hat
-product alone says "RHOSO 18.0". User-facing texts name the destination provider instead (§21.8, PRD FR-34).
+product alone says "RHOSO 18.0". User-facing texts never say "RHOSO" for the destination (§21.8, PRD FR-34, plan
+T6, the owner's choice of 2026-10-16): a text built for a plan or a migration - a finding's message, an executor's
+refusal or failure, an event - names the destination provider by its `name` ("do not exist in OpenStack 2026.2
+Hibiscus (DC3)"), by its `id` when the stored name is blank (review RV20-11); a fixed text - a catalog remediation,
+the dashboard's copy - says "the destination". A text about the Red Hat product itself (the RHOSO 18.0 preset, its
+`validated` tier) keeps its name. Nothing the advisor sends to Jev carries a provider's name, which is operator free
+text (§13.4, review RV20-01). Its question names the destination by kind and series, as "RHOSO 18.0" or "a community
+OpenStack 2026.2 destination". The evidence it sends has the name replaced the same way.
 
 ### 1.1 Why parallel (side-by-side) migration and not adoption
 
@@ -68,7 +75,7 @@ from VMware. Seamless serves those cases and is designed to coexist with adoptio
 | Fact | Design consequence |
 |---|---|
 | Upstream releases a series every six months; each moves through Maintained, Unmaintained and End of Life; every other series is SLURP (releases.openstack.org, read 2026-10-16). | Support tiers tied to that lifecycle, from a 2023.1 Antelope floor to 2026.2 Hibiscus; the window moves with each upstream release (§21.1, §21.2). |
-| Compute's maximum microversion is 2.95 in 2023.1 and 2023.2, 2.96 in 2024.1 and 2024.2, 2.100 in 2025.1 and 2025.2, 2.103 in 2026.1 and 2.104 in 2026.2 (Nova's API microversion history). | Every series of the window has what Seamless calls for (2.60; 2.85 for storage handover); the maximum detects the series range (§21.3). |
+| Compute's maximum microversion is 2.95 in 2023.1 and 2023.2, 2.96 in 2024.1 and 2024.2, 2.100 in 2025.1 and 2025.2, 2.103 in 2026.1 and 2.104 in 2026.2 (Nova's API microversion history). | Every series of the window has what Seamless calls for (2.60; a storage handover's 2.85 is the source's, §21.4); the maximum detects the series range (§21.3). |
 | From 2023.2 oslo.policy defaults to the secure-RBAC rules (new defaults and scope); scope is always enforced from 2024.1; Neutron's `advsvc` is deprecated for the `service` role. | Permission checks follow the destination's policy profile (§21.5). |
 | Networking is ML2/OVN or ML2/OVS; TLS, the deployment tool (Kolla-Ansible, OpenStack-Ansible, DevStack) and the guest images are the operator's choice. | The MTU checks apply as on RHOSO 18.0; `verify_tls` stays on; conversion host images are part of the support statement (§21.6, §21.7). |
 
@@ -158,11 +165,25 @@ ConversionHostConfig { manage: bool = true, name: str|null, flavor: str|null,
         # ssh_key_secret: secret holding the private key used to reach an existing conversion
         # host (required for VMware sources, whose kit has no prestage step)
 
-Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$), name: str, kind: ProviderKind,
+Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
+           name: str,                                  # not blank: POST and PATCH refuse a name with no
+                                                       # character outside Unicode's separators (Z), controls
+                                                       # (Cc) and format characters (Cf) - empty, spaces,
+                                                       # U+200B, U+FEFF - (422); a provider stored blank before
+                                                       # is named by its id in texts, by the same rule (§1
+                                                       # naming, RV20-11, RV21-08). The categories are those of
+                                                       # Unicode 15.1, one pinned list of code points both
+                                                       # sides read - never the runtime's database, which
+                                                       # differs between Python 3.11 and newer (RV22-06)
+           kind: ProviderKind,
            role: ProviderRole, endpoint: str, cloud: str|null, credentials_secret: str|null,
            region: str|null, verify_tls: bool = true, ca_cert_path: str|null,
            conversion_host: ConversionHostConfig|null,
            distribution: Distribution|null,            # must match kind (see above); null = by kind
+           release: str|null (regex ^20[0-9]{2}\.[12]$), # the community series its operator declares, e.g.
+                                                       # "2026.2" (§10.1, §21.3); refused on kind vmware (422)
+           policy_profile: "secure_rbac"|"legacy"|null, # the policy defaults its operator declares (§21.5):
+                                                       # null = by kind and series (§10.1); refused on vmware (422)
            credentials_updated_at: datetime|null,      # server-owned: set by PUT …/credentials
            conversion_key_updated_at: datetime|null,   # server-owned: set by PUT …/conversion-key
            capabilities: dict[str, Any] = {}, status: "unknown"|"ok"|"degraded"|"error" = "unknown",
@@ -802,6 +823,20 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_rollback_delete_ports` | `true` | `delete_ports` of `import_workload_rollback` |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | `conversion_host` of `import_workload_rollback` |
 
+Role `conversion_host_content` (upstream, modified; plan task T7, D15) installs the copy tools on a conversion host by
+its OS. `os_migrate_conversion_host_content_tasks` (role vars, a Jinja expression of the gathered facts) names the task
+file:
+
+| Conversion host | Task file | What it installs |
+|---|---|---|
+| RHEL (`ansible_distribution` RedHat) | `rhel.yml` | the subscription (RHC) tasks, then `nbdkit`, `nbdkit-basic-plugins`, `qemu-img`, `libguestfs-tools`, `libvirt` (libvirtd started) |
+| another member of the RHEL family (`ansible_os_family` RedHat: CentOS Stream 9 and 10, Rocky Linux 9, AlmaLinux 9) | `centos.yml` | EPEL, then `nbdkit`, `nbdkit-basic-plugins`, `qemu-img`, `guestfs-tools`, `libvirt` (libvirtd started) |
+| Ubuntu 24.04 or later | `ubuntu.yml` | with apt (the package lists refreshed): `qemu-utils`, `nbdkit`, `libnbd-bin` (nbdcopy), `libguestfs-tools` |
+
+Any other OS fails the role with a message that names it and the supported ones, where it used to install nothing and
+the transfer then failed for want of nbdkit. An Ubuntu cloud image logs in as `ubuntu`: the provider's
+`conversion_host.ssh_user` (default `cloud-user`, §4.2) names it.
+
 ### 6.6 Hardening of existing code (required)
 
 `roles/import_from_hypervisor/tasks/process_disk.yml` exports hypervisor disks with `qemu-nbd`
@@ -998,9 +1033,12 @@ way the import will after the stop:
   Another project's network only when it is shared with the credential's project or is external (Neutron's `shared`
   and `router:external`, as the credential sees them). An admin credential sees every project's networks, and a port
   on another project's private network would put the VM on that tenant's network. There, also only when the token
-  carries the `admin` or `advsvc` role (`credential_roles`: the role names of the credential's token). Neutron's
-  policy (2023.1 `create_port:fixed_ips:ip_address`, `create_port:mac_address`, `create_port:port_security_enabled`)
-  lets only those roles, or the network's own project, choose a port's address, MAC or port security. The import
+  carries a role the destination's policy profile counts (`credential_roles`: the role names of the credential's
+  token; the profile is `_migration_params.policy_profile`, §21.5). Neutron's policy
+  (`create_port:fixed_ips:ip_address`, `create_port:mac_address`, `create_port:port_security_enabled`) lets only
+  those roles, or the network's own project, choose a port's address, MAC or port security: `admin` or `advsvc`
+  under `legacy` (the 2023.1 rules; an export from before the param reads `legacy`), `admin` or `service` under
+  `secure_rbac` (the defaults from 2023.2), and `admin` alone under `unknown`, the role both count. The import
   chooses them for every port: through Nova it asks for the port's address, and Nova creates the port with the
   migration user's token; through Neutron it sends the MAC, every address and the port-security flag. An external
   network that is not shared (`router:external` without `shared`), the credential's own included, also needs the
@@ -1145,11 +1183,12 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   the cutover fails before the source stops (the owner's choice, 2026-10-14).
 * `os_migrate_workloads_preserve_volume_type: true` whenever `plan.mappings.volume_types` is non-empty
   (§6.4).
-* `port_creation_mode`: before every OpenStack playbook run of a migration, the executor writes
-  `plan.port_creation_mode` into the planned server's `_migration_params` in `workloads.yml`, after an export as
-  well. A mode chosen after a warm migration's export therefore applies at its cutover. In `neutron` mode, a warm
-  cutover whose `workloads.yml` lists a port without `security_group_refs` (exported before §6.6's rule) exports the
-  workload again first.
+* `port_creation_mode` and `policy_profile`: before every OpenStack playbook run of a migration, the executor writes
+  `plan.port_creation_mode`, and the destination's policy profile (§21.5: as its check reports it, and for a report
+  that names none as the provider's declarations alone), into the planned server's `_migration_params` in
+  `workloads.yml`, after an export as well. A mode chosen after a warm migration's export therefore applies at its
+  cutover. In `neutron` mode, a warm cutover whose `workloads.yml` lists a port without `security_group_refs`
+  (exported before §6.6's rule) exports the workload again first.
 * `nic_overrides`: after the mappings, each port of the planned server whose `mac_address` (lower case) has an entry
   in `plan.nic_overrides[vm.source_id]` gets the entry's `network` as its `network_ref` name. Its addresses — the
   entry's `fixed_ips`, else the port's own — become address-only fixed IP references (no `subnet_ref`, §6.6), so
@@ -1170,7 +1209,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
     the networks the credential sees (a shared provider network that another project owns is found). Whether the
     credential may put a port there is the destination check's (§6.6): it refuses, before the source stops, another
     project's network that is neither shared with the credential's project nor external, and any network of
-    another project when the credential's token carries neither the `admin` nor the `advsvc` role.
+    another project when the credential's token carries no role its policy profile counts (§6.6).
   Every fixed IP reference of a port becomes address-only (§6.6), so Neutron finds the address in the resolved
   network's subnets whatever their names. A port's network name that does not resolve stops the cutover there,
   before the source stops: a permanent failure naming the port. A warm pre-copy or sync run, which makes no port,
@@ -1254,7 +1293,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   its record has no `network_key` (a VM validated before the key was recorded: the kit would look a NIC on a
   distributed port group up by its key and drop it, so the plan is validated again, after a retry if the migration
   failed), when the network does not resolve, when the credential may not put a port there (§6.6's rule, with the
-  roles of the destination's capabilities), when the NIC's IPv4 addresses are not all host addresses of one subnet of
+  roles the destination's inventory reads live for the run, as the handover's step 0 and the collection read them -
+  the destination's check report's when the inventory cannot read them; when neither names any, a NIC that needs a
+  role is refused: a reset report never lets a token through, review RV19-01), when the NIC's IPv4 addresses are not
+  all host addresses of one subnet of
   that network, when two NICs share a key but need different values, or when another port of that network holds
   the NIC's MAC or one of its IPv4 addresses (`DestinationProvider.ports`): the kit asks Neutron for both, which
   refuses them (`MacAddressInUse`, `IpAddressAlreadyAllocated`) after the power-off. The failure names the port.
@@ -1304,8 +1346,10 @@ volumes with their server, so the order is:
      when there is no such network, when there are several in the credential's project, or when there are several
      elsewhere and none in its project;
    * that network is another project's and the credential may not put a port there, by §6.6's rule with the roles
-     of its token. The handover's admin credential sees every project's networks, so step 8 would otherwise put the
-     VM on another tenant's private network;
+     of its token, read for the run - the destination's check report's when they cannot be read; when neither names
+     any, a port that needs a role is refused, as §7.2's kit refuses it: a reset report never lets a token through
+     (review RV20-07). The handover's admin credential sees every project's networks, so step 8 would otherwise put
+     the VM on another tenant's private network;
    * an address step 8 would give the port is one Neutron refuses on that network (§6.6's rules for a port Nova
      creates in `"nova"` mode, or for one created through Neutron with the kept MAC in `"neutron"` mode);
    * another port of that network holds such an address, or in `"neutron"` mode the port's MAC. The exception is the
@@ -1615,7 +1659,10 @@ someone deleted the source after it ran again — is not running: while `source_
 and emits `migration.source_stopped` (data `{"power_state": null, "gone": true}`), so Finalize works again, with no
 source left to keep or delete (the owner's choice, 2026-10-14) — deleting a diverged source in its cloud is a way out
 too; without the flag it is skipped. A provider error is skipped (logged), never a failure, and leaves the flag as it
-is: only a cloud that answers can say the VM is gone. In demo mode, `POST /demo/vms/{source_id}/power {"state": "on"|"off"}` (operator; 404
+is: only a cloud that answers can say the VM is gone. Each change of the flag
+is written with its event in one store transaction (`put_with_event`, §11) and the event published after it commits:
+a store error leaves neither, never a flag without its alert, and the next watch tries again (the owner's choice,
+2026-10-16, review RV21-04). In demo mode, `POST /demo/vms/{source_id}/power {"state": "on"|"off"}` (operator; 404
 outside demo mode) sets a fake source VM's power state, so the alert shows on the next watch.
 
 **Bulk finalize.** `POST /plans/{id}/finalize {"wave_id": str|null, "confirm": str, "delete_source": bool = false}`
@@ -1702,7 +1749,9 @@ strategy ineligible):
 * `storage_handover`: requires `plan.handover.enabled`, every disk `kind == "volume"`, every
   `volume_type` in `plan.handover.backend_map`, no `multiattach`, no `encrypted` disk (Cinder
   cannot unmanage encrypted volumes), and `src_caps["admin"]` and
-  `dst_caps["admin"]` truthy; for every volume disk whose `pool` is known and listed in
+  `dst_caps["admin"]` truthy, and the source's `src_caps["compute_microversion"]` not below 2.85 when the check read
+  it (step 3's `delete_on_termination` update goes to the source server; the destination never receives it, §21.4);
+  for every volume disk whose `pool` is known and listed in
   `src_caps["storage_backends"]`: a family other than `other`, and — when `dst_caps` lists
   `storage_backends` — a destination pool that resolves (§7.3.1); with `plan.port_creation_mode` `"nova"`, no NIC
   with more than one fixed IP (the destination server then gets one fixed IP per port, so the others would be
@@ -1725,7 +1774,9 @@ tie, so the advisor keeps out of it unless no eligible strategy meets the SLO.
 
 `run_preflight(vm, plan, src_inv: SourceInventory, dst_inv: DestinationInventory, all_vms=None, *,
 source=None, destination=None) -> list[Finding]` — `all_vms` are the plan's selected VMs (duplicate
-names, cumulative quotas), `source`/`destination` the providers (conversion-host check).
+names, cumulative quotas), `source`/`destination` the providers (conversion-host check). Where a finding's message
+means the destination cloud it names the destination provider (`destination.name`, "the destination" when
+`run_preflight` has none); its remediation, fixed by the catalog, says "the destination" (§1 naming, plan T6).
 Finding catalog (code — severity — condition):
 
 | Code | Severity | Condition |
@@ -1744,11 +1795,13 @@ Finding catalog (code — severity — condition):
 | `DST_KEYPAIR_MISSING` | blocker | an OpenStack VM's `key_name` names no keypair of the destination credential and pre-staging does not create it: `"keypairs"` is not in `plan.prestage_resources`, or the source credential does not own it (its owner is another user: create the keypair, its public key, for the destination credential). Without this check the cutover fails after validation, in its destination check |
 | `MAP_KEYPAIR_PRESTAGED` | info | `"keypairs"` is pre-staged and the VM's `key_name`, owned by the source credential, has no keypair of the destination credential: pre-staging imports it (the same name and public key) |
 | `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
+| `DST_CAPABILITY_MISSING` | blocker | the destination's check report (§10) gives a maximum below the floor every strategy needs (§21.4): `compute_microversion` below 2.60 or `block_storage_microversion` below 3.0; the finding names each capability, the floor and the maximum read; a maximum the check could not read is not judged; a gap one strategy alone has - the source's compute below 2.85 for `storage_handover` - is that strategy's eligibility reason instead (§9.2) |
+| `DST_RELEASE_OUTSIDE_SUPPORT` | warning | the destination's `support_tier` (§10.1) is `tier3` (End of Life upstream) or `outside` (below the floor, newer than validated, not detected), or the detected range contradicts its declared `release` (`declared_outside_range`, §10.1; the tier is the range's); RHOSO 18.0 (`validated`) never; it blocks nothing - capabilities do (§21.4) |
 | `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU (the destination network: the NIC's `plan.nic_overrides` entry's network, else the mapped one, as the rule of §7.3 step 0 resolves it) |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
 | `MAP_NETWORK_AMBIGUOUS` | blocker | a VM's NIC goes to a RHOSO network name (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name, §7.2) that the rule of §7.3 step 0 cannot resolve to one network: several networks of the destination credential's project carry it, or none of them does and several of other projects do (`DestinationInventory.network_details`). The cutover would refuse it before the stop. The message names the NIC's MAC, the name and the projects |
 | `NET_ADDRESS_REFUSED` | blocker | an OpenStack VM's NIC without a `plan.nic_overrides` entry keeps an address that Neutron would refuse on its resolved RHOSO network, by §6.6's rules: a host address of one of the network's subnets, and on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode and no address in `"nova"` mode, where a port keeps its first address only. A VMware NIC's IPv4 guest addresses (the migration kit sends only those, with one subnet per NIC, §7.2) must all be host addresses of one subnet of its resolved network. A network that pre-staging would create is not checked. The message names the NIC's MAC, the address and the network |
-| `NET_PORT_NOT_PERMITTED` | blocker | a VM's NIC resolves, by the rule of §7.3 step 0 (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name — the migration kit creates every port with the NIC's MAC, §7.2), to a network (`DestinationInventory.network_details`) where the destination credential may not put a port, by §6.6's rule. Either it is another project's network (`own` false) that is neither `shared` with the credential's project nor `external`, or using it needs a role the credential's token lacks: `admin` or `advsvc` for another project's network, and `admin` for any external network that is not `shared`, the credential's own included (the `roles` of the destination's capabilities, as validation's check reports them; when the destination reports no `roles`, the role half is not judged). The cutover recreates every port with its address or MAC, which Neutron's policy would refuse after the source stops, and Nova attaches no unshared external network for a token without `admin`; the destination check refuses both before the stop. The message names the NIC's MAC, the network, its project and the half of the rule that fails |
+| `NET_PORT_NOT_PERMITTED` | blocker | a VM's NIC resolves, by the rule of §7.3 step 0 (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name — the migration kit creates every port with the NIC's MAC, §7.2), to a network (`DestinationInventory.network_details`) where the destination credential may not put a port, by §6.6's rule. Either it is another project's network (`own` false) that is neither `shared` with the credential's project nor `external`, or using it needs a role the credential's token lacks: for another project's network one the destination's `policy_profile` counts (§6.6: `admin` or `advsvc` under `legacy`; `admin` or `service` under `secure_rbac`; `admin` under `unknown`; a report that names no profile reads as the provider's declarations alone, §21.5), and `admin` for any external network that is not `shared`, the credential's own included (the `roles` and `policy_profile` of the destination's capabilities, as validation's check reports them; when the destination reports no `roles`, the role half is not judged). The cutover recreates every port with its address or MAC, which Neutron's policy would refuse after the source stops, and Nova attaches no unshared external network for a token without `admin`; the destination check refuses both before the stop. The message names the NIC's MAC, the network, its project and the half of the rule that fails |
 | `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
 | `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one, resolved by the rule of §7.3 step 0; its `DestinationInventory.subnets` by `network_id`) or is no host address there — as Neutron's `check_subnet_ip` rules for a port created with no owner, an IPv4 subnet's network address (at any prefix length) and its broadcast address below a /31 (a /31 or /32 has none), while an IPv6 subnet's first address is taken (§6.6); on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode, and no address in `"nova"` mode (§6.6); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
@@ -1869,16 +1922,29 @@ sees; `own` when the credential's project owns it: what a NIC's RHOSO network na
 port on another project's network, §6.6),
 subnets: list[{id, name, network, network_id, cidr, ipv6_address_mode, ipv6_ra_mode}] (the subnets the destination
 credential sees, by network name and by the id of the network they belong to: where a NIC's addresses must lie,
-§9.3; `id` is what a VMware NIC's `network_map` value names, §7.2)}`. `networks` keeps the name→MTU view; with two networks of one name its MTU is one of theirs.
+§9.3; `id` is what a VMware NIC's `network_map` value names, §7.2), roles: list[str]|null (the role names of the
+destination credential's token, read with the inventory - live for every run -, null when they cannot be read: what
+the VMware kit's network map judges, §7.2, review RV19-01)}`. `networks` keeps the name→MTU view; with two networks of
+one name its MTU is one of theirs.
 
 Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking calls wrapped with
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`, as a source and as a destination - a community
 OpenStack destination (kind `openstack`, distribution `openstack_community` or `kolla`) takes the same code path as
 RHOSO 18.0, §21; `check()` reports `{"admin": bool,
-"roles": [the role names of the credential's token, sorted], "compute_microversion": str, "ovn": bool,
+"roles": [the role names of the credential's token, sorted; left out when they cannot be read], "compute_microversion": str,
+"block_storage_microversion": str, "ovn": bool,
 "volume_backends": [pool names], "storage_backends": [{"pool": str, "vendor": str|null, "protocol": str|null,
-"family": "rbd"|"netapp_nfs"|"netapp_block"|"other"}]}`, both lists empty without admin (`roles` is what
-`NET_PORT_NOT_PERMITTED` judges, §9.3: Neutron's policy names roles, while `admin` is the compute probe);
+"family": "rbd"|"netapp_nfs"|"netapp_block"|"other"}], "tls": bool, "plain_http": [str]}`, both backend lists empty
+without admin (`roles` is what `NET_PORT_NOT_PERMITTED` judges, §9.3: Neutron's policy names roles, while `admin` is
+the compute probe; a report without it leaves the role half unjudged there, and a run reads the roles live, §7.2,
+§7.3 step 0, review 20); the microversions are each service's maximum as `major.minor` text (keystoneauth hands a parsed
+version tuple, `(2, 104)`, reported as `"2.104"`), `""` when unreadable; `tls` is true when the provider's `endpoint`,
+the auth URL its credential is posted to (the `auth_url` of its `clouds.yaml` entry or of its credentials secret,
+§13.3) and the endpoint of each service Seamless calls (`identity`, `compute`, `block-storage`, `network`, `image`,
+each as keystoneauth reads it from the catalog) use https, and `plain_http` names those that do not (`endpoint` for
+the provider's own, `auth_url` for the credential's; one that cannot be read counts neither way, Security.md); a
+destination's check adds §10.1's `destination_release` keys -
+`release_range`, `release`, `support_tier` and `policy_profile`;
 volume disks carry their Cinder `pool`;
 `os_type` is the most specific of the server metadata `os_type`/`os_distro`, the boot volume's
 `volume_image_metadata` or the boot image's properties (`os_distro` + `os_version`, then `os_type`)),
@@ -1889,11 +1955,74 @@ name when Tools report one, else the configured guest id), `FakeSourceProvider`/
 one vGPU flavor, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+ disks;
 13 VMware VMs with mixed CBT/snapshot/independent-disk states, `dc2-portal-02` among them tagged
 `demo-fault: cutover-refusal` (§7.4); a RHOSO destination with networks, flavors, volume types and
-quotas). `providers.registry.build(provider, settings)` returns the right implementation (fake when
-`settings.demo`). The demo seeds two running plans: the finance plan takes 22 of the 24 OpenStack
+quotas; and a community OpenStack destination, `hibiscus-dc3` - kind `openstack`, distribution `kolla`, declared
+`release` `2026.2` - that shares that inventory and whose check reports 2026.2's maxima, compute 2.104 and block
+storage 3.71 (a plausible value: §21.3 has not confirmed 2026.2's), so Tier 1 and the secure-RBAC profile, §10.1).
+`providers.registry.build(provider, settings)` returns the right implementation (fake when `settings.demo`; a fake
+destination is given its provider and reports by its kind). The demo seeds two running plans, both to `rhoso18`:
+the finance plan takes 22 of the 24 OpenStack
 VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (one VM, one migration
 across plans, §5.4) — and the VMware plan 12 of the 13 VMware VMs: `dc2-portal-02` stays unplanned,
-for the operator to plan warm (§7.4).
+for the operator to plan warm (§7.4). No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
+
+### 10.1 Destination release series (`seamless_migrate.planning.platforms`)
+
+A pure module (no I/O) holding the series table of §21.1 and the detection and tier rules of §21.3 (plan task T1,
+0.2.0; the check reports them from T3).
+
+* `SERIES`: one entry per community series of the window, oldest first: `name` (`"2026.2"`), `codename`
+  (`"Hibiscus"`), `phase` (`"Maintained"`, `"Unmaintained"` or `"End of Life"`, as releases.openstack.org shows it),
+  `slurp` (bool), `tier` (`"tier1"`, `"tier2"` or `"tier3"`), `compute_max` (Nova's maximum microversion of the series)
+  and `block_storage_max` (Cinder's, or null where §21.3 has not confirmed it). `READ_ON` is the date the phases were
+  read (`"2026-10-16"`). §21.1's table and `SERIES` change in the same commit
+  (`test_the_sdd_support_table_matches_the_code_series_table`).
+* `maximum_microversion(document) -> str | null`: the maximum microversion a service's version document gives: its
+  `version` object, or in the root document the `versions` entry whose `status` is `CURRENT` (else the highest one);
+  null when it gives none.
+* `release_range(compute_max, block_storage_max=None) -> ReleaseRange {series: tuple[str, ...], outside: null | "older"
+  | "newer" | "not_detected"}`, `series` oldest first:
+  * a compute maximum equal to series' maxima is those series (`"2.96"` is 2024.1 or 2024.2);
+  * one between two series' maxima is the two series it falls between, the newest whose maximum is below it and the
+    oldest whose maximum is above it (`"2.98"` is 2024.2 or 2025.1): Nova's microversions are never backported, so
+    only a development snapshot shows one;
+  * one below the oldest series' maximum (2.95) is `outside: "older"` (Zed or older), one above the newest (2.104)
+    `outside: "newer"`, and a missing or unreadable one `outside: "not_detected"`, each with no series;
+  * a block-storage maximum keeps the series whose `block_storage_max` equals it, and a series whose `block_storage_max`
+    is null when it is at least the greatest confirmed maximum of the series older than it (Cinder's microversions only
+    grow: a Cinder below an older series' maximum is no newer series' Cinder; `"2.98"` with `"3.70"` keeps neither
+    2024.2 nor 2025.1); it narrows the range, never widens it, and a narrowing that would leave no series is not
+    applied (Nova and Cinder of different series, as during an upgrade).
+* `support_tier(release_range, declared=None) -> SupportTier {tier: "tier1" | "tier2" | "tier3" | "outside", reason:
+  null | "end_of_life" | "below_floor" | "newer_than_validated" | "not_detected", declared_outside_range: bool}`:
+  * a declared series (`Provider.release`, T2) decides the tier when the range holds it, and when the range is empty
+    and does not contradict it - any series when nothing was detected, one older than the window's oldest series
+    when the range is `older`, one newer than its newest when `newer` -: where the APIs cannot tell the series, the
+    declaration does (review RV18-06). A declared series of the window decides its own tier; one outside the window
+    reads `outside` with the reason its place gives (`below_floor` older, `newer_than_validated` newer);
+  * otherwise the range decides: the least favourable tier of its series (`tier1`, then `tier2`, then `tier3`), or
+    `outside` when it has none; a declared series the range contradicts sets `declared_outside_range`, which the
+    pre-flight warns of (T4);
+  * `reason` is `end_of_life` for `tier3`, for `outside` the range's `outside` (`older` reads `below_floor`, `newer`
+    reads `newer_than_validated`, `not_detected` as is), and null for `tier1` and `tier2`.
+  RHOSO 18.0 (kind `rhoso`) is `validated` by its kind, never by detection (T3).
+* `destination_release(kind, release, policy_profile, compute_max, block_storage_max) -> {release_range: [str],
+  release: str|null, support_tier: {tier, reason, declared_outside_range}, policy_profile: "secure_rbac" | "legacy" |
+  "unknown"}`, what a destination's check reports (§10; `release` and `policy_profile` as its provider declares them,
+  §4.2):
+  * `release_range` is the detected range's series; `release` the series the check settles on: the declared one when
+    it decides the tier (above: the range holds it or, empty, does not contradict it), else the range's only series,
+    else null;
+  * `support_tier` is `support_tier(range, declared)` for kind `openstack`, and `{"tier": "validated", "reason": null,
+    "declared_outside_range": false}` for kind `rhoso`;
+  * `policy_profile` is the declared one; else `legacy` for kind `rhoso` (D14, until the lab confirms RHOSO 18.0's);
+    else by the settled series - `release` when set, else the range: `secure_rbac` when every series is 2023.2 or
+    later or the range is `newer`, `legacy` when every series is 2023.1 or the range is `older` (oslo.policy enforces
+    the new defaults from 2023.2), and `unknown` when the range straddles the two or nothing was detected. Under
+    `unknown` the permission checks count only roles that work under both profiles (§21.5, T5).
+* `REVIEWED_MICROVERSIONS = {"compute": "2.100", "block_storage": "3.71"}`: the newest microversions whose behaviour
+  Seamless's calls were checked against (§21.7). openstacksdk asks a cloud for the lower of a resource's cap and the
+  cloud's maximum; `test_the_sdk_never_asks_more_than_its_caps_of_any_series_of_the_window` fails when the installed
+  openstacksdk would ask any series of the window for more than these (raising the pin re-checks them).
 
 ---
 
@@ -1946,7 +2075,9 @@ a value that only grows), `versions(kind) -> [(id, version)]` (in creation order
 `SELECT … GROUP BY` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
 `derived_status` and `migration_counts` from it, §8.1), `delete(kind, id)`,
 `get_versioned(kind, id, model_cls) -> (model, version)` (one read that returns the version too: `plan apply`'s
-compare-and-write, §15), `create_user(user, actor) -> Event` (§13.1: the `user` document and its `user.created` event in
+compare-and-write, §15), `put_with_event(kind, model, event, expected_version) -> (version, Event)` (a versioned
+update and its event in one transaction, a `ConflictError` as `put`'s: the source watch's flag and alert, §8.1),
+`create_user(user, actor) -> Event` (§13.1: the `user` document and its `user.created` event in
 one transaction; a `ConflictError` for a name that exists in any case), `delete_events_before(before) -> int` (`events
 prune`, §15),
 `append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500, kinds=None, tail=False,
@@ -1992,9 +2123,9 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/providers` | viewer | — | `Provider[]` |
 | POST | `/providers` | admin | `Provider` (status fields ignored; a field `Provider` does not have: 422) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
-| PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; no value returned) |
-| PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set) |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown` and the check report (`capabilities`) to `{}`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
+| PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
+| PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, recorded `sync_passes` of a strategy other than `cold`) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
@@ -2218,6 +2349,18 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
   `SEAMLESS_MEMORY_REDACT_NAMES` — wherever a name stands between characters that are not letters or digits, so a
   name inside another word stays (`web-010` is another VM than `web-01`) while names built from it are covered:
   `web-01-data`, `web-01_root`, `data-web-01` become `[vm]-data`, `[vm]_root`, `data-[vm]`.
+
+The destination provider's name never reaches Jev, whatever `SEAMLESS_MEMORY_REDACT_NAMES` says (§1 naming). The
+advisor's strategy question names the destination by kind and series (`planning/platforms.destination_descriptor`, by
+§10.1's settled series: "RHOSO 18.0", "a community OpenStack 2026.2 destination", "a community OpenStack destination"
+when no series is settled - a declared series the APIs contradict included; before any check reported one, the
+declared series, which a first check settles unless the APIs contradict it). In the evidence it sends, which quotes eligibility reasons that name the provider, the
+name is replaced by that descriptor wherever it stands as a word, by the rule VM names follow (`replace_names`). The
+evidence, and the VM's name the question carries, go through the secret patterns first, then through one
+`replace_names` pass that holds the provider's name and, when names are redacted, the VM's: the longer name first, so
+neither replacement splits the other (a VM `dc3` replaced first left `jakarta-[vm]-prod` of a provider
+`jakarta-dc3-prod`), and the provider's descriptor where the two names are equal. The question's own words and the
+descriptor it holds never go through it: a provider named `RHOSO` made "moving to RHOSO 18.0 18.0?" (review RV21-10). The input snapshot (§14.5) is what is sent.
 
 The control plane uses the same `redact` for the text it publishes from outside sources: step and
 provider error messages and every `migration.log` line (§4). Where it cuts such text, it redacts first,
@@ -2637,6 +2780,10 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   "Navigation": the focus stays in it, Escape or a tap on the dimmed page closes it and returns the focus to the
   menu button; a choice closes it, and the page already shown puts the focus on the page, as a navigation does),
   holding the full sidebar's groups and session; without motion when `prefers-reduced-motion` asks.
+* Destination wording (§1 naming, plan T6): the dashboard names RHOSO 18.0 and community OpenStack as destinations
+  where it lists platforms (the Providers page, its empty state, the sign-in page), and wherever it means the
+  destination cloud it says "the destination" - or the destination provider's name where a plan or a migration is
+  shown, as the API's messages do; the offline mock mirrors the API's messages word for word.
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
   when the caller names it, the object it acts on under it (its kind and id); a close button (×, "Close") in the
@@ -2848,7 +2995,8 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   for an approver in `precopy`/`syncing` of a warm migration — the dialog shows the last pass's change and the
   estimated downtime the Force cutover records (the API's formula, §5.4, ported and checked against a case table the
   control plane generates) and asks for the reason (§5.4) —,
-  an alert while `source_running_at` is set — the source VM runs again, so its data diverges from RHOSO; stop it, or
+  an alert while `source_running_at` is set — the source VM runs again, so its data diverges from the plan's
+  destination provider, named; stop it, or
   roll back (§8.1) — and Finalize unavailable then, saying so, as the API refuses it (a finalize that began deleting
   the source stays available, §8.1), the time in Completed and the finalize reminder past the plan's `finalize_warning_h`, and in
   demo mode "Power on the source VM" / "Power off" for an operator on a completed migration (`POST /demo/vms/…`), so
@@ -2860,11 +3008,12 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   a name only another project's network carries is marked "another project's", one the rule of §7.3 step 0 cannot
   resolve "several networks"; a network where the RHOSO credential may not put a port, by §6.6's rule — another
   project's that is neither shared with its project nor external, or one whose use needs a role missing from the
-  destination's `roles` (`admin` or `advsvc` for another project's, `admin` for an unshared external network, its
-  own included) — is marked "not allowed", and when selected a note under the field says why, as
+  destination's `roles` (for another project's, a role its `policy_profile` counts, §6.6 - `admin` or `advsvc`
+  under legacy, `admin` or `service` under secure-RBAC, `admin` under unknown -; `admin` for an unshared external
+  network, its own included) — is marked "not allowed", and when selected a note under the field says why, as
   `NET_PORT_NOT_PERMITTED` does)
   and its addresses (comma separated; empty keeps its own), unavailable with the reason while the plan cannot be
-  edited (its migrations, read as summaries while the plan is editable, say whether one is in flight, §12). A network an entry names that RHOSO no longer lists stays selected, marked "not in RHOSO". A refused
+  edited (its migrations, read as summaries while the plan is editable, say whether one is in flight, §12). A network an entry names that the destination no longer lists stays selected, marked "not on the destination". A refused
   address field is marked invalid, is described by its problem, and gets the focus. A VMware source says the
   migration kit keeps the guest's network settings; its rows name the RHOSO network each NIC's port group goes
   to (the plan's mapping, else the same name, §7.2) with the guest's addresses, and a VMware VM that still has
@@ -2925,7 +3074,17 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   recommendation" link to it, ahead of the migration's own actions, so its first control is the decision its text
   asks for, not the cutover's Approve), `/providers` (status cards + Check,
   each card summarizing the storage backends by driver family —
-  `storage_backends`, §7.3.1; admins add and edit providers with a distribution preset —
+  `storage_backends`, §7.3.1 —, and saying every other reported value in words: a maximum the check could not read
+  (`""`, §10) reads "not read" and an empty list "none", never a bare label; a destination's card shows its release
+  series - the declared one, else the detected range, with codenames (§10.1), else why the range is empty: older or
+  newer than the window when the maxima were read, "Not detected" only when they were not -, its support tier
+  (Validated, Tier 1, 2 or 3, or Outside, with the reason in words) and its policy profile, and warns when the
+  detected range contradicts its declared series or its profile is unknown (check it so its series is detected, or
+  declare its policy profile or series: §21.5's two ways out, review RV20-09); a provider whose check
+  reports plain HTTP says so, naming `plain_http`'s endpoints; the form
+  takes, for an OpenStack destination, the declared release series (blank: detect it, the window's series offered
+  newest first) and, for an OpenStack or RHOSO destination, the declared policy profile (blank: by kind and series,
+  §4.2); admins add and edit providers with a distribution preset —
   OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
   enter write-only credentials and the conversion-host SSH key, or name instead a secret managed outside Seamless
   (`credentials_secret`, `conversion_host.ssh_key_secret`, §13.3: mounted files, the Kubernetes store or
@@ -3250,17 +3409,19 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D11 | Product documents in the collection artifact (the SDD, PRD, QASuite, Security and Performance documents are packed; audit material and agent plans are not) | packed | owner decision (audit D-21) |
 | D12 | The `TODO(…): confirm` markers of this document — LAB, ADV-04, ADV-06, ADV-17, ADV-18, ADV-19 — each a default taken without the owner's word | the defaults as written | each is an owner decision; remove the marker when decided (audit D-20) |
 | D13 | Destination platforms: RHOSO 18.0 and community OpenStack | decided by the owner 2026-10-16: the window 2023.1 Antelope – 2026.2 Hibiscus with the tiers of §21.1 (Jev 0.93), the series detected from the version documents plus an optional declared one (§21.3, Jev 0.77) | each upstream release and end of life (§21.2) |
-| D14 | The policy profile RHOSO 18.0 ships: the legacy rules or the secure-RBAC defaults (§21.5) | judged as today: `admin` or `advsvc` for a port on another project's network | the lab run on RHOSO 18.0 (`TODO(LAB): confirm`) |
-| D15 | Conversion host images on community clouds beyond CentOS Stream 9 and RHEL 9: the RHEL family by `ansible_os_family` (Rocky Linux, AlmaLinux, CentOS Stream 10), then Ubuntu 24.04 LTS (§21.6) | CentOS Stream 9 and RHEL 9 only | 0.2.0 (plan task T7) |
+| D14 | The policy profile RHOSO 18.0 ships: the legacy rules or the secure-RBAC defaults (§21.5) | judged as today: `admin` or `advsvc` for a port on another project's network; the check reports `legacy` for kind `rhoso` unless its provider declares a profile (§10.1) | the owner confirms it on the lab run on RHOSO 18.0 (owner, 2026-10-16; `TODO(LAB): confirm`) |
+| D15 | Conversion host images on community clouds beyond CentOS Stream 9 and RHEL 9: the RHEL family by `ansible_os_family` (Rocky Linux, AlmaLinux, CentOS Stream 10), then Ubuntu 24.04 LTS (§21.6) | CentOS Stream 9 and RHEL 9 only; the order approved by the owner 2026-10-16 (the RHEL family first, then Ubuntu 24.04) | 0.2.0 (plan task T7) |
 
 ## 21. Destination platforms: RHOSO 18.0 and community OpenStack
 
 Status: the owner's goal of 2026-10-16 (D13). §21.1, §21.2 and §21.7 state the policy and what the code does today;
-§21.3–§21.6 and §21.8 are **planned for 0.2.0**. Each planned item becomes binding in §4, §6, §9.3, §10 or §16 in the
-commit that implements it, with its tests (plan `superpowers/plans/2026-10-16-community-openstack-destinations.md`).
-Until then a community OpenStack destination works but is not validated. The API accepts a destination provider of
-kind `openstack`, the dashboard offers the OpenStack Community and Kolla-Ansible presets for the destination role, and
-`OpenStackProvider` serves it on the same code path as RHOSO 18.0 (§10).
+§21.3 (T1, T3), §21.4 (T4), §21.5 (T5) and §21.6 (T7) are binding in the sections §21.8 names, as are the declared
+series (T2), the destination-neutral texts (T6, §1, §9.3, §16), the demo's community destination (T9) and the
+provider page, form and NIC picker (T8, §16); T10 (the lab, §21.9) is **planned for 0.2.0** (plan
+`superpowers/plans/2026-10-16-community-openstack-destinations.md`). Until T10 a community OpenStack destination works
+but is not validated. The API accepts a destination provider of kind `openstack`, the dashboard offers the
+OpenStack Community and Kolla-Ansible presets for the destination role, and `OpenStackProvider` serves it on the same
+code path as RHOSO 18.0 (§10).
 
 ### 21.1 Support window and tiers
 
@@ -3292,10 +3453,10 @@ Upstream phases as releases.openstack.org shows them on 2026-10-16:
   minor release of its GA (next: 2027.1 Indri, estimated 2027-03-24).
 * When upstream marks a series Unmaintained it moves to Tier 2 if it is SLURP, else to Tier 3; at its End of Life to
   Tier 3; the floor follows the oldest SLURP series not at its end of life.
-* §21.1's table and the code's series table (planned `planning/platforms.py`) change in the same commit, each with the
+* §21.1's table and the code's series table (`planning/platforms.py`, §10.1) change in the same commit, each with the
   date they were read.
 
-### 21.3 Release detection (planned, 0.2.0)
+### 21.3 Release detection (0.2.0: the rules are §10.1's since T1; the check reports them since T3)
 
 * The provider check reads the services' version documents: compute's maximum microversion (as `compute_microversion`
   today), block storage's, and Neutron's extension list.
@@ -3303,28 +3464,43 @@ Upstream phases as releases.openstack.org shows them on 2026-10-16:
   is 2025.1 or 2025.2; 2.103 is 2026.1; 2.104 is 2026.2. A maximum between two of them reads as the range around it, one
   above 2.104 as "Outside (newer)". Block storage's maximum is 3.70 in 2023.1 and 2023.2 and 3.71 in 2024.1 and 2024.2
   (Cinder's history); later series `TODO(LAB): confirm`. It may narrow the range, never widen it.
-* A declared series (planned optional `Provider.release`, e.g. `2026.2`) inside the detected range decides the tier; one
+* A declared series (`Provider.release`, §4.2, e.g. `2026.2`) inside the detected range decides the tier; one
   outside it warns, and the range decides. With none declared, the tier is the least favourable one the range allows: a
   2.96 cloud is 2024.1 (Tier 2) or 2024.2 (Tier 3), so Tier 3, until its operator declares the series.
-* The check reports `release_range`, `release` and `support_tier` (planned keys of the `check()` report, §10).
+* A destination's check reports `release_range`, `release`, `support_tier` and `policy_profile` (§10, §10.1's
+  `destination_release`), and `block_storage_microversion` beside `compute_microversion`.
 
-### 21.4 Capability floor per strategy (planned pre-flight, 0.2.0)
+### 21.4 Capability floor per strategy (0.2.0: the pre-flight judges it since T4)
 
 | Capability | Needed by | Floor | Checked by |
 |---|---|---|---|
 | Keystone v3, a project-scoped token | every strategy | — | the provider check (authentication) |
-| Compute API | every strategy | 2.60 (multi-attach); openstacksdk caps its calls (§21.7) | `compute_microversion` |
-| Compute 2.85 (`delete_on_termination` update) | `storage_handover` (§7.3 step 0) | 2.85 | the handover's step 0 (the source today; the destination, planned) |
-| Block Storage v3 | every strategy | 3.0 | the provider check |
-| Cinder manage and a mapped backend of the same driver family (§7.3.1) | `storage_handover` | the `admin` role | `storage_backends` (today) |
+| Compute API | every strategy | 2.60 (multi-attach); openstacksdk caps its calls (§21.7) | `compute_microversion` (`DST_CAPABILITY_MISSING`) |
+| Compute 2.85 (`delete_on_termination` update of the source server, §7.3 step 3) | `storage_handover` | 2.85 on the source | the strategy selector (the source's `compute_microversion`, an eligibility reason) and the handover's step 0, before the stop |
+| Block Storage v3 | every strategy | 3.0 | the provider check; `block_storage_microversion` (`DST_CAPABILITY_MISSING`) |
+| Cinder manage and a mapped backend of the same driver family (§7.3.1) | `storage_handover` | the `admin` role | the strategy selector (eligibility) and `storage_backends` (§7.3.1) |
 | Glance v2 | an image-booted VM | — | the provider check |
-| Neutron ports with fixed IPs, MAC and port security | every strategy (§6.6) | — | Neutron's extensions (planned) |
+| Neutron ports with fixed IPs, MAC and port security | every strategy (§6.6) | — | Neutron's extensions (planned, after LAB-D04; see below) |
 | A conversion host image the roles support (§21.6) | `cold`, `warm`, `vmware_cold`, `vmware_warm` | — | pre-staging |
 | VDDK on the destination conversion host | `vmware_cold`, `vmware_warm` | — | the vmware-migration-kit |
 
-Planned findings (§9.3 when implemented): `DST_CAPABILITY_MISSING` (blocker; it names the capability and the strategy
-that needs it) and `DST_RELEASE_OUTSIDE_SUPPORT` (warning: a Tier 3 or Outside destination, with the reason: End of
-Life upstream, below the floor, newer than validated, or not detected).
+Findings (plan task T4; each enters §9.3's catalog with its code):
+
+* `DST_CAPABILITY_MISSING` (blocker, every strategy) judges the destination's check report (§10): `compute_microversion`
+  below 2.60 or `block_storage_microversion` below 3.0. A maximum the check could not read (`""`) is not judged. The
+  finding names each missing capability, the floor and the maximum read.
+* A gap one strategy alone has is that strategy's eligibility reason, never a finding - a blocker finding blocks the
+  migration whatever its strategy (§9.3): the strategy selector makes `storage_handover` ineligible when the
+  source's `compute_microversion` is below 2.85 (the handover's `delete_on_termination` update goes to the source
+  server; the destination never receives it - review RV18-07), as it does without the destination's `admin`
+  (Cinder manage) and as §7.3.1's backend checks do (Jev 0.86).
+* The Neutron row is not judged yet: the collection sets a port's port security only when it recreates ports through
+  Neutron (`port_creation_mode: "neutron"`, §6.6), and which extension each port mode needs waits for the lab
+  (LAB-D04) - a blocker must not rest on an assumption (Jev 0.88).
+* `DST_RELEASE_OUTSIDE_SUPPORT` (warning, every strategy) when the check's `support_tier` is `tier3` or `outside`, with
+  its reason (End of Life upstream, below the floor, newer than validated, not detected), or when it reports
+  `declared_outside_range`: the declared series is not what the APIs read, and the tier is the range's. RHOSO 18.0
+  (`validated`) never gets it. Behaviour follows capabilities: the warning blocks nothing.
 
 ### 21.5 Policy profiles and roles
 
@@ -3341,17 +3517,30 @@ Life upstream, below the floor, newer than validated, or not detected).
 * The destination credential (project-scoped) needs: `member` for `cold` and `warm` in its own project; `admin` for
   pre-staging flavors, for `storage_handover` (volume manage) and for an external network that is not shared; `service`
   or `admin` for a port with a fixed IP or MAC on another project's network. `manager` is never required.
-* Planned: the check reports `policy_profile` (declared, else secure-RBAC for a community series from 2023.2), and
-  `NET_PORT_NOT_PERMITTED` judges `service` under the secure-RBAC profile and `advsvc` only under the legacy one (§6.6,
-  §9.3 when implemented).
+* The check reports `policy_profile`: the one its provider declares (`Provider.policy_profile`, §4.2), else by kind
+  and series (§10.1: `legacy` for RHOSO 18.0 until D14 is decided, `secure_rbac` from 2023.2, `unknown` when the
+  series cannot tell). `NET_PORT_NOT_PERMITTED`, the executors' checks before the stop and the collection's
+  destination check count `service` under the secure-RBAC profile, `advsvc` only under the legacy one, and under
+  `unknown` only `admin`, the role both count (§6.6, §9.3; plan task T5).
+* A check report that names no profile - reset to `{}` by a provider change or new credentials (§12; allowed while
+  a plan runs, and a validated plan starts without a new check), or kept from before 0.2.0 - reads as the
+  provider's declarations alone: §10.1's `destination_release` with no maximum read, i.e. the declared profile,
+  else `legacy` for RHOSO 18.0, else the declared series' profile, else `unknown`. The pre-flight, the executors'
+  checks before the stop and the profile they write for the collection read it so; a reset report never counts a
+  role the destination's own profile refuses (review RV18-04).
+* Under `unknown`, a port refusal's advice names both ways out: check the provider, so its series is detected from
+  its maxima, or declare its policy profile or series (review 19). An operator may check a provider while a plan
+  that uses it runs or is paused; a PATCH that declares is refused then (§12). After a reset, the next check settles
+  an undeclared community destination's profile unless its range straddles 2023.1 and 2023.2 or its compute maximum
+  cannot be read (nothing detected, §10.1); then only declaring settles it (review 20). The pre-flight's `NET_PORT_NOT_PERMITTED` remediation, the executors' and the collection's refusals,
+  and the dashboard's mirror of them say so.
 
 ### 21.6 Conversion hosts on community clouds
 
-* Today `conversion_host_content` installs the copy tools only when `ansible_distribution` is CentOS or RedHat: a
-  community cloud's conversion host image is CentOS Stream 9 (no subscription) or RHEL 9.
-* Planned (D15): the RHEL family by `ansible_os_family` (Rocky Linux 9, AlmaLinux 9, CentOS Stream 10), then Ubuntu
-  24.04 LTS (apt: `qemu-utils`, `nbdkit`, `libnbd-bin` for nbdcopy, `libguestfs-tools`). Every image keeps Python 3.6 or
-  later for blocksync (§6.2, D7).
+* `conversion_host_content` installs the copy tools on the RHEL family by `ansible_os_family` (RHEL with its
+  subscription; CentOS Stream 9 and 10, Rocky Linux 9, AlmaLinux 9 with EPEL) and on Ubuntu 24.04 LTS or later (apt:
+  `qemu-utils`, `nbdkit`, `libnbd-bin` for nbdcopy, `libguestfs-tools`), and fails on any other OS (§6.5; T7, in
+  D15's order). Every image keeps Python 3.6 or later for blocksync (§6.2, D7); an Ubuntu image's user is `ubuntu`.
 * VMware sources need VDDK on the destination conversion host, as on RHOSO 18.0.
 
 ### 21.7 API changes the design absorbs (today)
@@ -3360,29 +3549,33 @@ Life upstream, below the floor, newer than validated, or not detected).
   (openstacksdk 4.21: servers 2.100, flavors 2.61, volume attachments 2.89, block storage 3.71). Compute 2.101 (a volume
   attach answers 202), 2.102 (flavors lose `rxtx_factor` and `OS-FLV-DISABLED:disabled`) and 2.103 (`/os-volumes_boot`
   is gone) never reach Seamless's calls, and an older cloud gets its own maximum.
-* Raising the openstacksdk pin (the root `requirements.txt`, `aee/`, the image) re-checks those caps against the window:
-  the planned contract suite replays recorded version documents of every series (QASuite S-DST).
+* The collection pins openstacksdk (the root `requirements.txt`, `aee/`), and raising that pin re-checks those caps
+  against the window; the control plane's image and CI install the newest openstacksdk `seamless/pyproject.toml`
+  allows (`>=4.5`), so every CI run re-checks them: the contract suite (QASuite S-DST, since T1) runs openstacksdk's own
+  negotiation against every series' maxima.
 * Networking is ML2/OVN or ML2/OVS, as the operator chose: the MTU checks (§9.3) apply as on RHOSO 18.0, no OVS- or
   OVN-specific binding is copied, and `ovn` in the check report is informational.
 * TLS is the operator's choice on a community cloud: `verify_tls` stays on by default, with a CA bundle per provider
-  (§4.2). Planned: the check reports a plain-HTTP endpoint (Security.md).
+  (§4.2). The check reports `tls` and the endpoints that use plain HTTP (`plain_http`, §10; Security.md).
 
-### 21.8 Planned contract changes (0.2.0; not binding until implemented)
+### 21.8 Contract changes of 0.2.0 (each binding from its plan task)
 
 | Item | Becomes binding in | Plan task |
 |---|---|---|
-| the series table, detection and tiers (§21.1–§21.3) | §10, a new `planning/platforms.py` | T1 |
-| `Provider.release: str|null`, the declared series | §4.2, §12, §16 | T2 |
-| `check()` keys `release_range`, `release`, `support_tier`, `policy_profile`, `tls` | §10 | T3 |
-| findings `DST_CAPABILITY_MISSING` (blocker), `DST_RELEASE_OUTSIDE_SUPPORT` (warning) | §9.3 | T4 |
-| `NET_PORT_NOT_PERMITTED` by the policy profile (§21.5) | §6.6, §9.3 | T5 |
-| destination-neutral texts: findings, events, the CLI and the dashboard name the destination provider | §9.3, §16 | T6 |
-| conversion host images (§21.6) | §6.5, Performance.md | T7 |
-| the provider page shows series, tier and profile; the provider form takes the declared series | §16 | T8 |
-| the demo: a community destination (2026.2 Hibiscus, Kolla-Ansible preset) beside `rhoso18` | §10, §7.4 | T9 |
+| the series table, detection and tiers (§21.1–§21.3) | §10.1, `planning/platforms.py` (binding) | T1 |
+| `Provider.release: str|null`, the declared series | §4.2, §12 (binding); the dashboard's form, §16, with T8 | T2 |
+| `check()` keys `release_range`, `release`, `support_tier`, `policy_profile`, `tls`; `Provider.policy_profile` | §10, §10.1, §4.2, §12 (binding) | T3 |
+| findings `DST_CAPABILITY_MISSING` (blocker), `DST_RELEASE_OUTSIDE_SUPPORT` (warning) | §21.4 (binding); §9.3 with the catalog | T4 |
+| `NET_PORT_NOT_PERMITTED` by the policy profile (§21.5) | §6.6, §9.3 (binding); the dashboard's picker with T8 | T5 |
+| destination-neutral texts: a text built for a plan or migration names the destination provider, a fixed text says "the destination" | §1, §9.3, §16 (binding) | T6 |
+| conversion host images (§21.6) | §6.5 (binding), Performance.md | T7 |
+| the provider page shows series, tier and profile; the provider form takes the declared series | §16 (binding) | T8 |
+| the demo: a community destination (2026.2 Hibiscus, Kolla-Ansible preset) beside `rhoso18` | §10 (binding) | T9 |
 | the lab matrix M7–M12 and the LAB-D cases | QASuite §6.7, §7 | T10 |
 
 ### 21.9 Validation
 
-QASuite §6.7 (AC-6, journey 6 of the PRD), §7.1 (matrices M7–M12), §7.2 (LAB-D01…LAB-D08), and the planned contract
-suite S-DST: recorded version documents per series, the detection and tier table, the policy-profile cases.
+QASuite §6.7 (AC-6, journey 6 of the PRD), §7.1 (matrices M7–M12), §7.2 (LAB-D01…LAB-D08), and the contract suite
+S-DST: version documents per series (synthetic until the lab records them), the detection and tier table (since T1),
+and each series read through a real keystoneauth session (review 18); the policy-profile cases are QASuite FR-32's
+(since T5).

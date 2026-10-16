@@ -1,9 +1,11 @@
 import secrets
 import threading
+from datetime import UTC, datetime
 
 import pytest
 import sqlalchemy as sa
 
+from seamless_migrate import store as store_module
 from seamless_migrate.domain.enums import Phase, PlanStatus
 from seamless_migrate.domain.models import Event, Migration, Plan, Provider
 from seamless_migrate.events import AUDIT_KINDS
@@ -26,6 +28,47 @@ def test_put_get_roundtrip(any_store: Store):
 
     with pytest.raises(NotFound):
         any_store.get("plan", "plan-missing", Plan)
+
+
+def test_put_with_event_writes_the_document_and_its_event_together(any_store: Store, monkeypatch):
+    """SDD §11, §8.1 (review RV21-04): a versioned update and its event in one transaction - both
+    are written, or neither: a version conflict, or an event the store cannot append, leaves the
+    document as it was and no event."""
+    mig = make_migration()
+    version = any_store.put("migration", mig)
+    flagged = mig.model_copy(
+        update={"source_running_at": datetime(2026, 10, 16, 12, 0, tzinfo=UTC)}
+    )
+    event = Event(
+        kind="migration.source_running",
+        plan_id=mig.plan_id,
+        migration_id=mig.id,
+        message="web-01: the source VM runs again",
+        data={"power_state": "running"},
+    )
+
+    def neither():
+        assert any_store.get("migration", mig.id, Migration).source_running_at is None
+        assert any_store.events(kinds=["migration.source_running"]) == []
+
+    with pytest.raises(ConflictError):
+        any_store.put_with_event("migration", flagged, event, version + 1)
+    neither()
+
+    def refused():
+        raise RuntimeError("the store was briefly unavailable")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(store_module.events, "insert", refused)
+        with pytest.raises(RuntimeError):
+            any_store.put_with_event("migration", flagged, event, version)
+    neither()
+    saved, written = any_store.put_with_event("migration", flagged, event, version)
+    assert saved == version + 1 and written.seq is not None
+    assert (
+        any_store.get("migration", mig.id, Migration).source_running_at == flagged.source_running_at
+    )
+    assert [e.seq for e in any_store.events(kinds=["migration.source_running"])] == [written.seq]
 
 
 def test_optimistic_conflict_raises(any_store: Store):

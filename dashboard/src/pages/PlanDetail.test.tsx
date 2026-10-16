@@ -49,6 +49,15 @@ describe('PlanDetail', () => {
     expect(within(table).getAllByRole('row')).toHaveLength(11);
   });
 
+  it("names a destination stored with a blank name by its id in the plan's settings (SDD §1 naming, §4.2, review RV21-06)", async () => {
+    const server = createTestServer();
+    server.providers.find((p) => p.id === 'rhoso-prod')!.name = '   ';
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-4f2a9c1e', path: '/plans/:planId', token: 'operator', server });
+    const settings = await screen.findByRole('region', { name: /settings/i });
+    const term = within(settings).getByText('Destination', { selector: 'dt' });
+    expect(term.nextElementSibling).toHaveTextContent('rhoso-prod');
+  });
+
   it('never names the plan being edited as holding its own VMs in the VM picker (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
@@ -540,7 +549,12 @@ describe('PlanDetail', () => {
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
     const queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
     const row = within(queue).getByRole('listitem', { name: 'web-cache-01' });
-    expect(within(row).getByRole('button', { name: 'Source VM running' })).toHaveAccessibleDescription(/^Running again since .+: its data diverges from RHOSO$/);
+    // the plan's destination provider by name, once the providers are loaded (SDD §1 naming, plan T6)
+    await waitFor(() =>
+      expect(within(row).getByRole('button', { name: 'Source VM running' })).toHaveAccessibleDescription(
+        /^Running again since .+: its data diverges from RHOSO 18\.0 — Production$/,
+      ),
+    );
     expect(within(row).getByRole('button', { name: 'Finalize overdue' })).toHaveAccessibleDescription(`In Completed longer than the plan's ${plan.finalize_warning_h} h`);
     expect(row.querySelector('[title]')).toBeNull();
   });

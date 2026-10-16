@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from seamless_migrate import store as store_module
 from seamless_migrate.ai.advisor import Advisor
 from seamless_migrate.ai.jev import JevClient
 from seamless_migrate.ai.knowledge import KnowledgeService
@@ -16,7 +17,14 @@ from seamless_migrate.ai.memory import MemoryClient
 from seamless_migrate.ai.redaction import redact
 from seamless_migrate.ai.snapshots import canonical_json
 from seamless_migrate.config import Settings
-from seamless_migrate.domain.enums import DecisionStatus, Phase, PlanStatus, ReasonCode, Strategy
+from seamless_migrate.domain.enums import (
+    DecisionStatus,
+    Phase,
+    PlanStatus,
+    ProviderKind,
+    ReasonCode,
+    Strategy,
+)
 from seamless_migrate.domain.models import (
     AdvisorNote,
     AdvisorPolicy,
@@ -3666,6 +3674,54 @@ async def test_a_recommendation_is_audited_once_with_its_redacted_input(
     )
 
 
+async def test_the_question_to_jev_names_the_destination_by_kind_never_its_providers_name(
+    tmp_path, store
+):
+    """SDD §1 naming, §13.4 (review RV20-01): validation asks the advisor with the destination's
+    kind and series; its provider's name, operator free text, reaches neither the call to Jev nor
+    the stored input snapshot."""
+    advisor, session = _tie_advisor("warm", 0.9)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    store.put("provider", DST_PROVIDER.model_copy(update={"name": "ACME Bank - Jakarta DC3"}))
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    snapshot = store.get("advisor_snapshot", rec.input_snapshot_sha256, AdvisorSnapshot)
+    assert snapshot.payload["arguments"]["decision"].endswith(" moving to RHOSO 18.0?")
+    assert "ACME" not in json.dumps(snapshot.payload)
+    assert session.calls and session.calls[0][0] == "jev_decide"
+    assert "ACME" not in json.dumps(session.calls, default=str)
+
+
+class _Settling(StaticDestination):
+    """A community destination whose check - the one validation runs - settles 2026.2."""
+
+    async def check(self):
+        return {**await super().check(), "release_range": ["2026.2"], "release": "2026.2"}
+
+
+@pytest.mark.parametrize("stored", [{"release": "2025.1"}, {}], ids=["earlier", "reset"])
+async def test_the_question_to_jev_names_the_series_the_validations_own_check_settled(
+    tmp_path, store, stored
+):
+    """SDD §13.4 (review RV21-01): the question names the destination by the series the check
+    this validation runs settled - the report it judges with - never by the report stored before
+    it: an earlier series, or none after a credentials reset."""
+    advisor, _ = _tie_advisor("warm", 0.9)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor, destination=_Settling()
+    )
+    store.put(
+        "provider",
+        DST_PROVIDER.model_copy(update={"kind": ProviderKind.openstack, "capabilities": stored}),
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    assert store.get("provider", DST_PROVIDER.id, Provider).capabilities["release"] == "2026.2"
+    [rec] = _recommendations(store)
+    snapshot = store.get("advisor_snapshot", rec.input_snapshot_sha256, AdvisorSnapshot)
+    decision = snapshot.payload["arguments"]["decision"]
+    assert decision.endswith(" moving to a community OpenStack 2026.2 destination?"), decision
+
+
 def _finance(plan) -> AdvisorPolicy:
     return AdvisorPolicy(
         id="pol-finance",
@@ -4338,7 +4394,7 @@ async def test_validation_blocks_a_vm_whose_nic_override_cannot_be_applied(tmp_p
     blocked = await h.by_vm(plan.id, "vm-1")
     assert blocked.phase == P.blocked
     [f] = [f for f in blocked.findings if f.code == "MAP_NIC_OVERRIDE_INVALID"]
-    assert "fa:16:3e:00:00:0a: RHOSO has no network 'rhoso-missing'" in f.message
+    assert "fa:16:3e:00:00:0a: RHOSO 18.0 has no network 'rhoso-missing'" in f.message
     assert (await h.by_vm(plan.id, "vm-2")).phase != P.blocked
 
 
@@ -6088,6 +6144,120 @@ async def test_the_source_watch_reads_each_plan_once_per_pass(tmp_path, store, m
     monkeypatch.setattr(h.orch, "_plan", gone)
     await h.orch._watch_sources_once()
     assert asked == [plan.id]
+
+
+async def test_a_store_error_reading_the_destination_never_loses_the_source_running_alert(
+    tmp_path, store, monkeypatch, caplog
+):
+    """SDD §8.1 (review RV20-03): the alert names the destination provider (T6), read before the
+    flag is saved. A store error on that read leaves the flag unsaved for this pass, logged, and
+    the next pass records the flag and emits migration.source_running together: never a flag
+    without its alert."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    real_get = h.orch.db.get
+    failed: list[str] = []
+
+    async def flaky_get(kind, key, *args, **kwargs):
+        if (kind, key) == ("provider", plan.destination_provider_id) and not failed:
+            failed.append(key)
+            raise RuntimeError("the store was briefly unavailable")
+        return await real_get(kind, key, *args, **kwargs)
+
+    monkeypatch.setattr(h.orch.db, "get", flaky_get)
+
+    def alerts():
+        events = store.events(since_seq=0, limit=100000)
+        return [e for e in events if e.kind == "migration.source_running"]
+
+    await h.orch._watch_sources()
+    assert failed == [plan.destination_provider_id]
+    assert (await h.migration(m.id)).source_running_at is None
+    assert alerts() == []
+    assert f"source watch failed for {m.id}" in caplog.text
+    await h.orch._watch_sources()
+    assert (await h.migration(m.id)).source_running_at is not None
+    [alert] = alerts()
+    assert (alert.migration_id, alert.data) == (m.id, {"power_state": "running"})
+    assert f"its data diverges from {DST_PROVIDER.name};" in alert.message
+
+
+def _refuse_event_once(monkeypatch, kind: str) -> list[str]:
+    """The events table's insert refusing one row of ``kind``, once - in whatever transaction the
+    store writes it (review RV21-04); the list names what it refused."""
+    real_insert = store_module.events.insert
+    failed: list[str] = []
+
+    class RefusedOnce:
+        def __init__(self):
+            self.statement = real_insert()
+
+        def values(self, **row):
+            if row.get("kind") == kind and not failed:
+                failed.append(kind)
+                raise RuntimeError("the store was briefly unavailable")
+            return self.statement.values(**row)
+
+    monkeypatch.setattr(store_module.events, "insert", RefusedOnce)
+    return failed
+
+
+async def test_a_store_error_writing_the_alert_never_leaves_the_flag_without_it(
+    tmp_path, store, monkeypatch, caplog
+):
+    """SDD §8.1 (review RV21-04, the owner's choice): the flag and its migration.source_running
+    alert are one store transaction. An alert the store cannot append leaves neither, logged, and
+    the next pass writes both - never a flag without its alert (finalize answering 409 while no
+    page shows why)."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    failed = _refuse_event_once(monkeypatch, "migration.source_running")
+
+    def alerts():
+        events = store.events(since_seq=0, limit=100000)
+        return [e for e in events if e.kind == "migration.source_running"]
+
+    await h.orch._watch_sources()
+    assert failed == ["migration.source_running"]
+    assert (await h.migration(m.id)).source_running_at is None
+    assert alerts() == []
+    assert "the source watch failed" in caplog.text
+    await h.orch._watch_sources()
+    assert (await h.migration(m.id)).source_running_at is not None
+    assert len(alerts()) == 1
+
+
+@pytest.mark.parametrize("seen", ["stopped", "gone"])
+async def test_a_store_error_writing_the_stopped_event_never_clears_the_flag_without_it(
+    tmp_path, store, monkeypatch, seen
+):
+    """SDD §8.1 (review RV21-04): clearing the flag and its migration.source_stopped event are one
+    store transaction too, for a source seen stopped or gone - an event the store cannot append
+    leaves the flag set, and the next pass clears it with its event."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    await h.orch._watch_sources()
+    assert (await h.migration(m.id)).source_running_at is not None
+    if seen == "stopped":
+        h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "stopped"})
+    else:
+        del h.source.vms["vm-1"]
+    failed = _refuse_event_once(monkeypatch, "migration.source_stopped")
+
+    def stops():
+        events = store.events(since_seq=0, limit=100000)
+        return [e for e in events if e.kind == "migration.source_stopped"]
+
+    await h.orch._watch_sources()
+    assert failed == ["migration.source_stopped"]
+    assert (await h.migration(m.id)).source_running_at is not None
+    assert stops() == []
+    await h.orch._watch_sources()
+    assert (await h.migration(m.id)).source_running_at is None
+    assert len(stops()) == 1
 
 
 async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_path, store):

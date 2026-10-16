@@ -45,7 +45,8 @@ from ..planning.networks import (
     kit_network_key,
     kit_network_value,
     kit_subnet,
-    port_refusal,
+    policy_profile_of,
+    port_refusal_at_run,
     resolve_network,
 )
 from ..providers.base import ProviderError
@@ -155,9 +156,12 @@ def apply_mappings(doc: dict[str, Any], mappings: Mappings) -> dict[str, Any]:
     return out
 
 
-def set_port_creation_mode(doc: dict[str, Any], mode: str) -> dict[str, Any]:
+def set_port_creation_mode(
+    doc: dict[str, Any], mode: str, profile: str = "legacy"
+) -> dict[str, Any]:
     """Return a copy of an exported ``workloads.yml`` whose servers recreate their ports in
-    ``mode`` (``plan.port_creation_mode``, SDD §7.2)."""
+    ``mode`` (``plan.port_creation_mode``, SDD §7.2) and whose destination check judges another
+    project's network by the destination's policy ``profile`` (SDD §6.6, §21.5)."""
     out = copy.deepcopy(doc)
     for resource in out.get("resources") or []:
         if resource.get("type") != SERVER_TYPE:
@@ -165,6 +169,7 @@ def set_port_creation_mode(doc: dict[str, Any], mode: str) -> dict[str, Any]:
         if not isinstance(resource.get("_migration_params"), dict):
             resource["_migration_params"] = {}
         resource["_migration_params"]["port_creation_mode"] = mode
+        resource["_migration_params"]["policy_profile"] = profile
     return out
 
 
@@ -273,19 +278,25 @@ def _scoped_ref(ref: dict[str, Any], network: dict[str, Any]) -> dict:
     return {**ref, "project_name": scope, "domain_name": scope}
 
 
-def _resolved_ref(ref: dict[str, Any], networks: Sequence[dict[str, Any]], what: str) -> dict:
+def _resolved_ref(
+    ref: dict[str, Any], networks: Sequence[dict[str, Any]], what: str, where: str
+) -> dict:
     name = ref.get("name")
     network, why = resolve_network(networks, str(name))
     if network is None:
+        # the destination provider ``where`` names (SDD §1 naming)
         raise PermanentStepError(
-            f"{what} cannot go to RHOSO network {name!r}: "
+            f"{what} cannot go to network {name!r} of {where}: "
             + (why or f"there is no network named {name!r}")
         )
     return _scoped_ref(ref, network)
 
 
 def resolve_network_refs(
-    doc: dict[str, Any], networks: Sequence[dict[str, Any]], deferred: list[str] | None = None
+    doc: dict[str, Any],
+    networks: Sequence[dict[str, Any]],
+    deferred: list[str] | None = None,
+    where: str = "the destination",
 ) -> dict[str, Any]:
     """Return a copy of an exported ``workloads.yml`` whose server ports and floating IPs name the
     RHOSO network the rule of SDD §7.3 step 0 resolves (``network_details``): the credential's own
@@ -306,7 +317,7 @@ def resolve_network_refs(
             params = port.get("params") or {}
             what = f"the port {params.get('mac_address')} of {server.get('name')}"
             try:
-                ref = _resolved_ref(params.get("network_ref") or {}, networks, what)
+                ref = _resolved_ref(params.get("network_ref") or {}, networks, what, where)
             except PermanentStepError as exc:
                 if deferred is None:
                     raise
@@ -363,8 +374,11 @@ def _apply_port_mode(
     record: dict[str, Any] | None = None,
     exports: bool = False,
     deferred: list[str] | None = None,
+    profile: str = "legacy",
+    where: str = "the destination",
 ) -> bool:
-    """Write the plan's port_creation_mode into an existing export before a run, and resolve its
+    """Write the plan's port_creation_mode and the destination's policy ``profile`` into an
+    existing export before a run, and resolve its
     network references again with the destination's ``networks`` when given, unless the run
     replaces the export: it ``exports`` anyway (the cold cutover), or True is returned (SDD §7.2).
     A warm pass passes ``deferred``, where a port network that does not resolve is added.
@@ -387,10 +401,10 @@ def _apply_port_mode(
             or _overridden_ports(doc)
         )
     ) or (record is not None and _read_export_record(osm) != record)
-    doc = set_port_creation_mode(doc, mode)
+    doc = set_port_creation_mode(doc, mode, profile)
     # a new export is resolved after it instead: the one it replaces may no longer resolve
     if networks and not (reexport or exports):
-        doc = resolve_network_refs(doc, networks, deferred)
+        doc = resolve_network_refs(doc, networks, deferred, where)
     path.write_text(yaml.safe_dump(doc, sort_keys=False))
     return reexport
 
@@ -963,6 +977,8 @@ class AnsibleExecutor:
                 export_record(mappings, nics, ctx.migration.vm.name) if judged else None,
                 any(p.name == "export_workloads.yml" for p in self._playbooks(step, strategy, osm)),
                 deferred,
+                policy_profile_of(ctx.destination.capabilities, ctx.destination),
+                ctx.destination.label,
             )
             await self._log_deferred(ctx, deferred)
         leftover = (
@@ -1012,9 +1028,9 @@ class AnsibleExecutor:
             # the cold role skips every task (the stop included) when the destination already
             # has a server with the workload's name: nothing was migrated
             raise PermanentStepError(
-                f"import_workloads.yml skipped {ctx.migration.vm.name}: the destination already "
-                "has a server with that name and nothing was migrated; delete or rename it, "
-                "or roll the migration back"
+                f"import_workloads.yml skipped {ctx.migration.vm.name}: "
+                f"{ctx.destination.label} already has a server with that name and nothing was "
+                "migrated; delete or rename it, or roll the migration back"
             )
         result = await self._result(step, strategy, ctx, osm, started, passes_before)
         if deferred is not None:
@@ -1043,12 +1059,13 @@ class AnsibleExecutor:
             # an unanswered lookup is not "no such server": refuse before anything is stopped
             # (a duplicate name is a lookup error too)
             raise TransientStepError(
-                f"could not check the destination for a server named {m.vm.name}: {exc}"
+                f"could not check {ctx.destination.label} for a server named {m.vm.name}: {exc}"
             ) from exc
         if existing:
             raise PermanentStepError(
-                f"a server named {m.vm.name} already exists in the destination ({existing}) and "
-                "this migration did not create it; delete or rename it before the cutover"
+                f"a server named {m.vm.name} already exists in {ctx.destination.label} "
+                f"({existing}) and this migration did not create it; delete or rename it before "
+                "the cutover"
             )
 
     async def _result(
@@ -1088,7 +1105,7 @@ class AnsibleExecutor:
                 # previous pass would feed a phantom pass into convergence and the estimate
                 raise PermanentStepError(
                     f"the playbook recorded no new pass for {m.vm.name} (the workload was "
-                    "skipped); check the destination for a same-named server"
+                    f"skipped); check {ctx.destination.label} for a same-named server"
                 )
             sync_pass = _warm_sync_pass(state["passes"][-1], m, started)
             if step == StepName.CUTOVER:
@@ -1138,8 +1155,8 @@ class AnsibleExecutor:
             inventory = await self.providers.get(ctx.destination).inventory()
         except ProviderError as exc:
             await ctx.log(
-                f"could not read the destination's networks ({exc}): the network references "
-                "stay as exported"
+                f"could not read the networks of {ctx.destination.label} ({exc}): the network "
+                "references stay as exported"
             )
             return None
         # none listed (an older provider): nothing to resolve against
@@ -1163,10 +1180,16 @@ class AnsibleExecutor:
         try:
             inventory = await dst.inventory()
         except ProviderError as exc:
-            raise TransientStepError(f"could not read the destination's networks: {exc}") from exc
+            raise TransientStepError(
+                f"could not read the networks of {ctx.destination.label}: {exc}"
+            ) from exc
         networks = list(getattr(inventory, "network_details", None) or [])
         subnets = list(getattr(inventory, "subnets", None) or [])
-        roles = ctx.destination.capabilities.get("roles")
+        # the token's roles read now with the inventory, as the handover's step 0 and the
+        # collection read them; the check report's only when they cannot be read - a report new
+        # credentials reset names none (SDD §7.2, §10, review RV19-01)
+        live = getattr(inventory, "roles", None)
+        roles = live if live is not None else ctx.destination.capabilities.get("roles")
         vm = ctx.migration.vm
         out: dict[str, str] = {}
         problems: list[str] = []
@@ -1191,14 +1214,16 @@ class AnsibleExecutor:
             network, why = resolve_network(networks, name)
             if network is None:
                 problems.append(
-                    f"{what} cannot go to RHOSO network {name!r}: "
+                    f"{what} cannot go to network {name!r} of {ctx.destination.label}: "
                     + (why or f"there is no network named {name!r}")
                 )
                 continue
-            refused = port_refusal(network, roles)
+            profile = policy_profile_of(ctx.destination.capabilities, ctx.destination)
+            # no roles to judge, and a port there needs one: never let through (RV19-01)
+            refused = port_refusal_at_run(network, roles, profile)
             if refused:
                 problem = (
-                    f"{what} cannot go to RHOSO network {name!r} "
+                    f"{what} cannot go to network {name!r} of {ctx.destination.label} "
                     f"(project {network.get('project_id')}): {refused}"
                 )
                 if deferred is None:
@@ -1212,7 +1237,9 @@ class AnsibleExecutor:
                 problems.append(f"{what} on {name!r}: {why}")
                 continue
             try:
-                held = await self._held_by_another_port(dst, str(network["id"]), nic)
+                held = await self._held_by_another_port(
+                    dst, str(network["id"]), nic, ctx.destination.label
+                )
             except TransientStepError as exc:
                 if deferred is None:
                     raise
@@ -1254,9 +1281,12 @@ class AnsibleExecutor:
         deferred.logged = len(deferred)
 
     @staticmethod
-    async def _held_by_another_port(dst: Any, network_id: str, nic: Nic) -> str | None:
+    async def _held_by_another_port(
+        dst: Any, network_id: str, nic: Nic, where: str = "the destination"
+    ) -> str | None:
         """What another port of the network holds of what the kit asks Neutron for after the
-        power-off: the NIC's MAC, else one of its IPv4 addresses (SDD §7.2)."""
+        power-off: the NIC's MAC, else one of its IPv4 addresses (SDD §7.2); a failed read names
+        the destination provider, ``where`` (SDD §1 naming)."""
         try:
             if nic.mac:
                 for port in await dst.ports(network_id=network_id, mac_address=nic.mac.lower()):
@@ -1265,7 +1295,7 @@ class AnsibleExecutor:
                 for port in await dst.ports(network_id=network_id, ip_address=address):
                     return f"port {port['id']} holds {address}"
         except ProviderError as exc:
-            raise TransientStepError(f"could not read the destination's ports: {exc}") from exc
+            raise TransientStepError(f"could not read the ports of {where}: {exc}") from exc
         return None
 
     @staticmethod
@@ -1287,7 +1317,10 @@ class AnsibleExecutor:
         try:
             return await self.providers.get(ctx.destination).find_server(ctx.migration.vm.name)
         except ProviderError as exc:
-            await ctx.log(f"could not look up the destination server: {exc}")
+            await ctx.log(
+                f"could not look up the server named {ctx.migration.vm.name} in "
+                f"{ctx.destination.label}: {exc}"
+            )
             return None
 
     async def _vmware_rollback(self, ctx: StepContext) -> StepResult:
@@ -1459,6 +1492,8 @@ class AnsibleExecutor:
                         networks,
                         deferred,
                         volumes,
+                        policy_profile_of(destination.capabilities, destination),
+                        destination.label,
                     )
                     if ctx is not None:
                         await self._log_deferred(ctx, deferred)
@@ -1477,6 +1512,8 @@ class AnsibleExecutor:
         networks: Sequence[dict[str, Any]] | None = None,
         deferred: list[str] | None = None,
         validated_volumes: Sequence[str] | None = None,
+        profile: str = "legacy",
+        where: str = "the destination",
     ) -> None:
         """Keep only the planned server of the export, check that it still lists every volume
         the migration validated (``validated_volumes``), apply the mappings, the VM's NIC
@@ -1509,7 +1546,7 @@ class AnsibleExecutor:
         if mappings is not None:
             doc = apply_mappings(doc, mappings)
         if port_mode is not None:
-            doc = set_port_creation_mode(doc, port_mode)
+            doc = set_port_creation_mode(doc, port_mode, profile)
         # written first: a rollback reads the planned server from it, should an override fail
         path.write_text(yaml.safe_dump(doc, sort_keys=False))
         if validated_volumes:
@@ -1533,7 +1570,7 @@ class AnsibleExecutor:
             doc = apply_nic_overrides(doc, nic_overrides)
             path.write_text(yaml.safe_dump(doc, sort_keys=False))
         if networks:
-            doc = resolve_network_refs(doc, networks, deferred)
+            doc = resolve_network_refs(doc, networks, deferred, where)
             path.write_text(yaml.safe_dump(doc, sort_keys=False))
         missing = ports_without_security_groups(doc) if port_mode == "neutron" else []
         if missing:

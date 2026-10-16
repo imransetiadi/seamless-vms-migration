@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import type { DestinationNetwork, DestinationSubnet, Nic } from '../api/types';
-import { capabilityRoles, kitSubnet, portRefusal, resolveNetwork } from './networks';
+// One case table for the control plane and the dashboard (SDD §6.6, §21.5; plan T8).
+import raw from '../../../seamless/tests/fixtures/port_refusal_cases.json?raw';
+import type { DestinationNetwork, DestinationSubnet, Nic, ProviderKind } from '../api/types';
+import { capabilityRoles, kitSubnet, policyProfileOf, portRefusal, resolveNetwork } from './networks';
 import { kitIpv4 } from './nics';
 
 const net = (id: string, name: string, own: boolean, project_id = own ? 'shop' : `${id}-owner`): DestinationNetwork => ({
@@ -106,5 +108,27 @@ describe('the VMware migration kit (SDD §7.2)', () => {
       why: "10.2.0.5, 10.2.1.5 lie in different subnets of the port's network: the migration kit gives a NIC's IPv4 addresses one subnet",
     });
     expect(kitSubnet(nic('10.2.0.5', '10.2.0.6'), [first, second])).toEqual({ subnet: first, why: null });
+  });
+});
+
+const shared = JSON.parse(raw) as {
+  networks: Record<string, Pick<DestinationNetwork, 'own' | 'shared' | 'external'>>;
+  cases: Array<{ network: string; profile: string; roles: string[] | null; expected: string | null }>;
+  profile_cases: Array<{
+    why: string;
+    capabilities: Record<string, unknown>;
+    provider: { kind: ProviderKind; release: string | null; policy_profile: 'secure_rbac' | 'legacy' | null };
+    expected: string;
+  }>;
+};
+
+describe('the port rule by the policy profile, like the control plane (SDD §6.6, §21.5)', () => {
+  it.each(shared.cases.map((c) => [`${c.network}, ${c.profile}, ${JSON.stringify(c.roles)}`, c] as const))('%s', (_name, c) => {
+    const network: DestinationNetwork = { id: 'n', name: 'n', mtu: 1500, project_id: 'p', ...shared.networks[c.network]! };
+    expect(portRefusal(network, c.roles ?? undefined, c.profile)).toBe(c.expected);
+  });
+
+  it.each(shared.profile_cases.map((c) => [c.why, c] as const))('the profile: %s', (_why, c) => {
+    expect(policyProfileOf(c.capabilities, c.provider)).toBe(c.expected);
   });
 });

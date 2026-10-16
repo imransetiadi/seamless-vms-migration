@@ -1,5 +1,7 @@
 import json
+import unicodedata
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -7,11 +9,14 @@ from pydantic import ValidationError
 from seamless_migrate.domain.enums import (
     Phase,
     PlanStatus,
+    ProviderKind,
+    ProviderRole,
     Role,
     Strategy,
     SyncPassKind,
 )
 from seamless_migrate.domain.models import (
+    BLANK_RANGES,
     AdvisorNote,
     CutoverWindow,
     Estimate,
@@ -19,7 +24,9 @@ from seamless_migrate.domain.models import (
     Finding,
     Migration,
     Plan,
+    Provider,
     SyncPass,
+    is_blank,
     new_migration_id,
     new_plan_id,
 )
@@ -114,6 +121,51 @@ def test_provider_id_regex_enforced():
     for bad in ("A", "-abc", "x", "has_underscore", "a" * 64):
         with pytest.raises(ValidationError):
             make_provider(id=bad)
+
+
+def test_provider_release_is_optional_and_validated_as_a_series():
+    """SDD §4.2: a provider declares no series unless its operator does, and a declared one reads
+    as releases.openstack.org names them - a year, a dot, 1 or 2 (§10.1, §21.3)."""
+    assert make_provider().release is None
+    for series in ("2023.1", "2024.2", "2026.2", "2027.1"):
+        assert make_provider(release=series).release == series
+    for bad in (
+        "2026.3",
+        "26.2",
+        "2026.2.1",
+        "2026",
+        "Hibiscus",
+        " 2026.2",
+        "2026.2 ",
+        "1999.1",
+        "",
+    ):
+        with pytest.raises(ValidationError, match="release"):
+            make_provider(release=bad)
+
+
+def test_a_release_on_a_vmware_provider_is_refused():
+    """SDD §4.2: an OpenStack series means nothing for vCenter - refused, never stored."""
+    vmware = {"id": "vc-01", "kind": ProviderKind.vmware, "endpoint": "https://vcenter.example"}
+    assert make_provider(**vmware).release is None
+    with pytest.raises(ValidationError, match="release"):
+        make_provider(**vmware, release="2026.2")
+    destination = {"id": "dst-hibiscus", "role": ProviderRole.destination, "release": "2026.2"}
+    assert make_provider(**destination).release == "2026.2"
+
+
+def test_provider_policy_profile_is_declared_or_null_and_refused_on_vmware():
+    """SDD §4.2, §21.5: a provider declares secure_rbac or legacy, or nothing (by kind and series,
+    §10.1); a vmware provider declares none."""
+    assert make_provider().policy_profile is None
+    for profile in ("secure_rbac", "legacy"):
+        assert make_provider(policy_profile=profile).policy_profile == profile
+    for bad in ("unknown", "strict", "SECURE_RBAC", ""):
+        with pytest.raises(ValidationError, match="policy_profile"):
+            make_provider(policy_profile=bad)
+    vmware = {"id": "vc-01", "kind": ProviderKind.vmware, "endpoint": "https://vcenter.example"}
+    with pytest.raises(ValidationError, match="policy_profile"):
+        make_provider(**vmware, policy_profile="legacy")
 
 
 def test_plan_port_creation_mode_is_nova_unless_neutron_is_chosen():
@@ -272,3 +324,49 @@ def test_prestage_resources_are_the_playbook_pairs_of_the_collection():
         if (playbooks / ("import_" + p.stem.removeprefix("export_") + ".yml")).exists()
     }
     assert set(PRESTAGE_RESOURCES) == pairs - {"workloads"}
+
+
+LABEL_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "provider_name_cases.json").read_text(encoding="utf-8")
+)["label_cases"]
+
+
+@pytest.mark.parametrize("case", LABEL_CASES, ids=[c["note"] for c in LABEL_CASES])
+def test_a_provider_stored_with_a_blank_name_loads_and_is_named_by_its_id(case):
+    """SDD §1 naming, §4.2 (reviews RV20-11, RV21-08): the API refuses a blank name at the request
+    boundary, so a provider stored blank before keeps loading; a text names it by its id - blank
+    by the rule the dashboard shares (provider_name_cases.json): no character outside Unicode's
+    separators, controls and format characters."""
+    stored = make_provider(id="dst-case", name="RHOSO").model_dump(mode="json")
+    loaded = Provider.model_validate({**stored, "name": case["name"]})
+    assert loaded.name == case["name"] and loaded.label == case["label"]
+
+
+BLANK = json.loads(
+    (Path(__file__).parent / "fixtures" / "blank_ranges.json").read_text(encoding="utf-8")
+)
+
+
+def test_the_blank_rule_is_one_pinned_list_never_the_runtimes_database(monkeypatch):
+    """SDD §4.2 (review RV22-06): blank is Unicode 15.1's separators, controls and format
+    characters, one pinned list the dashboard reads too - never the runtime's own database, which
+    differs between Python 3.11 (the image) and newer: U+13439 is blank on every runtime."""
+    assert [list(r) for r in BLANK_RANGES] == BLANK["ranges"]
+    pinned = {cp for first, last in BLANK["ranges"] for cp in range(first, last + 1)}
+
+    def read(ch):
+        raise AssertionError(f"the runtime's database was read for {ch!r}")
+
+    monkeypatch.setattr(unicodedata, "category", read)
+    assert [cp for cp in range(0x110000) if is_blank(chr(cp)) != (cp in pinned)] == []
+    assert is_blank("\U00013439 \u200b") and not is_blank("\U00013439x")
+
+
+@pytest.mark.skipif(
+    unicodedata.unidata_version != BLANK["unicode"], reason="another Unicode version"
+)
+def test_the_pinned_blank_list_is_what_its_unicode_version_says():
+    """The fixture is Unicode 15.1's Z, Cc and Cf: regenerate it on a runtime of that version."""
+    categories = {"Zs", "Zl", "Zp", "Cc", "Cf"}
+    pinned = {cp for first, last in BLANK["ranges"] for cp in range(first, last + 1)}
+    assert pinned == {cp for cp in range(0x110000) if unicodedata.category(chr(cp)) in categories}

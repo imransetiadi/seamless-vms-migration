@@ -1,4 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+// the keys an OpenStack or RHOSO check reports, as the API's (SDD §10; plan T8)
+import checkKeysRaw from '../../../seamless/tests/fixtures/check_report_keys.json?raw';
+// what POST and PATCH /providers answer for a name: one case table for the API and the mock (SDD §4.2)
+import nameRaw from '../../../seamless/tests/fixtures/provider_name_cases.json?raw';
+// what GET /advisor/data-sent lists: the API's own list, which the mock serves too (SDD §13.4)
+import dataSentRaw from '../../../seamless/tests/fixtures/data_sent.json?raw';
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
@@ -32,6 +38,10 @@ import {
 } from './types';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
+const CHECK_KEYS = JSON.parse(checkKeysRaw) as { openstack: string[]; destination: string[] };
+const NAME_CASES = (
+  JSON.parse(nameRaw) as { cases: Array<{ route: 'POST' | 'PATCH'; body: { name?: unknown }; status: number; message: string | null; note: string }> }
+).cases;
 
 function setup(token: string | null = 'admin') {
   const server = new MockServer({ now: () => NOW, seed: 1 });
@@ -219,6 +229,64 @@ describe('mock API', () => {
     expect(page.map((m) => m.id)).toEqual(all.slice(1, 3).map((m) => m.id));
   });
 
+  it("answers a destination's inventory with its token's roles, as the API demo's does (SDD §10, review RV20-10)", () => {
+    const { server } = setup();
+    for (const id of ['rhoso-prod', 'rhoso-staging', 'hibiscus-dc3']) {
+      const answer = server.handle('GET', `/providers/${id}/inventory`, new URLSearchParams(), undefined, 'viewer');
+      expect(answer.status, id).toBe(200);
+      // the demo's admin token, as its check reports it and the API demo's inventory reads it live (7f4cc5b5)
+      expect((answer.body as { roles?: unknown }).roles, id).toEqual(['admin', 'member', 'reader']);
+    }
+  });
+
+  it("checks a provider re-created under a seeded id by its own role and kind, never the deleted cloud's pools (review RV20-14)", () => {
+    const { server } = setup();
+    const call = (method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const backends = (id: string) => (call('POST', `/providers/${id}/check`).body as { capabilities: { volume_backends?: string[] } }).capabilities.volume_backends;
+    expect(backends('hibiscus-dc3')).toEqual(['kolla@rbd-1#volumes']);
+    expect(call('DELETE', '/providers/hibiscus-dc3').status).toBe(204);
+    const base = { name: 'DC3 again', kind: 'openstack', distribution: 'openstack_community', endpoint: 'https://keystone.example.invalid:5000/v3', cloud: 'x' };
+    // another role under the id: the generic pools, never the deleted destination's
+    expect(call('POST', '/providers', { ...base, id: 'hibiscus-dc3', role: 'source' }).status).toBe(201);
+    expect(backends('hibiscus-dc3')).not.toContain('kolla@rbd-1#volumes');
+    // another kind of destination under the id: the generic pools too
+    expect(call('DELETE', '/providers/hibiscus-dc3').status).toBe(204);
+    expect(call('POST', '/providers', { ...base, id: 'hibiscus-dc3', role: 'destination', kind: 'rhoso', distribution: 'rhoso' }).status).toBe(201);
+    expect(backends('hibiscus-dc3')).not.toContain('kolla@rbd-1#volumes');
+    // the same role and kind again is the same cloud added back: its pools
+    expect(call('DELETE', '/providers/hibiscus-dc3').status).toBe(204);
+    expect(call('POST', '/providers', { ...base, id: 'hibiscus-dc3', role: 'destination' }).status).toBe(201);
+    expect(backends('hibiscus-dc3')).toEqual(['kolla@rbd-1#volumes']);
+  });
+
+  it("never reads a deleted provider's inventory for one created again under its id (SDD §12, review RV21-12)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    expect(call('DELETE', '/providers/rhoso-staging').status).toBe(204);
+    const base = { name: 'Staging again', kind: 'openstack', distribution: 'openstack_community', endpoint: 'https://keystone.example.invalid:5000/v3', cloud: 'x' };
+    expect(call('POST', '/providers', { ...base, id: 'rhoso-staging', role: 'source' }).status).toBe(201);
+    // a source's inventory is its VMs - none yet for a new cloud -, never the deleted destination's networks and flavors
+    expect(call('GET', '/providers/rhoso-staging/inventory').body).toEqual([]);
+  });
+
+  it('keeps a provider whose id is an Object.prototype key apart from it, as any other id (SDD §4.2, review RV22-02)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const base = { name: 'Lab', kind: 'openstack', distribution: 'openstack_community', endpoint: 'https://keystone.example.invalid:5000/v3', cloud: 'x' };
+    const seen = ['brandnew', 'constructor'].map((id) => {
+      // "constructor" matches ^[a-z0-9][a-z0-9-]{1,62}$: the API stores it like any other id
+      const created = call('POST', '/providers', { ...base, id, role: 'source' }).status;
+      const inventory = call('GET', `/providers/${id}/inventory`).body;
+      const plan = call('POST', '/plans', { name: `p-${id}`, source_provider_id: id, destination_provider_id: 'rhoso-prod', vm_ids: [] });
+      const validated = call('POST', `/plans/${(plan.body as { id: string }).id}/validate`).status;
+      return { id, created, inventory, validated };
+    });
+    expect(seen).toEqual([
+      { id: 'brandnew', created: 201, inventory: [], validated: 200 },
+      { id: 'constructor', created: 201, inventory: [], validated: 200 },
+    ]);
+  });
+
   it('manages providers: PATCH, write-only credentials and conversion key (SDD §12)', async () => {
     const { server, client } = setup();
     const patched = await client.patch<Provider>('/providers/community-lab', { region: 'R2', distribution: 'kolla' });
@@ -226,6 +294,11 @@ describe('mock API', () => {
     await expect(client.patch('/providers/community-lab', { kind: 'vmware' })).rejects.toMatchObject({ status: 422 });
     await expect(client.patch('/providers/community-lab', { distribution: 'vmware' })).rejects.toMatchObject({ status: 422 });
     await expect(setup('operator').client.patch('/providers/community-lab', { region: 'x' })).rejects.toMatchObject({ status: 403 });
+    // a blank name is refused, as the API refuses it (SDD §4.2, review RV20-11)
+    await expect(client.patch('/providers/community-lab', { name: ' \t ' })).rejects.toMatchObject({ status: 422, message: 'name: must not be blank' });
+    const vcenter = server.providers.find((p) => p.id === 'vcenter-hq')!;
+    await expect(client.post('/providers', { ...vcenter, id: 'vc-blank', name: '' })).rejects.toMatchObject({ status: 422, message: 'name: must not be blank' });
+    expect(server.providers.some((p) => p.id === 'vc-blank')).toBe(false);
     const stored = await client.put<Provider>('/providers/community-lab/credentials', { username: 'u', password: 'p', project_name: 'x' });
     expect(stored.credentials_secret).toBe('provider-community-lab');
     expect(JSON.stringify(stored)).not.toContain('"p"');
@@ -236,6 +309,85 @@ describe('mock API', () => {
     });
     expect(keyed.conversion_host?.ssh_key_secret).toBe('provider-community-lab-ssh');
     expect(server.events.filter((e) => e.kind === 'provider.credentials_updated')).toHaveLength(2);
+  });
+
+  it.each(NAME_CASES.map((c) => [c.note, c] as const))("answers a provider's name as the API does: %s (SDD §4.2, reviews RV20-11, RV21-07)", (_note, c) => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const base = { kind: 'openstack', role: 'destination', distribution: 'openstack_community', endpoint: 'https://keystone.example.invalid:5000/v3', cloud: 'x' };
+    const lab = server.providers.find((p) => p.id === 'community-lab')!;
+    const before = lab.name;
+    const [path, body] = c.route === 'POST' ? ['/providers', { ...base, id: 'dst-case', ...c.body }] : ['/providers/community-lab', c.body];
+    const res = server.handle(c.route, path, new URLSearchParams(), body, 'admin');
+    const message = res.status < 300 ? null : (res.body as { error: { message: string } }).error.message;
+    expect({ status: res.status, message }).toEqual({ status: c.status, message: c.message });
+    const stored = c.route === 'POST' ? server.providers.find((p) => p.id === 'dst-case') : lab;
+    expect(stored?.name).toBe(c.message === null ? c.body.name : c.route === 'POST' ? undefined : before);
+  });
+
+  it("words a provider's events and an unreachable provider's error by its id, as the API does (SDD §4, §12, review RV21-06)", async () => {
+    const { server, client } = setup();
+    // a name the texts must not read bare: the API's events and provider errors name the provider by id
+    const body = { kind: 'openstack', role: 'destination', distribution: 'openstack_community', endpoint: 'https://unreachable.example.invalid:5000/v3', cloud: 'x', id: 'dst-dc4', name: 'DC4' };
+    await client.post('/providers', body);
+    await client.post('/providers/dst-dc4/check');
+    await expect(client.get('/providers/dst-dc4/inventory')).rejects.toMatchObject({ status: 502, message: 'dst-dc4: The endpoint did not answer (connection timed out).' });
+    await client.delete('/providers/dst-dc4');
+    const mine = server.events.filter((e) => e.kind.startsWith('provider.') && e.message.includes('dst-dc4')).map((e) => [e.kind, e.message]);
+    expect(mine).toEqual([
+      ['provider.created', 'provider dst-dc4 created'],
+      ['provider.checked', 'provider dst-dc4: error'],
+      ['provider.deleted', 'provider dst-dc4 deleted'],
+    ]);
+    // the demo's seeded checks too
+    const seeded = server.events.filter((e) => e.kind === 'provider.checked').map((e) => e.message);
+    expect(seeded.filter((m) => !/^provider [a-z0-9-]+: (ok|degraded|error|unknown)$/.test(m))).toEqual([]);
+  });
+
+  it("gives a provider's events the API's data: the provider, and the secrets it reads where the API names them (SDD §4.3, §13.3, review RV22-03)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const body = {
+      id: 'dst-dc4',
+      name: 'DC4',
+      kind: 'openstack',
+      role: 'destination',
+      distribution: 'openstack_community',
+      endpoint: 'https://keystone.dc4.example.invalid:5000/v3',
+      cloud: null,
+      credentials_secret: 'dc4-credentials',
+    };
+    expect(call('POST', '/providers', body).status).toBe(201);
+    expect(call('POST', '/providers/dst-dc4/check').status).toBe(200);
+    expect(call('PATCH', '/providers/dst-dc4', { region: 'R2' }).status).toBe(200);
+    expect(call('DELETE', '/providers/dst-dc4').status).toBe(204);
+    const data = Object.fromEntries(server.events.filter((e) => e.message.includes('dst-dc4')).map((e) => [e.kind, e.data]));
+    // what routes_providers.create_provider, update_provider, delete_provider and orchestrator.check_provider emit
+    expect(data).toEqual({
+      'provider.created': { provider_id: 'dst-dc4', kind: 'openstack', role: 'destination', credentials_secret: 'dc4-credentials' },
+      'provider.checked': { provider_id: 'dst-dc4', status: 'ok', message: null },
+      'provider.updated': { provider_id: 'dst-dc4', fields: ['region'], credentials_secret: 'dc4-credentials' },
+      'provider.deleted': { provider_id: 'dst-dc4' },
+    });
+  });
+
+  it("answers a PATCH of an unknown provider in the API's order: what its body alone refuses before the 404 (SDD §4.2, §12, review RV22-07)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const answer = (body: unknown) => {
+      const res = server.handle('PATCH', '/providers/ghost', new URLSearchParams(), body, 'admin');
+      return { status: res.status, message: (res.body as { error?: { message: string } }).error?.message };
+    };
+    // routes_providers.update_provider: fields that cannot change, then a blank name (422), then the lookup (404)
+    expect([answer({ name: '\u200b' }), answer({ id: 'x' }), answer({ region: 'R2' })]).toEqual([
+      { status: 422, message: 'name: must not be blank' },
+      { status: 422, message: 'fields cannot be changed: id' },
+      { status: 404, message: 'Provider ghost not found.' },
+    ]);
+  });
+
+  it('answers a PATCH of a name that is not a string with its 409 first while a running plan uses the provider, as the API does (review RV21-07)', async () => {
+    const { server, client } = setup();
+    const busy = server.plans.find((p) => p.status === 'running')!.destination_provider_id;
+    await expect(client.patch(`/providers/${busy}`, { name: null })).rejects.toMatchObject({ status: 409 });
   });
 
   it('filters and pages the plans list', async () => {
@@ -1633,6 +1785,37 @@ describe('mock validation decides like the API (SDD §14.4)', () => {
     expect(snapshot.payload).toMatchObject({ tool: 'jev_decide', scope: ['cold', 'warm'], deterministic: 'warm' });
   });
 
+  it('sends Jev the destination by kind and series, never its provider name (SDD §1 naming, §13.4, review RV20-01)', async () => {
+    const { server, client, plan, before } = validating({ option: 'cold', confidence: 0.8 });
+    const name = 'ACME Bank - Jakarta DC3 (prod)';
+    const destination = server.providers.find((p) => p.id === plan.destination_provider_id)!;
+    destination.name = name;
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    const snapshot = server.snapshots.get(rec!.input_snapshot_sha256!)!;
+    expect(JSON.stringify(snapshot.payload)).not.toContain('ACME');
+    expect(snapshot.payload).toMatchObject({ arguments: { decision: expect.stringMatching(/ moving to RHOSO 18\.0\?$/) } });
+    // the eligibility reasons the operators read name the provider (T6); what Jev gets names the kind
+    expect(server.migrations.some((m) => m.plan_id === plan.id && m.estimates.some((e) => e.reasons.some((r) => r.includes(name))))).toBe(true);
+    expect(snapshot.payload).toMatchObject({ arguments: { evidence: expect.stringContaining('without a backend of RHOSO 18.0') } });
+  });
+
+  it('names the destination once in the question, whatever its provider is called (SDD §1 naming, §13.4, review RV21-10)', async () => {
+    const { server, client, plan, before } = validating({ option: 'cold', confidence: 0.8 });
+    // a provider named like the descriptor's own words: the question once gave "moving to RHOSO 18.0 18.0?"
+    server.providers.find((p) => p.id === plan.destination_provider_id)!.name = 'RHOSO';
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    const snapshot = server.snapshots.get(rec!.input_snapshot_sha256!)!;
+    expect(snapshot.payload).toMatchObject({ arguments: { decision: expect.stringMatching(/ moving to RHOSO 18\.0\?$/) } });
+    // the VM's name still goes through it: a provider named like the VM never leaves through the VM's name
+    const again = validating({ option: 'cold', confidence: 0.8 });
+    again.server.providers.find((p) => p.id === again.plan.destination_provider_id)!.name = again.db.vm.name;
+    await again.client.post(`/plans/${again.plan.id}/validate`);
+    const [named] = again.server.recommendations.slice(again.before);
+    expect(JSON.stringify(again.server.snapshots.get(named!.input_snapshot_sha256!)!.payload)).not.toContain(again.db.vm.name);
+  });
+
   it('keeps the deterministic choice when the confidence is below the threshold', async () => {
     const { server, client, plan, db, before } = validating({ option: 'cold', confidence: 0.57 });
     await client.post(`/plans/${plan.id}/validate`);
@@ -2257,6 +2440,12 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     expect(batch.data).toEqual({ wave_id: null, finalized: [other.vm.name], skipped: [{ vm: 'web-01', migration_id: web01.id, reason }] });
   });
 
+  it('lists what leaves for Jev in the API\'s own words: the shared data_sent.json (SDD §13.4, review RV21-03)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const res = server.handle('GET', '/advisor/data-sent', new URLSearchParams(), undefined, 'viewer');
+    expect((res.body as { items: unknown[] }).items).toEqual((JSON.parse(dataSentRaw) as { items: unknown[] }).items);
+  });
+
   it('declares the item key jev_classify sends, never the VM\'s id, like the API (SDD §14.2, §13.4)', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const res = server.handle('GET', '/advisor/data-sent', new URLSearchParams(), undefined, 'viewer');
@@ -2467,3 +2656,94 @@ describe('mock plans: nic_overrides (SDD §4.2, §12)', () => {
     });
   });
 });
+
+describe('providers of community destinations, like the API (SDD §4.2, §10, §10.1, §12; plan T8)', () => {
+  const call = (server: MockServer, method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+  const keysOf = (o: object) => Object.keys(o).sort();
+  const base = { endpoint: 'https://keystone.example.org/v3', cloud: 'x' };
+
+  it('the mock check reports the same keys', () => {
+    const { server } = setup('admin');
+    expect(call(server, 'POST', '/providers', { ...base, id: 'src-x', name: 'Source X', kind: 'openstack', role: 'source', distribution: 'openstack_community' }).status).toBe(201);
+    const declared = { ...base, id: 'dc3', name: 'Hibiscus DC3', kind: 'openstack', role: 'destination', distribution: 'kolla', release: '2026.2', policy_profile: 'legacy' };
+    expect(call(server, 'POST', '/providers', declared).status).toBe(201);
+    expect(call(server, 'POST', '/providers', { ...base, id: 'rhoso-x', name: 'RHOSO X', kind: 'rhoso', role: 'destination', distribution: 'rhoso' }).status).toBe(201);
+    const source = (call(server, 'POST', '/providers/src-x/check').body as Provider).capabilities;
+    expect(keysOf(source)).toEqual([...CHECK_KEYS.openstack].sort());
+    const dc3 = (call(server, 'POST', '/providers/dc3/check').body as Provider).capabilities;
+    expect(keysOf(dc3)).toEqual([...CHECK_KEYS.openstack, ...CHECK_KEYS.destination].sort());
+    // its series by its maxima, and the profile it declares (SDD §10.1)
+    expect(dc3).toMatchObject({ compute_microversion: '2.104', release_range: ['2026.2'], release: '2026.2', support_tier: { tier: 'tier1' }, policy_profile: 'legacy' });
+    const rhoso = (call(server, 'POST', '/providers/rhoso-x/check').body as Provider).capabilities;
+    expect(rhoso).toMatchObject({ support_tier: { tier: 'validated', reason: null }, policy_profile: 'legacy', tls: true, plain_http: [] });
+    // the seeded providers a check reported on carry them too
+    const checked = server.providers.filter((p) => p.kind !== 'vmware' && Object.keys(p.capabilities).length);
+    expect(checked.map((p) => p.id)).toEqual(expect.arrayContaining(['rhosp17-dc1', 'rhoso-prod', 'hibiscus-dc3']));
+    for (const p of checked) expect(keysOf(p.capabilities)).toEqual([...CHECK_KEYS.openstack, ...(p.role === 'destination' ? CHECK_KEYS.destination : [])].sort());
+  });
+
+  it("a check after new credentials reports the pools the provider's cloud has, as the API demo does (review RV19-02)", () => {
+    const { server } = setup('admin');
+    const rhoso = () => server.providers.find((p) => p.id === 'rhoso-prod')!;
+    const seeded = rhoso().capabilities.storage_backends;
+    // the analytics plan's Spark nodes, handed over to rhoso-prod's pools (SDD §7.3.1)
+    const spark = () =>
+      server.migrations
+        .filter((m) => m.plan_id === 'plan-c81d44a0' && m.vm.name !== 'analytics-db')
+        .map((m) => [m.vm.name, m.estimates.find((e) => e.strategy === 'storage_handover')?.reasons ?? ['no estimate']] as const);
+    // new credentials reset the report (SDD §12); the check reads the cloud again, whose pools did not change
+    expect(call(server, 'PUT', '/providers/rhoso-prod/credentials', { username: 'u', password: 'p', project_name: 'x' })).toMatchObject({
+      status: 200,
+      body: { status: 'unknown', capabilities: {} },
+    });
+    expect(call(server, 'POST', '/providers/rhoso-prod/check').status).toBe(200);
+    expect(rhoso().capabilities.storage_backends).toEqual(seeded);
+    expect(call(server, 'POST', '/plans/plan-c81d44a0/validate').status).toBe(200);
+    expect(spark().length).toBeGreaterThan(0);
+    expect(spark().filter(([, reasons]) => reasons.length)).toEqual([]);
+    // the source keeps its own report too: its pools, and OVN off
+    expect(call(server, 'PUT', '/providers/rhosp17-dc1/credentials', { username: 'u', password: 'p', project_name: 'x' }).status).toBe(200);
+    expect(call(server, 'POST', '/providers/rhosp17-dc1/check').status).toBe(200);
+    const source = server.providers.find((p) => p.id === 'rhosp17-dc1')!.capabilities;
+    expect(source).toMatchObject({ ovn: false });
+    expect((source.storage_backends as { pool: string }[]).map((b) => b.pool)).toContain('overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1');
+  });
+
+  it("a vCenter's check reports the API demo's VMware keys, never an OpenStack service (review RV19-05)", () => {
+    const { server } = setup('admin');
+    const vcenter = { ...base, id: 'vc-9', name: 'vCenter 9', kind: 'vmware', role: 'source', distribution: 'vmware' };
+    expect(call(server, 'POST', '/providers', vcenter).status).toBe(201);
+    // FakeSourceProvider.check for vmware: its VMs counted; no Nova, OVN or Cinder
+    const VMWARE_KEYS = ['admin', 'api_version', 'cbt_enabled_vms', 'vms_with_independent_disks', 'vms_with_snapshots', 'vms_without_tools'];
+    expect(keysOf((call(server, 'POST', '/providers/vc-9/check').body as Provider).capabilities)).toEqual(VMWARE_KEYS);
+    // the seeded vCenter reports what a check of it reads, counted from its VMs
+    const hq = server.providers.find((p) => p.id === 'vcenter-hq')!.capabilities;
+    expect(keysOf(hq)).toEqual(VMWARE_KEYS);
+    expect(hq).toMatchObject({ admin: true, api_version: '8.0.2.0' });
+    expect(hq.cbt_enabled_vms).toBeGreaterThan(0);
+    // an OpenStack declaration on vmware: the API's message, pydantic's "Value error, " included
+    expect(call(server, 'POST', '/providers', { ...vcenter, id: 'vc-8', release: '2026.2' })).toMatchObject({
+      status: 422,
+      body: { error: { message: 'Value error, release: an OpenStack release cannot be declared for vmware' } },
+    });
+  });
+
+  it('takes a declared series and policy profile, and refuses them where the API does (SDD §4.2, §12)', () => {
+    const { server } = setup('admin');
+    const dst = { ...base, id: 'dc4', name: 'DC4', kind: 'openstack', role: 'destination', distribution: 'openstack_community' };
+    expect(call(server, 'POST', '/providers', { ...dst, release: '2026.3' })).toMatchObject({ status: 422 });
+    expect(call(server, 'POST', '/providers', { ...dst, policy_profile: 'unknown' })).toMatchObject({ status: 422 });
+    const vcenter = { ...base, id: 'vc-9', name: 'vCenter 9', kind: 'vmware', role: 'source', distribution: 'vmware' };
+    expect(call(server, 'POST', '/providers', { ...vcenter, release: '2026.2' })).toMatchObject({ status: 422 });
+    expect(call(server, 'POST', '/providers', dst)).toMatchObject({ status: 201, body: { release: null, policy_profile: null } });
+    // a declaration is a provider change: the check report is reset (SDD §12)
+    expect(call(server, 'POST', '/providers/dc4/check').status).toBe(200);
+    const patched = call(server, 'PATCH', '/providers/dc4', { release: '2025.2', policy_profile: 'secure_rbac' });
+    expect(patched).toMatchObject({ status: 200, body: { release: '2025.2', policy_profile: 'secure_rbac', status: 'unknown', capabilities: {} } });
+    expect(call(server, 'PATCH', '/providers/dc4', { release: '2025' })).toMatchObject({ status: 422 });
+    expect(call(server, 'PATCH', '/providers/dc4', { release: null, policy_profile: null })).toMatchObject({ status: 200, body: { release: null, policy_profile: null } });
+    expect(call(server, 'POST', '/providers', vcenter).status).toBe(201);
+    expect(call(server, 'PATCH', '/providers/vc-9', { policy_profile: 'legacy' })).toMatchObject({ status: 422 });
+  });
+});
+

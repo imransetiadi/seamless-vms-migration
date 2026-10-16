@@ -190,7 +190,7 @@ try {
       await select.selectOption({ label: option });
     };
     await pick('Source provider', /finance|rhosp/i);
-    await pick('Destination (RHOSO 18.0)', /rhoso/i);
+    await pick('Destination provider', /rhoso/i);
     await dialog.getByLabel('Select report-01').check({ timeout: 15_000 });
     await dialog.getByLabel('Select batch-01').check();
     await pick('Default strategy', /^cold$/i);

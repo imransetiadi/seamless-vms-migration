@@ -14,6 +14,7 @@ import { StatusBadge } from '../components/StatusBadge';
 import { formatThreshold } from '../lib/advisor';
 import { formatDateTime, formatRelative } from '../lib/format';
 import { distinctApproverText, overrideReasonText, POLICY_MODE_LABELS, policyDecisionsText, policyScopeText } from '../lib/policies';
+import { providerLabel } from '../lib/providerUse';
 import { can } from '../lib/roles';
 import { useHashLanding } from '../lib/useHashLanding';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -135,7 +136,12 @@ export default function AdvisorPolicies() {
   const headingId = useId();
 
   const names = useMemo(
-    () => new Map([...(providers.data ?? []), ...(plans.data ?? [])].map((x) => [x.id, x.name] as [string, string])),
+    // a provider by its label - its name, else its id (SDD §4.2, review RV22-01) -, a plan by its name
+    () =>
+      new Map([
+        ...(providers.data ?? []).map((p) => [p.id, providerLabel(p)] as [string, string]),
+        ...(plans.data ?? []).map((p) => [p.id, p.name] as [string, string]),
+      ]),
     [providers.data, plans.data],
   );
   const items = useMemo(

@@ -134,11 +134,11 @@ for 0.2.0 (goal G7).
 | FR-27 | HA control plane (leader election) | C | 0.2.0 |
 | FR-28 | Network cut-over hooks (DNS/FIP/BGP) | C | 0.3.0 |
 | FR-29 | Community OpenStack destinations: a destination provider of kind `openstack` (distribution `openstack_community` or `kolla`) of a series in the support window, beside RHOSO 18.0 | M2 | Every strategy the destination's capabilities allow passes the lab matrix on each Tier 1 series (QASuite §6.7 AC-6, §7.1 M7–M12, §7.2 LAB-D); SDD §21.1 |
-| FR-30 | Release detection and support tier per destination: the series range the API version documents fit, an optional declared series, and the tier | M2 | The provider check shows range, declared series and tier; a declared series outside the range warns; with none declared the tier is the least favourable one the range allows (SDD §21.3) |
+| FR-30 | Release detection and support tier per destination: the series range the API version documents fit, an optional declared series, and the tier | M2 | The provider check shows range, declared series and tier; a declared series the detected range contradicts warns, and where the APIs cannot tell the series the declared one decides; with none declared the tier is the least favourable one the range allows (SDD §21.3) |
 | FR-31 | Destination capability pre-flight: what each chosen strategy needs (compute and block-storage microversions, Cinder manage, Neutron extensions, roles) | M2 | A missing capability blocks the plan and names it; a series outside the tiers or EOL upstream warns (SDD §21.4) |
 | FR-32 | Permission checks follow the destination's policy profile: secure-RBAC defaults (`reader`/`member`/`manager`/`admin`, `service`) or the legacy defaults | M2 | A port on another project's network is judged with `admin`/`service` under the new defaults and `admin`/`advsvc` under the legacy ones (SDD §21.5) |
 | FR-33 | Conversion hosts on community clouds: CentOS Stream 9 and RHEL 9, then Rocky Linux and AlmaLinux 9 and Ubuntu 24.04 LTS images | M2 | The conversion-host roles install and verify the copy tools on each listed image (SDD §21.6) |
-| FR-34 | Destination-neutral wording: findings, events, the CLI and the dashboard name the destination provider, not "RHOSO" | M2 | No user-facing text assumes RHOSO when the destination is community OpenStack (SDD §21.8) |
+| FR-34 | Destination-neutral wording: a text built for a plan or a migration (a finding, an event, a refusal, in the CLI and the dashboard) names the destination provider; a fixed text says "the destination"; only a text about the Red Hat product says "RHOSO 18.0"; nothing the advisor sends to Jev names a provider | M2 | No user-facing text assumes RHOSO when the destination is community OpenStack (SDD §1 naming, §21.8) |
 
 ## 7. Non-functional requirements
 
@@ -190,8 +190,8 @@ for 0.2.0 (goal G7).
   running the secure-RBAC defaults (the upstream default from 2023.2), Neutron counts `admin` or `service`
   for such a port and `advsvc` no longer (SDD §21.5).
 * Community OpenStack destinations: Keystone v3 with project-scoped tokens (application credentials
-  recommended), compute microversion ≥ 2.60 (≥ 2.85 for storage handover), Cinder v3; a series of the
-  support window (SDD §21.1).
+  recommended), compute microversion ≥ 2.60 (a storage handover needs ≥ 2.85 on the source cloud), Cinder v3; a
+  series of the support window (SDD §21.1).
 * VMware: VDDK available on the destination's conversion host; CBT enabled for warm.
 * Jev requires a provider API key (TypeSafe direct by default); everything works with Jev off.
 * agentmemory is optional; when configured, it runs as the team's memory server.
@@ -207,7 +207,7 @@ for 0.2.0 (goal G7).
 | AI advisor wrong | Suboptimal choice | Bounded to eligible tie set, confidence threshold, recorded with evidence, overridable |
 | Policy defaults differ by release (secure RBAC from 2023.2; `advsvc` deprecated for `service`) | A permission error late in a cutover, after the source stopped | Capability and role pre-flight per destination by its policy profile (SDD §21.4, §21.5); the lab matrix per Tier 1 series |
 | Upstream API changes in new series (compute 2.101–2.104 change attach status codes, drop flavor fields and `os-volumes_boot`) | A newer SDK or cloud breaks a call | openstacksdk's per-resource microversion caps (SDD §21.7); recorded version documents in contract tests; the window moves only after the lab matrix passes |
-| Community clouds without TLS, or with private CAs | Credentials or guest data in clear text | `verify_tls` on by default, CA bundle per provider; the check reports plain-HTTP endpoints (SDD §21.8, Security.md) |
+| Community clouds without TLS, or with private CAs | Credentials or guest data in clear text | `verify_tls` on by default, CA bundle per provider; the check reports plain-HTTP endpoints (`tls`, `plain_http`, SDD §10, Security.md) |
 | Credentials exposure | Security incident | Secrets in mounted files or the platform secret store (written once through the API, never read back), 0600 temp files for playbooks; redaction; Security.md controls |
 
 ## 12. Glossary

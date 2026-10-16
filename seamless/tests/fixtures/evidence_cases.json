@@ -343,7 +343,7 @@
         "code": "MAP_NETWORK_PRESTAGED",
         "severity": "info",
         "message": "pre-staging creates app-net",
-        "remediation": "Nothing to do: pre-staging creates the network in RHOSO with the same name. Add a network mapping to use an existing RHOSO network instead.",
+        "remediation": "Nothing to do: pre-staging creates the network on the destination with the same name. Add a network mapping to use an existing destination network instead.",
         "strategies": []
       }
     ],
@@ -560,14 +560,14 @@
         "code": "MAP_NETWORK_MISSING",
         "severity": "blocker",
         "message": "app-net has no mapping",
-        "remediation": "Add a network mapping or create a same-named network in RHOSO.",
+        "remediation": "Add a network mapping or create a same-named network on the destination.",
         "strategies": []
       },
       {
         "code": "MAP_NETWORK_MISSING",
         "severity": "blocker",
         "message": "db-net has no mapping",
-        "remediation": "Add a network mapping or create a same-named network in RHOSO.",
+        "remediation": "Add a network mapping or create a same-named network on the destination.",
         "strategies": []
       },
       {

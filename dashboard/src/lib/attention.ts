@@ -91,7 +91,7 @@ export function attentionItems(
       item = {
         migration: m,
         tone: 'danger',
-        reason: 'The source VM runs again: its data diverges from RHOSO',
+        reason: 'The source VM runs again: its data diverges from the destination',
         nextAction: 'Stop the source VM, or roll it back (operator)',
         rank: 1,
       };

@@ -684,7 +684,7 @@ describe('MigrationDetail', () => {
     await user.click(within(panel).getByRole('button', { name: 'Edit network' }));
     const dialog = await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` });
     expect(dialog).toHaveTextContent('Saving edits the plan: it returns to draft and is validated again.');
-    await user.selectOptions(within(dialog).getByRole('combobox', { name: `RHOSO network of ${nic!.mac}` }), 'tenant-web');
+    await user.selectOptions(within(dialog).getByRole('combobox', { name: `Destination network of ${nic!.mac}` }), 'tenant-web');
     await user.type(within(dialog).getByRole('textbox', { name: `Addresses of ${nic!.mac}` }), '10.20.9.9');
     await user.click(within(dialog).getByRole('button', { name: 'Save network' }));
     await waitFor(() => expect(plan.nic_overrides[m.vm.source_id]).toEqual({ [nic!.mac!]: { network: 'tenant-web', fixed_ips: ['10.20.9.9'] } }));
@@ -812,7 +812,8 @@ describe('MigrationDetail', () => {
     await user.selectOptions(select, 'provider-ext');
     expect(select).toHaveAccessibleDescription("provider-ext is another project's network: the cutover finds it by its name.");
     await user.selectOptions(select, 'tenant-web');
-    expect(select).toHaveAccessibleDescription('Several RHOSO networks are named tenant-web: validation refuses it.');
+    // the plan's destination provider by name, as the API's preflight says it (SDD §1 naming, plan T6)
+    await waitFor(() => expect(select).toHaveAccessibleDescription('Several networks of RHOSO 18.0 — Production are named tenant-web: validation refuses it.'));
     await user.selectOptions(select, 'tenant-app');
     expect(select).not.toHaveAccessibleDescription();
   });
@@ -844,16 +845,41 @@ describe('MigrationDetail', () => {
     // said under the field too, as NET_PORT_NOT_PERMITTED says it
     await user.selectOptions(select, 'provider-ext');
     expect(select).toHaveAccessibleDescription(
-      "The RHOSO credential may not put a port on provider-ext (project admin): Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither. Validation refuses it.",
+      "The credential of RHOSO 18.0 — Production may not put a port on provider-ext (project admin): Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither. Validation refuses it.",
     );
     await user.selectOptions(select, 'tenant-b-private');
     expect(select).toHaveAccessibleDescription(
-      "The RHOSO credential may not put a port on tenant-b-private (project tenant-b): it is neither shared with the credential's project nor external. Validation refuses it.",
+      "The credential of RHOSO 18.0 — Production may not put a port on tenant-b-private (project tenant-b): it is neither shared with the credential's project nor external. Validation refuses it.",
     );
     expect(within(select).getByRole('option', { name: 'own-ext (not allowed)' })).toBeInTheDocument();
     await user.selectOptions(select, 'own-ext');
     expect(select).toHaveAccessibleDescription(
-      "The RHOSO credential may not put a port on own-ext (project shop): it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it. Validation refuses it.",
+      "The credential of RHOSO 18.0 — Production may not put a port on own-ext (project shop): it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it. Validation refuses it.",
+    );
+  });
+
+  it("judges another project's network by the destination's policy profile, as the API does (SDD §16, §21.5; plan T8)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const destination = server.providers.find((p) => p.id === 'rhoso-prod')!;
+    // a secure-RBAC destination: the service role takes the port, advsvc no longer
+    destination.capabilities = { ...destination.capabilities, policy_profile: 'secure_rbac', roles: ['service', 'member'] };
+    const view = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    let panel = await screen.findByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
+    let select = within(await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` })).getAllByRole('combobox')[0]!;
+    expect(await within(select).findByRole('option', { name: "provider-ext (another project's)" })).toBeInTheDocument();
+    view.unmount();
+    destination.capabilities = { ...destination.capabilities, roles: ['advsvc', 'member'] };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    panel = await screen.findByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
+    select = within(await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` })).getAllByRole('combobox')[0]!;
+    expect(await within(select).findByRole('option', { name: 'provider-ext (not allowed)' })).toBeInTheDocument();
+    await user.selectOptions(select, 'provider-ext');
+    expect(select).toHaveAccessibleDescription(
+      "The credential of RHOSO 18.0 — Production may not put a port on provider-ext (project admin): Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither. Validation refuses it.",
     );
   });
 
@@ -868,11 +894,11 @@ describe('MigrationDetail', () => {
     const panel = await screen.findByRole('region', { name: 'Network' });
     await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
     const dialog = await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` });
-    const select = within(dialog).getByRole('combobox', { name: `RHOSO network of ${nic!.mac}` });
-    expect(await within(select).findByRole('option', { name: 'rhoso-gone (not in RHOSO)' })).toBeInTheDocument();
+    const select = within(dialog).getByRole('combobox', { name: `Destination network of ${nic!.mac}` });
+    expect(await within(select).findByRole('option', { name: 'rhoso-gone (not on the destination)' })).toBeInTheDocument();
     expect(select).toHaveValue('rhoso-gone');
     // said under the field too: a narrow select cuts its option's text
-    expect(select).toHaveAccessibleDescription('RHOSO does not list rhoso-gone: validation refuses it.');
+    await waitFor(() => expect(select).toHaveAccessibleDescription('rhoso-gone does not exist in RHOSO 18.0 — Production: validation refuses it.'));
     await user.click(within(dialog).getByRole('button', { name: 'Save network' }));
     await waitFor(() => expect(plan.status).toBe('draft'));
     expect(plan.nic_overrides[m.vm.source_id]).toEqual({ [nic!.mac!]: { network: 'rhoso-gone', fixed_ips: null } });
@@ -946,9 +972,12 @@ describe('MigrationDetail', () => {
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
     const alert = await screen.findByRole('alert', { name: 'Source VM running' });
     expect(alert).toHaveTextContent('The source VM runs again since');
-    expect(alert).toHaveTextContent('its data diverges from RHOSO: stop it, or roll back.');
+    await waitFor(() => expect(alert).toHaveTextContent('its data diverges from RHOSO 18.0 — Production: stop it, or roll back.'));
+    // the next step names the plan's destination provider too (SDD §1 naming, plan T6)
+    const next = screen.getByRole('region', { name: 'Next step' });
+    await waitFor(() => expect(next).toHaveTextContent('The source VM runs again, so its data diverges from RHOSO 18.0 — Production. Next:'));
     // a viewer sees the demo control, and why it is not theirs
-    const power = await within(screen.getByRole('region', { name: 'Next step' })).findByRole('button', { name: 'Power off the source VM (demo)' });
+    const power = await within(next).findByRole('button', { name: 'Power off the source VM (demo)' });
     expect(power).toHaveAttribute('aria-disabled', 'true');
     expect(power).toHaveAccessibleDescription('Requires the operator role.');
   });
