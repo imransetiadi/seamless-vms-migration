@@ -329,8 +329,9 @@ _PORT_ROLE_ADVICE = {
     "secure_rbac": "the destination credential has the service role for the migration window "
     "(Neutron's secure-RBAC defaults); admin is not needed for this",
     "legacy": "the destination credential has the advsvc role (Neutron's legacy rules)",
-    "unknown": "the provider declares its policy profile or series, so the check counts that "
-    "profile's role: service under secure-RBAC, advsvc under the legacy rules",
+    "unknown": "a check of the provider detects its series, or the provider declares its policy "
+    "profile or series, so the check counts that profile's role: service under secure-RBAC, "
+    "advsvc under the legacy rules",
 }
 
 

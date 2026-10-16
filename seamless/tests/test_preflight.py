@@ -1191,14 +1191,19 @@ def test_following_the_remediation_never_asks_to_correct_a_series_nothing_contra
 
 
 def test_declaring_the_series_settles_the_unknown_profile_the_refusal_asks_about():
-    """Review RV18-06: under the unknown profile NET_PORT_NOT_PERMITTED asks to declare the
-    provider's policy profile or series; with nothing detected a declared series was ignored, so
-    the service role stayed refused. Declared, 2026.2 reads secure-RBAC (SDD §10.1, §21.5)."""
+    """Review RV18-06: under the unknown profile NET_PORT_NOT_PERMITTED asks to check the provider
+    or declare its policy profile or series (review 19); with nothing detected a declared series
+    was ignored, so the service role stayed refused. Declared, 2026.2 reads secure-RBAC (SDD
+    §10.1, §21.5)."""
     service = {"roles": ["service", "member"]}
     before = _another_projects_port(
         {**destination_release("openstack", None, None, "", ""), **service}
     )
-    assert "declare the provider's policy profile or series" in before.message
+    # a check is allowed while a plan runs, a PATCH that declares is not (SDD §12, §21.5)
+    assert (
+        "check the provider so its series is detected, or declare its policy profile or series"
+        in before.message
+    )
     after = _another_projects_port(
         {**destination_release("openstack", "2026.2", None, "", ""), **service}
     )
@@ -1373,8 +1378,9 @@ PORT_REMEDIATION = (
         ("legacy", "the destination credential has the advsvc role (Neutron's legacy rules)"),
         (
             "unknown",
-            "the provider declares its policy profile or series, so the check counts that "
-            "profile's role: service under secure-RBAC, advsvc under the legacy rules",
+            "a check of the provider detects its series, or the provider declares its policy "
+            "profile or series, so the check counts that profile's role: service under "
+            "secure-RBAC, advsvc under the legacy rules",
         ),
     ],
     ids=["secure_rbac", "legacy", "unknown"],

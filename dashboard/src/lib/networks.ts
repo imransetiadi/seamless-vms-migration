@@ -43,7 +43,7 @@ const ROLE_RULE: Record<PolicyProfile, string> = {
   secure_rbac:
     "Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither",
   unknown:
-    "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (declare the provider's policy profile or series)",
+    "the destination's policy profile is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check the provider so its series is detected, or declare its policy profile or series)",
 };
 
 const knownProfile = (profile: string): PolicyProfile => (profile in PORT_ROLES_BY_PROFILE ? (profile as PolicyProfile) : 'unknown');

@@ -271,7 +271,13 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     expect(refused?.remediation).toBe(
       "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared network takes it once the destination credential has the service role for the migration window (Neutron's secure-RBAC defaults); admin is not needed for this. An external network that is not shared needs the admin role: Nova attaches it for no other.",
     );
-    expect(run(['service'], 'unknown')?.message).toContain("the destination's policy profile is unknown");
+    // unknown: the advice names the provider's check beside declaring, as the API's does (SDD §21.5, review 19)
+    const unknown = run(['service'], 'unknown');
+    expect(unknown?.message).toContain("the destination's policy profile is unknown");
+    expect(unknown?.message).toContain('(check the provider so its series is detected, or declare its policy profile or series)');
+    expect(unknown?.remediation).toBe(
+      "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared network takes it once a check of the provider detects its series, or the provider declares its policy profile or series, so the check counts that profile's role: service under secure-RBAC, advsvc under the legacy rules. An external network that is not shared needs the admin role: Nova attaches it for no other.",
+    );
   });
 
   it("writes a network's name and a missing project as the API's messages do (review NC-11)", () => {
