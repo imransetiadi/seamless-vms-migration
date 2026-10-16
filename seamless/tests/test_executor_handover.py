@@ -164,6 +164,10 @@ class FakeCompute:
     def wait_for_delete(self, res, interval=2, wait=120):
         return res
 
+    def get_flavor(self, flavor_id):
+        """A flavor by id, as a cloud answering below compute 2.47 makes one look it up."""
+        return NS(id=flavor_id, **self.c.flavor_details.get(flavor_id, {}))
+
     def find_flavor(self, name, ignore_missing=True):
         # by default every flavor exists
         if self.c.flavor_names is not None and name not in self.c.flavor_names:
@@ -415,6 +419,8 @@ class FakeCloud:
         self.group_list = None
         # Nova's flavors (None: every name), and Cinder's types: the source's and the mapped one
         self.flavor_names = None
+        # the flavors get_flavor reports by id: ephemeral (GiB), swap (MiB)
+        self.flavor_details = {}
         self.type_names = ("ceph-ssd", "ceph-hdd", "rbd-hdd")
         self.current_project_id = f"{name}-project"
         # keystoneauth: the role names of the token (the handover's admin credential)
@@ -1884,6 +1890,33 @@ async def test_handover_refuses_before_stop_when_cinder_cannot_unmanage_a_volume
     ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
     with pytest.raises(PermanentStepError, match=reason):
         await executor.run(StepName.CUTOVER, ctx)
+    assert calls == [] and rec.downtime_marks == 0
+
+
+@pytest.mark.parametrize(
+    ("server", "flavor_details", "named"),
+    [
+        ({"flavor": {"original_name": "m1.big", "ephemeral": 50, "swap": 0}}, {}, "an ephemeral"),
+        ({"flavor": {"original_name": "m1.swap", "ephemeral": 0, "swap": 1024}}, {}, "a swap"),
+        ({"image": {"id": "img-1"}}, {}, "a root disk from an image"),
+        ({"flavor": {"id": "flv-7"}}, {"flv-7": {"ephemeral": 20, "swap": ""}}, "an ephemeral"),
+    ],
+)
+async def test_handover_refuses_before_stop_a_server_with_a_disk_on_its_hypervisor(
+    tmp_path, server, flavor_details, named
+):
+    """SDD §7.3 step 0, §4.2: a server resized since its validation onto a flavor with an
+    ephemeral or swap disk - read from the flavor Nova embeds, or looked up by id where it does not
+    - or booted from an image. Step 4 would delete that disk with the server; it is refused while
+    the VM still runs (audit EX-15)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    for key, value in server.items():
+        setattr(clouds["src"].servers["srv-1"], key, value)
+    clouds["src"].flavor_details = flavor_details
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, ctx)
+    assert named in str(refused.value) and "on its hypervisor" in str(refused.value)
     assert calls == [] and rec.downtime_marks == 0
 
 
