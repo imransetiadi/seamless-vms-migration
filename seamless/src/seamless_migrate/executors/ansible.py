@@ -46,7 +46,7 @@ from ..planning.networks import (
     kit_network_value,
     kit_subnet,
     policy_profile_of,
-    port_refusal,
+    port_refusal_at_run,
     resolve_network,
 )
 from ..providers.base import ProviderError
@@ -1216,13 +1216,8 @@ class AnsibleExecutor:
                 )
                 continue
             profile = policy_profile_of(ctx.destination.capabilities, ctx.destination)
-            refused = port_refusal(network, roles, profile)
-            if roles is None and refused is None and port_refusal(network, [], profile):
-                # no roles to judge, and a port there needs one: never let through (RV19-01)
-                refused = (
-                    "the credential's token roles could not be read, and a port there needs a "
-                    "role: check the destination provider, then retry"
-                )
+            # no roles to judge, and a port there needs one: never let through (RV19-01)
+            refused = port_refusal_at_run(network, roles, profile)
             if refused:
                 problem = (
                     f"{what} cannot go to network {name!r} of {ctx.destination.name} "

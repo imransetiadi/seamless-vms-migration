@@ -2063,6 +2063,76 @@ async def test_the_handover_judges_the_declared_profile_after_the_report_was_res
     assert "secure-RBAC defaults let only the admin or service role" in str(refused.value)
 
 
+async def test_the_handover_judges_unreadable_token_roles_as_the_kit_does(tmp_path):
+    """SDD §7.3 step 0, §7.2 (review RV20-07): when the token's roles cannot be read, step 0
+    judges the destination check report's; when neither names any, a port that needs a role is
+    refused before the stop - a report new credentials reset never lets a token through - while
+    the credential's own network, which needs none, still takes the port."""
+    shared = NS(
+        id="shared-net",
+        name="rhoso-app",
+        project_id="admin-project",
+        is_shared=True,
+        is_router_external=False,
+    )
+    external = NS(
+        id="ext-net",
+        name="rhoso-app",
+        project_id="admin-project",
+        is_shared=False,
+        is_router_external=True,
+    )
+
+    def unreadable(session):
+        raise AttributeError("this auth plugin has no access info")
+
+    def run_with(name, listed, capabilities):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        if listed is not None:
+            clouds["dst"].network_list = listed
+        clouds["dst"].session = NS(auth=NS(get_access=unreadable))
+        destination = DST.model_copy(update={"capabilities": capabilities})
+        ctx = make_ctx(plan, mig, SRC, destination, settings)[0]
+        return executor, calls, clouds, ctx
+
+    unread = (
+        "the credential's token roles could not be read, and a port there needs a role: check "
+        "the destination provider, then retry"
+    )
+    for name, listed, capabilities in (
+        ("reset report", [shared], {}),
+        ("report without roles", [shared], {"policy_profile": "legacy"}),
+        ("external", [external], {}),
+    ):
+        executor, calls, clouds, ctx = run_with(name, listed, capabilities)
+        with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+            await executor.run(StepName.CUTOVER, ctx)
+        assert unread in str(refused.value), name
+        assert "port-1" in str(refused.value), name
+        assert [op for op in ops(calls) if op[1] in ("stop_server", "delete_server")] == [], name
+    # the check report's roles judge the token instead: a member is refused, an admin goes through
+    executor, calls, clouds, ctx = run_with("report member", [shared], {"roles": ["member"]})
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, ctx)
+    assert "Neutron lets only the admin or advsvc role" in str(refused.value)
+    executor, calls, clouds, ctx = run_with("report admin", [shared], {"roles": ["admin"]})
+    await executor.run(StepName.CUTOVER, ctx)
+    assert clouds["dst"].created[0]["networks"][0]["uuid"] == "shared-net"
+    # the token's roles read for the run win over the report's: a member is refused although the
+    # report still names admin
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "live member")
+    clouds["dst"].network_list = [shared]
+    clouds["dst"].roles = ["member"]
+    stale = DST.model_copy(update={"capabilities": {"roles": ["admin"]}})
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, stale, settings)[0])
+    assert "Neutron lets only the admin or advsvc role" in str(refused.value)
+    # the credential's own network needs no role: unreadable roles never refuse it
+    executor, calls, clouds, ctx = run_with("own", None, {})
+    await executor.run(StepName.CUTOVER, ctx)
+    assert clouds["dst"].created
+
+
 async def test_handover_step_0_refuses_an_address_neutron_would_refuse(tmp_path):
     """SDD §7.3 step 0 and §6.6: each address step 8 gives a port must be one Neutron takes on
     that network - a host address of its subnets; on a SLAAC subnet only the kept MAC's EUI-64

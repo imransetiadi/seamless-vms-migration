@@ -17,7 +17,7 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -26,7 +26,7 @@ from ..config import Settings
 from ..domain.enums import Strategy
 from ..domain.models import Mappings, Plan, Provider, utcnow
 from ..planning.ipam import address_refusal, requested_ips
-from ..planning.networks import policy_profile_of, port_refusal
+from ..planning.networks import policy_profile_of, port_refusal_at_run
 from ..providers.base import microversion_text
 from ..storage import (
     StorageError,
@@ -413,18 +413,22 @@ class HandoverExecutor:
         mappings: Mappings | None = None,
         profile: str = "legacy",
         cloud: str = "the destination",
+        reported_roles: Collection[str] | None = None,
     ) -> dict[str, Any]:
         """Step 0 as a read-only report: what each volume would become, and every problem; with the
         plan, also what would make step 6 or 8 fail on a port, a security group, the flavor or a
         volume type - ``mappings`` as those steps apply them, the plan's by default; ``profile``
-        is the destination's policy profile (§21.5)."""
+        is the destination's policy profile (§21.5), ``reported_roles`` the roles its check
+        report names."""
         mode = plan.port_creation_mode if plan is not None else "nova"
         definition = self._capture_definition(src, server_id, mode)
         attachments = definition["attachments"]
         problems: list[str] = []
         if plan is not None:
             problems.extend(
-                self._port_problems(dst, definition["networks"], plan, server_id, profile, cloud)
+                self._port_problems(
+                    dst, definition["networks"], plan, server_id, profile, cloud, reported_roles
+                )
             )
             problems.extend(self._group_problems(dst, definition, cloud))
             problems.extend(
@@ -515,6 +519,7 @@ class HandoverExecutor:
                 mappings,
                 policy_profile_of(destination.capabilities, destination),
                 destination.name,
+                destination.capabilities.get("roles"),
             ),
         )
 
@@ -526,13 +531,19 @@ class HandoverExecutor:
         vm_id: str,
         profile: str = "legacy",
         cloud: str = "the destination",
+        reported_roles: Collection[str] | None = None,
     ) -> list[str]:
         """What would make step 8 fail on a port, or put it where it must not go, found while the
         VM still runs (§7.3 step 0): its RHOSO network does not resolve with step 8's lookup, the
         credential may not put a port there, or an address step 8 would give it is one Neutron
         refuses there (§6.6)."""
         neutron = plan.port_creation_mode == "neutron"
+        # the token's roles read for the run - the destination's check report's when they cannot
+        # be read; when neither names any, a port that needs a role is refused, as the kit refuses
+        # it (SDD §7.3 step 0, §7.2, review RV20-07)
         roles = _token_roles(dst)
+        if roles is None and reported_roles is not None:
+            roles = set(reported_roles)
         problems: list[str] = []
         for n in networks:
             target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
@@ -546,7 +557,7 @@ class HandoverExecutor:
             # destination's policy profile counts: the admin credential sees every project's
             # private networks (§6.6, §21.5)
             project = _attr(network, "project_id")
-            why_not = port_refusal(
+            why_not = port_refusal_at_run(
                 {
                     "own": project == dst.current_project_id,
                     "shared": bool(_attr(network, "is_shared", False)),

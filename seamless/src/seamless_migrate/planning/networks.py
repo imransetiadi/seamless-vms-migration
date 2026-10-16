@@ -81,6 +81,27 @@ def port_refusal(
     return None
 
 
+#: why a run refuses a port that needs a role when neither the token nor the destination's check
+#: report names one (SDD §7.2, §7.3 step 0; reviews RV19-01, RV20-07)
+ROLES_UNREADABLE = (
+    "the credential's token roles could not be read, and a port there needs a role: check the "
+    "destination provider, then retry"
+)
+
+
+def port_refusal_at_run(
+    network: dict[str, Any], roles: Collection[str] | None, profile: str = "legacy"
+) -> str | None:
+    """§6.6's rule as a run judges it before the source stops (SDD §7.2, §7.3 step 0): ``roles``
+    None - neither the token nor the destination's check report names any - refuses a port that
+    needs a role, where ``port_refusal`` leaves that half unjudged: a report new credentials reset
+    never lets a token through."""
+    refused = port_refusal(network, roles, profile)
+    if refused is None and roles is None and port_refusal(network, [], profile):
+        return ROLES_UNREADABLE
+    return refused
+
+
 def resolve_network(
     networks: Sequence[dict[str, Any]], name: str
 ) -> tuple[dict[str, Any] | None, str | None]:
