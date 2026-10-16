@@ -1,6 +1,6 @@
 {
   "name": "seamless-migrate-dashboard",
-  "version": "0.1.0",
+  "version": "0.1.0-rc.1",
   "private": true,
   "description": "Seamless Migrate operator dashboard (SDD §16)",
   "type": "module",
