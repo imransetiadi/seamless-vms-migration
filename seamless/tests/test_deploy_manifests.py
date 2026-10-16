@@ -271,6 +271,21 @@ esac
 """
 
 
+def _tools(tmp_path: Path) -> Path:
+    """A bin directory holding only the tools the Makefile reads at parse time and its check recipe
+    runs - never a real docker, wherever this machine keeps one (CI's runner: /usr/bin/docker)."""
+    import shutil
+
+    tools = tmp_path / "tools"
+    if not tools.exists():
+        tools.mkdir()
+        for name in ("sh", "bash", "env", "grep", "sed", "awk", "uname", "cat", "head", "tr"):
+            found = shutil.which(name)
+            if found:
+                (tools / name).symlink_to(found)
+    return tools
+
+
 def _check_context(tmp_path: Path, host_os: str, docker: bool = True, **fake: str):
     """Run `make seamless-check-context` for real, with a fake docker (or none) on PATH."""
     import shutil
@@ -278,10 +293,11 @@ def _check_context(tmp_path: Path, host_os: str, docker: bool = True, **fake: st
 
     fakebin = tmp_path / "bin"
     fakebin.mkdir(exist_ok=True)
+    (fakebin / "docker").unlink(missing_ok=True)
     if docker:
         (fakebin / "docker").write_text(_FAKE_DOCKER)
         (fakebin / "docker").chmod(0o755)
-    env = _clean_env(path=f"{fakebin}:/usr/bin:/bin")
+    env = _clean_env(path=f"{fakebin}:{_tools(tmp_path)}")
     env.update(fake)
     make = shutil.which("make")
     assert make, "make is not installed"
