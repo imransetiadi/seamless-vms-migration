@@ -166,9 +166,12 @@ ConversionHostConfig { manage: bool = true, name: str|null, flavor: str|null,
         # host (required for VMware sources, whose kit has no prestage step)
 
 Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
-           name: str,                                  # not blank: POST and PATCH refuse an empty or
-                                                       # whitespace-only name (422); a provider stored blank
-                                                       # before is named by its id in texts (§1 naming, RV20-11)
+           name: str,                                  # not blank: POST and PATCH refuse a name with no
+                                                       # character outside Unicode's separators (Z), controls
+                                                       # (Cc) and format characters (Cf) - empty, spaces,
+                                                       # U+200B, U+FEFF - (422); a provider stored blank before
+                                                       # is named by its id in texts, by the same rule (§1
+                                                       # naming, RV20-11, RV21-08)
            kind: ProviderKind,
            role: ProviderRole, endpoint: str, cloud: str|null, credentials_secret: str|null,
            region: str|null, verify_tls: bool = true, ca_cert_path: str|null,
