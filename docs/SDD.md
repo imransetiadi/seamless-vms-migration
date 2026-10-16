@@ -1349,6 +1349,8 @@ volumes with their server, so the order is:
    * Cinder would refuse to unmanage a volume (step 5) — it refuses encrypted volumes ("Unmanaging
      encrypted volumes is not supported"), volumes with snapshots and volumes in a group or
      consistency group (Cinder `volume.api.delete(unmanage_only=True)`, Wallaby and later);
+   * a volume is attached to another server too (a multi-attach volume): it never becomes `available` once the
+     source server is deleted (step 4), so step 5 could never unmanage it (audit EX-09);
    * no attachment is the boot volume (step 2): the destination server could not be created, nor the
      source again on rollback;
    * the server has a disk on its hypervisor — a root disk from an image, its flavor's ephemeral or swap disk, read as
