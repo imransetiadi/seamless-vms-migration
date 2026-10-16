@@ -1311,6 +1311,8 @@ export class MockServer {
           // like the API (SDD §12, §13.2): the route's role first, then the lookup
           const writes = (!sub && (method === 'PATCH' || method === 'DELETE')) || ((sub === 'credentials' || sub === 'conversion-key') && method === 'PUT');
           this.require(token, writes ? 'admin' : sub === 'check' && method === 'POST' ? 'operator' : 'viewer', path);
+          // a PATCH's body alone is judged before the lookup, as the API's update_provider (review RV22-07)
+          if (!sub && method === 'PATCH') this.refusePatchBody(input);
           throw new HttpError(404, 'not_found', `Provider ${id} not found.`);
         }
         if (!sub && method === 'GET') {
@@ -1712,11 +1714,16 @@ export class MockServer {
   }
 
   /** PATCH /providers/{id}: editable fields only, 409 while a running/paused plan uses it. */
-  private patchProvider(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+  /** What PATCH /providers/{id} refuses from its body alone, before it looks the provider up, as the API (SDD §4.2, §12). */
+  private refusePatchBody(input: Record<string, unknown>): void {
     const unknown = Object.keys(input).filter((k) => !PROVIDER_EDITABLE.has(k)).sort();
     if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);
     // a blank name is refused, as the API refuses it (SDD §4.2, review RV20-11)
     if (typeof input.name === 'string' && isBlank(input.name)) throw new HttpError(422, 'validation_error', 'name: must not be blank');
+  }
+
+  private patchProvider(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+    this.refusePatchBody(input);
     const users = this.plans.filter(
       (p) => ['running', 'paused'].includes(p.status) && (p.source_provider_id === provider.id || p.destination_provider_id === provider.id),
     );

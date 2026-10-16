@@ -370,6 +370,20 @@ describe('mock API', () => {
     });
   });
 
+  it("answers a PATCH of an unknown provider in the API's order: what its body alone refuses before the 404 (SDD §4.2, §12, review RV22-07)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const answer = (body: unknown) => {
+      const res = server.handle('PATCH', '/providers/ghost', new URLSearchParams(), body, 'admin');
+      return { status: res.status, message: (res.body as { error?: { message: string } }).error?.message };
+    };
+    // routes_providers.update_provider: fields that cannot change, then a blank name (422), then the lookup (404)
+    expect([answer({ name: '\u200b' }), answer({ id: 'x' }), answer({ region: 'R2' })]).toEqual([
+      { status: 422, message: 'name: must not be blank' },
+      { status: 422, message: 'fields cannot be changed: id' },
+      { status: 404, message: 'Provider ghost not found.' },
+    ]);
+  });
+
   it('answers a PATCH of a name that is not a string with its 409 first while a running plan uses the provider, as the API does (review RV21-07)', async () => {
     const { server, client } = setup();
     const busy = server.plans.find((p) => p.status === 'running')!.destination_provider_id;
