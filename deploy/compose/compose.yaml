@@ -112,7 +112,7 @@ services:
     build:
       context: ../..
       dockerfile: seamless/Containerfile
-    image: seamless-migrate:${SEAMLESS_VERSION:-0.1.0}
+    image: seamless-migrate:${SEAMLESS_VERSION:-0.1.0-rc.1}
     init: true
     # SIGTERM: up to 5 s for open requests, then the orchestrator stops its steps (a playbook gets
     # 10 s after SIGTERM before SIGKILL) and removes their run files (SDD 8); the default 10 s is too short
