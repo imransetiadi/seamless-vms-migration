@@ -112,6 +112,112 @@ def test_docker_reads_the_seamless_ignore_file():
     assert link.resolve() == (ROOT / "seamless" / ".containerignore").resolve()
 
 
+# --- the dashboard the image serves: a host needs no Node.js (SDD §17.1) ---
+
+_FAKE_NPM = """#!/bin/bash
+# npm for the tests: records its calls; `run build` writes the dist a build would
+echo "npm $* cache=${npm_config_cache:-} skip=${PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD:-}" >> "$NPM_LOG"
+case "$1" in
+  ci) mkdir -p node_modules ;;
+  run) mkdir -p dist && echo built > dist/index.html ;;
+esac
+"""
+
+
+def _image_dashboard(tmp_path: Path, ctx: Path) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Run scripts/image-dashboard.sh as the Containerfile does, with a fake npm on PATH."""
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "npm").write_text(_FAKE_NPM)
+    (fakebin / "npm").chmod(0o755)
+    target = tmp_path / "opt" / "dashboard"
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    script = ROOT / "scripts" / "image-dashboard.sh"
+    run = subprocess.run(
+        ["bash", str(script), str(ctx), "dashboard/dist", str(target)],
+        env={
+            "PATH": f"{fakebin}:/usr/bin:/bin",
+            "NPM_LOG": str(tmp_path / "npm.log"),
+            "TMPDIR": str(scratch),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return run, target
+
+
+def _dashboard_sources(ctx: Path) -> None:
+    (ctx / "dashboard" / "src").mkdir(parents=True)
+    (ctx / "dashboard" / "package.json").write_text("{}")
+    (ctx / "dashboard" / "package-lock.json").write_text("{}")
+    (ctx / "dashboard" / "src" / "main.tsx").write_text("export {};")
+
+
+def test_the_image_builds_its_dashboard_when_the_build_context_has_none(tmp_path):
+    """SDD §17.1: a clean clone's image serves the dashboard - built from its sources with the
+    image's own Node, in a scratch copy whose node_modules and npm cache go with it - so a Linux
+    host needs no Node.js."""
+    ctx = tmp_path / "ctx"
+    _dashboard_sources(ctx)
+    run, target = _image_dashboard(tmp_path, ctx)
+    assert run.returncode == 0, run.stderr
+    assert (target / "index.html").read_text() == "built\n"
+    assert not (target / "node_modules").exists()
+    calls = (tmp_path / "npm.log").read_text().splitlines()
+    commands = [call.split(" cache=")[0] for call in calls]
+    assert commands == ["npm ci --no-audit --no-fund", "npm run build"]
+    # the npm cache lives in the scratch copy; the e2e devDependency downloads no browser
+    assert all(f"cache={tmp_path / 'tmp'}" in call and call.endswith("skip=1") for call in calls)
+    assert list((tmp_path / "tmp").iterdir()) == [], "the scratch copy is left behind"
+    assert not (ctx / "dashboard" / "node_modules").exists(), "the build context was written to"
+
+
+def test_the_image_copies_a_built_dashboard_as_it_is(tmp_path):
+    """SDD §17.1: a built dashboard in the context (CI's artifact, make dashboard-build) is copied,
+    and nothing is built."""
+    ctx = tmp_path / "ctx"
+    _dashboard_sources(ctx)
+    (ctx / "dashboard" / "dist" / "assets").mkdir(parents=True)
+    (ctx / "dashboard" / "dist" / "index.html").write_text("prebuilt")
+    (ctx / "dashboard" / "dist" / "assets" / "app.js").write_text("js")
+    run, target = _image_dashboard(tmp_path, ctx)
+    assert run.returncode == 0, run.stderr
+    assert (target / "index.html").read_text() == "prebuilt"
+    assert (target / "assets" / "app.js").read_text() == "js"
+    assert not (tmp_path / "npm.log").exists(), "npm ran although a build was there"
+
+
+def test_the_image_refuses_a_context_with_no_dashboard_at_all(tmp_path):
+    """SDD §17.1: no build and no sources is a broken context, never an image without its UI."""
+    ctx = tmp_path / "ctx"
+    ctx.mkdir()
+    run, _ = _image_dashboard(tmp_path, ctx)
+    assert run.returncode != 0
+    assert "neither a built dashboard" in run.stderr
+
+
+@pytest.mark.parametrize("ignore_file", ["seamless/.containerignore", ".dockerignore"])
+def test_the_build_context_holds_the_dashboard_sources_but_not_their_modules(ignore_file):
+    """SDD §17.1: the image builds the dashboard from the context, so its sources and the script
+    reach the builder; node_modules never does."""
+    lines = (ROOT / ignore_file).read_text(encoding="utf-8").splitlines()
+    for path in (
+        "scripts/image-dashboard.sh",
+        "dashboard/package.json",
+        "dashboard/package-lock.json",
+        "dashboard/src/main.tsx",
+        "dashboard/scripts/check-bundle.mjs",
+        "dashboard/index.html",
+    ):
+        assert not excluded(path, lines), f"{ignore_file} keeps {path} from the builder"
+    assert excluded("dashboard/node_modules/vite/package.json", lines)
+    containerfile = (ROOT / "seamless" / "Containerfile").read_text(encoding="utf-8")
+    assert "scripts/image-dashboard.sh" in containerfile
+    assert "serving the API only" not in containerfile
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 def test_every_secret_path_is_git_ignored():
     """A ``git add -A`` never stages a secret file (CLAUDE.md §7)."""
