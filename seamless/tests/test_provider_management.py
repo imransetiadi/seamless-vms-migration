@@ -125,6 +125,9 @@ def test_patch_is_refused_while_a_running_plan_uses_the_provider(api):
     api.store.put("plan", plan.model_copy(update={"status": PlanStatus.running}))
     res = patch(api, "/api/v1/providers/src-osp", {"name": "x"})
     assert res.status_code == 409 and plan.id in res.text
+    # the 409 comes before the merged provider is validated, for a name that is not a string too:
+    # the order the dashboard's mock keeps (review RV21-07)
+    assert patch(api, "/api/v1/providers/src-osp", {"name": None}).status_code == 409
     api.store.put(
         "plan",
         api.store.get("plan", plan.id, Plan).model_copy(update={"status": PlanStatus.completed}),

@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import json
 import time
+from pathlib import Path
 
 import fastapi.routing
 import httpx
@@ -630,28 +631,34 @@ def test_a_provider_declares_its_policy_profile(api):
     assert api.post("/api/v1/providers", json=vmware).status_code == 422
 
 
-def test_a_providers_name_is_never_blank(api):
-    """SDD §4.2 (review RV20-11): every text that names the destination provider reads its name,
-    so POST /providers and PATCH /providers/{id} refuse an empty or whitespace-only one (422) and
-    store nothing."""
-    for name in ("", "   "):
-        refused = api.post(
-            "/api/v1/providers", json={**DESTINATION, "id": "dst-blank", "name": name}
-        )
-        assert refused.status_code == 422, (name, refused.text)
-        assert refused.json()["error"]["message"] == "name: must not be blank"
-    missing = api.client.get("/api/v1/providers/dst-blank", headers=api.h(Role.viewer))
-    assert missing.status_code == 404
+NAME_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "provider_name_cases.json").read_text()
+)["cases"]
 
-    def patch(body):
-        return api.client.patch("/api/v1/providers/dst-rhoso", headers=api.h(Role.admin), json=body)
 
-    blank = patch({"name": " \t "})
-    assert (
-        blank.status_code == 422 and blank.json()["error"]["message"] == "name: must not be blank"
-    )
-    assert api.get("/api/v1/providers/dst-rhoso").json()["name"] == DESTINATION["name"]
-    assert patch({"name": "RHOSO 18.0 (prod)"}).json()["name"] == "RHOSO 18.0 (prod)"
+@pytest.mark.parametrize("case", NAME_CASES, ids=[c["note"].split(".")[0] for c in NAME_CASES])
+def test_a_providers_name_is_never_blank(api, case):
+    """SDD §4.2 (reviews RV20-11, RV21-07): every text that names the destination provider reads
+    its name, so POST /providers and PATCH /providers/{id} refuse one that is missing, not a
+    string, empty or whitespace-only (422) and store nothing - the cases the dashboard's mock
+    answers too (provider_name_cases.json)."""
+    if case["route"] == "POST":
+        body = {k: v for k, v in DESTINATION.items() if k != "name"}
+        answer = api.post("/api/v1/providers", json={**body, "id": "dst-case", **case["body"]})
+        path = "/api/v1/providers/dst-case"
+    else:
+        path = "/api/v1/providers/dst-rhoso"
+        answer = api.client.patch(path, headers=api.h(Role.admin), json=case["body"])
+    assert answer.status_code == case["status"], answer.text
+    stored = api.client.get(path, headers=api.h(Role.viewer))
+    if case["message"] is None:
+        assert stored.json()["name"] == case["body"]["name"]
+        return
+    assert answer.json()["error"]["message"] == case["message"]
+    if case["route"] == "POST":
+        assert stored.status_code == 404
+    else:
+        assert stored.json()["name"] == DESTINATION["name"]
 
 
 def test_a_plans_providers_cannot_change_while_one_of_its_migrations_is_failed(api):

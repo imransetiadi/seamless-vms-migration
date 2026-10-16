@@ -1,0 +1,93 @@
+{
+ "_comment": "What POST /providers and PATCH /providers/{id} answer for a provider's name (SDD §4.2): every text that names the provider reads it, so a name that is missing, not a string or blank is refused (422, in pydantic's words where the model refuses it) and nothing is stored. Shared by seamless/tests/test_api_resources.py and dashboard/src/api/mock.test.ts (reviews RV20-11, RV21-07). Each case: the route, the name part of an otherwise valid body ({} = no name) -> the status and, for a refusal, the message.",
+ "cases": [
+  {
+   "route": "POST",
+   "body": {},
+   "status": 422,
+   "message": "name: Field required",
+   "note": "1. no name"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": 123
+   },
+   "status": 422,
+   "message": "name: Input should be a valid string",
+   "note": "2. a number"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": null
+   },
+   "status": 422,
+   "message": "name: Input should be a valid string",
+   "note": "3. null"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": ""
+   },
+   "status": 422,
+   "message": "name: must not be blank",
+   "note": "4. empty"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": "   "
+   },
+   "status": 422,
+   "message": "name: must not be blank",
+   "note": "5. spaces"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": "DC3 (staging)"
+   },
+   "status": 201,
+   "message": null,
+   "note": "6. a name"
+  },
+  {
+   "route": "PATCH",
+   "body": {
+    "name": null
+   },
+   "status": 422,
+   "message": "name: Input should be a valid string",
+   "note": "7. null"
+  },
+  {
+   "route": "PATCH",
+   "body": {
+    "name": 123
+   },
+   "status": 422,
+   "message": "name: Input should be a valid string",
+   "note": "8. a number"
+  },
+  {
+   "route": "PATCH",
+   "body": {
+    "name": " \t "
+   },
+   "status": 422,
+   "message": "name: must not be blank",
+   "note": "9. whitespace"
+  },
+  {
+   "route": "PATCH",
+   "body": {
+    "name": "RHOSO 18.0 (prod)"
+   },
+   "status": 200,
+   "message": null,
+   "note": "10. a new name"
+  }
+ ]
+}

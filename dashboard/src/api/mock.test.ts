@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 // the keys an OpenStack or RHOSO check reports, as the API's (SDD §10; plan T8)
 import checkKeysRaw from '../../../seamless/tests/fixtures/check_report_keys.json?raw';
+// what POST and PATCH /providers answer for a name: one case table for the API and the mock (SDD §4.2)
+import nameRaw from '../../../seamless/tests/fixtures/provider_name_cases.json?raw';
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
@@ -35,6 +37,9 @@ import {
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
 const CHECK_KEYS = JSON.parse(checkKeysRaw) as { openstack: string[]; destination: string[] };
+const NAME_CASES = (
+  JSON.parse(nameRaw) as { cases: Array<{ route: 'POST' | 'PATCH'; body: { name?: unknown }; status: number; message: string | null; note: string }> }
+).cases;
 
 function setup(token: string | null = 'admin') {
   const server = new MockServer({ now: () => NOW, seed: 1 });
@@ -274,6 +279,25 @@ describe('mock API', () => {
     });
     expect(keyed.conversion_host?.ssh_key_secret).toBe('provider-community-lab-ssh');
     expect(server.events.filter((e) => e.kind === 'provider.credentials_updated')).toHaveLength(2);
+  });
+
+  it.each(NAME_CASES.map((c) => [c.note, c] as const))("answers a provider's name as the API does: %s (SDD §4.2, reviews RV20-11, RV21-07)", (_note, c) => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const base = { kind: 'openstack', role: 'destination', distribution: 'openstack_community', endpoint: 'https://keystone.example.invalid:5000/v3', cloud: 'x' };
+    const lab = server.providers.find((p) => p.id === 'community-lab')!;
+    const before = lab.name;
+    const [path, body] = c.route === 'POST' ? ['/providers', { ...base, id: 'dst-case', ...c.body }] : ['/providers/community-lab', c.body];
+    const res = server.handle(c.route, path, new URLSearchParams(), body, 'admin');
+    const message = res.status < 300 ? null : (res.body as { error: { message: string } }).error.message;
+    expect({ status: res.status, message }).toEqual({ status: c.status, message: c.message });
+    const stored = c.route === 'POST' ? server.providers.find((p) => p.id === 'dst-case') : lab;
+    expect(stored?.name).toBe(c.message === null ? c.body.name : c.route === 'POST' ? undefined : before);
+  });
+
+  it('answers a PATCH of a name that is not a string with its 409 first while a running plan uses the provider, as the API does (review RV21-07)', async () => {
+    const { server, client } = setup();
+    const busy = server.plans.find((p) => p.status === 'running')!.destination_provider_id;
+    await expect(client.patch(`/providers/${busy}`, { name: null })).rejects.toMatchObject({ status: 409 });
   });
 
   it('filters and pages the plans list', async () => {

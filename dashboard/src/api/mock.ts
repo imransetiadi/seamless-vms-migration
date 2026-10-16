@@ -1658,7 +1658,10 @@ export class MockServer {
   private createProvider(me: Me, input: Record<string, unknown>): MockResponse {
     const id = String(input.id ?? '');
     if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) throw new HttpError(422, 'validation_error', 'id: must match ^[a-z0-9][a-z0-9-]{1,62}$.');
-    if (typeof input.name === 'string' && !input.name.trim()) throw new HttpError(422, 'validation_error', 'name: must not be blank');
+    // a name missing or not a string is refused in pydantic's words, as the API's model refuses it: stored, every text
+    // that names the provider would read it (SDD §4.2, review RV21-07)
+    if (typeof input.name !== 'string') throw new HttpError(422, 'validation_error', input.name === undefined ? 'name: Field required' : 'name: Input should be a valid string');
+    if (!input.name.trim()) throw new HttpError(422, 'validation_error', 'name: must not be blank');
     if (this.providers.some((p) => p.id === id)) throw new HttpError(409, 'conflict', `provider '${id}' already exists`);
     // like the API: provider-{id} and provider-{id}-ssh must stay apart from every other provider's (SDD §13.3)
     const clash = this.providers.find((p) => id === `${p.id}-ssh` || p.id === `${id}-ssh`);
@@ -1704,6 +1707,8 @@ export class MockServer {
       (p) => ['running', 'paused'].includes(p.status) && (p.source_provider_id === provider.id || p.destination_provider_id === provider.id),
     );
     if (users.length) throw new HttpError(409, 'conflict', `provider is used by running or paused plan(s): ${users.map((p) => p.id).join(', ')}`);
+    // the API validates the merged provider after its 409: a name that is not a string answers 422 (review RV21-07)
+    if ('name' in input && typeof input.name !== 'string') throw new HttpError(422, 'validation_error', 'name: Input should be a valid string');
     checkDistribution({ ...provider, ...input });
     checkDeclarations({ ...provider, ...input });
     checkSecretNames(input, new Set(Object.keys(input)), provider.id);
