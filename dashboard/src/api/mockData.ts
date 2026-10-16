@@ -1193,9 +1193,11 @@ export function preflight(
     add('GUEST_OS_LEGACY', `Guest OS ${guest.label} is out of standard vendor support.`);
   if (guest.family === 'unknown')
     add('GUEST_OS_UNKNOWN', `The guest OS is not identified${vm.os_type ? ` (${vm.os_type})` : ''}.`);
-  if (sourceKind === 'vmware' && (guest.v2v === 'tech_preview' || guest.v2v === 'unverified'))
+  // virt-v2v converts a VMware guest - the source's kind says so, or a VMDK disk does - as the API judges it
+  const converted = sourceKind === 'vmware' || vm.disks.some((d) => d.kind === 'vmdk');
+  if (converted && (guest.v2v === 'tech_preview' || guest.v2v === 'unverified'))
     add('GUEST_CONVERSION_UNVERIFIED', `Converting ${guest.label} with virt-v2v is ${guest.v2v === 'tech_preview' ? 'a Technology Preview' : 'not supported by Red Hat'}.`);
-  if (sourceKind === 'vmware' && guest.v2v === 'unsupported')
+  if (converted && guest.v2v === 'unsupported')
     add('GUEST_CONVERSION_UNSUPPORTED', `virt-v2v on the RHEL 9 conversion host cannot prepare ${guest.label}.`);
   // by the VM's own fields, as the API's: only VMware's inventory sets them
   if (vm.cbt_enabled === false) add('VMW_CBT_DISABLED', 'Changed Block Tracking is disabled.');
