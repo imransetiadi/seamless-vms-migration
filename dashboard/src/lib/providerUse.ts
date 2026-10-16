@@ -47,7 +47,16 @@ export function deleteRefusal(users: readonly ProviderUser[], shown = 3): string
  * blank before the API refused one (review RV20-11) never reads "in : ...".
  */
 export function providerLabel(provider: Pick<Provider, 'id' | 'name'>): string {
-  return provider.name.trim() ? provider.name : provider.id;
+  return isBlank(provider.name) ? provider.id : provider.name;
+}
+
+/**
+ * Whether a provider's name is blank: no character outside Unicode's separators (Z), controls (Cc) and format characters
+ * (Cf) - empty, spaces, U+200B, U+FEFF -, the API's rule for refusing one and for labelling one stored before (SDD §4.2,
+ * review RV21-08).
+ */
+export function isBlank(name: string): boolean {
+  return /^[\p{Z}\p{Cc}\p{Cf}]*$/u.test(name);
 }
 
 /**

@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { MockServer } from '../api/mock';
 import type { Plan, Provider } from '../api/types';
 import { deleteRefusal, destinationName, plansThatNeed, providerLabel } from './providerUse';
+// the label a stored name reads as: one case table for the API and the dashboard (SDD §1 naming, §4.2)
+import nameRaw from '../../../seamless/tests/fixtures/provider_name_cases.json?raw';
 
 const plan = (id: string, status: Plan['status'], counts: Plan['migration_counts'] = {}, derived = status as Plan['derived_status']) =>
   ({ id, name: `Plan ${id}`, status, derived_status: derived, migration_counts: counts, source_provider_id: 'src', destination_provider_id: 'dst' }) as Plan;
@@ -97,3 +99,10 @@ describe("the offline mock names a plan's destination by its label, as the API's
   });
 });
 
+describe('labels a provider as the API does (SDD §1 naming, §4.2, review RV21-08)', () => {
+  const cases = (JSON.parse(nameRaw) as { label_cases: Array<{ name: string; label: string; note: string }> }).label_cases;
+
+  it.each(cases.map((c) => [c.note, c] as const))('%s', (_note, c) => {
+    expect(providerLabel({ id: 'dst-case', name: c.name })).toBe(c.label);
+  });
+});

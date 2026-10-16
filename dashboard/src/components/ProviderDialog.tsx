@@ -7,7 +7,7 @@ import { cn } from '../lib/cn';
 import { DISTRIBUTION_PRESETS, presetFor, slugify, type CredentialMode, type DistributionPreset } from '../lib/distributions';
 import { formatRelative } from '../lib/format';
 import { RELEASE_CHOICES, seriesText } from '../lib/platforms';
-import { providerLabel } from '../lib/providerUse';
+import { isBlank, providerLabel } from '../lib/providerUse';
 import { providerStatusMeta } from '../lib/status';
 import { Button } from './Button';
 import { ErrorBanner } from './ErrorBanner';
@@ -338,7 +338,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
 
   const validate = (): Errors => {
     const e: Errors = {};
-    if (!form.name.trim()) e.name = 'Enter a name operators will recognise.';
+    if (isBlank(form.name)) e.name = 'Enter a name operators will recognise.';
     if (!editing && !ID_PATTERN.test(form.id)) e.id = 'Use 2–63 lowercase letters, digits and dashes, starting with a letter or digit.';
     if (!/^https?:\/\/\S+$/.test(form.endpoint.trim())) e.endpoint = `Enter the full URL, e.g. ${preset.endpointExample}.`;
     const stored = editing && Boolean(current?.credentials_updated_at);

@@ -10,6 +10,7 @@ import ipaddress
 import math
 import re
 import secrets
+import unicodedata
 from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -153,7 +154,7 @@ class Provider(_Model):
     def label(self) -> str:
         """The name a text gives the provider (SDD §1 naming): its name, else its id - a name stored
         blank before the API refused one (review RV20-11) never reads "in : ..."."""
-        return self.name if self.name.strip() else self.id
+        return self.id if is_blank(self.name) else self.name
 
 
 class ProviderCreate(Provider):
@@ -167,13 +168,22 @@ class ProviderCreate(Provider):
     def _name_not_blank(cls, name: str) -> str:
         """A blank name is refused here, at the request boundary: a provider stored blank before
         keeps loading (SDD §4.2, review RV20-11)."""
-        if not name.strip():
+        if is_blank(name):
             raise PydanticCustomError("blank", BLANK_NAME)
         return name
 
 
 #: why POST and PATCH /providers refuse a name (SDD §4.2, review RV20-11)
 BLANK_NAME = "must not be blank"
+
+#: what a blank name holds only: Unicode's separators, controls and format characters (SDD §4.2)
+_BLANK_CATEGORIES = frozenset({"Zs", "Zl", "Zp", "Cc", "Cf"})
+
+
+def is_blank(name: str) -> bool:
+    """No character outside Unicode's separators (Z), controls (Cc) and format characters (Cf) -
+    empty, spaces, U+200B, U+FEFF: the rule the dashboard shares (SDD §4.2, review RV21-08)."""
+    return all(unicodedata.category(ch) in _BLANK_CATEGORIES for ch in name)
 
 
 DiskKind = Literal["volume", "ephemeral", "image_root", "vmdk"]

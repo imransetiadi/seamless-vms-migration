@@ -25,7 +25,7 @@ import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
 import { summaryOf } from '../lib/summary';
 import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
-import { destinationName, providerLabel } from '../lib/providerUse';
+import { destinationName, isBlank, providerLabel } from '../lib/providerUse';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -1662,7 +1662,7 @@ export class MockServer {
     // a name missing or not a string is refused in pydantic's words, as the API's model refuses it: stored, every text
     // that names the provider would read it (SDD §4.2, review RV21-07)
     if (typeof input.name !== 'string') throw new HttpError(422, 'validation_error', input.name === undefined ? 'name: Field required' : 'name: Input should be a valid string');
-    if (!input.name.trim()) throw new HttpError(422, 'validation_error', 'name: must not be blank');
+    if (isBlank(input.name)) throw new HttpError(422, 'validation_error', 'name: must not be blank');
     if (this.providers.some((p) => p.id === id)) throw new HttpError(409, 'conflict', `provider '${id}' already exists`);
     // like the API: provider-{id} and provider-{id}-ssh must stay apart from every other provider's (SDD §13.3)
     const clash = this.providers.find((p) => id === `${p.id}-ssh` || p.id === `${id}-ssh`);
@@ -1703,7 +1703,7 @@ export class MockServer {
     const unknown = Object.keys(input).filter((k) => !PROVIDER_EDITABLE.has(k)).sort();
     if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);
     // a blank name is refused, as the API refuses it (SDD §4.2, review RV20-11)
-    if (typeof input.name === 'string' && !input.name.trim()) throw new HttpError(422, 'validation_error', 'name: must not be blank');
+    if (typeof input.name === 'string' && isBlank(input.name)) throw new HttpError(422, 'validation_error', 'name: must not be blank');
     const users = this.plans.filter(
       (p) => ['running', 'paused'].includes(p.status) && (p.source_provider_id === provider.id || p.destination_provider_id === provider.id),
     );

@@ -338,6 +338,15 @@ describe('Providers page', () => {
     expect(within(dialog).getByLabelText(/keystone url/i)).toHaveFocus();
   });
 
+  it('asks for a name when it has no visible character, as the API refuses it (SDD §4.2, review RV21-08)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage();
+    const dialog = await openAdd(user);
+    await user.type(within(dialog).getByLabelText(/^name/i), '\u200b');
+    await user.click(within(dialog).getByRole('button', { name: /add and test connection/i }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/recognise/i);
+  });
+
   it('connects a Kolla-Ansible source: the preset fills the form, credentials stay write-only', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderPage();

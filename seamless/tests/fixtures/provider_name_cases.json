@@ -1,5 +1,5 @@
 {
- "_comment": "What POST /providers and PATCH /providers/{id} answer for a provider's name (SDD §4.2): every text that names the provider reads it, so a name that is missing, not a string or blank is refused (422, in pydantic's words where the model refuses it) and nothing is stored. Shared by seamless/tests/test_api_resources.py and dashboard/src/api/mock.test.ts (reviews RV20-11, RV21-07). Each case: the route, the name part of an otherwise valid body ({} = no name) -> the status and, for a refusal, the message.",
+ "_comment": "What POST /providers and PATCH /providers/{id} answer for a provider's name (SDD §4.2): every text that names the provider reads it, so a name that is missing, not a string or blank - no character outside Unicode's separators (Z), controls (Cc) and format characters (Cf) - is refused (422, in pydantic's words where the model refuses it) and nothing is stored; label_cases give the label a stored name reads as, for a provider whose id is dst-case. Shared by seamless/tests/test_api_resources.py, seamless/tests/test_models.py, dashboard/src/api/mock.test.ts and dashboard/src/lib/providerUse.test.ts (reviews RV20-11, RV21-07, RV21-08). Each case: the route, the name part of an otherwise valid body ({} = no name) -> the status and, for a refusal, the message.",
  "cases": [
   {
    "route": "POST",
@@ -88,6 +88,106 @@
    "status": 200,
    "message": null,
    "note": "10. a new name"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": "\ufeff"
+   },
+   "status": 422,
+   "message": "name: must not be blank",
+   "note": "11. a byte order mark alone (U+FEFF)"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": "\u200b"
+   },
+   "status": 422,
+   "message": "name: must not be blank",
+   "note": "12. a zero width space alone (U+200B)"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": "\u001c"
+   },
+   "status": 422,
+   "message": "name: must not be blank",
+   "note": "13. a control character alone (U+001C)"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": "\u0085"
+   },
+   "status": 422,
+   "message": "name: must not be blank",
+   "note": "14. a next-line control alone (U+0085)"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": "\u00a0\u3000"
+   },
+   "status": 422,
+   "message": "name: must not be blank",
+   "note": "15. a no-break and an ideographic space"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": "\ufeffDC3"
+   },
+   "status": 201,
+   "message": null,
+   "note": "16. a name a byte order mark starts"
+  },
+  {
+   "route": "PATCH",
+   "body": {
+    "name": "\u200b"
+   },
+   "status": 422,
+   "message": "name: must not be blank",
+   "note": "17. a zero width space alone (U+200B)"
+  }
+ ],
+ "label_cases": [
+  {
+   "name": "DC3 (Hibiscus)",
+   "label": "DC3 (Hibiscus)",
+   "note": "a name"
+  },
+  {
+   "name": "",
+   "label": "dst-case",
+   "note": "empty: the id"
+  },
+  {
+   "name": " \t ",
+   "label": "dst-case",
+   "note": "spaces: the id"
+  },
+  {
+   "name": "\u200b",
+   "label": "dst-case",
+   "note": "a zero width space: the id"
+  },
+  {
+   "name": "\ufeff",
+   "label": "dst-case",
+   "note": "a byte order mark: the id"
+  },
+  {
+   "name": "\u0085",
+   "label": "dst-case",
+   "note": "a next-line control: the id"
+  },
+  {
+   "name": "\ufeffDC3",
+   "label": "\ufeffDC3",
+   "note": "a name a byte order mark starts: the name as stored"
   }
  ]
 }

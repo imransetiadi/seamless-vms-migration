@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -322,13 +323,17 @@ def test_prestage_resources_are_the_playbook_pairs_of_the_collection():
     assert set(PRESTAGE_RESOURCES) == pairs - {"workloads"}
 
 
-def test_a_provider_stored_with_a_blank_name_loads_and_is_named_by_its_id():
-    """SDD §1 naming, §4.2 (review RV20-11): the API refuses a blank name at the request
-    boundary, so a provider stored blank before keeps loading; a text names it by its id."""
-    for name in ("", "   "):
-        stored = make_provider(id="dst-blank", name="RHOSO").model_dump(mode="json")
-        loaded = Provider.model_validate({**stored, "name": name})
-        assert loaded.name == name and loaded.label == "dst-blank"
-    assert (
-        make_provider(id="dst-dc3", name="OpenStack 2026.2 (DC3)").label == "OpenStack 2026.2 (DC3)"
-    )
+LABEL_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "provider_name_cases.json").read_text(encoding="utf-8")
+)["label_cases"]
+
+
+@pytest.mark.parametrize("case", LABEL_CASES, ids=[c["note"] for c in LABEL_CASES])
+def test_a_provider_stored_with_a_blank_name_loads_and_is_named_by_its_id(case):
+    """SDD §1 naming, §4.2 (reviews RV20-11, RV21-08): the API refuses a blank name at the request
+    boundary, so a provider stored blank before keeps loading; a text names it by its id - blank
+    by the rule the dashboard shares (provider_name_cases.json): no character outside Unicode's
+    separators, controls and format characters."""
+    stored = make_provider(id="dst-case", name="RHOSO").model_dump(mode="json")
+    loaded = Provider.model_validate({**stored, "name": case["name"]})
+    assert loaded.name == case["name"] and loaded.label == case["label"]
