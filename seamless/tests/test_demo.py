@@ -17,7 +17,7 @@ async def test_demo_seed_idempotent(tmp_path, store):
     await seed_demo(store, settings, services.orchestrator)
 
     providers = store.list("provider", Provider)
-    assert len(providers) == 3
+    assert len(providers) == 4
     # a demo database seeded before Distribution existed is backfilled on the next seed
     legacy = next(p for p in providers if p.id == "vcenter-dc2")
     _, version = store.get_versioned("provider", legacy.id, Provider)
@@ -29,8 +29,9 @@ async def test_demo_seed_idempotent(tmp_path, store):
         "rhosp17-finance": "rhosp",
         "vcenter-dc2": "vmware",
         "rhoso18": "rhoso",
+        "hibiscus-dc3": "kolla",
     }
-    assert sum(p.role == ProviderRole.destination for p in providers) == 1
+    assert sum(p.role == ProviderRole.destination for p in providers) == 2
     plans = store.list("plan", Plan)
     assert sorted(p.name for p in plans) == sorted(DEMO_PLAN_NAMES)
     assert DEMO_PLAN_NAMES == ("Finance apps (RHOSP 17.1 → RHOSO)", "DC2 VMware exit")
@@ -51,10 +52,42 @@ async def test_demo_seed_idempotent(tmp_path, store):
 
     events_before = store.max_seq()
     await seed_demo(store, settings, services.orchestrator)
-    assert len(store.list("provider", Provider)) == 3
+    assert len(store.list("provider", Provider)) == 4
     assert len(store.list("plan", Plan)) == 2
     assert len(store.list("migration", Migration)) == 34
     assert store.max_seq() == events_before, "a second seed changes nothing"
+
+
+async def test_demo_seeds_a_community_destination_beside_rhoso(tmp_path, store):
+    """SDD §10, plan T9: the demo holds a community OpenStack destination - 2026.2 Hibiscus, the
+    Kolla-Ansible preset - beside RHOSO 18.0. Its check reports its series, Tier 1 and the
+    secure-RBAC profile; RHOSO's stays validated and legacy; the demo plans keep rhoso18."""
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e7, demo_failure_rate=0.0
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+
+    hibiscus = store.get("provider", "hibiscus-dc3", Provider)
+    assert (hibiscus.kind, hibiscus.role, hibiscus.distribution, hibiscus.release) == (
+        ProviderKind.openstack,
+        ProviderRole.destination,
+        "kolla",
+        "2026.2",
+    )
+    assert {p.destination_provider_id for p in store.list("plan", Plan)} == {"rhoso18"}
+    caps = (await services.orchestrator.check_provider("hibiscus-dc3")).capabilities
+    assert caps["compute_microversion"] == "2.104"
+    assert caps["release_range"] == ["2026.2"] and caps["release"] == "2026.2"
+    assert caps["support_tier"] == {
+        "tier": "tier1",
+        "reason": None,
+        "declared_outside_range": False,
+    }
+    assert caps["policy_profile"] == "secure_rbac" and caps["tls"] is True
+    rhoso = (await services.orchestrator.check_provider("rhoso18")).capabilities
+    assert rhoso["support_tier"]["tier"] == "validated" and rhoso["policy_profile"] == "legacy"
+    assert rhoso["compute_microversion"] == "2.95"
 
 
 async def test_demo_runs_through_phases(tmp_path, store):

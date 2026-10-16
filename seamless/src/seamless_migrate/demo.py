@@ -84,6 +84,23 @@ DEMO_PROVIDERS = (
             address="192.0.2.50",
         ),
     ),
+    # a community OpenStack destination beside RHOSO 18.0 (SDD §10, §21; plan task T9)
+    Provider(
+        id="hibiscus-dc3",
+        name="OpenStack 2026.2 Hibiscus (DC3)",
+        kind=ProviderKind.openstack,
+        role=ProviderRole.destination,
+        endpoint="https://keystone.dc3.example.com:5000/v3",
+        cloud="hibiscus",
+        distribution="kolla",
+        release="2026.2",
+        conversion_host=ConversionHostConfig(
+            name="os-migrate-conv-dc3",
+            flavor="m1.large",
+            external_network="public",
+            address="192.0.2.60",
+        ),
+    ),
 )
 
 

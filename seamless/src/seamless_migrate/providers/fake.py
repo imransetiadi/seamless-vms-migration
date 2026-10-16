@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..domain.enums import ProviderKind
-from ..domain.models import Disk, Nic, VMRef
+from ..domain.models import Disk, Nic, Provider, VMRef
 from ..planning.platforms import destination_release
 from ..planning.preflight import DestinationInventory, SourceInventory
 from .base import ProviderError, VMNotFound
@@ -381,24 +381,41 @@ class FakeSourceProvider:
         )
 
 
+#: the demo destinations' maxima by kind (SDD §10): RHOSO 18.0's, and 2026.2 Hibiscus's for a
+#: community cloud - its block storage maximum a plausible value, §21.3 has not confirmed it
+_DESTINATION_MAXIMA = {
+    ProviderKind.rhoso: ("2.95", "3.70"),
+    ProviderKind.openstack: ("2.104", "3.71"),
+}
+
+
 class FakeDestinationProvider:
-    def __init__(self, seed: int = 42) -> None:
+    def __init__(self, seed: int = 42, provider: Provider | None = None) -> None:
         self.seed = seed
         self.deleted: set[str] = set()
+        #: the demo provider it stands for: its kind, declared series and profile (SDD §10)
+        self.provider = provider
 
     async def check(self) -> dict[str, Any]:
+        kind = self.provider.kind if self.provider is not None else ProviderKind.rhoso
+        compute, block_storage = _DESTINATION_MAXIMA.get(
+            kind, _DESTINATION_MAXIMA[ProviderKind.rhoso]
+        )
+        release = self.provider.release if self.provider is not None else None
+        profile = self.provider.policy_profile if self.provider is not None else None
         # an admin token (SDD §10): the demo's shared provider network takes its ports (§6.6)
         return {
             "admin": True,
             "roles": ["admin", "member", "reader"],
-            "compute_microversion": "2.95",
-            "block_storage_microversion": "3.70",
+            "compute_microversion": compute,
+            "block_storage_microversion": block_storage,
             "ovn": True,
             **_storage_caps(_DESTINATION_POOLS),
             "tls": True,
             "plain_http": [],
-            # RHOSO 18.0: validated by its kind, legacy until D14 (SDD §10.1)
-            **destination_release("rhoso", None, None, "2.95", "3.70"),
+            # RHOSO 18.0 validated by its kind and legacy until D14; a community cloud by its
+            # series (SDD §10.1)
+            **destination_release(kind, release, profile, compute, block_storage),
         }
 
     async def inventory(self) -> DestinationInventory:
