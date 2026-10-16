@@ -1,5 +1,6 @@
 import ast
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -1000,7 +1001,7 @@ async def test_handover_in_neutron_mode_resumes_on_the_port_it_created(tmp_path)
     a port created but not yet journaled is found by its description, unbound."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
     ctx, _ = make_ctx(neutron(plan), mig, SRC, DST, settings)
-    with pytest.raises(PermanentStepError, match="create the destination server"):
+    with pytest.raises(PermanentStepError, match="create the server in RHOSO 18.0"):
         await executor.run(StepName.CUTOVER, ctx)
     await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
     assert [op for op in ops(calls) if op[1] == "create_port"] == [
@@ -1343,7 +1344,7 @@ async def test_handover_resume_after_a_crash_while_creating_waits_for_the_same_s
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)
     clouds["dst"].crash_wait = "server"
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
-    with pytest.raises(PermanentStepError, match="create the destination server"):
+    with pytest.raises(PermanentStepError, match="create the server in RHOSO 18.0"):
         await executor.run(StepName.CUTOVER, ctx)
     result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert result.destination_server_id == "dst-new-1"
@@ -1358,7 +1359,7 @@ async def test_handover_resume_creates_the_server_again_when_the_one_sent_is_gon
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)
     clouds["dst"].crash_wait = "server"
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
-    with pytest.raises(PermanentStepError, match="create the destination server"):
+    with pytest.raises(PermanentStepError, match="create the server in RHOSO 18.0"):
         await executor.run(StepName.CUTOVER, ctx)
     clouds["dst"].compute.delete_server("dst-new-1")
     result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
@@ -1372,7 +1373,7 @@ async def test_handover_rollback_after_a_crash_while_creating_deletes_that_serve
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)
     clouds["dst"].crash_wait = "server"
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
-    with pytest.raises(PermanentStepError, match="create the destination server"):
+    with pytest.raises(PermanentStepError, match="create the server in RHOSO 18.0"):
         await executor.run(StepName.CUTOVER, ctx)
     calls.clear()
     result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
@@ -1579,7 +1580,7 @@ async def test_handover_netapp_block_manages_by_lun_path(tmp_path):
     [
         ([("hostgroup@ontap_nfs#10.20.0.5:/cinder_gold", ONTAP_NFS)], "no pool for the export"),
         ([("hostgroup@ontap_nfs#flex_a", ONTAP_ISCSI)], "same driver family"),
-        (None, "Cinder pools of the destination"),
+        (None, "Cinder pools of RHOSO 18.0"),
     ],
 )
 async def test_handover_refuses_before_stop_when_a_pool_cannot_be_resolved(
@@ -1627,6 +1628,99 @@ def test_the_runs_storage_resolution_names_the_destination_provider(tmp_path):
     assert str(refused.value).startswith(
         "volume vol-data: OpenStack 2026.2 Hibiscus (DC3) lists no pools for hostgroup@ontap_nfs"
     ), str(refused.value)
+
+
+async def test_every_handover_text_about_the_destination_cloud_names_its_provider(tmp_path):
+    """SDD §1 naming (review RV21-05): a refusal or failure of the handover about the destination
+    cloud names its provider - the pools it cannot read, step 0's port problems, the server it
+    fails to create - never "the destination", nor a network without its cloud."""
+    name = "OpenStack 2026.2 Hibiscus (DC3)"
+    named = DST.model_copy(update={"name": name})
+
+    async def refusal(case, change=lambda dst: None, plan_of=lambda p: p, **kw):
+        executor, _, clouds, plan, mig, settings = setup(tmp_path / case, **kw)
+        change(clouds["dst"])
+        with pytest.raises(PermanentStepError) as refused:
+            await executor.run(
+                StepName.CUTOVER, make_ctx(plan_of(plan), mig, SRC, named, settings)[0]
+            )
+        return str(refused.value)
+
+    def unreadable(dst):
+        dst.pools = None
+
+    def private(dst):
+        dst.network_list = [
+            NS(
+                id="private-net",
+                name="rhoso-app",
+                project_id="tenant-b",
+                is_shared=False,
+                is_router_external=False,
+            )
+        ]
+
+    def held(port_id, **change):
+        def put(dst):
+            base = {
+                "id": port_id,
+                "network_id": "dst-net-rhoso-app",
+                "mac_address": "fa:16:3e:99:99:99",
+                "fixed_ips": [{"ip_address": "10.0.0.5"}],
+                "device_id": "other-vm",
+                "created_by_nova": True,
+                "description": "",
+                "project_id": "dst-project",
+            }
+            dst.ports[port_id] = NS(**{**base, **change})
+
+        return put
+
+    where = f"port port-1 (fa:16:3e:00:00:01) on 'rhoso-app' of {name}"
+    assert f"cannot read the Cinder pools of {name} (scheduler-stats" in await refusal(
+        "pools", unreadable
+    )
+    assert f"{where} (project tenant-b): it is neither shared" in await refusal("private", private)
+
+    def outside(dst):
+        dst.subnet_list = [subnet("dst-net-rhoso-app", "10.9.0.0/24")]
+
+    moved = await refusal("address", outside)
+    assert f"{where}: 10.0.0.5 is no host address of any subnet" in moved
+    assert f"{where}: 10.0.0.5 is held by port taken" in await refusal("taken", held("taken"))
+    same = held("same-mac", mac_address="fa:16:3e:00:00:01", fixed_ips=[])
+    mac = await refusal("mac", same, neutron)
+    assert f"{where}: MAC fa:16:3e:00:00:01 is held by port same-mac" in mac
+    created = await refusal("create", plan_of=neutron, dst_crash_on="create_server")
+    assert created.startswith(f"create the server in {name}: "), created
+    # the run reads the pools again when it records the source definition, after the stop
+    executor, _, clouds, plan, _, _ = setup(tmp_path / "run-pools")
+    clouds["dst"].pools = None
+    vtype = next(iter(plan.handover.backend_map))
+    attachments = [{"volume_id": "vol-data", "volume_type": vtype, "host": "any"}]
+    with pytest.raises(
+        PermanentStepError, match=f"cannot read the Cinder pools of {re.escape(name)}"
+    ):
+        executor._resolve_storage(
+            clouds["src"], clouds["dst"], attachments, plan.handover.backend_map, name
+        )
+
+    async def rollback_failure(case, crash, plan_of=lambda p: p):
+        executor, _, _, plan, mig, settings = setup(tmp_path / case, dst_crash_on=crash)
+        ctx = make_ctx(plan_of(plan), mig, SRC, named, settings)[0]
+        mig.destination_server_id = (
+            await executor.run(StepName.CUTOVER, ctx)
+        ).destination_server_id
+        with pytest.raises(PermanentStepError) as failed:
+            await executor.run(
+                StepName.ROLLBACK, make_ctx(plan_of(plan), mig, SRC, named, settings)[0]
+            )
+        return str(failed.value)
+
+    deleted = await rollback_failure("delete-server", "delete_server")
+    assert deleted.startswith(f"delete the server in {name}: "), deleted
+    ports = await rollback_failure("delete-port", "delete_port", neutron)
+    assert ports.startswith(f"delete the port made for port-1 in {name}: "), ports
 
 
 async def test_the_run_resolves_storage_with_the_destination_providers_name(tmp_path, monkeypatch):
@@ -2041,14 +2135,16 @@ async def test_handover_step_0_refuses_a_network_the_credential_may_not_put_a_po
             "private",
             [private],
             ["admin", "member", "reader"],
-            "'rhoso-app' (project tenant-b): it is neither shared with the credential's project "
+            "'rhoso-app' of RHOSO 18.0 (project tenant-b): it is neither shared with the "
+            "credential's project "
             "nor external",
         ),
         (
             "member",
             [shared],
             ["member", "reader"],
-            "'rhoso-app' (project admin-project): Neutron lets only the admin or advsvc role, or "
+            "'rhoso-app' of RHOSO 18.0 (project admin-project): Neutron lets only the admin or "
+            "advsvc role, or "
             "that project, choose a port's address or MAC there",
         ),
     ):
@@ -2309,7 +2405,8 @@ async def test_handover_step_0_refuses_an_address_or_mac_another_port_holds(tmp_
 
     refused = await cutover("nova-taken", [leftover("taken")])
     assert (
-        "port port-1 (fa:16:3e:00:00:01) on 'rhoso-app': 10.0.0.5 is held by port taken" in refused
+        "port port-1 (fa:16:3e:00:00:01) on 'rhoso-app' of RHOSO 18.0: 10.0.0.5 is held by port "
+        "taken" in refused
     )
     refused = await cutover("neutron-taken", [leftover("taken")], neutron)
     assert "10.0.0.5 is held by port taken" in refused

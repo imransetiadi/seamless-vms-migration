@@ -358,12 +358,14 @@ class HandoverExecutor:
         }
 
     @staticmethod
-    def _pools(conn: Any, side: str) -> dict[str, dict[str, Any]]:
+    def _pools(conn: Any, where: str) -> dict[str, dict[str, Any]]:
+        """The Cinder pools of ``where`` - "the source", or the destination provider by its label
+        (SDD §1 naming, review RV21-05) - by name."""
         try:
             pools = list(conn.block_storage.backend_pools())
         except Exception as exc:
             raise PermanentStepError(
-                f"cannot read the Cinder pools of the {side} (scheduler-stats/get_pools, admin): "
+                f"cannot read the Cinder pools of {where} (scheduler-stats/get_pools, admin): "
                 f"{exc}; the manage reference depends on the driver family (SDD §7.3.1)"
             ) from exc
         return {str(_attr(p, "name")): dict(_attr(p, "capabilities") or {}) for p in pools}
@@ -387,10 +389,10 @@ class HandoverExecutor:
         )
         if missing:
             raise PermanentStepError(f"no handover backend for volume type(s): {missing}")
-        src_pools = self._pools(src, "source")
+        src_pools = self._pools(src, "the source")
         dst_backends = [
             {"pool": name, "family": storage_family(caps)}
-            for name, caps in self._pools(dst, "destination").items()
+            for name, caps in self._pools(dst, cloud).items()
         ]
         storage: dict[str, dict[str, Any]] = {}
         for att in attachments:
@@ -460,10 +462,10 @@ class HandoverExecutor:
         src_pools: dict[str, dict[str, Any]] | None = None
         dst_backends: list[dict[str, Any]] = []
         try:
-            src_pools = self._pools(src, "source")
+            src_pools = self._pools(src, "the source")
             dst_backends = [
                 {"pool": name, "family": storage_family(caps)}
-                for name, caps in self._pools(dst, "destination").items()
+                for name, caps in self._pools(dst, cloud).items()
             ]
         except PermanentStepError as exc:
             problems.append(str(exc))
@@ -575,7 +577,7 @@ class HandoverExecutor:
                 profile,
             )
             if why_not:
-                problems.append(f"{where} on {target!r} (project {project}): {why_not}")
+                problems.append(f"{where} on {target!r} of {cloud} (project {project}): {why_not}")
             net_id = _attr(network, "id")
             subnets = list(dst.network.subnets(network_id=net_id))
             # Nova keeps one address per port (step 8)
@@ -583,7 +585,7 @@ class HandoverExecutor:
             for address in given:
                 why = address_refusal(address, subnets, neutron=neutron, mac=n.get("mac_address"))
                 if why:
-                    problems.append(f"{where} on {target!r}: {address} {why}")
+                    problems.append(f"{where} on {target!r} of {cloud}: {address} {why}")
             # what another port of the network holds: Neutron refuses its address, and with the MAC
             # kept the MAC - all but the earlier attempt's own port, which step 8 uses again
             mine = (
@@ -605,7 +607,7 @@ class HandoverExecutor:
                 ]
                 if holders:
                     problems.append(
-                        f"{where} on {target!r}: {address} is held by port {holders[0]}"
+                        f"{where} on {target!r} of {cloud}: {address} is held by port {holders[0]}"
                     )
             mac = str(n.get("mac_address") or "").lower()
             if neutron and mac:
@@ -617,7 +619,7 @@ class HandoverExecutor:
                 ]
                 if holders:
                     problems.append(
-                        f"{where} on {target!r}: MAC {mac} is held by port {holders[0]}"
+                        f"{where} on {target!r} of {cloud}: MAC {mac} is held by port {holders[0]}"
                     )
         return problems
 
@@ -1182,7 +1184,7 @@ class HandoverExecutor:
                     "sent:create_server",
                 )
 
-            new_id = await self._call("create the destination server", create)
+            new_id = await self._call(f"create the server in {ctx.destination.label}", create)
             await asyncio.to_thread(journal.mark, "create_server", server_id=new_id)
         return StepResult(
             destination_server_id=journal.get("create_server")["server_id"],
@@ -1221,7 +1223,7 @@ class HandoverExecutor:
                     dst.compute.delete_server(server, ignore_missing=True)
                     dst.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
 
-            await self._call("delete the destination server", delete_destination)
+            await self._call(f"delete the server in {ctx.destination.label}", delete_destination)
             await asyncio.to_thread(journal.mark, "rb:delete_destination")
 
         if definition.get("port_creation_mode") == "neutron":
@@ -1248,7 +1250,10 @@ class HandoverExecutor:
                         if ours and (not bound or bound == deleted_server):
                             dst.network.delete_port(port, ignore_missing=True)
 
-                await self._call(f"delete the destination port of {n['port_id']}", delete_ports)
+                await self._call(
+                    f"delete the port made for {n['port_id']} in {ctx.destination.label}",
+                    delete_ports,
+                )
                 await asyncio.to_thread(journal.mark, key)
 
         def managed_at_rhoso(vid: str) -> str | None:
