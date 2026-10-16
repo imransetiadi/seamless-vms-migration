@@ -6,10 +6,12 @@
 #   export TOKEN='smg_...'            # the admin token printed once by scripts/compose-init.sh
 #   export APPROVER_TOKEN='smg_...'   # an approver of another user: a requester never approves their own
 #                                     # cutover (maker-checker, SDD §5.4) — seamless token create --role approver
-#   tests/e2e/smoke-demo.sh           # BASE defaults to http://127.0.0.1:8080
+#   tests/e2e/smoke-demo.sh           # BASE defaults to http://127.0.0.1:8080; SMOKE_WAIT_S (600) bounds the
+#                                     # wait for the seeded demo flow to settle
 #
 # Checks health, RBAC, the dashboard, metrics, the seeded demo flow (approvals, cutovers, one
-# retry per rolled-back migration), SSE replay, stats, Jev through the sidecar and agentmemory,
+# retry per rolled-back migration), SSE replay, stats, Jev through the sidecar and agentmemory (each
+# skipped, saying why, when it is not configured),
 # then validates a plan whose SLO nothing meets so Jev is asked for a strategy: the smoke plan of an
 # earlier run, or a new one on a VM no plan holds (SDD §5.4), so a re-run adds no plan.
 # Never prints the tokens, nor puts them on a command line. Exit code = number of failed checks.
@@ -29,6 +31,14 @@ check(){ if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 # a check that needs the smoke plan: skipped, not failed, when the demo has none to give (see below)
 needs_plan(){ if [ -n "$no_plan" ]; then skip "$1"; else check "$1" "$2"; fi; }
 no_plan=""
+
+# optional integrations (SDD §14.2, §14.3), by the advisor status: a check of one that is not configured is skipped,
+# not failed - Jev is off without TYPESAFE_API_KEY at compose-init, memory without SEAMLESS_MEMORY_URL - so a fresh
+# Linux host or a CI runner smokes green; a configured one that does not answer still fails its check
+jev_on(){ [[ "$advisor" != *'"jev":{"mode":"off"'* ]]; }
+memory_on(){ [[ "$advisor" != *'"memory":{"enabled":false'* ]]; }
+needs_jev(){ if jev_on; then check "$1" "$2"; else skip "$1 (Jev is off: no TYPESAFE_API_KEY at compose-init)"; fi; }
+needs_memory(){ if memory_on; then check "$1" "$2"; else skip "$1 (memory is disabled: no SEAMLESS_MEMORY_URL)"; fi; }
 
 health=$(curl -fsS -m 10 "$BASE/api/v1/health" || echo '{}')
 echo "health: $health"
@@ -55,7 +65,8 @@ check "demo plans seeded"           '[[ "$plans" == *\"plan-* ]]'
 pid=$(python3 -c 'import json,sys; p=json.load(sys.stdin); print(next((x["id"] for x in p if "Finance" in x["name"] or "finance" in x["name"]), p[0]["id"]))' <<<"$plans")
 echo "finance plan: $pid"
 python3 -c 'import json,sys; print("plans:", [(x["name"], x["status"]) for x in json.load(sys.stdin)])' <<<"$plans"
-deadline=$((SECONDS+300)); final=""; migs='[]'
+# a fresh demo on a small or busy host needs more than 300 s to settle; a settled one ends the wait at once
+deadline=$((SECONDS+${SMOKE_WAIT_S:-600})); final=""; migs='[]'
 while [ $SECONDS -lt $deadline ]; do
   migs=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/migrations" || echo '[]')
   summary=$(python3 -c 'import json,sys,collections; ms=json.load(sys.stdin); c=collections.Counter(m["phase"] for m in ms); print(dict(c))' <<<"$migs")
@@ -101,8 +112,8 @@ check "SSE stream replays since=0"  'curl -sS -m 4 -N -H "$H" "$BASE/api/v1/even
 
 advisor=$(curl -fsS -m 20 -H "$H" "$BASE/api/v1/advisor/status" || echo '{}')
 echo "advisor: $advisor"
-check "jev available via sidecar"   '[[ "$advisor" == *\"jev\":{\"mode\":\"http\",\"available\":true* ]]'
-check "memory available via host"   '[[ "$advisor" == *\"memory\":{\"enabled\":true,\"available\":true* ]]'
+needs_jev "jev available via sidecar"   '[[ "$advisor" == *\"jev\":{\"mode\":\"http\",\"available\":true* ]]'
+needs_memory "memory available via host"   '[[ "$advisor" == *\"memory\":{\"enabled\":true,\"available\":true* ]]'
 sim=$(curl -fsS -m 30 -X POST -H "$H" -H "Content-Type: application/json" -d '{"query":"warm cutover converged database"}' "$BASE/api/v1/advisor/similar-incidents" || echo '{}')
 check "similar-incidents answers"   '[[ "$sim" == *\"hits\"* ]]'
 
@@ -164,7 +175,11 @@ runs = bool(decided) and all(m["strategy"] == newest[m["id"]]["decision"]["final
 seen = [(r["subject"]["name"], r["model"]["name"], r["recommendation"]["option"], r["recommendation"]["confidence"], r["decision"]["status"], r["decision"]["final_option"]) for r in stored[:3]]
 print(json.dumps({"recommendations": seen, "runs_decision": runs}, separators=(",", ":")))')
 echo "advisor recommendations: $advice"
-needs_plan "jev strategy recommendation recorded (SDD §14.4)" '[[ "$advice" == *\"jev\"* ]]'
+if jev_on; then
+  needs_plan "jev strategy recommendation recorded (SDD §14.4)" '[[ "$advice" == *\"jev\"* ]]'
+else
+  skip "jev strategy recommendation recorded (SDD §14.4) (Jev is off: the rules decide)"
+fi
 needs_plan "the migration runs its newest decision (ADV-01)" '[[ "$advice" == *\"runs_decision\":true* ]]'
 # the newest recommendation is audited (created, then one decision) and its stored input re-hashes (SDD §14.5)
 audit=$({ curl -fsS -m 10 -H "$H" "$BASE/api/v1/advisor/recommendations?plan_id=$npid&limit=200" || echo '{}'; echo; curl -fsS -m 10 -H "$H" "$BASE/api/v1/events?audit=true&tail=true&limit=1000&plan_id=$npid" || echo '[]'; } |

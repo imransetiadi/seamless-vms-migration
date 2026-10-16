@@ -1187,7 +1187,7 @@ By hand, on a Linux server: the README's "Quick start — Linux server with Dock
 ### 14.6 Compose smoke test (E2)
 
 ```bash
-make seamless-colima-up
+make seamless-colima-up                    # macOS only (Linux: the machine's own Docker Engine, SDD §17.1)
 scripts/compose-init.sh                    # prints the admin token once: export TOKEN='smg_...'
 make seamless-demo                         # or seamless-up for a stack without demo data
 make seamless-ps
@@ -1195,10 +1195,23 @@ curl -fsS http://127.0.0.1:8080/api/v1/health | jq -e '.status == "ok" and .db =
 curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/me | jq -e '.role == "admin"'
 curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/advisor/status | jq .
 curl -s -o /dev/null -w 'dashboard: %{http_code}\n' http://127.0.0.1:8080/
-docker --context colima-seamless ps --format '{{.Names}}\t{{.Ports}}'      # only seamless publishes: 127.0.0.1:8080
+docker ps --format '{{.Names}}\t{{.Ports}}'     # macOS: docker --context colima-seamless ps; only seamless publishes 127.0.0.1:8080
 make seamless-logs SEAMLESS_SERVICE=seamless        # Ctrl-C to stop following
 make seamless-down                                   # keeps data;  make seamless-reset CONFIRM=yes  deletes it
 ```
+
+`tests/e2e/smoke-demo.sh` (§14.7) treats Jev and agentmemory as optional, as the product does (SDD §14.2,
+§14.3). It skips a check of one that is not configured, and says why:
+* Jev is off when `compose-init.sh` found no `TYPESAFE_API_KEY`;
+* memory is disabled when `SEAMLESS_MEMORY_URL` was removed from `.env`, as CI's `compose-linux` job does
+  (no agentmemory on the runner).
+
+A configured integration that does not answer still fails its check
+(`test_the_smoke_skips_an_optional_integration_that_is_not_configured`).
+
+`SMOKE_WAIT_S` (default 600) bounds the wait for the seeded demo flow to settle. On a fresh stack on a 4-CPU host
+shared with two other stacks, 30 of 34 migrations had completed after 300 s, with one warm migration still
+syncing. A settled demo ends the wait at once.
 
 ### 14.7 Journey and RBAC scripts (E2)
 

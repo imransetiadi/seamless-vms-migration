@@ -386,3 +386,42 @@ def test_the_rbac_matrix_hands_curl_each_token_from_a_private_header_file(tmp_pa
         assert len(sent) >= len(plain), (role, len(sent), len(plain))
     assert len(headers) == len(argv) - len(plain)
     assert list(tmp.iterdir()) == [], "the private header directory outlived the script"
+
+
+# --- optional integrations in the smoke test (SDD §14.2, §14.3; QASuite §14.6) ---
+
+
+def _smoke_gates(advisor: str, call: str) -> str:
+    """Run smoke-demo.sh's needs_jev/needs_memory with this advisor status and stub checks."""
+    script = (ROOT / "tests" / "e2e" / "smoke-demo.sh").read_text(encoding="utf-8")
+    start = script.index("# optional integrations")
+    end = script.index("\n\n", start)
+    gates = script[start:end]
+    prelude = (
+        'check() { if eval "$2"; then echo "PASS  $1"; else echo "FAIL  $1"; fi; }\n'
+        'skip() { echo "SKIP  $1"; }\n'
+    )
+    run = subprocess.run(
+        ["bash", "-c", prelude + gates + "\n" + call],
+        env={"PATH": "/usr/bin:/bin", "advisor": advisor},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return run.stdout
+
+
+def test_the_smoke_skips_an_optional_integration_that_is_not_configured():
+    """SDD §14.2, §14.3: without TYPESAFE_API_KEY Jev is off and the advisor falls back to rules;
+    without SEAMLESS_MEMORY_URL memory is disabled - so a fresh Linux host or CI runner smokes
+    green. A configured integration that does not answer still fails its check."""
+    off = '{"jev":{"mode":"off","available":false},"memory":{"enabled":false,"available":false}}'
+    out = _smoke_gates(off, 'needs_jev "jev up" false; needs_memory "memory up" false')
+    assert out.startswith("SKIP  jev up (Jev is off")
+    assert "SKIP  memory up (memory is disabled" in out
+    down = '{"jev":{"mode":"http","available":false},"memory":{"enabled":true,"available":false}}'
+    out = _smoke_gates(down, 'needs_jev "jev up" false; needs_memory "memory up" false')
+    assert out.splitlines() == ["FAIL  jev up", "FAIL  memory up"]
+    up = '{"jev":{"mode":"http","available":true},"memory":{"enabled":true,"available":true}}'
+    out = _smoke_gates(up, 'needs_jev "jev up" true; needs_memory "memory up" true')
+    assert out.splitlines() == ["PASS  jev up", "PASS  memory up"]
