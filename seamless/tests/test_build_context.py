@@ -198,6 +198,21 @@ def test_the_image_refuses_a_context_with_no_dashboard_at_all(tmp_path):
     assert "neither a built dashboard" in run.stderr
 
 
+def test_the_image_dashboard_script_names_its_three_arguments(tmp_path):
+    """SDD §17.1: the script the Containerfile runs refuses another number of arguments, naming
+    the three it takes, and touches nothing."""
+    script = ROOT / "scripts" / "image-dashboard.sh"
+    run = subprocess.run(
+        ["bash", str(script), str(tmp_path / "ctx"), "dashboard/dist"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 2
+    assert "<build context> <built dashboard> <target directory>" in run.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize("ignore_file", ["seamless/.containerignore", ".dockerignore"])
 def test_the_build_context_holds_the_dashboard_sources_but_not_their_modules(ignore_file):
     """SDD §17.1: the image builds the dashboard from the context, so its sources and the script

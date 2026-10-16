@@ -250,6 +250,33 @@ def test_a_linux_host_runs_the_stack_on_its_own_docker_engine():
     assert "compose.linux-host.yaml" not in remote
 
 
+def test_the_host_decides_the_engine_when_no_variable_says_so(tmp_path):
+    """SDD §17.1: with neither SEAMLESS_HOST_OS nor SEAMLESS_DOCKER_CONTEXT set, the targets ask
+    `uname -s` - this machine's own engine on Linux, the Colima profile's context on macOS - so a
+    Linux host needs no variable at all."""
+    import os
+    import shutil
+    import subprocess
+
+    make = shutil.which("make")
+    assert make, "make is not installed"
+    for host_os, context in (("Linux", "default"), ("Darwin", "colima-seamless")):
+        fakebin = tmp_path / host_os
+        fakebin.mkdir()
+        (fakebin / "uname").write_text(f"#!/bin/sh\necho {host_os}\n")
+        (fakebin / "uname").chmod(0o755)
+        out = subprocess.run(
+            [make, "-n", "--no-print-directory", "seamless-up"],
+            cwd=ROOT,
+            env=_clean_env(path=f"{fakebin}:{os.environ['PATH']}"),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        up = next(line for line in out.splitlines() if " up -d " in line)
+        assert f"docker --context {context} " in up, (host_os, up)
+
+
 def test_seamless_colima_up_on_linux_says_that_colima_is_not_needed():
     """SDD §17.1: on a Linux machine's own engine, seamless-colima-up starts nothing; on macOS it
     starts the dedicated profile without activating its context."""

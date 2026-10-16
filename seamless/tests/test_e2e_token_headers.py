@@ -444,3 +444,23 @@ def test_the_smoke_skips_the_jev_recommendation_check_when_jev_is_off():
     on = '{"jev":{"mode":"http","available":true}}'
     assert _smoke_gates(on, recorded).splitlines() == [f"PASS  {name}"]
     assert _smoke_gates(on, by_rules).splitlines() == [f"FAIL  {name}"]
+
+
+def test_the_smoke_waits_up_to_smoke_wait_s_for_the_demo_to_settle():
+    """QASuite §14.6: the wait for a fresh demo to settle is SMOKE_WAIT_S seconds, 600 unless set:
+    a fresh stack on a small or busy host needs more than the 300 s it used to be."""
+    script = (ROOT / "tests" / "e2e" / "smoke-demo.sh").read_text(encoding="utf-8")
+    line = next(text for text in script.splitlines() if text.startswith("deadline="))
+
+    def deadline(**env: str) -> int:
+        run = subprocess.run(
+            ["bash", "-c", f'SECONDS=0; {line}; echo "$deadline"'],
+            env={"PATH": "/usr/bin:/bin", **env},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return int(run.stdout)
+
+    assert deadline() == 600
+    assert deadline(SMOKE_WAIT_S="1200") == 1200
