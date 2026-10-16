@@ -43,6 +43,7 @@ import {
   strategyRecommendation,
   strategySnapshot,
   destinationDescriptor,
+  DEMO_TOKEN_ROLES,
   type StrategyDecision,
   checkOf,
   vmwareCheck,
@@ -1347,7 +1348,8 @@ export class MockServer {
         if (sub === 'inventory' && method === 'GET') {
           this.require(token, 'viewer', path);
           if (provider.status === 'error') throw new HttpError(502, 'provider_error', `${provider.name}: ${provider.status_message ?? 'unreachable'}`);
-          return ok(this.inventories[provider.id] ?? (provider.role === 'source' ? [] : { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [] }));
+          // a destination's answer names its token's roles, as the API demo's (SDD §10, review RV20-10)
+          return ok(this.inventories[provider.id] ?? (provider.role === 'source' ? [] : { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [], roles: [...DEMO_TOKEN_ROLES] }));
         }
       }
     }

@@ -222,6 +222,16 @@ describe('mock API', () => {
     expect(page.map((m) => m.id)).toEqual(all.slice(1, 3).map((m) => m.id));
   });
 
+  it("answers a destination's inventory with its token's roles, as the API demo's does (SDD §10, review RV20-10)", () => {
+    const { server } = setup();
+    for (const id of ['rhoso-prod', 'rhoso-staging', 'hibiscus-dc3']) {
+      const answer = server.handle('GET', `/providers/${id}/inventory`, new URLSearchParams(), undefined, 'viewer');
+      expect(answer.status, id).toBe(200);
+      // the demo's admin token, as its check reports it and the API demo's inventory reads it live (7f4cc5b5)
+      expect((answer.body as { roles?: unknown }).roles, id).toEqual(['admin', 'member', 'reader']);
+    }
+  });
+
   it('manages providers: PATCH, write-only credentials and conversion key (SDD §12)', async () => {
     const { server, client } = setup();
     const patched = await client.patch<Provider>('/providers/community-lab', { region: 'R2', distribution: 'kolla' });

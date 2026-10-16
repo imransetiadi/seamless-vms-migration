@@ -389,6 +389,9 @@ const DC3_STORAGE = [backend('kolla@rbd-1#volumes', 'rbd')];
 /** The maxima the demo's clouds report, as the API's fakes do (FakeSourceProvider; FakeDestinationProvider by kind). */
 const MAXIMA = { source: ['2.88', '3.64'], rhoso: ['2.95', '3.70'], openstack: ['2.104', '3.71'] } as const;
 
+/** The demo's admin token's role names: its check report and its destinations' inventories name them (SDD §10). */
+export const DEMO_TOKEN_ROLES: readonly string[] = ['admin', 'member', 'reader'];
+
 /**
  * An OpenStack or RHOSO provider's check report, with the keys the API's check reports (SDD §10; check_report_keys.json):
  * its token's roles, its services' maxima, its storage pools and TLS; a destination's adds its series, support tier and
@@ -403,7 +406,7 @@ function openstackCheck(
   return {
     admin: true,
     // an admin token (SDD §10): the demo's shared provider network takes its ports (§6.6)
-    roles: ['admin', 'member', 'reader'],
+    roles: [...DEMO_TOKEN_ROLES],
     compute_microversion: compute,
     block_storage_microversion: blockStorage,
     ovn: true,
@@ -734,6 +737,8 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
       erp: { cores: 64, ram_mb: 262144, instances: 20, volumes: 40, gigabytes: 9000 },
     },
     projects: ['shop', 'finance', 'platform', 'analytics', 'erp', 'media'],
+    // the token's roles, read live with the inventory, as the API demo's (SDD §10, 7f4cc5b5, review RV20-10)
+    roles: [...DEMO_TOKEN_ROLES],
     // where a NIC's addresses must lie (SDD §10): the mock VMs' addresses are in 10.20.0.0/16
     subnets: [
       ...['tenant-web', 'tenant-app', 'tenant-db', 'tenant-infra', 'analytics', 'erp-net'].map((network) => ({
@@ -762,7 +767,7 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
     'vcenter-hq': VMW_VMS.map(makeVm),
     'community-lab': LAB_VMS.map(makeVm),
     'rhoso-prod': destination,
-    'rhoso-staging': { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [] },
+    'rhoso-staging': { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [], roles: [...DEMO_TOKEN_ROLES] },
   };
 }
 
