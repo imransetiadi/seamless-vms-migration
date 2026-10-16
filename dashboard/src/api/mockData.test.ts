@@ -608,6 +608,8 @@ interface FindingCase {
   vm: VMRef;
   /** the plan's other selected VMs */
   others?: VMRef[];
+  /** the source provider's kind, openstack when not given */
+  source_kind?: ProviderKind;
   plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'>;
   expected: Record<string, string>;
 }
@@ -631,7 +633,7 @@ describe('the mock words eligibility and the handover findings as the API (SDD Â
   it.each(ELIGIBILITY.finding_cases)('$why', (c) => {
     const plan = { ...base, ...c.plan } as Plan;
     const selected = [c.vm, ...(c.others ?? [])];
-    const found = preflight(c.vm, 'openstack', plan, {}, { selected });
+    const found = preflight(c.vm, c.source_kind ?? 'openstack', plan, {}, { selected });
     expect(Object.fromEntries(found.filter((f) => f.code in c.expected).map((f) => [f.code, f.message]))).toEqual(c.expected);
   });
 });

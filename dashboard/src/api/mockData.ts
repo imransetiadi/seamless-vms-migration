@@ -1081,16 +1081,19 @@ export function preflight(
     findings.push({ code, severity: entry.severity, message, remediation: own.remediation || entry.remediation, strategies: [...entry.strategies] });
   };
 
-  if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', `${vm.name} is in ERROR state at the source.`);
-  if (vm.power_state === 'transitioning') add('SRC_VM_TRANSITIONAL_STATE', `${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot).`);
+  // every message below as the API words it, over the shared finding cases (SDD §9.3, §16)
+  if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', `Source VM ${vm.name} is in error state.`);
+  else if (vm.power_state === 'transitioning')
+    add('SRC_VM_TRANSITIONAL_STATE', `Source VM ${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot); a stop or snapshot would fail.`);
   // the other selected VMs of that name, by their project and id, as the API words them (SDD §9.3)
   const twins = (context.selected ?? [vm]).filter((v) => v.source_id !== vm.source_id && v.name === vm.name);
   if (twins.length)
     add('SRC_VM_DUPLICATE_NAME', `Another selected VM is also named ${pyRepr(vm.name)} (${pyNames(twins.map((t) => `${t.project || '-'}/${t.source_id}`))}); os-migrate selects workloads by name.`);
-  if (vm.disks.some((d) => d.multiattach))
-    add('SRC_VM_MULTIATTACH', 'A multi-attach volume is attached; warm and storage handover are not possible.');
-  if (vm.disks[0] && (vm.disks[0].kind === 'image_root' || vm.disks[0].kind === 'ephemeral'))
-    add('SRC_VM_EPHEMERAL_ROOT', 'Root disk is image-backed; each warm pass snapshots the server to Glance.');
+  const multi = vm.disks.filter((d) => d.multiattach).map((d) => d.name || d.id);
+  if (multi.length) add('SRC_VM_MULTIATTACH', `Multi-attach disk(s): ${pyNames(multi)}.`);
+  // the boot disk: the first bootable disk, else the first, as the API's VMRef.root_disk
+  const root = vm.disks.find((d) => d.bootable) ?? vm.disks[0];
+  if (root && (root.kind === 'image_root' || root.kind === 'ephemeral')) add('SRC_VM_EPHEMERAL_ROOT', `The root disk is ${root.kind.replaceAll('_', ' ')}.`);
   // every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); a VMware NIC's too: Seamless gives
   // the migration kit the network it resolves (§7.2)
   const seen = networkList({ networks: destinationNetworks, network_details: context.networkDetails });
@@ -1144,10 +1147,8 @@ export function preflight(
   }
   if (shrinks.length)
     add('NET_MTU_SHRINK', `The MTU in ${where} is smaller: ${pyNames(shrinks)}.`);
-  for (const nic of vm.nics) {
-    if (['direct', 'direct-physical', 'macvtap'].includes(nic.vnic_type))
-      add('NET_SRIOV_PORT', `Port on ${nic.network} uses vnic_type ${nic.vnic_type}.`);
-  }
+  const sriov = vm.nics.filter((nic) => ['direct', 'direct-physical', 'macvtap'].includes(nic.vnic_type)).map((nic) => nic.network);
+  if (sriov.length) add('NET_SRIOV_PORT', `SR-IOV/macvtap port(s) on: ${pyNames(sriov)}.`);
   const oddPorts = portsWithoutOneFixedIp(withPlannedAddresses(plan, vm));
   if (sourceKind !== 'vmware' && oddPorts.length && plan.port_creation_mode !== 'neutron')
     add('NET_PORT_IPS', `NIC(s) without exactly one fixed IP: ${describePorts(oddPorts)}. Cold and warm migration cannot recreate them; storage handover keeps one address per port.`);
@@ -1181,7 +1182,7 @@ export function preflight(
   for (const [code, message] of nicOverrideFindings(vm, sourceKind, plan, destinationNetworks, context))
     add(code, message);
   if ('pci_passthrough:alias' in vm.flavor_extra_specs)
-    add('VM_PCI_PASSTHROUGH', 'Flavor requests PCI passthrough.');
+    add('VM_PCI_PASSTHROUGH', `Flavor requests PCI passthrough (${vm.flavor_extra_specs['pci_passthrough:alias']}).`);
   if ('resources:VGPU' in vm.flavor_extra_specs)
     add('VM_VGPU', 'Flavor requests a vGPU (resources:VGPU).');
   const encrypted = vm.disks.filter((d) => d.encrypted).map((d) => d.name || d.id);
@@ -1196,16 +1197,12 @@ export function preflight(
     add('GUEST_CONVERSION_UNVERIFIED', `Converting ${guest.label} with virt-v2v is ${guest.v2v === 'tech_preview' ? 'a Technology Preview' : 'not supported by Red Hat'}.`);
   if (sourceKind === 'vmware' && guest.v2v === 'unsupported')
     add('GUEST_CONVERSION_UNSUPPORTED', `virt-v2v on the RHEL 9 conversion host cannot prepare ${guest.label}.`);
-  if (sourceKind === 'vmware') {
-    if (vm.cbt_enabled === false)
-      add('VMW_CBT_DISABLED', 'Changed Block Tracking is disabled; only cold migration is possible.');
-    if (vm.disks.some((d) => d.independent))
-      add('VMW_INDEPENDENT_DISK', 'An independent disk cannot be tracked by CBT.');
-    if (vm.snapshot_count > 0)
-      add('VMW_SNAPSHOTS_PRESENT', `${vm.snapshot_count} VMware snapshots exist.`);
-    if (vm.tools_ok === false)
-      add('VMW_TOOLS_MISSING', 'VMware Tools are not running; graceful shutdown may time out.');
-  }
+  // by the VM's own fields, as the API's: only VMware's inventory sets them
+  if (vm.cbt_enabled === false) add('VMW_CBT_DISABLED', 'Changed Block Tracking is disabled.');
+  const independent = vm.disks.filter((d) => d.independent).map((d) => d.name || d.id);
+  if (independent.length) add('VMW_INDEPENDENT_DISK', `Independent disk(s): ${pyNames(independent)}.`);
+  if (vm.snapshot_count > 0) add('VMW_SNAPSHOTS_PRESENT', `The VM has ${vm.snapshot_count} snapshot(s).`);
+  if (vm.tools_ok === false) add('VMW_TOOLS_MISSING', 'VMware Tools are not running.');
   // as the API words it (SDD §9.3, §16, review RV20-08): every volume whose type handover cannot map
   const unmappedTypes = vm.disks.filter((d) => d.kind === 'volume' && !Object.hasOwn(plan.handover.backend_map, d.volume_type || '')).map((d) => d.volume_type || '<default>');
   if (plan.handover.enabled && unmappedTypes.length)
