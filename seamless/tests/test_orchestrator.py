@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from seamless_migrate import store as store_module
 from seamless_migrate.ai.advisor import Advisor
 from seamless_migrate.ai.jev import JevClient
 from seamless_migrate.ai.knowledge import KnowledgeService
@@ -6183,28 +6182,8 @@ async def test_a_store_error_reading_the_destination_never_loses_the_source_runn
     assert f"its data diverges from {DST_PROVIDER.name};" in alert.message
 
 
-def _refuse_event_once(monkeypatch, kind: str) -> list[str]:
-    """The events table's insert refusing one row of ``kind``, once - in whatever transaction the
-    store writes it (review RV21-04); the list names what it refused."""
-    real_insert = store_module.events.insert
-    failed: list[str] = []
-
-    class RefusedOnce:
-        def __init__(self):
-            self.statement = real_insert()
-
-        def values(self, **row):
-            if row.get("kind") == kind and not failed:
-                failed.append(kind)
-                raise RuntimeError("the store was briefly unavailable")
-            return self.statement.values(**row)
-
-    monkeypatch.setattr(store_module.events, "insert", RefusedOnce)
-    return failed
-
-
 async def test_a_store_error_writing_the_alert_never_leaves_the_flag_without_it(
-    tmp_path, store, monkeypatch, caplog
+    tmp_path, store, refuse_events_insert, caplog
 ):
     """SDD §8.1 (review RV21-04, the owner's choice): the flag and its migration.source_running
     alert are one store transaction. An alert the store cannot append leaves neither, logged, and
@@ -6213,7 +6192,8 @@ async def test_a_store_error_writing_the_alert_never_leaves_the_flag_without_it(
     h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
     m = await h.by_vm(plan.id, "vm-1")
     h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
-    failed = _refuse_event_once(monkeypatch, "migration.source_running")
+    # refused when its insert runs, after the flag's update ran (review RV23-08)
+    failed = refuse_events_insert(store, "migration.source_running")
 
     def alerts():
         events = store.events(since_seq=0, limit=100000)
@@ -6231,7 +6211,7 @@ async def test_a_store_error_writing_the_alert_never_leaves_the_flag_without_it(
 
 @pytest.mark.parametrize("seen", ["stopped", "gone"])
 async def test_a_store_error_writing_the_stopped_event_never_clears_the_flag_without_it(
-    tmp_path, store, monkeypatch, seen
+    tmp_path, store, refuse_events_insert, seen
 ):
     """SDD §8.1 (review RV21-04): clearing the flag and its migration.source_stopped event are one
     store transaction too, for a source seen stopped or gone - an event the store cannot append
@@ -6245,7 +6225,7 @@ async def test_a_store_error_writing_the_stopped_event_never_clears_the_flag_wit
         h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "stopped"})
     else:
         del h.source.vms["vm-1"]
-    failed = _refuse_event_once(monkeypatch, "migration.source_stopped")
+    failed = refuse_events_insert(store, "migration.source_stopped")
 
     def stops():
         events = store.events(since_seq=0, limit=100000)

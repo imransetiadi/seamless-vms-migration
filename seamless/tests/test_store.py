@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 import pytest
 import sqlalchemy as sa
 
-from seamless_migrate import store as store_module
 from seamless_migrate.domain.enums import Phase, PlanStatus
 from seamless_migrate.domain.models import Event, Migration, Plan, Provider
 from seamless_migrate.events import AUDIT_KINDS
@@ -30,10 +29,13 @@ def test_put_get_roundtrip(any_store: Store):
         any_store.get("plan", "plan-missing", Plan)
 
 
-def test_put_with_event_writes_the_document_and_its_event_together(any_store: Store, monkeypatch):
+def test_put_with_event_writes_the_document_and_its_event_together(
+    any_store: Store, refuse_events_insert
+):
     """SDD §11, §8.1 (review RV21-04): a versioned update and its event in one transaction - both
     are written, or neither: a version conflict, or an event the store cannot append, leaves the
-    document as it was and no event."""
+    document as it was and no event. The event is refused when its insert runs, after the update
+    ran: a write split over two transactions fails this (review RV23-08)."""
     mig = make_migration()
     version = any_store.put("migration", mig)
     flagged = mig.model_copy(
@@ -55,13 +57,10 @@ def test_put_with_event_writes_the_document_and_its_event_together(any_store: St
         any_store.put_with_event("migration", flagged, event, version + 1)
     neither()
 
-    def refused():
-        raise RuntimeError("the store was briefly unavailable")
-
-    with monkeypatch.context() as patched:
-        patched.setattr(store_module.events, "insert", refused)
-        with pytest.raises(RuntimeError):
-            any_store.put_with_event("migration", flagged, event, version)
+    refused = refuse_events_insert(any_store, "migration.source_running")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        any_store.put_with_event("migration", flagged, event, version)
+    assert refused == ["migration.source_running"]
     neither()
     saved, written = any_store.put_with_event("migration", flagged, event, version)
     assert saved == version + 1 and written.seq is not None
