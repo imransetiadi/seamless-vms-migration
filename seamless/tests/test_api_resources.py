@@ -86,6 +86,7 @@ def test_provider_crud(api):
         "keypairs",  # SDD §11
         "subnets",  # SDD §11: where a NIC's addresses must lie
         "network_details",  # SDD §11: what a NIC's network name resolves to
+        "roles",  # SDD §10: the token's role names, read live (review RV19-01)
     }
 
     # a provider used by a non-terminal plan cannot be deleted

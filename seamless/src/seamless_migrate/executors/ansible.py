@@ -1182,7 +1182,11 @@ class AnsibleExecutor:
             raise TransientStepError(f"could not read the destination's networks: {exc}") from exc
         networks = list(getattr(inventory, "network_details", None) or [])
         subnets = list(getattr(inventory, "subnets", None) or [])
-        roles = ctx.destination.capabilities.get("roles")
+        # the token's roles read now with the inventory, as the handover's step 0 and the
+        # collection read them; the check report's only when they cannot be read - a report new
+        # credentials reset names none (SDD §7.2, §10, review RV19-01)
+        live = getattr(inventory, "roles", None)
+        roles = live if live is not None else ctx.destination.capabilities.get("roles")
         vm = ctx.migration.vm
         out: dict[str, str] = {}
         problems: list[str] = []
@@ -1213,6 +1217,12 @@ class AnsibleExecutor:
                 continue
             profile = policy_profile_of(ctx.destination.capabilities, ctx.destination)
             refused = port_refusal(network, roles, profile)
+            if roles is None and refused is None and port_refusal(network, [], profile):
+                # no roles to judge, and a port there needs one: never let through (RV19-01)
+                refused = (
+                    "the credential's token roles could not be read, and a port there needs a "
+                    "role: check the destination provider, then retry"
+                )
             if refused:
                 problem = (
                     f"{what} cannot go to network {name!r} of {ctx.destination.name} "

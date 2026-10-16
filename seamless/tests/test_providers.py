@@ -77,7 +77,9 @@ async def test_fake_destination_inventory_and_servers():
     inv = await dst.inventory()
     assert isinstance(inv, DestinationInventory)
     assert inv.flavors and inv.volume_types and inv.quotas and inv.networks
+    # the demo's token, read with the inventory as its check reports it (SDD §10, RV19-01)
     caps = await dst.check()
+    assert inv.roles == caps["roles"] == ["admin", "member", "reader"]
     assert caps["admin"] is True and caps["ovn"] is True
     server = await dst.get_server("srv-1")
     assert server["status"] == "ACTIVE" and server["ports"][0]["status"] == "ACTIVE"
@@ -884,6 +886,26 @@ async def test_openstack_volume_disks_carry_their_cinder_pool(stub_openstack):
     root, data = vm.disks
     assert root.pool == "overcloud@ontap_nfs#192.0.2.5:/cinder_vol"
     assert data.pool is None  # host attribute hidden from non-admin credentials
+
+
+async def test_a_destinations_inventory_reads_its_tokens_roles_live(stub_openstack):
+    """Review RV19-01, SDD §10: the destination inventory carries its token's role names, read with
+    it for every run - what the VMware kit's map judges, not a check report new credentials may
+    have reset. A token whose roles cannot be read gives None; a source inventory has none."""
+    conn = fake_conn(admin=False)
+    stub_openstack(conn)
+    destination = make_provider(id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination)
+    assert (await OpenStackProvider(destination, settings()).inventory()).roles == [
+        "member",
+        "reader",
+    ]
+
+    def unreadable(session):
+        raise RuntimeError("the token has expired")
+
+    conn.session = NS(auth=NS(get_access=unreadable))
+    assert (await OpenStackProvider(destination, settings()).inventory()).roles is None
+    assert not hasattr(await OpenStackProvider(make_provider(), settings()).inventory(), "roles")
 
 
 async def test_openstack_destination_inventory(stub_openstack):

@@ -375,6 +375,11 @@ class OpenStackProvider:
             for s in conn.network.subnets()
             if _attr(s, "network_id") in names
         ]
+        # the token's role names, read now: a check report new credentials reset names none
+        # (SDD §10, §7.2, review RV19-01)
+        roles = _try(
+            lambda: sorted(set(conn.session.auth.get_access(conn.session).role_names or [])), None
+        )
         return DestinationInventory(
             networks=networks,
             flavors=flavors,
@@ -384,6 +389,7 @@ class OpenStackProvider:
             keypairs=keypairs,
             subnets=subnets,
             network_details=network_details,
+            roles=roles,
         )
 
     @staticmethod

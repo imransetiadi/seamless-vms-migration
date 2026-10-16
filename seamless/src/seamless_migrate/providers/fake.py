@@ -448,6 +448,8 @@ class FakeDestinationProvider:
             volume_types=["ceph-ssd", "ceph-hdd", "netapp-nfs", "__DEFAULT__"],
             quotas={"finance": dict(free), "dc2": dict(free)},
             projects=["finance", "dc2"],
+            # the demo's admin token, as its check reports it (SDD §10, RV19-01)
+            roles=["admin", "member", "reader"],
             network_details=[
                 {
                     "id": f"net-{name}",

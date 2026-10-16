@@ -125,6 +125,7 @@ class FakeImpl:
         return DestinationInventory(
             network_details=list(self.registry.networks),
             subnets=[dst_subnet(n) for n in self.registry.networks] + self.registry.subnets,
+            roles=self.registry.roles,
         )
 
 
@@ -164,6 +165,9 @@ class FakeRegistry:
         # the destination's ports (SDD §10 DestinationProvider.ports)
         self.ports: list[dict] = []
         self.ports_error = False
+        # the token's role names the destination inventory reads live; None: it could not
+        # (SDD §10, review RV19-01)
+        self.roles: list[str] | None = None
 
     def get(self, provider):
         return FakeImpl(self)
@@ -542,6 +546,58 @@ async def test_the_cutover_port_refusal_follows_the_policy_profile(env):
         with pytest.raises(PermanentStepError, match=rule):
             await env.executor.run(StepName.CUTOVER, token(roles, profile)[0])
         assert len(read_log(env.log)) == ran, (roles, profile)
+
+
+def _kit_cutover_to_another_projects_network(env, capabilities):
+    """A VMware cutover of a NIC on another project's shared network, to a declared secure-RBAC
+    community destination whose check report is ``capabilities``."""
+    env.registry.networks.append(dst_net("shared-net", own=False))
+    shared = Nic(
+        network="shared-net",
+        mac="00:50:56:00:00:04",
+        fixed_ips=["10.0.0.7"],
+        network_key="dvportgroup-9",
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=Mappings())
+    vm = make_vm(source_id="srv-1", name="web-01", nics=[shared])
+    mig = make_migration(id="mig-00000000ab", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_warm)
+    secure = DST.model_copy(
+        update={
+            "kind": ProviderKind.openstack,
+            "policy_profile": "secure_rbac",
+            "capabilities": capabilities,
+        }
+    )
+    return make_ctx(plan, mig, VCENTER, secure, env.settings)[0]
+
+
+async def test_after_a_reset_report_the_kits_map_judges_the_tokens_live_roles(env):
+    """Review RV19-01: the kit's map judged the roles of the stored check report, and a report reset
+    to {} - new credentials, allowed while a plan runs - names none, so every token passed and
+    Neutron refused the port after the kit powered the VM off. It judges the roles the destination
+    inventory reads live, as the handover's step 0 and the collection do (SDD §7.2, §10)."""
+    ctx = _kit_cutover_to_another_projects_network(env, {})
+    env.registry.roles = ["advsvc", "member"]  # the new credential's token
+    with pytest.raises(PermanentStepError, match="secure-RBAC defaults let only the admin or ser"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []  # refused before the kit powers the VM off
+    env.registry.roles = ["service", "member"]
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["playbook"] == "os_migrate.vmware_migration_kit.migration"
+
+
+async def test_the_kits_map_refuses_a_nic_that_needs_a_role_when_no_roles_can_be_read(env):
+    """Review RV19-01: neither the inventory nor the check report names the token's roles: a NIC
+    that needs one is refused before the power-off, never let through (SDD §7.2)."""
+    ctx = _kit_cutover_to_another_projects_network(env, {})
+    with pytest.raises(PermanentStepError, match="roles could not be read") as refused:
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert "shared-net" in str(refused.value) and read_log(env.log) == []
+    # a report that still names the roles is judged by them, as before
+    env.registry.networks.pop()
+    ctx = _kit_cutover_to_another_projects_network(env, {"roles": ["service"]})
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["playbook"] == "os_migrate.vmware_migration_kit.migration"
 
 
 async def test_a_warm_cutover_after_new_credentials_writes_the_declared_profile(env, monkeypatch):

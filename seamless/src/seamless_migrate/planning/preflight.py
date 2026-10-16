@@ -46,6 +46,9 @@ class DestinationInventory:
     #: [{id, name, mtu, project_id, own, shared, external}]: every network the credential sees, what
     #: a NIC's network name resolves to (SDD §10, §7.3 step 0)
     network_details: list[dict[str, Any]] = field(default_factory=list)
+    #: the role names of the credential's token, read with the inventory - live for every run -;
+    #: None when they cannot be read: what the VMware kit's map judges (SDD §10, §7.2, RV19-01)
+    roles: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
