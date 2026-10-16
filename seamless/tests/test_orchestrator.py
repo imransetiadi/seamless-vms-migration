@@ -16,7 +16,14 @@ from seamless_migrate.ai.memory import MemoryClient
 from seamless_migrate.ai.redaction import redact
 from seamless_migrate.ai.snapshots import canonical_json
 from seamless_migrate.config import Settings
-from seamless_migrate.domain.enums import DecisionStatus, Phase, PlanStatus, ReasonCode, Strategy
+from seamless_migrate.domain.enums import (
+    DecisionStatus,
+    Phase,
+    PlanStatus,
+    ProviderKind,
+    ReasonCode,
+    Strategy,
+)
 from seamless_migrate.domain.models import (
     AdvisorNote,
     AdvisorPolicy,
@@ -3682,6 +3689,36 @@ async def test_the_question_to_jev_names_the_destination_by_kind_never_its_provi
     assert "ACME" not in json.dumps(snapshot.payload)
     assert session.calls and session.calls[0][0] == "jev_decide"
     assert "ACME" not in json.dumps(session.calls, default=str)
+
+
+class _Settling(StaticDestination):
+    """A community destination whose check - the one validation runs - settles 2026.2."""
+
+    async def check(self):
+        return {**await super().check(), "release_range": ["2026.2"], "release": "2026.2"}
+
+
+@pytest.mark.parametrize("stored", [{"release": "2025.1"}, {}], ids=["earlier", "reset"])
+async def test_the_question_to_jev_names_the_series_the_validations_own_check_settled(
+    tmp_path, store, stored
+):
+    """SDD §13.4 (review RV21-01): the question names the destination by the series the check
+    this validation runs settled - the report it judges with - never by the report stored before
+    it: an earlier series, or none after a credentials reset."""
+    advisor, _ = _tie_advisor("warm", 0.9)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor, destination=_Settling()
+    )
+    store.put(
+        "provider",
+        DST_PROVIDER.model_copy(update={"kind": ProviderKind.openstack, "capabilities": stored}),
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    assert store.get("provider", DST_PROVIDER.id, Provider).capabilities["release"] == "2026.2"
+    [rec] = _recommendations(store)
+    snapshot = store.get("advisor_snapshot", rec.input_snapshot_sha256, AdvisorSnapshot)
+    decision = snapshot.payload["arguments"]["decision"]
+    assert decision.endswith(" moving to a community OpenStack 2026.2 destination?"), decision
 
 
 def _finance(plan) -> AdvisorPolicy:

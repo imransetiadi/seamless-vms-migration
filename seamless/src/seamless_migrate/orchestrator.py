@@ -766,13 +766,15 @@ class Orchestrator:
             advice = None
             if self.advisor is not None and automatic and chooses:
                 # the destination by kind and series: its provider's name never leaves for Jev
-                # (SDD §1 naming, §13.4)
+                # (SDD §1 naming, §13.4) - the series this validation's own check settled, the
+                # report it judges with, never the one stored before it (review RV21-01)
+                checked = destination.model_copy(update={"capabilities": dst_caps})
                 advice = await self.advisor.recommend_strategy(
                     vm,
                     estimates,
                     plan,
                     findings,
-                    destination_descriptor(destination),
+                    destination_descriptor(checked),
                     destination.label,
                 )
             decision = None
