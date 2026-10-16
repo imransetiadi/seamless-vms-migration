@@ -44,6 +44,7 @@ import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { providerLabel } from '../lib/providerUse';
 import { buildStrategyEvidence } from './mockEvidence';
+import { FINDING_CATALOG } from './findingCatalog';
 import { derivePlanStatus } from './mockPlanStatus';
 import { isDatabase, suggestProbes } from './mockProbes';
 
@@ -978,20 +979,6 @@ export function eligibility(
 // Pre-flight findings (subset of SDD §9.3)
 // -------------------------------------------------------------------------------------------
 
-const NIC_OVERRIDE_REMEDIATION: Record<string, string> = {
-  MAP_NIC_OVERRIDE_INVALID:
-    "Fix the VM's network overrides on its migration page: an existing destination network, addresses inside its subnets, each given once in the plan. VMware VMs take none.",
-  MAP_NIC_OVERRIDE: 'Nothing to do: each NIC goes where its override says.',
-};
-
-/** The API's catalog remediations of the network checks (SDD §9.3). */
-const NETWORK_REMEDIATION = {
-  MAP_NETWORK_AMBIGUOUS:
-    "Send the NIC to a name one destination network carries: one of the credential's project, or the only one of that name - map its network to such a name, or rename one of the networks.",
-  NET_ADDRESS_REFUSED:
-    'Give the NIC an address its destination network takes: map its network to one whose subnets hold it, or set the address in a NIC override; for a SLAAC address keep the MAC (port_creation_mode "neutron").',
-};
-
 /** What lets another project's shared network take the port, by the destination's policy profile: the API's _PORT_ROLE_ADVICE (SDD §21.5). */
 const PORT_ROLE_ADVICE: Record<PolicyProfile, string> = {
   secure_rbac: "the destination credential has the service role for the migration window (Neutron's secure-RBAC defaults); admin is not needed for this",
@@ -1088,24 +1075,22 @@ export function preflight(
   const findings: Finding[] = [];
   // the destination provider a message about the destination cloud names, as the API's (SDD §1 naming, §9.3)
   const where = context.destination ?? 'the destination';
-  const add = (code: string, severity: Finding['severity'], message: string, remediation: string | null, strategies: Strategy[] = []) =>
-    findings.push({ code, severity, message, remediation, strategies });
+  const add = (code: string, message: string, own: { remediation?: string } = {}) => {
+    // the catalog's severity, strategies and remediation, unless the finding gives its own: the API's finding() (SDD §9.3)
+    const entry = FINDING_CATALOG[code]!;
+    findings.push({ code, severity: entry.severity, message, remediation: own.remediation || entry.remediation, strategies: [...entry.strategies] });
+  };
 
-  if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', 'blocker', `${vm.name} is in ERROR state at the source.`, 'Repair or reset the source instance, then re-validate.');
-  if (vm.power_state === 'transitioning') add('SRC_VM_TRANSITIONAL_STATE', 'blocker', `${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot).`, 'Wait until the VM is ACTIVE or SHUTOFF, then re-validate.');
+  if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', `${vm.name} is in ERROR state at the source.`);
+  if (vm.power_state === 'transitioning') add('SRC_VM_TRANSITIONAL_STATE', `${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot).`);
   // the other selected VMs of that name, by their project and id, as the API words them (SDD §9.3)
   const twins = (context.selected ?? [vm]).filter((v) => v.source_id !== vm.source_id && v.name === vm.name);
   if (twins.length)
-    add(
-      'SRC_VM_DUPLICATE_NAME',
-      'blocker',
-      `Another selected VM is also named ${pyRepr(vm.name)} (${pyNames(twins.map((t) => `${t.project || '-'}/${t.source_id}`))}); os-migrate selects workloads by name.`,
-      'Rename one of the instances or split them into separate plans.',
-    );
+    add('SRC_VM_DUPLICATE_NAME', `Another selected VM is also named ${pyRepr(vm.name)} (${pyNames(twins.map((t) => `${t.project || '-'}/${t.source_id}`))}); os-migrate selects workloads by name.`);
   if (vm.disks.some((d) => d.multiattach))
-    add('SRC_VM_MULTIATTACH', 'warning', 'A multi-attach volume is attached; warm and storage handover are not possible.', 'Detach the shared volume or migrate cold during a window.', ['warm', 'storage_handover']);
+    add('SRC_VM_MULTIATTACH', 'A multi-attach volume is attached; warm and storage handover are not possible.');
   if (vm.disks[0] && (vm.disks[0].kind === 'image_root' || vm.disks[0].kind === 'ephemeral'))
-    add('SRC_VM_EPHEMERAL_ROOT', 'info', 'Root disk is image-backed; each warm pass snapshots the server to Glance.', 'Expect slower pre-copy passes (boot_disk_copy).', ['warm']);
+    add('SRC_VM_EPHEMERAL_ROOT', 'Root disk is image-backed; each warm pass snapshots the server to Glance.');
   // every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); a VMware NIC's too: Seamless gives
   // the migration kit the network it resolves (§7.2)
   const seen = networkList({ networks: destinationNetworks, network_details: context.networkDetails });
@@ -1119,7 +1104,7 @@ export function preflight(
     else if (why) ambiguous.push(`${(nic.mac ?? '?').toLowerCase()} (${nic.network}): ${why}`);
   }
   if (ambiguous.length)
-    add('MAP_NETWORK_AMBIGUOUS', 'blocker', `The cutover cannot tell these networks of ${where} apart: ${ambiguous.join('; ')}.`, NETWORK_REMEDIATION.MAP_NETWORK_AMBIGUOUS);
+    add('MAP_NETWORK_AMBIGUOUS', `The cutover cannot tell these networks of ${where} apart: ${ambiguous.join('; ')}.`);
   // whether the credential may put each NIC's port on its resolved network, as the API (SDD §6.6, §9.3); the VMware
   // migration kit creates every port with the NIC's MAC (§7.2)
   const denied: string[] = [];
@@ -1129,7 +1114,7 @@ export function preflight(
     if (network && why) denied.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)} (project ${network.project_id ?? 'None'}): ${why}`);
   }
   if (denied.length)
-    add('NET_PORT_NOT_PERMITTED', 'blocker', `The credential of ${where} may not put these NICs on their network: ${denied.join('; ')}.`, portRemediation(context.profile));
+    add('NET_PORT_NOT_PERMITTED', `The credential of ${where} may not put these NICs on their network: ${denied.join('; ')}.`, { remediation: portRemediation(context.profile) });
   // a network RHOSO lacks, as the API words it (SDD §9.3): a NIC its override sends elsewhere is checked by
   // MAP_NIC_OVERRIDE_INVALID; pre-staging creates same-named networks for OpenStack sources only - the VMware kit has
   // no pre-stage step (§4.2, §7.2); nothing creates a network under a mapping's target name
@@ -1143,22 +1128,12 @@ export function preflight(
     .map((nic) => `${nic.network} -> ${plan.mappings.networks[nic.network]}`);
   const prestaged = plan.prestage_resources.includes('networks') && sourceKind !== 'vmware';
   if (missingNets.length && prestaged)
-    add(
-      'MAP_NETWORK_PRESTAGED',
-      'info',
-      `Pre-staging creates same-named network(s) in ${where}: ${pyNames(missingNets)}.`,
-      'Nothing to do: pre-staging creates the network on the destination with the same name. Add a network mapping to use an existing destination network instead.',
-    );
+    add('MAP_NETWORK_PRESTAGED', `Pre-staging creates same-named network(s) in ${where}: ${pyNames(missingNets)}.`);
   else if (missingNets.length)
-    add(
-      'MAP_NETWORK_MISSING',
-      'blocker',
-      `No mapping or same-named network in ${where} for: ${pyNames(missingNets)}.` +
-        (sourceKind === 'vmware' ? ' VMware sources are not pre-staged: map every port group.' : ''),
-      'Add a network mapping or create a same-named network on the destination.',
-    );
+    add('MAP_NETWORK_MISSING', `No mapping or same-named network in ${where} for: ${pyNames(missingNets)}.` +
+        (sourceKind === 'vmware' ? ' VMware sources are not pre-staged: map every port group.' : ''));
   if (badNetTargets.length)
-    add('MAP_NETWORK_MISSING', 'blocker', `Network mapping target(s) do not exist in ${where}: ${pyNames(badNetTargets)}.`, 'Fix the mapping: the destination network must exist.');
+    add('MAP_NETWORK_MISSING', `Network mapping target(s) do not exist in ${where}: ${pyNames(badNetTargets)}.`, { remediation: 'Fix the mapping: the destination network must exist.' });
   // one finding for every NIC whose network is smaller, worded as the API's (SDD §9.3, §16, review RV20-05)
   const shrinks: string[] = [];
   for (const nic of vm.nics) {
@@ -1168,19 +1143,14 @@ export function preflight(
       shrinks.push(target === mappedNetwork(plan.mappings.networks, nic.network) ? `${nic.network} ${nic.mtu} -> ${dstMtu}` : `${nic.network} ${nic.mtu} -> ${target} ${dstMtu}`);
   }
   if (shrinks.length)
-    add('NET_MTU_SHRINK', 'warning', `The MTU in ${where} is smaller: ${pyNames(shrinks)}.`, 'Lower the guest MTU or map to a destination network with a larger MTU (ML2/OVN Geneve networks typically use 1442).');
+    add('NET_MTU_SHRINK', `The MTU in ${where} is smaller: ${pyNames(shrinks)}.`);
   for (const nic of vm.nics) {
     if (['direct', 'direct-physical', 'macvtap'].includes(nic.vnic_type))
-      add('NET_SRIOV_PORT', 'warning', `Port on ${nic.network} uses vnic_type ${nic.vnic_type}.`, 'SR-IOV/macvtap ports need an equivalent physnet on the destination; map the network accordingly.');
+      add('NET_SRIOV_PORT', `Port on ${nic.network} uses vnic_type ${nic.vnic_type}.`);
   }
   const oddPorts = portsWithoutOneFixedIp(withPlannedAddresses(plan, vm));
   if (sourceKind !== 'vmware' && oddPorts.length && plan.port_creation_mode !== 'neutron')
-    add(
-      'NET_PORT_IPS',
-      'warning',
-      `NIC(s) without exactly one fixed IP: ${describePorts(oddPorts)}. Cold and warm migration cannot recreate them; storage handover keeps one address per port.`,
-      'Turn on "Keep MAC addresses and every fixed IP" in the plan (port_creation_mode "neutron"), give each such port exactly one fixed IP before the cutover, or migrate the VM by storage handover when its ports have at most one address each.',
-    );
+    add('NET_PORT_IPS', `NIC(s) without exactly one fixed IP: ${describePorts(oddPorts)}. Cold and warm migration cannot recreate them; storage handover keeps one address per port.`);
   // a NIC without an override keeps its own addresses: Neutron must take them on its resolved network (SDD §9.3, §6.6)
   if (sourceKind !== 'vmware' && context.subnets?.length) {
     const neutron = plan.port_creation_mode === 'neutron';
@@ -1195,7 +1165,7 @@ export function preflight(
       }
     }
     if (refused.length)
-      add('NET_ADDRESS_REFUSED', 'blocker', `Neutron would refuse these addresses on their network in ${where}: ${refused.join('; ')}.`, NETWORK_REMEDIATION.NET_ADDRESS_REFUSED);
+      add('NET_ADDRESS_REFUSED', `Neutron would refuse these addresses on their network in ${where}: ${refused.join('; ')}.`);
   }
   // the VMware migration kit sends a NIC's IPv4 guest addresses only, all with one subnet of its network (SDD §7.2, §9.3)
   if (sourceKind === 'vmware' && context.subnets?.length) {
@@ -1206,49 +1176,44 @@ export function preflight(
       if (network && why) refused.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)}: ${why}`);
     }
     if (refused.length)
-      add('NET_ADDRESS_REFUSED', 'blocker', `Neutron would refuse these addresses on their network in ${where}: ${refused.join('; ')}.`, NETWORK_REMEDIATION.NET_ADDRESS_REFUSED);
+      add('NET_ADDRESS_REFUSED', `Neutron would refuse these addresses on their network in ${where}: ${refused.join('; ')}.`);
   }
   for (const [code, message] of nicOverrideFindings(vm, sourceKind, plan, destinationNetworks, context))
-    add(code, code === 'MAP_NIC_OVERRIDE' ? 'info' : 'blocker', message, NIC_OVERRIDE_REMEDIATION[code] ?? null);
+    add(code, message);
   if ('pci_passthrough:alias' in vm.flavor_extra_specs)
-    add('VM_PCI_PASSTHROUGH', 'blocker', 'Flavor requests PCI passthrough.', 'PCI passthrough devices cannot be migrated; rebuild the VM with an equivalent flavor.');
+    add('VM_PCI_PASSTHROUGH', 'Flavor requests PCI passthrough.');
   if ('resources:VGPU' in vm.flavor_extra_specs)
-    add('VM_VGPU', 'blocker', 'Flavor requests a vGPU (resources:VGPU).', 'vGPU instances cannot be migrated; rebuild the VM with a vGPU flavor of the destination.');
+    add('VM_VGPU', 'Flavor requests a vGPU (resources:VGPU).');
   const encrypted = vm.disks.filter((d) => d.encrypted).map((d) => d.name || d.id);
   if (encrypted.length)
-    add('VOL_ENCRYPTED', 'warning', `Encrypted disk(s): ${pyNames(encrypted)}.`, 'The Barbican key must be re-created on the destination before the volume can be attached.');
+    add('VOL_ENCRYPTED', `Encrypted disk(s): ${pyNames(encrypted)}.`);
   const guest = guestOsOf(vm);
   if (guest.lifecycle === 'legacy')
-    add('GUEST_OS_LEGACY', 'warning', `Guest OS ${guest.label} is out of standard vendor support.`, 'Out of vendor support: it still migrates; test the application on the destination, check the virtio drivers and plan a longer verification.');
+    add('GUEST_OS_LEGACY', `Guest OS ${guest.label} is out of standard vendor support.`);
   if (guest.family === 'unknown')
-    add('GUEST_OS_UNKNOWN', 'info', `The guest OS is not identified${vm.os_type ? ` (${vm.os_type})` : ''}.`, 'Set the os_distro and os_version image properties or run VMware Tools; verification uses the Linux profile meanwhile.');
+    add('GUEST_OS_UNKNOWN', `The guest OS is not identified${vm.os_type ? ` (${vm.os_type})` : ''}.`);
   if (sourceKind === 'vmware' && (guest.v2v === 'tech_preview' || guest.v2v === 'unverified'))
-    add('GUEST_CONVERSION_UNVERIFIED', 'warning', `Converting ${guest.label} with virt-v2v is ${guest.v2v === 'tech_preview' ? 'a Technology Preview' : 'not supported by Red Hat'}.`, 'Run a test conversion of a copy first.', ['vmware_cold', 'vmware_warm']);
+    add('GUEST_CONVERSION_UNVERIFIED', `Converting ${guest.label} with virt-v2v is ${guest.v2v === 'tech_preview' ? 'a Technology Preview' : 'not supported by Red Hat'}.`);
   if (sourceKind === 'vmware' && guest.v2v === 'unsupported')
-    add('GUEST_CONVERSION_UNSUPPORTED', 'warning', `virt-v2v on the RHEL 9 conversion host cannot prepare ${guest.label}.`, 'Install the virtio storage and network drivers from an older virtio-win release inside the guest and test the conversion, or migrate the VM another way.', ['vmware_cold', 'vmware_warm']);
+    add('GUEST_CONVERSION_UNSUPPORTED', `virt-v2v on the RHEL 9 conversion host cannot prepare ${guest.label}.`);
   if (sourceKind === 'vmware') {
     if (vm.cbt_enabled === false)
-      add('VMW_CBT_DISABLED', 'warning', 'Changed Block Tracking is disabled; only cold migration is possible.', 'Enable CBT (requires a power cycle) or accept a cold window.', ['vmware_warm']);
+      add('VMW_CBT_DISABLED', 'Changed Block Tracking is disabled; only cold migration is possible.');
     if (vm.disks.some((d) => d.independent))
-      add('VMW_INDEPENDENT_DISK', 'warning', 'An independent disk cannot be tracked by CBT.', 'Convert the disk to dependent mode or migrate cold.', ['vmware_warm']);
+      add('VMW_INDEPENDENT_DISK', 'An independent disk cannot be tracked by CBT.');
     if (vm.snapshot_count > 0)
-      add('VMW_SNAPSHOTS_PRESENT', 'warning', `${vm.snapshot_count} VMware snapshots exist.`, 'Consolidate snapshots before migration.');
+      add('VMW_SNAPSHOTS_PRESENT', `${vm.snapshot_count} VMware snapshots exist.`);
     if (vm.tools_ok === false)
-      add('VMW_TOOLS_MISSING', 'info', 'VMware Tools are not running; graceful shutdown may time out.', 'Install or start VMware Tools.');
+      add('VMW_TOOLS_MISSING', 'VMware Tools are not running; graceful shutdown may time out.');
   }
   // as the API words it (SDD §9.3, §16, review RV20-08): every volume whose type handover cannot map
   const unmappedTypes = vm.disks.filter((d) => d.kind === 'volume' && !Object.hasOwn(plan.handover.backend_map, d.volume_type || '')).map((d) => d.volume_type || '<default>');
   if (plan.handover.enabled && unmappedTypes.length)
-    add('HANDOVER_BACKEND_UNMAPPED', 'info', `Volume type(s) without a handover backend: ${pyNames(unmappedTypes)}.`, 'Map the volume type to a Cinder backend of the destination in handover.backend_map.', ['storage_handover']);
+    add('HANDOVER_BACKEND_UNMAPPED', `Volume type(s) without a handover backend: ${pyNames(unmappedTypes)}.`);
   // like the API (SDD §9.3, ADV-18): a database VM verified only by its boot
   if (isDatabase(vm) && probesFor(vm.source_id, plan).probes.length === 0) {
     const suggested = suggestProbes(vm);
-    add(
-      'APP_PROBE_MISSING',
-      'warning',
-      `${vm.name} is a database VM without an application probe: verification would check only that it booted.${suggested.length ? ` Suggested: ${describeProbes(suggested)}.` : ''}`,
-      "Add an application probe for its service to the plan, for every VM or for this one (probe_overrides), or use the suggested probe on the plan page.",
-    );
+    add('APP_PROBE_MISSING', `${vm.name} is a database VM without an application probe: verification would check only that it booted.${suggested.length ? ` Suggested: ${describeProbes(suggested)}.` : ''}`);
   }
   return findings;
 }

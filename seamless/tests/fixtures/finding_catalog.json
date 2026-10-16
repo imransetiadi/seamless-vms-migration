@@ -1,0 +1,227 @@
+{
+ "_comment": "planning.preflight.CATALOG (SDD §9.3): each finding code's severity, the strategies it concerns and its default remediation; a finding may give its own remediation or severity, as the API's finding() allows (MAP_NETWORK_MISSING's mapping target, NET_PORT_NOT_PERMITTED by policy profile, MAP_FLAVOR_*, MAP_VOLUME_TYPE_MISSING). test_preflight.py holds the API's catalog equal to it, and dashboard/src/api/findingCatalog.test.ts the offline mock's FINDING_CATALOG, which the mock's pre-flight reads.",
+ "catalog": {
+  "SRC_VM_ERROR_STATE": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Repair or reset the source VM (running or stopped), then re-validate."
+  },
+  "SRC_VM_TRANSITIONAL_STATE": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Wait until the Nova task finishes and the VM is ACTIVE or SHUTOFF, then re-validate."
+  },
+  "SRC_VM_VOLUME_DETACHED": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Attach the volume(s) to the source VM again, then re-validate: an earlier cutover attempt's export may have left them detached, and the migration never drops a disk the VM had at a cutover attempt. To migrate the VM without one, cancel the migration and plan the VM anew."
+  },
+  "SRC_VM_DUPLICATE_NAME": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Rename one of the VMs (os-migrate selects workloads by name) or migrate them in separate plans."
+  },
+  "SRC_VM_MULTIATTACH": {
+   "severity": "warning",
+   "strategies": [
+    "warm",
+    "storage_handover"
+   ],
+   "remediation": "Detach the shared volume before cutover or migrate the VM cold."
+  },
+  "SRC_VM_EPHEMERAL_ROOT": {
+   "severity": "info",
+   "strategies": [
+    "warm"
+   ],
+   "remediation": "The image-booted root disk is pre-copied through server snapshots (boot_disk_copy), which makes passes slower."
+  },
+  "MAP_NETWORK_MISSING": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Add a network mapping or create a same-named network on the destination."
+  },
+  "MAP_NETWORK_PRESTAGED": {
+   "severity": "info",
+   "strategies": [],
+   "remediation": "Nothing to do: pre-staging creates the network on the destination with the same name. Add a network mapping to use an existing destination network instead."
+  },
+  "MAP_FLAVOR_PRESTAGED": {
+   "severity": "info",
+   "strategies": [],
+   "remediation": "Nothing to do: pre-staging creates the flavor on the destination with the same name, size and extra specs. Add a flavor mapping to use an existing destination flavor instead."
+  },
+  "DST_KEYPAIR_MISSING": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Create the keypair (its public key) for the destination's migration user, or pre-stage keypairs when the source migration user owns it."
+  },
+  "MAP_KEYPAIR_PRESTAGED": {
+   "severity": "info",
+   "strategies": [],
+   "remediation": "Nothing to do: pre-staging imports the keypair (name and public key) for the destination's migration user."
+  },
+  "MAP_FLAVOR_MISSING": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Add a flavor mapping or create a destination flavor with enough vCPUs, RAM and root disk."
+  },
+  "MAP_FLAVOR_AUTO": {
+   "severity": "info",
+   "strategies": [],
+   "remediation": "Add an explicit flavor mapping to override the automatically matched flavor."
+  },
+  "MAP_VOLUME_TYPE_MISSING": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Add a volume type mapping; otherwise the destination default volume type is used."
+  },
+  "DST_QUOTA_INSUFFICIENT": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Raise the destination project quotas or split the plan."
+  },
+  "DST_PROJECT_MISSING": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Map the VM's project to an existing destination project (plan.mappings.projects)."
+  },
+  "NET_MTU_SHRINK": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Lower the guest MTU or map to a destination network with a larger MTU (ML2/OVN Geneve networks typically use 1442)."
+  },
+  "NET_SRIOV_PORT": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "SR-IOV/macvtap ports need an equivalent physnet on the destination; map the network accordingly."
+  },
+  "NET_PORT_IPS": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Turn on \"Keep MAC addresses and every fixed IP\" in the plan (port_creation_mode \"neutron\"), give each such port exactly one fixed IP before the cutover, or migrate the VM by storage handover when its ports have at most one address each."
+  },
+  "MAP_NETWORK_AMBIGUOUS": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Send the NIC to a name one destination network carries: one of the credential's project, or the only one of that name - map its network to such a name, or rename one of the networks."
+  },
+  "NET_ADDRESS_REFUSED": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Give the NIC an address its destination network takes: map its network to one whose subnets hold it, or set the address in a NIC override; for a SLAAC address keep the MAC (port_creation_mode \"neutron\")."
+  },
+  "NET_PORT_NOT_PERMITTED": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared network takes it once the destination credential has the role its policy profile counts: service under secure-RBAC, advsvc under the legacy rules. An external network that is not shared needs the admin role: Nova attaches it for no other."
+  },
+  "MAP_NIC_OVERRIDE_INVALID": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Fix the VM's network overrides on its migration page: an existing destination network, addresses inside its subnets, each given once in the plan. VMware VMs take none."
+  },
+  "MAP_NIC_OVERRIDE": {
+   "severity": "info",
+   "strategies": [],
+   "remediation": "Nothing to do: each NIC goes where its override says."
+  },
+  "VM_PCI_PASSTHROUGH": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "PCI passthrough devices cannot be migrated; rebuild the VM with an equivalent flavor."
+  },
+  "VM_VGPU": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "vGPU instances cannot be migrated; rebuild the VM with a vGPU flavor of the destination."
+  },
+  "VOL_ENCRYPTED": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "The Barbican key must be re-created on the destination before the volume can be attached."
+  },
+  "GUEST_OS_LEGACY": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Out of vendor support: it still migrates; test the application on the destination, check the virtio drivers and plan a longer verification."
+  },
+  "GUEST_OS_UNKNOWN": {
+   "severity": "info",
+   "strategies": [],
+   "remediation": "Set the os_distro and os_version image properties (OpenStack) or run VMware Tools so the guest can be identified; verification uses the Linux profile meanwhile."
+  },
+  "GUEST_CONVERSION_UNVERIFIED": {
+   "severity": "warning",
+   "strategies": [
+    "vmware_cold",
+    "vmware_warm"
+   ],
+   "remediation": "virt-v2v converts this guest but Red Hat does not support the conversion: run a test conversion of a copy first."
+  },
+  "GUEST_CONVERSION_UNSUPPORTED": {
+   "severity": "warning",
+   "strategies": [
+    "vmware_cold",
+    "vmware_warm"
+   ],
+   "remediation": "The RHEL 9 conversion host has no drivers for this guest: install the virtio storage and network drivers from an older virtio-win release inside the guest and test the conversion, or migrate the VM another way."
+  },
+  "VMW_CBT_DISABLED": {
+   "severity": "warning",
+   "strategies": [
+    "vmware_warm"
+   ],
+   "remediation": "Enable Changed Block Tracking on the VM or accept a cold migration."
+  },
+  "VMW_INDEPENDENT_DISK": {
+   "severity": "warning",
+   "strategies": [
+    "vmware_warm"
+   ],
+   "remediation": "Independent disks are excluded from snapshots; change the disk mode or migrate cold."
+  },
+  "VMW_SNAPSHOTS_PRESENT": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Consolidate or delete the VM snapshots before migrating."
+  },
+  "VMW_TOOLS_MISSING": {
+   "severity": "info",
+   "strategies": [],
+   "remediation": "Install or start VMware Tools for graceful shutdown and IP discovery."
+  },
+  "DST_CAPABILITY_MISSING": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Use a destination whose APIs provide the capability (SDD §21.4); upgrading the destination's services raises their maxima."
+  },
+  "DST_RELEASE_OUTSIDE_SUPPORT": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Prefer a Tier 1 series for production (SDD §21.1); declare the destination's series on the provider when its APIs cannot tell it, and run the destination lab matrix (QASuite §7.1) before relying on it."
+  },
+  "CONV_HOST_MISSING": {
+   "severity": "warning",
+   "strategies": [
+    "cold",
+    "warm",
+    "vmware_cold",
+    "vmware_warm"
+   ],
+   "remediation": "Configure a conversion host on the provider."
+  },
+  "HANDOVER_BACKEND_UNMAPPED": {
+   "severity": "info",
+   "strategies": [
+    "storage_handover"
+   ],
+   "remediation": "Map the volume type to a Cinder backend of the destination in handover.backend_map."
+  },
+  "APP_PROBE_MISSING": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Add an application probe for its service to the plan, for every VM or for this one (probe_overrides), or use the suggested probe on the plan page."
+  }
+ }
+}

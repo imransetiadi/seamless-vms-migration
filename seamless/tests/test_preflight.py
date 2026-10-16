@@ -89,6 +89,23 @@ def only(findings, code):
     return matches[0]
 
 
+def test_the_finding_catalog_is_the_one_the_dashboards_mock_reads():
+    """SDD §9.3, §16: each code's severity, strategies and default remediation, as the shared
+    finding_catalog.json holds them for the dashboard's offline mock - a remediation changed here
+    fails this test until the fixture, and with it the mock, says the same."""
+    shared = json.loads(
+        (Path(__file__).parent / "fixtures" / "finding_catalog.json").read_text(encoding="utf-8")
+    )["catalog"]
+    assert {
+        code: {
+            "severity": entry.severity.value,
+            "strategies": [strategy.value for strategy in entry.strategies],
+            "remediation": entry.remediation,
+        }
+        for code, entry in CATALOG.items()
+    } == shared
+
+
 def test_catalog_is_complete():
     assert set(CATALOG) == {
         "SRC_VM_ERROR_STATE",
