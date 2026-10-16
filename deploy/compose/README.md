@@ -28,7 +28,7 @@ Networks: `backend` (`internal: true`: PostgreSQL ↔ control plane, no route ou
 
   ```bash
   # RHEL 8/9/10, Rocky Linux, AlmaLinux
-  sudo dnf -y install dnf-plugins-core git make curl openssl
+  sudo dnf -y install dnf-plugins-core git make openssl   # curl is there already (curl or RHEL 9's curl-minimal)
   sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
   sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   # Ubuntu, Debian: Docker's apt repository (https://docs.docker.com/engine/install/ubuntu/ or /debian/), then
