@@ -190,8 +190,8 @@ for 0.2.0 (goal G7).
   running the secure-RBAC defaults (the upstream default from 2023.2), Neutron counts `admin` or `service`
   for such a port and `advsvc` no longer (SDD §21.5).
 * Community OpenStack destinations: Keystone v3 with project-scoped tokens (application credentials
-  recommended), compute microversion ≥ 2.60 (≥ 2.85 for storage handover), Cinder v3; a series of the
-  support window (SDD §21.1).
+  recommended), compute microversion ≥ 2.60 (a storage handover needs ≥ 2.85 on the source cloud), Cinder v3; a
+  series of the support window (SDD §21.1).
 * VMware: VDDK available on the destination's conversion host; CBT enabled for warm.
 * Jev requires a provider API key (TypeSafe direct by default); everything works with Jev off.
 * agentmemory is optional; when configured, it runs as the team's memory server.

@@ -68,7 +68,7 @@ from VMware. Seamless serves those cases and is designed to coexist with adoptio
 | Fact | Design consequence |
 |---|---|
 | Upstream releases a series every six months; each moves through Maintained, Unmaintained and End of Life; every other series is SLURP (releases.openstack.org, read 2026-10-16). | Support tiers tied to that lifecycle, from a 2023.1 Antelope floor to 2026.2 Hibiscus; the window moves with each upstream release (§21.1, §21.2). |
-| Compute's maximum microversion is 2.95 in 2023.1 and 2023.2, 2.96 in 2024.1 and 2024.2, 2.100 in 2025.1 and 2025.2, 2.103 in 2026.1 and 2.104 in 2026.2 (Nova's API microversion history). | Every series of the window has what Seamless calls for (2.60; 2.85 for storage handover); the maximum detects the series range (§21.3). |
+| Compute's maximum microversion is 2.95 in 2023.1 and 2023.2, 2.96 in 2024.1 and 2024.2, 2.100 in 2025.1 and 2025.2, 2.103 in 2026.1 and 2.104 in 2026.2 (Nova's API microversion history). | Every series of the window has what Seamless calls for (2.60; a storage handover's 2.85 is the source's, §21.4); the maximum detects the series range (§21.3). |
 | From 2023.2 oslo.policy defaults to the secure-RBAC rules (new defaults and scope); scope is always enforced from 2024.1; Neutron's `advsvc` is deprecated for the `service` role. | Permission checks follow the destination's policy profile (§21.5). |
 | Networking is ML2/OVN or ML2/OVS; TLS, the deployment tool (Kolla-Ansible, OpenStack-Ansible, DevStack) and the guest images are the operator's choice. | The MTU checks apply as on RHOSO 18.0; `verify_tls` stays on; conversion host images are part of the support statement (§21.6, §21.7). |
 
@@ -1724,7 +1724,9 @@ strategy ineligible):
 * `storage_handover`: requires `plan.handover.enabled`, every disk `kind == "volume"`, every
   `volume_type` in `plan.handover.backend_map`, no `multiattach`, no `encrypted` disk (Cinder
   cannot unmanage encrypted volumes), and `src_caps["admin"]` and
-  `dst_caps["admin"]` truthy; for every volume disk whose `pool` is known and listed in
+  `dst_caps["admin"]` truthy, and the source's `src_caps["compute_microversion"]` not below 2.85 when the check read
+  it (step 3's `delete_on_termination` update goes to the source server; the destination never receives it, §21.4);
+  for every volume disk whose `pool` is known and listed in
   `src_caps["storage_backends"]`: a family other than `other`, and — when `dst_caps` lists
   `storage_backends` — a destination pool that resolves (§7.3.1); with `plan.port_creation_mode` `"nova"`, no NIC
   with more than one fixed IP (the destination server then gets one fixed IP per port, so the others would be
@@ -1766,7 +1768,7 @@ Finding catalog (code — severity — condition):
 | `DST_KEYPAIR_MISSING` | blocker | an OpenStack VM's `key_name` names no keypair of the destination credential and pre-staging does not create it: `"keypairs"` is not in `plan.prestage_resources`, or the source credential does not own it (its owner is another user: create the keypair, its public key, for the destination credential). Without this check the cutover fails after validation, in its destination check |
 | `MAP_KEYPAIR_PRESTAGED` | info | `"keypairs"` is pre-staged and the VM's `key_name`, owned by the source credential, has no keypair of the destination credential: pre-staging imports it (the same name and public key) |
 | `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
-| `DST_CAPABILITY_MISSING` | blocker | the destination's check report (§10) gives a maximum below the floor every strategy needs (§21.4): `compute_microversion` below 2.60 or `block_storage_microversion` below 3.0; the finding names each capability, the floor and the maximum read; a maximum the check could not read is not judged; a gap one strategy alone has - compute below 2.85 for `storage_handover` - is that strategy's eligibility reason instead |
+| `DST_CAPABILITY_MISSING` | blocker | the destination's check report (§10) gives a maximum below the floor every strategy needs (§21.4): `compute_microversion` below 2.60 or `block_storage_microversion` below 3.0; the finding names each capability, the floor and the maximum read; a maximum the check could not read is not judged; a gap one strategy alone has - the source's compute below 2.85 for `storage_handover` - is that strategy's eligibility reason instead (§9.2) |
 | `DST_RELEASE_OUTSIDE_SUPPORT` | warning | the destination's `support_tier` (§10.1) is `tier3` (End of Life upstream) or `outside` (below the floor, newer than validated, not detected), or the detected range contradicts its declared `release` (`declared_outside_range`, §10.1; the tier is the range's); RHOSO 18.0 (`validated`) never; it blocks nothing - capabilities do (§21.4) |
 | `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU (the destination network: the NIC's `plan.nic_overrides` entry's network, else the mapped one, as the rule of §7.3 step 0 resolves it) |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
@@ -3395,7 +3397,7 @@ Upstream phases as releases.openstack.org shows them on 2026-10-16:
 |---|---|---|---|
 | Keystone v3, a project-scoped token | every strategy | — | the provider check (authentication) |
 | Compute API | every strategy | 2.60 (multi-attach); openstacksdk caps its calls (§21.7) | `compute_microversion` (`DST_CAPABILITY_MISSING`) |
-| Compute 2.85 (`delete_on_termination` update) | `storage_handover` (§7.3 step 0) | 2.85 | the handover's step 0 (the source); the strategy selector (the destination's, an eligibility reason) |
+| Compute 2.85 (`delete_on_termination` update of the source server, §7.3 step 3) | `storage_handover` | 2.85 on the source | the strategy selector (the source's `compute_microversion`, an eligibility reason) and the handover's step 0, before the stop |
 | Block Storage v3 | every strategy | 3.0 | the provider check; `block_storage_microversion` (`DST_CAPABILITY_MISSING`) |
 | Cinder manage and a mapped backend of the same driver family (§7.3.1) | `storage_handover` | the `admin` role | the strategy selector (eligibility) and `storage_backends` (§7.3.1) |
 | Glance v2 | an image-booted VM | — | the provider check |
@@ -3410,8 +3412,9 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
   finding names each missing capability, the floor and the maximum read.
 * A gap one strategy alone has is that strategy's eligibility reason, never a finding - a blocker finding blocks the
   migration whatever its strategy (§9.3): the strategy selector makes `storage_handover` ineligible when the
-  destination's `compute_microversion` is below 2.85 (the handover's `delete_on_termination` update), as it does
-  without the destination's `admin` (Cinder manage) and as §7.3.1's backend checks do (Jev 0.86).
+  source's `compute_microversion` is below 2.85 (the handover's `delete_on_termination` update goes to the source
+  server; the destination never receives it - review RV18-07), as it does without the destination's `admin`
+  (Cinder manage) and as §7.3.1's backend checks do (Jev 0.86).
 * The Neutron row is not judged yet: the collection sets a port's port security only when it recreates ports through
   Neutron (`port_creation_mode: "neutron"`, §6.6), and which extension each port mode needs waits for the lab
   (LAB-D04) - a blocker must not rest on an assumption (Jev 0.88).
