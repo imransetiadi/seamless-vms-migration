@@ -166,8 +166,9 @@ def test_a_declared_series_inside_the_range_decides_the_tier(compute_max, declar
         ("2.104", "2025.1", SupportTier("tier1", declared_outside_range=True)),
         ("2.105", "2026.2", SupportTier("outside", "newer_than_validated", True)),
         ("2.93", "2023.1", SupportTier("outside", "below_floor", True)),
-        # with nothing detected, any declared series is outside the (empty) range
-        (None, "2026.2", SupportTier("outside", "not_detected", True)),
+        # an empty range contradicts a series of the window, and one on its other side
+        ("2.93", "2027.1", SupportTier("outside", "below_floor", True)),
+        ("2.105", "2022.2", SupportTier("outside", "newer_than_validated", True)),
         ("2.104", "2022.2", SupportTier("tier1", declared_outside_range=True)),
     ],
 )
@@ -178,6 +179,51 @@ def test_a_declared_series_outside_the_range_warns_and_the_range_decides(
 
 
 @pytest.mark.parametrize(
+    "compute_max, declared, verdict",
+    [
+        # nothing detected: the APIs cannot tell the series, so the declared one decides
+        (None, "2026.2", SupportTier("tier1")),
+        (None, "2024.2", SupportTier("tier3", "end_of_life")),
+        (None, "2022.2", SupportTier("outside", "below_floor")),
+        (None, "2027.1", SupportTier("outside", "newer_than_validated")),
+        # below the window a series older than it, above it one newer than it
+        ("2.93", "2022.2", SupportTier("outside", "below_floor")),
+        ("2.105", "2027.1", SupportTier("outside", "newer_than_validated")),
+    ],
+)
+def test_a_declared_series_the_empty_range_does_not_contradict_decides_the_tier(
+    compute_max, declared, verdict
+):
+    """Review RV18-06: with an empty range any declared series was "outside the range", so the
+    pre-flight told an operator who declared the series - as its remediation asks when the APIs
+    cannot tell it - to correct a declaration nothing contradicts, and it changed nothing. A
+    declaration the empty range does not contradict decides; no flag is set (SDD §10.1)."""
+    assert support_tier(release_range(compute_max), declared) == verdict
+
+
+@pytest.mark.parametrize(
+    "compute_max, declared, settled, profile",
+    [
+        (None, "2026.2", "2026.2", "secure_rbac"),
+        (None, "2023.1", "2023.1", "legacy"),
+        ("2.93", "2022.2", "2022.2", "legacy"),
+        ("2.105", "2027.1", "2027.1", "secure_rbac"),
+        # contradicted: the range decides
+        ("2.53", "2026.2", None, "legacy"),
+        ("2.105", "2022.2", None, "secure_rbac"),
+    ],
+)
+def test_an_uncontradicted_declared_series_is_settled_and_decides_the_profile(
+    compute_max, declared, settled, profile
+):
+    """Review RV18-06: the series the declaration decides is the one the check settles on, and
+    the policy profile follows it (SDD §10.1, §21.5)."""
+    report = destination_release("openstack", declared, None, compute_max, None)
+    assert (report["release"], report["policy_profile"]) == (settled, profile)
+    assert report["support_tier"]["declared_outside_range"] is (settled is None)
+
+
+@pytest.mark.parametrize(
     "compute_max, declared, settled",
     [
         ("2.104", None, "2026.2"),
@@ -185,7 +231,7 @@ def test_a_declared_series_outside_the_range_warns_and_the_range_decides(
         ("2.96", "2024.1", "2024.1"),
         ("2.96", "2026.2", None),  # declared outside the range: the range decides
         ("2.105", "2026.2", None),
-        (None, "2026.2", None),
+        (None, "2026.2", "2026.2"),  # nothing detected: the declared series decides (RV18-06)
     ],
 )
 def test_a_destination_settles_on_the_declared_series_else_the_ranges_only_one(

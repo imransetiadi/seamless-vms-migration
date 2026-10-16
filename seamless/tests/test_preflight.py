@@ -9,6 +9,7 @@ from seamless_migrate.domain.models import (
     Nic,
     VerificationConfig,
 )
+from seamless_migrate.planning.platforms import destination_release
 from seamless_migrate.planning.preflight import (
     CATALOG,
     DestinationInventory,
@@ -1158,6 +1159,40 @@ def test_finding_dst_release_outside_support(release_range, support_tier, releas
     f = only(check(destination=destination, dst_caps=caps), "DST_RELEASE_OUTSIDE_SUPPORT")
     assert f.severity == Severity.warning and f.strategies == [] and f.remediation
     assert f.message == message
+
+
+@pytest.mark.parametrize(
+    "release, compute", [("2026.2", ""), ("2022.2", "2.93"), ("2027.1", "2.105")]
+)
+def test_following_the_remediation_never_asks_to_correct_a_series_nothing_contradicts(
+    release, compute
+):
+    """Review RV18-06: the warning's remediation asks for the series when the APIs cannot tell
+    it; declared so - with nothing detected, or a correct series below or above the window -, the
+    next validation told the operator its APIs do not run it: "correct the declared series"."""
+    declared = COMMUNITY.model_copy(update={"release": release})
+    caps = destination_release("openstack", release, None, compute, "")
+    told = [
+        f.message
+        for f in check(destination=declared, dst_caps=caps)
+        if f.code == "DST_RELEASE_OUTSIDE_SUPPORT" and "correct the declared series" in f.message
+    ]
+    assert told == []
+
+
+def test_declaring_the_series_settles_the_unknown_profile_the_refusal_asks_about():
+    """Review RV18-06: under the unknown profile NET_PORT_NOT_PERMITTED asks to declare the
+    provider's policy profile or series; with nothing detected a declared series was ignored, so
+    the service role stayed refused. Declared, 2026.2 reads secure-RBAC (SDD §10.1, §21.5)."""
+    service = {"roles": ["service", "member"]}
+    before = _another_projects_port(
+        {**destination_release("openstack", None, None, "", ""), **service}
+    )
+    assert "declare the provider's policy profile or series" in before.message
+    after = _another_projects_port(
+        {**destination_release("openstack", "2026.2", None, "", ""), **service}
+    )
+    assert after is None, after.message
 
 
 def test_no_release_warning_for_a_supported_or_validated_destination():

@@ -151,6 +151,22 @@ def _series_number(name: str) -> tuple[int, int]:
     return int(year), int(half)
 
 
+def _declared_decides(found: ReleaseRange, declared: str) -> bool:
+    """Whether a declared series decides the tier and is the settled one (SDD §10.1): the range
+    holds it, or the range is empty and does not contradict it - any series when nothing was
+    detected, one older than the window when the range is ``older``, one newer than it when
+    ``newer``: where the APIs cannot tell the series, the declaration does (review RV18-06)."""
+    if declared in found.series:
+        return True
+    if found.series:
+        return False
+    if found.outside == "older":
+        return _series_number(declared) < _series_number(SERIES[0].name)
+    if found.outside == "newer":
+        return _series_number(declared) > _series_number(SERIES[-1].name)
+    return True
+
+
 def _profile_by_series(settled: str | None, found: ReleaseRange) -> str:
     """The policy profile a community cloud's series implies: the settled series, else every
     series of the range, must agree (SDD §10.1, §21.5); ``unknown`` when they do not."""
@@ -174,7 +190,7 @@ def destination_release(
     the series it settles on, its support tier and its policy profile. ``release`` and
     ``policy_profile`` are what its provider declares (§4.2)."""
     found = release_range(compute_max, block_storage_max)
-    if release is not None and release in found.series:
+    if release is not None and _declared_decides(found, release):
         settled: str | None = release
     else:
         settled = found.series[0] if len(found.series) == 1 else None
@@ -198,11 +214,17 @@ def destination_release(
 def support_tier(found: ReleaseRange, declared: str | None = None) -> SupportTier:
     """The tier of a cloud whose detected range is ``found`` (SDD §10.1, §21.3).
 
-    A declared series among the range's series decides; otherwise the range does - the least
-    favourable tier of its series, or ``outside`` when it has none - and a declared series sets
-    ``declared_outside_range``. RHOSO 18.0 is ``validated`` by its kind, never by this."""
+    A declared series decides when the range holds it or, empty, does not contradict it
+    (``_declared_decides``): its own tier, or ``outside`` with the reason its place gives when it
+    is not a series of the window. Otherwise the range does - the least favourable tier of its
+    series, or ``outside`` when it has none - and a declared series, which the range then
+    contradicts, sets ``declared_outside_range``. RHOSO 18.0 is ``validated`` by its kind, never by
+    this."""
     tiers = {series.name: series.tier for series in SERIES}
-    if declared is not None and declared in found.series:
+    if declared is not None and _declared_decides(found, declared):
+        if declared not in tiers:
+            older = _series_number(declared) < _series_number(SERIES[0].name)
+            return SupportTier("outside", "below_floor" if older else "newer_than_validated")
         tier = tiers[declared]
         return SupportTier(tier, "end_of_life" if tier == "tier3" else None)
     outside_range = declared is not None
