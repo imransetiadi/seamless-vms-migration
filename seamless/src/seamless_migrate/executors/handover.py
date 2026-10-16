@@ -539,7 +539,7 @@ class HandoverExecutor:
                     except StorageError as exc:
                         problems.append(f"volume {vid}: {exc}")
             volumes.append(entry)
-        problems.extend(self._unmanage_blockers(src, attachments))
+        problems.extend(self._unmanage_blockers(src, attachments, server_id))
         return {"server_id": server_id, "volumes": volumes, "problems": problems}
 
     async def readiness(
@@ -734,12 +734,15 @@ class HandoverExecutor:
         return problems
 
     @staticmethod
-    def _unmanage_blockers(src: Any, attachments: list[dict[str, Any]]) -> list[str]:
-        """What would make step 3 or 5 fail, found while the VM still runs (§7.3 step 0).
+    def _unmanage_blockers(
+        src: Any, attachments: list[dict[str, Any]], server_id: str
+    ) -> list[str]:
+        """What would make step 3, 4 or 5 fail, found while the VM still runs (§7.3 step 0).
 
         Cinder refuses to unmanage encrypted volumes, volumes with snapshots and volumes in a
         group (``volume.api.API.delete(unmanage_only=True)``, Wallaby and later); keeping a volume
-        when its server is deleted needs compute microversion 2.85.
+        when its server is deleted needs compute microversion 2.85; a volume another server holds
+        too never becomes available when the source server is deleted (audit EX-09).
         """
         problems: list[str] = []
         version = _attr(src.compute.get_endpoint_data(), "max_microversion")
@@ -756,6 +759,19 @@ class HandoverExecutor:
                 problems.append(f"volume {vid} is encrypted: Cinder cannot unmanage it")
             if _attr(volume, "group_id") or _attr(volume, "consistency_group_id"):
                 problems.append(f"volume {vid} belongs to a group: remove it from the group first")
+            holders = sorted(
+                {
+                    str(_attr(a, "server_id") or "an attachment without a server")
+                    for a in _attr(volume, "attachments") or []
+                    if _attr(a, "server_id") != server_id
+                }
+            )
+            if holders:
+                problems.append(
+                    f"volume {vid} is attached to another server too ({', '.join(holders)}): it "
+                    "would never become available once the source server is deleted - detach it "
+                    "there first"
+                )
             snapshots = len(
                 list(src.block_storage.snapshots(details=False, all_projects=True, volume_id=vid))
             )

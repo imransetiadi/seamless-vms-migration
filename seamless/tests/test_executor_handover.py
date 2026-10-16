@@ -1920,6 +1920,29 @@ async def test_handover_refuses_before_stop_a_server_with_a_disk_on_its_hypervis
     assert calls == [] and rec.downtime_marks == 0
 
 
+async def test_handover_refuses_before_stop_a_volume_another_server_holds_too(tmp_path):
+    """SDD §7.3 step 0: a multi-attach volume another server also holds stays in-use once step 4
+    deletes the source server, so step 5 could never unmanage it - refused while the VM runs. One
+    the source alone holds passes (audit EX-09)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    volume = clouds["src"].volumes["vol-data"]
+    volume.multiattach = True
+    volume.attachments = [{"server_id": "srv-1"}, {"server_id": "srv-db-2"}]
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, ctx)
+    assert "volume vol-data is attached to another server too (srv-db-2)" in str(refused.value)
+    assert calls == [] and rec.downtime_marks == 0
+    # an attachment without a server holds it as well
+    volume.attachments = [{"server_id": "srv-1"}, {"server_id": None}]
+    with pytest.raises(PermanentStepError, match="an attachment without a server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    # the source alone holds it: the handover goes ahead
+    volume.attachments = [{"server_id": "srv-1"}]
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+
+
 async def test_handover_refuses_before_stop_without_compute_microversion_2_85(tmp_path):
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)
     clouds["src"].compute.max_microversion = "2.79"
@@ -2516,11 +2539,11 @@ def test_handover_step_0_reads_a_real_sources_microversion(tmp_path):
     named as major.minor (SDD §7.3 step 0)."""
     caracal = InProcessCloud(tmp_path / "caracal", compute="2.96")
     conn = caracal.connect(make_provider(cloud="dst"), caracal.settings)
-    assert HandoverExecutor._unmanage_blockers(conn, []) == []
+    assert HandoverExecutor._unmanage_blockers(conn, [], "srv-1") == []
 
     train = InProcessCloud(tmp_path / "train", compute="2.79")
     conn = train.connect(make_provider(cloud="dst"), train.settings)
-    assert HandoverExecutor._unmanage_blockers(conn, []) == [
+    assert HandoverExecutor._unmanage_blockers(conn, [], "srv-1") == [
         "the source compute API supports microversion 2.79; keeping the volumes when the source "
         "server is deleted needs 2.85"
     ]
