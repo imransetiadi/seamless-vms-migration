@@ -278,19 +278,25 @@ def _scoped_ref(ref: dict[str, Any], network: dict[str, Any]) -> dict:
     return {**ref, "project_name": scope, "domain_name": scope}
 
 
-def _resolved_ref(ref: dict[str, Any], networks: Sequence[dict[str, Any]], what: str) -> dict:
+def _resolved_ref(
+    ref: dict[str, Any], networks: Sequence[dict[str, Any]], what: str, where: str
+) -> dict:
     name = ref.get("name")
     network, why = resolve_network(networks, str(name))
     if network is None:
+        # the destination provider ``where`` names (SDD §1 naming)
         raise PermanentStepError(
-            f"{what} cannot go to RHOSO network {name!r}: "
+            f"{what} cannot go to network {name!r} of {where}: "
             + (why or f"there is no network named {name!r}")
         )
     return _scoped_ref(ref, network)
 
 
 def resolve_network_refs(
-    doc: dict[str, Any], networks: Sequence[dict[str, Any]], deferred: list[str] | None = None
+    doc: dict[str, Any],
+    networks: Sequence[dict[str, Any]],
+    deferred: list[str] | None = None,
+    where: str = "the destination",
 ) -> dict[str, Any]:
     """Return a copy of an exported ``workloads.yml`` whose server ports and floating IPs name the
     RHOSO network the rule of SDD §7.3 step 0 resolves (``network_details``): the credential's own
@@ -311,7 +317,7 @@ def resolve_network_refs(
             params = port.get("params") or {}
             what = f"the port {params.get('mac_address')} of {server.get('name')}"
             try:
-                ref = _resolved_ref(params.get("network_ref") or {}, networks, what)
+                ref = _resolved_ref(params.get("network_ref") or {}, networks, what, where)
             except PermanentStepError as exc:
                 if deferred is None:
                     raise
@@ -369,6 +375,7 @@ def _apply_port_mode(
     exports: bool = False,
     deferred: list[str] | None = None,
     profile: str = "legacy",
+    where: str = "the destination",
 ) -> bool:
     """Write the plan's port_creation_mode and the destination's policy ``profile`` into an
     existing export before a run, and resolve its
@@ -397,7 +404,7 @@ def _apply_port_mode(
     doc = set_port_creation_mode(doc, mode, profile)
     # a new export is resolved after it instead: the one it replaces may no longer resolve
     if networks and not (reexport or exports):
-        doc = resolve_network_refs(doc, networks, deferred)
+        doc = resolve_network_refs(doc, networks, deferred, where)
     path.write_text(yaml.safe_dump(doc, sort_keys=False))
     return reexport
 
@@ -971,6 +978,7 @@ class AnsibleExecutor:
                 any(p.name == "export_workloads.yml" for p in self._playbooks(step, strategy, osm)),
                 deferred,
                 policy_profile_of(ctx.destination.capabilities, ctx.destination),
+                ctx.destination.name,
             )
             await self._log_deferred(ctx, deferred)
         leftover = (
@@ -1199,7 +1207,7 @@ class AnsibleExecutor:
             network, why = resolve_network(networks, name)
             if network is None:
                 problems.append(
-                    f"{what} cannot go to RHOSO network {name!r}: "
+                    f"{what} cannot go to network {name!r} of {ctx.destination.name}: "
                     + (why or f"there is no network named {name!r}")
                 )
                 continue
@@ -1207,7 +1215,7 @@ class AnsibleExecutor:
             refused = port_refusal(network, roles, profile)
             if refused:
                 problem = (
-                    f"{what} cannot go to RHOSO network {name!r} "
+                    f"{what} cannot go to network {name!r} of {ctx.destination.name} "
                     f"(project {network.get('project_id')}): {refused}"
                 )
                 if deferred is None:
@@ -1469,6 +1477,7 @@ class AnsibleExecutor:
                         deferred,
                         volumes,
                         policy_profile_of(destination.capabilities, destination),
+                        destination.name,
                     )
                     if ctx is not None:
                         await self._log_deferred(ctx, deferred)
@@ -1488,6 +1497,7 @@ class AnsibleExecutor:
         deferred: list[str] | None = None,
         validated_volumes: Sequence[str] | None = None,
         profile: str = "legacy",
+        where: str = "the destination",
     ) -> None:
         """Keep only the planned server of the export, check that it still lists every volume
         the migration validated (``validated_volumes``), apply the mappings, the VM's NIC
@@ -1544,7 +1554,7 @@ class AnsibleExecutor:
             doc = apply_nic_overrides(doc, nic_overrides)
             path.write_text(yaml.safe_dump(doc, sort_keys=False))
         if networks:
-            doc = resolve_network_refs(doc, networks, deferred)
+            doc = resolve_network_refs(doc, networks, deferred, where)
             path.write_text(yaml.safe_dump(doc, sort_keys=False))
         missing = ports_without_security_groups(doc) if port_mode == "neutron" else []
         if missing:

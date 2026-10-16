@@ -27,11 +27,11 @@ GIB = 2**30
 MIB = 2**20
 
 STRATEGY_DESCRIPTIONS = {
-    Strategy.cold: "Stop the VM, copy all used data over the network, boot on RHOSO.",
+    Strategy.cold: "Stop the VM, copy all used data over the network, boot on the destination.",
     Strategy.warm: "Pre-copy snapshots while the VM runs, then stop it and sync only changed "
     "blocks (the whole device is scanned).",
     Strategy.storage_handover: "Stop the VM and hand its Ceph-backed volumes from the source "
-    "Cinder to RHOSO Cinder via unmanage/manage; no data is copied.",
+    "Cinder to the destination's Cinder via unmanage/manage; no data is copied.",
     Strategy.vmware_cold: "Power off the VM, copy all used data with vmware-migration-kit and "
     "convert it with virt-v2v.",
     Strategy.vmware_warm: "Copy the VM with CBT-based passes while it runs, then power it off, "
@@ -123,10 +123,11 @@ class Advisor:
         estimates: Sequence[Estimate],
         plan: Plan,
         findings: Sequence[Finding] = (),
+        destination: str = "the destination",
     ) -> Advice | None:
         """Ask Jev to break a tie (or pick when nothing meets the SLO); ``None`` when no advice is
-        needed. Returns the advice - or why Jev gave none; ``decide()`` takes the decision
-        (SDD §14.2, §14.4)."""
+        needed; the question names the ``destination`` provider (SDD §1 naming). Returns the
+        advice - or why Jev gave none; ``decide()`` takes the decision (SDD §14.2, §14.4)."""
         scope = advisor_scope(estimates, plan.selection_policy)
         if not scope:
             return None
@@ -141,7 +142,8 @@ class Advisor:
         # the jev_decide arguments, built even when Jev is off: they are the input snapshot (§14.5)
         arguments: dict[str, Any] = {
             "decision": self._redact(
-                f"Which migration strategy should be used for VM {vm.name} moving to RHOSO 18.0?",
+                f"Which migration strategy should be used for VM {vm.name} moving to "
+                f"{destination}?",
                 [vm.name],
             ),
             "evidence": self._strategy_evidence(vm, estimates, plan, findings),

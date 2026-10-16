@@ -745,7 +745,9 @@ class Orchestrator:
                 dst_caps=dst_caps,
             )
             resolved = resolve_mappings(vm, plan, dst_inv)
-            reasons = eligibility(vm, source.kind, plan, src_caps, dst_caps, findings)
+            reasons = eligibility(
+                vm, source.kind, plan, src_caps, dst_caps, findings, destination.name
+            )
             estimates = [
                 estimate(vm, strategy, params, plan.downtime_slo_s).model_copy(
                     update={"eligible": not why, "reasons": list(why)}
@@ -762,7 +764,9 @@ class Orchestrator:
             chooses = current is None or current.phase in (*REVALIDATABLE, P.validating)
             advice = None
             if self.advisor is not None and automatic and chooses:
-                advice = await self.advisor.recommend_strategy(vm, estimates, plan, findings)
+                advice = await self.advisor.recommend_strategy(
+                    vm, estimates, plan, findings, destination.name
+                )
             decision = None
             rec_id = new_recommendation_id()
             # the evidence names the migration this validation writes, created below if new
@@ -1829,6 +1833,8 @@ class Orchestrator:
         # each plan read once per pass, a plan that is gone too: a plan of 1,000 VMs is ~22 KB,
         # and in demo the watch runs every few seconds
         plans: dict[str, Plan | None] = {}
+        #: the name of each plan's destination provider, as the alert names it (SDD §1 naming)
+        destinations: dict[str, str] = {}
         for m in await self.db.list("migration", Migration, phase=P.completed):
             try:
                 if m.plan_id not in plans:
@@ -1870,10 +1876,18 @@ class Orchestrator:
                 cur.source_running_at = seen if running else None
                 await self._save(cur, v)
             if running:
+                if plan.destination_provider_id not in destinations:
+                    try:
+                        provider = await self.db.get(
+                            "provider", plan.destination_provider_id, Provider
+                        )
+                        destinations[plan.destination_provider_id] = provider.name
+                    except NotFound:
+                        destinations[plan.destination_provider_id] = "the destination"
                 await self._emit(
                     "migration.source_running",
-                    f"{cur.vm.name}: the source VM runs again - its data diverges from RHOSO; "
-                    "stop it, or roll back",
+                    f"{cur.vm.name}: the source VM runs again - its data diverges from "
+                    f"{destinations[plan.destination_provider_id]}; stop it, or roll back",
                     migration=cur,
                     data={"power_state": str(vm.power_state)},
                 )

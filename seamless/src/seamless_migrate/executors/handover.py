@@ -134,7 +134,7 @@ def _existing_server(conn: Any, server_id: str) -> Any:
         raise
 
 
-def _destination_network(conn: Any, name: str) -> Any:
+def _destination_network(conn: Any, name: str, cloud: str = "the destination") -> Any:
     """A port's RHOSO network as step 8 finds it (SDD §7.3 step 0): the credential's own network of
     that name, else the only network of that name it sees - the admin credential sees every
     project's, and a name can be in several."""
@@ -143,16 +143,16 @@ def _destination_network(conn: Any, name: str) -> Any:
         return own[0]
     if own:
         raise PermanentStepError(
-            f"RHOSO has {len(own)} networks named {name!r} in the credential's project"
+            f"{cloud} has {len(own)} networks named {name!r} in the credential's project"
         )
     seen = list(conn.network.networks(name=name))
     if len(seen) == 1:
         return seen[0]
     if not seen:
-        raise PermanentStepError(f"RHOSO has no network named {name!r}")
+        raise PermanentStepError(f"{cloud} has no network named {name!r}")
     projects = ", ".join(sorted({str(_attr(n, "project_id")) for n in seen}))
     raise PermanentStepError(
-        f"RHOSO has {len(seen)} networks named {name!r}, none in the credential's project "
+        f"{cloud} has {len(seen)} networks named {name!r}, none in the credential's project "
         f"(projects {projects})"
     )
 
@@ -412,6 +412,7 @@ class HandoverExecutor:
         plan: Plan | None = None,
         mappings: Mappings | None = None,
         profile: str = "legacy",
+        cloud: str = "the destination",
     ) -> dict[str, Any]:
         """Step 0 as a read-only report: what each volume would become, and every problem; with the
         plan, also what would make step 6 or 8 fail on a port, a security group, the flavor or a
@@ -423,10 +424,12 @@ class HandoverExecutor:
         problems: list[str] = []
         if plan is not None:
             problems.extend(
-                self._port_problems(dst, definition["networks"], plan, server_id, profile)
+                self._port_problems(dst, definition["networks"], plan, server_id, profile, cloud)
             )
-            problems.extend(self._group_problems(dst, definition))
-            problems.extend(self._lookup_problems(dst, definition, mappings or plan.mappings))
+            problems.extend(self._group_problems(dst, definition, cloud))
+            problems.extend(
+                self._lookup_problems(dst, definition, mappings or plan.mappings, cloud)
+            )
         if attachments and not any(a["boot"] for a in attachments):
             # the destination server could not be created, nor the source again on rollback
             problems.append(
@@ -511,6 +514,7 @@ class HandoverExecutor:
                 plan,
                 mappings,
                 policy_profile_of(destination.capabilities, destination),
+                destination.name,
             ),
         )
 
@@ -521,6 +525,7 @@ class HandoverExecutor:
         plan: Plan,
         vm_id: str,
         profile: str = "legacy",
+        cloud: str = "the destination",
     ) -> list[str]:
         """What would make step 8 fail on a port, or put it where it must not go, found while the
         VM still runs (§7.3 step 0): its RHOSO network does not resolve with step 8's lookup, the
@@ -533,7 +538,7 @@ class HandoverExecutor:
             target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
             where = f"port {n.get('port_id')} ({n.get('mac_address')})"
             try:
-                network = _destination_network(dst, target)
+                network = _destination_network(dst, target, cloud)
             except PermanentStepError as exc:
                 problems.append(f"{where}: {exc}")
                 continue
@@ -598,7 +603,9 @@ class HandoverExecutor:
         return problems
 
     @staticmethod
-    def _group_problems(dst: Any, definition: dict[str, Any]) -> list[str]:
+    def _group_problems(
+        dst: Any, definition: dict[str, Any], cloud: str = "the destination"
+    ) -> list[str]:
         """The security groups step 8 asks for by name that are not exactly one group of the
         credential's project, found while the VM still runs (§7.3 step 0): the server's, which
         Nova looks up by name (``default`` aside), and each port's, which ``definition`` names in
@@ -617,12 +624,15 @@ class HandoverExecutor:
             if len(found) != 1:
                 many = f"{len(found)} security groups" if found else "no security group"
                 problems.append(
-                    f"{', '.join(who)}: RHOSO has {many} named {name!r} in the credential's project"
+                    f"{', '.join(who)}: {cloud} has {many} named {name!r} in the credential's "
+                    "project"
                 )
         return problems
 
     @staticmethod
-    def _lookup_problems(dst: Any, definition: dict[str, Any], mappings: Mappings) -> list[str]:
+    def _lookup_problems(
+        dst: Any, definition: dict[str, Any], mappings: Mappings, cloud: str = "the destination"
+    ) -> list[str]:
         """The flavor step 8 and the volume types step 6 would ask RHOSO for and it lacks, found
         while the VM still runs (§7.3 step 0): both steps run after the source server was deleted.
         Each is chosen as those steps choose it - the mapping, else the source's own name."""
@@ -630,7 +640,9 @@ class HandoverExecutor:
         source = definition["flavor"]
         flavor = mappings.flavors.get(source, source)
         if flavor and dst.compute.find_flavor(flavor, ignore_missing=True) is None:
-            problems.append(f"the server's flavor {source!r}: RHOSO has no flavor named {flavor!r}")
+            problems.append(
+                f"the server's flavor {source!r}: {cloud} has no flavor named {flavor!r}"
+            )
         known = {str(_attr(t, "name")) for t in dst.block_storage.types()}
         missing: dict[str, list[str]] = {}
         for att in definition["attachments"]:
@@ -639,7 +651,7 @@ class HandoverExecutor:
                 missing.setdefault(vtype, []).append(str(att["volume_id"]))
         for vtype, volumes in missing.items():
             which = f"volume {volumes[0]}" if len(volumes) == 1 else f"volumes {', '.join(volumes)}"
-            problems.append(f"{which}: RHOSO has no volume type named {vtype!r}")
+            problems.append(f"{which}: {cloud} has no volume type named {vtype!r}")
         return problems
 
     @staticmethod
@@ -888,6 +900,7 @@ class HandoverExecutor:
         plan: Plan,
         vm_id: str,
         journal: _Journal,
+        cloud: str = "the destination",
     ) -> list[dict[str, str]]:
         """Each port created first through Neutron on the mapped network with its MAC, every fixed
         IP, its security groups and its port-security flag (SDD §7.3 step 8), journaled: a resume
@@ -900,7 +913,7 @@ class HandoverExecutor:
             if not journal.done(key):
                 description = port_description(n["port_id"])
                 target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
-                network = _destination_network(conn, target)
+                network = _destination_network(conn, target, cloud)
                 project_id = conn.current_project_id
                 earlier = HandoverExecutor._earlier_ports(conn, n, network, addresses)
                 if earlier:
@@ -1088,7 +1101,7 @@ class HandoverExecutor:
                     host = backend_map[vtype]
                     manage_ref = {"source-name": f"volume-{att['volume_id']}"}
                 dest_id = await self._call(
-                    f"manage {att['volume_id']} in RHOSO",
+                    f"manage {att['volume_id']} in {ctx.destination.name}",
                     lambda a=att, t=vtype, h=host, r=manage_ref: self._manage(
                         dst,
                         h,
@@ -1108,7 +1121,7 @@ class HandoverExecutor:
             key = f"meta_dst:{att['volume_id']}"
             if metadata and not journal.done(key):
                 await self._call(
-                    f"restore the boot properties of {att['volume_id']} in RHOSO",
+                    f"restore the boot properties of {att['volume_id']} in {ctx.destination.name}",
                     lambda v=dest_ids[att["volume_id"]], m=metadata: self._set_boot_properties(
                         dst, v, m
                     ),
@@ -1121,12 +1134,14 @@ class HandoverExecutor:
                 # the mode the definition was recorded in (step 2), as a resume must keep it
                 vm_id = ctx.migration.vm.source_id
                 if definition.get("port_creation_mode") == "neutron":
-                    networks = self._destination_ports(dst, definition, ctx.plan, vm_id, journal)
+                    networks = self._destination_ports(
+                        dst, definition, ctx.plan, vm_id, journal, ctx.destination.name
+                    )
                 else:
                     networks = []
                     for n in definition["networks"]:
                         target, addresses = self._destination_nic(ctx.plan, vm_id, n)
-                        network = _destination_network(dst, target)
+                        network = _destination_network(dst, target, ctx.destination.name)
                         net = {"uuid": _attr(network, "id")}
                         # Nova keeps one address per port: its override's, else its first
                         if addresses:
@@ -1225,7 +1240,7 @@ class HandoverExecutor:
             key = f"rb:unmanage_dst:{att['volume_id']}"
             if dest_id and not journal.done(key):
                 await self._call(
-                    f"unmanage {dest_id} in RHOSO",
+                    f"unmanage {dest_id} in {ctx.destination.name}",
                     lambda v=dest_id, k=key: self._unmanage(dst, v, journal, f"sent:{k}"),
                 )
                 await asyncio.to_thread(journal.mark, key)

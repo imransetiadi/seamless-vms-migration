@@ -22,7 +22,11 @@ from tests.factories import make_disk, make_migration, make_plan, make_provider,
 
 SRC = make_provider(cloud="src")
 DST = make_provider(
-    id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    id="dst-rhoso",
+    name="RHOSO 18.0",
+    kind=ProviderKind.rhoso,
+    role=ProviderRole.destination,
+    cloud="dst",
 )
 
 
@@ -1385,7 +1389,7 @@ async def test_handover_rollback_resume_after_a_crash_while_recreating_the_sourc
     that server instead of creating a second one (SDD §7.3)."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="manage")
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
-    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO"):
+    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO 18.0"):
         await executor.run(StepName.CUTOVER, ctx)
     clouds["src"].crash_wait = "server"
     with pytest.raises(PermanentStepError, match="recreate the source server"):
@@ -1436,7 +1440,7 @@ async def test_handover_rollback_resume_after_a_crash_while_managing_back(tmp_pa
     that volume instead of managing the object again (SDD §7.3)."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="manage")
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
-    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO"):
+    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO 18.0"):
         await executor.run(StepName.CUTOVER, ctx)
     clouds["src"].crash_wait = "status"
     with pytest.raises(PermanentStepError):
@@ -1452,7 +1456,7 @@ async def test_handover_rollback_after_unmanage_manages_back_and_recreates(tmp_p
     them back, recreates the server and reports the new ids."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="manage")
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
-    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO"):
+    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO 18.0"):
         await executor.run(StepName.CUTOVER, ctx)
     calls.clear()
     result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
@@ -1832,8 +1836,9 @@ async def test_handover_step_0_refuses_a_security_group_step_8_could_not_find(tm
     clouds["dst"].group_list = [NS(id="sg-c", name="web", project_id="tenant-b")]
     with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
         await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
-    assert "the server: RHOSO has no security group named 'web' in the credential's project" in (
-        str(refused.value)
+    assert (
+        "the server: RHOSO 18.0 has no security group named 'web' in the credential's project"
+        in (str(refused.value))
     )
     assert "'default'" not in str(refused.value)
     assert [op for op in ops(calls) if op[1] == "stop_server"] == []
@@ -1842,8 +1847,9 @@ async def test_handover_step_0_refuses_a_security_group_step_8_could_not_find(tm
     clouds["dst"].group_list = twice
     with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
         await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
-    assert "port port-1: RHOSO has 2 security groups named 'web' in the credential's project" in (
-        str(refused.value)
+    assert (
+        "port port-1: RHOSO 18.0 has 2 security groups named 'web' in the credential's project"
+        in str(refused.value)
     )
     assert [op for op in ops(calls) if op[1] == "stop_server"] == []
     # through Nova the port's own groups are never asked for: the same destination passes
@@ -1879,7 +1885,7 @@ async def test_handover_step_0_refuses_a_flavor_or_a_volume_type_rhoso_lacks(tmp
     clouds["dst"].flavor_names = {"rhoso.large"}
     with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
         await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
-    assert "the server's flavor 'm1.small': RHOSO has no flavor named 'rhoso.small'" in (
+    assert "the server's flavor 'm1.small': RHOSO 18.0 has no flavor named 'rhoso.small'" in (
         str(refused.value)
     )
     assert [op for op in ops(calls) if op[1] == "stop_server"] == []
@@ -1888,7 +1894,7 @@ async def test_handover_step_0_refuses_a_flavor_or_a_volume_type_rhoso_lacks(tmp
     clouds["dst"].type_names = ("rbd-hdd",)
     with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
         await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
-    assert "volume vol-root: RHOSO has no volume type named 'ceph-ssd'" in str(refused.value)
+    assert "volume vol-root: RHOSO 18.0 has no volume type named 'ceph-ssd'" in str(refused.value)
     # vol-data is checked under its mapped type, which RHOSO has
     assert "vol-data" not in str(refused.value)
     assert [op for op in ops(calls) if op[1] == "stop_server"] == []

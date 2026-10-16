@@ -4338,7 +4338,7 @@ async def test_validation_blocks_a_vm_whose_nic_override_cannot_be_applied(tmp_p
     blocked = await h.by_vm(plan.id, "vm-1")
     assert blocked.phase == P.blocked
     [f] = [f for f in blocked.findings if f.code == "MAP_NIC_OVERRIDE_INVALID"]
-    assert "fa:16:3e:00:00:0a: RHOSO has no network 'rhoso-missing'" in f.message
+    assert "fa:16:3e:00:00:0a: RHOSO 18.0 has no network 'rhoso-missing'" in f.message
     assert (await h.by_vm(plan.id, "vm-2")).phase != P.blocked
 
 

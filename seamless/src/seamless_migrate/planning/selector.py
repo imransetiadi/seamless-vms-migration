@@ -40,11 +40,13 @@ def eligibility(
     src_caps: Mapping[str, Any],
     dst_caps: Mapping[str, Any],
     findings: Sequence[Finding] = (),
+    destination: str = "the destination",
 ) -> dict[Strategy, list[str]]:
     """Map every strategy applicable to the source family to its ineligibility reasons.
 
     An empty list means eligible. ``src_caps``/``dst_caps`` are the providers' capabilities plus
-    ``conversion_host`` (truthy when the provider has a conversion host configured).
+    ``conversion_host`` (truthy when the provider has a conversion host configured); a reason
+    about the destination cloud names its provider, ``destination`` (SDD §1 naming).
     """
     kind = ProviderKind(source_kind)
     out: dict[Strategy, list[str]] = {s: [] for s in strategies_for(kind)}
@@ -98,7 +100,7 @@ def eligibility(
         )
         if unmapped:
             handover.append(
-                "volume type(s) without a RHOSO backend in handover.backend_map: "
+                f"volume type(s) without a backend of {destination} in handover.backend_map: "
                 + ", ".join(unmapped)
             )
         if multiattach:

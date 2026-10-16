@@ -1,3 +1,6 @@
+import ast
+from pathlib import Path
+
 import pytest
 
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Severity, Strategy
@@ -24,7 +27,10 @@ from tests.cloud_support import AUTH_URL, InProcessCloud
 from tests.factories import make_disk, make_plan, make_provider, make_vm
 
 SRC = make_provider()
-DST = make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination)
+# the destination provider a message about the destination cloud names (SDD §1 naming, plan T6)
+DST = make_provider(
+    id="dst-rhoso", name="RHOSO 18.0", kind=ProviderKind.rhoso, role=ProviderRole.destination
+)
 
 
 def src_inv(**kw) -> SourceInventory:
@@ -486,7 +492,7 @@ def test_finding_map_nic_override_invalid_names_each_problem():
     )
     assert f.severity == Severity.blocker
     assert "fa:16:3e:00:00:99: the VM has no NIC with this MAC" in f.message
-    assert "fa:16:3e:00:00:01: RHOSO has no network 'rhoso-missing'" in f.message
+    assert "fa:16:3e:00:00:01: RHOSO 18.0 has no network 'rhoso-missing'" in f.message
     assert "fa:16:3e:00:00:02: 172.16.0.9 lies in no subnet of 'app-net'" in f.message
     assert "fa:16:3e:00:00:03: 10.0.0.5 also goes to db-01" in f.message
     # addresses only, on a network pre-staging would create: its subnets cannot be checked yet
@@ -496,8 +502,8 @@ def test_finding_map_nic_override_invalid_names_each_problem():
     )
     later = make_plan(nic_overrides={"vm-3": {"fa:16:3e:00:00:05": {"fixed_ips": ["10.9.0.6"]}}})
     f = only(check(lost, plan=later, dst=override_dst()), "MAP_NIC_OVERRIDE_INVALID")
-    assert "fa:16:3e:00:00:05: RHOSO has no network 'lost-net' yet" in f.message
-    assert "name an existing RHOSO network" in f.message
+    assert "fa:16:3e:00:00:05: RHOSO 18.0 has no network 'lost-net' yet" in f.message
+    assert "name an existing network of RHOSO 18.0" in f.message
     vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
     vmw = only(check(vm, plan=plan, dst=override_dst(), source=vmware), "MAP_NIC_OVERRIDE_INVALID")
     assert "migration kit keeps the guest's network settings" in vmw.message
@@ -1264,10 +1270,10 @@ def test_finding_net_port_not_permitted_counts_service_under_secure_rbac():
         refused = _another_projects_port({**secure, "roles": roles})
         assert refused is not None and refused.severity == Severity.blocker, roles
         assert refused.message == (
-            "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
-            "'rhoso-net' (project project-admin): Neutron's secure-RBAC defaults let only the "
-            "admin or service role, or that project, choose a port's address or MAC there, and "
-            "the credential's token has neither."
+            "The credential of RHOSO 18.0 may not put these NICs on their network: "
+            "fa:16:3e:00:00:01 on 'rhoso-net' (project project-admin): Neutron's secure-RBAC "
+            "defaults let only the admin or service role, or that project, choose a port's address "
+            "or MAC there, and the credential's token has neither."
         )
 
 
@@ -1381,6 +1387,102 @@ def test_the_port_refusals_remediation_names_the_least_role_its_profile_counts(p
     assert refused.remediation == PORT_REMEDIATION.format(role=role)
 
 
+HIBISCUS = make_provider(
+    id="hibiscus-dc3",
+    name="OpenStack 2026.2 Hibiscus (DC3)",
+    kind=ProviderKind.openstack,
+    role=ProviderRole.destination,
+    distribution="kolla",
+)
+
+#: the findings whose message means the destination cloud, and whose message names its provider
+DESTINATION_FINDINGS = {
+    "MAP_NETWORK_PRESTAGED",
+    "MAP_FLAVOR_PRESTAGED",
+    "MAP_KEYPAIR_PRESTAGED",
+    "MAP_NETWORK_MISSING",
+    "MAP_FLAVOR_MISSING",
+    "MAP_VOLUME_TYPE_MISSING",
+    "DST_KEYPAIR_MISSING",
+    "NET_PORT_NOT_PERMITTED",
+}
+
+
+def _destination_findings(destination):
+    """Findings about ``destination``'s cloud, for VMs and plans that meet them (SDD §9.3)."""
+    found = []
+    # pre-staging creates a network and a flavor and imports a keypair
+    prestage = make_plan(prestage_resources=[*DEFAULT_PRESTAGE, "flavors", "keypairs"])
+    vm = make_vm(nics=[Nic(network="db-net", mtu=9000)], flavor="m1.custom", key_name="ops-key")
+    found += check(vm, plan=prestage, src=src_inv(keypairs=["ops-key"]), destination=destination)
+    # nothing pre-staged: a network, flavor, keypair and volume type the destination lacks
+    bare = make_plan(
+        prestage_resources=[],
+        mappings=Mappings(networks={"app-net": "nope-net"}, volume_types={"ceph-ssd": "nope"}),
+    )
+    vm = make_vm(
+        nics=[Nic(network="app-net"), Nic(network="db-net")],
+        flavor="m1.huge",
+        vcpus=64,
+        ram_mb=262144,
+        key_name="ops-key",
+        disks=[make_disk(volume_type="ceph-ssd"), make_disk(volume_type="ceph-hdd")],
+    )
+    found += check(vm, plan=bare, destination=destination)
+    # a flavor mapped to one the destination lacks
+    mapped = make_plan(mappings=Mappings(flavors={"m1.custom": "nope"}))
+    found += check(make_vm(flavor="m1.custom"), plan=mapped, destination=destination)
+    found.append(_another_projects_port({"roles": ["member"]}, destination))
+    return [f for f in found if f is not None]
+
+
+def test_no_user_facing_text_assumes_rhoso_for_a_community_destination():
+    """SDD §1 naming, §9.3, plan T6 (PRD FR-34): a finding's message names the destination
+    provider where it means the destination cloud - "do not exist in OpenStack 2026.2 Hibiscus
+    (DC3)" -, and its remediation, fixed by the catalog, says "the destination": no text says
+    RHOSO for a community destination."""
+    assert [code for code, entry in CATALOG.items() if "RHOSO" in entry.remediation] == []
+    found = _destination_findings(HIBISCUS)
+    assert DESTINATION_FINDINGS <= {f.code for f in found}, sorted(
+        DESTINATION_FINDINGS - {f.code for f in found}
+    )
+    said = [
+        f"{f.code}: {f.message} {f.remediation or ''}"
+        for f in found
+        if "RHOSO" in (f.message + (f.remediation or ""))
+    ]
+    assert said == []
+    named = {f.code for f in found if HIBISCUS.name in f.message}
+    assert DESTINATION_FINDINGS <= named, sorted(DESTINATION_FINDINGS - named)
+
+
+#: the control plane's texts that are about the Red Hat product itself (SDD §1 naming): the demo's
+#: RHOSO 18.0 provider and the plan that moves to it
+PRODUCT_TEXTS = {("demo.py", "Finance apps (RHOSP 17.1 → RHOSO)"), ("demo.py", "RHOSO 18.0")}
+
+
+def test_no_control_plane_text_says_rhoso_but_the_products_own():
+    """SDD §1 naming, plan T6: beside the findings, an executor's refusal or failure, an event and
+    the advisor's question name the destination provider, and fixed texts say "the destination":
+    of the control plane's string literals - docstrings and comments aside - only the Red Hat
+    product's own say RHOSO."""
+    root = Path(__file__).parents[1] / "src" / "seamless_migrate"
+    said = set()
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docstrings = {
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and ast.get_docstring(node, clean=False) is not None
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if "RHOSO" in node.value and id(node) not in docstrings:
+                    said.add((str(path.relative_to(root)), node.value))
+    assert said <= PRODUCT_TEXTS, sorted(said - PRODUCT_TEXTS)
+
+
 def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projects_network():
     """SDD §9.3, §6.6: another project's network takes a NIC only when it is shared with the
     credential's project or external, and from a token with the admin or advsvc role - Neutron's
@@ -1405,9 +1507,10 @@ def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projec
     f = only(found(shared, member), "NET_PORT_NOT_PERMITTED")
     assert f.severity == Severity.blocker and f.remediation
     assert f.message == (
-        "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
-        "'rhoso-net' (project project-admin): Neutron lets only the admin or advsvc role, or that "
-        "project, choose a port's address or MAC there, and the credential's token has neither."
+        "The credential of RHOSO 18.0 may not put these NICs on their network: "
+        "fa:16:3e:00:00:01 on 'rhoso-net' (project project-admin): Neutron lets only the admin or "
+        "advsvc role, or that project, choose a port's address or MAC there, and the credential's "
+        "token has neither."
     )
     assert only(found(external, member), "NET_PORT_NOT_PERMITTED").message == f.message
     # with the admin or advsvc role a shared network takes it, an unshared external one only from
@@ -1424,9 +1527,9 @@ def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projec
     for caps in (member, {"admin": True, "roles": ["admin"]}, None, {}):
         f = only(found(private, caps), "NET_PORT_NOT_PERMITTED")
         assert f.message == (
-            "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
-            "'rhoso-net' (project project-b): it is neither shared with the credential's project "
-            "nor external."
+            "The credential of RHOSO 18.0 may not put these NICs on their network: "
+            "fa:16:3e:00:00:01 on 'rhoso-net' (project project-b): it is neither shared with the "
+            "credential's project nor external."
         )
     # no reported roles (a destination checked by another implementation): that half is not judged
     for caps in (None, {"admin": True}):
@@ -1436,9 +1539,10 @@ def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projec
     assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(own, member)]
     own_external = net("x", "rhoso-net", project_id="project-me", shared=False, external=True)
     assert only(found(own_external, member), "NET_PORT_NOT_PERMITTED").message == (
-        "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
-        "'rhoso-net' (project project-me): it is external and not shared, and Nova lets only the "
-        "admin role attach such a network to a server; the credential's token lacks it."
+        "The credential of RHOSO 18.0 may not put these NICs on their network: "
+        "fa:16:3e:00:00:01 on 'rhoso-net' (project project-me): it is external and not shared, and "
+        "Nova lets only the admin role attach such a network to a server; the credential's token "
+        "lacks it."
     )
     assert "NET_PORT_NOT_PERMITTED" not in [
         x.code for x in found(own_external, {"roles": ["admin"]})
@@ -1473,7 +1577,7 @@ def test_finding_net_address_refused_checks_a_vmware_nic_by_the_migration_kits_r
     assert "NET_ADDRESS_REFUSED" not in [x.code for x in found("10.2.1.5", "10.2.1.6", "fd00::5")]
     f = only(found("10.2.0.5", "10.2.1.5"), "NET_ADDRESS_REFUSED")
     assert f.message == (
-        "Neutron would refuse these addresses on their RHOSO network: 00:50:56:aa:bb:cc on "
+        "Neutron would refuse these addresses on their network in RHOSO 18.0: 00:50:56:aa:bb:cc on "
         "'dc2-prod': 10.2.0.5, 10.2.1.5 lie in different subnets of the port's network: the "
         "migration kit gives a NIC's IPv4 addresses one subnet."
     )

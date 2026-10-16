@@ -43,6 +43,7 @@ from tests.fake_ansible import install, read_log
 SRC = make_provider(cloud="src")
 DST = make_provider(
     id="dst-rhoso",
+    name="RHOSO 18.0",
     kind=ProviderKind.rhoso,
     role=ProviderRole.destination,
     cloud="dst",
@@ -526,7 +527,7 @@ async def test_the_cutover_port_refusal_follows_the_policy_profile(env):
     assert read_log(env.log)[-1]["vars"]["network_map"] == {
         "dvportgroup-9": "net-shared-net-theirs,sub-net-shared-net-theirs"
     }
-    assert not [line for line in rec.logs if "cannot go to RHOSO network" in line]
+    assert not [line for line in rec.logs if "cannot go to network" in line]
     # the cutover refuses before the kit runs when it does not
     for roles, profile, rule in (
         (
@@ -1039,8 +1040,8 @@ async def test_vmware_runs_give_the_kit_every_nic_by_its_key_and_refuse_before_i
 
     gone = Nic(network="gone-net", mac="00:50:56:00:00:09", fixed_ips=["10.0.0.9"])
     assert await refused([std, gone]) == (
-        "the NIC 00:50:56:00:00:09 of db-01 cannot go to RHOSO network 'gone-net': there is no "
-        "network named 'gone-net'"
+        "the NIC 00:50:56:00:00:09 of db-01 cannot go to network 'gone-net' of RHOSO 18.0: there "
+        "is no network named 'gone-net'"
     )
     outside = std.model_copy(update={"fixed_ips": ["192.0.2.5"]})
     assert await refused([outside]) == (
@@ -1433,7 +1434,8 @@ async def test_a_vmware_warm_pass_logs_what_only_the_cutovers_ports_meet(env):
     }
     [refused] = [ln for ln in rec.logs if ln.startswith(later)]
     assert refused.startswith(
-        later + "the NIC 00:50:56:00:00:04 of web-01 cannot go to RHOSO network 'shared-net' "
+        later
+        + "the NIC 00:50:56:00:00:04 of web-01 cannot go to network 'shared-net' of RHOSO 18.0 "
         "(project admin): "
     )
     assert "Neutron lets only the admin or advsvc role" in refused
@@ -1450,8 +1452,8 @@ async def test_a_vmware_warm_pass_logs_what_only_the_cutovers_ports_meet(env):
     with pytest.raises(PermanentStepError) as exc:
         await env.executor.run(StepName.PRECOPY, ctx)
     assert str(exc.value) == (
-        "the NIC 00:50:56:00:00:09 of web-01 cannot go to RHOSO network 'gone-net': there is no "
-        "network named 'gone-net'"
+        "the NIC 00:50:56:00:00:09 of web-01 cannot go to network 'gone-net' of RHOSO 18.0: there "
+        "is no network named 'gone-net'"
     )
     assert len(read_log(env.log)) == ran
 
@@ -2891,7 +2893,7 @@ def test_resolve_network_refs_keeps_a_floating_network_it_cannot_resolve():
 
 
 async def test_a_cutover_keeps_a_floating_network_it_cannot_resolve(env, monkeypatch):
-    """SDD §7.2, review NC-10: RHOSO has no network named like the floating IP's - the cutover
+    """SDD §7.2, review NC-10: RHOSO 18.0 has no network named like the floating IP's - the cutover
     runs with the reference as exported, for the destination check to judge by the mode."""
     monkeypatch.setenv("ANSIBLE_FAKE_FLOATING", "203.0.113.7@public")
     cold, _ = ctx_for(env, strategy=Strategy.cold)
@@ -2963,7 +2965,7 @@ async def test_a_warm_pass_logs_a_port_network_it_cannot_resolve_and_the_cutover
     env.registry.networks[1]["id"] = "net-rhoso-app-second"
     problem = (
         "the cutover will refuse this before the source stops: the port fa:16:3e:00:00:01 of "
-        "web-01 cannot go to RHOSO network 'rhoso-app': "
+        "web-01 cannot go to network 'rhoso-app' of RHOSO 18.0: "
     )
     precopy, rec = ctx_for(env)
     result = await env.executor.run(StepName.PRECOPY, precopy)
@@ -3026,7 +3028,7 @@ async def test_a_pass_logs_each_problem_it_defers_once():
         logged.append(line)
 
     ctx = SimpleNamespace(log=log)
-    problem = "the port fa:16:3e:00:00:01 of web-01 cannot go to RHOSO network 'gone'"
+    problem = "the port fa:16:3e:00:00:01 of web-01 cannot go to network 'gone' of RHOSO 18.0"
     deferred = Deferred()
     deferred.append(problem)
     await AnsibleExecutor._log_deferred(ctx, deferred)
@@ -3035,7 +3037,7 @@ async def test_a_pass_logs_each_problem_it_defers_once():
     await AnsibleExecutor._log_deferred(ctx, None)
     assert logged == [
         "the cutover will refuse this before the source stops: the port fa:16:3e:00:00:01 of "
-        "web-01 cannot go to RHOSO network 'gone'"
+        "web-01 cannot go to network 'gone' of RHOSO 18.0"
     ]
     # logged once, and kept for the pass's cutover_refusals (SDD §7.2)
     assert list(deferred) == [problem]
