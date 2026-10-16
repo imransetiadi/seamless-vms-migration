@@ -29,13 +29,11 @@ def test_put_get_roundtrip(any_store: Store):
         any_store.get("plan", "plan-missing", Plan)
 
 
-def test_put_with_event_writes_the_document_and_its_event_together(
-    any_store: Store, refuse_events_insert
-):
+def test_put_with_event_writes_the_document_and_its_event_together(any_store: Store, refuse_write):
     """SDD §11, §8.1 (review RV21-04): a versioned update and its event in one transaction - both
     are written, or neither: a version conflict, or an event the store cannot append, leaves the
-    document as it was and no event. The event is refused when its insert runs, after the update
-    ran: a write split over two transactions fails this (review RV23-08)."""
+    document as it was and no event. Each half is refused when it runs, after the other ran: a write
+    split over two transactions fails this, whichever half it writes first (RV23-08, RV24-03)."""
     mig = make_migration()
     version = any_store.put("migration", mig)
     flagged = mig.model_copy(
@@ -57,11 +55,12 @@ def test_put_with_event_writes_the_document_and_its_event_together(
         any_store.put_with_event("migration", flagged, event, version + 1)
     neither()
 
-    refused = refuse_events_insert(any_store, "migration.source_running")
-    with pytest.raises(RuntimeError, match="briefly unavailable"):
-        any_store.put_with_event("migration", flagged, event, version)
-    assert refused == ["migration.source_running"]
-    neither()
+    for write, of in (("INSERT INTO events", event.kind), ("UPDATE documents", "migration")):
+        refused = refuse_write(any_store, write, of)
+        with pytest.raises(RuntimeError, match="briefly unavailable"):
+            any_store.put_with_event("migration", flagged, event, version)
+        assert refused == [f"{write} {of}"]
+        neither()
     saved, written = any_store.put_with_event("migration", flagged, event, version)
     assert saved == version + 1 and written.seq is not None
     assert (

@@ -50,21 +50,24 @@ def store(tmp_path) -> Iterator[Store]:
 
 
 @pytest.fixture
-def refuse_events_insert() -> Iterator[Callable[[Store, str], list[str]]]:
-    """``refuse(store, kind)``: the store's events table refuses the next row of ``kind`` when its
-    INSERT runs - inside its transaction, after whatever ran there before it, as a store fails (a
-    lost connection, a lock timeout) - never when the statement is built, so a write split over
-    two transactions leaves its first half behind (review RV23-08). It returns the kinds refused."""
+def refuse_write() -> Iterator[Callable[[Store, str, str], list[str]]]:
+    """``refuse(store, write, kind)``: the store refuses the next ``write`` - "INSERT INTO events"
+    or "UPDATE documents" - of a row of ``kind`` (an event's kind, a document's) when it RUNS:
+    inside its transaction, after whatever ran there before it, as a store fails (a lost
+    connection, a lock timeout), never when the statement is built. Refusing each half in turn
+    fails a write split over two transactions, whichever half it writes first (reviews RV23-08,
+    RV24-03). It returns what it refused."""
     listening = []
 
-    def refuse(store: Store, kind: str) -> list[str]:
+    def refuse(store: Store, write: str, kind: str) -> list[str]:
         refused: list[str] = []
 
         def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
-            if refused or not statement.lstrip().upper().startswith("INSERT INTO EVENTS"):
+            if refused or not statement.lstrip().upper().startswith(write.upper()):
                 return
-            if context.compiled_parameters[0].get("kind") == kind:
-                refused.append(kind)
+            # the event's kind is its `kind` value, the document's its key's (`kind_1`)
+            if kind in context.compiled_parameters[0].values():
+                refused.append(f"{write} {kind}")
                 raise RuntimeError("the store was briefly unavailable")
 
         sa.event.listen(store.engine, "before_cursor_execute", before_cursor_execute)
