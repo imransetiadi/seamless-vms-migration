@@ -72,7 +72,8 @@ function matches(text: string, tokens: Set<string>, substrings: readonly string[
 
 /** `heuristic_tier`: an explicit tier tag, a legacy OS, then the rules in order. */
 export function tierOf(vm: VMRef): Tier {
-  const explicit = vm.tags.tier ?? vm.tags['seamless/tier'];
+  // an empty tier tag falls back to seamless/tier, as the API's `or` (review RV25-02)
+  const explicit = vm.tags.tier || vm.tags['seamless/tier'];
   if (explicit && (TIERS as readonly string[]).includes(explicit)) return explicit as Tier;
   if (identifyGuestOs(vm.os_type ?? null).lifecycle === 'legacy') return 'legacy_os';
   const { text, tokens } = describe(vm);

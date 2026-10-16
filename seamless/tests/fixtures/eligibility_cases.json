@@ -2283,6 +2283,77 @@
       "expected": {
         "APP_PROBE_MISSING": "db-02 is a database VM without an application probe: verification would check only that it booted."
       }
+    },
+    {
+      "why": "an empty tier tag falls back to seamless/tier, an explicit tier before a legacy guest",
+      "vm": {
+        "source_id": "vm-t",
+        "name": "report-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel6",
+        "host": null,
+        "tags": {
+          "tier": "",
+          "seamless/tier": "stateful_database"
+        },
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "6",
+          "label": "RHEL 6",
+          "lifecycle": "legacy",
+          "v2v": "unverified"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "APP_PROBE_MISSING": "report-01 is a database VM without an application probe: verification would check only that it booted."
+      }
     }
   ]
 }
