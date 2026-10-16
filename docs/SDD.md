@@ -3058,7 +3058,8 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   series - the declared one, else the detected range, with codenames (§10.1), else why the range is empty: older or
   newer than the window when the maxima were read, "Not detected" only when they were not -, its support tier
   (Validated, Tier 1, 2 or 3, or Outside, with the reason in words) and its policy profile, and warns when the
-  detected range contradicts its declared series or its profile is unknown (declare it); a provider whose check
+  detected range contradicts its declared series or its profile is unknown (check it so its series is detected, or
+  declare its policy profile or series: §21.5's two ways out, review RV20-09); a provider whose check
   reports plain HTTP says so, naming `plain_http`'s endpoints; the form
   takes, for an OpenStack destination, the declared release series (blank: detect it, the window's series offered
   newest first) and, for an OpenStack or RHOSO destination, the declared policy profile (blank: by kind and series,
