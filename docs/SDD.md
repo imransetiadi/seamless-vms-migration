@@ -2962,7 +2962,8 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   for an approver in `precopy`/`syncing` of a warm migration — the dialog shows the last pass's change and the
   estimated downtime the Force cutover records (the API's formula, §5.4, ported and checked against a case table the
   control plane generates) and asks for the reason (§5.4) —,
-  an alert while `source_running_at` is set — the source VM runs again, so its data diverges from RHOSO; stop it, or
+  an alert while `source_running_at` is set — the source VM runs again, so its data diverges from the plan's
+  destination provider, named; stop it, or
   roll back (§8.1) — and Finalize unavailable then, saying so, as the API refuses it (a finalize that began deleting
   the source stays available, §8.1), the time in Completed and the finalize reminder past the plan's `finalize_warning_h`, and in
   demo mode "Power on the source VM" / "Power off" for an operator on a completed migration (`POST /demo/vms/…`), so
@@ -2979,7 +2980,7 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   network, its own included) — is marked "not allowed", and when selected a note under the field says why, as
   `NET_PORT_NOT_PERMITTED` does)
   and its addresses (comma separated; empty keeps its own), unavailable with the reason while the plan cannot be
-  edited (its migrations, read as summaries while the plan is editable, say whether one is in flight, §12). A network an entry names that RHOSO no longer lists stays selected, marked "not in RHOSO". A refused
+  edited (its migrations, read as summaries while the plan is editable, say whether one is in flight, §12). A network an entry names that the destination no longer lists stays selected, marked "not on the destination". A refused
   address field is marked invalid, is described by its problem, and gets the focus. A VMware source says the
   migration kit keeps the guest's network settings; its rows name the RHOSO network each NIC's port group goes
   to (the plan's mapping, else the same name, §7.2) with the guest's addresses, and a VMware VM that still has
