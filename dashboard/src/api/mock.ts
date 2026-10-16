@@ -199,7 +199,8 @@ function advisorScope(estimates: readonly Estimate[], policy: Plan['selection_po
 
 /**
  * What the API's serializers send (GET /advisor/data-sent, SDD §13.4): the server generates it from its field
- * specs; the mock repeats it for a remote model whose console stays local.
+ * specs; the mock repeats it for a remote model whose console stays local - word for word, as mock.test.ts holds it to
+ * the API's own list (seamless/tests/fixtures/data_sent.json, review RV21-03).
  */
 const LOCAL_CONSOLE = 'The console excerpt stays in this installation: the advisor is remote and SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE is off.';
 const DATA_SENT: DataSentItem[] = [
@@ -207,7 +208,7 @@ const DATA_SENT: DataSentItem[] = [
     decision_type: 'migration_strategy',
     tool: 'jev_decide',
     fields: [
-      { key: 'decision', label: 'The question, naming the VM' },
+      { key: 'decision', label: "The question, naming the VM and the destination's kind and series (never a provider's name)" },
       { key: 'vm', label: 'VM name, vCPU, RAM and number of disks' },
       { key: 'disks', label: 'Each disk: kind, size, volume type, multi-attach, encrypted, independent' },
       { key: 'size', label: 'Provisioned and used size' },

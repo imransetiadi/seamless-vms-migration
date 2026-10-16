@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 import checkKeysRaw from '../../../seamless/tests/fixtures/check_report_keys.json?raw';
 // what POST and PATCH /providers answer for a name: one case table for the API and the mock (SDD §4.2)
 import nameRaw from '../../../seamless/tests/fixtures/provider_name_cases.json?raw';
+// what GET /advisor/data-sent lists: the API's own list, which the mock serves too (SDD §13.4)
+import dataSentRaw from '../../../seamless/tests/fixtures/data_sent.json?raw';
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
@@ -2351,6 +2353,12 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     const batch = server.events.filter((e) => e.kind === 'plan.finalized').at(-1)!;
     expect(batch.message).toBe(`${plan.name}: 1 finalized by sari, 1 skipped`);
     expect(batch.data).toEqual({ wave_id: null, finalized: [other.vm.name], skipped: [{ vm: 'web-01', migration_id: web01.id, reason }] });
+  });
+
+  it('lists what leaves for Jev in the API\'s own words: the shared data_sent.json (SDD §13.4, review RV21-03)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const res = server.handle('GET', '/advisor/data-sent', new URLSearchParams(), undefined, 'viewer');
+    expect((res.body as { items: unknown[] }).items).toEqual((JSON.parse(dataSentRaw) as { items: unknown[] }).items);
   });
 
   it('declares the item key jev_classify sends, never the VM\'s id, like the API (SDD §14.2, §13.4)', async () => {
