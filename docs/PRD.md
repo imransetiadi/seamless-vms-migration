@@ -138,7 +138,7 @@ for 0.2.0 (goal G7).
 | FR-31 | Destination capability pre-flight: what each chosen strategy needs (compute and block-storage microversions, Cinder manage, Neutron extensions, roles) | M2 | A missing capability blocks the plan and names it; a series outside the tiers or EOL upstream warns (SDD §21.4) |
 | FR-32 | Permission checks follow the destination's policy profile: secure-RBAC defaults (`reader`/`member`/`manager`/`admin`, `service`) or the legacy defaults | M2 | A port on another project's network is judged with `admin`/`service` under the new defaults and `admin`/`advsvc` under the legacy ones (SDD §21.5) |
 | FR-33 | Conversion hosts on community clouds: CentOS Stream 9 and RHEL 9, then Rocky Linux and AlmaLinux 9 and Ubuntu 24.04 LTS images | M2 | The conversion-host roles install and verify the copy tools on each listed image (SDD §21.6) |
-| FR-34 | Destination-neutral wording: findings, events, the CLI and the dashboard name the destination provider, not "RHOSO" | M2 | No user-facing text assumes RHOSO when the destination is community OpenStack (SDD §21.8) |
+| FR-34 | Destination-neutral wording: a text built for a plan or a migration (a finding, an event, a refusal, in the CLI and the dashboard) names the destination provider; a fixed text says "the destination"; only a text about the Red Hat product says "RHOSO 18.0"; nothing the advisor sends to Jev names a provider | M2 | No user-facing text assumes RHOSO when the destination is community OpenStack (SDD §1 naming, §21.8) |
 
 ## 7. Non-functional requirements
 
