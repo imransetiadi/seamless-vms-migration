@@ -1965,7 +1965,7 @@ export function buildFixtures(now: number): Fixtures {
   }
 
   for (const provider of providers.filter((p) => p.last_checked_at)) {
-    emit({ ts: provider.last_checked_at ?? iso(now), kind: 'provider.checked', plan_id: null, migration_id: null, actor: 'bayu', message: `provider ${provider.id}: ${provider.status}`, data: { status: provider.status } });
+    emit({ ts: provider.last_checked_at ?? iso(now), kind: 'provider.checked', plan_id: null, migration_id: null, actor: 'bayu', message: `provider ${provider.id}: ${provider.status}`, data: { provider_id: provider.id, status: provider.status, message: provider.status_message } });
   }
   // the API's audit of a refused request (SDD §13.1); 192.0.2.10 is a documentation address (RFC 5737)
   emit({

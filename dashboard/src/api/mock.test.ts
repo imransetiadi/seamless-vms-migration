@@ -343,6 +343,33 @@ describe('mock API', () => {
     expect(seeded.filter((m) => !/^provider [a-z0-9-]+: (ok|degraded|error|unknown)$/.test(m))).toEqual([]);
   });
 
+  it("gives a provider's events the API's data: the provider, and the secrets it reads where the API names them (SDD §4.3, §13.3, review RV22-03)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const body = {
+      id: 'dst-dc4',
+      name: 'DC4',
+      kind: 'openstack',
+      role: 'destination',
+      distribution: 'openstack_community',
+      endpoint: 'https://keystone.dc4.example.invalid:5000/v3',
+      cloud: null,
+      credentials_secret: 'dc4-credentials',
+    };
+    expect(call('POST', '/providers', body).status).toBe(201);
+    expect(call('POST', '/providers/dst-dc4/check').status).toBe(200);
+    expect(call('PATCH', '/providers/dst-dc4', { region: 'R2' }).status).toBe(200);
+    expect(call('DELETE', '/providers/dst-dc4').status).toBe(204);
+    const data = Object.fromEntries(server.events.filter((e) => e.message.includes('dst-dc4')).map((e) => [e.kind, e.data]));
+    // what routes_providers.create_provider, update_provider, delete_provider and orchestrator.check_provider emit
+    expect(data).toEqual({
+      'provider.created': { provider_id: 'dst-dc4', kind: 'openstack', role: 'destination', credentials_secret: 'dc4-credentials' },
+      'provider.checked': { provider_id: 'dst-dc4', status: 'ok', message: null },
+      'provider.updated': { provider_id: 'dst-dc4', fields: ['region'], credentials_secret: 'dc4-credentials' },
+      'provider.deleted': { provider_id: 'dst-dc4' },
+    });
+  });
+
   it('answers a PATCH of a name that is not a string with its 409 first while a running plan uses the provider, as the API does (review RV21-07)', async () => {
     const { server, client } = setup();
     const busy = server.plans.find((p) => p.status === 'running')!.destination_provider_id;

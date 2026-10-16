@@ -116,6 +116,14 @@ interface MockResponse {
   text?: string;
 }
 
+/** The secrets a provider reads, by name, for its audit events - never a value: the API's _secret_names (SDD §13.3). */
+function secretNames(provider: Provider): Record<string, string> {
+  return {
+    ...(provider.credentials_secret ? { credentials_secret: provider.credentials_secret } : {}),
+    ...(provider.conversion_host?.ssh_key_secret ? { ssh_key_secret: provider.conversion_host.ssh_key_secret } : {}),
+  };
+}
+
 class HttpError extends Error {
   constructor(
     readonly status: number,
@@ -1327,7 +1335,7 @@ export class MockServer {
           this.providers.splice(this.providers.indexOf(provider), 1);
           // its inventory goes with it: a provider created again under the id never reads it (review RV21-12)
           delete this.inventories[provider.id];
-          this.emit({ kind: 'provider.deleted', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} deleted`, data: {} });
+          this.emit({ kind: 'provider.deleted', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} deleted`, data: { provider_id: provider.id } });
           return { status: 204 };
         }
         if (sub === 'check' && method === 'POST') {
@@ -1340,14 +1348,15 @@ export class MockServer {
               provider.status_message = 'The endpoint did not answer (connection timed out).';
             } else {
               provider.status = 'ok';
-              provider.status_message = 'All services reachable.';
+              // as the API's check: a provider that answers has no status message (SDD §10, review RV22-03)
+              provider.status_message = null;
               // the API's keys: a vCenter's VMs counted; an OpenStack cloud's token roles, maxima, pools and TLS, and a
               // destination's series, tier and policy profile by what it declares (SDD §10, §10.1)
               const inventory = this.inventories[provider.id];
               provider.capabilities = provider.kind === 'vmware' ? vmwareCheck(Array.isArray(inventory) ? inventory : []) : checkOf(provider);
             }
           }
-          this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id}: ${provider.status}`, data: { status: provider.status } });
+          this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id}: ${provider.status}`, data: { provider_id: provider.id, status: provider.status, message: provider.status_message } });
           return ok(provider);
         }
         if (sub === 'inventory' && method === 'GET') {
@@ -1698,7 +1707,7 @@ export class MockServer {
       conversion_key_updated_at: null,
     } as Provider;
     this.providers.push(provider);
-    this.emit({ kind: 'provider.created', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} created`, data: {} });
+    this.emit({ kind: 'provider.created', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} created`, data: { provider_id: provider.id, kind: provider.kind, role: provider.role, ...secretNames(provider) } });
     return ok(provider, 201);
   }
 
@@ -1718,7 +1727,7 @@ export class MockServer {
     checkDeclarations({ ...provider, ...input });
     checkSecretNames(input, new Set(Object.keys(input)), provider.id);
     Object.assign(provider, input, { status: 'unknown', status_message: null, last_checked_at: null, capabilities: {} });
-    this.emit({ kind: 'provider.updated', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} updated`, data: { provider_id: provider.id, fields: Object.keys(input).sort() } });
+    this.emit({ kind: 'provider.updated', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} updated`, data: { provider_id: provider.id, fields: Object.keys(input).sort(), ...secretNames(provider) } });
     return ok(provider);
   }
 

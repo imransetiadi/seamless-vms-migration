@@ -363,7 +363,9 @@ describe('Providers page', () => {
     await user.click(within(dialog).getByRole('button', { name: /add and test connection/i }));
 
     const result = await screen.findByRole('dialog', { name: /kolla lab b is connected/i });
-    expect(result).toHaveTextContent(/all services reachable/i);
+    // the API's check gives a provider that answers no status message (review RV22-03): the result says what it is
+    expect(result).toHaveTextContent(/connection test result: /i);
+    expect(result).not.toHaveTextContent(/did not pass/i);
     const created = server.providers.find((p) => p.id === 'kolla-lab-b');
     expect(created).toMatchObject({ kind: 'openstack', role: 'source', distribution: 'kolla', credentials_secret: 'provider-kolla-lab-b', status: 'ok' });
     expect(created?.credentials_updated_at).not.toBeNull();
