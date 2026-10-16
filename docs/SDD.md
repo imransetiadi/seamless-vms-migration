@@ -1315,7 +1315,14 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   The rollback deletes the kit's ports of the VM after the destination server: Nova only unbinds a port it did not
   create when it deletes the server (`preserve_on_delete`), so the port would keep the NIC's MAC and addresses and
   refuse the next attempt. They are the unbound ports with one of the VM's NIC MACs and a name of the kit's form
-  (`<VM name>-NIC-<n>-VLAN-<network>`), whichever network they are on; a port bound to a server is never deleted.
+  (`<kit name>-NIC-<n>-VLAN-<network>`), whichever network they are on; a port bound to a server is never deleted,
+  nor another VM's port that shares a MAC (audit EX-07). `<kit name>` is the VM name as the kit (2.2.7,
+  `SafeVmName`) writes it into every name it gives: its transliteration table applied (`é` → `e`, `ß` → `ss`, …),
+  every other character outside `[A-Za-z0-9_-]` replaced by `_`, runs of `_` and of `-` collapsed, cut to 64
+  characters, trailing `_` and `-` removed. The kit names the destination server the same way, so every lookup of a
+  VMware migration's server by name — the name-collision refusal before its first attempt, the server its cutover
+  reports, its rollback's — uses `<kit name>`: a VM named `web01.example.com` gets the server `web01_example_com`,
+  which the VM's own name never finds (audit EX-18).
   A cancel's cleanup (§5.1) deletes only the server the migration recorded: it looks up no server by name, deletes no
   kit port and powers nothing on.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
