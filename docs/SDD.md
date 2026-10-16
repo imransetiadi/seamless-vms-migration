@@ -1922,12 +1922,13 @@ Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking ca
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`, as a source and as a destination - a community
 OpenStack destination (kind `openstack`, distribution `openstack_community` or `kolla`) takes the same code path as
 RHOSO 18.0, §21; `check()` reports `{"admin": bool,
-"roles": [the role names of the credential's token, sorted], "compute_microversion": str,
+"roles": [the role names of the credential's token, sorted; left out when they cannot be read], "compute_microversion": str,
 "block_storage_microversion": str, "ovn": bool,
 "volume_backends": [pool names], "storage_backends": [{"pool": str, "vendor": str|null, "protocol": str|null,
 "family": "rbd"|"netapp_nfs"|"netapp_block"|"other"}], "tls": bool, "plain_http": [str]}`, both backend lists empty
 without admin (`roles` is what `NET_PORT_NOT_PERMITTED` judges, §9.3: Neutron's policy names roles, while `admin` is
-the compute probe); the microversions are each service's maximum as `major.minor` text (keystoneauth hands a parsed
+the compute probe; a report without it leaves the role half unjudged there, and a run reads the roles live, §7.2,
+§7.3 step 0, review 20); the microversions are each service's maximum as `major.minor` text (keystoneauth hands a parsed
 version tuple, `(2, 104)`, reported as `"2.104"`), `""` when unreadable; `tls` is true when the provider's `endpoint`,
 the auth URL its credential is posted to (the `auth_url` of its `clouds.yaml` entry or of its credentials secret,
 §13.3) and the endpoint of each service Seamless calls (`identity`, `compute`, `block-storage`, `network`, `image`,
@@ -3492,8 +3493,8 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
 * Under `unknown`, a port refusal's advice names both ways out: check the provider, so its series is detected from
   its maxima, or declare its policy profile or series (review 19). An operator may check a provider while a plan
   that uses it runs or is paused; a PATCH that declares is refused then (§12). After a reset, the next check settles
-  an undeclared community destination's profile unless its range straddles 2023.1 and 2023.2; then only declaring
-  settles it. The pre-flight's `NET_PORT_NOT_PERMITTED` remediation, the executors' and the collection's refusals,
+  an undeclared community destination's profile unless its range straddles 2023.1 and 2023.2 or its compute maximum
+  cannot be read (nothing detected, §10.1); then only declaring settles it (review 20). The pre-flight's `NET_PORT_NOT_PERMITTED` remediation, the executors' and the collection's refusals,
   and the dashboard's mirror of them say so.
 
 ### 21.6 Conversion hosts on community clouds
