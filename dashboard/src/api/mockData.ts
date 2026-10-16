@@ -239,15 +239,14 @@ const SERIES_NAME = /^\d{4}\.[12]$/;
 
 /**
  * The destination by kind and series, as the API names it to Jev (`destination_descriptor`; SDD §1 naming, §13.4,
- * review RV20-01): "RHOSO 18.0", the community series the check settled, else the declared one - never the
- * provider's name, which is operator free text.
+ * review RV20-01): "RHOSO 18.0", the community series the check settled - never the provider's name, which is operator
+ * free text. A check's report says what is settled, the declared series too unless the APIs contradict it, so the
+ * declared series alone counts only before any check reported one (review RV21-09).
  */
 export function destinationDescriptor(destination: Pick<Provider, 'kind' | 'capabilities' | 'release'>): string {
   if (destination.kind === 'rhoso') return 'RHOSO 18.0';
-  for (const series of [destination.capabilities.release, destination.release]) {
-    if (typeof series === 'string' && SERIES_NAME.test(series)) return `a community OpenStack ${series} destination`;
-  }
-  return 'a community OpenStack destination';
+  const series = 'release' in destination.capabilities ? destination.capabilities.release : destination.release;
+  return typeof series === 'string' && SERIES_NAME.test(series) ? `a community OpenStack ${series} destination` : 'a community OpenStack destination';
 }
 
 /**

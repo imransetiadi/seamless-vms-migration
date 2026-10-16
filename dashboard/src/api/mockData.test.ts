@@ -496,6 +496,9 @@ describe('the mock advisor names the destination to Jev like the API (SDD §1 na
     for (const unsettled of [{ release: null }, { release: "ACME's own build" }, {}]) {
       expect(destinationDescriptor({ ...dc3, capabilities: unsettled, release: null })).toBe('a community OpenStack destination');
     }
+    // a declared series the APIs contradict: the check settles none, and none is named (review RV21-09)
+    const contradicted = { release: null, release_range: ['2025.1', '2025.2'] };
+    expect(destinationDescriptor({ ...dc3, capabilities: contradicted, release: '2024.1' })).toBe('a community OpenStack destination');
   });
 
   it('replaces a name wherever it stands as a word, the longest name first, as the API does', () => {

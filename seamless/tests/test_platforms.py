@@ -495,3 +495,8 @@ def test_the_destination_descriptor_names_the_kind_and_series_never_the_provider
     for unsettled in ({"release": None}, {"release": "ACME's own build"}, {}):
         bare = dc3.model_copy(update={"capabilities": unsettled, "release": None})
         assert destination_descriptor(bare) == "a community OpenStack destination"
+    # a declared series the APIs contradict: the check settles none, and none is named (RV21-09)
+    contradicted = destination_release("openstack", "2024.1", None, "2.100", None)
+    assert contradicted["release"] is None and contradicted["release_range"] == ["2025.1", "2025.2"]
+    stale = dc3.model_copy(update={"capabilities": contradicted, "release": "2024.1"})
+    assert destination_descriptor(stale) == "a community OpenStack destination"
