@@ -255,8 +255,8 @@ CATALOG: dict[str, CatalogEntry] = {
     "DST_CAPABILITY_MISSING": CatalogEntry(
         Severity.blocker,
         (),
-        "Use a destination whose APIs provide the capability (SDD §21.4) or a strategy that "
-        "does not need it; upgrading the destination's services raises their maxima.",
+        "Use a destination whose APIs provide the capability (SDD §21.4); upgrading the "
+        "destination's services raises their maxima.",
     ),
     "DST_RELEASE_OUTSIDE_SUPPORT": CatalogEntry(
         Severity.warning,
@@ -1224,7 +1224,8 @@ def _release_outside_support(destination: Provider, caps: Mapping[str, Any]) -> 
                 "below_floor": f"Destination {destination.id} runs a series older than "
                 f"{SERIES[0].name}, the support window's floor: no Seamless release validated it.",
                 "newer_than_validated": f"Destination {destination.id} runs a series newer than "
-                f"{SERIES[-1].name}, the newest a Seamless release validated.",
+                f"{SERIES[-1].name}, the newest series of the support window: no Seamless release "
+                "validated it.",
             }.get(
                 str(reason),
                 f"Destination {destination.id}'s series could not be detected (its compute API "

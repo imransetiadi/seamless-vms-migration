@@ -1069,6 +1069,8 @@ def test_finding_dst_capability_missing():
     every = found(compute_microversion="2.53", block_storage_microversion="2.0")
     assert len(every) == 1 and every[0].severity == Severity.blocker and every[0].remediation
     assert every[0].strategies == []  # every strategy
+    # no strategy avoids a floor every strategy needs: none is offered (review 18, nit 7)
+    assert "strategy" not in every[0].remediation, every[0].remediation
     assert every[0].message == (
         "Destination dst-flamingo lacks what every strategy needs: compute API 2.53, below 2.60 "
         "(multi-attach); block storage API 2.0, below 3.0."
@@ -1115,8 +1117,9 @@ TIER3 = {"tier": "tier3", "reason": "end_of_life", "declared_outside_range": Fal
             [],
             {"tier": "outside", "reason": "newer_than_validated", "declared_outside_range": False},
             None,
-            "Destination dst-flamingo runs a series newer than 2026.2, the newest a Seamless "
-            "release validated. The capability checks still apply.",
+            # no Seamless release validated 2026.2 yet: it is the window's newest (review 18, nit 8)
+            "Destination dst-flamingo runs a series newer than 2026.2, the newest series of the "
+            "support window: no Seamless release validated it. The capability checks still apply.",
         ),
         (
             [],
