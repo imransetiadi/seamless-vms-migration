@@ -220,3 +220,26 @@ describe('Advisor policies page (SDD §14.6, §16, ADV-04)', () => {
     await waitFor(() => expect(card(FINANCE)).toHaveTextContent(/Distinct approver\s*Not required/));
   });
 });
+
+describe('the advisor policy texts name a provider stored blank by its id (SDD §1 naming, §4.2, review RV22-01)', () => {
+  it("the policy card's scope reads the provider's id, never its blank name", async () => {
+    const server = createTestServer();
+    // stored before the API refused a blank name (review RV20-11): every text names it by its id
+    server.providers.find((p) => p.id === 'rhosp17-dc1')!.name = '   ';
+    renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies', token: 'viewer', server });
+    await screen.findByRole('heading', { level: 2, name: '1 policy' });
+    expect(screen.getByRole('article', { name: FINANCE })).toHaveTextContent('Plans from rhosp17-dc1');
+  });
+
+  it("the policy dialog's source-provider choice reads the provider's id, never its blank name", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    server.providers.find((p) => p.id === 'rhosp17-dc1')!.name = '   ';
+    renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies', server });
+    await screen.findByRole('heading', { level: 2, name: '1 policy' });
+    await user.click(within(screen.getByRole('article', { name: FINANCE })).getByRole('button', { name: `Edit ${FINANCE}` }));
+    const dialog = await screen.findByRole('dialog', { name: 'Edit policy' });
+    expect(within(dialog).getByRole('checkbox', { name: 'rhosp17-dc1' })).toBeChecked();
+  });
+});
+

@@ -11,6 +11,7 @@ import {
   type PolicyMode,
 } from '../api/types';
 import { DECISION_TYPE_LABELS } from '../lib/advisor';
+import { providerLabel } from '../lib/providerUse';
 import { Button } from './Button';
 import { Checkbox } from './Checkbox';
 import { ErrorBanner } from './ErrorBanner';
@@ -99,11 +100,14 @@ function validate(f: FormState): { errors: Errors; spec: AdvisorPolicySpec | nul
   };
 }
 
-/** Checked ids, keeping one the list no longer has so it can be unchecked (the API refuses an unknown id). */
-function choices(known: Array<{ id: string; name: string }>, chosen: string[]): Array<{ id: string; label: string }> {
-  const names = new Map(known.map((k) => [k.id, k.name]));
-  const gone = chosen.filter((id) => !names.has(id)).map((id) => ({ id, label: `${id} (not found)` }));
-  return [...known.map((k) => ({ id: k.id, label: k.name })), ...gone];
+/**
+ * Checked ids, keeping one the list no longer has so it can be unchecked (the API refuses an unknown id). The caller
+ * labels what it knows: a provider by providerLabel (SDD §4.2, review RV22-01), a plan by its name.
+ */
+function choices(known: Array<{ id: string; label: string }>, chosen: string[]): Array<{ id: string; label: string }> {
+  const ids = new Set(known.map((k) => k.id));
+  const gone = chosen.filter((id) => !ids.has(id)).map((id) => ({ id, label: `${id} (not found)` }));
+  return [...known, ...gone];
 }
 
 const toggled = <T,>(list: T[], item: T, on: boolean): T[] => (on ? [...list, item] : list.filter((x) => x !== item));
@@ -144,7 +148,17 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((f) => ({ ...f, [key]: value }));
   const sources = (providers.data ?? []).filter((p) => p.role === 'source');
   const scopeItems =
-    form.scope === 'providers' ? choices(sources, form.providerIds) : form.scope === 'plans' ? choices(plans.data ?? [], form.planIds) : [];
+    form.scope === 'providers'
+      ? choices(
+          sources.map((p) => ({ id: p.id, label: providerLabel(p) })),
+          form.providerIds,
+        )
+      : form.scope === 'plans'
+        ? choices(
+            (plans.data ?? []).map((p) => ({ id: p.id, label: p.name })),
+            form.planIds,
+          )
+        : [];
   const scopeQuery = form.scope === 'providers' ? providers : plans;
   const errorEntries = Object.entries(errors) as Array<[FieldKey, string]>;
 

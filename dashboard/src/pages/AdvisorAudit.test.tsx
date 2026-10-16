@@ -238,3 +238,29 @@ describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
     expect(screen.getByRole('button', { name: /download csv/i })).toHaveAccessibleDescription('The audit trail could not be loaded.');
   });
 });
+
+describe('a policy change names a provider stored blank by its id (SDD §1 naming, §4.2, §14.5, review RV22-01)', () => {
+  it("reads the provider's id in the change's scope, never its blank name", async () => {
+    const server = createTestServer();
+    server.providers.find((p) => p.id === 'rhosp17-dc1')!.name = '   ';
+    const plan = server.plans[0]!;
+    const finance = server.policies.find((p) => p.id === 'pol-finance')!;
+    const body = {
+      name: finance.name,
+      scope: { provider_ids: [], plan_ids: [plan.id] },
+      decision_types: finance.decision_types,
+      mode: finance.mode,
+      threshold: finance.threshold,
+      min_evidence_for_auto_apply: finance.min_evidence_for_auto_apply,
+      require_override_reason: finance.require_override_reason,
+      require_distinct_approver: finance.require_distinct_approver,
+    };
+    expect(server.handle('PUT', '/advisor/policies/pol-finance', new URLSearchParams(), body, 'admin').status).toBe(200);
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer', server });
+    const table = await screen.findByRole('table', { name: /advisor audit events/i });
+    await waitFor(() =>
+      expect(within(table).getAllByRole('listitem').map((li) => li.textContent)).toEqual([`Applies to: Plans from rhosp17-dc1 → Plan ${plan.name}`]),
+    );
+  });
+});
+
