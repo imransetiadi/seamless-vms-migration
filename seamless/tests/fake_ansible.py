@@ -187,7 +187,8 @@ SCRIPT = textwrap.dedent(
     created = os.environ.get("ANSIBLE_FAKE_CREATED")
     if created and stop_task and not os.environ.get("ANSIBLE_FAKE_STOP_SKIPPED"):
         with open(created, "a") as fh:
-            fh.write(name + "\\n")
+            # the name the playbook gives the server: the kit's own name of the VM (SDD 7.2)
+            fh.write(os.environ.get("ANSIBLE_FAKE_CREATED_NAME", name) + "\\n")
     print("PLAY RECAP ****")
     """
 )

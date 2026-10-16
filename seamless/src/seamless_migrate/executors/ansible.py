@@ -71,8 +71,41 @@ from .base import (
 log = logging.getLogger(__name__)
 
 KIT_PLAYBOOK = "os_migrate.vmware_migration_kit.migration"
-#: the name the migration kit gives the port it creates for a NIC: "{vm}-NIC-{n}-VLAN-{network}"
-KIT_PORT_NAME = re.compile(r"-NIC-\d+-VLAN-")
+#: the migration kit's transliteration table (SafeVmName in plugins/module_utils/utils.go of the
+#: pinned 2.2.7), as the kit has it
+_KIT_TRANSLITERATIONS = {
+    **dict(zip("áéíóúÁÉÍÓÚñÑüÜ", "aeiouAEIOUnNuU", strict=True)),
+    **dict(zip("ãõàâêôçÃÕÀÂÊÔÇ", "aoaaeocAOAAEOC", strict=True)),
+    **dict(zip("èëîïùûÈËÎÏÙÛ", "eeiiuuEEIIUU", strict=True)),
+    **{"æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ß": "ss"},
+    **dict(zip("äöÄÖìòÌÒ", "aoAOioIO", strict=True)),
+    **dict.fromkeys("·\u2019\u2013\u2014\u00a0", "_"),
+}
+
+
+def kit_vm_name(name: str) -> str:
+    """The VM's name as the migration kit writes it into every name it gives - its destination
+    server, the prefix of its ports (SDD §7.2): transliterated, every other character outside
+    [A-Za-z0-9_-] written ``_``, runs of ``_`` and of ``-`` collapsed, cut to 64 characters, its
+    trailing ``_`` and ``-`` removed (SafeVmName of the pinned kit 2.2.7)."""
+    safe = "".join(_KIT_TRANSLITERATIONS.get(ch, ch) for ch in name)
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", safe)
+    safe = re.sub(r"-+", "-", re.sub(r"_+", "_", safe))
+    return safe[:64].rstrip("_-")
+
+
+def destination_server_name(m: Migration) -> str:
+    """The name the migration's destination server gets: the VM's own from os-migrate, the kit's
+    name of it from the VMware migration kit (SDD §7.2)."""
+    return kit_vm_name(m.vm.name) if m.strategy in VMWARE else m.vm.name
+
+
+def kit_port_name(vm_name: str) -> re.Pattern[str]:
+    """The name the kit gives a port it creates for one of the VM's NICs:
+    "{kit name}-NIC-{n}-VLAN-{network}" (SDD §7.2)."""
+    return re.compile(re.escape(kit_vm_name(vm_name)) + r"-NIC-\d+-VLAN-")
+
+
 SERVER_TYPE = "openstack.compute.Server"
 OPENSTACK = frozenset({Strategy.cold, Strategy.warm})
 VMWARE = frozenset({Strategy.vmware_cold, Strategy.vmware_warm})
@@ -1050,7 +1083,8 @@ class AnsibleExecutor:
         return result
 
     async def _refuse_name_collision(self, ctx: StepContext) -> None:
-        """Before the first cutover attempt, refuse a destination server that carries the VM's name.
+        """Before the first cutover attempt, refuse a destination server that carries the name the
+        migration's server will get (the kit's name of a VMware VM, SDD §7.2).
 
         The cold role would skip the migration (and report success), the kit would fail after
         powering the VM off, and a later rollback by name would delete a server this migration
@@ -1060,17 +1094,18 @@ class AnsibleExecutor:
         m = ctx.migration
         if m.destination_server_id or m.downtime_started_at is not None:
             return
+        name = destination_server_name(m)
         try:
-            existing = await self.providers.get(ctx.destination).find_server(m.vm.name)
+            existing = await self.providers.get(ctx.destination).find_server(name)
         except ProviderError as exc:
             # an unanswered lookup is not "no such server": refuse before anything is stopped
             # (a duplicate name is a lookup error too)
             raise TransientStepError(
-                f"could not check {ctx.destination.label} for a server named {m.vm.name}: {exc}"
+                f"could not check {ctx.destination.label} for a server named {name}: {exc}"
             ) from exc
         if existing:
             raise PermanentStepError(
-                f"a server named {m.vm.name} already exists in {ctx.destination.label} "
+                f"a server named {name} already exists in {ctx.destination.label} "
                 f"({existing}) and this migration did not create it; delete or rename it before "
                 "the cutover"
             )
@@ -1306,27 +1341,28 @@ class AnsibleExecutor:
         return None
 
     @staticmethod
-    async def _delete_kit_ports(dst: Any, nics: list[Nic]) -> list[str]:
+    async def _delete_kit_ports(dst: Any, nics: list[Nic], vm_name: str) -> list[str]:
         """Delete the migration kit's ports of the VM (SDD §7.2): Nova only unbinds a port it did
         not create when it deletes the server, and the port would keep the NIC's MAC and addresses.
-        They are the unbound ports with one of the NICs' MACs and the kit's name form; a port bound
-        to a server is never deleted."""
+        They are the unbound ports with one of the NICs' MACs and the kit's name form for this VM;
+        a port bound to a server, or another VM's that shares a MAC, is never deleted (EX-07)."""
+        own = kit_port_name(vm_name)
         deleted: list[str] = []
         for mac in sorted({nic.mac.lower() for nic in nics if nic.mac}):
             for port in await dst.ports(mac_address=mac):
-                if port.get("device_id") or not KIT_PORT_NAME.search(str(port.get("name") or "")):
+                if port.get("device_id") or not own.match(str(port.get("name") or "")):
                     continue
                 await dst.delete_port(port["id"])
                 deleted.append(str(port["id"]))
         return deleted
 
     async def _lookup_server(self, ctx: StepContext) -> str | None:
+        name = destination_server_name(ctx.migration)
         try:
-            return await self.providers.get(ctx.destination).find_server(ctx.migration.vm.name)
+            return await self.providers.get(ctx.destination).find_server(name)
         except ProviderError as exc:
             await ctx.log(
-                f"could not look up the server named {ctx.migration.vm.name} in "
-                f"{ctx.destination.label}: {exc}"
+                f"could not look up the server named {name} in {ctx.destination.label}: {exc}"
             )
             return None
 
@@ -1342,10 +1378,10 @@ class AnsibleExecutor:
                 # the kit records nothing in the control plane before the cutover powers the
                 # VM off; a same-named server after that point was created by this migration
                 # (_refuse_name_collision ruled out a pre-existing one before the attempt)
-                server_id = await dst.find_server(vm.name)
+                server_id = await dst.find_server(kit_vm_name(vm.name))
             if server_id:
                 await dst.delete_server(server_id)
-            deleted_ports = await self._delete_kit_ports(dst, vm.nics)
+            deleted_ports = await self._delete_kit_ports(dst, vm.nics, vm.name)
             await self.providers.get(ctx.source).power_on(vm.source_id)
         except ProviderError as exc:
             raise TransientStepError(f"rollback: {exc}") from exc

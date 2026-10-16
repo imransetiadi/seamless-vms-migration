@@ -2632,6 +2632,137 @@ async def test_a_vmware_cancels_cleanup_deletes_only_a_recorded_server(env):
     assert env.registry.calls == [("delete_server", "dst-9")]
 
 
+KIT_NAMES = json.loads((Path(__file__).parent / "fixtures" / "kit_vm_name_cases.json").read_text())
+
+
+@pytest.mark.parametrize("name", sorted(KIT_NAMES["cases"]))
+def test_kit_vm_name_names_a_vm_as_the_migration_kit_does(name):
+    """SDD §7.2: the kit (2.2.7) writes a VM's name into every name it gives through its
+    SafeVmName; the expected names are SafeVmName's own outputs (audit EX-07, EX-18)."""
+    from seamless_migrate.executors.ansible import kit_vm_name
+
+    assert kit_vm_name(name) == KIT_NAMES["cases"][name]
+
+
+def kit_port(port_id, name, mac="00:50:56:00:00:01", device_id=""):
+    return {
+        "id": port_id,
+        "name": name,
+        "network_id": "net-app-net-mine",
+        "device_id": device_id,
+        "mac_address": mac,
+        "fixed_ips": ["10.0.0.5"],
+    }
+
+
+async def test_a_vmware_rollback_deletes_only_the_kit_ports_of_this_vm(env):
+    """SDD §7.2: the rollback deletes the unbound ports with one of the VM's MACs whose name starts
+    with the kit's name of this VM, then -NIC-<n>-VLAN-. Another VM's kit port that shares the MAC
+    (another vCenter, a hand-set MAC) is kept, as is one whose name only contains it (audit
+    EX-07)."""
+    nic = Nic(network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"])
+    env.registry.ports = [
+        kit_port("ours", "web01_example_com-NIC-0-VLAN-app-net"),
+        kit_port("other-vm", "db-07-NIC-0-VLAN-dc2-prod"),
+        kit_port("longer-name", "web01_example_com2-NIC-0-VLAN-app-net"),
+        kit_port("inside", "xweb01_example_com-NIC-0-VLAN-app-net"),
+    ]
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web01.example.com",
+        nics=[nic],
+        destination_server_id="dst-9",
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["deleted_ports"] == ["ours"]
+    assert [p["id"] for p in env.registry.ports] == ["other-vm", "longer-name", "inside"]
+
+
+async def test_a_vmware_cutover_reports_the_server_the_kit_named_after_the_vm(env, monkeypatch):
+    """SDD §7.2: the kit names the destination server as it names the VM - web01.example.com's
+    is web01_example_com, which a lookup by the VM's own name never finds. The cutover reports
+    that server, so verification probes it (audit EX-18)."""
+    monkeypatch.setenv("ANSIBLE_FAKE_VM_NAME", "web01.example.com")
+    monkeypatch.setenv("ANSIBLE_FAKE_CREATED_NAME", "web01_example_com")
+    nic = Nic(
+        network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net"
+    )
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web01.example.com",
+        nics=[nic],
+        mappings=Mappings(),
+    )
+    result = await env.executor.run(StepName.CUTOVER, ctx)
+    assert result.destination_server_id == "dst-web01_example_com"
+
+
+async def test_a_vmware_rollback_after_the_stop_deletes_the_server_the_kit_named(env):
+    """SDD §7.2: without a recorded server, the rollback after the power-off deletes the server the
+    kit built, found by the kit's name of the VM - never left running beside the source it powers
+    on, with the same MACs and addresses (audit EX-18)."""
+    registry = FakeRegistry(existing={"web01_example_com"})
+    executor = AnsibleExecutor(env.settings, providers=registry, poll_s=0.02)
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web01.example.com",
+        downtime_started_at=utcnow(),
+    )
+    result = await executor.run(StepName.ROLLBACK, ctx)
+    assert registry.calls == [
+        ("find_server", "web01_example_com"),
+        ("delete_server", "dst-web01_example_com"),
+        ("power_on", "srv-1"),
+    ]
+    assert result.details["deleted_server"] == "dst-web01_example_com"
+
+
+async def test_the_first_vmware_attempt_refuses_a_server_with_the_kits_name_of_the_vm(env):
+    """SDD §7.2: before the first attempt, a destination server named as the kit will name this
+    VM's is refused - the rollback would delete it by that name - though the VM's own name differs
+    from it (audit EX-18)."""
+    executor = AnsibleExecutor(
+        env.settings, providers=FakeRegistry(existing={"web01_example_com"}), poll_s=0.02
+    )
+    nic = Nic(
+        network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net"
+    )
+    ctx, rec = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web01.example.com",
+        nics=[nic],
+        mappings=Mappings(),
+    )
+    with pytest.raises(PermanentStepError, match="a server named web01_example_com already exists"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == [] and rec.downtime_marks == 0
+
+
+async def test_an_openstack_migration_looks_its_server_up_by_the_vms_own_name(env):
+    """SDD §7.2: os-migrate gives the destination server the VM's own name - only the VMware kit
+    writes its own name of the VM - so a cold migration of web01.example.com refuses a server of
+    that name and lets the kit's form of it be (audit EX-18)."""
+    for existing, refused in (("web01.example.com", True), ("web01_example_com", False)):
+        registry = FakeRegistry(existing={existing})
+        executor = AnsibleExecutor(env.settings, providers=registry, poll_s=0.02)
+        ctx, _ = ctx_for(env, strategy=Strategy.cold, name="web01.example.com")
+        if refused:
+            with pytest.raises(PermanentStepError, match="a server named web01.example.com"):
+                await executor.run(StepName.CUTOVER, ctx)
+        else:
+            await executor.run(StepName.CUTOVER, ctx)
+        finds = [c for c in registry.calls if c[0] == "find_server"]
+        assert finds[0] == ("find_server", "web01.example.com"), existing
+
+
 async def test_vmware_rollback_deletes_by_name_only_after_a_stop(env):
     """Without a recorded destination server, only a cutover that powered the VM off can have
     created a same-named server; an earlier failure leaves any such server alone."""
