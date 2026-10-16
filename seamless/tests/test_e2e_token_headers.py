@@ -425,3 +425,22 @@ def test_the_smoke_skips_an_optional_integration_that_is_not_configured():
     up = '{"jev":{"mode":"http","available":true},"memory":{"enabled":true,"available":true}}'
     out = _smoke_gates(up, 'needs_jev "jev up" true; needs_memory "memory up" true')
     assert out.splitlines() == ["PASS  jev up", "PASS  memory up"]
+
+
+def test_the_smoke_skips_the_jev_recommendation_check_when_jev_is_off():
+    """SDD §14.4: with Jev off the rules decide the strategy, so the check that Jev's
+    recommendation was recorded is skipped, saying why; with Jev on it still runs and can fail."""
+    script = (ROOT / "tests" / "e2e" / "smoke-demo.sh").read_text(encoding="utf-8")
+    start = script.index("\nif jev_on; then\n") + 1  # the block, not needs_jev's body
+    block = script[start : script.index("\nfi\n", start) + 3]
+    stub = 'needs_plan() { check "$1" "$2"; }\n'
+    recorded = stub + 'advice=\'{"model":"jev"}\'\n' + block
+    by_rules = stub + 'advice=\'{"model":"rules"}\'\n' + block
+    name = "jev strategy recommendation recorded (SDD §14.4)"
+    off = '{"jev":{"mode":"off","available":false}}'
+    assert _smoke_gates(off, by_rules).splitlines() == [
+        f"SKIP  {name} (Jev is off: the rules decide)"
+    ]
+    on = '{"jev":{"mode":"http","available":true}}'
+    assert _smoke_gates(on, recorded).splitlines() == [f"PASS  {name}"]
+    assert _smoke_gates(on, by_rules).splitlines() == [f"FAIL  {name}"]
