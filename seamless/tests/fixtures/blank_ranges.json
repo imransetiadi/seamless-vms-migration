@@ -1,0 +1,31 @@
+{
+ "_comment": "The code points a blank provider name holds only (SDD §4.2): Unicode 15.1's separators (Z), controls (Cc) and format characters (Cf), as [first, last] ranges. The API's domain/models.BLANK_RANGES (test_models.py) and the dashboard's lib/providerUse BLANK_RANGES (providerUse.test.ts) both equal it, so every runtime answers alike whatever its own Unicode database (review RV22-06). Regenerate it from a Python whose unicodedata.unidata_version is the version below; test_models.py checks it on one.",
+ "unicode": "15.1.0",
+ "ranges": [
+  [0, 32],
+  [127, 160],
+  [173, 173],
+  [1536, 1541],
+  [1564, 1564],
+  [1757, 1757],
+  [1807, 1807],
+  [2192, 2193],
+  [2274, 2274],
+  [5760, 5760],
+  [6158, 6158],
+  [8192, 8207],
+  [8232, 8239],
+  [8287, 8292],
+  [8294, 8303],
+  [12288, 12288],
+  [65279, 65279],
+  [65529, 65531],
+  [69821, 69821],
+  [69837, 69837],
+  [78896, 78911],
+  [113824, 113827],
+  [119155, 119162],
+  [917505, 917505],
+  [917536, 917631]
+ ]
+}

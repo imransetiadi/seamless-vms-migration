@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { MockServer } from '../api/mock';
 import type { Plan, Provider } from '../api/types';
-import { deleteRefusal, destinationName, plansThatNeed, providerLabel } from './providerUse';
+import { BLANK_RANGES, deleteRefusal, destinationName, isBlank, plansThatNeed, providerLabel } from './providerUse';
 // the label a stored name reads as: one case table for the API and the dashboard (SDD §1 naming, §4.2)
 import nameRaw from '../../../seamless/tests/fixtures/provider_name_cases.json?raw';
+// the code points a blank name holds only: the API's pinned list (SDD §4.2)
+import blankRaw from '../../../seamless/tests/fixtures/blank_ranges.json?raw';
 
 const plan = (id: string, status: Plan['status'], counts: Plan['migration_counts'] = {}, derived = status as Plan['derived_status']) =>
   ({ id, name: `Plan ${id}`, status, derived_status: derived, migration_counts: counts, source_provider_id: 'src', destination_provider_id: 'dst' }) as Plan;
@@ -106,3 +108,20 @@ describe('labels a provider as the API does (SDD §1 naming, §4.2, review RV21-
     expect(providerLabel({ id: 'dst-case', name: c.name })).toBe(c.label);
   });
 });
+
+describe('blank is one pinned list, the API\'s (SDD §4.2, review RV22-06)', () => {
+  const pinned = (JSON.parse(blankRaw) as { ranges: Array<[number, number]> }).ranges;
+
+  it("holds the API's list: Unicode 15.1's separators, controls and format characters", () => {
+    expect(BLANK_RANGES.map(([first, last]) => [first, last])).toEqual(pinned);
+  });
+
+  it('reads every code point by that list alone, never the runtime\'s Unicode tables', () => {
+    const listed = (cp: number) => pinned.some(([first, last]) => cp >= first && cp <= last);
+    const wrong: number[] = [];
+    for (let cp = 0; cp <= 0x10ffff; cp++) if (isBlank(String.fromCodePoint(cp)) !== listed(cp)) wrong.push(cp);
+    expect(wrong).toEqual([]);
+    expect([isBlank('\u{13439} \u200b'), isBlank('\u{13439}x')]).toEqual([true, false]);
+  });
+});
+

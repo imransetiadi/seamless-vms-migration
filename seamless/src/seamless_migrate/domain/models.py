@@ -6,11 +6,11 @@ serialize as ISO-8601 strings ending in ``Z``; naive inputs are interpreted as U
 
 from __future__ import annotations
 
+import bisect
 import ipaddress
 import math
 import re
 import secrets
-import unicodedata
 from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -176,14 +176,49 @@ class ProviderCreate(Provider):
 #: why POST and PATCH /providers refuse a name (SDD §4.2, review RV20-11)
 BLANK_NAME = "must not be blank"
 
-#: what a blank name holds only: Unicode's separators, controls and format characters (SDD §4.2)
-_BLANK_CATEGORIES = frozenset({"Zs", "Zl", "Zp", "Cc", "Cf"})
+#: the code points a blank name holds only - Unicode 15.1's separators (Z), controls (Cc) and
+#: format characters (Cf) - pinned, as the dashboard's BLANK_RANGES, so every runtime answers
+#: alike whatever its own Unicode database (SDD §4.2, review RV22-06); tests/fixtures/
+#: blank_ranges.json holds both to the same list
+BLANK_RANGES: tuple[tuple[int, int], ...] = (
+    (0x0000, 0x0020),
+    (0x007F, 0x00A0),
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x1680, 0x1680),
+    (0x180E, 0x180E),
+    (0x2000, 0x200F),
+    (0x2028, 0x202F),
+    (0x205F, 0x2064),
+    (0x2066, 0x206F),
+    (0x3000, 0x3000),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+)
+_BLANK_STARTS = tuple(first for first, _ in BLANK_RANGES)
 
 
 def is_blank(name: str) -> bool:
-    """No character outside Unicode's separators (Z), controls (Cc) and format characters (Cf) -
-    empty, spaces, U+200B, U+FEFF: the rule the dashboard shares (SDD §4.2, review RV21-08)."""
-    return all(unicodedata.category(ch) in _BLANK_CATEGORIES for ch in name)
+    """No character outside BLANK_RANGES - empty, spaces, U+200B, U+FEFF -: the rule the dashboard
+    shares, read from the pinned list alone (SDD §4.2, reviews RV21-08, RV22-06)."""
+    for ch in name:
+        cp = ord(ch)
+        at = bisect.bisect_right(_BLANK_STARTS, cp) - 1
+        if at < 0 or cp > BLANK_RANGES[at][1]:
+            return False
+    return True
 
 
 DiskKind = Literal["volume", "ephemeral", "image_root", "vmdk"]

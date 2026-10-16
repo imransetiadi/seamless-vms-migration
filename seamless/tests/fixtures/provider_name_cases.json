@@ -151,6 +151,15 @@
    "status": 422,
    "message": "name: must not be blank",
    "note": "17. a zero width space alone (U+200B)"
+  },
+  {
+   "route": "POST",
+   "body": {
+    "name": "\ud80d\udc39"
+   },
+   "status": 422,
+   "message": "name: must not be blank",
+   "note": "18. a format control Unicode 15 added (U+13439)"
   }
  ],
  "label_cases": [
@@ -188,6 +197,11 @@
    "name": "\ufeffDC3",
    "label": "\ufeffDC3",
    "note": "a name a byte order mark starts: the name as stored"
+  },
+  {
+   "name": "\ud80d\udc39",
+   "label": "dst-case",
+   "note": "a format control Unicode 15 added: the id"
   }
  ]
 }

@@ -1,4 +1,5 @@
 import json
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from seamless_migrate.domain.enums import (
     SyncPassKind,
 )
 from seamless_migrate.domain.models import (
+    BLANK_RANGES,
     AdvisorNote,
     CutoverWindow,
     Estimate,
@@ -24,6 +26,7 @@ from seamless_migrate.domain.models import (
     Plan,
     Provider,
     SyncPass,
+    is_blank,
     new_migration_id,
     new_plan_id,
 )
@@ -337,3 +340,33 @@ def test_a_provider_stored_with_a_blank_name_loads_and_is_named_by_its_id(case):
     stored = make_provider(id="dst-case", name="RHOSO").model_dump(mode="json")
     loaded = Provider.model_validate({**stored, "name": case["name"]})
     assert loaded.name == case["name"] and loaded.label == case["label"]
+
+
+BLANK = json.loads(
+    (Path(__file__).parent / "fixtures" / "blank_ranges.json").read_text(encoding="utf-8")
+)
+
+
+def test_the_blank_rule_is_one_pinned_list_never_the_runtimes_database(monkeypatch):
+    """SDD §4.2 (review RV22-06): blank is Unicode 15.1's separators, controls and format
+    characters, one pinned list the dashboard reads too - never the runtime's own database, which
+    differs between Python 3.11 (the image) and newer: U+13439 is blank on every runtime."""
+    assert [list(r) for r in BLANK_RANGES] == BLANK["ranges"]
+    pinned = {cp for first, last in BLANK["ranges"] for cp in range(first, last + 1)}
+
+    def read(ch):
+        raise AssertionError(f"the runtime's database was read for {ch!r}")
+
+    monkeypatch.setattr(unicodedata, "category", read)
+    assert [cp for cp in range(0x110000) if is_blank(chr(cp)) != (cp in pinned)] == []
+    assert is_blank("\U00013439 \u200b") and not is_blank("\U00013439x")
+
+
+@pytest.mark.skipif(
+    unicodedata.unidata_version != BLANK["unicode"], reason="another Unicode version"
+)
+def test_the_pinned_blank_list_is_what_its_unicode_version_says():
+    """The fixture is Unicode 15.1's Z, Cc and Cf: regenerate it on a runtime of that version."""
+    categories = {"Zs", "Zl", "Zp", "Cc", "Cf"}
+    pinned = {cp for first, last in BLANK["ranges"] for cp in range(first, last + 1)}
+    assert pinned == {cp for cp in range(0x110000) if unicodedata.category(chr(cp)) in categories}

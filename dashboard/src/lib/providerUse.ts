@@ -51,12 +51,48 @@ export function providerLabel(provider: Pick<Provider, 'id' | 'name'>): string {
 }
 
 /**
- * Whether a provider's name is blank: no character outside Unicode's separators (Z), controls (Cc) and format characters
- * (Cf) - empty, spaces, U+200B, U+FEFF -, the API's rule for refusing one and for labelling one stored before (SDD §4.2,
- * review RV21-08).
+ * The code points a blank name holds only - Unicode 15.1's separators (Z), controls (Cc) and format characters (Cf) -
+ * pinned, as the API's BLANK_RANGES, so every runtime answers alike whatever its own Unicode tables (SDD §4.2, review
+ * RV22-06); seamless/tests/fixtures/blank_ranges.json holds both to the same list.
+ */
+export const BLANK_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x0000, 0x0020],
+  [0x007f, 0x00a0],
+  [0x00ad, 0x00ad],
+  [0x0600, 0x0605],
+  [0x061c, 0x061c],
+  [0x06dd, 0x06dd],
+  [0x070f, 0x070f],
+  [0x0890, 0x0891],
+  [0x08e2, 0x08e2],
+  [0x1680, 0x1680],
+  [0x180e, 0x180e],
+  [0x2000, 0x200f],
+  [0x2028, 0x202f],
+  [0x205f, 0x2064],
+  [0x2066, 0x206f],
+  [0x3000, 0x3000],
+  [0xfeff, 0xfeff],
+  [0xfff9, 0xfffb],
+  [0x110bd, 0x110bd],
+  [0x110cd, 0x110cd],
+  [0x13430, 0x1343f],
+  [0x1bca0, 0x1bca3],
+  [0x1d173, 0x1d17a],
+  [0xe0001, 0xe0001],
+  [0xe0020, 0xe007f],
+];
+
+/**
+ * Whether a provider's name is blank: no character outside BLANK_RANGES - empty, spaces, U+200B, U+FEFF -, the API's
+ * rule for refusing one and for labelling one stored before (SDD §4.2, reviews RV21-08, RV22-06).
  */
 export function isBlank(name: string): boolean {
-  return /^[\p{Z}\p{Cc}\p{Cf}]*$/u.test(name);
+  for (const ch of name) {
+    const cp = ch.codePointAt(0)!;
+    if (!BLANK_RANGES.some(([first, last]) => cp >= first && cp <= last)) return false;
+  }
+  return true;
 }
 
 /**
