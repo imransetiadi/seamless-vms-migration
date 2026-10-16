@@ -1765,15 +1765,16 @@ export class MockServer {
     const key = String(input.private_key ?? '').trim();
     if (!key.startsWith('-----BEGIN') || !key.includes('PRIVATE KEY-----')) throw new HttpError(422, 'validation_error', 'private_key must be an OpenSSH or PEM private key');
     const host = provider.conversion_host ?? { manage: false, name: null, flavor: null, external_network: null, image: null, ssh_user: 'cloud-user', address: null, ssh_allowed_cidr: null, ssh_key_secret: null };
+    const secret = `provider-${provider.id}-ssh`;
     Object.assign(provider, {
-      conversion_host: { ...host, ssh_key_secret: `provider-${provider.id}-ssh` },
+      conversion_host: { ...host, ssh_key_secret: secret },
       conversion_key_updated_at: new Date(this.now()).toISOString(),
       status: 'unknown',
       status_message: null,
       last_checked_at: null,
       capabilities: {},
     });
-    this.emit({ kind: 'provider.credentials_updated', plan_id: null, migration_id: null, actor: me.name, message: `conversion-host key of provider ${provider.id} updated`, data: { provider_id: provider.id, keys: ['private_key'] } });
+    this.emit({ kind: 'provider.credentials_updated', plan_id: null, migration_id: null, actor: me.name, message: `conversion-host key of provider ${provider.id} updated`, data: { provider_id: provider.id, secret, keys: ['private_key'] } });
     return ok(provider);
   }
 

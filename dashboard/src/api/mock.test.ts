@@ -370,6 +370,21 @@ describe('mock API', () => {
     });
   });
 
+  it("gives the credential events the API's data: the provider, the secret written and its keys (SDD §4.3, §13.3, review RV23-02)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const id = server.providers.find((p) => p.kind === 'openstack')!.id;
+    const key = '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n-----END OPENSSH PRIVATE KEY-----\n'; // gitleaks:allow
+    expect(call('PUT', `/providers/${id}/credentials`, { username: 'u', password: 'p', project_name: 'x' }).status).toBe(200);
+    expect(call('PUT', `/providers/${id}/conversion-key`, { private_key: key }).status).toBe(200);
+    const data = server.events.filter((e) => e.kind === 'provider.credentials_updated' && e.data.provider_id === id).map((e) => e.data);
+    // what routes_providers.set_provider_credentials and set_conversion_key emit
+    expect(data).toEqual([
+      { provider_id: id, secret: `provider-${id}`, keys: ['password', 'project_name', 'username'] },
+      { provider_id: id, secret: `provider-${id}-ssh`, keys: ['private_key'] },
+    ]);
+  });
+
   it("answers a PATCH of an unknown provider in the API's order: what its body alone refuses before the 404 (SDD §4.2, §12, review RV22-07)", () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const answer = (body: unknown) => {
