@@ -113,6 +113,21 @@ describe('Providers page', () => {
     expect(detail('TLS')).toHaveTextContent('Plain HTTP: the auth URL and compute. Credentials travel unencrypted: use HTTPS outside a lab.');
   });
 
+  it('says a maximum the check could not read "not read" and an empty list "none", never a bare label (SDD §16, review RV19-03)', async () => {
+    const server = createTestServer();
+    const hibiscus = server.providers.find((p) => p.id === 'hibiscus-dc3')!;
+    // SDD §10: a maximum the check could not read is "" - DST_CAPABILITY_MISSING then judges nothing
+    hibiscus.capabilities = { ...hibiscus.capabilities, compute_microversion: '', block_storage_microversion: '', roles: [] };
+    renderPage('viewer', server);
+    const card = await screen.findByRole('article', { name: 'OpenStack 2026.2 Hibiscus (DC3)' });
+    const chip = (label: string) => within(within(card).getByRole('list', { name: 'Capabilities' })).getByText(label).closest('li');
+    expect(chip('Compute API')).toHaveTextContent(/^Compute API\s*not read$/);
+    expect(chip('Block storage API')).toHaveTextContent(/^Block storage API\s*not read$/);
+    expect(chip('Token roles')).toHaveTextContent(/^Token roles\s*none$/);
+    // a value the check read is said as it was read
+    expect(chip('Storage')).toHaveTextContent(/^Storage\s*Ceph RBD/);
+  });
+
   it('keeps Cancel focusable while the provider is saved, saying why (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Providers />, {

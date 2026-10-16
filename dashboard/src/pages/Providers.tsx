@@ -69,12 +69,13 @@ function Capabilities({ capabilities }: { capabilities: Record<string, unknown> 
             </li>
           );
         }
+        // a maximum the check could not read is "" (SDD §10) and an empty list lists nothing: said so, never a bare label (RV19-03)
         const text =
           key === 'storage_backends'
             ? storageSummary(storageBackends(capabilities)) || 'no pools listed'
             : Array.isArray(value)
-              ? value.join(', ')
-              : String(value);
+              ? value.join(', ') || 'none'
+              : String(value) || 'not read';
         return (
           <li key={key} className="inline-flex max-w-full items-baseline gap-1 rounded-sm border border-border px-1.5 py-0.5 text-xs text-foreground">
             <span className="text-muted-foreground">{label}</span>
