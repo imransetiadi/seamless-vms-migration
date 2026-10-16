@@ -14,9 +14,9 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: apiProxy,
-    // the dashboard's own files, plus the guest OS case table it shares with the control-plane
-    // tests (read by src/lib/guestOs.test.ts only; nothing outside dashboard/ is bundled)
-    fs: { allow: ['.', '../seamless/tests/fixtures'] },
+    // the dashboard's own files, the case tables it shares with the control-plane tests, and the browser journeys
+    // whose labels src/test/journey-labels.test.tsx keeps (review RV20-02); nothing outside dashboard/ is bundled
+    fs: { allow: ['.', '../seamless/tests/fixtures', '../tests/e2e'] },
   },
   preview: {
     port: 4173,

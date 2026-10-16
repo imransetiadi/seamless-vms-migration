@@ -138,7 +138,7 @@ try {
       await select.selectOption({ label: option });
     };
     await pick('Source provider', /vcenter|dc2/i);
-    await pick('Destination (RHOSO 18.0)', /rhoso/i);
+    await pick('Destination provider', /rhoso/i);
     await dialog.getByLabel('Select dc2-portal-02').check({ timeout: 15_000 });
     await pick('Default strategy', /vmware warm/i);
     await dialog.getByLabel('Require approval').uncheck();
