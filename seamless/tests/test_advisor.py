@@ -531,3 +531,22 @@ async def test_the_strategy_request_drops_secrets_and_keeps_the_vms_name_only_un
     assert "probe said password=[REDACTED]" in advice.request["evidence"]
     assert ("web-01" in sent) is not redact_names
     assert ("for VM [vm] moving" in advice.request["decision"]) is redact_names
+
+
+@pytest.mark.parametrize(
+    ("provider", "descriptor"),
+    [("RHOSO", "RHOSO 18.0"), ("OpenStack", "a community OpenStack 2026.2 destination")],
+)
+async def test_the_question_names_the_destination_once_whatever_its_provider_is_called(
+    provider, descriptor
+):
+    """SDD §1 naming, §13.4 (review RV21-10): the provider's name is replaced in the VM's name the
+    question carries, never in the descriptor it puts there - a provider named "RHOSO" gave
+    "moving to RHOSO 18.0 18.0?"."""
+    advice = await Advisor(None, Settings(jev_mode="http")).recommend_strategy(
+        make_vm(name="web-01"), TIE, make_plan(downtime_slo_s=1200), [], descriptor, provider
+    )
+    assert advice is not None and advice.request is not None
+    assert advice.request["decision"] == (
+        f"Which migration strategy should be used for VM web-01 moving to {descriptor}?"
+    )

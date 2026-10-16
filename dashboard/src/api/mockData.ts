@@ -291,7 +291,8 @@ export function strategySnapshot(input: {
   const payload = {
     tool: 'jev_decide',
     arguments: {
-      decision: withoutProvider(`Which migration strategy should be used for VM ${vm.name} moving to ${where}?`),
+      // the VM's name alone, never the descriptor the question holds (review RV21-10)
+      decision: `Which migration strategy should be used for VM ${withoutProvider(vm.name)} moving to ${where}?`,
       evidence: withoutProvider(
         `VM ${vm.name}: ${vm.vcpus} vCPU, ${vm.ram_mb} MB RAM, ${vm.disks.length} disk(s) [${disks}], provisioned ${gib(vm.disk_bytes)}, used ${gib(vm.used_bytes)}. ` +
           `Guest write rate ${rate}. Downtime SLO ${plan.downtime_slo_s} s. Link ${Math.round(plan.link_bps / MiB)} MiB/s. ` +

@@ -113,12 +113,13 @@ class Advisor:
     def _for_strategy(
         self, text: str, vm: VMRef, destination_name: str | None, destination: str
     ) -> str:
-        """Secrets redacted, then the VM's name (when names are redacted) and the destination
-        provider's name - operator free text, in the eligibility reasons the operators read (T6) -
-        replaced in one pass, longest first, so neither replacement splits the other: the VM's name
-        blanked first left "jakarta-[vm]-prod" to send. The provider's name gives way to the
-        destination's kind and series whatever the redaction setting, and wins when the two names
-        are equal (SDD §1 naming, §13.4, reviews RV20-01, RV21-02)."""
+        """The evidence, or the VM's name the question carries: secrets redacted, then the VM's name
+        (when names are redacted) and the destination provider's name - operator free text, in the
+        eligibility reasons the operators read (T6) - replaced in one pass, longest first, so
+        neither replacement splits the other: the VM's name blanked first left "jakarta-[vm]-prod"
+        to send. The provider's name gives way to the destination's kind and series whatever the
+        redaction setting, and wins when the two names are equal (SDD §1 naming, §13.4, reviews
+        RV20-01, RV21-02, RV21-10)."""
         names = {vm.name: "[vm]"} if self.settings.memory_redact_names else {}
         if destination_name:
             names[destination_name] = destination
@@ -164,12 +165,12 @@ class Advisor:
             return None  # nothing to decide: jev_decide needs at least two candidates
         # the jev_decide arguments, built even when Jev is off: they are the input snapshot (§14.5)
         arguments: dict[str, Any] = {
-            "decision": self._for_strategy(
-                f"Which migration strategy should be used for VM {vm.name} moving to "
-                f"{destination}?",
-                vm,
-                destination_name,
-                destination,
+            # the VM's name alone through the replacement: never the descriptor the question holds
+            # ("moving to RHOSO 18.0 18.0?" for a provider named RHOSO, review RV21-10)
+            "decision": (
+                "Which migration strategy should be used for VM "
+                f"{self._for_strategy(vm.name, vm, destination_name, destination)} moving to "
+                f"{destination}?"
             ),
             "evidence": self._strategy_evidence(
                 vm, estimates, plan, findings, destination_name, destination

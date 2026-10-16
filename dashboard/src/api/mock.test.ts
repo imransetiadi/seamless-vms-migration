@@ -1731,6 +1731,22 @@ describe('mock validation decides like the API (SDD §14.4)', () => {
     expect(snapshot.payload).toMatchObject({ arguments: { evidence: expect.stringContaining('without a backend of RHOSO 18.0') } });
   });
 
+  it('names the destination once in the question, whatever its provider is called (SDD §1 naming, §13.4, review RV21-10)', async () => {
+    const { server, client, plan, before } = validating({ option: 'cold', confidence: 0.8 });
+    // a provider named like the descriptor's own words: the question once gave "moving to RHOSO 18.0 18.0?"
+    server.providers.find((p) => p.id === plan.destination_provider_id)!.name = 'RHOSO';
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    const snapshot = server.snapshots.get(rec!.input_snapshot_sha256!)!;
+    expect(snapshot.payload).toMatchObject({ arguments: { decision: expect.stringMatching(/ moving to RHOSO 18\.0\?$/) } });
+    // the VM's name still goes through it: a provider named like the VM never leaves through the VM's name
+    const again = validating({ option: 'cold', confidence: 0.8 });
+    again.server.providers.find((p) => p.id === again.plan.destination_provider_id)!.name = again.db.vm.name;
+    await again.client.post(`/plans/${again.plan.id}/validate`);
+    const [named] = again.server.recommendations.slice(again.before);
+    expect(JSON.stringify(again.server.snapshots.get(named!.input_snapshot_sha256!)!.payload)).not.toContain(again.db.vm.name);
+  });
+
   it('keeps the deterministic choice when the confidence is below the threshold', async () => {
     const { server, client, plan, db, before } = validating({ option: 'cold', confidence: 0.57 });
     await client.post(`/plans/${plan.id}/validate`);
