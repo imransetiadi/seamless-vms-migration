@@ -259,6 +259,16 @@ describe('mock API', () => {
     expect(backends('hibiscus-dc3')).toEqual(['kolla@rbd-1#volumes']);
   });
 
+  it("never reads a deleted provider's inventory for one created again under its id (SDD §12, review RV21-12)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    expect(call('DELETE', '/providers/rhoso-staging').status).toBe(204);
+    const base = { name: 'Staging again', kind: 'openstack', distribution: 'openstack_community', endpoint: 'https://keystone.example.invalid:5000/v3', cloud: 'x' };
+    expect(call('POST', '/providers', { ...base, id: 'rhoso-staging', role: 'source' }).status).toBe(201);
+    // a source's inventory is its VMs - none yet for a new cloud -, never the deleted destination's networks and flavors
+    expect(call('GET', '/providers/rhoso-staging/inventory').body).toEqual([]);
+  });
+
   it('manages providers: PATCH, write-only credentials and conversion key (SDD §12)', async () => {
     const { server, client } = setup();
     const patched = await client.patch<Provider>('/providers/community-lab', { region: 'R2', distribution: 'kolla' });

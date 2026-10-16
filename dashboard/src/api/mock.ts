@@ -1323,6 +1323,8 @@ export class MockServer {
             );
           }
           this.providers.splice(this.providers.indexOf(provider), 1);
+          // its inventory goes with it: a provider created again under the id never reads it (review RV21-12)
+          delete this.inventories[provider.id];
           this.emit({ kind: 'provider.deleted', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} deleted`, data: {} });
           return { status: 204 };
         }
