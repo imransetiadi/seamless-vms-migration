@@ -378,6 +378,57 @@ describe('mock API', () => {
     });
   });
 
+  describe("judges each VM against the plan's VMs, its vm_ids, as the API's validation (SDD §9.3, §16, review RV25-01)", () => {
+    /** Each migration of the plan: its phase and the messages of the findings whose code starts with `prefix`. */
+    const judged = (server: MockServer, planId: string, prefix: string) =>
+      Object.fromEntries(
+        server.migrations
+          .filter((m) => m.plan_id === planId)
+          .map((m) => [m.vm.source_id, [m.phase, m.findings.filter((f) => f.code.startsWith(prefix)).map((f) => `${f.code}: ${f.message}`)]]),
+      );
+    const twinsOf = (vm: VMRef, twin: VMRef) => [`SRC_VM_DUPLICATE_NAME: Another selected VM is also named '${vm.name}' (${twin.project}/${twin.source_id}); os-migrate selects workloads by name.`];
+
+    it('blocks both VMs of one name at the plan\'s first validation, before either has a migration', async () => {
+      const { server, client } = setup('operator');
+      const [a, b, c] = freeVms(server, 'rhosp17-dc1', 3);
+      b!.name = a!.name;
+      const plan = await client.post<Plan>('/plans', { name: 'Twins', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [a!.source_id, b!.source_id, c!.source_id] });
+      await client.post(`/plans/${plan.id}/validate`);
+      const found = judged(server, plan.id, 'SRC_VM_DUPLICATE_NAME');
+      expect([found[a!.source_id], found[b!.source_id]]).toEqual([
+        ['blocked', twinsOf(a!, b!)],
+        ['blocked', twinsOf(b!, a!)],
+      ]);
+    });
+
+    it('no longer counts a twin taken out of the plan, as the finding advises', async () => {
+      const { server, client } = setup('operator');
+      const [a, b, c] = freeVms(server, 'rhosp17-dc1', 3);
+      b!.name = a!.name;
+      const plan = await client.post<Plan>('/plans', { name: 'Twins', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [a!.source_id, b!.source_id, c!.source_id] });
+      await client.post(`/plans/${plan.id}/validate`);
+      await client.patch(`/plans/${plan.id}`, { vm_ids: [a!.source_id, c!.source_id] });
+      await client.post(`/plans/${plan.id}/validate`);
+      expect(judged(server, plan.id, 'SRC_VM_DUPLICATE_NAME')[a!.source_id]).toEqual(['ready', []]);
+    });
+
+    it('lets a NIC override take the address of a VM taken out of the plan', async () => {
+      const { server, client } = setup('operator');
+      const [a, b] = freeVms(server, 'rhosp17-dc1', 2);
+      const plan = await client.post<Plan>('/plans', { name: 'Holders', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [a!.source_id, b!.source_id] });
+      await client.post(`/plans/${plan.id}/validate`);
+      await client.patch(`/plans/${plan.id}`, { vm_ids: [a!.source_id] });
+      const [nic, theirs] = [a!.nics[0]!, b!.nics[0]!];
+      const mac = nic.mac!.toLowerCase();
+      await client.patch(`/plans/${plan.id}`, { nic_overrides: { [a!.source_id]: { [mac]: { network: theirs.network, fixed_ips: [theirs.fixed_ips[0]] } } } });
+      await client.post(`/plans/${plan.id}/validate`);
+      expect(judged(server, plan.id, 'MAP_NIC')[a!.source_id]).toEqual([
+        'ready',
+        [`MAP_NIC_OVERRIDE: NIC override(s): ${mac} (${nic.network}) -> ${theirs.network}: ${theirs.fixed_ips[0]}.`],
+      ]);
+    });
+  });
+
   it("seeds an ok provider with no status message, nor its checked event, as the API's check leaves one (SDD §10, review RV23-04)", () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     expect(server.providers.filter((p) => p.status === 'ok').length).toBeGreaterThan(0);

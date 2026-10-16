@@ -1142,7 +1142,10 @@ export class MockServer {
     const networks = dst && !Array.isArray(dst) ? dst.networks : {};
     const subnets = dst && !Array.isArray(dst) ? (dst.subnets ?? []) : [];
     const networkDetails = dst && !Array.isArray(dst) ? dst.network_details : undefined;
-    const selected = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm);
+    // the plan's VMs as the API's validation reads them, its vm_ids from the source's inventory: never its migrations,
+    // which a first validation has not all created yet and a VM taken out of the plan leaves behind (review RV25-01)
+    const inventory = this.inventories[plan.source_provider_id];
+    const selected = plan.vm_ids.flatMap((id) => (Array.isArray(inventory) ? inventory.filter((v) => v.source_id === id) : []));
     // the destination's token roles, as its check reported them, and its policy profile - a report that names none
     // reads the provider's declarations (SDD §9.3, §10, §21.5)
     const roles = capabilityRoles(destination.capabilities);
