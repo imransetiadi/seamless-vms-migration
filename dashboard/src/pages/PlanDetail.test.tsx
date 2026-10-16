@@ -1517,4 +1517,32 @@ describe('PlanDetail', () => {
       ['tripleo-ceph', 'hostgroup@ceph-hdd#volumes-hdd'],
     ]);
   });
+  it('lists a saved network mapping of a network named __proto__ on the plan page and in the form (SDD §9.2, §16, review RV24-02)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const planId = 'plan-c81d44a0';
+    renderWithApp(<PlanDetail />, { route: `/plans/${planId}`, path: '/plans/:planId', token: 'operator', server });
+    const edit = async () => {
+      const actions = await screen.findByRole('group', { name: /plan actions/i });
+      await user.click(within(actions).getByRole('button', { name: /^edit plan$/i }));
+      const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+      await user.click(within(dialog).getByText(/^advanced/i));
+      return dialog;
+    };
+    let dialog = await edit();
+    const networks = within(dialog).getByLabelText(/^network mappings/i);
+    await user.clear(networks);
+    await user.type(networks, '__proto__ = tenant-web{enter}analytics = tenant-app');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(Object.entries(server.plans.find((p) => p.id === planId)!.mappings.networks)).toEqual([
+      ['__proto__', 'tenant-web'],
+      ['analytics', 'tenant-app'],
+    ]);
+    // the plan page lists what the plan holds after the save and its refetch, and the form edits it
+    await waitFor(() => expect(screen.getByText('analytics → tenant-app')).toBeInTheDocument());
+    expect(screen.getByText('__proto__ → tenant-web')).toBeInTheDocument();
+    dialog = await edit();
+    expect(within(dialog).getByLabelText(/^network mappings/i)).toHaveValue('__proto__ = tenant-web\nanalytics = tenant-app');
+  });
 });

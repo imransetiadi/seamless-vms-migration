@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
 import { render, type RenderResult } from '@testing-library/react';
 import type { ReactElement, ReactNode } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
@@ -8,6 +8,7 @@ import { ApiClient } from '../api/client';
 import { queryKeys } from '../api/hooks';
 import { LiveEventsProvider } from '../api/LiveEventsProvider';
 import { createMockFetch, MockServer } from '../api/mock';
+import { createQueryClient } from '../api/queryClient';
 import { ThemeProvider } from '../theme/ThemeProvider';
 
 
@@ -72,9 +73,8 @@ export function renderWithApp(ui: ReactElement, options: RenderOptions = {}): Re
   );
   // a hook that sets its own `retry` (noRetryOnClientErrors: twice on a 5xx) keeps this `retryDelay`, so a test of a
   // failed load waits no real 1 s + 2 s; a hook's `retry` overrides the default, its delay does not
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false, retryDelay: 0, staleTime: Infinity, refetchOnWindowFocus: false }, mutations: { retry: false, retryDelay: 0 } },
-  });
+  // the app's query client (main.tsx), so a test sees the cache the app has
+  const queryClient = createQueryClient({ queries: { retry: false, retryDelay: 0, staleTime: Infinity, refetchOnWindowFocus: false }, mutations: { retry: false, retryDelay: 0 } });
   // The app renders pages only after RequireAuth has loaded GET /me, so a page never sees an unknown
   // role. Pages rendered here skip RequireAuth: seed the session like it, or a test that clicks a
   // role-gated action races the /me request (the action stays soft-disabled until it returns).
