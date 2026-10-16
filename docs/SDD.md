@@ -2348,10 +2348,11 @@ advisor's strategy question names the destination by kind and series (`planning/
 when no series is settled - a declared series the APIs contradict included; before any check reported one, the
 declared series, which a first check settles unless the APIs contradict it). In the evidence it sends, which quotes eligibility reasons that name the provider, the
 name is replaced by that descriptor wherever it stands as a word, by the rule VM names follow (`replace_names`). The
-question and the evidence go through the secret patterns first, then through one `replace_names` pass that holds the
-provider's name and, when names are redacted, the VM's: the longer name first, so neither replacement splits the
-other (a VM `dc3` replaced first left `jakarta-[vm]-prod` of a provider `jakarta-dc3-prod`), and the provider's
-descriptor where the two names are equal. The input snapshot (§14.5) is what is sent.
+evidence, and the VM's name the question carries, go through the secret patterns first, then through one
+`replace_names` pass that holds the provider's name and, when names are redacted, the VM's: the longer name first, so
+neither replacement splits the other (a VM `dc3` replaced first left `jakarta-[vm]-prod` of a provider
+`jakarta-dc3-prod`), and the provider's descriptor where the two names are equal. The question's own words and the
+descriptor it holds never go through it: a provider named `RHOSO` made "moving to RHOSO 18.0 18.0?" (review RV21-10). The input snapshot (§14.5) is what is sent.
 
 The control plane uses the same `redact` for the text it publishes from outside sources: step and
 provider error messages and every `migration.log` line (§4). Where it cuts such text, it redacts first,
