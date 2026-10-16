@@ -3472,6 +3472,12 @@ Findings (plan task T4; each enters §9.3's catalog with its code):
   else `legacy` for RHOSO 18.0, else the declared series' profile, else `unknown`. The pre-flight, the executors'
   checks before the stop and the profile they write for the collection read it so; a reset report never counts a
   role the destination's own profile refuses (review RV18-04).
+* Under `unknown`, a port refusal's advice names both ways out: check the provider, so its series is detected from
+  its maxima, or declare its policy profile or series (review 19). An operator may check a provider while a plan
+  that uses it runs or is paused; a PATCH that declares is refused then (§12). After a reset, the next check settles
+  an undeclared community destination's profile unless its range straddles 2023.1 and 2023.2; then only declaring
+  settles it. The pre-flight's `NET_PORT_NOT_PERMITTED` remediation, the executors' and the collection's refusals,
+  and the dashboard's mirror of them say so.
 
 ### 21.6 Conversion hosts on community clouds
 
