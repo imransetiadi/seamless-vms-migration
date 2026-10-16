@@ -3041,10 +3041,13 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   recommendation" link to it, ahead of the migration's own actions, so its first control is the decision its text
   asks for, not the cutover's Approve), `/providers` (status cards + Check,
   each card summarizing the storage backends by driver family —
-  `storage_backends`, §7.3.1 —; a destination's card shows its release series - the declared one, else the detected
-  range, with codenames (§10.1) -, its support tier (Validated, Tier 1, 2 or 3, or Outside, with the reason in words)
-  and its policy profile, and warns when the detected range contradicts its declared series or its profile is
-  unknown (declare it); a provider whose check reports plain HTTP says so, naming `plain_http`'s endpoints; the form
+  `storage_backends`, §7.3.1 —, and saying every other reported value in words: a maximum the check could not read
+  (`""`, §10) reads "not read" and an empty list "none", never a bare label; a destination's card shows its release
+  series - the declared one, else the detected range, with codenames (§10.1), else why the range is empty: older or
+  newer than the window when the maxima were read, "Not detected" only when they were not -, its support tier
+  (Validated, Tier 1, 2 or 3, or Outside, with the reason in words) and its policy profile, and warns when the
+  detected range contradicts its declared series or its profile is unknown (declare it); a provider whose check
+  reports plain HTTP says so, naming `plain_http`'s endpoints; the form
   takes, for an OpenStack destination, the declared release series (blank: detect it, the window's series offered
   newest first) and, for an OpenStack or RHOSO destination, the declared policy profile (blank: by kind and series,
   §4.2); admins add and edit providers with a distribution preset —
