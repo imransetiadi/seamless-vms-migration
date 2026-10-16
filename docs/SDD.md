@@ -1336,8 +1336,10 @@ volumes with their server, so the order is:
      when there is no such network, when there are several in the credential's project, or when there are several
      elsewhere and none in its project;
    * that network is another project's and the credential may not put a port there, by §6.6's rule with the roles
-     of its token. The handover's admin credential sees every project's networks, so step 8 would otherwise put the
-     VM on another tenant's private network;
+     of its token, read for the run - the destination's check report's when they cannot be read; when neither names
+     any, a port that needs a role is refused, as §7.2's kit refuses it: a reset report never lets a token through
+     (review RV20-07). The handover's admin credential sees every project's networks, so step 8 would otherwise put
+     the VM on another tenant's private network;
    * an address step 8 would give the port is one Neutron refuses on that network (§6.6's rules for a port Nova
      creates in `"nova"` mode, or for one created through Neutron with the kept MAC in `"neutron"` mode);
    * another port of that network holds such an address, or in `"neutron"` mode the port's MAC. The exception is the
