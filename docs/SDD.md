@@ -1441,7 +1441,9 @@ volumes with their server, so the order is:
    that already runs — Nova's `task_state` `powering-off`, while the server still reads `ACTIVE` until the guest is
    down: the one a retried step finds, or one that a stop refused with 409 shows began meanwhile — is waited for and
    never sent again, since Nova refuses a second stop while one runs; the journal keeps the first stop's time
-   (review RV26-02). A step
+   (review RV26-02). A stop refused with 409 because the server is stopped already - one that began meanwhile and
+   ended before the step's own (an operator's, or the guest's own shutdown that Nova recorded) - is taken as done:
+   the step goes on, the stop journaled as sent, as for one that runs (review RV27-03). A step
    that ends without `SHUTOFF` once the stop was journaled as sent — a failure, or a cancel (the step timeout, a
    rollback request, a shutdown) — opens the clock at that mark's time: the source may be stopped, so the
    automatic rollback (§8) runs and a cancel is refused (§5.1) (audit EX-02).
@@ -1493,7 +1495,9 @@ volumes with their server, so the order is:
 Rollback walks the journal backwards. While the source server still exists (a failure before step 4)
 it sets every attachment's journaled `delete_on_termination` back and starts the server — also when only the stop
 was journaled as sent. A server Nova still powers off (`task_state` `powering-off`) reads `ACTIVE` and refuses a
-start until the guest is down: the rollback waits for `SHUTOFF` first, then starts it (review RV26-01). An empty
+start until the guest is down: the rollback waits until the stop ended - `SHUTOFF`, or `ACTIVE` again when Nova gave
+the power-off up (its `task_state` back to none, the guest still running) - then starts it unless it runs (reviews
+RV26-01, RV27-04). An empty
 journal means the source was never stopped. Otherwise:
 delete the destination server; delete the destination ports step 8 created through Neutron (journaled, or
 unbound with their description: a create sent before a crash), which Nova keeps; unmanage at RHOSO; manage at the
