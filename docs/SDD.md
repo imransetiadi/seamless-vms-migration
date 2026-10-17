@@ -1304,7 +1304,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 |---|---|---|---|
 | `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` — `rollback_workloads.yml` between the two when an earlier attempt left data (below) | `rollback_workloads.yml` |
 | `warm` | `export_workloads.yml` (first time, or again by the rules above) then `import_workloads_precopy.yml` | `import_workloads_cutover.yml`, after `export_workloads.yml` when a rule above exports again | `rollback_workloads.yml` |
-| `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, then the kit's ports of the VM and its volumes the kit would take as migrated (below), power on source - once a guest shutdown in progress ended: vSphere reads the VM `poweredOn`, its guest `shuttingDown`, until the guest is down, and a power-on then does nothing. A VM still on whose installed VMware Tools no longer run (guest `notRunning`: the last seconds of a shutdown, whose Tools stop first, or a guest still starting) is looked at again for up to 120 s, until it is off (powered on) or its guest runs (left alone); a VM without Tools is left alone at once. The wait ends within the provider call's bound (300 s, §8.1, less 5 s): a guest that does not end its shutdown by then is a provider error, which the rollback retries as transient, and a call that ended - timed out or cancelled - powers nothing on afterwards (reviews RV26-10, RV27-01, RV27-02) |
+| `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, then the kit's ports of the VM (below), power on source, then the kit's volumes the kit would take as migrated (below) - the power-on once a guest shutdown in progress ended: vSphere reads the VM `poweredOn`, its guest `shuttingDown`, until the guest is down, and a power-on then does nothing. A VM still on whose installed VMware Tools no longer run (guest `notRunning`: the last seconds of a shutdown, whose Tools stop first, or a guest still starting) is looked at again for up to 120 s, until it is off (powered on) or its guest runs (left alone); a VM without Tools is left alone at once. The wait ends within the provider call's bound (300 s, §8.1, less 5 s): a guest that does not end its shutdown by then is a provider error, which the rollback retries as transient, and a call that ended - timed out or cancelled - powers nothing on afterwards (reviews RV26-10, RV27-01, RV27-02) |
 | `vmware_warm` | kit `migration` with `cbt_sync: true`, `cutover: false` | kit `migration` with `cbt_sync: true`, `cutover: true` | as `vmware_cold` |
 
 * VMware vars: `vcenter_hostname`, `vcenter_username`, `vcenter_password`, `vcenter_datacenter`
@@ -1363,16 +1363,22 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   A cancel's cleanup (§5.1) deletes only the server the migration recorded: it looks up no server by name, deletes no
   kit port or volume and powers nothing on.
 
-  After the kit's ports, the rollback deletes the kit's volumes of the VM that the kit's next run would take as this
-  VM's own. The kit finds a VM's volume by its name, `<kit name>-<disk key>`, and the metadata `osm` `true`. One it
-  marked `converted` (`true`: virt-v2v converted it and the VM was powered off) it takes as migrated: it copies
+  Once the source is powered on, the rollback deletes the kit's volumes of the VM that the kit's next run would take
+  as this VM's own. The kit finds a VM's volume by its name, `<kit name>-<disk key>`, and the metadata `osm` `true`.
+  One it marked `converted` (`true`: virt-v2v converted it and the VM was powered off) it takes as migrated: it copies
   nothing, powers nothing off and boots the new server from it - the first attempt's disk, while the source runs again
   since the rollback powered it on (review RV28-01). Onto any other volume a `vmware_cold` run (no CBT sync) refuses
   to copy ("volume already exists"). So once the destination server is gone, the rollback deletes every volume named
   `<kit name>-<digits>` with `osm` `true` that is marked converted, or that belongs to a `vmware_cold` migration, and
   waits until each is gone; a `vmware_warm` volume not converted stays, since the next pass syncs it by CBT. A volume
   attached to another server is never deleted, nor is any volume when the VM has no kit name (`SRC_VM_NAME_UNUSABLE`,
-  §9.3).
+  §9.3). A volume Cinder does not delete fails the attempt, which is retried: the source already runs, and the
+  power-on does nothing to a running VM - the destination's clean-up never keeps the source stopped (§8, review
+  RV29-01). As a rollback may so end `failed` with such a volume left, a VMware kit run - a cutover, a `vmware_warm`
+  pass - is refused before it starts, before any clock, while a volume named `<kit name>-<digits>` with `osm` `true`
+  is marked converted, or, for a `vmware_cold` cutover, while any such volume exists: the refusal names each volume
+  and its holder and tells the operator to roll the migration back again, which deletes the ones it may (review
+  RV29-01).
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
   migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
