@@ -670,7 +670,9 @@ atomic during pre-copy; this is harmless because the final pass happens after sh
 Image-booted VMs (`kind == image_root`) follow os-migrate's `boot_disk_copy` semantics: when
 `boot_disk_copy` is true, every pass snapshots the server to Glance and creates a volume from that
 image (slower: documented in Performance.md); when false, only data volumes are synced and the
-destination boots from the same image name.
+destination boots from the same image name. The volume made from a server snapshot - here and in the cold export -
+is as large as Cinder needs for the image: the image file rounded up to whole GiB, its virtual disk (a qcow2 file
+holds a larger disk) and its `min_disk`, at least 1 GiB; Cinder refuses a smaller one (audit A-06).
 
 ### 6.2 Block delta sync — `plugins/module_utils/blocksync.py`
 
