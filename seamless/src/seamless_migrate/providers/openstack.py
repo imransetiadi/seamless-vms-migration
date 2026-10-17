@@ -650,6 +650,11 @@ class _MapContext:
     def server_to_vmref(self, server: Any) -> VMRef:
         conn = self.conn
         flavor = _attr(server, "flavor", default={}) or {}
+        flavor_id = _attr(flavor, "id")
+        if not _attr(flavor, "original_name") and flavor_id:
+            # Nova embeds the flavor from compute 2.47 on; below it the server holds only the
+            # flavor's id, which openstacksdk's Flavor reads as 0 everywhere (review RV28-08)
+            flavor = _try(lambda: conn.compute.get_flavor(flavor_id), None) or flavor
         vcpus, ram, disk_gb = (
             _attr(flavor, "vcpus"),
             _attr(flavor, "ram"),
@@ -657,11 +662,6 @@ class _MapContext:
         )
         flavor_name = _attr(flavor, "original_name", "name")
         extra_specs = _attr(flavor, "extra_specs", default={}) or {}
-        if vcpus is None and _attr(flavor, "id"):
-            full = conn.compute.get_flavor(_attr(flavor, "id"))
-            vcpus, ram, disk_gb = _attr(full, "vcpus"), _attr(full, "ram"), _attr(full, "disk")
-            flavor_name = _attr(full, "name", default=flavor_name)
-            extra_specs = _attr(full, "extra_specs", default={}) or {}
 
         image = _attr(server, "image", default={}) or {}
         image_booted = bool(_attr(image, "id"))

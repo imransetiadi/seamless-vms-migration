@@ -1722,6 +1722,51 @@ async def test_openstack_destination_volumes_and_a_delete_that_waits_for_the_vol
     assert clock[0] - started < osp.PROVIDER_CALL_TIMEOUT_S, "the wait outlived the call's bound"
 
 
+def test_the_inventory_looks_up_a_flavor_nova_did_not_embed():
+    """SDD §4.2, §10 (review RV28-08): Nova embeds the server's flavor - its original_name,
+    vCPUs, RAM, disks - from compute 2.47 on; below it (or with a clouds.yaml that pins an older
+    compute microversion) the server holds only the flavor's id. openstacksdk's Flavor then reads
+    0 for every field Nova left out, never None, so the inventory looks the flavor up by its id
+    whenever no original_name was embedded - and reads its ephemeral and swap disks from it too."""
+    from openstack.compute.v2.flavor import Flavor
+    from openstack.compute.v2.server import Server
+
+    from seamless_migrate.providers.openstack import _MapContext
+
+    looked = []
+
+    def get_flavor(flavor_id):
+        looked.append(flavor_id)
+        return Flavor(id=flavor_id, name="m1.big", vcpus=4, ram=8192, disk=40, ephemeral=10)
+
+    conn = NS(
+        compute=NS(get_flavor=get_flavor, volume_attachments=lambda server: []),
+        network=NS(ports=lambda **kw: [], get_network=lambda network_id: None),
+        identity=NS(get_project=lambda project_id: None),
+        image=NS(get_image=lambda image_id: None),
+    )
+    ctx = _MapContext(conn)
+    body = {"id": "srv-1", "name": "old-01", "status": "ACTIVE", "image": {"id": "img-1"}}
+    body["flavor"] = {"id": "flv-7", "links": []}
+    for server in (dict(body), Server(**body)):
+        looked.clear()
+        vm = ctx.server_to_vmref(server)
+        assert (looked, vm.vcpus, vm.ram_mb, vm.flavor) == (["flv-7"], 4, 8192, "m1.big")
+        assert [(d.kind, d.size_gb) for d in vm.disks] == [("image_root", 40), ("ephemeral", 10)]
+    # an embedded flavor (2.47+) is read as it is: no lookup
+    looked.clear()
+    embedded = {"original_name": "m1.small", "vcpus": 2, "ram": 2048, "disk": 20, "swap": 0}
+    vm = ctx.server_to_vmref(Server(**{**body, "flavor": embedded}))
+    assert (looked, vm.vcpus, vm.flavor) == ([], 2, "m1.small")
+
+    # a flavor deleted since: the server keeps what Nova gave of it, the inventory goes on
+    def gone(flavor_id):
+        raise RuntimeError(f"HTTP 404: flavor {flavor_id} could not be found")
+
+    conn.compute.get_flavor = gone
+    assert ctx.server_to_vmref(Server(**body)).vcpus == 0
+
+
 async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):
     from seamless_migrate.providers import openstack as osp
     from seamless_migrate.providers.openstack import OpenStackProvider, _MapContext
