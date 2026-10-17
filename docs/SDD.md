@@ -1173,7 +1173,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   time the playbook output showed the source-stop task starting, once the task's result line confirms
   it ran (a `skipping:` result, e.g. `data_copy: false`, starts no clock) (`TASK [... : Stop the source server]` for the
   warm role, `TASK [... : Perform workload stop if os_migrate_workload_stop_before_migration is true]`
-  for the cold role, the kit's power-off task for VMware); at the latest when the cutover step starts. A step
+  for the cold role, `TASK [os_migrate.vmware_migration_kit.import_workloads : Migrate Guest from Vmware using nbdkit
+  <vm>]` for VMware: kit 2.2.7 has no power-off task - its `migrate` module powers the VM off inside that task, a
+  Windows guest before the copy, any other guest after the copy and conversion, so for those the clock also counts the
+  copy and conversion (review RV26-03; `TODO(OWNER)`: whether their clock should start at the task's result line
+  instead); at the latest when the cutover step starts. A step
   cancelled while that task runs, before its result line (the step timeout, a rollback request, a shutdown),
   opens the clock at the task's start too: the source may be stopped, so the automatic rollback (§8) runs and a
   cancel is refused (§5.1) (audit EX-02).
