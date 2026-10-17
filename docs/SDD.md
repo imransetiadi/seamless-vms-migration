@@ -1375,16 +1375,19 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   kit's migrate task (the step timeout, a rollback request): it is detached from that host - found by the conversion
   host's name, else by the port that holds its address - and then deleted or kept by these rules, as §6.3 treats a
   transfer's volume the destination conversion host holds (review RV29-02). A volume attached to another server is
-  never deleted, nor is any volume when the VM has no kit name (`SRC_VM_NAME_UNUSABLE`, §9.3). A volume Cinder does
-  not delete fails the attempt, which is retried: the source already runs, and the power-on does nothing to a running
-  VM - the destination's clean-up never keeps the source stopped (§8, review RV29-01). As a rollback may so end
-  `failed` with such a volume left, a VMware kit run - a cutover, a `vmware_warm` pass - is refused before it starts,
-  before any clock, while a volume named `<kit name>-<digits>` with `osm` `true` is marked converted, or, for a
-  `vmware_cold` cutover, while any such volume exists: the refusal names each volume and its holder and tells the
-  operator to roll the migration back again, which deletes the ones it may (review RV29-01). A converted volume is no
-  refusal while the source has not run since this outage's stop - the clock open (§5.2) and vCenter reading the VM off
-  -: the kit then takes the volume it converted in this outage as migrated, which it is, as when a cutover is retried
-  after a failure past the conversion.
+  never deleted, nor is any volume when the VM has no kit name (`SRC_VM_NAME_UNUSABLE`, §9.3). The server the rollback
+  deletes counts as this migration's only when the migration recorded it: one found by the kit's name may be another
+  plan's VM the kit names alike (owner question q26), so what it held before its deletion is kept - a later kit run
+  refuses such a volume, and a second rollback, which finds no server holding it, deletes it (review RV29-03). A
+  volume Cinder does not delete fails the attempt, which is retried: the source already runs, and the power-on does
+  nothing to a running VM - the destination's clean-up never keeps the source stopped (§8, review RV29-01). As a
+  rollback may so end `failed` with such a volume left, a VMware kit run - a cutover, a `vmware_warm` pass - is
+  refused before it starts, before any clock, while a volume named `<kit name>-<digits>` with `osm` `true` is marked
+  converted, or, for a `vmware_cold` cutover, while any such volume exists: the refusal names each volume and its
+  holder and tells the operator to roll the migration back again, which deletes the ones it may (review RV29-01). A
+  converted volume is no refusal while the source has not run since this outage's stop - the clock open (§5.2) and
+  vCenter reading the VM off -: the kit then takes the volume it converted in this outage as migrated, which it is, as
+  when a cutover is retried after a failure past the conversion.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
   migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
