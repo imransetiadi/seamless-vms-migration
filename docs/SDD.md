@@ -1392,7 +1392,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   goes too, here and before a run (below): every later pass would fail at its attach (review RV30-07). A volume
   the destination's conversion host holds is the kit's own copy, left attached when a cutover was cut off inside the
   kit's migrate task (the step timeout, a rollback request): it is detached from that host - found by the conversion
-  host's name, else by the port that holds its address - and then deleted or kept by these rules, as §6.3 treats a
+  host's name, else as the Nova server holding its address (`server_of_address`: a fixed address on one of its
+  ports, or a floating one through the port Neutron's floating IP is associated with - never a floating IP's or a
+  router's own port, review RV30-06) - and then deleted or kept by these rules, as §6.3 treats a
   transfer's volume the destination conversion host holds (review RV29-02). A volume attached to another server is
   never deleted, nor is any volume when the VM has no kit name (`SRC_VM_NAME_UNUSABLE`, §9.3). The server the rollback
   deletes counts as this migration's only when the migration recorded it: one found by the kit's name may be another
@@ -2083,6 +2085,10 @@ class DestinationProvider(Protocol):
     async def detach_volume(self, server_id: str, volume_id: str) -> None
         # Nova's attachment of the volume to the server removed, then waits until Cinder reads the volume
         # available, within the call's bound (§8.1); a volume not attached to that server is no error (§7.2)
+    async def server_of_address(self, address: str) -> str | None
+        # the Nova server holding the address: a compute port (`device_owner` `compute:*`) with it as a fixed IP,
+        # else the compute port Neutron's floating IP of that address is associated with; None when none (§7.2
+        # VMware rollback, review RV30-06)
     async def server_volumes(self, server_id: str) -> list[str]
         # the ids of the volumes Nova lists as attached to the server - its record alone, no Cinder or Neutron
         # call; a server gone holds none (§7.2 VMware rollback, review RV30-04)
