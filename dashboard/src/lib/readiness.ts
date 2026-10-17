@@ -1,5 +1,6 @@
 import type { Nic, ProviderKind, Severity, VMRef } from '../api/types';
 import { guestOsOf } from './guestOs';
+import { kitVmName } from './kitName';
 
 /**
  * Inventory readiness hints derived client-side from VMRef fields. They mirror SDD §9.3 finding
@@ -52,6 +53,8 @@ export function readinessFlags(vm: VMRef, kind: ProviderKind): ReadinessFlag[] {
     );
   }
   if (kind === 'vmware') {
+    // the kit names the VM's server, ports and volumes after the VM (SDD §9.3, review RV28-03)
+    if (kitVmName(vm.name) === '') add('SRC_VM_NAME_UNUSABLE', 'Unusable name', 'blocker', "The migration kit keeps no character of the name: rename the VM in vCenter so that it holds a Latin letter or a digit.");
     if (vm.cbt_enabled === false) add('VMW_CBT_DISABLED', 'CBT off', 'warning', 'Changed Block Tracking is off: only cold migration.');
     if (vm.disks.some((d) => d.independent)) add('VMW_INDEPENDENT_DISK', 'Independent disk', 'warning', 'Independent disks cannot be tracked by CBT.');
     if (vm.snapshot_count > 0) {
