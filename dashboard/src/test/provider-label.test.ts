@@ -41,16 +41,17 @@ function probe(text: string): ts.Program {
   return ts.createProgram([file], options, host);
 }
 
-/** The dashboard's program with `extra` appended to its file `relative`, in memory. */
+/** A program of the dashboard's file `relative` with `extra` appended, in memory, and what it imports: rooted at that
+ * file alone, it type-checks a fraction of what the whole dashboard's program does. */
 function appended(relative: string, extra: string): ts.Program {
-  const { fileNames, options } = config();
+  const { options } = config();
   const file = `${root}/${relative}`;
   const text = `${ts.sys.readFile(file)}\n${extra}\n`;
   const host = ts.createCompilerHost(options);
   const read = host.getSourceFile.bind(host);
   host.getSourceFile = (name, version, ...rest) => (name === file ? ts.createSourceFile(name, text, version) : read(name, version, ...rest));
   host.readFile = (name) => (name === file ? text : ts.sys.readFile(name));
-  return ts.createProgram(fileNames, options, host);
+  return ts.createProgram([file], options, host);
 }
 
 /** Each read of a provider's bare name for a text in `program`'s sources under src/ (tests aside). */
@@ -160,9 +161,11 @@ function bareNames(program: ts.Program): string[] {
 }
 
 describe('every text names a provider by its label (SDD §1 naming, §4.2, review RV21-06)', () => {
+  // it builds and type-checks the whole dashboard, as the test that appends to it does: under a
+  // full parallel run that took over 30 s once (2026-10-17), so both get the same ceiling
   it("never reads a provider's bare name for a text", () => {
     expect(bareNames(dashboard())).toEqual([]);
-  }, 30_000);
+  }, 120_000);
 
   it("finds a Provider given wherever a shape of its own that reads `name` is expected (review RV23-05)", () => {
     const component = [
