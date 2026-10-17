@@ -2655,9 +2655,14 @@ class Orchestrator:
     async def _open_clock(self, mid: str, at: datetime | None) -> None:
         async with self._lock(mid):
             m, v = await self._load(mid)
-            if m.downtime_started_at is not None:
-                return
+            if fsm.source_stopped(m):
+                return  # open: the first stop's time stays
+            # none yet - or closed by the step that found the source running again and stops it
+            # once more: a new outage (SDD §5.2, review RV33-04)
             m.downtime_started_at = at or self._now()
+            m.downtime_ended_at = None
+            m.actual_downtime_s = None
+            m.downtime_model_s = None
             await self._save(m, v)
         await self._emit(
             "migration.downtime_started",

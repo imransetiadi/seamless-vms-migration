@@ -301,3 +301,109 @@ async def test_a_handover_retry_after_a_rotation_signs_in_with_the_new_credentia
         assert final.phase == P.completed, (h.history(final), final.error)
     finally:
         await h.orch.stop()
+
+
+async def _failed_after_its_rollback(h, mid, timeout=20.0):
+    """The migration once its automatic rollback itself failed: failed, after rolling_back."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        m = await h.migration(mid)
+        if m.phase == P.failed and P.rolling_back in h.history(m):
+            return m
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError((m.phase, h.history(m), m.error))
+        await asyncio.sleep(0.01)
+
+
+async def test_a_retry_after_a_failed_handover_rollback_keeps_the_boot_volume(tmp_path, store):
+    """SDD §7.3 step 3 (review RV33-01), end to end: the cutover fails at its delete (Nova 500),
+    the automatic rollback gives delete_on_termination back and fails at its start (performed,
+    its wait failed); the operator's Retry - the dashboard's "fix the cause and retry" - keeps the
+    volumes again before it deletes the source: Nova deletes no source volume."""
+    h, calls, clouds, mig = handover_harness(tmp_path, store, max_step_retries=0)
+    src = clouds["src"]
+    delete, wait = src.compute.delete_server, src.compute.wait_for_server
+    refused, started, waits_failed = [], [], []
+
+    def delete_once(s, ignore_missing=True):
+        if not refused:
+            refused.append(1)
+            raise RuntimeError("nova: HTTP 500 Internal Server Error")
+        return delete(s, ignore_missing=ignore_missing)
+
+    def start_server(s):
+        src.record("start_server", s.id)
+        s.status = "ACTIVE"
+        started.append(1)
+
+    def wait_for_server(s, status="ACTIVE", **kw):
+        if status == "ACTIVE" and started and not waits_failed:
+            waits_failed.append(1)
+            raise RuntimeError("nova: HTTP 500 Internal Server Error")
+        return wait(s, status=status, **kw)
+
+    src.compute.delete_server, src.compute.start_server = delete_once, start_server
+    src.compute.wait_for_server = wait_for_server
+    await h.orch.start()
+    try:
+        failed = await _failed_after_its_rollback(h, mig.id)
+        assert "start the source server" in (failed.error or ""), failed.error
+        assert src.servers["srv-1"].dot["vol-root"] is True  # given back
+        await h.orch.retry(mig.id, "rina")
+        final = await h.wait_phase(mig.id, P.completed, P.rolled_back, P.failed, timeout=20)
+    finally:
+        await h.orch.stop()
+    assert src.deleted_by_nova == [], (final.phase, final.error)
+    assert final.phase == P.completed, (h.history(final), final.error)
+
+
+async def test_a_retried_handover_cutover_that_finds_the_source_running_counts_a_new_outage(
+    tmp_path, store
+):
+    """SDD §5.2, §7.3 step 1 (review RV33-04), end to end: the rollback's start Nova performed
+    while its wait failed leaves the clock open though the source runs; when the operator retries
+    an hour later, the cutover finds it running, closes that outage and counts a new one from its
+    re-stop - the hour the source ran is no downtime."""
+    h, calls, clouds, mig = handover_harness(tmp_path, store, max_step_retries=0)
+    src = clouds["src"]
+    stop, ports, wait = src.compute.stop_server, src.network.ports, src.compute.wait_for_server
+    failing, started, waits_failed = [], [], []
+
+    def stop_then_fail_the_definition(s):
+        stop(s)
+        if not started:
+            failing.append(1)
+
+    def neutron_once(**query):
+        if failing:
+            failing.clear()
+            raise RuntimeError("neutron: HTTP 500 Internal Server Error")
+        return ports(**query)
+
+    def start_server(s):
+        src.record("start_server", s.id)
+        s.status = "ACTIVE"
+        started.append(1)
+
+    def wait_for_server(s, status="ACTIVE", **kw):
+        if status == "ACTIVE" and started and not waits_failed:
+            waits_failed.append(1)
+            raise RuntimeError("nova: HTTP 500 Internal Server Error")
+        return wait(s, status=status, **kw)
+
+    src.compute.stop_server, src.network.ports = stop_then_fail_the_definition, neutron_once
+    src.compute.start_server, src.compute.wait_for_server = start_server, wait_for_server
+    await h.orch.start()
+    try:
+        failed = await _failed_after_its_rollback(h, mig.id)
+        assert src.servers["srv-1"].status == "ACTIVE"  # the source runs again
+        h.clock.advance(3600)  # for an hour, before the operator retries
+        await h.orch.retry(mig.id, "rina")
+        final = await h.wait_phase(mig.id, P.completed, P.rolled_back, P.failed, timeout=20)
+    finally:
+        await h.orch.stop()
+    assert final.phase == P.completed, (h.history(final), final.error)
+    assert final.downtime_started_at > failed.downtime_started_at  # a new outage
+    assert final.actual_downtime_s is not None and 0 <= final.actual_downtime_s < 3600, (
+        final.actual_downtime_s
+    )

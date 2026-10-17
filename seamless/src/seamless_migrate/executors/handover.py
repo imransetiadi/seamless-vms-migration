@@ -1276,18 +1276,22 @@ class HandoverExecutor:
                     "storage handover refused: " + "; ".join(report["problems"])
                 )
 
-        def stop(server: Any) -> None:
+        def settle(server: Any) -> Any:
+            """The server once a start Nova runs ended: a rollback's, its wait cut off, reads
+            SHUTOFF until the guest runs, and Nova refuses a stop meanwhile (SDD §7.3 step 1,
+            review RV33-02)."""
             deadline = time.monotonic() + self.wait_s
             while _starting(server):
-                # a start Nova runs - a rollback's, its wait cut off - reads SHUTOFF until the guest
-                # runs, and Nova refuses a stop meanwhile: waited out, then the source is stopped
-                # (SDD §7.3 step 1, review RV33-02)
                 if time.monotonic() > deadline:
                     raise TimeoutError(
                         f"Timeout waiting for the start of server {server_id} to end"
                     )
                 time.sleep(self.poll_s or 0.1)
                 server = src.compute.get_server(server_id)
+            return server
+
+        def stop(server: Any, again: bool = False) -> None:
+            server = settle(server)
             if not _stopped(server):
                 # a stop that runs - the one a retry finds, the server reading ACTIVE until the
                 # guest is down - is waited for: Nova refuses a second (409), as it refuses a stop
@@ -1298,32 +1302,37 @@ class HandoverExecutor:
                     except Exception as exc:
                         if not _conflict(exc):
                             raise
-                        again = src.compute.get_server(server_id)
-                        if not (_stopping(again) or _stopped(again)):
+                        again_read = src.compute.get_server(server_id)
+                        if not (_stopping(again_read) or _stopped(again_read)):
                             raise
                 # Nova accepted a stop: should the wait fail, a rollback starts the source; the
-                # first one's time stays, the clock's start (SDD §7.3 step 1)
+                # first one's time stays, the clock's start (SDD §7.3 step 1) - a re-stop's is the
+                # start of a new outage (review RV33-04)
                 if not journal.done("sent:stop_source"):
                     journal.mark("sent:stop_source")
+                if again:
+                    journal.mark("sent:restop_source")
             src.compute.wait_for_server(
                 server, status="SHUTOFF", interval=self.poll_s, wait=self.wait_s
             )
 
-        def stop_again() -> None:
+        def to_stop_again() -> Any:
             # resumed past the stop: a rollback's start Nova performed while its wait failed -
             # which journals nothing - or an operator's start runs the source again, and a later
             # step deletes it; a source already gone was deleted by the attempt before, which
             # failed before it journaled that (SDD §7.3 step 1, review 31)
             server = _existing_server(src, server_id)
             if server is None:
-                return
+                return None
             if journal.done("sent:delete_source") and not _active(server):
                 # its deletion accepted: Nova starts no server it deletes or that a failed deletion
                 # left in ERROR, and its stop of one never reads SHUTOFF - step 4 sends the
                 # deletion again (review RV33-03)
-                return
-            stop(server)
+                return None
+            return settle(server)
 
+        restopping = False
+        restops_before = journal.last("sent:restop_source")
         try:
             if not journal.done("stop_source"):
                 await self._call(
@@ -1331,11 +1340,23 @@ class HandoverExecutor:
                 )
                 await _in_thread(journal.mark, "stop_source")
             elif not journal.done("delete_source"):
-                await self._call("stop source server", stop_again)
+                server = await self._call("stop source server", to_stop_again)
+                if server is not None and not _stopped(server):
+                    # it ran since the first stop: that outage ended - the clock closes - and this
+                    # stop opens a new one (SDD §5.2, §7.3 step 1, review RV33-04)
+                    await outlive_cancel(ctx.mark_downtime_end())
+                    restopping = True
+                    await self._call("stop source server", lambda: stop(server, again=True))
         except (Exception, asyncio.CancelledError):
             # SDD §7.3 step 1: the stop Nova accepted may have stopped the source - the clock opens
-            # at its request, so the rollback starts the source again and a cancel is refused
-            sent = journal.get("sent:stop_source")
+            # at its request, so the rollback starts the source again and a cancel is refused; a
+            # re-stop opens the new outage only once Nova accepted it (refused, the source runs)
+            if not restopping:
+                sent = journal.get("sent:stop_source")
+            elif journal.last("sent:restop_source") > restops_before:
+                sent = journal.get("sent:restop_source")
+            else:
+                sent = {}
             if sent:
                 at = datetime.fromisoformat(sent["at"])
                 await outlive_cancel(ctx.mark_downtime_start(at=at))
