@@ -1492,7 +1492,14 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   conversion fails, on the next ones (the kit's fallback), a conversion that failed leaving its disk "in an unknown,
   possibly corrupted state" (virt-v2v-in-place) - and the server it then boots from the volumes writes to every one
   of them, neither of which a CBT sync, copying only what the source changed, undoes (reviews RV32A-01, RV32A-02). A
-  marking that fails fails the cutover as transient, before the kit runs. A volume marked `cutover` is a first copy
+  marking that fails fails the cutover as transient, before the kit runs. Only the kit's migrate task (`Migrate Guest
+  from Vmware using nbdkit`) writes to a volume - the tasks before it check, connect and read vCenter -, so a cutover
+  kit run that fails or is cancelled before its output shows that task's header wrote to none: before its failure is
+  reported, the volumes this run marked `cutover` are marked `true` again, and the cutover's retry - or the pass a
+  Retry runs first - syncs them by CBT rather than copying every disk in full, the retry's inside the outage (review
+  RV34A-02). A marking back that fails is logged and leaves them `cutover`; a control plane that ends abruptly during
+  the run (a SIGKILL, an OOM kill) marks nothing back - its clock may not record a migrate task that ran -, so a copy
+  the kit may have rewritten is never taken as completed. A volume marked `cutover` is a first copy
   cut off for every later run and rollback - deleted, or left where another server holds it, by the rules above -
   but one: a cutover retried inside the same outage keeps such volumes for its CBT sync when the clock is open,
   vCenter reads the VM off and records no power-on of it since the clock opened (as for a converted volume above),
