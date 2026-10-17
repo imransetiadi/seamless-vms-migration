@@ -272,8 +272,17 @@ def _powering(server: Any) -> bool:
     return str(_attr(server, "task_state") or "").lower() in ("powering-off", "powering-on")
 
 
+def _starting(server: Any) -> bool:
+    """Nova powers the server on: its task state while a start runs, the status still SHUTOFF."""
+    return str(_attr(server, "task_state") or "").lower() == "powering-on"
+
+
 def _stopped(server: Any) -> bool:
     return str(_attr(server, "status", "")).upper() == "SHUTOFF"
+
+
+def _active(server: Any) -> bool:
+    return str(_attr(server, "status", "")).upper() == "ACTIVE"
 
 
 def _conflict(exc: BaseException) -> bool:
@@ -1259,6 +1268,17 @@ class HandoverExecutor:
                 )
 
         def stop(server: Any) -> None:
+            deadline = time.monotonic() + self.wait_s
+            while _starting(server):
+                # a start Nova runs - a rollback's, its wait cut off - reads SHUTOFF until the guest
+                # runs, and Nova refuses a stop meanwhile: waited out, then the source is stopped
+                # (SDD §7.3 step 1, review RV33-02)
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"Timeout waiting for the start of server {server_id} to end"
+                    )
+                time.sleep(self.poll_s or 0.1)
+                server = src.compute.get_server(server_id)
             if not _stopped(server):
                 # a stop that runs - the one a retry finds, the server reading ACTIVE until the
                 # guest is down - is waited for: Nova refuses a second (409), as it refuses a stop
@@ -1286,8 +1306,14 @@ class HandoverExecutor:
             # step deletes it; a source already gone was deleted by the attempt before, which
             # failed before it journaled that (SDD §7.3 step 1, review 31)
             server = _existing_server(src, server_id)
-            if server is not None:
-                stop(server)
+            if server is None:
+                return
+            if journal.done("sent:delete_source") and not _active(server):
+                # its deletion accepted: Nova starts no server it deletes or that a failed deletion
+                # left in ERROR, and its stop of one never reads SHUTOFF - step 4 sends the
+                # deletion again (review RV33-03)
+                return
+            stop(server)
 
         try:
             if not journal.done("stop_source"):
@@ -1348,6 +1374,9 @@ class HandoverExecutor:
                 server = _existing_server(src, server_id)
                 if server is not None:
                     src.compute.delete_server(server, ignore_missing=True)
+                    # Nova accepted it: a retry stops no server Nova deletes (step 1, RV33-03)
+                    if not journal.done("sent:delete_source"):
+                        journal.mark("sent:delete_source")
                     src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
                 for att in attachments:
                     if journal.done(f"unmanage_src:{att['volume_id']}"):

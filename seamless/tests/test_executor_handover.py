@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import contextlib
 import copy
 import gc
 import json
@@ -1467,6 +1468,182 @@ async def test_a_cutover_resumed_after_it_deleted_the_source_goes_on_without_a_s
     result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert result.destination_server_id == "dst-new-1"
     assert [c for c in calls if c[1] == "stop_server"] == [("src", "stop_server", "srv-1")]
+
+
+async def test_a_resumed_cutover_waits_out_a_start_nova_runs_before_it_stops_the_source(tmp_path):
+    """SDD §7.3 step 1 (review RV33-02): a source Nova still starts - the rollback's start
+    accepted, its wait cut off - reads SHUTOFF until the guest runs. The resumed cutover waits that
+    start out, then stops the source and deletes it stopped - never while it boots."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    stop, ports = src.compute.stop_server, src.network.ports
+    failing = []
+
+    def stop_then_fail_the_definition(s):
+        stop(s)
+        failing.append(1)
+
+    def neutron_once(**query):
+        if failing:
+            failing.clear()
+            raise RuntimeError("neutron: HTTP 503 Service Unavailable")
+        return ports(**query)
+
+    src.compute.stop_server, src.network.ports = stop_then_fail_the_definition, neutron_once
+    with pytest.raises((TransientStepError, PermanentStepError), match="record source definition"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.stop_server = stop
+
+    wait = src.compute.wait_for_server
+
+    def start_accepted(s):  # Nova accepts the rollback's start; the guest is not up yet
+        src.record("start_server", s.id)
+        s.task_state = "powering-on"
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.start_server, src.compute.wait_for_server = start_accepted, wait_fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.wait_for_server = wait
+    assert (server.status, server.task_state) == ("SHUTOFF", "powering-on")
+
+    reads = []
+    get = src.compute.get_server
+
+    def get_server(server_id):  # the guest is up on the third read
+        reads.append(server_id)
+        if len(reads) == 3 and server.task_state == "powering-on":
+            server.status, server.task_state = "ACTIVE", None
+        return get(server_id)
+
+    deleted_while = []
+    delete = src.compute.delete_server
+
+    def delete_server(s, ignore_missing=True):
+        found = src.servers[getattr(s, "id", s)]
+        deleted_while.append((found.status, getattr(found, "task_state", None)))
+        return delete(s, ignore_missing=ignore_missing)
+
+    src.compute.get_server, src.compute.delete_server = get_server, delete_server
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert deleted_while == [("SHUTOFF", None)], "the cutover deleted a source Nova was starting"
+    assert [c for c in calls if c[1] == "stop_server"] == [("src", "stop_server", "srv-1")] * 2
+
+
+@pytest.mark.parametrize("after", ["error", "running again"])
+async def test_a_cutover_retried_after_a_deletion_nova_accepted_sends_it_again(tmp_path, after):
+    """SDD §7.3 steps 1 and 4 (review RV33-03): a deletion Nova accepted is journaled as sent. When
+    the compute host fails it - the server reads ERROR, openstacksdk's wait times out, transient -
+    the retried step sends no stop, which Nova cannot complete on ERROR, and deletes it again. A
+    source that reads ACTIVE again (Nova's soft delete restored, an operator reset and started
+    it) is stopped first, as any source found running."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    delete, fake_wait = src.compute.delete_server, src.compute.wait_for_server
+    deletes = []
+
+    def delete_fails_on_the_host_once(s, ignore_missing=True):
+        deletes.append(1)
+        if len(deletes) == 1:
+            src.record("delete_server", s.id)
+            server.status = "ERROR" if after == "error" else "ACTIVE"
+            return None
+        found = src.servers[getattr(s, "id", s)]
+        deleted_while.append(found.status)
+        return delete(s, ignore_missing=ignore_missing)
+
+    def wait_for_delete(res, interval=2, wait=120):  # openstacksdk: until a 404, or a timeout
+        if getattr(res, "id", res) in src.servers:
+            raise RuntimeError("Timeout waiting for Server:srv-1 to delete")
+        return res
+
+    def sdk_wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        failures = ["ERROR"] if failures is None else failures
+        fresh = src.servers[s.id]  # openstacksdk's first read comes at once
+        if fresh.status == status:
+            return fresh
+        if fresh.status.lower() in [f.lower() for f in failures]:
+            raise RuntimeError(f"Server:{s.id} transitioned to failure state {fresh.status}")
+        return fake_wait(s, status=status, failures=failures, interval=interval, wait=wait)
+
+    def stop_server(s):  # Nova takes a stop of an ERROR server: powering-off, still ERROR
+        src.record("stop_server", s.id)
+        if s.status == "ERROR":
+            s.task_state = "powering-off"
+        else:
+            s.status = "SHUTOFF"
+
+    deleted_while = []
+    src.compute.delete_server, src.compute.stop_server = delete_fails_on_the_host_once, stop_server
+    src.compute.wait_for_delete, src.compute.wait_for_server = wait_for_delete, sdk_wait_for_server
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+    stops = [c for c in calls if c[1] == "stop_server"]
+    if after == "error":
+        assert stops == [("src", "stop_server", "srv-1")]  # the first stop alone
+        assert deleted_while == ["ERROR"]
+    else:
+        assert stops == [("src", "stop_server", "srv-1")] * 2
+        assert deleted_while == ["SHUTOFF"]
+
+
+async def test_a_deletion_nova_refused_never_spares_a_source_from_its_re_stop(tmp_path):
+    """SDD §7.3 steps 1 and 4 (review RV33-03): only a deletion Nova accepted is journaled as sent.
+    One it refused (HTTP 500) leaves the source to the re-stop: after a rollback whose start Nova
+    accepted - the guest booting, the start's wait failed - the retried cutover waits that start
+    out and stops the source before it deletes it."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    delete = src.compute.delete_server
+
+    def delete_refused(s, ignore_missing=True):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.delete_server = delete_refused
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+
+    wait = src.compute.wait_for_server
+
+    def start_accepted(s):
+        src.record("start_server", s.id)
+        s.task_state = "powering-on"
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.start_server, src.compute.wait_for_server = start_accepted, wait_fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.wait_for_server = wait
+
+    reads = []
+    get = src.compute.get_server
+
+    def get_server(server_id):  # the guest is up on the third read
+        reads.append(server_id)
+        if len(reads) == 3 and server.task_state == "powering-on":
+            server.status, server.task_state = "ACTIVE", None
+        return get(server_id)
+
+    deleted_while = []
+
+    def delete_server(s, ignore_missing=True):
+        found = src.servers[getattr(s, "id", s)]
+        deleted_while.append((found.status, getattr(found, "task_state", None)))
+        return delete(s, ignore_missing=ignore_missing)
+
+    src.compute.get_server, src.compute.delete_server = get_server, delete_server
+    with contextlib.suppress(TransientStepError, PermanentStepError):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert deleted_while == [("SHUTOFF", None)], "the cutover deleted a source Nova was starting"
 
 
 async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):
