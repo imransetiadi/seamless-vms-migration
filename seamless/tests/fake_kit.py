@@ -6,7 +6,7 @@ convert, power the VM off, mark the volume converted; one marked converted - "Vo
 converted, skipping migration..": nothing copied, nothing powered off. Then the role's "Create
 network ports" and "Create instance", which boots from that volume. The VM's power state and the
 volume live in the directory ``$ANSIBLE_FAKE_KIT_STATE`` (``power``: on/off; ``volume``:
-converted).
+converted; ``runs``: a line per run).
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from seamless_migrate.planning.kit import kit_vm_name
+from tests.factories import make_vm
 from tests.test_executor_ansible import FakeImpl, FakeRegistry
 
 KIT_CUTOVER = r"""#!@PYTHON@
@@ -32,6 +33,8 @@ for arg in sys.argv[1:]:
     if arg.startswith("@"):
         merged.update(yaml.load(Path(arg[1:]).read_text(), Loader=Loader) or {})
 state = Path(os.environ["ANSIBLE_FAKE_KIT_STATE"])
+with open(state / "runs", "a") as fh:
+    fh.write("run\n")
 vm = merged["vms_list"][0]
 host = "192.0.2.10"
 print("PLAY [Migrate vmware virtual machines] ****")
@@ -87,6 +90,10 @@ class KitRegistry(FakeRegistry):
             impl.calls.append(("power_on", source_id))
             (state / "power").write_text("on")
 
+        async def get_vm(source_id):
+            power = {"on": "running", "off": "stopped"}[(state / "power").read_text()]
+            return make_vm(source_id=source_id, name=self.vm_name, power_state=power)
+
         async def volumes():
             volume = state / "volume"
             if not volume.exists():
@@ -106,5 +113,6 @@ class KitRegistry(FakeRegistry):
             impl.calls.append(("delete_volume", volume_id))
             (state / "volume").unlink(missing_ok=True)
 
-        impl.power_on, impl.volumes, impl.delete_volume = power_on, volumes, delete_volume
+        impl.power_on, impl.get_vm = power_on, get_vm
+        impl.volumes, impl.delete_volume = volumes, delete_volume
         return impl

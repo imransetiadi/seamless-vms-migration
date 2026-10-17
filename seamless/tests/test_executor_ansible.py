@@ -102,6 +102,10 @@ class FakeImpl:
     async def power_on(self, source_id):
         self.calls.append(("power_on", source_id))
 
+    async def get_vm(self, source_id):
+        """The source VM as its provider reads it now (SDD §10): its power state."""
+        return make_vm(source_id=source_id, power_state=self.registry.source_power)
+
     async def ports(self, *, network_id=None, mac_address=None, ip_address=None):
         """The destination's ports matching every filter given (SDD §10)."""
         if self.registry.ports_error:
@@ -179,6 +183,8 @@ class FakeRegistry:
         # the destination project's volumes (SDD §10 DestinationProvider.volumes)
         self.volumes: list[dict] = []
         self.volumes_error = False
+        # the source VM's power state as its provider reads it (SDD §10 SourceProvider.get_vm)
+        self.source_power = "running"
         # the token's role names the destination inventory reads live; None: it could not
         # (SDD §10, review RV19-01)
         self.roles: list[str] | None = None
@@ -2842,8 +2848,8 @@ async def test_a_vmware_rollback_deletes_the_kit_volumes_its_next_run_would_take
     """SDD §7.2 (review RV28-01): the kit finds a VM's volume by its name, <kit name>-<disk key>,
     and the metadata osm; one it marked converted it takes as migrated - no copy, no power-off,
     the new server booted from the first attempt's disk while the source runs again. The rollback
-    deletes, after the server and the kit's ports, every such volume marked converted, and for a
-    vmware_cold migration (whose kit run refuses an existing volume) any such volume; a
+    deletes, once the source is powered on (review RV29-01), every such volume marked converted,
+    and for a vmware_cold migration (whose kit run refuses an existing volume) any such volume; a
     vmware_warm volume not converted stays for the next pass's CBT sync. Another VM's volume, one
     without the kit's metadata or of another name form, and one another server holds stay."""
     env.registry.volumes = [
@@ -2872,8 +2878,8 @@ async def test_a_vmware_rollback_deletes_the_kit_volumes_its_next_run_would_take
     assert result.details["deleted_volumes"] == gone
     assert env.registry.calls == [
         ("delete_server", "dst-9"),
-        *[("delete_volume", v) for v in gone],
         ("power_on", "srv-1"),
+        *[("delete_volume", v) for v in gone],
     ]
     kept = {
         "not-the-kits",
@@ -2886,12 +2892,142 @@ async def test_a_vmware_rollback_deletes_the_kit_volumes_its_next_run_would_take
     }
     kept |= {"unconverted"} if strategy == Strategy.vmware_warm else set()
     assert {v["id"] for v in env.registry.volumes} == kept
-    # volumes that cannot be read: the rollback is retried, the source not yet started
+    # volumes that cannot be read: the rollback is retried, the source started all the same
     env.registry.calls.clear()
     env.registry.volumes_error = True
     with pytest.raises(TransientStepError, match="rollback: volumes: HTTP 503"):
         await env.executor.run(StepName.ROLLBACK, ctx)
-    assert ("power_on", "srv-1") not in env.registry.calls
+    assert ("power_on", "srv-1") in env.registry.calls
+
+
+async def test_a_vmware_rollback_powers_the_source_on_before_cinder_may_refuse_a_volume(env):
+    """SDD §7.2, §8 (review RV29-01): the destination's clean-up never keeps the source stopped -
+    a kit volume Cinder will not delete (still deleting, error_deleting, a snapshot on it) fails
+    the attempt, which is retried, with the source already running: a retried power-on does
+    nothing to a running VM."""
+    env.registry.volumes = [kit_volume("converted", "web-01-2000")]
+
+    async def refuses(volume_id):
+        env.registry.calls.append(("delete_volume", volume_id))
+        raise ProviderError(f"dst: BadRequestException: 400: Invalid volume {volume_id}")
+
+    class Refusing(FakeImpl):
+        delete_volume = staticmethod(refuses)
+
+    env.registry.get = lambda provider: Refusing(env.registry)
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, destination_server_id="dst-9"
+    )
+    with pytest.raises(TransientStepError, match="rollback: dst: BadRequestException: 400"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert env.registry.calls == [
+        ("delete_server", "dst-9"),
+        ("power_on", "srv-1"),
+        ("delete_volume", "converted"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("strategy", "step", "volume", "refused"),
+    [
+        # the kit takes a converted volume as migrated: no run of either strategy may meet one
+        # while the source may have run since (here: no clock open)
+        (Strategy.vmware_cold, StepName.CUTOVER, kit_volume("v", "web-01-2000"), True),
+        (Strategy.vmware_warm, StepName.CUTOVER, kit_volume("v", "web-01-2000"), True),
+        (Strategy.vmware_warm, StepName.PRECOPY, kit_volume("v", "web-01-2000"), True),
+        (Strategy.vmware_warm, StepName.SYNC, kit_volume("v", "web-01-2000"), True),
+        # another server's: the kit would find it all the same - named with its holder
+        (
+            Strategy.vmware_cold,
+            StepName.CUTOVER,
+            kit_volume("v", "web-01-2000", attachments=["srv-other"]),
+            True,
+        ),
+        # a cold run refuses to copy onto any; a warm run syncs onto one not converted
+        (
+            Strategy.vmware_cold,
+            StepName.CUTOVER,
+            kit_volume("v", "web-01-2000", converted=False),
+            True,
+        ),
+        (
+            Strategy.vmware_warm,
+            StepName.CUTOVER,
+            kit_volume("v", "web-01-2000", converted=False),
+            False,
+        ),
+        (
+            Strategy.vmware_warm,
+            StepName.PRECOPY,
+            kit_volume("v", "web-01-2000", converted=False),
+            False,
+        ),
+        # another VM's, or not the kit's
+        (Strategy.vmware_cold, StepName.CUTOVER, kit_volume("v", "db-07-2000"), False),
+        (Strategy.vmware_cold, StepName.CUTOVER, kit_volume("v", "web-01-2000", osm=False), False),
+    ],
+)
+async def test_a_vmware_kit_run_is_refused_while_a_stale_kit_volume_of_the_vm_exists(
+    env, strategy, step, volume, refused
+):
+    """SDD §7.2 (review RV29-01): a rollback that could not delete the kit's converted volume ends
+    failed with the source running; a retry's kit run would take that volume as migrated and boot
+    the destination from it beside the source. So a VMware kit run is refused before it starts -
+    before any clock - while a volume of the VM's kit name with osm true is marked converted, or,
+    for a vmware_cold cutover, while any such volume exists; the refusal names the volume and its
+    holder, and the way out: roll the migration back again."""
+    env.registry.volumes = [volume]
+    env.registry.source_power = "stopped"  # off now, but with no clock open it may have run since
+    ctx, rec = ctx_for(env, strategy=strategy, source=VCENTER, nics=VMW_NICS)
+    if not refused:
+        await env.executor.run(step, ctx)
+        assert read_log(env.log)
+        return
+    with pytest.raises(PermanentStepError) as refusal:
+        await env.executor.run(step, ctx)
+    holder = ", attached to srv-other" if volume["attachments"] else ""
+    assert f"the kit's volume v (web-01-2000{holder})" in str(refusal.value)
+    assert "roll the migration back again" in str(refusal.value)
+    assert read_log(env.log) == [] and rec.downtime_marks == 0
+    # volumes that cannot be read are no answer: the run is retried, never started blind
+    env.registry.volumes_error = True
+    with pytest.raises(TransientStepError, match="volumes: HTTP 503"):
+        await env.executor.run(step, ctx)
+    assert read_log(env.log) == []
+
+
+@pytest.mark.parametrize("strategy", [Strategy.vmware_cold, Strategy.vmware_warm])
+@pytest.mark.parametrize(
+    ("source_power", "converted", "refused"),
+    [
+        ("stopped", True, False),  # off since this outage's conversion: the volume is current
+        ("running", True, True),  # a rollback powered it on, then could not delete the volume
+        ("unknown", True, True),  # vCenter does not say it is off
+        ("stopped", False, None),  # cold: the kit refuses to copy onto it; warm: CBT syncs onto it
+    ],
+)
+async def test_a_cutover_retried_while_the_source_stays_off_reuses_the_volume_the_kit_converted(
+    env, strategy, source_power, converted, refused
+):
+    """SDD §7.2 (review RV29-01): a converted kit volume is no refusal while the source has not
+    run since this outage's stop - the clock open and vCenter reading the VM off: the kit takes
+    the volume it converted in this outage as migrated, which it is (a cutover retried after a
+    failure past the conversion). Running, or not known to be off, it is refused; the clock alone
+    cannot tell, as a rollback that powered the source on and then failed leaves it open."""
+    if refused is None:
+        refused = strategy == Strategy.vmware_cold
+    env.registry.volumes = [kit_volume("v", "web-01-2000", converted=converted)]
+    env.registry.source_power = source_power
+    ctx, rec = ctx_for(
+        env, strategy=strategy, source=VCENTER, nics=VMW_NICS, downtime_started_at=utcnow()
+    )
+    if not refused:
+        await env.executor.run(StepName.CUTOVER, ctx)
+        assert read_log(env.log)
+        return
+    with pytest.raises(PermanentStepError, match="roll the migration back again"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []
 
 
 async def test_a_vmware_rollback_deletes_no_volume_of_a_vm_without_a_kit_name(env):

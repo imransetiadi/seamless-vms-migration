@@ -3047,14 +3047,10 @@ async def test_an_ansible_cutover_cut_off_while_its_clock_saves_still_announces_
         await h.orch.stop()
 
 
-async def test_a_vmware_retry_after_the_automatic_rollback_copies_and_stops_the_source_again(
-    tmp_path, store, monkeypatch
-):
-    """SDD §7.2, §8 (review RV28-01): a VMware cutover that fails after the kit's migrate task -
-    its clock open - is rolled back automatically, and the rollback powers the VM on. The kit had
-    converted the VM's volume; on the retry its migrate task would take that volume as migrated
-    and boot the destination from it - no copy, no power-off, the source running beside it. The
-    rollback deletes that volume, so the retry copies the VM again and powers it off."""
+def _vmware_kit_journey(tmp_path, store, monkeypatch, registry_class=None):
+    """A vmware_cold migration of web-01, ready, in a running plan, driven by the real
+    AnsibleExecutor over the fake kit run (tests/fake_kit.py), whose first run fails at the kit's
+    "Create network ports" after its migrate task converted the volume and powered the VM off."""
     from seamless_migrate.config import find_repo_root
     from seamless_migrate.executors.ansible import AnsibleExecutor
     from tests.factories import make_plan
@@ -3090,7 +3086,8 @@ async def test_a_vmware_retry_after_the_automatic_rollback_copies_and_stops_the_
         collection_root=find_repo_root(),
         max_step_retries=0,
     )
-    executor = AnsibleExecutor(settings, providers=KitRegistry(state, "web-01"), poll_s=0.02)
+    registry = (registry_class or KitRegistry)(state, "web-01")
+    executor = AnsibleExecutor(settings, providers=registry, poll_s=0.02)
     vm = make_vm(source_id="vm-1", name="web-01", nics=VMW_NICS)
     h = build_harness(tmp_path, store, [vm], executor=executor, settings=settings)
     store.put("provider", VCENTER)
@@ -3108,6 +3105,18 @@ async def test_a_vmware_retry_after_the_automatic_rollback_copies_and_stops_the_
         id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_cold, phase=P.ready
     )
     store.put("migration", m)
+    return h, m, state
+
+
+async def test_a_vmware_retry_after_the_automatic_rollback_copies_and_stops_the_source_again(
+    tmp_path, store, monkeypatch
+):
+    """SDD §7.2, §8 (review RV28-01): a VMware cutover that fails after the kit's migrate task -
+    its clock open - is rolled back automatically, and the rollback powers the VM on. The kit had
+    converted the VM's volume; on the retry its migrate task would take that volume as migrated
+    and boot the destination from it - no copy, no power-off, the source running beside it. The
+    rollback deletes that volume, so the retry copies the VM again and powers it off."""
+    h, m, state = _vmware_kit_journey(tmp_path, store, monkeypatch)
     await h.orch.start()
     try:
         first = await h.wait_phase(m.id, P.rolled_back, P.failed, timeout=30)
@@ -3118,6 +3127,55 @@ async def test_a_vmware_retry_after_the_automatic_rollback_copies_and_stops_the_
         done = await h.wait_phase(m.id, P.completed, P.failed, P.rolled_back, timeout=30)
         assert done.phase == P.completed, (done.phase, done.error)
         assert (state / "power").read_text() == "off", "the cutover completed with the VM running"
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_vmware_rollback_cinder_will_not_clean_restarts_the_source_and_the_retry_waits(
+    tmp_path, store, monkeypatch
+):
+    """SDD §7.2, §8 (review RV29-01): the automatic rollback powers the source on before it
+    deletes the kit's converted volume - Cinder refusing that delete fails the rollback with the
+    source running, never stopped. A retry's cutover would boot the destination from that volume
+    beside the source: it is refused before the kit runs, the automatic rollback that follows
+    deletes the volume once Cinder does, and the next retry copies the VM again and stops it."""
+    from seamless_migrate.providers.base import ProviderError
+    from tests.fake_kit import KitRegistry
+
+    refusing = [True]
+
+    class Picky(KitRegistry):
+        def get(self, provider):
+            impl = super().get(provider)
+            delete = impl.delete_volume
+
+            async def delete_volume(volume_id):
+                if refusing[0]:
+                    impl.calls.append(("delete_volume", volume_id))
+                    raise ProviderError("dst-rhoso: BadRequestException: 400: Invalid volume")
+                await delete(volume_id)
+
+            impl.delete_volume = delete_volume
+            return impl
+
+    h, m, state = _vmware_kit_journey(tmp_path, store, monkeypatch, Picky)
+    runs = lambda: len((state / "runs").read_text().split())  # noqa: E731
+    await h.orch.start()
+    try:
+        first = await h.wait_phase(m.id, P.failed, P.rolled_back, timeout=30)
+        assert first.phase == P.failed and P.rolling_back in h.history(first), first.error
+        assert (state / "power").read_text() == "on", "a refused clean-up kept the source stopped"
+        assert (state / "volume").exists() and runs() == 1
+        refusing[0] = False
+        await h.orch.retry(m.id, "rina")
+        second = await h.wait_phase(m.id, P.rolled_back, P.failed, P.completed, timeout=30)
+        assert second.phase == P.rolled_back, (second.phase, second.error)
+        assert runs() == 1, "the kit ran on the converted volume while the source ran"
+        assert not (state / "volume").exists() and (state / "power").read_text() == "on"
+        await h.orch.retry(m.id, "rina")
+        done = await h.wait_phase(m.id, P.completed, P.failed, P.rolled_back, timeout=30)
+        assert done.phase == P.completed, (done.phase, done.error)
+        assert runs() == 2 and (state / "power").read_text() == "off"
     finally:
         await h.orch.stop()
 

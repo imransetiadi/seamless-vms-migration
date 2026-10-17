@@ -29,6 +29,7 @@ import yaml
 from ..ai.redaction import redact_cut, redact_tail
 from ..config import Settings
 from ..domain.enums import ProviderKind, Strategy, SyncPassKind
+from ..domain.fsm import source_stopped
 from ..domain.models import (
     Mappings,
     Migration,
@@ -1018,6 +1019,8 @@ class AnsibleExecutor:
             raise PermanentStepError(f"step {step} does not apply to strategy {strategy}")
         if step == StepName.CUTOVER:
             await self._refuse_name_collision(ctx)
+        if strategy in VMWARE and step in (StepName.CUTOVER, StepName.PRECOPY, StepName.SYNC):
+            await self._refuse_stale_kit_volumes(ctx, strategy)
         if strategy == Strategy.cold and step == StepName.CUTOVER:
             await asyncio.to_thread(
                 _ensure_record, osm, ctx.migration.vm.source_id, ctx.migration.vm.name
@@ -1096,6 +1099,66 @@ class AnsibleExecutor:
                 f"({existing}) and this migration did not create it; delete or rename it before "
                 "the cutover"
             )
+
+    async def _refuse_stale_kit_volumes(self, ctx: StepContext, strategy: Strategy) -> None:
+        """Before a VMware kit run - so before any clock - refuse while a volume of the VM's kit
+        name holds what the run would take as migrated: one marked converted, or for a cold run
+        any, onto which the kit refuses to copy. A rollback that could not delete it ended failed
+        with the source running, and the run would boot the destination from it beside the
+        source (SDD §7.2, review RV29-01). A converted volume is the kit's own of this outage
+        while the source has not run since its stop: the clock open and the VM reading off."""
+        m = ctx.migration
+        kit = kit_vm_name(m.vm.name)
+        if not kit:
+            return
+        own = re.compile(re.escape(kit) + r"-[0-9]+")
+        where = ctx.destination.label
+        try:
+            volumes = await self.providers.get(ctx.destination).volumes()
+        except ProviderError as exc:
+            # an unanswered lookup is not "no such volume": refuse before the kit runs
+            raise TransientStepError(
+                f"could not check {where} for the kit's volumes of {m.vm.name}: {exc}"
+            ) from exc
+        stale = [
+            v
+            for v in volumes
+            if own.fullmatch(str(v.get("name") or ""))
+            and (v.get("metadata") or {}).get("osm") == "true"
+            and (
+                strategy == Strategy.vmware_cold
+                or (v.get("metadata") or {}).get("converted") == "true"
+            )
+        ]
+        if not stale:
+            return
+        if source_stopped(m) and all(
+            (v.get("metadata") or {}).get("converted") == "true" for v in stale
+        ):
+            try:
+                vm = await self.providers.get(ctx.source).get_vm(m.vm.source_id)
+            except ProviderError as exc:
+                raise TransientStepError(
+                    f"could not read {m.vm.name} from {ctx.source.label}: {exc}"
+                ) from exc
+            if vm.power_state == "stopped":
+                return  # converted in this outage, the source off since: the kit is right
+        named = ", ".join(
+            f"{v['id']} ({v.get('name')}"
+            + (
+                f", attached to {', '.join(map(str, v['attachments']))}"
+                if v.get("attachments")
+                else ""
+            )
+            + ")"
+            for v in stale
+        )
+        raise PermanentStepError(
+            f"{where} holds the kit's volume {named} of {m.vm.name}: the kit would take a "
+            "converted one as migrated and boot the new server from it, and refuses to copy a cold "
+            "run onto any - roll the migration back again, which deletes the ones it may, or "
+            f"delete them in {where}"
+        )
 
     async def _result(
         self,
@@ -1397,8 +1460,11 @@ class AnsibleExecutor:
             if server_id:
                 await dst.delete_server(server_id)
             deleted_ports = await self._delete_kit_ports(dst, vm.nics, vm.name)
-            deleted_volumes = await self._delete_kit_volumes(dst, vm.name, server_id, m.strategy)
+            # the source first: the destination's clean-up never keeps it stopped - a volume
+            # Cinder will not delete fails the attempt, which a retry repeats with the source
+            # running (SDD §7.2, §8, review RV29-01)
             await self.providers.get(ctx.source).power_on(vm.source_id)
+            deleted_volumes = await self._delete_kit_volumes(dst, vm.name, server_id, m.strategy)
         except ProviderError as exc:
             raise TransientStepError(f"rollback: {exc}") from exc
         return StepResult(
