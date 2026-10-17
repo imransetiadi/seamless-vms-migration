@@ -3231,10 +3231,11 @@ is no origin a browser sends (review RV31-03).
   "Retry or roll back (operator)", as a cancel is refused once the source was stopped (§5.1); only one never stopped
   adds the cancel (review RV32A-05). The Roll back dialog says what the rollback of the
   migration's strategy deletes: `warm` the destination server, its volumes kept for a retry; `cold` the server and
-  the volumes the cold import recorded (§6.3); `storage_handover` hands the volumes back to the source cloud, no data
-  moving (§7.3); `vmware_cold`/`vmware_warm` the server, the kit's ports and the kit's volumes the next attempt
-  cannot reuse — every one once the destination VM ran (§7.2) — and each starts the source VM again (review
-  RV32A-06).
+  the volumes the cold import recorded (§6.3); `storage_handover` the server - and the ports made for it through
+  Neutron - and hands the volumes back to the source cloud, no data moving, where the source VM is recreated under a
+  new id once the cutover deleted it (§7.3, review RV34B-05); `vmware_cold`/`vmware_warm` the server, the kit's
+  ports and the kit's volumes the next attempt cannot reuse — every one once the destination VM ran (§7.2) — and
+  each starts the source VM again (review RV32A-06).
 * Routes: `/` Overview (filtered by the plan in its address, `?plan=`: one that names no plan stays chosen and the page
   says the plan does not exist, with All plans, instead of showing its zeros as all clear; KPI tiles, phase
   distribution, throughput chart, downtime vs SLO,
