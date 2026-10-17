@@ -2818,7 +2818,9 @@ divisor) and `SEAMLESS_JEV_TIMEOUT_S` above 0; `SEAMLESS_MAX_CONCURRENT_MIGRATIO
 `SEAMLESS_MAX_CONCURRENT_CUTOVERS` at least 1; `SEAMLESS_MAX_STEP_RETRIES` (a negative count would silently
 disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE`
 0 or more, 0 keeping the meaning each row gives it; `SEAMLESS_DEMO_FAILURE_RATE` and
-`SEAMLESS_JEV_MIN_CONFIDENCE` 0…1.
+`SEAMLESS_JEV_MIN_CONFIDENCE` 0…1. Each entry of `SEAMLESS_CORS_ORIGINS` is one origin as a browser sends it -
+`http` or `https`, a host, an optional port 1…65535, no user, path, query or fragment (not even a trailing `/`, which
+would never match) - and never `*`, which would let every page call the API (Security.md C1-12, audit AP-10).
 
 ---
 
