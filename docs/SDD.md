@@ -1437,13 +1437,14 @@ volumes with their server, so the order is:
    * a volume type step 6 manages a volume into is not one of RHOSO's volume types. §9.3's `MAP_VOLUME_TYPE_MISSING`
      is only a warning when the plan maps no volume type, and step 6, like step 8, runs after the source server was
      deleted;
-   * that volume type asks for a backend — `volume_backend_name`, or `capabilities:volume_backend_name`, in its extra
-     specs — other than the backend of the pool step 6 manages the volume on, as the pool reports it
-     (`get_pools`): Cinder's scheduler (`CapabilitiesFilter`) refuses that manage (audit EX-10). The spec is matched as
-     that filter matches it (`extra_specs_ops`): one that starts with an operator word asks for every backend it
-     matches - `<or> a <or> b` either, `<in> x` one whose name holds x, `s==`, `s!=`, `s<`, `s<=`, `s>`, `s>=` by
-     string, `=` (at least), `==`, `!=`, `<=`, `>=` by number, `<is>` as booleans - and any other spec the backend of
-     exactly that name (review RV26-08).
+   * that volume type asks for a backend — `volume_backend_name` or `capabilities:volume_backend_name` in its extra
+     specs, each of them — other than the backend of the pool step 6 manages the volume on, as the pool reports it
+     (`get_pools`): Cinder's scheduler (`CapabilitiesFilter`) refuses that manage (audit EX-10). The filter takes the
+     pool only when every such spec matches it, so step 0 matches each; an empty or null spec matches no backend
+     (review RV28-02). A spec is matched as that filter matches it (`extra_specs_ops`): one that starts with an
+     operator word asks for every backend it matches - `<or> a <or> b` either, `<in> x` one whose name holds x, `s==`,
+     `s!=`, `s<`, `s<=`, `s>`, `s>=` by string, `=` (at least), `==`, `!=`, `<=`, `>=` by number, `<is>` as booleans -
+     and any other spec the backend of exactly that name (review RV26-08).
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()` — after the shutdown, which the estimate's parts
    count (§9.1) and an Ansible-driven cutover's clock does (§7.2): `TODO(LAB): confirm` whether the handover's clock
    starts at the stop request instead. The stop is journaled as sent once Nova
