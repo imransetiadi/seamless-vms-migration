@@ -1392,6 +1392,83 @@ async def test_a_handover_rollback_retried_while_its_start_still_runs_completes(
     assert [c for c in calls if c[1] == "start_server"] == [("src", "start_server", "srv-1")]
 
 
+async def test_a_cutover_retried_after_a_rollback_started_the_source_stops_it_again(tmp_path):
+    """SDD §7.3 (review 31, "not proven" there): a cutover that failed after its stop and before it
+    recorded the definition is rolled back by starting the source - a start Nova accepted and
+    performed while its wait then failed journals nothing. A cutover retried afterwards finds its
+    stop journaled and the source running: it stops the source again before it deletes it, and
+    never deletes a running server."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    stop, ports, wait = src.compute.stop_server, src.network.ports, src.compute.wait_for_server
+    failing = []
+
+    def stop_then_fail_the_definition(s):
+        stop(s)
+        failing.append(1)
+
+    def neutron_once(**query):
+        if failing:
+            failing.clear()
+            raise RuntimeError("neutron: HTTP 503 Service Unavailable")
+        return ports(**query)
+
+    src.compute.stop_server, src.network.ports = stop_then_fail_the_definition, neutron_once
+    with pytest.raises((TransientStepError, PermanentStepError), match="record source definition"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.stop_server = stop
+    assert server.status == "SHUTOFF"
+
+    def start_server(s):  # Nova accepts the rollback's start and boots the guest...
+        src.record("start_server", s.id)
+        s.status = "ACTIVE"
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 503 Service Unavailable")  # ...its wait never says so
+
+    src.compute.start_server, src.compute.wait_for_server = start_server, wait_fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.wait_for_server = wait
+    assert server.status == "ACTIVE"  # the source runs again
+
+    deleted_while = []
+    delete = src.compute.delete_server
+
+    def delete_server(s, ignore_missing=True):
+        deleted_while.append(src.servers[getattr(s, "id", s)].status)
+        return delete(s, ignore_missing=ignore_missing)
+
+    def slow_stop(s):  # the guest goes down while the stop is waited for, not before
+        src.record("stop_server", s.id)
+        s.task_state = "powering-off"
+
+    def wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        if status == "SHUTOFF" and s.task_state == "powering-off":
+            s.status, s.task_state = "SHUTOFF", None
+        return s
+
+    src.compute.delete_server, src.compute.stop_server = delete_server, slow_stop
+    src.compute.wait_for_server = wait_for_server
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert deleted_while == ["SHUTOFF"], "the cutover deleted a running source server"
+    assert [c for c in calls if c[1] == "stop_server"] == [("src", "stop_server", "srv-1")] * 2
+
+
+async def test_a_cutover_resumed_after_it_deleted_the_source_goes_on_without_a_stop(tmp_path):
+    """SDD §7.3 step 1: the re-stop of a resumed cutover reads the source first - a source the
+    cutover deleted before it journaled the delete is gone, and nothing is stopped (review 31)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].crash_wait = "status"  # dies waiting for the volumes the delete freed
+    with pytest.raises(PermanentStepError, match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "srv-1" not in clouds["src"].servers
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+    assert [c for c in calls if c[1] == "stop_server"] == [("src", "stop_server", "srv-1")]
+
+
 async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):
     """Crash before the server was deleted: the volumes are still attached and managed; the
     rollback sets the journaled delete_on_termination back and starts the source."""
@@ -1933,12 +2010,20 @@ async def test_handover_resume_after_a_crash_while_unmanaging_waits_instead_of_f
     with pytest.raises(PermanentStepError):
         await executor.run(StepName.CUTOVER, ctx)
     assert "vol-data" not in clouds["src"].volumes  # Cinder did unmanage it
+    reads, get = [], clouds["src"].compute.get_server
+
+    def get_server(server_id):
+        reads.append(server_id)
+        return get(server_id)
+
+    clouds["src"].compute.get_server = get_server
     result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert result.destination_server_id == "dst-new-1"
     assert [op for op in ops(calls) if op[1] == "unmanage"] == [
         ("src", "unmanage", "vol-data"),
         ("src", "unmanage", "vol-root"),
     ]
+    assert reads == []  # past the journaled delete: no source server to stop again (§7.3 step 1)
 
 
 async def test_handover_resume_after_a_crash_while_managing_waits_for_the_same_volume(tmp_path):
