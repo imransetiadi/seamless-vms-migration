@@ -243,6 +243,34 @@ async def test_a_memory_failure_says_what_happened():
     assert client.last_error == "health: ConnectError"
 
 
+@pytest.mark.parametrize("call", ["health", "remember"])
+async def test_an_unexpected_memory_answer_is_redacted_before_it_is_cut(call):
+    """SDD §13.4 (review RV27-07): health() and remember() name agentmemory's unexpected answer
+    in last_error, which the Advisor page shows every viewer - redacted before it is cut to 120
+    characters, so credentials in a URL whose "@" lies past the cut are still found."""
+    secret = "Hunter2-Prod-Secret"  # gitleaks:allow
+
+    def answer(pad):
+        text = "x" * pad + f" https://svc:{secret}@db.example:5432/agentmemory unreachable"
+        if call == "health":
+            return {"status": "degraded", "detail": text}
+        return {"success": False, "error": text}
+
+    # the secret starts 10 characters before the cut, so its "@" lies past it
+    pad = next(n for n in range(300) if str(answer(n)).find(secret) == 110)
+
+    def memory(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=answer(pad))
+
+    client = MemoryClient("http://memory:3111", None, "p", transport=httpx.MockTransport(memory))
+    if call == "health":
+        assert await client.health() is False
+    else:
+        assert await client.remember("lesson", "bug", ["seamless"]) is False
+    assert "unexpected answer" in client.last_error
+    assert secret[:6] not in client.last_error, client.last_error
+
+
 async def test_memory_health_and_from_settings():
     client = MemoryClient(
         "http://memory:3111",

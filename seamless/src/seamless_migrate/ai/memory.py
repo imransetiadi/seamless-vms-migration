@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from ..config import Settings
-from .redaction import redact, redact_payload
+from .redaction import redact, redact_cut, redact_payload
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +63,12 @@ def parse_hits(data: Any, limit: int) -> list[MemoryHit]:
         return []
     hits = [h for h in (_hit(i) for i in items) if h is not None]
     return hits[: max(0, limit)]
+
+
+def _answer(data: Any) -> str:
+    """agentmemory's unexpected answer, for last_error: redacted before it is cut, so credentials
+    the cut would split are still found (SDD §13.4, review RV27-07)."""
+    return redact_cut(str(data), 120)
 
 
 class MemoryClient:
@@ -152,7 +158,7 @@ class MemoryClient:
                 response.raise_for_status()
                 data = response.json()
             if not isinstance(data, dict) or data.get("success") is False:
-                raise ValueError(f"unexpected answer: {str(data)[:120]}")
+                raise ValueError(f"unexpected answer: {_answer(data)}")
         except Exception as exc:
             self._failed("remember", exc)
             return False
@@ -181,7 +187,7 @@ class MemoryClient:
                 response.raise_for_status()
                 data = response.json()
             if not isinstance(data, dict) or data.get("status", "ok") != "ok":
-                raise ValueError(f"unexpected answer: {str(data)[:120]}")
+                raise ValueError(f"unexpected answer: {_answer(data)}")
         except Exception as exc:
             self._failed("health", exc)
             return False
