@@ -406,10 +406,24 @@ class VMwareProvider:
                 uuid = getattr(config, "instanceUuid", None) or getattr(vm, "_moId", None)
                 if uuid != source_id:
                     continue
-                if str(getattr(vm.runtime, "powerState", "")) == "poweredOn":
-                    return
-                task = vm.PowerOnVM_Task()
                 deadline = time.monotonic() + 600
+                # a guest still shutting down - the kit's ShutdownGuest, cut off - reads poweredOn
+                # until it is down: wait for that, then power it on (SDD §7.2, review RV26-10).
+                # Its Tools stop just before vSphere powers it off, so once a shutdown was seen
+                # notRunning is its tail; never seen, notRunning is a VM running without Tools
+                shutting_down = False
+                while str(getattr(vm.runtime, "powerState", "")) == "poweredOn":
+                    state = str(getattr(getattr(vm, "guest", None), "guestState", ""))
+                    shutting_down = shutting_down or state == "shuttingDown"
+                    if not shutting_down or state not in ("shuttingDown", "notRunning"):
+                        return
+                    if time.monotonic() > deadline:
+                        raise ProviderError(
+                            f"{self.provider.id}: VM {source_id!r} is still shutting down; "
+                            "power it on once it is off"
+                        )
+                    time.sleep(2)
+                task = vm.PowerOnVM_Task()
                 while str(getattr(task.info, "state", "")) not in ("success", "error"):
                     if time.monotonic() > deadline:
                         raise ProviderError(f"{self.provider.id}: power-on timed out")

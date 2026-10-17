@@ -1814,6 +1814,85 @@ async def test_vmware_power_on_times_out(tmp_path, monkeypatch):
         await provider.power_on("5012-abcd")
 
 
+class ShuttingDown:
+    """A VM whose guest VMware Tools shut down - the migration kit's ShutdownGuest: vSphere reads
+    it poweredOn for ``looks`` reads of its power state, then poweredOff; its guest reads
+    shuttingDown until the last poweredOn look, which reads notRunning (the Tools stop just before
+    vSphere powers the VM off). A power-on meanwhile would find it on and do nothing."""
+
+    def __init__(self, looks):
+        self.left, self.host = looks, NS(name="esx-01.dc2")
+
+    @property
+    def powerState(self):  # noqa: N802 - pyVmomi naming
+        if self.left > 0:
+            self.left -= 1
+            return "poweredOn"
+        return "poweredOff"
+
+
+class ShuttingDownGuest:
+    def __init__(self, runtime):
+        self.runtime = runtime
+
+    @property
+    def guestState(self):  # noqa: N802 - pyVmomi naming
+        return "shuttingDown" if self.runtime.left > 0 else "notRunning"
+
+
+def shutting_down_vm(looks):
+    vm = PoweredOffVM()
+    vm.runtime = ShuttingDown(looks)
+    vm.guest = ShuttingDownGuest(vm.runtime)
+    return vm
+
+
+async def test_a_vmware_power_on_waits_for_a_guest_still_shutting_down(tmp_path, monkeypatch):
+    """SDD §7.2 (review RV26-10): the VMware rollback powers the source on while its guest is
+    still shutting down - the kit's shutdown was cut off by the step timeout or a rollback
+    request. vSphere reads the VM poweredOn until the guest is down, so the power-on waits for
+    it to be off and then powers it on, instead of reading it as running and leaving it to go
+    off a moment later; a guest that never ends its shutdown is an error, not "running"."""
+    from seamless_migrate.providers import vmware as vmw
+
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    clock = [0.0]
+
+    def tick():
+        clock[0] += 1.0
+        return clock[0]
+
+    monkeypatch.setattr(vmw, "time", NS(monotonic=tick, sleep=lambda s: None))
+
+    def provider_for(vm):
+        return vmw.VMwareProvider(
+            make_provider(
+                id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+            ),
+            settings(secrets_dir=tmp_path / "secrets"),
+            connector=lambda **_: fake_service_instance([vm]),
+            vim=FAKE_VIM,
+        )
+
+    vm = shutting_down_vm(looks=3)
+    await provider_for(vm).power_on("5012-abcd")
+    assert len(vm.tasks) == 1, "the power-on read a guest shutting down as running"
+    assert vm.runtime.left == 0
+    # a VM running without Tools reads notRunning too: never a shutdown, nothing to wait for
+    tools_less = PoweredOffVM(state="poweredOn")
+    tools_less.guest = NS(guestState="notRunning")
+    started = clock[0]
+    await provider_for(tools_less).power_on("5012-abcd")
+    assert tools_less.tasks == [] and clock[0] - started < 2
+    stuck = shutting_down_vm(looks=10**6)
+    with pytest.raises(ProviderError, match="still shutting down"):
+        await provider_for(stuck).power_on("5012-abcd")
+    assert stuck.tasks == []
+
+
 async def test_fake_destination_inventory_resolves_every_demo_nic():
     """SDD §10, §9.3: in demo mode every OpenStack demo VM's NIC resolves to one RHOSO network whose
     subnets take its addresses, and that the demo's admin credential may use - the demo plans are
