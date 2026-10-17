@@ -107,11 +107,24 @@ def test_settings_ansible_host_key_checking_is_off_by_default_and_can_be_turned_
         ("SEAMLESS_DEMO_FAILURE_RATE", "-0.1"),
         ("SEAMLESS_DEMO_FAILURE_RATE", "1.1"),
         ("SEAMLESS_JEV_MIN_CONFIDENCE", "1.1"),
+        # every page could call the API (Security.md C1-12, audit AP-10)
+        ("SEAMLESS_CORS_ORIGINS", "*"),
+        ("SEAMLESS_CORS_ORIGINS", "https://dashboard.example,*"),
+        # no origin a browser sends: it would never match, silently
+        ("SEAMLESS_CORS_ORIGINS", "dashboard.example"),
+        ("SEAMLESS_CORS_ORIGINS", "https://dashboard.example/"),
+        ("SEAMLESS_CORS_ORIGINS", "https://dashboard.example/app"),
+        ("SEAMLESS_CORS_ORIGINS", "ftp://dashboard.example"),
+        ("SEAMLESS_CORS_ORIGINS", "https://user@dashboard.example"),
+        ("SEAMLESS_CORS_ORIGINS", "https://dashboard.example:99999"),
+        ("SEAMLESS_CORS_ORIGINS", "HTTPS://dashboard.example"),
+        ("SEAMLESS_CORS_ORIGINS", "https://dashboard.example#"),
     ],
 )
 def test_settings_refuse_a_value_outside_its_bounds(variable, value):
     """Audit B-08 (SDD §15.1): a tick of 0 would spin and a negative retry count would silently
-    disable the retries - a value outside a setting's bounds is refused, naming the setting."""
+    disable the retries - a value outside a setting's bounds is refused, naming the setting. A CORS
+    origin is one origin, never "*" (audit AP-10)."""
     with pytest.raises(ValueError, match=variable.removeprefix("SEAMLESS_").lower()):
         Settings.from_env({variable: value})
 
@@ -132,6 +145,9 @@ def test_settings_refuse_a_value_outside_its_bounds(variable, value):
         ("SEAMLESS_DEMO_FAILURE_RATE", "1"),
         ("SEAMLESS_JEV_MIN_CONFIDENCE", "0"),
         ("SEAMLESS_JEV_MIN_CONFIDENCE", "1"),
+        ("SEAMLESS_CORS_ORIGINS", ""),
+        ("SEAMLESS_CORS_ORIGINS", "https://dashboard.example"),
+        ("SEAMLESS_CORS_ORIGINS", "http://127.0.0.1:5173,https://[2001:db8::1]:8443"),
     ],
 )
 def test_settings_accept_the_edge_of_their_bounds(variable, value):

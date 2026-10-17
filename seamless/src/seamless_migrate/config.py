@@ -6,8 +6,9 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 JevMode = Literal["off", "stdio", "http"]
 #: where the Jev model runs (SDD §13.4, ADV-06)
@@ -96,6 +97,31 @@ class Settings(BaseModel):
     def model_post_init(self, __context: object) -> None:
         if not self.db_url:
             object.__setattr__(self, "db_url", f"sqlite:///{self.data_dir / 'seamless.db'}")
+
+    @field_validator("cors_origins")
+    @classmethod
+    def _one_origin_each(cls, origins: list[str]) -> list[str]:
+        """Each entry is one origin as a browser sends it - never "*", which would let every page
+        call the API (SDD §15.1, Security.md C1-12, audit AP-10)."""
+        for origin in origins:
+            try:
+                parts = urlsplit(origin)
+                port_ok = parts.port is None or 1 <= parts.port <= 65535
+            except ValueError:  # a port that is no number or out of range
+                port_ok = False
+            if not (
+                parts.scheme in ("http", "https")
+                and parts.hostname
+                and port_ok
+                and not (parts.username or parts.password)
+                # nothing after the authority - no path, not even "/", no query or fragment - and
+                # the scheme as browsers send it
+                and origin == f"{parts.scheme}://{parts.netloc}"
+            ):
+                raise ValueError(
+                    f"{origin!r} is not an origin (scheme://host[:port], no path; never '*')"
+                )
+        return origins
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
