@@ -37,6 +37,7 @@ import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { pyNames, pyRepr } from '../lib/format';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
+import { kitVmName } from '../lib/kitName';
 import { addressRefusal, canonicalIp, ipInCidr, mappedNetwork, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
 import { kitSubnet, networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
 import { destinationRelease, parseMicroversion, type PolicyProfile } from '../lib/platforms';
@@ -1063,6 +1064,10 @@ function nicOverrideFindings(
   return [['MAP_NIC_OVERRIDE', `NIC override(s): ${applied.join('; ')}.`]];
 }
 
+/** SRC_VM_DUPLICATE_NAME's remediation for two VMware VMs the migration kit names alike, as the API's (SDD §9.3). */
+const KIT_TWIN_REMEDIATION =
+  'Rename one of the VMs in vCenter: the migration kit names a VM\'s server, ports and volumes after its name as it writes it, so the two would share them - in separate plans too, when they go to one destination project.';
+
 export function preflight(
   vm: VMRef,
   sourceKind: ProviderKind,
@@ -1087,8 +1092,23 @@ export function preflight(
     add('SRC_VM_TRANSITIONAL_STATE', `Source VM ${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot); a stop or snapshot would fail.`);
   // the other selected VMs of that name, by their project and id, as the API words them (SDD §9.3)
   const twins = (context.selected ?? [vm]).filter((v) => v.source_id !== vm.source_id && v.name === vm.name);
+  // the migration kit names a VMware VM's server, ports and volumes after its name as it writes it, and finds a volume
+  // again by that name (SDD §7.2, §9.3, review RV26-04)
+  const kit = sourceKind === 'vmware' ? kitVmName(vm.name) : null;
+  const kin = kit ? (context.selected ?? [vm]).filter((v) => v.source_id !== vm.source_id && kitVmName(v.name) === kit) : [];
   if (twins.length)
     add('SRC_VM_DUPLICATE_NAME', `Another selected VM is also named ${pyRepr(vm.name)} (${pyNames(twins.map((t) => `${t.project || '-'}/${t.source_id}`))}); os-migrate selects workloads by name.`);
+  else if (kin.length)
+    add(
+      'SRC_VM_DUPLICATE_NAME',
+      `Another selected VM has the name ${pyRepr(kit!)} as the migration kit writes it (${pyNames(kin.map((t) => `${t.project || '-'}/${t.source_id}`))}); the kit names the VM's server, ports and volumes after it.`,
+      { remediation: KIT_TWIN_REMEDIATION },
+    );
+  if (kit === '')
+    add(
+      'SRC_VM_NAME_UNUSABLE',
+      `The migration kit keeps no character of the name ${pyRepr(vm.name)} - only Latin letters, digits, '_' and '-' after its transliteration - so it would create the VM's server, ports and volumes without a name.`,
+    );
   const multi = vm.disks.filter((d) => d.multiattach).map((d) => d.name || d.id);
   if (multi.length) add('SRC_VM_MULTIATTACH', `Multi-attach disk(s): ${pyNames(multi)}.`);
   // the boot disk: the first bootable disk, else the first, as the API's VMRef.root_disk

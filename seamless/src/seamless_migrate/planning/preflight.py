@@ -11,6 +11,7 @@ from ..domain.enums import ProviderKind, Severity, Strategy
 from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
 from .ipam import address_refusal
+from .kit import kit_vm_name
 from .networks import kit_subnet, policy_profile_of, port_refusal, resolve_network
 from .platforms import SERIES, parse_microversion
 
@@ -85,6 +86,12 @@ CATALOG: dict[str, CatalogEntry] = {
         (),
         "Rename one of the VMs (os-migrate selects workloads by name) or migrate them in "
         "separate plans.",
+    ),
+    "SRC_VM_NAME_UNUSABLE": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Rename the VM in vCenter so that its name holds a Latin letter or a digit, then "
+        "re-validate: the migration kit names the VM's server, ports and volumes after it.",
     ),
     "SRC_VM_MULTIATTACH": CatalogEntry(
         Severity.warning,
@@ -344,6 +351,14 @@ def _port_remediation(profile: str) -> str:
         f"{_PORT_ROLE_ADVICE[profile]}. An external network that is not shared needs the admin "
         "role: Nova attaches it for no other."
     )
+
+
+#: SRC_VM_DUPLICATE_NAME's remediation for two VMware VMs the migration kit names alike (§9.3)
+KIT_TWIN_REMEDIATION = (
+    "Rename one of the VMs in vCenter: the migration kit names a VM's server, ports and volumes "
+    "after its name as it writes it, so the two would share them - in separate plans too, when "
+    "they go to one destination project."
+)
 
 
 def finding(
@@ -718,6 +733,14 @@ def run_preflight(
         )
 
     twins = [v for v in selected if v.source_id != vm.source_id and v.name == vm.name]
+    # the migration kit names a VMware VM's server, ports and volumes after its name as it writes
+    # it, and finds a volume again by that name (SDD §7.2, §9.3, review RV26-04)
+    kit = (
+        kit_vm_name(vm.name) if source is not None and source.kind == ProviderKind.vmware else None
+    )
+    kin = [
+        v for v in selected if v.source_id != vm.source_id and kit and kit_vm_name(v.name) == kit
+    ]
     if twins:
         # never `where`: every later message names the destination provider by it (§1 naming)
         others = _names(f"{t.project or '-'}/{t.source_id}" for t in twins)
@@ -726,6 +749,25 @@ def run_preflight(
                 "SRC_VM_DUPLICATE_NAME",
                 f"Another selected VM is also named {vm.name!r} ({others}); os-migrate selects "
                 "workloads by name.",
+            )
+        )
+    elif kin:
+        others = _names(f"{t.project or '-'}/{t.source_id}" for t in kin)
+        out.append(
+            finding(
+                "SRC_VM_DUPLICATE_NAME",
+                f"Another selected VM has the name {kit!r} as the migration kit writes it "
+                f"({others}); the kit names the VM's server, ports and volumes after it.",
+                remediation=KIT_TWIN_REMEDIATION,
+            )
+        )
+    if kit == "":
+        out.append(
+            finding(
+                "SRC_VM_NAME_UNUSABLE",
+                f"The migration kit keeps no character of the name {vm.name!r} - only Latin "
+                "letters, digits, '_' and '-' after its transliteration - so it would create the "
+                "VM's server, ports and volumes without a name.",
             )
         )
 

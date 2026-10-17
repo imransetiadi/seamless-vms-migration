@@ -666,4 +666,19 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
     const found = preflight(c.vm, c.source_kind ?? 'openstack', plan, networks, context);
     expect(Object.fromEntries(found.filter((f) => f.code in c.expected).map((f) => [f.code, f.message]))).toEqual(c.expected);
   });
+
+  it("judges a VMware source's VMs by the kit's names only, once, and never two unusable names as twins, as the API (SDD §9.3, review RV26-04)", () => {
+    const plan = { ...base } as Plan;
+    const template = ELIGIBILITY.finding_cases.find((c) => c.source_kind === 'vmware')!.vm;
+    const vmOf = (source_id: string, name: string) => ({ ...template, source_id, name, project: null });
+    const judged = (vm: VMRef, others: VMRef[], kind: ProviderKind) =>
+      preflight(vm, kind, plan, {}, { selected: [vm, ...others] }).filter((f) => f.code === 'SRC_VM_DUPLICATE_NAME' || f.code === 'SRC_VM_NAME_UNUSABLE');
+    const dotted = vmOf('vm-1', 'web.01');
+    expect(judged(dotted, [vmOf('vm-2', 'web_01')], 'openstack')).toEqual([]);
+    expect(judged(vmOf('vm-3', 'サーバー'), [], 'openstack')).toEqual([]);
+    expect(judged(dotted, [vmOf('vm-4', 'web.01')], 'vmware').map((f) => f.message)).toEqual([
+      "Another selected VM is also named 'web.01' (-/vm-4); os-migrate selects workloads by name.",
+    ]);
+    expect(judged(vmOf('vm-5', 'サーバー'), [vmOf('vm-6', 'веб')], 'vmware').map((f) => f.code)).toEqual(['SRC_VM_NAME_UNUSABLE']);
+  });
 });

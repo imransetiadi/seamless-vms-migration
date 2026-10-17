@@ -112,6 +112,7 @@ def test_catalog_is_complete():
         "SRC_VM_ERROR_STATE",
         "SRC_VM_TRANSITIONAL_STATE",
         "SRC_VM_DUPLICATE_NAME",
+        "SRC_VM_NAME_UNUSABLE",
         "SRC_VM_VOLUME_DETACHED",
         "SRC_VM_MULTIATTACH",
         "SRC_VM_EPHEMERAL_ROOT",
@@ -2263,6 +2264,37 @@ def test_the_shared_handover_finding_cases(case):
     source = VMWARE if case.get("source_kind") == "vmware" else SRC
     found = check(vm, plan=plan, all_vms=[vm, *others], source=source, **_destination(case))
     assert {f.code: f.message for f in found if f.code in case["expected"]} == case["expected"]
+
+
+def test_the_kits_names_judge_a_vmware_sources_vms_only_and_once():
+    """SDD §9.3 (review RV26-04): only a VMware source's VMs are compared by the migration kit's
+    names - an OpenStack VM keeps its own, so web.01 and web_01 are two VMs there and a Japanese
+    name is fine; VMware VMs named exactly alike get the one raw-name finding; two names the kit
+    keeps nothing of are no twins, each is unusable."""
+
+    def codes(vm, others, source):
+        found = check(vm, plan=make_plan(), all_vms=[vm, *others], source=source)
+        names = ("SRC_VM_DUPLICATE_NAME", "SRC_VM_NAME_UNUSABLE")
+        return [f.code for f in found if f.code in names]
+
+    dotted, underscored = (
+        make_vm(source_id="vm-1", name="web.01"),
+        make_vm(source_id="vm-2", name="web_01"),
+    )
+    assert codes(dotted, [underscored], SRC) == []
+    assert codes(make_vm(source_id="vm-3", name="サーバー"), [], SRC) == []
+    twin = make_vm(source_id="vm-4", name="web.01")
+    found = check(dotted, plan=make_plan(), all_vms=[dotted, twin], source=VMWARE)
+    duplicates = [f for f in found if f.code == "SRC_VM_DUPLICATE_NAME"]
+    assert [f.message for f in duplicates] == [
+        "Another selected VM is also named 'web.01' (finance/vm-4); os-migrate selects workloads "
+        "by name."
+    ]
+    japanese, cyrillic = (
+        make_vm(source_id="vm-5", name="サーバー"),
+        make_vm(source_id="vm-6", name="веб"),
+    )
+    assert codes(japanese, [cyrillic], VMWARE) == ["SRC_VM_NAME_UNUSABLE"]
 
 
 def _destination(case):

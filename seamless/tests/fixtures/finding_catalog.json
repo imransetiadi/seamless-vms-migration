@@ -21,6 +21,11 @@
    "strategies": [],
    "remediation": "Rename one of the VMs (os-migrate selects workloads by name) or migrate them in separate plans."
   },
+  "SRC_VM_NAME_UNUSABLE": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Rename the VM in vCenter so that its name holds a Latin letter or a digit, then re-validate: the migration kit names the VM's server, ports and volumes after it."
+  },
   "SRC_VM_MULTIATTACH": {
    "severity": "warning",
    "strategies": [
