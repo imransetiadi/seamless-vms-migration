@@ -2667,8 +2667,6 @@ class Orchestrator:
         """Run ``step`` as a cancellable task with transient retries; ``None`` if cancelled or once
         the migration left the step's phase."""
         plan = await self._plan(m.plan_id)
-        source = await self.db.get("provider", plan.source_provider_id, Provider)
-        destination = await self.db.get("provider", plan.destination_provider_id, Provider)
         executor = self.executors.for_strategy(m.strategy)
         attempt = 0
         loop = asyncio.get_running_loop()
@@ -2680,6 +2678,10 @@ class Orchestrator:
                 current, _ = await self._load(m.id)
                 if current.phase != m.phase:
                     return None
+                # each attempt reads the providers anew: a retry after a credential rotation
+                # signs in with the new credentials (SDD §8, §13.3, review RV26-07)
+                source = await self.db.get("provider", plan.source_provider_id, Provider)
+                destination = await self.db.get("provider", plan.destination_provider_id, Provider)
                 ctx = self._context(current, plan, source, destination)
                 work = runner(ctx) if runner is not None else executor.run(step, ctx)
                 task = asyncio.create_task(work, name=f"{step}:{m.id}")

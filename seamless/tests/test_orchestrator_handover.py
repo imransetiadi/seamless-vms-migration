@@ -247,3 +247,57 @@ async def test_the_automatic_rollback_starts_a_source_nova_still_powered_off(tmp
         assert clouds["src"].servers["srv-1"].status == "ACTIVE", h.history(final)
     finally:
         await h.orch.stop()
+
+
+@pytest.mark.parametrize(
+    ("cloud", "blipped"),
+    [
+        ("dst", lambda url, json: url == "/manageable_volumes"),  # step 6's manage
+        ("src", lambda url, json: "os-unmanage" in (json or {})),  # step 5's unmanage
+    ],
+    ids=["destination", "source"],
+)
+async def test_a_handover_retry_after_a_rotation_signs_in_with_the_new_credentials(
+    tmp_path, store, cloud, blipped
+):
+    """SDD §8, §13.3: a cutover attempt meets a 503 - on either cloud - and, while it waits for
+    its retry, the admin rotates both providers' credentials (PUT .../credentials, the old
+    password revoked). The retry reads the providers again and signs in with the new credentials,
+    so the cutover completes instead of being refused 401 and rolled back (review RV26-07)."""
+    from seamless_migrate.domain.models import utcnow
+    from tests.orch_support import DST_PROVIDER, SRC_PROVIDER
+    from tests.test_executor_handover import Credentialed
+
+    h, calls, clouds, mig = handover_harness(tmp_path, store)
+    revoked: set[str] = set()
+    h.executor._conn_factory = lambda p: Credentialed(
+        clouds[p.cloud], p.credentials_secret, revoked
+    )
+    for provider in (SRC_PROVIDER, DST_PROVIDER):
+        store.put("provider", provider.model_copy(update={"credentials_secret": "v1"}))
+    post = clouds[cloud].block_storage.post
+    rotated: list[str] = []
+
+    def blip_while_rotated(url, json=None, **kw):
+        if blipped(url, json) and not rotated:
+            # the call meets a 503; meanwhile the admin rotates both providers' credentials
+            for provider in (SRC_PROVIDER, DST_PROVIDER):
+                store.put(
+                    "provider",
+                    provider.model_copy(
+                        update={"credentials_secret": "v2", "credentials_updated_at": utcnow()}
+                    ),
+                )
+            revoked.add("v1")
+            rotated.append(url)
+            raise sdk_error(503, "Service Unavailable")
+        return post(url, json=json, **kw)
+
+    clouds[cloud].block_storage.post = blip_while_rotated
+    await h.orch.start()
+    try:
+        final = await h.wait_phase(mig.id, P.completed, P.rolled_back, P.failed, timeout=20)
+        assert rotated, "the cutover never made the call"
+        assert final.phase == P.completed, (h.history(final), final.error)
+    finally:
+        await h.orch.stop()
