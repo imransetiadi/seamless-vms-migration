@@ -1395,8 +1395,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   since the rollback powered it on (review RV28-01). Onto any other volume a `vmware_cold` run (no CBT sync) refuses
   to copy ("volume already exists"). So once the destination server is gone, the rollback deletes every volume named
   `<kit name>-<digits>` with `osm` `true` that is marked converted, that belongs to a `vmware_cold` migration, or that
-  is a `vmware_warm` first copy cut off - not converted and not marked `seamless_copied` (below) -, and waits until
-  each is gone; a `vmware_warm` volume not converted whose copy completed stays, since the next pass syncs it by CBT.
+  is a `vmware_warm` first copy cut off - not converted and not marked `seamless_copied` `true` (below) -, and waits
+  until each is gone; a `vmware_warm` volume not converted whose copy completed - marked `seamless_copied` `true` -
+  stays, since the next pass syncs it by CBT, while one a cutover's run may have written to - marked `cutover`
+  (below) - goes.
   Not when the migration recorded its destination server: the kit created that server from every kit volume of the
   VM, and its guest may have written to each - a journal replay, a database's crash recovery, days of service -,
   which a CBT sync, copying only what the source changed, never undoes; with a recorded server the rollback deletes
@@ -1447,6 +1449,22 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   copies the disk in full; one another server holds stays. The kit's
   conversion rewrites a volume's metadata to `osm` and `converted` alone, so a converted volume carries no mark:
   the rules above for converted volumes apply to it.
+
+  Right before every `vmware_warm` cutover kit run, once every check above passed, each such volume marked
+  `seamless_copied` `true` is marked `seamless_copied` `cutover`, which no rule reads as a completed copy: the
+  cutover's run rewrites in place the disk it converts - virt-v2v-in-place on the VM's first disk and, when that
+  conversion fails, on the next ones (the kit's fallback), a conversion that failed leaving its disk "in an unknown,
+  possibly corrupted state" (virt-v2v-in-place) - and the server it then boots from the volumes writes to every one
+  of them, neither of which a CBT sync, copying only what the source changed, undoes (reviews RV32A-01, RV32A-02). A
+  marking that fails fails the cutover as transient, before the kit runs. A volume marked `cutover` is a first copy
+  cut off for every later run and rollback - deleted, or left where another server holds it, by the rules above -
+  but one: a cutover retried inside the same outage keeps such volumes for its CBT sync when the clock is open,
+  vCenter reads the VM off and records no power-on of it since the clock opened (as for a converted volume above),
+  the migration records no destination server and none carries the destination server's name (`find_server`), and
+  the volume of the VM's first disk in vCenter's device order (`disk_keys`) is marked converted: that conversion
+  succeeded on its first try, so the kit converted no other disk, powered the VM off and then only synced the
+  others, and no server booted from them (2.2.7, `migrate.go`). A destination server an operator deletes by hand
+  inside the outage defeats that check.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
   migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
@@ -2156,7 +2174,8 @@ volume disks carry their Cinder `pool`;
 `volume_image_metadata` or the boot image's properties (`os_distro` + `os_version`, then `os_type`)),
 `VMwareProvider` (pyVmomi,
 lazy; reports CBT, snapshots, independent disks, tools state; powers a VM on for a rollback (`power_on`) and tells
-whether vCenter recorded a power-on of it since a time (`powered_on_since`, its events, §7.2); `os_type` is the VMware Tools pretty
+whether vCenter recorded a power-on of it since a time (`powered_on_since`, its events, §7.2), and lists the keys of a VM's
+disks in vCenter's device order (`disk_keys`: `config.hardware.device`, as the migration kit reads it, §7.2); `os_type` is the VMware Tools pretty
 name when Tools report one, else the configured guest id), `FakeSourceProvider`/
 `FakeDestinationProvider` (deterministic demo data: 24 OpenStack VMs including one multi-attach,
 one vGPU flavor, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+ disks;
