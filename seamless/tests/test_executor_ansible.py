@@ -2961,6 +2961,8 @@ async def test_a_vmware_rollback_deletes_the_kit_volumes_its_next_run_would_take
     assert env.registry.calls == [
         ("delete_server", "dst-9"),
         ("power_on", "srv-1"),
+        # the server booted from them: no completed copy before any deletion (review RV32A-01)
+        ("set_volume_metadata", "unconverted", {"seamless_copied": "cutover"}),
         *[("delete_volume", v) for v in gone],
         # "held": is its holder the kit's conversion host? (review RV29-02) - it is not
         ("find_server", "conv-dst"),
@@ -3670,6 +3672,74 @@ async def test_a_retried_vmware_rollback_still_keeps_what_a_server_found_by_name
     assert not (run_dir(env) / "rollback-kept.json").exists()
     later = await env.executor.run(StepName.ROLLBACK, ctx)
     assert later.details["deleted_volumes"] == ["root"]
+
+
+@pytest.mark.parametrize("server", ["recorded", "found by name", "found earlier", "none"])
+async def test_a_vmware_rollback_after_a_server_booted_leaves_no_copy_marked_completed(env, server):
+    """SDD §7.2 (review RV32A-01): whenever a server booted from the kit's volumes - recorded, or
+    found by the kit's name by this attempt or an earlier one (the keep record) - the rollback
+    marks each copy of the VM still marked completed 'cutover' right after the power-on, before it
+    deletes any port or volume: what it then cannot delete (Cinder refuses a volume with a
+    snapshot) or keeps (what a server found only by name held) is no completed copy for a later
+    run. With no server, a completed copy stays marked for the next pass's CBT sync."""
+    holder = {"recorded": ["dst-9"], "found by name": ["dst-web-01"]}.get(server, [])
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000", attachments=holder),
+        kit_volume("data", "web-01-2001", converted=False, copied=True, attachments=holder),
+    ]
+    kw = {"downtime_started_at": utcnow()} if server != "none" else {}
+    if server == "recorded":
+        kw["destination_server_id"] = "dst-9"
+
+        class SnapshotOnTheData(FakeImpl):
+            async def delete_volume(self, volume_id):
+                if volume_id == "data":  # Cinder refuses a volume with a snapshot
+                    raise ProviderError("dst: HTTP 400: Invalid volume: ... have snapshots")
+                await FakeImpl.delete_volume(self, volume_id)
+
+        env.registry.get = lambda provider: SnapshotOnTheData(env.registry)
+    elif server == "found by name":
+        env.registry.existing = {"web-01"}
+    elif server == "found earlier":
+        record = run_dir(env) / "rollback-kept.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text('{"server_id": "dst-web-01", "volumes": ["boot", "data"]}')
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, **kw)
+    if server == "recorded":
+        with pytest.raises(TransientStepError, match="have snapshots"):
+            await env.executor.run(StepName.ROLLBACK, ctx)
+    else:
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    marks = {v["id"]: v["metadata"].get("seamless_copied") for v in env.registry.volumes}
+    assert marks.get("data") == ("true" if server == "none" else "cutover")
+    calls = [c[0] for c in env.registry.calls]
+    if server != "none":
+        marked = calls.index("set_volume_metadata")
+        assert calls.index("power_on") < marked
+        assert all(calls.index(c) > marked for c in ("delete_port", "delete_volume") if c in calls)
+    else:
+        assert "set_volume_metadata" not in calls
+
+
+async def test_a_vmware_rollback_whose_copies_cannot_be_marked_fails_with_the_source_running(env):
+    """SDD §7.2 (review RV32A-01): a marking that fails fails the rollback's attempt after the
+    power-on - the source runs - and before it deletes any volume."""
+    env.registry.volumes = [
+        kit_volume("data", "web-01-2001", converted=False, copied=True, attachments=["dst-9"])
+    ]
+    env.registry.set_metadata_error = True
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        destination_server_id="dst-9",
+        downtime_started_at=utcnow(),
+    )
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    calls = [c[0] for c in env.registry.calls]
+    assert calls.index("power_on") < calls.index("set_volume_metadata")
+    assert "delete_volume" not in calls
 
 
 async def test_a_vmware_rollback_deletes_no_volume_of_a_vm_without_a_kit_name(env):

@@ -1120,7 +1120,13 @@ class AnsibleExecutor:
             # the role writes it during the pass: an earlier pass's is not this one's (SDD §6.6)
             remove_quietly(refusals_file)
         if strategy == Strategy.vmware_warm and step == StepName.CUTOVER:
-            await self._mark_cutover_copies(ctx)
+            try:
+                await self._mark_cutover_copies(ctx)
+            except ProviderError as exc:
+                raise TransientStepError(
+                    f"could not mark the kit's copies of {ctx.migration.vm.name} in "
+                    f"{ctx.destination.label} before its cutover: {exc}"
+                ) from exc
         stop_skipped = await self._execute(
             rdir,
             osm,
@@ -1309,21 +1315,15 @@ class AnsibleExecutor:
         return bool(keys) and f"{kit_vm_name(m.vm.name)}-{keys[0]}" in converted
 
     async def _mark_cutover_copies(self, ctx: StepContext) -> None:
-        """Right before a vmware_warm cutover's kit run, mark each of the VM's kit copies marked
-        completed 'cutover': the run converts a disk in place and boots a server that writes to
-        every one, which no CBT sync undoes, so no later run or rollback takes them as copies -
-        but a cutover retried inside the outage that may keep them (SDD §7.2, reviews RV32A-01,
-        RV32A-02). A marking that fails fails the cutover as transient, before the kit runs."""
+        """Mark each of the VM's kit copies marked completed 'cutover', no completed copy for any
+        later run or rollback (SDD §7.2, reviews RV32A-01, RV32A-02): right before a vmware_warm
+        cutover's kit run - it converts a disk in place and boots a server that writes to every
+        one, which no CBT sync undoes -, and in a rollback once a server booted from them. Raises
+        ProviderError; each caller fails its attempt as transient."""
         dst = self.providers.get(ctx.destination)
-        try:
-            for volume in kit_volumes(ctx.migration.vm.name, await dst.volumes()):
-                if _marked(volume, "seamless_copied"):
-                    await dst.set_volume_metadata(volume["id"], dict(CUTOVER_COPY))
-        except ProviderError as exc:
-            raise TransientStepError(
-                f"could not mark the kit's copies of {ctx.migration.vm.name} in "
-                f"{ctx.destination.label} before its cutover: {exc}"
-            ) from exc
+        for volume in kit_volumes(ctx.migration.vm.name, await dst.volumes()):
+            if _marked(volume, "seamless_copied"):
+                await dst.set_volume_metadata(volume["id"], dict(CUTOVER_COPY))
 
     async def _mark_kit_copies(self, ctx: StepContext) -> None:
         """After a vmware_warm pass the kit completed, mark each of the VM's kit volumes that is
@@ -1698,6 +1698,10 @@ class AnsibleExecutor:
             await self.providers.get(ctx.source).power_on(vm.source_id)
             # it runs: the clock closes now, whatever fails after (SDD §5.2, review RV30-03)
             await ctx.mark_downtime_end()
+            if server_id or kept:
+                # a server booted from the kit's volumes: what this rollback then cannot delete
+                # or keeps is no completed copy for a later run (SDD §7.2, review RV32A-01)
+                await self._mark_cutover_copies(ctx)
             deleted_ports = await self._delete_kit_ports(dst, vm.nics, vm.name)
             deleted_volumes = await self._delete_kit_volumes(
                 ctx, dst, m.destination_server_id, kept
