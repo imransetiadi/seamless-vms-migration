@@ -2587,6 +2587,10 @@ class Orchestrator:
             if not locked:
                 await self._mark_downtime(mid, at)
 
+        async def mark_downtime_end() -> None:
+            if not locked:
+                await outlive_cancel(self._close_clock(mid, plan))
+
         async def log_line(line: str) -> None:
             text = redact_cut(line, LOG_LINE_CHARS)
             await self._emit("migration.log", text, plan_id=m.plan_id, persist=False, migration=m)
@@ -2599,6 +2603,7 @@ class Orchestrator:
             settings=self.settings,
             report_progress=report_progress,
             mark_downtime_start=mark_downtime_start,
+            mark_downtime_end=mark_downtime_end,
             log=log_line,
             options=dict(options or {}),
         )
@@ -2659,6 +2664,25 @@ class Orchestrator:
             f"{m.vm.name}: source VM stopped",
             migration=m,
             data={"at": m.downtime_started_at.isoformat()},
+        )
+
+    async def _close_clock(self, mid: str, plan: Plan) -> None:
+        """The source runs again inside a step - a rollback's power-on: the clock closes now, so
+        an attempt that fails after it leaves the source counted as running (SDD §5.2, review
+        RV30-03). Saved, then announced, as a rollback's end does; a closed clock stays as it is."""
+        async with self._lock(mid):
+            m, v = await self._load(mid)
+            if not fsm.source_stopped(m):
+                return
+            now = self._now()
+            m.downtime_ended_at = now
+            m.actual_downtime_s = self._rollback_downtime_s(m, now, plan)
+            await self._save(m, v)
+        await self._emit(
+            "migration.downtime_ended",
+            f"{m.vm.name}: source running again after {m.actual_downtime_s:.0f} s",
+            migration=m,
+            data={"actual_downtime_s": m.actual_downtime_s},
         )
 
     async def _run_step(

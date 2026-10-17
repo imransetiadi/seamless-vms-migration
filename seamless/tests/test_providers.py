@@ -1302,6 +1302,53 @@ async def test_vmware_power_on_and_inventory(tmp_path):
     assert inv.networks == {} and inv.projects == []  # the fake vim has no Network type
 
 
+async def test_vmware_tells_whether_vcenter_recorded_a_power_on_since_a_time(tmp_path):
+    """SDD §7.2, §10 (review RV30-03): powered_on_since asks vCenter's event manager for the VM's
+    power-on, DRS power-on and resume events since the time - its power state cannot tell a VM
+    that ran and was shut down again."""
+    from datetime import UTC, datetime
+
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = PoweredOffVM()
+    since = datetime(2026, 10, 17, 9, 0, tzinfo=UTC)
+    queries: list = []
+    found: list = []  # the events vCenter answers with
+
+    class EventFilterSpec:
+        def __init__(self, entity, time, eventTypeId):  # noqa: N803 - pyVmomi naming
+            self.entity, self.time, self.event_type_ids = entity, time, eventTypeId
+
+    EventFilterSpec.ByEntity = lambda entity, recursion: NS(entity=entity, recursion=recursion)
+    EventFilterSpec.ByTime = lambda beginTime: NS(begin=beginTime)  # noqa: N803
+
+    def service_instance(**_):
+        si = fake_service_instance([vm])
+        si.RetrieveContent().eventManager = NS(
+            QueryEvents=lambda spec: queries.append(spec) or list(found)
+        )
+        return si
+
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=service_instance,
+        vim=NS(**vars(FAKE_VIM), event=NS(EventFilterSpec=EventFilterSpec)),
+    )
+    assert await provider.powered_on_since("5012-abcd", since) is False
+    found.append(NS(createdTime=since))
+    assert await provider.powered_on_since("5012-abcd", since) is True
+    spec = queries[0]
+    assert (spec.entity.entity, spec.entity.recursion, spec.time.begin) == (vm, "self", since)
+    assert set(spec.event_type_ids) == {"VmPoweredOnEvent", "DrsVmPoweredOnEvent", "VmResumedEvent"}
+    with pytest.raises(ProviderError, match="not found"):
+        await provider.powered_on_since("missing", since)
+
+
 async def test_vmware_get_vm_and_power_on_use_the_uuid_index(tmp_path):
     """One FindByUuid call instead of a walk over every VM in the vCenter."""
     secret_dir = tmp_path / "secrets" / "vcenter-dc2"

@@ -1147,8 +1147,9 @@ class AnsibleExecutor:
         any, onto which the kit refuses to copy. A rollback that could not delete it ended failed
         with the source running, and the run would boot the destination from it beside the
         source (SDD §7.2, review RV29-01). A converted volume is the kit's own of this outage
-        while the source has not run since its stop: the clock open and the VM reading off.
-        Returns the VM's kit volumes it read."""
+        while the source has not run since its stop: the clock open, the VM reading off and
+        vCenter recording no power-on of it since (review RV30-03). Returns the VM's kit volumes
+        it read."""
         m = ctx.migration
         if not kit_vm_name(m.vm.name):
             return []
@@ -1171,8 +1172,20 @@ class AnsibleExecutor:
                     f"could not read {m.vm.name} from {ctx.source.label}: {exc}"
                 ) from exc
             if vm.power_state == "stopped":
-                # converted in this outage, the source off since: the kit is right
-                return volumes
+                # off now - and not run since the clock opened? vCenter's events say; its power
+                # state alone does not, a VM run and shut down again reads off too (review RV30-03)
+                try:
+                    ran = await self.providers.get(ctx.source).powered_on_since(
+                        m.vm.source_id, m.downtime_started_at
+                    )
+                except ProviderError as exc:
+                    raise TransientStepError(
+                        f"could not read the power-ons of {m.vm.name} from {ctx.source.label}: "
+                        f"{exc}"
+                    ) from exc
+                if not ran:
+                    # converted in this outage, the source off since: the kit is right
+                    return volumes
         named = ", ".join(
             f"{v['id']} ({v.get('name')}"
             + (
@@ -1584,6 +1597,8 @@ class AnsibleExecutor:
             # kit's ports and volumes matter only to the next attempt, which a failure there
             # retries with the source running (SDD §7.2, §8, reviews RV29-01, RV30-04)
             await self.providers.get(ctx.source).power_on(vm.source_id)
+            # it runs: the clock closes now, whatever fails after (SDD §5.2, review RV30-03)
+            await ctx.mark_downtime_end()
             deleted_ports = await self._delete_kit_ports(dst, vm.nics, vm.name)
             deleted_volumes = await self._delete_kit_volumes(
                 ctx, dst, m.destination_server_id, kept

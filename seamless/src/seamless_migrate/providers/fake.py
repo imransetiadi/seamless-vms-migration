@@ -366,6 +366,11 @@ class FakeSourceProvider:
         await self.get_vm(source_id)
         self._power[source_id] = "running"
 
+    async def powered_on_since(self, source_id: str, since: Any) -> bool:
+        # the demo runs no VMware kit, whose cutover retry asks it (SDD §7.2)
+        await self.get_vm(source_id)
+        return False
+
     async def power_off(self, source_id: str) -> None:
         await self.get_vm(source_id)
         self._power[source_id] = "stopped"

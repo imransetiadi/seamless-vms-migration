@@ -35,6 +35,9 @@ class StepContext:
     #: ``await mark_downtime_start()`` or ``mark_downtime_start(at=<datetime>)`` when the
     #: executor learned the exact moment the source stopped (idempotent: first call wins)
     mark_downtime_start: Callable[..., Awaitable[None]]
+    #: ``await mark_downtime_end()`` once the source runs again - a rollback's power-on: the clock
+    #: closes then, not when the whole step succeeds (SDD §5.2; idempotent)
+    mark_downtime_end: Callable[[], Awaitable[None]]
     log: Callable[[str], Awaitable[None]]
     #: step options, e.g. ``{"delete_source": True}`` for FINALIZE (extension of SDD §7.1)
     options: dict[str, Any] = field(default_factory=dict)

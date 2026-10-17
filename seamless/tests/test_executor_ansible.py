@@ -110,6 +110,12 @@ class FakeImpl:
         """The source VM as its provider reads it now (SDD §10): its power state."""
         return make_vm(source_id=source_id, power_state=self.registry.source_power)
 
+    async def powered_on_since(self, source_id, since):
+        """Whether vCenter recorded a power-on of the VM since ``since`` (SDD §10)."""
+        if self.registry.powered_on is None:
+            raise ProviderError("events: HTTP 503")
+        return self.registry.powered_on
+
     async def ports(self, *, network_id=None, mac_address=None, ip_address=None):
         """The destination's ports matching every filter given (SDD §10)."""
         if self.registry.ports_error:
@@ -210,6 +216,8 @@ class FakeRegistry:
         self.set_metadata_error = False
         # the source VM's power state as its provider reads it (SDD §10 SourceProvider.get_vm)
         self.source_power = "running"
+        # whether vCenter recorded a power-on of it since the clock opened; None: unreadable
+        self.powered_on: bool | None = False
         # the token's role names the destination inventory reads live; None: it could not
         # (SDD §10, review RV19-01)
         self.roles: list[str] | None = None
@@ -3201,6 +3209,69 @@ async def test_a_marked_kit_volume_cinder_cannot_attach_is_deleted(env, status):
     result = await env.executor.run(StepName.ROLLBACK, rollback)
     assert result.details["deleted_volumes"] == ["broken"]
     assert [v["id"] for v in env.registry.volumes] == ["fine"]
+
+
+@pytest.mark.parametrize("power_on_fails", [False, True])
+async def test_a_vmware_rollback_closes_the_clock_once_its_power_on_succeeded(env, power_on_fails):
+    """SDD §5.2 (review RV30-03): the clock closes when the source runs again - the rollback marks
+    it right after its power-on, before the kit's ports and volumes, so an attempt that fails on
+    them leaves it closed: a retry never takes the source for stopped since the outage's stop. A
+    power-on that failed closes nothing."""
+    env.registry.volumes_error = True  # Cinder fails the attempt after the power-on
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        destination_server_id="dst-9",
+        downtime_started_at=utcnow(),
+    )
+
+    async def closed():
+        env.registry.calls.append(("clock_closed",))
+
+    ctx.mark_downtime_end = closed
+    if power_on_fails:
+
+        async def power_on(source_id):
+            env.registry.calls.append(("power_on", source_id))
+            raise ProviderError("vcenter: HTTP 503")
+
+        class Failing(FakeImpl):
+            pass
+
+        Failing.power_on = staticmethod(power_on)
+        env.registry.get = lambda provider: Failing(env.registry)
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    closing = [] if power_on_fails else [("clock_closed",)]
+    assert env.registry.calls == [("delete_server", "dst-9"), ("power_on", "srv-1"), *closing]
+
+
+@pytest.mark.parametrize("powered_on", [True, None])
+async def test_a_converted_kit_volume_is_no_reuse_once_vcenter_powered_the_vm_on_since_the_stop(
+    env, powered_on
+):
+    """SDD §7.2 (review RV30-03): vCenter reading the VM off does not say it has not run since the
+    stop - an operator may have powered it on from vCenter and shut it down again. A converted kit
+    volume is reused only while vCenter records no power-on of the VM since the clock opened; one
+    recorded refuses the run, and events that cannot be read retry it, never start it blind."""
+    env.registry.volumes = [kit_volume("v", "web-01-2000")]
+    env.registry.source_power = "stopped"
+    env.registry.powered_on = powered_on
+    ctx, rec = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        nics=VMW_NICS,
+        downtime_started_at=utcnow(),
+    )
+    if powered_on:
+        with pytest.raises(PermanentStepError, match="roll the migration back again"):
+            await env.executor.run(StepName.CUTOVER, ctx)
+    else:
+        with pytest.raises(TransientStepError, match="events: HTTP 503"):
+            await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []
 
 
 def _kit_leaves(env, monkeypatch, volumes, *, fail=None):

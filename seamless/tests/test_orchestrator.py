@@ -3136,9 +3136,11 @@ async def test_a_vmware_rollback_cinder_will_not_clean_restarts_the_source_and_t
 ):
     """SDD §7.2, §8 (review RV29-01): the automatic rollback powers the source on before it
     deletes the kit's converted volume - Cinder refusing that delete fails the rollback with the
-    source running, never stopped. A retry's cutover would boot the destination from that volume
-    beside the source: it is refused before the kit runs, the automatic rollback that follows
-    deletes the volume once Cinder does, and the next retry copies the VM again and stops it."""
+    source running, never stopped, and its clock closed at the power-on (SDD §5.2, review
+    RV30-03). A retry's cutover would boot the destination from that volume beside the source: it
+    is refused before the kit runs and, the source running, ends failed; the rollback the
+    operator then requests deletes the volume once Cinder does, and the next retry copies the VM
+    again and stops it."""
     from seamless_migrate.providers.base import ProviderError
     from tests.fake_kit import KitRegistry
 
@@ -3166,11 +3168,19 @@ async def test_a_vmware_rollback_cinder_will_not_clean_restarts_the_source_and_t
         assert first.phase == P.failed and P.rolling_back in h.history(first), first.error
         assert (state / "power").read_text() == "on", "a refused clean-up kept the source stopped"
         assert (state / "volume").exists() and runs() == 1
+        # the source runs again: its clock closed at the power-on, not at the rollback's end
+        assert first.downtime_ended_at is not None and first.actual_downtime_s is not None
+        kinds = [e.kind for e in h.store.events(since_seq=0, limit=1000)]
+        assert kinds.count("migration.downtime_ended") == 1
         refusing[0] = False
         await h.orch.retry(m.id, "rina")
+        refused = await h.wait_phase(m.id, P.rolled_back, P.failed, P.completed, timeout=30)
+        assert refused.phase == P.failed, (refused.phase, refused.error)
+        assert "roll the migration back again" in (refused.error or "")
+        assert runs() == 1, "the kit ran on the converted volume while the source ran"
+        await h.orch.rollback(m.id, "rina", "delete the kit's volume")
         second = await h.wait_phase(m.id, P.rolled_back, P.failed, P.completed, timeout=30)
         assert second.phase == P.rolled_back, (second.phase, second.error)
-        assert runs() == 1, "the kit ran on the converted volume while the source ran"
         assert not (state / "volume").exists() and (state / "power").read_text() == "on"
         await h.orch.retry(m.id, "rina")
         done = await h.wait_phase(m.id, P.completed, P.failed, P.rolled_back, timeout=30)

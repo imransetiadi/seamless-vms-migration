@@ -10,6 +10,7 @@ import ssl
 import threading
 import time
 from collections.abc import Callable, Iterable
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -31,6 +32,9 @@ TOOLS_STOPPED_LOOK_S = 120
 #: how long the provider remembers a guest shutdown a power-on saw, for the rollback's retry
 #: that comes after the call's bound ended (SDD §7.2, review RV29-08)
 SHUTDOWN_MEMORY_S = 1800
+#: vCenter's events of a VM that ran: a power-on, DRS's, a resume from suspend (SDD §7.2,
+#: review RV30-03)
+POWER_ON_EVENTS = ("VmPoweredOnEvent", "DrsVmPoweredOnEvent", "VmResumedEvent")
 
 Connector = Callable[..., Any]
 
@@ -479,6 +483,32 @@ class VMwareProvider:
             await self._run(work)
         finally:
             ended.set()
+
+    async def powered_on_since(self, source_id: str, since: datetime) -> bool:
+        """Whether vCenter recorded a power-on of the VM since ``since``: its events, as its
+        power state cannot tell a VM that ran and was shut down again (SDD §7.2, review
+        RV30-03)."""
+
+        def work(content: Any, vim: Any) -> bool:
+            direct = self._find_by_uuid(content, source_id)
+            candidates = (
+                [direct] if direct is not None else self._objects(content, vim, "VirtualMachine")
+            )
+            for vm in candidates:
+                config = getattr(vm, "config", None)
+                if (getattr(config, "instanceUuid", None) or getattr(vm, "_moId", None)) != (
+                    source_id
+                ):
+                    continue
+                spec = vim.event.EventFilterSpec(
+                    entity=vim.event.EventFilterSpec.ByEntity(entity=vm, recursion="self"),
+                    time=vim.event.EventFilterSpec.ByTime(beginTime=since),
+                    eventTypeId=list(POWER_ON_EVENTS),
+                )
+                return bool(content.eventManager.QueryEvents(spec))
+            raise ProviderError(f"{self.provider.id}: VM {source_id!r} not found")
+
+        return bool(await self._run(work))
 
     async def inventory(self) -> SourceInventory:
         def work(content: Any, vim: Any) -> SourceInventory:
