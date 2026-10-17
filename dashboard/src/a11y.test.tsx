@@ -57,7 +57,7 @@ function renderAt(path: string, token = 'admin', prepare?: (server: MockServer) 
 }
 
 async function settled() {
-  await waitFor(() => expect(screen.queryAllByText(/^Loading|Checking your session/i)).toHaveLength(0), { timeout: 8_000 });
+  await waitFor(() => expect(screen.queryAllByText(/^(?:Loading|Checking your session)/i)).toHaveLength(0), { timeout: 8_000 });
 }
 
 beforeAll(async () => {
