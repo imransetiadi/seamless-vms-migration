@@ -192,29 +192,9 @@
         - not item["_migration_params"]["use_nbdkit_direct"]|default(false)
 
   rescue:
-    - name: Clean up in the source cloud after migration failure
-      os_migrate.os_migrate.import_workload_src_cleanup:
-        cloud: src
-        validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
-        ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
-        client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
-        client_key: "{{ os_migrate_src_client_key | default(omit) }}"
-        data: "{{ item }}"
-        conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
-        ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-        ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
-        transfer_uuid: "{{ exports.transfer_uuid }}"
-        volume_map: "{{ exports.volume_map }}"
-        log_file: "{{ prelim.log_file }}"
-        state_file: "{{ prelim.state_file }}"
-        timeout: "{{ os_migrate_timeout }}"
-      when:
-        - prelim is defined and prelim.changed
-        - os_migrate_workload_cleanup_on_failure
-        - exports is defined and 'volume_map' in exports
-        - item["_migration_params"]["data_copy"] | default(true)
-        - not item["_migration_params"]["use_nbdkit_direct"]|default(false)
-
+    # first, and best effort: it never fails, so the source cleanup's failure never keeps it
+    # from running, and the transfer's failure is what the run reports (Seamless Migrate SDD
+    # 6.6, reviews RV32B-02, RV32B-04)
     - name: Clean up in the destination cloud after migration failure
       os_migrate.os_migrate.import_workload_dst_failure_cleanup:
         cloud: dst
@@ -240,6 +220,29 @@
         - exports is defined and 'volume_map' in exports
         - transfer is defined and transfer is not skipped
         - item["_migration_params"]["data_copy"] | default(true)
+
+    - name: Clean up in the source cloud after migration failure
+      os_migrate.os_migrate.import_workload_src_cleanup:
+        cloud: src
+        validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+        ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+        client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+        client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+        data: "{{ item }}"
+        conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
+        ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
+        ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
+        transfer_uuid: "{{ exports.transfer_uuid }}"
+        volume_map: "{{ exports.volume_map }}"
+        log_file: "{{ prelim.log_file }}"
+        state_file: "{{ prelim.state_file }}"
+        timeout: "{{ os_migrate_timeout }}"
+      when:
+        - prelim is defined and prelim.changed
+        - os_migrate_workload_cleanup_on_failure
+        - exports is defined and 'volume_map' in exports
+        - item["_migration_params"]["data_copy"] | default(true)
+        - not item["_migration_params"]["use_nbdkit_direct"]|default(false)
 
     - name: Fail if there was a problem in the migration
       ansible.builtin.fail:

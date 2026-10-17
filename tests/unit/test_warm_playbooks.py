@@ -881,6 +881,26 @@ def test_a_cold_transfer_cut_short_leaves_the_record_of_the_volumes_it_created(e
     assert not [c for c in calls if c["module"] == "import_workload_create_instance"]
 
 
+@pytest.mark.parametrize("source_cleanup", ["succeeds", "fails"])
+def test_the_cold_rescue_runs_the_destination_cleanup_first_whatever_the_source_cleanup_does(
+    env, source_cleanup
+):
+    """SDD 6.6 (reviews RV32B-04, RV32B-02): the rescue runs the destination cleanup - best effort,
+    it never fails - before the source cleanup, so a source cleanup that fails (a source conversion
+    host lost past its window, a root copy Cinder will not delete) no longer keeps it from running
+    once the transfer ran."""
+    env.world["fail_after"] = [["import_workload_transfer_volumes", "vm1"]]
+    if source_cleanup == "fails":
+        env.world["fail"] = [["import_workload_src_cleanup", "vm1"]]
+
+    rc, out, calls = env.run("import_workloads", **COLD)
+
+    assert rc != 0, out
+    assert env.state("srv-1")["dest_volumes"] == RECORDED  # the transfer ran and recorded them
+    modules = [c["module"] for c in calls if c["module"].endswith("_cleanup")]
+    assert modules == ["import_workload_dst_failure_cleanup", "import_workload_src_cleanup"]
+
+
 def test_a_cold_import_without_data_copy_records_the_server_and_no_volume(env):
     """data_copy false: the server boots from volumes the import did not create, so only the
     server is recorded - a rollback must never delete those volumes (SDD 6.3)."""
