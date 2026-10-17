@@ -555,12 +555,25 @@ class OpenStackProvider:
             if volume is None:
                 return
             status = str(_attr(volume, "status", default="") or "").lower()
+            if status == "error_deleting":
+                raise ProviderError(
+                    f"{self.provider.id}: volume {volume_id} is error_deleting: Cinder failed to "
+                    "delete it - reset its state, then try again"
+                )
+            if status == "deleting":
+                break  # Cinder deletes it already: waited for, never deleted twice (RV29-04)
             if status not in _VOLUME_SETTLING:
+                try:
+                    storage.delete_volume(volume, ignore_missing=True)
+                except Exception:
+                    # Cinder refuses a volume it began deleting meanwhile: that deletion counts
+                    again = storage.find_volume(volume_id, ignore_missing=True)
+                    if again is not None and _attr(again, "status") != "deleting":
+                        raise
                 break
             if time.monotonic() > deadline:
                 raise ProviderError(f"{self.provider.id}: volume {volume_id} is still {status}")
             time.sleep(2)
-        storage.delete_volume(volume, ignore_missing=True)
         storage.wait_for_delete(volume, wait=max(1, int(deadline - time.monotonic())))
 
     def _detach_volume(self, server_id: str, volume_id: str) -> None:

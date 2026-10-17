@@ -1768,6 +1768,72 @@ def test_the_inventory_looks_up_a_flavor_nova_did_not_embed():
     assert ctx.server_to_vmref(Server(**body)).vcpus == 0
 
 
+@pytest.mark.parametrize(
+    "case", ["deleting", "began meanwhile", "error_deleting", "gone", "maintenance"]
+)
+async def test_openstack_delete_volume_waits_for_a_deletion_cinder_runs(case):
+    """SDD §10 (review RV29-04): Cinder's delete takes only an available, error, error_restoring,
+    error_extending or error_managing volume and refuses any other with 400. A volume it is
+    already deleting - an earlier call's deletion outlived that call, or another delete began
+    between the read and this one - is waited for until it is gone, never deleted a second time;
+    one it failed to delete (error_deleting) is a provider error that names it."""
+    from openstack import exceptions
+
+    statuses = {
+        "v1": {
+            "deleting": "deleting",
+            "began meanwhile": "available",
+            "error_deleting": "error_deleting",
+            "gone": None,
+            "maintenance": "maintenance",
+        }[case]
+    }
+    reads, deletes = [0], []
+
+    class BlockStorage:
+        def find_volume(self, volume_id, ignore_missing=True):
+            reads[0] += 1
+            status = statuses.get(volume_id)
+            if status == "deleting" and reads[0] > 3:
+                statuses[volume_id] = status = None  # the backend is done
+            return None if status is None else NS(id=volume_id, status=status)
+
+        def delete_volume(self, volume, ignore_missing=True):
+            deletes.append(volume.id)
+            if case == "began meanwhile":
+                statuses[volume.id] = "deleting"  # another delete landed first
+            if statuses[volume.id] not in ("available", "error", "error_restoring"):
+                raise exceptions.BadRequestException(
+                    "400: Invalid volume: Volume status must be available or error"
+                )
+            statuses[volume.id] = "deleting"
+
+        def wait_for_delete(self, volume, interval=2, wait=120):
+            while self.find_volume(volume.id) is not None:
+                pass
+            return volume
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(
+        dst, settings(), connect_fn=lambda p, s: NS(block_storage=BlockStorage())
+    )
+    if case == "error_deleting":
+        with pytest.raises(ProviderError, match="volume v1 is error_deleting"):
+            await provider.delete_volume("v1")
+        assert deletes == []
+        return
+    if case == "maintenance":  # a refusal of its own: no deletion runs, the error stands
+        with pytest.raises(ProviderError, match="400: Invalid volume"):
+            await provider.delete_volume("v1")
+        assert deletes == ["v1"]
+        return
+    await provider.delete_volume("v1")
+    assert statuses["v1"] is None
+    assert deletes == (["v1"] if case == "began meanwhile" else [])
+
+
 async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_free():
     """SDD §10 (§7.2 VMware rollback, review RV29-02): detach_volume removes Nova's attachment of
     the volume to the server, ignoring one already gone, and waits until Cinder reads the volume
