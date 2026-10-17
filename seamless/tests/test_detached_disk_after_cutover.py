@@ -13,7 +13,7 @@ from seamless_migrate.domain.enums import Strategy
 from seamless_migrate.domain.models import Nic
 from seamless_migrate.executors.ansible import SERVER_TYPE, AnsibleExecutor
 from seamless_migrate.executors.base import PermanentStepError, StepName
-from seamless_migrate.planning.preflight import keep_detached_volumes
+from seamless_migrate.planning.preflight import CATALOG, keep_detached_volumes
 from tests.factories import make_disk, make_vm
 from tests.orch_support import ScriptedExecutor, build_harness, make_settings
 from tests.test_orchestrator import plan_for
@@ -173,3 +173,28 @@ def test_a_volume_the_vm_no_longer_lists_stays_with_a_blocker():
     image_booted = previous.model_copy(update={"disks": [root, DISKS[1]]})
     data_only = current.model_copy(update={"disks": [DISKS[1]]})
     assert keep_detached_volumes(image_booted, data_only)[1] == []
+
+
+def test_finding_src_vm_volume_detached():
+    """SDD §9.3, §5.4: one blocker names every volume the VM no longer lists, in the order the
+    migration validated them, with the catalog's way out; a disk that is no volume - an image root
+    or an ephemeral disk - is neither kept nor named."""
+    previous = make_vm(
+        name="db-01",
+        disks=[
+            make_disk(id="root", kind="image_root", device="/dev/vda"),
+            make_disk(id="vol-data", bootable=False, device="/dev/vdb"),
+            make_disk(id="eph", kind="ephemeral", bootable=False, device="/dev/vdc"),
+            make_disk(id="vol-logs", bootable=False, device="/dev/vdd"),
+        ],
+    )
+    current = previous.model_copy(update={"disks": []})
+
+    vm, findings = keep_detached_volumes(previous, current)
+
+    assert [d.id for d in vm.disks] == ["vol-data", "vol-logs"]
+    (f,) = findings
+    assert (f.code, f.severity) == ("SRC_VM_VOLUME_DETACHED", "blocker")
+    assert "vol-data, vol-logs" in f.message and "db-01" in f.message
+    assert f.remediation == CATALOG["SRC_VM_VOLUME_DETACHED"].remediation
+    assert f.remediation.startswith("Attach the volume(s) to the source VM again")

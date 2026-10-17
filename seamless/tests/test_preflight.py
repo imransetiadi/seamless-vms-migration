@@ -401,6 +401,21 @@ def test_finding_dst_keypair_missing_and_prestaged():
         assert all("KEYPAIR" not in x.code for x in quiet)
 
 
+def test_finding_map_keypair_prestaged():
+    """SDD §9.3, §7.2: pre-staging imports a keypair only where the destination credential lacks
+    it - one it owns already is used as it is, and nothing is said - and the info names the key and
+    the destination, with the catalog's "nothing to do"."""
+    vm = make_vm(key_name="ops-key")
+    src = src_inv(keypairs=["ops-key"])
+    prestage = make_plan(prestage_resources=[*DEFAULT_PRESTAGE, "keypairs"])
+    f = only(check(vm, plan=prestage, src=src), "MAP_KEYPAIR_PRESTAGED")
+    assert "'ops-key'" in f.message and DST.label in f.message
+    assert f.remediation == CATALOG["MAP_KEYPAIR_PRESTAGED"].remediation
+    assert f.remediation.startswith("Nothing to do")
+    owned = check(vm, plan=prestage, src=src, dst=dst_inv(keypairs=["ops-key"]))
+    assert all("KEYPAIR" not in x.code for x in owned)
+
+
 def test_finding_map_flavor_auto_records_resolved_mapping():
     dst = dst_inv(
         flavors=[
@@ -993,6 +1008,33 @@ def test_catalog_matches_sdd_9_3():
         r"^\| `([A-Z0-9_]+)` \| (blocker|warning|info)", section, re.M
     ):
         assert CATALOG[code].severity == severity, code
+
+
+def test_each_finding_code_has_a_test_named_for_it():
+    """QASuite FR-04: each finding code of SDD §9.3 has a ``test_finding_<code_lower>`` test or
+    ``test_finding_<code_lower>_<case>`` tests, and each such test is named for a code. A test
+    counts for the longest code its name begins with: MAP_NIC_OVERRIDE_INVALID's tests do not
+    stand in for MAP_NIC_OVERRIDE."""
+    import re
+    from pathlib import Path
+
+    from seamless_migrate.config import find_repo_root
+
+    sdd = (find_repo_root() / "docs" / "SDD.md").read_text(encoding="utf-8")
+    section = sdd[sdd.index("### 9.3") : sdd.index("### 9.4")]
+    codes = sorted(set(re.findall(r"`([A-Z][A-Z0-9_]{4,})`", section)), key=len, reverse=True)
+    tested, unnamed = set(), []
+    for path in sorted(Path(__file__).resolve().parent.glob("test_*.py")):
+        text = path.read_text(encoding="utf-8")
+        for name in re.findall(r"^(?:async )?def (test_finding_\w+)\(", text, re.M):
+            code = next(
+                (c for c in codes if f"{name}_".startswith(f"test_finding_{c.lower()}_")), None
+            )
+            if code is None:
+                unnamed.append(f"{path.name}::{name}")
+            tested.add(code)
+    assert sorted(set(codes) - tested) == [], "codes without a test_finding_ test"
+    assert unnamed == [], "test_finding_ tests named for no code of SDD §9.3"
 
 
 def net(network_id, name, own=True, mtu=1500, project_id=None, shared=None, external=False):
