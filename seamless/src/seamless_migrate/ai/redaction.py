@@ -20,8 +20,15 @@ _KEYWORDS = (
 #: A credential key may carry a prefix joined by ``_``/``-``/``.`` (``OS_PASSWORD``,
 #: ``vcenter_password``, ``ansible_become_pass``, ``AWS_SECRET_ACCESS_KEY``, ``auth.password``).
 _KEY = r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_.-])*(?:" + _KEYWORDS + r")(?![A-Za-z0-9])"
+#: The same key as a text is searched for it: each start looks at a prefix of at most 16 parts -
+#: a longer one is found from a later part, the value redacted all the same - so a run of "a."
+#: costs time linear in its length, not quadratic (SDD §13.4, review RV27-06).
+_SCANNED_KEY = r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_.-]){0,16}(?:" + _KEYWORDS + r")(?![A-Za-z0-9])"
 #: A mapping key whose whole value is a credential: a credential key, or a clouds.yaml ``auth``.
 _CREDENTIAL_KEY = re.compile(r"(?i)" + _KEY + r"|auth")
+#: A PEM block's first and last lines; the block is redacted from one to the first other after it.
+_PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]+-----")
+_PEM_END = re.compile(r"-----END [A-Z0-9 ]+-----")
 
 
 def _auth_block(match: re.Match[str]) -> str:
@@ -30,17 +37,12 @@ def _auth_block(match: re.Match[str]) -> str:
 
 
 _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
-    # PEM blocks (keys, certificates)
-    (
-        re.compile(r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----", re.S),
-        "[REDACTED PEM]",
-    ),
     # the auth section of a clouds.yaml: block style (every line indented under "auth:") ...
     (re.compile(r"(?m)^([ \t]*)auth:[ \t]*\n(?:\1[ \t]+\S[^\n]*(?:\n|$))+"), _auth_block),
     # ... and JSON or YAML flow style ("auth": {...})
     (re.compile(r"(?i)(?<![\w.-])([\"']?auth[\"']?\s*:\s*)\{[^{}]*\}"), r"\1" + REDACTED),
     # credentials in URLs and connection strings: scheme://user:pass@host (a pass with "@" too)
-    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/]*@"), r"\1[REDACTED]@"),
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]{0,63}://)[^\s/@:]+:[^\s/]*@"), r"\1[REDACTED]@"),
     # Authorization headers (any scheme)
     (re.compile(r"(?i)\b(authorization)\s*[:=]\s*(?:\w+\s+)?[^\s,;'\"]+"), r"\1: " + REDACTED),
     # bare bearer tokens
@@ -48,12 +50,16 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     # key=value / key: value / "key": "value" (the key possibly prefixed, e.g. OS_PASSWORD), which
     # also covers X-Auth-Token / X-Subject-Token headers and Password=...; in connection strings
     (
-        re.compile(r"(?i)([\"']?" + _KEY + r"[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&}]+)"),
+        re.compile(
+            r"(?i)([\"']?" + _SCANNED_KEY + r"[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&}]+)"
+        ),
         r"\1" + REDACTED,
     ),
     # CLI form: --os-password hunter2 / --password=hunter2 / -p hunter2 is too ambiguous
     (
-        re.compile(r"(?i)(--[a-z0-9-]*(?:password|passwd|secret|token|api-key|key)\s+)([^\s]+)"),
+        re.compile(
+            r"(?i)(--(?:[a-z0-9]+-){0,16}(?:password|passwd|secret|token|api-key|key)\s+)([^\s]+)"
+        ),
         r"\1" + REDACTED,
     ),
     # well-known token shapes: seamless API tokens, Keystone fernet tokens, JWTs
@@ -68,9 +74,24 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
 )
 
 
+def _redact_pem(text: str) -> str:
+    """Each PEM block (a key, a certificate) - its BEGIN line to the first END line after it -
+    replaced. No END line after a BEGIN line means none after a later one either, so each END
+    line is looked for once: time linear in the text (SDD §13.4, review RV27-06)."""
+    out: list[str] = []
+    pos = 0
+    while (begin := _PEM_BEGIN.search(text, pos)) is not None:
+        end = _PEM_END.search(text, begin.end())
+        if end is None:
+            break
+        out += [text[pos : begin.start()], "[REDACTED PEM]"]
+        pos = end.end()
+    return "".join(out) + text[pos:]
+
+
 def redact(text: str, redact_names: Sequence[str] | None = None) -> str:
     """Remove secrets (and optionally VM names) before text leaves the control plane."""
-    out = str(text)
+    out = _redact_pem(str(text))
     for pattern, replacement in _PATTERNS:
         out = pattern.sub(replacement, out)
     return replace_names(out, {name: "[vm]" for name in redact_names or []})

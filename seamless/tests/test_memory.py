@@ -201,6 +201,93 @@ def test_memory_hits_are_redacted_where_they_enter():
     assert all(secret[:8] not in h.title + h.content for h in hits), hits
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a." * 16384,  # a credential key's prefix, tried again from every start
+        "ab." * 10923,
+        "-" * 32768,  # a CLI flag's name: a line of dashes, as logs print them
+        "a" * 32768,  # a URL scheme
+        "-----BEGIN A-----" * 4000,  # PEM blocks that never end
+    ],
+    ids=["key prefix", "dotted words", "dash line", "scheme letters", "pem begins"],
+)
+def test_redact_costs_time_linear_in_the_text(text):
+    """SDD §13.4 (review RV27-06): redact runs in the event loop - over agentmemory's hits and
+    every migration.log line - for a time linear in the text's length: 32 KiB of the texts that
+    made a pattern quadratic cost well under a second, never seconds."""
+    import time
+
+    start = time.perf_counter()
+    redact(text)
+    assert time.perf_counter() - start < 0.5
+
+
+def test_redact_still_finds_what_its_linear_patterns_could_hide():
+    """SDD §13.4 (review RV27-06): the linear patterns find what the unbounded ones found - a key
+    with more than 16 prefix parts, a PEM block whose BEGIN line has no END line of its own, a long
+    URL scheme, a long CLI flag."""
+    secret = "Hunter2-Prod-Secret"  # gitleaks:allow
+    deep = ".".join("abcdefghijklmnopqrstu") + f".password={secret}"
+    assert secret not in redact(deep)
+    pem = f"x -----BEGIN A----- {secret} -----BEGIN B----- {secret} -----END B----- tail"
+    assert redact(pem) == "x [REDACTED PEM] tail"
+    assert redact(f"-----BEGIN A----- {secret}") == f"-----BEGIN A----- {secret}"  # no END: none
+    url = "postgresql+psycopg2+extra://svc:" + secret + "@db.example:5432/x"
+    assert secret not in redact(url)
+    assert secret not in redact("--os-application-credential-secret " + secret)
+
+
+def test_a_memory_hit_is_redacted_and_cut_as_it_arrives():
+    """SDD §13.4 (review RV27-06): a hit's content is redacted and cut at 4000 characters as
+    redact_cut cuts it - a secret the cut splits is still found - and its title at 200."""
+    secret = "Hunter2-Prod-Secret"  # gitleaks:allow
+    content = "x" * 3970 + f" https://svc:{secret}@db.example:5432 " + "y" * 20000
+    [hit] = parse_hits({"results": [{"title": "t" * 500, "content": content}]}, 5)
+    assert len(hit.content) == 4000 and secret[:6] not in hit.content
+    assert hit.title == "t" * 200
+
+
+def test_only_the_first_limit_hits_of_an_answer_are_read(monkeypatch):
+    """SDD §13.4 (review RV27-06): parse_hits reads hits until it has `limit` of them."""
+    from seamless_migrate.ai import memory as memory_module
+
+    seen = []
+    one = memory_module._hit
+    monkeypatch.setattr(memory_module, "_hit", lambda item: seen.append(item) or one(item))
+    hits = parse_hits({"results": [{}, *({"content": f"c{i}"} for i in range(10))]}, 3)
+    assert [h.content for h in hits] == ["c0", "c1", "c2"]
+    assert len(seen) == 4, "an item without content counts no hit; the reading stops at the third"
+
+
+async def test_one_agentmemory_hit_cannot_hold_the_event_loop():
+    """SDD §13.4 (review RV27-06): a search's hits are redacted in the event loop; one hit of the
+    text that made a redaction pattern quadratic leaves every other coroutine running."""
+    import asyncio
+    import time
+
+    def memory(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": [{"title": "notes", "content": "a." * 8192}]})
+
+    client = MemoryClient("http://memory:3111", None, "p", transport=httpx.MockTransport(memory))
+    ticks: list[float] = []
+
+    async def ticker():
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    tick = asyncio.create_task(ticker())
+    await asyncio.sleep(0.05)
+    try:
+        assert await client.search("cutover failed", limit=3)
+        await asyncio.sleep(0.05)
+    finally:
+        tick.cancel()
+    gap = max(later - earlier for earlier, later in zip(ticks, ticks[1:], strict=False))
+    assert gap < 1.0, f"no other coroutine ran for {gap:.1f} s while one hit was redacted"
+
+
 @pytest.mark.parametrize("mode", ["http_error", "connect_error", "bad_json"])
 async def test_memory_failures_swallowed(mode):
     def handler(request: httpx.Request) -> httpx.Response:
