@@ -579,6 +579,49 @@ def test_sync_creates_dest_volumes_only_on_first_pass(tmp_path):
     assert scenario.dst.devices["dst-conv"] == ["/dev/vda"]
 
 
+def test_a_destination_volume_whose_record_cannot_be_written_is_deleted(tmp_path):
+    """Seamless Migrate SDD 6.3 (audit A-05): a pass records each destination volume as soon as
+    Cinder accepted it; when that record cannot be written (a full disk), no record names the
+    volume and it would outlive every rollback - the pass deletes it, once Cinder settled it,
+    before it fails, as the cold transfer does."""
+    import errno
+
+    scenario = Scenario(tmp_path)
+    dst = scenario.dst
+    save = WarmState.save
+    # as Cinder: a volume is `creating` until it is waited for, and cannot be deleted before
+    create, wait, delete = dst.create_volume, dst.block_storage.wait_for_status, dst.delete_volume
+
+    def creating(*args, **kwargs):
+        volume = create(*args, **kwargs)
+        volume.status = "creating"
+        return volume
+
+    def settles(res, **kwargs):
+        dst.volumes[res.id].status = "available"
+        return wait(res, **kwargs)
+
+    def refuses_creating(name_or_id=None, **kwargs):
+        if dst.volumes[name_or_id].status == "creating":
+            raise RuntimeError("Invalid volume: Volume status must be available or error")
+        return delete(name_or_id=name_or_id, **kwargs)
+
+    def full_disk(state, *args, **kwargs):
+        if state.dest_volumes:  # the record of a destination volume
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return save(state, *args, **kwargs)
+
+    dst.create_volume, dst.delete_volume = creating, refuses_creating
+    dst.block_storage.wait_for_status = settles
+    with mock.patch.object(WarmState, "save", full_disk), pytest.raises(OSError, match="No space"):
+        scenario.run_pass("uuid-1")
+
+    created = scenario.dst.calls_to("create_volume")
+    assert [c[1]["name"] for c in created] == ["vm1-boot"]  # the pass stopped at its record
+    assert not [v for v in scenario.dst.volumes.values() if v.name == "vm1-boot"]
+    assert scenario.state().dest_volumes == {}
+
+
 def test_sync_destination_volumes_match_cold_path_params(tmp_path):
     scenario = Scenario(tmp_path)
     scenario.data["_migration_params"]["boot_volume_params"]["description"] = "boot copy"

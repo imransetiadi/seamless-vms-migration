@@ -453,6 +453,23 @@ class OpenStackVolumeBase:
             return None
         return volume_or_none(self.conn, id_maybe)
 
+    def _delete_unrecorded_volume(self, volume, timeout):
+        """
+        Delete a volume whose record could not be written - it would outlive
+        every rollback - once Cinder settled it: a volume still being created
+        cannot be deleted. A failure here is logged; the record's error stands.
+        """
+        try:
+            self.conn.block_storage.wait_for_status(
+                volume, status="available", failures=["error"], wait=timeout
+            )
+        except Exception as err:  # an errored volume is deleted all the same
+            self.log.warning("Volume %s did not become available: %s", volume.id, err)
+        try:
+            self.conn.delete_volume(name_or_id=volume.id, wait=False)
+        except Exception as err:
+            self.log.error("Could not delete the unrecorded volume %s: %s", volume.id, err)
+
     @use_lock(ATTACH_LOCK_FILE_DESTINATION)
     def _detach_volumes_from_destination_converter(self, volume_ids=None):
         """
@@ -1570,23 +1587,6 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             )
             if bootable is not None:
                 self.conn.block_storage.set_volume_bootable_status(new_volume, bootable)
-
-    def _delete_unrecorded_volume(self, volume, timeout):
-        """
-        Delete a volume whose record could not be written - it would outlive
-        every rollback - once Cinder settled it: a volume still being created
-        cannot be deleted. A failure here is logged; the record's error stands.
-        """
-        try:
-            self.conn.block_storage.wait_for_status(
-                volume, status="available", failures=["error"], wait=timeout
-            )
-        except Exception as err:  # an errored volume is deleted all the same
-            self.log.warning("Volume %s did not become available: %s", volume.id, err)
-        try:
-            self.conn.delete_volume(name_or_id=volume.id, wait=False)
-        except Exception as err:
-            self.log.error("Could not delete the unrecorded volume %s: %s", volume.id, err)
 
     def _before_destination_volumes_created(self):
         """

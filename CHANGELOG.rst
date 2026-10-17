@@ -534,3 +534,7 @@ This project follows a simple changelog to satisfy collection metadata validatio
   snapshot holds a larger disk than its file) and its ``min_disk``, at least
   1 GiB. A file of 2.5 GiB with ``min_disk`` 0 (a flavor with a 0 GiB root
   disk) asked for 2 GiB, and Cinder refused it on every pass.
+- A warm pass whose record of a new destination volume cannot be written (a
+  full disk) deletes that volume, once Cinder settled it, before it fails, as
+  the cold transfer does. Before, no record named the volume, so no rollback
+  ever deleted it and the guest's data stayed in the tenant.

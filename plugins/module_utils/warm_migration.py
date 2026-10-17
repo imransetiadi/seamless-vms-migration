@@ -862,7 +862,13 @@ class OpenstackWarmSync(_WarmVolumeBase):
             "bootable": bool(bootable),
             "name": params.get("name"),
         }
-        self.state.save()
+        try:
+            self.state.save()
+        except Exception:
+            # no record names the volume (a full disk): it would outlive every
+            # rollback (Seamless Migrate SDD 6.3, audit A-05)
+            self._delete_unrecorded_volume(volume, self.timeout)
+            raise
         volume = self._wait_volume_available(volume)
         if bootable is not None:
             self.conn.block_storage.set_volume_bootable_status(volume, bootable)
