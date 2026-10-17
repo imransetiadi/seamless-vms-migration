@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import operator
 import os
 import tempfile
 from collections.abc import Callable, Collection
@@ -276,6 +277,54 @@ def _backend_name(extra_specs: dict[str, Any]) -> str | None:
         "capabilities:volume_backend_name"
     )
     return str(name) if name else None
+
+
+def _boolean(text: Any) -> bool:
+    """A word read as a boolean, as oslo.utils' ``bool_from_string`` reads it (not strict)."""
+    if isinstance(text, bool):
+        return text
+    return str(text).strip().lower() in ("1", "t", "true", "on", "y", "yes")
+
+
+#: the comparison each operator word of a Cinder extra spec names (the scheduler's
+#: extra_specs_ops, SDD §7.3 step 0): a capability's value first, the spec's word second
+_SPEC_OPERATORS: dict[str, Callable[[Any, str], bool]] = {
+    "=": lambda value, word: float(value) >= float(word),
+    "==": lambda value, word: float(value) == float(word),
+    "!=": lambda value, word: float(value) != float(word),
+    ">=": lambda value, word: float(value) >= float(word),
+    "<=": lambda value, word: float(value) <= float(word),
+    "s==": operator.eq,
+    "s!=": operator.ne,
+    "s<": operator.lt,
+    "s<=": operator.le,
+    "s>": operator.gt,
+    "s>=": operator.ge,
+    "<in>": lambda value, word: word in value,
+    "<is>": lambda value, word: _boolean(value) is _boolean(word),
+}
+
+
+def cinder_spec_matches(value: Any, spec: str | None) -> bool:
+    """Whether a backend capability ``value`` satisfies the extra spec ``spec`` as Cinder's
+    scheduler decides it (CapabilitiesFilter, extra_specs_ops; SDD §7.3 step 0, review RV26-08):
+    a spec that starts with an operator word is that comparison with the word after it - ``<or>``
+    with each alternative, every other word after it - and any other spec the value itself."""
+    if spec is None:
+        return value is None
+    words = spec.split()
+    first = words[0] if words else ""
+    compare = _SPEC_OPERATORS.get(first)
+    if first != "<or>" and compare is None:
+        return bool(value == spec)
+    if value is None:
+        return False
+    if first == "<or>":
+        return value in words[1::2]
+    try:
+        return len(words) > 1 and bool(compare(value, words[1]))  # type: ignore[misc]
+    except (ValueError, TypeError):  # a number operator on what is no number
+        return False
 
 
 def _recreated_vm(vm: VMRef, server_id: str, new_ids: dict[str, str]) -> dict[str, Any]:
@@ -620,7 +669,7 @@ class HandoverExecutor:
                             )
                             wanted = type_backends.get(vtype or "")
                             have = (dst_pools.get(dst_host) or {}).get("volume_backend_name")
-                            if wanted and have and wanted != have:
+                            if wanted and have and not cinder_spec_matches(have, wanted):
                                 problems.append(
                                     f"volume {vid}: {cloud}'s volume type {vtype!r} asks for the "
                                     f"backend {wanted!r}, but step 6 manages the volume on "

@@ -2079,6 +2079,16 @@ async def test_handover_refuses_before_stop_a_volume_another_server_holds_too(tm
         ({"volume_backend_name": "ceph-hdd"}, True, False),
         ({}, True, False),
         ({"volume_backend_name": "ceph-ssd"}, False, False),
+        # Cinder's operators (extra_specs_ops): the scheduler takes these for ceph-hdd...
+        ({"volume_backend_name": "<or> ceph-ssd <or> ceph-hdd"}, True, False),
+        ({"volume_backend_name": "<in> ceph"}, True, False),
+        ({"volume_backend_name": "s== ceph-hdd"}, True, False),
+        ({"capabilities:volume_backend_name": "s!= ceph-ssd"}, True, False),
+        # ...and refuses these (review RV26-08)
+        ({"volume_backend_name": "<or> ceph-ssd <or> ceph-nvme"}, True, True),
+        ({"volume_backend_name": "<in> nfs"}, True, True),
+        ({"volume_backend_name": "s== ceph-ssd"}, True, True),
+        ({"volume_backend_name": "s!= ceph-hdd"}, True, True),
     ],
 )
 async def test_handover_refuses_before_stop_a_volume_type_the_pool_cannot_hold(
@@ -2103,11 +2113,62 @@ async def test_handover_refuses_before_stop_a_volume_type_the_pool_cannot_hold(
         return
     with pytest.raises(PermanentStepError, match="storage handover refused") as refusal:
         await executor.run(StepName.CUTOVER, ctx)
+    wanted = next(iter(specs.values()))
     assert (
-        "volume vol-data: RHOSO 18.0's volume type 'rbd-hdd' asks for the backend 'ceph-ssd', but "
-        "step 6 manages the volume on hostgroup@ceph-hdd#hdd, whose backend is 'ceph-hdd'"
+        f"volume vol-data: RHOSO 18.0's volume type 'rbd-hdd' asks for the backend {wanted!r}, "
+        "but step 6 manages the volume on hostgroup@ceph-hdd#hdd, whose backend is 'ceph-hdd'"
     ) in str(refusal.value)
     assert calls == [] and rec.downtime_marks == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "spec", "matches"),
+    [
+        # no operator: the whole spec, as it is written
+        ("ceph-hdd", "ceph-hdd", True),
+        ("ceph-hdd", "ceph-ssd", False),
+        ("ceph hdd", "ceph hdd", True),
+        (None, None, True),
+        ("ceph-hdd", None, False),
+        # <or>: any alternative - every other word after the first
+        ("ceph-hdd", "<or> ceph-ssd <or> ceph-hdd", True),
+        ("ceph-ssd", "<or> ceph-ssd <or> ceph-hdd", True),
+        ("ceph", "<or> ceph-ssd <or> ceph-hdd", False),
+        ("ceph-hdd", "<or> ceph-hdd", True),
+        ("ceph-hdd", "<or>", False),
+        ("<or>", "<or> ceph-ssd <or> ceph-hdd", False),  # a separator is no alternative
+        (None, "<or> ceph-hdd", False),
+        (None, "s!= ceph-hdd", False),  # a backend that reports none matches no operator
+        # the string operators compare with the first word after them
+        ("ceph-hdd", "s== ceph-hdd", True),
+        ("ceph-hdd", "s!= ceph-hdd", False),
+        ("b", "s< c", True),
+        ("c", "s<= c", True),
+        ("d", "s> c", True),
+        ("c", "s>= d", False),
+        ("ceph-hdd", "<in> hdd", True),
+        ("ceph-hdd", "<in> nvme", False),
+        # numbers: "=" means at least
+        ("10", "= 8", True),
+        ("4", "= 8", False),
+        ("8", "== 8.0", True),
+        ("8", "!= 8", False),
+        ("9", ">= 8", True),
+        ("7", "<= 8", True),
+        ("ceph-hdd", "== 8", False),  # no number: no match
+        # <is>: as booleans
+        ("True", "<is> true", True),
+        ("no", "<is> True", False),
+        # an operator with nothing to compare with, or with what it cannot compare
+        ("ceph-hdd", "s==", False),
+        (8, "<in> 8", False),
+    ],
+)
+def test_a_volume_type_spec_is_matched_as_cinders_scheduler_matches_it(value, spec, matches):
+    """SDD §7.3 step 0 (review RV26-08): Cinder's CapabilitiesFilter matches each extra spec with
+    extra_specs_ops.match - a spec starting with an operator word is that comparison, any other is
+    the whole string - so step 0 refuses exactly what the scheduler refuses."""
+    assert handover_module.cinder_spec_matches(value, spec) is matches
 
 
 async def test_handover_refuses_before_stop_without_compute_microversion_2_85(tmp_path):
