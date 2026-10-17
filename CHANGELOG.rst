@@ -532,7 +532,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``os_migrate_timeout``, and once more at the latest after
   ``os_migrate_timeout`` when the poll interval is longer: a stop or start
   that still runs then fails the play, where a wait of no retry used to start
-  nothing and report success.
+  nothing and report success. Each role names it ``Wait until no stop or start
+  of the source server runs``.
 - A volume made from a server snapshot - the warm ``boot_disk_copy`` pass and
   the cold export of an image-booted server - is as large as Cinder needs for
   the image: the image file rounded up to whole GiB, its virtual disk (a qcow2

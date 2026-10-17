@@ -115,7 +115,7 @@
                 data: "{{ item }}"
                 dst_filters: "{{ os_migrate_dst_filters }}"
 
-            - name: Wait for a stop of the source server that still runs
+            - name: Wait until no stop or start of the source server runs
               ansible.builtin.include_tasks: source_stop_settled.yml
 
             - name: Stop the source server

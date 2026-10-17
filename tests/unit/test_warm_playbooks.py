@@ -686,6 +686,36 @@ def test_a_rollback_waits_for_a_start_nova_still_runs(env):
     assert len([c for c in calls if c["module"] == "server_info"]) == 3
 
 
+def test_each_include_of_the_settle_wait_is_named_for_what_it_waits_for():
+    """SDD 6.5 (reviews RV29-06, RV31): the shared wait reads the source until Nova runs no stop
+    or start of it - every task that includes it says so in the play's output, and no name matches
+    a stop task of the control plane's clock (SDD 7.2), which keys on "Stop the source server"."""
+    included = []
+    for role, tasks in (
+        ("import_workloads_warm", "cutover.yml"),
+        ("import_workloads_warm", "rollback.yml"),
+        ("import_workloads", "workload.yml"),
+    ):
+        with open(os.path.join(REPO, "roles", role, "tasks", tasks)) as f:
+            text = f.read()
+
+        def walk(items):
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                target = str(item.get("ansible.builtin.include_tasks") or "")
+                if target.endswith("source_stop_settled.yml"):
+                    included.append((tasks, item.get("name")))
+                for key in ("block", "rescue", "always"):
+                    walk(item.get(key))
+
+        walk(yaml.safe_load(text))
+    assert included == [
+        (tasks, "Wait until no stop or start of the source server runs")
+        for tasks in ("cutover.yml", "rollback.yml", "workload.yml")
+    ], included
+
+
 def test_a_stop_wait_whose_poll_outlasts_its_timeout_reads_the_server_again(env):
     """SDD 6.5 (review RV27-09): the wait reads the server every os_migrate_source_stop_poll_s
     seconds, at most os_migrate_timeout seconds - and once more at the latest after the timeout,

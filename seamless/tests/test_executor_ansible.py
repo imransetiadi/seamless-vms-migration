@@ -1945,8 +1945,9 @@ def test_stop_task_pattern():
 
 def test_only_the_collections_stop_tasks_match_the_stop_task_pattern():
     """SDD §7.2, §6.5: the downtime clock opens at a task whose header matches STOP_TASK, so of the
-    collection's own tasks only the two that stop a source may match it - never the wait for a
-    stop that still runs before them and the rollback's start (review RV26-10), nor any other."""
+    collection's own tasks only the two that stop a source may match it - never the wait until no
+    stop or start of it runs, before them and before the rollback's start (review RV26-10), nor any
+    other."""
     from seamless_migrate.config import find_repo_root
 
     def names(tasks):
@@ -1968,7 +1969,9 @@ def test_only_the_collections_stop_tasks_match_the_stop_task_pattern():
         for play in yaml.safe_load(path.read_text(encoding="utf-8")) or []:
             for key in ("pre_tasks", "tasks", "post_tasks", "handlers"):
                 headers += [(path.name, n, f"TASK [{n}] ****") for n in names(play.get(key))]
-    assert any(name.startswith("Wait for a stop of the source") for _, name, _ in headers)
+    assert any(
+        name == "Wait until no stop or start of the source server runs" for _, name, _ in headers
+    )
     assert {(where, name) for where, name, header in headers if STOP_TASK.match(header)} == {
         ("import_workloads_warm", "Stop the source server"),
         (
