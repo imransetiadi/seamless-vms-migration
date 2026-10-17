@@ -3693,14 +3693,14 @@ async def test_a_retried_vmware_rollback_still_keeps_what_a_server_found_by_name
         env.registry.get = lambda provider: Deleted(env.registry)
     with pytest.raises(TransientStepError, match="HTTP 503"):
         await env.executor.run(StepName.ROLLBACK, ctx)
-    assert (run_dir(env) / "rollback-kept.json").exists()
+    assert (run_dir(env) / ".seamless" / "rollback-kept.json").exists()
     env.registry.volumes_error = False
     env.registry.get = lambda provider: FakeImpl(env.registry)
     env.registry.existing = set()  # Nova deleted the server: no lookup finds it any more
     retried = await env.executor.run(StepName.ROLLBACK, ctx)
     assert (retried.details["deleted_server"], retried.details["deleted_volumes"]) == (None, [])
     assert [v["id"] for v in env.registry.volumes] == ["root"]
-    assert not (run_dir(env) / "rollback-kept.json").exists()
+    assert not (run_dir(env) / ".seamless" / "rollback-kept.json").exists()
     later = await env.executor.run(StepName.ROLLBACK, ctx)
     assert later.details["deleted_volumes"] == ["root"]
 
@@ -3732,7 +3732,7 @@ async def test_a_vmware_rollback_after_a_server_booted_leaves_no_copy_marked_com
     elif server == "found by name":
         env.registry.existing = {"web-01"}
     elif server == "found earlier":
-        record = run_dir(env) / "rollback-kept.json"
+        record = run_dir(env) / ".seamless" / "rollback-kept.json"
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_text('{"server_id": "dst-web-01", "volumes": ["boot", "data"]}')
     ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, **kw)
@@ -3812,6 +3812,85 @@ async def test_a_vmware_rollback_deletes_a_server_of_the_kits_name_beside_a_reco
     else:
         assert deletes == ["srv-attempt-1"]
         assert ("find_server", "web-01") not in env.registry.calls
+
+
+@pytest.mark.parametrize("record", ["damaged", "not a record", "a directory"])
+async def test_a_vmware_rollback_whose_keep_record_cannot_be_read_still_powers_the_source_on(
+    env, record
+):
+    """SDD §7.2 (review RV32A-08): the keep record matters only to the deletions after the
+    power-on. One that cannot be read never keeps the source stopped: what to keep is unknown, so
+    that attempt deletes no kit volume of the VM, says so in its log, and deletes the server and
+    powers the source on as any other."""
+    path = run_dir(env) / ".seamless" / "rollback-kept.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if record == "damaged":
+        path.write_text('{"server_id": "dst-web-01", "volumes": ["boot",')
+    elif record == "not a record":
+        path.write_text('["boot"]')
+    else:
+        path.mkdir()
+    env.registry.volumes = [kit_volume("cut-off", "web-01-2000", converted=False)]
+    ctx, rec = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        destination_server_id="dst-9",
+        downtime_started_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["source_running"] is True
+    assert result.details["deleted_volumes"] == []
+    calls = [c[0] for c in env.registry.calls]
+    assert calls.index("delete_server") < calls.index("power_on")
+    assert "delete_volume" not in calls
+    assert any("rollback-kept.json" in line and "stays" in line for line in rec.logs)
+
+
+async def test_a_vm_named_like_the_old_keep_record_never_fails_the_rollback(env):
+    """SDD §7.2 (review RV32A-08): the kit creates a guest directory {run directory}/{VM name}; a
+    VM named rollback-kept.json takes the record's old path. The record lives one level below, so
+    the rollback records and keeps what a server found by name held as for any VM."""
+    from seamless_migrate.planning.kit import kit_vm_name
+
+    guest_dir = run_dir(env) / "rollback-kept.json"
+    guest_dir.mkdir(parents=True)  # the kit's guest directory of the VM so named
+    kit = kit_vm_name("rollback-kept.json")
+    env.registry.existing = {kit}
+    env.registry.volumes = [
+        kit_volume("root", f"{kit}-2000", attachments=[f"dst-{kit}"]),
+        kit_volume("stale", f"{kit}-2001"),  # converted, no server holds it: the rules delete it
+    ]
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="rollback-kept.json",
+        downtime_started_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert (result.details["deleted_server"], result.details["deleted_volumes"]) == (
+        f"dst-{kit}",
+        ["stale"],
+    )
+    assert guest_dir.is_dir()  # the kit's directory left as it is
+
+
+async def test_a_keep_record_an_earlier_build_wrote_is_read_too(env):
+    """SDD §7.2 (review RV32A-08): a migration in flight across the upgrade keeps what its record at
+    the old path names - the rollback reads that file too, and removes it once it succeeds."""
+    old = run_dir(env) / "rollback-kept.json"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text('{"server_id": "dst-web-01", "volumes": ["root"]}')
+    env.registry.volumes = [kit_volume("root", "web-01-2000")]
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, downtime_started_at=utcnow()
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["deleted_volumes"] == []
+    assert not old.exists()
+    later = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert later.details["deleted_volumes"] == ["root"]
 
 
 async def test_a_vmware_rollback_deletes_no_volume_of_a_vm_without_a_kit_name(env):

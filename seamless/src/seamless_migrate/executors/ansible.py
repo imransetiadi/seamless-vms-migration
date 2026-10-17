@@ -904,27 +904,52 @@ def _write_synced_json(path: Path, data: Any) -> None:
         log.warning("could not sync %s after writing %s: %s", path.parent, path.name, exc)
 
 
-#: the VMware rollback's record of what a server found only by name held (SDD §7.2, RV30-05)
-KEPT_RECORD = "rollback-kept.json"
+#: the VMware rollback's record of what a server found only by name held (SDD §7.2, RV30-05):
+#: one level below the guest directories the kit creates in the run directory, {VM name}, so
+#: no VM's name is its path (review RV32A-08)
+KEPT_RECORD = Path(".seamless") / "rollback-kept.json"
+#: where an earlier build wrote it - read too, by a migration in flight across the upgrade
+LEGACY_KEPT_RECORD = "rollback-kept.json"
+
+
+class _UnreadableKeepRecord(Exception):
+    """The VMware rollback's keep record cannot be read: what to keep is unknown."""
 
 
 def _read_kept(rdir: Path) -> set[str]:
     """The volumes earlier attempts of the VMware rollback kept: what the server they found only
-    by the kit's name held before they deleted it (SDD §7.2, review RV30-05)."""
-    path = rdir / KEPT_RECORD
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return set()
-    except ValueError as exc:
-        # what to keep is unknown: never delete on a guess
-        raise PermanentStepError(f"rollback: {path} cannot be read: {exc}") from None
-    return {str(volume) for volume in data.get("volumes") or []}
+    by the kit's name held before they deleted it (SDD §7.2, review RV30-05). Raises
+    _UnreadableKeepRecord for a record that cannot be read (review RV32A-08)."""
+    kept: set[str] = set()
+    for path in (rdir / KEPT_RECORD, rdir / LEGACY_KEPT_RECORD):
+        if path.name == LEGACY_KEPT_RECORD and path.parent == rdir and not path.is_file():
+            continue  # none, or the kit's guest directory of a VM so named
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise _UnreadableKeepRecord(f"{path} cannot be read: {exc}") from None
+        if not isinstance(data, dict) or not isinstance(data.get("volumes") or [], list):
+            raise _UnreadableKeepRecord(f"{path} is no keep record")
+        kept |= {str(volume) for volume in data.get("volumes") or []}
+    return kept
 
 
 def _record_kept(rdir: Path, server_id: str, kept: Collection[str]) -> None:
-    rdir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _write_synced_json(rdir / KEPT_RECORD, {"server_id": server_id, "volumes": sorted(kept)})
+    path = rdir / KEPT_RECORD
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _write_synced_json(path, {"server_id": server_id, "volumes": sorted(kept)})
+
+
+def _remove_kept(rdir: Path) -> None:
+    """A rollback that succeeded: a later one starts from what it finds (review RV29-03) - the
+    record removed, the legacy one too, never the kit's guest directory of a VM so named."""
+    with contextlib.suppress(OSError):
+        (rdir / KEPT_RECORD).unlink(missing_ok=True)
+    legacy = rdir / LEGACY_KEPT_RECORD
+    if legacy.is_file():
+        legacy.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -1677,8 +1702,15 @@ class AnsibleExecutor:
             dst = self.providers.get(ctx.destination)
             recorded = m.destination_server_id
             named = None
-            # what an earlier attempt kept of a server it then deleted (review RV30-05)
-            kept = await asyncio.to_thread(_read_kept, rdir)
+            # what an earlier attempt kept of a server it then deleted (review RV30-05); a record
+            # that cannot be read never keeps the source stopped: what to keep is unknown, so this
+            # attempt deletes no kit volume (SDD §7.2, review RV32A-08)
+            unreadable = None
+            try:
+                kept = await asyncio.to_thread(_read_kept, rdir)
+            except _UnreadableKeepRecord as exc:
+                kept, unreadable = set(), str(exc)
+                await ctx.log(f"rollback: {unreadable}; every kit volume of {vm.name} stays")
             if m.downtime_started_at is not None:
                 # the kit records nothing in the control plane before the cutover powers the
                 # VM off; a same-named server after that point was created by this migration
@@ -1710,18 +1742,20 @@ class AnsibleExecutor:
             await self.providers.get(ctx.source).power_on(vm.source_id)
             # it runs: the clock closes now, whatever fails after (SDD §5.2, review RV30-03)
             await ctx.mark_downtime_end()
-            if servers or kept:
+            if servers or kept or unreadable:
                 # a server booted from the kit's volumes: what this rollback then cannot delete
                 # or keeps is no completed copy for a later run (SDD §7.2, review RV32A-01)
                 await self._mark_cutover_copies(ctx)
             deleted_ports = await self._delete_kit_ports(dst, vm.nics, vm.name)
-            deleted_volumes = await self._delete_kit_volumes(
-                ctx, dst, m.destination_server_id, kept
+            deleted_volumes = (
+                []
+                if unreadable
+                else await self._delete_kit_volumes(ctx, dst, m.destination_server_id, kept)
             )
         except ProviderError as exc:
             raise TransientStepError(f"rollback: {exc}") from exc
         # done: a later rollback starts from what it finds (review RV29-03)
-        await asyncio.to_thread(remove_quietly, rdir / KEPT_RECORD)
+        await asyncio.to_thread(_remove_kept, rdir)
         return StepResult(
             details={
                 "source_running": True,
