@@ -1402,7 +1402,11 @@ volumes with their server, so the order is:
    count (§9.1) and an Ansible-driven cutover's clock does (§7.2): `TODO(LAB): confirm` whether the handover's clock
    starts at the stop request instead. The stop is journaled as sent once Nova
    accepted it (`sent:stop_source`), before the wait for `SHUTOFF`, so a step that fails while waiting leaves a
-   journal the rollback starts the source from; a stop call that itself fails leaves the journal empty. A step
+   journal the rollback starts the source from; a stop call that itself fails leaves the journal empty. A stop
+   that already runs — Nova's `task_state` `powering-off`, while the server still reads `ACTIVE` until the guest is
+   down: the one a retried step finds, or one that a stop refused with 409 shows began meanwhile — is waited for and
+   never sent again, since Nova refuses a second stop while one runs; the journal keeps the first stop's time
+   (review RV26-02). A step
    that ends without `SHUTOFF` once the stop was journaled as sent — a failure, or a cancel (the step timeout, a
    rollback request, a shutdown) — opens the clock at that mark's time: the source may be stopped, so the
    automatic rollback (§8) runs and a cancel is refused (§5.1) (audit EX-02).
@@ -1453,7 +1457,9 @@ volumes with their server, so the order is:
 
 Rollback walks the journal backwards. While the source server still exists (a failure before step 4)
 it sets every attachment's journaled `delete_on_termination` back and starts the server — also when only the stop
-was journaled as sent. An empty journal means the source was never stopped. Otherwise:
+was journaled as sent. A server Nova still powers off (`task_state` `powering-off`) reads `ACTIVE` and refuses a
+start until the guest is down: the rollback waits for `SHUTOFF` first, then starts it (review RV26-01). An empty
+journal means the source was never stopped. Otherwise:
 delete the destination server; delete the destination ports step 8 created through Neutron (journaled, or
 unbound with their description: a create sent before a crash), which Nova keeps; unmanage at RHOSO; manage at the
 source with the reference for the source's family and pool, named `volume-<rhoso_volume_id>`, and the
