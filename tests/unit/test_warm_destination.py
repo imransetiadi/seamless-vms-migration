@@ -214,6 +214,78 @@ def test_create_instance_module_finishes_a_recorded_server_an_operator_renamed(t
     assert "dst-srv" in dst.servers
 
 
+@pytest.mark.parametrize("recorded", ["gone", "none", "no state dir"])
+def test_create_instance_module_finish_only_never_creates_a_server(tmp_path, recorded):
+    """SDD §6.4 (audit A-07): the warm cutover's re-run finishes the server its warm state records,
+    passing an empty block device mapping. When that server vanished between the role's lookup and
+    this call, a create would build a server without the synchronised volumes - an image-booted VM
+    boots from its image - and record it as the destination, after the source stopped. With
+    finish_only the module never creates one - not even when warm_state_dir names no directory -:
+    it fails, naming the rollback, and leaves the record as it is."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_create_instance as create_module,
+    )
+
+    dst, state_dir = migrated(tmp_path)
+    del dst.servers["dst-srv"]  # gone since the role looked it up
+    if recorded == "none":
+        warm_migration.record_destination_server(state_dir, "srv-1", None)
+    args = dict(_create_instance_args(state_dir), block_device_mapping=[], finish_only=True)
+    if recorded == "no state dir":
+        args["warm_state_dir"] = ""
+    created = []
+
+    def fake_create(self, conn, block_device_mapping, on_create=None):
+        created.append(block_device_mapping)
+        new = dst.add_server("dst-new", "vm1")
+        if on_create is not None:  # none without a warm state
+            on_create(new)
+        return new
+
+    with mock.patch.object(server.Server, "create", fake_create), mock.patch.object(
+        server.Server, "from_sdk", return_value=mock.Mock(data={"params": {"name": "vm1"}})
+    ):
+        result = fake.run_module(create_module, args, dst)
+
+    assert created == []  # never a server without the synchronised volumes
+    assert result["_exit_code"] not in (None, 0) and result.get("failed") is True, result
+    assert "rollback_workloads.yml" in result["msg"]
+    if recorded == "gone":
+        assert "dst-srv was not found" in result["msg"]
+    expected = None if recorded == "none" else "dst-srv"
+    assert WarmState.load(state_dir, "srv-1").destination_server_id == expected
+
+
+def test_create_instance_module_replaces_a_recorded_server_that_is_gone(tmp_path):
+    """SDD §6.4 (audit A-07): without finish_only - the first create, and the cold import, which
+    records its server too - a recorded server that is gone (deleted by hand since) is replaced by
+    the one the call creates from the block device mapping it got: a refusal would fail a cold
+    retry after the source stopped and its volumes were transferred."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_create_instance as create_module,
+    )
+
+    dst, state_dir = migrated(tmp_path)
+    del dst.servers["dst-srv"]
+    created = []
+
+    def fake_create(self, conn, block_device_mapping, on_create=None):
+        created.append(block_device_mapping)
+        new = dst.add_server("dst-new", "vm1")
+        on_create(new)
+        return new
+
+    with mock.patch.object(server.Server, "create", fake_create), mock.patch.object(
+        server.Server, "from_sdk", return_value=mock.Mock(data={"params": {"name": "vm1"}})
+    ):
+        result = fake.run_module(create_module, _create_instance_args(state_dir), dst)
+
+    assert result["_exit_code"] in (None, 0), result
+    assert result["changed"] is True and result["server_id"] == "dst-new"
+    assert created == [BDM]
+    assert WarmState.load(state_dir, "srv-1").destination_server_id == "dst-new"
+
+
 # --- rollback ------------------------------------------------------------------
 
 

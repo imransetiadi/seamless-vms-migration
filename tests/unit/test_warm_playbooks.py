@@ -572,6 +572,29 @@ def test_cutover_rerun_finishes_a_healthy_destination_server(env):
     assert [c["args"]["server"] for c in calls if c["module"] == "server_info"] == ["dst-vm1", "dst-vm2"]
 
 
+def test_only_the_cutover_rerun_asks_create_instance_to_finish_only(env, tmp_path):
+    """SDD §6.4 (audit A-07): the re-run's call finishes the recorded server and must never create
+    one (finish_only); the first create and the cold import create the server from their block
+    device mapping, replacing a recorded server that is gone."""
+
+    def finish_only(calls):
+        return [c["args"].get("finish_only", False) for c in calls
+                if c["module"] == "import_workload_create_instance"
+                and c["args"]["data"]["params"]["name"] == "vm1"]
+
+    rc, out, first = env.run("import_workloads_cutover")
+    assert rc == 0, out
+    rc, out, rerun = env.run("import_workloads_cutover")
+    assert rc == 0, out
+    cold = Env(str(tmp_path / "cold"))
+    rc, out, cold_calls = cold.run("import_workloads", **COLD)
+    assert rc == 0, out
+
+    assert finish_only(first) == [False]
+    assert finish_only(rerun) == [True]
+    assert finish_only(cold_calls) == [False]
+
+
 def test_rollback_passes_the_destination_conversion_host(env):
     rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out

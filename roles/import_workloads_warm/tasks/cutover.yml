@@ -58,6 +58,9 @@
             data: "{{ item }}"
             block_device_mapping: []
             warm_state_dir: "{{ os_migrate_warm_state_dir }}"
+            # never a create: the server may vanish after the lookup above, and one built from an
+            # empty block device mapping lacks the synchronised volumes (SDD 6.4, audit A-07)
+            finish_only: true
 
         - name: Report a workload that was already cut over
           ansible.builtin.debug:

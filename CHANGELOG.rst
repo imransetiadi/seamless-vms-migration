@@ -556,3 +556,12 @@ This project follows a simple changelog to satisfy collection metadata validatio
   detached the volume by hand; where it extends one, the pass waited until its
   timeout for the volume to read ``available``, which an attached volume never
   does.
+- A warm cutover's re-run finishes the destination server its warm state
+  records through ``import_workload_create_instance``'s new ``finish_only``
+  option, with which the module never creates a server: a recorded server
+  that vanished after the role looked it up fails the re-run, which names the
+  rollback. Before, the module fell through to a create with an empty block
+  device mapping - a server without the synchronised volumes, an image-booted
+  VM booting from its image - and recorded it as the destination. Without
+  ``finish_only`` (the first create, the cold import) a recorded server that
+  is gone is still replaced by the one the call creates.
