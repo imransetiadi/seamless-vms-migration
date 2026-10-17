@@ -107,6 +107,21 @@ def _marked(volume: Mapping[str, Any], key: str) -> bool:
     return (volume.get("metadata") or {}).get(key) == "true"
 
 
+#: Cinder states from which a volume cannot be attached - and so not synced - but is deleted
+#: without a reset (SDD §7.2, review RV30-07)
+UNATTACHABLE = frozenset({"error", "error_restoring", "error_extending", "error_managing"})
+
+
+def _resumable(volume: Mapping[str, Any]) -> bool:
+    """A kit volume a vmware_warm run syncs onto by CBT: not converted, its copy completed (marked
+    copied) and attachable (SDD §7.2, reviews RV30-01, RV30-07)."""
+    return (
+        not _marked(volume, "converted")
+        and _marked(volume, "seamless_copied")
+        and str(volume.get("status") or "") not in UNATTACHABLE
+    )
+
+
 SERVER_TYPE = "openstack.compute.Server"
 OPENSTACK = frozenset({Strategy.cold, Strategy.warm})
 VMWARE = frozenset({Strategy.vmware_cold, Strategy.vmware_warm})
@@ -1181,13 +1196,14 @@ class AnsibleExecutor:
         """Before a vmware_warm kit run, delete each first copy cut off: a kit volume of the VM
         neither converted nor marked copied. The kit wrote its changeID before the copy it never
         finished, and would sync onto it only what the source changed since; deleted, the disk is
-        copied in full (SDD §7.2, review RV30-01). The destination's conversion host holding one
-        - a killed run's - lets go of it first; one another server holds stays."""
+        copied in full (SDD §7.2, review RV30-01). A marked one Cinder cannot attach goes too
+        (review RV30-07). The destination's conversion host holding one - a killed run's - lets go
+        of it first; one another server holds stays."""
         dst = self.providers.get(ctx.destination)
         host: list[str | None] = []  # looked up once, for the first copy held
         try:
             for volume in volumes:
-                if _marked(volume, "converted") or _marked(volume, "seamless_copied"):
+                if _marked(volume, "converted") or _resumable(volume):
                     continue
                 holders = [str(holder) for holder in volume.get("attachments") or []]
                 if holders:
@@ -1482,11 +1498,13 @@ class AnsibleExecutor:
         and the metadata ``osm``; one it marked ``converted`` it takes as migrated - no copy, no
         power-off, the new server booted from the first attempt's disk while the source runs
         again - and onto any other a vmware_cold run refuses to copy. A vmware_warm volume not
-        converted stays when marked copied - the next pass syncs it by CBT -, and one not marked,
-        a first copy cut off, goes (review RV30-01). The destination's conversion host holding
-        one is the kit's copy a cut-off run left: detached first (review RV29-02). A volume
-        another server holds is never deleted, nor one of ``kept`` - what a server found only by
-        name held (review RV29-03) -, nor any of a VM without a kit name."""
+        converted stays when marked copied and attachable - the next pass syncs it by CBT -, and
+        one not marked, a first copy cut off, goes (reviews RV30-01, RV30-07); with a recorded
+        server - the kit booted it from all of them - every one goes (review RV30-02). The
+        destination's conversion host holding one is the kit's copy a cut-off run left: detached
+        first (review RV29-02). A volume another server holds is never deleted, nor one of
+        ``kept`` - what a server found only by name held (review RV29-03) -, nor any of a VM
+        without a kit name."""
         m = ctx.migration
         if not kit_vm_name(m.vm.name):
             return []
@@ -1505,12 +1523,10 @@ class AnsibleExecutor:
                     holders = [holder for holder in holders if holder != host]
                 if any(holder != server_id for holder in holders):
                     continue
-            if (
-                m.strategy != Strategy.vmware_cold
-                and not _marked(volume, "converted")
-                and _marked(volume, "seamless_copied")
-            ):
-                continue  # a warm copy that completed: the next pass syncs it by CBT
+            if m.strategy != Strategy.vmware_cold and server_id is None and _resumable(volume):
+                # a warm copy that completed, from which no recorded server booted: the next pass
+                # syncs it by CBT (reviews RV30-01, RV30-02, RV30-07)
+                continue
             await dst.delete_volume(volume["id"])
             deleted.append(str(volume["id"]))
         return deleted
@@ -1558,19 +1574,17 @@ class AnsibleExecutor:
                 server_id = await dst.find_server(kit_vm_name(vm.name))
                 if server_id:
                     # it may be another plan's VM the kit names alike (owner question q26): what
-                    # it holds stays, its deletion detaching it notwithstanding (review RV29-03)
-                    kept = {
-                        str(v["id"])
-                        for v in await dst.volumes()
-                        if str(server_id) in map(str, v.get("attachments") or [])
-                    }
+                    # it holds stays, its deletion detaching it notwithstanding (review RV29-03) -
+                    # read from Nova's record, as no Cinder call comes before the power-on
+                    kept = set(await dst.server_volumes(server_id))
             if server_id:
                 await dst.delete_server(server_id)
-            deleted_ports = await self._delete_kit_ports(dst, vm.nics, vm.name)
-            # the source first: the destination's clean-up never keeps it stopped - a volume
-            # Cinder will not delete fails the attempt, which a retry repeats with the source
-            # running (SDD §7.2, §8, review RV29-01)
+            # the source next: only the server's deletion comes before it - two live copies on
+            # a stretched network -, and the destination's clean-up never keeps it stopped - the
+            # kit's ports and volumes matter only to the next attempt, which a failure there
+            # retries with the source running (SDD §7.2, §8, reviews RV29-01, RV30-04)
             await self.providers.get(ctx.source).power_on(vm.source_id)
+            deleted_ports = await self._delete_kit_ports(dst, vm.nics, vm.name)
             deleted_volumes = await self._delete_kit_volumes(
                 ctx, dst, m.destination_server_id, kept
             )

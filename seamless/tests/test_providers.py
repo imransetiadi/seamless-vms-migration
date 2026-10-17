@@ -1867,6 +1867,26 @@ async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_fre
     ]
 
 
+async def test_openstack_destination_reads_the_volumes_nova_lists_for_a_server():
+    """SDD §10 (§7.2 VMware rollback, review RV30-04): server_volumes reads Nova's record of the
+    server - no Cinder or Neutron call, so a rollback reads it before the source's power-on; a
+    server gone holds none."""
+    import openstack.exceptions
+
+    class Compute:
+        def get_server(self, server_id):
+            if server_id == "gone":
+                raise openstack.exceptions.NotFoundException("No Server found for gone")
+            return NS(attached_volumes=[{"id": "vol-1"}, NS(id="vol-2")])
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: NS(compute=Compute()))
+    assert await provider.server_volumes("srv-1") == ["vol-1", "vol-2"]
+    assert await provider.server_volumes("gone") == []
+
+
 async def test_openstack_destination_marks_a_volume_keeping_its_other_metadata():
     """SDD §10 (§7.2 VMware, review RV30-01): set_volume_metadata sets the given keys through
     Cinder's merge (POST /volumes/{id}/metadata), so the kit's own keys - osm, changeID - stay."""

@@ -75,6 +75,11 @@ class DestinationProvider(Protocol):
         volume available, within the call's bound; one not attached to it is no error."""
         ...
 
+    async def server_volumes(self, server_id: str) -> list[str]:
+        """The ids of the volumes Nova lists as attached to the server - its record alone, no
+        Cinder or Neutron call; a server gone holds none (§7.2)."""
+        ...
+
     async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
         """Set the given metadata keys on the volume and keep its other keys (Cinder's merge),
         within the call's bound: the mark of a VMware kit copy that completed (§7.2)."""

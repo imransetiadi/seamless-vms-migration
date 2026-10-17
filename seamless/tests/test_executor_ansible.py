@@ -142,6 +142,11 @@ class FakeImpl:
             if volume["id"] == volume_id:
                 volume["attachments"] = [s for s in volume["attachments"] if s != server_id]
 
+    async def server_volumes(self, server_id):
+        """Nova's record of the volumes attached to the server (SDD §10)."""
+        self.calls.append(("server_volumes", server_id))
+        return [v["id"] for v in self.registry.volumes if server_id in v.get("attachments", [])]
+
     async def set_volume_metadata(self, volume_id, metadata):
         """Cinder's merge of metadata keys into the volume's (SDD §10)."""
         self.calls.append(("set_volume_metadata", volume_id, dict(metadata)))
@@ -1345,8 +1350,9 @@ async def test_vmware_rollback_deletes_destination_and_powers_on_source(env):
 async def test_vmware_rollback_deletes_the_kits_ports_of_the_vm(env):
     """SDD §7.2: the kit creates each port and gives Nova its id, and Nova only unbinds such a port
     when it deletes the server - it would keep the NIC's MAC and addresses and refuse the next
-    attempt. The rollback deletes, after the server, the unbound ports with one of the VM's NIC
-    MACs and the kit's name form; any other port is kept (review RT-11)."""
+    attempt. The rollback deletes, after the server and the source's power-on (review RV30-04), the
+    unbound ports with one of the VM's NIC MACs and the kit's name form; any other port is kept
+    (review RT-11)."""
     mac = "00:50:56:00:00:01"
     nic = Nic(network="app-net", mac=mac, fixed_ips=["10.0.0.5"], network_key="app-net")
 
@@ -1376,17 +1382,18 @@ async def test_vmware_rollback_deletes_the_kits_ports_of_the_vm(env):
     result = await env.executor.run(StepName.ROLLBACK, ctx)
     assert env.registry.calls == [
         ("delete_server", "dst-9"),
-        ("delete_port", "kit"),
         ("power_on", "srv-1"),
+        ("delete_port", "kit"),
     ]
     assert result.details["deleted_ports"] == ["kit"]
     assert [p["id"] for p in env.registry.ports] == ["bound", "named-otherwise", "other-mac"]
-    # ports that cannot be read: the rollback is retried, the source not yet started
+    # ports that cannot be read: the rollback is retried - with the source already running, as
+    # the ports matter only to the next attempt (review RV30-04)
     env.registry.calls.clear()
     env.registry.ports_error = True
     with pytest.raises(TransientStepError, match="rollback: ports: HTTP 503"):
         await env.executor.run(StepName.ROLLBACK, ctx)
-    assert ("power_on", "srv-1") not in env.registry.calls
+    assert env.registry.calls == [("delete_server", "dst-9"), ("power_on", "srv-1")]
 
 
 async def test_vmware_runs_refuse_a_nic_whose_mac_or_address_another_port_holds(env):
@@ -2875,9 +2882,11 @@ async def test_a_vmware_rollback_deletes_the_kit_volumes_its_next_run_would_take
     the new server booted from the first attempt's disk while the source runs again. The rollback
     deletes, once the source is powered on (review RV29-01), every such volume marked converted,
     and for a vmware_cold migration (whose kit run refuses an existing volume) any such volume; a
-    vmware_warm volume not converted whose copy completed (marked, review RV30-01) stays for the
-    next pass's CBT sync, and one not marked - a first copy cut off - goes. Another VM's volume, one
-    without the kit's metadata or of another name form, and one another server holds stay."""
+    vmware_warm volume not converted stays for the next pass's CBT sync only when its copy
+    completed (marked, review RV30-01) and no destination server booted from it - here the
+    migration recorded one, which the kit created from every kit volume of the VM (review
+    RV30-02), so all go. Another VM's volume, one without the kit's metadata or of another name
+    form, and one another server holds stay."""
     env.registry.volumes = [
         kit_volume("converted", "web01_example_com-2000"),
         kit_volume("detaching", "web01_example_com-2001", attachments=["dst-9"]),
@@ -2899,10 +2908,8 @@ async def test_a_vmware_rollback_deletes_the_kit_volumes_its_next_run_would_take
         destination_server_id="dst-9",
     )
     result = await env.executor.run(StepName.ROLLBACK, ctx)
-    gone = ["converted", "detaching"] + (
-        ["unconverted"] if strategy == Strategy.vmware_cold else []
-    )
-    gone += ["cut-off"]  # not marked: a first copy cut off (review RV30-01)
+    # a recorded server booted from them all: the marked one goes too (review RV30-02)
+    gone = ["converted", "detaching", "unconverted", "cut-off"]
     assert result.details["deleted_volumes"] == gone
     assert env.registry.calls == [
         ("delete_server", "dst-9"),
@@ -2920,7 +2927,6 @@ async def test_a_vmware_rollback_deletes_the_kit_volumes_its_next_run_would_take
         "prefixed",
         "held",
     }
-    kept |= {"unconverted"} if strategy == Strategy.vmware_warm else set()
     assert {v["id"] for v in env.registry.volumes} == kept
     # volumes that cannot be read: the rollback is retried, the source started all the same
     env.registry.calls.clear()
@@ -3114,6 +3120,89 @@ async def test_a_vmware_rollback_detaches_the_kits_copy_from_its_conversion_host
     assert kept == ([] if deleted else [{**kept[0], "attachments": []}])
 
 
+async def test_a_vmware_rollback_reads_no_cinder_before_the_power_on(env):
+    """SDD §7.2, §8 (review RV30-04): only the server's deletion comes before the source's
+    power-on; what a server found only by name held (owner question q26, review RV29-03) is read
+    from Nova's record of it. An outage of Cinder that failed the cutover fails the attempt with
+    the source running, never before its power-on."""
+    env.registry.existing = {"web-01"}
+    env.registry.volumes = [kit_volume("root", "web-01-2000", attachments=["dst-web-01"])]
+    env.registry.volumes_error = True
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, downtime_started_at=utcnow()
+    )
+    with pytest.raises(TransientStepError, match="rollback: volumes: HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert env.registry.calls == [
+        ("find_server", "web-01"),
+        ("server_volumes", "dst-web-01"),
+        ("delete_server", "dst-web-01"),
+        ("power_on", "srv-1"),
+    ]
+
+
+async def test_a_vmware_rollback_with_a_recorded_server_deletes_every_kit_volume_of_the_vm(env):
+    """SDD §7.2 (review RV30-02): the kit created the recorded destination server from every kit
+    volume of the VM, and its guest may have written to each - a journal replay, a database's
+    crash recovery, days of service - which a CBT sync, copying only what the source changed,
+    never undoes. With a recorded server the rollback deletes every one of them, a marked copy
+    too, so the next pass copies them in full - also in an attempt retried after the first one
+    deleted the server, which Nova then no longer knows."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000", attachments=["dst-9"]),
+        kit_volume("data", "web-01-2001", converted=False, copied=True, attachments=["dst-9"]),
+    ]
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_warm, source=VCENTER, destination_server_id="dst-9"
+    )
+    vcenter_down = {"failing": True}
+
+    async def power_on(source_id):
+        env.registry.calls.append(("power_on", source_id))
+        if vcenter_down["failing"]:
+            raise ProviderError("vcenter: HTTP 503")
+
+    class FailingOnce(FakeImpl):
+        pass
+
+    FailingOnce.power_on = staticmethod(power_on)
+    env.registry.get = lambda provider: FailingOnce(env.registry)
+    with pytest.raises(TransientStepError, match="vcenter: HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert [v["id"] for v in env.registry.volumes] == ["boot", "data"]  # detached, not deleted
+    vcenter_down["failing"] = False
+    result = await env.executor.run(StepName.ROLLBACK, ctx)  # the retry: dst-9 is gone
+    assert result.details["deleted_volumes"] == ["boot", "data"]
+    assert env.registry.volumes == []
+
+
+@pytest.mark.parametrize(
+    "status", ["error", "error_restoring", "error_extending", "error_managing"]
+)
+async def test_a_marked_kit_volume_cinder_cannot_attach_is_deleted(env, status):
+    """SDD §7.2 (review RV30-07): a marked vmware_warm kit volume in an error state Cinder cannot
+    attach would fail every later pass at its attach - no dashboard action gets past it. It goes
+    before a run, as a first copy cut off does, and in the rollback; an available one stays."""
+
+    def volumes():
+        return [
+            dict(kit_volume("broken", "web-01-2000", converted=False, copied=True), status=status),
+            kit_volume("fine", "web-01-2001", converted=False, copied=True),
+        ]
+
+    env.registry.volumes = volumes()
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    assert [v["id"] for v in env.registry.volumes] == ["fine"]
+    env.registry.volumes = volumes()
+    rollback, _ = ctx_for(
+        env, strategy=Strategy.vmware_warm, source=VCENTER, downtime_started_at=utcnow()
+    )
+    result = await env.executor.run(StepName.ROLLBACK, rollback)
+    assert result.details["deleted_volumes"] == ["broken"]
+    assert [v["id"] for v in env.registry.volumes] == ["fine"]
+
+
 def _kit_leaves(env, monkeypatch, volumes, *, fail=None):
     """The kit's run, as the executor's: ``volumes`` are what it created or left in the
     destination project; ``fail`` makes Cinder unanswering right after it (review RV30-01)."""
@@ -3284,6 +3373,7 @@ async def test_a_vmware_rollback_after_the_stop_deletes_the_server_the_kit_named
     result = await executor.run(StepName.ROLLBACK, ctx)
     assert registry.calls == [
         ("find_server", "web01_example_com"),
+        ("server_volumes", "dst-web01_example_com"),
         ("delete_server", "dst-web01_example_com"),
         ("power_on", "srv-1"),
     ]
@@ -3346,6 +3436,7 @@ async def test_vmware_rollback_deletes_by_name_only_after_a_stop(env):
     result = await executor.run(StepName.ROLLBACK, ctx)
     assert registry.calls == [
         ("find_server", "web-01"),
+        ("server_volumes", "dst-web-01"),
         ("delete_server", "dst-web-01"),
         ("power_on", "srv-1"),
     ]

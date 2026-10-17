@@ -250,6 +250,9 @@ class OpenStackProvider:
     async def detach_volume(self, server_id: str, volume_id: str) -> None:
         await self._run(self._detach_volume, server_id, volume_id)
 
+    async def server_volumes(self, server_id: str) -> list[str]:
+        return await self._run(self._server_volumes, server_id)
+
     async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
         await self._run(self._set_volume_metadata, volume_id, metadata)
 
@@ -591,6 +594,18 @@ class OpenStackProvider:
             failures=["error"],
             wait=max(1, int(deadline - time.monotonic())),
         )
+
+    def _server_volumes(self, server_id: str) -> list[str]:
+        # Nova's record of the server (os-extended-volumes): no Cinder call, so a VMware rollback
+        # reads it before the source's power-on (SDD §7.2, §10)
+        import openstack.exceptions
+
+        try:
+            server = self._connection().compute.get_server(server_id)
+        except openstack.exceptions.NotFoundException:
+            return []  # a server gone holds none
+        attached = _attr(server, "attached_volumes", default=None) or []
+        return [str(_attr(v, "id")) for v in attached if _attr(v, "id")]
 
     def _set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
         # Cinder's POST /volumes/{id}/metadata merges: the kit's own keys stay (SDD §7.2, §10)
