@@ -1209,7 +1209,10 @@ class Orchestrator:
                 raise NotAllowed(f"a {fresh.status} plan cannot be started; validate it first")
             fresh.status = PlanStatus.running
 
-        plan = await self._update_plan(plan.id, start)
+        # PATCH /providers checks for running plans and writes under this lock (SDD §12, audit
+        # AP-07): taken last and innermost, it holds no other (§8)
+        async with self.provider_lock():
+            plan = await self._update_plan(plan.id, start)
         await self._emit("plan.started", f"{plan.name} started", plan_id=plan.id, actor=actor)
         self.wake()
         return plan

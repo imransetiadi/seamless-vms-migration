@@ -237,22 +237,27 @@ async def update_provider(
     if isinstance(body.get("name"), str) and is_blank(body["name"]):
         # at the request boundary: a provider stored blank before keeps loading (RV20-11)
         raise ApiError(422, "validation_error", f"name: {BLANK_NAME}")
-    provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
-    users = await _plans_using(request, provider_id, ACTIVE_PLAN_STATUSES)
-    if users:
-        raise ApiError(
-            409, "conflict", f"provider is used by running or paused plan(s): {', '.join(users)}"
-        )
-    try:
-        updated = Provider.model_validate(
-            {**provider.model_dump(mode="json"), **body, **_SERVER_OWNED}
-        )
-    except ValidationError as exc:
-        raise ApiError(
-            422, "validation_error", validation_message(exc.errors(), "invalid provider")
-        ) from None
-    _check_secret_names(updated, set(body))
-    await svc.db.put("provider", updated, expected_version=version)
+    # the check and the write hold the lock a plan start takes for its status write, so no start
+    # lands between them and leaves a running plan on a changed provider (SDD §12, audit AP-07)
+    async with svc.orchestrator.provider_lock():
+        provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
+        users = await _plans_using(request, provider_id, ACTIVE_PLAN_STATUSES)
+        if users:
+            raise ApiError(
+                409,
+                "conflict",
+                f"provider is used by running or paused plan(s): {', '.join(users)}",
+            )
+        try:
+            updated = Provider.model_validate(
+                {**provider.model_dump(mode="json"), **body, **_SERVER_OWNED}
+            )
+        except ValidationError as exc:
+            raise ApiError(
+                422, "validation_error", validation_message(exc.errors(), "invalid provider")
+            ) from None
+        _check_secret_names(updated, set(body))
+        await svc.db.put("provider", updated, expected_version=version)
     await emit(
         svc.store,
         svc.bus,

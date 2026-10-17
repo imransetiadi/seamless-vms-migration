@@ -2046,3 +2046,51 @@ def test_a_plan_rewritten_under_every_retry_answers_409_after_backing_off(api, m
     assert all(0 < wait <= orchestrator.PLAN_UPDATE_BACKOFF_S for wait in waits)
     assert waits[0] <= 0.01 < 0.1 <= waits[-1], "5 ms doubling up to the cap, jittered"
     assert api.get(f"/api/v1/plans/{plan['id']}").json()["waves"] == []
+
+
+async def test_a_provider_edit_and_a_plan_start_never_interleave(tmp_path):
+    """SDD §12 (audit AP-07): PATCH /providers/{id} answers 409 while a running or paused plan uses
+    the provider. A start of such a plan landing between the edit's check and its write would
+    leave a running plan on a changed provider: the edit holds the providers lock across both, and
+    the start takes it for its status write, so the start waits for the edit and goes on after."""
+    store = Store(f"sqlite:///{tmp_path / 'edit.db'}")
+    store.create_schema()
+    tokens = write_tokens(tmp_path / "tokens.yaml")
+    settings = make_settings(tmp_path, tokens_file=tmp_path / "tokens.yaml", dashboard_dir=None)
+    h = build_harness(
+        tmp_path, store, [make_vm(source_id="vm-1", name="web-01")], settings=settings
+    )
+    plan = make_plan(vm_ids=["vm-1"], default_strategy="cold")
+    store.put("plan", plan, expected_version=0)
+    await h.orch.validate_plan(plan.id, "alice")
+    app = create_app(settings, orchestrator=h.orch)
+    admin = {"Authorization": f"Bearer {tokens[Role.admin]}"}
+    entered, release = asyncio.Event(), asyncio.Event()
+    put = h.orch.db.put
+
+    async def slow_put(kind, model, *args, **kw):
+        if kind == "provider" and not entered.is_set():
+            entered.set()  # the edit found no running plan; its write waits here
+            await release.wait()
+        return await put(kind, model, *args, **kw)
+
+    h.orch.db.put = slow_put
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        editing = asyncio.create_task(
+            c.patch(
+                "/api/v1/providers/src-osp",
+                headers=admin,
+                json={"endpoint": "https://other-cloud.example/v3"},
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        starting = asyncio.create_task(h.orch.start_plan(plan.id, "bob"))
+        await asyncio.sleep(0.05)  # as far as the start gets meanwhile
+        status_meanwhile = store.get("plan", plan.id, Plan).status
+        release.set()
+        edited, _ = await editing, await starting
+    await h.orch.stop()
+    assert status_meanwhile == PlanStatus.validated, "the start landed inside the edit"
+    assert edited.status_code == 200, edited.text  # the edit came first...
+    assert store.get("plan", plan.id, Plan).status == PlanStatus.running  # ...then the start
+    store.dispose()
