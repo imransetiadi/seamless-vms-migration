@@ -119,8 +119,11 @@ def test_proxy_methods_the_executor_and_provider_call():
     assert "all_projects" in inspect.signature(BlockStorage.snapshots).parameters or (
         "query" in inspect.signature(BlockStorage.snapshots).parameters
     )
-    # a flavor looked up below compute 2.61 brings its extra specs only when asked (RV31-04)
-    assert "get_extra_specs" in inspect.signature(Compute.get_flavor).parameters
+    # a flavor looked up below compute 2.61 brings its extra specs only when asked, read apart
+    # from the flavor so a refused read keeps the flavor (RV31-04, RV32B-03)
+    from openstack.compute.v2.flavor import Flavor
+
+    assert "session" in inspect.signature(Flavor.fetch_extra_specs).parameters
 
 
 def test_the_calls_the_vmware_rollback_and_the_kit_copies_rely_on():

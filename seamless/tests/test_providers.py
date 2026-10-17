@@ -1842,19 +1842,39 @@ def test_the_inventory_looks_up_a_flavor_nova_did_not_embed():
     assert ctx.server_to_vmref(Server(**body)).vcpus == 0
 
 
+def _looked_up_flavors(forbidden=False):
+    """openstacksdk's get_flavor over a Nova below 2.61: a flavor without extra specs, which
+    get_extra_specs=True or Flavor.fetch_extra_specs reads from os-extra_specs - refused (403)
+    where the policy forbids the credential to read them."""
+    import openstack.exceptions
+    from openstack.compute.v2.flavor import Flavor
+
+    class LookedUp(Flavor):
+        def fetch_extra_specs(self, session):
+            if forbidden:
+                raise openstack.exceptions.ForbiddenException(
+                    "Policy doesn't allow os_compute_api:os-flavor-extra-specs:index"
+                )
+            self._update(extra_specs={"resources:VGPU": "1"})
+            return self
+
+    def get_flavor(flavor_id, get_extra_specs=False):
+        flavor = LookedUp(id=flavor_id, name="g1.large", vcpus=8, ram=16384)
+        return flavor.fetch_extra_specs(None) if get_extra_specs else flavor
+
+    return get_flavor
+
+
 def test_the_inventory_reads_the_extra_specs_of_a_flavor_it_looked_up():
     """SDD §4.2, §9.3 (review RV31-04): below compute 2.61 Nova's flavor holds no extra specs -
     openstacksdk fetches them (os-extra_specs) only when asked. A flavor the inventory looks up
     because Nova did not embed it (below 2.47) is asked for them, so a vGPU or PCI-passthrough
     VM still carries its flavor_extra_specs - and gets its VM_VGPU or VM_PCI_PASSTHROUGH blocker."""
-    from openstack.compute.v2.flavor import Flavor
     from openstack.compute.v2.server import Server
 
     from seamless_migrate.providers.openstack import _MapContext
 
-    def get_flavor(flavor_id, get_extra_specs=False):
-        specs = {"resources:VGPU": "1"} if get_extra_specs else None
-        return Flavor(id=flavor_id, name="g1.large", vcpus=8, ram=16384, extra_specs=specs)
+    get_flavor = _looked_up_flavors()
 
     conn = NS(
         compute=NS(get_flavor=get_flavor, volume_attachments=lambda server: []),
@@ -1865,6 +1885,29 @@ def test_the_inventory_reads_the_extra_specs_of_a_flavor_it_looked_up():
     body = {"id": "srv-1", "name": "gpu-01", "status": "ACTIVE", "image": {"id": "img-1"}}
     vm = _MapContext(conn).server_to_vmref(Server(**body, flavor={"id": "flv-gpu", "links": []}))
     assert (vm.flavor, vm.flavor_extra_specs) == ("g1.large", {"resources:VGPU": "1"})
+
+
+def test_the_inventory_keeps_a_looked_up_flavor_whose_extra_specs_it_may_not_read():
+    """SDD §4.2 (review RV32B-03): a policy may forbid the credential to read flavor extra specs
+    (os-extra_specs answers 403). The flavor the inventory looked up is then kept without them -
+    its vCPUs, RAM and name - as Nova 2.47+ leaves the specs out under that policy; never a VM read
+    as 0 vCPUs and no flavor."""
+    from openstack.compute.v2.server import Server
+
+    from seamless_migrate.providers.openstack import _MapContext
+
+    conn = NS(
+        compute=NS(
+            get_flavor=_looked_up_flavors(forbidden=True), volume_attachments=lambda server: []
+        ),
+        network=NS(ports=lambda **kw: [], get_network=lambda network_id: None),
+        identity=NS(get_project=lambda project_id: None),
+        image=NS(get_image=lambda image_id: None),
+    )
+    body = {"id": "srv-1", "name": "gpu-01", "status": "ACTIVE", "image": {"id": "img-1"}}
+    vm = _MapContext(conn).server_to_vmref(Server(**body, flavor={"id": "flv-gpu", "links": []}))
+    assert (vm.vcpus, vm.ram_mb, vm.flavor) == (8, 16384, "g1.large")
+    assert not vm.flavor_extra_specs
 
 
 @pytest.mark.parametrize(
