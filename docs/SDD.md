@@ -2948,7 +2948,14 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
 0 or more, 0 keeping the meaning each row gives it; `SEAMLESS_DEMO_FAILURE_RATE` and
 `SEAMLESS_JEV_MIN_CONFIDENCE` 0…1. Each entry of `SEAMLESS_CORS_ORIGINS` is one origin as a browser sends it -
 `http` or `https`, a host, an optional port 1…65535, no user, path, query or fragment (not even a trailing `/`, which
-would never match) - and never `*`, which would let every page call the API (Security.md C1-12, audit AP-10).
+would never match) - and never `*`, which would let every page call the API (Security.md C1-12, audit AP-10). The
+comparison is exact, so an entry is written as the URL Standard's host parser serializes it, or refused naming that
+spelling (review RV27-08): the host lower-cased and in punycode, a percent-encoded host decoded, a host ending in a
+number an IPv4 address in any of its forms written dotted in decimal, an IPv6 address in hex pieces with the first
+longest run of zeros compressed, no default port. A host holding `ß`, `ς` or a zero-width joiner - whose ASCII form
+Python's IDNA 2003 writes otherwise than browsers do - is refused without a spelling, asking for the `xn--` form the
+browser sends; a host the URL Standard rejects (an IPv4 part out of range, an IPv6 zone, a character it forbids)
+is no origin a browser sends (review RV31-03).
 
 ---
 
