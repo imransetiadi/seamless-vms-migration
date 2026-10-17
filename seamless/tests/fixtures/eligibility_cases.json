@@ -1,5 +1,5 @@
 {
-  "_comment": "The API's eligibility reasons per strategy (planning/selector.py) and its finding messages (planning/preflight.py) for each finding case - `others` are the plan's other selected VMs, `source_kind` the source provider's kind (openstack when not given): test_selector.py and test_preflight.py run them against the API, mockData.test.ts against the dashboard's mock, which words them as the API does (SDD §9.2, §9.3, §16, review RV20-08). source/destination give a provider's capabilities and whether it has a conversion host, as provider_caps reads them.",
+  "_comment": "The API's eligibility reasons per strategy (planning/selector.py) and its finding messages (planning/preflight.py) for each finding case - `others` are the plan's other selected VMs, `source_kind` the source provider's kind (openstack when not given): test_selector.py and test_preflight.py run them against the API, mockData.test.ts against the dashboard's mock, which words them as the API does (SDD §9.2, §9.3, §16, review RV20-08). source/destination give a provider's capabilities and whether it has a conversion host, as provider_caps reads them. A network case gives `destination` - its label, kind, networks (id, name, mtu, project_id, own, shared, external), subnets, the token's roles and its policy profile, as the check reports them - and the plan its mappings, prestage_resources and nic_overrides (SDD §6.6, §7.3 step 0, §9.3, §21.5).",
   "cases": [
     {
       "why": "an OpenStack VM every strategy takes",
@@ -2353,6 +2353,1205 @@
       },
       "expected": {
         "APP_PROBE_MISSING": "report-01 is a database VM without an application probe: verification would check only that it booted."
+      }
+    },
+    {
+      "why": "a NIC on a network with no mapping and no same-named network in the destination",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "web-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {}
+        },
+        "prestage_resources": []
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "roles": [
+          "member"
+        ],
+        "policy_profile": "secure_rbac"
+      },
+      "expected": {
+        "MAP_NETWORK_MISSING": "No mapping or same-named network in DC3 Jakarta for: web-net."
+      }
+    },
+    {
+      "why": "the same NIC when pre-staging creates the network",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "web-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {}
+        },
+        "prestage_resources": [
+          "networks"
+        ]
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "roles": [
+          "member"
+        ],
+        "policy_profile": "secure_rbac"
+      },
+      "expected": {
+        "MAP_NETWORK_PRESTAGED": "Pre-staging creates same-named network(s) in DC3 Jakarta: web-net."
+      }
+    },
+    {
+      "why": "a VMware NIC on an unmapped port group: VMware sources are not pre-staged",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "dc2-prod",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {}
+        },
+        "prestage_resources": [
+          "networks"
+        ]
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "roles": [
+          "member"
+        ],
+        "policy_profile": "secure_rbac"
+      },
+      "expected": {
+        "MAP_NETWORK_MISSING": "No mapping or same-named network in DC3 Jakarta for: dc2-prod. VMware sources are not pre-staged: map every port group."
+      }
+    },
+    {
+      "why": "a network mapped to a target the destination lacks",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "web-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "mappings": {
+          "networks": {
+            "web-net": "ghost-net"
+          },
+          "flavors": {},
+          "volume_types": {},
+          "projects": {}
+        },
+        "prestage_resources": []
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "roles": [
+          "member"
+        ],
+        "policy_profile": "secure_rbac"
+      },
+      "expected": {
+        "MAP_NETWORK_MISSING": "Network mapping target(s) do not exist in DC3 Jakarta: web-net -> ghost-net."
+      }
+    },
+    {
+      "why": "two NICs on network names that two other projects each use, none in the credential's own",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          },
+          {
+            "network": "web-net",
+            "mac": "fa:16:3e:00:00:02",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {}
+        },
+        "prestage_resources": []
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-a",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "tenant-a",
+            "own": false,
+            "shared": true,
+            "external": false
+          },
+          {
+            "id": "n-b",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "tenant-b",
+            "own": false,
+            "shared": true,
+            "external": false
+          },
+          {
+            "id": "n-c",
+            "name": "web-net",
+            "mtu": 1500,
+            "project_id": "tenant-c",
+            "own": false,
+            "shared": true,
+            "external": false
+          },
+          {
+            "id": "n-d",
+            "name": "web-net",
+            "mtu": 1500,
+            "project_id": "tenant-d",
+            "own": false,
+            "shared": true,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "roles": [
+          "member"
+        ],
+        "policy_profile": "secure_rbac"
+      },
+      "expected": {
+        "MAP_NETWORK_AMBIGUOUS": "The cutover cannot tell these networks of DC3 Jakarta apart: fa:16:3e:00:00:01 (app-net): 2 networks of other projects are named 'app-net' (tenant-a, tenant-b), none of the credential's project; fa:16:3e:00:00:02 (web-net): 2 networks of other projects are named 'web-net' (tenant-c, tenant-d), none of the credential's project."
+      }
+    },
+    {
+      "why": "another project's private network, and a shared one the token's roles may not choose an address on",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "priv-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          },
+          {
+            "network": "shared-net",
+            "mac": "fa:16:3e:00:00:02",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {}
+        },
+        "prestage_resources": []
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-p",
+            "name": "priv-net",
+            "mtu": 1500,
+            "project_id": "tenant-p",
+            "own": false,
+            "shared": false,
+            "external": false
+          },
+          {
+            "id": "n-s",
+            "name": "shared-net",
+            "mtu": 1500,
+            "project_id": "tenant-s",
+            "own": false,
+            "shared": true,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "roles": [
+          "member"
+        ],
+        "policy_profile": "secure_rbac"
+      },
+      "expected": {
+        "NET_PORT_NOT_PERMITTED": "The credential of DC3 Jakarta may not put these NICs on their network: fa:16:3e:00:00:01 on 'priv-net' (project tenant-p): it is neither shared with the credential's project nor external; fa:16:3e:00:00:02 on 'shared-net' (project tenant-s): Neutron's secure-RBAC defaults let only the admin or service role, or that project, choose a port's address or MAC there, and the credential's token has neither."
+      }
+    },
+    {
+      "why": "a shared network of another project when the destination's policy profile is unknown",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "shared-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {}
+        },
+        "prestage_resources": []
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-s",
+            "name": "shared-net",
+            "mtu": 1500,
+            "project_id": "tenant-s",
+            "own": false,
+            "shared": true,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "roles": [
+          "member"
+        ],
+        "policy_profile": "unknown"
+      },
+      "expected": {
+        "NET_PORT_NOT_PERMITTED": "The credential of DC3 Jakarta may not put these NICs on their network: fa:16:3e:00:00:01 on 'shared-net' (project tenant-s): the policy profile of DC3 Jakarta is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check DC3 Jakarta so its series is detected, or declare its policy profile or series)."
+      }
+    },
+    {
+      "why": "a jumbo-frame NIC on a destination network with a smaller MTU",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [],
+            "vnic_type": "normal",
+            "mtu": 9000,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {}
+        },
+        "prestage_resources": []
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "roles": [
+          "member"
+        ],
+        "policy_profile": "secure_rbac"
+      },
+      "expected": {
+        "NET_MTU_SHRINK": "The MTU in DC3 Jakarta is smaller: app-net 9000 -> 1500."
+      }
+    },
+    {
+      "why": "an address outside every subnet of the destination network",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.168.9.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {}
+        },
+        "prestage_resources": []
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [
+          {
+            "id": "s1",
+            "name": "app-v4",
+            "network": "app-net",
+            "network_id": "n-app",
+            "cidr": "10.0.0.0/24",
+            "ipv6_address_mode": null,
+            "ipv6_ra_mode": null
+          }
+        ],
+        "roles": [
+          "member"
+        ],
+        "policy_profile": "secure_rbac"
+      },
+      "expected": {
+        "NET_ADDRESS_REFUSED": "Neutron would refuse these addresses on their network in DC3 Jakarta: fa:16:3e:00:00:01 on 'app-net': 192.168.9.5 is no host address of any subnet of the port's network."
+      }
+    },
+    {
+      "why": "a NIC override to another network with its own address, and one whose network is missing",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          },
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:02",
+            "fixed_ips": [
+              "10.0.0.6"
+            ],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {
+          "vm-1": {
+            "fa:16:3e:00:00:01": {
+              "network": "db-net",
+              "fixed_ips": [
+                "10.1.0.5"
+              ]
+            },
+            "fa:16:3e:00:00:02": {
+              "network": "ghost-net",
+              "fixed_ips": null
+            }
+          }
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {}
+        },
+        "prestage_resources": []
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          },
+          {
+            "id": "n-db",
+            "name": "db-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [
+          {
+            "id": "s1",
+            "name": "app-v4",
+            "network": "app-net",
+            "network_id": "n-app",
+            "cidr": "10.0.0.0/24",
+            "ipv6_address_mode": null,
+            "ipv6_ra_mode": null
+          },
+          {
+            "id": "s2",
+            "name": "db-v4",
+            "network": "db-net",
+            "network_id": "n-db",
+            "cidr": "10.1.0.0/24",
+            "ipv6_address_mode": null,
+            "ipv6_ra_mode": null
+          }
+        ],
+        "roles": [
+          "member"
+        ],
+        "policy_profile": "secure_rbac"
+      },
+      "expected": {
+        "MAP_NIC_OVERRIDE_INVALID": "NIC override(s) of web-01 cannot be applied: fa:16:3e:00:00:02: DC3 Jakarta has no network 'ghost-net'."
+      }
+    },
+    {
+      "why": "a NIC override to another network with its own address",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": null,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {
+          "vm-1": {
+            "fa:16:3e:00:00:01": {
+              "network": "db-net",
+              "fixed_ips": [
+                "10.1.0.5"
+              ]
+            }
+          }
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {}
+        },
+        "prestage_resources": []
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          },
+          {
+            "id": "n-db",
+            "name": "db-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [
+          {
+            "id": "s2",
+            "name": "db-v4",
+            "network": "db-net",
+            "network_id": "n-db",
+            "cidr": "10.1.0.0/24",
+            "ipv6_address_mode": null,
+            "ipv6_ra_mode": null
+          }
+        ],
+        "roles": [
+          "member"
+        ],
+        "policy_profile": "secure_rbac"
+      },
+      "expected": {
+        "MAP_NIC_OVERRIDE": "NIC override(s): fa:16:3e:00:00:01 (app-net) -> db-net: 10.1.0.5."
       }
     }
   ]

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import eligibilityRaw from '../../../seamless/tests/fixtures/eligibility_cases.json?raw';
 import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, makeVm, preflight, replaceNames } from './mockData';
 import { capabilityRoles } from '../lib/networks';
-import type { DestinationInventory, DestinationNetwork, Finding, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
+import type { DestinationInventory, DestinationNetwork, DestinationSubnet, Finding, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
 
 const now = Date.parse('2026-10-09T12:00:00Z');
 
@@ -633,7 +633,9 @@ interface FindingCase {
   others?: VMRef[];
   /** the source provider's kind, openstack when not given */
   source_kind?: ProviderKind;
-  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'>;
+  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'> & Partial<Pick<Plan, 'mappings' | 'prestage_resources'>>;
+  /** a network case's destination: its label, networks, subnets, the token's roles and the policy profile */
+  destination?: { label: string; networks: DestinationNetwork[]; subnets?: DestinationSubnet[]; roles?: string[]; policy_profile?: string };
   expected: Record<string, string>;
 }
 
@@ -656,7 +658,12 @@ describe('the mock words eligibility and the handover findings as the API (SDD Â
   it.each(ELIGIBILITY.finding_cases)('$why', (c) => {
     const plan = { ...base, ...c.plan } as Plan;
     const selected = [c.vm, ...(c.others ?? [])];
-    const found = preflight(c.vm, c.source_kind ?? 'openstack', plan, {}, { selected });
+    const dest = c.destination;
+    const networks = Object.fromEntries((dest?.networks ?? []).map((n) => [n.name, n.mtu]));
+    const context = dest
+      ? { selected, networkDetails: dest.networks, subnets: dest.subnets ?? [], roles: dest.roles, profile: dest.policy_profile, destination: dest.label }
+      : { selected };
+    const found = preflight(c.vm, c.source_kind ?? 'openstack', plan, networks, context);
     expect(Object.fromEntries(found.filter((f) => f.code in c.expected).map((f) => [f.code, f.message]))).toEqual(c.expected);
   });
 });

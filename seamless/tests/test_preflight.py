@@ -2255,10 +2255,34 @@ ELIGIBILITY_CASES = json.loads(
 def test_the_shared_handover_finding_cases(case):
     """SDD §9.3, §16 (review RV20-08): the findings as the API words them, which the dashboard's
     mock words the same way (mockData.test.ts); `others` are the plan's other selected VMs,
-    `source_kind` the source provider's kind."""
-    plan = make_plan(handover=HandoverConfig(**case["plan"]["handover"]))
+    `source_kind` the source provider's kind; a network case's `destination` gives the
+    destination's label, networks, subnets, the token's roles and the policy profile."""
+    plan = make_plan(**case["plan"])
     vm = VMRef.model_validate(case["vm"])
     others = [VMRef.model_validate(other) for other in case.get("others", [])]
     source = VMWARE if case.get("source_kind") == "vmware" else SRC
-    found = check(vm, plan=plan, all_vms=[vm, *others], source=source)
+    found = check(vm, plan=plan, all_vms=[vm, *others], source=source, **_destination(case))
     assert {f.code: f.message for f in found if f.code in case["expected"]} == case["expected"]
+
+
+def _destination(case):
+    """check()'s destination for a finding case: its own when the case gives one (SDD §9.3)."""
+    dest = case.get("destination")
+    if dest is None:
+        return {}
+    details = dest["networks"]
+    return {
+        "dst": dst_inv(
+            networks={n["name"]: n.get("mtu") for n in details},
+            network_details=details,
+            subnets=dest.get("subnets", []),
+        ),
+        "destination": make_provider(
+            id="dst-case",
+            name=dest["label"],
+            kind=ProviderKind(dest.get("kind", "openstack")),
+            role=ProviderRole.destination,
+            cloud="dst",
+        ),
+        "dst_caps": {k: dest[k] for k in ("roles", "policy_profile") if k in dest} or None,
+    }
