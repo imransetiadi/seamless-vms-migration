@@ -370,6 +370,15 @@ class _Journal:
     def get(self, key: str) -> dict[str, Any]:
         return self.data["done"].get(key) or {}
 
+    def last(self, key: str) -> int:
+        """Where the key's last mark stands in the journal's order; -1 when never marked: a step
+        and its undo tell which came last (SDD §7.3, review RV33-01)."""
+        order = self.data["order"]
+        for index in range(len(order) - 1, -1, -1):
+            if order[index] == key:
+                return index
+        return -1
+
     def mark(self, key: str, **info: Any) -> None:
         self.data["done"][key] = {"at": utcnow().isoformat(), **info}
         self.data["order"].append(key)
@@ -1354,18 +1363,30 @@ class HandoverExecutor:
         attachments: list[dict[str, Any]] = definition["attachments"]
 
         # step 3: keep every volume when the server is deleted (runs journaled before this order
-        # had detached and unmanaged volumes already: nothing to keep for those)
+        # had detached and unmanaged volumes already: nothing to keep for those). A rollback
+        # attempt since the last keep may have given delete_on_termination back - even with its
+        # answer lost: kept again while the source server exists (SDD §7.3 step 3, RV33-01)
+        exists: list[bool] = []  # read once, for the first volume a rollback attempt followed
         for att in attachments:
             vid = att["volume_id"]
             if journal.done(f"detach:{vid}") or journal.done(f"unmanage_src:{vid}"):
                 continue
             key = f"keep:{vid}"
-            if not journal.done(key):
-                await self._call(
-                    f"keep {vid} when the source server is deleted",
-                    lambda v=vid: self._set_delete_on_termination(src, server_id, v, False),
-                )
-                await _in_thread(journal.mark, key)
+            if journal.done(key):
+                if journal.done("delete_source") or journal.last(key) > journal.last("rb:attempt"):
+                    continue
+                if not exists:
+                    found = await self._call(
+                        "read the source server", lambda: _existing_server(src, server_id)
+                    )
+                    exists.append(found is not None)
+                if not exists[0]:
+                    continue  # gone: Nova settled its volumes with it
+            await self._call(
+                f"keep {vid} when the source server is deleted",
+                lambda v=vid: self._set_delete_on_termination(src, server_id, v, False),
+            )
+            await _in_thread(journal.mark, key)
 
         # step 4: delete the source server; its volumes become available
         if not journal.done("delete_source"):
@@ -1498,6 +1519,9 @@ class HandoverExecutor:
             if recreated is not None:
                 return StepResult(details={"source_running": True, "vm": recreated})
             return StepResult(details={"source_running": True, "note": "nothing to roll back"})
+        # before its first call: a cutover resumed after this attempt keeps the volumes again, as
+        # it may give delete_on_termination back with Nova's answer lost (SDD §7.3, RV33-01)
+        await _in_thread(journal.mark, "rb:attempt")
         if not await _in_thread(definition_path.exists):
             # stopped but nothing else happened yet: just start the source again
             if not journal.done("rb:start_source"):
@@ -1659,10 +1683,12 @@ class HandoverExecutor:
             for att in attachments:
                 vid = att["volume_id"]
                 key = f"rb:dot:{vid}"
+                # given back unless done since its last keep - a cutover resumed after an earlier
+                # attempt keeps it again (SDD §7.3 rollback, review RV33-01)
                 if (
                     journal.done(f"keep:{vid}")
                     and att.get("delete_on_termination") is True
-                    and not journal.done(key)
+                    and journal.last(f"keep:{vid}") > journal.last(key)
                 ):
                     await self._call(
                         f"restore delete_on_termination of {vid}",

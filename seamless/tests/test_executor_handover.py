@@ -1646,6 +1646,144 @@ async def test_a_deletion_nova_refused_never_spares_a_source_from_its_re_stop(tm
     assert deleted_while == [("SHUTOFF", None)], "the cutover deleted a source Nova was starting"
 
 
+def _cutover_failing_at_the_delete(src):
+    """Nova answers 500 to the source server's deletion (step 4), after step 3 kept its volumes;
+    returns the restorer."""
+    delete = src.compute.delete_server
+
+    def delete_refused(s, ignore_missing=True):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.delete_server = delete_refused
+
+    def restore():
+        src.compute.delete_server = delete
+
+    return restore
+
+
+@pytest.mark.parametrize("attempt", ["start performed, its wait failed", "start refused", "lost"])
+async def test_a_cutover_resumed_after_a_rollback_attempt_keeps_the_volumes_again(
+    tmp_path, attempt
+):
+    """SDD §7.3 step 3 (review RV33-01): a rollback attempt gives delete_on_termination back before
+    it starts the source. When the attempt then fails - Nova performed the start and its wait
+    failed, Nova refused the start (409), or the answer to its giving back was lost while Nova
+    applied it - the journal still holds keep. Each rollback attempt journals rb:attempt before its
+    first call, and a cutover resumed after one keeps every volume again before it deletes the
+    source: Nova never deletes the boot volume with its server."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    assert server.dot == {"vol-root": True, "vol-data": False}
+    restore = _cutover_failing_at_the_delete(src)
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    restore()
+    assert server.dot == {"vol-root": False, "vol-data": False}  # step 3 kept them
+
+    wait, start, put = src.compute.wait_for_server, src.compute.start_server, src.compute.put
+    match = "start the source server"
+    if attempt == "start performed, its wait failed":
+
+        def start_server(s):
+            src.record("start_server", s.id)
+            s.status = "ACTIVE"
+
+        def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+            raise RuntimeError("nova: HTTP 503 Service Unavailable")
+
+        src.compute.start_server, src.compute.wait_for_server = start_server, wait_fails
+    elif attempt == "start refused":
+
+        class Conflict(Exception):
+            status_code = 409
+
+        def start_refused(s):
+            raise Conflict("Service is unavailable at this time.")
+
+        src.compute.start_server = start_refused
+    else:
+
+        def put_answer_lost(url, json=None, microversion=None, **kw):
+            put(url, json=json, microversion=microversion, **kw)  # Nova applies it...
+            raise RuntimeError("nova: HTTP 502 Bad Gateway")  # ...and its answer is lost
+
+        src.compute.put = put_answer_lost
+        match = "restore delete_on_termination"
+    with pytest.raises((TransientStepError, PermanentStepError), match=match):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.wait_for_server, src.compute.start_server, src.compute.put = wait, start, put
+    assert server.dot["vol-root"] is True  # given back
+
+    result = None
+    with contextlib.suppress(TransientStepError, PermanentStepError):
+        result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.deleted_by_nova == [], "Nova deleted the source's boot volume with its server"
+    assert result is not None and result.destination_server_id == "dst-new-1"
+
+
+async def test_a_cutover_resumed_after_a_rollback_attempt_keeps_nothing_of_a_server_gone(tmp_path):
+    """SDD §7.3 step 3 (review RV33-01): the volumes are kept again only while the source server
+    exists - one the attempt before deleted, failing before it journaled that, settled its volumes
+    with it: the resumed cutover goes on."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    src.crash_wait = "status"  # dies waiting for the volumes the delete freed
+    with pytest.raises(PermanentStepError, match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "srv-1" not in src.servers
+    get = src.compute.get_server
+
+    def get_fails(server_id):  # the rollback attempt fails at its first call
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.get_server = get_fails
+    with pytest.raises((TransientStepError, PermanentStepError, RuntimeError), match="HTTP 500"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.get_server = get
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+    # step 3's keeps of the first attempt alone: none for the server gone
+    assert sorted(c for c in calls if c[1] in ("keep", "dot")) == [
+        ("src", "keep", "vol-data"),
+        ("src", "keep", "vol-root"),
+    ]
+
+
+async def test_a_second_rollback_gives_back_what_a_resumed_cutover_kept_again(tmp_path):
+    """SDD §7.3 rollback (review RV33-01): the rollback gives delete_on_termination back for each
+    attachment whose last keep came after its last giving back - after a cutover resumed past an
+    earlier attempt kept the volumes again, a second rollback restores the source's own values."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    start = src.compute.start_server
+
+    class Conflict(Exception):
+        status_code = 409
+
+    def start_refused(s):
+        raise Conflict("Service is unavailable at this time.")
+
+    restore = _cutover_failing_at_the_delete(src)
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.start_server = start_refused
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.start_server = start
+    # the operator retries: the cutover keeps the volumes again, and fails at the delete again
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    restore()
+    assert server.dot == {"vol-root": False, "vol-data": False}
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["source_running"] is True
+    assert server.dot == {"vol-root": True, "vol-data": False}  # the source's own values
+    assert [c for c in calls if c[1] == "dot"] == [("src", "dot", "vol-root")] * 2
+
+
 async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):
     """Crash before the server was deleted: the volumes are still attached and managed; the
     rollback sets the journaled delete_on_termination back and starts the source."""
