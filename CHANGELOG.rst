@@ -508,3 +508,13 @@ This project follows a simple changelog to satisfy collection metadata validatio
   other OS fails the role with a message naming it, where it used to install
   nothing and the transfer then failed for want of nbdkit. An Ubuntu cloud
   image logs in as ``ubuntu``, not ``cloud-user``.
+- Each conversion host logs in as its own user:
+  ``os_migrate_src_conversion_host_ssh_user`` and
+  ``os_migrate_dst_conversion_host_ssh_user`` (both default to
+  ``os_migrate_conversion_host_ssh_user``) reach the source and the
+  destination host - the deployed hosts' inventory, the export, the source
+  cleanup, the warm snapshot and rollback on one side, the transfer, the
+  failure cleanup and the warm sync on the other. The transfer modules and
+  ``import_workload_warm_sync`` take ``src_ssh_user`` (default ``ssh_user``)
+  for the destination host's hop to the source host, so a RHEL source host
+  (``cloud-user``) works with an Ubuntu destination host (``ubuntu``).

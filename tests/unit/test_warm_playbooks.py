@@ -195,7 +195,8 @@ elif NAME == "server_action":
 elif NAME == "server_info":
     status = world.get("server_status", {}).get(args["server"], "ACTIVE")
     result = {"changed": False, "servers": [] if status == "MISSING" else [
-        {"id": args["server"], "name": args["server"], "status": status}]}
+        {"id": args["server"], "name": args["server"], "status": status,
+         "access_ipv4": "10.9.9.9"}]}
 print(json.dumps(result))
 '''
 
@@ -684,3 +685,85 @@ def test_a_cold_import_without_data_copy_records_the_server_and_no_volume(env):
     state = env.state("srv-1")
     assert state["destination_server_id"] == "dst-vm1"
     assert state["dest_volumes"] == {}
+
+
+# --- each conversion host's own SSH user (SDD 6.5, audit EX-08) ----------------------------------
+
+PER_SIDE = {
+    "os_migrate_conversion_host_ssh_user": "centos",  # upstream's single user, overridden per side
+    "os_migrate_src_conversion_host_ssh_user": "cloud-user",
+    "os_migrate_dst_conversion_host_ssh_user": "ubuntu",
+}
+
+
+def ssh_users(calls):
+    """Per conversion-host module: the (ssh_user, src_ssh_user) pairs its calls got."""
+    users = {}
+    for call in calls:
+        if "ssh_user" in call["args"]:
+            pair = (call["args"]["ssh_user"], call["args"].get("src_ssh_user"))
+            users.setdefault(call["module"], set()).add(pair)
+    return users
+
+
+def test_each_conversion_host_is_reached_as_its_own_sides_user(env):
+    """SDD 6.5 (audit EX-08): a RHEL source host (cloud-user) beside an Ubuntu destination host
+    (ubuntu). The modules that work on the source host get the source's user; those that work on
+    the destination host get the destination's, and the source's as src_ssh_user for their hop to
+    the source host - in the cold import (its failure cleanup too) and in a warm pass."""
+    env.world["fail"] = [["import_workload_create_instance", "vm1"]]
+    rc, out, calls = env.run(
+        "import_workloads", os_migrate_workload_cleanup_on_failure=True, **dict(COLD, **PER_SIDE)
+    )
+    assert rc != 0, out
+    assert ssh_users(calls) == {
+        "import_workload_export_volumes": {("cloud-user", None)},
+        "import_workload_transfer_volumes": {("ubuntu", "cloud-user")},
+        "import_workload_src_cleanup": {("cloud-user", None)},
+        "import_workload_dst_failure_cleanup": {("ubuntu", None)},
+    }
+    env.world = {}
+    rc, out, calls = env.run("import_workloads_precopy", **PER_SIDE)
+    assert rc == 0, out
+    assert ssh_users(calls) == {
+        "import_workload_warm_snapshot": {("cloud-user", None)},
+        "import_workload_warm_sync": {("ubuntu", "cloud-user")},
+    }
+
+
+def test_one_ssh_user_still_reaches_both_conversion_hosts(env):
+    """SDD 6.5: upstream's single os_migrate_conversion_host_ssh_user, set alone, still serves
+    both conversion hosts - and the hop between them (audit EX-08)."""
+    rc, out, calls = env.run("import_workloads_precopy", os_migrate_conversion_host_ssh_user="centos")
+    assert rc == 0, out
+    assert ssh_users(calls) == {
+        "import_workload_warm_snapshot": {("centos", None)},
+        "import_workload_warm_sync": {("centos", "centos")},
+    }
+
+
+def test_the_conversion_hosts_inventory_gives_each_host_its_sides_user(env):
+    """SDD 6.5 (audit EX-08): the deployed conversion hosts are added to the inventory with their
+    sides' users - which the link key's setup logs in as - however the single variable is set."""
+    real = os.path.join(REPO, "roles", "conversion_host", "tasks", "conv_hosts_inventory.yml")
+    tasks = os.path.join(env.collections, "ansible_collections", "os_migrate", "os_migrate",
+                         "roles", "conversion_host", "tasks")
+    shutil.copy(real, tasks)
+    with open(os.path.join(env.playbooks, "inventory_users.yml"), "w") as f:
+        f.write(
+            "---\n- hosts: localhost\n  gather_facts: false\n  tasks:\n"
+            "    - ansible.builtin.include_role:\n"
+            "        name: os_migrate.os_migrate.conversion_host\n"
+            "        tasks_from: conv_hosts_inventory.yml\n"
+            "    - ansible.builtin.debug:\n"
+            "        msg: \"USERS {{ hostvars['os_migrate_conv_src'].ansible_ssh_user }} "
+            "{{ hostvars['os_migrate_conv_dst'].ansible_ssh_user }}\"\n"
+        )
+    rc, out, calls = env.run(
+        "inventory_users",
+        os_migrate_src_conversion_host_name="conv-src",
+        os_migrate_dst_conversion_host_name="conv-dst",
+        **PER_SIDE,
+    )
+    assert rc == 0, out
+    assert "USERS cloud-user ubuntu" in out

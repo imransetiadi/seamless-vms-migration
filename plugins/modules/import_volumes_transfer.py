@@ -1,5 +1,5 @@
 #!/usr/bin/python
-
+# Modified by the Seamless Migrate project, 2026.
 
 from __future__ import absolute_import, division, print_function
 
@@ -76,6 +76,12 @@ options:
       - Provided by the import_volumes_export_volumes module.
     required: true
     type: str
+  src_ssh_user:
+    description:
+      - The SSH user the destination conversion host logs in to the source conversion host as,
+        for its hop to the source's exports. Defaults to I(ssh_user).
+    required: false
+    type: str
   state_file:
     description:
       - Path to store a transfer progress file for this conversion process.
@@ -130,7 +136,8 @@ EXAMPLES = r"""
     conversion_host:
       "{{ os_dst_conversion_host_info.openstack_conversion_host }}"
     ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-    ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+    ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
+    src_ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
     transfer_uuid: "{{ exports.transfer_uuid }}"
     src_conversion_host_address:
       "{{ os_src_conversion_host_info.openstack_conversion_host.address }}"
@@ -191,6 +198,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         state_file=None,
         log_file=None,
         timeout=DEFAULT_TIMEOUT,
+        src_ssh_user=None,
     ):
 
         super().__init__(
@@ -203,6 +211,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
             state_file=state_file,
             log_file=log_file,
             timeout=timeout,
+            src_ssh_user=src_ssh_user,
         )
 
         # Required unique parameters:
@@ -237,6 +246,7 @@ def run_module():
         conversion_host=dict(type="dict", required=True),
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
+        src_ssh_user=dict(type="str", required=False, default=None),
         transfer_uuid=dict(type="str", required=True),
         src_conversion_host_address=dict(type="str", required=True),
         volume_map=dict(type="dict", required=True),
@@ -284,6 +294,7 @@ def run_module():
         state_file=state_file,
         log_file=log_file,
         timeout=timeout,
+        src_ssh_user=module.params["src_ssh_user"],
     )
     destination_host.transfer_exports()
     result["volume_map"] = destination_host.volume_map

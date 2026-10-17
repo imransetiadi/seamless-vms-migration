@@ -91,13 +91,16 @@ The usual os-migrate variables apply as well: `os_migrate_data_dir`,
 `os_migrate_src_auth`/`os_migrate_dst_auth` and the other cloud settings,
 and the conversion host variables (`os_migrate_src_conversion_host_name`,
 `os_migrate_dst_conversion_host_name`, `os_migrate_conversion_host_ssh_user`,
-`os_migrate_conversion_keypair_private_path`).
+`os_migrate_conversion_keypair_private_path`). Each conversion host can log in
+as its own user: `os_migrate_src_conversion_host_ssh_user` and
+`os_migrate_dst_conversion_host_ssh_user` (a RHEL host's `cloud-user`, an
+Ubuntu host's `ubuntu`) default to `os_migrate_conversion_host_ssh_user`.
 
 ## Requirements
 
 * Conversion hosts in both clouds, deployed and linked with
-  `deploy_conversion_hosts.yml` (the destination host reaches the source host
-  over SSH with the link key of `os_migrate_conversion_host_ssh_user`), with
+  `deploy_conversion_hosts.yml` (the destination host's user reaches the source
+  host's over SSH with the link key), with
   passwordless `sudo` and Python 3.6+.
 * Workloads with `data_copy: true` and without `use_nbdkit_direct`.
 * No multi-attach volumes. Image-booted servers follow `boot_disk_copy`: with

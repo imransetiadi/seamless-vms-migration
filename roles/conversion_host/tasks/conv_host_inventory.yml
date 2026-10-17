@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: Discover conversion host
   os_migrate.os_migrate.server_info:
     server: "{{ os_migrate_conversion_host_name }}*"
@@ -25,7 +26,7 @@
       - "{{ inventory_group }}"
     os_migrate_conversion_host_name: "{{ os_migrate_conversion_host_name }}"
     ansible_ssh_host: "{{ _server_info.servers[0].access_ipv4 }}"
-    ansible_ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+    ansible_ssh_user: "{{ os_migrate_conversion_host_inventory_ssh_user | default(os_migrate_conversion_host_ssh_user) }}"
     ansible_ssh_private_key_file: "{{ os_migrate_conversion_keypair_private_path }}"
     ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
     # Generally conversion hosts act as centos, not as

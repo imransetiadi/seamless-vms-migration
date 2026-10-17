@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: Open cloud.yaml and set cloud variables as ansible vars
   ansible.builtin.include_vars:
     file: "{{ os_migrate_clouds_path | default(os_migrate_data_dir ~ '/clouds.yaml') }}"
@@ -14,7 +15,7 @@
       "{{ os_src_conversion_host_info.openstack_conversion_host }}"
     data: "{{ detached_volumes }}"
     ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-    ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+    ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
     log_dir: "{{ os_migrate_data_dir }}/volume_logs"
     timeout: "{{ os_migrate_timeout }}"
   register: exports
@@ -31,7 +32,8 @@
     conversion_host:
       "{{ os_dst_conversion_host_info.openstack_conversion_host }}"
     ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-    ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+    ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
+    src_ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
     transfer_uuid: "{{ exports.transfer_uuid }}"
     src_conversion_host_address:
       "{{ os_src_conversion_host_info.openstack_conversion_host.address }}"
@@ -52,7 +54,7 @@
     client_key: "{{ os_migrate_src_client_key | default(omit) }}"
     conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
     ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-    ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+    ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
     transfer_uuid: "{{ exports.transfer_uuid }}"
     volume_map: "{{ exports.volume_map }}"
     log_file: "{{ exports.log_file }}"

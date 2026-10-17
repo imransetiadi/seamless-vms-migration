@@ -145,6 +145,34 @@ def receive_commands(scenario):
     ]
 
 
+def test_a_warm_pass_reaches_each_conversion_host_as_its_own_user(tmp_path):
+    """Seamless Migrate SDD 6.5 (audit EX-08): the destination host is reached as its own user
+    (ubuntu), which runs the link key; the hop to the source host - the copy of blocksync, the
+    sender the receiver starts - logs in as the source host's user (cloud-user)."""
+    scenario = Scenario(tmp_path)
+    scenario.snapshot().create()
+    scenario.shells.shells = []
+    warm_migration.OpenstackWarmSync(
+        scenario.dst,
+        "dst-conv",
+        "/keys/conversion",
+        "ubuntu",
+        "uuid-1",
+        scenario.ser_server(),
+        scenario.state(),
+        SRC_CONV,
+        state_file=scenario.state_file,
+        shell_factory=scenario.shells,
+        src_ssh_user="cloud-user",
+    ).sync()
+    users = {(shell.address, shell.ssh_user) for shell in scenario.shells.shells}
+    assert users == {(DST_CONV, "ubuntu"), (SRC_CONV, "cloud-user")}
+    for receive in receive_commands(scenario):
+        words = " ".join(receive)
+        assert "-u ubuntu --" in words and "cloud-user@" + SRC_CONV in words, words
+        assert "ubuntu@" + SRC_CONV not in words, words
+
+
 # --- WarmState ------------------------------------------------------------
 
 

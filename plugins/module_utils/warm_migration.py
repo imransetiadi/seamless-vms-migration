@@ -661,6 +661,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
         timeout=DEFAULT_TIMEOUT,
         shell_factory=None,
         preserve_volume_type=False,
+        src_ssh_user=None,
     ):
         super(OpenstackWarmSync, self).__init__(
             openstack_connection,
@@ -674,6 +675,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
             timeout=timeout,
             shell_factory=shell_factory,
             preserve_volume_type=preserve_volume_type,
+            src_ssh_user=src_ssh_user,
         )
         self.ser_server = ser_server
         self.state = state
@@ -891,7 +893,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
 
     def _source_shell(self):
         return self.shell_factory(
-            self.source_conversion_host_address, self.ssh_user, self.ssh_key_path
+            self.source_conversion_host_address, self.src_ssh_user, self.ssh_key_path
         )
 
     def _install_blocksync(self):
@@ -937,8 +939,10 @@ class OpenstackWarmSync(_WarmVolumeBase):
         if self._cancelled.is_set():
             raise RuntimeError("cancelled after another disk failed")
         mapping = self.volume_map[dev]
+        # the receiver's hop logs in as the source host's user; it runs as this host's own,
+        # the link key's owner (SDD 6.5)
         source_ssh = RemoteShell(
-            self.source_conversion_host_address, self.ssh_user
+            self.source_conversion_host_address, self.src_ssh_user
         ).ssh_preamble()
         command = blocksync_receive_command(
             self.transfer_uuid,

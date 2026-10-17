@@ -348,6 +348,7 @@ class OpenStackVolumeBase:
         timeout=DEFAULT_TIMEOUT,
         shell_factory=None,
         preserve_volume_type=False,
+        src_ssh_user=None,
     ):
         # Required common parameters:
         # openstack_connection: OpenStack connection object
@@ -367,7 +368,11 @@ class OpenStackVolumeBase:
         # log_file: Debug log path for volume migration
         # preserve_volume_type: keep the serialized volume_type of destination
         #                       volumes instead of the destination default
+        # src_ssh_user: the source conversion host's user, for the destination
+        #               host's hop to it; ssh_user when unset (Seamless Migrate
+        #               SDD 6.5: each host keeps its own provider's user)
         self.conversion_host_address = conversion_host_address
+        self.src_ssh_user = src_ssh_user or ssh_user
         self.state_file = state_file
         self.log_file = log_file
         self.timeout = timeout
@@ -1454,7 +1459,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         # It is expected that key authorization has already been set up from
         # the destination conversion host to the source conversion host!
         source_shell = RemoteShell(
-            self.source_conversion_host_address, ssh_user=self.shell.ssh_user
+            self.source_conversion_host_address, ssh_user=self.src_ssh_user
         )
         forward_ports = ["-N", "-T"]
         for path, mapping in self.volume_map.items():

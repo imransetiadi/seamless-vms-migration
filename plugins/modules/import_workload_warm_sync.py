@@ -59,6 +59,12 @@ options:
       - The SSH user to connect to the conversion hosts.
     required: true
     type: str
+  src_ssh_user:
+    description:
+      - The SSH user the destination conversion host logs in to the source conversion host as,
+        for the copy of blocksync and its sender. Defaults to I(ssh_user).
+    required: false
+    type: str
   state_dir:
     description:
       - Directory of the warm state files, normally C({{ os_migrate_data_dir }}/workload_warm).
@@ -155,7 +161,8 @@ EXAMPLES = r"""
     conversion_host: "{{ os_dst_conversion_host_info.openstack_conversion_host }}"
     src_conversion_host_address: "{{ os_src_conversion_host_info.openstack_conversion_host.address }}"
     ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-    ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+    ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
+    src_ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
     state_dir: "{{ os_migrate_data_dir }}/workload_warm"
     transfer_uuid: "{{ snapshot.transfer_uuid }}"
     pass_kind: auto
@@ -232,6 +239,7 @@ def run_module():
         conversion_host=dict(type="dict", required=True),
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
+        src_ssh_user=dict(type="str", required=False, default=None),
         state_dir=dict(type="str", required=True),
         src_conversion_host_address=dict(type="str", required=True),
         dst_conversion_host_address=dict(type="str", default=None),
@@ -297,6 +305,7 @@ def run_module():
             state_file=params["state_file"],
             log_file=params["log_file"],
             timeout=params["timeout"],
+            src_ssh_user=params["src_ssh_user"],
         )
         sync_pass = warm_sync.sync(params["pass_kind"])
         block_device_mapping = warm_sync.block_device_mapping()

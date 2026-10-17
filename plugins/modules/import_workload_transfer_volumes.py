@@ -87,6 +87,12 @@ options:
       - Provided by the import_workloads_export_volumes module.
     required: true
     type: str
+  src_ssh_user:
+    description:
+      - The SSH user the destination conversion host logs in to the source conversion host as,
+        for its hop to the source's exports. Defaults to I(ssh_user).
+    required: false
+    type: str
   state_file:
     description:
       - Path to store a transfer progress file for this conversion process.
@@ -215,7 +221,8 @@ workload.yml:
       data: "{{ item }}"
       conversion_host: "{{ os_dst_conversion_host_info.openstack_conversion_host }}"
       ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-      ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+      ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
+      src_ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
       transfer_uuid: "{{ exports.transfer_uuid }}"
       src_conversion_host_address: "{{ os_src_conversion_host_info.openstack_conversion_host.address }}"
       volume_map: "{{ exports.volume_map }}"
@@ -297,6 +304,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         nbdkit_export_name=None,
         preserve_volume_type=False,
         warm_state_dir=None,
+        src_ssh_user=None,
     ):
 
         super().__init__(
@@ -310,6 +318,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
             log_file=log_file,
             timeout=timeout,
             preserve_volume_type=preserve_volume_type,
+            src_ssh_user=src_ssh_user,
         )
 
         # Required unique parameters:
@@ -557,6 +566,7 @@ def run_module():
         conversion_host=dict(type="dict", required=True),
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
+        src_ssh_user=dict(type="str", required=False, default=None),
         transfer_uuid=dict(type="str", required=True),
         src_conversion_host_address=dict(type="str", required=True),
         volume_map=dict(type="dict", required=True),
@@ -629,6 +639,7 @@ def run_module():
         nbdkit_export_name=nbdkit_export_name,
         preserve_volume_type=module.params["preserve_volume_type"],
         warm_state_dir=module.params["warm_state_dir"],
+        src_ssh_user=module.params["src_ssh_user"],
     )
     try:
         destination_host.transfer_exports()
