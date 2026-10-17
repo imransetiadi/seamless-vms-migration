@@ -2013,6 +2013,38 @@ async def test_openstack_destination_finds_the_server_holding_an_address():
     assert await provider.server_of_address("203.0.113.9") is None
 
 
+@pytest.mark.parametrize("read", ["503", "gone"])
+async def test_openstack_destination_takes_a_failed_port_read_for_no_answer(read):
+    """SDD §7.2, §10 (review RV32A-04): the port a floating IP is associated with is read through
+    Neutron; a read that fails (a 503, a timeout) is no answer - a provider error, which the
+    rollback retries - while a port gone since the listing is no server holding the address."""
+    import openstack.exceptions
+
+    floating = [NS(floating_ip_address="198.51.100.40", port_id="conv-port")]
+
+    class Network:
+        def ports(self, fixed_ips):
+            return []
+
+        def ips(self, floating_ip_address):
+            return [f for f in floating if f.floating_ip_address == floating_ip_address]
+
+        def get_port(self, port_id):
+            if read == "gone":
+                raise openstack.exceptions.NotFoundException(f"No Port found for {port_id}")
+            raise openstack.exceptions.HttpException(message="Service Unavailable", http_status=503)
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: NS(network=Network()))
+    if read == "gone":
+        assert await provider.server_of_address("198.51.100.40") is None
+        return
+    with pytest.raises(ProviderError, match="503|Service Unavailable"):
+        await provider.server_of_address("198.51.100.40")
+
+
 async def test_openstack_destination_reads_the_volumes_nova_lists_for_a_server():
     """SDD §10 (§7.2 VMware rollback, review RV30-04): server_volumes reads Nova's record of the
     server - no Cinder or Neutron call, so a rollback reads it before the source's power-on; a

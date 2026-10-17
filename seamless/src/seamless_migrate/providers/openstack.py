@@ -613,10 +613,17 @@ class OpenStackProvider:
             fixed = [ip.get("ip_address") for ip in _attr(port, "fixed_ips", default=None) or []]
             if canonical in (_canonical_ip(str(a)) for a in fixed if a) and server(port):
                 return server(port)
+        import openstack.exceptions
+
         for floating in network.ips(floating_ip_address=canonical):
             port_id = _attr(floating, "port_id")
-            port = _try(lambda pid=port_id: network.get_port(pid), None) if port_id else None
-            if port is not None and server(port):
+            if not port_id:
+                continue
+            try:
+                port = network.get_port(port_id)
+            except openstack.exceptions.NotFoundException:
+                continue  # gone since the listing; a read that failed is no answer (RV32A-04)
+            if server(port):
                 return server(port)
         return None
 
