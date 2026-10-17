@@ -1027,6 +1027,19 @@ was made from undeletable (review RV8-03). The cleanup puts the data volumes bac
 copy, snapshot and image, and tries every step: what it could not do fails it at the end, naming each, so one failed
 removal never keeps a data volume off the source VM.
 
+A cold transfer that fails leaves its destination volumes to the rescue's destination cleanup (audit A-08).
+`import_workload_transfer_volumes` lets an error other than a disk's failed identity check escape, as before - what
+the control plane classifies stays as it was (owner question q8) - so its result carries no volume map:
+`import_workload_dst_failure_cleanup`, given no `volume_map`, takes the workload's record instead (`warm_state_dir`):
+the destination volumes the transfer recorded as soon as Cinder created them (§6.3). The role runs it whenever the
+transfer task ran, with the transfer's map when it returned one. The conversion host may be what failed the
+transfer: the cleanup's one SSH check at its start - every conversion-host module's - no longer fails it; a host it
+cannot reach keeps the volumes attached to it, which the rollback deletes by the record, and the cleanup takes that
+host's attach lock and detaches only after the check reached it; then it deletes, through the API, the volumes no
+server holds. Before, the rescue skipped the cleanup whenever the transfer itself failed, and a hand-run cold
+import left its volumes on the conversion host; and a conversion host the check could not reach failed the cleanup
+before it deleted anything.
+
 `import_workload_prelim` skips a workload whose name a destination server already carries only for a server of
 exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name filter as a regular expression) and
 keeps the servers whose name is equal, as the warm rollback does — an unescaped `web.01` matched an unrelated
