@@ -246,6 +246,16 @@ async def _in_thread(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     return await outlive_cancel(asyncio.to_thread(fn, *args, **kwargs))
 
 
+def _stopping(server: Any) -> bool:
+    """Nova powers the server off: its task state while a stop runs, the status still ACTIVE."""
+    return str(_attr(server, "task_state") or "").lower() == "powering-off"
+
+
+def _conflict(exc: BaseException) -> bool:
+    """Nova's or Cinder's 409: the action is refused in the resource's present state."""
+    return (getattr(exc, "status_code", None) or getattr(exc, "http_status", None)) == 409
+
+
 def _backend_name(extra_specs: dict[str, Any]) -> str | None:
     """The backend a Cinder volume type asks for in its extra specs, as the scheduler's
     CapabilitiesFilter reads it: ``volume_backend_name``, also scoped ``capabilities:``."""
@@ -1176,9 +1186,20 @@ class HandoverExecutor:
                 def stop() -> None:
                     server = src.compute.get_server(server_id)
                     if str(_attr(server, "status", "")).upper() != "SHUTOFF":
-                        src.compute.stop_server(server)
-                        # Nova accepted it: should the wait fail, a rollback starts the source
-                        journal.mark("sent:stop_source")
+                        # a stop that runs - the one a retry finds, the server reading ACTIVE
+                        # until the guest is down - is waited for: Nova refuses a second (409)
+                        if not _stopping(server):
+                            try:
+                                src.compute.stop_server(server)
+                            except Exception as exc:
+                                if not (
+                                    _conflict(exc) and _stopping(src.compute.get_server(server_id))
+                                ):
+                                    raise
+                        # Nova accepted a stop: should the wait fail, a rollback starts the source;
+                        # the first one's time stays, the clock's start (SDD §7.3 step 1)
+                        if not journal.done("sent:stop_source"):
+                            journal.mark("sent:stop_source")
                     src.compute.wait_for_server(
                         server, status="SHUTOFF", interval=self.poll_s, wait=self.wait_s
                     )
@@ -1571,6 +1592,13 @@ class HandoverExecutor:
 
     def _start(self, conn: Any, server_id: str) -> None:
         server = conn.compute.get_server(server_id)
+        if _stopping(server):
+            # Nova still powers the guest off: the server reads ACTIVE until it is down, and a
+            # start is refused until then - wait for the stop to end, then start (review RV26-01)
+            conn.compute.wait_for_server(
+                server, status="SHUTOFF", interval=self.poll_s, wait=self.wait_s
+            )
+            server = conn.compute.get_server(server_id)
         if str(_attr(server, "status", "")).upper() != "ACTIVE":
             conn.compute.start_server(server)
         conn.compute.wait_for_server(

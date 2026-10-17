@@ -595,6 +595,62 @@ def shared_pool(clouds):
     return images
 
 
+def powering_off(cloud, settle_s, blips=1):
+    """Nova as upstream answers a stop (compute/api.py, api/openstack/common.py _STATE_MAP): the
+    server keeps reading ACTIVE, task_state "powering-off", until the guest is down ``settle_s``
+    later, then SHUTOFF; meanwhile a second stop and a start are refused with 409. The first
+    ``blips`` waits for SHUTOFF meet nova-api answering 503 (review 26's model)."""
+    server = cloud.servers["srv-1"]
+    server.task_state = None
+    lock = threading.Lock()
+    settled = threading.Event()
+    left = [blips]
+    nova = "https://nova.dc1.example:8774/v2.1/servers/srv-1/action"
+
+    def conflict(action):
+        message = f"Cannot '{action}' instance srv-1 while it is in task_state {server.task_state}"
+        body = f'{{"conflictingRequest": {{"code": 409, "message": "{message}"}}}}'
+        return sdk_error(409, "Conflict", body.encode(), url=nova)
+
+    def stop_server(s):
+        with lock:
+            if s.task_state is not None or s.status != "ACTIVE":
+                raise conflict("stop")
+            cloud.record("stop_server", s.id)
+            s.task_state = "powering-off"
+
+        def settle():
+            time.sleep(settle_s)
+            with lock:
+                s.status, s.task_state = "SHUTOFF", None
+            settled.set()
+
+        threading.Thread(target=settle, daemon=True).start()
+
+    def start_server(s):
+        with lock:
+            if s.status != "SHUTOFF" or s.task_state is not None:
+                raise conflict("start")
+            cloud.record("start_server", s.id)
+            s.status = "ACTIVE"
+
+    def wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        if status == "SHUTOFF" and left[0] > 0:
+            left[0] -= 1
+            raise sdk_error(503, "Service Unavailable", url=nova)
+        deadline = time.monotonic() + 20
+        while s.status != status:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"Timeout waiting for the server to transition to {status}")
+            time.sleep(0.02)
+        return s
+
+    cloud.compute.stop_server = stop_server
+    cloud.compute.start_server = start_server
+    cloud.compute.wait_for_server = wait_for_server
+    return settled
+
+
 def held_manage(cloud, source_name):
     """A slow cinder-api: it accepts the manage of ``source_name``, but its answer waits until the
     test sets the second event (the first is set once the call waits)."""
@@ -1126,6 +1182,67 @@ async def test_a_handover_cancelled_while_it_opens_the_clock_still_opens_it(tmp_
     with pytest.raises(asyncio.CancelledError):
         await step
     assert rec.downtime_marks == 1
+
+
+async def test_a_retried_handover_cutover_waits_for_the_stop_it_sent(tmp_path):
+    """SDD §7.3 step 1, §7.1: a 503 during the stop's wait is retried; the retry finds the stop it
+    sent still running - the server reads ACTIVE, task_state powering-off - and waits for it
+    instead of sending a second stop, which Nova refuses with 409 (review RV26-02)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    powering_off(clouds["src"], settle_s=1.0)
+    stop, sent = clouds["src"].compute.stop_server, []
+
+    def counted(server):
+        sent.append(server.id)  # every stop sent, refused ones too
+        stop(server)
+
+    clouds["src"].compute.stop_server = counted
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(TransientStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    journal = executor.run_dir(ctx) / JOURNAL_FILE
+    first_at = json.loads(journal.read_text())["done"]["sent:stop_source"]["at"]
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id
+    assert [c for c in calls if c[1] == "stop_server"] == [("src", "stop_server", "srv-1")]
+    assert sent == ["srv-1"], "a second stop was sent, which Nova refuses while one runs"
+    # the first stop's time stays journaled: the clock's start (SDD §7.3 step 1)
+    archived = executor.run_dir(ctx) / JOURNAL_FILE
+    assert json.loads(archived.read_text())["done"]["sent:stop_source"]["at"] == first_at
+
+
+async def test_a_handover_stop_refused_for_one_that_began_meanwhile_waits_for_it(tmp_path):
+    """SDD §7.3 step 1: a stop that began between the server's read and the cutover's stop - Nova
+    refuses the second with 409 while it powers the guest off - is waited for, not a failure
+    (review RV26-02)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    powering_off(clouds["src"], settle_s=0.5, blips=0)
+    stop = clouds["src"].compute.stop_server
+
+    def racing_stop(server):
+        stop(server)  # another stop lands first...
+        stop(server)  # ...so this one is refused: 409, task_state powering-off
+
+    clouds["src"].compute.stop_server = racing_stop
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id
+
+
+async def test_a_handover_rollback_starts_a_source_nova_still_powers_off(tmp_path):
+    """SDD §7.3 rollback: a stop that never confirmed is rolled back while Nova still powers the
+    guest off - the server reads ACTIVE, task_state powering-off. The rollback waits for the
+    power-off to end and starts the source, never reading that ACTIVE as running (review
+    RV26-01)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    settled = powering_off(clouds["src"], settle_s=1.0)
+    with pytest.raises(TransientStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["source_running"] is True
+    # once Nova finished the power-off, the source runs - started after it, not read as running
+    assert await asyncio.to_thread(settled.wait, 5)
+    assert clouds["src"].servers["srv-1"].status == "ACTIVE"
+    assert ("src", "start_server", "srv-1") in calls
 
 
 async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):
@@ -2255,12 +2372,12 @@ async def test_a_providers_name_never_decides_whether_a_failure_is_retried(tmp_p
         await executor._call("manage vol-1 in DC3", busy)
 
 
-def sdk_error(status, reason, body=b""):
+def sdk_error(status, reason, body=b"", url="https://cinder.dc3.example:8776/v3/volumes"):
     """The exception openstacksdk itself raises for an HTTP error answer (raise_from_response)."""
     import requests
     from openstack import exceptions
 
-    request = requests.Request("POST", "https://cinder.dc3.example:8776/v3/volumes").prepare()
+    request = requests.Request("POST", url).prepare()
     response = requests.models.Response()
     response.status_code, response.reason, response._content = status, reason, body
     response.request, response.url = request, request.url

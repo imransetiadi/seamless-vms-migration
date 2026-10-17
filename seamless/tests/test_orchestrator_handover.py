@@ -12,7 +12,14 @@ from seamless_migrate.domain.enums import Phase, PlanStatus
 from seamless_migrate.executors.handover import HandoverExecutor
 from seamless_migrate.orchestrator import NotAllowed
 from tests.orch_support import build_harness, make_settings
-from tests.test_executor_handover import HTTPError, held_manage, sdk_error, setup, shared_pool
+from tests.test_executor_handover import (
+    HTTPError,
+    held_manage,
+    powering_off,
+    sdk_error,
+    setup,
+    shared_pool,
+)
 
 P = Phase
 
@@ -221,5 +228,22 @@ async def test_a_handover_retries_a_manage_cinder_answered_503_and_completes(tmp
         final = await h.wait_phase(mig.id, P.completed, P.failed, P.rolled_back, timeout=20)
         assert blips and final.phase == P.completed, (h.history(final), final.error)
         assert P.rolling_back not in h.history(final)
+    finally:
+        await h.orch.stop()
+
+
+async def test_the_automatic_rollback_starts_a_source_nova_still_powered_off(tmp_path, store):
+    """SDD §7.3 step 1, §8, §5.1: a stop Nova accepted meets a 503 during its wait, and the
+    automatic rollback starts while Nova still powers the guest off - the server reads ACTIVE. The
+    rollback waits for the power-off to end and starts the source, so rolled_back means the source
+    runs (review RV26-01)."""
+    h, calls, clouds, mig = handover_harness(tmp_path, store, max_step_retries=0)
+    settled = powering_off(clouds["src"], settle_s=1.5)
+    await h.orch.start()
+    try:
+        final = await h.wait_phase(mig.id, P.rolled_back, P.failed, timeout=20)
+        assert await asyncio.to_thread(settled.wait, 10), "Nova never finished the power-off"
+        assert final.phase == P.rolled_back, final.error
+        assert clouds["src"].servers["srv-1"].status == "ACTIVE", h.history(final)
     finally:
         await h.orch.stop()
