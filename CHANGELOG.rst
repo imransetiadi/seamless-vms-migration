@@ -518,3 +518,13 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``import_workload_warm_sync`` take ``src_ssh_user`` (default ``ssh_user``)
   for the destination host's hop to the source host, so a RHEL source host
   (``cloud-user``) works with an Ubuntu destination host (``ubuntu``).
+- Every stop and start of a source server waits first until Nova runs no stop
+  of it: the warm cutover's stop, the cold import's stop
+  (``os_migrate_workload_stop_before_migration``) and the rollback's start.
+  Nova keeps a server ``ACTIVE``, with the task state ``powering-off``, until
+  the guest is down, and refuses a second stop or a start meanwhile, while
+  ``server_action`` decides by the status alone. So a rollback after a stop
+  that was cut off (a timeout, a 503 during its wait) started nothing and the
+  source ended ``SHUTOFF``, and a re-run's stop was refused with 409. The wait
+  reads the server every ``os_migrate_source_stop_poll_s`` seconds (default
+  5), at most ``os_migrate_timeout``.

@@ -1,0 +1,25 @@
+---
+# Wait until Nova runs no stop of the workload's source server (Seamless Migrate SDD 6.5, review
+# RV26-10). Nova powers a server off with its task_state "powering-off" while the server still
+# reads ACTIVE until the guest is down, and refuses a second stop or a start (409) meanwhile;
+# server_action reads that ACTIVE as running - a start would start nothing, a stop would be
+# refused. A stop cut off before its wait ended (a step timeout, a 503 during the wait) leaves
+# exactly that for the rollback or the re-run that follows. The cold role includes this file
+# too. Its task name must match none of the control plane's stop task patterns (SDD 7.2).
+- name: Wait until no stop of the source server runs
+  os_migrate.os_migrate.server_info:
+    cloud: src
+    server: "{{ item['_info']['id'] }}"
+    validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+    ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+    client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+    client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+  register: import_workloads_warm_source_power
+  until: >-
+    import_workloads_warm_source_power.servers | default([])
+    | map(attribute='task_state', default=none) | select('equalto', 'powering-off')
+    | list | length == 0
+  retries: >-
+    {{ (os_migrate_timeout | int)
+       // ([os_migrate_source_stop_poll_s | default(5) | int, 1] | max) }}
+  delay: "{{ os_migrate_source_stop_poll_s | default(5) | int }}"

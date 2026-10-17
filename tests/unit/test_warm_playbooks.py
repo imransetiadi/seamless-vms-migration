@@ -81,6 +81,21 @@ def load(path):
         return json.load(f)
 
 
+def nova(server):
+    """Nova as upstream answers while it powers ``server`` off: with world "powering_off", the
+    server reads ACTIVE, task state powering-off, for that many server_info reads, then SHUTOFF.
+    None for a server Nova does not stop; else (reads left, counter file, reads so far)."""
+    left = world.get("powering_off", {}).get(server)
+    if left is None:
+        return None
+    path = WORLD + ".reads." + server
+    reads = 0
+    if os.path.exists(path):
+        with open(path) as f:
+            reads = int(f.read())
+    return max(left - reads, 0), path, reads
+
+
 def save(path, state):
     # as WarmState.save does: the first record creates the state directory
     if not os.path.isdir(os.path.dirname(path)):
@@ -192,11 +207,32 @@ elif NAME in ("import_workload_src_cleanup", "import_workload_dst_failure_cleanu
     result = {"changed": True}
 elif NAME == "server_action":
     result = {"changed": True}
+    power = nova(args["server"])
+    if power is not None and args["action"] in ("start", "stop"):
+        # openstack.cloud's server_action reads the status: ACTIVE while Nova powers it off
+        if power[0] and args["action"] == "start":
+            result = {"changed": False}  # "already ACTIVE": nothing started
+        elif power[0]:
+            result = {"failed": True, "msg": "ConflictException: 409: Client Error for url: "
+                      "https://nova.example.invalid/v2.1/servers/%%s/action, Cannot 'stop' "
+                      "instance while it is in task_state powering-off" %% args["server"]}
+        elif args["action"] == "stop":
+            result = {"changed": False}  # SHUTOFF already
+    if result.get("changed"):
+        with open(WORLD + ".nova", "a") as f:
+            f.write("%%s %%s\n" %% (args["action"], args["server"]))
 elif NAME == "server_info":
     status = world.get("server_status", {}).get(args["server"], "ACTIVE")
+    task_state = None
+    power = nova(args["server"])
+    if power is not None:
+        left, path, reads = power
+        status, task_state = ("ACTIVE", "powering-off") if left else ("SHUTOFF", None)
+        with open(path, "w") as f:
+            f.write(str(reads + 1))
     result = {"changed": False, "servers": [] if status == "MISSING" else [
         {"id": args["server"], "name": args["server"], "status": status,
-         "access_ipv4": "10.9.9.9"}]}
+         "task_state": task_state, "access_ipv4": "10.9.9.9"}]}
 print(json.dumps(result))
 '''
 
@@ -272,6 +308,14 @@ class Env:
                 "dst": {"auth": {"auth_url": "https://dst.example.invalid:5000/v3"}},
             }}, f)
         self.world = {}
+
+    def nova_actions(self):
+        """The starts and stops Nova took (refused ones and the module's no-ops are not)."""
+        path = self.world_file + ".nova"
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return f.read().splitlines()
 
     def state(self, server_id):
         path = os.path.join(self.state_dir, server_id + ".json")
@@ -567,6 +611,59 @@ def test_a_rollback_can_leave_the_source_as_it_is(env):
     rc, out, calls = env.run("rollback_workloads", os_migrate_workloads_filter=[{"regex": "^vm2$"}])
     assert rc == 0, out
     assert modules_for(calls, "vm2", "srv-2") == ["import_workload_rollback", "server_action:start"]
+
+
+def test_a_rollback_starts_a_source_nova_still_powers_off(env):
+    """SDD 6.5, 8 (review RV26-10): Nova still powers the source off - the server reads ACTIVE,
+    task state powering-off - when the rollback comes (a cutover's stop cut off by the step
+    timeout, or one whose wait met a 503, opens the clock and starts the rollback at once).
+    server_action reads that ACTIVE as running and would start nothing, leaving the source to
+    end SHUTOFF: the rollback waits until no stop runs, then starts it."""
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+    env.world["powering_off"] = {"srv-1": 2}
+
+    rc, out, calls = env.run(
+        "rollback_workloads",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_source_stop_poll_s=0,
+    )
+
+    assert rc == 0, out
+    assert env.nova_actions() == ["start srv-1"], out
+
+
+def test_a_warm_cutover_rerun_waits_for_a_stop_nova_still_runs(env):
+    """SDD 6.5 (review RV26-10): a re-run of the cutover - the retry after a 503 during the
+    stop's wait - finds Nova still powering the source off. A second stop would be refused
+    (409, a permanent failure that rolls the cutover back): the cutover waits for the stop that
+    runs, then goes on with the source SHUTOFF."""
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+    env.world["powering_off"] = {"srv-1": 2}
+
+    rc, out, calls = env.run(
+        "import_workloads_cutover",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_source_stop_poll_s=0,
+    )
+
+    assert rc == 0, out
+    assert env.state("srv-1")["destination_server_id"] == "dst-vm1"
+    assert env.nova_actions() == [], "a stop was sent while one ran"
+
+
+def test_a_cold_import_waits_for_a_stop_nova_still_runs(env):
+    """SDD 6.5 (review RV26-10): the cold import's stop - a retry after a 503 during an earlier
+    attempt's wait - finds Nova still powering the source off: it waits for that stop instead of
+    sending a second one Nova refuses."""
+    env.world["powering_off"] = {"srv-1": 2}
+
+    rc, out, calls = env.run("import_workloads", os_migrate_source_stop_poll_s=0, **COLD)
+
+    assert rc == 0, out
+    assert env.state("srv-1")["destination_server_id"] == "dst-vm1"
+    assert env.nova_actions() == [], "a stop was sent while one ran"
 
 
 def test_a_rollback_can_leave_the_ports_alone(env):

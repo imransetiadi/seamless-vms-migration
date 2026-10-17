@@ -1845,6 +1845,41 @@ def test_stop_task_pattern():
     assert not any(STOP_TASK.match(line) for line in misses)
 
 
+def test_only_the_collections_stop_tasks_match_the_stop_task_pattern():
+    """SDD §7.2, §6.5: the downtime clock opens at a task whose header matches STOP_TASK, so of the
+    collection's own tasks only the two that stop a source may match it - never the wait for a
+    stop that still runs before them and the rollback's start (review RV26-10), nor any other."""
+    from seamless_migrate.config import find_repo_root
+
+    def names(tasks):
+        for task in tasks or []:
+            if isinstance(task, dict):
+                if task.get("name"):
+                    yield str(task["name"])
+                for key in ("block", "rescue", "always"):
+                    yield from names(task.get(key))
+
+    root, headers = find_repo_root(), []
+    for path in sorted((root / "roles").glob("*/tasks/*.yml")):
+        role = path.parent.parent.name
+        headers += [
+            (role, name, f"TASK [os_migrate.os_migrate.{role} : {name}] ****")
+            for name in names(yaml.safe_load(path.read_text(encoding="utf-8")))
+        ]
+    for path in sorted((root / "playbooks").glob("*.yml")):
+        for play in yaml.safe_load(path.read_text(encoding="utf-8")) or []:
+            for key in ("pre_tasks", "tasks", "post_tasks", "handlers"):
+                headers += [(path.name, n, f"TASK [{n}] ****") for n in names(play.get(key))]
+    assert any(name.startswith("Wait for a stop of the source") for _, name, _ in headers)
+    assert {(where, name) for where, name, header in headers if STOP_TASK.match(header)} == {
+        ("import_workloads_warm", "Stop the source server"),
+        (
+            "import_workloads",
+            "Perform workload stop if os_migrate_workload_stop_before_migration is true",
+        ),
+    }
+
+
 async def test_resolved_flavor_is_applied_to_the_export(env):
     plan = make_plan(id="plan-00c0ffee", mappings=Mappings(networks={"app-net": "rhoso-app"}))
     vm = make_vm(source_id="srv-1", name="web-01", flavor="m1.small")

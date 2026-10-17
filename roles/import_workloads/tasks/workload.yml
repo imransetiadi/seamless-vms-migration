@@ -36,6 +36,14 @@
       when:
         - prelim is defined and prelim.changed
 
+    # a stop that still runs is waited for, not sent again (Seamless Migrate SDD 6.5)
+    - name: Wait for a stop of the source server that still runs
+      ansible.builtin.include_tasks: "{{ role_path }}/../import_workloads_warm/tasks/source_stop_settled.yml"
+      when:
+        - prelim is defined and prelim.changed
+        - os_migrate_workload_stop_before_migration | bool
+        - item["_migration_params"]["data_copy"] | default(true)
+
     # Stop VM if not stopped and if config set to true
     - name: Perform workload stop if os_migrate_workload_stop_before_migration is true
       os_migrate.os_migrate.server_action:

@@ -24,8 +24,8 @@ the task file:
 | Playbook | Per filtered workload |
 |---|---|
 | `import_workloads_precopy.yml` | snapshot → sync (`auto`: `full` on the first pass, then `delta`) → remove the snapshot |
-| `import_workloads_cutover.yml` | stop the source (wait for SHUTOFF) → snapshot → sync (`final`) → remove the snapshot → create the destination server from the synchronised volumes (`import_workload_create_instance`) and record its ID |
-| `rollback_workloads.yml` | delete the recorded destination server (and, with `os_migrate_rollback_delete_dest_volumes`, the destination volumes, emptying the warm state) → start the source server (unless `os_migrate_rollback_start_source: false`) |
+| `import_workloads_cutover.yml` | wait while a stop of the source still runs → stop the source (wait for SHUTOFF) → snapshot → sync (`final`) → remove the snapshot → create the destination server from the synchronised volumes (`import_workload_create_instance`) and record its ID |
+| `rollback_workloads.yml` | delete the recorded destination server (and, with `os_migrate_rollback_delete_dest_volumes`, the destination volumes, emptying the warm state) → start the source server once no stop of it runs (unless `os_migrate_rollback_start_source: false`) |
 
 Run `export_workloads.yml` first, as for `import_workloads.yml`. Pre-copy can
 run any number of times; a cutover that already created the destination
@@ -82,6 +82,7 @@ name with `%`, `/` and NUL written `%25`, `%2F` and `%00`
 | `os_migrate_rollback_start_source` | `true` | the rollback's last step starts the source server; `false` leaves it as it is (Seamless Migrate's cleanup before a cold cutover, when the source may stay stopped) |
 | `os_migrate_rollback_all` | `false` | a rollback with the catch-all workload filter (`regex: .*`, every workload of the data dir) is refused unless this is `true`; an exact filter rolls back one workload |
 | `os_migrate_rollback_delete_ports` | `true` | the rollback deletes the destination ports created through Neutron for the workload's source ports; `false` deletes none (Seamless Migrate's cleanup after a cancel, which made no port, where an unbound one may belong to another migration of the VM) |
+| `os_migrate_source_stop_poll_s` | `5` | seconds between the reads of the server while Nova still stops it: the cutover's stop and the rollback's start first wait until no stop runs (Nova reads `ACTIVE`, task state `powering-off`, until the guest is down, and refuses a second stop or a start meanwhile), at most `os_migrate_timeout` |
 | `os_migrate_workloads_filter` | `[{regex: .*}]` | workloads to process (name filter, as for `import_workloads`) |
 | `os_migrate_workload_cleanup_on_failure` | `true` | remove the temporary snapshot when a pass fails |
 | `os_migrate_workload_boot_volume_prefix` | `os-migrate-` | name prefix of the temporary snapshots, volumes and images |

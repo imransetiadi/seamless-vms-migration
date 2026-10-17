@@ -83,6 +83,10 @@
       another server and were kept.
   when: import_workloads_warm_rollback.kept_volume_ids | default([]) | length > 0
 
+- name: Wait for a stop of the source server that still runs
+  ansible.builtin.include_tasks: source_stop_settled.yml
+  when: os_migrate_rollback_start_source | bool
+
 - name: Start the source server
   os_migrate.os_migrate.server_action:
     cloud: src
