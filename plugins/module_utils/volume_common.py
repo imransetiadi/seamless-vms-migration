@@ -18,6 +18,7 @@ import time
 import fcntl
 import errno
 import functools
+import math
 
 # Default timeout for OpenStack operations
 DEFAULT_TIMEOUT = 1800
@@ -45,6 +46,19 @@ def _is_not_found(err):
     """openstacksdk's NotFoundException (a 404), whatever its version names it."""
     return getattr(err, "status_code", None) == 404 or any(
         cls.__name__ == "NotFoundException" for cls in type(err).__mro__
+    )
+
+
+def image_volume_size(image):
+    """The smallest volume, in GiB, that Cinder creates from ``image`` - a server snapshot: its
+    file rounded up to whole GiB, its virtual disk (a qcow2 file holds a larger disk) and its
+    min_disk, at least 1 (Seamless Migrate SDD 6.1, audit A-06)."""
+    gib = 1024 ** 3
+    return max(
+        int(math.ceil((getattr(image, "size", None) or 0) / float(gib))),
+        int(math.ceil((getattr(image, "virtual_size", None) or 0) / float(gib))),
+        int(getattr(image, "min_disk", None) or 0),
+        1,
     )
 
 
@@ -1249,7 +1263,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                 image=image.id,
                 wait=False,
                 name=image.name,
-                size=max(image.size // (1024**3), image.min_disk),
+                size=image_volume_size(image),
             )
             self.volume_map["/dev/vda"]["source_id"] = volume.id
             volume = self.conn.block_storage.wait_for_status(

@@ -243,6 +243,28 @@ def test_a_successful_image_copy_maps_the_copy_and_the_cleanup_removes_it():
     assert _holders(src, "vol-data1") == ["srv-1"]
 
 
+@pytest.mark.parametrize(
+    ("image", "size"),
+    [
+        (dict(size=3 * fake.GIB + 5, min_disk=20), 20),
+        (dict(size=int(2.5 * fake.GIB), min_disk=0), 3),
+        (dict(size=fake.GIB, min_disk=0, virtual_size=10 * fake.GIB), 10),
+    ],
+)
+def test_the_cold_image_copy_is_as_large_as_cinder_needs_for_the_image(image, size):
+    """Seamless Migrate SDD 6.1 (audit A-06): the cold export sizes the volume it creates from the
+    server's snapshot as the warm pass does - the file rounded up, the virtual disk, min_disk."""
+    src, data = _image_booted_vm()
+    src.server_image = image
+    host = SourceHost(src)
+
+    with mock.patch.object(volume_common.time, "sleep"):
+        exported = fake.run_module(export_module, dict(COMMON, data=data), src, host)
+    assert exported["_exit_code"] in (None, 0), exported
+    root = exported["volume_map"]["/dev/vda"]
+    assert (root["size"], src.volumes[root["source_id"]].size) == (size, size)
+
+
 def test_a_failed_image_copy_leaves_no_image_behind():
     """An image-booted VM with boot_disk_copy: the export makes an image of the VM, then a volume
     from it. The image is recorded as soon as it exists, so the cleanup removes it."""

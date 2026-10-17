@@ -42,6 +42,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     RemoteShell,
     destination_volume_sdk_params,
     detach_volume_bounded,
+    image_volume_size,
     use_lock,
     volume_or_none,
 )
@@ -55,7 +56,6 @@ BLOCKSYNC_REMOTE_PATH = "/tmp/seamless-blocksync-{transfer_uuid}.py"
 
 _SAFE_SERVER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SAFE_TRANSFER_UUID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
-_GIB = 1024 ** 3
 
 
 def utc_now():
@@ -558,7 +558,7 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
         image = self.conn.get_image_by_id(image.id)
         if image is None or image.status != "active":
             raise RuntimeError("Could not create new image of image-based instance!")
-        size = max((image.size or 0) // _GIB, image.min_disk or 0, 1)
+        size = image_volume_size(image)
         volume = self.conn.create_volume(
             size=size,
             image=image.id,

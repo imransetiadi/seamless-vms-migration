@@ -512,6 +512,30 @@ def test_snapshot_image_booted_server_with_boot_disk_copy(tmp_path):
     assert boot["image_id"] not in scenario.src.images
 
 
+#: a server snapshot as Glance reports it, and the volume Cinder needs for it (audit A-06)
+IMAGE_SIZES = [
+    (dict(size=3 * fake.GIB + 5, min_disk=20), 20),  # Nova's min_disk: the instance's root disk
+    (dict(size=int(2.5 * fake.GIB), min_disk=0), 3),  # a raw file of 2.5 GiB needs 3, not 2
+    (dict(size=fake.GIB, min_disk=0, virtual_size=10 * fake.GIB), 10),  # a qcow2 file holds a larger disk
+    (dict(size=None, min_disk=None), 1),
+]
+
+
+@pytest.mark.parametrize(("image", "size"), IMAGE_SIZES)
+def test_a_boot_disk_copy_volume_is_as_large_as_cinder_needs_for_the_image(tmp_path, image, size):
+    """Seamless Migrate SDD 6.1 (audit A-06): the volume a boot_disk_copy pass creates from the
+    server's snapshot holds the image - its file rounded up to whole GiB, its virtual disk and
+    its min_disk, at least 1 GiB; Cinder refuses a smaller one on every pass."""
+    scenario = Scenario(tmp_path, image_booted=True, boot_disk_copy=True)
+    scenario.src.server_image = image
+
+    volume_map = scenario.snapshot("uuid-1").create()
+
+    boot = volume_map["/dev/vda"]
+    assert boot["size"] == size
+    assert scenario.src.volumes[boot["tmp_volume_id"]].size == size
+
+
 def test_snapshot_image_booted_server_without_boot_disk_copy(tmp_path):
     scenario = Scenario(tmp_path, image_booted=True, boot_disk_copy=False)
 

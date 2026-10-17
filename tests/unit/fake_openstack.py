@@ -60,6 +60,8 @@ class FakeCloud:
         self.volumes = {}
         self.snapshots = {}
         self.images = {}
+        # what Glance reports of a server snapshot (create_server_image) beside its defaults
+        self.server_image = {}
         self.devices = {}
         self.ports = {}
         self.networks = {}
@@ -435,13 +437,9 @@ class _FakeCompute:
 
     def create_server_image(self, server, name, metadata=None, wait=False, timeout=120):
         self.cloud.record("create_server_image", server=server, name=name, wait=wait)
-        image = Obj(
-            id=self.cloud.new_id("img"),
-            name=name,
-            size=3 * GIB + 5,
-            min_disk=20,
-            status="active",
-        )
+        traits = dict(size=3 * GIB + 5, min_disk=20, virtual_size=None)
+        traits.update(self.cloud.server_image)
+        image = Obj(id=self.cloud.new_id("img"), name=name, status="active", **traits)
         self.cloud.images[image.id] = image
         return image
 
