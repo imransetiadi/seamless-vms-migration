@@ -407,3 +407,46 @@ async def test_a_retried_handover_cutover_that_finds_the_source_running_counts_a
     assert final.actual_downtime_s is not None and 0 <= final.actual_downtime_s < 3600, (
         final.actual_downtime_s
     )
+
+
+async def test_a_retry_after_a_first_stop_never_confirmed_counts_a_new_outage(tmp_path, store):
+    """SDD §5.2, §7.3 step 1 (review RV34B-04), end to end: the first stop is accepted and its wait
+    fails - only the stop sent is journaled, the clock opened at its request -; the automatic
+    rollback finds no definition and starts the source, Nova performs the start while its wait
+    fails: failed, the clock open, the source running. The operator's retry an hour later finds
+    it running, closes that outage and counts a new one from its stop."""
+    h, calls, clouds, mig = handover_harness(tmp_path, store, max_step_retries=0)
+    src = clouds["src"]
+    wait = src.compute.wait_for_server
+    shutoff_failed, started, active_failed = [], [], []
+
+    def start_server(s):
+        src.record("start_server", s.id)
+        s.status = "ACTIVE"
+        started.append(1)
+
+    def wait_for_server(s, status="ACTIVE", **kw):
+        if status == "SHUTOFF" and not shutoff_failed:
+            shutoff_failed.append(1)  # the first stop: accepted, its wait fails
+            raise HTTPError("HTTP 500 Internal Server Error: nova-api")
+        if status == "ACTIVE" and started and not active_failed:
+            active_failed.append(1)  # the rollback's start: performed, its wait fails
+            raise RuntimeError("nova: HTTP 500 Internal Server Error")
+        return wait(s, status=status, **kw)
+
+    src.compute.start_server, src.compute.wait_for_server = start_server, wait_for_server
+    await h.orch.start()
+    try:
+        failed = await _failed_after_its_rollback(h, mig.id)
+        assert failed.downtime_started_at is not None and failed.downtime_ended_at is None
+        assert src.servers["srv-1"].status == "ACTIVE"  # the source runs again
+        h.clock.advance(3600)  # for an hour, before the operator retries
+        await h.orch.retry(mig.id, "rina")
+        final = await h.wait_phase(mig.id, P.completed, P.rolled_back, P.failed, timeout=20)
+    finally:
+        await h.orch.stop()
+    assert final.phase == P.completed, (h.history(final), final.error)
+    assert final.downtime_started_at > failed.downtime_started_at  # a new outage
+    assert final.actual_downtime_s is not None and 0 <= final.actual_downtime_s < 3600, (
+        final.actual_downtime_s
+    )

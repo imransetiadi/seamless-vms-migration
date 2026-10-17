@@ -1730,6 +1730,86 @@ async def test_a_re_stop_that_finds_the_source_running_counts_a_new_outage(tmp_p
         assert len(seen) == 3 and seen[2][:2] == ("clock", "start") and seen[2][2] is not None
 
 
+@pytest.mark.parametrize(
+    "found", ["running", "running, its stop's wait failed", "still powering off", "stopped"]
+)
+async def test_a_retry_after_a_first_stop_never_confirmed_counts_the_run_since(tmp_path, found):
+    """SDD §5.2, §7.3 step 1 (review RV34B-04): only the first stop was journaled as sent - Nova
+    accepted it, its wait failed - and a rollback's start, its own wait failed, ran the source
+    since. The retry finds it running: that outage ended - the clock closes - and its stop opens a
+    new one, at that stop's request when its wait fails too. A stop Nova still runs, or a source
+    that stayed stopped, is the same outage."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    wait, start = src.compute.wait_for_server, src.compute.start_server
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.wait_for_server = wait_fails  # the first stop: accepted, its wait fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+
+    def start_server(s):  # Nova performs the rollback's start, whose wait fails
+        src.record("start_server", s.id)
+        s.status = "ACTIVE"
+
+    src.compute.start_server = start_server
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.start_server, src.compute.wait_for_server = start, wait
+    if found == "still powering off":
+        server.task_state = "powering-off"  # a stop Nova still runs: whose, no read tells
+    elif found == "stopped":
+        server.status = "SHUTOFF"
+
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    end, begin = ctx.mark_downtime_end, ctx.mark_downtime_start
+
+    async def mark_end():
+        calls.append(("clock", "end", None))
+        await end()
+
+    async def mark_start(at=None):
+        calls.append(("clock", "start", at))
+        await begin(at=at)
+
+    ctx.mark_downtime_end, ctx.mark_downtime_start = mark_end, mark_start
+    if found == "still powering off":
+
+        def powered_off(s, status="ACTIVE", failures=None, interval=2, wait=120):
+            s.status, s.task_state = "SHUTOFF", None  # the guest is down
+            return s
+
+        src.compute.wait_for_server = powered_off
+    elif found == "running, its stop's wait failed":
+        src.compute.wait_for_server = wait_fails
+    retried = len(calls)
+    if found == "running, its stop's wait failed":
+        with pytest.raises((TransientStepError, PermanentStepError), match="stop source server"):
+            await executor.run(StepName.CUTOVER, ctx)
+    else:
+        await executor.run(StepName.CUTOVER, ctx)
+    seen = [c for c in calls[retried:] if c[0] == "clock" or c[1] == "stop_server"]
+    if found == "running":
+        assert seen == [
+            ("clock", "end", None),
+            ("src", "stop_server", "srv-1"),
+            ("clock", "start", None),
+        ]
+    elif found == "running, its stop's wait failed":
+        journal = json.loads((executor.run_dir(ctx) / "handover-journal.json").read_text())
+        restop = datetime.fromisoformat(journal["done"]["sent:restop_source"]["at"])
+        assert seen == [
+            ("clock", "end", None),
+            ("src", "stop_server", "srv-1"),
+            ("clock", "start", restop),  # this stop's request, never the first one's
+        ]
+    else:
+        assert seen == [("clock", "start", None)]  # the first stop's outage goes on
+
+
 async def test_a_refused_re_stop_never_reopens_the_clock_at_an_earlier_re_stops_time(tmp_path):
     """SDD §5.2, §7.3 step 1 (review RV33-04): a re-stop opens a new outage only once Nova accepted
     that re-stop - an earlier attempt's accepted re-stop, journaled, is no start for a re-stop Nova

@@ -1335,9 +1335,19 @@ class HandoverExecutor:
         restops_before = journal.last("sent:restop_source")
         try:
             if not journal.done("stop_source"):
-                await self._call(
-                    "stop source server", lambda: stop(src.compute.get_server(server_id))
+                server = await self._call(
+                    "stop source server", lambda: settle(src.compute.get_server(server_id))
                 )
+                if journal.done("sent:stop_source") and _active(server) and not _stopping(server):
+                    # only the first stop was journaled as sent, its wait failed or cut off: a
+                    # rollback's start Nova performed, or an operator's, ran the source since -
+                    # that outage ended and this stop opens a new one (SDD §5.2, §7.3 step 1,
+                    # review RV34B-04)
+                    await outlive_cancel(ctx.mark_downtime_end())
+                    restopping = True
+                    await self._call("stop source server", lambda: stop(server, again=True))
+                else:
+                    await self._call("stop source server", lambda: stop(server))
                 await _in_thread(journal.mark, "stop_source")
             elif not journal.done("delete_source"):
                 server = await self._call("stop source server", to_stop_again)
