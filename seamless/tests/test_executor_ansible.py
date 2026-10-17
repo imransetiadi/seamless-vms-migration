@@ -1727,6 +1727,37 @@ def test_build_vars_and_inventory_are_pure(env):
     assert inventory["migrator"]["hosts"]["localhost"]["ansible_connection"] == "local"
 
 
+@pytest.mark.parametrize("step", [StepName.PRESTAGE, StepName.CUTOVER, StepName.PRECOPY])
+def test_each_conversion_host_gets_its_own_providers_ssh_user(env, step):
+    """SDD §6.5, §21.6: a RHOSP source with a RHEL conversion host (cloud-user) and a community
+    destination with an Ubuntu one (ubuntu): each side's variable names its own provider's user -
+    the collection reaches each host with it - never the other's; a provider without a conversion
+    host config keeps the default, cloud-user (audit EX-08)."""
+    src = make_provider(
+        conversion_host=ConversionHostConfig(name="conv-src", manage=False, ssh_user="cloud-user")
+    )
+    dst = make_provider(
+        id="dst-hibiscus",
+        role=ProviderRole.destination,
+        cloud="dst",
+        release="2026.2",
+        conversion_host=ConversionHostConfig(name="conv-dst", manage=False, ssh_user="ubuntu"),
+    )
+    for source, destination, expected in (
+        (src, dst, ("cloud-user", "ubuntu")),
+        (dst.model_copy(update={"role": ProviderRole.source}), src, ("ubuntu", "cloud-user")),
+        (src.model_copy(update={"conversion_host": None}), dst, ("cloud-user", "ubuntu")),
+    ):
+        ctx, _ = ctx_for(env, strategy=Strategy.warm, source=source)
+        ctx.destination = destination
+        v = build_vars(step, ctx)
+        users = (
+            v["os_migrate_src_conversion_host_ssh_user"],
+            v["os_migrate_dst_conversion_host_ssh_user"],
+        )
+        assert users == expected, (source.id, destination.id)
+
+
 def test_build_vars_safety_pins_and_volume_types(env):
     """SDD §7.2: password SSH pinned off, SEC-03 CIDR, preserved volume types, cold rollback."""
     ctx, _ = ctx_for(env, strategy=Strategy.cold)

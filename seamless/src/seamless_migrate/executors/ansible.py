@@ -497,6 +497,10 @@ def _common_openstack_vars(
         if provider.ca_cert_path:
             out[f"os_migrate_{side}_ca_cert"] = provider.ca_cert_path
         host = provider.conversion_host
+        # each conversion host is reached as its own provider's user (SDD §6.5, audit EX-08)
+        out[f"os_migrate_{side}_conversion_host_ssh_user"] = (
+            host.ssh_user if host else None
+        ) or "cloud-user"
         if host is None:
             continue
         ssh_user = host.ssh_user or ssh_user
