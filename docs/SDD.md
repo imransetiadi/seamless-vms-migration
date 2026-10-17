@@ -1621,7 +1621,8 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
 * Failure handling: `TransientStepError` → retry with backoff `2^attempt` s (×1/demo_speed) up to
   `max_step_retries`; then `failed`. Each attempt starts under the migration's lock and only while the
   migration is still in the step's phase, so an action under that lock (a cancel) either finds the
-  attempt running or ends the retries (§5.1). If downtime had started and
+  attempt running or ends the retries (§5.1). Each attempt reads the plan's providers again, so a retry after a
+  credential rotation signs in with the new credentials (§13.3; review RV26-07). If downtime had started and
   `plan.verification.auto_rollback` is true → `rolling_back` automatically, saved in the same write as
   `failed` (the history keeps both): a restart, or an event that fails to be written, right after the
   failure resumes the rollback (`rolling_back` is resumed) and never leaves the stopped VM in `failed`.
