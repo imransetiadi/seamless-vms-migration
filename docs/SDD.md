@@ -815,15 +815,17 @@ environment block as `import_workloads.yml`):
 | `playbooks/rollback_workloads.yml` | delete destination server if recorded; when `os_migrate_rollback_delete_dest_volumes` (default false) also delete dst volumes and empty the warm state (the file stays, §6.3) — with a warm state only the volumes it records (a volume attached to the destination server later is not the migration's: kept and returned as `kept_volume_ids`, like a volume still attached to a server other than the destination conversion host; without a warm state the destination server's attachments are the migration's); start the source server once no stop of it runs (below), unless `os_migrate_rollback_start_source` is `false` (the cleanup before a cold cutover, §7, leaves it as it is). Refuses the catch-all filter (`os_migrate_workloads_filter` unset or `[{regex: '.*'}]`) unless `os_migrate_rollback_all: true`: a rollback reverts every cut-over workload it matches (the control plane always passes `^<name>$`) |
 
 Every stop and start of a source server - the warm cutover's stop, the cold import's (`import_workloads.yml` with
-`os_migrate_workload_stop_before_migration`) and the rollback's start - first waits until Nova runs no stop of it:
-Nova powers a server off with its `task_state` `powering-off` while the server still reads `ACTIVE` until the guest is
-down, and refuses a second stop or a start (409) meanwhile, while the vendored `server_action` reads that `ACTIVE` as
-running - a start would start nothing, leaving the source to end `SHUTOFF` under a rolled-back migration, and a stop
-would be refused. A stop cut off before its wait ended (the step timeout, a rollback request, a 503 during the wait)
-leaves exactly that for the rollback or the retry that follows (§8). The wait reads the server (`server_info`) every
+`os_migrate_workload_stop_before_migration`) and the rollback's start - first waits until Nova runs no stop or start
+of it: Nova powers a server off with its `task_state` `powering-off` while the server still reads `ACTIVE` until the
+guest is down, and refuses a second stop or a start (409) meanwhile, while the vendored `server_action` reads that
+`ACTIVE` as running - a start would start nothing, leaving the source to end `SHUTOFF` under a rolled-back migration,
+and a stop would be refused. Nova starts a server the same way - `task_state` `powering-on` while it still reads
+`SHUTOFF` - and refuses a stop or a second start meanwhile: the wait waits for that too (review RV29-06). A stop cut
+off before its wait ended (the step timeout, a rollback request, a 503 during the wait) leaves exactly that for the
+rollback or the retry that follows (§8). The wait reads the server (`server_info`) every
 `os_migrate_source_stop_poll_s` seconds, at most `os_migrate_timeout` seconds - and once more at the latest after
-`os_migrate_timeout` seconds, also when the poll interval is longer; a stop that still runs then fails the play
-(review RV27-09) -; its task names none of the stop task patterns of §7.2, so it opens no downtime clock (review
+`os_migrate_timeout` seconds, also when the poll interval is longer; a stop or start that still runs then fails the
+play (review RV27-09) -; its task names none of the stop task patterns of §7.2, so it opens no downtime clock (review
 RV26-10).
 
 Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_src_auth`,
@@ -1526,7 +1528,9 @@ it sets every attachment's journaled `delete_on_termination` back and starts the
 was journaled as sent. A server Nova still powers off (`task_state` `powering-off`) reads `ACTIVE` and refuses a
 start until the guest is down: the rollback waits until the stop ended - `SHUTOFF`, or `ACTIVE` again when Nova gave
 the power-off up (its `task_state` back to none, the guest still running) - then starts it unless it runs (reviews
-RV26-01, RV27-04). An empty
+RV26-01, RV27-04). A server Nova still powers on (`task_state` `powering-on`: an earlier attempt's start accepted, its
+wait cut off) reads `SHUTOFF` and refuses a second start: the rollback waits for that start to end too (review
+RV29-06). An empty
 journal means the source was never stopped. Otherwise:
 delete the destination server; delete the destination ports step 8 created through Neutron (journaled, or
 unbound with their description: a create sent before a crash), which Nova keeps; unmanage at RHOSO; manage at the
