@@ -1378,7 +1378,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   pass - is refused before it starts, before any clock, while a volume named `<kit name>-<digits>` with `osm` `true`
   is marked converted, or, for a `vmware_cold` cutover, while any such volume exists: the refusal names each volume
   and its holder and tells the operator to roll the migration back again, which deletes the ones it may (review
-  RV29-01).
+  RV29-01). A converted volume is no refusal while the source has not run since this outage's stop - the clock open
+  (§5.2) and vCenter reading the VM off -: the kit then takes the volume it converted in this outage as migrated,
+  which it is, as when a cutover is retried after a failure past the conversion.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
   migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
