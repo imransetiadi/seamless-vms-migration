@@ -282,10 +282,11 @@ def _api_path_takes_another_method(request: Request) -> bool:
 def _dashboard_file(root: Path, full_path: str) -> str | None:
     """The dashboard's file at ``full_path``, contained first (SDD §12): a path whose ".." leaves
     the directory is never looked at, and a symlink inside it counts only when what it names
-    stays inside; None for any other path - the index answers it."""
+    stays inside; None for any other path - the index answers it - as for a NUL byte, which
+    names no file (review RV33-05)."""
     inside = f"{root}{os.sep}"
     candidate = os.path.normpath(os.path.join(root, full_path))
-    if not (full_path and candidate.startswith(inside)):
+    if not (full_path and "\x00" not in full_path and candidate.startswith(inside)):
         return None
     real = os.path.realpath(candidate)
     return real if real.startswith(inside) and os.path.isfile(real) else None

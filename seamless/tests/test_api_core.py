@@ -585,6 +585,22 @@ def test_the_dashboard_fallback_looks_at_no_path_outside_its_directory(tmp_path,
     store.dispose()
 
 
+def test_the_dashboard_fallback_answers_a_nul_path_with_the_index(tmp_path):
+    """SDD §12 (review RV33-05): a path holding a NUL byte - GET /plans%00, unauthenticated - names
+    no file: the fallback answers the index, never a 500 with a traceback in the log."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>Seamless</title>")
+    settings, _ = api_settings(tmp_path, dashboard_dir=dist)
+    store = Store(f"sqlite:///{tmp_path / 'spa-nul.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        for path in ("/plans%00", "/%00", "/assets%00/x.js"):
+            answer = client.get(path)
+            assert answer.status_code == 200 and "Seamless" in answer.text, (path, answer.text)
+    store.dispose()
+
+
 def test_a_wrong_method_on_an_api_route_is_405_where_the_dashboard_is_served(tmp_path):
     """SDD §12: 405 `method_not_allowed` for a method an API route does not take - the
     dashboard's GET fallback must not turn a GET on a POST-only route into a 404."""
