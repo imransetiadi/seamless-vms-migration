@@ -1611,7 +1611,10 @@ volumes with their server, so the order is:
    (step 4) unless it reads `ACTIVE`: Nova starts no server it is deleting or that a failed deletion left in `ERROR`,
    and its stop of one never reads `SHUTOFF` (review RV33-03). A source found running has run since the first stop:
    that outage ended - the step closes the clock - and the re-stop opens a new one, at the re-stop's request when
-   the step then ends without `SHUTOFF` (§5.2, review RV33-04).
+   the step then ends without `SHUTOFF` (§5.2, review RV33-04). So has one a step finds running - once a start Nova
+   runs ended, and with no power-off in progress - when only the first stop was journaled as sent, its wait failed
+   or cut off: a rollback's start that Nova performed while its own wait failed, or an operator's, ran it since; its
+   stop is that re-stop (review RV34B-04).
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
    `plan.port_creation_mode` `"neutron"` also its security groups by name), and the volume attachments in device
