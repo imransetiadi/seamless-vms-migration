@@ -4015,6 +4015,49 @@ async def test_a_vmware_rollback_whose_keep_record_cannot_be_read_still_powers_t
     assert any("rollback-kept.json" in line and "stays" in line for line in rec.logs)
 
 
+@pytest.mark.parametrize("record", ["damaged", "a directory"])
+async def test_a_vmware_rollback_writes_no_keep_record_over_one_it_cannot_read(env, record):
+    """SDD §7.2 (review RV34A-03): with the clock open, a server of the kit's name found beside a
+    keep record that cannot be read is deleted and the source powered on as any other. No record
+    is written over the unreadable one: its path may refuse the write (a directory there), and
+    one written over a damaged file would let a later attempt delete what that file kept. The
+    volumes the server held are logged; while the record cannot be read no attempt deletes a kit
+    volume of the VM - here the attempt retried after a failure past the power-on."""
+    path = run_dir(env) / ".seamless" / "rollback-kept.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if record == "damaged":
+        path.write_text('{"server_id": "dst-old", "volumes": ["kept-earlier",')
+    else:
+        path.mkdir()
+    env.registry.existing = {"web-01"}  # the kit's server, found by name
+    env.registry.volumes = [
+        kit_volume("root", "web-01-2000", attachments=["dst-web-01"]),
+        # what an earlier attempt kept of a server it found by name, in the damaged record
+        kit_volume("kept-earlier", "web-01-2001", converted=False),
+    ]
+    env.registry.ports_error = True  # the first attempt fails past the power-on
+    ctx, rec = ctx_for(
+        env, strategy=Strategy.vmware_warm, source=VCENTER, downtime_started_at=utcnow()
+    )
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    calls = [c[0] for c in env.registry.calls]
+    assert calls.index("delete_server") < calls.index("power_on")
+    # the retry: the clock closed at the power-on, the server is gone
+    env.registry.ports_error = False
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        downtime_started_at=utcnow(),
+        downtime_ended_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert "delete_volume" not in [c[0] for c in env.registry.calls]
+    assert result.details["deleted_volumes"] == []
+    assert any("root" in line and "dst-web-01" in line for line in rec.logs), rec.logs
+
+
 async def test_a_vm_named_like_the_old_keep_record_never_fails_the_rollback(env):
     """SDD §7.2 (review RV32A-08): the kit creates a guest directory {run directory}/{VM name}; a
     VM named rollback-kept.json takes the record's old path. The record lives one level below, so

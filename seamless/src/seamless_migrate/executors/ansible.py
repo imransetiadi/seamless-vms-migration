@@ -1765,13 +1765,25 @@ class AnsibleExecutor:
                     # it holds stays, its deletion detaching it notwithstanding (review RV29-03) -
                     # read from Nova's record, as no Cinder call comes before the power-on, and
                     # recorded before the deletion: a retried attempt no longer finds the server
-                    kept |= set(await dst.server_volumes(named))
-                    try:
-                        await asyncio.to_thread(_record_kept, rdir, named, kept)
-                    except OSError as exc:
-                        raise TransientStepError(
-                            f"rollback: could not record what {named} holds: {exc}"
-                        ) from exc
+                    held = set(await dst.server_volumes(named))
+                    kept |= held
+                    if unreadable is not None:
+                        # none written over a record that cannot be read: its path may refuse
+                        # the write, and one written over a damaged file would let a later attempt
+                        # delete what that file kept; while it cannot be read no attempt deletes a
+                        # kit volume (SDD §7.2, review RV34A-03)
+                        await ctx.log(
+                            f"rollback: what {named} holds is not recorded "
+                            f"({', '.join(sorted(held)) or 'no volume'}): the record cannot be "
+                            f"read, so no kit volume of {vm.name} is deleted"
+                        )
+                    else:
+                        try:
+                            await asyncio.to_thread(_record_kept, rdir, named, kept)
+                        except OSError as exc:
+                            raise TransientStepError(
+                                f"rollback: could not record what {named} holds: {exc}"
+                            ) from exc
             servers = [server for server in (recorded, named) if server]
             for server in servers:
                 await dst.delete_server(server)
