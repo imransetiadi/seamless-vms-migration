@@ -548,3 +548,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
   earlier pass extended to the source's grown size but could not record is
   recorded at the size Cinder reports, rather than extended again to the size
   it has, which Cinder refused on every later pass.
+- A warm pass first detaches from the destination conversion host the
+  recorded destination volumes a pass interrupted earlier left attached, then
+  extends one whose source volume grew. Before, the extend ran first: where
+  Cinder refuses to extend an ``in-use`` volume (its microversion or backend do
+  not allow it), every later pass failed the same way until an operator
+  detached the volume by hand; where it extends one, the pass waited until its
+  timeout for the volume to read ``available``, which an attached volume never
+  does.

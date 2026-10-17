@@ -860,6 +860,45 @@ def test_sync_extends_the_destination_volume_when_the_source_grew(tmp_path):
     assert ("extend_volume", {"volume": data_id, "size": 15}) in scenario.dst.calls
 
 
+@pytest.mark.parametrize("online", [False, True], ids=["refused-in-use", "extended-online"])
+def test_a_pass_detaches_what_an_interrupted_pass_left_attached_before_it_extends(tmp_path, online):
+    """Seamless Migrate SDD 6.4 (audit A-04): a pass interrupted earlier can leave a destination
+    volume attached to the destination conversion host. When its source volume grew, the next
+    pass extends it - which Cinder refuses for an `in-use` volume unless its microversion and
+    backend allow, and after which the pass waits for `available`, which an attached volume never
+    reads. The pass detaches what the interrupted one left first, so it neither fails nor wedges
+    every later pass until an operator detaches the volume by hand."""
+    scenario = Scenario(tmp_path)
+    scenario.run_pass("uuid-1")
+    dst = scenario.dst
+    data_id = scenario.state().dest_volumes["/dev/vdb"]["dest_id"]
+    # the pass interrupted here: the volume stayed attached to the conversion host
+    dst.attach_volume(dst.servers["dst-conv"], dst.volumes[data_id])
+    scenario.src.volumes["vol-data"].size = 15  # grown between passes
+    extend = dst.block_storage.extend_volume
+
+    def cinder_extend(volume, size):
+        status = dst.volumes[volume.id].status
+        if status != "available" and not online:
+            raise RuntimeError(
+                "BadRequestException: 400: Invalid volume: Volume %s status must be "
+                "'{'status': 'available'}' to extend, currently %s." % (volume.id, status)
+            )
+        return extend(volume, size)
+
+    dst.block_storage.extend_volume = cinder_extend
+
+    scenario.run_pass("uuid-2")
+
+    state = scenario.state()
+    assert state.dest_volumes["/dev/vdb"] == {
+        "dest_id": data_id, "size": 15, "bootable": False, "name": "vm1-data",
+    }
+    assert dst.volumes[data_id].size == 15
+    assert dst.volumes[data_id].attachments == []
+    assert [p["number"] for p in state.passes] == [1, 2]
+
+
 def test_sync_recreates_a_destination_volume_that_is_gone(tmp_path, caplog):
     scenario = Scenario(tmp_path)
     scenario.run_pass("uuid-1")

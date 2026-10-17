@@ -700,6 +700,14 @@ class OpenstackWarmSync(_WarmVolumeBase):
         number = len(self.state.passes) + 1
         started_at = utc_now()
         started = time.monotonic()
+        # A pass interrupted earlier may have left volumes attached: detached
+        # before any is extended, which Cinder does for an in-use volume only
+        # where its microversion and backend allow, and whose wait for
+        # `available` an attached volume never ends (Seamless Migrate SDD 6.4,
+        # audit A-04).
+        self._detach_volumes_from_destination_converter(
+            volume_ids=[entry["dest_id"] for entry in self.state.dest_volumes.values()]
+        )
         created = self._ensure_dest_volumes(source_map)
         orphaned = sorted(set(self.state.dest_volumes) - set(source_map))
         if orphaned:
@@ -738,8 +746,6 @@ class OpenstackWarmSync(_WarmVolumeBase):
         summaries = []
         error = None
         try:
-            # A pass interrupted earlier may have left volumes attached.
-            self._detach_volumes_from_destination_converter()
             self._attach_destination_volumes()
             self._install_blocksync()
             summaries = self._run_receivers()
