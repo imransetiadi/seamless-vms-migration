@@ -28,6 +28,8 @@ log = logging.getLogger(__name__)
 #: openstacksdk per-request timeout and the ceiling of one provider call from the control plane
 PROVIDER_API_TIMEOUT_S = 60
 PROVIDER_CALL_TIMEOUT_S = 300.0
+#: Cinder statuses of a volume still attached to, or detaching from, a server: no delete yet
+_VOLUME_SETTLING = frozenset({"in-use", "attaching", "detaching", "reserved"})
 T = TypeVar("T")
 
 _POWER = {
@@ -238,6 +240,12 @@ class OpenStackProvider:
 
     async def delete_port(self, port_id: str) -> None:
         await self._run(self._delete_port, port_id)
+
+    async def volumes(self) -> list[dict[str, Any]]:
+        return await self._run(self._volumes)
+
+    async def delete_volume(self, volume_id: str) -> None:
+        await self._run(self._delete_volume, volume_id)
 
     # -- implementation (runs in worker threads) ----------------------------------------------
     def _check(self) -> dict[str, Any]:
@@ -514,6 +522,43 @@ class OpenStackProvider:
 
     def _delete_port(self, port_id: str) -> None:
         self._connection().network.delete_port(port_id, ignore_missing=True)
+
+    def _volumes(self) -> list[dict[str, Any]]:
+        """The project's volumes, with their metadata and the servers holding them (SDD §10)."""
+        out: list[dict[str, Any]] = []
+        for volume in self._connection().block_storage.volumes(details=True):
+            metadata = _attr(volume, "metadata", default=None) or {}
+            attachments = _attr(volume, "attachments", default=None) or []
+            out.append(
+                {
+                    "id": str(_attr(volume, "id")),
+                    "name": str(_attr(volume, "name", default="") or ""),
+                    "status": str(_attr(volume, "status", default="") or ""),
+                    "metadata": {str(k): str(v) for k, v in metadata.items()},
+                    "attachments": [
+                        str(a.get("server_id")) for a in attachments if a.get("server_id")
+                    ],
+                }
+            )
+        return out
+
+    def _delete_volume(self, volume_id: str) -> None:
+        # Cinder refuses to delete a volume still detaching from the server just deleted: wait for
+        # it to settle, then for the deletion - within the call's bound (SDD §8.1, §10)
+        deadline = time.monotonic() + PROVIDER_CALL_TIMEOUT_S - 5
+        storage = self._connection().block_storage
+        while True:
+            volume = storage.find_volume(volume_id, ignore_missing=True)
+            if volume is None:
+                return
+            status = str(_attr(volume, "status", default="") or "").lower()
+            if status not in _VOLUME_SETTLING:
+                break
+            if time.monotonic() > deadline:
+                raise ProviderError(f"{self.provider.id}: volume {volume_id} is still {status}")
+            time.sleep(2)
+        storage.delete_volume(volume, ignore_missing=True)
+        storage.wait_for_delete(volume, wait=max(1, int(deadline - time.monotonic())))
 
 
 def _os_hint(properties: Mapping[str, Any]) -> str | None:

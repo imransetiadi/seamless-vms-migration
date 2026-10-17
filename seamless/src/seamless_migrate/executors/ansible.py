@@ -1345,6 +1345,34 @@ class AnsibleExecutor:
                 deleted.append(str(port["id"]))
         return deleted
 
+    @staticmethod
+    async def _delete_kit_volumes(
+        dst: Any, vm_name: str, server_id: str | None, strategy: Strategy
+    ) -> list[str]:
+        """Delete the kit's volumes of the VM that its next run would take as this VM's own (SDD
+        §7.2, review RV28-01): the kit finds a VM's volume by its name, ``<kit name>-<disk key>``,
+        and the metadata ``osm``; one it marked ``converted`` it takes as migrated - no copy, no
+        power-off, the new server booted from the first attempt's disk while the source runs
+        again - and onto any other a vmware_cold run refuses to copy. A vmware_warm volume not
+        converted stays: the next pass syncs it by CBT. A volume another server holds is never
+        deleted, nor any of a VM without a kit name."""
+        kit = kit_vm_name(vm_name)
+        if not kit:
+            return []
+        own = re.compile(re.escape(kit) + r"-[0-9]+")
+        deleted: list[str] = []
+        for volume in await dst.volumes():
+            metadata = volume.get("metadata") or {}
+            if not own.fullmatch(str(volume.get("name") or "")) or metadata.get("osm") != "true":
+                continue
+            if strategy != Strategy.vmware_cold and metadata.get("converted") != "true":
+                continue
+            if any(holder != server_id for holder in volume.get("attachments") or []):
+                continue
+            await dst.delete_volume(volume["id"])
+            deleted.append(str(volume["id"]))
+        return deleted
+
     async def _lookup_server(self, ctx: StepContext) -> str | None:
         name = destination_server_name(ctx.migration)
         try:
@@ -1371,6 +1399,7 @@ class AnsibleExecutor:
             if server_id:
                 await dst.delete_server(server_id)
             deleted_ports = await self._delete_kit_ports(dst, vm.nics, vm.name)
+            deleted_volumes = await self._delete_kit_volumes(dst, vm.name, server_id, m.strategy)
             await self.providers.get(ctx.source).power_on(vm.source_id)
         except ProviderError as exc:
             raise TransientStepError(f"rollback: {exc}") from exc
@@ -1379,6 +1408,7 @@ class AnsibleExecutor:
                 "source_running": True,
                 "deleted_server": server_id,
                 "deleted_ports": deleted_ports,
+                "deleted_volumes": deleted_volumes,
             }
         )
 

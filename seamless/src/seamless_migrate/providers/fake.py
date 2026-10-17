@@ -532,3 +532,10 @@ class FakeDestinationProvider:
 
     async def delete_port(self, port_id: str) -> None:
         return None
+
+    async def volumes(self) -> list[dict[str, Any]]:
+        # nor a kit volume a VMware rollback would delete (SDD §7.2)
+        return []
+
+    async def delete_volume(self, volume_id: str) -> None:
+        return None

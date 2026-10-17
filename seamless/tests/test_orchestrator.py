@@ -3047,6 +3047,81 @@ async def test_an_ansible_cutover_cut_off_while_its_clock_saves_still_announces_
         await h.orch.stop()
 
 
+async def test_a_vmware_retry_after_the_automatic_rollback_copies_and_stops_the_source_again(
+    tmp_path, store, monkeypatch
+):
+    """SDD §7.2, §8 (review RV28-01): a VMware cutover that fails after the kit's migrate task -
+    its clock open - is rolled back automatically, and the rollback powers the VM on. The kit had
+    converted the VM's volume; on the retry its migrate task would take that volume as migrated
+    and boot the destination from it - no copy, no power-off, the source running beside it. The
+    rollback deletes that volume, so the retry copies the VM again and powers it off."""
+    from seamless_migrate.config import find_repo_root
+    from seamless_migrate.executors.ansible import AnsibleExecutor
+    from tests.factories import make_plan
+    from tests.fake_kit import KitRegistry, install_kit
+    from tests.test_executor_ansible import MAPPINGS, VCENTER, VMW_NICS
+
+    state = tmp_path / "kit-state"
+    state.mkdir()
+    (state / "power").write_text("on")
+    (state / "fail_ports_once").write_text("")
+    script = install_kit(tmp_path / "bin")
+    monkeypatch.setenv("ANSIBLE_FAKE_KIT_STATE", str(state))
+    monkeypatch.setenv("ANSIBLE_FAKE_CREATED", str(tmp_path / "created.txt"))
+    clouds = tmp_path / "clouds.yaml"
+    clouds.write_text(
+        "clouds:\n"
+        "  dst:\n    auth: {auth_url: 'https://dst/v3', username: du, password: dpw, "
+        "project_name: finance}\n"
+    )
+    secret = tmp_path / "secrets" / "vcenter-dc2"
+    secret.mkdir(parents=True)
+    for key, value in (
+        ("username", "svc@vsphere.local"),
+        ("password", "vpw"),
+        ("datacenter", "DC2"),
+    ):
+        (secret / key).write_text(value)
+    settings = make_settings(
+        tmp_path,
+        ansible_playbook=str(script),
+        clouds_yaml=clouds,
+        secrets_dir=tmp_path / "secrets",
+        collection_root=find_repo_root(),
+        max_step_retries=0,
+    )
+    executor = AnsibleExecutor(settings, providers=KitRegistry(state, "web-01"), poll_s=0.02)
+    vm = make_vm(source_id="vm-1", name="web-01", nics=VMW_NICS)
+    h = build_harness(tmp_path, store, [vm], executor=executor, settings=settings)
+    store.put("provider", VCENTER)
+    plan = make_plan(
+        id="plan-00c0ffee",
+        source_provider_id=VCENTER.id,
+        vm_ids=["vm-1"],
+        status=PlanStatus.running,
+        require_approval=False,
+        auto_cutover=True,
+        mappings=MAPPINGS,
+    )
+    store.put("plan", plan)
+    m = make_migration(
+        id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_cold, phase=P.ready
+    )
+    store.put("migration", m)
+    await h.orch.start()
+    try:
+        first = await h.wait_phase(m.id, P.rolled_back, P.failed, timeout=30)
+        assert first.phase == P.rolled_back and P.rolling_back in h.history(first), first.error
+        assert (state / "power").read_text() == "on", "the rollback powers the VM on"
+        assert not (state / "volume").exists(), "the rollback kept the kit's converted volume"
+        await h.orch.retry(m.id, "rina")
+        done = await h.wait_phase(m.id, P.completed, P.failed, P.rolled_back, timeout=30)
+        assert done.phase == P.completed, (done.phase, done.error)
+        assert (state / "power").read_text() == "off", "the cutover completed with the VM running"
+    finally:
+        await h.orch.stop()
+
+
 async def test_failed_cutover_auto_rolls_back(tmp_path, store):
     settings = make_settings(tmp_path)
 

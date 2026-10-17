@@ -90,6 +90,9 @@ async def test_fake_destination_inventory_and_servers():
     # the demo destination holds no port another migration could collide with (SDD §10)
     assert await dst.ports(network_id="net-1", mac_address="00:50:56:00:00:01") == []
     await dst.delete_port("port-gone")
+    # nor a kit volume a VMware rollback would delete (SDD §7.2, §10)
+    assert await dst.volumes() == []
+    await dst.delete_volume("vol-gone")
 
 
 def test_registry_returns_fake_in_demo():
@@ -1629,6 +1632,94 @@ async def test_openstack_destination_ports_match_every_filter_and_delete_is_idem
     assert [p["id"] for p in await provider.ports()] == ["p1", "p2", "p3"]
     await provider.delete_port("p1")
     assert deleted == [("p1", True)]
+
+
+async def test_openstack_destination_volumes_and_a_delete_that_waits_for_the_volume(
+    monkeypatch,
+):
+    """SDD §10 (§7.2 VMware rollback, review RV28-01): volumes() lists the project's volumes with
+    their metadata and the servers holding them; delete_volume waits while a volume still detaches
+    from the server just deleted (Cinder refuses to delete it meanwhile), deletes it and waits
+    until Cinder no longer has it, within the call's bound; a volume already gone is no error, and
+    one that does not settle in time is a provider error, never a delete Cinder refuses."""
+    from seamless_migrate.providers import openstack as osp
+
+    clock = [0.0]
+
+    def tick():
+        clock[0] += 1.0
+        return clock[0]
+
+    monkeypatch.setattr(osp, "time", NS(monotonic=tick, sleep=lambda s: None))
+    statuses = {"v1": ["in-use", "detaching", "available"], "stuck": ["detaching"]}
+    calls = []
+
+    def volume(volume_id, name, status, metadata=None, holders=()):
+        return NS(
+            id=volume_id,
+            name=name,
+            status=status,
+            metadata=metadata or {},
+            attachments=[{"server_id": s, "attachment_id": f"a-{s}"} for s in holders],
+        )
+
+    class BlockStorage:
+        def volumes(self, details=True, **query):
+            calls.append(("volumes", details, query))
+            return [
+                volume("v1", "web-01-2000", "in-use", {"osm": "true", "converted": "true"}, ["d9"]),
+                volume("v2", None, "available"),
+            ]
+
+        def find_volume(self, volume_id, ignore_missing=True):
+            calls.append(("find_volume", volume_id))
+            left = statuses.get(volume_id)
+            if not left:
+                return None
+            return volume(volume_id, "x", left.pop(0) if len(left) > 1 else left[0])
+
+        def delete_volume(self, volume, ignore_missing=True):
+            assert volume.status == "available", volume.status
+            calls.append(("delete_volume", volume.id, ignore_missing))
+
+        def wait_for_delete(self, volume, interval=2, wait=120):
+            calls.append(("wait_for_delete", volume.id, wait > 0))
+            return volume
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(
+        dst, settings(), connect_fn=lambda p, s: NS(block_storage=BlockStorage())
+    )
+    assert await provider.volumes() == [
+        {
+            "id": "v1",
+            "name": "web-01-2000",
+            "status": "in-use",
+            "metadata": {"osm": "true", "converted": "true"},
+            "attachments": ["d9"],
+        },
+        {"id": "v2", "name": "", "status": "available", "metadata": {}, "attachments": []},
+    ]
+    assert calls == [("volumes", True, {})]
+    calls.clear()
+    await provider.delete_volume("v1")
+    assert calls == [
+        ("find_volume", "v1"),
+        ("find_volume", "v1"),
+        ("find_volume", "v1"),
+        ("delete_volume", "v1", True),
+        ("wait_for_delete", "v1", True),
+    ]
+    calls.clear()
+    await provider.delete_volume("gone")
+    assert calls == [("find_volume", "gone")]
+    started = clock[0]
+    with pytest.raises(ProviderError, match="volume stuck is still detaching"):
+        await provider.delete_volume("stuck")
+    assert ("delete_volume", "stuck", True) not in calls
+    assert clock[0] - started < osp.PROVIDER_CALL_TIMEOUT_S, "the wait outlived the call's bound"
 
 
 async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):

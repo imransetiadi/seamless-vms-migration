@@ -60,6 +60,16 @@ class DestinationProvider(Protocol):
         """Delete a port; one already gone is no error."""
         ...
 
+    async def volumes(self) -> list[dict[str, Any]]:
+        """The volumes of the credential's project: ``[{id, name, status, metadata: {key: value},
+        attachments: [server_id, ...]}]`` (§7.2 VMware rollback)."""
+        ...
+
+    async def delete_volume(self, volume_id: str) -> None:
+        """Delete a volume once Cinder settled it, and wait until it is gone, within the call's
+        bound; one already gone is no error."""
+        ...
+
 
 def provider_caps(provider: Provider) -> dict[str, Any]:
     """Capabilities used by the selector: stored capabilities plus ``conversion_host``."""

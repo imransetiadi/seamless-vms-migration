@@ -118,6 +118,16 @@ class FakeImpl:
         self.calls.append(("delete_port", port_id))
         self.registry.ports = [p for p in self.registry.ports if p["id"] != port_id]
 
+    async def volumes(self):
+        """The destination project's volumes (SDD §10)."""
+        if self.registry.volumes_error:
+            raise ProviderError("volumes: HTTP 503")
+        return [dict(v) for v in self.registry.volumes]
+
+    async def delete_volume(self, volume_id):
+        self.calls.append(("delete_volume", volume_id))
+        self.registry.volumes = [v for v in self.registry.volumes if v["id"] != volume_id]
+
     async def inventory(self):
         """The destination's networks, for the network references (SDD §7.2)."""
         self.calls.append(("inventory",))
@@ -166,6 +176,9 @@ class FakeRegistry:
         # the destination's ports (SDD §10 DestinationProvider.ports)
         self.ports: list[dict] = []
         self.ports_error = False
+        # the destination project's volumes (SDD §10 DestinationProvider.volumes)
+        self.volumes: list[dict] = []
+        self.volumes_error = False
         # the token's role names the destination inventory reads live; None: it could not
         # (SDD §10, review RV19-01)
         self.roles: list[str] | None = None
@@ -2120,6 +2133,12 @@ class FailingImpl:
     async def delete_port(self, port_id):
         raise ProviderError(f"delete port {port_id}: HTTP 503")
 
+    async def volumes(self):
+        raise ProviderError("volumes: connection refused")
+
+    async def delete_volume(self, volume_id):
+        raise ProviderError(f"delete volume {volume_id}: HTTP 503")
+
 
 class FailingRegistry(FakeRegistry):
     def get(self, provider):
@@ -2787,6 +2806,94 @@ async def test_a_vmware_rollback_deletes_only_the_kit_ports_of_this_vm(env):
     result = await env.executor.run(StepName.ROLLBACK, ctx)
     assert result.details["deleted_ports"] == ["ours"]
     assert [p["id"] for p in env.registry.ports] == ["other-vm", "longer-name", "inside"]
+
+
+def kit_volume(volume_id, name, converted=True, osm=True, attachments=()):
+    metadata = {"osm": "true"} if osm else {}
+    if converted:
+        metadata["converted"] = "true"
+    return {
+        "id": volume_id,
+        "name": name,
+        "status": "in-use" if attachments else "available",
+        "metadata": metadata,
+        "attachments": list(attachments),
+    }
+
+
+@pytest.mark.parametrize("strategy", [Strategy.vmware_cold, Strategy.vmware_warm])
+async def test_a_vmware_rollback_deletes_the_kit_volumes_its_next_run_would_take_as_migrated(
+    env, strategy
+):
+    """SDD §7.2 (review RV28-01): the kit finds a VM's volume by its name, <kit name>-<disk key>,
+    and the metadata osm; one it marked converted it takes as migrated - no copy, no power-off,
+    the new server booted from the first attempt's disk while the source runs again. The rollback
+    deletes, after the server and the kit's ports, every such volume marked converted, and for a
+    vmware_cold migration (whose kit run refuses an existing volume) any such volume; a
+    vmware_warm volume not converted stays for the next pass's CBT sync. Another VM's volume, one
+    without the kit's metadata or of another name form, and one another server holds stay."""
+    env.registry.volumes = [
+        kit_volume("converted", "web01_example_com-2000"),
+        kit_volume("detaching", "web01_example_com-2001", attachments=["dst-9"]),
+        kit_volume("unconverted", "web01_example_com-2002", converted=False),
+        kit_volume("not-the-kits", "web01_example_com-2003", osm=False),
+        kit_volume("other-vm", "db-07-2000"),
+        kit_volume("longer-name", "web01_example_com2-2000"),
+        kit_volume("no-disk-key", "web01_example_com-boot"),
+        kit_volume("suffixed", "web01_example_com-2000-old"),
+        kit_volume("prefixed", "old-web01_example_com-2000"),
+        kit_volume("held", "web01_example_com-2004", attachments=["srv-other"]),
+    ]
+    ctx, _ = ctx_for(
+        env,
+        strategy=strategy,
+        source=VCENTER,
+        name="web01.example.com",
+        destination_server_id="dst-9",
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    gone = ["converted", "detaching"] + (
+        ["unconverted"] if strategy == Strategy.vmware_cold else []
+    )
+    assert result.details["deleted_volumes"] == gone
+    assert env.registry.calls == [
+        ("delete_server", "dst-9"),
+        *[("delete_volume", v) for v in gone],
+        ("power_on", "srv-1"),
+    ]
+    kept = {
+        "not-the-kits",
+        "other-vm",
+        "longer-name",
+        "no-disk-key",
+        "suffixed",
+        "prefixed",
+        "held",
+    }
+    kept |= {"unconverted"} if strategy == Strategy.vmware_warm else set()
+    assert {v["id"] for v in env.registry.volumes} == kept
+    # volumes that cannot be read: the rollback is retried, the source not yet started
+    env.registry.calls.clear()
+    env.registry.volumes_error = True
+    with pytest.raises(TransientStepError, match="rollback: volumes: HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert ("power_on", "srv-1") not in env.registry.calls
+
+
+async def test_a_vmware_rollback_deletes_no_volume_of_a_vm_without_a_kit_name(env):
+    """SDD §7.2, §9.3: a VM whose name the kit keeps nothing of has no kit name, and the kit's
+    names of its volumes are bare suffixes - the rollback deletes none of them."""
+    env.registry.volumes = [kit_volume("bare", "-2000")]
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="受注",
+        destination_server_id="dst-9",
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["deleted_volumes"] == []
+    assert [v["id"] for v in env.registry.volumes] == ["bare"]
 
 
 async def test_a_vmware_cutover_reports_the_server_the_kit_named_after_the_vm(env, monkeypatch):
