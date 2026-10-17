@@ -21,7 +21,16 @@ import { forcedDowntime } from '../lib/forcedEstimate';
 import { formatBytes, formatDateTime, formatDuration } from '../lib/format';
 import { hasDataPath } from '../lib/fsm';
 import { isWarmStrategy } from '../lib/phase';
-import { approveDialog, MIGRATION_ACTION_ORDER, migrationActions, nextStep, requestWaitsForApprover, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
+import {
+  approveDialog,
+  MIGRATION_ACTION_ORDER,
+  migrationActions,
+  nextStep,
+  requestWaitsForApprover,
+  rollbackEffect,
+  waitsOnClosedWindow,
+  type MigrationActionKey,
+} from '../lib/migrationActions';
 import { destinationName } from '../lib/providerUse';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -398,7 +407,7 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         subject={`Migration ${m.id}`}
         tone="danger"
         title={`Roll back ${m.vm.name}?`}
-        description="Deletes the destination instance (volumes are kept) and starts the source VM again. Downtime ends when the source is running."
+        description={`${rollbackEffect(m)} Downtime ends when the source is running.`}
         confirmLabel="Roll back"
         canConfirm={reason.trim().length > 0}
         confirmReason="Enter a reason first."

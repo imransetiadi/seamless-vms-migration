@@ -53,6 +53,20 @@ describe('attentionItems', () => {
     expect(items[0]?.reason).toMatch(/source VM is stopped/);
   });
 
+  it('offers no Cancel for a failed migration whose source was stopped once, and a failed rollback its rollback (review RV32A-05)', () => {
+    const { byName } = scenario();
+    const base = byName('app-billing-01');
+    const closed = { phase: 'failed' as const, downtime_started_at: '2026-10-08T11:00:00Z', downtime_ended_at: '2026-10-08T11:20:00Z', cutover_refusals: [] };
+    const [rolled] = attentionItems([{ ...base, ...closed, error: 'rollback: rollback: dst: HTTP 400' }], new Map(), NOW);
+    expect(rolled?.nextAction).toMatch(/roll back again/i);
+    expect(rolled?.nextAction).not.toMatch(/cancel/i);
+    const [ran] = attentionItems([{ ...base, ...closed, error: 'cutover: stop source server: HTTP 500' }], new Map(), NOW);
+    expect(ran?.nextAction).not.toMatch(/cancel/i);
+    const open = { phase: 'failed' as const, downtime_started_at: null, downtime_ended_at: null, cutover_refusals: [], error: 'precopy: x' };
+    const [never] = attentionItems([{ ...base, ...open }], new Map(), NOW);
+    expect(never?.nextAction).toMatch(/cancel/i);
+  });
+
   it('flags single-shot migrations at the cutover gate only when their wave is active (SDD §5.4)', () => {
     const { fx, plans, byName } = scenario();
     // wave-3 depends on wave-1 and wave-2, which are still running.

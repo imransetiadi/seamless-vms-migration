@@ -314,6 +314,15 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
       if (m.downtime_started_at && !m.downtime_ended_at) {
         return { text: 'Failed after the source VM was stopped. Next: roll back to restart it, or fix the cause and retry.', action: 'rollback' };
       }
+      if (m.error?.startsWith('rollback: ')) {
+        // the rollback failed after the source ran again (its clock closed, SDD §5.2): rolling back again finishes
+        // the clean-up, and a cancel is refused once the source was stopped (SDD §5.1, §16, review RV32A-05)
+        return { text: 'The rollback failed after the source VM started again. Next: fix the cause and roll back again.', action: 'rollback' };
+      }
+      if (m.downtime_started_at) {
+        // the source was stopped once and runs again: a cancel is refused (SDD §5.1, §16, review RV32A-05)
+        return { text: 'Failed after the source VM ran again. Next: fix the cause and retry, or roll back.', action: 'retry' };
+      }
       if (m.cutover_refusals.length > 0 && m.error?.startsWith('cutover: ')) {
         // SDD §16: the cutover's check refused what the passes found, before the source stopped
         return {
@@ -328,6 +337,21 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
       return { text: 'Rolled back; the source VM runs again. Next: fix the cause and retry.', action: 'retry' };
     case 'cancelled':
       return { text: 'Cancelled. Nothing further will run.', action: null };
+  }
+}
+
+/** What a rollback of the migration deletes and restarts, by its strategy (SDD §6.3, §7.2, §7.3, §16, review RV32A-06). */
+export function rollbackEffect(m: Pick<Migration, 'strategy'>): string {
+  switch (m.strategy) {
+    case 'warm':
+      return 'Deletes the destination instance - its volumes are kept for a retry - and starts the source VM again.';
+    case 'cold':
+      return 'Deletes the destination instance and the volumes the cold import created, and starts the source VM again.';
+    case 'storage_handover':
+      return 'Hands the volumes back to the source cloud - no data moves - and starts the source VM again there.';
+    case 'vmware_cold':
+    case 'vmware_warm':
+      return "Deletes the destination instance, the migration kit's ports and the kit's volumes the next attempt cannot reuse - every one once the destination VM ran - and powers the source VM on again.";
   }
 }
 

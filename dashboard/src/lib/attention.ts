@@ -96,7 +96,13 @@ export function attentionItems(
         rank: 1,
       };
     } else if (m.phase === 'failed') {
-      item = { migration: m, tone: 'danger', reason: m.error ? `Failed: ${m.error}` : 'Failed', nextAction: 'Retry, roll back or cancel (operator)', rank: 1 };
+      // only what the migration can take: a cancel is refused once the source was stopped (SDD §5.1, §16, review RV32A-05)
+      const nextAction = m.error?.startsWith('rollback: ')
+        ? 'Roll back again to finish the clean-up (operator)'
+        : m.downtime_started_at
+          ? 'Retry or roll back (operator)'
+          : 'Retry, roll back or cancel (operator)';
+      item = { migration: m, tone: 'danger', reason: m.error ? `Failed: ${m.error}` : 'Failed', nextAction, rank: 1 };
     } else if (m.review_required) {
       item = {
         migration: m,
