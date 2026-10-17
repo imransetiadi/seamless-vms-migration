@@ -3429,6 +3429,30 @@ async def test_a_first_copy_cut_off_is_deleted_before_the_next_vmware_warm_run(e
     assert {v["id"] for v in env.registry.volumes} == {"copied", "held", "other-vm"}
 
 
+@pytest.mark.parametrize("step", [StepName.PRECOPY, StepName.SYNC, StepName.CUTOVER])
+async def test_a_marked_copy_the_conversion_host_holds_is_detached_and_kept_before_a_run(env, step):
+    """SDD §7.2 (review RV32A-03): a marked copy the destination's conversion host still holds - a
+    pass cut off during its CBT sync, or the kit's own detach that failed, which it only logs - is
+    detached from it and kept for the CBT sync before every vmware_warm run: the kit attaches it
+    again, which Nova refuses while it is attached. One another server holds stays attached."""
+    env.registry.existing = {"conv-dst"}  # Nova's server of the destination's conversion host
+    env.registry.volumes = [
+        kit_volume(
+            "copied-held", "web-01-2001", converted=False, copied=True, attachments=["dst-conv-dst"]
+        ),
+        kit_volume(
+            "copied-elsewhere", "web-01-2002", converted=False, copied=True, attachments=["srv-x"]
+        ),
+    ]
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(step, ctx)
+    assert [c for c in env.registry.calls if c[0] in ("detach_volume", "delete_volume")] == [
+        ("detach_volume", "dst-conv-dst", "copied-held")
+    ]
+    held = {v["id"]: v["attachments"] for v in env.registry.volumes}
+    assert held == {"copied-held": [], "copied-elsewhere": ["srv-x"]}
+
+
 async def test_a_vmware_warm_cutover_marks_its_copies_cutover_right_before_its_kit_run(
     env, monkeypatch
 ):

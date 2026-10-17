@@ -1262,20 +1262,26 @@ class AnsibleExecutor:
         copied in full (SDD §7.2, review RV30-01). A marked one Cinder cannot attach goes too
         (review RV30-07), and one an earlier cutover marked - unless ``cutover``: a cutover retried
         inside the outage keeps them (reviews RV32A-01, RV32A-02). The destination's conversion host
-        holding one - a killed run's - lets go of it first; one another server holds stays."""
+        holding one - a killed run's - lets go of it first, of a copy kept too (review RV32A-03);
+        one another server holds stays."""
         dst = self.providers.get(ctx.destination)
         host: list[str | None] = []  # looked up once, for the first copy held
         try:
             for volume in volumes:
-                if _marked(volume, "converted") or _resumable(volume, cutover=cutover):
+                if _marked(volume, "converted"):
                     continue
+                kept = _resumable(volume, cutover=cutover)
                 holders = [str(holder) for holder in volume.get("attachments") or []]
                 if holders:
                     if not host:
                         host.append(await self._conversion_host_server(ctx, dst))
                     if host[0] is None or any(holder != host[0] for holder in holders):
                         continue
+                    # a pass cut off during its sync, or the kit's own detach that failed, left
+                    # it attached: the kit attaches it again, which Nova refuses (review RV32A-03)
                     await dst.detach_volume(host[0], volume["id"])
+                if kept:
+                    continue
                 await dst.delete_volume(volume["id"])
                 await ctx.log(
                     f"deleted the kit's volume {volume['id']} ({volume.get('name')}): a first "
