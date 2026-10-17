@@ -88,16 +88,29 @@ def _failure_kind(exc: Exception) -> type[Exception]:
     """Retried or not by the error itself (SDD §7.3): an answer of 502, 503 or 504 - openstacksdk's
     HttpException, keystoneauth's HTTP error, a raw call's - and keystoneauth's retriable
     connection failures (a connect timeout, a connection that failed) are transient, as the SDK
-    and keystoneauth word them; any other error by its own text (audit EX-12)."""
-    status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
-    if status in TRANSIENT_STATUS:
-        return TransientStepError
+    and keystoneauth word them; any other error by its own text (audit EX-12). The error is read
+    with those it was raised from or while handling, as Python chains them, the first answer
+    deciding: keystoneauth's DiscoveryFailure carries a Keystone a first sign-in could not reach
+    (review RV26-05)."""
     try:
         from keystoneauth1.exceptions import RetriableConnectionFailure
     except ImportError:  # without openstacksdk no keystoneauth error can arise
         RetriableConnectionFailure = ()  # noqa: N806
-    if isinstance(exc, RetriableConnectionFailure):
-        return TransientStepError
+    link: BaseException | None = exc
+    seen: set[int] = set()
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        status = getattr(link, "status_code", None) or getattr(link, "http_status", None)
+        if status is not None:  # an answer came: it decides
+            return TransientStepError if status in TRANSIENT_STATUS else classify_failure(str(exc))
+        if isinstance(link, RetriableConnectionFailure):
+            return TransientStepError
+        # the error it was raised from, else the one it was raised while handling - unless its
+        # author cut the chain (``raise ... from None``), as Python's traceback shows it
+        if link.__cause__ is not None:
+            link = link.__cause__
+        else:
+            link = None if link.__suppress_context__ else link.__context__
     return classify_failure(str(exc))
 
 

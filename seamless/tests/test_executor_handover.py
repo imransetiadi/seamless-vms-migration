@@ -2388,11 +2388,49 @@ def sdk_error(status, reason, body=b"", url="https://cinder.dc3.example:8776/v3/
     raise AssertionError("no exception")
 
 
+def keystone_at_sign_in(answer):
+    """What keystoneauth itself raises when a connection's first sign-in meets ``answer`` - an
+    error of the HTTP session, or a status Keystone answers - at an auth URL without its version
+    path, as many clouds.yaml carry it (the generic password plugin, openstacksdk's
+    ``password``)."""
+    import requests
+    from keystoneauth1 import session as ks_session
+    from keystoneauth1.identity import generic
+
+    class Keystone(requests.Session):
+        def request(self, method, url, **kw):
+            if isinstance(answer, BaseException):
+                raise answer
+            response = requests.models.Response()
+            response.status_code, response._content = answer, b"{}"
+            response.request = requests.Request(method, url).prepare()
+            response.url = url
+            return response
+
+    plugin = generic.Password(
+        auth_url="https://keystone.dc3.example:5000",
+        username="u",
+        password="p",
+        project_name="admin",
+        user_domain_name="Default",
+        project_domain_name="Default",
+    )
+    try:
+        ks_session.Session(auth=plugin, session=Keystone()).get_token()
+    except Exception as exc:  # noqa: BLE001 - the error under test
+        return exc
+    raise AssertionError("no error")
+
+
 def sdk_errors():
     """What openstacksdk and keystoneauth raise themselves (the installed versions), by name."""
+    import requests
     from keystoneauth1 import exceptions as ksa
 
     url = "https://cinder.dc3.example:8776/v3/volumes"
+    refused = (
+        "Max retries exceeded (Caused by NewConnectionError('[Errno 111] Connection refused'))"
+    )
     return {
         "sdk 503": sdk_error(503, "Service Unavailable"),
         "sdk 504": sdk_error(504, "Gateway Time-out"),
@@ -2406,6 +2444,14 @@ def sdk_errors():
         "sdk 400": sdk_error(400, "Bad Request", b'{"badRequest": {"message": "Invalid volume"}}'),
         "sdk 404": sdk_error(404, "Not Found"),
         "sdk 409": sdk_error(409, "Conflict"),
+        # keystoneauth's DiscoveryFailure, raised while handling what the sign-in met
+        "sign-in refused": keystone_at_sign_in(requests.exceptions.ConnectionError(refused)),
+        "sign-in 502": keystone_at_sign_in(502),
+        "sign-in certificate": keystone_at_sign_in(
+            requests.exceptions.SSLError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"
+            )
+        ),
     }
 
 
@@ -2422,12 +2468,18 @@ def sdk_errors():
         ("sdk 400", False),
         ("sdk 404", False),
         ("sdk 409", False),
+        ("sign-in refused", True),
+        ("sign-in 502", True),
+        ("sign-in certificate", False),
     ],
 )
 async def test_a_handover_call_is_retried_on_the_sdks_own_transient_errors(tmp_path, name, retried):
     """SDD §7.3: a call answered 502, 503 or 504 - the SDK's HttpException, keystoneauth's HTTP
     error - or failing with keystoneauth's retriable connection failures is retried, as the SDK and
-    keystoneauth word them; refusals are not (audit EX-12)."""
+    keystoneauth word them; refusals are not (audit EX-12). A connection's first sign-in to an auth
+    URL without its version path wraps them in keystoneauth's DiscoveryFailure: a Keystone that
+    refused the connection or answered 502 is retried, a certificate it failed is not (review
+    RV26-05)."""
     executor, *_ = setup(tmp_path)
     error = sdk_errors()[name]
 
@@ -2437,6 +2489,50 @@ async def test_a_handover_call_is_retried_on_the_sdks_own_transient_errors(tmp_p
     with pytest.raises((TransientStepError, PermanentStepError)) as failed:
         await executor._call("manage vol-1 in RHOSO 18.0", call)
     assert type(failed.value) is (TransientStepError if retried else PermanentStepError)
+
+
+async def test_a_handover_failure_is_judged_by_what_it_was_raised_from(tmp_path):
+    """SDD §7.3: an error raised from a retriable one, or while handling it, is retried - the
+    first error of the chain with a status decides, and one whose author cut the chain
+    (``raise ... from None``) is judged by its own text (review RV26-05)."""
+    from keystoneauth1 import exceptions as ksa
+    from openstack import exceptions as sdk
+
+    executor, *_ = setup(tmp_path)
+    url = "https://cinder.dc3.example:8776/v3/volumes"
+
+    def blip():
+        return ksa.ConnectFailure(f"Unable to establish connection to {url}: Connection refused")
+
+    def wrapped():  # as openstacksdk's cloud layer re-raises (openstacksdk_exceptions)
+        raise sdk.SDKException("Error fetching volume vol-1") from blip()
+
+    def answered():
+        try:
+            raise blip()
+        except ksa.ConnectFailure:
+            raise sdk_error(409, "Conflict")  # noqa: B904 - an answer came after all: it decides
+
+    def cut():
+        try:
+            raise blip()
+        except ksa.ConnectFailure:
+            raise RuntimeError("volume vol-1 is in use") from None
+
+    def looped():
+        first, second = RuntimeError("volume vol-1 is in use"), RuntimeError("its snapshot too")
+        first.__context__, second.__context__ = second, first
+        raise first
+
+    async def kind(fn):
+        with pytest.raises((TransientStepError, PermanentStepError)) as failed:
+            await executor._call("manage vol-1 in RHOSO 18.0", fn)
+        return type(failed.value)
+
+    assert await kind(wrapped) is TransientStepError
+    assert await kind(answered) is PermanentStepError
+    assert await kind(cut) is PermanentStepError
+    assert await kind(looped) is PermanentStepError
 
 
 @pytest.mark.parametrize(
