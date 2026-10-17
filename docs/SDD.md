@@ -1040,11 +1040,15 @@ cannot reach keeps the volumes attached to it, which the rollback deletes by the
 host's attach lock and detaches only after the check reached it; then it deletes, through the API, the volumes no
 server holds. Before, the rescue skipped the cleanup whenever the transfer itself failed, and a hand-run cold
 import left its volumes on the conversion host; and a conversion host the check could not reach failed the cleanup
-before it deleted anything. The cleanup is best effort and never fails the rescue: a detach that fails - a lock wait
-that gives up on a host lost after the check, a detach Nova never ends - leaves that volume attached and the cleanup
-goes on (a lock give-up ends the detaches, the host being lost); a deletion that fails (Cinder does not finish it)
-leaves that volume; each is logged to the workload's log and named in the result (`volumes_left`), never printed as
-a failure, and the rollback deletes what is left by the record. The rescue runs it before the source cleanup, whose
+before it deleted anything. The cleanup is best effort and never fails the rescue: a detach that fails leaves that volume
+attached, a deletion that fails leaves that volume, and the cleanup goes on with the next one - but a wait that gives
+up ends its phase, as each later volume would wait it out again, the cold source stopped all the while (review
+RV34B-01): a lock wait that gives up - on a host lost after the check, or on a lock another conversion holds
+throughout (a stale lock file whose owner is on another host is never taken for dead) - or a detach Nova does not end
+within the timeout ends the detaches, what is still attached left so; a deletion Cinder does not finish within it
+ends the deletions, the volumes not yet deleted left as they are, no deletion sent for them. Each volume left is
+logged to the workload's log and named in the result (`volumes_left`), never printed as a failure, and the rollback
+deletes what is left by the record. The rescue runs it before the source cleanup, whose
 own failure so no longer keeps it from running. A failed transfer is so classified and reported by its own failure,
 never by the cleanup's - whose words ("Timeout waiting for Volume ... to delete", "Lock timeout") would read as
 transient in the output's tail (reviews RV32B-02, RV32B-04, RV32B-05).
