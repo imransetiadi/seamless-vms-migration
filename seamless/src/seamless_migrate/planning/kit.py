@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import re
 
+#: the migration kit's transliteration table (SafeVmName in plugins/module_utils/utils.go of the
+#: pinned 2.2.7), as the kit has it
 KIT_TRANSLITERATIONS = {
     **dict(zip("áéíóúÁÉÍÓÚñÑüÜ", "aeiouAEIOUnNuU", strict=True)),
     **dict(zip("ãõàâêôçÃÕÀÂÊÔÇ", "aoaaeocAOAAEOC", strict=True)),

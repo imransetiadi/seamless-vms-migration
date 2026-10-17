@@ -74,8 +74,6 @@ log = logging.getLogger(__name__)
 KIT_PLAYBOOK = "os_migrate.vmware_migration_kit.migration"
 
 
-#: the migration kit's transliteration table (SafeVmName in plugins/module_utils/utils.go of the
-#: pinned 2.2.7), as the kit has it
 def destination_server_name(m: Migration) -> str:
     """The name the migration's destination server gets: the VM's own from os-migrate, the kit's
     name of it from the VMware migration kit (SDD §7.2)."""
