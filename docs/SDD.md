@@ -519,7 +519,9 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   the clock is open. A verified
   migration's downtime is that sum plus the plan's boot time; a rollback's is that sum, plus the boot time when the
   cutover had finished (the destination booted for its verification). A clock no step reported model seconds for
-  stays in wall seconds. A retry resets a
+  stays in wall seconds. A clock the step closed because it found the source running again opens anew when the
+  same step stops the source again - a new outage, as for a storage-handover cutover resumed after a rollback's start
+  (§7.3 step 1, review RV33-04). A retry resets a
   closed clock but keeps an open one: the source has not run since it stopped, so the downtime of
   the next attempt counts from that first stop (in demo mode the kept model seconds and the next attempt's add up)
   and the stats report the VM's whole outage.
@@ -1562,8 +1564,14 @@ volumes with their server, so the order is:
    past the stop - `stop_source` done, `delete_source` not - reads the source first and, unless it reads
    `SHUTOFF`, stops it again and waits for `SHUTOFF` before any later step: a rollback's start that Nova performed
    while its wait failed journals nothing, and an operator may start the source between attempts, so the step
-   that deletes the source would otherwise delete a running server (review 31). A source already gone - deleted
-   by the attempt before, which failed before it journaled that - needs no stop. The clock keeps its first start.
+   that deletes the source would otherwise delete a running server (review 31). A source Nova still starts
+   (`task_state` `powering-on`: a rollback's start accepted, its wait cut off) reads `SHUTOFF` until it runs: that
+   start is waited out first, then the source is stopped (review RV33-02). A source already gone - deleted by the
+   attempt before, which failed before it journaled that - needs no stop, nor does one whose deletion Nova accepted
+   (step 4) unless it reads `ACTIVE`: Nova starts no server it is deleting or that a failed deletion left in `ERROR`,
+   and its stop of one never reads `SHUTOFF` (review RV33-03). A source found running has run since the first stop:
+   that outage ended - the step closes the clock - and the re-stop opens a new one, at the re-stop's request when
+   the step then ends without `SHUTOFF` (§5.2, review RV33-04).
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
    `plan.port_creation_mode` `"neutron"` also its security groups by name), and the volume attachments in device
@@ -1577,8 +1585,13 @@ volumes with their server, so the order is:
    `PUT /servers/{id}/os-volume_attachments/{volume_id}` `{"volumeAttachment": {"volumeId": …,
    "delete_on_termination": false}}` with compute microversion **2.85**; verify by re-reading.
    Step 0 already refused a cloud without 2.85; a rejected update aborts before any destructive
-   step (permanent error; the VM is restarted and the migration fails with a clear reason).
-4. Delete the source server; wait until every journaled volume is `available`.
+   step (permanent error; the VM is restarted and the migration fails with a clear reason). Every rollback attempt
+   journals `rb:attempt` before its first call: it may give a `delete_on_termination` back even when Nova's answer is
+   lost. A cutover resumed after such an attempt, while the source server exists, sets it to false again - and
+   journals the attachment's `keep` again - for each attachment whose last `keep` came before that attempt;
+   otherwise step 4 would delete the volume with its server (review RV33-01).
+4. Delete the source server - journaled as sent once Nova accepts the deletion -; wait until every journaled volume
+   is `available`.
 5. `POST /v3/{project}/volumes/{id}/action {"os-unmanage": null}` for each volume (source).
 6. `POST /v3/{project}/manageable_volumes` on RHOSO for each volume: `{"volume": {"host":
    <resolved destination host>, "ref": <reference for the family and destination pool, named
@@ -1610,8 +1623,9 @@ volumes with their server, so the order is:
    with the entry's addresses when it lists them (in `"nova"` mode its one address).
 
 Rollback walks the journal backwards. While the source server still exists (a failure before step 4)
-it sets every attachment's journaled `delete_on_termination` back and starts the server — also when only the stop
-was journaled as sent. A server Nova still powers off (`task_state` `powering-off`) reads `ACTIVE` and refuses a
+it sets every attachment's journaled `delete_on_termination` back - each whose last `keep` came after the last time
+the rollback gave it back, as a cutover resumed after an earlier attempt keeps it again (review RV33-01) - and starts
+the server — also when only the stop was journaled as sent. A server Nova still powers off (`task_state` `powering-off`) reads `ACTIVE` and refuses a
 start until the guest is down: the rollback waits until the stop ended - `SHUTOFF`, or `ACTIVE` again when Nova gave
 the power-off up (its `task_state` back to none, the guest still running) - then starts it unless it runs (reviews
 RV26-01, RV27-04). A server Nova still powers on (`task_state` `powering-on`: an earlier attempt's start accepted, its
