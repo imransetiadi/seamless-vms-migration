@@ -868,12 +868,17 @@ def _ensure_record(osm: Path, server_id: str, server_name: str) -> None:
         "pending_snapshot": None,
         "destination_server_id": None,
     }
-    # as WarmState.save: mode 0600, synced, renamed into place - then the directory is synced
-    # too, so the rename outlives a crash: a missing record would let a later rollback take a
-    # same-named server by its name (review RV4-07)
+    # synced into place: a missing record would let a later rollback take a same-named server
+    # by its name (review RV4-07)
+    _write_synced_json(path, record)
+
+
+def _write_synced_json(path: Path, data: Any) -> None:
+    """As WarmState.save: mode 0600, synced, renamed into place - then the directory is synced
+    too, so the rename outlives a crash."""
     tmp = path.with_name(f".{path.name}.tmp")
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-        json.dump(record, f)
+        json.dump(data, f)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
@@ -884,9 +889,32 @@ def _ensure_record(osm: Path, server_id: str, server_name: str) -> None:
         finally:
             os.close(directory)
     except OSError as exc:
-        # some filesystems (network or FUSE mounts) cannot sync a directory: the record is written
-        # and synced all the same, and failing every cold cutover there would gain nothing
-        log.warning("could not sync %s after writing the workload record: %s", path.parent, exc)
+        # some filesystems (network or FUSE mounts) cannot sync a directory: the file is written
+        # and synced all the same, and failing every step there would gain nothing
+        log.warning("could not sync %s after writing %s: %s", path.parent, path.name, exc)
+
+
+#: the VMware rollback's record of what a server found only by name held (SDD §7.2, RV30-05)
+KEPT_RECORD = "rollback-kept.json"
+
+
+def _read_kept(rdir: Path) -> set[str]:
+    """The volumes earlier attempts of the VMware rollback kept: what the server they found only
+    by the kit's name held before they deleted it (SDD §7.2, review RV30-05)."""
+    path = rdir / KEPT_RECORD
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return set()
+    except ValueError as exc:
+        # what to keep is unknown: never delete on a guess
+        raise PermanentStepError(f"rollback: {path} cannot be read: {exc}") from None
+    return {str(volume) for volume in data.get("volumes") or []}
+
+
+def _record_kept(rdir: Path, server_id: str, kept: Collection[str]) -> None:
+    rdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _write_synced_json(rdir / KEPT_RECORD, {"server_id": server_id, "volumes": sorted(kept)})
 
 
 @dataclass(frozen=True)
@@ -1576,10 +1604,12 @@ class AnsibleExecutor:
         vm = m.vm
         if ctx.options.get("delete_dest_volumes"):
             return await self._vmware_cancel_cleanup(ctx)
+        rdir = run_dir(self.settings, ctx.plan.id, m.id)
         try:
             dst = self.providers.get(ctx.destination)
             server_id = m.destination_server_id
-            kept: set[str] = set()
+            # what an earlier attempt kept of a server it then deleted (review RV30-05)
+            kept = await asyncio.to_thread(_read_kept, rdir)
             if server_id is None and m.downtime_started_at is not None:
                 # the kit records nothing in the control plane before the cutover powers the
                 # VM off; a same-named server after that point was created by this migration
@@ -1588,8 +1618,15 @@ class AnsibleExecutor:
                 if server_id:
                     # it may be another plan's VM the kit names alike (owner question q26): what
                     # it holds stays, its deletion detaching it notwithstanding (review RV29-03) -
-                    # read from Nova's record, as no Cinder call comes before the power-on
-                    kept = set(await dst.server_volumes(server_id))
+                    # read from Nova's record, as no Cinder call comes before the power-on, and
+                    # recorded before the deletion: a retried attempt no longer finds the server
+                    kept |= set(await dst.server_volumes(server_id))
+                    try:
+                        await asyncio.to_thread(_record_kept, rdir, server_id, kept)
+                    except OSError as exc:
+                        raise TransientStepError(
+                            f"rollback: could not record what {server_id} holds: {exc}"
+                        ) from exc
             if server_id:
                 await dst.delete_server(server_id)
             # the source next: only the server's deletion comes before it - two live copies on
@@ -1605,6 +1642,8 @@ class AnsibleExecutor:
             )
         except ProviderError as exc:
             raise TransientStepError(f"rollback: {exc}") from exc
+        # done: a later rollback starts from what it finds (review RV29-03)
+        await asyncio.to_thread(remove_quietly, rdir / KEPT_RECORD)
         return StepResult(
             details={
                 "source_running": True,

@@ -3391,6 +3391,58 @@ async def test_a_vmware_rollback_keeps_what_a_server_found_only_by_name_held(env
     assert (again.details["deleted_server"], again.details["deleted_volumes"]) == (None, ["root"])
 
 
+@pytest.mark.parametrize("fails", ["delete_server", "power_on", "volumes"])
+async def test_a_retried_vmware_rollback_still_keeps_what_a_server_found_by_name_held(env, fails):
+    """SDD §7.2 (review RV30-05, owner question q26): the first attempt records what the server it
+    found by the kit's name held, then deletes it; an attempt retried after a failure from that
+    deletion on - Nova's deletion whose answer timed out, vCenter's power-on, Cinder - or resumed
+    after a restart finds no server any more and keeps what the record names. A rollback that
+    succeeds removes the record, so a later one, finding no server holding the volume, deletes it
+    (review RV29-03)."""
+    env.registry.existing = {"web_01"}
+    env.registry.volumes = [kit_volume("root", "web_01-2000", attachments=["dst-web_01"])]
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web_01",
+        downtime_started_at=utcnow(),
+    )
+    if fails == "volumes":
+        env.registry.volumes_error = True
+    elif fails == "power_on":
+
+        async def power_on(source_id):
+            env.registry.calls.append(("power_on", source_id))
+            raise ProviderError("vcenter: HTTP 503")
+
+        class Failing(FakeImpl):
+            pass
+
+        Failing.power_on = staticmethod(power_on)
+        env.registry.get = lambda provider: Failing(env.registry)
+    else:
+
+        class Deleted(FakeImpl):
+            async def delete_server(self, server_id):
+                await FakeImpl.delete_server(self, server_id)  # Nova deleted it, then
+                raise ProviderError("dst: HTTP 503")  # its answer was lost
+
+        env.registry.get = lambda provider: Deleted(env.registry)
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert (run_dir(env) / "rollback-kept.json").exists()
+    env.registry.volumes_error = False
+    env.registry.get = lambda provider: FakeImpl(env.registry)
+    env.registry.existing = set()  # Nova deleted the server: no lookup finds it any more
+    retried = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert (retried.details["deleted_server"], retried.details["deleted_volumes"]) == (None, [])
+    assert [v["id"] for v in env.registry.volumes] == ["root"]
+    assert not (run_dir(env) / "rollback-kept.json").exists()
+    later = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert later.details["deleted_volumes"] == ["root"]
+
+
 async def test_a_vmware_rollback_deletes_no_volume_of_a_vm_without_a_kit_name(env):
     """SDD §7.2, §9.3: a VM whose name the kit keeps nothing of has no kit name, and the kit's
     names of its volumes are bare suffixes - the rollback deletes none of them."""
