@@ -1040,7 +1040,14 @@ cannot reach keeps the volumes attached to it, which the rollback deletes by the
 host's attach lock and detaches only after the check reached it; then it deletes, through the API, the volumes no
 server holds. Before, the rescue skipped the cleanup whenever the transfer itself failed, and a hand-run cold
 import left its volumes on the conversion host; and a conversion host the check could not reach failed the cleanup
-before it deleted anything.
+before it deleted anything. The cleanup is best effort and never fails the rescue: a detach that fails - a lock wait
+that gives up on a host lost after the check, a detach Nova never ends - leaves that volume attached and the cleanup
+goes on (a lock give-up ends the detaches, the host being lost); a deletion that fails (Cinder does not finish it)
+leaves that volume; each is logged to the workload's log and named in the result (`volumes_left`), never printed as
+a failure, and the rollback deletes what is left by the record. The rescue runs it before the source cleanup, whose
+own failure so no longer keeps it from running. A failed transfer is so classified and reported by its own failure,
+never by the cleanup's - whose words ("Timeout waiting for Volume ... to delete", "Lock timeout") would read as
+transient in the output's tail (reviews RV32B-02, RV32B-04, RV32B-05).
 
 `import_workload_prelim` skips a workload whose name a destination server already carries only for a server of
 exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name filter as a regular expression) and
