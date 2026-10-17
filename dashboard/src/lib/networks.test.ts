@@ -42,6 +42,15 @@ describe('resolveNetwork (SDD §7.3 step 0, §9.3)', () => {
 });
 
 describe('portRefusal (SDD §6.6, §9.3)', () => {
+  it("reads a policy profile by own key: a name from Object's prototype is an unknown profile, never a crash", () => {
+    // SDD §21.5: the profile comes from a check report; `in` matched "toString" and then called a function's .includes
+    const another = { ...net('n1', 'shared-net', false), shared: true };
+    for (const name of ['toString', 'constructor', '__proto__', 'hasOwnProperty']) {
+      expect(portRefusal(another, ['member'], name, 'DC3 Jakarta')).toBe(portRefusal(another, ['member'], 'unknown', 'DC3 Jakarta'));
+      expect(policyProfileOf({ policy_profile: name }, undefined)).toBe('unknown');
+    }
+  });
+
   const roleWhy = "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither";
   const privateWhy = "it is neither shared with the credential's project nor external";
   const novaWhy =

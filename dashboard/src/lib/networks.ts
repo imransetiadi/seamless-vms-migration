@@ -46,7 +46,9 @@ const ROLE_RULE: Record<PolicyProfile, (where: string) => string> = {
     `the policy profile of ${where} is unknown, so only the admin role, or that project, may choose a port's address or MAC there, and the credential's token lacks it (check ${where} so its series is detected, or declare its policy profile or series)`,
 };
 
-const knownProfile = (profile: string): PolicyProfile => (profile in PORT_ROLES_BY_PROFILE ? (profile as PolicyProfile) : 'unknown');
+// by own key: a reported name from Object's prototype ("toString") is no profile (review 23's own-key reads)
+const knownProfile = (profile: string): PolicyProfile =>
+  Object.hasOwn(PORT_ROLES_BY_PROFILE, profile) ? (profile as PolicyProfile) : 'unknown';
 
 /**
  * Why the destination credential may not put a port on `network`, or null, as the API's port_refusal (SDD §6.6): another
