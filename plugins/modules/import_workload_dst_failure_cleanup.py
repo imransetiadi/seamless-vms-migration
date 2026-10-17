@@ -153,7 +153,10 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
     DEFAULT_TIMEOUT,
     ConversionHostUnreachable,
+    DetachTimeout,
+    LockUnavailable,
     OpenStackVolumeBase,
+    is_timeout,
 )
 
 
@@ -205,17 +208,19 @@ class OpenStackDstFailureCleanup(OpenStackVolumeBase):
         """Detach the volumes from the destination conversion host - under its attach lock, only
         when the check reached it - then delete those no server holds (SDD 6.6, audit A-08). Best
         effort: what it cannot detach or delete is logged and left for the rollback, which
-        deletes it by the record; it never fails the rescue (reviews RV32B-02, RV32B-05).
-        Returns the ids of the volumes it left."""
+        deletes it by the record; it never fails the rescue (reviews RV32B-02, RV32B-05). A wait
+        that gives up ends its phase: each later volume would wait it out again, the cold source
+        stopped all the while (review RV34B-01). Returns the ids of the volumes it left."""
         if self.reachable:
             for volume_id in [mapping["dest_id"] for mapping in self.volume_map.values()]:
                 try:
                     self._detach_volumes_from_destination_converter(volume_ids=[volume_id])
-                except ConversionHostUnreachable as err:
-                    # the host is lost: every other detach would wait out the lock again
+                except (ConversionHostUnreachable, LockUnavailable, DetachTimeout) as err:
+                    # the host lost, the lock another conversion holds, a detach Nova does not
+                    # end: every other detach would wait it out again
                     self.log.warning(
-                        "The destination conversion host was lost (%s): what it holds stays "
-                        "for the rollback, which deletes it by the record",
+                        "Detaching from the destination conversion host gave up (%s): what it "
+                        "holds stays for the rollback, which deletes it by the record",
                         err,
                     )
                     break
@@ -229,9 +234,12 @@ class OpenStackDstFailureCleanup(OpenStackVolumeBase):
 
     def _delete_volumes_best_effort(self):
         """Delete each volume of the map no server holds; one Cinder does not delete - or one
-        still attached - is logged and left."""
+        still attached - is logged and left. A deletion Cinder does not finish within the timeout
+        ends the deletions: the volumes not yet deleted are left, no deletion sent for them
+        (review RV34B-01)."""
         self.log.info("Deleting migrated volumes from destination.")
         left = []
+        stalled = False
         for mapping in self.volume_map.values():
             volume_id = mapping["dest_id"]
             try:
@@ -244,6 +252,14 @@ class OpenStackDstFailureCleanup(OpenStackVolumeBase):
                     )
                     left.append(volume_id)
                     continue
+                if stalled:
+                    self.log.warning(
+                        "Volume %s is not deleted - a deletion before it did not finish in time: "
+                        "it stays for the rollback",
+                        volume_id,
+                    )
+                    left.append(volume_id)
+                    continue
                 self.log.info("Deleting volume %s.", volume_id)
                 self.conn.delete_volume(volume_id, timeout=self.timeout, wait=True)
             except Exception as err:  # pylint: disable=broad-except
@@ -253,6 +269,9 @@ class OpenStackDstFailureCleanup(OpenStackVolumeBase):
                     err,
                 )
                 left.append(volume_id)
+                if is_timeout(err):
+                    # Cinder did not finish it in time: every other deletion would wait it out again
+                    stalled = True
         return left
 
 

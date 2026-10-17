@@ -49,6 +49,12 @@ def _is_not_found(err):
     )
 
 
+def is_timeout(err):
+    """openstacksdk's ResourceTimeout - a wait that gave up, such as "Timeout waiting for Volume
+    ... to delete" -, whatever module raised it (Seamless Migrate SDD 6.6, review RV34B-01)."""
+    return any(cls.__name__ == "ResourceTimeout" for cls in type(err).__mro__)
+
+
 def _qcow2_virtual_size(conn, image):
     """The virtual disk size the qcow2 file of ``image`` declares in its header - bytes 24 to 31,
     big-endian - read from the first bytes of a streamed download, closed at once: Glance before
@@ -131,7 +137,7 @@ def detach_volume_bounded(conn, server, volume, timeout):
         if server["id"] not in holders and (holders or status == "available"):
             return
         time.sleep(1)
-    raise RuntimeError(
+    raise DetachTimeout(
         "Timed out after %s s waiting to detach volume %s from server %s"
         % (timeout, volume["id"], server["id"])
     )
@@ -167,6 +173,16 @@ GIVE_UP_PREFIXES = ("Lock timeout", "SSH timeout")
 class ConversionHostUnreachable(RuntimeError):
     """A wait gave up: ssh to the conversion host failed for SSH_UNREACHABLE_S
     without a break (Seamless Migrate SDD 6.6)."""
+
+
+class LockUnavailable(RuntimeError):
+    """A lock wait gave up: another conversion held the lock for the whole wait (Seamless
+    Migrate SDD 6.6, review RV34B-01)."""
+
+
+class DetachTimeout(RuntimeError):
+    """A detach Nova did not end within the timeout (detach_volume_bounded; Seamless Migrate SDD
+    6.6, review RV34B-01)."""
 
 
 class DiskIdentityError(RuntimeError):
@@ -289,7 +305,7 @@ def use_lock(lock_file):
                     time.sleep(1)
                     self.log.info("Error waiting for lock: %s", str(err))
             else:
-                raise RuntimeError("Unable to acquire lock " + lock_file)
+                raise LockUnavailable("Unable to acquire lock " + lock_file)
             try:
                 return function(self, *args, **kwargs)
             finally:

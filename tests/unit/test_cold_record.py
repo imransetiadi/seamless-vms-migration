@@ -1156,6 +1156,113 @@ def test_the_destination_cleanup_never_fails_on_a_deletion_cinder_does_not_finis
     assert sorted(dst.volumes) == ["dvol-data", "unrelated"]  # dvol-boot detached and deleted
 
 
+def _both_held_by_the_conversion_host(tmp_path):
+    """vm1's failed transfer with both its volumes still attached to the destination conversion
+    host, both recorded as Cinder created them; an unrelated volume beside them."""
+    src, dst = _clouds()
+    dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True, server_id="dst-conv", device="/dev/vdb")
+    dst.add_volume("dvol-data", "vm1-data", 10, server_id="dst-conv", device="/dev/vdc")
+    dst.add_volume("unrelated", "keep-me", 1)
+    state_dir = str(tmp_path / "workload_warm")
+    _record(state_dir, TRANSFERRED)
+    return src, dst, state_dir
+
+
+@pytest.mark.parametrize(
+    "trouble", ["a lock another conversion holds", "a detach nova never ends", "one volume refused"]
+)
+def test_a_wait_that_gives_up_ends_the_destination_cleanups_detaches(tmp_path, monkeypatch, trouble):
+    """SDD 6.6 (review RV34B-01): a wait that gives up ends the detaches - a lock another
+    conversion holds throughout (use_lock's "Unable to acquire lock": a stale lock whose owner is
+    on another host is never taken for dead) or a detach Nova does not end within the timeout:
+    each later volume would wait it out again, the cold source stopped all the while. What is
+    still attached stays for the rollback. A refusal of one volume says nothing of the next: the
+    cleanup goes on."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_dst_failure_cleanup as cleanup_module,
+    )
+
+    src, dst, state_dir = _both_held_by_the_conversion_host(tmp_path)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(volume_common, "DEFAULT_TIMEOUT", 5)  # the lock's tries: 1800 on a host
+    val = None
+    if trouble == "a lock another conversion holds":
+
+        def val(command):  # "( test ! -e lock || exit 17 )": the lock is held throughout
+            return 17 if command[:2] == ["sudo", "flock"] else None
+
+    elif trouble == "a detach nova never ends":
+        dst.detach_reads = 10 ** 6  # Nova accepted the detach; the guest never lets go
+    else:
+        dst.fail_on["detach_volume"] = lambda kwargs: kwargs["volume"] == "dvol-boot"
+    shells = fake.ShellFactory([dst, src], val=val)
+    result = fake.run_module(
+        cleanup_module, dict(_cleanup_args(state_dir=state_dir), timeout=3), dst,
+        shell_factory=shells,
+    )
+
+    assert result["_exit_code"] in (None, 0), result
+    locks = [c for c in shells.commands_at("10.1.0.10") if c[:2] == ["sudo", "flock"]]
+    detaches = [call[1]["volume"] for call in dst.calls_to("detach_volume")]
+    if trouble == "one volume refused":
+        assert detaches == ["dvol-boot", "dvol-data"]
+        assert result["volumes_left"] == ["dvol-boot"]
+        assert sorted(dst.volumes) == ["dvol-boot", "unrelated"]
+    else:
+        # one wait - the lock's tries, or one detach -, never one per volume
+        assert len(locks) == (5 if trouble == "a lock another conversion holds" else 1), locks
+        assert detaches == ([] if trouble == "a lock another conversion holds" else ["dvol-boot"])
+        assert result["volumes_left"] == ["dvol-boot", "dvol-data"]
+        assert sorted(dst.volumes) == ["dvol-boot", "dvol-data", "unrelated"]
+
+
+@pytest.mark.parametrize("trouble", ["timed out", "refused"])
+def test_a_deletion_cinder_does_not_finish_ends_the_destination_cleanups_deletions(
+    tmp_path, trouble
+):
+    """SDD 6.6 (review RV34B-01): a deletion Cinder does not finish within the timeout ends the
+    deletions - each later one would wait it out again -, no deletion sent for the volumes not yet
+    deleted, which stay for the rollback; a deletion Cinder refuses for one volume says nothing of
+    the next: the cleanup goes on."""
+    import openstack.exceptions
+
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_dst_failure_cleanup as cleanup_module,
+    )
+
+    src, dst, state_dir = _left_by_a_failed_transfer(tmp_path)
+    delete = dst.delete_volume
+
+    def stuck(name_or_id=None, wait=True, timeout=None, force=False):
+        if name_or_id != "dvol-boot":
+            return delete(name_or_id=name_or_id, wait=wait, timeout=timeout, force=force)
+        dst.record("delete_volume", name_or_id=name_or_id)
+        if trouble == "timed out":
+            raise openstack.exceptions.ResourceTimeout(
+                "Timeout waiting for Volume:dvol-boot to delete"
+            )
+        raise openstack.exceptions.BadRequestException(
+            "Invalid volume: Volume status must be available or error"
+        )
+
+    dst.delete_volume = stuck
+    result = fake.run_module(
+        cleanup_module, _cleanup_args(state_dir=state_dir), dst,
+        shell_factory=fake.ShellFactory([dst, src]),
+    )
+
+    assert result["_exit_code"] in (None, 0), result
+    deletions = [call[1]["name_or_id"] for call in dst.calls_to("delete_volume")]
+    if trouble == "timed out":
+        assert deletions == ["dvol-boot"]
+        assert result["volumes_left"] == ["dvol-boot", "dvol-data"]
+        assert sorted(dst.volumes) == ["dvol-boot", "dvol-data", "unrelated"]
+    else:
+        assert deletions == ["dvol-boot", "dvol-data"]
+        assert result["volumes_left"] == ["dvol-boot"]
+        assert sorted(dst.volumes) == ["dvol-boot", "unrelated"]
+
+
 @pytest.mark.parametrize("gone", ["the conversion host", "the record"])
 def test_the_destination_cleanup_that_cannot_start_gives_up_without_failing(tmp_path, gone):
     """SDD 6.6 (review RV32B-02): best effort to the end - a cleanup that cannot even start, its

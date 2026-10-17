@@ -575,10 +575,14 @@ This project follows a simple changelog to satisfy collection metadata validatio
   check at the start no longer fails it: a conversion host it cannot reach
   keeps the volumes it holds for the rollback, and those no server holds are
   deleted through the API. The cleanup is best effort and never fails: a
-  detach that fails (a lock wait that gives up, a detach Nova never ends) or a
-  deletion Cinder does not finish leaves that volume, logged and named in the
-  result (``volumes_left``), and the cleanup goes on; one that cannot start
-  (its conversion host gone, a record not the workload's) says so in its
+  detach or a deletion that fails leaves that volume, logged and named in the
+  result (``volumes_left``), and the cleanup goes on with the next one - but a
+  wait that gives up ends its phase, as each later volume would wait it out
+  again: a lock wait that gives up (the conversion host lost, or the lock
+  another conversion holds throughout, now ``LockUnavailable``) or a detach
+  Nova does not end in time (``DetachTimeout``) ends the detaches, and a
+  deletion Cinder does not finish in time ends the deletions; one that cannot
+  start (its conversion host gone, a record not the workload's) says so in its
   result. The rescue runs it before the source cleanup, so a source cleanup
   that fails no longer keeps it from running, and a failed transfer is
   reported and classified by its own failure, not the cleanup's.
