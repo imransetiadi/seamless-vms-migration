@@ -1371,16 +1371,20 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   to copy ("volume already exists"). So once the destination server is gone, the rollback deletes every volume named
   `<kit name>-<digits>` with `osm` `true` that is marked converted, or that belongs to a `vmware_cold` migration, and
   waits until each is gone; a `vmware_warm` volume not converted stays, since the next pass syncs it by CBT. A volume
-  attached to another server is never deleted, nor is any volume when the VM has no kit name (`SRC_VM_NAME_UNUSABLE`,
-  §9.3). A volume Cinder does not delete fails the attempt, which is retried: the source already runs, and the
-  power-on does nothing to a running VM - the destination's clean-up never keeps the source stopped (§8, review
-  RV29-01). As a rollback may so end `failed` with such a volume left, a VMware kit run - a cutover, a `vmware_warm`
-  pass - is refused before it starts, before any clock, while a volume named `<kit name>-<digits>` with `osm` `true`
-  is marked converted, or, for a `vmware_cold` cutover, while any such volume exists: the refusal names each volume
-  and its holder and tells the operator to roll the migration back again, which deletes the ones it may (review
-  RV29-01). A converted volume is no refusal while the source has not run since this outage's stop - the clock open
-  (§5.2) and vCenter reading the VM off -: the kit then takes the volume it converted in this outage as migrated,
-  which it is, as when a cutover is retried after a failure past the conversion.
+  the destination's conversion host holds is the kit's own copy, left attached when a cutover was cut off inside the
+  kit's migrate task (the step timeout, a rollback request): it is detached from that host - found by the conversion
+  host's name, else by the port that holds its address - and then deleted or kept by these rules, as §6.3 treats a
+  transfer's volume the destination conversion host holds (review RV29-02). A volume attached to another server is
+  never deleted, nor is any volume when the VM has no kit name (`SRC_VM_NAME_UNUSABLE`, §9.3). A volume Cinder does
+  not delete fails the attempt, which is retried: the source already runs, and the power-on does nothing to a running
+  VM - the destination's clean-up never keeps the source stopped (§8, review RV29-01). As a rollback may so end
+  `failed` with such a volume left, a VMware kit run - a cutover, a `vmware_warm` pass - is refused before it starts,
+  before any clock, while a volume named `<kit name>-<digits>` with `osm` `true` is marked converted, or, for a
+  `vmware_cold` cutover, while any such volume exists: the refusal names each volume and its holder and tells the
+  operator to roll the migration back again, which deletes the ones it may (review RV29-01). A converted volume is no
+  refusal while the source has not run since this outage's stop - the clock open (§5.2) and vCenter reading the VM off
+  -: the kit then takes the volume it converted in this outage as migrated, which it is, as when a cutover is retried
+  after a failure past the conversion.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
   migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
@@ -2024,6 +2028,9 @@ class DestinationProvider(Protocol):
     async def delete_volume(self, volume_id: str) -> None
         # once Cinder settled it (a volume still detaching from a deleted server), and waits until it is gone,
         # within the call's bound (§8.1); a volume already gone is no error
+    async def detach_volume(self, server_id: str, volume_id: str) -> None
+        # Nova's attachment of the volume to the server removed, then waits until Cinder reads the volume
+        # available, within the call's bound (§8.1); a volume not attached to that server is no error (§7.2)
 ```
 
 `SourceInventory {networks: dict[str, int|None] (name→mtu), projects: list[str], keypairs: list[str] (the names of
