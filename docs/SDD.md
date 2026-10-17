@@ -2165,8 +2165,9 @@ JSON everywhere; errors are `{"error": {"code": str, "message": str}}` with HTTP
 transition / conflict), 413 (`payload_too_large`, below), 422 (schema), 429 (`too_many_requests`, the
 auth lockout of §15.1), 500 (`internal_error`, message never carries internals), 502
 (`provider_error`, the redacted provider message), 503 (`/ready` while degraded). Every response,
-including error responses written by the server-error handler, carries the security headers of
-Security.md R-05.
+including error responses written by the server-error handler and the answers to CORS preflights (with
+`SEAMLESS_CORS_ORIGINS` set: the CORS layer answers them before any route, a refused one as the envelope, 400
+`bad_request` "Disallowed CORS origin"; audit AP-09), carries the security headers of Security.md R-05.
 A request body with a field the route does not take is refused with 422 (`validation_error`, naming
 the field) — on `POST /plans` and `POST /providers` as on `PATCH /plans/{id}` and `PATCH /providers/{id}`
 — so a misspelt guard (`requrie_approval`, `verify_tsl`) never silently yields a plan or provider
