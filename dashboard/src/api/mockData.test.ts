@@ -667,7 +667,7 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
     expect(Object.fromEntries(found.filter((f) => f.code in c.expected).map((f) => [f.code, f.message]))).toEqual(c.expected);
   });
 
-  it("judges a VMware source's VMs by the kit's names only, once, and never two unusable names as twins, as the API (SDD §9.3, review RV26-04)", () => {
+  it("judges a VMware source's VMs by the kit's names only, once, and never two unusable names as twins, as the API (SDD §9.3, reviews RV26-04, RV28-04)", () => {
     const plan = { ...base } as Plan;
     const template = ELIGIBILITY.finding_cases.find((c) => c.source_kind === 'vmware')!.vm;
     const vmOf = (source_id: string, name: string) => ({ ...template, source_id, name, project: null });
@@ -676,7 +676,15 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
     const dotted = vmOf('vm-1', 'web.01');
     expect(judged(dotted, [vmOf('vm-2', 'web_01')], 'openstack')).toEqual([]);
     expect(judged(vmOf('vm-3', 'サーバー'), [], 'openstack')).toEqual([]);
-    expect(judged(dotted, [vmOf('vm-4', 'web.01')], 'vmware').map((f) => f.message)).toEqual([
+    // a VM named exactly alike is a kit twin too: one finding with the kit's reason and remedy names every VM written alike
+    expect(judged(dotted, [vmOf('vm-4', 'web.01'), vmOf('vm-2', 'web_01')], 'vmware').map((f) => [f.message, f.remediation])).toEqual([
+      [
+        "Another selected VM has the name 'web_01' as the migration kit writes it (-/vm-2, -/vm-4); the kit names the VM's server, ports and volumes after it.",
+        "Rename one of the VMs in vCenter: the migration kit names a VM's server, ports and volumes after its name as it writes it, so the two would share them - in separate plans too, when they go to one destination project.",
+      ],
+    ]);
+    // an OpenStack source keeps os-migrate's reason for the same name
+    expect(judged(dotted, [vmOf('vm-4', 'web.01')], 'openstack').map((f) => f.message)).toEqual([
       "Another selected VM is also named 'web.01' (-/vm-4); os-migrate selects workloads by name.",
     ]);
     expect(judged(vmOf('vm-5', 'サーバー'), [vmOf('vm-6', 'веб')], 'vmware').map((f) => f.code)).toEqual(['SRC_VM_NAME_UNUSABLE']);

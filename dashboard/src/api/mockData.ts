@@ -1090,11 +1090,12 @@ export function preflight(
   if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', `Source VM ${vm.name} is in error state.`);
   else if (vm.power_state === 'transitioning')
     add('SRC_VM_TRANSITIONAL_STATE', `Source VM ${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot); a stop or snapshot would fail.`);
-  // the other selected VMs of that name, by their project and id, as the API words them (SDD §9.3)
-  const twins = (context.selected ?? [vm]).filter((v) => v.source_id !== vm.source_id && v.name === vm.name);
   // the migration kit names a VMware VM's server, ports and volumes after its name as it writes it, and finds a volume
-  // again by that name (SDD §7.2, §9.3, review RV26-04)
+  // again by that name: from a VMware source the kit's names decide, the same name included (SDD §7.2, §9.3, reviews
+  // RV26-04, RV28-04)
   const kit = sourceKind === 'vmware' ? kitVmName(vm.name) : null;
+  // the other selected VMs of that name, by their project and id, as the API words them (SDD §9.3)
+  const twins = kit === null ? (context.selected ?? [vm]).filter((v) => v.source_id !== vm.source_id && v.name === vm.name) : [];
   const kin = kit ? (context.selected ?? [vm]).filter((v) => v.source_id !== vm.source_id && kitVmName(v.name) === kit) : [];
   if (twins.length)
     add('SRC_VM_DUPLICATE_NAME', `Another selected VM is also named ${pyRepr(vm.name)} (${pyNames(twins.map((t) => `${t.project || '-'}/${t.source_id}`))}); os-migrate selects workloads by name.`);

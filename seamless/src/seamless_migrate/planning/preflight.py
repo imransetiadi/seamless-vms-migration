@@ -732,12 +732,15 @@ def run_preflight(
             )
         )
 
-    twins = [v for v in selected if v.source_id != vm.source_id and v.name == vm.name]
     # the migration kit names a VMware VM's server, ports and volumes after its name as it writes
-    # it, and finds a volume again by that name (SDD §7.2, §9.3, review RV26-04)
+    # it, and finds a volume again by that name: from a VMware source the kit's names decide, the
+    # same name included (SDD §7.2, §9.3, reviews RV26-04, RV28-04)
     kit = (
         kit_vm_name(vm.name) if source is not None and source.kind == ProviderKind.vmware else None
     )
+    twins = [
+        v for v in selected if v.source_id != vm.source_id and kit is None and v.name == vm.name
+    ]
     kin = [
         v for v in selected if v.source_id != vm.source_id and kit and kit_vm_name(v.name) == kit
     ]

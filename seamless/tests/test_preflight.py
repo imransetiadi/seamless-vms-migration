@@ -19,6 +19,7 @@ from seamless_migrate.domain.models import (
 from seamless_migrate.planning.platforms import destination_release
 from seamless_migrate.planning.preflight import (
     CATALOG,
+    KIT_TWIN_REMEDIATION,
     DestinationInventory,
     SourceInventory,
     fitting_flavor,
@@ -2273,9 +2274,10 @@ def test_the_shared_handover_finding_cases(case):
 
 
 def test_the_kits_names_judge_a_vmware_sources_vms_only_and_once():
-    """SDD §9.3 (review RV26-04): only a VMware source's VMs are compared by the migration kit's
-    names - an OpenStack VM keeps its own, so web.01 and web_01 are two VMs there and a Japanese
-    name is fine; VMware VMs named exactly alike get the one raw-name finding; two names the kit
+    """SDD §9.3 (reviews RV26-04, RV28-04): only a VMware source's VMs are compared by the
+    migration kit's names - an OpenStack VM keeps its own, so web.01 and web_01 are two VMs there
+    and a Japanese name is fine. From a VMware source a VM named exactly alike is a kit twin too:
+    one finding with the kit's reason and remedy names every VM written alike; two names the kit
     keeps nothing of are no twins, each is unusable."""
 
     def codes(vm, others, source):
@@ -2290,9 +2292,19 @@ def test_the_kits_names_judge_a_vmware_sources_vms_only_and_once():
     assert codes(dotted, [underscored], SRC) == []
     assert codes(make_vm(source_id="vm-3", name="サーバー"), [], SRC) == []
     twin = make_vm(source_id="vm-4", name="web.01")
-    found = check(dotted, plan=make_plan(), all_vms=[dotted, twin], source=VMWARE)
+    found = check(dotted, plan=make_plan(), all_vms=[dotted, twin, underscored], source=VMWARE)
     duplicates = [f for f in found if f.code == "SRC_VM_DUPLICATE_NAME"]
-    assert [f.message for f in duplicates] == [
+    assert [(f.message, f.remediation) for f in duplicates] == [
+        (
+            "Another selected VM has the name 'web_01' as the migration kit writes it "
+            "(finance/vm-2, finance/vm-4); the kit names the VM's server, ports and volumes after "
+            "it.",
+            KIT_TWIN_REMEDIATION,
+        )
+    ]
+    # an OpenStack source keeps os-migrate's reason and remedy for the same name
+    found = check(dotted, plan=make_plan(), all_vms=[dotted, twin], source=SRC)
+    assert [f.message for f in found if f.code == "SRC_VM_DUPLICATE_NAME"] == [
         "Another selected VM is also named 'web.01' (finance/vm-4); os-migrate selects workloads "
         "by name."
     ]
