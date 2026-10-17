@@ -1670,7 +1670,12 @@ start until the guest is down: the rollback waits until the stop ended - `SHUTOF
 the power-off up (its `task_state` back to none, the guest still running) - then starts it unless it runs (reviews
 RV26-01, RV27-04). A server Nova still powers on (`task_state` `powering-on`: an earlier attempt's start accepted, its
 wait cut off) reads `SHUTOFF` and refuses a second start: the rollback waits for that start to end too (review
-RV29-06). An empty
+RV29-06). A source whose deletion Nova accepted (step 4, journaled as sent) no longer counts as existing unless it
+reads `ACTIVE`: Nova starts no server it is deleting or that a failed deletion left in `ERROR`, and a deletion it
+then finishes - nova-compute resuming it, an operator clearing the server - honours the `delete_on_termination` it
+finds. So the rollback gives nothing back and starts nothing there: it deletes the server again, waits until it is
+gone and every journaled volume never unmanaged is `available`, and recreates the source as for one gone (below); a
+deletion that fails again fails the attempt with every volume still kept (review RV34B-02). An empty
 journal means the source was never stopped. Otherwise:
 delete the destination server; delete the destination ports step 8 created through Neutron (journaled, or
 unbound with their description: a create sent before a crash), which Nova keeps; unmanage at RHOSO; manage at the
