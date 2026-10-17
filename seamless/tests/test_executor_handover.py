@@ -1980,6 +1980,125 @@ async def test_handover_rollback_after_the_source_is_deleted_recreates_it(tmp_pa
     assert result.details["vm"]["source_id"] == "src-new-1"
 
 
+def _deletion_the_host_fails(clouds):
+    """Step 4's deletion as Nova and a broken compute host answer it: Nova accepts it, the host
+    fails it - the server left in ERROR, where Nova starts it no more - until ``fixed``; once fixed,
+    a deletion ends as Nova's, the volumes kept or deleted by their delete_on_termination."""
+    src = clouds["src"]
+    delete = src.compute.delete_server
+    host = NS(fixed=False)
+
+    def delete_server(s, ignore_missing=True):
+        sid = getattr(s, "id", s)
+        if host.fixed:
+            held = [vid for vid, _device in src.servers[sid].attachments]
+            delete(s, ignore_missing=ignore_missing)
+            for vid in held:
+                if vid in src.volumes:
+                    src.volumes[vid].status = "detaching"  # Cinder ends each detach a little later
+            return
+        src.record("delete_server", sid)
+        src.servers[sid].status = "ERROR"
+
+    settle = src.block_storage.wait_for_status
+
+    def wait_for_status(res, status="available", failures=None, interval=2, wait=120):
+        if getattr(res, "status", None) == "detaching":
+            res.status = "available"
+        return settle(res, status=status, failures=failures, interval=interval, wait=wait)
+
+    def wait_for_delete(res, interval=2, wait=120):
+        if getattr(res, "id", res) in src.servers:
+            raise RuntimeError(f"Timeout waiting for Server:{res.id} to delete")
+        return res
+
+    class Conflict(Exception):
+        status_code = 409
+
+    def start_server(s):
+        if s.status == "ERROR":
+            raise Conflict(f"Cannot 'start' instance {s.id} while it is in vm_state error")
+        src.record("start_server", s.id)
+
+    src.compute.delete_server = delete_server
+    src.compute.wait_for_delete = wait_for_delete
+    src.compute.start_server = start_server
+    src.block_storage.wait_for_status = wait_for_status
+    return host
+
+
+@pytest.mark.parametrize("host", ["fixed", "still broken"])
+async def test_a_rollback_after_nova_accepted_the_source_deletion_never_gives_its_volumes_back(
+    tmp_path, host
+):
+    """SDD §7.3 rollback (review RV34B-02): step 4's deletion was accepted - journaled as sent - and
+    the compute host failed it, the source left in ERROR. Nova starts no such server, and a deletion
+    it finishes later honours the delete_on_termination it finds: the rollback gives nothing back
+    and starts nothing. It deletes the server again, waits until it is gone and its volumes are
+    available, and recreates the source from the journaled definition; a deletion that fails again
+    fails the attempt with every volume still kept."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    compute = _deletion_the_host_fails(clouds)
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.servers["srv-1"].status == "ERROR"
+    compute.fixed = host == "fixed"
+    calls.clear()
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    if host == "fixed":
+        result = await executor.run(StepName.ROLLBACK, ctx)
+        assert "srv-1" not in src.servers and src.deleted_by_nova == []
+        bdm = src.created[0]["block_device_mapping"]
+        assert [(b["uuid"], b["delete_on_termination"]) for b in bdm] == [
+            ("vol-root", True),
+            ("vol-data", False),
+        ]
+        assert result.details["vm"]["source_id"] == "src-new-1"
+    else:
+        with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+            await executor.run(StepName.ROLLBACK, ctx)
+        assert src.servers["srv-1"].dot == {"vol-root": False, "vol-data": False}
+    assert not [c for c in ops(calls) if c[1] in ("dot", "start_server")], ops(calls)
+
+
+async def test_a_rollback_that_cannot_read_the_source_fails_as_its_answer_says(tmp_path):
+    """SDD §7.3 rollback (review RV34B-02): whether the source still exists decides between giving
+    its volumes back and recreating it - a read Nova does not answer fails the attempt by that
+    answer (a 503 is retried) and decides nothing."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    _deletion_the_host_fails(clouds)
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+
+    class Unavailable(Exception):
+        status_code = 503
+
+    def get_server(server_id):
+        raise Unavailable("Service Unavailable (HTTP 503)")
+
+    clouds["src"].compute.get_server = get_server
+    calls.clear()
+    with pytest.raises(TransientStepError, match="read the source server: Service Unavailable"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert not [c for c in ops(calls) if c[1] in ("create_server", "dot", "start_server")]
+
+
+async def test_a_rollback_after_nova_accepted_the_source_deletion_starts_one_that_runs(tmp_path):
+    """SDD §7.3 rollback (review RV34B-02): a source whose deletion Nova accepted still counts as
+    existing when it reads ACTIVE - started since, as step 1 has it: what the cutover kept is given
+    back and the server runs on."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    _deletion_the_host_fails(clouds)
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.servers["srv-1"].status = "ACTIVE"  # reset and started by hand
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.servers["srv-1"].dot == {"vol-root": True, "vol-data": False}
+    assert "vm" not in result.details and not src.created
+
+
 async def test_handover_journals_every_port_with_its_mac_and_addresses(tmp_path):
     """SDD §7.3 step 2: every port with its id, MAC and every fixed IP (IPv4 and IPv6)."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)

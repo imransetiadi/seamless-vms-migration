@@ -1665,9 +1665,18 @@ class HandoverExecutor:
                 await _in_thread(journal.mark, meta_key)
 
         any_unmanaged = any(journal.done(f"unmanage_src:{a['volume_id']}") for a in attachments)
-        source_gone = journal.done("delete_source") or (
-            await _in_thread(_existing_server, src, server_id) is None
-        )
+        source_gone = journal.done("delete_source")
+        if not source_gone:
+            found = await self._call(
+                "read the source server", lambda: _existing_server(src, server_id)
+            )
+            # a deletion Nova accepted (step 4) leaves a server it is deleting, or one a failed
+            # deletion left in ERROR: Nova starts neither, and a deletion it finishes honours the
+            # delete_on_termination it finds - recreated as one gone unless it runs (SDD §7.3
+            # rollback, review RV34B-02)
+            source_gone = found is None or (
+                journal.done("sent:delete_source") and not _active(found)
+            )
         new_server_id = server_id
         if any_unmanaged or source_gone:
             if not journal.done("delete_source") and not journal.done("rb:delete_stale_source"):
@@ -1677,6 +1686,18 @@ class HandoverExecutor:
                     if server is not None:
                         src.compute.delete_server(server, ignore_missing=True)
                         src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
+                    # the volumes it held, never unmanaged, carry the recreated server: Nova takes
+                    # only an available one, as after step 4 (review RV34B-02)
+                    for att in attachments:
+                        if new_ids.get(att["volume_id"]) != att["volume_id"]:
+                            continue
+                        src.block_storage.wait_for_status(
+                            src.block_storage.get_volume(att["volume_id"]),
+                            status="available",
+                            failures=["error"],
+                            interval=self.poll_s,
+                            wait=self.wait_s,
+                        )
 
                 await self._call("delete the stale source server", delete_stale)
                 await _in_thread(journal.mark, "rb:delete_stale_source")
