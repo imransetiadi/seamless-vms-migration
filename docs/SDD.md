@@ -1534,7 +1534,12 @@ volumes with their server, so the order is:
    the step goes on, the stop journaled as sent, as for one that runs (review RV27-03). A step
    that ends without `SHUTOFF` once the stop was journaled as sent — a failure, or a cancel (the step timeout, a
    rollback request, a shutdown) — opens the clock at that mark's time: the source may be stopped, so the
-   automatic rollback (§8) runs and a cancel is refused (§5.1) (audit EX-02).
+   automatic rollback (§8) runs and a cancel is refused (§5.1) (audit EX-02). A cutover that resumes its journal
+   past the stop - `stop_source` done, `delete_source` not - reads the source first and, unless it reads
+   `SHUTOFF`, stops it again and waits for `SHUTOFF` before any later step: a rollback's start that Nova performed
+   while its wait failed journals nothing, and an operator may start the source between attempts, so the step
+   that deletes the source would otherwise delete a running server (review 31). A source already gone - deleted
+   by the attempt before, which failed before it journaled that - needs no stop. The clock keeps its first start.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
    `plan.port_creation_mode` `"neutron"` also its security groups by name), and the volume attachments in device
