@@ -1356,7 +1356,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   empties it. The other problems leave the NIC no correct value in the map, which the kit reads in
   every run, and stop every run.
 
-  The rollback deletes the kit's ports of the VM after the destination server: Nova only unbinds a port it did not
+  The rollback deletes the kit's ports of the VM after the destination server and the source's power-on (below):
+  Nova only unbinds a port it did not
   create when it deletes the server (`preserve_on_delete`), so the port would keep the NIC's MAC and addresses and
   refuse the next attempt. They are the unbound ports with one of the VM's NIC MACs and a name of the kit's form
   (`<kit name>-NIC-<n>-VLAN-<network>`), whichever network they are on; a port bound to a server is never deleted,
@@ -1379,17 +1380,27 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   `<kit name>-<digits>` with `osm` `true` that is marked converted, that belongs to a `vmware_cold` migration, or that
   is a `vmware_warm` first copy cut off - not converted and not marked `seamless_copied` (below) -, and waits until
   each is gone; a `vmware_warm` volume not converted whose copy completed stays, since the next pass syncs it by CBT.
-  A volume
+  Not when the migration recorded its destination server: the kit created that server from every kit volume of the
+  VM, and its guest may have written to each - a journal replay, a database's crash recovery, days of service -,
+  which a CBT sync, copying only what the source changed, never undoes; with a recorded server the rollback deletes
+  every kit volume of the VM, converted or not, so the next pass copies them in full (review RV30-02). A marked
+  volume in an error state Cinder cannot attach (`error`, `error_restoring`, `error_extending`, `error_managing`)
+  goes too, here and before a run (below): every later pass would fail at its attach (review RV30-07). A volume
   the destination's conversion host holds is the kit's own copy, left attached when a cutover was cut off inside the
   kit's migrate task (the step timeout, a rollback request): it is detached from that host - found by the conversion
   host's name, else by the port that holds its address - and then deleted or kept by these rules, as §6.3 treats a
   transfer's volume the destination conversion host holds (review RV29-02). A volume attached to another server is
   never deleted, nor is any volume when the VM has no kit name (`SRC_VM_NAME_UNUSABLE`, §9.3). The server the rollback
   deletes counts as this migration's only when the migration recorded it: one found by the kit's name may be another
-  plan's VM the kit names alike (owner question q26), so what it held before its deletion is kept - a later kit run
+  plan's VM the kit names alike (owner question q26), so what it held before its deletion - read from Nova's record of
+  it (`server_volumes`), as no Cinder call comes before the power-on - is kept - a later kit run
   refuses such a volume, and a second rollback, which finds no server holding it, deletes it (review RV29-03). A
   volume Cinder does not delete fails the attempt, which is retried: the source already runs, and the power-on does
-  nothing to a running VM - the destination's clean-up never keeps the source stopped (§8, review RV29-01). As a
+  nothing to a running VM - the destination's clean-up never keeps the source stopped (§8, review RV29-01). Only the
+  server's deletion comes before the power-on - a destination server running beside the source on a stretched
+  network would be a second live copy -; the kit's ports and volumes matter only to the next attempt, so the
+  rollback reads and deletes them after it, and an outage of Neutron or Cinder that failed the cutover fails the
+  attempt with the source running, never before (review RV30-04). As a
   rollback may so end `failed` with such a volume left, a VMware kit run - a cutover, a `vmware_warm` pass - is
   refused before it starts, before any clock, while a volume named `<kit name>-<digits>` with `osm` `true` is marked
   converted, or, for a `vmware_cold` cutover, while any such volume exists: the refusal names each volume and its
@@ -1408,7 +1419,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   marking that fails fails the pass as transient, and the retry copies the unmarked volumes in full. Before every
   `vmware_warm` kit run - a pass, the cutover -, once the refusal above found nothing, such a volume neither
   converted nor marked is a first copy cut off: it is detached from the destination's conversion host when that
-  host holds it and deleted, so the kit copies the disk in full; one another server holds stays. The kit's
+  host holds it and deleted, as is a marked one in an error state Cinder cannot attach (review RV30-07), so the kit
+  copies the disk in full; one another server holds stays. The kit's
   conversion rewrites a volume's metadata to `osm` and `converted` alone, so a converted volume carries no mark:
   the rules above for converted volumes apply to it.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
@@ -2062,6 +2074,9 @@ class DestinationProvider(Protocol):
     async def detach_volume(self, server_id: str, volume_id: str) -> None
         # Nova's attachment of the volume to the server removed, then waits until Cinder reads the volume
         # available, within the call's bound (§8.1); a volume not attached to that server is no error (§7.2)
+    async def server_volumes(self, server_id: str) -> list[str]
+        # the ids of the volumes Nova lists as attached to the server - its record alone, no Cinder or Neutron
+        # call; a server gone holds none (§7.2 VMware rollback, review RV30-04)
     async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None
         # sets the given metadata keys on the volume and keeps its other keys (Cinder's merge), within the call's
         # bound (§8.1): the mark of a VMware kit copy that completed (§7.2, review RV30-01)
