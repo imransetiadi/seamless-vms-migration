@@ -225,8 +225,15 @@ def test_redact_costs_time_linear_in_the_text(text):
 
 @pytest.mark.parametrize(
     "unit",
-    ["eyJ-", "--x ", "a.", "-", "ab."],
-    ids=["jwt starts", "flag starts", "key prefix", "dash line", "dotted words"],
+    ["eyJ-", "--x ", "a--", "a.", "-", "ab."],
+    ids=[
+        "jwt starts",
+        "flag starts",
+        "flags after words",
+        "key prefix",
+        "dash line",
+        "dotted words",
+    ],
 )
 def test_four_times_the_text_costs_redact_about_four_times_the_time(unit):
     """SDD §13.4 (reviews RV27-06, RV31-01): every pattern of redact costs time linear in the
@@ -265,6 +272,23 @@ def test_redact_finds_a_credential_word_glued_into_a_cli_flag():
         assert secret not in redact(f"tool {flag} {secret} --next"), flag
     text = f"tool --name web-01 --password {secret}"
     assert redact(text) == "tool --name web-01 --password [REDACTED]"
+
+
+def test_redact_finds_a_cli_flag_after_an_escaped_line_break():
+    """SDD §13.4 (review RV32B-01): Ansible prints a failed task's result as one JSON line, where a
+    line break of a command or its output is a backslash and an "n" - a flag that starts a line
+    follows a letter. A flag is read after any character but a dash, so its value is redacted -
+    also glued after a word -, and a flag of another name keeps its value."""
+    import json
+
+    secret = "Hunter2-Prod-Secret"  # gitleaks:allow
+    result = {"cmd": "openstack --os-cloud src server list \\\n--os-password " + secret}
+    line = "fatal: [localhost]: FAILED! => " + json.dumps(result)
+    assert "\\n--os-password" in line  # as ansible-playbook prints it
+    assert secret not in redact(line)
+    for glued in ("x--password", "1--password", "_--password", "a-b--password", "x---password"):
+        assert secret not in redact(f"{glued} {secret}"), glued
+    assert redact(f"x--name {secret}") == f"x--name {secret}"
 
 
 def test_redact_still_finds_what_its_linear_patterns_could_hide():
