@@ -2169,9 +2169,12 @@ including error responses written by the server-error handler and the answers to
 `SEAMLESS_CORS_ORIGINS` set: the CORS layer answers them before any route, a refused one as the envelope, 400
 `bad_request` "Disallowed CORS origin"; audit AP-09), carries the security headers of Security.md R-05.
 A request body with a field the route does not take is refused with 422 (`validation_error`, naming
-the field) — on `POST /plans` and `POST /providers` as on `PATCH /plans/{id}` and `PATCH /providers/{id}`
-— so a misspelt guard (`requrie_approval`, `verify_tsl`) never silently yields a plan or provider
-without it; a stored document keeps loading with fields a later version added (§11).
+the field) — at any depth, a nested object's field too (`conversion_host.ssh_allowed_cdir`, `verification.tcp_port`,
+a probe's `expect_stauts`), on `POST /plans` and `POST /providers` as on `PATCH /plans/{id}` and
+`PATCH /providers/{id}`, on `POST` and `PUT /advisor/policies` (a misspelt `scope` would make a plan's policy a global
+one) and in `seamless plan apply` (§15) — so a misspelt guard (`requrie_approval`, `verify_tsl`) never silently yields a
+plan, provider or policy without it (audit AP-01, AP-02); a stored document keeps loading with fields a later version
+added, at any depth (§11).
 Authentication: `Authorization: Bearer <token>` (§13).
 A request body holds at most 1 MiB (1,048,576 bytes). A larger `Content-Length`, or a chunked body
 that grows past it, is refused with 413 before the body is parsed: the framework parses a route's
