@@ -1228,8 +1228,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   `/` written `%2F` and NUL written `%00` — both sides apply the same rule, so a tenant's VM name (`../x`, `/etc/x`)
   never names a file outside `workload_logs`, and two names never share a file.
 * Cold rollback passes `os_migrate_rollback_match_by_name: true` only once the source was stopped
-  (`downtime_started_at` set), as the VMware rollback looks up the server by name only then (beside a recorded
-  one too, §7.2): the cold role creates
+  (`downtime_started_at` set) - the VMware rollback looks a server up by name only after the stop too, and only
+  while the clock is open, as its own power-on closes the clock once the servers it found are gone (§7.2): the cold
+  role creates
   the server after the stop, so before it a same-named destination server is not this migration's — a cutover
   refused for a name collision, or skipped by the role for one, is rolled back by starting the source alone and
   deletes nothing. A server the cold import recorded (§6.3) is found by its id first, one whose record Nova's lost answer
@@ -1437,12 +1438,17 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   a rollback succeeds and removes the record (review RV30-05) - is kept: a later kit run refuses such a volume, and a
   second rollback, which finds no server holding it, deletes it (review RV29-03). A record that cannot be read (a
   damaged file) never keeps the source stopped: what to keep is then unknown, so that attempt deletes no kit volume of
-  the VM, says so in its log, and deletes the server and powers the source on as any other (review RV32A-08). While
-  the clock is open the rollback looks the server up by the kit's name even when one is recorded: the recorded one
+  the VM, says so in its log, and deletes the server and powers the source on as any other (review RV32A-08). The
+  rollback looks the server up by the kit's name only while the clock is open (§5.2), and then even when one is
+  recorded: the recorded one
   may be an earlier attempt's that a failed rollback already deleted - kept recorded, as only a rollback that
   succeeds clears it - while the new attempt's cutover did not record its own (a Nova lookup that failed, a step cut
   off after the kit created the server). A server found by name that is not the recorded one is deleted before the
-  power-on too, what it held kept as above, so the source never runs beside it (review RV32A-07). A
+  power-on too, what it held kept as above, so the source never runs beside it (review RV32A-07). Once the clock
+  closed it looks nothing up by name: an earlier attempt's power-on closed it only after every server that attempt
+  found was gone, a verification only with the recorded server running, so a server of the kit's name then is
+  another VM's - another plan's the kit names alike, an operator's replacement - that a lookup would delete or, as a
+  second server of that name, fail every attempt on before the power-on (review RV34A-01). A
   volume Cinder does not delete fails the attempt, which is retried: the source already runs, and the power-on does
   nothing to a running VM - the destination's clean-up never keeps the source stopped (§8, review RV29-01). Only the
   server's deletion comes before the power-on - a destination server running beside the source on a stretched
