@@ -2564,6 +2564,35 @@ def sdk_error(status, reason, body=b"", url="https://cinder.dc3.example:8776/v3/
     raise AssertionError("no exception")
 
 
+@pytest.mark.parametrize(
+    ("name", "retried"),
+    [("sdk 503", True), ("connect failure", True), ("sign-in refused", True), ("sdk 400", False)],
+)
+@pytest.mark.parametrize("step", [0, 2])
+async def test_a_cinder_pool_read_that_fails_is_retried_as_any_call(tmp_path, name, retried, step):
+    """SDD §7.3 (review RV27-05): the Cinder pools are read as any other call - an answer of 502,
+    503 or 504, a retriable connection failure, the sign-in's blip is retried; any other failure
+    stays the refusal it was. At step 0 a retried read refuses nothing; at step 2, after the stop,
+    it fails the attempt as transient instead of handing the cutover to the automatic rollback."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    dst = clouds["dst"]
+    pools, reads = dst.block_storage.backend_pools, []
+
+    def backend_pools():
+        reads.append(len(reads) + 1)
+        if len(reads) == (1 if step == 0 else 2):  # step 0 reads them, step 2 again after the stop
+            raise sdk_errors()[name]
+        return pools()
+
+    dst.block_storage.backend_pools = backend_pools
+    with pytest.raises((TransientStepError, PermanentStepError)) as failed:
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    kind = TransientStepError if retried else PermanentStepError
+    assert type(failed.value) is kind, str(failed.value)[:300]
+    assert "cannot read the Cinder pools" in str(failed.value)
+    assert (("src", "stop_server", "srv-1") in calls) == (step == 2)
+
+
 def keystone_at_sign_in(answer):
     """What keystoneauth itself raises when a connection's first sign-in meets ``answer`` - an
     error of the HTTP session, or a status Keystone answers - at an auth URL without its version

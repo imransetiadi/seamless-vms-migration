@@ -516,7 +516,9 @@ class HandoverExecutor:
         try:
             pools = list(conn.block_storage.backend_pools())
         except Exception as exc:
-            raise PermanentStepError(
+            # read as any call: a 503, a connection failure, the sign-in's blip is retried - at
+            # step 2 the source has stopped (SDD §7.3, review RV27-05)
+            raise _failure_kind(exc)(
                 f"cannot read the Cinder pools of {where} (scheduler-stats/get_pools, admin): "
                 f"{exc}; the manage reference depends on the driver family (SDD §7.3.1)"
             ) from exc
