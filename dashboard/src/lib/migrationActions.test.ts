@@ -176,6 +176,26 @@ describe('migrationActions rules', () => {
     expect(nextStep(migration('failed', { error: 'precopy: x' }), null).text).toMatch(/or cancel/i);
   });
 
+  it('never says a failed rollback started the source, and offers the cancel to one never stopped (review RV34B-03)', () => {
+    const closed = { downtime_started_at: '2026-10-08T11:00:00Z', downtime_ended_at: '2026-10-08T11:20:00Z' };
+    // a completed migration's rollback that failed before it started the source: its verification closed the clock
+    const verified = migration('failed', { ...closed, error: 'rollback: start the source server: HTTP 503' }, 'storage_handover');
+    const step = nextStep(verified, null);
+    expect(step.action).toBe('rollback');
+    expect(step.text).not.toMatch(/started again|runs again/i);
+    expect(step.text).toMatch(/may still be stopped/i);
+    expect(step.text).toMatch(/roll back again/i);
+    expect(migrationActions(verified, 'operator').cancel.enabled).toBe(false);
+    // the rollback of a migration never stopped failed: its source runs, and the API takes a cancel
+    const never = migration('failed', { error: 'rollback: delete the server in rhoso: HTTP 503' }, 'storage_handover');
+    const neverStep = nextStep(never, null);
+    expect(neverStep.action).toBe('rollback');
+    expect(neverStep.text).toMatch(/never stopped/i);
+    expect(neverStep.text).toMatch(/or cancel/i);
+    expect(neverStep.text).not.toMatch(/started again/i);
+    expect(migrationActions(never, 'operator').cancel.enabled).toBe(true);
+  });
+
   it.each([
     ['warm', /volumes are kept/i, null],
     ['cold', /volumes the cold import created/i, /volumes are kept/i],

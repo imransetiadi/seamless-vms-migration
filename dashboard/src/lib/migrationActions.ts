@@ -315,9 +315,17 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
         return { text: 'Failed after the source VM was stopped. Next: roll back to restart it, or fix the cause and retry.', action: 'rollback' };
       }
       if (m.error?.startsWith('rollback: ')) {
-        // the rollback failed after the source ran again (its clock closed, SDD §5.2): rolling back again finishes
-        // the clean-up, and a cancel is refused once the source was stopped (SDD §5.1, §16, review RV32A-05)
-        return { text: 'The rollback failed after the source VM started again. Next: fix the cause and roll back again.', action: 'rollback' };
+        if (!m.downtime_started_at) {
+          // never stopped: its source runs, and the API takes a cancel (SDD §5.1, §16, review RV34B-03)
+          return { text: 'The rollback failed; the source VM was never stopped. Next: fix the cause and roll back again, or cancel.', action: 'rollback' };
+        }
+        // nothing the migration records tells whether the rollback started the source before it failed - a completed
+        // migration's clock closed at its verification -, and a cancel is refused once the source was stopped (SDD §5.1,
+        // §5.2, §16, reviews RV32A-05, RV34B-03)
+        return {
+          text: 'The rollback failed; the source VM may still be stopped — check it in the source cloud. Next: fix the cause and roll back again.',
+          action: 'rollback',
+        };
       }
       if (m.downtime_started_at) {
         // the source was stopped once and runs again: a cancel is refused (SDD §5.1, §16, review RV32A-05)
