@@ -1376,8 +1376,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   nothing, powers nothing off and boots the new server from it - the first attempt's disk, while the source runs again
   since the rollback powered it on (review RV28-01). Onto any other volume a `vmware_cold` run (no CBT sync) refuses
   to copy ("volume already exists"). So once the destination server is gone, the rollback deletes every volume named
-  `<kit name>-<digits>` with `osm` `true` that is marked converted, or that belongs to a `vmware_cold` migration, and
-  waits until each is gone; a `vmware_warm` volume not converted stays, since the next pass syncs it by CBT. A volume
+  `<kit name>-<digits>` with `osm` `true` that is marked converted, that belongs to a `vmware_cold` migration, or that
+  is a `vmware_warm` first copy cut off - not converted and not marked `seamless_copied` (below) -, and waits until
+  each is gone; a `vmware_warm` volume not converted whose copy completed stays, since the next pass syncs it by CBT.
+  A volume
   the destination's conversion host holds is the kit's own copy, left attached when a cutover was cut off inside the
   kit's migrate task (the step timeout, a rollback request): it is detached from that host - found by the conversion
   host's name, else by the port that holds its address - and then deleted or kept by these rules, as §6.3 treats a
@@ -1395,6 +1397,20 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   converted volume is no refusal while the source has not run since this outage's stop - the clock open (§5.2) and
   vCenter reading the VM off -: the kit then takes the volume it converted in this outage as migrated, which it is, as
   when a cutover is retried after a failure past the conversion.
+
+  The kit writes a new volume's CBT `changeID` - the change id of the snapshot it copies - when it creates the
+  volume, before its full copy, and marks no copy complete; every later run with CBT copies only what the source
+  changed since that change id (2.2.7, `migrate.go`). A first copy cut off - a failed `nbdcopy`, the step timeout,
+  a rollback request, a restart - so leaves a volume that no later pass or cutover completes (review RV30-01).
+  After each `vmware_warm` pass the kit completed, the control plane therefore marks each volume named
+  `<kit name>-<digits>` with `osm` `true` that is not converted and attached to no server with the metadata
+  `seamless_copied` `true` (`DestinationProvider.set_volume_metadata`, which keeps the volume's other keys); a
+  marking that fails fails the pass as transient, and the retry copies the unmarked volumes in full. Before every
+  `vmware_warm` kit run - a pass, the cutover -, once the refusal above found nothing, such a volume neither
+  converted nor marked is a first copy cut off: it is detached from the destination's conversion host when that
+  host holds it and deleted, so the kit copies the disk in full; one another server holds stays. The kit's
+  conversion rewrites a volume's metadata to `osm` and `converted` alone, so a converted volume carries no mark:
+  the rules above for converted volumes apply to it.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
   migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
@@ -2046,6 +2062,9 @@ class DestinationProvider(Protocol):
     async def detach_volume(self, server_id: str, volume_id: str) -> None
         # Nova's attachment of the volume to the server removed, then waits until Cinder reads the volume
         # available, within the call's bound (§8.1); a volume not attached to that server is no error (§7.2)
+    async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None
+        # sets the given metadata keys on the volume and keeps its other keys (Cinder's merge), within the call's
+        # bound (§8.1): the mark of a VMware kit copy that completed (§7.2, review RV30-01)
 ```
 
 `SourceInventory {networks: dict[str, int|None] (name→mtu), projects: list[str], keypairs: list[str] (the names of
