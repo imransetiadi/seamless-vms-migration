@@ -747,7 +747,10 @@ gets the file:
 
 A warm pass records each destination volume it creates (`dest_volumes`) as soon as Cinder accepted it, before it
 waits for it; a volume whose record cannot be written (a full disk) is deleted, once Cinder settled it, before the pass
-fails - no record would name it for a rollback (audit A-05).
+fails - no record would name it for a rollback (audit A-05). A destination volume a later pass extends to the source's
+grown size is recorded at that size after Cinder extended it; when an earlier pass extended it but could not record it,
+the next pass reads the size Cinder reports and records it, never extending it again to the size it has, which Cinder
+refuses (review RV29-07).
 
 The cold import (`import_workloads.yml`, §6.5) writes the same file for a workload it copies, with no pass: the
 volumes its transfer created (`dest_volumes`, each with the `dest_id`, `size`, `bootable` and `name` the warm path
