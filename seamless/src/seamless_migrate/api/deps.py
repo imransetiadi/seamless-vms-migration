@@ -13,9 +13,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import Request
+from pydantic import BaseModel, ValidationError
 
 from ..config import Settings
 from ..domain.enums import Role
+from ..domain.models import REQUEST_BODY
 from ..events import EventBus, emit
 from ..orchestrator import Orchestrator
 from ..security.auth import (
@@ -161,6 +163,16 @@ def validation_message(errors: Sequence[Any], fallback: str = "invalid request")
         location = ".".join(str(p) for p in err.get("loc", ()) if p != "body")
         parts.append(f"{location}: {err.get('msg')}" if location else str(err.get("msg")))
     return "; ".join(parts) or fallback
+
+
+async def refuse_unknown_fields(request: Request, model: type[BaseModel]) -> None:
+    """A request body's field unknown at any depth is a 422 naming it (SDD §12, audit AP-01,
+    AP-02): FastAPI validates a body without a context, where a nested object ignores a field it
+    does not take, so the body is read again as a request body."""
+    try:
+        model.model_validate(await request.json(), context=REQUEST_BODY)
+    except ValidationError as exc:
+        raise ApiError(422, "validation_error", validation_message(exc.errors())) from None
 
 
 def _client(request: Request) -> str:

@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from ..domain.enums import PlanStatus, ProviderKind, ProviderRole, Role
 from ..domain.models import (
     BLANK_NAME,
+    REQUEST_BODY,
     ConversionHostConfig,
     Migration,
     Plan,
@@ -35,7 +36,13 @@ from ..security.secret_store import (
 )
 from ..security.secrets import valid_secret_name
 from ..store import ConflictError, NotFound
-from .deps import ApiError, require_role, services, validation_message
+from .deps import (
+    ApiError,
+    refuse_unknown_fields,
+    require_role,
+    services,
+    validation_message,
+)
 from .schemas import ConversionKeyRequest, ProviderCredentialsRequest
 
 log = logging.getLogger(__name__)
@@ -174,6 +181,7 @@ async def create_provider(
     principal: Principal = Depends(require_role(Role.admin)),
 ) -> Provider:
     svc = services(request)
+    await refuse_unknown_fields(request, ProviderCreate)
     _check_secret_names(body, {"credentials_secret", "conversion_host"})
     provider = body.model_copy(
         update={**_SERVER_OWNED, "credentials_updated_at": None, "conversion_key_updated_at": None}
@@ -250,7 +258,8 @@ async def update_provider(
             )
         try:
             updated = Provider.model_validate(
-                {**provider.model_dump(mode="json"), **body, **_SERVER_OWNED}
+                {**provider.model_dump(mode="json"), **body, **_SERVER_OWNED},
+                context=REQUEST_BODY,  # a nested field unknown is refused too (audit AP-01)
             )
         except ValidationError as exc:
             raise ApiError(

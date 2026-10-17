@@ -10,6 +10,7 @@ from pydantic import TypeAdapter, ValidationError
 from ..domain.enums import Phase, PlanStatus, ProviderRole, Role
 from ..domain.models import (
     PLAN_EDITABLE_FIELDS,
+    REQUEST_BODY,
     Migration,
     Plan,
     PlanCreate,
@@ -23,7 +24,14 @@ from ..plan_checks import PlanSpecError, check_plan_spec
 from ..plan_status import derive_plan_status_from_phases
 from ..security.auth import Principal
 from ..store import NotFound
-from .deps import ApiError, _audit_denied, require_role, services, validation_message
+from .deps import (
+    ApiError,
+    _audit_denied,
+    refuse_unknown_fields,
+    require_role,
+    services,
+    validation_message,
+)
 from .schemas import (
     CancelRequest,
     PlanFinalizeRequest,
@@ -144,6 +152,7 @@ async def create_plan(
     body: PlanCreate, request: Request, principal: Principal = Depends(require_role(Role.operator))
 ) -> PlanOut:
     svc = services(request)
+    await refuse_unknown_fields(request, PlanCreate)
     await _check_policy_fields(request, _non_default_policy_fields(body), principal)
     _check_plan_spec(body)
     plan = Plan(**body.model_dump())
@@ -203,7 +212,8 @@ async def update_plan(
                 raise ApiError(409, "conflict", failed_provider_change_refusal(failed))
         try:
             merged = PlanCreate.model_validate(
-                {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body}
+                {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body},
+                context=REQUEST_BODY,  # a nested field unknown is refused too (audit AP-01)
             )
         except ValidationError as exc:
             raise ApiError(422, "validation_error", validation_message(exc.errors())) from None

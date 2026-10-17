@@ -292,6 +292,33 @@ def test_plan_apply_refuses_a_create_naming_unknown_fields_like_post(env, capsys
     assert store.list("plan", Plan) == []
 
 
+def test_plan_apply_refuses_a_misspelt_nested_field_like_post(env, capsys):
+    """SDD §15/§12 (audit AP-01): a nested object's field PlanCreate does not have is refused like a
+    top-level one - a plan whose verification misspells tcp_ports is never stored without its
+    check of the application port."""
+    store = store_for(env)
+    store.put("provider", make_provider(id="src-osp"))
+    store.put(
+        "provider",
+        make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    path = env / "plan.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "name": "Finance web tier",
+                "source_provider_id": "src-osp",
+                "destination_provider_id": "dst-rhoso",
+                "vm_ids": ["vm-1"],
+                "verification": {"tcp_port": [443]},
+            }
+        )
+    )
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    assert "tcp_port" in capsys.readouterr().err
+    assert store.list("plan", Plan) == []
+
+
 def _applied_plan(env, capsys):
     store = store_for(env)
     store.put("provider", make_provider(id="src-osp"))
