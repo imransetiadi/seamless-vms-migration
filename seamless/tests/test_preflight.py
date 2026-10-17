@@ -169,6 +169,12 @@ def test_finding_src_vm_duplicate_name():
     assert f.severity == Severity.blocker
 
 
+def test_finding_src_vm_name_unusable():
+    """SDD §9.3 (review RV26-04): a VMware VM's name the migration kit keeps no character of."""
+    f = only(check(make_vm(name="サーバー"), source=VMWARE), "SRC_VM_NAME_UNUSABLE")
+    assert f.severity == Severity.blocker and f.strategies == [] and "vCenter" in f.remediation
+
+
 def test_duplicate_names_blocked():
     """Names are what os-migrate filters on: duplicates across projects block every copy."""
     a = make_vm(source_id="a", name="app.server[1]", project="finance")
