@@ -250,6 +250,9 @@ class OpenStackProvider:
     async def detach_volume(self, server_id: str, volume_id: str) -> None:
         await self._run(self._detach_volume, server_id, volume_id)
 
+    async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
+        await self._run(self._set_volume_metadata, volume_id, metadata)
+
     # -- implementation (runs in worker threads) ----------------------------------------------
     def _check(self) -> dict[str, Any]:
         conn = self._connection()
@@ -588,6 +591,10 @@ class OpenStackProvider:
             failures=["error"],
             wait=max(1, int(deadline - time.monotonic())),
         )
+
+    def _set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
+        # Cinder's POST /volumes/{id}/metadata merges: the kit's own keys stay (SDD §7.2, §10)
+        self._connection().block_storage.set_volume_metadata(volume_id, **metadata)
 
 
 def _os_hint(properties: Mapping[str, Any]) -> str | None:

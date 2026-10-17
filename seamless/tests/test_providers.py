@@ -1867,6 +1867,25 @@ async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_fre
     ]
 
 
+async def test_openstack_destination_marks_a_volume_keeping_its_other_metadata():
+    """SDD §10 (§7.2 VMware, review RV30-01): set_volume_metadata sets the given keys through
+    Cinder's merge (POST /volumes/{id}/metadata), so the kit's own keys - osm, changeID - stay."""
+    calls = []
+
+    class BlockStorage:
+        def set_volume_metadata(self, volume, **metadata):
+            calls.append(("set_volume_metadata", volume, metadata))
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(
+        dst, settings(), connect_fn=lambda p, s: NS(block_storage=BlockStorage())
+    )
+    await provider.set_volume_metadata("vol-1", {"seamless_copied": "true"})
+    assert calls == [("set_volume_metadata", "vol-1", {"seamless_copied": "true"})]
+
+
 async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):
     from seamless_migrate.providers import openstack as osp
     from seamless_migrate.providers.openstack import OpenStackProvider, _MapContext

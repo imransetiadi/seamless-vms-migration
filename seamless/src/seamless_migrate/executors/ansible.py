@@ -87,6 +87,26 @@ def kit_port_name(vm_name: str) -> re.Pattern[str]:
     return re.compile(re.escape(kit_vm_name(vm_name)) + r"-NIC-\d+-VLAN-")
 
 
+#: the control plane's mark of a vmware_warm kit copy that completed (SDD §7.2, review RV30-01)
+COPIED = {"seamless_copied": "true"}
+
+
+def kit_volumes(vm_name: str, volumes: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The volumes the kit's next run takes as the VM's own: named "{kit name}-{disk key}" with
+    the metadata osm true - none for a VM without a kit name (SDD §7.2)."""
+    kit = kit_vm_name(vm_name)
+    if not kit:
+        return []
+    own = re.compile(re.escape(kit) + r"-[0-9]+")
+    return [v for v in volumes if own.fullmatch(str(v.get("name") or "")) and _marked(v, "osm")]
+
+
+def _marked(volume: Mapping[str, Any], key: str) -> bool:
+    """Whether the volume's metadata ``key`` reads true: the kit's ``osm`` and ``converted``, the
+    control plane's ``seamless_copied`` (SDD §7.2)."""
+    return (volume.get("metadata") or {}).get(key) == "true"
+
+
 SERVER_TYPE = "openstack.compute.Server"
 OPENSTACK = frozenset({Strategy.cold, Strategy.warm})
 VMWARE = frozenset({Strategy.vmware_cold, Strategy.vmware_warm})
@@ -1020,7 +1040,9 @@ class AnsibleExecutor:
         if step == StepName.CUTOVER:
             await self._refuse_name_collision(ctx)
         if strategy in VMWARE and step in (StepName.CUTOVER, StepName.PRECOPY, StepName.SYNC):
-            await self._refuse_stale_kit_volumes(ctx, strategy)
+            volumes = await self._refuse_stale_kit_volumes(ctx, strategy)
+            if strategy == Strategy.vmware_warm:
+                await self._delete_cut_off_kit_copies(ctx, volumes)
         if strategy == Strategy.cold and step == StepName.CUTOVER:
             await asyncio.to_thread(
                 _ensure_record, osm, ctx.migration.vm.source_id, ctx.migration.vm.name
@@ -1062,6 +1084,8 @@ class AnsibleExecutor:
                 f"{ctx.destination.label} already has a server with that name and nothing was "
                 "migrated; delete or rename it, or roll the migration back"
             )
+        if strategy == Strategy.vmware_warm and step in (StepName.PRECOPY, StepName.SYNC):
+            await self._mark_kit_copies(ctx)
         result = await self._result(step, strategy, ctx, osm, started, passes_before)
         if deferred is not None:
             # SDD §7.2: what this pass met that the cutover refuses before the source stops -
@@ -1100,41 +1124,31 @@ class AnsibleExecutor:
                 "the cutover"
             )
 
-    async def _refuse_stale_kit_volumes(self, ctx: StepContext, strategy: Strategy) -> None:
+    async def _refuse_stale_kit_volumes(
+        self, ctx: StepContext, strategy: Strategy
+    ) -> list[dict[str, Any]]:
         """Before a VMware kit run - so before any clock - refuse while a volume of the VM's kit
         name holds what the run would take as migrated: one marked converted, or for a cold run
         any, onto which the kit refuses to copy. A rollback that could not delete it ended failed
         with the source running, and the run would boot the destination from it beside the
         source (SDD §7.2, review RV29-01). A converted volume is the kit's own of this outage
-        while the source has not run since its stop: the clock open and the VM reading off."""
+        while the source has not run since its stop: the clock open and the VM reading off.
+        Returns the VM's kit volumes it read."""
         m = ctx.migration
-        kit = kit_vm_name(m.vm.name)
-        if not kit:
-            return
-        own = re.compile(re.escape(kit) + r"-[0-9]+")
+        if not kit_vm_name(m.vm.name):
+            return []
         where = ctx.destination.label
         try:
-            volumes = await self.providers.get(ctx.destination).volumes()
+            volumes = kit_volumes(m.vm.name, await self.providers.get(ctx.destination).volumes())
         except ProviderError as exc:
             # an unanswered lookup is not "no such volume": refuse before the kit runs
             raise TransientStepError(
                 f"could not check {where} for the kit's volumes of {m.vm.name}: {exc}"
             ) from exc
-        stale = [
-            v
-            for v in volumes
-            if own.fullmatch(str(v.get("name") or ""))
-            and (v.get("metadata") or {}).get("osm") == "true"
-            and (
-                strategy == Strategy.vmware_cold
-                or (v.get("metadata") or {}).get("converted") == "true"
-            )
-        ]
+        stale = [v for v in volumes if strategy == Strategy.vmware_cold or _marked(v, "converted")]
         if not stale:
-            return
-        if source_stopped(m) and all(
-            (v.get("metadata") or {}).get("converted") == "true" for v in stale
-        ):
+            return volumes
+        if source_stopped(m) and all(_marked(v, "converted") for v in stale):
             try:
                 vm = await self.providers.get(ctx.source).get_vm(m.vm.source_id)
             except ProviderError as exc:
@@ -1142,7 +1156,8 @@ class AnsibleExecutor:
                     f"could not read {m.vm.name} from {ctx.source.label}: {exc}"
                 ) from exc
             if vm.power_state == "stopped":
-                return  # converted in this outage, the source off since: the kit is right
+                # converted in this outage, the source off since: the kit is right
+                return volumes
         named = ", ".join(
             f"{v['id']} ({v.get('name')}"
             + (
@@ -1159,6 +1174,59 @@ class AnsibleExecutor:
             "run onto any - roll the migration back again, which deletes the ones it may, or "
             f"delete them in {where}"
         )
+
+    async def _delete_cut_off_kit_copies(
+        self, ctx: StepContext, volumes: list[dict[str, Any]]
+    ) -> None:
+        """Before a vmware_warm kit run, delete each first copy cut off: a kit volume of the VM
+        neither converted nor marked copied. The kit wrote its changeID before the copy it never
+        finished, and would sync onto it only what the source changed since; deleted, the disk is
+        copied in full (SDD §7.2, review RV30-01). The destination's conversion host holding one
+        - a killed run's - lets go of it first; one another server holds stays."""
+        dst = self.providers.get(ctx.destination)
+        host: list[str | None] = []  # looked up once, for the first copy held
+        try:
+            for volume in volumes:
+                if _marked(volume, "converted") or _marked(volume, "seamless_copied"):
+                    continue
+                holders = [str(holder) for holder in volume.get("attachments") or []]
+                if holders:
+                    if not host:
+                        host.append(await self._conversion_host_server(ctx, dst))
+                    if host[0] is None or any(holder != host[0] for holder in holders):
+                        continue
+                    await dst.detach_volume(host[0], volume["id"])
+                await dst.delete_volume(volume["id"])
+                await ctx.log(
+                    f"deleted the kit's volume {volume['id']} ({volume.get('name')}): a first "
+                    "copy cut off, which the kit copies again in full"
+                )
+        except ProviderError as exc:
+            raise TransientStepError(
+                f"could not delete a first copy cut off of {ctx.migration.vm.name} in "
+                f"{ctx.destination.label}: {exc}"
+            ) from exc
+
+    async def _mark_kit_copies(self, ctx: StepContext) -> None:
+        """After a vmware_warm pass the kit completed, mark each of the VM's kit volumes that is
+        not converted and that no server holds: its copy completed, and a later run keeps it for
+        its CBT sync (SDD §7.2, review RV30-01). A marking that fails fails the pass as
+        transient: its retry copies the unmarked volumes in full."""
+        dst = self.providers.get(ctx.destination)
+        try:
+            for volume in kit_volumes(ctx.migration.vm.name, await dst.volumes()):
+                if (
+                    _marked(volume, "converted")
+                    or _marked(volume, "seamless_copied")
+                    or volume.get("attachments")
+                ):
+                    continue
+                await dst.set_volume_metadata(volume["id"], dict(COPIED))
+        except ProviderError as exc:
+            raise TransientStepError(
+                f"could not mark the kit's copies of {ctx.migration.vm.name} in "
+                f"{ctx.destination.label}: {exc}"
+            ) from exc
 
     async def _result(
         self,
@@ -1414,21 +1482,17 @@ class AnsibleExecutor:
         and the metadata ``osm``; one it marked ``converted`` it takes as migrated - no copy, no
         power-off, the new server booted from the first attempt's disk while the source runs
         again - and onto any other a vmware_cold run refuses to copy. A vmware_warm volume not
-        converted stays: the next pass syncs it by CBT. The destination's conversion host holding
+        converted stays when marked copied - the next pass syncs it by CBT -, and one not marked,
+        a first copy cut off, goes (review RV30-01). The destination's conversion host holding
         one is the kit's copy a cut-off run left: detached first (review RV29-02). A volume
         another server holds is never deleted, nor one of ``kept`` - what a server found only by
         name held (review RV29-03) -, nor any of a VM without a kit name."""
         m = ctx.migration
-        kit = kit_vm_name(m.vm.name)
-        if not kit:
+        if not kit_vm_name(m.vm.name):
             return []
-        own = re.compile(re.escape(kit) + r"-[0-9]+")
         deleted: list[str] = []
         conversion_host: list[str | None] = []  # looked up once, for the first volume held
-        for volume in await dst.volumes():
-            metadata = volume.get("metadata") or {}
-            if not own.fullmatch(str(volume.get("name") or "")) or metadata.get("osm") != "true":
-                continue
+        for volume in kit_volumes(m.vm.name, await dst.volumes()):
             if str(volume["id"]) in kept:
                 continue
             holders = [str(holder) for holder in volume.get("attachments") or []]
@@ -1441,8 +1505,12 @@ class AnsibleExecutor:
                     holders = [holder for holder in holders if holder != host]
                 if any(holder != server_id for holder in holders):
                     continue
-            if m.strategy != Strategy.vmware_cold and metadata.get("converted") != "true":
-                continue
+            if (
+                m.strategy != Strategy.vmware_cold
+                and not _marked(volume, "converted")
+                and _marked(volume, "seamless_copied")
+            ):
+                continue  # a warm copy that completed: the next pass syncs it by CBT
             await dst.delete_volume(volume["id"])
             deleted.append(str(volume["id"]))
         return deleted

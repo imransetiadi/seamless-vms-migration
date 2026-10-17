@@ -75,6 +75,11 @@ class DestinationProvider(Protocol):
         volume available, within the call's bound; one not attached to it is no error."""
         ...
 
+    async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
+        """Set the given metadata keys on the volume and keep its other keys (Cinder's merge),
+        within the call's bound: the mark of a VMware kit copy that completed (§7.2)."""
+        ...
+
 
 def provider_caps(provider: Provider) -> dict[str, Any]:
     """Capabilities used by the selector: stored capabilities plus ``conversion_host``."""

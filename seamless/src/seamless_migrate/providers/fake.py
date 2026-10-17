@@ -542,3 +542,6 @@ class FakeDestinationProvider:
 
     async def detach_volume(self, server_id: str, volume_id: str) -> None:
         return None
+
+    async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
+        return None
