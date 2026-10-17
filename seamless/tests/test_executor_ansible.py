@@ -148,6 +148,24 @@ class FakeImpl:
             if volume["id"] == volume_id:
                 volume["attachments"] = [s for s in volume["attachments"] if s != server_id]
 
+    async def server_of_address(self, address):
+        """The Nova server holding the address (SDD §10): a compute port with it as a fixed IP,
+        else the compute port its floating IP is associated with."""
+        compute = [
+            p
+            for p in self.registry.ports
+            if str(p.get("device_owner") or "").startswith("compute:") and p.get("device_id")
+        ]
+        for port in compute:
+            if address in port["fixed_ips"]:
+                return port["device_id"]
+        for fip in self.registry.floating_ips:
+            if fip["floating_ip_address"] == address:
+                for port in compute:
+                    if port["id"] == fip["port_id"]:
+                        return port["device_id"]
+        return None
+
     async def server_volumes(self, server_id):
         """Nova's record of the volumes attached to the server (SDD §10)."""
         self.calls.append(("server_volumes", server_id))
@@ -209,6 +227,8 @@ class FakeRegistry:
         self.inventory_error = False
         # the destination's ports (SDD §10 DestinationProvider.ports)
         self.ports: list[dict] = []
+        # Neutron's floating IPs: {floating_ip_address, port_id}
+        self.floating_ips: list[dict] = []
         self.ports_error = False
         # the destination project's volumes (SDD §10 DestinationProvider.volumes)
         self.volumes: list[dict] = []
@@ -269,12 +289,19 @@ def env(tmp_path, monkeypatch):
 
 
 def ctx_for(
-    env, strategy=Strategy.warm, source=SRC, name="web-01", mappings=MAPPINGS, nics=None, **mig_kw
+    env,
+    strategy=Strategy.warm,
+    source=SRC,
+    name="web-01",
+    mappings=MAPPINGS,
+    nics=None,
+    destination=DST,
+    **mig_kw,
 ):
     plan = make_plan(id="plan-00c0ffee", mappings=mappings)
     vm = make_vm(source_id="srv-1", name=name, **({"nics": nics} if nics is not None else {}))
     mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy, **mig_kw)
-    return make_ctx(plan, mig, source, DST, env.settings)
+    return make_ctx(plan, mig, source, destination, env.settings)
 
 
 def run_dir(env) -> Path:
@@ -3107,6 +3134,7 @@ async def test_a_vmware_rollback_detaches_the_kits_copy_from_its_conversion_host
                 "name": "",
                 "network_id": "net-transit",
                 "device_id": host,
+                "device_owner": "compute:nova",
                 "mac_address": "fa:16:3e:00:00:99",
                 "fixed_ips": ["192.0.2.10"],
             }
@@ -3359,6 +3387,56 @@ async def test_a_first_copy_cut_off_is_deleted_before_the_next_vmware_warm_run(e
         ("delete_volume", "cut-off-held"),
     ]
     assert {v["id"] for v in env.registry.volumes} == {"copied", "held", "other-vm"}
+
+
+@pytest.mark.parametrize("credential", ["admin", "member"])
+async def test_a_vmware_rollback_finds_a_conversion_host_known_by_its_floating_address(
+    env, credential
+):
+    """SDD §7.2 (review RV30-06): a conversion host configured by its address alone may be known
+    by its floating IP, which Neutron puts on the floating IP's own port - an admin sees that port,
+    with the floating IP's id as its device; a project member sees none. The rollback takes the
+    server whose compute port Neutron's floating IP is associated with, detaches the copy a cut-off
+    run left there and deletes it."""
+    host = "srv-conv-7"
+    env.registry.ports = [
+        {
+            "id": "conv-port",
+            "name": "",
+            "network_id": "net-transit",
+            "device_id": host,
+            "device_owner": "compute:nova",
+            "mac_address": "fa:16:3e:00:00:99",
+            "fixed_ips": ["10.0.0.40"],
+        }
+    ]
+    if credential == "admin":
+        env.registry.ports.append(
+            {
+                "id": "fip-port",
+                "name": "",
+                "network_id": "public",
+                "device_id": "fip-1",
+                "device_owner": "network:floatingip",
+                "mac_address": "fa:16:3e:00:00:98",
+                "fixed_ips": ["198.51.100.40"],
+            }
+        )
+    env.registry.floating_ips = [{"floating_ip_address": "198.51.100.40", "port_id": "conv-port"}]
+    env.registry.volumes = [kit_volume("cut-off-copy", "web-01-2000", attachments=[host])]
+    floating = DST.model_copy(
+        update={"conversion_host": ConversionHostConfig(manage=False, address="198.51.100.40")}
+    )
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        destination=floating,
+        downtime_started_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert ("detach_volume", host, "cut-off-copy") in env.registry.calls
+    assert result.details["deleted_volumes"] == ["cut-off-copy"]
 
 
 @pytest.mark.parametrize("recorded", [False, True])

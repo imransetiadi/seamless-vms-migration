@@ -75,6 +75,12 @@ class DestinationProvider(Protocol):
         volume available, within the call's bound; one not attached to it is no error."""
         ...
 
+    async def server_of_address(self, address: str) -> str | None:
+        """The Nova server holding the address: a compute port with it as a fixed IP, else the
+        compute port Neutron's floating IP of that address is associated with; None when none
+        (§7.2)."""
+        ...
+
     async def server_volumes(self, server_id: str) -> list[str]:
         """The ids of the volumes Nova lists as attached to the server - its record alone, no
         Cinder or Neutron call; a server gone holds none (§7.2)."""

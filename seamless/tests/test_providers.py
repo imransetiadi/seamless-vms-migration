@@ -1914,6 +1914,53 @@ async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_fre
     ]
 
 
+async def test_openstack_destination_finds_the_server_holding_an_address():
+    """SDD §10 (§7.2 VMware rollback, review RV30-06): server_of_address takes a compute port's
+    device - by the address as one of its fixed IPs, else through Neutron's floating IP of that
+    address - and never a floating IP's own port or a router's."""
+    ports = [
+        NS(
+            id="conv-port",
+            device_id="srv-conv",
+            device_owner="compute:nova",
+            fixed_ips=[{"ip_address": "10.0.0.40"}],
+        ),
+        NS(
+            id="fip-port",
+            device_id="fip-1",
+            device_owner="network:floatingip",
+            fixed_ips=[{"ip_address": "198.51.100.40"}],
+        ),
+        NS(
+            id="router-port",
+            device_id="router-1",
+            device_owner="network:router_interface",
+            fixed_ips=[{"ip_address": "10.0.0.1"}],
+        ),
+    ]
+    floating = [NS(floating_ip_address="198.51.100.40", port_id="conv-port")]
+
+    class Network:
+        def ports(self, fixed_ips):
+            address = fixed_ips[0].split("=", 1)[1]
+            return [p for p in ports if address in [ip["ip_address"] for ip in p.fixed_ips]]
+
+        def ips(self, floating_ip_address):
+            return [f for f in floating if f.floating_ip_address == floating_ip_address]
+
+        def get_port(self, port_id):
+            return {p.id: p for p in ports}[port_id]
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: NS(network=Network()))
+    assert await provider.server_of_address("10.0.0.40") == "srv-conv"
+    assert await provider.server_of_address("198.51.100.40") == "srv-conv"
+    assert await provider.server_of_address("10.0.0.1") is None  # a router's
+    assert await provider.server_of_address("203.0.113.9") is None
+
+
 async def test_openstack_destination_reads_the_volumes_nova_lists_for_a_server():
     """SDD §10 (§7.2 VMware rollback, review RV30-04): server_volumes reads Nova's record of the
     server - no Cinder or Neutron call, so a rollback reads it before the source's power-on; a

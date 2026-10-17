@@ -548,6 +548,9 @@ class FakeDestinationProvider:
     async def detach_volume(self, server_id: str, volume_id: str) -> None:
         return None
 
+    async def server_of_address(self, address: str) -> str | None:
+        return None
+
     async def server_volumes(self, server_id: str) -> list[str]:
         return []
 

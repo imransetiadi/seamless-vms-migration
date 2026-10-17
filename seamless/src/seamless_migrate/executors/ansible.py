@@ -1574,8 +1574,9 @@ class AnsibleExecutor:
 
     @staticmethod
     async def _conversion_host_server(ctx: StepContext, dst: Any) -> str | None:
-        """The destination conversion host's Nova server: by its name, else the server of the
-        port that holds its address (SDD §7.2, review RV29-02)."""
+        """The destination conversion host's Nova server: by its name, else the server holding
+        its address - fixed, or floating through Neutron's floating IP (SDD §7.2, reviews RV29-02,
+        RV30-06)."""
         host = ctx.destination.conversion_host
         if host is None:
             return None
@@ -1584,9 +1585,9 @@ class AnsibleExecutor:
             if found:
                 return str(found)
         if host.address:
-            for port in await dst.ports(ip_address=host.address):
-                if port.get("device_id"):
-                    return str(port["device_id"])
+            found = await dst.server_of_address(host.address)
+            if found:
+                return str(found)
         return None
 
     async def _lookup_server(self, ctx: StepContext) -> str | None:

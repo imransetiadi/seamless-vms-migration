@@ -250,6 +250,9 @@ class OpenStackProvider:
     async def detach_volume(self, server_id: str, volume_id: str) -> None:
         await self._run(self._detach_volume, server_id, volume_id)
 
+    async def server_of_address(self, address: str) -> str | None:
+        return await self._run(self._server_of_address, address)
+
     async def server_volumes(self, server_id: str) -> list[str]:
         return await self._run(self._server_volumes, server_id)
 
@@ -594,6 +597,28 @@ class OpenStackProvider:
             failures=["error"],
             wait=max(1, int(deadline - time.monotonic())),
         )
+
+    def _server_of_address(self, address: str) -> str | None:
+        # a compute port's device only: a floating IP's own port names the floating IP, a
+        # router's the router (SDD §7.2, §10, review RV30-06)
+        network = self._connection().network
+        canonical = _canonical_ip(address)
+
+        def server(port: Any) -> str | None:
+            owner = str(_attr(port, "device_owner", default="") or "")
+            device = _attr(port, "device_id")
+            return str(device) if owner.startswith("compute:") and device else None
+
+        for port in network.ports(fixed_ips=[f"ip_address={canonical}"]):
+            fixed = [ip.get("ip_address") for ip in _attr(port, "fixed_ips", default=None) or []]
+            if canonical in (_canonical_ip(str(a)) for a in fixed if a) and server(port):
+                return server(port)
+        for floating in network.ips(floating_ip_address=canonical):
+            port_id = _attr(floating, "port_id")
+            port = _try(lambda pid=port_id: network.get_port(pid), None) if port_id else None
+            if port is not None and server(port):
+                return server(port)
+        return None
 
     def _server_volumes(self, server_id: str) -> list[str]:
         # Nova's record of the server (os-extended-volumes): no Cinder call, so a VMware rollback
