@@ -591,7 +591,7 @@ class HandoverExecutor:
             problems.extend(
                 self._lookup_problems(dst, definition, mappings or plan.mappings, cloud)
             )
-        local = self._local_disks(src, src.compute.get_server(server_id))
+        local = self._local_disks(src.compute.get_server(server_id))
         if local:
             # validation rules a handover out for them, but a resize since then shows only here
             problems.append(
@@ -713,15 +713,12 @@ class HandoverExecutor:
         )
 
     @staticmethod
-    def _local_disks(conn: Any, server: Any) -> list[str]:
+    def _local_disks(server: Any) -> list[str]:
         """The server's disks on its hypervisor, read as the inventory reads them (SDD §4.2): a
-        root disk from an image, its flavor's ephemeral (GiB) and swap (MiB) disks - from the
-        flavor Nova embeds, looked up by id where it embeds none (below compute 2.47)."""
+        root disk from an image, the ephemeral (GiB) and swap (MiB) disks of the flavor Nova embeds
+        - from compute 2.47 on; a source without 2.85 is refused anyway (review RV26-09)."""
         flavor = _attr(server, "flavor", default={}) or {}
         ephemeral, swap = _attr(flavor, "ephemeral"), _attr(flavor, "swap")
-        if ephemeral is None and swap is None and _attr(flavor, "id"):
-            full = conn.compute.get_flavor(_attr(flavor, "id"))
-            ephemeral, swap = _attr(full, "ephemeral"), _attr(full, "swap")
         disks = []
         if _attr(_attr(server, "image", default={}) or {}, "id"):
             disks.append("a root disk from an image")
