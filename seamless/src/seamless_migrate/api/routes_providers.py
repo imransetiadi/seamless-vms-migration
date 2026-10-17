@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from collections import Counter
 from collections.abc import Callable
 from typing import Any
@@ -137,10 +138,15 @@ def _check_secret_names(provider: Provider, fields: set[str]) -> None:
         "credentials_secret": credentials_secret_name(provider.id),
         "conversion_host.ssh_key_secret": conversion_key_secret_name(provider.id),
     }
+    # compared as the readers fold the name: a case-insensitive filesystem opens provider-x for
+    # Provider-x, the SEAMLESS_SECRET_ variables upper-case it and take any other character as _
+    # (audit AP-04) - only the provider's own exact name passes
     taken = [
         field
         for field, name in names.items()
-        if name is not None and name.startswith("provider-") and name != own[field]
+        if name is not None
+        and re.sub(r"[^a-z0-9]", "-", name.lower()).startswith("provider-")
+        and name != own[field]
     ]
     if taken:
         raise ApiError(
