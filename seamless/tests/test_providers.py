@@ -1783,7 +1783,7 @@ def test_the_inventory_looks_up_a_flavor_nova_did_not_embed():
 
     looked = []
 
-    def get_flavor(flavor_id):
+    def get_flavor(flavor_id, get_extra_specs=False):
         looked.append(flavor_id)
         return Flavor(id=flavor_id, name="m1.big", vcpus=4, ram=8192, disk=40, ephemeral=10)
 
@@ -1808,11 +1808,36 @@ def test_the_inventory_looks_up_a_flavor_nova_did_not_embed():
     assert (looked, vm.vcpus, vm.flavor) == ([], 2, "m1.small")
 
     # a flavor deleted since: the server keeps what Nova gave of it, the inventory goes on
-    def gone(flavor_id):
+    def gone(flavor_id, get_extra_specs=False):
         raise RuntimeError(f"HTTP 404: flavor {flavor_id} could not be found")
 
     conn.compute.get_flavor = gone
     assert ctx.server_to_vmref(Server(**body)).vcpus == 0
+
+
+def test_the_inventory_reads_the_extra_specs_of_a_flavor_it_looked_up():
+    """SDD §4.2, §9.3 (review RV31-04): below compute 2.61 Nova's flavor holds no extra specs -
+    openstacksdk fetches them (os-extra_specs) only when asked. A flavor the inventory looks up
+    because Nova did not embed it (below 2.47) is asked for them, so a vGPU or PCI-passthrough
+    VM still carries its flavor_extra_specs - and gets its VM_VGPU or VM_PCI_PASSTHROUGH blocker."""
+    from openstack.compute.v2.flavor import Flavor
+    from openstack.compute.v2.server import Server
+
+    from seamless_migrate.providers.openstack import _MapContext
+
+    def get_flavor(flavor_id, get_extra_specs=False):
+        specs = {"resources:VGPU": "1"} if get_extra_specs else None
+        return Flavor(id=flavor_id, name="g1.large", vcpus=8, ram=16384, extra_specs=specs)
+
+    conn = NS(
+        compute=NS(get_flavor=get_flavor, volume_attachments=lambda server: []),
+        network=NS(ports=lambda **kw: [], get_network=lambda network_id: None),
+        identity=NS(get_project=lambda project_id: None),
+        image=NS(get_image=lambda image_id: None),
+    )
+    body = {"id": "srv-1", "name": "gpu-01", "status": "ACTIVE", "image": {"id": "img-1"}}
+    vm = _MapContext(conn).server_to_vmref(Server(**body, flavor={"id": "flv-gpu", "links": []}))
+    assert (vm.flavor, vm.flavor_extra_specs) == ("g1.large", {"resources:VGPU": "1"})
 
 
 @pytest.mark.parametrize(
@@ -2058,7 +2083,7 @@ async def test_openstack_flavor_without_embedded_specs_is_fetched(stub_openstack
     conn = fake_conn()
     server = conn.compute.get_server("srv-1")
     server.flavor = {"id": "flv-1"}  # older Nova: no embedded vcpus/ram/disk
-    conn.compute.get_flavor = lambda flavor_id: NS(
+    conn.compute.get_flavor = lambda flavor_id, get_extra_specs=False: NS(
         id=flavor_id, name="m1.small", vcpus=2, ram=4096, disk=20, extra_specs={"hw:x": "1"}
     )
     stub_openstack(conn)

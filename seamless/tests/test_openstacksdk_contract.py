@@ -119,3 +119,5 @@ def test_proxy_methods_the_executor_and_provider_call():
     assert "all_projects" in inspect.signature(BlockStorage.snapshots).parameters or (
         "query" in inspect.signature(BlockStorage.snapshots).parameters
     )
+    # a flavor looked up below compute 2.61 brings its extra specs only when asked (RV31-04)
+    assert "get_extra_specs" in inspect.signature(Compute.get_flavor).parameters

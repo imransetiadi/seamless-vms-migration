@@ -729,8 +729,12 @@ class _MapContext:
         flavor_id = _attr(flavor, "id")
         if not _attr(flavor, "original_name") and flavor_id:
             # Nova embeds the flavor from compute 2.47 on; below it the server holds only the
-            # flavor's id, which openstacksdk's Flavor reads as 0 everywhere (review RV28-08)
-            flavor = _try(lambda: conn.compute.get_flavor(flavor_id), None) or flavor
+            # flavor's id, which openstacksdk's Flavor reads as 0 everywhere (review RV28-08) -
+            # and its extra specs only when asked, below 2.61 (review RV31-04)
+            flavor = (
+                _try(lambda: conn.compute.get_flavor(flavor_id, get_extra_specs=True), None)
+                or flavor
+            )
         vcpus, ram, disk_gb = (
             _attr(flavor, "vcpus"),
             _attr(flavor, "ram"),
