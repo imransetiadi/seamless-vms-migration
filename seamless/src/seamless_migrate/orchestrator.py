@@ -87,6 +87,7 @@ from .executors.base import (
     StepName,
     StepResult,
     TransientStepError,
+    outlive_cancel,
 )
 from .invariants import check_invariants
 from .planning.estimator import (
@@ -2637,6 +2638,13 @@ class Orchestrator:
         )
 
     async def _mark_downtime(self, mid: str, at: datetime | None = None) -> None:
+        # a cancel of the step (the step timeout, a rollback request, a shutdown) waits for the
+        # clock and its event: one that split them left an open clock unannounced - the clock is
+        # saved first, so a failed event never leaves a stopped source without it (SDD §5,
+        # review RV26-06)
+        await outlive_cancel(self._open_clock(mid, at))
+
+    async def _open_clock(self, mid: str, at: datetime | None) -> None:
         async with self._lock(mid):
             m, v = await self._load(mid)
             if m.downtime_started_at is not None:

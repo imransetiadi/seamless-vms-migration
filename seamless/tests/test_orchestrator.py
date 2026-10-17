@@ -2912,6 +2912,141 @@ async def test_downtime_clock_falls_back_to_the_cutover_step_start(tmp_path, sto
     assert h.kinds().count("migration.downtime_started") == 1
 
 
+def slow_clock_answer(store):
+    """The store saves the migration's downtime clock, but its answer is slow to come back (a busy
+    database): the returned events are set once the save landed, and the answer waits for the
+    second."""
+    import threading
+
+    held, release = threading.Event(), threading.Event()
+
+    def slowed(write):
+        def slow_answer(kind, model, *args, **kw):
+            answer = write(kind, model, *args, **kw)
+            if kind == "migration" and model.downtime_started_at is not None and not held.is_set():
+                held.set()
+                release.wait(30)
+            return answer
+
+        return slow_answer
+
+    store.put = slowed(store.put)
+    store.put_with_event = slowed(store.put_with_event)  # the clock saved with its event
+    return held, release
+
+
+async def test_a_cancelled_clock_mark_ends_once_its_clock_and_its_event_are_stored(tmp_path, store):
+    """SDD §4.3, §7.2: whichever executor opens the downtime clock, a cancel that lands while the
+    clock's save runs - the step timeout, a rollback request, a shutdown - waits for that save and
+    for its migration.downtime_started event: an open clock is never left unannounced (review
+    RV26-06)."""
+    h = build_harness(tmp_path, store, [vm(1)])
+    m = make_migration(id="mig-00000000aa", plan_id="plan-00c0ffee", vm=vm(1), phase=P.cutover)
+    store.put("migration", m)
+    held, release = slow_clock_answer(store)
+    mark = asyncio.create_task(h.orch._mark_downtime(m.id))
+    try:
+        assert await asyncio.to_thread(held.wait, 10), "the clock was never saved"
+        mark.cancel()
+        await asyncio.sleep(0.2)
+        assert not mark.done(), "the cancel cut the mark off between the clock and its event"
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await mark
+    assert (await h.migration(m.id)).downtime_started_at is not None
+    assert h.kinds().count("migration.downtime_started") == 1
+
+
+async def test_a_downtime_event_the_store_refuses_still_leaves_the_clock_open(tmp_path, store):
+    """SDD §5, §8: the clock is saved before its event - a store error writing
+    migration.downtime_started fails the mark, but leaves the clock open, so the automatic
+    rollback still restarts a source that may be stopped and a cancel is still refused (review
+    RV26-06)."""
+    h = build_harness(tmp_path, store, [vm(1)])
+    m = make_migration(id="mig-00000000aa", plan_id="plan-00c0ffee", vm=vm(1), phase=P.cutover)
+    store.put("migration", m)
+    append, put_with_event = store.append_event, store.put_with_event
+
+    def refused(event):
+        if event.kind == "migration.downtime_started":
+            raise RuntimeError("database is locked")
+
+    def refusing(event):
+        refused(event)
+        return append(event)
+
+    def refusing_with(kind, model, event, *args, **kw):
+        refused(event)  # the event written with the clock in one transaction: neither lands
+        return put_with_event(kind, model, event, *args, **kw)
+
+    store.append_event, store.put_with_event = refusing, refusing_with
+    with pytest.raises(RuntimeError, match="database is locked"):
+        await h.orch._mark_downtime(m.id)
+    assert (await h.migration(m.id)).downtime_started_at is not None
+    assert "migration.downtime_started" not in h.kinds()
+
+
+async def test_an_ansible_cutover_cut_off_while_its_clock_saves_still_announces_it_once(
+    tmp_path, store, monkeypatch
+):
+    """SDD §4.3, §7.2, §15.1: the step timeout cuts a cold cutover's playbook off while the clock
+    its stop task opened is being saved. The clock is announced once - migration.downtime_started
+    in the trail - and the automatic rollback follows (review RV26-06)."""
+    from seamless_migrate.config import find_repo_root
+    from seamless_migrate.executors.ansible import AnsibleExecutor
+    from tests.factories import make_plan
+    from tests.fake_ansible import install
+    from tests.test_executor_ansible import FakeRegistry
+
+    script = install(tmp_path / "bin")
+    monkeypatch.setenv("ANSIBLE_FAKE_LOG", str(tmp_path / "ansible.log"))
+    monkeypatch.setenv("ANSIBLE_FAKE_SLEEP", "0.05")
+    clouds = tmp_path / "clouds.yaml"
+    clouds.write_text(
+        "clouds:\n"
+        "  src:\n    auth: {auth_url: 'https://src/v3', username: su, password: spw, "
+        "project_name: finance}\n"
+        "  dst:\n    auth: {auth_url: 'https://dst/v3', username: du, password: dpw, "
+        "project_name: finance}\n"
+    )
+    settings = make_settings(
+        tmp_path,
+        ansible_playbook=str(script),
+        clouds_yaml=clouds,
+        collection_root=find_repo_root(),
+        step_timeout_s=1.0,
+        max_step_retries=0,
+    )
+    executor = AnsibleExecutor(settings, providers=FakeRegistry(), poll_s=0.02)
+    source = make_vm(source_id="srv-1", name="web-01")
+    h = build_harness(tmp_path, store, [source], executor=executor, settings=settings)
+    plan = make_plan(
+        id="plan-00c0ffee",
+        vm_ids=[source.source_id],
+        status=PlanStatus.running,
+        require_approval=False,
+        auto_cutover=True,
+    )
+    store.put("plan", plan)
+    m = make_migration(
+        id="mig-00000000aa", plan_id=plan.id, vm=source, strategy=Strategy.cold, phase=P.ready
+    )
+    store.put("migration", m)
+    held, release = slow_clock_answer(store)
+    await h.orch.start()
+    try:
+        assert await asyncio.to_thread(held.wait, 15), "the clock was never saved"
+        await asyncio.sleep(1.5)  # the step timeout cuts the step off while the save answers
+        release.set()
+        final = await h.wait_phase(m.id, P.rolled_back, P.failed, timeout=30)
+        assert final.downtime_started_at is not None and P.rolling_back in h.history(final)
+        assert h.kinds().count("migration.downtime_started") == 1, h.kinds()
+    finally:
+        release.set()
+        await h.orch.stop()
+
+
 async def test_failed_cutover_auto_rolls_back(tmp_path, store):
     settings = make_settings(tmp_path)
 
