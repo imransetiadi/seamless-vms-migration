@@ -505,7 +505,9 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   saved and its event written, so an open clock is never left unannounced; the clock is saved first, so a store error
   on the event never leaves a source that may be stopped without its clock (review RV26-06). `downtime_ended_at` is
   set when verification passes or, on
-  rollback, when the source VM is running again. A verification that passes again — the first one was saved,
+  rollback, when the source VM is running again - marked by the step as soon as its power-on succeeded
+  (`StepContext.mark_downtime_end()`, the VMware rollback), so an attempt that fails after it leaves the clock
+  closed: the source runs, and the next cutover counts a new outage (review RV30-03). A verification that passes again — the first one was saved,
   but a stop or a failed event write came before `completed` — keeps the end and the downtime the first one
   recorded: the outage ended then. `actual_downtime_s` = difference — except in demo mode (§7.4),
   where the downtime is in model seconds, the time base of the passes' `duration_s`, so a demo's downtime compares
@@ -1131,6 +1133,7 @@ class StepContext:
     plan: Plan; migration: Migration; source: Provider; destination: Provider; settings: Settings
     report_progress: Callable[[float, int, int], Awaitable[None]]   # pct, bytes_done, bytes_total
     mark_downtime_start: Callable[[], Awaitable[None]]
+    mark_downtime_end: Callable[[], Awaitable[None]]   # the source runs again (a rollback's power-on): closes the clock (§5.2)
     log: Callable[[str], Awaitable[None]]   # one whole output line; the orchestrator redacts and cuts it (§4)
 
 @dataclass
@@ -1311,7 +1314,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 |---|---|---|---|
 | `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` — `rollback_workloads.yml` between the two when an earlier attempt left data (below) | `rollback_workloads.yml` |
 | `warm` | `export_workloads.yml` (first time, or again by the rules above) then `import_workloads_precopy.yml` | `import_workloads_cutover.yml`, after `export_workloads.yml` when a rule above exports again | `rollback_workloads.yml` |
-| `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, then the kit's ports of the VM (below), power on source, then the kit's volumes the kit would take as migrated (below) - the power-on once a guest shutdown in progress ended: vSphere reads the VM `poweredOn`, its guest `shuttingDown`, until the guest is down, and a power-on then does nothing. A VM still on whose installed VMware Tools no longer run (guest `notRunning`: the last seconds of a shutdown, whose Tools stop first, or a guest still starting) is looked at again for up to 120 s, until it is off (powered on) or its guest runs (left alone); a VM without Tools is left alone at once. The wait ends within the provider call's bound (300 s, §8.1, less 5 s): a guest that does not end its shutdown by then is a provider error, which the rollback retries as transient - the provider remembers a shutdown it saw for 30 minutes, so the retry waits through the shutdown's last seconds, its Tools stopped, to its own bound rather than for 120 s (review RV29-08) -, and a call that ended - timed out or cancelled - powers nothing on afterwards (reviews RV26-10, RV27-01, RV27-02) |
+| `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, power on source, then the kit's ports of the VM and the volumes the kit would take as migrated (below) - the power-on once a guest shutdown in progress ended: vSphere reads the VM `poweredOn`, its guest `shuttingDown`, until the guest is down, and a power-on then does nothing. A VM still on whose installed VMware Tools no longer run (guest `notRunning`: the last seconds of a shutdown, whose Tools stop first, or a guest still starting) is looked at again for up to 120 s, until it is off (powered on) or its guest runs (left alone); a VM without Tools is left alone at once. The wait ends within the provider call's bound (300 s, §8.1, less 5 s): a guest that does not end its shutdown by then is a provider error, which the rollback retries as transient - the provider remembers a shutdown it saw for 30 minutes, so the retry waits through the shutdown's last seconds, its Tools stopped, to its own bound rather than for 120 s (review RV29-08) -, and a call that ended - timed out or cancelled - powers nothing on afterwards (reviews RV26-10, RV27-01, RV27-02) |
 | `vmware_warm` | kit `migration` with `cbt_sync: true`, `cutover: false` | kit `migration` with `cbt_sync: true`, `cutover: true` | as `vmware_cold` |
 
 * VMware vars: `vcenter_hostname`, `vcenter_username`, `vcenter_password`, `vcenter_datacenter`
@@ -1405,8 +1408,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   refused before it starts, before any clock, while a volume named `<kit name>-<digits>` with `osm` `true` is marked
   converted, or, for a `vmware_cold` cutover, while any such volume exists: the refusal names each volume and its
   holder and tells the operator to roll the migration back again, which deletes the ones it may (review RV29-01). A
-  converted volume is no refusal while the source has not run since this outage's stop - the clock open (§5.2) and
-  vCenter reading the VM off -: the kit then takes the volume it converted in this outage as migrated, which it is, as
+  converted volume is no refusal while the source has not run since this outage's stop - the clock open (§5.2),
+  vCenter reading the VM off and recording no power-on of it since the clock opened (`powered_on_since`: its
+  `VmPoweredOnEvent`, `DrsVmPoweredOnEvent` and `VmResumedEvent`), as a VM that ran and was shut down again reads off
+  as well (review RV30-03) -: the kit then takes the volume it converted in this outage as migrated, which it is, as
   when a cutover is retried after a failure past the conversion.
 
   The kit writes a new volume's CBT `changeID` - the change id of the snapshot it copies - when it creates the
@@ -2122,7 +2127,8 @@ volume disks carry their Cinder `pool`;
 `os_type` is the most specific of the server metadata `os_type`/`os_distro`, the boot volume's
 `volume_image_metadata` or the boot image's properties (`os_distro` + `os_version`, then `os_type`)),
 `VMwareProvider` (pyVmomi,
-lazy; reports CBT, snapshots, independent disks, tools state; `os_type` is the VMware Tools pretty
+lazy; reports CBT, snapshots, independent disks, tools state; powers a VM on for a rollback (`power_on`) and tells
+whether vCenter recorded a power-on of it since a time (`powered_on_since`, its events, §7.2); `os_type` is the VMware Tools pretty
 name when Tools report one, else the configured guest id), `FakeSourceProvider`/
 `FakeDestinationProvider` (deterministic demo data: 24 OpenStack VMs including one multi-attach,
 one vGPU flavor, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+ disks;
