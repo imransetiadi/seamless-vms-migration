@@ -70,6 +70,11 @@ class DestinationProvider(Protocol):
         bound; one already gone is no error."""
         ...
 
+    async def detach_volume(self, server_id: str, volume_id: str) -> None:
+        """Remove Nova's attachment of the volume to the server and wait until Cinder reads the
+        volume available, within the call's bound; one not attached to it is no error."""
+        ...
+
 
 def provider_caps(provider: Provider) -> dict[str, Any]:
     """Capabilities used by the selector: stored capabilities plus ``conversion_host``."""

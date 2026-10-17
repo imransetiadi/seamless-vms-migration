@@ -93,6 +93,7 @@ async def test_fake_destination_inventory_and_servers():
     # nor a kit volume a VMware rollback would delete (SDD §7.2, §10)
     assert await dst.volumes() == []
     await dst.delete_volume("vol-gone")
+    await dst.detach_volume("srv-conv", "vol-gone")
 
 
 def test_registry_returns_fake_in_demo():
@@ -1765,6 +1766,39 @@ def test_the_inventory_looks_up_a_flavor_nova_did_not_embed():
 
     conn.compute.get_flavor = gone
     assert ctx.server_to_vmref(Server(**body)).vcpus == 0
+
+
+async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_free():
+    """SDD §10 (§7.2 VMware rollback, review RV29-02): detach_volume removes Nova's attachment of
+    the volume to the server, ignoring one already gone, and waits until Cinder reads the volume
+    available, within the call's bound."""
+    calls = []
+
+    class Compute:
+        def delete_volume_attachment(self, server, volume, ignore_missing=True):
+            calls.append(("delete_volume_attachment", server, volume, ignore_missing))
+
+    class BlockStorage:
+        def get_volume(self, volume_id):
+            return NS(id=volume_id, status="detaching")
+
+        def wait_for_status(self, volume, status="available", failures=None, interval=2, wait=None):
+            calls.append(("wait_for_status", volume.id, status, failures, wait is not None))
+            return volume
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(
+        dst,
+        settings(),
+        connect_fn=lambda p, s: NS(compute=Compute(), block_storage=BlockStorage()),
+    )
+    await provider.detach_volume("srv-conv", "vol-1")
+    assert calls == [
+        ("delete_volume_attachment", "srv-conv", "vol-1", True),
+        ("wait_for_status", "vol-1", "available", ["error"], True),
+    ]
 
 
 async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):

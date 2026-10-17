@@ -132,6 +132,12 @@ class FakeImpl:
         self.calls.append(("delete_volume", volume_id))
         self.registry.volumes = [v for v in self.registry.volumes if v["id"] != volume_id]
 
+    async def detach_volume(self, server_id, volume_id):
+        self.calls.append(("detach_volume", server_id, volume_id))
+        for volume in self.registry.volumes:
+            if volume["id"] == volume_id:
+                volume["attachments"] = [s for s in volume["attachments"] if s != server_id]
+
     async def inventory(self):
         """The destination's networks, for the network references (SDD §7.2)."""
         self.calls.append(("inventory",))
@@ -2159,6 +2165,9 @@ class FailingImpl:
     async def delete_volume(self, volume_id):
         raise ProviderError(f"delete volume {volume_id}: HTTP 503")
 
+    async def detach_volume(self, server_id, volume_id):
+        raise ProviderError(f"detach volume {volume_id}: HTTP 503")
+
 
 class FailingRegistry(FakeRegistry):
     def get(self, provider):
@@ -2880,6 +2889,8 @@ async def test_a_vmware_rollback_deletes_the_kit_volumes_its_next_run_would_take
         ("delete_server", "dst-9"),
         ("power_on", "srv-1"),
         *[("delete_volume", v) for v in gone],
+        # "held": is its holder the kit's conversion host? (review RV29-02) - it is not
+        ("find_server", "conv-dst"),
     ]
     kept = {
         "not-the-kits",
@@ -3028,6 +3039,49 @@ async def test_a_cutover_retried_while_the_source_stays_off_reuses_the_volume_th
     with pytest.raises(PermanentStepError, match="roll the migration back again"):
         await env.executor.run(StepName.CUTOVER, ctx)
     assert read_log(env.log) == []
+
+
+@pytest.mark.parametrize(
+    ("strategy", "converted", "deleted"),
+    [
+        (Strategy.vmware_cold, False, True),  # a cold run refuses any: deleted
+        (Strategy.vmware_warm, False, False),  # the next pass syncs onto it: kept, detached
+        (Strategy.vmware_warm, True, True),  # converted: deleted
+    ],
+)
+@pytest.mark.parametrize("found_by", ["name", "address"])
+async def test_a_vmware_rollback_detaches_the_kits_copy_from_its_conversion_host(
+    env, strategy, converted, deleted, found_by
+):
+    """SDD §7.2 (review RV29-02): a cutover cut off inside the kit's migrate task leaves the
+    kit's copy attached to the kit's own conversion host - a server of the destination project.
+    It is the kit's own volume, not another server's: the rollback detaches it from that host,
+    found by its name or else by the port holding its address, then deletes or keeps it by the
+    usual rules - a warm volume not converted stays, detached, for the next pass's CBT sync."""
+    if found_by == "name":
+        env.registry.existing = {"conv-dst"}  # Nova's server of the destination's conversion host
+        host = "dst-conv-dst"
+    else:
+        host = "srv-conv-7"
+        env.registry.ports = [
+            {
+                "id": "conv-port",
+                "name": "",
+                "network_id": "net-transit",
+                "device_id": host,
+                "mac_address": "fa:16:3e:00:00:99",
+                "fixed_ips": ["192.0.2.10"],
+            }
+        ]
+    env.registry.volumes = [
+        kit_volume("cut-off-copy", "web-01-2000", converted=converted, attachments=[host])
+    ]
+    ctx, _ = ctx_for(env, strategy=strategy, source=VCENTER, downtime_started_at=utcnow())
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert ("detach_volume", host, "cut-off-copy") in env.registry.calls
+    assert result.details["deleted_volumes"] == (["cut-off-copy"] if deleted else [])
+    kept = [v for v in env.registry.volumes if v["id"] == "cut-off-copy"]
+    assert kept == ([] if deleted else [{**kept[0], "attachments": []}])
 
 
 async def test_a_vmware_rollback_deletes_no_volume_of_a_vm_without_a_kit_name(env):

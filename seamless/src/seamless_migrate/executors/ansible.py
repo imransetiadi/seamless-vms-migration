@@ -1406,33 +1406,60 @@ class AnsibleExecutor:
                 deleted.append(str(port["id"]))
         return deleted
 
-    @staticmethod
     async def _delete_kit_volumes(
-        dst: Any, vm_name: str, server_id: str | None, strategy: Strategy
+        self, ctx: StepContext, dst: Any, server_id: str | None
     ) -> list[str]:
         """Delete the kit's volumes of the VM that its next run would take as this VM's own (SDD
         §7.2, review RV28-01): the kit finds a VM's volume by its name, ``<kit name>-<disk key>``,
         and the metadata ``osm``; one it marked ``converted`` it takes as migrated - no copy, no
         power-off, the new server booted from the first attempt's disk while the source runs
         again - and onto any other a vmware_cold run refuses to copy. A vmware_warm volume not
-        converted stays: the next pass syncs it by CBT. A volume another server holds is never
-        deleted, nor any of a VM without a kit name."""
-        kit = kit_vm_name(vm_name)
+        converted stays: the next pass syncs it by CBT. The destination's conversion host holding
+        one is the kit's copy a cut-off run left: detached first (review RV29-02). A volume
+        another server holds is never deleted, nor any of a VM without a kit name."""
+        m = ctx.migration
+        kit = kit_vm_name(m.vm.name)
         if not kit:
             return []
         own = re.compile(re.escape(kit) + r"-[0-9]+")
         deleted: list[str] = []
+        conversion_host: list[str | None] = []  # looked up once, for the first volume held
         for volume in await dst.volumes():
             metadata = volume.get("metadata") or {}
             if not own.fullmatch(str(volume.get("name") or "")) or metadata.get("osm") != "true":
                 continue
-            if strategy != Strategy.vmware_cold and metadata.get("converted") != "true":
-                continue
-            if any(holder != server_id for holder in volume.get("attachments") or []):
+            holders = [str(holder) for holder in volume.get("attachments") or []]
+            if any(holder != server_id for holder in holders):
+                if not conversion_host:
+                    conversion_host.append(await self._conversion_host_server(ctx, dst))
+                host = conversion_host[0]
+                if host is not None and host in holders:
+                    await dst.detach_volume(host, volume["id"])
+                    holders = [holder for holder in holders if holder != host]
+                if any(holder != server_id for holder in holders):
+                    continue
+            if m.strategy != Strategy.vmware_cold and metadata.get("converted") != "true":
                 continue
             await dst.delete_volume(volume["id"])
             deleted.append(str(volume["id"]))
         return deleted
+
+    @staticmethod
+    async def _conversion_host_server(ctx: StepContext, dst: Any) -> str | None:
+        """The destination conversion host's Nova server: by its name, else the server of the
+        port that holds its address (SDD §7.2, review RV29-02)."""
+        host = ctx.destination.conversion_host
+        if host is None:
+            return None
+        if host.name:
+            found = await dst.find_server(host.name)
+            if found:
+                return str(found)
+        if host.address:
+            for port in await dst.ports(ip_address=host.address):
+                if port.get("device_id"):
+                    return str(port["device_id"])
+        return None
 
     async def _lookup_server(self, ctx: StepContext) -> str | None:
         name = destination_server_name(ctx.migration)
@@ -1464,7 +1491,7 @@ class AnsibleExecutor:
             # Cinder will not delete fails the attempt, which a retry repeats with the source
             # running (SDD §7.2, §8, review RV29-01)
             await self.providers.get(ctx.source).power_on(vm.source_id)
-            deleted_volumes = await self._delete_kit_volumes(dst, vm.name, server_id, m.strategy)
+            deleted_volumes = await self._delete_kit_volumes(ctx, dst, server_id)
         except ProviderError as exc:
             raise TransientStepError(f"rollback: {exc}") from exc
         return StepResult(

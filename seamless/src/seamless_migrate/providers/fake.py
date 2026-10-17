@@ -539,3 +539,6 @@ class FakeDestinationProvider:
 
     async def delete_volume(self, volume_id: str) -> None:
         return None
+
+    async def detach_volume(self, server_id: str, volume_id: str) -> None:
+        return None

@@ -247,6 +247,9 @@ class OpenStackProvider:
     async def delete_volume(self, volume_id: str) -> None:
         await self._run(self._delete_volume, volume_id)
 
+    async def detach_volume(self, server_id: str, volume_id: str) -> None:
+        await self._run(self._detach_volume, server_id, volume_id)
+
     # -- implementation (runs in worker threads) ----------------------------------------------
     def _check(self) -> dict[str, Any]:
         conn = self._connection()
@@ -559,6 +562,19 @@ class OpenStackProvider:
             time.sleep(2)
         storage.delete_volume(volume, ignore_missing=True)
         storage.wait_for_delete(volume, wait=max(1, int(deadline - time.monotonic())))
+
+    def _detach_volume(self, server_id: str, volume_id: str) -> None:
+        # the wait ends within the call's bound (SDD §8.1, §10)
+        deadline = time.monotonic() + PROVIDER_CALL_TIMEOUT_S - 5
+        conn = self._connection()
+        conn.compute.delete_volume_attachment(server_id, volume_id, ignore_missing=True)
+        volume = conn.block_storage.get_volume(volume_id)
+        conn.block_storage.wait_for_status(
+            volume,
+            status="available",
+            failures=["error"],
+            wait=max(1, int(deadline - time.monotonic())),
+        )
 
 
 def _os_hint(properties: Mapping[str, Any]) -> str | None:
