@@ -2494,7 +2494,12 @@ agents write too - redacted as they arrive, title and content, before anything c
 over the cut plus 16384 characters, and cuts after (`redact_cut(text, limit)`): a secret the cut splits
 — a PEM block, a URL with credentials — is still found, at a bounded cost. The cuts: a `migration.log`
 line at 2000 characters (§4), the failing output line in an Ansible step's error at 500, a provider
-SDK's error message at 500, an HTTP error body in the handover executor at 300. The service log too:
+SDK's error message at 500, an HTTP error body in the handover executor at 300, an agentmemory hit's content at 4000
+and its title at 200 - only the first `limit` hits of an answer are read (review RV27-06). Every pattern of `redact`
+costs time linear in the text's length - each start looks at a credential key's prefix of at most 16 parts, a URL
+scheme of at most 64 characters and a CLI flag name of at most 64, and a PEM block runs from its BEGIN line to the
+first END line after it, found once -, so a bounded text holds the event loop for a bounded time (review RV27-06).
+The service log too:
 the root handler's formatter (`cli.configure_logging`) passes every record through `redact` — the
 whole line in plain mode; in JSON mode the message and the exception text before they are serialized,
 as redacting a serialized line could break its quoting — so neither a message nor the chained
