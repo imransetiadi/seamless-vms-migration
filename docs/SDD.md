@@ -2034,7 +2034,10 @@ class DestinationProvider(Protocol):
         # attachments: [server_id, …]}] (§7.2 VMware rollback)
     async def delete_volume(self, volume_id: str) -> None
         # once Cinder settled it (a volume still detaching from a deleted server), and waits until it is gone,
-        # within the call's bound (§8.1); a volume already gone is no error
+        # within the call's bound (§8.1); a volume already gone is no error; one Cinder is already deleting
+        # (`deleting`, or a delete it refused because it began meanwhile) is waited for, never deleted a second
+        # time, which Cinder refuses; one Cinder failed to delete (`error_deleting`) is a provider error naming
+        # it (review RV29-04)
     async def detach_volume(self, server_id: str, volume_id: str) -> None
         # Nova's attachment of the volume to the server removed, then waits until Cinder reads the volume
         # available, within the call's bound (§8.1); a volume not attached to that server is no error (§7.2)
