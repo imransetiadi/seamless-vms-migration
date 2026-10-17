@@ -36,6 +36,39 @@ def _auth_block(match: re.Match[str]) -> str:
     return f"{match.group(1)}auth: {REDACTED}{end}"
 
 
+#: a dotted chain of base64url runs, each run read once (possessive): where JWTs are looked for
+_BASE64URL_CHAIN = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]++(?:\.[A-Za-z0-9_-]++)*+")
+
+
+def _jwt_start(run: str) -> int:
+    """Where a JWT's header starts in one run - at the run's start or after a "-" in it, "eyJ"
+    and 8 characters more -; -1 when it holds none."""
+    position = 0
+    while (index := run.find("eyJ", position)) >= 0 and len(run) - index - 3 >= 8:
+        if index == 0 or run[index - 1] == "-":
+            return index
+        position = index + 1
+    return -1
+
+
+def _redact_jwts(match: re.Match[str]) -> str:
+    """Each JWT of a dotted chain - a header, then two parts of 8 characters at least - replaced.
+    Every run is looked at once, so "eyJ-eyJ-..." costs time linear in its length while a JWT
+    glued after a "-" - an OAuth state, a session id - is found (SDD §13.4, reviews RV31-01,
+    RV32B-06)."""
+    runs, out, i = match.group(0).split("."), [], 0
+    while i < len(runs):
+        if i + 2 < len(runs) and len(runs[i + 1]) >= 8 and len(runs[i + 2]) >= 8:
+            start = _jwt_start(runs[i])
+            if start >= 0:
+                out.append(runs[i][:start] + REDACTED)
+                i += 3
+                continue
+        out.append(runs[i])
+        i += 1
+    return ".".join(out)
+
+
 _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
     # the auth section of a clouds.yaml: block style (every line indented under "auth:") ...
     (re.compile(r"(?m)^([ \t]*)auth:[ \t]*\n(?:\1[ \t]+\S[^\n]*(?:\n|$))+"), _auth_block),
@@ -71,12 +104,8 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     # well-known token shapes: seamless API tokens, Keystone fernet tokens, JWTs
     (re.compile(r"\bsmg_[A-Za-z0-9_-]{16,}"), REDACTED),
     (re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}"), REDACTED),
-    # a JWT starts where a base64url run starts: "eyJ-eyJ-..." is one start, not one per "eyJ",
-    # each scanning to the run's end (SDD §13.4, review RV31-01)
-    (
-        re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
-        REDACTED,
-    ),
+    # JWTs: each dotted base64url run read once (SDD §13.4, reviews RV31-01, RV32B-06)
+    (_BASE64URL_CHAIN, _redact_jwts),
     # API key shapes: AWS access key ids, GitHub tokens, sk- keys, Slack tokens
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), REDACTED),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}|\bgithub_pat_[A-Za-z0-9_]{22,}"), REDACTED),

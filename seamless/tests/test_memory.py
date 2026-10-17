@@ -225,9 +225,22 @@ def test_redact_costs_time_linear_in_the_text(text):
 
 @pytest.mark.parametrize(
     "unit",
-    ["eyJ-", "--x ", "a--", "a.", "-", "ab."],
+    [
+        "eyJ-",
+        "eyJaaaaaaaa.",
+        "eyJaaaaaaaa.aaaaaaa.",
+        "-eyJaaaaaaaa",
+        "--x ",
+        "a--",
+        "a.",
+        "-",
+        "ab.",
+    ],
     ids=[
         "jwt starts",
+        "jwt headers",
+        "jwt halves",
+        "jwts after dashes",
         "flag starts",
         "flags after words",
         "key prefix",
@@ -289,6 +302,31 @@ def test_redact_finds_a_cli_flag_after_an_escaped_line_break():
     for glued in ("x--password", "1--password", "_--password", "a-b--password", "x---password"):
         assert secret not in redact(f"{glued} {secret}"), glued
     assert redact(f"x--name {secret}") == f"x--name {secret}"
+
+
+def test_redact_finds_a_jwt_glued_after_a_dash():
+    """SDD §13.4 (review RV32B-06): a JWT is redacted where it starts a base64url run or follows a
+    dash inside one - an OAuth state, a session id, a token file's name - as the pattern before the
+    linear rewrite found it; one glued after a letter or "_" is no JWT start, as before."""
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWFtbGVzcyJ9.Zq7PlaceholderSignature0"  # gitleaks:allow
+    payload = "eyJzdWIiOiJzZWFtbGVzcyJ9"
+    for text in (
+        f"GET /sso/return/state-{jwt} 302",
+        f"session-{jwt}",
+        f"a.b-{jwt}.tail",
+        jwt,
+        f"Bearer {jwt}",
+    ):
+        assert payload not in redact(text), text
+    assert redact(f"state-{jwt}.tail") == "state-[REDACTED].tail"
+    assert payload in redact(f"x_{jwt}")  # no start after a word character, as ever
+    # a header or a part shorter than 8 characters is no JWT
+    for text in (
+        "eyJabc.defghijkl.mnopqrstu",
+        "eyJhbGciOiJIUzI1NiJ9.short.mnopqrstu",
+        "eyJhbGciOiJIUzI1NiJ9.defghijkl.short",
+    ):
+        assert redact(text) == text, text
 
 
 def test_redact_still_finds_what_its_linear_patterns_could_hide():
