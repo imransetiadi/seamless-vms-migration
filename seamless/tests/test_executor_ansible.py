@@ -1253,6 +1253,20 @@ async def test_vmware_nics_of_one_key_take_the_subnet_the_one_with_an_address_ne
     )
 
 
+@pytest.mark.parametrize("step", [StepName.PRECOPY, StepName.SYNC])
+async def test_a_vmware_warm_pass_that_runs_the_kits_migrate_task_opens_no_clock(env, step):
+    """SDD §7.2 (review RV28-06): the kit runs its migrate task - "Migrate Guest from Vmware
+    using nbdkit <vm>", whose header opens a cutover's clock - in every run, a CBT pass too (no
+    conversion, no power-off): a pass that prints it opens no downtime clock of the VM, which
+    runs on."""
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(step, ctx)
+    assert any("Migrate Guest from Vmware using nbdkit web-01" in line for line in rec.logs), [
+        line for line in rec.logs if line.startswith("TASK [")
+    ]
+    assert rec.downtime_marks == 0
+
+
 async def test_vmware_warm_flags(env):
     ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
     await env.executor.run(StepName.PRECOPY, ctx)
