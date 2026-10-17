@@ -83,18 +83,24 @@ def load(path):
 
 
 def nova(server):
-    """Nova as upstream answers while it powers ``server`` off: with world "powering_off", the
-    server reads ACTIVE, task state powering-off, for that many server_info reads, then SHUTOFF.
-    None for a server Nova does not stop; else (reads left, counter file, reads so far)."""
-    left = world.get("powering_off", {}).get(server)
-    if left is None:
+    """Nova as upstream answers while it powers ``server`` off or on: with world "powering_off",
+    the server reads ACTIVE, task state powering-off, for that many server_info reads, then
+    SHUTOFF; with world "powering_on", SHUTOFF, task state powering-on, then ACTIVE. None for a
+    server Nova does neither to; else (reads left, counter file, reads so far, the task state,
+    the status while it runs, the status after)."""
+    for key, task, during, after in (("powering_off", "powering-off", "ACTIVE", "SHUTOFF"),
+                                     ("powering_on", "powering-on", "SHUTOFF", "ACTIVE")):
+        left = world.get(key, {}).get(server)
+        if left is not None:
+            break
+    else:
         return None
     path = WORLD + ".reads." + server
     reads = 0
     if os.path.exists(path):
         with open(path) as f:
             reads = int(f.read())
-    return max(left - reads, 0), path, reads
+    return max(left - reads, 0), path, reads, task, during, after
 
 
 def save(path, state):
@@ -210,15 +216,18 @@ elif NAME == "server_action":
     result = {"changed": True}
     power = nova(args["server"])
     if power is not None and args["action"] in ("start", "stop"):
-        # openstack.cloud's server_action reads the status: ACTIVE while Nova powers it off
-        if power[0] and args["action"] == "start":
-            result = {"changed": False}  # "already ACTIVE": nothing started
-        elif power[0]:
+        left, task, during, after = power[0], power[3], power[4], power[5]
+        # openstack.cloud's server_action reads the status: ACTIVE while Nova powers the server
+        # off, SHUTOFF while it powers it on - and Nova refuses an action meanwhile (409)
+        if left and (args["action"], during) in (("start", "ACTIVE"), ("stop", "SHUTOFF")):
+            result = {"changed": False}  # "already ACTIVE" / "already SHUTOFF": nothing sent
+        elif left:
             result = {"failed": True, "msg": "ConflictException: 409: Client Error for url: "
-                      "https://nova.example.invalid/v2.1/servers/%%s/action, Cannot 'stop' "
-                      "instance while it is in task_state powering-off" %% args["server"]}
-        elif args["action"] == "stop":
-            result = {"changed": False}  # SHUTOFF already
+                      "https://nova.example.invalid/v2.1/servers/%%s/action, Cannot '%%s' "
+                      "instance while it is in task_state %%s"
+                      %% (args["server"], args["action"], task)}
+        elif (args["action"], after) in (("stop", "SHUTOFF"), ("start", "ACTIVE")):
+            result = {"changed": False}  # SHUTOFF / ACTIVE already
     if result.get("changed"):
         with open(WORLD + ".nova", "a") as f:
             f.write("%%s %%s\n" %% (args["action"], args["server"]))
@@ -227,8 +236,8 @@ elif NAME == "server_info":
     task_state = None
     power = nova(args["server"])
     if power is not None:
-        left, path, reads = power
-        status, task_state = ("ACTIVE", "powering-off") if left else ("SHUTOFF", None)
+        left, path, reads, task, during, after = power
+        status, task_state = (during, task) if left else (after, None)
         with open(path, "w") as f:
             f.write(str(reads + 1))
     result = {"changed": False, "servers": [] if status == "MISSING" else [
@@ -632,6 +641,26 @@ def test_a_rollback_starts_a_source_nova_still_powers_off(env):
 
     assert rc == 0, out
     assert env.nova_actions() == ["start srv-1"], out
+
+
+def test_a_rollback_waits_for_a_start_nova_still_runs(env):
+    """SDD 6.5 (review RV29-06): Nova starts a server with its task state powering-on while the
+    server still reads SHUTOFF, and refuses a second start meanwhile (409). A rollback retried
+    while an earlier attempt's start still runs waits until no start runs: the source then runs,
+    and there is nothing left to start - where a start sent meanwhile failed the rollback."""
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+    env.world["powering_on"] = {"srv-1": 2}  # Nova still powers srv-1 on for two reads
+
+    rc, out, calls = env.run(
+        "rollback_workloads",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_source_stop_poll_s=0,
+    )
+
+    assert rc == 0, out
+    assert env.nova_actions() == [], out
+    assert len([c for c in calls if c["module"] == "server_info"]) == 3
 
 
 def test_a_stop_wait_whose_poll_outlasts_its_timeout_reads_the_server_again(env):

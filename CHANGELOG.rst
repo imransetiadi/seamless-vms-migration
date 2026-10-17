@@ -519,18 +519,20 @@ This project follows a simple changelog to satisfy collection metadata validatio
   for the destination host's hop to the source host, so a RHEL source host
   (``cloud-user``) works with an Ubuntu destination host (``ubuntu``).
 - Every stop and start of a source server waits first until Nova runs no stop
-  of it: the warm cutover's stop, the cold import's stop
+  or start of it: the warm cutover's stop, the cold import's stop
   (``os_migrate_workload_stop_before_migration``) and the rollback's start.
   Nova keeps a server ``ACTIVE``, with the task state ``powering-off``, until
-  the guest is down, and refuses a second stop or a start meanwhile, while
-  ``server_action`` decides by the status alone. So a rollback after a stop
-  that was cut off (a timeout, a 503 during its wait) started nothing and the
-  source ended ``SHUTOFF``, and a re-run's stop was refused with 409. The wait
-  reads the server every ``os_migrate_source_stop_poll_s`` seconds (default
-  5), at most ``os_migrate_timeout``, and once more at the latest after
-  ``os_migrate_timeout`` when the poll interval is longer: a stop that still
-  runs then fails the play, where a wait of no retry used to start nothing
-  and report success.
+  the guest is down - and ``SHUTOFF``, with ``powering-on``, until it runs -
+  and refuses a stop or a start meanwhile, while ``server_action`` decides by
+  the status alone. So a rollback after a stop that was cut off (a timeout, a
+  503 during its wait) started nothing and the source ended ``SHUTOFF``, a
+  re-run's stop was refused with 409, and a rollback retried while its first
+  start still ran was refused with 409. The wait reads the server every
+  ``os_migrate_source_stop_poll_s`` seconds (default 5), at most
+  ``os_migrate_timeout``, and once more at the latest after
+  ``os_migrate_timeout`` when the poll interval is longer: a stop or start
+  that still runs then fails the play, where a wait of no retry used to start
+  nothing and report success.
 - A volume made from a server snapshot - the warm ``boot_disk_copy`` pass and
   the cold export of an image-booted server - is as large as Cinder needs for
   the image: the image file rounded up to whole GiB, its virtual disk (a qcow2
