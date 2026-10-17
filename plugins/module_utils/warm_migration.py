@@ -558,7 +558,7 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
         image = self.conn.get_image_by_id(image.id)
         if image is None or image.status != "active":
             raise RuntimeError("Could not create new image of image-based instance!")
-        size = image_volume_size(image)
+        size = image_volume_size(image, self.conn)
         volume = self.conn.create_volume(
             size=size,
             image=image.id,

@@ -518,6 +518,11 @@ IMAGE_SIZES = [
     (dict(size=int(2.5 * fake.GIB), min_disk=0), 3),  # a raw file of 2.5 GiB needs 3, not 2
     (dict(size=fake.GIB, min_disk=0, virtual_size=10 * fake.GIB), 10),  # a qcow2 file holds a larger disk
     (dict(size=None, min_disk=None), 1),
+    # Glance before Victoria records no virtual size: a qcow2 file's own header gives it
+    # (review RV29-09); a raw file is its disk; a header that cannot be read leaves the file's size
+    (dict(size=fake.GIB, min_disk=0, disk_format="qcow2", data=fake.qcow2_header(10 * fake.GIB)), 10),
+    (dict(size=int(2.5 * fake.GIB), min_disk=0, disk_format="raw", data=b"\x00" * 512), 3),
+    (dict(size=fake.GIB, min_disk=0, disk_format="qcow2", data=b""), 1),
 ]
 
 

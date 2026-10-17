@@ -49,14 +49,43 @@ def _is_not_found(err):
     )
 
 
-def image_volume_size(image):
+def _qcow2_virtual_size(conn, image):
+    """The virtual disk size the qcow2 file of ``image`` declares in its header - bytes 24 to 31,
+    big-endian - read from the first bytes of a streamed download, closed at once: Glance before
+    Victoria records no virtual_size (Seamless Migrate SDD 6.1, review RV29-09). None when the
+    file is no qcow2 or cannot be read."""
+    try:
+        response = conn.image.download_image(image, stream=True)
+    except Exception:  # no answer: the file's own size stands
+        return None
+    head = b""
+    try:
+        for chunk in response.iter_content(chunk_size=512):
+            head += chunk
+            if len(head) >= 32:
+                break
+    except Exception:  # a download cut short: the file's own size stands
+        return None
+    finally:
+        response.close()
+    if len(head) < 32 or head[:4] != b"QFI\xfb":
+        return None
+    return int.from_bytes(head[24:32], "big")
+
+
+def image_volume_size(image, conn=None):
     """The smallest volume, in GiB, that Cinder creates from ``image`` - a server snapshot: its
     file rounded up to whole GiB, its virtual disk (a qcow2 file holds a larger disk) and its
-    min_disk, at least 1 (Seamless Migrate SDD 6.1, audit A-06)."""
+    min_disk, at least 1 (Seamless Migrate SDD 6.1, audit A-06). Where Glance records no virtual
+    disk of a qcow2 image, its file's header is read through ``conn``, the image's cloud (review
+    RV29-09)."""
     gib = 1024 ** 3
+    virtual = getattr(image, "virtual_size", None)
+    if not virtual and conn is not None and getattr(image, "disk_format", None) == "qcow2":
+        virtual = _qcow2_virtual_size(conn, image)
     return max(
         int(math.ceil((getattr(image, "size", None) or 0) / float(gib))),
-        int(math.ceil((getattr(image, "virtual_size", None) or 0) / float(gib))),
+        int(math.ceil((virtual or 0) / float(gib))),
         int(getattr(image, "min_disk", None) or 0),
         1,
     )
@@ -1280,7 +1309,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                 image=image.id,
                 wait=False,
                 name=image.name,
-                size=image_volume_size(image),
+                size=image_volume_size(image, self.conn),
             )
             self.volume_map["/dev/vda"]["source_id"] = volume.id
             volume = self.conn.block_storage.wait_for_status(

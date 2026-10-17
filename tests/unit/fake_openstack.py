@@ -83,6 +83,8 @@ class FakeCloud:
         self.block_storage = _FakeBlockStorage(self)
         self.compute = _FakeCompute(self)
         self.network = _FakeNetwork(self)
+        self.image = _FakeImage(self)
+        self.downloads = []  # the streamed image downloads (_FakeImage)
 
     # --- model helpers -------------------------------------------------
     def new_id(self, kind):
@@ -442,6 +444,38 @@ class _FakeCompute:
         image = Obj(id=self.cloud.new_id("img"), name=name, status="active", **traits)
         self.cloud.images[image.id] = image
         return image
+
+
+class _FakeImage:
+    """Glance's image data, as a streamed download returns it: an image's ``data`` trait."""
+
+    def __init__(self, cloud):
+        self.cloud = cloud
+
+    def download_image(self, image, stream=False, **kwargs):
+        image_id = getattr(image, "id", image)
+        self.cloud.record("download_image", image=image_id, stream=stream)
+        download = _FakeDownload((self.cloud.images.get(image_id) or {}).get("data") or b"")
+        self.cloud.downloads.append(download)
+        return download
+
+
+class _FakeDownload:
+    def __init__(self, data):
+        self.data, self.closed = data, False
+
+    def iter_content(self, chunk_size=1):
+        for start in range(0, len(self.data), chunk_size):
+            yield self.data[start:start + chunk_size]
+
+    def close(self):
+        self.closed = True
+
+
+def qcow2_header(virtual_size):
+    """The first bytes of a qcow2 file declaring ``virtual_size`` (its header: magic, version,
+    backing file, cluster bits, then the size at offset 24, big-endian)."""
+    return b"QFI\xfb" + (3).to_bytes(4, "big") + bytes(16) + virtual_size.to_bytes(8, "big") + bytes(480)
 
 
 class _FakeNetwork:
