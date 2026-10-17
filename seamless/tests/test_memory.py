@@ -223,6 +223,50 @@ def test_redact_costs_time_linear_in_the_text(text):
     assert time.perf_counter() - start < 0.5
 
 
+@pytest.mark.parametrize(
+    "unit",
+    ["eyJ-", "--x ", "a.", "-", "ab."],
+    ids=["jwt starts", "flag starts", "key prefix", "dash line", "dotted words"],
+)
+def test_four_times_the_text_costs_redact_about_four_times_the_time(unit):
+    """SDD §13.4 (reviews RV27-06, RV31-01): every pattern of redact costs time linear in the
+    text's length. 64 KiB of a text built to start a pattern every few characters costs at most
+    eight times 16 KiB of it - a quadratic pattern costs sixteen - each the best of three runs, so
+    another load on the machine slows both alike."""
+    import time
+
+    def cost(text):
+        best = float("inf")
+        for _ in range(3):
+            start = time.perf_counter()
+            redact(text)
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    small = cost(unit * (16384 // len(unit)))
+    large = cost(unit * (65536 // len(unit)))
+    assert large < 8 * small + 0.02, (small, large)
+
+
+def test_redact_finds_a_credential_word_glued_into_a_cli_flag():
+    """SDD §13.4 (review RV31-02): a CLI flag whose name, at most 64 characters, ends in a
+    credential word - glued to the word before it or not, in any case - has its value redacted;
+    another flag keeps its value, and the flag after it is still looked at."""
+    secret = "Hunter2-Prod-Secret"  # gitleaks:allow
+    for flag in (
+        "--apikey",
+        "--authToken",
+        "--clientSecret",
+        "--adminpassword",
+        "--os-password",
+        "--sshkey",
+        "--os-application-credential-secret",
+    ):
+        assert secret not in redact(f"tool {flag} {secret} --next"), flag
+    text = f"tool --name web-01 --password {secret}"
+    assert redact(text) == "tool --name web-01 --password [REDACTED]"
+
+
 def test_redact_still_finds_what_its_linear_patterns_could_hide():
     """SDD §13.4 (review RV27-06): the linear patterns find what the unbounded ones found - a key
     with more than 16 prefix parts, a PEM block whose BEGIN line has no END line of its own, a long

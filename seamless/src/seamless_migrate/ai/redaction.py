@@ -55,17 +55,26 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
         ),
         r"\1" + REDACTED,
     ),
-    # CLI form: --os-password hunter2 / --password=hunter2 / -p hunter2 is too ambiguous
+    # CLI form: --os-password hunter2, --apikey x, --authToken x - a flag name of at most 64
+    # characters ending in a credential word, read once from where a flag can start, so a text
+    # costs time linear in its length (SDD §13.4, reviews RV27-06, RV31-02); --password=hunter2 is
+    # the key=value form above, and -p hunter2 too ambiguous
     (
         re.compile(
-            r"(?i)(--(?:[a-z0-9]+-){0,16}(?:password|passwd|secret|token|api-key|key)\s+)([^\s]+)"
+            r"(?i)(?<![A-Za-z0-9_-])(--[A-Za-z0-9-]{1,64}+"
+            r"(?:(?<=password)|(?<=passwd)|(?<=secret)|(?<=token)|(?<=key))\s+)(\S+)"
         ),
         r"\1" + REDACTED,
     ),
     # well-known token shapes: seamless API tokens, Keystone fernet tokens, JWTs
     (re.compile(r"\bsmg_[A-Za-z0-9_-]{16,}"), REDACTED),
     (re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}"), REDACTED),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), REDACTED),
+    # a JWT starts where a base64url run starts: "eyJ-eyJ-..." is one start, not one per "eyJ",
+    # each scanning to the run's end (SDD §13.4, review RV31-01)
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+        REDACTED,
+    ),
     # API key shapes: AWS access key ids, GitHub tokens, sk- keys, Slack tokens
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), REDACTED),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}|\bgithub_pat_[A-Za-z0-9_]{22,}"), REDACTED),
