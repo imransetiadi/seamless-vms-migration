@@ -132,7 +132,10 @@ SCRIPT = textwrap.dedent(
                                         "Stop the source server",
     }}.get(base)
     if base == "{kit}" and merged.get("cutover"):
-        stop_task = "os_migrate.vmware_migration_kit.migration : Power off the VM"
+        # kit 2.2.7 has no power-off task: its migrate module powers the VM off inside this one
+        # (a Windows guest before the copy, any other after the conversion; review RV26-03)
+        stop_task = ("os_migrate.vmware_migration_kit.import_workloads : "
+                     "Migrate Guest from Vmware using nbdkit " + name)
     if stop_task:
         print("TASK [" + stop_task + "] ****")
         sys.stdout.flush()

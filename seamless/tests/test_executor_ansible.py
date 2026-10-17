@@ -1833,6 +1833,9 @@ def test_stop_task_pattern():
         "TASK [os_migrate.os_migrate.import_workloads : Perform workload stop if "
         "os_migrate_workload_stop_before_migration is true] ****",
         "TASK [os_migrate.vmware_migration_kit.migration : Power off the VM] ****",
+        # the pinned kit's own: its migrate module powers the VM off inside it (review RV26-03)
+        "TASK [os_migrate.vmware_migration_kit.import_workloads : Migrate Guest from Vmware "
+        "using nbdkit web-01] ****",
         "TASK [migration : Poweroff source VM] ****",
         "TASK [migration : Shutdown VM before cutover] ****",
     ]
@@ -1956,6 +1959,46 @@ async def test_a_cutover_cancelled_while_its_stop_task_runs_opens_the_clock_at_i
     step.cancel()
     await asyncio.sleep(0.1)
     step.cancel()  # while the clock is being opened
+    with pytest.raises(asyncio.CancelledError):
+        await step
+    assert len(rec.downtime_at) == 1 and began <= rec.downtime_at[0] <= seen
+
+
+async def test_a_vmware_cutover_that_fails_after_the_kits_migrate_task_opens_the_clock(
+    env, monkeypatch
+):
+    """SDD §7.2 (review RV26-03): the pinned kit has no power-off task - its migrate module powers
+    the VM off inside "Migrate Guest from Vmware using nbdkit <vm>". A cutover that fails after it
+    (the kit's port or instance creation) leaves the VM off: the clock opens at that task's start,
+    so the automatic rollback powers the VM on and a cancel is refused."""
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", '{"msg": "Failed to create port: Conflict 409"}')
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_cold, source=VCENTER, nics=VMW_NICS)
+    began = utcnow()
+    with pytest.raises((PermanentStepError, TransientStepError)):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert any("Migrate Guest from Vmware using nbdkit web-01" in line for line in rec.logs)
+    assert rec.downtime_marks == 1, "the kit powered the VM off, yet no clock opened"
+    assert began <= rec.downtime_at[0] <= utcnow()
+
+
+async def test_a_vmware_cutover_cut_off_inside_the_kits_migrate_task_opens_the_clock(
+    env, monkeypatch
+):
+    """SDD §7.2 (review RV26-03, audit EX-02): a VMware cutover cut off - the step timeout, a
+    rollback request, a shutdown - while the kit's migrate task runs may have the VM powered off:
+    the clock opens at the task's start."""
+    monkeypatch.setenv("ANSIBLE_FAKE_STOP_HANG", "30")
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_cold, source=VCENTER, nics=VMW_NICS)
+    began = utcnow()
+    step = asyncio.create_task(env.executor.run(StepName.CUTOVER, ctx))
+    for _ in range(500):
+        if any("Migrate Guest from Vmware" in line for line in rec.logs):
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError(rec.logs)
+    seen = utcnow()
+    step.cancel()
     with pytest.raises(asyncio.CancelledError):
         await step
     assert len(rec.downtime_at) == 1 and began <= rec.downtime_at[0] <= seen

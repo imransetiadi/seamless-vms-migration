@@ -113,9 +113,12 @@ WARM_CHUNK_SIZE = 4194304
 WARM_WORKERS = 4
 TRANSIENT = re.compile(r"(?i)timeout|http 503|connection reset")
 #: Playbook output lines that start the source-stop task (SDD §7.2 downtime clock): the warm
-#: role's "Stop the source server", the cold role's "Perform workload stop …", the kit's power-off.
+#: role's "Stop the source server", the cold role's "Perform workload stop …", and the kit's
+#: "Migrate Guest from Vmware using nbdkit <vm>" - kit 2.2.7 has no power-off task, its migrate
+#: module powers the VM off inside that one (review RV26-03); a power-off or shut-down task too.
 STOP_TASK = re.compile(
-    r"(?i)^TASK \[[^\]]*(?:stop the source server|perform workload stop|power[ _-]?off|shut ?down)"
+    r"(?i)^TASK \[[^\]]*(?:stop the source server|perform workload stop|power[ _-]?off|shut ?down"
+    r"|migrate guest from vmware using nbdkit)"
 )
 #: Result lines of an Ansible task (default stdout callback).
 _RESULT_LINE = re.compile(r"^(ok|changed|failed|fatal|skipping|unreachable):")
