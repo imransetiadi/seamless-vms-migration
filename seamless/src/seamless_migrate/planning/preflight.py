@@ -773,7 +773,6 @@ def run_preflight(
             finding(
                 "MAP_NETWORK_MISSING",
                 f"No mapping or same-named network in {where} for: {_names(missing_nets)}."
-                + ("" if prestaged or "networks" not in plan.prestage_resources else "")
                 + (
                     " VMware sources are not pre-staged: map every port group."
                     if source is not None and source.kind == ProviderKind.vmware
