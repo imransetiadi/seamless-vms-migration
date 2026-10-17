@@ -28,6 +28,9 @@ _POWER = {"poweredOn": "running", "poweredOff": "stopped", "suspended": "paused"
 #: how long a rollback's power-on looks again at a VM still on whose installed VMware Tools no
 #: longer run - the last seconds of a guest shutdown, or a guest still starting (SDD §7.2)
 TOOLS_STOPPED_LOOK_S = 120
+#: how long the provider remembers a guest shutdown a power-on saw, for the rollback's retry
+#: that comes after the call's bound ended (SDD §7.2, review RV29-08)
+SHUTDOWN_MEMORY_S = 1800
 
 Connector = Callable[..., Any]
 
@@ -229,6 +232,8 @@ class VMwareProvider:
         self.settings = settings
         self._connector = connector
         self._vim_module = vim
+        #: VM instanceUuid -> when a power-on last saw its guest shut down (monotonic seconds)
+        self._shutdowns_seen: dict[str, float] = {}
 
     # -- plumbing ----------------------------------------------------------------------------
     def _vim(self) -> Any:
@@ -410,6 +415,9 @@ class VMwareProvider:
         # thread goes on (SDD §7.2, review RV27-02)
         deadline = time.monotonic() + PROVIDER_CALL_TIMEOUT_S - 5
         ended = threading.Event()
+        seen = self._shutdowns_seen.get(source_id)
+        # an earlier attempt saw this guest shut down: its Tools stopped is that shutdown's tail
+        remembered = seen is not None and time.monotonic() - seen < SHUTDOWN_MEMORY_S
 
         def work(content: Any, vim: Any) -> None:
             direct = self._find_by_uuid(content, source_id)
@@ -426,7 +434,7 @@ class VMwareProvider:
                 # Its Tools stop just before vSphere powers it off, so once a shutdown was seen
                 # notRunning is its tail; never seen, notRunning with installed Tools may be that
                 # tail too, or a guest still starting: looked at again for a while (RV27-01)
-                shutting_down = False
+                shutting_down = remembered
                 look_until = None
                 while True:
                     if ended.is_set():  # timed out or cancelled: never act behind its back
@@ -437,7 +445,9 @@ class VMwareProvider:
                     state = str(getattr(guest, "guestState", ""))
                     shutting_down = shutting_down or state == "shuttingDown"
                     if shutting_down:
+                        self._shutdowns_seen[source_id] = time.monotonic()
                         if state not in ("shuttingDown", "notRunning"):
+                            self._shutdowns_seen.pop(source_id, None)  # it runs again
                             return
                     elif state != "notRunning" or not _tools_installed(guest):
                         return
@@ -459,6 +469,7 @@ class VMwareProvider:
                     time.sleep(2)
                 if str(task.info.state) == "error":
                     raise ProviderError(f"{self.provider.id}: power-on failed: {task.info.error}")
+                self._shutdowns_seen.pop(source_id, None)  # powered on: the shutdown is over
                 return
             raise ProviderError(f"{self.provider.id}: VM {source_id!r} not found")
 

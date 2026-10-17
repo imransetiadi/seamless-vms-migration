@@ -2213,6 +2213,99 @@ async def test_a_vmware_power_on_ends_within_its_call_and_never_acts_after_it(
     assert len(looks) == seen, "the thread of a cancelled call went on asking vCenter"
 
 
+@pytest.mark.parametrize("later", [2, 1801])
+async def test_a_vmware_rollback_retry_remembers_the_shutdown_an_earlier_attempt_saw(
+    tmp_path, monkeypatch, later
+):
+    """SDD §7.2 (review RV29-08): a guest that does not end its shutdown within the call's bound
+    is a provider error the rollback retries. The retry's first look may read the guest
+    notRunning with its Tools stopped - the shutdown's last phase, which the provider looks at
+    for 120 s only as a guest that might be starting. The provider remembers the shutdown it saw
+    for 30 minutes: the retry waits through that phase to its own bound and powers the VM on once
+    it is off. Past the 30 minutes it looks for 120 s again. Here vmtoolsd stops 250 s into the
+    rollback and the guest powers off 180 s later."""
+    from seamless_migrate.providers import vmware as vmw
+
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(vmw, "time", NS(monotonic=lambda: clock[0], sleep=sleep))
+    vm = PoweredOffVM()
+    tools_stop = [250.0]
+
+    class Runtime:
+        host = NS(name="esx-01.dc2")
+
+        @property
+        def powerState(self):  # noqa: N802 - pyVmomi naming
+            if vm.tasks:
+                return "poweredOn"
+            return "poweredOn" if clock[0] < tools_stop[0] + 180 else "poweredOff"
+
+    class Guest:
+        toolsVersionStatus2 = "guestToolsCurrent"
+
+        @property
+        def guestState(self):  # noqa: N802 - pyVmomi naming
+            return "shuttingDown" if clock[0] < tools_stop[0] else "notRunning"
+
+    vm.runtime, vm.guest = Runtime(), Guest()
+    vcenter = vcenter_for(tmp_path, vm)
+    with pytest.raises(ProviderError, match="still shutting down"):
+        await vcenter.power_on("5012-abcd")  # the first attempt: its bound ends at 295 s
+    if later > 1800:
+        tools_stop[0] = clock[0] + later  # a new shutdown's tail, long after the remembered one
+    sleep(later)
+    await vcenter.power_on("5012-abcd")
+    sleep(240)
+    if later < 1800:
+        assert vm.tasks, "the retry returned without a power-on; the VM went off under it"
+        # powered on, the shutdown is over: a later look at the VM, its Tools stopped, is 120 s
+        started = clock[0]
+        await vcenter.power_on("5012-abcd")
+        assert len(vm.tasks) == 1 and clock[0] - started <= 125
+    else:
+        assert vm.tasks == [], "a shutdown seen 30 minutes ago still decided the look"
+
+
+async def test_a_guest_that_runs_again_ends_the_shutdown_the_provider_remembers(
+    tmp_path, monkeypatch
+):
+    """SDD §7.2 (review RV29-08): a shutdown the provider remembers ends when the guest runs
+    again - it rebooted rather than powering off: the retry leaves it alone, and a later look at
+    the VM, its Tools stopped, is the 120 s one again, never a wait to the call's bound."""
+    from seamless_migrate.providers import vmware as vmw
+
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(vmw, "time", NS(monotonic=lambda: clock[0], sleep=sleep))
+    guest_state = ["shuttingDown"]
+    vm = tools_stopped_vm(["poweredOn"], ["shuttingDown"])
+
+    class Guest:
+        toolsVersionStatus2 = "guestToolsCurrent"
+
+        @property
+        def guestState(self):  # noqa: N802 - pyVmomi naming
+            return guest_state[0]
+
+    vm.guest = Guest()
+    vcenter = vcenter_for(tmp_path, vm)
+    with pytest.raises(ProviderError, match="still shutting down"):
+        await vcenter.power_on("5012-abcd")
+    guest_state[0] = "running"  # it rebooted
+    await vcenter.power_on("5012-abcd")
+    guest_state[0] = "notRunning"  # its Tools stopped later on: no shutdown is remembered
+    started = clock[0]
+    await vcenter.power_on("5012-abcd")
+    assert vm.tasks == [] and clock[0] - started <= 125
+
+
 async def test_fake_destination_inventory_resolves_every_demo_nic():
     """SDD §10, §9.3: in demo mode every OpenStack demo VM's NIC resolves to one RHOSO network whose
     subnets take its addresses, and that the demo's admin credential may use - the demo plans are
