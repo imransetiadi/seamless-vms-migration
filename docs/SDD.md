@@ -1460,7 +1460,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   `vmware_warm` kit run - a pass, the cutover -, once the refusal above found nothing, such a volume neither
   converted nor marked is a first copy cut off: it is detached from the destination's conversion host when that
   host holds it and deleted, as is a marked one in an error state Cinder cannot attach (review RV30-07), so the kit
-  copies the disk in full; one another server holds stays. The kit's
+  copies the disk in full; one another server holds stays. A marked one the conversion host holds - a pass cut off
+  during its sync, or the kit's own detach that failed, which it only logs - is detached from it and kept for the
+  CBT sync: the kit attaches it again, which Nova refuses while it is attached (review RV32A-03). The kit's
   conversion rewrites a volume's metadata to `osm` and `converted` alone, so a converted volume carries no mark:
   the rules above for converted volumes apply to it.
 
