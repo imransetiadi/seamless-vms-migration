@@ -218,8 +218,12 @@ class Settings(BaseModel):
         """Each entry is one origin as a browser sends it - never "*", which would let every page
         call the API (SDD §15.1, Security.md C1-12, audit AP-10)."""
         for origin in origins:
+            refused = f"{origin!r} is not an origin (scheme://host[:port], no path; never '*')"
             try:
                 parts = urlsplit(origin)
+            except ValueError:  # a bracketed host Python refuses, an unclosed bracket (RV32B-08)
+                raise ValueError(refused) from None
+            try:
                 port_ok = parts.port is None or 1 <= parts.port <= 65535
             except ValueError:  # a port that is no number or out of range
                 port_ok = False
@@ -232,9 +236,7 @@ class Settings(BaseModel):
                 # the scheme as browsers send it
                 and origin == f"{parts.scheme}://{parts.netloc}"
             ):
-                raise ValueError(
-                    f"{origin!r} is not an origin (scheme://host[:port], no path; never '*')"
-                )
+                raise ValueError(refused)
             # the comparison is exact: an origin written otherwise than the browser sends it would
             # start the server and allow nothing (SDD §15.1, review RV27-08)
             try:

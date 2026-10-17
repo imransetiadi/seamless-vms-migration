@@ -186,6 +186,10 @@ def test_a_cors_origin_no_browser_sends_is_refused(origin):
         ("SEAMLESS_CORS_ORIGINS", "https://dashboard.example:99999"),
         ("SEAMLESS_CORS_ORIGINS", "HTTPS://dashboard.example"),
         ("SEAMLESS_CORS_ORIGINS", "https://dashboard.example#"),
+        # an entry Python's urlsplit itself refuses, first or not (review RV32B-08)
+        ("SEAMLESS_CORS_ORIGINS", "http://[127.0.0.1]:5173"),
+        ("SEAMLESS_CORS_ORIGINS", "http://[::1:5173"),
+        ("SEAMLESS_CORS_ORIGINS", "https://dashboard.example,http://[::1:5173"),
     ],
 )
 def test_settings_refuse_a_value_outside_its_bounds(variable, value):

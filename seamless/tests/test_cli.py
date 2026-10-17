@@ -909,3 +909,16 @@ def test_plan_apply_names_a_non_string_key_it_cannot_change(env, capsys):
     path.write_text(path.read_text() + "1: typo\n")
     assert cli.main(["plan", "apply", "-f", str(path)]) == 1
     assert capsys.readouterr().err == "error: fields cannot be changed: 1\n"
+
+
+@pytest.mark.parametrize("origin", ["http://[127.0.0.1]:5173", "http://[::1:5173"])
+def test_a_cors_origin_python_cannot_split_ends_the_cli_with_an_error_line(
+    monkeypatch, capsys, origin
+):
+    """SDD §15.1 (review RV32B-08): a value outside its bounds refuses to start the control plane
+    with "error: ..." and exit code 1 - also a first SEAMLESS_CORS_ORIGINS entry Python's urlsplit
+    itself refuses (a bracketed IPv4 address, an unclosed bracket), never a traceback."""
+    monkeypatch.setenv("SEAMLESS_CORS_ORIGINS", origin)
+    assert cli.main(["version"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and "is not an origin" in err, err
