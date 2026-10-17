@@ -227,7 +227,10 @@
         ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
         ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
         transfer_uuid: "{{ exports.transfer_uuid }}"
-        volume_map: "{{ transfer.volume_map }}"
+        # a transfer that failed returns no map: the cleanup takes the volumes it recorded as
+        # Cinder created them (Seamless Migrate SDD 6.6, audit A-08)
+        volume_map: "{{ transfer.volume_map | default(omit) }}"
+        warm_state_dir: "{{ os_migrate_warm_state_dir | default(os_migrate_data_dir ~ '/workload_warm') }}"
         log_file: "{{ prelim.log_file }}"
         state_file: "{{ prelim.state_file }}"
         timeout: "{{ os_migrate_timeout }}"
@@ -235,7 +238,7 @@
         - prelim is defined and prelim.changed
         - os_migrate_workload_cleanup_on_failure
         - exports is defined and 'volume_map' in exports
-        - transfer is defined and 'volume_map' in transfer
+        - transfer is defined and transfer is not skipped
         - item["_migration_params"]["data_copy"] | default(true)
 
     - name: Fail if there was a problem in the migration

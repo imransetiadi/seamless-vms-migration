@@ -565,3 +565,12 @@ This project follows a simple changelog to satisfy collection metadata validatio
   VM booting from its image - and recorded it as the destination. Without
   ``finish_only`` (the first create, the cold import) a recorded server that
   is gone is still replaced by the one the call creates.
+- A cold import whose transfer failed cleans the destination volumes the
+  transfer created: ``import_workload_dst_failure_cleanup`` takes the
+  workload's record (new ``warm_state_dir``; ``volume_map`` now optional) when
+  the transfer returned no map, and the role's rescue runs it whenever the
+  transfer ran. Before, the rescue skipped it when the transfer itself failed,
+  and the volumes stayed attached to the destination conversion host. Its SSH
+  check at the start no longer fails it: a conversion host it cannot reach
+  keeps the volumes it holds for the rollback, and those no server holds are
+  deleted through the API.

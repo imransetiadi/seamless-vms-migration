@@ -826,19 +826,28 @@ def test_a_failed_cold_import_keeps_the_record_of_the_volumes_it_created(env):
         assert env.state("srv-1")["dest_volumes"] == RECORDED
         cleaned = [c for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
         assert bool(cleaned) is cleanup
+        # the transfer returned its map: the cleanup takes it, the record beside it (audit A-08)
+        assert all(
+            c["args"]["volume_map"] and c["args"]["warm_state_dir"] == env.state_dir
+            for c in cleaned
+        )
 
 
 def test_a_cold_transfer_cut_short_leaves_the_record_of_the_volumes_it_created(env):
-    """SDD 6.3 (review lead B): the transfer created the volumes, then failed before it returned
-    its volume_map - the failure cleanup cannot see them, and a rollback deletes them by the
-    record alone."""
+    """SDD 6.3, 6.6 (review lead B, audit A-08): the transfer created the volumes, then failed
+    before it returned its volume_map. The record names them: the rescue's destination cleanup
+    takes it (warm_state_dir, no volume_map) - before, it was skipped and a hand-run import left
+    the volumes on the conversion host - and a rollback deletes by the record what it could not."""
     env.world["fail_after"] = [["import_workload_transfer_volumes", "vm1"]]
 
     rc, out, calls = env.run("import_workloads", **COLD)
 
     assert rc != 0, out
     assert env.state("srv-1")["dest_volumes"] == RECORDED
-    assert not [c for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
+    cleaned = [c["args"] for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
+    assert [(args.get("warm_state_dir"), "volume_map" in args) for args in cleaned] == [
+        (env.state_dir, False)
+    ]
     assert not [c for c in calls if c["module"] == "import_workload_create_instance"]
 
 

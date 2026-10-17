@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# Modified by the Seamless Migrate project, 2026.
 
 
 from __future__ import absolute_import, division, print_function
@@ -93,9 +94,17 @@ options:
   volume_map:
     description:
       - Dictionary providing information about the volumes to transfer.
-      - Provided by the import_workloads_export_volumes module.
-    required: true
+      - Provided by the import_workloads_transfer_volumes module.
+      - A transfer that failed returns none; I(warm_state_dir) then names the volumes.
+    required: false
     type: dict
+  warm_state_dir:
+    description:
+      - Directory of the workloads' state files. Without I(volume_map), the destination volumes
+        the workload's record holds - the transfer recorded each as soon as Cinder created it -
+        are the ones cleaned up.
+    required: false
+    type: str
   timeout:
     description:
       - Timeout for long running operations, in seconds.
@@ -139,6 +148,7 @@ from ansible.module_utils.basic import AnsibleModule
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import os_auth
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import server
+from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_migration
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
     DEFAULT_TIMEOUT,
@@ -174,6 +184,29 @@ class OpenStackDstFailureCleanup(OpenStackVolumeBase):
         )
         self.volume_map = volume_map
 
+    def _check_ssh(self):
+        """The one SSH check at the start, its answer kept rather than raised: the conversion host
+        may be what failed the transfer, and the API alone still deletes the volumes no server
+        holds (Seamless Migrate SDD 6.6, audit A-08)."""
+        try:
+            self.shell.test_ssh_connection()
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning(
+                "The destination conversion host cannot be reached (%s): the volumes it holds "
+                "stay for the rollback, which deletes them by the record",
+                err,
+            )
+            self.reachable = False
+        else:
+            self.reachable = True
+
+    def delete_migrated_volumes(self):
+        """Detach the volumes from the destination conversion host - under its attach lock, only
+        when the check reached it - then delete those no server holds (SDD 6.6, audit A-08)."""
+        if self.reachable:
+            self._detach_volumes_from_destination_converter()
+        self._delete_volumes()
+
 
 def run_module():
     argument_spec = os_auth.openstack_full_argument_spec(
@@ -182,7 +215,8 @@ def run_module():
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
         transfer_uuid=dict(type="str", required=True),
-        volume_map=dict(type="dict", required=True),
+        volume_map=dict(type="dict", default=None),
+        warm_state_dir=dict(type="str", default=None),
         state_file=dict(type="str", default=None),
         log_file=dict(type="str", default=None),
         timeout=dict(type="int", default=DEFAULT_TIMEOUT),
@@ -194,6 +228,7 @@ def run_module():
 
     module = AnsibleModule(
         argument_spec=argument_spec,
+        required_one_of=[("volume_map", "warm_state_dir")],
     )
 
     conn = os_auth.get_connection(module)
@@ -206,6 +241,18 @@ def run_module():
     ssh_user = module.params["ssh_user"]
     transfer_uuid = module.params["transfer_uuid"]
     volume_map = module.params["volume_map"]
+    if volume_map is None:
+        # a transfer that failed returns no map: the volumes it recorded as Cinder created them
+        # (Seamless Migrate SDD 6.3, 6.6, audit A-08)
+        try:
+            state = warm_migration.WarmState.load(module.params["warm_state_dir"], info["id"])
+        except ValueError as err:
+            module.fail_json(msg=str(err))
+        volume_map = {
+            device: {"dest_id": entry["dest_id"]}
+            for device, entry in state.dest_volumes.items()
+            if entry.get("dest_id")
+        }
 
     # Optional parameters
     state_file = module.params.get("state_file", None)

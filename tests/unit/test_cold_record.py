@@ -10,6 +10,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import os
+import subprocess
 import time
 from unittest import mock
 
@@ -1004,3 +1005,100 @@ def _holds_lock(shells, lock_file):
     taken = [i for i, c in enumerate(commands) if c[:2] == ["sudo", "flock"] and lock_file in c]
     freed = [i for i, c in enumerate(commands) if c[:3] == ["sudo", "rm", "-vf"] and lock_file + ".lock" in c]
     return bool(taken) and (not freed or taken[-1] > freed[-1])
+
+
+# --- the rescue's destination cleanup after a failed transfer (SDD 6.6, audit A-08) -------------
+
+
+def _cleanup_args(volume_map=None, state_dir=None):
+    args = {
+        "data": fake.workload_data(), "conversion_host": {"id": "dst-conv"},
+        "ssh_key_path": "/keys/k", "ssh_user": "cloud-user", "transfer_uuid": "uuid-1",
+    }
+    if volume_map is not None:
+        args["volume_map"] = volume_map
+    if state_dir is not None:
+        args["warm_state_dir"] = state_dir
+    return args
+
+
+def _left_by_a_failed_transfer(tmp_path):
+    """vm1's failed transfer: its boot volume still on the destination conversion host, its data
+    volume detached, both recorded as Cinder created them; an unrelated volume beside them."""
+    src, dst = _clouds()
+    dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True, server_id="dst-conv", device="/dev/vdb")
+    dst.add_volume("dvol-data", "vm1-data", 10)
+    dst.add_volume("unrelated", "keep-me", 1)
+    state_dir = str(tmp_path / "workload_warm")
+    _record(state_dir, TRANSFERRED)
+    return src, dst, state_dir
+
+
+@pytest.mark.parametrize("given", ["the transfer's map", "the record"])
+def test_the_destination_cleanup_removes_a_failed_transfers_volumes(tmp_path, given):
+    """SDD 6.6 (audit A-08): a transfer that failed raises - its result carries no volume map, and
+    its errors reach the control plane's classifier as before - so the rescue's destination
+    cleanup takes the workload's record instead: the volumes the transfer recorded as Cinder
+    created them. Given the map, or the record, it detaches them from the destination conversion
+    host and deletes them; nothing else."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_dst_failure_cleanup as cleanup_module,
+    )
+
+    src, dst, state_dir = _left_by_a_failed_transfer(tmp_path)
+    args = (
+        _cleanup_args(volume_map=TRANSFERRED)
+        if given == "the transfer's map"
+        else _cleanup_args(state_dir=state_dir)
+    )
+    result = fake.run_module(cleanup_module, args, dst, shell_factory=fake.ShellFactory([dst, src]))
+
+    assert result["_exit_code"] in (None, 0), result
+    assert sorted(dst.volumes) == ["unrelated"]
+
+
+def test_the_destination_cleanup_of_a_conversion_host_it_cannot_reach_still_deletes_what_it_can(
+    tmp_path,
+):
+    """SDD 6.6 (audit A-08): the conversion host may be what failed the transfer. The cleanup's
+    one SSH check at its start no longer fails it: the volume that host holds stays for the
+    rollback, which deletes it by the record - no attach lock is taken on a host the check could
+    not reach - and a volume no server holds is deleted through the API."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_dst_failure_cleanup as cleanup_module,
+    )
+
+    src, dst, state_dir = _left_by_a_failed_transfer(tmp_path)
+    shells = fake.ShellFactory([dst, src])
+
+    def unreachable(shell):
+        shell.commands.append(["echo connected"])
+        raise subprocess.CalledProcessError(255, ["ssh", "-o", "ConnectTimeout=10", "cloud-user@x"])
+
+    with mock.patch.object(fake.FakeShell, "test_ssh_connection", unreachable):
+        result = fake.run_module(
+            cleanup_module, _cleanup_args(state_dir=state_dir), dst, shell_factory=shells
+        )
+
+    assert result["_exit_code"] in (None, 0), result
+    assert sorted(dst.volumes) == ["dvol-boot", "unrelated"]
+    assert not [c for c in shells.commands_at("10.1.0.10") if c[:2] == ["sudo", "flock"]]
+
+
+def test_the_destination_cleanup_with_neither_map_nor_record_removes_nothing(tmp_path):
+    """SDD 6.6 (audit A-08): no map and no record of the workload: nothing is the transfer's."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_dst_failure_cleanup as cleanup_module,
+    )
+
+    src, dst = _clouds()
+    dst.add_volume("unrelated", "keep-me", 1)
+    result = fake.run_module(
+        cleanup_module,
+        _cleanup_args(state_dir=str(tmp_path / "workload_warm")),
+        dst,
+        shell_factory=fake.ShellFactory([dst, src]),
+    )
+
+    assert result["_exit_code"] in (None, 0), result
+    assert sorted(dst.volumes) == ["unrelated"]
