@@ -527,7 +527,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   that was cut off (a timeout, a 503 during its wait) started nothing and the
   source ended ``SHUTOFF``, and a re-run's stop was refused with 409. The wait
   reads the server every ``os_migrate_source_stop_poll_s`` seconds (default
-  5), at most ``os_migrate_timeout``.
+  5), at most ``os_migrate_timeout``, and once more at the latest after
+  ``os_migrate_timeout`` when the poll interval is longer: a stop that still
+  runs then fails the play, where a wait of no retry used to start nothing
+  and report success.
 - A volume made from a server snapshot - the warm ``boot_disk_copy`` pass and
   the cold export of an image-booted server - is as large as Cinder needs for
   the image: the image file rounded up to whole GiB, its virtual disk (a qcow2

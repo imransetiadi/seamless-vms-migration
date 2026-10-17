@@ -19,7 +19,10 @@
     import_workloads_warm_source_power.servers | default([])
     | map(attribute='task_state', default=none) | select('equalto', 'powering-off')
     | list | length == 0
+  # at least one more read, at the latest after the timeout: with retries 0 ansible-core runs the
+  # task once and never evaluates `until` (review RV27-09)
   retries: >-
-    {{ (os_migrate_timeout | int)
-       // ([os_migrate_source_stop_poll_s | default(5) | int, 1] | max) }}
-  delay: "{{ os_migrate_source_stop_poll_s | default(5) | int }}"
+    {{ [(os_migrate_timeout | int)
+        // ([os_migrate_source_stop_poll_s | default(5) | int, 1] | max), 1] | max }}
+  delay: >-
+    {{ [os_migrate_source_stop_poll_s | default(5) | int, os_migrate_timeout | int] | min }}

@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 import yaml
@@ -631,6 +632,29 @@ def test_a_rollback_starts_a_source_nova_still_powers_off(env):
 
     assert rc == 0, out
     assert env.nova_actions() == ["start srv-1"], out
+
+
+def test_a_stop_wait_whose_poll_outlasts_its_timeout_reads_the_server_again(env):
+    """SDD 6.5 (review RV27-09): the wait reads the server every os_migrate_source_stop_poll_s
+    seconds, at most os_migrate_timeout seconds - and once more at the latest after the timeout,
+    also when the poll interval is longer. Retries of timeout // poll came out 0 there, and
+    ansible-core then ran the task once without looking at `until`: the stop that still ran was
+    neither waited for nor reported, and the rollback started nothing yet ended rc 0."""
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+    env.world["powering_off"] = {"srv-1": 2}  # Nova powers srv-1 off past the timeout
+    started = time.monotonic()
+
+    rc, out, calls = env.run(
+        "rollback_workloads",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_source_stop_poll_s=60,
+        os_migrate_timeout=2,
+    )
+
+    reads = [c for c in calls if c["module"] == "server_info"]
+    assert (rc != 0, len(reads), env.nova_actions()) == (True, 2, []), (rc, len(reads), out[-1500:])
+    assert time.monotonic() - started < 30, "the wait outlived os_migrate_timeout"
 
 
 def test_a_warm_cutover_rerun_waits_for_a_stop_nova_still_runs(env):
