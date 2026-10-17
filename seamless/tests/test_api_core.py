@@ -500,6 +500,32 @@ def test_similar_incidents_reach_viewers_redacted_in_recommendations(api):
     assert hits and "Hunter2-Prod-Secret" not in page.text, hits[:1]
 
 
+def test_cors_preflight_answers_keep_the_security_headers_and_the_envelope(tmp_path):
+    """SDD §12 (audit AP-09): every response carries the R-05 security headers and every error is
+    the envelope - a CORS preflight's answer too, allowed or refused, though the CORS layer answers
+    it before any route."""
+    settings, _ = api_settings(tmp_path, cors_origins=["https://dashboard.example"])
+    store = Store(f"sqlite:///{tmp_path / 'cors.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+
+        def preflight(origin):
+            headers = {"Origin": origin, "Access-Control-Request-Method": "GET"}
+            return client.options("/api/v1/plans", headers=headers)
+
+        refused, allowed = preflight("https://evil.example"), preflight("https://dashboard.example")
+    store.dispose()
+    for res in (refused, allowed):
+        assert {"x-frame-options", "content-security-policy"} <= set(res.headers), res.headers
+    assert allowed.status_code == 200
+    assert allowed.headers["access-control-allow-origin"] == "https://dashboard.example"
+    assert refused.status_code == 400, refused.text
+    assert refused.json() == {"error": {"code": "bad_request", "message": "Disallowed CORS origin"}}
+    assert "access-control-allow-origin" not in refused.headers
+    # a cache must not answer the allowed origin with this refusal
+    assert "Origin" in refused.headers["vary"]
+
+
 def test_spa_fallback_serves_index(tmp_path):
     dist = tmp_path / "dist"
     (dist / "assets").mkdir(parents=True)

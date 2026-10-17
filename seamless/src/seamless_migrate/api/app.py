@@ -15,8 +15,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
+from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.responses import Response
 from starlette.routing import Match
 
 from .. import __version__
@@ -211,6 +213,21 @@ class BodyLimitMiddleware:
         return f"request body larger than {self.max_bytes} bytes"
 
 
+class EnvelopeCORSMiddleware(CORSMiddleware):
+    """Starlette's CORS, whose refused preflight is the error envelope (SDD §12, audit AP-09): the
+    CORS layer answers a preflight before any route, so no error handler sees it."""
+
+    def preflight_response(self, request_headers: Headers) -> Response:
+        response = super().preflight_response(request_headers)
+        if response.status_code < 400:
+            return response
+        refused = _error(response.status_code, "bad_request", bytes(response.body).decode())
+        for name, value in response.headers.items():  # Vary and the allowed methods stay
+            if name not in ("content-type", "content-length"):
+                refused.headers[name] = value
+        return refused
+
+
 def _install_security_headers(app: FastAPI) -> None:
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Any) -> Any:
@@ -366,15 +383,16 @@ def create_app(
     # added before the security headers middleware, which therefore wraps it: a 413 carries the
     # R-05 headers too
     app.add_middleware(BodyLimitMiddleware)
-    _install_security_headers(app)
-    _install_api_docs(app, settings)
     if settings.cors_origins:
+        # inside the security headers too: the CORS layer answers preflights itself (audit AP-09)
         app.add_middleware(
-            CORSMiddleware,
+            EnvelopeCORSMiddleware,
             allow_origins=settings.cors_origins,
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
             allow_headers=["Authorization", "Content-Type"],
         )
+    _install_security_headers(app)
+    _install_api_docs(app, settings)
     for module in (
         routes_misc,
         routes_advisor,
