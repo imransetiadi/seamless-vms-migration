@@ -90,8 +90,11 @@ async def outlive_cancel(work: Awaitable[T]) -> T:
 class Executor(Protocol):
     name: str
 
-    def supports(self, strategy: Strategy) -> bool: ...
+    def supports(self, strategy: Strategy) -> bool:
+        """Whether this executor runs the strategy."""
 
-    async def prestage(self, plan: Plan, source: Provider, destination: Provider) -> None: ...
+    async def prestage(self, plan: Plan, source: Provider, destination: Provider) -> None:
+        """Prestage the plan's resources in the destination before its migrations (SDD §7.1)."""
 
-    async def run(self, step: StepName, ctx: StepContext) -> StepResult: ...
+    async def run(self, step: StepName, ctx: StepContext) -> StepResult:
+        """Run one step of a migration (SDD §7.1)."""

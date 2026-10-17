@@ -547,6 +547,44 @@ def test_spa_fallback_serves_index(tmp_path):
     store.dispose()
 
 
+def test_the_dashboard_fallback_looks_at_no_path_outside_its_directory(tmp_path, monkeypatch):
+    """SDD §12 (CodeQL py/path-injection): a path that leaves the dashboard's directory - ".."
+    segments - is answered with the index without the file system being asked about it, and a
+    symlink inside the directory that names a file outside it is not served."""
+    import os
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>Seamless</title>")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("nope")
+    (dist / "leak.txt").symlink_to(secret)
+    settings, _ = api_settings(tmp_path, dashboard_dir=dist)
+    store = Store(f"sqlite:///{tmp_path / 'spa-paths.db'}")
+    store.create_schema()
+    looked: list[str] = []
+    stat, lstat = os.stat, os.lstat
+
+    def spying(real):
+        def call(path, *args, **kwargs):
+            looked.append(os.fspath(path) if not isinstance(path, int) else "")
+            return real(path, *args, **kwargs)
+
+        return call
+
+    with TestClient(create_app(settings, store)) as client:
+        monkeypatch.setattr(os, "stat", spying(stat))
+        monkeypatch.setattr(os, "lstat", spying(lstat))
+        outside = client.get("/..%2Fsecret.txt")
+        monkeypatch.setattr(os, "stat", stat)
+        monkeypatch.setattr(os, "lstat", lstat)
+        assert outside.status_code == 200 and "Seamless" in outside.text
+        assert str(secret) not in looked, looked
+        linked = client.get("/leak.txt")
+        assert linked.status_code == 200 and "nope" not in linked.text
+    store.dispose()
+
+
 def test_a_wrong_method_on_an_api_route_is_405_where_the_dashboard_is_served(tmp_path):
     """SDD §12: 405 `method_not_allowed` for a method an API route does not take - the
     dashboard's GET fallback must not turn a GET on a POST-only route into a 404."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -278,6 +279,18 @@ def _api_path_takes_another_method(request: Request) -> bool:
     )
 
 
+def _dashboard_file(root: Path, full_path: str) -> str | None:
+    """The dashboard's file at ``full_path``, contained first (SDD §12): a path whose ".." leaves
+    the directory is never looked at, and a symlink inside it counts only when what it names
+    stays inside; None for any other path - the index answers it."""
+    inside = f"{root}{os.sep}"
+    candidate = os.path.normpath(os.path.join(root, full_path))
+    if not (full_path and candidate.startswith(inside)):
+        return None
+    real = os.path.realpath(candidate)
+    return real if real.startswith(inside) and os.path.isfile(real) else None
+
+
 def _install_spa(app: FastAPI, dist: Path) -> None:
     root = dist.resolve()
     index = root / "index.html"
@@ -292,10 +305,7 @@ def _install_spa(app: FastAPI, dist: Path) -> None:
             return _error(405, "method_not_allowed", "Method Not Allowed")
         if first == "api" or first in _DISABLED_DOCS:
             return _error(404, "not_found", "Not Found")
-        candidate = (root / full_path).resolve()
-        if full_path and candidate.is_file() and candidate.is_relative_to(root):
-            return FileResponse(candidate)
-        return FileResponse(index)
+        return FileResponse(_dashboard_file(root, full_path) or index)
 
 
 def build_services(

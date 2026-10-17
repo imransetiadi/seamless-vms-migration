@@ -844,3 +844,28 @@ def test_registry_reconnects_after_new_credentials(tmp_path):
         update={"credentials_updated_at": datetime(2026, 10, 9, tzinfo=UTC)}
     )
     assert registry.get(stamped) is not first
+
+
+def test_the_kubernetes_secret_store_always_checks_the_api_servers_certificate(monkeypatch):
+    """SDD §13.3, §17 (CodeQL py/request-without-cert-validation): the store checks the API
+    server's certificate against the ServiceAccount's CA, or a CA file it is given - no parameter
+    turns the check off."""
+    import httpx
+
+    from seamless_migrate.security import secret_store
+
+    seen: list = []
+    real = httpx.Client
+
+    def client(**kwargs):
+        seen.append(kwargs.get("verify"))
+        return real(base_url=kwargs["base_url"])
+
+    monkeypatch.setattr(secret_store.httpx, "Client", client)
+    given = secret_store.KubernetesSecretStore("ns", token="t", ca_cert="/etc/pki/api-ca.crt")
+    default = secret_store.KubernetesSecretStore("ns", token="t")
+    given._client().close()
+    default._client().close()
+    assert seen == ["/etc/pki/api-ca.crt", str(secret_store.SA_DIR / "ca.crt")]
+    with pytest.raises(TypeError):
+        secret_store.KubernetesSecretStore("ns", token="t", verify=False)

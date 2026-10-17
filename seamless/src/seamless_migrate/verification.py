@@ -105,7 +105,7 @@ async def _tcp_probe(host: str, port: int) -> tuple[bool, str]:
     try:
         await writer.wait_closed()
     except OSError:
-        pass
+        pass  # the probe connected: how the close of its connection ends changes nothing
     return True, f"connected to {host}:{port} in {(time.monotonic() - started) * 1000:.0f} ms"
 
 
@@ -147,7 +147,7 @@ async def _app_probe(host: str, probe: AppProbe) -> ProbeAnswer:
         try:
             await writer.wait_closed()
         except OSError:
-            pass
+            pass  # the probe connected: how the close of its connection ends changes nothing
         return ProbeAnswer("passed", f"connected to {where}", True)
     url = f"{probe.kind}://{_url_host(host)}:{probe.port}{probe.path}"
     try:
