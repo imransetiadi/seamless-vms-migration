@@ -19,7 +19,7 @@ import re
 import signal
 import sys
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1407,7 +1407,7 @@ class AnsibleExecutor:
         return deleted
 
     async def _delete_kit_volumes(
-        self, ctx: StepContext, dst: Any, server_id: str | None
+        self, ctx: StepContext, dst: Any, server_id: str | None, kept: Collection[str] = ()
     ) -> list[str]:
         """Delete the kit's volumes of the VM that its next run would take as this VM's own (SDD
         §7.2, review RV28-01): the kit finds a VM's volume by its name, ``<kit name>-<disk key>``,
@@ -1416,7 +1416,8 @@ class AnsibleExecutor:
         again - and onto any other a vmware_cold run refuses to copy. A vmware_warm volume not
         converted stays: the next pass syncs it by CBT. The destination's conversion host holding
         one is the kit's copy a cut-off run left: detached first (review RV29-02). A volume
-        another server holds is never deleted, nor any of a VM without a kit name."""
+        another server holds is never deleted, nor one of ``kept`` - what a server found only by
+        name held (review RV29-03) -, nor any of a VM without a kit name."""
         m = ctx.migration
         kit = kit_vm_name(m.vm.name)
         if not kit:
@@ -1427,6 +1428,8 @@ class AnsibleExecutor:
         for volume in await dst.volumes():
             metadata = volume.get("metadata") or {}
             if not own.fullmatch(str(volume.get("name") or "")) or metadata.get("osm") != "true":
+                continue
+            if str(volume["id"]) in kept:
                 continue
             holders = [str(holder) for holder in volume.get("attachments") or []]
             if any(holder != server_id for holder in holders):
@@ -1479,11 +1482,20 @@ class AnsibleExecutor:
         try:
             dst = self.providers.get(ctx.destination)
             server_id = m.destination_server_id
+            kept: set[str] = set()
             if server_id is None and m.downtime_started_at is not None:
                 # the kit records nothing in the control plane before the cutover powers the
                 # VM off; a same-named server after that point was created by this migration
                 # (_refuse_name_collision ruled out a pre-existing one before the attempt)
                 server_id = await dst.find_server(kit_vm_name(vm.name))
+                if server_id:
+                    # it may be another plan's VM the kit names alike (owner question q26): what
+                    # it holds stays, its deletion detaching it notwithstanding (review RV29-03)
+                    kept = {
+                        str(v["id"])
+                        for v in await dst.volumes()
+                        if str(server_id) in map(str, v.get("attachments") or [])
+                    }
             if server_id:
                 await dst.delete_server(server_id)
             deleted_ports = await self._delete_kit_ports(dst, vm.nics, vm.name)
@@ -1491,7 +1503,9 @@ class AnsibleExecutor:
             # Cinder will not delete fails the attempt, which a retry repeats with the source
             # running (SDD §7.2, §8, review RV29-01)
             await self.providers.get(ctx.source).power_on(vm.source_id)
-            deleted_volumes = await self._delete_kit_volumes(ctx, dst, server_id)
+            deleted_volumes = await self._delete_kit_volumes(
+                ctx, dst, m.destination_server_id, kept
+            )
         except ProviderError as exc:
             raise TransientStepError(f"rollback: {exc}") from exc
         return StepResult(

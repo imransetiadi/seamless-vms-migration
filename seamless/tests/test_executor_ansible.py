@@ -98,6 +98,10 @@ class FakeImpl:
 
     async def delete_server(self, server_id):
         self.calls.append(("delete_server", server_id))
+        # as Nova: the server's volumes are detached with it (the kit's keep: no delete on
+        # termination)
+        for volume in self.registry.volumes:
+            volume["attachments"] = [s for s in volume.get("attachments", []) if s != server_id]
 
     async def power_on(self, source_id):
         self.calls.append(("power_on", source_id))
@@ -3082,6 +3086,36 @@ async def test_a_vmware_rollback_detaches_the_kits_copy_from_its_conversion_host
     assert result.details["deleted_volumes"] == (["cut-off-copy"] if deleted else [])
     kept = [v for v in env.registry.volumes if v["id"] == "cut-off-copy"]
     assert kept == ([] if deleted else [{**kept[0], "attachments": []}])
+
+
+@pytest.mark.parametrize("recorded", [False, True])
+async def test_a_vmware_rollback_keeps_what_a_server_found_only_by_name_held(env, recorded):
+    """SDD §7.2 (review RV29-03, owner question q26): with no recorded server and the clock open,
+    the rollback deletes the server it finds by the VM's kit name - possibly another plan's VM the
+    kit names alike, cut over into the same project meanwhile. What that server held before its
+    deletion stays: the other plan's migration keeps its disks, a later kit run refuses them and a
+    second rollback, finding no server holding them, deletes them. A server the migration
+    recorded is its own: what it held is deleted."""
+    env.registry.existing = {"web_01"}  # found by the kit's name of web_01
+    env.registry.volumes = [kit_volume("root", "web_01-2000", attachments=["dst-web_01"])]
+    kw = {"destination_server_id": "dst-web_01"} if recorded else {}
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web_01",
+        downtime_started_at=utcnow(),
+        **kw,
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["deleted_server"] == "dst-web_01"
+    assert result.details["deleted_volumes"] == (["root"] if recorded else [])
+    if recorded:
+        return
+    # a second rollback: no server holds the volume any more - deleted
+    env.registry.existing = set()
+    again = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert (again.details["deleted_server"], again.details["deleted_volumes"]) == (None, ["root"])
 
 
 async def test_a_vmware_rollback_deletes_no_volume_of_a_vm_without_a_kit_name(env):
