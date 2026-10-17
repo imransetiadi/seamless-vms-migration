@@ -108,6 +108,27 @@ def test_the_finding_catalog_is_the_one_the_dashboards_mock_reads():
     } == shared
 
 
+def test_the_qasuite_counts_the_mocks_codes_and_the_shared_finding_cases():
+    """docs/QASuite.md FR-04 states how many of the catalog's codes the dashboard's offline mock
+    implements and how many shared finding cases hold its messages to the API's - as the suite
+    is, not as it was (CLAUDE.md §8.2, review RV28-05)."""
+    root = Path(__file__).resolve().parents[2]
+    row = next(
+        line
+        for line in (root / "docs" / "QASuite.md").read_text(encoding="utf-8").splitlines()
+        if line.startswith("| FR-04 |")
+    )
+    implemented, total = map(int, re.search(r"\((\d+) of its (\d+) codes", row).groups())
+    shared = int(re.search(r"`mockData\.test\.ts`; (\d+) cases:", row).group(1))
+    mock = (root / "dashboard" / "src" / "api" / "mockData.ts").read_text(encoding="utf-8")
+    named = {code for code in CATALOG if re.search(f"['\"`]{re.escape(code)}['\"`]", mock)}
+    assert (implemented, total, shared) == (
+        len(named),
+        len(CATALOG),
+        len(ELIGIBILITY_CASES["finding_cases"]),
+    )
+
+
 def test_catalog_is_complete():
     assert set(CATALOG) == {
         "SRC_VM_ERROR_STATE",
