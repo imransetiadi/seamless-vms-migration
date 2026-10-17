@@ -1333,10 +1333,63 @@ async def test_a_handover_rollback_whose_source_stop_does_not_end_fails_to_be_re
         await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
     executor.wait_s = 0.5
     started = time.monotonic()
-    with pytest.raises(TransientStepError, match="stop of server srv-1 to end"):
+    with pytest.raises(TransientStepError, match="stop or start of server srv-1 to end"):
         await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert time.monotonic() - started < 4
     assert ("src", "start_server", "srv-1") not in calls
+
+
+async def test_a_handover_rollback_retried_while_its_start_still_runs_completes(tmp_path):
+    """SDD §7.3 rollback (review RV29-06): Nova starts a server with its task_state powering-on
+    while the server still reads SHUTOFF, and refuses a second start meanwhile with 409. The
+    rollback's start was accepted, then its wait for ACTIVE met a 503 and the attempt is retried:
+    the retry waits for the start that runs instead of sending a second one, which Nova's 409
+    would fail for good while the source boots."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    src.crash_wait = "server"  # the stop's wait dies after the stop was sent
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    server = src.servers["srv-1"]
+    assert server.status == "SHUTOFF"
+    server.task_state = None
+    lock, blips = threading.Lock(), [1]
+    nova = "https://nova.dc1.example:8774/v2.1/servers/srv-1/action"
+
+    def start_server(s):
+        with lock:
+            if s.status != "SHUTOFF" or s.task_state is not None:
+                message = f"Cannot 'start' instance srv-1 while it is in task_state {s.task_state}"
+                body = f'{{"conflictingRequest": {{"code": 409, "message": "{message}"}}}}'
+                raise sdk_error(409, "Conflict", body.encode(), url=nova)
+            src.record("start_server", s.id)
+            s.task_state = "powering-on"  # vm_state stopped: the status stays SHUTOFF
+
+        def boots():
+            time.sleep(0.5)  # Nova reconnects the volumes and powers the guest on
+            with lock:
+                s.status, s.task_state = "ACTIVE", None
+
+        threading.Thread(target=boots, daemon=True).start()
+
+    def wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        if status == "ACTIVE" and blips[0] > 0:
+            blips[0] -= 1
+            raise sdk_error(503, "Service Unavailable", url=nova)  # nova-api blips meanwhile
+        deadline = time.monotonic() + min(wait, 20)
+        while s.status != status:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"Timeout waiting for the server to transition to {status}")
+            time.sleep(0.02)
+        return s
+
+    src.compute.start_server, src.compute.wait_for_server = start_server, wait_for_server
+    with pytest.raises(TransientStepError, match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details == {"source_running": True}
+    assert server.status == "ACTIVE"
+    assert [c for c in calls if c[1] == "start_server"] == [("src", "start_server", "srv-1")]
 
 
 async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):

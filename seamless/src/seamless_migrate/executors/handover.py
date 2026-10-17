@@ -266,6 +266,12 @@ def _stopping(server: Any) -> bool:
     return str(_attr(server, "task_state") or "").lower() == "powering-off"
 
 
+def _powering(server: Any) -> bool:
+    """Nova powers the server off or on: its task state while a stop runs (the status still
+    ACTIVE) or a start runs (the status still SHUTOFF); it refuses a stop or a start meanwhile."""
+    return str(_attr(server, "task_state") or "").lower() in ("powering-off", "powering-on")
+
+
 def _stopped(server: Any) -> bool:
     return str(_attr(server, "status", "")).upper() == "SHUTOFF"
 
@@ -1667,12 +1673,16 @@ class HandoverExecutor:
     def _start(self, conn: Any, server_id: str) -> None:
         server = conn.compute.get_server(server_id)
         deadline = time.monotonic() + self.wait_s
-        while _stopping(server):
-            # Nova still powers the guest off: the server reads ACTIVE until it is down, and a
-            # start is refused until then. Wait until the stop ended - SHUTOFF, or ACTIVE again
-            # when Nova gave the power-off up - then start it unless it runs (RV26-01, RV27-04)
+        while _powering(server):
+            # Nova still powers the guest off - the server reads ACTIVE until it is down - or on
+            # - it reads SHUTOFF until it runs (an earlier attempt's start) -, and refuses a start
+            # meanwhile. Wait until that ended - SHUTOFF, or ACTIVE again when Nova gave the
+            # power-off up, ACTIVE once it booted - then start it unless it runs (RV26-01,
+            # RV27-04, RV29-06)
             if time.monotonic() > deadline:
-                raise TimeoutError(f"Timeout waiting for the stop of server {server_id} to end")
+                raise TimeoutError(
+                    f"Timeout waiting for the stop or start of server {server_id} to end"
+                )
             time.sleep(self.poll_s or 0.1)
             server = conn.compute.get_server(server_id)
         if str(_attr(server, "status", "")).upper() != "ACTIVE":
