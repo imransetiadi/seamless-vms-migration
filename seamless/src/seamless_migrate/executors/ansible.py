@@ -40,6 +40,7 @@ from ..domain.models import (
     next_pass_number,
     utcnow,
 )
+from ..planning.kit import kit_vm_name
 from ..planning.networks import (
     kit_ipv4,
     kit_network_key,
@@ -71,29 +72,10 @@ from .base import (
 log = logging.getLogger(__name__)
 
 KIT_PLAYBOOK = "os_migrate.vmware_migration_kit.migration"
+
+
 #: the migration kit's transliteration table (SafeVmName in plugins/module_utils/utils.go of the
 #: pinned 2.2.7), as the kit has it
-_KIT_TRANSLITERATIONS = {
-    **dict(zip("áéíóúÁÉÍÓÚñÑüÜ", "aeiouAEIOUnNuU", strict=True)),
-    **dict(zip("ãõàâêôçÃÕÀÂÊÔÇ", "aoaaeocAOAAEOC", strict=True)),
-    **dict(zip("èëîïùûÈËÎÏÙÛ", "eeiiuuEEIIUU", strict=True)),
-    **{"æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ß": "ss"},
-    **dict(zip("äöÄÖìòÌÒ", "aoAOioIO", strict=True)),
-    **dict.fromkeys("·\u2019\u2013\u2014\u00a0", "_"),
-}
-
-
-def kit_vm_name(name: str) -> str:
-    """The VM's name as the migration kit writes it into every name it gives - its destination
-    server, the prefix of its ports (SDD §7.2): transliterated, every other character outside
-    [A-Za-z0-9_-] written ``_``, runs of ``_`` and of ``-`` collapsed, cut to 64 characters, its
-    trailing ``_`` and ``-`` removed (SafeVmName of the pinned kit 2.2.7)."""
-    safe = "".join(_KIT_TRANSLITERATIONS.get(ch, ch) for ch in name)
-    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", safe)
-    safe = re.sub(r"-+", "-", re.sub(r"_+", "_", safe))
-    return safe[:64].rstrip("_-")
-
-
 def destination_server_name(m: Migration) -> str:
     """The name the migration's destination server gets: the VM's own from os-migrate, the kit's
     name of it from the VMware migration kit (SDD §7.2)."""

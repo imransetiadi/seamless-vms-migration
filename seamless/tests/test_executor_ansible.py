@@ -2748,7 +2748,7 @@ KIT_NAMES = json.loads((Path(__file__).parent / "fixtures" / "kit_vm_name_cases.
 def test_kit_vm_name_names_a_vm_as_the_migration_kit_does(name):
     """SDD §7.2: the kit (2.2.7) writes a VM's name into every name it gives through its
     SafeVmName; the expected names are SafeVmName's own outputs (audit EX-07, EX-18)."""
-    from seamless_migrate.executors.ansible import kit_vm_name
+    from seamless_migrate.planning.kit import kit_vm_name
 
     assert kit_vm_name(name) == KIT_NAMES["cases"][name]
 
