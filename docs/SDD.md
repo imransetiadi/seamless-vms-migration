@@ -2446,7 +2446,10 @@ neither replacement splits the other (a VM `dc3` replaced first left `jakarta-[v
 descriptor it holds never go through it: a provider named `RHOSO` made "moving to RHOSO 18.0 18.0?" (review RV21-10). The input snapshot (§14.5) is what is sent.
 
 The control plane uses the same `redact` for the text it publishes from outside sources: step and
-provider error messages and every `migration.log` line (§4). Where it cuts such text, it redacts first,
+provider error messages, every `migration.log` line (§4), and agentmemory's search hits - an outside service that
+agents write too - redacted as they arrive, title and content, before anything cuts or publishes them: what
+`POST /advisor/similar-incidents` answers, and the `similar_incidents` a recommendation and a failure's note keep
+(§14.3, §14.4; audit AP-05). Where it cuts such text, it redacts first,
 over the cut plus 16384 characters, and cuts after (`redact_cut(text, limit)`): a secret the cut splits
 — a PEM block, a URL with credentials — is still found, at a bounded cost. The cuts: a `migration.log`
 line at 2000 characters (§4), the failing output line in an Ansible step's error at 500, a provider
