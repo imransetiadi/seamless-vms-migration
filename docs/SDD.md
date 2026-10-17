@@ -1159,7 +1159,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 ### 7.2 AnsibleExecutor (`executors/ansible.py`)
 
 * Run directory: `{data_dir}/plans/{plan_id}/migrations/{migration_id}/` with its own
-  `os_migrate_data_dir` (`osm/`) so concurrent migrations never share `workloads.yml`.
+  `os_migrate_data_dir` (`osm/`) so concurrent migrations never share `workloads.yml`, and the VMware rollback's
+  `rollback-kept.json` (below).
   Plan-level prestage uses `{data_dir}/plans/{plan_id}/osm/`.
 * Secrets: `secrets.yml` (mode 0600) holds `os_migrate_src_auth`/`os_migrate_dst_auth` (resolved
   from the providers' `cloud` entries, §13.3) and is deleted in a `finally` block together with the
@@ -1396,7 +1397,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   never deleted, nor is any volume when the VM has no kit name (`SRC_VM_NAME_UNUSABLE`, §9.3). The server the rollback
   deletes counts as this migration's only when the migration recorded it: one found by the kit's name may be another
   plan's VM the kit names alike (owner question q26), so what it held before its deletion - read from Nova's record of
-  it (`server_volumes`), as no Cinder call comes before the power-on - is kept - a later kit run
+  it (`server_volumes`), as no Cinder call comes before the power-on, and recorded in the run directory
+  (`rollback-kept.json`, written and synced before the deletion) so that an attempt retried or resumed after it,
+  which finds no server any more, keeps it too until a rollback succeeds and removes the record (review RV30-05) -
+  is kept - a later kit run
   refuses such a volume, and a second rollback, which finds no server holding it, deletes it (review RV29-03). A
   volume Cinder does not delete fails the attempt, which is retried: the source already runs, and the power-on does
   nothing to a running VM - the destination's clean-up never keeps the source stopped (§8, review RV29-01). Only the
