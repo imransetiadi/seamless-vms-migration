@@ -1402,7 +1402,13 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   Not when the migration recorded its destination server: the kit created that server from every kit volume of the
   VM, and its guest may have written to each - a journal replay, a database's crash recovery, days of service -,
   which a CBT sync, copying only what the source changed, never undoes; with a recorded server the rollback deletes
-  every kit volume of the VM, converted or not, so the next pass copies them in full (review RV30-02). A marked
+  every kit volume of the VM, converted or not, so the next pass copies them in full (review RV30-02). Whenever a
+  server booted from the kit's volumes - the one the migration recorded, or one found by the kit's name, by this
+  attempt or by an earlier one (`rollback-kept.json`, below) -, the rollback marks each kit copy of the VM still
+  marked `seamless_copied` `true` as `cutover` (below) right after the power-on, before it deletes any port or
+  volume: what it then cannot delete (Cinder refuses a volume with a snapshot) or keeps (what a server found only by
+  name held) is no completed copy for any later run, nor is a copy a cutover of an earlier build left marked (review
+  RV32A-01); a marking that fails fails the attempt, with the source running. A marked
   volume in an error state Cinder cannot attach (`error`, `error_restoring`, `error_extending`, `error_managing`)
   goes too, here and before a run (below): every later pass would fail at its attach (review RV30-07). A volume
   the destination's conversion host holds is the kit's own copy, left attached when a cutover was cut off inside the
