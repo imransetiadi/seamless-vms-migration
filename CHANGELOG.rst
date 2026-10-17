@@ -542,4 +542,7 @@ This project follows a simple changelog to satisfy collection metadata validatio
 - A warm pass whose record of a new destination volume cannot be written (a
   full disk) deletes that volume, once Cinder settled it, before it fails, as
   the cold transfer does. Before, no record named the volume, so no rollback
-  ever deleted it and the guest's data stayed in the tenant.
+  ever deleted it and the guest's data stayed in the tenant. A volume an
+  earlier pass extended to the source's grown size but could not record is
+  recorded at the size Cinder reports, rather than extended again to the size
+  it has, which Cinder refused on every later pass.

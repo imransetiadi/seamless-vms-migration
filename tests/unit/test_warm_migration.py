@@ -622,6 +622,49 @@ def test_a_destination_volume_whose_record_cannot_be_written_is_deleted(tmp_path
     assert scenario.state().dest_volumes == {}
 
 
+def test_a_volume_extended_without_its_record_is_recorded_not_extended_again(tmp_path):
+    """Seamless Migrate SDD 6.3 (review RV29-07): a pass extends a destination volume to the
+    source's grown size, then records it. When that record cannot be written (a full disk), Cinder
+    holds the volume at the new size while the state file keeps the old one; the next pass reads
+    the size Cinder reports and records it - an extend to the size the volume has would be
+    refused by Cinder ("New size for extend must be greater than current size") on every pass."""
+    import errno
+
+    scenario = Scenario(tmp_path)
+    scenario.run_pass("uuid-1")
+    data_id = scenario.state().dest_volumes["/dev/vdb"]["dest_id"]
+    scenario.src.volumes["vol-data"].size = 15  # grown between passes
+    dst = scenario.dst
+    extend = dst.block_storage.extend_volume
+
+    def cinder_extend(volume, size):
+        current = dst.volumes[volume.id].size
+        if int(size) - current <= 0:
+            raise RuntimeError(
+                "BadRequestException: 400: Invalid input received: New size for extend must be "
+                "greater than current size. (current: %s, extended: %s)." % (current, size)
+            )
+        return extend(volume, size)
+
+    dst.block_storage.extend_volume = cinder_extend
+    save = WarmState.save
+
+    def full_disk(state, *args, **kwargs):
+        if (state.dest_volumes.get("/dev/vdb") or {}).get("size") == 15:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return save(state, *args, **kwargs)
+
+    with mock.patch.object(WarmState, "save", full_disk), pytest.raises(OSError, match="space"):
+        scenario.run_pass("uuid-2")
+    assert dst.volumes[data_id].size == 15  # extended at Cinder ...
+    assert scenario.state().dest_volumes["/dev/vdb"]["size"] == 10  # ... recorded at 10
+
+    scenario.run_pass("uuid-3")  # the disk has room again
+
+    assert scenario.state().dest_volumes["/dev/vdb"]["size"] == 15
+    assert len(scenario.state().passes) == 2
+
+
 def test_sync_destination_volumes_match_cold_path_params(tmp_path):
     scenario = Scenario(tmp_path)
     scenario.data["_migration_params"]["boot_volume_params"]["description"] = "boot copy"

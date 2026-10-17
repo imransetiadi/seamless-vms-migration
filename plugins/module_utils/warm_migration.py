@@ -812,7 +812,14 @@ class OpenstackWarmSync(_WarmVolumeBase):
                         # a pass interrupted while Cinder created it
                         volume = self._wait_volume_available(volume)
                     if source["size"] and source["size"] > recorded["size"]:
-                        self._extend_dest_volume(dev, volume, source["size"])
+                        if (getattr(volume, "size", None) or 0) >= source["size"]:
+                            # an earlier pass extended it but could not record it (a full disk):
+                            # recorded now, never extended again to the size it has, which Cinder
+                            # refuses (Seamless Migrate SDD 6.3, review RV29-07)
+                            self.state.dest_volumes[dev]["size"] = int(volume.size)
+                            self.state.save()
+                        else:
+                            self._extend_dest_volume(dev, volume, source["size"])
                     if recorded.get("bootable"):
                         # set again: a pass interrupted between the create and the flag
                         # left it unset, and Nova refuses to boot from such a volume
