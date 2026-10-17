@@ -275,13 +275,15 @@ def _conflict(exc: BaseException) -> bool:
     return (getattr(exc, "status_code", None) or getattr(exc, "http_status", None)) == 409
 
 
-def _backend_name(extra_specs: dict[str, Any]) -> str | None:
-    """The backend a Cinder volume type asks for in its extra specs, as the scheduler's
-    CapabilitiesFilter reads it: ``volume_backend_name``, also scoped ``capabilities:``."""
-    name = extra_specs.get("volume_backend_name") or extra_specs.get(
-        "capabilities:volume_backend_name"
-    )
-    return str(name) if name else None
+def _backend_specs(extra_specs: dict[str, Any]) -> list[str | None]:
+    """Every spec of a Cinder volume type on the backend's name - ``volume_backend_name``, also
+    scoped ``capabilities:`` - as the scheduler's CapabilitiesFilter matches each of them: an
+    empty or null one too, which no backend's name satisfies (review RV28-02)."""
+    return [
+        None if extra_specs[key] is None else str(extra_specs[key])
+        for key in ("volume_backend_name", "capabilities:volume_backend_name")
+        if key in extra_specs
+    ]
 
 
 def _boolean(text: Any) -> bool:
@@ -635,7 +637,7 @@ class HandoverExecutor:
         # the backend each destination volume type asks for (step 6's manage, audit EX-10)
         type_backends = (
             {
-                str(_attr(t, "name")): _backend_name(_attr(t, "extra_specs", default={}) or {})
+                str(_attr(t, "name")): _backend_specs(_attr(t, "extra_specs", default={}) or {})
                 for t in dst.block_storage.types()
             }
             if plan is not None
@@ -674,12 +676,16 @@ class HandoverExecutor:
                             vtype = (mappings or plan.mappings).volume_types.get(
                                 att["volume_type"] or "", att["volume_type"]
                             )
-                            wanted = type_backends.get(vtype or "")
                             have = (dst_pools.get(dst_host) or {}).get("volume_backend_name")
-                            if wanted and have and not cinder_spec_matches(have, wanted):
+                            refusing = [
+                                spec
+                                for spec in type_backends.get(vtype or "") or []
+                                if not cinder_spec_matches(have, spec)
+                            ]
+                            if have and refusing:
                                 problems.append(
                                     f"volume {vid}: {cloud}'s volume type {vtype!r} asks for the "
-                                    f"backend {wanted!r}, but step 6 manages the volume on "
+                                    f"backend {refusing[0]!r}, but step 6 manages the volume on "
                                     f"{dst_host}, whose backend is {have!r}: Cinder's scheduler "
                                     "would refuse it - map the volume type to a type of that "
                                     "backend, or its backend to the type's"

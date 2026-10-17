@@ -2237,6 +2237,58 @@ async def test_handover_refuses_before_stop_a_volume_type_the_pool_cannot_hold(
 
 
 @pytest.mark.parametrize(
+    ("specs", "refused_by"),
+    [
+        # Cinder's CapabilitiesFilter takes the pool only when every backend spec matches it
+        (
+            {
+                "volume_backend_name": "<or> ceph-hdd <or> ceph-ssd",
+                "capabilities:volume_backend_name": "ceph-ssd",
+            },
+            "ceph-ssd",
+        ),
+        (
+            {"volume_backend_name": "ceph-hdd", "capabilities:volume_backend_name": "<in> ssd"},
+            "<in> ssd",
+        ),
+        # an empty or null spec - the Cinder API accepts both - matches no backend
+        ({"volume_backend_name": "", "capabilities:volume_backend_name": "ceph-hdd"}, ""),
+        ({"volume_backend_name": None, "capabilities:volume_backend_name": "ceph-hdd"}, None),
+        # both match: the handover goes ahead
+        (
+            {"volume_backend_name": "<in> ceph", "capabilities:volume_backend_name": "ceph-hdd"},
+            False,
+        ),
+    ],
+)
+async def test_handover_refuses_a_volume_type_any_backend_spec_of_which_the_pool_fails(
+    tmp_path, specs, refused_by
+):
+    """SDD §7.3 step 0 (review RV28-02): a volume type asks for its backend with
+    volume_backend_name and with capabilities:volume_backend_name, and Cinder's scheduler takes
+    the pool only when each of them matches - step 0 matches every one, so the type one of them
+    refuses is refused while the VM runs, not at step 6 after the source server was deleted."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].pools = [
+        ("hostgroup@ceph-ssd#ssd", {**CEPH, "volume_backend_name": "ceph-ssd"}),
+        ("hostgroup@ceph-hdd#hdd", {**CEPH, "volume_backend_name": "ceph-hdd"}),
+    ]
+    clouds["dst"].type_specs = {"rbd-hdd": specs}
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    if refused_by is False:
+        assert (await executor.run(StepName.CUTOVER, ctx)).destination_server_id
+        return
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refusal:
+        await executor.run(StepName.CUTOVER, ctx)
+    assert (
+        f"volume vol-data: RHOSO 18.0's volume type 'rbd-hdd' asks for the backend "
+        f"{refused_by!r}, but step 6 manages the volume on hostgroup@ceph-hdd#hdd, whose backend "
+        "is 'ceph-hdd'"
+    ) in str(refusal.value)
+    assert calls == [] and rec.downtime_marks == 0
+
+
+@pytest.mark.parametrize(
     ("value", "spec", "matches"),
     [
         # no operator: the whole spec, as it is written
