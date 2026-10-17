@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -38,6 +39,21 @@ def find_repo_root(start: Path | None = None) -> Path:
         if (candidate / "galaxy.yml").is_file():
             return candidate
     return Path.cwd()
+
+
+def _browser_origin(scheme: str, host: str, port: int | None) -> str | None:
+    """An origin as a browser serializes it: the host lower-cased and in punycode, an IPv6
+    address written canonically, no default port (SDD §15.1); None for a host it cannot write."""
+    try:
+        address = ipaddress.ip_address(host)
+        host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    except ValueError:
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return None
+    default = {"http": 80, "https": 443}.get(scheme)
+    return f"{scheme}://{host}" if port in (None, default) else f"{scheme}://{host}:{port}"
 
 
 class Settings(BaseModel):
@@ -120,6 +136,15 @@ class Settings(BaseModel):
             ):
                 raise ValueError(
                     f"{origin!r} is not an origin (scheme://host[:port], no path; never '*')"
+                )
+            # the comparison is exact: an origin written otherwise than the browser sends it would
+            # start the server and allow nothing (SDD §15.1, review RV27-08)
+            sent = _browser_origin(parts.scheme, parts.hostname, parts.port)
+            if origin != sent:
+                raise ValueError(
+                    f"{origin!r} is not an origin as a browser sends it: write {sent!r}"
+                    if sent
+                    else f"{origin!r} is not an origin a browser sends"
                 )
         return origins
 

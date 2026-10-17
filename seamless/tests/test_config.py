@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -88,6 +89,27 @@ def test_settings_ansible_host_key_checking_is_off_by_default_and_can_be_turned_
     assert on.ansible_host_key_checking is True
     off = Settings.from_env({"SEAMLESS_ANSIBLE_HOST_KEY_CHECKING": "false"})
     assert off.ansible_host_key_checking is False
+
+
+@pytest.mark.parametrize(
+    ("configured", "browser_sends"),
+    [
+        ("https://Dashboard.Example.com", "https://dashboard.example.com"),
+        ("https://dashboard.example.com:443", "https://dashboard.example.com"),
+        ("http://dashboard.example.com:80", "http://dashboard.example.com"),
+        ("http://[0:0:0:0:0:0:0:1]:5173", "http://[::1]:5173"),
+        ("https://b\u00fccher.example", "https://xn--bcher-kva.example"),
+    ],
+)
+def test_a_cors_origin_is_written_as_a_browser_sends_it(configured, browser_sends):
+    """SDD §15.1 (review RV27-08): each entry of SEAMLESS_CORS_ORIGINS is one origin as a browser
+    sends it - the host lower-cased and in punycode, an IPv6 address written canonically, no
+    default port - since the comparison is exact: any other spelling would start the server and
+    silently allow nothing. It is refused, naming the spelling the browser sends; that one is
+    taken."""
+    with pytest.raises(ValueError, match=re.escape(f"write '{browser_sends}'")):
+        Settings(cors_origins=[configured])
+    assert Settings(cors_origins=[browser_sends]).cors_origins == [browser_sends]
 
 
 @pytest.mark.parametrize(
