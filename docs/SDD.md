@@ -745,6 +745,10 @@ gets the file:
   "destination_server_id": null }
 ```
 
+A warm pass records each destination volume it creates (`dest_volumes`) as soon as Cinder accepted it, before it
+waits for it; a volume whose record cannot be written (a full disk) is deleted, once Cinder settled it, before the pass
+fails - no record would name it for a rollback (audit A-05).
+
 The cold import (`import_workloads.yml`, §6.5) writes the same file for a workload it copies, with no pass: the
 volumes its transfer created (`dest_volumes`, each with the `dest_id`, `size`, `bootable` and `name` the warm path
 records, from the transfer's `volume_map` — never a volume it did not create, as with `data_copy: false`) each as
