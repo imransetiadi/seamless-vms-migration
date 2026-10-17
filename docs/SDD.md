@@ -500,7 +500,11 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
 * Single-shot strategies (`cold`, `storage_handover`, `vmware_cold`): `ready → cutover → verifying
   → completed`.
 * **Downtime clock:** `downtime_started_at` is set when the executor stops the source VM
-  (`StepContext.mark_downtime_start()`), `downtime_ended_at` when verification passes or, on
+  (`StepContext.mark_downtime_start()`) and announced by `migration.downtime_started`. A cancel of the step (the step
+  timeout, a rollback request, a shutdown) that lands while the clock is being opened takes effect once the clock is
+  saved and its event written, so an open clock is never left unannounced; the clock is saved first, so a store error
+  on the event never leaves a source that may be stopped without its clock (review RV26-06). `downtime_ended_at` is
+  set when verification passes or, on
   rollback, when the source VM is running again. A verification that passes again — the first one was saved,
   but a stop or a failed event write came before `completed` — keeps the end and the downtime the first one
   recorded: the outage ended then. `actual_downtime_s` = difference — except in demo mode (§7.4),
