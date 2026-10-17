@@ -510,6 +510,29 @@ class VMwareProvider:
 
         return bool(await self._run(work))
 
+    async def disk_keys(self, source_id: str) -> list[int]:
+        """The keys of the VM's disks in vCenter's device order - ``config.hardware.device``, as the
+        migration kit reads them to choose the disk it converts first (SDD §7.2, §10, reviews
+        RV32A-01, RV32A-02)."""
+
+        def work(content: Any, vim: Any) -> list[int]:
+            direct = self._find_by_uuid(content, source_id)
+            candidates = (
+                [direct] if direct is not None else self._objects(content, vim, "VirtualMachine")
+            )
+            for vm in candidates:
+                config = getattr(vm, "config", None)
+                if (getattr(config, "instanceUuid", None) or getattr(vm, "_moId", None)) != (
+                    source_id
+                ):
+                    continue
+                devices = getattr(getattr(config, "hardware", None), "device", None) or []
+                disk_cls = vim.vm.device.VirtualDisk
+                return [int(d.key) for d in devices if isinstance(d, disk_cls)]
+            raise ProviderError(f"{self.provider.id}: VM {source_id!r} not found")
+
+        return list(await self._run(work))
+
     async def inventory(self) -> SourceInventory:
         def work(content: Any, vim: Any) -> SourceInventory:
             networks = {str(n.name): None for n in self._objects(content, vim, "Network")}

@@ -1349,6 +1349,33 @@ async def test_vmware_tells_whether_vcenter_recorded_a_power_on_since_a_time(tmp
         await provider.powered_on_since("missing", since)
 
 
+async def test_vmware_lists_a_vms_disk_keys_in_vcenters_device_order(tmp_path):
+    """SDD §7.2, §10 (reviews RV32A-01, RV32A-02): disk_keys answers the keys of the VM's disks in
+    vCenter's device order - config.hardware.device, as the migration kit reads them to choose the
+    disk it converts first -, never sorted, and no other device's."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = fake_vcenter_vm()
+    first, second, nic = vm.config.hardware.device
+    vm.config.hardware.device = [second, nic, first]  # vCenter lists the higher key first
+    provider = provider_for_plain(tmp_path, vm)
+    assert await provider.disk_keys("5012-abcd") == [2001, 2000]
+    with pytest.raises(ProviderError, match="not found"):
+        await provider.disk_keys("missing")
+
+
+async def test_the_demo_source_lists_its_vms_disk_keys_as_vcenter_numbers_them():
+    """SDD §10: the demo's VMware VMs answer disk_keys as vCenter numbers a VM's disks, from 2000
+    in their order - the names the kit gives their volumes (SDD §7.2)."""
+    source = FakeSourceProvider(ProviderKind.vmware, seed=42)
+    for vm in await source.list_vms():
+        assert await source.disk_keys(vm.source_id) == [2000 + i for i in range(len(vm.disks))]
+    with pytest.raises(VMNotFound):
+        await source.disk_keys("missing")
+
+
 async def test_vmware_get_vm_and_power_on_use_the_uuid_index(tmp_path):
     """One FindByUuid call instead of a walk over every VM in the vCenter."""
     secret_dir = tmp_path / "secrets" / "vcenter-dc2"

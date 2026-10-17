@@ -116,6 +116,13 @@ class FakeImpl:
             raise ProviderError("events: HTTP 503")
         return self.registry.powered_on
 
+    async def disk_keys(self, source_id):
+        """The keys of the VM's disks in vCenter's device order (SDD §10)."""
+        self.calls.append(("disk_keys", source_id))
+        if self.registry.disk_keys is None:
+            raise ProviderError("devices: HTTP 503")
+        return list(self.registry.disk_keys)
+
     async def ports(self, *, network_id=None, mac_address=None, ip_address=None):
         """The destination's ports matching every filter given (SDD §10)."""
         if self.registry.ports_error:
@@ -238,6 +245,8 @@ class FakeRegistry:
         self.source_power = "running"
         # whether vCenter recorded a power-on of it since the clock opened; None: unreadable
         self.powered_on: bool | None = False
+        # its disks' keys in vCenter's device order; None: unreadable
+        self.disk_keys: list[int] | None = [2000, 2001, 2002, 2003]
         # the token's role names the destination inventory reads live; None: it could not
         # (SDD §10, review RV19-01)
         self.roles: list[str] | None = None
@@ -2901,7 +2910,7 @@ def kit_volume(volume_id, name, converted=True, osm=True, attachments=(), copied
     if converted:
         metadata["converted"] = "true"
     if copied:  # the control plane's mark of a vmware_warm copy that completed (SDD §7.2)
-        metadata["seamless_copied"] = "true"
+        metadata["seamless_copied"] = "true" if copied is True else copied
     return {
         "id": volume_id,
         "name": name,
@@ -3409,6 +3418,126 @@ async def test_a_first_copy_cut_off_is_deleted_before_the_next_vmware_warm_run(e
         ("delete_volume", "cut-off-held"),
     ]
     assert {v["id"] for v in env.registry.volumes} == {"copied", "held", "other-vm"}
+
+
+async def test_a_vmware_warm_cutover_marks_its_copies_cutover_right_before_its_kit_run(
+    env, monkeypatch
+):
+    """SDD §7.2 (reviews RV32A-01, RV32A-02): right before a vmware_warm cutover's kit run each kit
+    copy marked completed is marked 'cutover', which no later run or rollback takes as a copy: the
+    run converts a disk in place and boots a server that writes to every one, which no CBT sync
+    undoes. Another VM's copy keeps its mark."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000", converted=False, copied=True),
+        kit_volume("data", "web-01-2001", converted=False, copied=True),
+        kit_volume("other-vm", "db-07-2000", converted=False, copied=True),
+    ]
+    seen = []
+    kit_run = env.executor._execute
+
+    async def run(*args, **kwargs):
+        seen.append({v["id"]: v["metadata"].get("seamless_copied") for v in env.registry.volumes})
+        return await kit_run(*args, **kwargs)
+
+    monkeypatch.setattr(env.executor, "_execute", run)
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert seen == [{"boot": "cutover", "data": "cutover", "other-vm": "true"}]
+
+
+async def test_a_vmware_warm_cutover_whose_copies_cannot_be_marked_never_runs_the_kit(env):
+    """SDD §7.2 (reviews RV32A-01, RV32A-02): a marking that fails fails the cutover as transient
+    before the kit runs - never a cutover over copies a later run would still take as completed."""
+    env.registry.volumes = [kit_volume("data", "web-01-2001", converted=False, copied=True)]
+    env.registry.set_metadata_error = True
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []
+
+
+@pytest.mark.parametrize(
+    "step", [StepName.PRECOPY, StepName.SYNC, StepName.CUTOVER, StepName.ROLLBACK]
+)
+async def test_a_copy_a_cutover_marked_is_deleted_by_a_later_run_or_rollback(env, step):
+    """SDD §7.2 (reviews RV32A-01, RV32A-02): a volume marked 'cutover' is a first copy cut off for
+    every later run and rollback - a pass, a cutover outside the outage, a rollback with no server
+    recorded -: deleted, so the kit copies the disk in full."""
+    env.registry.volumes = [kit_volume("data", "web-01-2001", converted=False, copied="cutover")]
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(step, ctx)
+    assert [c for c in env.registry.calls if c[0] == "delete_volume"] == [("delete_volume", "data")]
+
+
+@pytest.mark.parametrize(
+    ("case", "deleted"),
+    [
+        ("the first disk converted", []),
+        # the kit's fallback converted another disk: the first one's conversion failed
+        ("another disk converted", ["data"]),
+        ("a server of the destination name", ["data"]),
+        ("a server recorded", ["data"]),
+        ("nothing converted", ["boot", "data"]),
+    ],
+)
+async def test_a_cutover_retried_in_the_outage_keeps_its_copies_only_after_a_first_conversion(
+    env, case, deleted
+):
+    """SDD §7.2 (reviews RV32A-01, RV32A-02): a cutover retried inside the same outage keeps the
+    volumes an earlier attempt marked 'cutover' for its CBT sync only when no server booted from
+    them - none recorded, none of the destination server's name - and the kit converted the VM's
+    first disk in vCenter's device order: that conversion succeeded on its first try, so the kit
+    converted no other disk, powered the VM off and only synced the rest. Otherwise they are
+    deleted and copied in full."""
+    first_converted = case != "nothing converted"
+    env.registry.volumes = [
+        kit_volume(
+            "boot",
+            "web-01-2000",
+            converted=first_converted,
+            copied=False if first_converted else "cutover",
+        ),
+        kit_volume("data", "web-01-2001", converted=False, copied="cutover"),
+    ]
+    if case == "another disk converted":
+        env.registry.disk_keys = [2001, 2000]
+    if case == "a server of the destination name":
+        env.registry.existing = {"web-01"}
+    env.registry.source_power = "stopped"
+    recorded = {"destination_server_id": "dst-9"} if case == "a server recorded" else {}
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        nics=VMW_NICS,
+        downtime_started_at=utcnow(),
+        **recorded,
+    )
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)  # the kit ran
+    assert [c[1] for c in env.registry.calls if c[0] == "delete_volume"] == deleted
+
+
+async def test_a_cutover_retried_in_the_outage_that_cannot_read_the_disk_order_is_retried(env):
+    """SDD §7.2 (reviews RV32A-01, RV32A-02): an unanswered read of the VM's disk order is no answer
+    - the cutover fails as transient before it deletes or runs anything."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000"),
+        kit_volume("data", "web-01-2001", converted=False, copied="cutover"),
+    ]
+    env.registry.disk_keys = None
+    env.registry.source_power = "stopped"
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        nics=VMW_NICS,
+        downtime_started_at=utcnow(),
+    )
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []
+    assert not [c for c in env.registry.calls if c[0] == "delete_volume"]
 
 
 @pytest.mark.parametrize("credential", ["admin", "member"])

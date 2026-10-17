@@ -89,6 +89,9 @@ def kit_port_name(vm_name: str) -> re.Pattern[str]:
 
 #: the control plane's mark of a vmware_warm kit copy that completed (SDD §7.2, review RV30-01)
 COPIED = {"seamless_copied": "true"}
+#: its mark once a cutover's kit run may have written to it - no completed copy (SDD §7.2,
+#: reviews RV32A-01, RV32A-02)
+CUTOVER_COPY = {"seamless_copied": "cutover"}
 
 
 def kit_volumes(vm_name: str, volumes: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -112,12 +115,19 @@ def _marked(volume: Mapping[str, Any], key: str) -> bool:
 UNATTACHABLE = frozenset({"error", "error_restoring", "error_extending", "error_managing"})
 
 
-def _resumable(volume: Mapping[str, Any]) -> bool:
+def _cutover_copy(volume: Mapping[str, Any]) -> bool:
+    """Whether a cutover's kit run may have written to the kit volume: its copy mark reads
+    'cutover' (SDD §7.2, reviews RV32A-01, RV32A-02)."""
+    return (volume.get("metadata") or {}).get("seamless_copied") == CUTOVER_COPY["seamless_copied"]
+
+
+def _resumable(volume: Mapping[str, Any], *, cutover: bool = False) -> bool:
     """A kit volume a vmware_warm run syncs onto by CBT: not converted, its copy completed (marked
-    copied) and attachable (SDD §7.2, reviews RV30-01, RV30-07)."""
+    copied) - or, for a cutover retried inside the outage that may keep them, marked by that
+    outage's cutover - and attachable (SDD §7.2, reviews RV30-01, RV30-07, RV32A-01, RV32A-02)."""
     return (
         not _marked(volume, "converted")
-        and _marked(volume, "seamless_copied")
+        and (_marked(volume, "seamless_copied") or (cutover and _cutover_copy(volume)))
         and str(volume.get("status") or "") not in UNATTACHABLE
     )
 
@@ -1085,7 +1095,10 @@ class AnsibleExecutor:
         if strategy in VMWARE and step in (StepName.CUTOVER, StepName.PRECOPY, StepName.SYNC):
             volumes = await self._refuse_stale_kit_volumes(ctx, strategy)
             if strategy == Strategy.vmware_warm:
-                await self._delete_cut_off_kit_copies(ctx, volumes)
+                cutover = step == StepName.CUTOVER and await self._keeps_cutover_copies(
+                    ctx, volumes
+                )
+                await self._delete_cut_off_kit_copies(ctx, volumes, cutover=cutover)
         if strategy == Strategy.cold and step == StepName.CUTOVER:
             await asyncio.to_thread(
                 _ensure_record, osm, ctx.migration.vm.source_id, ctx.migration.vm.name
@@ -1106,6 +1119,8 @@ class AnsibleExecutor:
         if deferred is not None and strategy == Strategy.warm:
             # the role writes it during the pass: an earlier pass's is not this one's (SDD §6.6)
             remove_quietly(refusals_file)
+        if strategy == Strategy.vmware_warm and step == StepName.CUTOVER:
+            await self._mark_cutover_copies(ctx)
         stop_skipped = await self._execute(
             rdir,
             osm,
@@ -1233,19 +1248,20 @@ class AnsibleExecutor:
         )
 
     async def _delete_cut_off_kit_copies(
-        self, ctx: StepContext, volumes: list[dict[str, Any]]
+        self, ctx: StepContext, volumes: list[dict[str, Any]], *, cutover: bool = False
     ) -> None:
         """Before a vmware_warm kit run, delete each first copy cut off: a kit volume of the VM
         neither converted nor marked copied. The kit wrote its changeID before the copy it never
         finished, and would sync onto it only what the source changed since; deleted, the disk is
         copied in full (SDD §7.2, review RV30-01). A marked one Cinder cannot attach goes too
-        (review RV30-07). The destination's conversion host holding one - a killed run's - lets go
-        of it first; one another server holds stays."""
+        (review RV30-07), and one an earlier cutover marked - unless ``cutover``: a cutover retried
+        inside the outage keeps them (reviews RV32A-01, RV32A-02). The destination's conversion host
+        holding one - a killed run's - lets go of it first; one another server holds stays."""
         dst = self.providers.get(ctx.destination)
         host: list[str | None] = []  # looked up once, for the first copy held
         try:
             for volume in volumes:
-                if _marked(volume, "converted") or _resumable(volume):
+                if _marked(volume, "converted") or _resumable(volume, cutover=cutover):
                     continue
                 holders = [str(holder) for holder in volume.get("attachments") or []]
                 if holders:
@@ -1263,6 +1279,50 @@ class AnsibleExecutor:
             raise TransientStepError(
                 f"could not delete a first copy cut off of {ctx.migration.vm.name} in "
                 f"{ctx.destination.label}: {exc}"
+            ) from exc
+
+    async def _keeps_cutover_copies(self, ctx: StepContext, volumes: list[dict[str, Any]]) -> bool:
+        """Whether a vmware_warm cutover retried inside this outage keeps the kit volumes an earlier
+        attempt marked 'cutover' for its CBT sync (SDD §7.2, reviews RV32A-01, RV32A-02): no
+        server booted from them - the migration records none, none carries the destination
+        server's name - and the kit converted the volume of the VM's first disk in vCenter's device
+        order, so that conversion succeeded on its first try: the kit converted no other disk,
+        powered the VM off and then only synced the rest. The refusal before let a converted
+        volume through only with the clock open, the VM off and no power-on of it since."""
+        m = ctx.migration
+        if not source_stopped(m) or m.destination_server_id:
+            return False
+        if not any(_cutover_copy(v) for v in volumes):
+            return False
+        converted = {str(v.get("name")) for v in volumes if _marked(v, "converted")}
+        if not converted:
+            return False
+        try:
+            if await self.providers.get(ctx.destination).find_server(destination_server_name(m)):
+                return False
+            keys = await self.providers.get(ctx.source).disk_keys(m.vm.source_id)
+        except ProviderError as exc:
+            # an unanswered read is no answer: nothing deleted, nothing run (SDD §7.2)
+            raise TransientStepError(
+                f"could not check whether the cutover of {m.vm.name} keeps its copies: {exc}"
+            ) from exc
+        return bool(keys) and f"{kit_vm_name(m.vm.name)}-{keys[0]}" in converted
+
+    async def _mark_cutover_copies(self, ctx: StepContext) -> None:
+        """Right before a vmware_warm cutover's kit run, mark each of the VM's kit copies marked
+        completed 'cutover': the run converts a disk in place and boots a server that writes to
+        every one, which no CBT sync undoes, so no later run or rollback takes them as copies -
+        but a cutover retried inside the outage that may keep them (SDD §7.2, reviews RV32A-01,
+        RV32A-02). A marking that fails fails the cutover as transient, before the kit runs."""
+        dst = self.providers.get(ctx.destination)
+        try:
+            for volume in kit_volumes(ctx.migration.vm.name, await dst.volumes()):
+                if _marked(volume, "seamless_copied"):
+                    await dst.set_volume_metadata(volume["id"], dict(CUTOVER_COPY))
+        except ProviderError as exc:
+            raise TransientStepError(
+                f"could not mark the kit's copies of {ctx.migration.vm.name} in "
+                f"{ctx.destination.label} before its cutover: {exc}"
             ) from exc
 
     async def _mark_kit_copies(self, ctx: StepContext) -> None:

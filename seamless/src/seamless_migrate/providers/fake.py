@@ -371,6 +371,11 @@ class FakeSourceProvider:
         await self.get_vm(source_id)
         return False
 
+    async def disk_keys(self, source_id: str) -> list[int]:
+        # vCenter's keys of the VM's disks, in its device order: 2000 on (SDD §7.2, §10)
+        vm = await self.get_vm(source_id)
+        return [2000 + i for i in range(len(vm.disks))]
+
     async def power_off(self, source_id: str) -> None:
         await self.get_vm(source_id)
         self._power[source_id] = "stopped"
