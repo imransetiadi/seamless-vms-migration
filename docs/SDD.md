@@ -3190,7 +3190,16 @@ is no origin a browser sends (review RV31-03).
   for "The cutover will refuse {n} problem(s): fix it first.", so the approver sees it where the approval is given.
   A rolled-back migration waits for a person too — to fix the cause and retry it, or to cancel it — so Needs
   attention lists it last, after the overdue finalizes: "Rolled back — the source VM runs again", with "Fix the
-  cause, then retry or cancel (operator)".
+  cause, then retry or cancel (operator)". A failed migration is offered only what it can take, alike in Needs
+  attention and its next step: one whose rollback failed after the source ran again — its error from the rollback
+  step (`rollback: …`), its clock closed (§5.2) — "Roll back again to finish the clean-up (operator)"; any other whose
+  source was stopped once "Retry or roll back (operator)", as a cancel is refused once the source was stopped (§5.1);
+  only one never stopped adds the cancel (review RV32A-05). The Roll back dialog says what the rollback of the
+  migration's strategy deletes: `warm` the destination server, its volumes kept for a retry; `cold` the server and
+  the volumes the cold import recorded (§6.3); `storage_handover` hands the volumes back to the source cloud, no data
+  moving (§7.3); `vmware_cold`/`vmware_warm` the server, the kit's ports and the kit's volumes the next attempt
+  cannot reuse — every one once the destination VM ran (§7.2) — and each starts the source VM again (review
+  RV32A-06).
 * Routes: `/` Overview (filtered by the plan in its address, `?plan=`: one that names no plan stays chosen and the page
   says the plan does not exist, with All plans, instead of showing its zeros as all clear; KPI tiles, phase
   distribution, throughput chart, downtime vs SLO,
