@@ -1175,7 +1175,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 
 * Run directory: `{data_dir}/plans/{plan_id}/migrations/{migration_id}/` with its own
   `os_migrate_data_dir` (`osm/`) so concurrent migrations never share `workloads.yml`, and the VMware rollback's
-  `rollback-kept.json` (below).
+  `.seamless/rollback-kept.json` (below) - one level below the guest directories the migration kit creates there,
+  `{run directory}/{VM name}`, so no VM's name is the record's (review RV32A-08).
   Plan-level prestage uses `{data_dir}/plans/{plan_id}/osm/`.
 * Secrets: `secrets.yml` (mode 0600) holds `os_migrate_src_auth`/`os_migrate_dst_auth` (resolved
   from the providers' `cloud` entries, §13.3) and is deleted in a `finally` block together with the
@@ -1424,10 +1425,12 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   deletes counts as this migration's only when the migration recorded it: one found by the kit's name may be another
   plan's VM the kit names alike (owner question q26), so what it held before its deletion - read from Nova's record of
   it (`server_volumes`), as no Cinder call comes before the power-on, and recorded in the run directory
-  (`rollback-kept.json`, written and synced before the deletion) so that an attempt retried or resumed after it,
-  which finds no server any more, keeps it too until a rollback succeeds and removes the record (review RV30-05) -
-  is kept - a later kit run
-  refuses such a volume, and a second rollback, which finds no server holding it, deletes it (review RV29-03). While
+  (`.seamless/rollback-kept.json`, written and synced before the deletion; a `rollback-kept.json` file an earlier build
+  wrote is read too) so that an attempt retried or resumed after it, which finds no server any more, keeps it too until
+  a rollback succeeds and removes the record (review RV30-05) - is kept: a later kit run refuses such a volume, and a
+  second rollback, which finds no server holding it, deletes it (review RV29-03). A record that cannot be read (a
+  damaged file) never keeps the source stopped: what to keep is then unknown, so that attempt deletes no kit volume of
+  the VM, says so in its log, and deletes the server and powers the source on as any other (review RV32A-08). While
   the clock is open the rollback looks the server up by the kit's name even when one is recorded: the recorded one
   may be an earlier attempt's that a failed rollback already deleted - kept recorded, as only a rollback that
   succeeds clears it - while the new attempt's cutover did not record its own (a Nova lookup that failed, a step cut
