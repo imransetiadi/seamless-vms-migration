@@ -462,6 +462,8 @@ class VMwareProvider:
                             "power it on once it is off"
                         )
                     time.sleep(2)
+                if ended.is_set():  # the last read outlived the call: still nothing powered on
+                    raise ProviderError(f"{self.provider.id}: the power-on call ended")
                 task = vm.PowerOnVM_Task()
                 while str(getattr(task.info, "state", "")) not in ("success", "error"):
                     if time.monotonic() > deadline:

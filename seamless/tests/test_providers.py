@@ -2372,6 +2372,54 @@ async def test_a_guest_that_runs_again_ends_the_shutdown_the_provider_remembers(
     assert vm.tasks == [] and clock[0] - started <= 125
 
 
+async def test_a_power_state_read_in_flight_when_the_power_on_call_ends_powers_nothing_on(
+    tmp_path, monkeypatch
+):
+    """SDD §7.2 (review RV29-05): "a call that ended - timed out or cancelled - powers nothing on
+    afterwards". Each power-state read is a vCenter round trip: one still in flight when the call
+    is cancelled answers poweredOff afterwards, and the thread must not then power the VM on
+    behind the back of the call that ended (and of the rollback's retry)."""
+    import asyncio
+    import threading
+    import time as real_time
+
+    from seamless_migrate.providers import vmware as vmw
+
+    real_sleep = real_time.sleep
+    monkeypatch.setattr(
+        vmw, "time", NS(monotonic=real_time.monotonic, sleep=lambda s: real_sleep(0.01))
+    )
+    in_read, answer = threading.Event(), threading.Event()
+    reads = []
+    vm = PoweredOffVM()
+
+    class Runtime:
+        host = NS(name="esx-01.dc2")
+
+        @property
+        def powerState(self):  # noqa: N802 - pyVmomi naming
+            reads.append(1)
+            if len(reads) == 1:
+                return "poweredOn"  # the first look: the guest still shuts down
+            in_read.set()  # the next look: vCenter answers slowly ...
+            answer.wait(30)  # ... only after the call ended
+            return "poweredOff"
+
+    class Guest:
+        toolsVersionStatus2 = "guestToolsCurrent"
+        guestState = "shuttingDown"
+
+    vm.runtime, vm.guest = Runtime(), Guest()
+    call = asyncio.create_task(vcenter_for(tmp_path, vm).power_on("5012-abcd"))
+    assert await asyncio.to_thread(in_read.wait, 10)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    answer.set()
+    await asyncio.sleep(0.5)
+    assert vm.tasks == [], "the call was cancelled, yet its thread powered the VM on afterwards"
+
+
 async def test_fake_destination_inventory_resolves_every_demo_nic():
     """SDD §10, §9.3: in demo mode every OpenStack demo VM's NIC resolves to one RHOSO network whose
     subnets take its addresses, and that the demo's admin credential may use - the demo plans are
