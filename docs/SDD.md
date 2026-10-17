@@ -1442,7 +1442,12 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   a rollback succeeds and removes the record (review RV30-05) - is kept: a later kit run refuses such a volume, and a
   second rollback, which finds no server holding it, deletes it (review RV29-03). A record that cannot be read (a
   damaged file) never keeps the source stopped: what to keep is then unknown, so that attempt deletes no kit volume of
-  the VM, says so in its log, and deletes the server and powers the source on as any other (review RV32A-08). The
+  the VM, says so in its log, and deletes the server and powers the source on as any other (review RV32A-08). No
+  record is written over one that cannot be read: for a server found by name beside it, the attempt logs the volumes
+  that server held instead - a record written over a damaged file would let a later attempt delete what that file
+  kept, and one at an unusable path (a directory there, a `.seamless/` a restore left unwritable) cannot be written
+  at all, which kept the source stopped (review RV34A-03); while the record cannot be read, no attempt deletes a kit
+  volume of the VM. The
   rollback looks the server up by the kit's name only while the clock is open (§5.2), and then even when one is
   recorded: the recorded one
   may be an earlier attempt's that a failed rollback already deleted - kept recorded, as only a rollback that
