@@ -672,7 +672,9 @@ Image-booted VMs (`kind == image_root`) follow os-migrate's `boot_disk_copy` sem
 image (slower: documented in Performance.md); when false, only data volumes are synced and the
 destination boots from the same image name. The volume made from a server snapshot - here and in the cold export -
 is as large as Cinder needs for the image: the image file rounded up to whole GiB, its virtual disk (a qcow2 file
-holds a larger disk) and its `min_disk`, at least 1 GiB; Cinder refuses a smaller one (audit A-06).
+holds a larger disk) and its `min_disk`, at least 1 GiB; Cinder refuses a smaller one (audit A-06). Glance records the
+virtual disk (`virtual_size`) only since Victoria: for a `qcow2` image it records none of, the size is read from the
+image file's own header - its first bytes, from a streamed download (review RV29-09).
 
 ### 6.2 Block delta sync — `plugins/module_utils/blocksync.py`
 
