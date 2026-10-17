@@ -196,6 +196,14 @@ describe('migrationActions rules', () => {
     expect(migrationActions(never, 'operator').cancel.enabled).toBe(true);
   });
 
+  it('says a storage-handover rollback deletes the destination instance before it hands the volumes back (review RV34B-05)', () => {
+    const text = rollbackEffect(migration('completed', {}, 'storage_handover'));
+    expect(text).toMatch(/^Deletes the destination instance/);
+    expect(text).toMatch(/through Neutron/i);
+    expect(text).toMatch(/back to the source cloud/i);
+    expect(text).toMatch(/new id/i);
+  });
+
   it.each([
     ['warm', /volumes are kept/i, null],
     ['cold', /volumes the cold import created/i, /volumes are kept/i],

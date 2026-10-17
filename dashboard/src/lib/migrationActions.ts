@@ -348,7 +348,7 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
   }
 }
 
-/** What a rollback of the migration deletes and restarts, by its strategy (SDD §6.3, §7.2, §7.3, §16, review RV32A-06). */
+/** What a rollback of the migration deletes and restarts, by its strategy (SDD §6.3, §7.2, §7.3, §16, reviews RV32A-06, RV34B-05). */
 export function rollbackEffect(m: Pick<Migration, 'strategy'>): string {
   switch (m.strategy) {
     case 'warm':
@@ -356,7 +356,7 @@ export function rollbackEffect(m: Pick<Migration, 'strategy'>): string {
     case 'cold':
       return 'Deletes the destination instance and the volumes the cold import created, and starts the source VM again.';
     case 'storage_handover':
-      return 'Hands the volumes back to the source cloud - no data moves - and starts the source VM again there.';
+      return 'Deletes the destination instance - and the ports made for it through Neutron - and hands the volumes back to the source cloud - no data moves -, where the source VM starts again, recreated under a new id once the cutover deleted it.';
     case 'vmware_cold':
     case 'vmware_warm':
       return "Deletes the destination instance, the migration kit's ports and the kit's volumes the next attempt cannot reuse - every one once the destination VM ran - and powers the source VM on again.";
