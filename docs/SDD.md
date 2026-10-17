@@ -2394,7 +2394,10 @@ letter or digit; `POST /providers` and `PATCH /providers/{id}` refuse (422) a `c
 `conversion_host.ssh_key_secret` that is not one, instead of the connection check failing on it later. The whole name
 must match (a trailing newline does not), and it never starts with `provider-` unless it is the provider's own for that
 field (`credentials_secret`: `provider-{id}`; `ssh_key_secret`: `provider-{id}-ssh`): those name other providers' secrets, which a check would send to this provider's
-endpoint. The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
+endpoint. The name is compared as the readers fold it - a case-insensitive filesystem (a host run on macOS or
+Windows) opens `provider-x` for `Provider-x`, and the variables upper-case the name and turn every other character
+into `_` - lower-cased, with every character other than a letter or digit taken as `-`: a name that folds to one
+starting with `provider-` is refused unless it is exactly the provider's own (audit AP-04). The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
 (its own writes) or `seamless.io/provider-secret: "true"` (one an operator made for providers), never the
 deployment's own (`seamless-db`, `seamless-tokens`, …); a name that store cannot hold (upper-case, `_`) is not
 looked up there, and the variables are read next. `provider.created` and `provider.updated` name the secrets the
