@@ -3068,6 +3068,25 @@ async def test_a_vmware_kit_run_is_refused_while_a_stale_kit_volume_of_the_vm_ex
     assert read_log(env.log) == []
 
 
+async def test_a_kit_volume_refusal_says_the_way_out_before_it_names_the_volumes(env):
+    """SDD §7.2 (review RV30-08): Migration.error keeps 1000 characters and the migration.error
+    event's message 300. The refusal says the way out - roll the migration back again - before it
+    names each volume and its holder, so a VM with many disks and a long name keeps it in both."""
+    from seamless_migrate.planning.kit import kit_vm_name
+
+    name = "erp-db-cluster-node-01.datacenter2.corp.example.com"
+    env.registry.volumes = [
+        kit_volume(f"0000000{i}-1111-2222-3333-444444444444", f"{kit_vm_name(name)}-{2000 + i}")
+        for i in range(8)
+    ]
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_cold, source=VCENTER, name=name, nics=VMW_NICS)
+    with pytest.raises(PermanentStepError) as refusal:
+        await env.executor.run(StepName.CUTOVER, ctx)
+    message = str(refusal.value)
+    assert "roll the migration back again" in message[:300]
+    assert all(volume["id"] in message for volume in env.registry.volumes)
+
+
 @pytest.mark.parametrize("strategy", [Strategy.vmware_cold, Strategy.vmware_warm])
 @pytest.mark.parametrize(
     ("source_power", "converted", "refused"),

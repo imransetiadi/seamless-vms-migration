@@ -1224,11 +1224,12 @@ class AnsibleExecutor:
             + ")"
             for v in stale
         )
+        # the way out first: Migration.error keeps 1000 characters, its event 300 (review RV30-08)
         raise PermanentStepError(
-            f"{where} holds the kit's volume {named} of {m.vm.name}: the kit would take a "
-            "converted one as migrated and boot the new server from it, and refuses to copy a cold "
-            "run onto any - roll the migration back again, which deletes the ones it may, or "
-            f"delete them in {where}"
+            "roll the migration back again, which deletes the kit's volumes it may, or delete them "
+            f"in {where}: the kit would take a converted one as migrated and boot the new server "
+            f"from it, and refuses to copy a cold run onto any - {where} holds the kit's volume "
+            f"{named} of {m.vm.name}"
         )
 
     async def _delete_cut_off_kit_copies(
