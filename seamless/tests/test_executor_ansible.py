@@ -3773,14 +3773,18 @@ async def test_a_vmware_rollback_whose_copies_cannot_be_marked_fails_with_the_so
     assert "delete_volume" not in calls
 
 
-@pytest.mark.parametrize("case", ["a new server beside", "the recorded one", "clock closed"])
+@pytest.mark.parametrize(
+    "case", ["a new server beside", "the recorded one", "clock never opened", "clock closed"]
+)
 async def test_a_vmware_rollback_deletes_a_server_of_the_kits_name_beside_a_recorded_one(env, case):
     """SDD §7.2 (review RV32A-07): while the clock is open the rollback looks the server up by the
     kit's name even when one is recorded - the recorded one may be an earlier attempt's that a
     failed rollback already deleted, while the new attempt's cutover did not record its own. One
     found that is not the recorded one is deleted before the power-on too, what it held kept
-    (q26): the source never runs beside it. The recorded one found by name is deleted once; with
-    the clock closed nothing is looked up by name."""
+    (q26): the source never runs beside it. The recorded one found by name is deleted once. With
+    the clock never opened, or closed - an earlier attempt's power-on came only after every server
+    it found was gone -, nothing is looked up by name: a server of the kit's name then is another
+    VM's (review RV34A-01)."""
     env.registry.existing = {"web-01"}  # the kit's server of web-01, running
     env.registry.volumes = [kit_volume("held", "web-01-2001", attachments=["dst-web-01"])]
     live_at_power_on: list[list[str]] = []
@@ -3797,7 +3801,10 @@ async def test_a_vmware_rollback_deletes_a_server_of_the_kits_name_beside_a_reco
 
     env.registry.get = lambda provider: Nova(env.registry)
     recorded = "dst-web-01" if case == "the recorded one" else "srv-attempt-1"
-    clock = {} if case == "clock closed" else {"downtime_started_at": utcnow()}
+    clock = {
+        "clock never opened": {},
+        "clock closed": {"downtime_started_at": utcnow(), "downtime_ended_at": utcnow()},
+    }.get(case, {"downtime_started_at": utcnow()})
     ctx, _ = ctx_for(
         env, strategy=Strategy.vmware_cold, source=VCENTER, destination_server_id=recorded, **clock
     )
@@ -3812,6 +3819,35 @@ async def test_a_vmware_rollback_deletes_a_server_of_the_kits_name_beside_a_reco
     else:
         assert deletes == ["srv-attempt-1"]
         assert ("find_server", "web-01") not in env.registry.calls
+
+
+@pytest.mark.parametrize("recorded", ["dst-9", None])
+async def test_a_vmware_rollback_after_the_clock_closed_looks_nothing_up_by_name(env, recorded):
+    """SDD §7.2 (review RV34A-01): once the clock closed - a verification with the recorded server
+    running, or an earlier attempt's power-on after it deleted every server it found - the
+    rollback looks no server up by the kit's name, with or without a recorded one: two servers of
+    that name, which Nova's lookup refuses, never keep the source stopped."""
+
+    class Nova(FakeImpl):
+        async def find_server(self, name):
+            self.calls.append(("find_server", name))
+            raise ProviderError(f"More than one Server exists with the name '{name}'.")
+
+    env.registry.get = lambda provider: Nova(env.registry)
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        destination_server_id=recorded,
+        downtime_started_at=utcnow(),
+        downtime_ended_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert not [c for c in env.registry.calls if c[0] == "find_server"]
+    deletes = [c[1] for c in env.registry.calls if c[0] == "delete_server"]
+    assert deletes == ([recorded] if recorded else [])
+    assert ("power_on", "srv-1") in env.registry.calls
+    assert result.details["source_running"] is True
 
 
 @pytest.mark.parametrize("record", ["damaged", "not a record", "a directory"])

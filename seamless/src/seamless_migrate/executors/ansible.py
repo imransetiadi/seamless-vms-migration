@@ -1711,12 +1711,15 @@ class AnsibleExecutor:
             except _UnreadableKeepRecord as exc:
                 kept, unreadable = set(), str(exc)
                 await ctx.log(f"rollback: {unreadable}; every kit volume of {vm.name} stays")
-            if m.downtime_started_at is not None:
+            if source_stopped(m):
                 # the kit records nothing in the control plane before the cutover powers the
                 # VM off; a same-named server after that point was created by this migration
                 # (_refuse_name_collision ruled out a pre-existing one before the attempt) - also
                 # beside a recorded one, maybe an earlier attempt's that a failed rollback already
-                # deleted while the new attempt's cutover did not record its own (review RV32A-07)
+                # deleted while the new attempt's cutover did not record its own (review RV32A-07).
+                # Only while the clock is open: an earlier attempt's power-on closed it only after
+                # every server it found was gone, a verification only with the recorded one
+                # running - a server of the kit's name then is another VM's (review RV34A-01)
                 found = await dst.find_server(kit_vm_name(vm.name))
                 if found and found != recorded:
                     named = found
