@@ -3490,6 +3490,138 @@ async def test_a_vmware_warm_cutover_whose_copies_cannot_be_marked_never_runs_th
 
 
 @pytest.mark.parametrize(
+    ("ending", "mark"),
+    [
+        ("a failure before", "true"),
+        ("a cancel before", "true"),
+        ("a failure after", "cutover"),
+        ("a cancel after", "cutover"),
+    ],
+)
+async def test_a_cutover_kit_run_that_never_reached_its_migrate_task_marks_its_copies_back(
+    env, monkeypatch, ending, mark
+):
+    """SDD §7.2 (review RV34A-02): only the kit's migrate task writes to a volume. A cutover kit run
+    that fails - an SSH reset in the kit's checks - or is cancelled before its output shows that
+    task's header wrote to none: the copies it marked 'cutover' are marked 'true' again before its
+    failure is reported, so its retry syncs them by CBT rather than copying every disk in full
+    inside the outage. Once the header showed, they stay 'cutover': the kit may have written."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000", converted=False, copied=True),
+        kit_volume("data", "web-01-2001", converted=False, copied=True),
+    ]
+    if ending == "a failure before":
+        monkeypatch.setenv("ANSIBLE_FAKE_FAIL_BEFORE_STOP", "Connection reset by peer")
+    elif ending == "a cancel before":
+        monkeypatch.setenv("ANSIBLE_FAKE_FAIL_BEFORE_STOP", "never reached")
+        monkeypatch.setenv("ANSIBLE_FAKE_PRE_HANG", "30")
+    elif ending == "a failure after":
+        monkeypatch.setenv("ANSIBLE_FAKE_FAIL", "Connection reset by peer")
+    else:
+        monkeypatch.setenv("ANSIBLE_FAKE_STOP_HANG", "30")
+
+    class Cinder(FakeImpl):
+        async def set_volume_metadata(self, volume_id, metadata):
+            if metadata == {"seamless_copied": "true"}:
+                await asyncio.sleep(0.2)  # a marking back still running when cancelled again
+            await FakeImpl.set_volume_metadata(self, volume_id, metadata)
+
+    env.registry.get = lambda provider: Cinder(env.registry)
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    if ending.startswith("a failure"):
+        with pytest.raises(TransientStepError, match="Connection reset by peer"):
+            await env.executor.run(StepName.CUTOVER, ctx)
+    else:
+        step = asyncio.create_task(env.executor.run(StepName.CUTOVER, ctx))
+        shown = "Check the source" if ending == "a cancel before" else "Migrate Guest from Vmware"
+        for _ in range(500):
+            if any(shown in line for line in rec.logs):
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError(rec.logs)
+        step.cancel()
+        await asyncio.sleep(0.1)
+        step.cancel()  # while the copies are being marked back
+        with pytest.raises(asyncio.CancelledError):
+            await step
+    copied = {v["id"]: v["metadata"].get("seamless_copied") for v in env.registry.volumes}
+    assert copied == {"boot": mark, "data": mark}
+    if mark == "true":
+        # the retry syncs them by CBT: nothing deleted, no disk copied in full
+        monkeypatch.delenv("ANSIBLE_FAKE_FAIL_BEFORE_STOP")
+        ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+        await env.executor.run(StepName.CUTOVER, ctx)
+        assert not [c for c in env.registry.calls if c[0] == "delete_volume"]
+
+
+@pytest.mark.parametrize("failing", ["the marking back", "the marking"])
+async def test_a_cutover_whose_copies_cannot_all_be_marked_back_leaves_them_cutover(
+    env, monkeypatch, failing
+):
+    """SDD §7.2 (review RV34A-02): a marking back that fails is logged and leaves the copies not yet
+    marked back 'cutover' - copied in full later, never taken as completed - and the run's own
+    failure is what the step reports. A marking that fails before the kit runs marks back what it
+    marked."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000", converted=False, copied=True),
+        kit_volume("data", "web-01-2001", converted=False, copied=True),
+    ]
+    refused = (
+        ("boot", {"seamless_copied": "true"})
+        if failing == "the marking back"
+        else ("data", {"seamless_copied": "cutover"})
+    )
+
+    class Cinder(FakeImpl):
+        async def set_volume_metadata(self, volume_id, metadata):
+            if (volume_id, metadata) == refused:
+                self.calls.append(("set_volume_metadata", volume_id, dict(metadata)))
+                raise ProviderError("volume metadata: HTTP 503")
+            await FakeImpl.set_volume_metadata(self, volume_id, metadata)
+
+    env.registry.get = lambda provider: Cinder(env.registry)
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL_BEFORE_STOP", "Connection reset by peer")
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    expected = "Connection reset by peer" if failing == "the marking back" else "HTTP 503"
+    with pytest.raises(TransientStepError, match=expected):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    copied = {v["id"]: v["metadata"].get("seamless_copied") for v in env.registry.volumes}
+    if failing == "the marking back":
+        assert copied == {"boot": "cutover", "data": "cutover"}
+        assert any("boot, data" in line and "completed again" in line for line in rec.logs)
+    else:
+        assert copied == {"boot": "true", "data": "true"}
+        assert read_log(env.log) == []  # the kit never ran
+
+
+async def test_a_cutover_kit_run_marks_back_only_the_copies_it_marked(env, monkeypatch):
+    """SDD §7.2 (review RV34A-02): a cutover retried inside the outage keeps the copies an earlier
+    attempt marked 'cutover', which that attempt's kit wrote to: a run of the retry that fails
+    before its migrate task marks back only what it marked itself - here nothing."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000"),
+        kit_volume("data", "web-01-2001", converted=False, copied="cutover"),
+    ]
+    env.registry.source_power = "stopped"
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL_BEFORE_STOP", "Connection reset by peer")
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        nics=VMW_NICS,
+        downtime_started_at=utcnow(),
+    )
+    with pytest.raises(TransientStepError, match="Connection reset by peer"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert [v["metadata"].get("seamless_copied") for v in env.registry.volumes] == [
+        None,
+        "cutover",
+    ]
+    assert not [c for c in env.registry.calls if c[0] == "set_volume_metadata"]
+
+
+@pytest.mark.parametrize(
     "step", [StepName.PRECOPY, StepName.SYNC, StepName.CUTOVER, StepName.ROLLBACK]
 )
 async def test_a_copy_a_cutover_marked_is_deleted_by_a_later_run_or_rollback(env, step):

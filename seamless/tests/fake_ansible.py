@@ -142,6 +142,14 @@ SCRIPT = textwrap.dedent(
         print("TASK [" + kit_task + "] ****")
         print("ok: [localhost]")
         sys.stdout.flush()
+    if stop_task and os.environ.get("ANSIBLE_FAKE_FAIL_BEFORE_STOP"):
+        # a task before the stop - the kit's checks, its SSH to the conversion host - fails, first
+        # hanging this long (a step cancelled meanwhile); review RV34A-02
+        print("TASK [" + base + " : Check the source and the conversion host] ****")
+        sys.stdout.flush()
+        time.sleep(float(os.environ.get("ANSIBLE_FAKE_PRE_HANG", "0")))
+        print("fatal: [localhost]: FAILED! => " + os.environ["ANSIBLE_FAKE_FAIL_BEFORE_STOP"])
+        sys.exit(2)
     if stop_task:
         print("TASK [" + stop_task + "] ****")
         sys.stdout.flush()

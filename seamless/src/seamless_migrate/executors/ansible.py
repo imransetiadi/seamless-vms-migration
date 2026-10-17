@@ -958,6 +958,14 @@ class _Playbook:
     stops_source: bool = False
 
 
+@dataclass
+class _RunTrace:
+    """What a run's output showed: whether a playbook's source-stop task started - on VMware the
+    kit's migrate task, the only one that writes to a volume (SDD §7.2, review RV34A-02)."""
+
+    stop_task_started: bool = False
+
+
 # -- executor -----------------------------------------------------------------------------------
 class AnsibleExecutor:
     name = "ansible"
@@ -1144,27 +1152,37 @@ class AnsibleExecutor:
         if deferred is not None and strategy == Strategy.warm:
             # the role writes it during the pass: an earlier pass's is not this one's (SDD §6.6)
             remove_quietly(refusals_file)
-        if strategy == Strategy.vmware_warm and step == StepName.CUTOVER:
-            try:
-                await self._mark_cutover_copies(ctx)
-            except ProviderError as exc:
-                raise TransientStepError(
-                    f"could not mark the kit's copies of {ctx.migration.vm.name} in "
-                    f"{ctx.destination.label} before its cutover: {exc}"
-                ) from exc
-        stop_skipped = await self._execute(
-            rdir,
-            osm,
-            build_vars(step, ctx, network_map),
-            ctx.source,
-            ctx.destination,
-            build_inventory(ctx),
-            playbooks,
-            ctx,
-            effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings),
-            networks,
-            deferred,
-        )
+        marked: list[str] = []  # the copies this cutover marked 'cutover'
+        trace = _RunTrace()
+        try:
+            if strategy == Strategy.vmware_warm and step == StepName.CUTOVER:
+                try:
+                    await self._mark_cutover_copies(ctx, marked)
+                except ProviderError as exc:
+                    raise TransientStepError(
+                        f"could not mark the kit's copies of {ctx.migration.vm.name} in "
+                        f"{ctx.destination.label} before its cutover: {exc}"
+                    ) from exc
+            stop_skipped = await self._execute(
+                rdir,
+                osm,
+                build_vars(step, ctx, network_map),
+                ctx.source,
+                ctx.destination,
+                build_inventory(ctx),
+                playbooks,
+                ctx,
+                effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings),
+                networks,
+                deferred,
+                trace=trace,
+            )
+        except BaseException:
+            if marked and not trace.stop_task_started:
+                # the kit never reached its migrate task, the only one that writes to a volume:
+                # what this run marked is a completed copy still (SDD §7.2, review RV34A-02)
+                await outlive_cancel(self._mark_copies_back(ctx, marked))
+            raise
         if stop_skipped and strategy == Strategy.cold:
             # the cold role skips every task (the stop included) when the destination already
             # has a server with the workload's name: nothing was migrated
@@ -1345,16 +1363,36 @@ class AnsibleExecutor:
             ) from exc
         return bool(keys) and f"{kit_vm_name(m.vm.name)}-{keys[0]}" in converted
 
-    async def _mark_cutover_copies(self, ctx: StepContext) -> None:
+    async def _mark_cutover_copies(self, ctx: StepContext, marked: list[str] | None = None) -> None:
         """Mark each of the VM's kit copies marked completed 'cutover', no completed copy for any
         later run or rollback (SDD §7.2, reviews RV32A-01, RV32A-02): right before a vmware_warm
         cutover's kit run - it converts a disk in place and boots a server that writes to every
-        one, which no CBT sync undoes -, and in a rollback once a server booted from them. Raises
-        ProviderError; each caller fails its attempt as transient."""
+        one, which no CBT sync undoes -, and in a rollback once a server booted from them. Each
+        one marked is added to ``marked``. Raises ProviderError; each caller fails its attempt as
+        transient."""
         dst = self.providers.get(ctx.destination)
         for volume in kit_volumes(ctx.migration.vm.name, await dst.volumes()):
             if _marked(volume, "seamless_copied"):
                 await dst.set_volume_metadata(volume["id"], dict(CUTOVER_COPY))
+                if marked is not None:
+                    marked.append(volume["id"])
+
+    async def _mark_copies_back(self, ctx: StepContext, marked: Sequence[str]) -> None:
+        """A vmware_warm cutover kit run that ended before the kit's migrate task wrote to no
+        volume: the copies it marked 'cutover' are completed copies still, marked so again for the
+        retry's CBT sync. A marking back that fails is logged and leaves the rest 'cutover' (SDD
+        §7.2, review RV34A-02)."""
+        dst = self.providers.get(ctx.destination)
+        for index, volume_id in enumerate(marked):
+            try:
+                await dst.set_volume_metadata(volume_id, dict(COPIED))
+            except ProviderError as exc:
+                await ctx.log(
+                    f"could not mark the kit's copies {', '.join(marked[index:])} of "
+                    f"{ctx.migration.vm.name} completed again: {exc}; a later run copies them "
+                    "in full"
+                )
+                return
 
     async def _mark_kit_copies(self, ctx: StepContext) -> None:
         """After a vmware_warm pass the kit completed, mark each of the VM's kit volumes that is
@@ -1858,8 +1896,11 @@ class AnsibleExecutor:
         mappings: Mappings | None,
         networks: Sequence[dict[str, Any]] | None = None,
         deferred: list[str] | None = None,
+        *,
+        trace: _RunTrace | None = None,
     ) -> bool:
-        """Run the playbooks; True when the source-stop task of one of them was skipped."""
+        """Run the playbooks; True when the source-stop task of one of them was skipped. What the
+        output showed is kept in ``trace``."""
         vars_path = workdir / "vars.yml"
         secrets_path = workdir / "secrets.yml"
         inventory_path = workdir / "inventory.yml"
@@ -1890,7 +1931,15 @@ class AnsibleExecutor:
                     # written again once the rewrite of the new export finishes (SDD §7.2)
                     remove_quietly(osm / EXPORT_RECORD)
                 stop_skipped |= await self._run_playbook(
-                    playbook, workdir, inventory_path, vars_path, secrets_path, ctx, osm, env
+                    playbook,
+                    workdir,
+                    inventory_path,
+                    vars_path,
+                    secrets_path,
+                    ctx,
+                    osm,
+                    env,
+                    trace=trace,
                 )
                 if playbook.name == "export_workloads.yml" and (ctx or mappings) is not None:
                     planned = ctx.migration.vm.source_id if ctx is not None else None
@@ -2019,6 +2068,8 @@ class AnsibleExecutor:
         ctx: StepContext | None,
         osm: Path,
         env: dict[str, str],
+        *,
+        trace: _RunTrace | None = None,
     ) -> bool:
         """Run one playbook; True when its source-stop task was seen but skipped."""
         name = playbook.name
@@ -2071,6 +2122,8 @@ class AnsibleExecutor:
                     # SDD §7.2: the downtime clock starts when the source-stop task starts…
                     watch_stop = False
                     stop_seen_at = utcnow()
+                    if trace is not None:
+                        trace.stop_task_started = True
                 elif stop_seen_at is not None and line.startswith("TASK ["):
                     # …the next task began without a result that ran: the stop was skipped
                     stop_seen_at = None
