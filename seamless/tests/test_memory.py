@@ -173,6 +173,34 @@ async def test_memory_search_tolerant_parsing():
     assert parse_hits("garbage", 5) == []
 
 
+def test_memory_hits_are_redacted_where_they_enter():
+    """SDD §13.4 (audit AP-05): agentmemory is an outside service, so its hits are redacted as they
+    enter - a title, a content, a nested observation, a plain-text item - before anything cuts or
+    publishes them: a plain item's title is cut from its redacted text, so credentials in a URL
+    whose "@" lies past the cut never survive in it."""
+    secret = "Hunter2-Prod-Secret"  # gitleaks:allow
+    hits = parse_hits(
+        {
+            "results": [
+                {
+                    "title": f"db-01 OS_PASSWORD={secret}",
+                    "content": f"stop failed; OS_PASSWORD={secret}",
+                },
+                {
+                    "observation": {
+                        "title": "t",
+                        "narrative": f"ran --os-password {secret} server stop",
+                    }
+                },
+                f"{'x' * 50} https://admin:{secret}@keystone.dc1.example:5000/v3 refused",
+            ]
+        },
+        5,
+    )
+    assert len(hits) == 3
+    assert all(secret[:8] not in h.title + h.content for h in hits), hits
+
+
 @pytest.mark.parametrize("mode", ["http_error", "connect_error", "bad_json"])
 async def test_memory_failures_swallowed(mode):
     def handler(request: httpx.Request) -> httpx.Response:

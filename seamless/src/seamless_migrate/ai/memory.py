@@ -30,8 +30,11 @@ def _score(value: Any) -> float | None:
 
 
 def _hit(item: Any) -> MemoryHit | None:
+    """One hit as the control plane may publish it: agentmemory is an outside service, so its text
+    is redacted as it arrives, before anything cuts it (SDD §13.4, audit AP-05)."""
     if isinstance(item, str):
-        return MemoryHit(title=item[:80], content=item)
+        text = redact(item)
+        return MemoryHit(title=text[:80], content=text)
     if not isinstance(item, dict):
         return None
     sources = [item]
@@ -43,7 +46,8 @@ def _hit(item: Any) -> MemoryHit | None:
     )
     if not content:
         return None
-    title = next((str(s["title"]) for s in sources if s.get("title")), content[:80])
+    content = redact(content)
+    title = next((redact(str(s["title"])) for s in sources if s.get("title")), content[:80])
     return MemoryHit(title=title, content=content, score=_score(item.get("score")))
 
 

@@ -1,9 +1,11 @@
 import inspect
 import re
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from seamless_migrate.ai.memory import MemoryClient
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, Role
 from seamless_migrate.domain.models import Provider
@@ -446,6 +448,56 @@ def test_advisor_status_and_similar_incidents_without_memory(api):
     assert "estimates" in keys and all(f["label"] for f in sent[0]["fields"])
     res = api.post("/api/v1/advisor/similar-incidents", Role.operator, json={"query": "x"})
     assert res.status_code == 200 and res.json() == {"hits": []}
+
+
+LEAKED = (
+    "cutover of db-01 failed; ran --os-password Hunter2-Prod-Secret; "
+    "OS_PASSWORD=Hunter2-Prod-Secret"  # gitleaks:allow
+)
+
+
+def memory_answering(content):
+    """agentmemory answering every search with one hit whose title and content carry a password."""
+
+    def memory(request):
+        title = "db-01 OS_PASSWORD=Hunter2-Prod-Secret"  # gitleaks:allow
+        hit = {"title": title, "content": content}
+        return httpx.Response(200, json={"results": [hit]})
+
+    return MemoryClient(
+        "http://memory.example:3111",
+        None,
+        "seamless-migrate",
+        transport=httpx.MockTransport(memory),
+    )
+
+
+def test_similar_incidents_reach_operators_redacted(api):
+    """SDD §13.4 (audit AP-05): POST /advisor/similar-incidents answers agentmemory's hits - text of
+    an outside service, which agents write too - redacted."""
+    api.client.app.state.services.memory = memory_answering(LEAKED)
+    res = api.post("/api/v1/advisor/similar-incidents", Role.operator, json={"query": "db-01"})
+    assert res.status_code == 200 and res.json()["hits"], res.text
+    assert "Hunter2-Prod-Secret" not in res.text, res.text
+
+
+def test_similar_incidents_reach_viewers_redacted_in_recommendations(api):
+    """SDD §13.4, §14.4 (audit AP-05): the hits a validation stores in each recommendation, which
+    every viewer reads from GET /advisor/recommendations, are redacted before they are cut."""
+    for provider in (SOURCE, DESTINATION):
+        assert api.post("/api/v1/providers", json=provider).status_code == 201
+    api.client.app.state.services.orchestrator.knowledge.memory = memory_answering(LEAKED)
+    vm_ids = [vm["source_id"] for vm in api.get("/api/v1/providers/src-osp/inventory").json()]
+    plan = {"name": "Redacted hits", "source_provider_id": "src-osp"}
+    plan |= {"destination_provider_id": "dst-rhoso", "vm_ids": vm_ids}
+    made = api.post("/api/v1/plans", Role.operator, json=plan)
+    assert made.status_code == 201, made.text
+    validated = api.post(f"/api/v1/plans/{made.json()['id']}/validate", Role.operator)
+    assert validated.status_code == 200, validated.text
+    page = api.get("/api/v1/advisor/recommendations?limit=200", Role.viewer)
+    assert page.status_code == 200 and page.json()["total"] > 0, page.text
+    hits = [hit for rec in page.json()["items"] for hit in rec["similar_incidents"]]
+    assert hits and "Hunter2-Prod-Secret" not in page.text, hits[:1]
 
 
 def test_spa_fallback_serves_index(tmp_path):
