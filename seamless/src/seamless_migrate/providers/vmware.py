@@ -7,6 +7,7 @@ import logging
 import math
 import re
 import ssl
+import threading
 import time
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -24,6 +25,9 @@ log = logging.getLogger(__name__)
 
 GIB = 2**30
 _POWER = {"poweredOn": "running", "poweredOff": "stopped", "suspended": "paused"}
+#: how long a rollback's power-on looks again at a VM still on whose installed VMware Tools no
+#: longer run - the last seconds of a guest shutdown, or a guest still starting (SDD §7.2)
+TOOLS_STOPPED_LOOK_S = 120
 
 Connector = Callable[..., Any]
 
@@ -36,6 +40,13 @@ def _tools_os_name(guest: Any) -> str | None:
     detailed = str(getattr(guest, "guestDetailedData", "") or "")
     match = _PRETTY_NAME.search(detailed)
     return match.group(1).strip() or None if match else None
+
+
+def _tools_installed(guest: Any) -> bool:
+    """Whether the guest has VMware Tools installed (``toolsVersionStatus2``); unknown reads as
+    not installed."""
+    status = str(getattr(guest, "toolsVersionStatus2", "") or "")
+    return bool(status) and status != "guestToolsNotInstalled"
 
 
 def _import_pyvmomi() -> tuple[Any, Any, Any]:
@@ -395,6 +406,10 @@ class VMwareProvider:
 
     async def power_on(self, source_id: str) -> None:
         """Power the source VM on again (rollback of VMware strategies)."""
+        # the wait ends within the call's bound: past it the call reports a timeout while its
+        # thread goes on (SDD §7.2, review RV27-02)
+        deadline = time.monotonic() + PROVIDER_CALL_TIMEOUT_S - 5
+        ended = threading.Event()
 
         def work(content: Any, vim: Any) -> None:
             direct = self._find_by_uuid(content, source_id)
@@ -406,17 +421,31 @@ class VMwareProvider:
                 uuid = getattr(config, "instanceUuid", None) or getattr(vm, "_moId", None)
                 if uuid != source_id:
                     continue
-                deadline = time.monotonic() + 600
                 # a guest still shutting down - the kit's ShutdownGuest, cut off - reads poweredOn
                 # until it is down: wait for that, then power it on (SDD §7.2, review RV26-10).
                 # Its Tools stop just before vSphere powers it off, so once a shutdown was seen
-                # notRunning is its tail; never seen, notRunning is a VM running without Tools
+                # notRunning is its tail; never seen, notRunning with installed Tools may be that
+                # tail too, or a guest still starting: looked at again for a while (RV27-01)
                 shutting_down = False
-                while str(getattr(vm.runtime, "powerState", "")) == "poweredOn":
-                    state = str(getattr(getattr(vm, "guest", None), "guestState", ""))
+                look_until = None
+                while True:
+                    if ended.is_set():  # timed out or cancelled: never act behind its back
+                        raise ProviderError(f"{self.provider.id}: the power-on call ended")
+                    if str(getattr(vm.runtime, "powerState", "")) != "poweredOn":
+                        break
+                    guest = getattr(vm, "guest", None)
+                    state = str(getattr(guest, "guestState", ""))
                     shutting_down = shutting_down or state == "shuttingDown"
-                    if not shutting_down or state not in ("shuttingDown", "notRunning"):
+                    if shutting_down:
+                        if state not in ("shuttingDown", "notRunning"):
+                            return
+                    elif state != "notRunning" or not _tools_installed(guest):
                         return
+                    else:
+                        if look_until is None:
+                            look_until = time.monotonic() + TOOLS_STOPPED_LOOK_S
+                        if time.monotonic() > look_until:
+                            return
                     if time.monotonic() > deadline:
                         raise ProviderError(
                             f"{self.provider.id}: VM {source_id!r} is still shutting down; "
@@ -433,7 +462,10 @@ class VMwareProvider:
                 return
             raise ProviderError(f"{self.provider.id}: VM {source_id!r} not found")
 
-        await self._run(work)
+        try:
+            await self._run(work)
+        finally:
+            ended.set()
 
     async def inventory(self) -> SourceInventory:
         def work(content: Any, vim: Any) -> SourceInventory:

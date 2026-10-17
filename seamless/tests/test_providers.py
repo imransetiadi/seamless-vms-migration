@@ -1796,7 +1796,7 @@ async def test_vmware_power_on_times_out(tmp_path, monkeypatch):
     vm = PoweredOffVM(task_state="running")
     clock = [0.0]
 
-    def fast_clock():  # every call advances 400 s: the 600 s deadline passes on the 2nd poll
+    def fast_clock():  # every call advances 400 s: the deadline (the call's, less 5 s) passes
         clock[0] += 400.0
         return clock[0]
 
@@ -1891,6 +1891,156 @@ async def test_a_vmware_power_on_waits_for_a_guest_still_shutting_down(tmp_path,
     with pytest.raises(ProviderError, match="still shutting down"):
         await provider_for(stuck).power_on("5012-abcd")
     assert stuck.tasks == []
+
+
+class Reads:
+    """vSphere's answers to one attribute, read after read; the last one stays."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+
+    def next(self):
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+
+def tools_stopped_vm(power, guest, tools="guestToolsCurrent"):
+    """A VM whose power state and guest state read ``power`` and ``guest`` in turn; its VMware
+    Tools are ``tools`` (installed and current by default, but not running)."""
+    vm = PoweredOffVM()
+    power_reads, guest_reads = Reads(*power), Reads(*guest)
+
+    class Runtime:
+        host = NS(name="esx-01.dc2")
+
+        @property
+        def powerState(self):  # noqa: N802 - pyVmomi naming
+            return power_reads.next()
+
+    class Guest:
+        toolsVersionStatus2 = tools
+        toolsRunningStatus = "guestToolsNotRunning"
+
+        @property
+        def guestState(self):  # noqa: N802 - pyVmomi naming
+            return guest_reads.next()
+
+    vm.runtime, vm.guest = Runtime(), Guest()
+    return vm
+
+
+def vcenter_for(tmp_path, vm):
+    from seamless_migrate.providers import vmware as vmw
+
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True, exist_ok=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    return vmw.VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda **_: fake_service_instance([vm]),
+        vim=FAKE_VIM,
+    )
+
+
+async def test_a_vmware_power_on_looks_again_at_a_vm_whose_tools_stopped(tmp_path, monkeypatch):
+    """SDD §7.2 (review RV27-01): a guest's VMware Tools stop just before vSphere powers the VM
+    off, so a rollback whose first look falls in the last seconds of a shutdown reads the VM on
+    and its guest notRunning, as for a VM running without Tools. A VM whose installed Tools no
+    longer run is looked at again for up to 120 s: powered on once it is off, left alone once its
+    guest runs (one still starting) or when the 120 s end; a VM without Tools is left alone at
+    once, and so is a guest seen shutting down that runs again (a reboot)."""
+    from seamless_migrate.providers import vmware as vmw
+
+    clock = [0.0]
+
+    def tick():
+        clock[0] += 1.0
+        return clock[0]
+
+    monkeypatch.setattr(vmw, "time", NS(monotonic=tick, sleep=lambda s: None))
+
+    async def power_on(vm):
+        started = clock[0]
+        await vcenter_for(tmp_path, vm).power_on("5012-abcd")
+        return len(vm.tasks), clock[0] - started
+
+    # the last seconds of a shutdown: off at the next look - powered on
+    tail = tools_stopped_vm(["poweredOn", "poweredOff"], ["notRunning"])
+    assert (await power_on(tail))[0] == 1, "the power-on read a shutdown's tail as a VM running"
+    # a guest still starting: its Tools run at the third look - left alone, no 120 s wait
+    starting = tools_stopped_vm(["poweredOn"], ["notRunning", "notRunning", "running"])
+    tasks, waited = await power_on(starting)
+    assert tasks == 0 and waited < 20, waited
+    # installed Tools that never run again on a VM that stays on: left alone after 120 s
+    silent = tools_stopped_vm(["poweredOn"], ["notRunning"])
+    tasks, waited = await power_on(silent)
+    assert tasks == 0 and 120 <= waited < 150, waited
+    # no Tools at all: a VM running without them, left alone at once
+    tools_less = tools_stopped_vm(["poweredOn"], ["notRunning"], tools="guestToolsNotInstalled")
+    tasks, waited = await power_on(tools_less)
+    assert tasks == 0 and waited < 3, waited
+    # a guest seen shutting down that runs again - it rebooted: left alone once it runs
+    rebooted = tools_stopped_vm(["poweredOn"], ["shuttingDown", "notRunning", "running"])
+    tasks, waited = await power_on(rebooted)
+    assert tasks == 0 and waited < 20, waited
+
+
+async def test_a_vmware_power_on_ends_within_its_call_and_never_acts_after_it(
+    tmp_path, monkeypatch
+):
+    """SDD §7.2 (review RV27-02): every provider call is cut at its bound (300 s, SDD §8.1), and
+    the thread that runs it cannot be stopped. The wait for a guest shutdown ends within that
+    bound, less 5 s, with the "still shutting down" error the rollback retries; and a call that
+    ended - timed out or cancelled - never powers the VM on afterwards, behind the back of the
+    rollback's retry."""
+    import asyncio
+    import time as real_time
+
+    from seamless_migrate.providers import vmware as vmw
+
+    clock = [0.0]
+
+    def tick():
+        clock[0] += 1.0
+        return clock[0]
+
+    monkeypatch.setattr(vmw, "time", NS(monotonic=tick, sleep=lambda s: None))
+    stuck = shutting_down_vm(looks=10**6)
+    with pytest.raises(ProviderError, match="still shutting down"):
+        await vcenter_for(tmp_path, stuck).power_on("5012-abcd")
+    assert clock[0] < vmw.PROVIDER_CALL_TIMEOUT_S, "the wait outlived the call's bound"
+
+    # a call cancelled while the guest shuts down: the guest is down a moment later
+    real_sleep = real_time.sleep
+    monkeypatch.setattr(
+        vmw, "time", NS(monotonic=real_time.monotonic, sleep=lambda s: real_sleep(0.01))
+    )
+    off_at = real_time.monotonic() + 0.3
+    vm = tools_stopped_vm(["poweredOn"], ["shuttingDown"])
+    looks = []
+
+    class Runtime:
+        host = NS(name="esx-01.dc2")
+
+        @property
+        def powerState(self):  # noqa: N802 - pyVmomi naming
+            looks.append(1)
+            return "poweredOn" if real_time.monotonic() < off_at else "poweredOff"
+
+    vm.runtime = Runtime()
+    call = asyncio.create_task(vcenter_for(tmp_path, vm).power_on("5012-abcd"))
+    await asyncio.sleep(0.1)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    await asyncio.sleep(0.2)
+    seen = len(looks)
+    await asyncio.sleep(0.4)  # the guest is down by now
+    assert vm.tasks == [], "the call was cancelled, yet its thread powered the VM on"
+    assert len(looks) == seen, "the thread of a cancelled call went on asking vCenter"
 
 
 async def test_fake_destination_inventory_resolves_every_demo_nic():
