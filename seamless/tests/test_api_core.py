@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, Role
+from seamless_migrate.domain.models import Provider
 from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, ROLES, SOURCE, Api, api_settings
 from tests.factories import make_migration
@@ -492,12 +493,67 @@ def test_auth_disabled_maps_to_anonymous_admin(tmp_path):
     settings, _ = api_settings(tmp_path, auth_disabled=True, tokens_file=None)
     store = Store(f"sqlite:///{tmp_path / 'anon.db'}")
     store.create_schema()
-    with TestClient(create_app(settings, store)) as client:
+    # an auth-off server is reached by a loopback name only (SDD §13.1, audit AP-03)
+    with TestClient(create_app(settings, store), base_url="http://127.0.0.1:8080") as client:
         assert client.get("/api/v1/me").json() == {"name": "anonymous", "role": "admin"}
         assert client.post("/api/v1/providers", json=SOURCE).status_code == 201
         created = [e for e in store.events(since_seq=0) if e.kind == "provider.created"]
         assert created[0].actor == "anonymous"
     store.dispose()
+
+
+def test_with_authentication_off_only_this_machines_pages_reach_the_api(tmp_path):
+    """SDD §13.1, Security.md C1-02/C1-12 (audit AP-03): with authentication off the anonymous
+    admin answers only this machine. A DNS-rebinding page reaches the loopback port under its own
+    name - a Host naming no loopback address - and another site's page sends simple cross-site
+    requests: both are refused with 403, before any side effect. Loopback names (with any port,
+    IPv6 too) and clients that send no Origin (the CLI, curl) keep working."""
+    settings, _ = api_settings(tmp_path, auth_disabled=True, tokens_file=None)
+    store = Store(f"sqlite:///{tmp_path / 'off.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store), base_url="http://127.0.0.1:8080") as client:
+        assert client.post("/api/v1/providers", json=SOURCE).status_code == 201
+        rebound = {"Host": "rebind.attacker.example:8080"}
+        listed = client.get("/api/v1/providers", headers=rebound)
+        assert listed.status_code == 403, listed.text
+        assert listed.json()["error"]["code"] == "forbidden"
+        assert "x-frame-options" in listed.headers  # R-05 headers on the refusal too
+        repointed = client.patch(
+            "/api/v1/providers/src-osp",
+            headers={**rebound, "Origin": "http://rebind.attacker.example:8080"},
+            json={"endpoint": "https://rebind.attacker.example/v3"},
+        )
+        assert repointed.status_code == 403, repointed.text
+        # a simple cross-site request reaches the loopback Host itself: its Origin gives it away
+        for cross_site in (
+            {"Origin": "https://evil.example"},
+            {"Origin": "null"},
+            {"Sec-Fetch-Site": "cross-site"},
+        ):
+            refused = client.post("/api/v1/providers/src-osp/check", headers=cross_site)
+            assert refused.status_code == 403, (cross_site, refused.text)
+        assert store.get("provider", "src-osp", Provider).endpoint == SOURCE["endpoint"]
+        denied = [e for e in store.events(since_seq=0) if e.kind == "auth.denied"]
+        assert len(denied) == 5 and all(
+            e.data["reason"].startswith("with authentication off") for e in denied
+        ), [e.message for e in denied]
+        for host in ("127.0.0.1:8080", "localhost:5173", "[::1]:8080", "127.0.0.2", "LOCALHOST"):
+            assert client.get("/api/v1/providers", headers={"Host": host}).status_code == 200, host
+        same_site = {"Origin": "http://localhost:5173", "Sec-Fetch-Site": "same-site"}
+        assert (
+            client.patch(
+                "/api/v1/providers/src-osp", headers=same_site, json={"name": "Source DC1"}
+            ).status_code
+            == 200
+        )
+    store.dispose()
+
+
+def test_with_authentication_on_any_host_is_answered(api):
+    """SDD §13.1 (audit AP-03): the loopback rule is the auth-off mode's alone - with tokens the
+    server answers the names it is reached by (a route, an ingress host)."""
+    headers = {**api.h("viewer"), "Host": "seamless.apps.example"}
+    assert api.client.get("/api/v1/providers", headers=headers).status_code == 200
 
 
 def test_health_says_whether_authentication_is_off(api, tmp_path):

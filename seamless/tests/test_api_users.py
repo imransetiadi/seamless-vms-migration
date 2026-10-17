@@ -130,7 +130,8 @@ def test_failed_audit_rolls_back_user_creation(api):
 
 def test_auth_disabled_cannot_issue_real_access(tmp_path, store):
     settings, _ = api_settings(tmp_path, auth_disabled=True)
-    with TestClient(create_app(settings, store)) as client:
+    # an auth-off server is reached by a loopback name only (SDD §13.1, audit AP-03)
+    with TestClient(create_app(settings, store), base_url="http://127.0.0.1:8080") as client:
         response = client.post("/api/v1/users", json={"name": "alice"})
         assert response.status_code == 409
         assert "enable authentication" in response.json()["error"]["message"]

@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import Request
 
@@ -17,7 +18,14 @@ from ..config import Settings
 from ..domain.enums import Role
 from ..events import EventBus, emit
 from ..orchestrator import Orchestrator
-from ..security.auth import ANONYMOUS_ADMIN, DashboardUser, Principal, TokenStore, hash_token
+from ..security.auth import (
+    ANONYMOUS_ADMIN,
+    DashboardUser,
+    Principal,
+    TokenStore,
+    hash_token,
+    is_loopback,
+)
 from ..store import AsyncStore, Store, VersionedDocuments
 
 log = logging.getLogger(__name__)
@@ -214,11 +222,50 @@ def require_permission(name: str) -> Callable[[Request], Awaitable[Principal]]:
     return require_role(PERMISSIONS[name])
 
 
+#: Methods that change nothing: another site's page is refused only a change (SDD §13.1)
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _loopback_name(netloc: str) -> bool:
+    """Whether ``host[:port]`` - a Host header, an Origin's authority - names a loopback address."""
+    try:
+        return is_loopback(urlsplit(f"//{netloc}").hostname or "")
+    except ValueError:  # a port that is no number, an unclosed bracket
+        return False
+
+
+def foreign_page(request: Request) -> str | None:
+    """Why a request may come from another site's page, else None (SDD §13.1, audit AP-03).
+
+    With authentication off the loopback bind alone keeps the anonymous admin to the machine, and
+    a page of any site reaches the loopback port: by DNS rebinding under its own name - a Host
+    naming no loopback address - or by a plain cross-site request, whose Origin names another
+    site (``null`` too) or whose ``Sec-Fetch-Site`` says so. A client that sends neither header
+    (the CLI, curl) is no page."""
+    host = request.headers.get("host")
+    if host is not None and not _loopback_name(host):
+        return (
+            "with authentication off the API answers only a loopback name "
+            "(127.0.0.1, localhost, ::1)"
+        )
+    if request.method in SAFE_METHODS:
+        return None
+    origin = request.headers.get("origin")
+    cross_site = request.headers.get("sec-fetch-site", "").lower() == "cross-site"
+    if cross_site or (origin is not None and not _loopback_name(urlsplit(origin).netloc)):
+        return "with authentication off the API takes changes only from this machine's own pages"
+    return None
+
+
 def require_role(role: Role) -> Callable[[Request], Awaitable[Principal]]:
     """FastAPI dependency: the caller's principal, which must hold at least ``role``."""
 
     async def dependency(request: Request) -> Principal:
         svc = services(request)
+        refusal = foreign_page(request) if svc.settings.auth_disabled else None
+        if refusal is not None:
+            await _audit_denied(request, refusal, role)
+            raise ApiError(403, "forbidden", refusal)
         principal = await authenticate(request)
         if principal is None:
             client = _client(request)
