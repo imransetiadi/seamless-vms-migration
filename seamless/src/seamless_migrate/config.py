@@ -7,7 +7,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -41,17 +41,115 @@ def find_repo_root(start: Path | None = None) -> Path:
     return Path.cwd()
 
 
-def _browser_origin(scheme: str, host: str, port: int | None) -> str | None:
-    """An origin as a browser serializes it: the host lower-cased and in punycode, an IPv6
-    address written canonically, no default port (SDD §15.1); None for a host it cannot write."""
-    try:
-        address = ipaddress.ip_address(host)
-        host = f"[{address.compressed}]" if address.version == 6 else address.compressed
-    except ValueError:
-        try:
-            host = host.encode("idna").decode("ascii")
-        except UnicodeError:
+#: characters Python's IDNA 2003 maps where browsers (UTS #46, nontransitional) keep them: their
+#: hosts' ASCII forms differ - Python writes strasse for the browser's xn--strae-oqa (RV31-03)
+_IDNA_DEVIATIONS = frozenset("\u00df\u03c2\u200c\u200d")
+_IPV4_DIGITS = {10: "0123456789", 16: "0123456789abcdefABCDEF", 8: "01234567"}
+#: what the URL Standard forbids in a domain - a browser sends no host that holds one
+_FORBIDDEN_IN_HOST = frozenset(" #%/:<>?@[\\]^|\x7f") | {chr(c) for c in range(0x20)}
+
+
+class _IdnaDeviation(ValueError):
+    """A host whose ASCII form Python's IDNA 2003 writes otherwise than browsers."""
+
+
+def _ipv4_number(part: str) -> int | None:
+    """A part of an IPv4 address as the URL Standard reads it: decimal, 0x hexadecimal or 0 octal;
+    None when it is no such number."""
+    base = 10
+    if part[:2] in ("0x", "0X"):
+        part, base = part[2:], 16
+    elif len(part) > 1 and part[0] == "0":
+        part, base = part[1:], 8
+    if not part:
+        return 0 if base == 16 else None
+    if any(c not in _IPV4_DIGITS[base] for c in part):
+        return None
+    return int(part, base)
+
+
+def _ipv4_host(host: str) -> int | None:
+    """The URL Standard's IPv4 parser over a host that ends in a number: up to four parts, each a
+    number, the last filling the bytes left; None for a host it rejects."""
+    parts = host.split(".")
+    if parts[-1] == "" and len(parts) > 1:
+        parts.pop()
+    if len(parts) > 4:
+        return None
+    numbers: list[int] = []
+    for part in parts:
+        number = _ipv4_number(part)
+        if number is None:
             return None
+        numbers.append(number)
+    *head, last = numbers
+    if any(n > 255 for n in head) or last >= 256 ** (5 - len(numbers)):
+        return None
+    return last + sum(n * 256 ** (3 - i) for i, n in enumerate(head))
+
+
+def _ends_in_a_number(host: str) -> bool:
+    """The URL Standard's check: the last label - a trailing dot aside - is all digits or 0x hex."""
+    parts = host.split(".")
+    if parts[-1] == "" and len(parts) > 1:
+        parts.pop()
+    last = parts[-1]
+    return (bool(last) and all(c in "0123456789" for c in last)) or (
+        last[:2] in ("0x", "0X") and _ipv4_number(last) is not None
+    )
+
+
+def _ipv6_text(address: ipaddress.IPv6Address) -> str:
+    """An IPv6 address as the URL Standard writes it: eight hex pieces, the first longest run of
+    two or more zero pieces compressed - never the dotted tail Python 3.13 writes for ::ffff:."""
+    pieces = [int.from_bytes(address.packed[i : i + 2], "big") for i in range(0, 16, 2)]
+    start, length, i = -1, 1, 0
+    while i < 8:
+        if pieces[i]:
+            i += 1
+            continue
+        j = i
+        while j < 8 and not pieces[j]:
+            j += 1
+        if j - i > length:
+            start, length = i, j - i
+        i = j
+    words = [f"{piece:x}" for piece in pieces]
+    if start < 0:
+        return ":".join(words)
+    return ":".join(words[:start]) + "::" + ":".join(words[start + length :])
+
+
+def _browser_origin(scheme: str, host: str, port: int | None) -> str | None:
+    """An origin as a browser serializes it, by the URL Standard's host parser (SDD §15.1, reviews
+    RV27-08, RV31-03): an IPv6 address in hex pieces, a percent-encoded host decoded, a host ending
+    in a number an IPv4 address in any of its forms written dotted, any other host lower-cased and
+    in punycode; no default port. None for a host it rejects; _IdnaDeviation for one whose ASCII
+    form Python writes otherwise than browsers."""
+    if ":" in host:
+        try:
+            address = ipaddress.IPv6Address(host)
+        except ValueError:
+            return None
+        if address.scope_id:
+            return None  # a zone: no browser sends one
+        host = f"[{_ipv6_text(address)}]"
+    else:
+        host = unquote(host)
+        if _FORBIDDEN_IN_HOST & set(host):
+            return None
+        if _ends_in_a_number(host):
+            number = _ipv4_host(host)
+            if number is None:
+                return None
+            host = str(ipaddress.IPv4Address(number))
+        elif _IDNA_DEVIATIONS & set(host):
+            raise _IdnaDeviation(host)
+        else:
+            try:
+                host = host.encode("idna").decode("ascii").lower()
+            except UnicodeError:
+                return None
     default = {"http": 80, "https": 443}.get(scheme)
     return f"{scheme}://{host}" if port in (None, default) else f"{scheme}://{host}:{port}"
 
@@ -139,7 +237,14 @@ class Settings(BaseModel):
                 )
             # the comparison is exact: an origin written otherwise than the browser sends it would
             # start the server and allow nothing (SDD §15.1, review RV27-08)
-            sent = _browser_origin(parts.scheme, parts.hostname, parts.port)
+            try:
+                sent = _browser_origin(parts.scheme, parts.hostname, parts.port)
+            except _IdnaDeviation:
+                raise ValueError(
+                    f"{origin!r}: its host holds \u00df, \u03c2 or a zero-width joiner, which "
+                    "Python writes otherwise than a browser - write the origin's xn-- form as the "
+                    "browser sends it (its Origin header)"
+                ) from None
             if origin != sent:
                 raise ValueError(
                     f"{origin!r} is not an origin as a browser sends it: write {sent!r}"

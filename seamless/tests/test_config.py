@@ -99,6 +99,17 @@ def test_settings_ansible_host_key_checking_is_off_by_default_and_can_be_turned_
         ("http://dashboard.example.com:80", "http://dashboard.example.com"),
         ("http://[0:0:0:0:0:0:0:1]:5173", "http://[::1]:5173"),
         ("https://b\u00fccher.example", "https://xn--bcher-kva.example"),
+        # the URL Standard's host parser (review RV31-03): a percent-encoded host is decoded, a
+        # host ending in a number is an IPv4 address in any of its forms, written dotted, and an
+        # IPv6 address is written in hex pieces - never dotted, as Python 3.13 writes ::ffff:a.b.c.d
+        ("https://ex%61mple.com", "https://example.com"),
+        ("http://127.1:5173", "http://127.0.0.1:5173"),
+        ("http://2130706433:5173", "http://127.0.0.1:5173"),
+        ("http://0x7f.0.0.1:5173", "http://127.0.0.1:5173"),
+        ("http://0177.0.0.1:5173", "http://127.0.0.1:5173"),
+        ("http://127.0.0.1.:5173", "http://127.0.0.1:5173"),
+        ("http://[::ffff:127.0.0.1]:5173", "http://[::ffff:7f00:1]:5173"),
+        ("http://[2001:db8:0:0:1:0:0:1]", "http://[2001:db8::1:0:0:1]"),
     ],
 )
 def test_a_cors_origin_is_written_as_a_browser_sends_it(configured, browser_sends):
@@ -110,6 +121,40 @@ def test_a_cors_origin_is_written_as_a_browser_sends_it(configured, browser_send
     with pytest.raises(ValueError, match=re.escape(f"write '{browser_sends}'")):
         Settings(cors_origins=[configured])
     assert Settings(cors_origins=[browser_sends]).cors_origins == [browser_sends]
+
+
+@pytest.mark.parametrize(
+    ("host", "browser_sends"),
+    [
+        ("stra\u00dfe.example", "https://xn--strae-oqa.example"),
+        ("\u03c2a.example", "https://xn--a-xmb.example"),
+    ],
+)
+def test_a_cors_origin_whose_host_python_writes_otherwise_than_browsers_is_refused(
+    host, browser_sends
+):
+    """SDD §15.1 (review RV31-03): Python's IDNA 2003 writes a host holding \u00df, \u03c2 or a
+    zero-width joiner otherwise than browsers do (UTS #46 keeps them: xn--strae-oqa, where Python
+    writes strasse - another domain). Such an entry is refused, asking for the xn-- form the browser
+    sends - never naming another domain; that form is taken."""
+    with pytest.raises(ValueError) as refused:
+        Settings(cors_origins=[f"https://{host}"])
+    # no spelling of its own: Python's would be another domain (strasse, xn--a-zmb)
+    assert "xn--" in str(refused.value) and "write '" not in str(refused.value)
+    assert Settings(cors_origins=[browser_sends]).cors_origins == [browser_sends]
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["http://256.0.0.1", "http://1.2.3.4.5", "http://[fe80::1%25en0]", "https://a%20b.example"],
+)
+def test_a_cors_origin_no_browser_sends_is_refused(origin):
+    """SDD §15.1 (review RV31-03): a host the URL Standard rejects - an IPv4 part out of range, five
+    parts ending in a number, an IPv6 zone, a character it forbids once decoded - is no origin a
+    browser sends: refused, with no spelling to write instead."""
+    with pytest.raises(ValueError, match="is not an origin a browser sends") as refused:
+        Settings(cors_origins=[origin])
+    assert "write '" not in str(refused.value)
 
 
 @pytest.mark.parametrize(
