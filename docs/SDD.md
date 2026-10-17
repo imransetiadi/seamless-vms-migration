@@ -2308,9 +2308,16 @@ The tokens file is refused at start-up (the server does not start) when an entry
 so a hand-edited file cannot add one either.
 `SEAMLESS_AUTH_DISABLED=true` maps every request to principal `anonymous` with role `admin`; the CLI
 refuses to start with it unless the bind host is loopback (`127.0.0.1`, `::1`, `localhost`).
-Demo mode on loopback disables auth by default. Every request refused for its role emits
+Demo mode on loopback disables auth by default. The loopback bind alone does not keep that admin to the machine: a
+page of any site reaches the loopback port, by DNS rebinding under its own name, or by a plain cross-site request.
+So, with authentication off, a route that takes a role refuses (403 `forbidden`, before anything else) a request whose
+`Host` names no loopback address, and a state-changing one (any method but `GET`, `HEAD` and `OPTIONS`) whose
+`Origin` names no loopback address (`null` included) or whose `Sec-Fetch-Site` is `cross-site`; a loopback name with
+any port, IPv6 included, passes, and so does a client that sends neither header - the CLI, curl (audit AP-03). Every
+request refused for its role emits
 `auth.denied` — a missing or invalid token (401), the per-address lockout (429), a role below the
-route's minimum or an approver-only plan field set below the approver role (403, §12) — with `actor`
+route's minimum, an approver-only plan field set below the approver role, or, with authentication off, a request
+another site's page may have sent (403, §12) — with `actor`
 the principal's name (`unauthenticated` without one), `message` `METHOD path: reason` and `data`
 `{path, method, reason, required_role, client}`, never the token; at most 30 per client address and
 minute are recorded.
