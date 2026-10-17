@@ -514,6 +514,8 @@ def setup(tmp_path, crash_on=None, dst_crash_on=None):
         "src": source_cloud(calls, crash_on),
         "dst": FakeCloud("dst", calls, pools=dst_pools, crash_on=dst_crash_on),
     }
+    # every test's clouds share one pool whose objects a manage renames (SDD §7.3 step 6)
+    shared_pool(clouds)
     settings = Settings(data_dir=tmp_path / "data")
     executor = HandoverExecutor(settings, conn_factory=lambda p: clouds[p.cloud], poll_s=0)
     plan = make_plan(
@@ -555,17 +557,21 @@ def ops(calls):
 
 
 def shared_pool(clouds):
-    """The two clouds share one Ceph pool, as SDD §7.3 has them: a manage finds the object by its
-    source-name and the driver renames it ``volume-<new id>`` (step 6), an unmanage keeps it, and
-    Nova refuses a server on a volume its Cinder does not know or another server holds (audit
-    EX-17: the plain fakes manage any name)."""
+    """The two clouds share one pool, as SDD §7.3 has them: a manage finds the object by its
+    source-name - a Ceph image, a NetApp share's file or a FlexVol's LUN, named after the part
+    past the share or FlexVol (§7.3.1) - and the driver renames it ``volume-<new id>`` (step 6),
+    an unmanage keeps it, and Nova refuses a server on a volume its Cinder does not know or another
+    server holds (audit EX-17: plain fakes managed any name). Applied once per pair of clouds."""
+    if getattr(clouds["src"], "images", None) is not None:
+        return clouds["src"].images
     images = {f"volume-{vid}" for vid in clouds["src"].volumes}
+    clouds["src"].images = images
     for cloud in clouds.values():
         post = cloud.block_storage.post
 
         def manage(url, json=None, _post=post, **kw):
             if url == "/manageable_volumes":
-                name = json["volume"]["ref"]["source-name"]
+                name = json["volume"]["ref"]["source-name"].rsplit("/", 1)[-1]
                 if name not in images:
                     return refused(f"Manage existing volume failed: image {name} not found")
                 response = _post(url, json=json, **kw)
