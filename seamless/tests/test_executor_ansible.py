@@ -3305,7 +3305,14 @@ async def test_a_vmware_rollback_closes_the_clock_once_its_power_on_succeeded(en
     with pytest.raises(TransientStepError, match="HTTP 503"):
         await env.executor.run(StepName.ROLLBACK, ctx)
     closing = [] if power_on_fails else [("clock_closed",)]
-    assert env.registry.calls == [("delete_server", "dst-9"), ("power_on", "srv-1"), *closing]
+    # the clock open: a server of the kit's name is looked for beside the recorded one (RV32A-07)
+    lookup = [("find_server", "web-01")]
+    assert env.registry.calls == [
+        *lookup,
+        ("delete_server", "dst-9"),
+        ("power_on", "srv-1"),
+        *closing,
+    ]
 
 
 @pytest.mark.parametrize("powered_on", [True, None])
@@ -3740,6 +3747,47 @@ async def test_a_vmware_rollback_whose_copies_cannot_be_marked_fails_with_the_so
     calls = [c[0] for c in env.registry.calls]
     assert calls.index("power_on") < calls.index("set_volume_metadata")
     assert "delete_volume" not in calls
+
+
+@pytest.mark.parametrize("case", ["a new server beside", "the recorded one", "clock closed"])
+async def test_a_vmware_rollback_deletes_a_server_of_the_kits_name_beside_a_recorded_one(env, case):
+    """SDD §7.2 (review RV32A-07): while the clock is open the rollback looks the server up by the
+    kit's name even when one is recorded - the recorded one may be an earlier attempt's that a
+    failed rollback already deleted, while the new attempt's cutover did not record its own. One
+    found that is not the recorded one is deleted before the power-on too, what it held kept
+    (q26): the source never runs beside it. The recorded one found by name is deleted once; with
+    the clock closed nothing is looked up by name."""
+    env.registry.existing = {"web-01"}  # the kit's server of web-01, running
+    env.registry.volumes = [kit_volume("held", "web-01-2001", attachments=["dst-web-01"])]
+    live_at_power_on: list[list[str]] = []
+
+    class Nova(FakeImpl):
+        async def delete_server(self, server_id):
+            await FakeImpl.delete_server(self, server_id)
+            if server_id == "dst-web-01":
+                self.registry.existing.discard("web-01")
+
+        async def power_on(self, source_id):
+            live_at_power_on.append(sorted(self.registry.existing))
+            await FakeImpl.power_on(self, source_id)
+
+    env.registry.get = lambda provider: Nova(env.registry)
+    recorded = "dst-web-01" if case == "the recorded one" else "srv-attempt-1"
+    clock = {} if case == "clock closed" else {"downtime_started_at": utcnow()}
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, destination_server_id=recorded, **clock
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    deletes = [c[1] for c in env.registry.calls if c[0] == "delete_server"]
+    if case == "a new server beside":
+        assert live_at_power_on == [[]], "the source was powered on beside the new server"
+        assert sorted(deletes) == ["dst-web-01", "srv-attempt-1"]
+        assert result.details["deleted_volumes"] == []  # what the server found by name held
+    elif case == "the recorded one":
+        assert live_at_power_on == [[]] and deletes == ["dst-web-01"]
+    else:
+        assert deletes == ["srv-attempt-1"]
+        assert ("find_server", "web-01") not in env.registry.calls
 
 
 async def test_a_vmware_rollback_deletes_no_volume_of_a_vm_without_a_kit_name(env):

@@ -1669,28 +1669,34 @@ class AnsibleExecutor:
         rdir = run_dir(self.settings, ctx.plan.id, m.id)
         try:
             dst = self.providers.get(ctx.destination)
-            server_id = m.destination_server_id
+            recorded = m.destination_server_id
+            named = None
             # what an earlier attempt kept of a server it then deleted (review RV30-05)
             kept = await asyncio.to_thread(_read_kept, rdir)
-            if server_id is None and m.downtime_started_at is not None:
+            if m.downtime_started_at is not None:
                 # the kit records nothing in the control plane before the cutover powers the
                 # VM off; a same-named server after that point was created by this migration
-                # (_refuse_name_collision ruled out a pre-existing one before the attempt)
-                server_id = await dst.find_server(kit_vm_name(vm.name))
-                if server_id:
+                # (_refuse_name_collision ruled out a pre-existing one before the attempt) - also
+                # beside a recorded one, maybe an earlier attempt's that a failed rollback already
+                # deleted while the new attempt's cutover did not record its own (review RV32A-07)
+                found = await dst.find_server(kit_vm_name(vm.name))
+                if found and found != recorded:
+                    named = found
                     # it may be another plan's VM the kit names alike (owner question q26): what
                     # it holds stays, its deletion detaching it notwithstanding (review RV29-03) -
                     # read from Nova's record, as no Cinder call comes before the power-on, and
                     # recorded before the deletion: a retried attempt no longer finds the server
-                    kept |= set(await dst.server_volumes(server_id))
+                    kept |= set(await dst.server_volumes(named))
                     try:
-                        await asyncio.to_thread(_record_kept, rdir, server_id, kept)
+                        await asyncio.to_thread(_record_kept, rdir, named, kept)
                     except OSError as exc:
                         raise TransientStepError(
-                            f"rollback: could not record what {server_id} holds: {exc}"
+                            f"rollback: could not record what {named} holds: {exc}"
                         ) from exc
-            if server_id:
-                await dst.delete_server(server_id)
+            servers = [server for server in (recorded, named) if server]
+            for server in servers:
+                await dst.delete_server(server)
+            server_id = recorded or named
             # the source next: only the server's deletion comes before it - two live copies on
             # a stretched network -, and the destination's clean-up never keeps it stopped - the
             # kit's ports and volumes matter only to the next attempt, which a failure there
@@ -1698,7 +1704,7 @@ class AnsibleExecutor:
             await self.providers.get(ctx.source).power_on(vm.source_id)
             # it runs: the clock closes now, whatever fails after (SDD §5.2, review RV30-03)
             await ctx.mark_downtime_end()
-            if server_id or kept:
+            if servers or kept:
                 # a server booted from the kit's volumes: what this rollback then cannot delete
                 # or keeps is no completed copy for a later run (SDD §7.2, review RV32A-01)
                 await self._mark_cutover_copies(ctx)
@@ -1714,6 +1720,7 @@ class AnsibleExecutor:
             details={
                 "source_running": True,
                 "deleted_server": server_id,
+                "deleted_servers": servers,
                 "deleted_ports": deleted_ports,
                 "deleted_volumes": deleted_volumes,
             }
