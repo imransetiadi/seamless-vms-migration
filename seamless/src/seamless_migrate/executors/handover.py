@@ -19,6 +19,7 @@ import logging
 import operator
 import os
 import tempfile
+import time
 from collections.abc import Callable, Collection
 from datetime import datetime
 from pathlib import Path
@@ -263,6 +264,10 @@ async def _in_thread(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
 def _stopping(server: Any) -> bool:
     """Nova powers the server off: its task state while a stop runs, the status still ACTIVE."""
     return str(_attr(server, "task_state") or "").lower() == "powering-off"
+
+
+def _stopped(server: Any) -> bool:
+    return str(_attr(server, "status", "")).upper() == "SHUTOFF"
 
 
 def _conflict(exc: BaseException) -> bool:
@@ -1244,16 +1249,18 @@ class HandoverExecutor:
 
                 def stop() -> None:
                     server = src.compute.get_server(server_id)
-                    if str(_attr(server, "status", "")).upper() != "SHUTOFF":
+                    if not _stopped(server):
                         # a stop that runs - the one a retry finds, the server reading ACTIVE
-                        # until the guest is down - is waited for: Nova refuses a second (409)
+                        # until the guest is down - is waited for: Nova refuses a second (409),
+                        # as it refuses a stop of a server another stop ended meanwhile (RV27-03)
                         if not _stopping(server):
                             try:
                                 src.compute.stop_server(server)
                             except Exception as exc:
-                                if not (
-                                    _conflict(exc) and _stopping(src.compute.get_server(server_id))
-                                ):
+                                if not _conflict(exc):
+                                    raise
+                                again = src.compute.get_server(server_id)
+                                if not (_stopping(again) or _stopped(again)):
                                     raise
                         # Nova accepted a stop: should the wait fail, a rollback starts the source;
                         # the first one's time stays, the clock's start (SDD §7.3 step 1)
@@ -1651,12 +1658,14 @@ class HandoverExecutor:
 
     def _start(self, conn: Any, server_id: str) -> None:
         server = conn.compute.get_server(server_id)
-        if _stopping(server):
+        deadline = time.monotonic() + self.wait_s
+        while _stopping(server):
             # Nova still powers the guest off: the server reads ACTIVE until it is down, and a
-            # start is refused until then - wait for the stop to end, then start (review RV26-01)
-            conn.compute.wait_for_server(
-                server, status="SHUTOFF", interval=self.poll_s, wait=self.wait_s
-            )
+            # start is refused until then. Wait until the stop ended - SHUTOFF, or ACTIVE again
+            # when Nova gave the power-off up - then start it unless it runs (RV26-01, RV27-04)
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Timeout waiting for the stop of server {server_id} to end")
+            time.sleep(self.poll_s or 0.1)
             server = conn.compute.get_server(server_id)
         if str(_attr(server, "status", "")).upper() != "ACTIVE":
             conn.compute.start_server(server)

@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import copy
 import gc
 import json
 import re
@@ -589,11 +590,14 @@ def shared_pool(clouds):
     return images
 
 
-def powering_off(cloud, settle_s, blips=1):
+def powering_off(cloud, settle_s, blips=1, gives_up=False):
     """Nova as upstream answers a stop (compute/api.py, api/openstack/common.py _STATE_MAP): the
     server keeps reading ACTIVE, task_state "powering-off", until the guest is down ``settle_s``
     later, then SHUTOFF; meanwhile a second stop and a start are refused with 409. The first
-    ``blips`` waits for SHUTOFF meet nova-api answering 503 (review 26's model)."""
+    ``blips`` waits for SHUTOFF meet nova-api answering 503 (review 26's model). With
+    ``gives_up`` the driver fails the power-off instead: compute/manager.py's
+    @reverts_task_state puts task_state back to None, and the server stays ACTIVE, its guest
+    running (review RV27-04)."""
     server = cloud.servers["srv-1"]
     server.task_state = None
     lock = threading.Lock()
@@ -616,7 +620,7 @@ def powering_off(cloud, settle_s, blips=1):
         def settle():
             time.sleep(settle_s)
             with lock:
-                s.status, s.task_state = "SHUTOFF", None
+                s.status, s.task_state = ("ACTIVE" if gives_up else "SHUTOFF"), None
             settled.set()
 
         threading.Thread(target=settle, daemon=True).start()
@@ -632,7 +636,7 @@ def powering_off(cloud, settle_s, blips=1):
         if status == "SHUTOFF" and left[0] > 0:
             left[0] -= 1
             raise sdk_error(503, "Service Unavailable", url=nova)
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + min(wait, 20)
         while s.status != status:
             if time.monotonic() > deadline:
                 raise RuntimeError(f"Timeout waiting for the server to transition to {status}")
@@ -1237,6 +1241,102 @@ async def test_a_handover_rollback_starts_a_source_nova_still_powers_off(tmp_pat
     assert await asyncio.to_thread(settled.wait, 5)
     assert clouds["src"].servers["srv-1"].status == "ACTIVE"
     assert ("src", "start_server", "srv-1") in calls
+
+
+@pytest.mark.parametrize("ended", ["before the step's stop", "before the step's re-read"])
+async def test_a_handover_stop_refused_for_a_source_off_already_goes_on(tmp_path, ended):
+    """SDD §7.3 step 1 (review RV27-03): Nova answers a stop with 409 also when the server is
+    stopped already - a stop that began after the step read the server ACTIVE (an operator's, or
+    the guest's own shutdown that Nova recorded) ended before the step's own stop, or before the
+    step read the server again after the 409. That stop is taken as done: the cutover goes on, its
+    stop journaled as sent and its clock opened, where a permanent failure would leave the source
+    SHUTOFF under a cutover that never ran."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    powering_off(src, settle_s=0.3, blips=0)
+    stop = src.compute.stop_server
+
+    def raced(server):
+        if ended == "before the step's stop":
+            server.status = "SHUTOFF"  # another stop ended meanwhile
+            stop(server)  # 409: the server is stopped
+            return
+        stop(server)  # another stop lands first...
+        try:
+            stop(server)  # ...so this one is refused: 409 while it powers the guest off
+        except Exception:
+            server.status, server.task_state = "SHUTOFF", None  # and it ends before the re-read
+            raise
+
+    src.compute.stop_server = raced
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    result = await executor.run(StepName.CUTOVER, ctx)
+    assert result.destination_server_id
+    assert rec.downtime_marks == 1
+
+
+async def test_a_handover_stop_refused_for_another_reason_fails_with_that_reason(tmp_path):
+    """SDD §7.3 step 1 (review RV27-03): only a stop refused with 409 is read again, for a stop
+    that began meanwhile; a stop refused for another reason (403: the credential may not stop
+    it) fails with that reason at once - never read again, whose own failure would hide it."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    src.servers["srv-1"].task_state = None
+    get, refused = src.compute.get_server, []
+    url = "https://nova.dc1.example:8774/v2.1/servers/srv-1/action"
+
+    def get_server(server_id):
+        if refused:  # nova-api blips meanwhile
+            raise sdk_error(503, "Service Unavailable", url=url)
+        return get(server_id)
+
+    def stop_server(server):
+        refused.append(server.id)
+        raise sdk_error(403, "Forbidden", b'{"forbidden": {"code": 403}}', url=url)
+
+    src.compute.get_server, src.compute.stop_server = get_server, stop_server
+    with pytest.raises(PermanentStepError, match="stop source server: ForbiddenException: 403"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert refused == ["srv-1"]
+
+
+async def test_a_handover_rollback_after_a_power_off_nova_gave_up_finds_the_source_running(
+    tmp_path,
+):
+    """SDD §7.3 rollback (review RV27-04): Nova does not always end a power-off with SHUTOFF -
+    when the driver fails, task_state goes back to None and the server stays ACTIVE, its guest
+    running. The rollback waits until the stop ended, not for a SHUTOFF that never comes, and
+    starts the source only when it does not run."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    executor.wait_s = 5
+    settled = powering_off(clouds["src"], settle_s=0.5, gives_up=True)
+    with pytest.raises(TransientStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    # as openstacksdk, every read answers a new object: the server is read again, never watched
+    get = clouds["src"].compute.get_server
+    clouds["src"].compute.get_server = lambda server_id: copy.copy(get(server_id))
+    started = time.monotonic()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details == {"source_running": True}
+    assert settled.is_set() and time.monotonic() - started < 4, "waited for a SHUTOFF"
+    assert clouds["src"].servers["srv-1"].status == "ACTIVE"
+    assert ("src", "start_server", "srv-1") not in calls, "it runs: nothing to start"
+
+
+async def test_a_handover_rollback_whose_source_stop_does_not_end_fails_to_be_retried(tmp_path):
+    """SDD §7.3 rollback (review RV27-04): the wait for a stop to end is bounded by the step's
+    wait (wait_s): a power-off that outlasts it fails the attempt as transient, to be retried -
+    never a wait without end, nor a start Nova would refuse."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    powering_off(clouds["src"], settle_s=5)
+    with pytest.raises(TransientStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    executor.wait_s = 0.5
+    started = time.monotonic()
+    with pytest.raises(TransientStepError, match="stop of server srv-1 to end"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert time.monotonic() - started < 4
+    assert ("src", "start_server", "srv-1") not in calls
 
 
 async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):
