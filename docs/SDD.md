@@ -1011,7 +1011,11 @@ fails the export, and so does a virtio-blk disk (`vdX`) whose serial file is gon
 loudly, as permanent (review RV12-03, RV13-02). ssh failing at the check is no such failure and is retried as
 transient: the serial read's error quotes the ssh command line, ConnectTimeout included, and the check of the by-id link
 gives up with "SSH timeout: conversion host {address} unreachable over SSH, checking the by-id link of {device}" (review
-RV14-02). The export serves the disk's udev link `/dev/disk/by-id/virtio-<serial>`, but that adds no protection once the
+RV14-02). A command on a conversion host that fails by itself - any exit status but ssh's own 255 - fails with a
+message naming its program and that status ("nbdkit on the conversion host exited with status 1"), never ssh's command
+line: ConnectTimeout among ssh's options read as a "timeout", so a permanent failure - the export's NBD server refused,
+with the source VM stopped - was retried as transient (review RV42B-02); its full command stays in the module's log.
+ssh's own failure keeps its command line, retried as transient as above. The export serves the disk's udev link `/dev/disk/by-id/virtio-<serial>`, but that adds no protection once the
 export runs: nbdkit resolves the path it serves once, at its start, and opens that
 device path on every later connection, so a volume taken off the host after the export started still has the transfer
 read whatever disk took its path, without an error - a residual the owner decides on (qemu-nbd keeps the descriptor it
