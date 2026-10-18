@@ -1701,7 +1701,13 @@ source server from the journaled definition with the volumes in device order, ea
 false) while Nova builds it - a build Nova aborts deletes every volume flagged otherwise, the VM's only copy of its
 data -, and once it is `ACTIVE` give each volume its journaled `delete_on_termination` back (the step 3 call,
 journaled per volume); a recreated server Nova left in `ERROR` is deleted on the next attempt, its volumes kept, and
-created again (review RV35B-04). Every step is
+created again (review RV35B-04). Before that deletion, each journaled port still bound to the failed build is
+unbound through Neutron (its device and host cleared): Nova's deletion takes every port of the server its network
+cache no longer keeps - a build it aborted cleared that cache -, the user's own port reused included. And every
+attempt reads a journaled port again before the recreate: one gone is created again from the journaled MAC,
+addresses, security groups and port-security flag, and journaled anew - a user's own port so loses what the
+definition does not record, such as a floating IP's association -; one still bound to a server that is gone is
+unbound (review RV36B-02). Every step is
 a metadata operation — data never moves — and each sub-step is journaled
 (`handover-journal.json`, 0600) so a crash resumes at the first incomplete sub-step. Each call is a blocking
 openstacksdk call in a worker thread, which no cancel stops: a step cancelled by the step timeout (§15.1), a
