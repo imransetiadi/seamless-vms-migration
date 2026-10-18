@@ -3020,7 +3020,10 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   migration is `pending`, `blocked` or `ready`: approve → `approved`, final = the recommended option, which must
   be usable and eligible now; override → `overridden`, final = the chosen eligible option, `reason_text` = the
   reason (required, at least 10 characters, when the policy in force says so — the API refuses with 422, not only
-  the dashboard). The new decision replaces the recommendation's (the earlier one stays in the audit trail as
+  the dashboard). Eligible is judged at the request, as `PUT …/strategy` judges it (§12): a Retry does not
+  re-assess the estimates the last validation stored, so `storage_handover` is not eligible while the migration
+  holds the destination volumes an earlier attempt created (§9.2) — an approve of it is refused with 409, an
+  override to it with 422, each naming that reason (review RV41B-01). The new decision replaces the recommendation's (the earlier one stays in the audit trail as
   `before`), emits `decision.approved` or `decision.overridden` (actor `user:<name>`), sets `migration.strategy`
   to the final option, clears `advisor_hold` and — when the strategy changes — the approvals, the cutover
   request and `force_window` (§5.4). An override also records the option in `plan.strategy_overrides`, like
