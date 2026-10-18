@@ -1713,8 +1713,10 @@ attempt reads a journaled port again before the recreate: one gone is created ag
 addresses, security groups and port-security flag, and journaled anew - a user's own port so loses what the
 definition does not record, such as a floating IP's association -; one still bound to a server that is gone is
 unbound (review RV36B-02). The downtime clock closes once the recreated server is `ACTIVE` - on every attempt
-that finds it journaled, before the give-back - and once the start of a source that still exists succeeded (§5.2):
-an attempt that fails after it, a give-back Nova refuses, leaves the source counted as running, and the migration
+that finds it journaled, before the give-back - and once the start of a source that still exists succeeded (§5.2);
+the call, its journal mark and that close run as one, which a cancel - the step timeout, a shutdown - waits out as it
+does the call alone (review RV37A-01): an attempt that fails after it, a give-back Nova refuses, leaves the source
+counted as running, and the migration
 names the server it replaced until a Roll back succeeds. A cutover resumed on a journal whose rollback recreated the
 source - a Retry after that failed attempt - refuses before any call and before the clock opens ("a rollback
 attempt recreated the source server <id>, which runs: roll back to finish it"): that rollback unmanaged every volume
