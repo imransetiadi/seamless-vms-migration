@@ -1881,7 +1881,9 @@ class AnsibleExecutor:
         (SDD §5.1, §7.2, review RV-01, RV-02). The kit's volumes of the VM it keeps it names: the
         kit names them after the VM, so another plan's migration of it takes them as its own, and
         the operator deletes them once none migrates it; a read that fails is named and fails
-        nothing, the server being gone (review RV42B, lead NP-2)."""
+        nothing, the server being gone (review RV42B, lead NP-2). One a server holds is that
+        server's disk - another plan's cut-over server of the VM, another VM the kit names alike
+        -, never named for deletion (review RV43B-01)."""
         server_id = ctx.migration.destination_server_id
         dst = self.providers.get(ctx.destination)
         if server_id:
@@ -1899,6 +1901,7 @@ class AnsibleExecutor:
         details["kept_volumes"] = [
             {"id": str(v["id"]), "name": str(v.get("name"))}
             for v in kit_volumes(ctx.migration.vm.name, volumes)
+            if not v.get("attachments")
         ]
         return StepResult(details=details)
 
