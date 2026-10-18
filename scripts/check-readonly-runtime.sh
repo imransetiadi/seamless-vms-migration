@@ -14,7 +14,7 @@
 #     with the executor's ANSIBLE_HOME under the data directory.
 #
 #   scripts/check-readonly-runtime.sh
-#   DOCKER="docker --context colima-seamless" CP_IMAGE=seamless-migrate:0.1.0 scripts/check-readonly-runtime.sh
+#   DOCKER="docker --context colima-seamless" CP_IMAGE=seamless-migrate:<version> scripts/check-readonly-runtime.sh
 #   STATEFULSET=old/postgres-statefulset.yaml scripts/check-readonly-runtime.sh   # check another manifest
 #
 # Exit status: the number of failed checks. Needs python3 with PyYAML (PYTHON=… to choose one).

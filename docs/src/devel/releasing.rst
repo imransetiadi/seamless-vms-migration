@@ -3,6 +3,15 @@
 Releasing the OS Migrate collection
 ===================================
 
+.. note::
+
+   This is upstream os-migrate's release process. The Seamless Migrate fork
+   follows ``RELEASING.md`` at the repository root instead: it takes only the
+   version edits below from this page, attaches the collection tarball to its
+   GitHub Release, never publishes it to Ansible Galaxy under upstream's
+   ``os_migrate`` namespace, and tags ``vX.Y.Z`` in its own repository, never
+   upstream's (Seamless Migrate SDD §20 D6).
+
 Set env vars with old and new versions:
 
 ::

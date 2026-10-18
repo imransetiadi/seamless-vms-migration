@@ -123,6 +123,63 @@ async def run_plan(h, plan):
     await h.orch.start()
 
 
+async def _a_paused_plan_whose_finished_vm_left_the_source(tmp_path, store):
+    """SDD §5.4 (review PL-09): web-01 is cut over, completed and finalized with delete_source - its
+    VM gone from the source, as a storage handover's step 4 leaves it too -, and its plan paused
+    with web-02 still ready. Returns the harness, the plan and the source's reads from then on."""
+    vms = [vm(1), vm(2)]
+    h, plan = await setup(
+        tmp_path, store, vms, plan_kw={"default_strategy": Strategy.cold, "auto_cutover": False}
+    )
+    await run_plan(h, plan)
+    first = await h.by_vm(plan.id, "vm-1")
+    await h.orch.request_cutover(first.id, "sari")
+    await h.wait_phase(first.id, P.completed)
+    await h.orch.pause_plan(plan.id, "alice")
+    await h.orch.finalize(first.id, "sari", delete_source=True, confirm="web-01")
+    del h.source.vms["vm-1"]  # the finalize deleted the source server
+    reads: list[str] = []
+    get_vm = h.source.get_vm
+
+    async def counted(source_id):
+        reads.append(source_id)
+        return await get_vm(source_id)
+
+    h.source.get_vm = counted
+    return h, plan, reads
+
+
+async def test_a_plan_whose_finished_vm_left_the_source_validates_again(tmp_path, store):
+    """SDD §5.4 (review PL-09): a validation reads from the source only the VMs it re-assesses; a
+    finished migration counts as its recorded VM, so its plan validates again once that VM left
+    the source - never 502 "VM ... not found" - and the finished migration stays as it is."""
+    h, plan, reads = await _a_paused_plan_whose_finished_vm_left_the_source(tmp_path, store)
+    try:
+        report = await h.orch.validate_plan(plan.id, "alice")
+    finally:
+        await h.orch.stop()
+    assert sorted((i.vm_name, i.phase) for i in report.migrations) == [
+        ("web-01", P.finalized),
+        ("web-02", P.ready),
+    ]
+    assert reads == ["vm-2"]
+
+
+async def test_the_waves_of_a_plan_whose_finished_vm_left_the_source_are_planned_again(
+    tmp_path, store
+):
+    """SDD §5.4, §9.4 (review PL-09): the wave planner reads the plan's VMs as a validation does -
+    a finished migration's VM as recorded -, so the waves of a plan whose finished VM left the
+    source are planned again, every VM in one."""
+    h, plan, reads = await _a_paused_plan_whose_finished_vm_left_the_source(tmp_path, store)
+    try:
+        planned = await h.orch.auto_waves(plan.id, 10, "alice")
+    finally:
+        await h.orch.stop()
+    assert sorted(v for w in planned.waves for v in w.vm_ids) == ["vm-1", "vm-2"]
+    assert reads == ["vm-2"]
+
+
 async def test_validate_creates_migrations_with_findings_and_estimates(tmp_path, store):
     gpu = vm(3, "gpu-01", flavor_extra_specs={"resources:VGPU": "1"})
     vms = [vm(1), vm(2, "db-02", size_gb=600, used_gb=300.0), gpu]
@@ -355,10 +412,10 @@ def _park_vms(h, monkeypatch):
     entered, release = asyncio.Event(), asyncio.Event()
     original = h.orch._vms
 
-    async def parked(plan, impl):
+    async def parked(*args):
         entered.set()
         await release.wait()
-        return await original(plan, impl)
+        return await original(*args)
 
     monkeypatch.setattr(h.orch, "_vms", parked)
     return entered, release
@@ -529,6 +586,19 @@ async def test_a_validation_takes_over_a_migration_an_interrupted_one_left_valid
     h, plan, stuck = await _left_validating(tmp_path, store)
     report = await h.orch.validate_plan(plan.id, "alice")
     assert {item.migration_id: item.phase for item in report.migrations}[stuck.id] == P.ready
+
+
+async def test_a_validation_reads_the_source_vm_of_a_migration_left_validating(tmp_path, store):
+    """SDD §5.4 (review PL-09): a migration an interrupted validation left in validating is
+    re-assessed, so its VM is read from the source again - a disk added since counts -, never taken
+    as recorded as a finished migration's is."""
+    h, plan, stuck = await _left_validating(tmp_path, store)
+    grown = h.source.vms["vm-2"]
+    extra = make_disk(id="vol-2b", size_gb=50, used_gb=5.0)
+    h.source.vms["vm-2"] = grown.model_copy(update={"disks": [*grown.disks, extra]})
+    await h.orch.validate_plan(plan.id, "alice")
+    taken = await h.migration(stuck.id)
+    assert (taken.phase, [d.id for d in taken.vm.disks]) == (P.ready, ["vol-2", "vol-2b"])
     taken = await h.migration(stuck.id)
     assert taken.phase == P.ready
     # taken over as it was: one transition, written once
@@ -2985,6 +3055,126 @@ async def test_a_downtime_event_the_store_refuses_still_leaves_the_clock_open(tm
         await h.orch._mark_downtime(m.id)
     assert (await h.migration(m.id)).downtime_started_at is not None
     assert "migration.downtime_started" not in h.kinds()
+
+
+#: each half of the clock's close, refused in turn when it runs (reviews RV36B-03, RV37B-01): the
+#: migration's UPDATE, or its migration.downtime_ended's INSERT
+CLOSE_HALVES = {
+    "clock": ("UPDATE documents", "migration"),
+    "event": ("INSERT INTO events", "migration.downtime_ended"),
+}
+
+
+@pytest.mark.parametrize("half", list(CLOSE_HALVES))
+async def test_a_store_error_closing_the_clock_inside_a_step_retries_the_attempt(
+    tmp_path, store, refuse_write, half
+):
+    """SDD §5.2 (reviews RV36B-03, RV37B-01): a rollback closes the clock inside its step once the
+    source runs; a store error on either half of that close - the clock's save, its event - fails
+    the attempt as transient, never the rollback, and leaves neither: the retry closes the clock
+    and announces it, once."""
+    settings = make_settings(tmp_path)
+    attempts: list[int] = []
+    refused: list[list[str]] = []
+
+    async def cutover(ctx):
+        await ctx.mark_downtime_start()
+        raise PermanentStepError("the destination refused the server")
+
+    async def rollback(ctx):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            refused.append(refuse_write(store, *CLOSE_HALVES[half]))
+        await ctx.mark_downtime_end()
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.CUTOVER: cutover, StepName.ROLLBACK: rollback}
+    )
+    h, plan = await setup(tmp_path, store, [vm(1)], executor=executor, settings=settings)
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back, P.failed)
+    await h.orch.stop()
+    assert m.phase == P.rolled_back, (h.history(m), m.error)
+    assert refused[0] == [" ".join(CLOSE_HALVES[half])] and attempts == [1, 2]
+    assert m.downtime_ended_at is not None and m.actual_downtime_s is not None
+    assert h.kinds().count("migration.downtime_started") == 1
+    assert h.kinds().count("migration.downtime_ended") == 1, h.kinds()
+
+
+@pytest.mark.parametrize("half", list(CLOSE_HALVES))
+async def test_a_restop_whose_close_the_store_refused_announces_each_outage_end(
+    tmp_path, store, refuse_write, half
+):
+    """SDD §5.2, §7.3 step 1 (reviews RV33-04, RV37B-01): a cutover attempt finds the source it
+    stopped running again, closes that outage's clock and stops the source once more - a new
+    outage. A store error on either half of the close retries the attempt, whose close then lands
+    with its event: each outage reads its start and its end, never two starts in a row."""
+    settings = make_settings(tmp_path)
+    attempts: list[int] = []
+    refused: list[list[str]] = []
+
+    async def cutover(ctx):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            await ctx.mark_downtime_start()
+            raise TransientStepError("Timeout waiting for the stop of the source server")
+        if len(attempts) == 2:
+            refused.append(refuse_write(store, *CLOSE_HALVES[half]))
+        await ctx.mark_downtime_end()  # the source ran again: that outage ended
+        await ctx.mark_downtime_start()  # and the re-stop starts a new one
+        return StepResult(destination_server_id="dst-1")
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: cutover})
+    h, plan = await setup(tmp_path, store, [vm(1)], executor=executor, settings=settings)
+    await run_plan(h, plan)
+    m = await h.wait_phase(
+        (await h.by_vm(plan.id, "vm-1")).id, P.completed, P.failed, P.rolled_back
+    )
+    await h.orch.stop()
+    assert m.phase == P.completed, (h.history(m), m.error)
+    assert refused[0] == [" ".join(CLOSE_HALVES[half])] and attempts == [1, 2, 3]
+    assert [k for k in h.kinds() if k.startswith("migration.downtime")] == [
+        "migration.downtime_started",
+        "migration.downtime_ended",
+        "migration.downtime_started",
+        "migration.downtime_ended",
+    ]
+
+
+@pytest.mark.parametrize("half", list(CLOSE_HALVES))
+async def test_a_rollback_whose_closing_write_the_store_refused_resumes_and_announces_it(
+    tmp_path, store, refuse_write, half
+):
+    """SDD §5.2, §8 (review RV37B-01): a rollback whose step leaves the clock to its end - the
+    rollback's own close - and whose closing write the store refuses, on either half (the
+    migration's save, its migration.downtime_ended), writes neither: its driver resumes it, and
+    the close lands with its event - rolled_back, the outage announced once."""
+    settings = make_settings(tmp_path)
+    attempts: list[int] = []
+    refused: list[list[str]] = []
+
+    async def cutover(ctx):
+        await ctx.mark_downtime_start()
+        raise PermanentStepError("the destination refused the server")
+
+    async def rollback(ctx):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:  # the next write of the migration is the rollback's close
+            refused.append(refuse_write(store, *CLOSE_HALVES[half]))
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.CUTOVER: cutover, StepName.ROLLBACK: rollback}
+    )
+    h, plan = await setup(tmp_path, store, [vm(1)], executor=executor, settings=settings)
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back, P.failed)
+    await h.orch.stop()
+    assert m.phase == P.rolled_back, (h.history(m), m.error)
+    assert refused[0] == [" ".join(CLOSE_HALVES[half])] and attempts == [1, 2]
+    assert m.downtime_ended_at is not None and m.actual_downtime_s is not None
+    assert h.kinds().count("migration.downtime_ended") == 1, h.kinds()
 
 
 async def test_an_ansible_cutover_cut_off_while_its_clock_saves_still_announces_it_once(

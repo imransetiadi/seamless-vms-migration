@@ -125,6 +125,10 @@ You can customize the role behavior using these variables in your playbook or in
     # Protocol: 'tcp' or 'ssh'
     os_migrate_nbdkit_protocol: tcp
 
+    # Address qemu-nbd listens on: 127.0.0.1 by default; tcp needs the hypervisor's
+    # migration-network IP, and the role refuses the loopback default there
+    os_migrate_nbdkit_bind_address: 192.0.2.10
+
     # SSH user (only for ssh protocol)
     os_migrate_nbdkit_ssh_user: stack
 
@@ -237,7 +241,9 @@ When using NBD direct mode:
 
 4. Ensure firewall rules allow the destination conversion host to connect to ports 10809+ on your hypervisors.
 
-5. qemu-nbd binds to all interfaces by default. Use firewall rules to restrict access to only the destination conversion host.
+5. qemu-nbd listens on ``os_migrate_nbdkit_bind_address``, ``127.0.0.1`` by default, so an export is not reachable
+   from the network. The ``tcp`` protocol needs the hypervisor's migration-network IP there - the role refuses the
+   loopback default for it -; keep firewall rules that let only the destination conversion host reach that address.
 
 Complete workflow example
 -------------------------

@@ -16,8 +16,10 @@ This role is part of the nbdkit direct mode migration workflow. It:
 2. Filters workloads with `use_nbdkit_direct: true`
 3. For each workload (which must be SHUTOFF):
    - Connects to the hypervisor (from `hypervisor_hostname` in workload data)
-   - Finds the instance disks (`disk`, `disk.eph*`)
-   - Inspects each disk format with `qemu-img info`
+   - Finds the instance disks (`disk`, `disk.eph*`; the config drive `disk.config` is not exported)
+   - Takes each disk's format from the instance's `disk.info`, where Nova recorded it, and reads its size with
+     `qemu-img info -f <format>` - qemu never guesses a format; the role stops before any export when `disk.info`
+     is missing or unreadable, or records no single format for a disk (Seamless Migrate SDD §6.6)
    - Exports each disk with `qemu-nbd` on port `os_migrate_nbdkit_port + N`
    - Updates the workload file with the NBD URIs (`nbdkit_disks`)
 

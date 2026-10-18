@@ -68,7 +68,7 @@ it (or on a documented deviation recorded with the results).
 |---|---|
 | Source cloud A | RHOSP 17.1 (also run once on community OpenStack 2023.1/2024.1); Ceph RBD-backed Cinder (3+ OSD nodes, SSD/NVMe OSDs, 10 GbE); OVN networking |
 | Destination cloud B | RHOSO 18.0 on OpenShift 4.16+; Ceph RBD-backed Cinder of the same hardware class; a second variant where cloud B shares cloud A's Ceph cluster (handover tests) |
-| Destination cloud B, community (0.2.0) | each Tier 1 series of SDD §21.1 (QASuite §7.1 M7–M11) on the same hardware class: Kolla-Ansible or OpenStack-Ansible, Ceph RBD-backed Cinder, OVN (M8 on ML2/OVS); the same conversion host sizing, with a CentOS Stream 9 image until SDD §21.6 adds the others. The model of §4 applies unchanged: the data path does not depend on the destination's release |
+| Destination cloud B, community (0.2.0) | each Tier 1 series of SDD §21.1 (QASuite §7.1 M7–M11) on the same hardware class: Kolla-Ansible or OpenStack-Ansible, Ceph RBD-backed Cinder (M10: NetApp ONTAP NFS, QASuite §7.1), OVN (M8 on ML2/OVS); the same conversion host sizing, on each image family SDD §21.6 supports - the RHEL family and Ubuntu 24.04, whose `nbdcopy` comes from `libnbd-bin` - with the Ubuntu host measured too. The model of §4 applies unchanged: the data path does not depend on the destination's release |
 | Inter-cloud network | 10 GbE, RTT < 1 ms, MTU 1500; shaped variants with `tc`: 1 Gbit/s, and 10 Gbit/s with 20 ms RTT (`netem`) for WAN behavior; jumbo-frame variant (MTU 9000 underlay) |
 | Storage path | volumes are read through the compute node's 10 GbE storage network, so the aggregate read ceiling of one conversion host is **≈ 1,190 MiB/s** per side (`S_agg`) whatever `P × S` says — measure it with `fio` on four attached volumes at once (§6.1) |
 | Conversion hosts | one pair per cloud, 4 vCPU / 8 GiB (plus an 8 vCPU variant for multi-disk runs), RHEL 9 image, virtio devices, `hw_vif_multiqueue_enabled=true`; OpenSSH with `aes128-gcm@openssh.com`, compression off (§7) |
@@ -405,7 +405,7 @@ QASuite §9 (PERF-E2E). Downtime is `actual_downtime_s` over ≥ 10 runs.
 | **P-XL 500 GiB single disk, 2 MiB/s writer** | **LAB-W12** | `warm`, 10 G and 1 G | **1,294 s (21.6 min)** at `S` = 500; 1,550 s (25.8 min) at `S` = 400 | **SM-1 p95**: max of 10 runs ≤ 1,500 s ⇔ measured `S` ≥ 416 MiB/s | 5 with the defaults; tuned (§7.3): 2 at 10 G, 3 at 1 G → *to be filled* | *to be filled* |
 | P-L 200 GiB, cold | LAB-C01 (on P-L) | `cold`, 1 G | 1,253 s (20.9 min) | none (reference) | — | *to be filled* |
 | P-M, 1 / 3 / 6 volumes | LAB-H01, H02, H03 | `storage_handover`, shared Ceph | 260 / 300 / 360 s | **G1c**: ≤ 360 s up to six volumes, the measured shutdown added to the clock (SDD §7.3) | — | *to be filled* |
-| VMware 200 GiB, CBT | LAB-V02 | `vmware_warm`, 1 G | 360 s (6.0 min) | ±30 % of the model | 2 → *to be filled* | *to be filled* |
+| VMware 200 GiB, CBT | LAB-V02 | `vmware_warm`, 1 G | 360 s (6.0 min) | ±30 % of the model | 3 → *to be filled* | *to be filled* |
 
 ### 6.4 Calibrating the estimator
 
@@ -433,25 +433,31 @@ is left to the operator is the plan-level starting point, so that the very first
    ```
 
 5. Evaluate the results after the fact from `GET /migrations` (`vm.disks[].size_gb`, `actual_downtime_s`,
-   `estimate`, `sync_passes[].kind`); `$TOKEN` is a viewer token taken from the environment:
+   `estimate`, `sync_passes[].kind`); `$TOKEN` is a viewer token taken from the environment (`read -rs TOKEN`),
+   whose header curl reads from a private file - never from its command line (Security.md §7.2):
 
    ```bash
+   hdr=$(mktemp -d)/auth && (umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$hdr")
    # downtime populations of the targets: G1a (largest disk <= 100 GiB, total <= 400 GiB, p90 <= 600 s),
-   # SM-1 (largest disk <= 500 GiB, p95 <= 1500 s), G1c (handover, <= 360 s); nearest-rank percentiles
-   curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/migrations | jq '
+   # SM-1 (largest disk <= 500 GiB, p95 <= 1500 s), G1c (handover, <= 360 s); nearest-rank percentiles; only
+   # migrations that succeeded - completed or finalized -, never a rolled-back or cancelled one's downtime
+   curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/migrations | jq '
      def largest_gib: (.vm.disks | map(.size_gb) | max);
      def total_gib: (.vm.disks | map(.size_gb) | add);
      def pct($pp): sort | .[((((length * $pp) + 99) / 100) | floor) - 1];
      def summary($limit): { n: length, p50_s: pct(50), p90_s: pct(90), p95_s: pct(95), max_s: max, limit_s: $limit };
-     [ .[] | select(.strategy == "warm" and .phase == "completed" and .actual_downtime_s != null) ] as $warm
+     def succeeded: (.phase == "completed" or .phase == "finalized");
+     [ .[] | select(.strategy == "warm" and succeeded and .actual_downtime_s != null) ] as $warm
      | { g1a_largest_le_100gib: ([ $warm[] | select(largest_gib <= 100 and total_gib <= 400) | .actual_downtime_s ] | summary(600)),
          sm1_largest_le_500gib: ([ $warm[] | select(largest_gib <= 500) | .actual_downtime_s ] | summary(1500)),
          g1a_over_600s: [ $warm[] | select(largest_gib <= 100 and total_gib <= 400 and .actual_downtime_s > 600)
                           | { name: .vm.name, actual_downtime_s, largest_gib: largest_gib, total_gib: total_gib } ],
-         handover: ([ .[] | select(.strategy == "storage_handover" and .actual_downtime_s != null)
+         handover: ([ .[] | select(.strategy == "storage_handover" and succeeded and .actual_downtime_s != null)
                         | .actual_downtime_s ] | summary(360)) }'
    ```
 
+   The handover's `actual_downtime_s` leaves out the guest's shutdown - its clock starts after it (SDD §7.3 step 1,
+   `TODO(LAB)`) - so G1c compares `handover` plus the measured shutdown with 360 s.
    G1a holds when `g1a_largest_le_100gib.p90_s ≤ 600` with `n ≥ 10`; the SM-1 p95 gate uses
    `sm1_largest_le_500gib.p95_s ≤ 1500`; `g1a_over_600s` names the misses together with their total size
    (§3.2 note 1). `/stats` gives p95 only over **all** migrations, which mixes the populations, so use this
@@ -461,10 +467,11 @@ is left to the operator is the plan-level starting point, so that the very first
    pass; the others are reported separately:
 
    ```bash
-   curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/migrations | jq '
+   curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/migrations | jq '
      def delta_calibrated: any(.sync_passes[]?; .kind == "delta");
      def within30: ((.actual_downtime_s - .estimate.downtime_s) | fabs) / .estimate.downtime_s <= 0.3;
-     [ .[] | select(.actual_downtime_s != null and .estimate != null and .estimate.downtime_s > 0) ]
+     def succeeded: (.phase == "completed" or .phase == "finalized");
+     [ .[] | select(succeeded and .actual_downtime_s != null and .estimate != null and .estimate.downtime_s > 0) ]
      | { calibrated:   ([ .[] | select(delta_calibrated) ]       | { n: length, within_30_pct: (map(select(within30)) | length) }),
          uncalibrated: ([ .[] | select(delta_calibrated | not) ] | { n: length, within_30_pct: (map(select(within30)) | length) }) }
      | .calibrated.share = (if .calibrated.n > 0 then (.calibrated.within_30_pct / .calibrated.n) else null end)'
@@ -534,7 +541,7 @@ is left to the operator is the plan-level starting point, so that the very first
 | Ceph RBD | O(1) | O(1) copy-on-write clone (flatten is off by default) | `snapshot_s` ≈ seconds; pass time is the scan. Preferred |
 | LVM thin | O(1) | O(1) thin snapshot | similar to RBD |
 | NetApp ONTAP (NFS, iSCSI, FC) | O(1) FlexClone file/LUN clone | O(1) clone (FlexClone license required) | similar to RBD while the FlexVol has free space and snapshot reserve; without FlexClone the driver cannot clone and the warm path fails at the first pass — use cold or storage handover. Storage handover on a shared SVM is a rename (SDD §7.3.1) |
-| LVM thick | O(size) | **full copy** of the volume | every pass pays a local copy before the scan — pre-copy and `snapshot` terms are much larger than the model assumes; reduce `max_sync_passes`, prefer cold/handover, or move volumes to RBD. The 0.1.0 finding catalog has no LVM finding: read `volume_backends` from the provider check. Cold: the export of a volume-booted VM makes the same full copy of the root volume, after the source stopped, so it adds root size ÷ local copy rate to the downtime, and a copy that outlasts `os_migrate_timeout` (1800 s) fails the export (raise the timeout for a root volume of several hundred GiB); deleting the copy zeroes it with Cinder's default `volume_clear`, after the destination started, or before the rollback when the cutover failed. A cold cutover step retried after a transient failure (`max_step_retries`, no rollback in between) first deletes each destination volume the failed attempt created, while the source is still stopped (SDD §6.3): on an LVM-thick destination each delete zeroes the volume, so the retry's downtime grows by their size ÷ the zeroing rate, and one still deleting at `os_migrate_timeout` fails the transfer with "Could not delete volume … it is still being deleted after 1800 s", which is permanent, so the rollback starts the source VM |
+| LVM thick | O(size) | **full copy** of the volume | every pass pays a local copy before the scan — pre-copy and `snapshot` terms are much larger than the model assumes; reduce `max_sync_passes`, prefer cold/handover, or move volumes to RBD. The 0.1.0 finding catalog has no LVM finding: read `volume_backends` from the provider check. Cold: the export of a volume-booted VM makes the same full copy of the root volume, after the source stopped, so it adds root size ÷ local copy rate to the downtime, and a copy that outlasts `os_migrate_timeout` (1800 s) fails the export (raise the timeout for a root volume of several hundred GiB); deleting the copy zeroes it with Cinder's default `volume_clear`, after the destination started, or before the rollback when the cutover failed. A cold transfer that fails deletes the destination volumes it created in its own rescue, best effort, while the source is still stopped (SDD §6.6, audit A-08); a cold cutover step retried after a transient failure (`max_step_retries`, no rollback in between) first deletes what the rescue left (SDD §6.3). On an LVM-thick destination each delete zeroes the volume, so the downtime grows by their size ÷ the zeroing rate; a deletion Cinder does not finish ends the rescue's deletions (review RV34B-01), and one still deleting when the retry reaches it at `os_migrate_timeout` fails the transfer with "Could not delete volume … it is still being deleted after 1800 s", which is permanent, so the rollback starts the source VM |
 | Community destinations | as their backend's row | as their backend's row | the data path is the same as RHOSO 18.0's; a DevStack or small lab cloud often runs LVM-backed Cinder (LVM thick: its row applies, so measure it before trusting a warm estimate there); record the series and the backend in the environment descriptor (§2) |
 | Image-booted VMs | — | `boot_disk_copy: true` snapshots the server to Glance and builds a volume from the image **each pass** (SDD §6.1) | minutes per pass proportional to the disk; with `boot_disk_copy: false` only data volumes sync and the destination boots from the same image name — use it whenever the image exists on the destination |
 
@@ -636,7 +643,7 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   19–27 µs per access-log record, against 1.4 µs without.
 * **Shutdown (SDD §8):** on SIGTERM `seamless serve` waits at most 5 s for open requests (an event stream never
   ends by itself), then the lifespan runs `stop()`, which may take up to 15 s while it stops a running playbook
-  (SIGTERM, then SIGKILL after 10 s); the container's stop grace covers both — 30 s on Compose, 60 s on OpenShift.
+  (SIGTERM, then SIGKILL after 10 s); the container's stop grace covers both — 30 s on Compose, 60 s on OpenShift — except a storage-handover call in flight, which no cancel stops: its step ends only once that call returned, within the call's own bound (SDD §7.3, audit EX-01), and a grace that ends first leaves the journal a crash leaves, from which the next start resumes.
 
 ### 9.2 PostgreSQL
 

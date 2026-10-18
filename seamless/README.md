@@ -55,7 +55,7 @@ seamless status --plan PLAN_ID
 ```
 
 `serve` refuses `SEAMLESS_AUTH_DISABLED=true` unless it binds to a loopback address
-(`127.0.0.1`, `::1`, `localhost`). The demo seeds three providers and the plans
+(`127.0.0.1`, `::1`, `localhost`). The demo seeds four providers - RHOSP 17.1, vCenter, RHOSO 18.0 and a community OpenStack 2026.2 destination - and the plans
 "Finance apps (RHOSP 17.1 → RHOSO)" (cuts over automatically, ~10 % simulated failures exercise
 rollback) and "DC2 VMware exit" (waits for approvals) — idempotently.
 
@@ -69,9 +69,10 @@ replacement and revocation currently need a database administrator (see Security
 
 * Only SHA-256 hashes of API tokens are stored (`SEAMLESS_TOKENS_FILE` or database users); failed authentication
   emits `auth.denied` (never the token).
-* Credentials are never stored or returned: OpenStack credentials come from `SEAMLESS_CLOUDS_YAML`
-  by cloud name, VMware credentials from `SEAMLESS_SECRETS_DIR/<name>/{username,password}` or
-  `SEAMLESS_SECRET_<NAME>_USERNAME/_PASSWORD`. Ansible receives them only through a 0600
+* Credentials are never stored in the database or returned by the API: OpenStack credentials come from
+  `SEAMLESS_CLOUDS_YAML` by cloud name, VMware credentials from `SEAMLESS_SECRETS_DIR/<name>/{username,password}` or
+  `SEAMLESS_SECRET_<NAME>_USERNAME/_PASSWORD`; those entered in the dashboard go to the secret store
+  (`SEAMLESS_SECRETS_DIR` files, or Kubernetes Secrets, SDD §13.3). Ansible receives them only through a 0600
   `secrets.yml` removed after every run (together with the `clouds.yaml` os-migrate writes).
 * The Jev stdio child gets only `PATH`, `HOME` and the Jev provider keys; payloads to Jev and
   agentmemory are redacted; guest console output is screened and never sent to agentmemory.
@@ -80,9 +81,9 @@ replacement and revocation currently need a database administrator (see Security
 
 Built from the repository root (it installs this package with the `openstack,vmware,jev`
 extras, `ansible-core`, the collection, `os_migrate.vmware_migration_kit`, Node 22 for `npx`,
-and copies `dashboard/dist` when present). It runs as UID 1001 with data in `/var/lib/seamless`.
+and copies `dashboard/dist` when the build context has it, else builds one with its own Node 22). It runs as UID 1001 with data in `/var/lib/seamless`.
 
 ```bash
-podman build --ignorefile seamless/.containerignore -f seamless/Containerfile -t seamless:0.1.0 .
-docker build -f seamless/Containerfile -t seamless:0.1.0 .   # reads Containerfile.dockerignore
+podman build --ignorefile seamless/.containerignore -f seamless/Containerfile -t seamless:<version> .
+docker build -f seamless/Containerfile -t seamless:<version> .   # reads Containerfile.dockerignore
 ```

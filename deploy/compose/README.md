@@ -61,12 +61,18 @@ Then open <http://127.0.0.1:8080/> and sign in at `/login` with the admin token.
 from your workstation first (`ssh -L 8080:127.0.0.1:8080 you@server`). Or call the API:
 
 ```bash
-export TOKEN='smg_...'                                   # the token printed by compose-init.sh
+read -rs TOKEN && export TOKEN                           # paste the token compose-init.sh printed; nothing echoes
+hdr=$(mktemp -d)/auth && (umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$hdr")
 curl -fsS http://127.0.0.1:8080/api/v1/health            # {"status":"ok",...,"db":"ok","orchestrator":{"running":true,...}}
 curl -fsS http://127.0.0.1:8080/api/v1/ready             # same body; HTTP 503 while the DB or the orchestrator loop is down
-curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/me
-curl -N   -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/events/stream    # live SSE
+curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/me
+curl -N   -H @"$hdr" http://127.0.0.1:8080/api/v1/events/stream    # live SSE
+rm -rf "${hdr%/auth}"                                    # when you are done
 ```
+
+The token never goes on a command line, where `ps` shows it to every user of the host and shell history keeps it
+([Security.md](../../docs/Security.md) §7.2): `read -rs` takes it without echo, `printf` - a shell builtin - writes the
+header into a private file (`mktemp -d` is mode 0700), and curl reads it from there (`-H @file`).
 
 `compose-init.sh` is idempotent (existing files are kept). `--force` regenerates both files:
 
@@ -97,6 +103,10 @@ wait polls the right port.
 
 ## Make targets
 
+`scripts/seamless-ctl.sh docker|podman ACTION` runs the same lifecycle through these targets - `up`, `down`,
+`stop`, `start`, `restart`, `scale 0|1`, `capacity`, `status`, `logs`, and a planned stop's `--drain` - as it does on
+Kubernetes and OpenShift; [docs/Operations.md](../../docs/Operations.md) is the tutorial (SDD §17.2).
+
 | Target | What it does |
 |---|---|
 | `seamless-colima-up` | macOS: `colima start seamless --activate=false --cpu 4 --memory 6 --disk 40` (keeps your active Docker context), prints the daemon info and the still-active context. Linux: says that Colima is not needed |
@@ -104,6 +114,8 @@ wait polls the right port.
 | `seamless-up` | builds and starts the stack, waits until healthy (`up -d --build --wait`) |
 | `seamless-demo` | like `seamless-up` with `SEAMLESS_DEMO=true`: fake providers, simulated executor, seeded plans |
 | `seamless-down` | removes the containers, keeps volumes (also stops the `jev` sidecar) |
+| `seamless-stop` / `seamless-start` | stops the control plane alone (PostgreSQL keeps running) / starts it again as it was, demo or not, or creates it after `seamless-down` |
+| `seamless-restart` | recreates the control plane from the current `.env`, compose files and sources - after a change - keeping its mode |
 | `seamless-ps` / `seamless-logs` | status / follow logs (`SEAMLESS_SERVICE=seamless` to filter) |
 | `seamless-reset` | **deletes** containers and volumes; needs `CONFIRM=yes` |
 | `seamless-test` | `cd seamless && .venv/bin/pytest -q` (export `SEAMLESS_TEST_PG_URL` to include PostgreSQL) |

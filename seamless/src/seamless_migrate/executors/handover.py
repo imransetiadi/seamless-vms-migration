@@ -227,6 +227,12 @@ def port_description(source_port_id: str) -> str:
     return f"os-migrate:{source_port_id}"
 
 
+def rollback_port_description(source_port_id: str) -> str:
+    """The description of a source port the handover rollback creates: how a later attempt finds
+    one an earlier attempt created whose answer was lost (SDD §7.3 rollback, review RV37A-04)."""
+    return f"os-migrate-rollback:{source_port_id}"
+
+
 def _existing_port(conn: Any, port_id: str) -> Any:
     """The port, or ``None`` when it is gone (HTTP 404): Nova deletes the ports it created."""
     try:
@@ -285,13 +291,41 @@ def _active(server: Any) -> bool:
     return str(_attr(server, "status", "")).upper() == "ACTIVE"
 
 
+def _unbind_port(conn: Any, port: Any) -> None:
+    """Clear a port's binding through Neutron - its device and host -, so a deletion of the
+    server it was bound to leaves it (SDD §7.3 rollback, review RV36B-02)."""
+    conn.network.update_port(port, device_id="", device_owner="", binding_host_id="")
+
+
+def _free_for_the_source(conn: Any, port: Any) -> bool:
+    """Whether ``port`` is free for the recreated source server: unbound, or bound to a server that
+    is gone - a failed build Nova deleted, the source whose deletion could not unbind the user's own
+    port -, which this unbinds as Nova's deletion would have (SDD §7.3 rollback, reviews RV36B-02,
+    RV37A-03). Only a port whose owner is Nova's (``compute:*``) or none: one another service holds
+    - a DHCP agent's, a router's, whose device is no server - is never unbound."""
+    holder = _attr(port, "device_id")
+    if not holder:
+        return True
+    owner = str(_attr(port, "device_owner") or "")
+    if owner and not owner.startswith("compute:"):
+        return False
+    if _existing_server(conn, holder) is not None:
+        return False
+    _unbind_port(conn, port)
+    return True
+
+
 def _reached_by_deletion(journal: _Journal, server: Any) -> bool:
-    """Whether step 4's deletion reached the source (SDD §7.3, reviews RV34B-02, RV35B-01): Nova
-    accepted it and the server does not read ACTIVE; Nova reads it as being deleted, whatever the
-    journal holds; or it is in ERROR once the deletion was tried - Nova may take a deletion whose
-    answer is an error, a 500 once it saved the deleting state, or is lost while the compute host
-    fails it. Nova starts no such server, and its deletion honours delete_on_termination."""
-    if str(_attr(server, "task_state") or "").lower() == "deleting":
+    """Whether step 4's deletion reached the source (SDD §7.3, reviews RV34B-02, RV35B-01,
+    RV36B-01): Nova accepted it and the server does not read ACTIVE; Nova reads it as being deleted
+    or soft-deleted - a cloud with reclaim_instance_interval -, whatever the journal holds; or it
+    is in ERROR once the deletion was tried - Nova may take a deletion whose answer is an error, a
+    500 once it saved the deleting state, or is lost while the compute host fails it. Nova starts
+    no such server, and its deletion - a soft delete's reclaim too - honours
+    delete_on_termination."""
+    if str(_attr(server, "task_state") or "").lower() in ("deleting", "soft-deleting"):
+        return True
+    if str(_attr(server, "status", "")).upper() == "SOFT_DELETED":
         return True
     if journal.done("sent:delete_source"):
         return not _active(server)
@@ -1103,10 +1137,12 @@ class HandoverExecutor:
         conn: Any, networks: list[dict[str, Any]], journal: _Journal
     ) -> list[dict[str, str]]:
         """The source server's NICs for its recreation (SDD §7.3 rollback): a port a user created
-        survives the server's deletion unbound and is used again; a port Nova created is gone and
-        is recreated with its MAC, every fixed IP, its security groups and its port-security flag
-        (journaled, so a resume does not create it twice). A definition journaled without ports
-        keeps its network and first address."""
+        survives the server's deletion and is used again - unbound, or unbound now when Nova's
+        deletion could not; a port Nova created is gone and is recreated with its MAC, every fixed
+        IP, its security groups, its port-security flag and the rollback's description (journaled,
+        so a resume does not create it twice; one created while its answer was lost is found by
+        that description). A definition journaled without ports keeps its network and first
+        address."""
         nics: list[dict[str, str]] = []
         for n in networks:
             if not n.get("port_id"):
@@ -1116,10 +1152,18 @@ class HandoverExecutor:
                 nics.append(nic)
                 continue
             key = f"rb:port:{n['port_id']}"
-            if not journal.done(key):
+            if journal.done(key):
+                port = _existing_port(conn, journal.get(key)["port_id"])
+                if port is not None:
+                    _free_for_the_source(conn, port)  # bound to a server that is gone (RV36B-02)
+            if not journal.done(key) or port is None:
+                # none yet, or the journaled one gone - with a failed build Nova deleted, by
+                # hand -: created again and journaled anew (SDD §7.3 rollback, review RV36B-02)
                 port = _existing_port(conn, n["port_id"])
-                if port is not None and not _attr(port, "device_id"):
-                    port_id = n["port_id"]
+                if port is not None and _free_for_the_source(conn, port):
+                    port_id = n["port_id"]  # the user's own, left bound or not (review RV37A-03)
+                elif (earlier := HandoverExecutor._earlier_source_port(conn, n)) is not None:
+                    port_id = str(_attr(earlier, "id"))  # its answer lost (review RV37A-04)
                 else:
                     fixed_ips = [{k: v for k, v in ip.items() if v} for ip in n["fixed_ips"]]
                     # never an address the source's Neutron derives from the kept MAC itself:
@@ -1129,6 +1173,7 @@ class HandoverExecutor:
                         "network_id": n["network_id"],
                         "mac_address": n["mac_address"],
                         "fixed_ips": requested_ips(fixed_ips, subnets),
+                        "description": rollback_port_description(n["port_id"]),
                     }
                     # a definition journaled before step 2 recorded them has none
                     if n.get("security_group_ids") is not None:
@@ -1140,6 +1185,24 @@ class HandoverExecutor:
                 journal.mark(key, port_id=port_id)
             nics.append({"port": journal.get(key)["port_id"]})
         return nics
+
+    @staticmethod
+    def _earlier_source_port(conn: Any, n: dict[str, Any]) -> Any:
+        """The unbound port an earlier rollback attempt created for the journaled port ``n`` while
+        its answer was lost, or ``None`` (SDD §7.3 rollback, review RV37A-04): on the source network
+        with the MAC - Neutron gives a MAC to one port of a network - and the rollback's
+        description."""
+        description = rollback_port_description(n["port_id"])
+        return next(
+            (
+                p
+                for p in conn.network.ports(
+                    network_id=n["network_id"], mac_address=n["mac_address"]
+                )
+                if _attr(p, "description") == description and not _attr(p, "device_id")
+            ),
+            None,
+        )
 
     @staticmethod
     def _earlier_ports(
@@ -1282,6 +1345,15 @@ class HandoverExecutor:
     async def _cutover(self, ctx: StepContext) -> StepResult:
         rdir = self.run_dir(ctx)
         journal = await _in_thread(_Journal, rdir / JOURNAL_FILE)
+        if journal.done("rb:create_source"):
+            # a Retry after a rollback attempt that recreated the source: that rollback unmanaged
+            # every volume at RHOSO, so this journal's cutover can never complete, and the source
+            # runs - refused before any call and before the clock opens (SDD §7.3, RV36B-03)
+            recreated = journal.get("rb:create_source")["server_id"]
+            raise PermanentStepError(
+                f"a rollback attempt recreated the source server {recreated}, which runs: roll "
+                "back to finish it"
+            )
         src = await self._conn(ctx.source)
         dst = await self._conn(ctx.destination)
         # the plan's mappings overlaid with the flavor preflight matched: what steps 6 and 8 apply
@@ -1585,8 +1657,7 @@ class HandoverExecutor:
         if not await _in_thread(definition_path.exists):
             # stopped but nothing else happened yet: just start the source again
             if not journal.done("rb:start_source"):
-                await self._call("start the source server", lambda: self._start(src, server_id))
-                await _in_thread(journal.mark, "rb:start_source")
+                await self._start_as_one(ctx, journal, src, server_id)
             await _in_thread(journal.archive, "rolled-back")
             return StepResult(details={"source_running": True})
 
@@ -1734,10 +1805,20 @@ class HandoverExecutor:
                 def delete_failed_build() -> None:
                     sent = journal.get("sent:rb:create_source")
                     server = _existing_server(src, sent["server_id"]) if sent else None
+                    if server is None and sent:
+                        # gone already: the attempt that deleted it may have died in the wait
+                        # below, Cinder still detaching its volumes - waited for, as for a stale
+                        # source (SDD §7.3 rollback, review RV36B-04)
+                        self._wait_available(src, list(new_ids.values()))
                     if server is None or str(_attr(server, "status", "")).upper() != "ERROR":
                         return
                     # a build Nova failed: deleted, its volumes kept, and created again below
-                    # (SDD §7.3 rollback, review RV35B-04)
+                    # (SDD §7.3 rollback, review RV35B-04) - its journaled ports unbound first:
+                    # Nova's deletion takes every port its network cache no longer keeps (RV36B-02)
+                    for key in [k for k in journal.data["order"] if k.startswith("rb:port:")]:
+                        port = _existing_port(src, journal.get(key)["port_id"])
+                        if port is not None and _attr(port, "device_id") == sent["server_id"]:
+                            _unbind_port(src, port)
                     src.compute.delete_server(server, ignore_missing=True)
                     src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
                     self._wait_available(src, list(new_ids.values()))
@@ -1749,19 +1830,30 @@ class HandoverExecutor:
                     "recreate the source ports",
                     lambda: self._source_ports(src, definition["networks"], journal),
                 )
-                created = await self._call(
-                    "recreate the source server",
-                    lambda: self._create_server(
-                        src,
-                        definition,
-                        definition["flavor"],
-                        networks,
-                        self._bdm(attachments, new_ids),
-                        journal,
-                        "sent:rb:create_source",
-                    ),
-                )
-                await _in_thread(journal.mark, "rb:create_source", server_id=created)
+
+                async def recreate() -> None:
+                    created = await self._call(
+                        "recreate the source server",
+                        lambda: self._create_server(
+                            src,
+                            definition,
+                            definition["flavor"],
+                            networks,
+                            self._bdm(attachments, new_ids),
+                            journal,
+                            "sent:rb:create_source",
+                        ),
+                    )
+                    await _in_thread(journal.mark, "rb:create_source", server_id=created)
+                    await ctx.mark_downtime_end()  # it runs: the clock closes (review RV36B-03)
+
+                # the recreate, its journal mark and the clock's close as one: a cancel - the step
+                # timeout, a shutdown - waits them out as it does the call (SDD §7.3, RV37A-01)
+                await outlive_cancel(recreate())
+            else:
+                # found journaled, it runs: the clock closes on every attempt, so one whose
+                # give-back fails leaves the source counted as running (SDD §5.2, RV36B-03)
+                await outlive_cancel(ctx.mark_downtime_end())
             new_server_id = journal.get("rb:create_source")["server_id"]
             # each volume's journaled delete_on_termination, once the recreated server runs: kept
             # while Nova built it (SDD §7.3 rollback, review RV35B-04)
@@ -1804,8 +1896,7 @@ class HandoverExecutor:
                     )
                     await _in_thread(journal.mark, key)
             if not journal.done("rb:start_source"):
-                await self._call("start the source server", lambda: self._start(src, server_id))
-                await _in_thread(journal.mark, "rb:start_source")
+                await self._start_as_one(ctx, journal, src, server_id)
 
         details: dict[str, Any] = {"source_running": True}
         if new_server_id != server_id or any(k != v for k, v in new_ids.items()):
@@ -1833,6 +1924,20 @@ class HandoverExecutor:
             if f"rb:manage_src:{a['volume_id']}" in done
         }
         return _recreated_vm(vm, str(created["server_id"]), new_ids)
+
+    async def _start_as_one(
+        self, ctx: StepContext, journal: _Journal, conn: Any, server_id: str
+    ) -> None:
+        """Start the source server, close the clock and journal ``rb:start_source`` as one: a cancel
+        - the step timeout, a shutdown - that lands during the start waits out the rest with it, so
+        a source that runs is never left with its clock open (SDD §5.2, §7.3, review RV37A-01)."""
+
+        async def start() -> None:
+            await self._call("start the source server", lambda: self._start(conn, server_id))
+            await ctx.mark_downtime_end()  # it runs: the clock closes now (review RV36B-03)
+            await _in_thread(journal.mark, "rb:start_source")
+
+        await outlive_cancel(start())
 
     def _start(self, conn: Any, server_id: str) -> None:
         server = conn.compute.get_server(server_id)

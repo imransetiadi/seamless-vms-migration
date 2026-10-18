@@ -15,14 +15,15 @@ the deployment the artifacts serve is in [SDD §17](docs/SDD.md).
 
 | Component | Version lives in | Artifact |
 |---|---|---|
-| Control plane (`seamless/`) | `seamless/pyproject.toml` (`version`) and `seamless/src/seamless_migrate/__init__.py` (`__version__`, printed by `seamless --version` and returned by `GET /api/v1/health`) | container image `seamless-migrate:X.Y.Z`, built from `seamless/Containerfile` |
+| Control plane (`seamless/`) | `seamless/pyproject.toml` (`version`) and `seamless/src/seamless_migrate/__init__.py` (`__version__`, printed by `seamless version` and returned by `GET /api/v1/health`) | container image `seamless-migrate:X.Y.Z`, built from `seamless/Containerfile` |
 | Dashboard (`dashboard/`) | `dashboard/package.json` and `dashboard/package-lock.json` | `dashboard/dist`, baked into the image |
-| Deployment (`deploy/`) | `deploy/compose/compose.yaml` (`${SEAMLESS_VERSION:-X.Y.Z}`, documented in `deploy/compose/README.md`), `newTag` and the `app.kubernetes.io/version` label in `deploy/openshift/kustomization.yaml`, `newTag` in `deploy/kubernetes/kustomization.yaml` | the manifests, in the release's source archive |
+| Deployment (`deploy/`) | `deploy/compose/compose.yaml` (`${SEAMLESS_VERSION:-X.Y.Z}`, documented in `deploy/compose/README.md`), `newTag` and the `app.kubernetes.io/version` label in `deploy/openshift/kustomization.yaml`, `newTag` in `deploy/kubernetes/kustomization.yaml`, and `SEAMLESS_VERSION` in the `Makefile` (the control-plane image `make deploy-runtime-check` runs) | the manifests, in the release's source archive |
 | Image labels | `org.opencontainers.image.version` in `seamless/Containerfile` | the label `docker inspect` shows on the image |
 | os-migrate collection (repository root) | `galaxy.yml` (`version`) and `plugins/module_utils/const.py` (`OS_MIGRATE_VERSION`); `tests/unit/test_version.py` keeps them equal | `os_migrate-os_migrate-<collection version>.tar.gz` from `make build` |
 
 The image carries the control plane, the built dashboard and this collection (SDD §17), so one image
-tag stands for one product release.
+tag stands for one product release. `seamless/tests/test_release_versions.py` checks that every location of the
+product version above names the same one.
 
 ## 2. Versions and tags
 
@@ -46,9 +47,10 @@ A tag is cut only when every gate below holds, or a waiver recorded in the relea
 
 **Every release candidate and every final release**
 
-- [ ] CI is green on the release commit of `main`. The `ci` workflow runs the `control-plane`,
-      `collection`, `dashboard`, `security`, `manifests` and `image` jobs, the last one with trivy
-      (no fixable HIGH or CRITICAL) and a CycloneDX SBOM.
+- [ ] CI is green on the release commit of `main`. The `ci` workflow runs nine jobs: `control-plane`,
+      `collection`, `dashboard`, `dashboard-e2e`, `security`, `manifests` and `deploy-scripts` on every run, and
+      `image` - with trivy (no fixable HIGH or CRITICAL) and a CycloneDX SBOM - and `compose-linux` - the Compose
+      smoke on a Linux engine - on `main`, nightly and when dispatched, not on pull requests.
 - [ ] `make seamless-check` is green on a clean checkout of that commit.
 - [ ] No secret anywhere: `gitleaks dir -c .gitleaks-tree.toml --redact --no-banner .` and
       `gitleaks git --redact --no-banner .` are clean (CLAUDE.md §7).
@@ -84,6 +86,7 @@ perl -pi -e "s/SEAMLESS_VERSION:-\Q$OLD\E/SEAMLESS_VERSION:-$NEW/" deploy/compos
 perl -pi -e "s/newTag: \Q$OLD\E/newTag: $NEW/" deploy/openshift/kustomization.yaml deploy/kubernetes/kustomization.yaml
 perl -pi -e "s{app.kubernetes.io/version: \Q$OLD\E}{app.kubernetes.io/version: $NEW}" deploy/openshift/kustomization.yaml
 perl -pi -e "s/image.version=\"\Q$OLD\E\"/image.version=\"$NEW\"/" seamless/Containerfile
+perl -pi -e "s/^SEAMLESS_VERSION \?= \Q$OLD\E/SEAMLESS_VERSION ?= $NEW/" Makefile
 
 # what pins the version and must follow by hand: the health payload the control-plane tests expect,
 # the Compose README's table of defaults
@@ -124,9 +127,15 @@ git push origin "v$NEW"
 
 ### 4.3 Build the artifacts from the tag
 
-Always build from a clean checkout of the tag, never from a working tree with local changes. On this
-project's developer machines every `docker` command targets the dedicated Colima profile: use
-`docker --context colima-seamless …`, never the default context (CLAUDE.md §6).
+Always build from a clean checkout of the tag, never from a working tree with local changes. Every `docker`
+command below goes through `$DOCKER`, so it reaches the engine the image was built on: on the project's macOS
+developer machines the dedicated Colima profile, never the default context (CLAUDE.md §6); on a Linux host the
+machine's own Docker Engine (SDD §17.1).
+
+```bash
+DOCKER="docker --context colima-seamless"     # macOS; on Linux: DOCKER=docker
+                                              # bash; in zsh run `setopt SH_WORD_SPLIT` first so $DOCKER splits
+```
 
 ```bash
 git clone --branch "v$NEW" https://github.com/imransetiadi/seamless-vms-migration.git release-$NEW
@@ -135,13 +144,14 @@ cd release-$NEW
 # collection tarball: CI builds it from the tracked files on every run (job `collection`, artifact
 # `collection-tarball`, audit D-04) — download that artifact of the release commit's run, or build it
 # the same way locally; `make build` is upstream's path through its builder container
-gh run download --name collection-tarball --dir dist   # the run of the release commit
+gh run list --workflow ci --branch main --limit 5        # find the run of the release commit
+gh run download <run-id> --name collection-tarball       # that run's tarball, into this directory
 ls os_migrate-os_migrate-*.tar.gz
 
 (cd dashboard && npm ci && npm run build)    # the image copies dashboard/dist
-docker --context colima-seamless build -f seamless/Containerfile -t seamless-migrate:$NEW \
+$DOCKER build -f seamless/Containerfile -t seamless-migrate:$NEW \
   --build-arg "SOURCE_COMMIT=$(git rev-parse HEAD)" .
-docker run --rm seamless-migrate:$NEW --version  # prints $NEW: the image's entrypoint is the seamless CLI
+$DOCKER run --rm seamless-migrate:$NEW version   # prints $NEW: the image's entrypoint is the seamless CLI
 ```
 
 The `ci` workflow builds the same image on `main` but pushes it nowhere. The release manager pushes it
@@ -149,14 +159,16 @@ to the project's registry and records its digest in the release notes. The manif
 the image by digest, as `deploy/openshift/kustomization.yaml` suggests for production:
 
 ```bash
-docker tag seamless-migrate:$NEW <registry>/seamless-migrate:$NEW
-docker push <registry>/seamless-migrate:$NEW     # note the sha256 digest it prints
+$DOCKER tag seamless-migrate:$NEW <registry>/seamless-migrate:$NEW
+$DOCKER push <registry>/seamless-migrate:$NEW     # note the sha256 digest it prints
 ```
 
 Scan the released image and write its SBOM with [trivy](https://trivy.dev/), as the `image` job of CI
 does for the image it builds:
 
 ```bash
+# trivy reads the image from the engine DOCKER_HOST names: on macOS the Colima profile's socket
+export DOCKER_HOST=unix://$HOME/.colima/seamless/docker.sock     # macOS only; on Linux leave it unset
 trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 seamless-migrate:$NEW
 trivy image --format cyclonedx --output sbom.cdx.json seamless-migrate:$NEW
 ```
@@ -204,9 +216,9 @@ itself.
   its health must name the version:
 
   ```bash
-  docker run -d --name smoke -p 127.0.0.1:18080:8080 -e SEAMLESS_DEMO=true seamless-migrate:$NEW serve
+  $DOCKER run -d --name smoke -p 127.0.0.1:18080:8080 -e SEAMLESS_DEMO=true seamless-migrate:$NEW serve
   curl -fsS http://127.0.0.1:18080/api/v1/health     # {"status":"ok","version":"<NEW>",...}
-  docker rm -f smoke
+  $DOCKER rm -f smoke
   ```
 - Announce the release with a link to its notes, and keep the PRD §9 release plan current through the
   controller.
@@ -302,6 +314,8 @@ what protects the data. For every MINOR, and for a PATCH that touches `store.py`
    production deployment.
 2. **Quiesce**: pause every running plan from the dashboard (no cutover in flight), then scale the control
    plane to 0 (`Recreate` keeps a single writer; a rolling update would start the new version beside the old).
+   `scripts/seamless-ctl.sh PLATFORM stop --drain TOKEN_FILE` does both, and `resume` starts the plans again
+   afterwards ([docs/Operations.md](docs/Operations.md) §5).
 3. **Roll the image**: set the new tag or digest in the kustomization (or `SEAMLESS_VERSION` on Compose) and
    apply; with the two-role PostgreSQL setup of Security.md §9.4, start the new version once with the owner
    role's URL so `create_schema()` can add indexes, then switch back to the application role.

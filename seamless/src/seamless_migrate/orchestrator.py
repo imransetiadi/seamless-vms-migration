@@ -23,7 +23,15 @@ import random
 import time
 import weakref
 from collections import Counter, defaultdict
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Literal
@@ -137,6 +145,9 @@ APPROVABLE = frozenset(
 )
 CUTOVER_REQUESTABLE = frozenset({P.ready, P.precopy, P.syncing, P.awaiting_cutover})
 REVALIDATABLE = frozenset({P.pending, P.blocked, P.ready})
+#: the migrations a validation re-assesses - one left in validating is an interrupted validation's
+#: (plan lock) -, whose VMs it reads from the source; any other counts as its recorded vm (§5.4)
+REASSESSED = REVALIDATABLE | {P.validating}
 #: phases whose migration validation cancels when its VM leaves ``vm_ids`` (SDD §5.4); a
 #: migration it finds in validating is a leftover of an interrupted validation (plan lock)
 REMOVABLE = REVALIDATABLE | {P.failed, P.validating}
@@ -604,9 +615,17 @@ class Orchestrator:
             raise BadRequest(f"provider {provider.id} check failed: {checked.status_message}")
         return {**checked.capabilities, "conversion_host": checked.conversion_host is not None}
 
-    async def _vms(self, plan: Plan, impl: Any) -> list[VMRef]:
+    async def _vms(self, plan: Plan, impl: Any, existing: Mapping[str, Migration]) -> list[VMRef]:
+        """The plan's VMs as a validation and the wave planner read them (SDD §5.4): from the source
+        each VM with no migration yet or one a validation re-assesses; any other migration's
+        recorded vm - a VM that left the source, deleted by a storage handover or a finalize with
+        delete_source, keeps its plan valid (review PL-09)."""
         vms = []
         for vm_id in plan.vm_ids:
+            m = existing.get(vm_id)
+            if m is not None and m.phase not in REASSESSED:
+                vms.append(m.vm)
+                continue
             try:
                 vms.append(await impl.get_vm(vm_id))
             except ProviderError as exc:
@@ -687,10 +706,10 @@ class Orchestrator:
             dst_inv = await dst_impl.inventory()
         except ProviderError as exc:
             raise ProviderError(f"inventory failed: {exc}") from None  # 502, redacted (SDD §12)
-        vms = await self._vms(plan, src_impl)
         existing = {
             m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)
         }
+        vms = await self._vms(plan, src_impl, existing)
         cancelled = sorted(
             m.vm.name for vm in vms if (m := existing.get(vm.source_id)) and m.phase == P.cancelled
         )
@@ -1136,7 +1155,10 @@ class Orchestrator:
         if max_wave_size < 1:
             raise BadRequest("max_wave_size must be >= 1")
         source = await self._provider(plan.source_provider_id, ProviderRole.source)
-        vms = await self._vms(plan, self.providers.get(source))
+        existing = {
+            m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)
+        }
+        vms = await self._vms(plan, self.providers.get(source), existing)
         if self.advisor is not None:
             tiers, note = await self.advisor.classify_workloads(vms)
         else:
@@ -2589,7 +2611,12 @@ class Orchestrator:
 
         async def mark_downtime_end() -> None:
             if not locked:
-                await outlive_cancel(self._close_clock(mid, plan))
+                try:
+                    await outlive_cancel(self._close_clock(mid, plan))
+                except Exception as exc:
+                    # the source runs: a store error saving the close is retried with the
+                    # attempt, which closes the clock again (SDD §5.2, review RV36B-03)
+                    raise TransientStepError(f"close the downtime clock: {exc}") from exc
 
         async def log_line(line: str) -> None:
             text = redact_cut(line, LOG_LINE_CHARS)
@@ -2674,7 +2701,9 @@ class Orchestrator:
     async def _close_clock(self, mid: str, plan: Plan) -> None:
         """The source runs again inside a step - a rollback's power-on: the clock closes now, so
         an attempt that fails after it leaves the source counted as running (SDD §5.2, review
-        RV30-03). Saved, then announced, as a rollback's end does; a closed clock stays as it is."""
+        RV30-03). The close and its event are one store transaction, as a rollback's end writes
+        them: a store error leaves neither, and the retry closes and announces it (review
+        RV37B-01). A closed clock stays as it is."""
         async with self._lock(mid):
             m, v = await self._load(mid)
             if not fsm.source_stopped(m):
@@ -2682,13 +2711,13 @@ class Orchestrator:
             now = self._now()
             m.downtime_ended_at = now
             m.actual_downtime_s = self._rollback_downtime_s(m, now, plan)
-            await self._save(m, v)
-        await self._emit(
-            "migration.downtime_ended",
-            f"{m.vm.name}: source running again after {m.actual_downtime_s:.0f} s",
-            migration=m,
-            data={"actual_downtime_s": m.actual_downtime_s},
-        )
+            await self._save_with_event(
+                m,
+                v,
+                "migration.downtime_ended",
+                f"{m.vm.name}: source running again after {m.actual_downtime_s:.0f} s",
+                {"actual_downtime_s": m.actual_downtime_s},
+            )
 
     async def _run_step(
         self,
@@ -3101,14 +3130,19 @@ class Orchestrator:
                 cur.actual_downtime_s = self._rollback_downtime_s(cur, now, plan)
             cur.destination_server_id = None
             cur.checkpoint = "rolled_back"
-            v = await self._save(cur, v)
             if ended:
-                await self._emit(
+                # the close and its event in one store transaction: a store error leaves neither,
+                # and the resumed rollback closes the clock and announces it (SDD §5.2, review
+                # RV37B-01)
+                v = await self._save_with_event(
+                    cur,
+                    v,
                     "migration.downtime_ended",
                     f"{cur.vm.name}: source running again after {cur.actual_downtime_s:.0f} s",
-                    migration=cur,
-                    data={"actual_downtime_s": cur.actual_downtime_s},
+                    {"actual_downtime_s": cur.actual_downtime_s},
                 )
+            else:
+                v = await self._save(cur, v)
             cur, v = await self._transition(
                 cur, v, P.rolled_back, "rollback finished; the source VM runs again"
             )

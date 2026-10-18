@@ -1,6 +1,7 @@
-# Seamless Migrate - local stack for the dedicated Colima profile "seamless" (SDD 17.1).
+# Seamless Migrate - the single-host stack (SDD 17.1): a Linux host's own Docker Engine (context default),
+# Podman (SEAMLESS_ENGINE=podman), or on macOS the dedicated Colima profile "seamless".
 #
-#   make seamless-colima-up      # once: Colima profile "seamless" (Docker context colima-seamless)
+#   make seamless-colima-up      # macOS, once: Colima profile "seamless" (Docker context colima-seamless)
 #   scripts/compose-init.sh      # once: writes .env + tokens.yaml, prints the admin token ONCE
 #   make seamless-up             # postgres + seamless (+ jev when COMPOSE_PROFILES=ai in .env)
 #   make seamless-demo           # same, with simulated clouds (SEAMLESS_DEMO=true)
@@ -10,7 +11,8 @@
 # never published and only `seamless` shares its network (it sits on `frontend` because it needs npm and
 # the Jev provider API). No secret is stored in this file: .env and tokens.yaml are generated and git-ignored.
 #
-# Always address this stack through the Docker context colima-seamless (the Make targets do):
+# Address this stack through the engine it runs on (the Make targets pick it per host): on macOS the Docker
+# context colima-seamless, on Linux the default one:
 #   docker --context colima-seamless compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env ps
 #
 # Precedence: Compose lets a variable exported in your shell win over --env-file. The Make targets unset the

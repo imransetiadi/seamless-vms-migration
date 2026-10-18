@@ -506,8 +506,14 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   on the event never leaves a source that may be stopped without its clock (review RV26-06). `downtime_ended_at` is
   set when verification passes or, on
   rollback, when the source VM is running again - marked by the step as soon as its power-on succeeded
-  (`StepContext.mark_downtime_end()`, the VMware rollback), so an attempt that fails after it leaves the clock
-  closed: the source runs, and the next cutover counts a new outage (review RV30-03). A verification that passes again — the first one was saved,
+  (`StepContext.mark_downtime_end()`: the VMware rollback, and the storage-handover rollback once the source server
+  it started or recreated reads `ACTIVE`, §7.3), so an attempt that fails after it leaves the clock
+  closed: the source runs, and the next cutover counts a new outage (reviews RV30-03, RV36B-03). A store error
+  saving that close fails the attempt as transient (`StepContext.mark_downtime_end()` raises `TransientStepError`):
+  it is retried within the step's retries, and the retry closes the clock again (review RV36B-03). A close inside a
+  step, and a rollback's at its end, is written with its `migration.downtime_ended` in one store transaction
+  (`put_with_event`, §11): a store error on either leaves neither, so the retry closes the clock and announces it -
+  never a closed outage without its end event; the open keeps its save-first order (review RV37B-01). A verification that passes again — the first one was saved,
   but a stop or a failed event write came before `completed` — keeps the end and the downtime the first one
   recorded: the outage ended then. `actual_downtime_s` = difference — except in demo mode (§7.4),
   where the downtime is in model seconds, the time base of the passes' `duration_s`, so a demo's downtime compares
@@ -592,7 +598,11 @@ Approvals, `cutover_requested` (with its requester) and a pending `force_window`
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
 `blocked` and `ready`, and one left in `validating`: a plan's validations run one at a time under
-its lock, so no other validation is still at work on it. A re-assessment of a migration whose history reached
+its lock, so no other validation is still at work on it. It reads from the source only those VMs and the ones with
+no migration yet; a migration in any other phase counts as its recorded `vm` wherever the whole plan does (duplicate
+names, the addresses a NIC override must not take, the quota, §9.3), and the wave planner (§9.4) reads the plan's VMs
+the same way - so a VM that left the source, deleted by a storage handover (§7.3 step 4) or by a finalize with
+`delete_source` (§8.1), never fails its plan's validation or wave planning (review PL-09). A re-assessment of a migration whose history reached
 `cutover` keeps each volume of its validated `vm.disks` that the VM no longer lists - a cold export detaches the data
 volumes, and one that failed may have left them so when its rescue failed too (§6.6) - among the migration's disks,
 as the blocker `SRC_VM_VOLUME_DETACHED` (§9.3): neither a validation nor the export check (§7.2) drops a disk the
@@ -1186,8 +1196,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 
 * Run directory: `{data_dir}/plans/{plan_id}/migrations/{migration_id}/` with its own
   `os_migrate_data_dir` (`osm/`) so concurrent migrations never share `workloads.yml`, and the VMware rollback's
-  `.seamless/rollback-kept.json` (below) - one level below the guest directories the migration kit creates there,
-  `{run directory}/{VM name}`, so no VM's name is the record's (review RV32A-08).
+  keep records, one per attempt, in `.seamless/` (`rollback-kept.<server>.<unique>.json`, below) - one level below
+  the guest directories the migration kit creates there, `{run directory}/{VM name}`, so no VM's name is a record's
+  (reviews RV32A-08, RV36A-03).
   Plan-level prestage uses `{data_dir}/plans/{plan_id}/osm/`.
 * Secrets: `secrets.yml` (mode 0600) holds `os_migrate_src_auth`/`os_migrate_dst_auth` (resolved
   from the providers' `cloud` entries, §13.3) and is deleted in a `finally` block together with the
@@ -1420,7 +1431,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   which a CBT sync, copying only what the source changed, never undoes; with a recorded server the rollback deletes
   every kit volume of the VM, converted or not, so the next pass copies them in full (review RV30-02). Whenever a
   server booted from the kit's volumes - the one the migration recorded, or one found by the kit's name, by this
-  attempt or by an earlier one (`rollback-kept.json`, below) -, the rollback marks each kit copy of the VM still
+  attempt or by an earlier one (its keep record, below) -, the rollback marks each kit copy of the VM still
   marked `seamless_copied` `true` as `cutover` (below) right after the power-on, before it deletes any port or
   volume: what it then cannot delete (Cinder refuses a volume with a snapshot) or keeps (what a server found only by
   name held) is no completed copy for any later run, nor is a copy a cutover of an earlier build left marked (review
@@ -1436,18 +1447,20 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   never deleted, nor is any volume when the VM has no kit name (`SRC_VM_NAME_UNUSABLE`, §9.3). The server the rollback
   deletes counts as this migration's only when the migration recorded it: one found by the kit's name may be another
   plan's VM the kit names alike (owner question q26), so what it held before its deletion - read from Nova's record of
-  it (`server_volumes`), as no Cinder call comes before the power-on, and recorded in the run directory
-  (`.seamless/rollback-kept.json`, written and synced before the deletion; a `rollback-kept.json` file an earlier build
-  wrote is read too) so that an attempt retried or resumed after it, which finds no server any more, keeps it too until
-  a rollback succeeds and removes the record (review RV30-05) - is kept: a later kit run refuses such a volume, and a
-  second rollback, which finds no server holding it, deletes it (review RV29-03). A record that cannot be read (a
-  damaged file) never keeps the source stopped: what to keep is then unknown, so that attempt deletes no kit volume of
-  the VM, says so in its log, and deletes the server and powers the source on as any other (review RV32A-08). No
-  record is written over one that cannot be read: for a server found by name beside it, the attempt logs the volumes
-  that server held instead - a record written over a damaged file would let a later attempt delete what that file
-  kept, and one at an unusable path (a directory there, a `.seamless/` a restore left unwritable) cannot be written
-  at all, which kept the source stopped (review RV34A-03); while the record cannot be read, no attempt deletes a kit
-  volume of the VM. The
+  it (`server_volumes`), as no Cinder call comes before the power-on, and recorded in the run directory - each attempt
+  in a record of its own in `.seamless/` (`rollback-kept.<server>.<unique>.json`), written and synced before the
+  deletion and never over another record; the single `.seamless/rollback-kept.json` and the run directory's
+  `rollback-kept.json` earlier builds wrote are read too - so that an attempt retried or resumed after it, which finds
+  no server any more, keeps it too until a rollback succeeds and removes every record (reviews RV30-05, RV35A-02) - is
+  kept: a later kit run refuses such a volume, and a second rollback, which finds no server holding it, deletes it
+  (review RV29-03). A record that cannot be read (a damaged file, a read that fails) never keeps the source stopped:
+  what to keep is then unknown, so that attempt deletes no kit volume of the VM, says so in its log, and deletes the
+  server and powers the source on as any other (review RV32A-08); it still records what a server it found by name
+  held, in a record of its own - a damaged one stays as it is (review RV34A-03) -, so an attempt whose read succeeds
+  again keeps that too (review RV35A-02). A record that cannot be written (a `.seamless/` a restore left unwritable, a
+  full or read-only volume) never keeps the source stopped either: the attempt logs the volumes the server held,
+  deletes it and powers the source on, and deletes no kit volume of the VM; an attempt after it can no more tell what
+  that server held than a rollback after one that succeeded (review RV35A-03). The
   rollback looks the server up by the kit's name only while the clock is open (§5.2), and then even when one is
   recorded: the recorded one
   may be an earlier attempt's that a failed rollback already deleted - kept recorded, as only a rollback that
@@ -1674,10 +1687,13 @@ the power-off up (its `task_state` back to none, the guest still running) - then
 RV26-01, RV27-04). A server Nova still powers on (`task_state` `powering-on`: an earlier attempt's start accepted, its
 wait cut off) reads `SHUTOFF` and refuses a second start: the rollback waits for that start to end too (review
 RV29-06). A source step 4's deletion reached no longer counts as existing: one whose deletion Nova accepted (step 4,
-journaled as sent) unless it reads `ACTIVE`; one Nova reads as being deleted (`task_state` `deleting`), whatever the
-journal holds; and one in `ERROR` once step 4 tried its deletion (journaled as tried) - Nova may take a deletion whose
-answer is an error, a 500 once it saved the deleting state, or is lost, while the compute host fails it (review
-RV35B-01). Nova starts no server it is deleting or that a failed deletion left in `ERROR`, and a deletion it
+journaled as sent) unless it reads `ACTIVE`; one Nova reads as being deleted or soft-deleted (`task_state` `deleting`
+or `soft-deleting`, or `SOFT_DELETED` on a cloud with `reclaim_instance_interval`, whose reclaim later deletes the
+server with its volumes by their `delete_on_termination`), whatever the journal holds (review RV36B-01); and one in
+`ERROR` once step 4 tried its deletion (journaled as tried) - Nova may take a deletion whose answer is an error, a 500
+once it saved the deleting state, or is lost, while the compute host fails it (review RV35B-01). A soft-deleted source
+is sent its deletion again - another soft delete - and the rollback waits for it in vain: the VM stays down until
+restored by hand, every volume kept (owner question q42). Nova starts no server it is deleting or that a failed deletion left in `ERROR`, and a deletion it
 then finishes - nova-compute resuming it, an operator clearing the server - honours the `delete_on_termination` it
 finds. So the rollback gives nothing back and starts nothing there: it deletes the server again, waits until it is
 gone and every journaled volume never unmanaged is `available`, and recreates the source as for one gone (below); a
@@ -1689,14 +1705,34 @@ source with the reference for the source's family and pool, named `volume-<rhoso
 journaled source host/type (a definition journaled without `storage` is RBD), with the journaled image
 metadata set back (step 7); recreate
 the source ports with their journaled MAC, fixed IPs, security group ids and port-security flag (admin is already
-required; Nova applies a server's groups only to the ports it creates). The fixed IPs leave out those on a SLAAC or
+required; Nova applies a server's groups only to the ports it creates) and the description
+`os-migrate-rollback:{source port id}`: an attempt first uses again an unbound port on the source network with the MAC
+and that description - one an earlier attempt created whose answer was lost, which otherwise holds the MAC and fails
+every later create (review RV37A-04). The fixed IPs leave out those on a SLAAC or
 DHCPv6-stateless subnet of the source network, whose EUI-64 address of the kept MAC the source's Neutron derives
 itself (§6.6): sent, that address is refused, or allocated twice. Then recreate the
 source server from the journaled definition with the volumes in device order, each kept (`delete_on_termination`
 false) while Nova builds it - a build Nova aborts deletes every volume flagged otherwise, the VM's only copy of its
 data -, and once it is `ACTIVE` give each volume its journaled `delete_on_termination` back (the step 3 call,
 journaled per volume); a recreated server Nova left in `ERROR` is deleted on the next attempt, its volumes kept, and
-created again (review RV35B-04). Every step is
+created again once every journaled volume is `available` - also on an attempt that finds that build gone already,
+as for a stale source: the attempt that deleted it may have died in that wait (reviews RV35B-04, RV36B-04). Before that deletion, each journaled port still bound to the failed build is
+unbound through Neutron (its device and host cleared): Nova's deletion takes every port of the server its network
+cache no longer keeps - a build it aborted cleared that cache -, the user's own port reused included. And every
+attempt reads a journaled port again before the recreate: one gone is created again from the journaled MAC,
+addresses, security groups and port-security flag, and journaled anew - a user's own port so loses what the
+definition does not record, such as a floating IP's association -; one still bound to a server that is gone is
+unbound (review RV36B-02). So is a user's own port the first attempt finds bound to a server that is gone, then used
+again: Nova's deletion of the source unbinds it, and deletes the server all the same when that unbind fails (review
+RV37A-03). Only a port whose owner is Nova's (`compute:*`) or none is unbound, never one another service holds. The downtime clock closes once the recreated server is `ACTIVE` - on every attempt
+that finds it journaled, before the give-back - and once the start of a source that still exists succeeded (§5.2);
+the call, its journal mark and that close run as one, which a cancel - the step timeout, a shutdown - waits out as it
+does the call alone (review RV37A-01): an attempt that fails after it, a give-back Nova refuses, leaves the source
+counted as running, and the migration
+names the server it replaced until a Roll back succeeds. A cutover resumed on a journal whose rollback recreated the
+source - a Retry after that failed attempt - refuses before any call and before the clock opens ("a rollback
+attempt recreated the source server <id>, which runs: roll back to finish it"): that rollback unmanaged every volume
+at RHOSO, so the journal's cutover can never complete, and the source runs (review RV36B-03). Every step is
 a metadata operation — data never moves — and each sub-step is journaled
 (`handover-journal.json`, 0600) so a crash resumes at the first incomplete sub-step. Each call is a blocking
 openstacksdk call in a worker thread, which no cancel stops: a step cancelled by the step timeout (§15.1), a
@@ -2436,7 +2472,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
 | POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them; a field `PlanCreate` does not have — a misspelt one too — is refused with 422, never dropped) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
-| PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry — except its providers: a changed `source_provider_id` or `destination_provider_id` is refused (409) while a migration of the plan is `failed`, since its rollback acts on the clouds its attempt used (it matches the destination server by name on the cold path) — roll it back or cancel it first; the 409 names each such VM with what releases it — roll back or retry a `failed` one whose source is stopped, finish, roll back or cancel one in flight, finalize or roll back a `completed` one (§8.1); resets status to `draft`); setting `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
+| PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry — except its providers: a changed `source_provider_id` or `destination_provider_id` is refused (409) while a migration of the plan is `failed`, since its rollback acts on the clouds its attempt used (on the cold path it finds the destination server by the migration's record; a name serves only a migration cut over before records existed, after the stop, §7.2) — roll it back or cancel it first; the 409 names each such VM with what releases it — roll back or retry a `failed` one whose source is stopped, finish, roll back or cancel one in flight, finalize or roll back a `completed` one (§8.1); resets status to `draft`); setting `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}`, 1–1000 (422 outside); in `draft`, `validated` or `paused` (409 otherwise, and while a migration of the plan is in flight, as for `PATCH`: the plan returns to `draft`, which the tick does not drive) | `Plan` |
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
 | POST | `/plans/{id}/start` | operator | — | `Plan` (from `validated`, `paused` or `failed` — a failed plan pre-stages again; 409 when any migration is `blocked`) |
@@ -3664,8 +3700,8 @@ read from the developer's environment (`TYPESAFE_API_KEY`) at init time and neve
 bind mount; `.env` is 0600.
 `Makefile` targets: `seamless-colima-up` (macOS: `colima start seamless --activate=false --cpu 4 --memory 6
 --disk 40` — `--activate=false` keeps the developer's current Docker context),
-`seamless-init`, `seamless-up` / `seamless-down` / `seamless-ps` / `seamless-logs` / `seamless-reset`
-(all through the engine and context below), `seamless-demo` (control plane started with `SEAMLESS_DEMO=true`
+`seamless-init`, `seamless-up` / `seamless-down` / `seamless-stop` / `seamless-start` / `seamless-restart` /
+`seamless-ps` / `seamless-logs` / `seamless-reset` (all through the engine and context below; §17.2), `seamless-demo` (control plane started with `SEAMLESS_DEMO=true`
 against PostgreSQL), `seamless-test` and `seamless-check` (the CI checks that need only the venv and the
 dashboard's `node_modules`: the control plane with its coverage gate, ruff and DEMO-07, the collection, the
 scanners that are installed, the dashboard's unit tests and build; its comment, `make seamless-help` and the README
@@ -3701,6 +3737,45 @@ CI (QASuite §14.5) proves the Linux path:
 * A pull-request job runs `scripts/compose-init.sh` and the targets' dry runs in Rocky Linux 9, AlmaLinux 9,
   Debian 12, Ubuntu 24.04 and Fedora containers.
 
+### 17.2 Operations: up, down, stop, start, restart and scale
+
+`scripts/seamless-ctl.sh PLATFORM ACTION [options]` runs a deployment's lifecycle the same way on every platform:
+`docker` and `podman` drive the single-host stack of §17.1 through its Make targets (`SEAMLESS_ENGINE`), and
+`kubernetes` and `openshift` drive the manifests of §17 through `kubectl` or `oc` in one namespace (`--namespace`,
+default `seamless-migrate`). It never runs a second orchestrator and never deletes data - removing the volumes stays
+`make seamless-reset CONFIRM=yes`, and on a cluster deleting the namespace or its PVCs stays a manual act.
+
+| Action | `docker`, `podman` | `kubernetes`, `openshift` |
+|---|---|---|
+| `up` | `make seamless-up` (`--demo`: `seamless-demo`): build, create or recreate what changed, wait until healthy | `apply -k` the overlay (`deploy/kubernetes`, `deploy/openshift`), then PostgreSQL and the control plane scaled to one replica each - an apply restores no replica count an earlier `down` set - and both rollouts awaited |
+| `down` | `make seamless-down`: the containers removed, the volumes kept | the control plane to 0 replicas and its pod gone, then PostgreSQL to 0; PVCs, Secrets and the ConfigMap kept |
+| `stop` | `make seamless-stop`: the control plane's container stopped, PostgreSQL left running | the control plane to 0 replicas and its pod gone |
+| `start` | `make seamless-start`: the stopped container started as it was, or created when `down` removed it, then waited for | PostgreSQL back to one replica when it is at 0, then the control plane to one, both rollouts awaited |
+| `restart` | `make seamless-restart`: the control plane recreated from the current `.env`, compose files and sources (`up -d --build --force-recreate --no-deps seamless`), then waited for | `rollout restart` of the Deployment - `Recreate` ends the old pod before the new one starts -, then awaited |
+| `scale N` | `N` 0 is `stop`, 1 is `start` | the same |
+| `capacity` | `--max-migrations N` and `--max-cutovers N` written to `deploy/compose/.env` as `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` and `SEAMLESS_MAX_CONCURRENT_CUTOVERS` (§15.1, at least 1), then `restart` | the same settings patched into the ConfigMap `seamless-config`, `--cpu` and `--memory` set as the container's limits, then one rollout, awaited; the next `apply -k` brings the manifests' values back, so a lasting change goes into them |
+| `status` | `make seamless-ps` and `GET /api/v1/health` | the Deployment, the StatefulSet and their pods, and `GET /api/v1/health` at `--url` when given |
+| `logs` | `make seamless-logs` for the control plane | the control plane's log, followed |
+
+* **Scale.** `scale` takes 0 or 1 and refuses any other count: the orchestrator is a singleton (§17, D2), and a
+  second replica would run two orchestrators against one database. Scaling up is capacity - concurrency slots and
+  CPU and memory for the one control plane, each concurrent migration costing about 250 MiB (Performance.md §8) -,
+  while the conversion hosts move the data (Performance.md).
+* **The mode a restart keeps.** `make seamless-start` and `seamless-restart` keep the mode the control plane ran in:
+  without `SEAMLESS_DEMO` in their environment they read it from the running or stopped container, so a demo
+  stack comes back a demo stack and a real one a real one.
+* **Stopping safely.** A stop is safe at any time (§8): running steps end within the stop grace and resume from
+  their checkpoint once the control plane runs again. `--drain TOKEN_FILE` makes a planned stop quieter: before
+  `down`, `stop`, `restart` or `scale 0` it pauses every running plan (`POST /plans/{id}/pause`), so no new
+  migration starts, and waits until no migration is in `cutover`, `verifying` or `rolling_back` - a cutover ends
+  rather than resuming after the restart - for at most `--wait-timeout` seconds (default 1800; a timeout stops
+  nothing). It prints the plans it paused, which `resume --token-file TOKEN_FILE PLAN_ID...` starts again (`POST
+  /plans/{id}/start`). The operator's token is read from a file only its owner may read - any other mode is refused
+  - and reaches curl through a header file in a private directory, never a command line (§13.1); the API is
+  `http://127.0.0.1:<SEAMLESS_HOST_PORT>` on the single host and the Route's or Ingress's URL (`--url`) on a
+  cluster. `--drain` and `resume` need `python3` to read the API's JSON.
+* `--dry-run` prints every command and runs none. The tutorial is `docs/Operations.md`.
+
 ---
 
 ## 18. Observability
@@ -3730,11 +3805,11 @@ tests/unit/test_warm_playbooks.py             tests/perf/bench_blocksync.py
 seamless/ (pyproject.toml, Containerfile, src/seamless_migrate/…, tests/…)
 dashboard/ (package.json, src/…, design-system/…, e2e/…)
 deploy/openshift/   deploy/openshift/backup/   deploy/kubernetes/   deploy/compose/   tests/e2e/
-scripts/compose-init.sh   scripts/check-readonly-runtime.sh   scripts/collection-sanity.sh   scripts/vendor-openstack-cloud.sh
+scripts/compose-init.sh   scripts/seamless-ctl.sh   scripts/check-readonly-runtime.sh   scripts/collection-sanity.sh   scripts/vendor-openstack-cloud.sh
 .github/workflows/{ci,codeql}.yml   .github/dependabot.yml   .pre-commit-config.yaml   .gitleaks.toml   .gitleaks-tree.toml
 .dockerignore   seamless/.containerignore   RELEASING.md   NOTICE   CONTRIBUTING.md   SECURITY.md   CODE_OF_CONDUCT.md   CONTRIBUTORS.md   CODEOWNERS
 docs/advisor/   docs/audits/   docs/UI-UX-AUDIT-2026-10-15.md   AUDIT-UI-UX-BY-GEMINI.md
-docs/{PRD,SDD,MEMORY,QASuite,Security,Performance}.md
+docs/{PRD,SDD,MEMORY,QASuite,Security,Performance,Operations}.md
 docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 .mcp.json   .claude/settings.json   CLAUDE.md
 ```
@@ -3759,7 +3834,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D12 | The `TODO(…): confirm` markers of this document — LAB, ADV-04, ADV-06, ADV-17, ADV-18, ADV-19 — each a default taken without the owner's word | the defaults as written | each is an owner decision; remove the marker when decided (audit D-20) |
 | D13 | Destination platforms: RHOSO 18.0 and community OpenStack | decided by the owner 2026-10-16: the window 2023.1 Antelope – 2026.2 Hibiscus with the tiers of §21.1 (Jev 0.93), the series detected from the version documents plus an optional declared one (§21.3, Jev 0.77) | each upstream release and end of life (§21.2) |
 | D14 | The policy profile RHOSO 18.0 ships: the legacy rules or the secure-RBAC defaults (§21.5) | judged as today: `admin` or `advsvc` for a port on another project's network; the check reports `legacy` for kind `rhoso` unless its provider declares a profile (§10.1) | the owner confirms it on the lab run on RHOSO 18.0 (owner, 2026-10-16; `TODO(LAB): confirm`) |
-| D15 | Conversion host images on community clouds beyond CentOS Stream 9 and RHEL 9: the RHEL family by `ansible_os_family` (Rocky Linux, AlmaLinux, CentOS Stream 10), then Ubuntu 24.04 LTS (§21.6) | CentOS Stream 9 and RHEL 9 only; the order approved by the owner 2026-10-16 (the RHEL family first, then Ubuntu 24.04) | 0.2.0 (plan task T7) |
+| D15 | Conversion host images on community clouds beyond CentOS Stream 9 and RHEL 9: the RHEL family by `ansible_os_family` (Rocky Linux, AlmaLinux, CentOS Stream 10), then Ubuntu 24.04 LTS (§21.6) | decided: the order the owner approved 2026-10-16 (the RHEL family first, then Ubuntu 24.04), implemented by plan task T7 (§6.5, §21.6) | the lab (plan task T10, §21.9) validates the images |
 
 ## 21. Destination platforms: RHOSO 18.0 and community OpenStack
 

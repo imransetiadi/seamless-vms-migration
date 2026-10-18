@@ -63,14 +63,15 @@ Ansible 2.16+, and dashboard work Node.js 22+ with npm.
 ### Local stack (Docker Compose)
 
 ```sh
-make seamless-colima-up      # start the dedicated Colima profile "seamless"
+make seamless-colima-up      # macOS: start the dedicated Colima profile "seamless" (on Linux it says none is needed)
 scripts/compose-init.sh      # once: generates .env and tokens.yaml and prints the admin API token once
 make seamless-demo           # full stack with simulated clouds
 make seamless-logs           # follow the logs
 make seamless-down           # stop the stack and keep the data
 ```
 
-To use another engine, add `SEAMLESS_DOCKER_CONTEXT=default` (Docker) or `SEAMLESS_ENGINE=podman`
+On Linux the targets use the machine's own Docker Engine (context `default`); on macOS the Colima profile. For
+another engine add `SEAMLESS_DOCKER_CONTEXT=desktop-linux` (Docker Desktop on macOS) or `SEAMLESS_ENGINE=podman`
 (Podman) to the `make` targets. Details and troubleshooting are in
 [deploy/compose/README.md](deploy/compose/README.md).
 
@@ -81,7 +82,8 @@ cd seamless
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev,jev,collection]'
 .venv/bin/pytest -q                # SQLite; set SEAMLESS_TEST_PG_URL to also test against PostgreSQL
-.venv/bin/seamless serve --demo    # API at http://127.0.0.1:8080; the dashboard too once dashboard/dist is built
+SEAMLESS_SECRETS_DIR=data/secrets .venv/bin/seamless serve --demo    # API at http://127.0.0.1:8080; the dashboard
+                                   # too once dashboard/dist is built; credentials entered in it go to data/secrets
 ```
 
 ### Dashboard
@@ -105,7 +107,8 @@ is set. CI runs the first two and the PostgreSQL tests on every pull request, an
 `main` and nightly.
 
 If you touch a `Containerfile` or anything under `deploy/`, also run `make deploy-runtime-check`,
-which runs the images the same way the manifests do.
+which runs the images the same way the manifests do: PostgreSQL always, the control plane when its image
+`seamless-migrate:$(SEAMLESS_VERSION)` is built (`make seamless-demo` builds it; without it that part is skipped).
 
 The AI features are optional. You do not need Jev or agentmemory for development or tests, and
 everything works with Jev turned off.
