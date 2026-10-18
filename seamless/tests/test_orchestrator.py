@@ -418,7 +418,9 @@ def _passes(count: int) -> list[SyncPass]:
     ]
 
 
-@pytest.mark.parametrize(
+#: what a rollback kept, where no workload record tells (SDD §5.1, §9.3, review RV39-02): strategy,
+#: the phases of the migration's history, its recorded passes, and whether its copies remain
+NO_RECORD_CASES = pytest.mark.parametrize(
     ("strategy", "phases", "passes", "held"),
     [
         (Strategy.warm, CUT, 2, True),
@@ -445,6 +447,9 @@ def _passes(count: int) -> list[SyncPass]:
         "storage_handover: no copy",
     ],
 )
+
+
+@NO_RECORD_CASES
 async def test_where_no_record_tells_warm_passes_and_an_uncut_vmware_warm_attempt_hold_volumes(
     tmp_path, store, strategy, phases, passes, held
 ):
@@ -464,6 +469,30 @@ async def test_where_no_record_tells_warm_passes_and_an_uncut_vmware_warm_attemp
     )
     try:
         assert await h.orch.holds_destination_volumes(m) is held
+    finally:
+        await h.orch.stop()
+
+
+@NO_RECORD_CASES
+async def test_where_no_record_tells_copied_data_is_what_a_rollback_kept(
+    tmp_path, store, strategy, phases, passes, held
+):
+    """SDD §5.1, §12 (review RV39-02's rule for copied data): without a workload record a
+    rolled-back migration keeps copied data - its cancel cleans it up, its providers stay - as
+    §9.3 counts it held: a warm migration's passes, a vmware_warm one's while its last attempt ran
+    no cutover. The kit's rollback deleted its copies after one, and a vmware_cold rollback keeps
+    none."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=strategy,
+        phase=phases[-1],
+        phase_history=_history(*phases),
+        sync_passes=_passes(passes),
+    )
+    try:
+        assert await h.orch.copied_data(m) is held
     finally:
         await h.orch.stop()
 

@@ -314,13 +314,25 @@ const DATA_SENT: DataSentItem[] = [
   { decision_type: 'console_screening', tool: 'jev_screen', fields: [{ key: 'console', label: 'The last 6,000 characters of the console, redacted' }], sent: false, note: LOCAL_CONSOLE },
 ];
 
+/** Whether `m`'s last attempt reached its cutover: one since it last entered pre-copy (the API's `_last_attempt_ran_a_cutover`). */
+function lastAttemptRanACutover(m: Migration): boolean {
+  for (const change of [...m.phase_history].reverse()) {
+    if (change.to_phase === 'cutover') return true;
+    if (change.to_phase === 'precopy') return false;
+  }
+  return false;
+}
+
 /**
- * Whether an OpenStack migration holds the destination volumes an earlier attempt created (SDD §9.3, review RV38A-01):
- * the mock keeps no workload record, so as the API without one - a warm migration's passes. (A VMware source has no
- * storage handover, the one strategy this keeps out.)
+ * What a rollback kept of `m`'s copies (SDD §5.1, §9.3, review RV39-02): the mock keeps no workload record, so as the API
+ * without one (`_kept_after_rollback`) - a warm migration's passes, and a vmware_warm one's while its last attempt ran no
+ * cutover (the kit's rollback deletes its copies after one, or marks them cutover); a cold, vmware_cold or handover
+ * rollback keeps no copy. It is the destination volumes a migration holds (§9.3) and the copied data it keeps (§5.1).
  */
-function holdsDestinationVolumes(m: Migration): boolean {
-  return m.strategy === 'warm' && m.sync_passes.length > 0;
+function keptAfterRollback(m: Migration): boolean {
+  if (m.strategy === 'warm') return m.sync_passes.length > 0;
+  if (m.strategy === 'vmware_warm') return m.sync_passes.length > 0 && !lastAttemptRanACutover(m);
+  return false;
 }
 
 /** Drop the cutover request with its requester and the window bypass granted with it (SDD §5.4). */
@@ -1161,7 +1173,7 @@ export class MockServer {
     const profile = policyProfileOf(destination.capabilities, destination);
     m.findings = preflight(m.vm, source.kind, plan, networks, { subnets, selected, networkDetails, roles, profile, destination: providerLabel(destination) });
     // what an earlier attempt left at the destination keeps a handover out (SDD §9.2, review 39 lead L1)
-    const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings, holdsDestinationVolumes(m));
+    const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings, keptAfterRollback(m));
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
     m.estimate = m.estimates.find((e) => e.strategy === m.strategy) ?? null;
@@ -2058,9 +2070,8 @@ export class MockServer {
       if (p.status !== 'completed') return [`${p.id} ("${p.name}", ${p.status})`];
       const mine = this.migrations.filter((m) => m.plan_id === p.id);
       const n = mine.filter((m) => !RELEASES_VM.has(m.phase)).length;
-      // the mock keeps no record: like the API without one, passes of a strategy other than cold - a cold rollback deleted
-      // what it copied (SDD §5.1, §12)
-      const kept = mine.filter((m) => m.phase === 'rolled_back' && m.strategy !== 'cold' && m.sync_passes.length > 0).length;
+      // the mock keeps no record: like the API without one, what the rollback kept (SDD §5.1, §9.3, §12, review RV39-02)
+      const kept = mine.filter((m) => m.phase === 'rolled_back' && keptAfterRollback(m)).length;
       const why = [
         ...(n ? [`${n} VM${n === 1 ? '' : 's'} not finalized`] : []),
         ...(kept ? [`${kept} rolled-back VM${kept === 1 ? ' keeping its' : 's keeping their'} copied data`] : []),

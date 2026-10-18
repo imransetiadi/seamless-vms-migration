@@ -1513,6 +1513,23 @@ describe('mock API', () => {
     rolled.strategy = 'cold';
     expect(remove().status).toBe(204);
     server.providers.push(provider);
+    // so does a vmware_cold one, whose demo cutover lists a pass; the kit's rollback after a cutover deletes its copies, and
+    // one before its cutover keeps them for the next CBT pass (SDD §5.1, §9.3, §12, review RV39-02)
+    const at = '2026-10-08T09:00:00Z';
+    const through = (...phases: Migration['phase'][]) =>
+      phases.map((to_phase, i) => ({ from_phase: i ? phases[i - 1]! : ('ready' as const), to_phase, at, reason: 'test', actor: 'test' }));
+    rolled.strategy = 'vmware_cold';
+    expect(remove().status).toBe(204);
+    server.providers.push(provider);
+    rolled.strategy = 'vmware_warm';
+    rolled.phase_history = through('precopy', 'syncing', 'awaiting_cutover', 'cutover', 'rolling_back', 'rolled_back');
+    expect(remove().status).toBe(204);
+    server.providers.push(provider);
+    rolled.phase_history = through('precopy', 'syncing', 'awaiting_cutover', 'rolling_back', 'rolled_back');
+    expect(remove().status).toBe(409);
+    // only the last attempt counts: an earlier one's cutover, then a Retry whose attempt rolled back before its own
+    rolled.phase_history = through('precopy', 'cutover', 'rolling_back', 'rolled_back', 'ready', 'precopy', 'syncing', 'rolling_back', 'rolled_back');
+    expect(remove().status).toBe(409);
     rolled.strategy = 'warm';
     // the cancel cleans up what the rollback kept (the mock's cleanup ends at once): the provider goes
     await client.post<Migration>(`/migrations/${rolled.id}/cancel`, { reason: 'not migrated after all' });
