@@ -472,7 +472,8 @@ SEAMLESS_NO_CONTEXT_HINT  = $(if $(filter colima-%,$(SEAMLESS_DOCKER_CONTEXT)),R
 SEAMLESS_COMPOSE_NOENV = env POSTGRES_PASSWORD=unused JEV_MCP_AUTH_TOKEN=unused $(SEAMLESS_COMPOSE_BASE)
 
 .PHONY: seamless-help seamless-colima-up seamless-check-context seamless-check-env seamless-init \
-        seamless-up seamless-demo seamless-down seamless-ps seamless-logs seamless-reset \
+        seamless-up seamless-demo seamless-down seamless-stop seamless-start seamless-restart \
+        seamless-ps seamless-logs seamless-reset \
         seamless-test seamless-check dashboard-build lab-handover deploy-runtime-check
 
 seamless-help:
@@ -483,6 +484,10 @@ seamless-help:
 	@echo "  seamless-up         - build and start postgres, seamless (and jev when COMPOSE_PROFILES=ai)"
 	@echo "  seamless-demo       - same, with simulated providers and executor (SEAMLESS_DEMO=true)"
 	@echo "  seamless-down       - stop and remove the containers (volumes are kept)"
+	@echo "  seamless-stop       - stop the control plane alone; PostgreSQL keeps running (SDD 17.2)"
+	@echo "  seamless-start      - start the control plane again as it was (demo or not), or create it after seamless-down"
+	@echo "  seamless-restart    - recreate the control plane from the current .env, compose files and sources (after a change)"
+	@echo "  (or the same for every platform: scripts/seamless-ctl.sh docker|podman|kubernetes|openshift ACTION, docs/Operations.md)"
 	@echo "  seamless-ps         - show container status"
 	@echo "  seamless-logs       - follow logs (SEAMLESS_SERVICE=seamless|postgres|jev to filter)"
 	@echo "  seamless-reset      - DELETE containers and volumes (requires CONFIRM=yes)"
@@ -548,6 +553,35 @@ seamless-down: seamless-check-context
 	else \
 		$(SEAMLESS_COMPOSE_NOENV) --profile '*' down --remove-orphans; \
 	fi
+
+# The control plane alone (SDD 17.2): its container stopped, PostgreSQL (and jev) left running. Running steps end
+# within the stop grace and resume from their checkpoint at the next start (SDD 8).
+seamless-stop: seamless-check-context seamless-check-env
+	$(SEAMLESS_COMPOSE) --profile '*' stop seamless
+
+# The stopped container started as it was - its mode, demo or not, kept - or, when seamless-down removed it, a new
+# one in the mode SEAMLESS_DEMO gives (the default: not a demo); then waited for.
+seamless-start: seamless-check-context seamless-check-env
+	@if [ -n "$$($(SEAMLESS_COMPOSE) ps -a -q seamless 2>/dev/null)" ]; then \
+		echo "+ $(SEAMLESS_COMPOSE_CMD) start seamless"; $(SEAMLESS_COMPOSE) --profile '*' start seamless; \
+	else \
+		$(SEAMLESS_COMPOSE) up -d $(SEAMLESS_UP_WAIT) seamless; \
+	fi
+	@$(SEAMLESS_WAIT_HEALTH)
+	@echo "Seamless Migrate: http://127.0.0.1:$(SEAMLESS_HOST_PORT)/"
+
+# The control plane recreated from the current .env, compose files and sources (SDD 17.2) - after a change, or to
+# restart it - PostgreSQL untouched. Its mode is kept: SEAMLESS_DEMO from the environment, else from .env, else the
+# one the existing container ran with (make seamless-demo sets it for its own run only).
+seamless-restart: seamless-check-context seamless-check-env
+	@id=$$($(SEAMLESS_COMPOSE) ps -a -q seamless 2>/dev/null); mode=$${SEAMLESS_DEMO:-}; \
+	if [ -z "$$mode" ] && [ -n "$$id" ] && ! grep -q '^SEAMLESS_DEMO=' "$(SEAMLESS_ENV_FILE)"; then \
+		mode=$$($(SEAMLESS_DOCKER) inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$$id" | sed -n 's/^SEAMLESS_DEMO=//p'); \
+	fi; \
+	echo "+ $${mode:+SEAMLESS_DEMO=$$mode }$(SEAMLESS_COMPOSE_CMD) up -d --build --force-recreate --no-deps seamless"; \
+	env $${mode:+SEAMLESS_DEMO=$$mode} $(SEAMLESS_COMPOSE) up -d --build --force-recreate --no-deps $(SEAMLESS_UP_WAIT) seamless
+	@$(SEAMLESS_WAIT_HEALTH)
+	@echo "Seamless Migrate: http://127.0.0.1:$(SEAMLESS_HOST_PORT)/"
 
 seamless-ps: seamless-check-context seamless-check-env
 	$(SEAMLESS_COMPOSE) --profile '*' ps

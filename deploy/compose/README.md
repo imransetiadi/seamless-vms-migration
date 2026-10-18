@@ -103,6 +103,10 @@ wait polls the right port.
 
 ## Make targets
 
+`scripts/seamless-ctl.sh docker|podman ACTION` runs the same lifecycle through these targets - `up`, `down`,
+`stop`, `start`, `restart`, `scale 0|1`, `capacity`, `status`, `logs`, and a planned stop's `--drain` - as it does on
+Kubernetes and OpenShift; [docs/Operations.md](../../docs/Operations.md) is the tutorial (SDD §17.2).
+
 | Target | What it does |
 |---|---|
 | `seamless-colima-up` | macOS: `colima start seamless --activate=false --cpu 4 --memory 6 --disk 40` (keeps your active Docker context), prints the daemon info and the still-active context. Linux: says that Colima is not needed |
@@ -110,6 +114,8 @@ wait polls the right port.
 | `seamless-up` | builds and starts the stack, waits until healthy (`up -d --build --wait`) |
 | `seamless-demo` | like `seamless-up` with `SEAMLESS_DEMO=true`: fake providers, simulated executor, seeded plans |
 | `seamless-down` | removes the containers, keeps volumes (also stops the `jev` sidecar) |
+| `seamless-stop` / `seamless-start` | stops the control plane alone (PostgreSQL keeps running) / starts it again as it was, demo or not, or creates it after `seamless-down` |
+| `seamless-restart` | recreates the control plane from the current `.env`, compose files and sources - after a change - keeping its mode |
 | `seamless-ps` / `seamless-logs` | status / follow logs (`SEAMLESS_SERVICE=seamless` to filter) |
 | `seamless-reset` | **deletes** containers and volumes; needs `CONFIRM=yes` |
 | `seamless-test` | `cd seamless && .venv/bin/pytest -q` (export `SEAMLESS_TEST_PG_URL` to include PostgreSQL) |

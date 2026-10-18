@@ -289,12 +289,50 @@ them against the Kubernetes 1.30 schemas.
 | Kubernetes 1.28+ | `deploy/kubernetes/` | `kubectl apply -k deploy/kubernetes` |
 | OpenShift 4.16+ | `deploy/openshift/` | `oc apply -k deploy/openshift` |
 
+## Operate a deployment: up, down, restart and scale
+
+One script brings a deployment up and down, stops, starts, restarts and scales it, the same way on every
+platform ([docs/Operations.md](docs/Operations.md) is the full tutorial, [SDD §17.2](docs/SDD.md) the binding
+description):
+
+```bash
+scripts/seamless-ctl.sh PLATFORM ACTION [OPTIONS]      # PLATFORM: docker | podman | kubernetes | openshift
+```
+
+| Action | Does | Example |
+|---|---|---|
+| `up` | deploy or update everything and wait until it runs | `scripts/seamless-ctl.sh docker up` (`--demo` for simulated clouds) |
+| `down` | stop everything for maintenance; the data stays (volumes, PVCs, Secrets) | `scripts/seamless-ctl.sh openshift down` |
+| `stop` / `start` | stop or start the control plane alone; PostgreSQL keeps running | `scripts/seamless-ctl.sh podman stop` |
+| `restart` | restart the control plane from its current configuration - after a change | `scripts/seamless-ctl.sh kubernetes restart` |
+| `scale 0` / `scale 1` | scale the control plane down to 0 or back up to 1 | `scripts/seamless-ctl.sh openshift scale 0` |
+| `capacity` | scale the one control plane up or down: concurrent migrations and cutovers, and on a cluster its CPU and memory | `scripts/seamless-ctl.sh kubernetes capacity --max-migrations 20 --memory 8Gi` |
+| `status` / `logs` | what runs and its health / follow the control plane's log | `scripts/seamless-ctl.sh docker status` |
+
+* **One control plane.** Its orchestrator is a singleton, so `scale` takes 0 or 1 and refuses more (a second
+  replica would run two orchestrators against one database); scale up with `capacity` instead.
+* **Stopping is safe.** Running steps end within the stop grace and every migration resumes from its checkpoint
+  when the control plane runs again. Before planned maintenance, `--drain FILE` pauses the running plans and
+  waits until no cutover is in flight, and `resume` starts them again afterwards (the operator's token is read
+  from a `chmod 600` file, never from the command line):
+
+  ```bash
+  scripts/seamless-ctl.sh docker stop --drain ~/.seamless/operator.token
+  scripts/seamless-ctl.sh docker start
+  scripts/seamless-ctl.sh docker resume --token-file ~/.seamless/operator.token <plan-id>...
+  ```
+* **After a change:** a setting in `deploy/compose/.env`, a Secret or the cluster's ConfigMap needs `restart`; a
+  new version (`git pull`) or a changed manifest needs `up`.
+* `--dry-run` prints every command and runs none; on a cluster `--namespace` picks the namespace (default
+  `seamless-migrate`).
+
 ## Documentation
 
 | Document | Contents |
 |---|---|
 | [docs/PRD.md](docs/PRD.md) | Problem, goals, personas, journeys, requirements `FR-01…FR-34`, `NFR-01…NFR-12` |
 | [docs/SDD.md](docs/SDD.md) | **Binding design**: architecture, strategies, state machine, blocksync protocol, REST API, security model, AI integration, deployment |
+| [docs/Operations.md](docs/Operations.md) | Operating a deployment: up, down, stop, start, restart, scale and capacity, with a planned stop's drain, on Docker, Podman, Kubernetes and OpenShift |
 | [docs/MEMORY.md](docs/MEMORY.md) | Memory architecture (agentmemory, PostgreSQL audit memory, contributor memory), redaction, governance, decision log |
 | [docs/QASuite.md](docs/QASuite.md) | Test strategy, traceability `FR → test`, acceptance scenarios, lab matrix, security/resilience tests, exact commands |
 | [docs/Security.md](docs/Security.md) | Threat model (STRIDE), controls, AI safety, baseline os-migrate findings, checklists, incident response |

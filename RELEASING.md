@@ -314,6 +314,8 @@ what protects the data. For every MINOR, and for a PATCH that touches `store.py`
    production deployment.
 2. **Quiesce**: pause every running plan from the dashboard (no cutover in flight), then scale the control
    plane to 0 (`Recreate` keeps a single writer; a rolling update would start the new version beside the old).
+   `scripts/seamless-ctl.sh PLATFORM stop --drain TOKEN_FILE` does both, and `resume` starts the plans again
+   afterwards ([docs/Operations.md](docs/Operations.md) §5).
 3. **Roll the image**: set the new tag or digest in the kustomization (or `SEAMLESS_VERSION` on Compose) and
    apply; with the two-role PostgreSQL setup of Security.md §9.4, start the new version once with the owner
    role's URL so `create_schema()` can add indexes, then switch back to the application role.
