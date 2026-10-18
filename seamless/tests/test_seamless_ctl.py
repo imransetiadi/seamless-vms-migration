@@ -242,6 +242,31 @@ def test_a_cluster_start_brings_postgresql_back_first_when_it_is_down(
     ]
 
 
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+@pytest.mark.parametrize("postgres", [2, 3])
+def test_a_cluster_start_brings_postgresql_back_to_one_database_before_the_control_plane(
+    tmp_path, platform, postgres
+):
+    """SDD §17.2 (review RV38B-15): each PostgreSQL replica is a database of its own (a PVC each)
+    behind the one headless Service the control plane connects to. Scaled out of band, start
+    brings it back to one, waits until the others are gone - rollout status does not wait for a
+    scale-down - and only then starts the control plane, whose connections reach one database;
+    it names the replicas it found and the PVCs it kept. It acted at 0 replicas only, and started
+    the control plane against every database."""
+    proc, _, _ = _run(
+        tmp_path, platform, "start", cluster=fake_kube.cluster(replicas=0, postgres=postgres)
+    )
+    state = _cluster_after(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert state["statefulset"]["replicas"] == 1
+    assert [p["name"] for p in state["statefulset"]["pods"]] == ["seamless-postgres-0"]
+    [pod] = fake_kube.running(state)
+    assert pod["databases"] == ["seamless-postgres-0"]
+    kept = [f"data-seamless-postgres-{i}" for i in range(1, postgres)]
+    assert f"PostgreSQL ran {postgres} replicas" in proc.stderr, proc.stderr
+    assert all(pvc in proc.stderr for pvc in kept), proc.stderr
+
+
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
 def test_a_cluster_stop_and_scale_zero_leave_postgresql_running(tmp_path, platform, tool, overlay):
     """SDD §17.2: stop - and scale 0 - end the control plane alone; PostgreSQL keeps its replica."""

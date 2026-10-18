@@ -20,7 +20,7 @@ ACTION
   up                 deploy or update everything, then wait until it runs
   down               stop everything; the data stays (volumes, or PVCs and Secrets)
   stop               stop the control plane alone; PostgreSQL keeps running
-  start              start the control plane again (PostgreSQL first when it is down)
+  start              start the control plane again (PostgreSQL first, back to one replica)
   restart            restart the control plane from its current configuration - after a change
   scale 0|1          the control plane's replicas: 0 stops it, 1 starts it; more is refused - the
                      orchestrator is a singleton (SDD §17, D2)
@@ -330,14 +330,14 @@ kube() { run "$KUBE" -n "$NS" "$@"; }
 # evicted) stays until the pod GC removes it, never by the scale-down: it is not waited for (SDD §17.2, review RV38B-03).
 ACTIVE='status.phase!=Failed,status.phase!=Succeeded'
 wait_gone() {
-  local selector="app.kubernetes.io/name=$1" pods
+  local selector="app.kubernetes.io/name=$1" fields=$ACTIVE${2:+,$2} pods
   if [ "$DRY" = 1 ]; then
-    kube wait --for=delete pod -l "$selector" "--field-selector=$ACTIVE" "--timeout=${TIMEOUT}s"
+    kube wait --for=delete pod -l "$selector" "--field-selector=$fields" "--timeout=${TIMEOUT}s"
     return
   fi
-  pods=$("$KUBE" -n "$NS" get pods -l "$selector" "--field-selector=$ACTIVE" -o name)
+  pods=$("$KUBE" -n "$NS" get pods -l "$selector" "--field-selector=$fields" -o name)
   [ -z "$pods" ] ||
-    "$KUBE" -n "$NS" wait --for=delete pod -l "$selector" "--field-selector=$ACTIVE" "--timeout=${TIMEOUT}s"
+    "$KUBE" -n "$NS" wait --for=delete pod -l "$selector" "--field-selector=$fields" "--timeout=${TIMEOUT}s"
 }
 rollout() { kube rollout status "$1" "--timeout=${TIMEOUT}s"; }
 control_plane_to() {
@@ -345,16 +345,26 @@ control_plane_to() {
   if [ "$1" = 0 ]; then wait_gone seamless; else rollout deployment/seamless; fi
 }
 cluster_start() {
-  local replicas=0
+  local replicas=0 i=1 kept=''
   if [ "$DRY" = 1 ]; then
-    say "# when PostgreSQL is at 0 replicas:"
+    say "# when PostgreSQL is not at 1 replica:"
   else
     replicas=$("$KUBE" -n "$NS" get statefulset/seamless-postgres -o 'jsonpath={.spec.replicas}') ||
       die "no StatefulSet seamless-postgres in namespace $NS: run up first"
+    is_count "$replicas" || die "seamless-postgres reports '$replicas' replicas"
   fi
-  if [ "${replicas:-0}" = 0 ]; then
+  if [ "$replicas" != 1 ]; then
     kube scale statefulset/seamless-postgres --replicas=1
     rollout statefulset/seamless-postgres
+  fi
+  # Each replica is a database of its own (a PVC each) behind the one headless Service the control plane connects to:
+  # scaled out of band, the others are gone before it starts - rollout status does not wait for a scale-down - and their
+  # PVCs are kept (SDD §17.2, review RV38B-15).
+  if [ "$DRY" = 1 ] || [ "$replicas" -gt 1 ]; then
+    while [ "$i" -lt "$replicas" ]; do kept="$kept data-seamless-postgres-$i" i=$((i + 1)); done
+    [ "$DRY" = 1 ] || printf '%s: PostgreSQL ran %s replicas, each a database of its own behind one Service: back to one, seamless-postgres-0; what the others hold stays in their PVCs:%s\n' \
+      "$PROG" "$replicas" "$kept" >&2
+    wait_gone seamless-postgres metadata.name!=seamless-postgres-0
   fi
   control_plane_to 1
 }

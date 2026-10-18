@@ -3,8 +3,12 @@ state - the control plane's Deployment, PostgreSQL's StatefulSet, the ConfigMap 
 the JSON file FAKE_K8S_STATE, logs each call to STUB_LOG as the generic stubs do, and follows what
 kubectl and the API server do (review 38b, read from their sources):
 
-* a ReplicaSet scaled down deletes active pods only - a Failed (evicted) pod stays until the pod GC;
-  ``kubectl wait --for=delete`` waits until every pod it selects is gone;
+* a ReplicaSet or StatefulSet scaled down deletes active pods only - a Failed (evicted) pod stays
+  until the pod GC; a deleted pod is terminating, still listed and still reached through its
+  Service, until its grace period ends, which here is while ``kubectl wait --for=delete`` waits -
+  that wait ends once every pod it selects is gone;
+* a new control plane pod records the PostgreSQL pods there as it starts (``databases``): the
+  headless Service it connects to resolves to each, and each is a database of its own;
 * ``kubectl rollout status`` of a Deployment at 0 replicas reports "successfully rolled out";
 * a patch of the pod template (``rollout restart``'s annotation, new limits) makes a new template:
   ``Recreate`` ends the old pod, and the new one reads the ConfigMap as it starts; ``kubectl set
@@ -53,16 +57,22 @@ def qty(value):
 def new_pod(kind):
     st["serial"] += 1
     obj = st[kind]
-    return {"name": f"{obj['name']}-{st['serial']}", "phase": "Running",
-            "config": dict(st["configmap"]), "limits": dict(obj.get("limits", {}))}
+    pod = {"name": f"{obj['name']}-{st['serial']}", "phase": "Running",
+           "config": dict(st["configmap"]), "limits": dict(obj.get("limits", {}))}
+    if kind == "deployment":
+        pod["databases"] = [p["name"] for p in st["statefulset"]["pods"] if p["phase"] == "Running"]
+    return pod
+
+
+def active(kind):
+    return [p for p in st[kind]["pods"] if p["phase"] == "Running" and not p.get("terminating")]
 
 
 def reconcile(kind):
     obj = st[kind]
-    active = [p for p in obj["pods"] if p["phase"] == "Running"]
-    for pod in active[obj["replicas"]:]:  # a scale-down deletes active pods only
-        obj["pods"].remove(pod)
-    while len([p for p in obj["pods"] if p["phase"] == "Running"]) < obj["replicas"]:
+    for pod in active(kind)[obj["replicas"]:]:  # a scale-down deletes active pods only
+        pod["terminating"] = True
+    while len(active(kind)) < obj["replicas"]:
         obj["pods"].append(new_pod(kind))
 
 
@@ -77,8 +87,8 @@ def selected(kind):
     field = flags.get("--field-selector", "")
     for clause in filter(None, field.split(",")):
         key, value = clause.split("!=", 1)
-        assert key == "status.phase", clause
-        pods = [p for p in pods if p["phase"] != value]
+        assert key in ("status.phase", "metadata.name"), clause
+        pods = [p for p in pods if p["phase" if key == "status.phase" else "name"] != value]
     return pods
 
 
@@ -104,6 +114,9 @@ if verb == "get" and words[1] in KINDS:
 if verb == "get" and words[1] == "pods":
     done("".join(f"pod/{p['name']}\n" for p in selected(label_kind())))
 if verb == "wait":
+    for pod in selected(label_kind()):
+        if pod.get("terminating"):  # its grace period ends
+            st[label_kind()]["pods"].remove(pod)
     left = [p["name"] for p in selected(label_kind())]
     if left:  # nothing deletes what is left: the wait runs out
         done(f"error: timed out waiting for the condition on pods/{left[0]}\n", 1)
