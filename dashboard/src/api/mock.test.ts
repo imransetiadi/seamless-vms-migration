@@ -2949,6 +2949,23 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     expect(handover(other).eligible).toBe(true);
   });
 
+  it('refuses a strategy change to a storage handover while an earlier attempt holds its volumes, as the API (SDD §12, review RV40-01)', async () => {
+    const { server, client } = setup('operator');
+    const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!; // ready, its handover estimate eligible
+    expect(m.estimates.find((e) => e.strategy === 'storage_handover')?.eligible).toBe(true);
+    // what a Retry leaves of a rolled-back warm attempt, which re-assesses nothing: its passes (the mock keeps no record)
+    m.strategy = 'warm';
+    m.sync_passes = [
+      { number: 1, kind: 'full', started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 },
+    ];
+    await expect(client.put(`/migrations/${m.id}/strategy`, { strategy: 'storage_handover' })).rejects.toMatchObject({
+      status: 400,
+      message:
+        'storage_handover is not eligible for analytics-node-3: an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first.',
+    });
+    expect(server.migrations.find((x) => x.id === m.id)!.strategy).toBe('warm');
+  });
+
   it("plans the automatic waves from the plan's VMs, a never-validated plan's too (review RV39-03)", async () => {
     const { server, client } = setup('operator');
     const vms = freeVms(server, 'rhosp17-dc1', 2).map((v) => v.source_id);

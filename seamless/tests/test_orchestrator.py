@@ -564,6 +564,58 @@ async def test_a_workload_record_without_volumes_wins_over_warm_passes(tmp_path,
         await h.orch.stop()
 
 
+@pytest.mark.parametrize("held", [True, False], ids=["volumes held", "nothing held"])
+async def test_a_strategy_change_to_a_handover_is_refused_while_an_earlier_attempt_holds_volumes(
+    tmp_path, store, held
+):
+    """SDD §12, §9.2 (review RV40-01): a Retry puts a rolled-back warm attempt back in ready
+    without re-assessing the estimates the first validation stored - storage_handover eligible
+    then, nothing held -, and a paused plan starts without a new validation: the strategy change
+    judges the held volumes itself and refuses the handover, which would leave them behind. With
+    nothing held it is accepted."""
+    from seamless_migrate.executors.ansible import run_dir
+    from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
+
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"handover": handover, "auto_cutover": False, "default_strategy": Strategy.warm},
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        first = await h.by_vm(plan.id, "vm-1")
+        assert first.estimate_for(Strategy.storage_handover).eligible
+        # the warm attempt ran its pre-copy and was rolled back; its record keeps the volumes
+        first.phase = P.rolled_back
+        first.phase_history = [*first.phase_history, *_history(*UNCUT)]
+        if held:
+            first.sync_passes = _passes(2, first.phase_history)
+            record = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+            record.parent.mkdir(parents=True, exist_ok=True)
+            record.write_text(json.dumps({"dest_volumes": {"vol-1": "dst-vol-1"}}))
+        store.put("migration", first)
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        await h.orch.retry(first.id, "alice")
+        if held:
+            with pytest.raises(BadRequest, match=HELD_VOLUMES_REASON):
+                await h.orch.set_strategy(first.id, Strategy.storage_handover, "alice")
+            left = await h.migration(first.id)
+            assert left.strategy == Strategy.warm
+            assert (await h.plan(plan.id)).strategy_overrides == {}
+            # another strategy is not held out: cold removes the volumes first (COLD-02)
+            changed = await h.orch.set_strategy(first.id, Strategy.cold, "alice")
+            assert changed.strategy == Strategy.cold
+        else:
+            changed = await h.orch.set_strategy(first.id, Strategy.storage_handover, "alice")
+            assert changed.strategy == Strategy.storage_handover
+    finally:
+        await h.orch.stop()
+
+
 async def test_an_unreadable_workload_record_counts_as_volumes_held(tmp_path, store):
     """SDD §9.3 (review RV39-04): a record that cannot be read may list volumes the next attempt
     uses: it counts as holding them, whatever the strategy's fallback would say."""

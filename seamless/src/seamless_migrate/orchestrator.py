@@ -121,7 +121,7 @@ from .planning.preflight import (
     run_preflight,
 )
 from .planning.probes import suggest_probes
-from .planning.selector import eligibility, select_strategy
+from .planning.selector import HELD_VOLUMES_REASON, eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
 from .providers.base import ProviderError, VMNotFound
 from .store import AsyncStore, ConflictError, NotFound, Store, VersionedDocuments
@@ -2074,6 +2074,10 @@ class Orchestrator:
                 raise BadRequest(f"strategy {strategy} does not apply to this VM (validate first)")
             if not est.eligible:
                 raise BadRequest(f"strategy {strategy} is not eligible: {'; '.join(est.reasons)}")
+            if strategy == Strategy.storage_handover and await self.holds_destination_volumes(m):
+                # §9.2 judged now: a Retry does not re-assess the estimates the last validation
+                # stored, and a handover would leave the held volumes behind (SDD §12, RV40-01)
+                raise BadRequest(f"strategy {strategy} is not eligible: {HELD_VOLUMES_REASON}")
             m.strategy = strategy
             m.estimate = est
             m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)

@@ -48,6 +48,7 @@ import {
   type StrategyDecision,
   checkOf,
   vmwareCheck,
+  HELD_VOLUMES_REASON,
 } from './mockData';
 import { buildStrategyEvidence, evidenceCount } from './mockEvidence';
 import { derivePlanStatus } from './mockPlanStatus';
@@ -2389,6 +2390,11 @@ export class MockServer {
     }
     const est: Estimate | undefined = m.estimates.find((e) => e.strategy === strategy);
     if (!est || !est.eligible) throw new HttpError(400, 'bad_request', `${strategy} is not eligible for ${m.vm.name}${est?.reasons.length ? `: ${est.reasons.join('; ')}` : ''}.`);
+    // like the API (SDD §12, §9.2, review RV40-01): judged now - a Retry re-assesses no stored estimate, and a handover
+    // would leave an earlier attempt's volumes behind
+    if (strategy === 'storage_handover' && keptAfterRollback(m)) {
+      throw new HttpError(400, 'bad_request', `${strategy} is not eligible for ${m.vm.name}: ${HELD_VOLUMES_REASON}.`);
+    }
     m.strategy = strategy;
     m.estimate = est;
     this.clearApprovals(m);
