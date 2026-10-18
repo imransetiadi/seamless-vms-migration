@@ -417,6 +417,25 @@ def test_a_recorded_pass_whole_time_adds_back_its_snapshot_on_the_warm_path(
     assert whole_pass_seconds(unrecorded, strategy, params) == added
 
 
+def test_a_pass_is_link_bound_by_what_crossed_the_link_not_what_changed():
+    """SDD §9.1 (review RV40-09): the margin is 1.1 times the pass's bytes_transferred over L -
+    what crossed the link -, not bytes_changed: zero blocks are skipped. 40 GiB changed, 20 GiB
+    sent in a 200 s pass at 125 MiB/s outlasted the 163.84 s those take by more than 10 %: the
+    scan bound it, and its reading replaces an optimistic S."""
+    vm = make_vm(disks=[make_disk(id="d0", size_gb=100, used_gb=60.0)])
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=200.0,
+        bytes_scanned=100 * GIB,
+        bytes_changed=40 * GIB,
+        bytes_transferred=20 * GIB,
+    )
+    optimistic = replace(P, scan_bps=1000 * MIB)
+    assert observed_scan_rate(sync_pass, vm, optimistic) == pytest.approx(100 * GIB / 200.0)
+
+
 def test_a_pass_that_scanned_less_than_the_largest_disk_ran_one_stream():
     """SDD §9.1 (review PL-07): a pass that scanned fewer bytes than the largest disk holds read
     them in one stream at most - its S is what it scanned over its duration, never the largest
