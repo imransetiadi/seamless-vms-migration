@@ -42,7 +42,7 @@ can print anything to its console and can name its VM anything).
 | Asset | Class | Where it lives | Required protection |
 |---|---|---|---|
 | Cloud credentials (`clouds.yaml`, Keystone application credentials, vCenter user/password) | **Secret** | OpenShift Secret / mounted file; 0600 temp files per run (SDD §13.3) | Never in DB, API, logs, git or images; read-only mounts; rotation (§7) |
-| API tokens (`smg_…`) | **Secret** (plaintext), Internal (SHA-256 hash) | Operators' password managers; hashes in `tokens.yaml` / Secret | Shown once; hash-only storage; constant-time compare |
+| API tokens (`smg_…`) | **Secret** (plaintext), Internal (SHA-256 hash) | Operators' password managers; hashes in `tokens.yaml` / Secret (bootstrap tokens) and in the database's `documents` rows of kind `user` (dashboard users, `POST /users`, §5.1) | Shown once; hash-only storage; constant-time compare |
 | `POSTGRES_PASSWORD`, `JEV_MCP_AUTH_TOKEN`, `TYPESAFE_API_KEY`, `AGENTMEMORY_SECRET` | **Secret** | `deploy/compose/.env` (0600, git-ignored) or OpenShift Secrets | Environment/Secret only; never committed (§7, §10) |
 | SSH keys: conversion keypair, dst→src link keypair | **Secret** | `{os_migrate_data_dir}/conversion/` (dir 0700, key 0600), per-migration run directory (SDD §7.2) | Per-migration scope; delete with the run directory |
 | Disk contents in transit and on conversion hosts | **Confidential** (customer data, may include secrets) | SSH channel, NBD on loopback, attached volumes | Encrypted in transit; loopback-only NBD; temporary volumes deleted |
@@ -209,7 +209,7 @@ QASuite case that exercises the control.
 | Category | Position in 0.1.0 |
 |---|---|
 | API1 Broken object-level authorization | Single-tenant control plane: every authenticated principal sees every plan; separation is by **role**, not by object ownership. Per-team scoping is not in 0.1.0 |
-| API2 Broken authentication | Hashed static tokens, constant-time comparison, `auth.denied` audit. No expiry. Lockout: after `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` (default 60) failed bearer authentications from one client address within a minute, further *failed* authentications from that address get `429` until the window drains (in-process, per replica; valid tokens are never blocked, so a shared ingress/NAT address cannot be used to lock operators out — set uvicorn's `FORWARDED_ALLOW_IPS` to the ingress address so the real client address is used); rate limiting beyond that — add at the ingress |
+| API2 Broken authentication | Hashed static tokens, constant-time comparison, `auth.denied` audit. No expiry. Lockout: after `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` (default 60) failed bearer authentications from one client address within a minute, further *failed* authentications from that address get `429` until the window drains (in-process, per replica; a valid bootstrap-file token is never blocked, but a dashboard user's token is looked up only while its address is not locked out (SDD §13.1, §15.1), so failed attempts from a shared ingress/NAT address can lock every dashboard user out — set uvicorn's `FORWARDED_ALLOW_IPS` to the ingress address so the real client address is used); rate limiting beyond that — add at the ingress |
 | API3 Broken object property-level authorization | No credential material in any response model; status fields of `Provider` are ignored on create |
 | API4 Unrestricted resource consumption | Orchestrator concurrency caps; ingress limits recommended (C1-09) |
 | API5 Broken function-level authorization | Minimum role per route (§5.2) with the exhaustive `test_role_matrix` |
@@ -277,7 +277,7 @@ default, `require_distinct_approver`, SDD §5.4) refuses a cutover's requester a
 
 ### 5.3 Audit
 
-Every mutating call emits a persisted event (`plan.*`, `migration.*`, `provider.*`, `advisor.*`, `policy.*`,
+Every mutating call emits a persisted event (`plan.*`, `migration.*`, `provider.*`, `user.created`, `advisor.*`, `policy.*`,
 `decision.*`, `memory.lesson_saved`, `auth.denied`, `events.pruned` — a CLI prune records who cut the trail and where, SDD §15; SDD §4.3) with `ts`, `actor`, `message` and structured `data`; ephemeral
 progress/log/heartbeat events are never stored. Forward `SEAMLESS_LOG_JSON=true` logs to your platform
 logging, and export `events` to a SIEM by polling `GET /api/v1/events?since=<seq>&limit=1000` or by
@@ -394,6 +394,7 @@ malicious, corruption).
 | Secret | Created by | Stored in | Rotate when / how |
 |---|---|---|---|
 | Admin and operator API tokens | `compose-init.sh`, `seamless token create` | holder's password manager; hash in `tokens.yaml` / Secret `seamless-tokens` | §5.1 |
+| Dashboard users' tokens | an admin's **Users > Add user** (`POST /users`) | holder's password manager; digest in the database (`documents`, kind `user`) | §5.1: delete the user's row (no restart), create the user again |
 | `POSTGRES_PASSWORD` | `compose-init.sh` (`openssl rand -hex 24`) / `oc create secret` | `.env` (0600) / Secret `seamless-db` | annually or on suspicion: `ALTER USER seamless PASSWORD '…'` **and** update `SEAMLESS_DB_URL`; Compose `--rotate-db-password` only for a *new* DB |
 | `JEV_MCP_AUTH_TOKEN` | `compose-init.sh` | `.env` | any time: `compose-init.sh --force --keep-token` (plain `--force` also replaces the admin token), recreate the stack |
 | `TYPESAFE_API_KEY` | provider console | caller's environment → `.env` / Secret `seamless-ai` | quarterly, on staff change, on suspicion; issue separate keys per environment; revoke the old key at the provider |
@@ -805,17 +806,22 @@ document; record the lesson in memory (screened, no secrets — [MEMORY.md](MEMO
 
 **A. API token compromised**
 ```bash
-# contain: delete the entry, recreate the control plane
+# contain - a bootstrap-file token: delete its entry, recreate the control plane
 $EDITOR deploy/compose/tokens.yaml          # OpenShift: oc -n seamless-migrate edit secret seamless-tokens
 make seamless-down seamless-up              # OpenShift: oc -n seamless-migrate rollout restart deploy/seamless
+# contain - a dashboard user's token (Users > Add user): delete its `user` row, no restart (§5.1); `$C` as in
+# deploy/compose/README.md (OpenShift: the same statement through psql in the database pod)
+printf "DELETE FROM documents WHERE kind = 'user' AND id = lower('%s');\n" '<user-name>' \
+  | $C exec -T postgres sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -U seamless -d seamless'
 # scope: everything that principal did (page with since=<last seq>); an admin token read with `read -rs TOKEN`,
 # its header written to a private file - never on a command line (§7.2)
 hdr=$(mktemp -d)/auth && (umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$hdr")
 curl -fsS -H @"$hdr" "http://127.0.0.1:8080/api/v1/events?since=0&limit=1000" \
   | jq -r '.[] | select(.actor=="<token-name>") | [.seq,.ts,.kind,.migration_id,.message] | @tsv'
 ```
-Review `migration.approved`, `migration.action`, `provider.created/deleted`; roll back anything unauthorized
-(rollback is operator-level); issue a new token to the legitimate holder.
+Review `migration.approved`, `migration.action`, `provider.created/deleted` and `user.created` (an admin token may
+have added users: delete each one you cannot account for, as above); roll back anything unauthorized (rollback is
+operator-level); issue a new token to the legitimate holder - a dashboard user is created again (§5.1).
 
 **B. Cloud credentials exposed**
 ```bash
@@ -844,7 +850,10 @@ from `checkpoint`).
 
 **F. Database exposed or tampered:** rotate the DB password (`ALTER USER … PASSWORD …` and the Secret); compare
 `events` with the last export/backup; treat `approvals` in the DB as untrusted — pause all plans and re-approve
-in-flight migrations; restore from a known-good backup if rows were altered.
+in-flight migrations; restore from a known-good backup if rows were altered. The database also holds the dashboard
+users' digests: a write can plant a `user` row — a working token, with no `user.created` event to compare — or
+replace a digest. List them (`GET /users`, admin), delete every row you cannot account for (playbook A), then issue
+every dashboard user again (delete and create, §5.1) and rotate the bootstrap tokens.
 
 **G. Injection attempt detected** (event `advisor.verification` with a `screen` note, or
 `review_required` with the reason "console output contained instructions aimed at an AI agent"): no AI action
