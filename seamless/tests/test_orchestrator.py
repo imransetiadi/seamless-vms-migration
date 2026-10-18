@@ -410,10 +410,18 @@ def _history(*phases: Phase) -> list[PhaseChange]:
     return changes
 
 
-def _passes(count: int) -> list[SyncPass]:
-    start = utcnow() - timedelta(hours=3)
+def _passes(count: int, history: list[PhaseChange] | None = None) -> list[SyncPass]:
+    """``count`` passes, started in the last attempt of ``history`` - after it last entered
+    precopy - or three hours ago without one."""
+    precopy = [c.at for c in history or [] if c.to_phase == P.precopy]
+    start = precopy[-1] + timedelta(seconds=1) if precopy else utcnow() - timedelta(hours=3)
     return [
-        SyncPass(number=n, kind="full" if n == 1 else "delta", started_at=start, duration_s=60.0)
+        SyncPass(
+            number=n,
+            kind="full" if n == 1 else "delta",
+            started_at=start + timedelta(seconds=n),
+            duration_s=60.0,
+        )
         for n in range(1, count + 1)
     ]
 
@@ -429,6 +437,12 @@ NO_RECORD_CASES = pytest.mark.parametrize(
         (Strategy.vmware_warm, UNCUT, 0, False),
         (Strategy.vmware_warm, CUT, 2, False),
         (Strategy.vmware_warm, (*CUT, P.ready, *UNCUT), 3, True),
+        (
+            Strategy.vmware_warm,
+            (*CUT, P.ready, P.precopy, P.awaiting_cutover, P.rolling_back, P.rolled_back),
+            3,
+            True,
+        ),
         (Strategy.vmware_warm, (*UNCUT, P.ready, *CUT[:4], P.failed, P.ready), 3, False),
         (Strategy.cold, (P.cutover, P.rolling_back, P.rolled_back), 1, False),
         (Strategy.vmware_cold, (P.cutover, P.rolling_back, P.rolled_back), 1, False),
@@ -441,6 +455,7 @@ NO_RECORD_CASES = pytest.mark.parametrize(
         "vmware_warm whose first copy was cut off: its rollback deleted it",
         "vmware_warm whose cutover ran: its rollback deleted them",
         "vmware_warm whose last attempt ran no cutover",
+        "vmware_warm whose last attempt converged from its first pass",
         "vmware_warm retried to ready after a cutover",
         "cold: its rollback deletes its copy",
         "vmware_cold: its rollback deletes its copy",
@@ -459,13 +474,14 @@ async def test_where_no_record_tells_warm_passes_and_an_uncut_vmware_warm_attemp
     kit's rollback deletes its copies after one, or marks them cutover. A cold, vmware_cold or
     storage_handover rollback keeps no copy, the demo's recorded full pass notwithstanding."""
     h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*phases)
     m = make_migration(
         plan_id=plan.id,
         vm=vm(1),
         strategy=strategy,
         phase=phases[-1],
-        phase_history=_history(*phases),
-        sync_passes=_passes(passes),
+        phase_history=history,
+        sync_passes=_passes(passes, history),
     )
     try:
         assert await h.orch.holds_destination_volumes(m) is held
@@ -483,16 +499,67 @@ async def test_where_no_record_tells_copied_data_is_what_a_rollback_kept(
     no cutover. The kit's rollback deleted its copies after one, and a vmware_cold rollback keeps
     none."""
     h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*phases)
     m = make_migration(
         plan_id=plan.id,
         vm=vm(1),
         strategy=strategy,
         phase=phases[-1],
-        phase_history=_history(*phases),
-        sync_passes=_passes(passes),
+        phase_history=history,
+        sync_passes=_passes(passes, history),
     )
     try:
         assert await h.orch.copied_data(m) is held
+    finally:
+        await h.orch.stop()
+
+
+@pytest.mark.parametrize(
+    ("strategy", "held"), [(Strategy.vmware_warm, False), (Strategy.warm, True)]
+)
+async def test_an_earlier_attempts_passes_hold_no_kit_copy_of_a_later_attempt(
+    tmp_path, store, strategy, held
+):
+    """SDD §9.3, §5.1 (review RV40-05): attempt 1 recorded its passes and ran its cutover - the
+    kit's rollback deleted its copies -, attempt 2's first copy was cut off with no pass recorded
+    (the kit deletes it too): the passes are attempt 1's and tell nothing of what the kit still
+    holds - nothing. A warm migration's rollback keeps its volumes for every later attempt: its
+    passes still hold them."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*CUT, P.ready, P.precopy, P.failed, P.ready)
+    first_attempt = history[: len(CUT)]
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=strategy,
+        phase=P.ready,
+        phase_history=history,
+        sync_passes=_passes(2, first_attempt),
+    )
+    try:
+        assert await h.orch.holds_destination_volumes(m) is held
+        assert await h.orch.copied_data(m) is held
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_workload_record_without_volumes_wins_over_warm_passes(tmp_path, store):
+    """SDD §9.3, §5.1 (review RV40-08): the record tells, and the fallback applies only where none
+    can: a record whose destination volumes are gone - a cold cutover's cleanup or rollback
+    emptied it (COLD-02) - holds nothing and keeps no copied data, whatever warm passes the
+    migration lists."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    m = make_migration(
+        plan_id=plan.id, vm=vm(1), strategy=Strategy.warm, phase=P.ready, sync_passes=_passes(2)
+    )
+    record = run_dir(h.settings, plan.id, m.id) / "osm" / "workload_warm" / "vm-1.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"dest_volumes": {}}))
+    try:
+        assert await h.orch.holds_destination_volumes(m) is False
+        assert await h.orch.copied_data(m) is False
     finally:
         await h.orch.stop()
 
@@ -578,7 +645,7 @@ async def test_a_revalidation_counts_all_of_a_vmware_warm_attempt_whose_cutover_
         first.strategy = Strategy.vmware_warm
         first.phase = P.rolled_back
         first.phase_history = [*first.phase_history, *_history(*(CUT if cutover_ran else UNCUT))]
-        first.sync_passes = _passes(2)
+        first.sync_passes = _passes(2, first.phase_history)
         store.put("migration", first)
         dst.free = dict(QUOTA_ONE_VOLUME_HELD)
         report = await h.orch.validate_plan(plan.id, "alice")

@@ -294,13 +294,18 @@ def _last_attempt_ran_a_cutover(m: Migration) -> bool:
 
 def _kept_after_rollback(m: Migration) -> bool:
     """What a rollback kept of ``m``'s copies where no workload record tells - the demo, the VMware
-    kit (SDD §5.1, §9.3, review RV39-02): a warm migration's passes, and a vmware_warm one's while
-    its last attempt ran no cutover - the kit's rollback deletes its copies after one, or marks them
-    cutover (§7.2); a cold, vmware_cold or handover rollback keeps no copy."""
+    kit (SDD §5.1, §9.3, reviews RV39-02, RV40-05): a warm migration's passes, and passes a
+    vmware_warm one's last attempt recorded with no cutover of that attempt - the kit's rollback
+    deletes its copies after one, or marks them cutover (§7.2); a cold, vmware_cold or handover
+    rollback keeps no copy."""
     if m.strategy == Strategy.warm:
         return bool(m.sync_passes)
     if m.strategy == Strategy.vmware_warm:
-        return bool(m.sync_passes) and not _last_attempt_ran_a_cutover(m)
+        # the last attempt's passes alone: an earlier attempt's tell nothing of what the kit still
+        # holds - it deletes its copies after a cutover and a first copy cut off (review RV40-05)
+        since = _phase_started(m, Phase.precopy)
+        passes = [p for p in m.sync_passes if since is None or p.started_at >= since]
+        return bool(passes) and not _last_attempt_ran_a_cutover(m)
     return False
 
 

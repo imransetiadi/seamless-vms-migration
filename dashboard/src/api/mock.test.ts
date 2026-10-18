@@ -1527,9 +1527,22 @@ describe('mock API', () => {
     server.providers.push(provider);
     rolled.phase_history = through('precopy', 'syncing', 'awaiting_cutover', 'rolling_back', 'rolled_back');
     expect(remove().status).toBe(409);
-    // only the last attempt counts: an earlier one's cutover, then a Retry whose attempt rolled back before its own
+    // only the last attempt counts: an earlier one's cutover, then a Retry whose attempt rolled back before its own - one
+    // that converged from its first pass, never syncing, too (review RV40-07)
     rolled.phase_history = through('precopy', 'cutover', 'rolling_back', 'rolled_back', 'ready', 'precopy', 'syncing', 'rolling_back', 'rolled_back');
     expect(remove().status).toBe(409);
+    rolled.phase_history = through('precopy', 'cutover', 'rolling_back', 'rolled_back', 'ready', 'precopy', 'awaiting_cutover', 'rolling_back', 'rolled_back');
+    expect(remove().status).toBe(409);
+    // and only its passes: the earlier attempt's passes, its cutover, then a first copy cut off with no pass (review RV40-05)
+    const later = new Date(Math.max(...passes.map((p) => Date.parse(p.started_at))) + 60_000).toISOString();
+    rolled.phase_history = [
+      ...through('precopy', 'cutover', 'rolling_back', 'rolled_back', 'ready'),
+      { from_phase: 'ready', to_phase: 'precopy', at: later, reason: 'test', actor: 'test' },
+      { from_phase: 'precopy', to_phase: 'failed', at: later, reason: 'test', actor: 'test' },
+      { from_phase: 'failed', to_phase: 'rolled_back', at: later, reason: 'test', actor: 'test' },
+    ];
+    expect(remove().status).toBe(204);
+    server.providers.push(provider);
     rolled.strategy = 'warm';
     // the cancel cleans up what the rollback kept (the mock's cleanup ends at once): the provider goes
     await client.post<Migration>(`/migrations/${rolled.id}/cancel`, { reason: 'not migrated after all' });
