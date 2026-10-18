@@ -332,6 +332,16 @@ class FakeNetwork:
         self.c.record("delete_port", port_id)
         self.c.ports.pop(port_id, None)
 
+    def update_port(self, port, **attrs):
+        port_id = getattr(port, "id", port)
+        if port_id not in self.c.ports:
+            raise NotFoundException(f"HTTP 404: port {port_id} not found")
+        if attrs.get("device_id") == "":
+            self.c.record("unbind_port", port_id)
+        for key, value in attrs.items():
+            setattr(self.c.ports[port_id], key, value)
+        return self.c.ports[port_id]
+
     def get_security_group(self, group_id):
         return NS(id=group_id, name=self.c.security_groups[group_id])
 
@@ -2476,6 +2486,128 @@ async def test_a_recreated_source_whose_build_fails_keeps_every_volume_and_is_bu
     assert result.details["vm"]["source_id"] == "src-new-2"
 
 
+async def _a_failed_build_holding_its_port(tmp_path, port):
+    """RV36B-02's start: the recreated source's build is aborted while Neutron is flaky - the
+    VIF plugging times out -; its cleanup could not unbind the port it was given and cleared the
+    network info cache, so Nova's later deletion of the build deletes every port still bound to it
+    (no requested networks, nothing marked preserve_on_delete). Returns the setup once the first
+    rollback attempt failed on the build."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    if port == "the user's own port":
+        src.ports["port-1"].created_by_nova = False  # survives the source's deletion, reused
+    host = _deletion_the_host_fails(clouds)
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    host.fixed = True  # the deletion sent again ends
+    create, nova_delete, nova_wait = (
+        src.compute.create_server,
+        src.compute.delete_server,
+        src.compute.wait_for_server,
+    )
+    aborted: set[str] = set()
+
+    def create_server(**params):
+        for net in params.get("networks") or []:
+            if "port" in net and net["port"] not in src.ports:
+                raise _NovaAnswer(f"Port {net['port']} could not be found.", 400)
+            if "port" in net and src.ports[net["port"]].device_id:
+                raise _NovaAnswer(f"Port {net['port']} is still in use.", 409)
+        server = create(**params)
+        if not aborted:
+            aborted.add(server.id)
+            for b in params["block_device_mapping"]:
+                src.volumes[b["uuid"]].status = "available"
+            server.status = "ERROR"
+        return server
+
+    def delete_server(s, ignore_missing=True):
+        sid = getattr(s, "id", s)
+        if sid in aborted:  # deallocate_for_instance: every port still bound to it goes
+            for p in [p for p in src.ports.values() if p.device_id == sid]:
+                src.record("nova_deletes_port", p.id)
+                src.ports.pop(p.id)
+        return nova_delete(s, ignore_missing=ignore_missing)
+
+    def wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        if s.status == "ERROR":
+            raise RuntimeError(f"Server:{s.id} transitioned to failure state ERROR")
+        return nova_wait(s, status=status, failures=failures, interval=interval, wait=wait)
+
+    src.compute.create_server = create_server
+    src.compute.delete_server = delete_server
+    src.compute.wait_for_server = wait_for_server
+    with pytest.raises(PermanentStepError, match="failure state ERROR"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    return executor, calls, clouds, plan, mig, settings
+
+
+@pytest.mark.parametrize("port", ["the port the rollback recreated", "the user's own port"])
+async def test_a_failed_build_is_deleted_without_the_journaled_port(tmp_path, port):
+    """SDD §7.3 rollback (review RV36B-02): before it deletes a recreated build Nova left in ERROR,
+    the rollback unbinds each journaled port still bound to it, so Nova's deletion leaves the
+    port - the one the rollback recreated, or the user's own reused - and the recreate uses it."""
+    executor, calls, clouds, plan, mig, settings = await _a_failed_build_holding_its_port(
+        tmp_path, port
+    )
+    src = clouds["src"]
+    journal = json.loads(
+        (
+            executor.run_dir(make_ctx(plan, mig, SRC, DST, settings)[0]) / "handover-journal.json"
+        ).read_text()
+    )
+    journaled = journal["done"]["rb:port:port-1"]["port_id"]
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "nova_deletes_port" not in [c[1] for c in ops(calls)], ops(calls)
+    assert ("src", "unbind_port", journaled) in ops(calls)
+    assert src.created[-1]["networks"] == [{"port": journaled}]
+    assert result.details["vm"]["source_id"] == "src-new-2"
+
+
+async def test_a_journaled_port_lost_anyway_is_created_again(tmp_path):
+    """SDD §7.3 rollback (review RV36B-02): a journaled port gone all the same - an unbind that
+    failed, a deletion by hand - is created again from the journaled MAC and addresses and
+    journaled anew: the rollback still recreates the source."""
+    executor, calls, clouds, plan, mig, settings = await _a_failed_build_holding_its_port(
+        tmp_path, "the port the rollback recreated"
+    )
+    src = clouds["src"]
+    run_dir = executor.run_dir(make_ctx(plan, mig, SRC, DST, settings)[0])
+    lost = json.loads((run_dir / "handover-journal.json").read_text())["done"]["rb:port:port-1"]
+    src.ports.pop(lost["port_id"])  # gone by hand
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["source_running"] is True
+    new_port = src.created[-1]["networks"][0]["port"]
+    assert new_port != lost["port_id"] and new_port in src.ports
+    assert src.ports[new_port].mac_address == "fa:16:3e:00:00:01"
+    assert ("src", "create_port", "fa:16:3e:00:00:01") in ops(calls)
+    [archived] = sorted(run_dir.glob("handover-journal.rolled-back-*.json"))  # the rollback's end
+    assert json.loads(archived.read_text())["done"]["rb:port:port-1"]["port_id"] == new_port
+
+
+async def test_a_journaled_port_still_bound_to_a_build_gone_is_unbound(tmp_path):
+    """SDD §7.3 rollback (review RV36B-02): a journaled port still bound to a build that is gone - a
+    deletion by hand while Neutron could not unbind it - is unbound and used again: Nova takes no
+    port bound to another server."""
+    executor, calls, clouds, plan, mig, settings = await _a_failed_build_holding_its_port(
+        tmp_path, "the port the rollback recreated"
+    )
+    src = clouds["src"]
+    run_dir = executor.run_dir(make_ctx(plan, mig, SRC, DST, settings)[0])
+    journal = json.loads((run_dir / "handover-journal.json").read_text())
+    journaled = journal["done"]["rb:port:port-1"]["port_id"]
+    build = journal["done"]["sent:rb:create_source"]["server_id"]
+    assert src.ports[journaled].device_id == build
+    src.servers.pop(build)  # deleted by hand, its port left bound
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ("src", "unbind_port", journaled) in ops(calls)
+    assert src.created[-1]["networks"] == [{"port": journaled}]
+    assert result.details["source_running"] is True
+
+
 async def test_handover_journals_every_port_with_its_mac_and_addresses(tmp_path):
     """SDD §7.3 step 2: every port with its id, MAC and every fixed IP (IPv4 and IPv6)."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)
@@ -3074,6 +3206,9 @@ async def test_handover_rollback_resume_after_a_crash_while_recreating_the_sourc
         ("src", "create_server", "web-01")
     ]
     assert sorted(clouds["src"].servers) == ["src-new-1"]
+    # its port stays bound to it: only a port bound to a server that is gone is unbound (RV36B-02)
+    assert "unbind_port" not in [op[1] for op in ops(calls)]
+    assert {p.id: p.device_id for p in clouds["src"].ports.values()} == {"src-port-1": "src-new-1"}
 
 
 async def test_handover_rollback_after_a_crash_while_managing_unmanages_that_volume(tmp_path):

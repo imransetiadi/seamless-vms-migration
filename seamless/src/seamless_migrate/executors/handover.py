@@ -285,6 +285,12 @@ def _active(server: Any) -> bool:
     return str(_attr(server, "status", "")).upper() == "ACTIVE"
 
 
+def _unbind_port(conn: Any, port: Any) -> None:
+    """Clear a port's binding through Neutron - its device and host -, so a deletion of the
+    server it was bound to leaves it (SDD §7.3 rollback, review RV36B-02)."""
+    conn.network.update_port(port, device_id="", device_owner="", binding_host_id="")
+
+
 def _reached_by_deletion(journal: _Journal, server: Any) -> bool:
     """Whether step 4's deletion reached the source (SDD §7.3, reviews RV34B-02, RV35B-01,
     RV36B-01): Nova accepted it and the server does not read ACTIVE; Nova reads it as being deleted
@@ -1120,7 +1126,14 @@ class HandoverExecutor:
                 nics.append(nic)
                 continue
             key = f"rb:port:{n['port_id']}"
-            if not journal.done(key):
+            if journal.done(key):
+                port = _existing_port(conn, journal.get(key)["port_id"])
+                holder = _attr(port, "device_id") if port is not None else None
+                if holder and _existing_server(conn, holder) is None:
+                    _unbind_port(conn, port)  # still bound to a server that is gone (RV36B-02)
+            if not journal.done(key) or port is None:
+                # none yet, or the journaled one gone - with a failed build Nova deleted, by
+                # hand -: created again and journaled anew (SDD §7.3 rollback, review RV36B-02)
                 port = _existing_port(conn, n["port_id"])
                 if port is not None and not _attr(port, "device_id"):
                     port_id = n["port_id"]
@@ -1741,7 +1754,12 @@ class HandoverExecutor:
                     if server is None or str(_attr(server, "status", "")).upper() != "ERROR":
                         return
                     # a build Nova failed: deleted, its volumes kept, and created again below
-                    # (SDD §7.3 rollback, review RV35B-04)
+                    # (SDD §7.3 rollback, review RV35B-04) - its journaled ports unbound first:
+                    # Nova's deletion takes every port its network cache no longer keeps (RV36B-02)
+                    for key in [k for k in journal.data["order"] if k.startswith("rb:port:")]:
+                        port = _existing_port(src, journal.get(key)["port_id"])
+                        if port is not None and _attr(port, "device_id") == sent["server_id"]:
+                            _unbind_port(src, port)
                     src.compute.delete_server(server, ignore_missing=True)
                     src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
                     self._wait_available(src, list(new_ids.values()))
