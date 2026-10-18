@@ -93,6 +93,10 @@ identically (§7).
              ▲   reads CLAUDE.md at start;  jev_screen (jev MCP) before summarizing outside text into memory
 ```
 
+Hits come back through the same layer: `MemoryClient` redacts each hit as it arrives, cuts its content at 4,000
+characters and its title at 200 - so one hit's redaction costs a bounded time - and reads only the first `limit`
+hits of an answer (SDD §13.4, audit AP-05, review RV27-06).
+
 Step by step for the three product triggers:
 
 1. **Completion** (`on_completed`, phase `completed`): the service writes one `fact` lesson — OS type, disk
@@ -208,8 +212,11 @@ words that appear in an error message — treat the memory server as an internal
   search for the offending string; ③ **rotate** the leaked secret (Security.md §7, §13); ④ find the leak's
   origin — if a Seamless payload carried it, add a failing case to `test_redact_removes_secrets` first, then
   fix `redact()` in `ai/redaction.py`; ⑤ record the incident (Security.md §13).
-* **Erasure requests:** operator identities exist only in L2 `events` (`actor`) and git history; agentmemory
-  holds none by design. Handle requests against L2 under change control.
+* **Erasure requests:** operator identities live in L2 - the `events` trail (`actor`) and the dashboard users'
+  `user` documents (the lower-cased name is the id, with the role and the token digest, SDD §13.1) -, in the bootstrap
+  tokens file's names (`GET /users` lists both kinds), and in git history; agentmemory holds none by design. No route
+  deletes a user: erasing one is a database change (delete its `user` row, Security.md §5.1), and a file token's
+  name goes by editing the file (§5.1). Handle requests against L2 under change control.
 * **Access control:** bind the memory server to loopback; when it must be reachable (team server, cluster),
   require its bearer secret (`SEAMLESS_MEMORY_SECRET` / `AGENTMEMORY_SECRET`) and TLS in front of it.
 
@@ -360,12 +367,14 @@ server; never impersonate another agent id.
 
 ### 6.1 Open decisions inherited from SDD §20
 
+SDD §20 tracks D1–D15 and each one's status; the four below concern this document's subject.
+
 | # | Decision | Default taken | Revisit when | Status |
 |---|---|---|---|---|
 | D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with parallel read-ahead and, in the estimator, the per-disk parallel scan term (SDD §9.1) | changed-extent tracking — Ceph-direct `rbd diff` and libvirt checkpoints (FR-26, opt-in, needs Ceph credentials) — 0.2.0, target ≤ 5 min median | Open — quantified in [Performance.md](Performance.md) §3, §4, §11 |
 | D2 | Single-replica orchestrator | accepted | PostgreSQL + leader election — 0.2.0 | Open — enforced by `strategy: Recreate` in the manifests |
 | D3 | Network cut-over (FIP/DNS/BGP) | out of scope; hooks documented | customer demand for OVN BGP integration | Open |
-| D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL` | Open — `JEV_PROVIDER=compatible` is supported by jev-mcp |
+| D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL`; partly decided by the SDD §13.4 settings (`SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`) | Open — `JEV_PROVIDER=compatible` is supported by jev-mcp |
 
 ### 6.2 Architecture decisions recorded by this document
 
@@ -375,10 +384,10 @@ server; never impersonate another agent id.
 | M-02 | **Hash-based delta sync** (BLAKE2b-128 over 4 MiB chunks, protocol v1) instead of Cinder incremental backups or `rbd diff` | Works on any Cinder backend, needs no storage credentials, needs no change tracking on the source, end-to-end manifest digest | Downtime has a floor of the scan time `max(Dmax/S, D/(S·P))` (SDD §9.1); small random writes amplify to chunk size | changed-extent tracking in 0.2.0 (`rbd diff`, libvirt checkpoints); FIPS-only policies (BLAKE2b is not FIPS-approved — protocol v2 could negotiate SHA-256) | SDD §6.2, §20 D1; Performance.md §5 |
 | M-03 | **PostgreSQL 16 is the system of record**; SQLite only for tests and quick local runs | Concurrent writers (orchestrator tasks + API), JSONB, backup/PITR tooling, operational familiarity, advisory locks for 0.2.0 leader election | A database is a deployment dependency; same Core code must pass on both engines (`SEAMLESS_TEST_PG_URL`) | If HA design chooses another coordination primitive | SDD §11, §17 |
 | M-04 | **Jev is advisory-only**, bounded to the eligible tie set / no-SLO case, applied only at `confidence ≥ 0.6` | Live `jev_decide` on a clear case scored 0.65–0.68, so 0.8 would almost never apply; the deterministic selector must stay authoritative | Slightly more overrides than a stricter threshold, always inside bounds; every call recorded as an `AdvisorNote` with source and confidence | After collecting real outcomes: calibrate confidence against operator overrides per tool | SDD §14.2 |
-| M-05 | **Dedicated Colima profile `seamless`** (4 CPU / 6 GiB / 40 GiB), Docker context `colima-seamless`, every Make target pinned to it | The developer's `default` profile and other containers (e.g. `seamless-pg-test`) must never be disturbed; reproducible resources; no port or volume collisions | Slightly more setup; two VMs when both profiles run (memory) | If CI replaces local Compose runs | SDD §17.1 |
+| M-05 | **Dedicated Colima profile `seamless`** (4 CPU / 6 GiB / 40 GiB), Docker context `colima-seamless`, every Make target pinned to it on macOS - on a Linux host the targets use the machine's own Docker Engine (context `default`, SDD §17.1) | The developer's `default` profile and other containers (e.g. `seamless-pg-test`) must never be disturbed; reproducible resources; no port or volume collisions | Slightly more setup; two VMs when both profiles run (memory) | If CI replaces local Compose runs | SDD §17.1 |
 | M-06 | **Memory is optional, external and non-fatal** (agentmemory over REST, 5 s timeout, errors swallowed) | A support tool must not become a point of failure of a migration platform | Recall quality depends on a server the team operates; tests must prove the swallow behavior | If memory becomes part of an approval workflow (not planned) | SDD §14.3 |
-| M-07 | **Credentials never enter the database or an API response**; they come from mounted files, or — entered in the dashboard — are written once through `PUT /providers/{id}/credentials` to the platform secret store (`SEAMLESS_SECRET_STORE`), and reach playbooks as 0600 temp files | Few credential paths to audit and rotate, none of them readable back | A provider references a mounted `clouds.yaml` entry, its `provider-{id}` secret, or a secret managed outside Seamless that it names (never written by the dashboard; SDD §13.3) | Per-tenant credential stores | SDD §13.3 |
-| M-08 | **Static hashed bearer tokens** in 0.1.0 (OIDC/OpenShift OAuth later) | Works offline and in demo; no IdP dependency; hash-only storage | Manual rotation; tokens do not expire | Enterprise SSO requirement | SDD §13.1 |
+| M-07 | **Cloud credentials never enter the database or an API response** (the dashboard users' token digests are in the database, and `POST /users` returns a new API token once - SDD §13.1 -, which are no cloud credentials); they come from mounted files, or — entered in the dashboard — are written once through `PUT /providers/{id}/credentials` to the platform secret store (`SEAMLESS_SECRET_STORE`), and reach playbooks as 0600 temp files | Few credential paths to audit and rotate, none of them readable back | A provider references a mounted `clouds.yaml` entry, its `provider-{id}` secret, or a secret managed outside Seamless that it names (never written by the dashboard; SDD §13.3) | Per-tenant credential stores | SDD §13.3 |
+| M-08 | **Hashed bearer tokens** in 0.1.0 - the bootstrap file's, static, and the dashboard users' an admin issues into the database (SDD §13.1) - (OIDC/OpenShift OAuth later) | Works offline and in demo; no IdP dependency; hash-only storage | Manual rotation; tokens do not expire; a dashboard user's token is revoked by deleting its database row (no route) | Enterprise SSO requirement | SDD §13.1 |
 | M-09 | **Two Compose networks**: `backend` (`internal: true`, PostgreSQL) and `frontend` (outbound) | PostgreSQL gets no route out and no published port | The control plane is on both | — | SDD §17.1 |
 | M-10 | **Edge-TLS Route** on OpenShift; no in-pod TLS in 0.1.0 | Re-encrypt requires TLS in the application | Router → pod hop is plain HTTP, confined by NetworkPolicy | In-pod TLS or a service-mesh/sidecar | SDD §17 |
 
@@ -392,7 +401,7 @@ server; never impersonate another agent id.
 | Auth failure (401/403) | Same as above | None | `last_error` mentions the status | Fix `SEAMLESS_MEMORY_SECRET` |
 | Black-holed network (packets dropped) | Each call costs up to the 5 s timeout | Failure handling must not block the FSM on memory. `test_memory_failures_swallowed` covers errors, not latency, so the timing is verified by the resilience test QASuite §11 R-04 | Step-duration metrics | Remove the filter |
 | Wrong URL or project id | Lessons are written to, or searched in, the wrong place | None; recall quality drops | Probe memory with `test_live_memory_roundtrip`; compare projects | Correct the setting; delete stray memories (§3.5) |
-| Poisoned or low-quality memory (e.g. text derived from a tenant-controlled error message) | Hits are displayed to operators as advisory notes (escaped); never executed, never fed into decisions | None | Reviewers see the note text | Delete the memory; keep lessons structured and truncated; if hits are ever placed into an LLM prompt they must be screened first (§5.4) |
+| Poisoned or low-quality memory (e.g. text derived from a tenant-controlled error message) | Hits are redacted and cut as they arrive (§2), then displayed to operators as advisory notes (escaped); never executed, never fed into decisions | None | Reviewers see the note text | Delete the memory; keep lessons structured and truncated; if hits are ever placed into an LLM prompt they must be screened first (§5.4) |
 | Secret reached memory | Exposure to everyone with memory access | None on migrations; security incident | Review of `memory_audit`, gitleaks-style scans of exports | §3.5 checklist, then rotate the secret |
 | Memory data loss (disk failure, wiped directory) | Recall starts empty | None | Empty recall results | Restore the backup (§3.4); optionally regenerate lessons from L2 |
 | Two environments share one project id | Lab lessons pollute production recall | None | Unexpected hits | Use per-environment project ids (§3.3) |
@@ -410,6 +419,7 @@ server; never impersonate another agent id.
 | Failures swallowed | `test_memory_failures_swallowed` |
 | Similar incidents attached on failure | `test_knowledge_on_failure_attaches_hits`, `test_similar_incidents_attached_on_failure` (orchestrator) |
 | Redaction | `test_redact_removes_secrets`, `test_a_fixture_of_fake_secrets_redacts_to_the_reviewed_snapshot`, `test_every_agentmemory_request_leaves_redacted` |
+| Hits redacted and cut as they arrive, the first `limit` read | `test_memory_hits_are_redacted_where_they_enter`, `test_a_memory_hit_is_redacted_and_cut_as_it_arrives`, `test_only_the_first_limit_hits_of_an_answer_are_read` |
 | Console output blocked from AI use | `test_verification_blocked_console_sets_review_required` |
 | Live server | `test_live_memory_roundtrip` (`SEAMLESS_LIVE_MEMORY=1`) |
 | Outage behavior | QASuite §11 R-04 (agentmemory outage and black-holed network); R-03 covers the Jev counterpart |
