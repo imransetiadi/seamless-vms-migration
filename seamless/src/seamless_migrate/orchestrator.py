@@ -763,6 +763,18 @@ class Orchestrator:
         # a memory outage is met once per validation: the search is not repeated for every VM
         memory_up = True
         for vm in vms:
+            current = existing.get(vm.source_id)
+            detached: list[Finding] = []
+            if (
+                current is not None
+                and current.phase in REASSESSED
+                and any(change.to_phase == P.cutover for change in current.phase_history)
+            ):
+                # a disk the VM had at a cutover attempt never leaves the migration by a
+                # validation - an attempt's cold export may have left it detached (SDD §5.4) -,
+                # and its blocker and the kept disk reach the eligibility and the estimates
+                # (SDD §9.2, review PL-10)
+                vm, detached = keep_detached_volumes(current.vm, vm)
             # dst_caps: what the check above just read (its token's roles, SDD §9.3), not the
             # capabilities `destination` held before it
             findings = run_preflight(
@@ -777,6 +789,7 @@ class Orchestrator:
                 # the quota counts what a cutover will still create (SDD §9.3, review PL-02)
                 phases=phases,
             )
+            findings = [*findings, *detached]
             resolved = resolve_mappings(vm, plan, dst_inv)
             reasons = eligibility(
                 vm, source.kind, plan, src_caps, dst_caps, findings, destination.label
@@ -793,7 +806,6 @@ class Orchestrator:
             )
             # SDD §14.4: validation makes no choice for a migration in flight or finished (it
             # leaves it alone), so the advisor is not asked about it
-            current = existing.get(vm.source_id)
             chooses = current is None or current.phase in (*REVALIDATABLE, P.validating)
             advice = None
             if self.advisor is not None and automatic and chooses:
@@ -1068,11 +1080,6 @@ class Orchestrator:
             steps: list[tuple[Phase, str, dict[str, Any] | None]] = []
             if m.phase != P.validating:
                 steps.append((P.validating, "pre-flight validation", None))
-            if any(change.to_phase == P.cutover for change in m.phase_history):
-                # a disk the VM had at a cutover attempt never leaves the migration by a
-                # validation: an attempt's cold export may have left it detached (SDD §5.4)
-                vm, detached = keep_detached_volumes(m.vm, vm)
-                findings = [*findings, *detached]
             final = self._assess(m, plan, vm, strategy, why, estimates, findings, resolved, hold)
             # both transitions in one write (SDD §5.4)
             m, v = await self._transitions(m, v, [*steps, final], actor)
