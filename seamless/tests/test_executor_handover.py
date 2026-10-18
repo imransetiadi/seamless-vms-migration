@@ -152,7 +152,7 @@ class FakeCompute:
             if port.created_by_nova:
                 self.c.ports.pop(port.id)
             else:
-                port.device_id = ""
+                port.device_id = port.device_owner = ""
         for vid, _device in getattr(server, "attachments", []) or []:
             volume = self.c.volumes.get(vid)
             if volume is None:
@@ -191,6 +191,7 @@ class FakeCompute:
         for net in params.get("networks") or []:
             if "port" in net:
                 self.c.ports[net["port"]].device_id = server.id
+                self.c.ports[net["port"]].device_owner = "compute:nova"
         self.c.servers[server.id] = server
         return server
 
@@ -317,6 +318,7 @@ class FakeNetwork:
             mac_address=attrs.get("mac_address") or "fa:16:3e:ff:ff:ff",
             fixed_ips=list(attrs.get("fixed_ips") or []),
             device_id="",
+            device_owner="",
             created_by_nova=False,
             description=attrs.get("description", ""),
             security_group_ids=list(attrs.get("security_group_ids") or []),
@@ -505,6 +507,7 @@ def source_cloud(calls, crash_on=None):
             {"subnet_id": "sub-v6", "ip_address": "fd00::5"},
         ],
         device_id="srv-1",
+        device_owner="compute:nova",
         created_by_nova=True,
         security_group_ids=["sg-1"],
         is_port_security_enabled=True,
@@ -2720,6 +2723,151 @@ async def test_a_journaled_port_still_bound_to_a_build_gone_is_unbound(tmp_path)
     assert result.details["source_running"] is True
 
 
+class _NeutronAnswer(_NovaAnswer):
+    """An answer of Neutron's API with its HTTP status."""
+
+
+def _neutron_refusing_a_held_mac(src):
+    """Neutron's port create (db_base_plugin_v2 ``_create_db_port_obj``): a MAC another port of the
+    network holds is refused, MacAddressInUse (409). Returns the wrapped create."""
+    create_port = src.network.create_port
+
+    def neutron_create_port(**attrs):
+        for p in src.ports.values():
+            if p.network_id == attrs["network_id"] and p.mac_address == attrs.get("mac_address"):
+                raise _NeutronAnswer(
+                    f"Unable to complete operation for network {attrs['network_id']}. The mac "
+                    f"address {attrs['mac_address']} is in use.",
+                    409,
+                )
+        return create_port(**attrs)
+
+    src.network.create_port = neutron_create_port
+    return create_port
+
+
+def _the_users_port_left_bound(src):
+    """The VM's NIC is a port the user created: Nova's deletion of the source unbinds it
+    (deallocate_for_instance -> _unbind_ports), which only logs Neutron's error - a flaky Neutron
+    leaves it bound, device and owner, to the server Nova deleted all the same."""
+    src.ports["port-1"].created_by_nova = False
+    nova_delete = src.compute.delete_server
+
+    def delete_server(s, ignore_missing=True):
+        sid = getattr(s, "id", s)
+        kept = {p.id: p.device_owner for p in src.ports.values() if p.device_id == sid}
+        nova_delete(s, ignore_missing=ignore_missing)
+        for pid, owner in kept.items():
+            if pid in src.ports:  # the unbind failed, only logged
+                src.ports[pid].device_id, src.ports[pid].device_owner = sid, owner
+
+    src.compute.delete_server = delete_server
+
+
+async def test_a_users_port_left_bound_to_the_deleted_source_is_unbound_and_used_again(tmp_path):
+    """SDD §7.3 rollback (review RV37A-03): Nova deleted the source while its unbind of the user's
+    own port failed, so the port stays bound to a server that is gone. The first attempt unbinds it
+    through Neutron and boots the source on it again - never a second port with its MAC, which
+    Neutron refuses on every Roll back."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
+    src = clouds["src"]
+    _the_users_port_left_bound(src)
+    _neutron_refusing_a_held_mac(src)
+    with pytest.raises(PermanentStepError, match="create the server in RHOSO 18.0"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "srv-1" not in src.servers and src.ports["port-1"].device_id == "srv-1"
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["source_running"] is True
+    assert ("src", "unbind_port", "port-1") in ops(calls)
+    assert ("src", "create_port", "fa:16:3e:00:00:01") not in ops(calls)
+    assert src.created[-1]["networks"] == [{"port": "port-1"}]
+    assert src.ports["port-1"].device_id == result.details["vm"]["source_id"]
+
+
+async def test_a_port_another_service_holds_is_never_unbound(tmp_path):
+    """SDD §7.3 rollback (review RV37A-03): only a port whose owner is Nova's (compute:*) or none is
+    unbound. One another service holds - its device is no server, so Nova reads it gone - is left
+    as it is: the rollback cannot take it and fails, for an operator to look at."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
+    src = clouds["src"]
+    _the_users_port_left_bound(src)
+    _neutron_refusing_a_held_mac(src)
+    with pytest.raises(PermanentStepError, match="create the server in RHOSO 18.0"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    held = src.ports["port-1"]
+    held.device_id, held.device_owner = "dhcp-agent-1-net-1", "network:dhcp"
+    calls.clear()
+    with pytest.raises(PermanentStepError, match="mac address fa:16:3e:00:00:01 is in use"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "unbind_port" not in [c[1] for c in ops(calls)]
+    assert (held.device_id, held.device_owner) == ("dhcp-agent-1-net-1", "network:dhcp")
+
+
+async def test_a_source_port_created_with_its_answer_lost_is_used_again(tmp_path):
+    """SDD §7.3 rollback (review RV37A-04): Neutron created the source's port while its answer was
+    lost (a proxy's 504): nothing was journaled. The retry finds it - unbound, on the source
+    network, with the MAC and the rollback's description os-migrate-rollback:{source port id} -
+    and boots the source on it, never a second create of its MAC, which Neutron refuses."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
+    src = clouds["src"]
+    create_port = _neutron_refusing_a_held_mac(src)
+    refusing = src.network.create_port
+    lost: list[str] = []
+
+    def answer_lost(**attrs):
+        if lost:
+            return refusing(**attrs)
+        port = create_port(**attrs)
+        lost.append(port.id)
+        raise _NeutronAnswer("Gateway Timeout (HTTP 504)", 504)  # created; the answer is lost
+
+    src.network.create_port = answer_lost
+    with pytest.raises(PermanentStepError, match="create the server in RHOSO 18.0"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    with pytest.raises(TransientStepError, match="Gateway Timeout"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.ports[lost[0]].description == "os-migrate-rollback:port-1"
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["source_running"] is True
+    assert "create_port" not in [c[1] for c in ops(calls)]
+    assert src.created[-1]["networks"] == [{"port": lost[0]}]
+    assert [p.id for p in src.ports.values()] == lost
+
+
+async def test_an_earlier_source_port_a_server_holds_is_never_taken(tmp_path):
+    """SDD §7.3 rollback (review RV37A-04): a port with the rollback's description that a server
+    holds - one an earlier attempt created, attached since by hand to a server that runs - is no
+    earlier attempt's to use: the rollback never takes a port from a running server."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
+    src = clouds["src"]
+    create_port = _neutron_refusing_a_held_mac(src)
+    refusing = src.network.create_port
+    lost: list[str] = []
+
+    def answer_lost(**attrs):
+        if lost:
+            return refusing(**attrs)
+        port = create_port(**attrs)
+        lost.append(port.id)
+        raise _NeutronAnswer("Gateway Timeout (HTTP 504)", 504)
+
+    src.network.create_port = answer_lost
+    with pytest.raises(PermanentStepError, match="create the server in RHOSO 18.0"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    with pytest.raises(TransientStepError, match="Gateway Timeout"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.servers["srv-other"] = NS(id="srv-other", name="other", status="ACTIVE")
+    src.ports[lost[0]].device_id = "srv-other"
+    src.ports[lost[0]].device_owner = "compute:nova"
+    created = len(src.created)
+    with pytest.raises(PermanentStepError, match="mac address fa:16:3e:00:00:01 is in use"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.ports[lost[0]].device_id == "srv-other"
+    assert len(src.created) == created  # no source server built on it
+
+
 def the_give_back_refused(src):
     """nova-api restarting while a rollback gives delete_on_termination back to the server it
     recreated: each such PUT is answered 503 until ``refusing["on"]`` is cleared (RV36B-03)."""
@@ -3131,6 +3279,7 @@ async def test_handover_rollback_of_a_definition_without_port_groups_recreates_t
             {"subnet_id": "sub-v4", "ip_address": "10.0.0.5"},
             {"subnet_id": "sub-v6", "ip_address": "fd00::5"},
         ],
+        "description": "os-migrate-rollback:port-1",
     }
 
 

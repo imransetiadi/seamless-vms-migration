@@ -227,6 +227,12 @@ def port_description(source_port_id: str) -> str:
     return f"os-migrate:{source_port_id}"
 
 
+def rollback_port_description(source_port_id: str) -> str:
+    """The description of a source port the handover rollback creates: how a later attempt finds
+    one an earlier attempt created whose answer was lost (SDD §7.3 rollback, review RV37A-04)."""
+    return f"os-migrate-rollback:{source_port_id}"
+
+
 def _existing_port(conn: Any, port_id: str) -> Any:
     """The port, or ``None`` when it is gone (HTTP 404): Nova deletes the ports it created."""
     try:
@@ -289,6 +295,24 @@ def _unbind_port(conn: Any, port: Any) -> None:
     """Clear a port's binding through Neutron - its device and host -, so a deletion of the
     server it was bound to leaves it (SDD §7.3 rollback, review RV36B-02)."""
     conn.network.update_port(port, device_id="", device_owner="", binding_host_id="")
+
+
+def _free_for_the_source(conn: Any, port: Any) -> bool:
+    """Whether ``port`` is free for the recreated source server: unbound, or bound to a server that
+    is gone - a failed build Nova deleted, the source whose deletion could not unbind the user's own
+    port -, which this unbinds as Nova's deletion would have (SDD §7.3 rollback, reviews RV36B-02,
+    RV37A-03). Only a port whose owner is Nova's (``compute:*``) or none: one another service holds
+    - a DHCP agent's, a router's, whose device is no server - is never unbound."""
+    holder = _attr(port, "device_id")
+    if not holder:
+        return True
+    owner = str(_attr(port, "device_owner") or "")
+    if owner and not owner.startswith("compute:"):
+        return False
+    if _existing_server(conn, holder) is not None:
+        return False
+    _unbind_port(conn, port)
+    return True
 
 
 def _reached_by_deletion(journal: _Journal, server: Any) -> bool:
@@ -1113,10 +1137,12 @@ class HandoverExecutor:
         conn: Any, networks: list[dict[str, Any]], journal: _Journal
     ) -> list[dict[str, str]]:
         """The source server's NICs for its recreation (SDD §7.3 rollback): a port a user created
-        survives the server's deletion unbound and is used again; a port Nova created is gone and
-        is recreated with its MAC, every fixed IP, its security groups and its port-security flag
-        (journaled, so a resume does not create it twice). A definition journaled without ports
-        keeps its network and first address."""
+        survives the server's deletion and is used again - unbound, or unbound now when Nova's
+        deletion could not; a port Nova created is gone and is recreated with its MAC, every fixed
+        IP, its security groups, its port-security flag and the rollback's description (journaled,
+        so a resume does not create it twice; one created while its answer was lost is found by
+        that description). A definition journaled without ports keeps its network and first
+        address."""
         nics: list[dict[str, str]] = []
         for n in networks:
             if not n.get("port_id"):
@@ -1128,15 +1154,16 @@ class HandoverExecutor:
             key = f"rb:port:{n['port_id']}"
             if journal.done(key):
                 port = _existing_port(conn, journal.get(key)["port_id"])
-                holder = _attr(port, "device_id") if port is not None else None
-                if holder and _existing_server(conn, holder) is None:
-                    _unbind_port(conn, port)  # still bound to a server that is gone (RV36B-02)
+                if port is not None:
+                    _free_for_the_source(conn, port)  # bound to a server that is gone (RV36B-02)
             if not journal.done(key) or port is None:
                 # none yet, or the journaled one gone - with a failed build Nova deleted, by
                 # hand -: created again and journaled anew (SDD §7.3 rollback, review RV36B-02)
                 port = _existing_port(conn, n["port_id"])
-                if port is not None and not _attr(port, "device_id"):
-                    port_id = n["port_id"]
+                if port is not None and _free_for_the_source(conn, port):
+                    port_id = n["port_id"]  # the user's own, left bound or not (review RV37A-03)
+                elif (earlier := HandoverExecutor._earlier_source_port(conn, n)) is not None:
+                    port_id = str(_attr(earlier, "id"))  # its answer lost (review RV37A-04)
                 else:
                     fixed_ips = [{k: v for k, v in ip.items() if v} for ip in n["fixed_ips"]]
                     # never an address the source's Neutron derives from the kept MAC itself:
@@ -1146,6 +1173,7 @@ class HandoverExecutor:
                         "network_id": n["network_id"],
                         "mac_address": n["mac_address"],
                         "fixed_ips": requested_ips(fixed_ips, subnets),
+                        "description": rollback_port_description(n["port_id"]),
                     }
                     # a definition journaled before step 2 recorded them has none
                     if n.get("security_group_ids") is not None:
@@ -1157,6 +1185,24 @@ class HandoverExecutor:
                 journal.mark(key, port_id=port_id)
             nics.append({"port": journal.get(key)["port_id"]})
         return nics
+
+    @staticmethod
+    def _earlier_source_port(conn: Any, n: dict[str, Any]) -> Any:
+        """The unbound port an earlier rollback attempt created for the journaled port ``n`` while
+        its answer was lost, or ``None`` (SDD §7.3 rollback, review RV37A-04): on the source network
+        with the MAC - Neutron gives a MAC to one port of a network - and the rollback's
+        description."""
+        description = rollback_port_description(n["port_id"])
+        return next(
+            (
+                p
+                for p in conn.network.ports(
+                    network_id=n["network_id"], mac_address=n["mac_address"]
+                )
+                if _attr(p, "description") == description and not _attr(p, "device_id")
+            ),
+            None,
+        )
 
     @staticmethod
     def _earlier_ports(
