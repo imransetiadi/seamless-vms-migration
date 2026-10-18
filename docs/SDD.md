@@ -3821,7 +3821,8 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   `cutover`, `verifying` or `rolling_back` - a cutover ends rather than resuming after the restart - for at most
   `--wait-timeout` seconds (default 1800; a timeout stops and changes nothing). A `capacity` that would be refused
   pauses no plan: its checks - `deploy/compose/.env` present on the single host, the server-side dry run of a
-  cluster's limits - run before the drain, the dry run again after it. It prints the plans it paused, which
+  cluster's limits - run before the drain, the dry run again after it. It prints the plans it paused - also when it
+  fails or is interrupted after a pause, which stops nothing (reviews RV38B-05, RV41A-05) -, which
   `resume --token-file TOKEN_FILE PLAN_ID...` starts again (`POST /plans/{id}/start`) - every plan it is given: one
   that Start refuses (cancelled meanwhile, or a migration blocked: 409) is named, the others start all the same, and
   the script then exits 1 (review RV38B-14). The operator's token is read from a file only its owner may read - any
