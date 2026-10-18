@@ -393,6 +393,25 @@ def _drain_rules(cutover_answers):
     ]
 
 
+@pytest.mark.parametrize("timeout", ["08", "09"])
+def test_a_drain_reads_a_leading_zero_wait_timeout_as_decimal_seconds(tmp_path, timeout):
+    """SDD §17.2 (review RV38B-06): --wait-timeout takes seconds, 08 being eight. Bash reads a
+    leading zero as octal in $(( )), where 08 and 09 are errors: the drain ended after its pauses,
+    before its wait, and the script stopped the control plane without asking whether a cutover
+    was in flight."""
+    rules = _drain_rules([{"stdout": "[]"}])
+    proc, calls, _ = _run(
+        tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", "--wait-timeout", timeout, rules=rules
+    )
+    assert proc.returncode == 0, proc.stderr
+    order = [
+        "ask" if c["cmd"] == "curl" and "phase=cutover" in " ".join(c["args"]) else c["cmd"]
+        for c in calls
+        if c["cmd"] == "make" or "phase=cutover" in " ".join(c["args"])
+    ]
+    assert order == ["ask", "make"], (order, proc.stderr)
+
+
 def test_a_drain_pauses_the_running_plans_and_waits_until_no_cutover_is_in_flight(tmp_path):
     """SDD §17.2, §13.1: --drain pauses every running plan, waits until no migration is in cutover,
     verifying or rolling_back, then stops; the token reaches curl only through a header file in a

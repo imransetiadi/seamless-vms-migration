@@ -136,6 +136,8 @@ NARGS=${#ARGS[@]}
 case $NS in '' | -* | *[!a-z0-9-]* | *-) refuse "--namespace '$NS' is no Kubernetes namespace name" ;; esac
 is_count "$WAIT_TIMEOUT" || refuse "--wait-timeout takes seconds, not '$WAIT_TIMEOUT'"
 is_count "$TIMEOUT" || refuse "--timeout takes seconds, not '$TIMEOUT'"
+# in decimal: bash's $(( )) reads a leading zero as octal, where 08 and 09 are errors (review RV38B-06)
+WAIT_TIMEOUT=$((10#$WAIT_TIMEOUT)) TIMEOUT=$((10#$TIMEOUT))
 if [ -n "$URL" ]; then
   case $URL in http://* | https://*) URL=${URL%/} ;; *) refuse "--url must start with http:// or https://" ;; esac
 fi
