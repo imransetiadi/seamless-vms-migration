@@ -537,7 +537,7 @@ environment descriptor; a gate failure also records the measured `S`, the host's
 SDD §7.2). The PERF-E2E rows are
 gates, not reports: [§13.2](#132-exit-criteria--release-010) item 6 says what happens on a miss.
 
-`k6` script for PERF-CP-01 (`k6 run -e BASE=http://127.0.0.1:8080/api/v1 -e TOKEN=<viewer token> k6-api.js`):
+`k6` script for PERF-CP-01 (`read -rs TOKEN && export TOKEN` with a viewer token, then `k6 run -e BASE=http://127.0.0.1:8080/api/v1 k6-api.js`: k6 hands the script the environment, `__ENV.TOKEN`, so the token is on no command line - Security.md §7.2):
 
 ```javascript
 import http from 'k6/http';
@@ -579,7 +579,7 @@ Controls and threats are in [Security.md](Security.md); IDs below are referenced
 | S-06 | Secret temp files | during a run list `secrets.yml` and `clouds.yaml` modes; after the run list again | mode 0600 while present; deleted after every run, including failed ones (`test_secrets_file_0600_and_deleted_after_run`), and when the stack stops with a dashboard open: SIGTERM reaches `stop()` within 5 s (`test_serve_stops_the_orchestrator_though_an_event_stream_stays_open`, `test_the_containers_stop_grace_leaves_room_for_the_orchestrator_to_stop`) |
 | S-07 | API documentation exposure (Security.md R-04) | unauthenticated `GET /docs`, `/redoc`, `/openapi.json`, `/api/docs`, `/api/openapi.json` on a non-demo stack (`test_security_headers_and_api_docs_exposure`, `test_disabled_api_docs_paths_answer_404_where_the_dashboard_is_served`) | `/docs`, `/redoc`, `/openapi.json` 404 with the error envelope, also where the dashboard is served (the SPA fallback does not answer them); `/api/docs` and `/api/openapi.json` 401 without a token, 200 for a viewer (public in demo only) |
 | S-08 | SSRF and traversal | `POST /providers` with `endpoint=http://169.254.169.254/` and `credentials_secret: "../../etc/passwd"`, `ca_cert_path: "/etc/shadow"` | a traversal secret name is rejected (`security.secrets.resolve` name check, `test_secret_name_rejects_path_traversal`); metadata endpoint unreachable under the NetworkPolicy; `ca_cert_path` is admin-only and unvalidated (document); `test_secret_name_rejects_path_traversal` pins the name check; since 2026-10-11 the API refuses such a name when it is written (422, whole-name match) and another provider's `provider-*` name, the Kubernetes store reads only Secrets it wrote or labelled `seamless.io/provider-secret: "true"`, and an id whose managed secret names would be another provider's is refused (409): `test_a_secret_name_the_reader_could_not_use_is_refused`, `test_a_provider_may_not_name_another_providers_secret`, `test_kubernetes_store_reads_only_its_own_or_labelled_secrets`, `test_an_id_whose_secret_names_are_another_providers_is_refused`; the dashboard's fallback looks at no path outside its directory and the Kubernetes store always checks the API server's certificate (CodeQL triage 2026-10-17): `test_the_dashboard_fallback_looks_at_no_path_outside_its_directory`, `test_the_dashboard_fallback_answers_a_nul_path_with_the_index` (review RV33-05), `test_the_kubernetes_secret_store_always_checks_the_api_servers_certificate` |
-| S-09 | Input fuzzing | `schemathesis run http://127.0.0.1:8080/api/openapi.json -H "Authorization: Bearer $VIEWER" --checks all` (demo; the API description lives under `/api`, `/openapi.json` is 404 — S-07) | no 5xx, no stack traces, error envelope everywhere |
+| S-09 | Input fuzzing | `schemathesis --config-file st.toml run http://127.0.0.1:8080/api/openapi.json --checks all`, `st.toml` holding `headers = { Authorization = "Bearer ${VIEWER}" }` - Schemathesis 4 fills it from the environment (`read -rs VIEWER && export VIEWER`), so the token is on no command line (demo; the API description lives under `/api`, `/openapi.json` is 404 — S-07) | no 5xx, no stack traces, error envelope everywhere |
 | S-10 | SSH host-key policy (SEC-02) | start a rogue `sshd` with a different host key at the conversion host's address | **target:** connection refused; **baseline 0.1.0:** connects — record as open finding |
 | S-11 | Link-key restrictions (SEC-06) | from the destination host run `ssh <src> id` and `ssh -L` to an arbitrary port with the link key | **target:** only the permitted forwards work, no shell; **baseline:** shell works — open |
 | S-12 | Helper script handling (R-02) | `ls -l /tmp/seamless-blocksync-*` during a pass; as another unprivileged user try to replace or delete it | the sticky bit blocks replacement and deletion by other users (baseline); **target:** installed 0700 in a private directory and checksum-verified before `sudo python3` |
@@ -605,12 +605,19 @@ Controls and threats are in [Security.md](Security.md); IDs below are referenced
 ZAP (S-23) — run only against the **demo** stack, never against one connected to real clouds:
 
 ```bash
-docker --context colima-seamless run --rm --network seamless_frontend -v "$PWD:/zap/wrk:rw" \
+read -rs VIEWER                                 # a viewer token of the demo stack; nothing echoes
+work=$(mktemp -d)                               # private (0700): the replacer rule with the token, then the report
+(umask 077 && printf '%s\n' 'replacer.full_list(0).description=auth' 'replacer.full_list(0).enabled=true' \
+  'replacer.full_list(0).matchtype=REQ_HEADER' 'replacer.full_list(0).matchstr=Authorization' \
+  'replacer.full_list(0).regex=false' "replacer.full_list(0).replacement=Bearer $VIEWER" > "$work/auth.prop")
+docker --context colima-seamless run --rm --network seamless_frontend -v "$work:/zap/wrk:rw" \
   ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py -t http://seamless:8080/api/openapi.json -f openapi -S \
-  -r zap-report.html -z "-config replacer.full_list(0).description=auth -config replacer.full_list(0).enabled=true \
-  -config replacer.full_list(0).matchtype=REQ_HEADER -config replacer.full_list(0).matchstr=Authorization \
-  -config replacer.full_list(0).regex=false -config replacer.full_list(0).replacement='Bearer ${VIEWER}'"
+  -r zap-report.html -z "-configfile /zap/wrk/auth.prop"
+cp "$work/zap-report.html" . && rm -rf "$work"
 ```
+
+ZAP reads the rule from the properties file (`-configfile`), so the token is on no command line (Security.md §7.2);
+`printf` is a shell builtin.
 
 S-20 hardening listing (Compose; prints only security-relevant fields, never the environment):
 
@@ -1191,12 +1198,14 @@ By hand, on a Linux server: the README's "Quick start — Linux server with Dock
 
 ```bash
 make seamless-colima-up                    # macOS only (Linux: the machine's own Docker Engine, SDD §17.1)
-scripts/compose-init.sh                    # prints the admin token once: export TOKEN='smg_...'
+scripts/compose-init.sh                    # prints the admin token once
+read -rs TOKEN && export TOKEN             # paste it; nothing echoes, no command line holds it (Security.md §7.2)
+hdr=$(mktemp -d)/auth && (umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$hdr")
 make seamless-demo                         # or seamless-up for a stack without demo data
 make seamless-ps
 curl -fsS http://127.0.0.1:8080/api/v1/health | jq -e '.status == "ok" and .db == "ok"'
-curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/me | jq -e '.role == "admin"'
-curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/advisor/status | jq .
+curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/me | jq -e '.role == "admin"'
+curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/advisor/status | jq .
 curl -s -o /dev/null -w 'dashboard: %{http_code}\n' http://127.0.0.1:8080/
 docker ps --format '{{.Names}}\t{{.Ports}}'     # macOS: docker --context colima-seamless ps; only seamless publishes 127.0.0.1:8080
 make seamless-logs SEAMLESS_SERVICE=seamless        # Ctrl-C to stop following
@@ -1218,7 +1227,7 @@ syncing. A settled demo ends the wait at once.
 
 ### 14.7 Journey and RBAC scripts (E2)
 
-Committed scripts (`export TOKEN=…` then run them; `smoke-demo.sh`, `demo-journey.sh` and `demo-restart.sh` also take
+Committed scripts (`read -rs TOKEN && export TOKEN`, never the token typed into a command, then run them; `smoke-demo.sh`, `demo-journey.sh` and `demo-restart.sh` also take
 `APPROVER_TOKEN`, an approver token of a second user created like DEMO-05's — `seamless token create --name … --role
 approver`, appended to `tokens.yaml` — because the requester of a cutover never approves it: maker-checker, SDD §5.4;
 the smoke also checks that the requester's own approval is refused with 409; each script hands curl its tokens from
@@ -1333,8 +1342,9 @@ sudo fio --name=scan --filename=/dev/vdb --rw=read --bs=4M --iodepth=16 --direct
 # aggregate read ceiling S_agg: four concurrent readers, one per attached volume (global options precede the first --name)
 sudo fio --rw=read --bs=4M --iodepth=16 --direct=1 --readonly --runtime=60 --time_based --group_reporting \
   --name=s1 --filename=/dev/vdb --name=s2 --filename=/dev/vdc --name=s3 --filename=/dev/vdd --name=s4 --filename=/dev/vde
-k6 run -e BASE=http://127.0.0.1:8080/api/v1 -e TOKEN="$VIEWER" k6-api.js    # PERF-CP-01 (script in §9)
-curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/stats | jq '{p95_downtime_s, max_downtime_s, slo_compliance_pct, downtime_by_strategy}'   # all migrations mixed
+hdr=$(mktemp -d)/auth && (umask 077 && printf 'Authorization: Bearer %s\n' "$VIEWER" > "$hdr")   # VIEWER read with read -rs
+TOKEN=$VIEWER k6 run -e BASE=http://127.0.0.1:8080/api/v1 k6-api.js    # PERF-CP-01 (script in §9); the token in k6's environment, not its arguments
+curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/stats | jq '{p95_downtime_s, max_downtime_s, slo_compliance_pct, downtime_by_strategy}'   # all migrations mixed
 # the PERF-E2E gates (G1a, SM-1, G1c populations and the G2 share) use the queries of Performance.md §6.4
 ```
 
@@ -1353,7 +1363,8 @@ DOCKER_HOST=unix://$HOME/.colima/seamless/docker.sock trivy image --severity HIG
 DOCKER_HOST=unix://$HOME/.colima/seamless/docker.sock trivy image --format cyclonedx --output sbom.cdx.json seamless-migrate:0.1.0
 trivy config deploy/                                  # manifests and compose
 
-VIEWER=... OPERATOR=... APPROVER=... ADMIN=... bash tests/e2e/rbac-live.sh        # S-01 on the live stack (§14.7)
+read -rs VIEWER; read -rs OPERATOR; read -rs APPROVER; read -rs ADMIN          # one token per role; nothing echoes
+export VIEWER OPERATOR APPROVER ADMIN && bash tests/e2e/rbac-live.sh            # S-01 on the live stack (§14.7)
 # ZAP baseline (S-23): see the command in §10 - demo stack only
 ```
 

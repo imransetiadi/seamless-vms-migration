@@ -286,7 +286,7 @@ developers may opt in at user scope, knowing the server's privacy filter strips 
 | Check | Command / test | Expected |
 |---|---|---|
 | Server up | `curl -fsS http://127.0.0.1:3111/agentmemory/livez` | HTTP 200, `"status":"ok"` |
-| Control plane sees it | `curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/advisor/status` | `"memory":{"enabled":true,"available":true}` |
+| Control plane sees it | `curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/advisor/status` (`$hdr`: a private header file, as in [deploy/compose/README.md](../deploy/compose/README.md), never the token on a command line) | `"memory":{"enabled":true,"available":true}` |
 | Contract | `test_memory_remember_payload_and_auth_header`, `test_memory_search_tolerant_parsing` | body `{content,type,concepts,files,project}`, bearer header only when a secret is set |
 | Round trip | `SEAMLESS_LIVE_MEMORY=1 SEAMLESS_MEMORY_URL=http://127.0.0.1:3111 .venv/bin/pytest -m live -k memory` (`test_live_memory_roundtrip`) | write then find the probe memory |
 | Contributor MCP | in Claude Code `/mcp` lists `agentmemory` and `jev` as connected | tools such as `memory_smart_search`, `memory_save` available |

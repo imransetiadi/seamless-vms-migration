@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # rbac-live.sh - live RBAC matrix check against SDD 12 / Security.md 5.2 (bash 3.2 compatible)
-# usage: VIEWER=... OPERATOR=... APPROVER=... ADMIN=... bash rbac-live.sh
+# usage: read -rs VIEWER (and OPERATOR, APPROVER, ADMIN), export them, then: bash rbac-live.sh -
+# never a token typed into a command line, where ps and shell history keep it (Security.md 7.2)
 set -u
 BASE=${BASE:-http://127.0.0.1:8080/api/v1}
 : "${VIEWER:?}" "${OPERATOR:?}" "${APPROVER:?}" "${ADMIN:?}"

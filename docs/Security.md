@@ -808,8 +808,10 @@ document; record the lesson in memory (screened, no secrets — [MEMORY.md](MEMO
 # contain: delete the entry, recreate the control plane
 $EDITOR deploy/compose/tokens.yaml          # OpenShift: oc -n seamless-migrate edit secret seamless-tokens
 make seamless-down seamless-up              # OpenShift: oc -n seamless-migrate rollout restart deploy/seamless
-# scope: everything that principal did (page with since=<last seq>)
-curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/api/v1/events?since=0&limit=1000" \
+# scope: everything that principal did (page with since=<last seq>); an admin token read with `read -rs TOKEN`,
+# its header written to a private file - never on a command line (§7.2)
+hdr=$(mktemp -d)/auth && (umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$hdr")
+curl -fsS -H @"$hdr" "http://127.0.0.1:8080/api/v1/events?since=0&limit=1000" \
   | jq -r '.[] | select(.actor=="<token-name>") | [.seq,.ts,.kind,.migration_id,.message] | @tsv'
 ```
 Review `migration.approved`, `migration.action`, `provider.created/deleted`; roll back anything unauthorized

@@ -61,12 +61,18 @@ Then open <http://127.0.0.1:8080/> and sign in at `/login` with the admin token.
 from your workstation first (`ssh -L 8080:127.0.0.1:8080 you@server`). Or call the API:
 
 ```bash
-export TOKEN='smg_...'                                   # the token printed by compose-init.sh
+read -rs TOKEN && export TOKEN                           # paste the token compose-init.sh printed; nothing echoes
+hdr=$(mktemp -d)/auth && (umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$hdr")
 curl -fsS http://127.0.0.1:8080/api/v1/health            # {"status":"ok",...,"db":"ok","orchestrator":{"running":true,...}}
 curl -fsS http://127.0.0.1:8080/api/v1/ready             # same body; HTTP 503 while the DB or the orchestrator loop is down
-curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/me
-curl -N   -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/events/stream    # live SSE
+curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/me
+curl -N   -H @"$hdr" http://127.0.0.1:8080/api/v1/events/stream    # live SSE
+rm -rf "${hdr%/auth}"                                    # when you are done
 ```
+
+The token never goes on a command line, where `ps` shows it to every user of the host and shell history keeps it
+([Security.md](../../docs/Security.md) §7.2): `read -rs` takes it without echo, `printf` - a shell builtin - writes the
+header into a private file (`mktemp -d` is mode 0700), and curl reads it from there (`-H @file`).
 
 `compose-init.sh` is idempotent (existing files are kept). `--force` regenerates both files:
 

@@ -433,12 +433,14 @@ is left to the operator is the plan-level starting point, so that the very first
    ```
 
 5. Evaluate the results after the fact from `GET /migrations` (`vm.disks[].size_gb`, `actual_downtime_s`,
-   `estimate`, `sync_passes[].kind`); `$TOKEN` is a viewer token taken from the environment:
+   `estimate`, `sync_passes[].kind`); `$TOKEN` is a viewer token taken from the environment (`read -rs TOKEN`),
+   whose header curl reads from a private file - never from its command line (Security.md §7.2):
 
    ```bash
+   hdr=$(mktemp -d)/auth && (umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$hdr")
    # downtime populations of the targets: G1a (largest disk <= 100 GiB, total <= 400 GiB, p90 <= 600 s),
    # SM-1 (largest disk <= 500 GiB, p95 <= 1500 s), G1c (handover, <= 360 s); nearest-rank percentiles
-   curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/migrations | jq '
+   curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/migrations | jq '
      def largest_gib: (.vm.disks | map(.size_gb) | max);
      def total_gib: (.vm.disks | map(.size_gb) | add);
      def pct($pp): sort | .[((((length * $pp) + 99) / 100) | floor) - 1];
@@ -461,7 +463,7 @@ is left to the operator is the plan-level starting point, so that the very first
    pass; the others are reported separately:
 
    ```bash
-   curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/migrations | jq '
+   curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/migrations | jq '
      def delta_calibrated: any(.sync_passes[]?; .kind == "delta");
      def within30: ((.actual_downtime_s - .estimate.downtime_s) | fabs) / .estimate.downtime_s <= 0.3;
      [ .[] | select(.actual_downtime_s != null and .estimate != null and .estimate.downtime_s > 0) ]
