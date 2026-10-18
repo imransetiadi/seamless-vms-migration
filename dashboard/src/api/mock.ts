@@ -12,7 +12,7 @@
  */
 import { DEFAULT_API_BASE } from './client';
 import { forcedDowntime } from '../lib/forcedEstimate';
-import { canTransition, hasDataPath } from '../lib/fsm';
+import { canTransition } from '../lib/fsm';
 import { guestOsOf } from '../lib/guestOs';
 import { capabilityRoles, policyProfileOf } from '../lib/networks';
 import { canonicalIp, isIpAddress } from '../lib/nics';
@@ -333,13 +333,6 @@ function passesSinceTheKitReleasedItsCopies(m: Migration): Migration['sync_passe
   return m.sync_passes;
 }
 
-/**
- * What a rollback kept of `m`'s copies (SDD §5.1, §9.3, reviews RV39-02, RV40-05, RV41B-02): the mock keeps no workload
- * record, so as the API without one (`_kept_after_rollback`) - a warm migration's passes, and a vmware_warm one's passes
- * since the kit last released its copies (its rollback deletes them after a cutover, or marks them cutover; an attempt
- * with no cutover leaves them marked for the next run's CBT sync); a cold, vmware_cold or handover rollback keeps no copy.
- * It is the destination volumes a migration holds (§9.3) and the copied data it keeps (§5.1).
- */
 /** `est` ineligible with §9.2's reason when it is an eligible storage handover (the API's `_held_out`, SDD §12). */
 function heldOut(est: Estimate): Estimate {
   if (est.strategy !== 'storage_handover' || !est.eligible) return est;
@@ -366,6 +359,13 @@ function copiesStrategy(m: Migration): Strategy {
   return waiting && m.attempt_strategies.length ? m.attempt_strategies[m.attempt_strategies.length - 1]! : m.strategy;
 }
 
+/**
+ * What a rollback kept of `m`'s copies (SDD §5.1, §9.3, reviews RV39-02, RV40-05, RV41B-02): the mock keeps no workload
+ * record, so as the API without one (`_kept_after_rollback`) - a warm migration's passes, and a vmware_warm one's passes
+ * since the kit last released its copies (its rollback deletes them after a cutover, or marks them cutover; an attempt
+ * with no cutover leaves them marked for the next run's CBT sync); a cold, vmware_cold or handover rollback keeps no copy.
+ * It is the destination volumes a migration holds (§9.3) and the copied data it keeps (§5.1).
+ */
 function keptAfterRollback(m: Migration): boolean {
   const strategy = copiesStrategy(m);
   if (strategy === 'warm') return m.sync_passes.length > 0;
@@ -2636,8 +2636,9 @@ export class MockServer {
         }
         if (m.phase === 'failed' && m.downtime_started_at) throw new HttpError(409, 'conflict', 'The source VM was stopped; roll back instead of cancelling.');
         const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : 'cancelled by operator';
-        // like the API (SDD §5.1): the data copied so far is cleaned up after the cancel
-        const cleanup = hasDataPath(m);
+        // like the API (SDD §5.1): the data copied so far is cleaned up after the cancel - a pass that runs, or the copies
+        // the API reads as kept where no record tells (its `copied_data`, §9.3, review RV43B-03), not any recorded pass
+        const cleanup = m.phase === 'precopy' || m.phase === 'syncing' || keptAfterRollback(m);
         this.transition(m, 'cancelled', reason, me.name);
         record('cancelled', { reason });
         if (cleanup) record('temporary resources of the cancelled migration removed', { action: 'cleanup' });

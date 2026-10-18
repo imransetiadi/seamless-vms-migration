@@ -542,6 +542,45 @@ describe('mock API', () => {
     expect(actions(cold.id)).not.toContain('cleanup');
   });
 
+  it("decides a cancel's cleanup by the copies the API reads as kept, not by any recorded pass (SDD §5.1, §9.3, review RV43B-03)", async () => {
+    const { server, client } = setup('operator');
+    const actions = (id: string) =>
+      server.events.filter((e) => e.migration_id === id && e.kind === 'migration.action').map((e) => e.data.action);
+    const pass = { number: 1, kind: 'full' as const, started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 };
+    const change = (from_phase: Migration['phase'], to_phase: Migration['phase'], at: string) => ({ from_phase, to_phase, at, reason: 'test', actor: 'test' });
+    // a warm attempt recorded a pass, the retried cold attempt released its copies, and warm is chosen since: the copies
+    // follow the retried attempt's strategy - cold keeps none
+    const released = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!;
+    expect(released.phase).toBe('ready');
+    released.attempt_strategies = ['warm', 'cold'];
+    released.strategy = 'warm';
+    released.sync_passes = [pass];
+    await client.post(`/migrations/${released.id}/cancel`, {});
+    expect(actions(released.id).at(-1)).toBe('cancel');
+    // a vmware_warm migration whose last attempt ran a cutover, rolled back: the kit's rollback released its copies
+    const cutOver = server.migrations.find((m) => m.vm.name === 'ad-dc-01')!;
+    Object.assign(cutOver, {
+      strategy: 'vmware_warm',
+      phase: 'rolled_back',
+      attempt_strategies: [],
+      sync_passes: [pass],
+      approvals: [],
+      cutover_requested: false,
+      downtime_started_at: null,
+      downtime_ended_at: null,
+      phase_history: [
+        change('ready', 'precopy', '2026-10-08T08:59:00Z'),
+        change('precopy', 'syncing', '2026-10-08T09:31:00Z'),
+        change('syncing', 'awaiting_cutover', '2026-10-08T09:32:00Z'),
+        change('awaiting_cutover', 'cutover', '2026-10-08T09:40:00Z'),
+        change('cutover', 'rolling_back', '2026-10-08T09:50:00Z'),
+        change('rolling_back', 'rolled_back', '2026-10-08T09:55:00Z'),
+      ],
+    });
+    await client.post(`/migrations/${cutOver.id}/cancel`, {});
+    expect(actions(cutOver.id).at(-1)).toBe('cancel');
+  });
+
   it('cancels a rolled-back migration and cleans up the data path its rollback kept, like the API (SDD §5.1)', async () => {
     const { server, client } = setup('operator');
     const actions = (id: string) =>
