@@ -180,7 +180,7 @@ The "Automated tests" column uses the plan's test names; §4 maps the plan's nam
 | NFR-08 usability | S-UI, `contrast.test.ts`, §12 (UI-15: no sideways scroll at 320 px); SSE latency ≤ 2 s measured in PERF-CP-03 |
 | NFR-09 observability | `test_metrics_format`, `test_events_since`; `tests/e2e/demo-restart.sh` (DEMO-06) reports gaps in the event seqs and `migration.phase` orders the FSM forbids after a restart mid-run; `smoke-demo.sh` checks that events are readable and that the SSE stream replays from `since=0` |
 | NFR-10 portability | environment matrix (§3), compose and kustomize checks; one release, one version: `test_every_version_location_of_a_release_names_one_version` (every location of RELEASING.md §1, the Makefile's `SEAMLESS_VERSION` - the image `make deploy-runtime-check` runs - included; docs-drift DD2-06) |
-| NFR-11 maintainability | coverage gate ≥ 85 % (§13), `ruff check`, ansible-lint |
+| NFR-11 maintainability | coverage gate ≥ 85 % (§13), `ruff check`, ansible-lint; this document names only tests that exist: `test_every_test_qasuite_names_exists` (every backticked test name a test function or module of the suites, every cited dashboard test file present; docs-drift DD2-48) |
 | NFR-12 compatibility | §7.1 M7–M12 per release candidate; `test_the_sdd_support_table_matches_the_code_series_table` (S-DST) keeps SDD §21.1 and the code's series table equal |
 
 ---
