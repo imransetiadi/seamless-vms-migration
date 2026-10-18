@@ -610,11 +610,13 @@ lab-handover:
 # when it starts. PostgreSQL always; the control plane when its image exists locally (make seamless-demo builds it).
 # SEAMLESS_RELEASE is the release's version (RELEASING.md §1; seamless/tests/test_release_versions.py keeps it
 # so). SEAMLESS_VERSION, the control-plane image the stack runs, is read as Compose reads it: the shell or the
-# command line, else deploy/compose/.env, else the release - so the check inspects that image (review RV37B-04).
+# command line, else deploy/compose/.env, else the release - an empty value is ${SEAMLESS_VERSION:-…}'s default,
+# the release - so the check inspects that image (reviews RV37B-04, 38b).
 SEAMLESS_RELEASE := 0.1.0-rc.2
 ifeq ($(origin SEAMLESS_VERSION),undefined)
 SEAMLESS_VERSION := $(or $(shell sed -n "s/^SEAMLESS_VERSION=[\"']\{0,1\}\([^\"']*\)[\"']\{0,1\}$$/\1/p" $(SEAMLESS_ENV_FILE) 2>/dev/null | tail -n 1),$(SEAMLESS_RELEASE))
 endif
+override SEAMLESS_VERSION := $(or $(SEAMLESS_VERSION),$(SEAMLESS_RELEASE))
 SEAMLESS_CP_IMAGE ?= seamless-migrate:$(SEAMLESS_VERSION)
 deploy-runtime-check: seamless-check-context
 	@[ -x seamless/.venv/bin/python ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'"; exit 1; }

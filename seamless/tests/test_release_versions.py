@@ -106,13 +106,24 @@ def _resolved(tmp_path, env_file: str | None, environment: dict[str, str] | None
         ('SEAMLESS_VERSION="0.2.1"\n', None, "0.2.1"),
         ("SEAMLESS_VERSION='0.2.2'\n", None, "0.2.2"),
         ("SEAMLESS_VERSION=0.2.0\n", {"SEAMLESS_VERSION": "0.3.0"}, "0.3.0"),
+        ("SEAMLESS_VERSION=0.2.0\n", {"SEAMLESS_VERSION": ""}, __version__),
+        ("SEAMLESS_VERSION=\n", None, __version__),
     ],
-    ids=["the release", "pinned in .env", "quoted in .env", "single-quoted", "the shell over .env"],
+    ids=[
+        "the release",
+        "pinned in .env",
+        "quoted in .env",
+        "single-quoted",
+        "the shell over .env",
+        "an empty shell value: Compose's default",
+        "an empty .env value: Compose's default",
+    ],
 )
 def test_the_runtime_check_inspects_the_image_compose_runs(
     tmp_path, env_file, environment, version
 ):
     """RELEASING.md §1, §9 (review RV37B-04): make deploy-runtime-check inspects the image the
     Compose stack runs - SEAMLESS_VERSION read as Compose reads it: the shell or the command line,
-    else deploy/compose/.env, else the release."""
+    else deploy/compose/.env, else the release; an empty value is ${SEAMLESS_VERSION:-...}'s
+    default, the release, never an image without a tag (review 38b)."""
     assert _resolved(tmp_path, env_file, environment) == f"{version} seamless-migrate:{version}"
