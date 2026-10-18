@@ -3089,6 +3089,61 @@ async def test_a_rolled_back_migrations_cancel_cleanup_touches_only_its_own_data
     assert cleanup["vars"]["os_migrate_rollback_delete_ports"] is False
 
 
+@pytest.mark.parametrize("read", ["kept", "none", "unread"])
+async def test_a_cancels_cleanup_names_the_kit_volumes_it_keeps(tmp_path, store, read):
+    """SDD §5.1 (review RV42B, lead NP-2): a VMware cancel's cleanup keeps the kit's copies of
+    the VM - another plan's migration of it takes them as its own - and its migration.action names
+    each, the ids in data.kept_volumes, for the operator to delete once no plan migrates the VM; a
+    read of them that failed is named, and the cleanup stands."""
+    details = {
+        "kept": {"kept_volumes": [
+            {"id": "vol-a", "name": "web-01-2000"}, {"id": "vol-b", "name": "web-01-2001"}
+        ]},
+        "none": {"kept_volumes": []},
+        "unread": {"kept_volumes": None, "kept_volumes_unread": "volumes: HTTP 503 " + "x" * 400},
+    }[read]  # fmt: skip
+
+    async def rollback(ctx):
+        if ctx.options.get("delete_dest_volumes"):
+            return StepResult(details={"deleted_server": None, "deleted_ports": [], **details})
+        return StepResult(details={"source_running": True})
+
+    settings = make_settings(tmp_path)
+    executor = ScriptedExecutor(settings, hooks={StepName.ROLLBACK: rollback})
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.rollback(m.id, "rina", "the application owner wants it back")
+    m = await h.wait_phase(m.id, P.rolled_back)
+    await h.orch.cancel(m.id, "rina", "this VM is not migrated after all")
+    assert (await _settled(h, m.id))[-2:] == ["cancel", "cleanup"]
+    await h.orch.stop()
+    [event] = [
+        e
+        for e in h.store.events(since_seq=0, limit=1000)
+        if e.kind == "migration.action" and e.data.get("action") == "cleanup"
+    ]
+    assert store.get("migration", m.id, Migration).checkpoint == "cleaned"
+    head = f"{m.vm.name}: temporary resources of the cancelled migration removed"
+    if read == "none":
+        assert event.message == head
+        assert "kept_volumes" not in event.data
+    elif read == "kept":
+        assert event.message.startswith(head + "; ")
+        assert "vol-a (web-01-2000), vol-b (web-01-2001)" in event.message
+        assert "delete them once no plan migrates the VM" in event.message
+        assert event.data["kept_volumes"] == ["vol-a", "vol-b"]
+    else:
+        assert event.message.startswith(head + "; ")
+        # cut as the cleanup's failure is: 300 characters of the provider's answer
+        assert "(volumes: HTTP 503 " + "x" * 282 + ")" in event.message
+        assert "delete them once no plan migrates the VM" in event.message
+        assert "kept_volumes" not in event.data
+
+
 def _write_record(settings, plan_id, m, **record):
     """The workload's record (SDD §6.3), as the collection keeps it in the migration's run dir."""
     from seamless_migrate.executors.ansible import run_dir

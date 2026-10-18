@@ -2857,6 +2857,46 @@ async def test_a_vmware_cancels_cleanup_deletes_only_a_recorded_server(env):
     assert env.registry.calls == [("delete_server", "dst-9")]
 
 
+@pytest.mark.parametrize("strategy", [Strategy.vmware_warm, Strategy.vmware_cold])
+async def test_a_vmware_cancels_cleanup_names_the_kit_volumes_of_the_vm_it_keeps(env, strategy):
+    """SDD §5.1, §7.2 (review RV42B, lead NP-2): a cancel's cleanup on VMware deletes no kit
+    volume - the kit names them after the VM, so they are another plan's migration's to sync onto
+    -, but it reads the ones the kit's next run takes as the VM's own and names them for the
+    operator; a read that fails is named and fails nothing, the server being gone."""
+    env.registry.volumes = [
+        kit_volume("vol-copy", "web-01-2000", converted=False, copied=True),
+        kit_volume("vol-conv", "web-01-2001", attachments=["dst-plan-b"]),
+        kit_volume("vol-noosm", "web-01-2002", osm=False),  # not the kit's: no osm mark
+        kit_volume("vol-other", "web-02-2000", converted=False, copied=True),  # another VM's
+        kit_volume("vol-boot", "web-01-boot"),  # not <kit name>-<digits>
+    ]
+    ctx, _ = ctx_for(env, strategy=strategy, source=VCENTER, destination_server_id="dst-9")
+    ctx.options["delete_dest_volumes"] = True
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert env.registry.calls == [("delete_server", "dst-9")]
+    assert result.details["kept_volumes"] == [
+        {"id": "vol-copy", "name": "web-01-2000"},
+        {"id": "vol-conv", "name": "web-01-2001"},
+    ]
+    assert "kept_volumes_unread" not in result.details
+    assert [v["id"] for v in env.registry.volumes] == [
+        "vol-copy", "vol-conv", "vol-noosm", "vol-other", "vol-boot"
+    ]  # fmt: skip
+
+    # none of the kit's: an empty list, nothing to name
+    env.registry.volumes = [kit_volume("vol-other", "web-02-2000")]
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["kept_volumes"] == []
+
+    # Cinder unreadable: named, and the cleanup stands - the server it deleted is gone
+    env.registry.calls.clear()
+    env.registry.volumes_error = True
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert env.registry.calls == [("delete_server", "dst-9")]
+    assert result.details["kept_volumes"] is None
+    assert result.details["kept_volumes_unread"] == "volumes: HTTP 503"
+
+
 KIT_NAMES = json.loads((Path(__file__).parent / "fixtures" / "kit_vm_name_cases.json").read_text())
 
 

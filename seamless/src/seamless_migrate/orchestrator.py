@@ -1779,7 +1779,7 @@ class Orchestrator:
                 ctx = self._context(
                     m, plan, source, destination, options={"delete_dest_volumes": True}, locked=True
                 )
-                await self.executors.for_strategy(m.strategy).run(StepName.ROLLBACK, ctx)
+                result = await self.executors.for_strategy(m.strategy).run(StepName.ROLLBACK, ctx)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1795,15 +1795,29 @@ class Orchestrator:
                     ),
                 )
                 return
+            message = f"{m.vm.name}: temporary resources of the cancelled migration removed"
+            data: dict[str, Any] = {"action": "cleanup"}
+            # the migration kit's volumes of the VM a VMware cleanup keeps: another plan's
+            # migration of the VM takes them as its own (SDD §5.1, §7.2, review RV42B, lead NP-2)
+            kept = result.details.get("kept_volumes")
+            unread = result.details.get("kept_volumes_unread")
+            if kept:
+                data["kept_volumes"] = [v["id"] for v in kept]
+                message += (
+                    f"; {destination.label} keeps the migration kit's volumes of the VM, "
+                    + ", ".join(f"{v['id']} ({v['name']})" for v in kept)
+                    + ": another plan's migration of the VM takes them as its own - delete them "
+                    "once no plan migrates the VM"
+                )
+            elif unread:
+                message += (
+                    "; the migration kit's volumes of the VM it keeps could not be read from "
+                    f"{destination.label} ({redact_cut(unread, 300)}): another plan's migration "
+                    "of the VM takes them as its own - delete them once no plan migrates the VM"
+                )
             await record(
                 "cleaned",
-                self._emit(
-                    "migration.action",
-                    f"{m.vm.name}: temporary resources of the cancelled migration removed",
-                    migration=m,
-                    actor=actor,
-                    data={"action": "cleanup"},
-                ),
+                self._emit("migration.action", message, migration=m, actor=actor, data=data),
             )
         except asyncio.CancelledError:
             # a shutdown interrupted the cleanup before its outcome was recorded: its mark stays,

@@ -1877,15 +1877,30 @@ class AnsibleExecutor:
 
     async def _vmware_cancel_cleanup(self, ctx: StepContext) -> StepResult:
         """A cancel's cleanup on VMware deletes only a server the migration recorded: no lookup by
-        name, no kit port, no power-on - the VM it released may since be another plan's (SDD §5.1,
-        §7.2, review RV-01, RV-02)."""
+        name, no kit port or volume, no power-on - the VM it released may since be another plan's
+        (SDD §5.1, §7.2, review RV-01, RV-02). The kit's volumes of the VM it keeps it names: the
+        kit names them after the VM, so another plan's migration of it takes them as its own, and
+        the operator deletes them once none migrates it; a read that fails is named and fails
+        nothing, the server being gone (review RV42B, lead NP-2)."""
         server_id = ctx.migration.destination_server_id
+        dst = self.providers.get(ctx.destination)
         if server_id:
             try:
-                await self.providers.get(ctx.destination).delete_server(server_id)
+                await dst.delete_server(server_id)
             except ProviderError as exc:
                 raise TransientStepError(f"rollback: {exc}") from exc
-        return StepResult(details={"deleted_server": server_id, "deleted_ports": []})
+        details: dict[str, Any] = {"deleted_server": server_id, "deleted_ports": []}
+        try:
+            volumes = await dst.volumes()
+        except ProviderError as exc:
+            return StepResult(
+                details={**details, "kept_volumes": None, "kept_volumes_unread": str(exc)}
+            )
+        details["kept_volumes"] = [
+            {"id": str(v["id"]), "name": str(v.get("name"))}
+            for v in kit_volumes(ctx.migration.vm.name, volumes)
+        ]
+        return StepResult(details=details)
 
     async def _finalize(self, ctx: StepContext) -> StepResult:
         if not ctx.options.get("delete_source"):
