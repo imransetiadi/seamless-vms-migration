@@ -2862,7 +2862,9 @@ class Orchestrator:
             if rate is not None:
                 m.vm = m.vm.model_copy(update={"change_rate_bps": rate})
         if m.strategy == Strategy.warm:
-            observed = observed_scan_rate(sync_pass, m.vm, params_for_plan(plan))
+            # the migration's current S: a pass the link bound may only raise it (SDD §9.1,
+            # review RV38A-02)
+            observed = observed_scan_rate(sync_pass, m.vm, self._params(m, plan))
             if observed is not None:
                 m.observed_scan_bps = observed
         if sync_pass.kind == SyncPassKind.final:

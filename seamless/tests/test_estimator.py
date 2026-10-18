@@ -327,6 +327,33 @@ def test_a_pass_at_the_aggregate_ceiling_leaves_the_scan_rate_as_it_was():
     assert scan_seconds(vm, replace(ceiling, scan_bps=rate)) == pytest.approx(2 * at_ceiling)
 
 
+@pytest.mark.parametrize(
+    "sent_gib, overhead, reads_back",
+    [(40, 1.0, None), (40, 1.05, None), (10, 1.0, 500 * MIB)],
+    ids=["link-bound as predicted", "link-bound with 5% fixed work", "scan-bound"],
+)
+def test_a_link_bound_delta_pass_never_lowers_the_scan_rate(sent_gib, overhead, reads_back):
+    """SDD §9.1 (review RV38A-02): the model runs a delta pass as max(scan, Δ/L) - scan and
+    transfer overlap -, so a pass whose changes took at least as long over the link as the model's
+    scan at the current S lasts Δ/L whatever S is: what it reads only bounds S from below and
+    never lowers it - with or without the pass's fixed work. A pass the scan bound still reads
+    back its S."""
+    vm = make_vm(disks=[make_disk(id="d0", size_gb=100)])
+    scan = scan_seconds(vm, P)  # 204.8 s at 500 MiB/s
+    sent = sent_gib * GIB
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=max(scan, sent / P.link_bps) * overhead,
+        bytes_scanned=vm.disk_bytes,
+        bytes_changed=sent,
+        bytes_transferred=sent,
+    )
+    observed = observed_scan_rate(sync_pass, vm, P)
+    assert observed == (pytest.approx(reads_back) if reads_back else None)
+
+
 def test_a_pass_that_scanned_less_than_the_largest_disk_ran_one_stream():
     """SDD §9.1 (review PL-07): a pass that scanned fewer bytes than the largest disk holds read
     them in one stream at most - its S is what it scanned over its duration, never the largest

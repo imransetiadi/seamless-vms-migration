@@ -392,6 +392,53 @@ async def test_a_revalidation_never_counts_the_volumes_an_earlier_attempt_holds(
     ), how
 
 
+@pytest.mark.parametrize("calibrated_mib", [None, 200], ids=["planned S", "S calibrated low"])
+async def test_a_link_bound_delta_pass_leaves_the_slo_rule_converging(
+    tmp_path, store, calibrated_mib
+):
+    """SDD §5.3, §9.1 (review RV38A-02): after a delta pass the link bound - the guest wrote 40 GiB
+    in the 1000 s between the snapshots, sent in 327.68 s at 125 MiB/s, its 100 GiB scan 204.8 s -
+    the calibration keeps the planned scan rate, so the final downtime stays within the 500 s SLO
+    and the rule converges by slo: no extra pass for a pass that ran as predicted. Judged at the
+    migration's own S: one an earlier pass calibrated low (200 MiB/s, a scan of 512 s the pass
+    could not have lasted) is raised to what the pass reads, 312.5 MiB/s."""
+    from seamless_migrate.domain.models import SyncPass
+    from seamless_migrate.planning.estimator import EstimatorParams, scan_seconds
+
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm, "downtime_slo_s": 500}
+    )
+    the_vm = make_vm(disks=[make_disk(id="d0", size_gb=100, used_gb=60.0)], change_rate_bps=None)
+    first = SyncPass(
+        number=1,
+        kind="full",
+        started_at=utcnow(),
+        duration_s=521.5,
+        bytes_scanned=the_vm.disk_bytes,
+        bytes_changed=the_vm.used_bytes,
+        bytes_transferred=the_vm.used_bytes,
+    )
+    params = EstimatorParams()
+    sent = 40 * 2**30
+    second = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=first.started_at + timedelta(seconds=1000),
+        duration_s=max(scan_seconds(the_vm, params), sent / params.link_bps),
+        bytes_scanned=the_vm.disk_bytes,
+        bytes_changed=sent,
+        bytes_transferred=sent,
+    )
+    m = make_migration(plan_id=plan.id, phase=P.syncing, vm=the_vm, sync_passes=[first, second])
+    m.observed_scan_bps = calibrated_mib * 2**20 if calibrated_mib else None
+    h.orch._calibrate(m, plan, second)
+    if calibrated_mib is None:
+        assert m.observed_scan_bps is None
+        assert h.orch._converged(m, plan)[0] == "slo"
+    else:
+        assert m.observed_scan_bps == pytest.approx(312.5 * 2**20)
+
+
 async def test_validate_creates_migrations_with_findings_and_estimates(tmp_path, store):
     gpu = vm(3, "gpu-01", flavor_extra_specs={"resources:VGPU": "1"})
     vms = [vm(1), vm(2, "db-02", size_gb=600, used_gb=300.0), gpu]

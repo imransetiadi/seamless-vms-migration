@@ -269,7 +269,10 @@ def observed_scan_rate(sync_pass: SyncPass, vm: VMRef, params: EstimatorParams) 
 
     Only delta/final passes calibrate it: pass 1 is usually link-bound and would understate it.
     ``None`` too for a pass at the aggregate ceiling (``A`` set, ``B / A >= duration_s``): it lasts
-    as long whatever ``S`` is, so it does not tell ``S``.
+    as long whatever ``S`` is, so it does not tell ``S``. A pass the link bound - its changes took
+    at least as long over the link as the model's scan at the current ``S`` (``params.scan_bps``,
+    the migration's calibrated one) - only bounds ``S`` from below: what it reads may raise ``S``,
+    never lower it, and ``None`` otherwise (SDD §9.1, review RV38A-02).
     """
     if sync_pass.kind == SyncPassKind.full:
         return None
@@ -281,4 +284,8 @@ def observed_scan_rate(sync_pass: SyncPass, vm: VMRef, params: EstimatorParams) 
         return None
     streams = max(1, min(int(params.parallel_disks), len(vm.disks) or 1))
     largest = max((d.size_gb for d in vm.disks), default=0) * GIB
-    return max(min(largest, scanned), scanned / streams) / duration
+    rate = max(min(largest, scanned), scanned / streams) / duration
+    link = params.link_bps
+    if link and link > 0 and sync_pass.bytes_transferred / link >= scan_seconds(vm, params):
+        return rate if rate > params.scan_bps else None
+    return rate
