@@ -3398,7 +3398,13 @@ is no origin a browser sends (review RV31-03).
   and that the bytes they transferred stay counted, §5.4), downtime clock (in demo mode it runs in model time,
   `/health` `demo_speed`; it counts whole seconds while it runs, and once the downtime ended it shows the actual
   downtime rounded to the second, as every other view and the text under it give it; the estimate's parts — shutdown, final sync or copy, conversion, create, boot — and the
-  difference between estimate and actual, ADV-16), a "Data inconsistent" badge with the issues (§5.5), Force cutover
+  difference between estimate and actual, ADV-16), a "Data inconsistent" badge with the issues (§5.5), an Estimate
+  inputs panel — what the downtime estimate rests on (§9.1): the guest write rate and the scan rate per disk stream,
+  each with its source (measured by a delta pass, from the inventory, a plan override or the planning default; VMware
+  CBT needs no scan rate), the plan's link speed, every other estimator override the plan sets with its value
+  (disks scanned in parallel, aggregate scan cap, source shutdown, snapshot, volume create, boot, handover per volume,
+  conversion, in-place conversion), and on the OpenStack warm path the disks scanned in parallel even when the plan
+  sets none (the planning default, 4); the planning defaults are the API's `EstimatorParams` —, Force cutover
   for an approver in `precopy`/`syncing` of a warm migration — the dialog shows the last pass's change and the
   estimated downtime the Force cutover records (the API's formula, §5.4, ported and checked against a case table the
   control plane generates) and asks for the reason (§5.4) —,
