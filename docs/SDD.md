@@ -2163,7 +2163,11 @@ libosinfo short ids (`win2k19`, `debian12`), VMware guest ids (`rhel9_64Guest`,
 `windows2019srvNext_64Guest`, `ubuntu64Guest`) and VMware Tools names (`Ubuntu 22.04.4 LTS`,
 `Microsoft Windows Server 2019 Standard`). Distributions: RHEL, CentOS (Linux and Stream), Rocky,
 AlmaLinux, Oracle Linux, Ubuntu (versions and code names), Debian (versions and code names), SLES,
-openSUSE, Fedora, Windows Server 2003–2025 and Windows client 7–11. The case table shared by both test
+openSUSE, Fedora, Windows Server 2003–2025 and Windows client 7–11 (also by the libosinfo client ids `win7`,
+`win8`, `win8.1`, `win10`, `win11`). A VMware guest id without a version names the releases govmomi gives it:
+`windows8Guest` Windows 8, `oracleLinuxGuest`/`oracleLinux64Guest` Oracle Linux 4/5, `centosGuest`/`centos64Guest`
+CentOS 4/5, `slesGuest`/`sles64Guest` SLES 9. A CentOS of version 9 or later is CentOS Stream (`centos9_64Guest`,
+`centos 9`): CentOS Linux ended with 8 (reviews PL-04, PL-05). The case table shared by both test
 suites is `seamless/tests/fixtures/guest_os_cases.json`.
 
 Lifecycle as of 2026-10 (`legacy` = out of standard vendor support): RHEL/Oracle ≤ 7, CentOS Linux
