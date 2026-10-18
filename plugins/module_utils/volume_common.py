@@ -49,9 +49,12 @@ def _is_not_found(err):
     )
 
 
-def is_timeout(err):
+def gave_up_waiting(err):
     """openstacksdk's ResourceTimeout - a wait that gave up, such as "Timeout waiting for Volume
-    ... to delete" -, whatever module raised it (Seamless Migrate SDD 6.6, review RV34B-01)."""
+    ... to delete" -, whatever module raised it (Seamless Migrate SDD 6.6, review RV34B-01). Its
+    name reads as no timeout: ansible-core before 2.19 prints an escaped error's traceback, each
+    frame's function named, and Seamless Migrate classifies a failure whose output says "timeout"
+    as transient (review RV41A-09)."""
     return any(cls.__name__ == "ResourceTimeout" for cls in type(err).__mro__)
 
 

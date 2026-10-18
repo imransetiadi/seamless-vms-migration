@@ -398,14 +398,6 @@ def test_no_collection_error_reads_transient_by_its_class_name():
     assert {name: path for name, path in errors.items() if TRANSIENT.search(name)} == {}
 
 
-#: may match TRANSIENT: a predicate on an exception that raises nothing itself, so no traceback
-#: ever shows its frame (review RV36A-02)
-#: the collection's predicates on an exception that raise nothing themselves - so no traceback ever
-#: shows their frame -, by file and name: a function of that name elsewhere is no such predicate
-#: (reviews RV36A-02, RV37B-02)
-RAISES_NOTHING = {("plugins/module_utils/volume_common.py", "is_timeout")}
-
-
 def _what_ansible_core_prints_of_the_collection() -> dict[str, str]:
     """What ansible-core before 2.19 can print of the collection's code in the output the executor
     classifies, with the file defining it: a raised class qualified by its module's dotted path
@@ -426,67 +418,18 @@ def _what_ansible_core_prints_of_the_collection() -> dict[str, str]:
     return found
 
 
-def _raises(root: Path, path: str, name: str) -> bool | None:
-    """Whether a function or method named ``name`` in ``path`` raises anything itself - a raise or
-    an assert in any definition of that name: a later module-level one is the one Python binds, and
-    a method's frame is named as a function's (review RV38B-19); ``None`` without one."""
-    tree = ast.parse((root / path).read_text(encoding="utf-8"))
-    found = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
-    ]
-    if not found:
-        return None
-    return any(
-        isinstance(inner, (ast.Raise, ast.Assert)) for node in found for inner in ast.walk(node)
-    )
-
-
-@pytest.mark.parametrize(
-    ("source", "raises"),
-    [
-        ("def is_timeout(err):\n    return 'timed out' in str(err)\n", False),
-        (
-            "def is_timeout(err):\n    return False\n\n\ndef is_timeout(err):\n"
-            "    raise RuntimeError(err)\n",
-            True,
-        ),
-        (
-            "def is_timeout(err):\n    return False\n\n\nclass Waiter:\n"
-            "    def is_timeout(self, err):\n        raise RuntimeError(err)\n",
-            True,
-        ),
-        ("def is_timeout(err):\n    assert err is not None, err\n    return False\n", True),
-        ("def other(err):\n    raise RuntimeError(err)\n", None),
-    ],
-    ids=["a predicate", "a raising one defined below it", "a raising method", "an assert", "none"],
-)
-def test_the_raise_check_reads_every_definition_of_the_name(tmp_path, source, raises):
-    """Review RV38B-19: a predicate the transient guard allows must raise nothing - judged over
-    every definition of its name, a method's too, an assert counted as a raise."""
-    (tmp_path / "m.py").write_text(source, encoding="utf-8")
-    assert _raises(tmp_path, "m.py", "is_timeout") is raises
-
-
 def test_nothing_ansible_core_prints_of_the_collection_reads_transient():
-    """SDD §6.6 (owner question q8, reviews RV35A-01, RV36A-02): beside a raised class's own name,
-    ansible-core before 2.19 prints its module path, and an escaped error's traceback names each
-    frame's file and function - a module, class, function or method of the collection whose name
-    matches TRANSIENT so turns a permanent failure transient, a stuck detach retried with the cold
-    source stopped. None may, but a predicate that raises nothing."""
+    """SDD §6.6 (owner question q8, reviews RV35A-01, RV36A-02, RV41A-09): beside a raised class's
+    own name, ansible-core before 2.19 prints its module path, and an escaped error's traceback
+    names each frame's file and function - a module, class, function or method of the collection
+    whose name matches TRANSIENT so turns a permanent failure transient, a stuck detach retried
+    with the cold source stopped. None may: any expression can raise out of its own frame (an
+    index, a call), so no predicate is "raising nothing" for sure - the one that read so was
+    renamed."""
     found = _what_ansible_core_prints_of_the_collection()
     assert "plugins.module_utils.volume_common.DetachStuck" in found
     assert "plugins/module_utils/volume_common.py:wait_for_lock" in found
-    allowed = {f"{path}:{name}" for path, name in RAISES_NOTHING}
-    assert {
-        name: path for name, path in found.items() if TRANSIENT.search(name) and name not in allowed
-    } == {}
-    # each predicate allowed raises nothing itself (review RV37B-02)
-    root = find_repo_root()
-    assert {(path, name): _raises(root, path, name) for path, name in RAISES_NOTHING} == {
-        place: False for place in RAISES_NOTHING
-    }
+    assert {name: path for name, path in found.items() if TRANSIENT.search(name)} == {}
 
 
 @pytest.mark.parametrize(
@@ -501,23 +444,25 @@ def test_nothing_ansible_core_prints_of_the_collection_reads_transient():
         ),
         (
             "plugins/module_utils/volume_common.py",
-            lambda text: text.replace(
-                '    return any(cls.__name__ == "ResourceTimeout"',
-                '    if err is None:\n        raise ValueError("no error")\n'
-                '    return any(cls.__name__ == "ResourceTimeout"',
-                1,
-            ),
+            lambda text: text.replace("def gave_up_waiting(err):", "def is_timeout(err):", 1),
+        ),
+        (
+            "plugins/module_utils/volume_common.py",
+            lambda text: text + '\n\ndef index_timeout(err):\n    return err.args[0] == "late"\n',
         ),
     ],
-    ids=["a raising is_timeout in another module", "the allowed predicate made to raise"],
+    ids=[
+        "a raising is_timeout in another module",
+        "the predicate named after a timeout again",
+        "a predicate that raises by an index",
+    ],
 )
-def test_the_transient_guard_allows_only_a_predicate_that_raises_nothing(
+def test_the_transient_guard_flags_every_name_that_reads_transient(
     tmp_path, monkeypatch, path, mutate
 ):
-    """Reviews RV36A-02, RV37B-02: the guard allows is_timeout by its place - volume_common's
-    predicate - and only while it raises nothing: a raising function of that name in another
-    module, whose frame an escaped error's 2.18 traceback prints, or the predicate made to raise,
-    fails it."""
+    """Reviews RV36A-02, RV37B-02, RV41A-09: a function of the collection whose name matches
+    TRANSIENT fails the guard - raising or not: an expression such as `err.args[0]` raises out of
+    its frame without a raise statement, and the 2.18 traceback prints that frame's name."""
     root = tmp_path / "repo"
     shutil.copytree(find_repo_root() / "plugins", root / "plugins")
     target = root / path

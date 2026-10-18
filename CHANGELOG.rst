@@ -581,7 +581,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   again: a lock wait that gives up (the conversion host lost, or the lock
   another conversion holds throughout, now ``LockUnavailable``) or a detach
   Nova does not end in time (``DetachStuck``) ends the detaches, and a
-  deletion Cinder does not finish in time ends the deletions; one that cannot
+  deletion Cinder does not finish in time ends the deletions - no name of
+  the collection reads as a timeout, as ansible-core before 2.19 prints an
+  escaped error's frames, which Seamless Migrate would read as transient
+  (the predicate is ``gave_up_waiting``); one that cannot
   start (its conversion host gone, a record not the workload's) says so in its
   result. The rescue runs it before the source cleanup, so a source cleanup
   that fails no longer keeps it from running, and a failed transfer is
