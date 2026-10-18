@@ -2,9 +2,12 @@
 it."""
 
 import json
+import os
 import re
+import subprocess
 import tomllib
 
+import pytest
 import yaml
 
 from seamless_migrate import __version__
@@ -53,8 +56,9 @@ def _release_versions() -> dict[str, str]:
         "seamless/Containerfile": _one(
             r'org\.opencontainers\.image\.version="([^"]+)"', "seamless/Containerfile"
         ),
-        # the control-plane image make deploy-runtime-check runs (docs-drift DD2-06)
-        "Makefile": _one(r"^SEAMLESS_VERSION \?= (\S+)$", "Makefile"),
+        # the release the control-plane image make deploy-runtime-check runs defaults to
+        # (docs-drift DD2-06, review RV37B-04)
+        "Makefile": _one(r"^SEAMLESS_RELEASE := (\S+)$", "Makefile"),
     }
 
 
@@ -64,3 +68,51 @@ def test_every_version_location_of_a_release_names_one_version():
     check a stale image."""
     versions = _release_versions()
     assert set(versions.values()) == {__version__}, versions
+
+
+def _resolved(tmp_path, env_file: str | None, environment: dict[str, str] | None = None) -> str:
+    """SEAMLESS_VERSION and SEAMLESS_CP_IMAGE as the Makefile resolves them, with ``env_file`` as
+    deploy/compose/.env (none when ``None``) and ``environment`` exported."""
+    wrapper = tmp_path / "print.mk"
+    # $(info ...) prints the values as Make holds them - quotes included, which a shell echo drops
+    wrapper.write_text(
+        "include Makefile\nzz-print:\n\t@true$(info $(SEAMLESS_VERSION) $(SEAMLESS_CP_IMAGE))\n"
+    )
+    dotenv = tmp_path / "compose.env"
+    dotenv.unlink(missing_ok=True)
+    if env_file is not None:
+        dotenv.write_text(env_file, encoding="utf-8")
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("SEAMLESS_VERSION", "SEAMLESS_CP_IMAGE")
+    }
+    env.update(environment or {})
+    done = subprocess.run(
+        ["make", "-s", "--no-print-directory", "-f", str(wrapper), "zz-print"]
+        + [f"SEAMLESS_ENV_FILE={dotenv}"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.strip()
+
+
+@pytest.mark.parametrize(
+    "env_file, environment, version",
+    [
+        (None, None, __version__),
+        ("COMPOSE_PROFILES=ai\nSEAMLESS_VERSION=0.2.0\n", None, "0.2.0"),
+        ('SEAMLESS_VERSION="0.2.1"\n', None, "0.2.1"),
+        ("SEAMLESS_VERSION='0.2.2'\n", None, "0.2.2"),
+        ("SEAMLESS_VERSION=0.2.0\n", {"SEAMLESS_VERSION": "0.3.0"}, "0.3.0"),
+    ],
+    ids=["the release", "pinned in .env", "quoted in .env", "single-quoted", "the shell over .env"],
+)
+def test_the_runtime_check_inspects_the_image_compose_runs(
+    tmp_path, env_file, environment, version
+):
+    """RELEASING.md §1, §9 (review RV37B-04): make deploy-runtime-check inspects the image the
+    Compose stack runs - SEAMLESS_VERSION read as Compose reads it: the shell or the command line,
+    else deploy/compose/.env, else the release."""
+    assert _resolved(tmp_path, env_file, environment) == f"{version} seamless-migrate:{version}"

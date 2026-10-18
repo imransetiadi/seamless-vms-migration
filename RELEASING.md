@@ -17,7 +17,7 @@ the deployment the artifacts serve is in [SDD §17](docs/SDD.md).
 |---|---|---|
 | Control plane (`seamless/`) | `seamless/pyproject.toml` (`version`) and `seamless/src/seamless_migrate/__init__.py` (`__version__`, printed by `seamless version` and returned by `GET /api/v1/health`) | container image `seamless-migrate:X.Y.Z`, built from `seamless/Containerfile` |
 | Dashboard (`dashboard/`) | `dashboard/package.json` and `dashboard/package-lock.json` | `dashboard/dist`, baked into the image |
-| Deployment (`deploy/`) | `deploy/compose/compose.yaml` (`${SEAMLESS_VERSION:-X.Y.Z}`, documented in `deploy/compose/README.md`), `newTag` and the `app.kubernetes.io/version` label in `deploy/openshift/kustomization.yaml`, `newTag` in `deploy/kubernetes/kustomization.yaml`, and `SEAMLESS_VERSION` in the `Makefile` (the control-plane image `make deploy-runtime-check` runs) | the manifests, in the release's source archive |
+| Deployment (`deploy/`) | `deploy/compose/compose.yaml` (`${SEAMLESS_VERSION:-X.Y.Z}`, documented in `deploy/compose/README.md`), `newTag` and the `app.kubernetes.io/version` label in `deploy/openshift/kustomization.yaml`, `newTag` in `deploy/kubernetes/kustomization.yaml`, and `SEAMLESS_RELEASE` in the `Makefile` (the default of the control-plane image `make deploy-runtime-check` runs; a `SEAMLESS_VERSION` in the shell or in `deploy/compose/.env` comes first, as for Compose) | the manifests, in the release's source archive |
 | Image labels | `org.opencontainers.image.version` in `seamless/Containerfile` | the label `docker inspect` shows on the image |
 | os-migrate collection (repository root) | `galaxy.yml` (`version`) and `plugins/module_utils/const.py` (`OS_MIGRATE_VERSION`); `tests/unit/test_version.py` keeps them equal | `os_migrate-os_migrate-<collection version>.tar.gz` from `make build` |
 
@@ -86,7 +86,7 @@ perl -pi -e "s/SEAMLESS_VERSION:-\Q$OLD\E/SEAMLESS_VERSION:-$NEW/" deploy/compos
 perl -pi -e "s/newTag: \Q$OLD\E/newTag: $NEW/" deploy/openshift/kustomization.yaml deploy/kubernetes/kustomization.yaml
 perl -pi -e "s{app.kubernetes.io/version: \Q$OLD\E}{app.kubernetes.io/version: $NEW}" deploy/openshift/kustomization.yaml
 perl -pi -e "s/image.version=\"\Q$OLD\E\"/image.version=\"$NEW\"/" seamless/Containerfile
-perl -pi -e "s/^SEAMLESS_VERSION \?= \Q$OLD\E/SEAMLESS_VERSION ?= $NEW/" Makefile
+perl -pi -e "s/^SEAMLESS_RELEASE := \Q$OLD\E/SEAMLESS_RELEASE := $NEW/" Makefile
 
 # what pins the version and must follow by hand: the health payload the control-plane tests expect,
 # the Compose README's table of defaults
