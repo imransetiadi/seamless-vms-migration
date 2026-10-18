@@ -236,7 +236,7 @@ The concurrency settings are patched into the ConfigMap and `--cpu`/`--memory` b
 one rollout. These are live changes: the next `up` (`apply -k`) brings the manifests' values back, so put a
 lasting change into the overlay - `deploy/openshift/configmap.yaml` and the `resources:` of
 `deploy/openshift/deployment.yaml` (or a kustomize patch of your own). The requests and limits there are sized for
-10 concurrent migrations.
+10 concurrent migrations at about 250 MiB each: above 10 without `--memory`, the script warns, as on the single host.
 
 ---
 

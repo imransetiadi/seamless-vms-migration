@@ -286,6 +286,24 @@ def test_cluster_capacity_patches_the_configmap_and_sets_the_limits_in_one_rollo
     ]
 
 
+@pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
+def test_cluster_capacity_warns_when_more_migrations_than_its_memory_limit_was_sized_for(
+    tmp_path, platform, tool, overlay
+):
+    """SDD §17.2, Operations.md §4.6 (review 38b): each concurrent migration needs about 250 MiB,
+    and the manifests' 4Gi limit is sized for 10 - like the single host, the script says so when
+    more are asked for without --memory, and goes on; with --memory, or 10 at most, it says
+    nothing."""
+    proc, calls, _ = _run(tmp_path, platform, "capacity", "--max-migrations", "20")
+    assert proc.returncode == 0, proc.stderr
+    assert "about 250 MiB" in proc.stderr and "deploy/openshift/deployment.yaml" in proc.stderr
+    assert "--memory" in proc.stderr
+    assert "-n seamless-migrate rollout restart deployment/seamless" in _args(calls, tool)
+    for argv in (["--max-migrations", "20", "--memory", "8Gi"], ["--max-migrations", "10"]):
+        proc, _, _ = _run(tmp_path / argv[-1], platform, "capacity", *argv)
+        assert proc.returncode == 0 and "250 MiB" not in proc.stderr, (argv, proc.stderr)
+
+
 ENV = "".join(
     [
         "POSTGRES_PASSWORD=x\n",

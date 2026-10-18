@@ -348,6 +348,10 @@ cluster_start() {
 }
 cluster_capacity() {
   local data='' limits=''
+  if [ -n "$MAX_MIGRATIONS" ] && [ "$MAX_MIGRATIONS" -gt 10 ] && [ -z "$MEMORY" ]; then
+    printf '%s: each concurrent migration needs about 250 MiB (Performance.md §8); the control plane'"'"'s memory limit in deploy/openshift/deployment.yaml (4Gi) is sized for 10 - give --memory for %s\n' \
+      "$PROG" "$MAX_MIGRATIONS" >&2
+  fi
   [ -n "$MAX_MIGRATIONS" ] && data="\"SEAMLESS_MAX_CONCURRENT_MIGRATIONS\":\"$MAX_MIGRATIONS\""
   [ -n "$MAX_CUTOVERS" ] && data="${data:+$data,}\"SEAMLESS_MAX_CONCURRENT_CUTOVERS\":\"$MAX_CUTOVERS\""
   [ -n "$data" ] && kube patch configmap/seamless-config --type merge -p "{\"data\":{$data}}"
