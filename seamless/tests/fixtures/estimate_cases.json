@@ -1192,6 +1192,89 @@
     }
   },
   {
+    "name": "warm: a calibrated 0 B/s stays 0: an idle guest",
+    "vm": {
+      "source_id": "vm-1",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d0",
+          "name": null,
+          "size_gb": 100,
+          "used_gb": 60.0,
+          "bootable": true,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500,
+          "network_key": null
+        }
+      ],
+      "power_state": "running",
+      "os_type": "rhel9",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": null,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": 0.0,
+      "key_name": null,
+      "disk_bytes": 107374182400,
+      "used_bytes": 64424509440,
+      "guest_os": {
+        "family": "linux",
+        "distro": "rhel",
+        "version": "9",
+        "label": "RHEL 9",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "strategy": "warm",
+    "plan": {
+      "link_bps": 131072000.0,
+      "convergence_threshold_bytes": 1073741824,
+      "max_sync_passes": 5,
+      "estimator_overrides": {},
+      "downtime_slo_s": 600
+    },
+    "expected": {
+      "strategy": "warm",
+      "precopy_s": 756.3199999999999,
+      "passes": 2,
+      "downtime_s": 474.8,
+      "total_s": 1231.12,
+      "final_delta_bytes": 0,
+      "meets_slo": true,
+      "downtime_parts": {
+        "shutdown_s": 60.0,
+        "copy_s": 234.8,
+        "conversion_s": 0.0,
+        "create_s": 60.0,
+        "boot_s": 120.0
+      }
+    }
+  },
+  {
     "name": "warm: disks without used sizes: 60 % of the disk",
     "vm": {
       "source_id": "vm-1",
@@ -1610,6 +1693,119 @@
         "conversion_s": 0.0,
         "create_s": 60.04,
         "boot_s": 120.04
+      }
+    }
+  },
+  {
+    "name": "storage handover: just over the SLO by a fractional step override",
+    "vm": {
+      "source_id": "vm-1",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d0",
+          "name": null,
+          "size_gb": 40,
+          "used_gb": 20.0,
+          "bootable": true,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        },
+        {
+          "id": "d1",
+          "name": null,
+          "size_gb": 30,
+          "used_gb": 10.0,
+          "bootable": false,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vdb",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        },
+        {
+          "id": "d2",
+          "name": null,
+          "size_gb": 10,
+          "used_gb": 5.0,
+          "bootable": false,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vdc",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500,
+          "network_key": null
+        }
+      ],
+      "power_state": "running",
+      "os_type": "rhel9",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": null,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": null,
+      "key_name": null,
+      "disk_bytes": 85899345920,
+      "used_bytes": 37580963840,
+      "guest_os": {
+        "family": "linux",
+        "distro": "rhel",
+        "version": "9",
+        "label": "RHEL 9",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "strategy": "storage_handover",
+    "plan": {
+      "link_bps": 131072000.0,
+      "convergence_threshold_bytes": 1073741824,
+      "max_sync_passes": 5,
+      "estimator_overrides": {
+        "shutdown_s": 60.04
+      },
+      "downtime_slo_s": 300
+    },
+    "expected": {
+      "strategy": "storage_handover",
+      "precopy_s": 0.0,
+      "passes": 0,
+      "downtime_s": 300.04,
+      "total_s": 300.04,
+      "final_delta_bytes": 0,
+      "meets_slo": false,
+      "downtime_parts": {
+        "shutdown_s": 60.04,
+        "copy_s": 60.0,
+        "conversion_s": 0.0,
+        "create_s": 60.0,
+        "boot_s": 120.0
       }
     }
   },
