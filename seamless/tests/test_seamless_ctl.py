@@ -510,6 +510,30 @@ def test_dry_run_prints_every_command_and_runs_none(tmp_path):
         f"make -C {tree} --no-print-directory seamless-restart SEAMLESS_ENGINE=docker"
         in proc.stdout
     )
+    # a capacity rewrites no .env, a drain pauses no plan (review RV38B-17)
+    proc, calls, tree = _run(
+        tmp_path / "capacity",
+        "docker",
+        "capacity",
+        "--max-migrations",
+        "12",
+        "--dry-run",
+        env_file=ENV,
+    )
+    assert proc.returncode == 0 and calls == [], proc.stderr
+    assert (tree / "deploy" / "compose" / ".env").read_text() == ENV
+    assert "SEAMLESS_MAX_CONCURRENT_MIGRATIONS=12" in proc.stdout
+    proc, calls, _ = _run(
+        tmp_path / "drain",
+        "docker",
+        "stop",
+        "--drain",
+        "@TOKEN_FILE",
+        "--dry-run",
+        rules=_drain_rules([]),
+    )
+    assert proc.returncode == 0 and calls == [], proc.stderr
+    assert "/plans?status=running" in proc.stdout and "then wait" in proc.stdout
 
 
 API = "http://127.0.0.1:8080/api/v1"
@@ -600,6 +624,30 @@ def test_status_and_drain_ask_the_port_the_stack_publishes(tmp_path):
     assert proc.returncode == 0, proc.stderr
     asked = [c["args"][-1] for c in status + drain if c["cmd"] == "curl"]
     assert asked and all(url.startswith("http://127.0.0.1:18081/") for url in asked), asked
+
+
+def test_a_drain_waits_while_a_migration_verifies_or_rolls_back_too(tmp_path):
+    """SDD §17.2 (review RV38B-16): a drain waits until no migration is in cutover, verifying or
+    rolling_back - each of them asked again until it is clear, not cutover alone."""
+    busy = [{"stdout": '[{"id": "m-1"}]'}, {"stdout": "[]"}]
+    rules = [
+        {"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"stdout": RUNNING}]},
+        {"cmd": "curl", "has": ["phase=cutover"], "answers": [{"stdout": "[]"}]},
+        {"cmd": "curl", "has": ["phase=verifying"], "answers": busy},
+        {"cmd": "curl", "has": ["phase=rolling_back"], "answers": busy},
+    ]
+    proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", rules=rules)
+    assert proc.returncode == 0, proc.stderr
+    asked = [
+        phase
+        for c in calls
+        if c["cmd"] == "curl"
+        for phase in ("cutover", "verifying", "rolling_back")
+        if f"phase={phase}&" in c["args"][-1]
+    ]
+    assert asked == ["cutover", "verifying", "rolling_back"] * 2
+    assert "waiting: a migration is in verifying rolling_back" in proc.stdout + proc.stderr
+    assert [c for c in calls if c["cmd"] == "make"], "stopped once all three were clear"
 
 
 def test_a_drain_whose_pause_fails_names_the_plans_it_already_paused(tmp_path):
@@ -778,5 +826,12 @@ def test_the_make_targets_stop_start_and_restart_the_control_plane_alone():
     restart = dry("seamless-restart")
     assert "up -d --build --force-recreate --no-deps --wait --wait-timeout 300 seamless" in restart
     assert "SEAMLESS_DEMO=" in restart and ".Config.Env" in restart  # the mode the container ran in
+    # and the compose command it runs is handed that mode, not only the line it echoes (RV38B-18)
+    ran = next(
+        line.strip()
+        for line in restart.splitlines()
+        if "up -d --build --force-recreate" in line and not line.strip().startswith("echo")
+    )
+    assert ran.startswith("env ${mode:+SEAMLESS_DEMO=$mode} "), ran
     podman = dry("seamless-restart", "SEAMLESS_ENGINE=podman")
     assert "podman compose" in podman and "--wait" not in podman.split("seamless-restart")[0]
