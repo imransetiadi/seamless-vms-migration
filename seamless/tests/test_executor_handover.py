@@ -2203,6 +2203,134 @@ async def test_a_rollback_after_nova_accepted_the_source_deletion_never_gives_it
     assert not [c for c in ops(calls) if c[1] in ("dot", "start_server")], ops(calls)
 
 
+class _NovaAnswer(Exception):
+    """An answer of Nova's API with its HTTP status."""
+
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _deletion_taken_with_an_error(clouds, answer):
+    """Step 4's DELETE as Nova takes it while the executor sees no success (SDD §7.3, RV35B-01):
+    nova-api answers 500 once it saved ``task_state`` deleting (its cast to the host failed), or
+    the answer is lost while the compute host fails the deletion (ERROR); refused outright, a 409
+    changes nothing."""
+    src = clouds["src"]
+
+    def delete_server(s, ignore_missing=True):
+        server = src.servers[getattr(s, "id", s)]
+        src.record("delete_server", server.id)
+        if answer == "a 500 once it saved the deleting state":
+            server.task_state = "deleting"
+            raise _NovaAnswer("nova: HTTP 500 Internal Server Error (MessageDeliveryFailure)", 500)
+        if answer == "an answer lost while the host failed it":
+            server.status, server.task_state = "ERROR", None
+            raise _NovaAnswer("Gateway Timeout (HTTP 504)", 504)
+        raise _NovaAnswer("Cannot 'delete' instance srv-1 while it is in task_state rebooting", 409)
+
+    src.compute.delete_server = delete_server
+
+
+@pytest.mark.parametrize(
+    "answer", ["a 500 once it saved the deleting state", "an answer lost while the host failed it"]
+)
+async def test_a_deletion_nova_took_with_an_error_never_gets_its_volumes_back(tmp_path, answer):
+    """SDD §7.3 rollback (review RV35B-01): Nova took step 4's deletion though the executor saw no
+    success - nothing journaled it as sent. Step 4 journaled it as tried, and the source reads as
+    being deleted, or in ERROR: the rollback gives no delete_on_termination back and starts
+    nothing, so the deletion Nova finishes later - nova-compute resuming it, an operator clearing
+    the server - keeps every volume."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    finish = src.compute.delete_server  # Nova's own deletion: honours each attachment's flag
+    _deletion_taken_with_an_error(clouds, answer)
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    calls.clear()
+    with contextlib.suppress(TransientStepError, PermanentStepError):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert not [c for c in ops(calls) if c[1] in ("dot", "start_server")], ops(calls)
+    flags = dict(server.dot)
+    finish(server)  # the deletion Nova finishes later honours the flags it finds
+    assert src.deleted_by_nova == [], flags
+
+
+async def test_a_deletion_nova_refused_outright_still_gives_the_volumes_back(tmp_path):
+    """SDD §7.3 rollback (review RV35B-01): a DELETE Nova refused outright changes nothing - the
+    source stays SHUTOFF with no task: though step 4 tried it, the rollback gives the volumes
+    their delete_on_termination back and starts the source, as for any source that exists."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    _deletion_taken_with_an_error(clouds, "refused outright")
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.servers["srv-1"].dot == {"vol-root": True, "vol-data": False}
+    assert ("src", "start_server", "srv-1") in ops(calls)
+    assert "vm" not in result.details
+
+
+async def test_a_rollback_never_recreates_a_source_in_error_step_4_never_reached(tmp_path):
+    """SDD §7.3 rollback (review RV35B-01): ERROR counts as reached by step 4's deletion only once
+    step 4 tried it - a source that went to ERROR before (here during step 3) is no source Nova
+    deletes: the rollback neither deletes nor recreates it, and gives its volumes back."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    put = src.compute.put
+
+    def keep_fails(url, json=None, microversion=None, **kw):
+        if (
+            url.endswith("/vol-root")
+            and json["volumeAttachment"].get("delete_on_termination") is False
+        ):
+            server.status = "ERROR"  # the compute host broke meanwhile
+            return FakeResponse({"conflictingRequest": {"code": 409, "message": "busy"}}, 409)
+        return put(url, json=json, microversion=microversion, **kw)
+
+    src.compute.put = keep_fails
+    with pytest.raises((TransientStepError, PermanentStepError)):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.put = put
+    calls.clear()
+    with contextlib.suppress(TransientStepError, PermanentStepError):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert not [c for c in ops(calls) if c[1] in ("delete_server", "create_server")], ops(calls)
+    assert "srv-1" in src.servers
+
+
+async def test_a_retry_never_re_stops_a_source_step_4_reached(tmp_path):
+    """SDD §7.3 step 1 (review RV35B-01): a source in ERROR once step 4 tried its deletion - the
+    answer lost while the host failed it - has not run since the stop: the retry closes no clock
+    and sends no stop; step 4 sends the deletion again."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    delete = src.compute.delete_server
+    _deletion_taken_with_an_error(clouds, "an answer lost while the host failed it")
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.delete_server = delete  # the host fixed
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+
+    async def mark_end():
+        calls.append(("clock", "end", None))
+
+    async def mark_start(at=None):
+        calls.append(("clock", "start", at))
+
+    ctx.mark_downtime_end, ctx.mark_downtime_start = mark_end, mark_start
+    retried = len(calls)
+    await executor.run(StepName.CUTOVER, ctx)
+    seen = [
+        c for c in calls[retried:] if c[0] == "clock" or c[1] in ("stop_server", "delete_server")
+    ]
+    assert seen == [("clock", "start", None), ("src", "delete_server", "srv-1")]
+    assert src.deleted_by_nova == []
+
+
 async def test_a_rollback_that_cannot_read_the_source_fails_as_its_answer_says(tmp_path):
     """SDD §7.3 rollback (review RV34B-02): whether the source still exists decides between giving
     its volumes back and recreating it - a read Nova does not answer fails the attempt by that

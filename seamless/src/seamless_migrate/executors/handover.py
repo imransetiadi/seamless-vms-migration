@@ -285,6 +285,21 @@ def _active(server: Any) -> bool:
     return str(_attr(server, "status", "")).upper() == "ACTIVE"
 
 
+def _reached_by_deletion(journal: _Journal, server: Any) -> bool:
+    """Whether step 4's deletion reached the source (SDD §7.3, reviews RV34B-02, RV35B-01): Nova
+    accepted it and the server does not read ACTIVE; Nova reads it as being deleted, whatever the
+    journal holds; or it is in ERROR once the deletion was tried - Nova may take a deletion whose
+    answer is an error, a 500 once it saved the deleting state, or is lost while the compute host
+    fails it. Nova starts no such server, and its deletion honours delete_on_termination."""
+    if str(_attr(server, "task_state") or "").lower() == "deleting":
+        return True
+    if journal.done("sent:delete_source"):
+        return not _active(server)
+    return journal.done("try:delete_source") and (
+        str(_attr(server, "status", "")).upper() == "ERROR"
+    )
+
+
 def _conflict(exc: BaseException) -> bool:
     """Nova's or Cinder's 409: the action is refused in the resource's present state."""
     return (getattr(exc, "status_code", None) or getattr(exc, "http_status", None)) == 409
@@ -1324,10 +1339,10 @@ class HandoverExecutor:
             server = _existing_server(src, server_id)
             if server is None:
                 return None
-            if journal.done("sent:delete_source") and not _active(server):
-                # its deletion accepted: Nova starts no server it deletes or that a failed deletion
-                # left in ERROR, and its stop of one never reads SHUTOFF - step 4 sends the
-                # deletion again (review RV33-03)
+            if _reached_by_deletion(journal, server):
+                # Nova starts no server it deletes or that a failed deletion left in ERROR, and
+                # its stop of one never reads SHUTOFF - step 4 sends the deletion again (reviews
+                # RV33-03, RV35B-01)
                 return None
             return settle(server)
 
@@ -1426,6 +1441,10 @@ class HandoverExecutor:
             def delete_source() -> None:
                 server = _existing_server(src, server_id)
                 if server is not None:
+                    # tried first: Nova may take the deletion while its answer is an error or
+                    # lost, which journals nothing as sent (SDD §7.3, review RV35B-01)
+                    if not journal.done("try:delete_source"):
+                        journal.mark("try:delete_source")
                     src.compute.delete_server(server, ignore_missing=True)
                     # Nova accepted it: a retry stops no server Nova deletes (step 1, RV33-03)
                     if not journal.done("sent:delete_source"):
@@ -1681,13 +1700,11 @@ class HandoverExecutor:
             found = await self._call(
                 "read the source server", lambda: _existing_server(src, server_id)
             )
-            # a deletion Nova accepted (step 4) leaves a server it is deleting, or one a failed
-            # deletion left in ERROR: Nova starts neither, and a deletion it finishes honours the
-            # delete_on_termination it finds - recreated as one gone unless it runs (SDD §7.3
-            # rollback, review RV34B-02)
-            source_gone = found is None or (
-                journal.done("sent:delete_source") and not _active(found)
-            )
+            # step 4's deletion reached it - accepted, or taken with an error or a lost answer:
+            # Nova starts no such server, and a deletion it finishes honours the
+            # delete_on_termination it finds - recreated as one gone (SDD §7.3 rollback, reviews
+            # RV34B-02, RV35B-01)
+            source_gone = found is None or _reached_by_deletion(journal, found)
         new_server_id = server_id
         if any_unmanaged or source_gone:
             if not journal.done("delete_source") and not journal.done("rb:delete_stale_source"):
