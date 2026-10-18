@@ -190,6 +190,29 @@ class DetachStuck(RuntimeError):
     (review RV35A-01)."""
 
 
+def _program(command):
+    """The program a remote command runs: its first word past sudo and options."""
+    for word in " ".join(str(part) for part in command).split():
+        if word != "sudo" and not word.startswith("-"):
+            return word.rsplit("/", 1)[-1]
+    return "a command"
+
+
+class RemoteCommandFailed(subprocess.CalledProcessError):
+    """A command on the conversion host that failed by itself - an exit status other than
+    ssh's own SSH_FAILED. Its message names the program and the status, never ssh's command
+    line: ConnectTimeout among ssh's options read as a "timeout", which the control plane
+    retries as transient, so a failure no retry fixes ran again with the source VM stopped
+    (Seamless Migrate SDD 6.6, review RV42B-02). ``cmd`` is the remote command, which the
+    module's log holds in full."""
+
+    def __str__(self):
+        return "%s on the conversion host exited with status %d" % (
+            _program(self.cmd),
+            self.returncode,
+        )
+
+
 class DiskIdentityError(RuntimeError):
     """A disk failed its identity check: it is another volume's, or the volume
     left the conversion host. Permanent: import_workload_transfer_volumes, the
@@ -1098,10 +1121,20 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
         return preamble
 
     def cmd_out(self, command, **kwargs):
-        """Run command on the target conversion host and get the output."""
+        """Run command on the target conversion host and get the output. A command that fails
+        by itself raises RemoteCommandFailed; ssh's own failure (SSH_FAILED) subprocess's
+        CalledProcessError, whose ssh command line the control plane retries as transient
+        (Seamless Migrate SDD 6.6, review RV42B-02)."""
         args = self.ssh_preamble()
         args.extend(command)
-        return subprocess.check_output(args, **kwargs).decode("utf-8").strip()
+        try:
+            return subprocess.check_output(args, **kwargs).decode("utf-8").strip()
+        except subprocess.CalledProcessError as err:
+            if err.returncode == SSH_FAILED:
+                raise
+            raise RemoteCommandFailed(
+                err.returncode, list(command), err.output, err.stderr
+            ) from None
 
     def cmd_val(self, command, **kwargs):
         """Run command on the target conversion host and get return code."""

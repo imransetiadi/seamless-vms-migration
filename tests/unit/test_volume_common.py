@@ -348,6 +348,41 @@ def test_a_lock_wait_rides_out_a_failed_ssh_now_and_then_and_a_busy_lock():
     assert clock.now > volume_common.SSH_UNREACHABLE_S
 
 
+@pytest.mark.parametrize(
+    ("command", "status", "message"),
+    [
+        (["sudo", "nbdkit", "--readonly", "file", "file=/dev/vdb"], 1, "nbdkit"),
+        (['pgrep -f "ssh -o ConnectTimeout=10 -L 10809:localhost:10809 h"'], 1, "pgrep"),
+        (["sudo", "nbdkit", "--readonly", "file", "file=/dev/vdb"], 255, None),
+    ],
+    ids=["nbdkit failing", "a pattern that holds an ssh command", "ssh failing"],
+)
+def test_a_remote_command_failing_by_itself_names_its_program_not_sshs_options(
+    command, status, message
+):
+    """Seamless Migrate SDD 6.6 (review RV42B-02): a command on the conversion host that fails by
+    itself names its program and exit status - ssh's command line, ConnectTimeout among its
+    options, read as a "timeout" the control plane retried with the source VM stopped -, while
+    ssh's own failure (255) is raised as subprocess raises it, its command line kept."""
+    shell = volume_common.RemoteShell("10.0.0.10", "cloud-user", "/keys/k")
+
+    def ssh_exits(args, **kwargs):
+        raise subprocess.CalledProcessError(status, args, output=b"partial")
+
+    with mock.patch.object(volume_common.subprocess, "check_output", ssh_exits):
+        with pytest.raises(subprocess.CalledProcessError) as caught:
+            shell.cmd_out(command)
+    err = caught.value
+    assert (err.returncode, err.output) == (status, b"partial")
+    if message is None:
+        assert not isinstance(err, volume_common.RemoteCommandFailed)
+        assert "ConnectTimeout=10" in str(err)
+    else:
+        assert isinstance(err, volume_common.RemoteCommandFailed) and err.cmd == command
+        assert str(err) == f"{message} on the conversion host exited with status {status}"
+        assert err.__suppress_context__  # the ssh command line goes with no traceback either
+
+
 def test_conversion_host_ssh_keeps_the_link_alive():
     """SDD §6.6: a silent partition ends the ssh in about a minute (audit COL-09), for module
     commands and for the data link a warm pass opens from the destination to the source."""

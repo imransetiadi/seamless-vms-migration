@@ -22,7 +22,7 @@ import yaml
 
 from seamless_migrate.config import find_repo_root
 from seamless_migrate.executors.ansible import SERVER_TYPE, TRANSIENT, classify_failure
-from seamless_migrate.executors.base import PermanentStepError
+from seamless_migrate.executors.base import PermanentStepError, TransientStepError
 
 #: a module that runs the cold export's detach of a data volume (OpenstackVolumeExport.
 #: _detach_data_volumes_from_source, the real detach_volume_bounded) against a cloud whose
@@ -363,6 +363,123 @@ def test_a_failed_exports_volume_names_never_make_a_stuck_detach_transient(tmp_p
     assert "Timed out after 2 s waiting to detach volume vol-data from server srv-1" in output
     assert volume_name not in output, output
     assert classify_failure(output) is PermanentStepError
+
+
+#: the real export module on the collection's fakes (test_cold_export_failure's source host): its
+#: NBD server's start on the conversion host goes through the real RemoteShell.cmd_out, whose ssh
+#: exits with the status given - 255 ssh's own failure, any other the remote command's; prints the
+#: module's failure result
+NBD_START_FAILURE = textwrap.dedent(
+    """\
+    import json
+    import subprocess
+    import sys
+    from unittest import mock
+
+    from ansible_collections.os_migrate.os_migrate.plugins.module_utils import volume_common
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_export_volumes as export,
+    )
+    from ansible_collections.os_migrate.os_migrate.tests.unit import fake_openstack as fake
+    from ansible_collections.os_migrate.os_migrate.tests.unit import (
+        test_cold_export_failure as cold,
+    )
+
+    status = int(sys.argv[1])
+    RealShell = volume_common.RemoteShell  # run_module patches the name with the factory
+
+
+    class NbdServerFails(cold.SourceHost):
+        def __call__(self, address, ssh_user, key_path=None):
+            shell = super().__call__(address, ssh_user, key_path)
+            out = shell.cmd_out
+            real = RealShell(address, ssh_user, key_path)
+
+            def ssh_exits(args, **kwargs):
+                raise subprocess.CalledProcessError(status, args)
+
+            def cmd_out(command, **kwargs):
+                if "nbdkit" in command and "--readonly" in command:
+                    with mock.patch.object(volume_common.subprocess, "check_output", ssh_exits):
+                        return real.cmd_out(command, **kwargs)
+                return out(command, **kwargs)
+
+            shell.cmd_out = cmd_out
+            return shell
+
+
+    src, data = cold._boot_from_volume_vm()
+    with mock.patch.object(volume_common.time, "sleep"):
+        result = fake.run_module(export, dict(cold.COMMON, data=data), src, NbdServerFails(src))
+    for key in ("_exit_code", "_connected", "failed", "invocation"):
+        result.pop(key, None)
+    print(json.dumps(result))
+    """
+)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(1, PermanentStepError), (255, TransientStepError)],
+    ids=["the remote command fails by itself", "ssh fails"],
+)
+def test_a_remote_command_failing_by_itself_stays_permanent_and_ssh_failing_transient(
+    tmp_path, status, expected
+):
+    """SDD §6.6 (reviews RV15-01, RV42B-02): the cold export's NBD server fails to start on the
+    conversion host with the source VM stopped. Its error quoted ssh's whole command line,
+    `-o ConnectTimeout=10` among its options, which TRANSIENT reads as a "timeout": a failure no
+    retry fixes was retried, another export with the source stopped. A remote command failing by
+    itself names its program and status and stays permanent; ssh's own failure (255) keeps its
+    command line, retried as transient as §6.6 relies on."""
+    run = subprocess.run(
+        [sys.executable, "-c", NBD_START_FAILURE, str(status)],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(_collections(tmp_path)),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    result_file = tmp_path / "result.json"
+    result_file.write_text(run.stdout)
+    work = tmp_path / "work"
+    (work / "library").mkdir(parents=True)
+    (work / "library" / "fail_as.py").write_text(FAIL_AS)
+    task = {
+        "name": "Import a workload",
+        "block": [
+            {
+                "name": "Expose source volumes",
+                "fail_as": {"result_file": str(result_file)},
+                "register": "exports",
+            }
+        ],
+        "rescue": [
+            {
+                "name": "Fail if there was a problem in the migration",
+                "ansible.builtin.fail": {"msg": "Failed to import srv-1."},
+            }
+        ],
+    }
+    play = {
+        "name": "Import workloads",
+        "hosts": "localhost",
+        "connection": "local",
+        "gather_facts": False,
+        "tasks": [task],
+    }
+    (work / "play.yml").write_text(yaml.safe_dump([play], sort_keys=False))
+
+    output = _run_playbook(tmp_path, _playbook(), work)
+
+    assert ("ConnectTimeout" in output) is (status == 255), output[-2000:]
+    assert classify_failure(output) is expected
 
 
 def _collection_error_classes() -> dict[str, str]:
