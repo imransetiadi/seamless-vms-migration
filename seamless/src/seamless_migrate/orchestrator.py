@@ -282,30 +282,31 @@ def _add_model_s(m: Migration, details: dict[str, Any]) -> None:
         m.downtime_model_s = (m.downtime_model_s or 0.0) + float(model_s)
 
 
-def _last_attempt_ran_a_cutover(m: Migration) -> bool:
-    """Whether ``m``'s last attempt reached its cutover: one since it last entered pre-copy."""
+def _passes_since_the_kit_released_its_copies(m: Migration) -> list[SyncPass]:
+    """A vmware_warm ``m``'s passes since the kit last released its copies (SDD §9.3, §7.2,
+    reviews RV40-05, RV41B-02): those that started once the attempt after its last cutover entered
+    pre-copy - a cutover's own final pass not among them -, every pass when no cutover ran, none
+    when its last attempt ran one. The kit's rollback deletes its copies after a cutover, or marks
+    them cutover; the copies an attempt with no cutover completed stay, marked, and a later run cut
+    off - a CBT sync of them - keeps them."""
+    entered = None  # when the first attempt after the last cutover entered pre-copy
     for change in reversed(m.phase_history):
         if change.to_phase == Phase.cutover:
-            return True
+            return [] if entered is None else [p for p in m.sync_passes if p.started_at >= entered]
         if change.to_phase == Phase.precopy:
-            return False
-    return False
+            entered = change.at
+    return list(m.sync_passes)
 
 
 def _kept_after_rollback(m: Migration) -> bool:
     """What a rollback kept of ``m``'s copies where no workload record tells - the demo, the VMware
-    kit (SDD §5.1, §9.3, reviews RV39-02, RV40-05): a warm migration's passes, and passes a
-    vmware_warm one's last attempt recorded with no cutover of that attempt - the kit's rollback
-    deletes its copies after one, or marks them cutover (§7.2); a cold, vmware_cold or handover
-    rollback keeps no copy."""
+    kit (SDD §5.1, §9.3, reviews RV39-02, RV40-05, RV41B-02): a warm migration's passes, and a
+    vmware_warm one's passes since the kit last released its copies (§7.2); a cold, vmware_cold or
+    handover rollback keeps no copy."""
     if m.strategy == Strategy.warm:
         return bool(m.sync_passes)
     if m.strategy == Strategy.vmware_warm:
-        # the last attempt's passes alone: an earlier attempt's tell nothing of what the kit still
-        # holds - it deletes its copies after a cutover and a first copy cut off (review RV40-05)
-        since = _phase_started(m, Phase.precopy)
-        passes = [p for p in m.sync_passes if since is None or p.started_at >= since]
-        return bool(passes) and not _last_attempt_ran_a_cutover(m)
+        return bool(_passes_since_the_kit_released_its_copies(m))
     return False
 
 

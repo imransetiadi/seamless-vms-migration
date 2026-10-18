@@ -520,25 +520,93 @@ async def test_where_no_record_tells_copied_data_is_what_a_rollback_kept(
 async def test_an_earlier_attempts_passes_hold_no_kit_copy_of_a_later_attempt(
     tmp_path, store, strategy, held
 ):
-    """SDD §9.3, §5.1 (review RV40-05): attempt 1 recorded its passes and ran its cutover - the
-    kit's rollback deleted its copies -, attempt 2's first copy was cut off with no pass recorded
-    (the kit deletes it too): the passes are attempt 1's and tell nothing of what the kit still
-    holds - nothing. A warm migration's rollback keeps its volumes for every later attempt: its
-    passes still hold them."""
+    """SDD §9.3, §5.1 (reviews RV40-05, RV41B-02): attempt 1 recorded its passes and ran its
+    cutover - the kit's rollback deleted its copies, the cutover's own final pass with them -,
+    attempt 2's first copy was cut off with no pass recorded (the kit deletes it too): no pass
+    since the kit released its copies, so it holds nothing. A warm migration's rollback keeps its
+    volumes for every later attempt: its passes still hold them."""
     h, plan = await setup(tmp_path, store, [vm(1)])
     history = _history(*CUT, P.ready, P.precopy, P.failed, P.ready)
     first_attempt = history[: len(CUT)]
+    # the cutover's own final pass, recorded while it ran (review RV41B-02): released all the same
+    cut_at = next(c.at for c in history if c.to_phase == P.cutover)
+    final = SyncPass(
+        number=3, kind="final", started_at=cut_at + timedelta(seconds=5), duration_s=30.0
+    )
     m = make_migration(
         plan_id=plan.id,
         vm=vm(1),
         strategy=strategy,
         phase=P.ready,
         phase_history=history,
-        sync_passes=_passes(2, first_attempt),
+        sync_passes=[*_passes(2, first_attempt), final],
     )
     try:
         assert await h.orch.holds_destination_volumes(m) is held
         assert await h.orch.copied_data(m) is held
+    finally:
+        await h.orch.stop()
+
+
+@pytest.mark.parametrize(
+    ("earlier", "later"),
+    [
+        ((), (P.ready, P.precopy, P.rolling_back, P.rolled_back, P.ready)),
+        ((), (P.ready, P.precopy, P.failed, P.ready)),
+        ((*CUT, P.ready), (P.ready, P.precopy, P.failed, P.ready)),
+    ],
+    ids=[
+        "attempt 2 rolled back during its first run",
+        "attempt 2's first run failed",
+        "after a cutover's attempt, the next one's copies through a third cut off",
+    ],
+)
+async def test_an_uncut_attempts_kit_copies_stay_through_a_later_attempt_cut_off(
+    tmp_path, store, earlier, later
+):
+    """SDD §9.3, §7.2, §5.1 (review RV41B-02): attempt 1 completed its passes and ran no cutover -
+    the kit marked its copies seamless_copied true, and its rollback kept them -, attempt 2's
+    first run, a CBT sync of those copies, was cut off before it recorded a pass: the copies stay,
+    so the kit still holds them - only a cutover releases them (RV40-05). The rule took attempt 2's
+    passes alone and read them released: a false quota shortfall for another VM, a provider
+    deleted under a rolled-back VM's copies."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*earlier, *UNCUT, *later)
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=Strategy.vmware_warm,
+        phase=later[-1],
+        phase_history=history,
+        sync_passes=_passes(2, history[: len(earlier) + len(UNCUT)]),
+    )
+    try:
+        assert await h.orch.holds_destination_volumes(m) is True
+        assert await h.orch.copied_data(m) is True
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_pass_that_started_as_the_attempt_after_a_cutover_began_holds_kit_copies(
+    tmp_path, store
+):
+    """SDD §9.3 (review RV41B-04): the passes since the kit last released its copies are those
+    that started once the attempt after the last cutover entered pre-copy - one that started at
+    that very instant among them."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*CUT, P.ready, *UNCUT)
+    entered = history[len(CUT) + 1].at
+    assert history[len(CUT) + 1].to_phase == P.precopy
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=Strategy.vmware_warm,
+        phase=P.rolled_back,
+        phase_history=history,
+        sync_passes=[SyncPass(number=1, kind="full", started_at=entered, duration_s=60.0)],
+    )
+    try:
+        assert await h.orch.holds_destination_volumes(m) is True
     finally:
         await h.orch.stop()
 

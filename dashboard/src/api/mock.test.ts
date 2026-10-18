@@ -1550,6 +1550,71 @@ describe('mock API', () => {
     expect(remove().status).toBe(204);
   });
 
+  it('holds a vmware_warm migration\'s kit copies through the passes since the kit last released them, as the API (SDD §9.3, §7.2, reviews RV41B-02, RV41B-04)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const rolled = server.migrations.find((m) => m.phase === 'rolled_back')!;
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    const id = plan.destination_provider_id;
+    const users = server.plans.filter((p) => p.source_provider_id === id || p.destination_provider_id === id);
+    for (const p of users) p.status = 'completed';
+    for (const m of server.migrations.filter((x) => users.some((p) => p.id === x.plan_id))) m.phase = 'finalized';
+    const provider = server.providers.find((p) => p.id === id)!;
+    const remove = () => {
+      const status = server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin').status;
+      if (status === 204) server.providers.push(provider);
+      return status;
+    };
+    rolled.phase = 'rolled_back';
+    rolled.strategy = 'vmware_warm';
+    const step = (from_phase: Migration['phase'], to_phase: Migration['phase'], at: string) => ({ from_phase, to_phase, at, reason: 'test', actor: 'test' });
+    const pass = (number: number, started_at: string, kind: 'full' | 'delta' | 'final' = number === 1 ? 'full' : 'delta') => ({
+      number, kind, started_at, ended_at: started_at, bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 60,
+    });
+    // attempt 1 completed two passes and ran no cutover: the kit marked its copies, its rollback kept them; attempt 2's
+    // first run - a CBT sync of those copies - was cut off before a pass: they stay (RV41B-02)
+    const uncut = [
+      step('ready', 'precopy', '2026-10-08T08:00:00Z'),
+      step('precopy', 'syncing', '2026-10-08T08:30:00Z'),
+      step('syncing', 'awaiting_cutover', '2026-10-08T09:00:00Z'),
+      step('awaiting_cutover', 'rolling_back', '2026-10-08T09:10:00Z'),
+      step('rolling_back', 'rolled_back', '2026-10-08T09:11:00Z'),
+      step('rolled_back', 'ready', '2026-10-08T10:00:00Z'),
+    ];
+    rolled.sync_passes = [pass(1, '2026-10-08T08:00:01Z'), pass(2, '2026-10-08T08:30:01Z')];
+    rolled.phase_history = [...uncut, step('ready', 'precopy', '2026-10-08T10:01:00Z'), step('precopy', 'rolling_back', '2026-10-08T10:05:00Z'), step('rolling_back', 'rolled_back', '2026-10-08T10:06:00Z')];
+    expect(remove()).toBe(409);
+    rolled.phase_history = [...uncut, step('ready', 'precopy', '2026-10-08T10:01:00Z'), step('precopy', 'failed', '2026-10-08T10:05:00Z'), step('failed', 'rolled_back', '2026-10-08T10:06:00Z')];
+    expect(remove()).toBe(409);
+    // attempt 1 ran its cutover - its rollback deleted the copies, its own final pass with them -, attempt 2's first copy
+    // was cut off: nothing since the kit released them
+    const cut = [
+      step('ready', 'precopy', '2026-10-08T08:00:00Z'),
+      step('precopy', 'awaiting_cutover', '2026-10-08T09:00:00Z'),
+      step('awaiting_cutover', 'cutover', '2026-10-08T09:10:00Z'),
+      step('cutover', 'rolling_back', '2026-10-08T09:20:00Z'),
+      step('rolling_back', 'rolled_back', '2026-10-08T09:21:00Z'),
+      step('rolled_back', 'ready', '2026-10-08T10:00:00Z'),
+      step('ready', 'precopy', '2026-10-08T10:01:00Z'),
+    ];
+    rolled.sync_passes = [pass(1, '2026-10-08T08:00:01Z'), pass(2, '2026-10-08T09:10:05Z', 'final')];
+    rolled.phase_history = [...cut, step('precopy', 'rolling_back', '2026-10-08T10:05:00Z'), step('rolling_back', 'rolled_back', '2026-10-08T10:06:00Z')];
+    expect(remove()).toBe(204);
+    // a pass that started as attempt 2 entered pre-copy - the mock's seeds stamp pass 1 so - holds them (RV41B-04)
+    rolled.sync_passes = [...rolled.sync_passes, pass(3, '2026-10-08T10:01:00Z', 'full')];
+    expect(remove()).toBe(409);
+    // attempt 2 completed it and ran no cutover; attempt 3's first run was cut off: the copies stay
+    rolled.phase_history = [
+      ...cut,
+      step('precopy', 'rolling_back', '2026-10-08T10:05:00Z'),
+      step('rolling_back', 'rolled_back', '2026-10-08T10:06:00Z'),
+      step('rolled_back', 'ready', '2026-10-08T11:00:00Z'),
+      step('ready', 'precopy', '2026-10-08T11:01:00Z'),
+      step('precopy', 'failed', '2026-10-08T11:02:00Z'),
+      step('failed', 'rolled_back', '2026-10-08T11:03:00Z'),
+    ];
+    expect(remove()).toBe(409);
+  });
+
   it('refuses a rollback whose provider no longer exists, like the API: nothing changes (SDD §5.1)', async () => {
     const { server, client } = setup('operator');
     const done = byPhase(server, 'completed');

@@ -315,29 +315,34 @@ const DATA_SENT: DataSentItem[] = [
   { decision_type: 'console_screening', tool: 'jev_screen', fields: [{ key: 'console', label: 'The last 6,000 characters of the console, redacted' }], sent: false, note: LOCAL_CONSOLE },
 ];
 
-/** Whether `m`'s last attempt reached its cutover: one since it last entered pre-copy (the API's `_last_attempt_ran_a_cutover`). */
-function lastAttemptRanACutover(m: Migration): boolean {
+/**
+ * A vmware_warm `m`'s passes since the kit last released its copies (the API's `_passes_since_the_kit_released_its_copies`,
+ * SDD §9.3, §7.2, reviews RV40-05, RV41B-02): those that started once the attempt after its last cutover entered pre-copy -
+ * a cutover's own final pass not among them -, every pass when no cutover ran, none when its last attempt ran one.
+ */
+function passesSinceTheKitReleasedItsCopies(m: Migration): Migration['sync_passes'] {
+  let entered: string | undefined; // when the first attempt after the last cutover entered pre-copy
   for (const change of [...m.phase_history].reverse()) {
-    if (change.to_phase === 'cutover') return true;
-    if (change.to_phase === 'precopy') return false;
+    if (change.to_phase === 'cutover') {
+      if (entered === undefined) return [];
+      const since = Date.parse(entered);
+      return m.sync_passes.filter((p) => Date.parse(p.started_at) >= since);
+    }
+    if (change.to_phase === 'precopy') entered = change.at;
   }
-  return false;
+  return m.sync_passes;
 }
 
 /**
- * What a rollback kept of `m`'s copies (SDD §5.1, §9.3, reviews RV39-02, RV40-05): the mock keeps no workload record, so
- * as the API without one (`_kept_after_rollback`) - a warm migration's passes, and passes a vmware_warm one's last attempt
- * recorded with no cutover of that attempt (the kit's rollback deletes its copies after one, or marks them cutover); a cold, vmware_cold or handover
- * rollback keeps no copy. It is the destination volumes a migration holds (§9.3) and the copied data it keeps (§5.1).
+ * What a rollback kept of `m`'s copies (SDD §5.1, §9.3, reviews RV39-02, RV40-05, RV41B-02): the mock keeps no workload
+ * record, so as the API without one (`_kept_after_rollback`) - a warm migration's passes, and a vmware_warm one's passes
+ * since the kit last released its copies (its rollback deletes them after a cutover, or marks them cutover; an attempt
+ * with no cutover leaves them marked for the next run's CBT sync); a cold, vmware_cold or handover rollback keeps no copy.
+ * It is the destination volumes a migration holds (§9.3) and the copied data it keeps (§5.1).
  */
 function keptAfterRollback(m: Migration): boolean {
   if (m.strategy === 'warm') return m.sync_passes.length > 0;
-  if (m.strategy === 'vmware_warm') {
-    // the last attempt's passes alone: an earlier attempt's tell nothing of what the kit still holds (review RV40-05)
-    const since = [...m.phase_history].reverse().find((c) => c.to_phase === 'precopy')?.at;
-    const passes = m.sync_passes.filter((p) => since === undefined || Date.parse(p.started_at) >= Date.parse(since));
-    return passes.length > 0 && !lastAttemptRanACutover(m);
-  }
+  if (m.strategy === 'vmware_warm') return passesSinceTheKitReleasedItsCopies(m).length > 0;
   return false;
 }
 
