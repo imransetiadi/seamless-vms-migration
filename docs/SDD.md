@@ -3811,10 +3811,13 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   stack comes back a demo stack and a real one a real one.
 * **Stopping safely.** A stop is safe at any time (§8): running steps end within the stop grace and resume from
   their checkpoint once the control plane runs again. `--drain TOKEN_FILE` makes a planned stop quieter: before
-  `down`, `stop`, `restart` or `scale 0` it pauses every running plan (`POST /plans/{id}/pause`), so no new
-  migration starts, and waits until no migration is in `cutover`, `verifying` or `rolling_back` - a cutover ends
-  rather than resuming after the restart - for at most `--wait-timeout` seconds (default 1800; a timeout stops
-  nothing). It prints the plans it paused, which `resume --token-file TOKEN_FILE PLAN_ID...` starts again (`POST
+  `down`, `stop`, `restart`, `scale 0` or `capacity` - which ends in a restart (review RV38B-22) - it pauses every
+  running plan (`POST /plans/{id}/pause`), so no new migration starts, and waits until no migration is in
+  `cutover`, `verifying` or `rolling_back` - a cutover ends rather than resuming after the restart - for at most
+  `--wait-timeout` seconds (default 1800; a timeout stops and changes nothing). A `capacity` that would be refused
+  pauses no plan: its checks - `deploy/compose/.env` present on the single host, the server-side dry run of a
+  cluster's limits - run before the drain, the dry run again after it. It prints the plans it paused, which
+  `resume --token-file TOKEN_FILE PLAN_ID...` starts again (`POST
   /plans/{id}/start`). The operator's token is read from a file only its owner may read - any other mode is refused
   - and reaches curl through a header file in a private directory, never a command line (§13.1); the API is
   `http://127.0.0.1:<SEAMLESS_HOST_PORT>` on the single host - the port Compose publishes: the shell's, else
