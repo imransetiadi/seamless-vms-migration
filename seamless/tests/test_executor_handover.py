@@ -1810,6 +1810,67 @@ async def test_a_retry_after_a_first_stop_never_confirmed_counts_the_run_since(t
         assert seen == [("clock", "start", None)]  # the first stop's outage goes on
 
 
+@pytest.mark.parametrize("first_stop", ["journaled as sent only", "confirmed"])
+async def test_a_close_that_fails_never_reopens_the_clock_at_the_first_stop(tmp_path, first_stop):
+    """SDD §5.2, §7.3 step 1 (review RV35B-03): a step that finds the source running closes the
+    clock before it stops the source again; when that close fails - its event write, or a cancel
+    landing in it - the step's failure never reopens the clock at the first stop's time: the
+    source runs, and only a re-stop Nova accepted opens a new outage."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    stop, ports = src.compute.stop_server, src.network.ports
+    wait, start = src.compute.wait_for_server, src.compute.start_server
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    if first_stop == "confirmed":
+        failing = []
+
+        def stop_then_fail_the_definition(s):
+            stop(s)
+            failing.append(1)
+
+        def neutron_once(**query):
+            if failing:
+                failing.clear()
+                raise RuntimeError("neutron: HTTP 503 Service Unavailable")
+            return ports(**query)
+
+        src.compute.stop_server, src.network.ports = stop_then_fail_the_definition, neutron_once
+        with pytest.raises((TransientStepError, PermanentStepError), match="record source"):
+            await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        src.compute.stop_server = stop
+    else:
+        src.compute.wait_for_server = wait_fails  # the first stop: accepted, its wait fails
+        with pytest.raises((TransientStepError, PermanentStepError), match="stop source server"):
+            await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+
+    def start_server(s):  # Nova performs the rollback's start, whose wait fails
+        src.record("start_server", s.id)
+        s.status = "ACTIVE"
+
+    src.compute.start_server, src.compute.wait_for_server = start_server, wait_fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.start_server, src.compute.wait_for_server = start, wait
+
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+
+    async def close_fails():
+        calls.append(("clock", "end", None))
+        raise RuntimeError("store error writing the event")
+
+    async def mark_start(at=None):
+        calls.append(("clock", "start", at))
+
+    ctx.mark_downtime_end, ctx.mark_downtime_start = close_fails, mark_start
+    retried = len(calls)
+    with pytest.raises(RuntimeError, match="store error writing the event"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert [c for c in calls[retried:] if c[0] == "clock"] == [("clock", "end", None)]
+
+
 async def test_a_refused_re_stop_never_reopens_the_clock_at_an_earlier_re_stops_time(tmp_path):
     """SDD §5.2, §7.3 step 1 (review RV33-04): a re-stop opens a new outage only once Nova accepted
     that re-stop - an earlier attempt's accepted re-stop, journaled, is no start for a re-stop Nova

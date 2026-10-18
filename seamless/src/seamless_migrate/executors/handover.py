@@ -1342,9 +1342,10 @@ class HandoverExecutor:
                     # only the first stop was journaled as sent, its wait failed or cut off: a
                     # rollback's start Nova performed, or an operator's, ran the source since -
                     # that outage ended and this stop opens a new one (SDD §5.2, §7.3 step 1,
-                    # review RV34B-04)
-                    await outlive_cancel(ctx.mark_downtime_end())
+                    # review RV34B-04) - marked first: a close that fails never reopens the clock
+                    # at the first stop (review RV35B-03)
                     restopping = True
+                    await outlive_cancel(ctx.mark_downtime_end())
                     await self._call("stop source server", lambda: stop(server, again=True))
                 else:
                     await self._call("stop source server", lambda: stop(server))
@@ -1353,9 +1354,9 @@ class HandoverExecutor:
                 server = await self._call("stop source server", to_stop_again)
                 if server is not None and not _stopped(server):
                     # it ran since the first stop: that outage ended - the clock closes - and this
-                    # stop opens a new one (SDD §5.2, §7.3 step 1, review RV33-04)
-                    await outlive_cancel(ctx.mark_downtime_end())
+                    # stop opens a new one (SDD §5.2, §7.3 step 1, reviews RV33-04, RV35B-03)
                     restopping = True
+                    await outlive_cancel(ctx.mark_downtime_end())
                     await self._call("stop source server", lambda: stop(server, again=True))
         except (Exception, asyncio.CancelledError):
             # SDD §7.3 step 1: the stop Nova accepted may have stopped the source - the clock opens
