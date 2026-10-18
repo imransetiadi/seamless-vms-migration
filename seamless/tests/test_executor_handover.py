@@ -2486,6 +2486,77 @@ async def test_a_recreated_source_whose_build_fails_keeps_every_volume_and_is_bu
     assert result.details["vm"]["source_id"] == "src-new-2"
 
 
+async def test_a_rollback_cancelled_in_the_recreate_still_journals_it_and_closes_the_clock(
+    tmp_path,
+):
+    """SDD §5.2, §7.3 rollback (review RV37A-01): a cancel - the step timeout, a shutdown - that
+    lands while Nova builds the recreated source waits out the call, its journal mark and the
+    clock's close, which run as one: the source runs, so the clock is closed and rb:create_source
+    journaled, and the cutover a Retry resumes refuses before any call."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
+    src = clouds["src"]
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    wait = src.compute.wait_for_server
+    waiting = threading.Event()
+
+    def slow(s, status="ACTIVE", **kw):
+        if status == "ACTIVE" and str(s.id).startswith("src-new-"):
+            waiting.set()
+            time.sleep(0.5)  # the cancel lands here; Nova reads the server ACTIVE when it ends
+        return wait(s, status=status, **kw)
+
+    src.compute.wait_for_server = slow
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    task = asyncio.ensure_future(executor.run(StepName.ROLLBACK, ctx))
+    assert await asyncio.to_thread(waiting.wait, 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    run_dir = executor.run_dir(make_ctx(plan, mig, SRC, DST, settings)[0])
+    done = json.loads((run_dir / "handover-journal.json").read_text())["done"]
+    assert src.servers["src-new-1"].status == "ACTIVE"
+    assert rec.downtime_ends == 1 and done["rb:create_source"]["server_id"] == "src-new-1"
+    src.compute.wait_for_server = wait
+    calls.clear()
+    with pytest.raises(PermanentStepError, match="roll back to finish it"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert calls == []
+
+
+@pytest.mark.parametrize("path", ["no definition yet", "the source still exists"])
+async def test_a_rollback_cancelled_in_the_start_still_closes_the_clock(tmp_path, path):
+    """SDD §5.2, §7.3 rollback (review RV37A-01): a cancel that lands while the source starts waits
+    out the start, the clock's close and its journal mark - on both start paths."""
+    if path == "no definition yet":
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+        clouds["src"].crash_wait = "server"  # the stop sent, its wait dies: no definition yet
+    else:
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="delete_server")
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src = clouds["src"]
+    wait = src.compute.wait_for_server
+    waiting = threading.Event()
+
+    def slow(s, status="ACTIVE", **kw):
+        if status == "ACTIVE":
+            waiting.set()
+            time.sleep(0.5)  # the cancel lands while the guest boots
+        return wait(s, status=status, **kw)
+
+    src.compute.wait_for_server = slow
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    task = asyncio.ensure_future(executor.run(StepName.ROLLBACK, ctx))
+    assert await asyncio.to_thread(waiting.wait, 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    run_dir = executor.run_dir(make_ctx(plan, mig, SRC, DST, settings)[0])
+    done = json.loads((run_dir / "handover-journal.json").read_text())["done"]
+    assert rec.downtime_ends == 1 and "rb:start_source" in done
+
+
 async def test_a_rollback_resumed_in_the_failed_builds_volume_wait_waits_again(tmp_path):
     """SDD §7.3 rollback (review RV36B-04): the attempt that deletes a recreated build Nova left in
     ERROR dies while it waits for the volumes - a restart, or a wait that timed out and is retried.

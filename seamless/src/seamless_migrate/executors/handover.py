@@ -1611,10 +1611,7 @@ class HandoverExecutor:
         if not await _in_thread(definition_path.exists):
             # stopped but nothing else happened yet: just start the source again
             if not journal.done("rb:start_source"):
-                await self._call("start the source server", lambda: self._start(src, server_id))
-                # it runs: the clock closes now (SDD §5.2, §7.3, review RV36B-03)
-                await outlive_cancel(ctx.mark_downtime_end())
-                await _in_thread(journal.mark, "rb:start_source")
+                await self._start_as_one(ctx, journal, src, server_id)
             await _in_thread(journal.archive, "rolled-back")
             return StepResult(details={"source_running": True})
 
@@ -1787,23 +1784,31 @@ class HandoverExecutor:
                     "recreate the source ports",
                     lambda: self._source_ports(src, definition["networks"], journal),
                 )
-                created = await self._call(
-                    "recreate the source server",
-                    lambda: self._create_server(
-                        src,
-                        definition,
-                        definition["flavor"],
-                        networks,
-                        self._bdm(attachments, new_ids),
-                        journal,
-                        "sent:rb:create_source",
-                    ),
-                )
-                await _in_thread(journal.mark, "rb:create_source", server_id=created)
+
+                async def recreate() -> None:
+                    created = await self._call(
+                        "recreate the source server",
+                        lambda: self._create_server(
+                            src,
+                            definition,
+                            definition["flavor"],
+                            networks,
+                            self._bdm(attachments, new_ids),
+                            journal,
+                            "sent:rb:create_source",
+                        ),
+                    )
+                    await _in_thread(journal.mark, "rb:create_source", server_id=created)
+                    await ctx.mark_downtime_end()  # it runs: the clock closes (review RV36B-03)
+
+                # the recreate, its journal mark and the clock's close as one: a cancel - the step
+                # timeout, a shutdown - waits them out as it does the call (SDD §7.3, RV37A-01)
+                await outlive_cancel(recreate())
+            else:
+                # found journaled, it runs: the clock closes on every attempt, so one whose
+                # give-back fails leaves the source counted as running (SDD §5.2, RV36B-03)
+                await outlive_cancel(ctx.mark_downtime_end())
             new_server_id = journal.get("rb:create_source")["server_id"]
-            # it runs: the clock closes now, on every attempt that finds it, so one whose give-back
-            # fails leaves the source counted as running (SDD §5.2, §7.3, review RV36B-03)
-            await outlive_cancel(ctx.mark_downtime_end())
             # each volume's journaled delete_on_termination, once the recreated server runs: kept
             # while Nova built it (SDD §7.3 rollback, review RV35B-04)
             for att in attachments:
@@ -1845,10 +1850,7 @@ class HandoverExecutor:
                     )
                     await _in_thread(journal.mark, key)
             if not journal.done("rb:start_source"):
-                await self._call("start the source server", lambda: self._start(src, server_id))
-                # it runs: the clock closes now (SDD §5.2, §7.3, review RV36B-03)
-                await outlive_cancel(ctx.mark_downtime_end())
-                await _in_thread(journal.mark, "rb:start_source")
+                await self._start_as_one(ctx, journal, src, server_id)
 
         details: dict[str, Any] = {"source_running": True}
         if new_server_id != server_id or any(k != v for k, v in new_ids.items()):
@@ -1876,6 +1878,20 @@ class HandoverExecutor:
             if f"rb:manage_src:{a['volume_id']}" in done
         }
         return _recreated_vm(vm, str(created["server_id"]), new_ids)
+
+    async def _start_as_one(
+        self, ctx: StepContext, journal: _Journal, conn: Any, server_id: str
+    ) -> None:
+        """Start the source server, close the clock and journal ``rb:start_source`` as one: a cancel
+        - the step timeout, a shutdown - that lands during the start waits out the rest with it, so
+        a source that runs is never left with its clock open (SDD §5.2, §7.3, review RV37A-01)."""
+
+        async def start() -> None:
+            await self._call("start the source server", lambda: self._start(conn, server_id))
+            await ctx.mark_downtime_end()  # it runs: the clock closes now (review RV36B-03)
+            await _in_thread(journal.mark, "rb:start_source")
+
+        await outlive_cancel(start())
 
     def _start(self, conn: Any, server_id: str) -> None:
         server = conn.compute.get_server(server_id)
