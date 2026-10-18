@@ -58,13 +58,18 @@ Run ``export_workloads.yml`` first, exactly as for the cold path, then:
 
 ``rollback_workloads.yml``
     delete the recorded destination server (and, with
-    ``os_migrate_rollback_delete_dest_volumes: true``, the destination volumes
-    and the warm state; a volume still attached to a server other than the
-    destination conversion host is kept and reported) → start the source
-    server again. The playbooks stop at the first failing workload. For workloads without
-    a warm state (for example a cold migration) set
-    ``os_migrate_rollback_match_by_name: true`` to delete the only destination
-    server named exactly like the workload.
+    ``os_migrate_rollback_delete_dest_volumes: true``, the recorded destination
+    volumes, emptying the warm state: the file stays, the sign that the
+    workload's migration recorded it, so no later rollback takes a same-named
+    server for the workload's; a volume still attached to a server other than
+    the destination conversion host is kept and reported) → start the source
+    server again, once no stop or start Nova runs is still under way
+    (``os_migrate_source_stop_poll_s``). The playbooks stop at the first failing
+    workload. The cold import records its workload in the same file; only for a
+    workload without a state file - one the cold import copied before it
+    recorded its workloads - does ``os_migrate_rollback_match_by_name: true``
+    delete the only destination server named exactly like the workload: with a
+    state file, even an empty one, no server is taken by its name alone.
 
 Warm state file
 ---------------
@@ -119,17 +124,21 @@ Variables
        of the destination default; also honoured by ``import_workloads``
    * - ``os_migrate_rollback_delete_dest_volumes``
      - ``false``
-     - the rollback also deletes the destination volumes and the warm state;
-       a volume still attached to a server other than the destination
-       conversion host is kept and reported
+     - the rollback also deletes the destination volumes (the recorded ones;
+       for a workload without a warm state file, those attached to the deleted
+       server) and empties the warm state - the file stays -; a volume still
+       attached to a server other than the destination conversion host is kept
+       and reported
    * - ``os_migrate_dst_conversion_host_name``
      - ``os_migrate_conv_dst``
      - destination conversion host; the only server a rollback detaches
        destination volumes from
    * - ``os_migrate_rollback_match_by_name``
      - ``false``
-     - rollback of a workload without a warm state: delete the only
-       destination server named exactly like the workload
+     - rollback of a workload without a warm state file (one the cold import
+       copied before it recorded its workload): delete the only destination
+       server named exactly like the workload; with a state file, even an
+       empty one, no server is taken by its name alone
    * - ``os_migrate_rollback_all``
      - ``false``
      - a rollback with the catch-all workload filter (``regex: .*``, every
@@ -151,6 +160,11 @@ Variables
    * - ``os_migrate_warm_state_dir``
      - ``{{ os_migrate_data_dir }}/workload_warm``
      - warm state files
+   * - ``os_migrate_source_stop_poll_s``
+     - ``5``
+     - seconds between the reads of the server while Nova still stops or
+       starts it: the cutover's stop and the rollback's start first wait until
+       no stop or start runs, at most ``os_migrate_timeout``
    * - ``os_migrate_workloads_filter``
      - ``[{regex: .*}]``
      - workloads to process (name filter, as for ``import_workloads``)
@@ -168,14 +182,17 @@ The usual os-migrate variables apply as well: ``os_migrate_data_dir``,
 ``os_migrate_src_auth``/``os_migrate_dst_auth`` and the other cloud settings,
 and the conversion host variables (``os_migrate_src_conversion_host_name``,
 ``os_migrate_dst_conversion_host_name``, ``os_migrate_conversion_host_ssh_user``,
-``os_migrate_conversion_keypair_private_path``).
+``os_migrate_conversion_keypair_private_path``). Each conversion host can log
+in as its own user: ``os_migrate_src_conversion_host_ssh_user`` and
+``os_migrate_dst_conversion_host_ssh_user`` (a RHEL host's ``cloud-user``, an
+Ubuntu host's ``ubuntu``) default to ``os_migrate_conversion_host_ssh_user``.
 
 Requirements and limits
 -----------------------
 
 * Conversion hosts in both clouds, deployed and linked with
   ``deploy_conversion_hosts.yml`` (the destination host reaches the source
-  host over SSH with the link key of ``os_migrate_conversion_host_ssh_user``),
+  host over SSH with the link key, as the source host's user),
   with passwordless ``sudo`` and Python 3.6+.
 * Workloads with ``data_copy: true`` and without ``use_nbdkit_direct``.
 * No multi-attach volumes. Image-booted servers follow ``boot_disk_copy``:
