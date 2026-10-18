@@ -170,10 +170,11 @@ def test_no_e2e_script_puts_a_bearer_token_on_a_command_line():
     assert _tokens_on_command_lines(E2E) == []
 
 
-#: a token variable given a literal value - exported, or typed before the script - where the shell
-#: history keeps it (Security.md §7.2, reviews RV37B-06, RV38B-20); a value read from a variable or
-#: a command is no literal
-TYPED_TOKEN = re.compile(r"\b[A-Z_]*TOKEN=(?![\"']?\$)\S")
+#: a token variable given a literal value - exported, or typed before the script, an ANSI-C $'...'
+#: or a single-quoted '$...' one too - where the shell history keeps it (Security.md §7.2, reviews
+#: RV37B-06, RV38B-20, RV41A-12); a variable or a command - $VAR, "$VAR", $(...), `...` - or an
+#: empty value is no literal
+TYPED_TOKEN = re.compile(r"\b[A-Z_]*TOKEN=(?!\"?\$(?!')|`|\"\"|''|\s|$)")
 
 
 @pytest.mark.parametrize(
@@ -186,6 +187,13 @@ TYPED_TOKEN = re.compile(r"\b[A-Z_]*TOKEN=(?![\"']?\$)\S")
         (': "${TOKEN:?read -rs TOKEN && export TOKEN: the admin token}"', False),
         ('TOKEN=$(cat "$HOME/.seamless-token")', False),
         ('TOKEN="$ADMIN"', False),
+        ("export TOKEN=$'smg_abc123'", True),
+        ("TOKEN='$typed'", True),
+        ('TOKEN=`cat "$HOME/.seamless-token"`', False),
+        ('TOKEN="$1"', False),
+        ('TOKEN=""', False),
+        ("TOKEN=''", False),
+        ("TOKEN=", False),
     ],
     ids=[
         "typed before",
@@ -195,11 +203,20 @@ TYPED_TOKEN = re.compile(r"\b[A-Z_]*TOKEN=(?![\"']?\$)\S")
         "required",
         "a command",
         "a variable",
+        "an ANSI-C quoted literal",
+        "a single-quoted dollar",
+        "a backquoted command",
+        "a positional parameter",
+        "empty in double quotes",
+        "empty in single quotes",
+        "empty",
     ],
 )
 def test_the_typed_token_check_flags_every_literal(line, typed):
-    """Review RV38B-20: the check matched `export ...TOKEN=` only, so a usage line typing the token
-    before the script passed; any token variable given a literal is flagged."""
+    """Reviews RV38B-20, RV41A-12: the check matched `export ...TOKEN=` only, so a usage line typing
+    the token before the script passed; any token variable given a literal is flagged - an ANSI-C
+    `$'...'` or a single-quoted `'$...'` one too -, never a variable, a command or an empty
+    value."""
     assert bool(TYPED_TOKEN.search(line)) is typed
 
 
