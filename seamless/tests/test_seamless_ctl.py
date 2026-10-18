@@ -533,6 +533,35 @@ def test_a_drain_that_times_out_stops_nothing(tmp_path):
     assert "plan-aa" in proc.stderr and "resume" in proc.stderr
 
 
+@pytest.mark.parametrize(("mode", "used"), [(0o644, False), (0o600, True)], ids=["0644", "0600"])
+def test_a_symlinked_token_file_is_judged_by_the_file_it_points_to(tmp_path, mode, used):
+    """SDD §17.2 (review RV38B-08): the token file must be one only its owner may read - the file a
+    symlink points to, never the link's own mode: macOS gives a link the umask's mode (0700 under
+    077), which let a link to a world-readable token through, and Linux 0777, which refused a link
+    to a 0600 one."""
+    target = tmp_path / "shared" / "operator.token"
+    target.parent.mkdir()
+    target.write_text(TOKEN + "\n")
+    target.chmod(mode)
+    link = tmp_path / "operator-link.token"
+    old = os.umask(0o077)
+    try:
+        os.symlink(target, link)
+    finally:
+        os.umask(old)
+    rules = [
+        {"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"stdout": "[]"}]},
+        {"cmd": "curl", "has": ["phase="], "answers": [{"stdout": "[]"}]},
+    ]
+    proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", str(link), rules=rules)
+    sent = [c for c in calls if c["cmd"] == "curl"]
+    if used:
+        assert proc.returncode == 0 and sent, proc.stderr
+    else:
+        assert proc.returncode == 2 and not sent, proc.stderr
+        assert "may be read by others" in proc.stderr
+
+
 @pytest.mark.parametrize("mode", [0o640, 0o644, 0o604])
 def test_a_token_file_others_may_read_is_refused(tmp_path, mode):
     """SDD §17.2, §13.1: the operator's token file must be readable by its owner alone."""

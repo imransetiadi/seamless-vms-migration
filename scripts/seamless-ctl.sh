@@ -201,7 +201,8 @@ open_token() {
   local file=$1 token=
   case $- in *x*) refuse "xtrace (bash -x) is on and would print the operator's token: run without it" ;; esac
   [ -f "$file" ] && [ -r "$file" ] || refuse "cannot read the token file '$file'"
-  if [ -n "$(find "$file" -prune \( -perm -040 -o -perm -004 \) -print 2>/dev/null)" ]; then
+  # the mode of the file a symlink points to, never the link's own (-L; review RV38B-08)
+  if [ -n "$(find -L "$file" -prune \( -perm -040 -o -perm -004 \) -print 2>/dev/null)" ]; then
     refuse "the token file '$file' may be read by others: chmod 600 '$file'"
   fi
   if [ "$DRY" = 1 ]; then HEADER='@<private directory>/auth.header'; return; fi
