@@ -463,6 +463,30 @@ def test_a_capacity_limit_the_api_server_refuses_changes_nothing(tmp_path, platf
     assert [p["name"] for p in fake_kube.running(state)] == ["seamless-1"]
 
 
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_cluster_capacity_dry_run_changes_nothing(tmp_path, platform):
+    """SDD §17.2 (reviews RV38B-17, RV41A-08): --dry-run prints every command of a cluster's
+    capacity - the server-side dry run, the ConfigMap's patch, the template's, the rollout - and
+    runs none: no kubectl or oc call, the ConfigMap and the pod as they were."""
+    argv = ["capacity", "--max-migrations", "20", "--memory", "8Gi", "--dry-run"]
+    proc, calls, _ = _run(tmp_path, platform, *argv, cluster=fake_kube.cluster())
+    state = _cluster_after(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert calls == []
+    assert state["configmap"]["SEAMLESS_MAX_CONCURRENT_MIGRATIONS"] == "10"
+    assert state["serial"] == 1 and state["deployment"]["limits"]["memory"] == "4Gi"
+    printed = [line for line in proc.stdout.splitlines() if line.startswith("+ ")]
+    assert [
+        next(w for w in ("--dry-run=server", "configmap", "rollout", "patch") if w in line)
+        for line in printed
+    ] == [
+        "--dry-run=server",
+        "configmap",
+        "patch",
+        "rollout",
+    ], printed
+
+
 def test_the_documented_dry_run_of_a_cluster_down_is_what_the_script_prints():
     """Operations.md §2 shows `kubernetes down --dry-run`'s output: it is what the script prints
     (review 38b, a check of its own made a test)."""
