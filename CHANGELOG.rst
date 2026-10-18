@@ -580,7 +580,7 @@ This project follows a simple changelog to satisfy collection metadata validatio
   wait that gives up ends its phase, as each later volume would wait it out
   again: a lock wait that gives up (the conversion host lost, or the lock
   another conversion holds throughout, now ``LockUnavailable``) or a detach
-  Nova does not end in time (``DetachTimeout``) ends the detaches, and a
+  Nova does not end in time (``DetachStuck``) ends the detaches, and a
   deletion Cinder does not finish in time ends the deletions; one that cannot
   start (its conversion host gone, a record not the workload's) says so in its
   result. The rescue runs it before the source cleanup, so a source cleanup

@@ -153,7 +153,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
     DEFAULT_TIMEOUT,
     ConversionHostUnreachable,
-    DetachTimeout,
+    DetachStuck,
     LockUnavailable,
     OpenStackVolumeBase,
     is_timeout,
@@ -215,7 +215,7 @@ class OpenStackDstFailureCleanup(OpenStackVolumeBase):
             for volume_id in [mapping["dest_id"] for mapping in self.volume_map.values()]:
                 try:
                     self._detach_volumes_from_destination_converter(volume_ids=[volume_id])
-                except (ConversionHostUnreachable, LockUnavailable, DetachTimeout) as err:
+                except (ConversionHostUnreachable, LockUnavailable, DetachStuck) as err:
                     # the host lost, the lock another conversion holds, a detach Nova does not
                     # end: every other detach would wait it out again
                     self.log.warning(

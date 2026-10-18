@@ -7,6 +7,8 @@ failure result carrying the tenant's volume names turned a stuck detach, meant t
 
 from __future__ import annotations
 
+import ast
+import builtins
 import json
 import os
 import shutil
@@ -19,7 +21,7 @@ import pytest
 import yaml
 
 from seamless_migrate.config import find_repo_root
-from seamless_migrate.executors.ansible import SERVER_TYPE, classify_failure
+from seamless_migrate.executors.ansible import SERVER_TYPE, TRANSIENT, classify_failure
 from seamless_migrate.executors.base import PermanentStepError
 
 #: a module that runs the cold export's detach of a data volume (OpenstackVolumeExport.
@@ -360,3 +362,36 @@ def test_a_failed_exports_volume_names_never_make_a_stuck_detach_transient(tmp_p
     assert "Timed out after 2 s waiting to detach volume vol-data from server srv-1" in output
     assert volume_name not in output, output
     assert classify_failure(output) is PermanentStepError
+
+
+def _collection_error_classes() -> dict[str, str]:
+    """Every exception class the collection's plugins define, by name, with its file: a class
+    deriving from a built-in exception, from another such class, or from a library one named
+    ...Error or ...Exception."""
+    bases: dict[str, tuple[list[str], str]] = {}
+    for path in sorted((find_repo_root() / "plugins").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ClassDef):
+                names = [ast.unparse(b).rsplit(".", 1)[-1] for b in node.bases]
+                bases[node.name] = (names, str(path.relative_to(find_repo_root())))
+
+    def is_error(name: str, seen: frozenset[str] = frozenset()) -> bool:
+        if isinstance(getattr(builtins, name, None), type) and issubclass(
+            getattr(builtins, name), BaseException
+        ):
+            return True
+        if name in bases and name not in seen:
+            return any(is_error(base, seen | {name}) for base in bases[name][0])
+        return name.endswith(("Error", "Exception"))
+
+    return {name: path for name, (_, path) in bases.items() if is_error(name)}
+
+
+def test_no_collection_error_reads_transient_by_its_class_name():
+    """SDD §6.6 (owner question q8, review RV35A-01): ansible-core before 2.19 - the image's and
+    CI's pin - prints an escaped exception's qualified class name in the task output the executor
+    classifies, so an error class of the collection whose name matches TRANSIENT turns every
+    failure it raises transient - a stuck detach retried with the cold source stopped. None may."""
+    errors = _collection_error_classes()
+    assert "ConversionHostUnreachable" in errors and "DiskIdentityError" in errors
+    assert {name: path for name, path in errors.items() if TRANSIENT.search(name)} == {}

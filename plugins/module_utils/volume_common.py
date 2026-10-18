@@ -137,7 +137,7 @@ def detach_volume_bounded(conn, server, volume, timeout):
         if server["id"] not in holders and (holders or status == "available"):
             return
         time.sleep(1)
-    raise DetachTimeout(
+    raise DetachStuck(
         "Timed out after %s s waiting to detach volume %s from server %s"
         % (timeout, volume["id"], server["id"])
     )
@@ -180,9 +180,11 @@ class LockUnavailable(RuntimeError):
     Migrate SDD 6.6, review RV34B-01)."""
 
 
-class DetachTimeout(RuntimeError):
+class DetachStuck(RuntimeError):
     """A detach Nova did not end within the timeout (detach_volume_bounded; Seamless Migrate SDD
-    6.6, review RV34B-01)."""
+    6.6, review RV34B-01). Named without "timeout": ansible-core before 2.19 prints an escaped
+    exception's class name, and the control plane would read the stuck detach as transient
+    (review RV35A-01)."""
 
 
 class DiskIdentityError(RuntimeError):
