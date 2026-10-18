@@ -2138,7 +2138,9 @@ Finding catalog (code — severity — condition):
 ### 9.4 Wave planner (`planning/waves.py`)
 
 `plan_waves(vms: list[VMRef], tiers: dict[str, str], max_wave_size: int = 10) -> list[Wave]`.
-Tiers (from the advisor, §14.2; deterministic fallback by regex on name/tags/os_type):
+Tiers (from the advisor, §14.2; deterministic fallback by regex: `os_type` decides `legacy_os` (§9.5), and the service
+keywords match the name and the tag values only - an OS name is never a service: an Oracle Linux guest is no Oracle
+database, review PL-03):
 `stateless_web`, `middleware_queue`, `infrastructure_service`, `stateful_database`, `legacy_os`,
 `manual_review`. Wave 1 is a **pilot** of up to 3 lowest-risk VMs (`stateless_web` first, smallest
 disks first): app groups are taken whole in that order while they fit, and once one does not fit, only
@@ -2183,10 +2185,10 @@ guests boot unchanged when the boot properties travel with the volumes (§6, §7
 
 ### 9.6 Probe suggestions (`planning/probes.py`, ADV-18)
 
-`suggest_probes(vm) -> list[AppProbe]` — from the VM's tier (§9.4's rules) and the service its name, tags or OS
-names:
+`suggest_probes(vm) -> list[AppProbe]` — from the VM's tier (§9.4's rules) and the service its name or tags name
+(never its OS, §9.4):
 
-| Tier | Service (name, tag or OS contains) | Probe |
+| Tier | Service (name or tag contains) | Probe |
 |---|---|---|
 | `stateful_database` | PostgreSQL (`postgres`, `pgsql`, token `pg`) | tcp 5432 |
 | | MySQL, MariaDB, Galera | tcp 3306 |
