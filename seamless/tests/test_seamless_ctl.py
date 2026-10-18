@@ -44,12 +44,17 @@ for n, rule in enumerate(json.loads(Path(os.environ["STUB_RULES"]).read_text()))
 TOOLS = ("make", "kubectl", "oc", "curl", "docker", "podman")
 
 
+#: the helper that reads deploy/compose/.env as Compose does (SDD §17.2)
+DOTENV = SCRIPT.parent / "dotenv-value.sh"
+
+
 def _run(tmp_path, *argv, rules=(), xtrace=False, env_file=None, token_mode=0o600):
     """Run a copy of the script in a scratch tree with the stub tools first on PATH; return the run
     and the tools' calls in order."""
     tree = tmp_path / "tree"
     (tree / "scripts").mkdir(parents=True, exist_ok=True)
     shutil.copy(SCRIPT, tree / "scripts" / SCRIPT.name)
+    shutil.copy(DOTENV, tree / "scripts" / DOTENV.name)
     if env_file is not None:
         (tree / "deploy" / "compose").mkdir(parents=True, exist_ok=True)
         (tree / "deploy" / "compose" / ".env").write_text(env_file)
@@ -391,6 +396,81 @@ def _drain_rules(cutover_answers):
         {"cmd": "curl", "has": ["phase=verifying"], "answers": [{"stdout": "[]"}]},
         {"cmd": "curl", "has": ["phase=rolling_back"], "answers": [{"stdout": "[]"}]},
     ]
+
+
+@pytest.mark.parametrize(
+    ("dotenv", "value"),
+    [
+        ("KEY=1.2.3\n", "1.2.3"),
+        ("export KEY=1.2.3\n", "1.2.3"),
+        ("  KEY = 1.2.3  \n", "1.2.3"),
+        ('KEY="1.2.3" # pinned\n', "1.2.3"),
+        ("KEY='1.2.3' # pinned\n", "1.2.3"),
+        ("KEY=1.2.3 # pinned\n", "1.2.3"),
+        ("KEY=1.2.3\t# pinned\n", "1.2.3"),
+        ("KEY=a#b\n", "a#b"),
+        ("KEY=1\nKEY=2\n", "2"),
+        ("KEYS=1\nOTHER=2\n", ""),
+        ("# KEY=1\n", ""),
+        ("KEY=1.2.3\r\n", "1.2.3"),
+        ("KEY=\n", ""),
+    ],
+    ids=[
+        "plain",
+        "an export prefix",
+        "spaces around",
+        "double quotes and a comment",
+        "single quotes and a comment",
+        "an inline comment",
+        "a tab before the comment",
+        "a hash inside a value",
+        "the last definition",
+        "another key",
+        "a commented line",
+        "CRLF",
+        "empty",
+    ],
+)
+def test_the_dotenv_helper_reads_a_key_as_compose_does(tmp_path, dotenv, value):
+    """SDD §17.2 (reviews RV38B-07, RV38B-09): scripts/dotenv-value.sh reads deploy/compose/.env by
+    Compose's dotenv rules - an export prefix, spaces around the key and the value, quotes, an
+    inline comment after an unquoted value, the last definition winning."""
+    path = tmp_path / ".env"
+    path.write_text(dotenv)
+    done = subprocess.run(
+        ["sh", str(DOTENV), "KEY", str(path)], capture_output=True, text=True, check=True
+    )
+    assert done.stdout == (value + "\n" if value else "")
+
+
+def test_status_and_drain_ask_the_port_the_stack_publishes(tmp_path):
+    """SDD §17.2 (review RV38B-07): with SEAMLESS_HOST_PORT moved in deploy/compose/.env, Compose
+    publishes that port - status and a drain ask it, so the operator's token never goes to
+    whatever program holds 8080; the shell's port still wins."""
+    port_env = "POSTGRES_PASSWORD=x\nexport SEAMLESS_HOST_PORT = 18081 # moved\n"
+    _, status, _ = _run(
+        tmp_path / "status",
+        "docker",
+        "status",
+        env_file=port_env,
+        rules=[{"cmd": "curl", "answers": [{"stdout": "{}"}]}],
+    )
+    rules = [
+        {"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"stdout": "[]"}]},
+        {"cmd": "curl", "has": ["phase="], "answers": [{"stdout": "[]"}]},
+    ]
+    proc, drain, _ = _run(
+        tmp_path / "drain",
+        "docker",
+        "stop",
+        "--drain",
+        "@TOKEN_FILE",
+        env_file=port_env,
+        rules=rules,
+    )
+    assert proc.returncode == 0, proc.stderr
+    asked = [c["args"][-1] for c in status + drain if c["cmd"] == "curl"]
+    assert asked and all(url.startswith("http://127.0.0.1:18081/") for url in asked), asked
 
 
 @pytest.mark.parametrize("timeout", ["08", "09"])

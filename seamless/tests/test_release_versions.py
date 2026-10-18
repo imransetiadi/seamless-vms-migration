@@ -70,14 +70,18 @@ def test_every_version_location_of_a_release_names_one_version():
     assert set(versions.values()) == {__version__}, versions
 
 
-def _resolved(tmp_path, env_file: str | None, environment: dict[str, str] | None = None) -> str:
-    """SEAMLESS_VERSION and SEAMLESS_CP_IMAGE as the Makefile resolves them, with ``env_file`` as
-    deploy/compose/.env (none when ``None``) and ``environment`` exported."""
+def _resolved(
+    tmp_path,
+    env_file: str | None,
+    environment: dict[str, str] | None = None,
+    names: tuple[str, ...] = ("SEAMLESS_VERSION", "SEAMLESS_CP_IMAGE"),
+) -> str:
+    """``names`` (SEAMLESS_VERSION and SEAMLESS_CP_IMAGE) as the Makefile resolves them, with
+    ``env_file`` as deploy/compose/.env (none when ``None``) and ``environment`` exported."""
     wrapper = tmp_path / "print.mk"
     # $(info ...) prints the values as Make holds them - quotes included, which a shell echo drops
-    wrapper.write_text(
-        "include Makefile\nzz-print:\n\t@true$(info $(SEAMLESS_VERSION) $(SEAMLESS_CP_IMAGE))\n"
-    )
+    shown = " ".join(f"$({name})" for name in names)
+    wrapper.write_text(f"include Makefile\nzz-print:\n\t@true$(info {shown})\n")
     dotenv = tmp_path / "compose.env"
     dotenv.unlink(missing_ok=True)
     if env_file is not None:
@@ -108,6 +112,10 @@ def _resolved(tmp_path, env_file: str | None, environment: dict[str, str] | None
         ("SEAMLESS_VERSION=0.2.0\n", {"SEAMLESS_VERSION": "0.3.0"}, "0.3.0"),
         ("SEAMLESS_VERSION=0.2.0\n", {"SEAMLESS_VERSION": ""}, __version__),
         ("SEAMLESS_VERSION=\n", None, __version__),
+        ("SEAMLESS_VERSION=0.2.0 # pinned\n", None, "0.2.0"),
+        ("export SEAMLESS_VERSION=0.2.0\n", None, "0.2.0"),
+        ("SEAMLESS_VERSION = 0.2.0\n", None, "0.2.0"),
+        ('SEAMLESS_VERSION="0.2.0" # pinned\n', None, "0.2.0"),
     ],
     ids=[
         "the release",
@@ -117,6 +125,10 @@ def _resolved(tmp_path, env_file: str | None, environment: dict[str, str] | None
         "the shell over .env",
         "an empty shell value: Compose's default",
         "an empty .env value: Compose's default",
+        "an inline comment",
+        "an export prefix",
+        "spaces around =",
+        "quoted with a comment",
     ],
 )
 def test_the_runtime_check_inspects_the_image_compose_runs(
@@ -127,3 +139,20 @@ def test_the_runtime_check_inspects_the_image_compose_runs(
     else deploy/compose/.env, else the release; an empty value is ${SEAMLESS_VERSION:-...}'s
     default, the release, never an image without a tag (review 38b)."""
     assert _resolved(tmp_path, env_file, environment) == f"{version} seamless-migrate:{version}"
+
+
+@pytest.mark.parametrize(
+    "env_file, environment, port",
+    [
+        (None, None, "8080"),
+        ("SEAMLESS_HOST_PORT=18081\n", None, "18081"),
+        ("export SEAMLESS_HOST_PORT = 18081 # moved\n", None, "18081"),
+        ("SEAMLESS_HOST_PORT=18081\n", {"SEAMLESS_HOST_PORT": "18082"}, "18082"),
+        ("SEAMLESS_HOST_PORT=18081\n", {"SEAMLESS_HOST_PORT": ""}, "8080"),
+    ],
+    ids=["the default", "moved in .env", "as Compose reads it", "the shell over .env", "empty"],
+)
+def test_the_make_targets_wait_on_the_port_compose_publishes(tmp_path, env_file, environment, port):
+    """SDD §17.2 (review RV38B-07b): make seamless-start and seamless-restart poll the port Compose
+    publishes - the shell's, else .env's, else 8080 - never the shell's alone."""
+    assert _resolved(tmp_path, env_file, environment, ("SEAMLESS_HOST_PORT",)) == port

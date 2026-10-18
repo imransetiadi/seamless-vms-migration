@@ -185,7 +185,9 @@ elif [ -n "$MAX_MIGRATIONS$MAX_CUTOVERS$CPU$MEMORY" ]; then
 fi
 
 if [ "$KIND" = host ]; then
-  API=${URL:-http://127.0.0.1:${SEAMLESS_HOST_PORT:-8080}}
+  # the port Compose publishes: the shell's, else deploy/compose/.env's, else 8080 (SDD §17.2, review RV38B-07)
+  port=${SEAMLESS_HOST_PORT-$(sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env")}
+  API=${URL:-http://127.0.0.1:${port:-8080}}
 else
   API=$URL
   if [ -n "$DRAIN" ] || [ "$ACTION" = resume ]; then

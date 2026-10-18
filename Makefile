@@ -404,6 +404,9 @@ SEAMLESS_ON_LINUX_ENGINE = $(and $(filter Linux,$(SEAMLESS_HOST_OS)),$(filter de
 SEAMLESS_COMPOSE_DIR    := $(CURDIR)/deploy/compose
 SEAMLESS_COMPOSE_FILE   := $(SEAMLESS_COMPOSE_DIR)/compose.yaml
 SEAMLESS_ENV_FILE       := $(SEAMLESS_COMPOSE_DIR)/.env
+# the value Compose reads for the key $(1) from SEAMLESS_ENV_FILE, by its dotenv rules - an export prefix, spaces, quotes,
+# an inline comment, the last definition wins (scripts/dotenv-value.sh, SDD §17.2, review RV38B-09)
+SEAMLESS_DOTENV = $(shell sh scripts/dotenv-value.sh $(1) $(SEAMLESS_ENV_FILE) 2>/dev/null)
 SEAMLESS_TOKENS_FILE    := $(SEAMLESS_COMPOSE_DIR)/tokens.yaml
 # optional: restrict logs to one service, e.g. make seamless-logs SEAMLESS_SERVICE=seamless
 SEAMLESS_SERVICE        ?=
@@ -425,7 +428,12 @@ SEAMLESS_UNSET_ENV = $(foreach v,$(SEAMLESS_ENV_OWNED),-u $(v))
 # another Docker host with SEAMLESS_DOCKER_CONTEXT) or podman (`podman compose`, which runs docker-compose when it is
 # installed — recommended — or podman-compose). Example: make seamless-demo SEAMLESS_ENGINE=podman
 SEAMLESS_ENGINE ?= docker
-SEAMLESS_HOST_PORT ?= 8080
+# the port Compose publishes: the shell's or the command line's, else .env's, else 8080 - an empty value is
+# ${SEAMLESS_HOST_PORT:-8080}'s default -, so the health waits poll the stack's port (SDD §17.2, review RV38B-07b)
+ifeq ($(origin SEAMLESS_HOST_PORT),undefined)
+SEAMLESS_HOST_PORT := $(call SEAMLESS_DOTENV,SEAMLESS_HOST_PORT)
+endif
+override SEAMLESS_HOST_PORT := $(or $(SEAMLESS_HOST_PORT),8080)
 ifeq ($(SEAMLESS_ENGINE),podman)
 SEAMLESS_DOCKER       = podman
 SEAMLESS_COMPOSE_CMD  = podman compose
@@ -610,11 +618,11 @@ lab-handover:
 # when it starts. PostgreSQL always; the control plane when its image exists locally (make seamless-demo builds it).
 # SEAMLESS_RELEASE is the release's version (RELEASING.md §1; seamless/tests/test_release_versions.py keeps it
 # so). SEAMLESS_VERSION, the control-plane image the stack runs, is read as Compose reads it: the shell or the
-# command line, else deploy/compose/.env, else the release - an empty value is ${SEAMLESS_VERSION:-…}'s default,
-# the release - so the check inspects that image (reviews RV37B-04, 38b).
+# command line, else deploy/compose/.env read by Compose's dotenv rules (SEAMLESS_DOTENV), else the release - an empty
+# value is ${SEAMLESS_VERSION:-…}'s default, the release - so the check inspects that image (reviews RV37B-04, 38b).
 SEAMLESS_RELEASE := 0.1.0-rc.2
 ifeq ($(origin SEAMLESS_VERSION),undefined)
-SEAMLESS_VERSION := $(or $(shell sed -n "s/^SEAMLESS_VERSION=[\"']\{0,1\}\([^\"']*\)[\"']\{0,1\}$$/\1/p" $(SEAMLESS_ENV_FILE) 2>/dev/null | tail -n 1),$(SEAMLESS_RELEASE))
+SEAMLESS_VERSION := $(call SEAMLESS_DOTENV,SEAMLESS_VERSION)
 endif
 override SEAMLESS_VERSION := $(or $(SEAMLESS_VERSION),$(SEAMLESS_RELEASE))
 SEAMLESS_CP_IMAGE ?= seamless-migrate:$(SEAMLESS_VERSION)

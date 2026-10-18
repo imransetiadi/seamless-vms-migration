@@ -99,8 +99,9 @@ After `--force`, recreate the stack so the control plane reloads the files: `mak
 Every target takes the same variables (`make seamless-logs SEAMLESS_ENGINE=podman`, `make seamless-down …`).
 With Podman, the host is `host.containers.internal` (set `SEAMLESS_MEMORY_URL` in `.env` for agentmemory);
 rootless Podman keeps the named volumes in your user's storage. On SELinux hosts the token mount is
-relabelled (`selinux: z`). If you changed `SEAMLESS_HOST_PORT` in `.env`, pass it to make too so the health
-wait polls the right port.
+relabelled (`selinux: z`). The targets read `SEAMLESS_HOST_PORT` and `SEAMLESS_VERSION` from `.env` as Compose
+does (an `export` prefix, spaces, quotes and inline comments included; a value in the shell still wins), so after a
+port change in `.env` the health wait polls the new port.
 
 ## Make targets
 
