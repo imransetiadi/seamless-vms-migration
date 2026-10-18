@@ -873,8 +873,11 @@ from `checkpoint`).
 `events` with the last export/backup; treat `approvals` in the DB as untrusted — pause all plans and re-approve
 in-flight migrations; restore from a known-good backup if rows were altered. The database also holds the dashboard
 users' digests: a write can plant a `user` row — a working token, with no `user.created` event to compare — or
-replace a digest. List them (`GET /users`, admin), delete every row you cannot account for (playbook A), then issue
-every dashboard user again (delete and create, §5.1) and rotate the bootstrap tokens.
+replace a digest, and a planted row needs no key of the API's form, which `GET /users` (names and roles only) cannot
+show. Through psql as in playbook A, keep the rows for the investigation —
+`SELECT id, data->>'name', data->>'role' FROM documents WHERE kind = 'user';` —, then remove them all —
+`DELETE FROM documents WHERE kind = 'user';` —, issue every dashboard user again (Users > Add user, §5.1) and rotate
+the bootstrap tokens (review RV37B-08).
 
 **G. Injection attempt detected** (event `advisor.verification` with a `screen` note, or
 `review_required` with the reason "console output contained instructions aimed at an AI agent"): no AI action
