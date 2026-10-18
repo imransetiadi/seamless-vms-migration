@@ -31,6 +31,8 @@ from ..config import Settings
 _NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{0,200}$")
 _KEY = re.compile(r"^[A-Za-z0-9_]+$")
 SA_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+#: the CA the API server's certificate is checked against unless another CA file is given
+SA_CA_CERT = str(SA_DIR / "ca.crt")
 MANAGED_BY = "seamless-migrate"
 #: an operator's Secret made for providers (SDD §13.3); the store reads no other it did not write
 PROVIDER_SECRET_LABEL = "seamless.io/provider-secret"
@@ -130,7 +132,7 @@ class KubernetesSecretStore:
         base_url: str | None = None,
         token: str | None = None,
         transport: httpx.BaseTransport | None = None,
-        ca_cert: str | None = None,
+        ca_cert: str = SA_CA_CERT,
     ) -> None:
         self.namespace = namespace or self._read_sa("namespace")
         host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
@@ -140,7 +142,7 @@ class KubernetesSecretStore:
         self._transport = transport
         # the API server's certificate is checked against the ServiceAccount's CA, or the CA
         # file given - never not at all (SDD §13.3, §17)
-        self._ca_cert = ca_cert or str(SA_DIR / "ca.crt")
+        self._ca_cert = ca_cert
 
     @staticmethod
     def _read_sa(name: str) -> str:
