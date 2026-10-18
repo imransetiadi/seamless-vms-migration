@@ -11,7 +11,7 @@
 #     public; keep the Red Hat image when you have a pull secret for registry.redhat.io)
 #
 # Deploy:
-#   1. Build and push the image (repository root; `make dashboard-build` first):
+#   1. Build and push the image (repository root; it builds the dashboard when dashboard/dist is absent):
 #        docker build -f seamless/Containerfile -t <registry>/seamless-migrate:0.1.0-rc.2 .   # or: podman build …
 #        docker push <registry>/seamless-migrate:0.1.0-rc.2
 #   2. Set newName/newTag (or a digest) for seamless-migrate below, the Ingress host in ingress.yaml and,
