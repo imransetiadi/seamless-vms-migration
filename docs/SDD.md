@@ -539,7 +539,8 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
 
 After each pass, the migration moves to `awaiting_cutover` when **any** of these holds:
 `last_pass.bytes_changed <= plan.convergence_threshold_bytes`, or
-`estimate_final_downtime(last pass) <= plan.downtime_slo_s`, or `passes >= plan.max_sync_passes`.
+`estimate_final_downtime(last pass) <= plan.downtime_slo_s` (after a pass as long as the last one's whole time, §9.1
+`T_last`), or `passes >= plan.max_sync_passes`.
 Otherwise another delta pass runs. The rule that moved the migration is recorded in `Migration.converged_by`
 (`threshold`, `slo`, `max_passes`, or `force` for a Force cutover, §5.4), and its estimate becomes the one that rule
 used — the final-downtime estimate with its parts (a final pass does not recalibrate it), so the Downtime panel compares
@@ -588,7 +589,7 @@ dropped and its `bytes_transferred` moves to `sync_bytes_dropped`. `bytes_transf
 characters) is the only way to cut over before convergence. In `precopy` or `syncing` of a warm migration it records
 `Migration.force_cutover` — actor, time, reason, the last pass's `bytes_changed` and the estimated final downtime: the
 downtime if cut over after the running pass, `final_downtime_parts` (§5.3) after a pass as long as the last one that
-ended or — in `precopy`, before any pass ended — as long as the first pass's expected duration (§9.1:
+ended - its whole time, §9.1 `T_last` - or — in `precopy`, before any pass ended — as long as the first pass's expected duration (§9.1:
 `snapshot_s + max(used/L, scan)`, VMware `used/L`) — and a
 cutover request (its requester the forcer when none), and emits `migration.force_cutover` (audit). The running pass
 finishes, then the migration moves to `awaiting_cutover` with `converged_by: "force"`; the gate still applies — an
@@ -2029,6 +2030,10 @@ disks, and the **scan time** `scan = max(Dmax / S, D / min(S·P, A))`.
 
 `total_s = precopy_s + downtime_s`; `final_delta_bytes = Δf` (0 for single-shot);
 `meets_slo = downtime_s <= slo_s`. Ineligible strategies still get numbers with `eligible=false`.
+`T_last` is the last pass's whole time, as `Tk` is: a `warm` pass records as its `duration_s` the part after its
+snapshot (the collection's sync reports it, §6.2, and the demo records the same, §7.4), so the final-downtime estimate after a recorded pass -
+the SLO rule's (§5.3), the estimate it records, a Force cutover's figure (§5.4) and the dashboard's port of it - takes
+`duration_s + snapshot` for a `warm` pass and `duration_s` for a `vmware_warm` one (review RV39-07).
 
 **Configuration and calibration (PRD G2).** `EstimatorParams` gains `parallel_disks: int = 4`.
 `Plan.estimator_overrides: dict[str, float] = {}` overrides any `EstimatorParams` field for that plan
