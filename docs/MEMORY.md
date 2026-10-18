@@ -81,6 +81,8 @@ identically (§7).
                               + event advisor.similar_incidents ─► dashboard / API (read-only advice)
 
    Untrusted input never reaches memory:
+        guest console output stays local by default (SDD §13.4); only on-prem, or with
+        SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE=true, does it go on:
         guest console output ──► jev_screen ──pass──► jev_verify evidence (redacted, Jev only)
                                        ├─ block ───────► dropped; migration.review_required = true
                                        └─ review/skip ─► dropped
@@ -132,7 +134,7 @@ never a dump of logs, console output or API payloads.**
 | Never stored in agentmemory | Why | Enforced by |
 |---|---|---|
 | Passwords, tokens, API keys, `Authorization` headers, PEM/private-key blocks, credentials inside URLs and connection strings, the `auth` section of a `clouds.yaml` | Secret exposure (NFR-06, NFR-07) | The one redaction layer `ai/redaction.py`, applied by `MemoryClient` to every request body (`test_redact_removes_secrets`, `test_every_agentmemory_request_leaves_redacted`); agentmemory's own privacy filter server-side; `<private>` tags are stripped by the server |
-| Guest console output (including excerpts) | Untrusted text (prompt-injection carrier) and may contain secrets | By construction: only `review_verification` reads it, after `jev_screen`, and sends it to Jev — never to `KnowledgeService` (SDD §13.4; `test_verification_blocked_console_sets_review_required`) |
+| Guest console output (including excerpts) | Untrusted text (prompt-injection carrier) and may contain secrets | By construction: only `review_verification` reads it; it sends it to Jev, after `jev_screen`, only where the console may leave (on-prem, or `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE=true`; by default it stays local) — never to `KnowledgeService` (SDD §13.4; `test_verification_blocked_console_sets_review_required`) |
 | API tokens, token hashes, `clouds.yaml` or VMware credential material | Credentials never leave the credential path (SDD §13.3) | Never part of any `Migration`/`Plan` field that lessons are built from |
 | Raw Ansible/`blocksync` output and run-directory contents | Hostnames, paths, addresses; unbounded size | Lessons carry the error *class* and a truncated message only |
 | Tenant disk contents, snapshots, images | Never reach the control plane | Data path is conversion host ↔ conversion host (SDD §6) |
