@@ -3817,10 +3817,12 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   `--wait-timeout` seconds (default 1800; a timeout stops and changes nothing). A `capacity` that would be refused
   pauses no plan: its checks - `deploy/compose/.env` present on the single host, the server-side dry run of a
   cluster's limits - run before the drain, the dry run again after it. It prints the plans it paused, which
-  `resume --token-file TOKEN_FILE PLAN_ID...` starts again (`POST
-  /plans/{id}/start`). The operator's token is read from a file only its owner may read - any other mode is refused
-  - and reaches curl through a header file in a private directory, never a command line (§13.1); the API is
-  `http://127.0.0.1:<SEAMLESS_HOST_PORT>` on the single host - the port Compose publishes: the shell's, else
+  `resume --token-file TOKEN_FILE PLAN_ID...` starts again (`POST /plans/{id}/start`) - every plan it is given: one
+  that Start refuses (cancelled meanwhile, or a migration blocked: 409) is named, the others start all the same, and
+  the script then exits 1 (review RV38B-14). The operator's token is read from a file only its owner may read - any
+  other mode is refused - and reaches curl through a header file in a private directory, never a command line
+  (§13.1); the API is `http://127.0.0.1:<SEAMLESS_HOST_PORT>` on the single host - the port Compose publishes:
+  the shell's, else
   `deploy/compose/.env`'s, else 8080, the file read by Compose's dotenv rules (an `export ` prefix, spaces around `=`,
   quotes, an inline comment after an unquoted value, the last definition wins), so the token never goes to a port the
   stack does not publish (review RV38B-07); the Make targets read `SEAMLESS_HOST_PORT` and `SEAMLESS_VERSION` the same
