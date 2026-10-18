@@ -346,9 +346,20 @@ function heldOut(est: Estimate): Estimate {
   return { ...est, eligible: false, reasons: [...est.reasons, HELD_VOLUMES_REASON] };
 }
 
+/**
+ * The strategy of the attempt whose copies remain (the API's `_copies_strategy`, SDD §9.3, review RV40-06): while `m`
+ * waits for its next attempt, the one a Retry recorded - a validation or a strategy change may have chosen another
+ * since -, else its own.
+ */
+function copiesStrategy(m: Migration): Strategy {
+  const waiting = ['pending', 'validating', 'blocked', 'ready'].includes(m.phase);
+  return waiting && m.attempt_strategies.length ? m.attempt_strategies[m.attempt_strategies.length - 1]! : m.strategy;
+}
+
 function keptAfterRollback(m: Migration): boolean {
-  if (m.strategy === 'warm') return m.sync_passes.length > 0;
-  if (m.strategy === 'vmware_warm') return passesSinceTheKitReleasedItsCopies(m).length > 0;
+  const strategy = copiesStrategy(m);
+  if (strategy === 'warm') return m.sync_passes.length > 0;
+  if (strategy === 'vmware_warm') return passesSinceTheKitReleasedItsCopies(m).length > 0;
   return false;
 }
 

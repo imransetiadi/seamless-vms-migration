@@ -298,14 +298,28 @@ def _passes_since_the_kit_released_its_copies(m: Migration) -> list[SyncPass]:
     return list(m.sync_passes)
 
 
+#: the phases in which a migration waits for its next attempt (SDD §9.3)
+WAITING_FOR_AN_ATTEMPT = frozenset({Phase.pending, Phase.validating, Phase.blocked, Phase.ready})
+
+
+def _copies_strategy(m: Migration) -> Strategy:
+    """The strategy of the attempt whose copies remain: while ``m`` waits for its next attempt,
+    the one a Retry recorded - a validation or a strategy change may have chosen another for the
+    next attempt since -, else its own (SDD §9.3, review RV40-06)."""
+    if m.phase in WAITING_FOR_AN_ATTEMPT and m.attempt_strategies:
+        return m.attempt_strategies[-1]
+    return m.strategy
+
+
 def _kept_after_rollback(m: Migration) -> bool:
     """What a rollback kept of ``m``'s copies where no workload record tells - the demo, the VMware
-    kit (SDD §5.1, §9.3, reviews RV39-02, RV40-05, RV41B-02): a warm migration's passes, and a
-    vmware_warm one's passes since the kit last released its copies (§7.2); a cold, vmware_cold or
-    handover rollback keeps no copy."""
-    if m.strategy == Strategy.warm:
+    kit (SDD §5.1, §9.3, reviews RV39-02, RV40-05, RV40-06, RV41B-02): a warm attempt's passes,
+    and a vmware_warm one's passes since the kit last released its copies (§7.2) - the attempt
+    whose copies remain -; a cold, vmware_cold or handover rollback keeps no copy."""
+    strategy = _copies_strategy(m)
+    if strategy == Strategy.warm:
         return bool(m.sync_passes)
-    if m.strategy == Strategy.vmware_warm:
+    if strategy == Strategy.vmware_warm:
         return bool(_passes_since_the_kit_released_its_copies(m))
     return False
 

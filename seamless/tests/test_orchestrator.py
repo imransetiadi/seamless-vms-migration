@@ -587,6 +587,67 @@ async def test_an_uncut_attempts_kit_copies_stay_through_a_later_attempt_cut_off
         await h.orch.stop()
 
 
+#: a retried attempt, the strategy chosen since, the phases through now: are its copies held
+RETRIED_CASES = pytest.mark.parametrize(
+    ("attempted", "chosen", "phases", "held"),
+    [
+        (Strategy.vmware_warm, Strategy.vmware_cold, (*UNCUT, P.ready), True),
+        (Strategy.warm, Strategy.cold, (*UNCUT, P.ready), True),
+        (Strategy.warm, Strategy.cold, (*UNCUT, P.ready, P.validating, P.blocked), True),
+        (Strategy.cold, Strategy.warm, (P.cutover, P.rolling_back, P.rolled_back, P.ready), False),
+        (
+            Strategy.vmware_warm,
+            Strategy.vmware_cold,
+            (*UNCUT, P.ready, P.cutover, P.rolling_back, P.rolled_back),
+            False,
+        ),
+        (
+            Strategy.cold,
+            Strategy.warm,
+            (P.cutover, P.rolling_back, P.rolled_back, P.ready, *UNCUT),
+            True,
+        ),
+    ],
+    ids=[
+        "vmware_warm switched to vmware_cold: the kit's copies stay",
+        "warm switched to cold, ready",
+        "warm switched to cold, blocked by a validation",
+        "cold switched to warm: its rollback deleted its copy",
+        "the vmware_cold attempt ran and was rolled back: its rollback deleted them",
+        "the warm attempt chosen after a cold one ran its passes: they hold",
+    ],
+)
+
+
+@RETRIED_CASES
+async def test_where_no_record_tells_the_retried_attempts_strategy_holds_its_copies(
+    tmp_path, store, attempted, chosen, phases, held
+):
+    """SDD §9.3, §5.1 (review RV40-06): a Retry puts a migration back with its attempt's copies
+    kept, and a validation or PUT .../strategy may choose another strategy for the next attempt;
+    while it waits for that attempt the copies are the retried attempt's - the VMware kit keeps
+    no record, so a vmware_warm migration switched to vmware_cold read as holding nothing. Once
+    the next attempt ran, its own strategy tells."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*phases)
+    # the passes of the warm attempt: the retried one's, or the later one's after a cold attempt
+    warm = attempted in (Strategy.warm, Strategy.vmware_warm)
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=chosen,
+        phase=phases[-1],
+        phase_history=history,
+        attempt_strategies=[attempted],
+        sync_passes=_passes(2, history[: phases.index(P.ready)] if warm else history),
+    )
+    try:
+        assert await h.orch.holds_destination_volumes(m) is held
+        assert await h.orch.copied_data(m) is held
+    finally:
+        await h.orch.stop()
+
+
 async def test_a_pass_that_started_as_the_attempt_after_a_cutover_began_holds_kit_copies(
     tmp_path, store
 ):

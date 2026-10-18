@@ -3126,6 +3126,27 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     },
   );
 
+  it.each([
+    ['warm', 'cold', true],
+    ['vmware_warm', 'vmware_cold', true],
+    ['cold', 'warm', false],
+  ] as const)(
+    "reads a retried %s attempt's copies by its own strategy, not the %s chosen since, as the API (SDD §9.3, review RV40-06)",
+    async (attempted, chosen, held) => {
+      const { server, client } = setup('operator');
+      const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!; // ready, its handover estimate eligible
+      // the retried attempt recorded a pass; a validation or a strategy change chose another strategy since
+      m.attempt_strategies = [attempted];
+      m.strategy = chosen;
+      m.sync_passes = [
+        { number: 1, kind: 'full', started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 },
+      ];
+      const put = client.put<Migration>(`/migrations/${m.id}/strategy`, { strategy: 'storage_handover' });
+      if (held) await expect(put).rejects.toMatchObject({ status: 400, message: expect.stringContaining('an earlier attempt keeps its destination volumes') });
+      else expect((await put).strategy).toBe('storage_handover');
+    },
+  );
+
   it("leaves a migration's wave to the next validation when the waves are planned anew, as the API (review RV40-03)", async () => {
     let clock = NOW;
     const server = new MockServer({ now: () => clock, seed: 1 });
