@@ -1781,7 +1781,10 @@ shares, or the FlexVol inside its pool search pattern.
 Used by `--demo` and tests. Time is compressed by `settings.demo_speed` (default 60). Byte counts
 follow the estimator model (§9.1) with seeded jitter (`settings.demo_seed`). Each pass reports
 `bytes_changed = min(disk_bytes, change_rate_bps · previous_pass_duration)`; a warm cutover's `final` pass starts once the
-source is stopped. A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
+source is stopped. A `warm` pass takes the model's `snapshot + max(scan, Δ/L)` (the scan as §9.1 models it) and records as
+its `duration_s` the part after the snapshot, as the collection's warm sync does, so a pass that ran as the model predicts
+reads back the plan's `S`; `previous_pass_duration` is the previous pass's whole time, its snapshot included (review
+RV38A-05). A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
 cutover its shutdown — its clock starts when it stops the source, as an Ansible-driven cutover's does (§7.2), so its
 downtime has the parts its estimate has — its copy, conversion and create; a failed cutover up to its failure, in its
 `PermanentStepError`'s `details` — and the rollback its own 90 s, plus the model seconds of a cutover it interrupted
