@@ -353,8 +353,23 @@ wait_gone() {
     return
   fi
   pods=$("$KUBE" -n "$NS" get pods -l "$selector" "--field-selector=$fields" -o name)
-  [ -z "$pods" ] ||
-    "$KUBE" -n "$NS" wait --for=delete pod -l "$selector" "--field-selector=$fields" "--timeout=${TIMEOUT}s"
+  [ -n "$pods" ] || return 0
+  [ -z "${3-}" ] || "$3" "$pods" # what is waited for, said first
+  "$KUBE" -n "$NS" wait --for=delete pod -l "$selector" "--field-selector=$fields" "--timeout=${TIMEOUT}s"
+}
+# PostgreSQL's pods but seamless-postgres-0 gone before a control plane starts: each replica is a database of its own
+# (a PVC each) behind the one headless Service the control plane connects to, so the others - scaled out of band - are
+# judged by their pods, never by the replica count alone, waited for and named, their PVCs kept (SDD §17.2, reviews
+# RV38B-15, RV42A-01, RV42A-02).
+postgres_others_gone() { wait_gone seamless-postgres metadata.name!=seamless-postgres-0 postgres_others; }
+postgres_others() {
+  local pod n=1 kept=''
+  for pod in $1; do
+    kept="$kept data-${pod#pod/}"
+    n=$((n + 1))
+  done
+  printf '%s: PostgreSQL ran %s replicas, each a database of its own behind one Service: back to one, seamless-postgres-0; what the others hold stays in their PVCs:%s\n' \
+    "$PROG" "$n" "$kept" >&2
 }
 rollout() { kube rollout status "$1" "--timeout=${TIMEOUT}s"; }
 control_plane_to() {
@@ -362,7 +377,7 @@ control_plane_to() {
   if [ "$1" = 0 ]; then wait_gone seamless; else rollout deployment/seamless; fi
 }
 cluster_start() {
-  local replicas=0 i=1 kept=''
+  local replicas=0
   if [ "$DRY" = 1 ]; then
     say "# when PostgreSQL is not at 1 replica:"
   else
@@ -374,15 +389,7 @@ cluster_start() {
     kube scale statefulset/seamless-postgres --replicas=1
     rollout statefulset/seamless-postgres
   fi
-  # Each replica is a database of its own (a PVC each) behind the one headless Service the control plane connects to:
-  # scaled out of band, the others are gone before it starts - rollout status does not wait for a scale-down - and their
-  # PVCs are kept (SDD §17.2, review RV38B-15).
-  if [ "$DRY" = 1 ] || [ "$replicas" -gt 1 ]; then
-    while [ "$i" -lt "$replicas" ]; do kept="$kept data-seamless-postgres-$i" i=$((i + 1)); done
-    [ "$DRY" = 1 ] || printf '%s: PostgreSQL ran %s replicas, each a database of its own behind one Service: back to one, seamless-postgres-0; what the others hold stays in their PVCs:%s\n' \
-      "$PROG" "$replicas" "$kept" >&2
-    wait_gone seamless-postgres metadata.name!=seamless-postgres-0
-  fi
+  postgres_others_gone # rollout status does not wait for a scale-down
   control_plane_to 1
 }
 # A cluster's capacity: the ConfigMap's settings, and one new pod template - a restart annotation, as rollout restart
@@ -471,6 +478,7 @@ cluster() {
       # an apply restores no replica count an earlier down set (SDD §17.2)
       kube scale statefulset/seamless-postgres --replicas=1
       rollout statefulset/seamless-postgres
+      postgres_others_gone # rollout status does not wait for a scale-down
       control_plane_to 1
       say "after a change to the ConfigMap or a Secret alone, run: scripts/seamless-ctl.sh $PLATFORM restart"
       ;;

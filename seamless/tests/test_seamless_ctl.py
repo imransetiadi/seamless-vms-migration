@@ -123,6 +123,8 @@ def _args(calls, cmd):
 PLATFORMS = ["docker", "podman", "kubernetes", "openshift"]
 #: the pods a stop waits for: the running ones, never one that failed (SDD §17.2, review RV38B-03)
 ACTIVE = "--field-selector=status.phase!=Failed,status.phase!=Succeeded"
+#: PostgreSQL's pods a start or an up waits for: every one but seamless-postgres-0 (review RV42A-01)
+OTHER_DATABASES = ACTIVE + ",metadata.name!=seamless-postgres-0"
 
 
 @pytest.mark.parametrize("platform", PLATFORMS)
@@ -227,6 +229,7 @@ def test_a_cluster_up_applies_the_overlay_and_scales_both_back_to_one(
         f"{ns} apply -k {tree / overlay}",
         f"{ns} scale statefulset/seamless-postgres --replicas=1",
         f"{ns} rollout status statefulset/seamless-postgres --timeout=600s",
+        f"{ns} get pods -l app.kubernetes.io/name=seamless-postgres {OTHER_DATABASES} -o name",
         f"{ns} scale deployment/seamless --replicas=1",
         f"{ns} rollout status deployment/seamless --timeout=600s",
     ]
@@ -252,6 +255,8 @@ def test_a_cluster_start_brings_postgresql_back_first_when_it_is_down(
     assert _args(calls, tool) == [
         f"{ns} get statefulset/seamless-postgres -o jsonpath={{.spec.replicas}}",
         *(database if postgres == "0" else []),
+        # the others judged by their pods, whatever the count says (review RV42A-01)
+        f"{ns} get pods -l app.kubernetes.io/name=seamless-postgres {OTHER_DATABASES} -o name",
         f"{ns} scale deployment/seamless --replicas=1",
         f"{ns} rollout status deployment/seamless --timeout=600s",
     ]
@@ -280,6 +285,41 @@ def test_a_cluster_start_brings_postgresql_back_to_one_database_before_the_contr
     kept = [f"data-seamless-postgres-{i}" for i in range(1, postgres)]
     assert f"PostgreSQL ran {postgres} replicas" in proc.stderr, proc.stderr
     assert all(pvc in proc.stderr for pvc in kept), proc.stderr
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+@pytest.mark.parametrize("action", ["start", "up"])
+def test_postgresql_extra_pods_still_there_are_awaited_before_the_control_plane(
+    tmp_path, platform, action
+):
+    """SDD §17.2 (reviews RV42A-01, RV42A-02): PostgreSQL's replica count already back at one -
+    scaled down by hand, or a start run again after its wait gave up - with the extra pods still
+    terminating, each a database of its own behind the one Service: start and up judge by the
+    pods and wait them out before the control plane starts, naming them. start waited only for a
+    count above one; up never waited."""
+    state = fake_kube.cluster(replicas=0, postgres=3)
+    state["statefulset"]["replicas"] = 1
+    for pod in state["statefulset"]["pods"][1:]:
+        pod["terminating"] = True
+    proc, _, _ = _run(tmp_path, platform, action, cluster=state)
+    after = _cluster_after(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert [p["name"] for p in after["statefulset"]["pods"]] == ["seamless-postgres-0"]
+    [pod] = fake_kube.running(after)
+    assert pod["databases"] == ["seamless-postgres-0"]
+    assert "PostgreSQL ran 3 replicas" in proc.stderr, proc.stderr
+    assert "data-seamless-postgres-1 data-seamless-postgres-2" in proc.stderr
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_cluster_up_from_postgresql_scaled_out_waits_for_the_extra_databases(tmp_path, platform):
+    """SDD §17.2 (review RV42A-02): up scales PostgreSQL back to one - rollout status does not wait
+    for a scale-down - and starts the control plane only once the others are gone."""
+    proc, _, _ = _run(tmp_path, platform, "up", cluster=fake_kube.cluster(replicas=0, postgres=3))
+    after = _cluster_after(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    [pod] = fake_kube.running(after)
+    assert pod["databases"] == ["seamless-postgres-0"]
 
 
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)

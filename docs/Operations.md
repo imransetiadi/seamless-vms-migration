@@ -52,10 +52,10 @@ Compose, deleting the namespace or its PVCs on a cluster.
 
 | Action | What it does | docker / podman | kubernetes / openshift |
 |---|---|---|---|
-| `up` | deploy or update everything, then wait until it runs | `make seamless-up` (`--demo`: `seamless-demo`) - builds, creates or recreates what changed | `apply -k` the overlay, then PostgreSQL and the control plane at one replica each, both rollouts awaited |
+| `up` | deploy or update everything, then wait until it runs | `make seamless-up` (`--demo`: `seamless-demo`) - builds, creates or recreates what changed | `apply -k` the overlay, then PostgreSQL and the control plane at one replica each, both rollouts awaited - PostgreSQL's extra pods, if it was scaled out, gone first |
 | `down` | stop everything; the data stays | `make seamless-down` - containers removed, volumes kept | control plane to 0 (its running pod gone; an evicted pod is not waited for), then PostgreSQL to 0 |
 | `stop` | stop the control plane alone | `make seamless-stop` | control plane to 0 replicas |
-| `start` | start the control plane again | `make seamless-start` - the stopped container as it was, or a new one after `down` | PostgreSQL back to 1 first when it is not at 1 - each extra replica is a database of its own: named, awaited gone, its PVC kept -, then the control plane |
+| `start` | start the control plane again | `make seamless-start` - the stopped container as it was, or a new one after `down` | PostgreSQL back to 1 first when it is not at 1 - each extra replica is a database of its own: named, awaited gone (by its pods, also when the count already reads 1), its PVC kept -, then the control plane |
 | `restart` | restart the control plane from its current configuration | `make seamless-restart` - recreated from `.env`, the compose files and the sources | `rollout restart` (the old pod ends before the new one starts); a stopped control plane is started instead |
 | `scale 0` / `scale 1` | the control plane's replicas | `stop` / `start` | `stop` / `start` |
 | `capacity` | scale the one control plane up or down | `--max-migrations`, `--max-cutovers` into `deploy/compose/.env`, then `restart` | `--cpu`/`--memory` checked by a server-side dry run (a limit the API server refuses changes nothing), the same settings into the ConfigMap, then one patch of the pod template - its limits and a restart -, one rollout; a failed patch or rollout - a LimitRange or quota refusing the new pod - is rolled back, the settings put back |
