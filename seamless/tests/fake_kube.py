@@ -21,7 +21,11 @@ kubectl and the API server do (review 38b, read from their sources):
   and ``rollout status`` fails once the progress deadline passes; ``rollout undo`` brings the
   previous template back, as a new one;
 * ``unavailable`` set, every real (not dry-run) patch of the Deployment fails as the API server
-  restarting does.
+  restarting does; ``fail_configmap_patch`` N fails the ConfigMap's Nth patch the same way;
+* a rollout that passes its progress deadline (``rollout status`` with fewer running pods than
+  replicas) leaves the Deployment's Progressing condition at ProgressDeadlineExceeded: a later
+  ``rollout status`` fails at once (kubectl's rollout_status.go), a new template resets it, an
+  undo keeps it (the controller's sync.go) - ``wait --for=condition=Available`` judges the pods.
 """
 
 from __future__ import annotations
@@ -91,9 +95,11 @@ def reconcile(kind):
         obj["pods"].append(pod)
 
 
-def new_template():  # Recreate: the old pod ends, a new one reads the ConfigMap as it starts
+def new_template(keep_progress=False):  # Recreate: the old pod ends, a new one reads the ConfigMap
     obj = st["deployment"]
     obj.pop("failed_create", None)
+    if not keep_progress:  # a new template progresses again; an undo keeps the deadline
+        obj.pop("deadline_exceeded", None)
     obj["pods"] = [p for p in obj["pods"] if p["phase"] != "Running"]
     reconcile("deployment")
 
@@ -133,6 +139,11 @@ if verb == "get" and words[1] == "configmap/seamless-config":
     done(st["configmap"].get(key, "<no value>"))
 if verb == "get" and words[1] == "pods":
     done("".join(f"pod/{p['name']}\n" for p in selected(label_kind())))
+if verb == "wait" and flags.get("--for") == "condition=Available":
+    if len(active("deployment")) < st["deployment"]["replicas"]:
+        done("error: timed out waiting for the condition on deployments/seamless\n", 1)
+    st["deployment"].pop("deadline_exceeded", None)  # the controller marks it available
+    done("deployment.apps/seamless condition met\n")
 if verb == "wait":
     for pod in selected(label_kind()):
         if pod.get("terminating"):  # its grace period ends
@@ -143,7 +154,8 @@ if verb == "wait":
     done()
 if verb == "rollout" and words[1] == "status":
     kind = KINDS[words[2]]
-    if len(active(kind)) < st[kind]["replicas"]:
+    if st[kind].get("deadline_exceeded") or len(active(kind)) < st[kind]["replicas"]:
+        st[kind]["deadline_exceeded"] = True
         done(f'error: deployment "seamless" exceeded its progress deadline\n', 1)
     done(f"{words[2]} successfully rolled out\n")
 if verb == "rollout" and words[1] == "restart":
@@ -156,9 +168,12 @@ if verb == "rollout" and words[1] == "undo":
     obj = st["deployment"]
     previous = obj.get("history", []).pop()
     obj["limits"], obj["annotations"] = previous["limits"], previous["annotations"]
-    new_template()
+    new_template(keep_progress=True)
     done("deployment.apps/seamless rolled back\n")
 if verb == "patch" and words[1] == "configmap/seamless-config":  # a merge patch: null removes
+    st["configmap_patches"] = st.get("configmap_patches", 0) + 1
+    if st.get("fail_configmap_patch") == st["configmap_patches"]:
+        done("Error from server (InternalError): an admission webhook timed out\n", 1)
     for key, value in json.loads(flags["-p"])["data"].items():
         if value is None:
             st["configmap"].pop(key, None)

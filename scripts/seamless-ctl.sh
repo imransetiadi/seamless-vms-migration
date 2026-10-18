@@ -438,7 +438,7 @@ cluster_capacity() {
   # reviews RV41A-06, RV41A-07)
   kube patch deployment/seamless -p "$CAP_PATCH" || capacity_failed "the pod template could not be patched"
   rollout deployment/seamless || capacity_failed "the new pod did not start - a LimitRange or a quota may refuse \
-its limits (kubectl -n $NS describe replicaset -l app.kubernetes.io/name=seamless)" undo
+its limits ($KUBE -n $NS describe replicaset -l app.kubernetes.io/name=seamless)" undo
   say "the next 'up' (apply -k) brings the manifests' values back: put a lasting change into $OVERLAY"
 }
 # The settings seamless-config holds for the keys capacity changes, as merge-patch data - a key it lacks as null, which
@@ -456,17 +456,24 @@ capacity_settings_now() {
   done
   printf '%s' "$data"
 }
-# Put back what a failed capacity changed - the ConfigMap's settings (cluster_capacity's $before) and, after a
-# rollout, the template - then stop.
+# Put back what a failed capacity changed, then stop: the ConfigMap's settings (cluster_capacity's $before) first, so
+# the pod the undo starts reads them as they were, and after a rollout the template - all the same when the put-back
+# fails, which is named (SDD §17.2, reviews RV41A-06, RV41A-07, RV42A-03). The undo is awaited by the Deployment
+# becoming Available: its Progressing condition keeps a passed deadline after an undo, which rollout status reads as
+# failed at once (review RV42A-07); a second bare undo would bring the refused template back, so none is advised.
 capacity_failed() {
+  local left=''
   if [ -n "$before" ]; then
     kube patch configmap/seamless-config --type merge -p "{\"data\":{$before}}" ||
-      die "$1, and seamless-config could not be put back: set its concurrency settings yourself"
+      left="seamless-config could not be put back: set {$before} in it yourself"
   fi
-  if [ "${2-}" = undo ]; then
-    { kube rollout undo deployment/seamless && rollout deployment/seamless; } ||
-      die "$1, and the rollout could not be undone: $KUBE -n $NS rollout undo deployment/seamless"
+  if [ "${2-}" = undo ] &&
+    ! { kube rollout undo deployment/seamless && kube wait --for=condition=Available deployment/seamless \
+      "--timeout=${TIMEOUT}s"; }; then
+    left="${left:+$left; }the template was not rolled back: find the revision before this capacity with $KUBE -n $NS \
+rollout history deployment/seamless and roll back to it (--to-revision)"
   fi
+  [ -z "$left" ] || die "$1, and $left"
   die "$1: seamless-config and the pod template are put back as they were"
 }
 

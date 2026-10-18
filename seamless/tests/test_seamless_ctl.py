@@ -550,13 +550,37 @@ def test_a_capacity_limit_a_limitrange_refuses_is_rolled_back(tmp_path, platform
     state = fake_kube.cluster()
     state["limitrange"] = {"memory": "4Gi"}
     argv = ["capacity", "--max-migrations", "20", "--memory", "8Gi"]
-    proc, _, _ = _run(tmp_path, platform, *argv, cluster=state)
+    proc, calls, _ = _run(tmp_path, platform, *argv, cluster=state)
     after = _cluster_after(tmp_path)
     assert proc.returncode == 1, proc.stderr
     assert "LimitRange" in proc.stderr, proc.stderr
     [pod] = fake_kube.running(after)
     assert pod["limits"]["memory"] == "4Gi"
     assert pod["config"]["SEAMLESS_MAX_CONCURRENT_MIGRATIONS"] == "10"
+    # the undo is awaited by its pod - the Progressing condition keeps the passed deadline after an
+    # undo, so a rollout status on it failed at once - and no second undo is advised (RV42A-07)
+    assert "put back as they were" in proc.stderr, proc.stderr
+    assert "could not be undone" not in proc.stderr
+    tool = "oc" if platform == "openshift" else "kubectl"
+    assert f"{tool} -n seamless-migrate describe replicaset" in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_refused_rollout_is_undone_also_when_the_settings_cannot_be_put_back(tmp_path, platform):
+    """SDD §17.2 (review RV42A-03): the settings' put-back failing (an admission webhook timing
+    out) died before the undo - the refused template stayed and no control plane ran. The undo
+    runs all the same, and the message names what could not be put back."""
+    state = fake_kube.cluster()
+    state["limitrange"] = {"memory": "4Gi"}
+    state["fail_configmap_patch"] = 2  # the put-back, after the capacity's own patch
+    argv = ["capacity", "--max-migrations", "20", "--memory", "8Gi"]
+    proc, _, _ = _run(tmp_path, platform, *argv, cluster=state)
+    after = _cluster_after(tmp_path)
+    assert proc.returncode == 1, proc.stderr
+    [pod] = fake_kube.running(after)
+    assert pod["limits"]["memory"] == "4Gi"  # the template rolled back, the control plane running
+    assert "seamless-config could not be put back" in proc.stderr, proc.stderr
+    assert "SEAMLESS_MAX_CONCURRENT_MIGRATIONS" in proc.stderr  # what to set back
 
 
 @pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
