@@ -3811,8 +3811,9 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   CPU and memory for the one control plane, each concurrent migration costing about 250 MiB (Performance.md §8) -,
   while the conversion hosts move the data (Performance.md).
 * **The mode a restart keeps.** `make seamless-start` and `seamless-restart` keep the mode the control plane ran in:
-  without `SEAMLESS_DEMO` in their environment they read it from the running or stopped container, so a demo
-  stack comes back a demo stack and a real one a real one.
+  without `SEAMLESS_DEMO` in their environment or in `.env` - whether `.env` sets it is read as Compose reads it
+  (below, review RV41A-04) - they read it from the running or stopped container, so a demo stack comes back a demo
+  stack and a real one a real one.
 * **Stopping safely.** A stop is safe at any time (§8): running steps end within the stop grace and resume from
   their checkpoint once the control plane runs again. `--drain TOKEN_FILE` makes a planned stop quieter: before
   `down`, `stop`, `restart`, `scale 0` or `capacity` - which ends in a restart (review RV38B-22) - it pauses every
@@ -3827,10 +3828,14 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   other mode is refused - and reaches curl through a header file in a private directory, never a command line
   (§13.1); the API is `http://127.0.0.1:<SEAMLESS_HOST_PORT>` on the single host - the port Compose publishes:
   the shell's, else
-  `deploy/compose/.env`'s, else 8080, the file read by Compose's dotenv rules (an `export ` prefix, spaces around `=`,
-  quotes, an inline comment after an unquoted value, the last definition wins), so the token never goes to a port the
-  stack does not publish (review RV38B-07); the Make targets read `SEAMLESS_HOST_PORT` and `SEAMLESS_VERSION` the same
-  way (RV38B-07b, RV38B-09) - and the Route's or Ingress's URL (`--url`) on a cluster. `--drain` and `resume` need `python3` to read the API's JSON.
+  `deploy/compose/.env`'s, else 8080, the file read by Compose's dotenv rules (a leading
+  byte-order mark ignored, an `export ` prefix, a key ended by `=` or `:`, spaces around it, quotes, an inline comment
+  after ` #` in an unquoted value, the last definition wins - reviews RV41A-01, RV41A-03); a value Compose would
+  interpolate - a `$` in an unquoted or double-quoted value - is refused, never guessed: the script and the Make
+  targets that use the value stop and name it (review RV41A-02). So the token never goes to a port the stack does not
+  publish (review RV38B-07); the Make targets read `SEAMLESS_HOST_PORT` and `SEAMLESS_VERSION` the same way
+  (RV38B-07b, RV38B-09) - and the Route's or Ingress's URL (`--url`) on a cluster. `--drain` and `resume` need
+  `python3` to read the API's JSON.
 * `--dry-run` prints every command and runs none. The tutorial is `docs/Operations.md`.
 
 ---
