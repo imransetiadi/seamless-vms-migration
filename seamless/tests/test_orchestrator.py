@@ -4924,6 +4924,83 @@ async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_
     assert overridden.decision.status == DecisionStatus.overridden
 
 
+@pytest.mark.parametrize(
+    ("action", "answer", "attempt", "passes"),
+    [
+        ("override", ("warm", 0.99), UNCUT, 2),
+        ("override", ("warm", 0.99), (P.precopy, P.rolling_back, P.rolled_back), 0),
+        ("approve", ("storage_handover", 0.5), (P.cutover, P.rolling_back, P.rolled_back), 0),
+    ],
+    ids=[
+        "an override to it after a warm attempt's passes",
+        "an override to it after a warm attempt rolled back in its first pass",
+        "an approve of its recommendation after a cold rollback that kept the volumes",
+    ],
+)
+async def test_an_advisor_decision_takes_no_handover_while_an_earlier_attempt_holds_volumes(
+    tmp_path, store, action, answer, attempt, passes
+):
+    """SDD §14.6, §9.2 (review RV41B-01): approve and override judge eligible at the request, as
+    PUT …/strategy does (RV40-01). After an attempt whose record keeps its destination volumes - a
+    warm one's passes, a first pass cut off after creating them, a cold rollback that could not
+    delete them - and a Retry, the stored estimates still call storage_handover eligible: an
+    override to it is refused (422), an approve of a recommendation of it (the advisor's
+    below-threshold answer, the rules having chosen cold) too (409), each naming the held volumes,
+    and neither the strategy nor the plan changes - a paused plan's Start would have run the
+    handover over them. Another option is still a person's call."""
+    from seamless_migrate.executors.ansible import run_dir
+    from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
+
+    advisor, _ = _tie_advisor(*answer)
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1, size_gb=4, used_gb=1.0)],
+        {"handover": handover, "auto_cutover": False},
+        advisor=advisor,
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        [rec] = _recommendations(store)
+        first = await h.by_vm(plan.id, "vm-1")
+        assert (rec.recommendation.option, first.strategy) == (
+            answer[0],
+            Strategy.warm if action == "override" else Strategy.cold,
+        )
+        assert first.estimate_for(Strategy.storage_handover).eligible  # nothing held then
+        first.phase = P.rolled_back
+        first.phase_history = [*first.phase_history, *_history(*attempt)]
+        first.sync_passes = _passes(passes, first.phase_history)
+        record = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"dest_volumes": {"vol-1": "dst-vol-1"}}))
+        store.put("migration", first)
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        retried = await h.orch.retry(first.id, "alice")
+        assert retried.estimate_for(Strategy.storage_handover).eligible  # as stored
+        if action == "override":
+            with pytest.raises(Unprocessable, match=HELD_VOLUMES_REASON):
+                await h.orch.override_recommendation(
+                    rec.id, "storage_handover", "the owner wants the handover", "rina"
+                )
+        else:
+            with pytest.raises(NotAllowed, match=HELD_VOLUMES_REASON):
+                await h.orch.approve_recommendation(rec.id, "rina")
+        left = await h.migration(first.id)
+        assert left.strategy == first.strategy
+        assert (await h.plan(plan.id)).strategy_overrides == {}
+        assert store.get("recommendation", rec.id, AdvisorRecommendation).decision == rec.decision
+        overridden = await h.orch.override_recommendation(
+            rec.id, "warm", "the owner chose warm", "rina"
+        )
+        assert overridden.decision.final_option == "warm"
+    finally:
+        await h.orch.stop()
+
+
 async def test_a_decision_keeps_the_rules_of_the_policy_that_took_it(tmp_path, store):
     """SDD §14.6 (advisor Phase 1 audit, A3): a policy change applies from the next validation and
     never rewrites a decision - switching maker-checker or the override reason off afterwards lets

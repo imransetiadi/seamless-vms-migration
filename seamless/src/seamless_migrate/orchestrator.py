@@ -2168,6 +2168,20 @@ class Orchestrator:
             if isinstance(action, Approve) and rec.decision.status == DecisionStatus.approved:
                 raise NotAllowed("The decision is already approved.")  # one event per change
             eligible = tuple(e.strategy.value for e in m.estimates if e.eligible)
+            handover = Strategy.storage_handover.value
+            chosen = action.option if isinstance(action, Override) else rec.recommendation.option
+            if (
+                chosen == handover
+                and handover in eligible
+                and await self.holds_destination_volumes(m)
+            ):
+                # §9.2 judged now, as PUT …/strategy: a Retry does not re-assess the estimates
+                # the last validation stored, and a handover would leave the held volumes behind
+                # (SDD §14.6, review RV41B-01)
+                refusal = f"strategy {handover} is not eligible: {HELD_VOLUMES_REASON}"
+                if isinstance(action, Override):
+                    raise Unprocessable(refusal)
+                raise NotAllowed(f"nothing to approve: {refusal}")
             advice = Advice(
                 option=rec.recommendation.option,
                 confidence=rec.recommendation.confidence,

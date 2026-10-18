@@ -35,6 +35,7 @@ import {
   type PlanFinalizeResult,
   type RecommendationPage,
   type Stats,
+  type Strategy,
   type VMRef,
   type Wave,
 } from './types';
@@ -2965,6 +2966,65 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     });
     expect(server.migrations.find((x) => x.id === m.id)!.strategy).toBe('warm');
   });
+
+  it.each(['override', 'approve'] as const)(
+    'takes no storage handover by an advisor decision (%s) while an earlier attempt holds its volumes, as the API (SDD §14.6, review RV41B-01)',
+    async (action) => {
+      const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+      const as = (token: string) => new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+      const eligible = (m: Migration, s: Strategy) => m.estimates.find((e) => e.strategy === s)?.eligible === true;
+      // the handover plan under an SLO no strategy meets: the advisor chooses between every eligible strategy, and the
+      // Finance policy holds each decision for a person
+      await as('operator').patch('/plans/plan-c81d44a0', { downtime_slo_s: 60 });
+      await as('operator').post('/plans/plan-c81d44a0/validate');
+      const m = server.migrations.find(
+        (x) => x.plan_id === 'plan-c81d44a0' && x.advisor_hold !== null && (['storage_handover', 'warm', 'cold'] as const).every((s) => eligible(x, s)),
+      )!;
+      const rec = server.recommendations.filter((r) => r.migration_id === m.id).at(-1)!;
+      await as('admin').post(`/advisor/recommendations/${rec.id}/approve`, {}); // warm: no plan override
+      expect([m.strategy, m.advisor_hold]).toEqual(['warm', null]);
+      // the warm attempt ran its pre-copy and was rolled back; a Retry re-assesses nothing (the mock keeps no record)
+      m.sync_passes = [
+        { number: 1, kind: 'full', started_at: '2026-10-08T11:00:30Z', ended_at: '2026-10-08T11:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1770 },
+      ];
+      m.phase = 'rolled_back';
+      m.phase_history = [
+        ...m.phase_history,
+        ...(['precopy', 'syncing', 'awaiting_cutover', 'rolling_back', 'rolled_back'] as const).map((to_phase, i, all) => ({
+          from_phase: i ? all[i - 1]! : ('ready' as const),
+          to_phase,
+          at: `2026-10-08T11:0${i}:00Z`,
+          reason: 'test',
+          actor: 'test',
+        })),
+      ];
+      await as('operator').post(`/migrations/${m.id}/retry`, {});
+      expect([m.phase, eligible(m, 'storage_handover')]).toEqual(['ready', true]); // as stored
+      const refusal = `storage_handover is not eligible for ${m.vm.name}: an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first.`;
+      if (action === 'override') {
+        await expect(
+          as('admin').post(`/advisor/recommendations/${rec.id}/override`, { option: 'storage_handover', reason: 'the owner wants the handover' }),
+        ).rejects.toMatchObject({ status: 422, message: refusal });
+      } else {
+        // the newest recommendation recommends the handover, its decision one a person may still approve
+        const newest = server.recommendations.find((r) => r.id === rec.id)!;
+        newest.recommendation.option = 'storage_handover';
+        newest.decision.status = 'below_threshold';
+        await expect(as('admin').post(`/advisor/recommendations/${rec.id}/approve`, {})).rejects.toMatchObject({
+          status: 409,
+          message: `nothing to approve: ${refusal}`,
+        });
+      }
+      expect(m.strategy).toBe('warm');
+      expect(server.plans.find((p) => p.id === m.plan_id)!.strategy_overrides[m.vm.source_id]).toBeUndefined();
+      // another option is still a person's call
+      const cold = await as('admin').post<AdvisorRecommendation>(`/advisor/recommendations/${rec.id}/override`, {
+        option: 'cold',
+        reason: 'the owner chose cold',
+      });
+      expect(cold.decision.final_option).toBe('cold');
+    },
+  );
 
   it("leaves a migration's wave to the next validation when the waves are planned anew, as the API (review RV40-03)", async () => {
     let clock = NOW;

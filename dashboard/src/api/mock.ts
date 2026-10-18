@@ -1685,6 +1685,14 @@ export class MockServer {
     if (pinned) throw new HttpError(409, 'conflict', `The plan sets the strategy of ${m.vm.name} (${pinned}): change it in the plan.`);
     if (action === 'approve' && rec.decision.status === 'approved') throw new HttpError(409, 'conflict', 'The decision is already approved.');
     const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy as string);
+    const chosen = action === 'override' ? input.option : rec.recommendation.option;
+    if (chosen === 'storage_handover' && eligible.includes(chosen) && keptAfterRollback(m)) {
+      // like the API (SDD §14.6, §9.2, review RV41B-01): judged now, as PUT …/strategy - a Retry re-assesses no stored
+      // estimate, and a handover would leave an earlier attempt's volumes behind
+      const refusal = `storage_handover is not eligible for ${m.vm.name}: ${HELD_VOLUMES_REASON}.`;
+      if (action === 'override') throw new HttpError(422, 'validation_error', refusal);
+      throw new HttpError(409, 'conflict', `nothing to approve: ${refusal}`);
+    }
     const at = new Date(this.now()).toISOString();
     let decided: AdvisorRecommendation;
     if (action === 'approve') {
