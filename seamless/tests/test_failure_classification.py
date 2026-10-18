@@ -400,7 +400,10 @@ def test_no_collection_error_reads_transient_by_its_class_name():
 
 #: may match TRANSIENT: a predicate on an exception that raises nothing itself, so no traceback
 #: ever shows its frame (review RV36A-02)
-RAISES_NOTHING = {"is_timeout"}
+#: the collection's predicates on an exception that raise nothing themselves - so no traceback ever
+#: shows their frame -, by file and name: a function of that name elsewhere is no such predicate
+#: (reviews RV36A-02, RV37B-02)
+RAISES_NOTHING = {("plugins/module_utils/volume_common.py", "is_timeout")}
 
 
 def _what_ansible_core_prints_of_the_collection() -> dict[str, str]:
@@ -418,8 +421,18 @@ def _what_ansible_core_prints_of_the_collection() -> dict[str, str]:
             if isinstance(node, ast.ClassDef):
                 found[f"{module}.{node.name}"] = str(relative)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                found[node.name] = str(relative)
+                # a frame is its file and its function: kept apart per file (review RV37B-02)
+                found[f"{relative}:{node.name}"] = str(relative)
     return found
+
+
+def _raises(root: Path, path: str, name: str) -> bool | None:
+    """Whether the function ``name`` of ``path`` raises anything itself; ``None`` without one."""
+    tree = ast.parse((root / path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return any(isinstance(inner, ast.Raise) for inner in ast.walk(node))
+    return None
 
 
 def test_nothing_ansible_core_prints_of_the_collection_reads_transient():
@@ -429,9 +442,52 @@ def test_nothing_ansible_core_prints_of_the_collection_reads_transient():
     matches TRANSIENT so turns a permanent failure transient, a stuck detach retried with the cold
     source stopped. None may, but a predicate that raises nothing."""
     found = _what_ansible_core_prints_of_the_collection()
-    assert "plugins.module_utils.volume_common.DetachStuck" in found and "wait_for_lock" in found
+    assert "plugins.module_utils.volume_common.DetachStuck" in found
+    assert "plugins/module_utils/volume_common.py:wait_for_lock" in found
+    allowed = {f"{path}:{name}" for path, name in RAISES_NOTHING}
     assert {
-        name: path
-        for name, path in found.items()
-        if TRANSIENT.search(name) and name not in RAISES_NOTHING
+        name: path for name, path in found.items() if TRANSIENT.search(name) and name not in allowed
     } == {}
+    # each predicate allowed raises nothing itself (review RV37B-02)
+    root = find_repo_root()
+    assert {(path, name): _raises(root, path, name) for path, name in RAISES_NOTHING} == {
+        place: False for place in RAISES_NOTHING
+    }
+
+
+@pytest.mark.parametrize(
+    "path, mutate",
+    [
+        (
+            "plugins/module_utils/blocksync.py",
+            lambda text: (
+                text
+                + '\n\ndef is_timeout(err):\n    raise RuntimeError(f"Volume {err} is stuck")\n'
+            ),
+        ),
+        (
+            "plugins/module_utils/volume_common.py",
+            lambda text: text.replace(
+                '    return any(cls.__name__ == "ResourceTimeout"',
+                '    if err is None:\n        raise ValueError("no error")\n'
+                '    return any(cls.__name__ == "ResourceTimeout"',
+                1,
+            ),
+        ),
+    ],
+    ids=["a raising is_timeout in another module", "the allowed predicate made to raise"],
+)
+def test_the_transient_guard_allows_only_a_predicate_that_raises_nothing(
+    tmp_path, monkeypatch, path, mutate
+):
+    """Reviews RV36A-02, RV37B-02: the guard allows is_timeout by its place - volume_common's
+    predicate - and only while it raises nothing: a raising function of that name in another
+    module, whose frame an escaped error's 2.18 traceback prints, or the predicate made to raise,
+    fails it."""
+    root = tmp_path / "repo"
+    shutil.copytree(find_repo_root() / "plugins", root / "plugins")
+    target = root / path
+    target.write_text(mutate(target.read_text(encoding="utf-8")), encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "find_repo_root", lambda: root)
+    with pytest.raises(AssertionError):
+        test_nothing_ansible_core_prints_of_the_collection_reads_transient()
