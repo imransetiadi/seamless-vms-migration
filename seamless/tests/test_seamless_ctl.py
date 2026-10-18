@@ -61,11 +61,12 @@ def _run(
     cluster=None,
     tools=None,
     cwd=None,
+    environment=None,
 ):
     """Run a copy of the script in a scratch tree with the stub tools first on PATH; return the run
     and the tools' calls in order. With ``cluster`` (a fake_kube state), kubectl and oc keep it -
-    read it back with ``_cluster_after(tmp_path)``; ``tools`` adds scripts by name to that PATH, and
-    ``cwd`` is where the script runs."""
+    read it back with ``_cluster_after(tmp_path)``; ``tools`` adds scripts by name to that PATH,
+    ``cwd`` is where the script runs, and ``environment`` is exported to it."""
     tree = tmp_path / "tree"
     (tree / "scripts").mkdir(parents=True, exist_ok=True)
     shutil.copy(SCRIPT, tree / "scripts" / SCRIPT.name)
@@ -99,6 +100,7 @@ def _run(
         STUB_RULES=str(tmp_path / "rules.json"),
         TMPDIR=str(tmp_path),
         **fake,
+        **(environment or {}),
     )
     argv = [str(token_file) if a == "@TOKEN_FILE" else a for a in argv]
     cmd = ["bash", *(["-x"] if xtrace else []), str(tree / "scripts" / SCRIPT.name), *argv]
@@ -1005,6 +1007,34 @@ def test_a_drain_that_fails_after_a_pause_names_the_plans_it_paused(tmp_path, ru
     assert "nothing was stopped" in proc.stderr, proc.stderr
     assert f"resume --token-file {tmp_path / 'operator.token'} {' '.join(paused)}" in proc.stderr
     assert not [c for c in calls if c["cmd"] == "make"]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["capacity", "--max-migrations", "20"], ["restart"]],
+    ids=["capacity", "restart"],
+)
+def test_a_drain_pauses_no_plan_for_a_restart_its_make_target_refuses(tmp_path, argv):
+    """SDD §17.2 (review RV42A-04): the single host's restart - capacity's last step - waits on
+    SEAMLESS_HOST_PORT, which its Make target refuses when Compose would interpolate it; --url
+    gets past the script's own port check, so the drain paused every plan and the restart then
+    stopped. The port is checked before the drain: nothing is paused or changed."""
+    port_env = "POSTGRES_PASSWORD=x\nPORT=18081\nSEAMLESS_HOST_PORT=${PORT}\n"
+    proc, calls, tree = _run(
+        tmp_path, "docker", *argv, "--drain", "@TOKEN_FILE", "--url", "http://127.0.0.1:18081",
+        env_file=port_env, rules=_drain_rules([{"stdout": "[]"}]),
+    )  # fmt: skip
+    assert proc.returncode == 1, proc.stderr
+    assert "SEAMLESS_HOST_PORT" in proc.stderr and "nothing was changed" in proc.stderr, proc.stderr
+    assert calls == []  # no plan listed or paused, no make
+    assert (tree / "deploy" / "compose" / ".env").read_text() == port_env
+    # the shell's own port is the one Make takes, as Compose does: nothing to refuse
+    proc, calls, _ = _run(
+        tmp_path / "shell", "docker", *argv, "--drain", "@TOKEN_FILE", env_file=port_env,
+        rules=_drain_rules([{"stdout": "[]"}]), environment={"SEAMLESS_HOST_PORT": "18081"},
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    assert [c["cmd"] for c in calls][-1] == "make"
 
 
 def test_an_interrupted_drain_names_the_plans_it_paused(tmp_path):

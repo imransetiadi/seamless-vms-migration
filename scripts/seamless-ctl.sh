@@ -196,7 +196,12 @@ if [ "$KIND" = host ]; then
   port=${port:-8080}
   if [ -z "$URL" ] && { [ -n "$DRAIN" ] || [ "$ACTION" = resume ] || [ "$ACTION" = status ]; }; then
     case $port in
-      '?') die "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value, or --url" ;;
+      '?')
+        case $ACTION in
+          restart | capacity) die "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value" ;;
+          *) die "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value, or --url" ;;
+        esac
+        ;;
       *[!0-9]*) die "SEAMLESS_HOST_PORT is '$port', no port: give a plain number, or --url" ;;
     esac
   fi
@@ -414,11 +419,21 @@ capacity_patch() {
 capacity_check() {
   if [ "$KIND" = host ]; then
     [ -f "$ROOT/deploy/compose/.env" ] || die "deploy/compose/.env is missing: run make seamless-init first"
+    restart_port_readable
   else
     need "$KUBE" "install it and log in to the cluster"
     capacity_patch
     [ -z "$CAP_LIMITS" ] || kube patch deployment/seamless -p "$CAP_PATCH" --dry-run=server
   fi
+}
+# The single host's restart - capacity's last step - waits on the port its Make target reads, which it refuses when
+# Compose would interpolate it (Makefile's SEAMLESS_DOTENV_STOP); the shell's own port wins there, as here. Checked
+# before a drain, so no plan is paused for a restart that would stop (SDD §17.2, review RV42A-04).
+restart_port_readable() {
+  [ -z "${SEAMLESS_HOST_PORT+set}" ] || return 0
+  sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env" >/dev/null ||
+    die "the restart's Make target cannot read SEAMLESS_HOST_PORT in deploy/compose/.env: give it a plain value;" \
+      "nothing was changed"
 }
 cluster_capacity() {
   if [ -n "$MAX_MIGRATIONS" ] && [ "$MAX_MIGRATIONS" -gt 10 ] && [ -z "$MEMORY" ]; then
@@ -543,6 +558,7 @@ if [ "$ACTION" = resume ]; then
 fi
 if [ -n "$DRAIN" ]; then
   [ "$ACTION" != capacity ] || capacity_check
+  [ "$KIND$ACTION" != hostrestart ] || restart_port_readable
   drain
 fi
 if [ "$KIND" = host ]; then host; else cluster; fi
