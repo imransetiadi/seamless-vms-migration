@@ -106,9 +106,11 @@ After running import_from_hypervisor, your workload definition will be updated w
 Each entry in the list represents one disk with:
 
 * ``device``: The device name on the destination instance
-* ``uri``: The NBD URI to connect to - its host is the address qemu-nbd listens on
-  (``os_migrate_nbdkit_bind_address``, here ``192.0.2.10``), and the hypervisor's name only when it listens on
-  every interface (``0.0.0.0`` or ``::``)
+* ``uri``: The NBD URI to connect to. With the ``tcp`` protocol, ``nbd://<host>:<port>``: its host is the address
+  qemu-nbd listens on (``os_migrate_nbdkit_bind_address``, here ``192.0.2.10``), and the hypervisor's name only when
+  it listens on every interface (``0.0.0.0`` or ``::``). With the ``ssh`` protocol,
+  ``nbd+ssh://<os_migrate_nbdkit_ssh_user>@<hypervisor name>:<port>``: the hypervisor's name, which the tunnel logs
+  in to, whatever qemu-nbd listens on there (``127.0.0.1`` by default)
 * ``port``: The qemu-nbd port number
 * ``size``: Disk size in GiB: the exact byte count ``qemu-img info`` reports, rounded up, so the
   destination volume is never smaller than the disk; a disk whose size cannot be read stops the export
