@@ -1,12 +1,20 @@
 import { Gauge } from 'lucide-react';
 import type { Migration, Plan } from '../api/types';
-import { formatRate } from '../lib/format';
+import { ESTIMATOR_DEFAULTS, paramsFor } from '../lib/forcedEstimate';
+import { formatDuration, formatRate } from '../lib/format';
 import { isWarmStrategy } from '../lib/phase';
 
-/** Planning default of the per-stream scan rate (SDD §9.1 `EstimatorParams.scan_bps`). */
-const DEFAULT_SCAN_BPS = 524_288_000;
-/** Planning default of the guest write rate (SDD §9.1 `EstimatorParams.change_rate_bps`). */
-const DEFAULT_CHANGE_RATE_BPS = 2_097_152;
+/** The estimator overrides listed besides the rates and the disks in parallel, when the plan sets them (SDD §16). */
+const OTHER_OVERRIDES = [
+  { key: 'max_aggregate_scan_bps', label: 'Aggregate scan cap', show: formatRate },
+  { key: 'shutdown_s', label: 'Source shutdown', show: formatDuration },
+  { key: 'snapshot_s', label: 'Snapshot', show: formatDuration },
+  { key: 'create_s', label: 'Volume create', show: formatDuration },
+  { key: 'boot_s', label: 'Boot', show: formatDuration },
+  { key: 'handover_per_volume_s', label: 'Handover per volume', show: formatDuration },
+  { key: 'v2v_s', label: 'Conversion', show: formatDuration },
+  { key: 'v2v_inplace_s', label: 'In-place conversion', show: formatDuration },
+] as const;
 
 export interface CalibrationPanelProps {
   migration: Migration;
@@ -28,10 +36,13 @@ function Row({ label, value, source }: { label: string; value: string; source: s
 /**
  * What the downtime estimate currently rests on (SDD §9.1 "Configuration and calibration"):
  * the guest write rate and the per-stream scan rate, each either a planning default, a plan
- * override, or a value measured by a delta pass of this very migration.
+ * override, or a value measured by a delta pass of this very migration; the link speed; and the
+ * plan's other estimator overrides — the disks in parallel shown on the OpenStack warm path in any case (§16).
  */
 export function CalibrationPanel({ migration: m, plan }: CalibrationPanelProps) {
   const overrides = plan?.estimator_overrides ?? {};
+  // what the estimate uses: the plan's parameters, the planning defaults without a plan (SDD §9.1)
+  const p = plan ? paramsFor(plan) : ESTIMATOR_DEFAULTS;
   // a delta pass with byte counts calibrated the write rate (the VMware kit reports none)
   const measuredDelta = m.sync_passes.some(
     (p) => p.kind !== 'full' && p.ended_at !== null && (p.bytes_changed > 0 || p.bytes_scanned > 0),
@@ -43,7 +54,7 @@ export function CalibrationPanel({ migration: m, plan }: CalibrationPanelProps) 
       : 'scan_bps' in overrides
         ? 'plan override'
         : 'planning default';
-  const scan = m.observed_scan_bps ?? overrides.scan_bps ?? DEFAULT_SCAN_BPS;
+  const scan = m.observed_scan_bps ?? p.scan_bps;
   const changeSource =
     m.vm.change_rate_bps !== null
       ? measuredDelta
@@ -52,7 +63,7 @@ export function CalibrationPanel({ migration: m, plan }: CalibrationPanelProps) 
       : 'change_rate_bps' in overrides
         ? 'plan override'
         : 'planning default';
-  const changeRate = m.vm.change_rate_bps ?? overrides.change_rate_bps ?? DEFAULT_CHANGE_RATE_BPS;
+  const changeRate = m.vm.change_rate_bps ?? p.change_rate_bps;
   // the scan rate is calibrated for the OpenStack warm path only; CBT passes have no scan term
   const calibrated = m.observed_scan_bps !== null || (cbt && measuredDelta);
   const warm = isWarmStrategy(m.strategy);
@@ -75,9 +86,16 @@ export function CalibrationPanel({ migration: m, plan }: CalibrationPanelProps) 
           <Row label="Scan rate per disk stream" value={formatRate(scan)} source={scanSource} />
         )}
         {plan && <Row label="Link speed" value={formatRate(plan.link_bps)} source="plan" />}
-        {'parallel_disks' in overrides && (
-          <Row label="Disks scanned in parallel" value={String(overrides.parallel_disks)} source="plan override" />
+        {(m.strategy === 'warm' || 'parallel_disks' in overrides) && (
+          <Row
+            label="Disks scanned in parallel"
+            value={String(p.parallel_disks)}
+            source={'parallel_disks' in overrides ? 'plan override' : 'planning default'}
+          />
         )}
+        {OTHER_OVERRIDES.filter(({ key }) => key in overrides).map(({ key, label, show }) => (
+          <Row key={key} label={label} value={show(p[key])} source="plan override" />
+        ))}
       </dl>
     </div>
   );

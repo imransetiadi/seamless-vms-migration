@@ -29,6 +29,8 @@ const DEFAULTS = {
 };
 
 export type EstimatorParams = typeof DEFAULTS;
+/** The planning defaults, for a view without a plan. */
+export const ESTIMATOR_DEFAULTS: Readonly<EstimatorParams> = Object.freeze({ ...DEFAULTS });
 export type PlanEstimatorSettings = Pick<Plan, 'link_bps' | 'convergence_threshold_bytes' | 'max_sync_passes' | 'estimator_overrides'>;
 
 const INT_FIELDS = new Set(['convergence_threshold_bytes', 'max_passes', 'parallel_disks']);

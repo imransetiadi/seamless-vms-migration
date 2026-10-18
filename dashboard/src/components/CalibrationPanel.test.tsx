@@ -14,6 +14,13 @@ function fixtures(): { warm: Migration; plan: Plan } {
   return { warm, plan };
 }
 
+/** A row of the panel: its value and its source. */
+function row(label: string): [string, string] {
+  const dd = screen.getByText(label, { selector: 'dt' }).nextElementSibling as HTMLElement;
+  const [value, source] = Array.from(dd.children).map((c) => c.textContent ?? '');
+  return [value ?? '', source ?? ''];
+}
+
 describe('CalibrationPanel', () => {
   it('shows measured rates once a delta pass calibrated the migration', () => {
     const { warm, plan } = fixtures();
@@ -48,6 +55,8 @@ describe('CalibrationPanel', () => {
     expect(screen.getByText('not needed')).toBeInTheDocument();
     expect(screen.getByText(/changed-block tracking knows the delta/)).toBeInTheDocument();
     expect(screen.queryByText(/measured by the last delta pass/)).not.toBeInTheDocument();
+    // CBT passes scan no disk: no disks in parallel unless the plan sets them
+    expect(screen.queryByText('Disks scanned in parallel', { selector: 'dt' })).not.toBeInTheDocument();
   });
 
   it('does not call a delta pass without byte counts a measurement', () => {
@@ -57,6 +66,50 @@ describe('CalibrationPanel', () => {
     render(<CalibrationPanel migration={m} plan={plan} />);
     expect(screen.getByText(/not calibrated yet/i)).toBeInTheDocument();
     expect(screen.getByText('from the inventory')).toBeInTheDocument();
+  });
+
+  it('shows the disks scanned in parallel on the OpenStack warm path, the planning default when the plan sets none (SDD §16)', () => {
+    const { warm, plan } = fixtures();
+    render(<CalibrationPanel migration={warm} plan={{ ...plan, estimator_overrides: {} }} />);
+    expect(row('Disks scanned in parallel')).toEqual(['4', 'planning default']);
+  });
+
+  it('shows the disks in parallel the estimate uses: a fractional override counts its whole part, as the API does', () => {
+    const { warm, plan } = fixtures();
+    render(<CalibrationPanel migration={warm} plan={{ ...plan, estimator_overrides: { parallel_disks: 2.5 } }} />);
+    expect(row('Disks scanned in parallel')).toEqual(['2', 'plan override']);
+  });
+
+  it('lists every other estimator override the plan sets, with its value (SDD §16)', () => {
+    const { warm, plan } = fixtures();
+    const overrides = {
+      max_aggregate_scan_bps: 600 * MiB,
+      shutdown_s: 45,
+      snapshot_s: 20,
+      create_s: 90,
+      boot_s: 150,
+      handover_per_volume_s: 25,
+      v2v_s: 420,
+      v2v_inplace_s: 90,
+    };
+    render(<CalibrationPanel migration={warm} plan={{ ...plan, estimator_overrides: overrides }} />);
+    expect(row('Aggregate scan cap')).toEqual(['600 MiB/s', 'plan override']);
+    expect(row('Source shutdown')).toEqual(['45 s', 'plan override']);
+    expect(row('Snapshot')).toEqual(['20 s', 'plan override']);
+    expect(row('Volume create')).toEqual(['1m 30s', 'plan override']);
+    expect(row('Boot')).toEqual(['2m 30s', 'plan override']);
+    expect(row('Handover per volume')).toEqual(['25 s', 'plan override']);
+    expect(row('Conversion')).toEqual(['7m 00s', 'plan override']);
+    expect(row('In-place conversion')).toEqual(['1m 30s', 'plan override']);
+  });
+
+  it("keeps a single-shot strategy's panel short: no disks in parallel or step time the plan does not set", () => {
+    const { warm, plan } = fixtures();
+    const m: Migration = { ...warm, strategy: 'cold', sync_passes: [], observed_scan_bps: null };
+    render(<CalibrationPanel migration={m} plan={{ ...plan, estimator_overrides: {} }} />);
+    for (const label of ['Disks scanned in parallel', 'Aggregate scan cap', 'Source shutdown', 'Snapshot', 'Boot']) {
+      expect(screen.queryByText(label, { selector: 'dt' })).not.toBeInTheDocument();
+    }
   });
 
   it('explains that single-shot strategies are never calibrated', () => {
