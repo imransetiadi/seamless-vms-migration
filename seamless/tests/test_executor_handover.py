@@ -1,9 +1,12 @@
 import ast
 import asyncio
+import contextlib
+import copy
 import gc
 import json
 import re
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -12,7 +15,7 @@ import pytest
 
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy
-from seamless_migrate.domain.models import HandoverConfig, Mappings
+from seamless_migrate.domain.models import HandoverConfig, Mappings, VMRef, utcnow
 from seamless_migrate.executors import handover as handover_module
 from seamless_migrate.executors.base import PermanentStepError, StepName, TransientStepError
 from seamless_migrate.executors.handover import (
@@ -222,7 +225,10 @@ class FakeBlockStorage:
         return res
 
     def types(self):
-        return [NS(id=f"type-{name}", name=name) for name in self.c.type_names]
+        return [
+            NS(id=f"type-{name}", name=name, extra_specs=dict(self.c.type_specs.get(name, {})))
+            for name in self.c.type_names
+        ]
 
     def backend_pools(self):
         if self.c.pools is None:
@@ -415,6 +421,8 @@ class FakeCloud:
         # Nova's flavors (None: every name), and Cinder's types: the source's and the mapped one
         self.flavor_names = None
         self.type_names = ("ceph-ssd", "ceph-hdd", "rbd-hdd")
+        # each type's extra specs (by name), e.g. the backend it asks for
+        self.type_specs = {}
         self.current_project_id = f"{name}-project"
         # keystoneauth: the role names of the token (the handover's admin credential)
         self.roles = ["admin", "member", "reader"]
@@ -502,6 +510,8 @@ def setup(tmp_path, crash_on=None, dst_crash_on=None):
         "src": source_cloud(calls, crash_on),
         "dst": FakeCloud("dst", calls, pools=dst_pools, crash_on=dst_crash_on),
     }
+    # every test's clouds share one pool whose objects a manage renames (SDD §7.3 step 6)
+    shared_pool(clouds)
     settings = Settings(data_dir=tmp_path / "data")
     executor = HandoverExecutor(settings, conn_factory=lambda p: clouds[p.cloud], poll_s=0)
     plan = make_plan(
@@ -543,17 +553,21 @@ def ops(calls):
 
 
 def shared_pool(clouds):
-    """The two clouds share one Ceph pool, as SDD §7.3 has them: a manage finds the object by its
-    source-name and the driver renames it ``volume-<new id>`` (step 6), an unmanage keeps it, and
-    Nova refuses a server on a volume its Cinder does not know or another server holds (audit
-    EX-17: the plain fakes manage any name)."""
+    """The two clouds share one pool, as SDD §7.3 has them: a manage finds the object by its
+    source-name - a Ceph image, a NetApp share's file or a FlexVol's LUN, named after the part
+    past the share or FlexVol (§7.3.1) - and the driver renames it ``volume-<new id>`` (step 6),
+    an unmanage keeps it, and Nova refuses a server on a volume its Cinder does not know or another
+    server holds (audit EX-17: plain fakes managed any name). Applied once per pair of clouds."""
+    if getattr(clouds["src"], "images", None) is not None:
+        return clouds["src"].images
     images = {f"volume-{vid}" for vid in clouds["src"].volumes}
+    clouds["src"].images = images
     for cloud in clouds.values():
         post = cloud.block_storage.post
 
         def manage(url, json=None, _post=post, **kw):
             if url == "/manageable_volumes":
-                name = json["volume"]["ref"]["source-name"]
+                name = json["volume"]["ref"]["source-name"].rsplit("/", 1)[-1]
                 if name not in images:
                     return refused(f"Manage existing volume failed: image {name} not found")
                 response = _post(url, json=json, **kw)
@@ -575,6 +589,65 @@ def shared_pool(clouds):
 
         cloud.compute.create_server = create_server
     return images
+
+
+def powering_off(cloud, settle_s, blips=1, gives_up=False):
+    """Nova as upstream answers a stop (compute/api.py, api/openstack/common.py _STATE_MAP): the
+    server keeps reading ACTIVE, task_state "powering-off", until the guest is down ``settle_s``
+    later, then SHUTOFF; meanwhile a second stop and a start are refused with 409. The first
+    ``blips`` waits for SHUTOFF meet nova-api answering 503 (review 26's model). With
+    ``gives_up`` the driver fails the power-off instead: compute/manager.py's
+    @reverts_task_state puts task_state back to None, and the server stays ACTIVE, its guest
+    running (review RV27-04)."""
+    server = cloud.servers["srv-1"]
+    server.task_state = None
+    lock = threading.Lock()
+    settled = threading.Event()
+    left = [blips]
+    nova = "https://nova.dc1.example:8774/v2.1/servers/srv-1/action"
+
+    def conflict(action):
+        message = f"Cannot '{action}' instance srv-1 while it is in task_state {server.task_state}"
+        body = f'{{"conflictingRequest": {{"code": 409, "message": "{message}"}}}}'
+        return sdk_error(409, "Conflict", body.encode(), url=nova)
+
+    def stop_server(s):
+        with lock:
+            if s.task_state is not None or s.status != "ACTIVE":
+                raise conflict("stop")
+            cloud.record("stop_server", s.id)
+            s.task_state = "powering-off"
+
+        def settle():
+            time.sleep(settle_s)
+            with lock:
+                s.status, s.task_state = ("ACTIVE" if gives_up else "SHUTOFF"), None
+            settled.set()
+
+        threading.Thread(target=settle, daemon=True).start()
+
+    def start_server(s):
+        with lock:
+            if s.status != "SHUTOFF" or s.task_state is not None:
+                raise conflict("start")
+            cloud.record("start_server", s.id)
+            s.status = "ACTIVE"
+
+    def wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        if status == "SHUTOFF" and left[0] > 0:
+            left[0] -= 1
+            raise sdk_error(503, "Service Unavailable", url=nova)
+        deadline = time.monotonic() + min(wait, 20)
+        while s.status != status:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"Timeout waiting for the server to transition to {status}")
+            time.sleep(0.02)
+        return s
+
+    cloud.compute.stop_server = stop_server
+    cloud.compute.start_server = start_server
+    cloud.compute.wait_for_server = wait_for_server
+    return settled
 
 
 def held_manage(cloud, source_name):
@@ -781,6 +854,7 @@ async def test_a_cancelled_handover_step_ends_only_after_its_call_returned(tmp_p
         ("src", "manage", "volume-dst-vol-1"),
         ("src", "create_port", "fa:16:3e:00:00:01"),
         ("src", "create_server", "web-01"),
+        ("src", "dot", "src-vol-1"),  # its delete_on_termination back once it runs
     ]
     assert result.details["vm"]["source_id"] == "src-new-1"
 
@@ -873,6 +947,85 @@ def test_every_handover_call_in_a_thread_outlives_a_cancel():
     assert direct == []
 
 
+class Credentialed:
+    """A cloud reached with one credential: once it is revoked, every call is refused, as Keystone
+    refuses to authenticate a rotated password again."""
+
+    def __init__(self, cloud, secret, revoked):
+        self.cloud, self.secret, self.revoked, self.closed = cloud, secret, revoked, False
+
+    def close(self):
+        self.closed = True
+
+    def __getattr__(self, name):
+        target = getattr(self.cloud, name)
+        if name not in ("compute", "block_storage", "network"):
+            return target
+        session = self
+
+        class Service:
+            def __getattr__(self, attr):
+                call = getattr(target, attr)
+
+                def guarded(*args, **kwargs):
+                    if session.secret in session.revoked:
+                        raise HTTPError("HTTP 401 Unauthorized: authentication required")
+                    return call(*args, **kwargs)
+
+                return guarded
+
+        return Service()
+
+
+async def test_a_handover_reconnects_once_its_providers_credentials_were_rotated(tmp_path):
+    """SDD §10, §13.3: credentials are rotated while a plan runs (PUT .../credentials, the old
+    password revoked). The handover's next step connects with the new ones, as the provider
+    registry does, and closes the old connection - so the rollback of a cutover that failed after
+    it deleted the source still rebuilds it. A change of state alone reconnects nothing (audit
+    EX-14)."""
+    _, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
+    revoked: set[str] = set()
+    built: list[Credentialed] = []
+
+    def connect(provider):
+        built.append(Credentialed(clouds[provider.cloud], provider.credentials_secret, revoked))
+        return built[-1]
+
+    executor = HandoverExecutor(settings, conn_factory=connect, poll_s=0)
+    old_src, old_dst = (
+        SRC.model_copy(update={"credentials_secret": "v1"}),
+        DST.model_copy(update={"credentials_secret": "v1"}),
+    )
+    with pytest.raises(PermanentStepError, match="create the server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, old_src, old_dst, settings)[0])
+    assert ("src", "delete_server", "srv-1") in calls and len(built) == 2
+    checked = {"status": "ok", "last_checked_at": utcnow()}
+    await executor._conn(old_src.model_copy(update=checked))
+    assert len(built) == 2, "a provider's state is not how it is reached"
+    revoked.add("v1")
+    rotated = {"credentials_secret": "v2", "credentials_updated_at": utcnow()}
+    src, dst = old_src.model_copy(update=rotated), old_dst.model_copy(update=rotated)
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, src, dst, settings)[0])
+    assert result.details["vm"]["source_id"] == "src-new-1"
+    assert [c.secret for c in built] == ["v1", "v1", "v2", "v2"]
+    assert [c.closed for c in built] == [True, True, False, False]
+
+
+async def test_two_handover_steps_reaching_a_provider_at_once_share_one_connection(tmp_path):
+    """Two migrations' steps reach the same provider at once: one connection is built and both use
+    it - none is built twice and left open (audit EX-14)."""
+    built = []
+
+    def connect(provider):
+        time.sleep(0.1)  # keystoneauth signs in
+        built.append(provider.id)
+        return NS(close=lambda: None)
+
+    executor = HandoverExecutor(Settings(data_dir=tmp_path), conn_factory=connect, poll_s=0)
+    first, second = await asyncio.gather(executor._conn(SRC), executor._conn(SRC))
+    assert first is second and built == [SRC.id]
+
+
 async def test_handover_rollback_reverses_order(tmp_path):
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
@@ -889,6 +1042,7 @@ async def test_handover_rollback_reverses_order(tmp_path):
         ("src", "manage", "volume-dst-vol-1"),
         ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
         ("src", "create_server", "web-01"),
+        ("src", "dot", "src-vol-1"),  # its delete_on_termination back once it runs
     ]
     src_manage = clouds["src"].managed
     assert [m["host"] for m in src_manage] == [
@@ -896,9 +1050,11 @@ async def test_handover_rollback_reverses_order(tmp_path):
         "overcloud@tripleo_ceph#hdd",
     ]
     params = clouds["src"].created[0]
+    # every volume kept while Nova builds it, the boot volume's flag given back once it runs
     assert [
         (b["boot_index"], b["delete_on_termination"]) for b in params["block_device_mapping"]
-    ] == [(0, True), (-1, False)]
+    ] == [(0, False), (-1, False)]
+    assert clouds["src"].servers["src-new-1"].dot == {"src-vol-1": True, "src-vol-2": False}
     # the recreated source VM has new ids; the executor reports them to the orchestrator
     assert result.details["source_running"] is True
     new_vm = result.details["vm"]
@@ -1031,6 +1187,905 @@ async def test_a_handover_cancelled_while_it_opens_the_clock_still_opens_it(tmp_
     assert rec.downtime_marks == 1
 
 
+async def test_a_retried_handover_cutover_waits_for_the_stop_it_sent(tmp_path):
+    """SDD §7.3 step 1, §7.1: a 503 during the stop's wait is retried; the retry finds the stop it
+    sent still running - the server reads ACTIVE, task_state powering-off - and waits for it
+    instead of sending a second stop, which Nova refuses with 409 (review RV26-02)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    powering_off(clouds["src"], settle_s=1.0)
+    stop, sent = clouds["src"].compute.stop_server, []
+
+    def counted(server):
+        sent.append(server.id)  # every stop sent, refused ones too
+        stop(server)
+
+    clouds["src"].compute.stop_server = counted
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(TransientStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    journal = executor.run_dir(ctx) / JOURNAL_FILE
+    first_at = json.loads(journal.read_text())["done"]["sent:stop_source"]["at"]
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id
+    assert [c for c in calls if c[1] == "stop_server"] == [("src", "stop_server", "srv-1")]
+    assert sent == ["srv-1"], "a second stop was sent, which Nova refuses while one runs"
+    # the first stop's time stays journaled: the clock's start (SDD §7.3 step 1)
+    archived = executor.run_dir(ctx) / JOURNAL_FILE
+    assert json.loads(archived.read_text())["done"]["sent:stop_source"]["at"] == first_at
+
+
+async def test_a_handover_stop_refused_for_one_that_began_meanwhile_waits_for_it(tmp_path):
+    """SDD §7.3 step 1: a stop that began between the server's read and the cutover's stop - Nova
+    refuses the second with 409 while it powers the guest off - is waited for, not a failure
+    (review RV26-02)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    powering_off(clouds["src"], settle_s=0.5, blips=0)
+    stop = clouds["src"].compute.stop_server
+
+    def racing_stop(server):
+        stop(server)  # another stop lands first...
+        stop(server)  # ...so this one is refused: 409, task_state powering-off
+
+    clouds["src"].compute.stop_server = racing_stop
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id
+
+
+async def test_a_handover_rollback_starts_a_source_nova_still_powers_off(tmp_path):
+    """SDD §7.3 rollback: a stop that never confirmed is rolled back while Nova still powers the
+    guest off - the server reads ACTIVE, task_state powering-off. The rollback waits for the
+    power-off to end and starts the source, never reading that ACTIVE as running (review
+    RV26-01)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    settled = powering_off(clouds["src"], settle_s=1.0)
+    with pytest.raises(TransientStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["source_running"] is True
+    # once Nova finished the power-off, the source runs - started after it, not read as running
+    assert await asyncio.to_thread(settled.wait, 5)
+    assert clouds["src"].servers["srv-1"].status == "ACTIVE"
+    assert ("src", "start_server", "srv-1") in calls
+
+
+@pytest.mark.parametrize("ended", ["before the step's stop", "before the step's re-read"])
+async def test_a_handover_stop_refused_for_a_source_off_already_goes_on(tmp_path, ended):
+    """SDD §7.3 step 1 (review RV27-03): Nova answers a stop with 409 also when the server is
+    stopped already - a stop that began after the step read the server ACTIVE (an operator's, or
+    the guest's own shutdown that Nova recorded) ended before the step's own stop, or before the
+    step read the server again after the 409. That stop is taken as done: the cutover goes on, its
+    stop journaled as sent and its clock opened, where a permanent failure would leave the source
+    SHUTOFF under a cutover that never ran."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    powering_off(src, settle_s=0.3, blips=0)
+    stop = src.compute.stop_server
+
+    def raced(server):
+        if ended == "before the step's stop":
+            server.status = "SHUTOFF"  # another stop ended meanwhile
+            stop(server)  # 409: the server is stopped
+            return
+        stop(server)  # another stop lands first...
+        try:
+            stop(server)  # ...so this one is refused: 409 while it powers the guest off
+        except Exception:
+            server.status, server.task_state = "SHUTOFF", None  # and it ends before the re-read
+            raise
+
+    src.compute.stop_server = raced
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    result = await executor.run(StepName.CUTOVER, ctx)
+    assert result.destination_server_id
+    assert rec.downtime_marks == 1
+
+
+async def test_a_handover_stop_refused_for_another_reason_fails_with_that_reason(tmp_path):
+    """SDD §7.3 step 1 (review RV27-03): only a stop refused with 409 is read again, for a stop
+    that began meanwhile; a stop refused for another reason (403: the credential may not stop
+    it) fails with that reason at once - never read again, whose own failure would hide it."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    src.servers["srv-1"].task_state = None
+    get, refused = src.compute.get_server, []
+    url = "https://nova.dc1.example:8774/v2.1/servers/srv-1/action"
+
+    def get_server(server_id):
+        if refused:  # nova-api blips meanwhile
+            raise sdk_error(503, "Service Unavailable", url=url)
+        return get(server_id)
+
+    def stop_server(server):
+        refused.append(server.id)
+        raise sdk_error(403, "Forbidden", b'{"forbidden": {"code": 403}}', url=url)
+
+    src.compute.get_server, src.compute.stop_server = get_server, stop_server
+    with pytest.raises(PermanentStepError, match="stop source server: ForbiddenException: 403"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert refused == ["srv-1"]
+
+
+async def test_a_handover_rollback_after_a_power_off_nova_gave_up_finds_the_source_running(
+    tmp_path,
+):
+    """SDD §7.3 rollback (review RV27-04): Nova does not always end a power-off with SHUTOFF -
+    when the driver fails, task_state goes back to None and the server stays ACTIVE, its guest
+    running. The rollback waits until the stop ended, not for a SHUTOFF that never comes, and
+    starts the source only when it does not run."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    executor.wait_s = 5
+    settled = powering_off(clouds["src"], settle_s=0.5, gives_up=True)
+    with pytest.raises(TransientStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    # as openstacksdk, every read answers a new object: the server is read again, never watched
+    get = clouds["src"].compute.get_server
+    clouds["src"].compute.get_server = lambda server_id: copy.copy(get(server_id))
+    started = time.monotonic()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details == {"source_running": True}
+    assert settled.is_set() and time.monotonic() - started < 4, "waited for a SHUTOFF"
+    assert clouds["src"].servers["srv-1"].status == "ACTIVE"
+    assert ("src", "start_server", "srv-1") not in calls, "it runs: nothing to start"
+
+
+async def test_a_handover_rollback_whose_source_stop_does_not_end_fails_to_be_retried(tmp_path):
+    """SDD §7.3 rollback (review RV27-04): the wait for a stop to end is bounded by the step's
+    wait (wait_s): a power-off that outlasts it fails the attempt as transient, to be retried -
+    never a wait without end, nor a start Nova would refuse."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    powering_off(clouds["src"], settle_s=5)
+    with pytest.raises(TransientStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    executor.wait_s = 0.5
+    started = time.monotonic()
+    with pytest.raises(TransientStepError, match="stop or start of server srv-1 to end"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert time.monotonic() - started < 4
+    assert ("src", "start_server", "srv-1") not in calls
+
+
+async def test_a_handover_rollback_retried_while_its_start_still_runs_completes(tmp_path):
+    """SDD §7.3 rollback (review RV29-06): Nova starts a server with its task_state powering-on
+    while the server still reads SHUTOFF, and refuses a second start meanwhile with 409. The
+    rollback's start was accepted, then its wait for ACTIVE met a 503 and the attempt is retried:
+    the retry waits for the start that runs instead of sending a second one, which Nova's 409
+    would fail for good while the source boots."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    src.crash_wait = "server"  # the stop's wait dies after the stop was sent
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    server = src.servers["srv-1"]
+    assert server.status == "SHUTOFF"
+    server.task_state = None
+    lock, blips = threading.Lock(), [1]
+    nova = "https://nova.dc1.example:8774/v2.1/servers/srv-1/action"
+
+    def start_server(s):
+        with lock:
+            if s.status != "SHUTOFF" or s.task_state is not None:
+                message = f"Cannot 'start' instance srv-1 while it is in task_state {s.task_state}"
+                body = f'{{"conflictingRequest": {{"code": 409, "message": "{message}"}}}}'
+                raise sdk_error(409, "Conflict", body.encode(), url=nova)
+            src.record("start_server", s.id)
+            s.task_state = "powering-on"  # vm_state stopped: the status stays SHUTOFF
+
+        def boots():
+            time.sleep(0.5)  # Nova reconnects the volumes and powers the guest on
+            with lock:
+                s.status, s.task_state = "ACTIVE", None
+
+        threading.Thread(target=boots, daemon=True).start()
+
+    def wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        if status == "ACTIVE" and blips[0] > 0:
+            blips[0] -= 1
+            raise sdk_error(503, "Service Unavailable", url=nova)  # nova-api blips meanwhile
+        deadline = time.monotonic() + min(wait, 20)
+        while s.status != status:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"Timeout waiting for the server to transition to {status}")
+            time.sleep(0.02)
+        return s
+
+    src.compute.start_server, src.compute.wait_for_server = start_server, wait_for_server
+    with pytest.raises(TransientStepError, match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details == {"source_running": True}
+    assert server.status == "ACTIVE"
+    assert [c for c in calls if c[1] == "start_server"] == [("src", "start_server", "srv-1")]
+
+
+async def test_a_cutover_retried_after_a_rollback_started_the_source_stops_it_again(tmp_path):
+    """SDD §7.3 (review 31, "not proven" there): a cutover that failed after its stop and before it
+    recorded the definition is rolled back by starting the source - a start Nova accepted and
+    performed while its wait then failed journals nothing. A cutover retried afterwards finds its
+    stop journaled and the source running: it stops the source again before it deletes it, and
+    never deletes a running server."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    stop, ports, wait = src.compute.stop_server, src.network.ports, src.compute.wait_for_server
+    failing = []
+
+    def stop_then_fail_the_definition(s):
+        stop(s)
+        failing.append(1)
+
+    def neutron_once(**query):
+        if failing:
+            failing.clear()
+            raise RuntimeError("neutron: HTTP 503 Service Unavailable")
+        return ports(**query)
+
+    src.compute.stop_server, src.network.ports = stop_then_fail_the_definition, neutron_once
+    with pytest.raises((TransientStepError, PermanentStepError), match="record source definition"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.stop_server = stop
+    assert server.status == "SHUTOFF"
+
+    def start_server(s):  # Nova accepts the rollback's start and boots the guest...
+        src.record("start_server", s.id)
+        s.status = "ACTIVE"
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 503 Service Unavailable")  # ...its wait never says so
+
+    src.compute.start_server, src.compute.wait_for_server = start_server, wait_fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.wait_for_server = wait
+    assert server.status == "ACTIVE"  # the source runs again
+
+    deleted_while = []
+    delete = src.compute.delete_server
+
+    def delete_server(s, ignore_missing=True):
+        deleted_while.append(src.servers[getattr(s, "id", s)].status)
+        return delete(s, ignore_missing=ignore_missing)
+
+    def slow_stop(s):  # the guest goes down while the stop is waited for, not before
+        src.record("stop_server", s.id)
+        s.task_state = "powering-off"
+
+    def wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        if status == "SHUTOFF" and s.task_state == "powering-off":
+            s.status, s.task_state = "SHUTOFF", None
+        return s
+
+    src.compute.delete_server, src.compute.stop_server = delete_server, slow_stop
+    src.compute.wait_for_server = wait_for_server
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert deleted_while == ["SHUTOFF"], "the cutover deleted a running source server"
+    assert [c for c in calls if c[1] == "stop_server"] == [("src", "stop_server", "srv-1")] * 2
+
+
+async def test_a_cutover_resumed_after_it_deleted_the_source_goes_on_without_a_stop(tmp_path):
+    """SDD §7.3 step 1: the re-stop of a resumed cutover reads the source first - a source the
+    cutover deleted before it journaled the delete is gone, and nothing is stopped (review 31)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].crash_wait = "status"  # dies waiting for the volumes the delete freed
+    with pytest.raises(PermanentStepError, match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "srv-1" not in clouds["src"].servers
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+    assert [c for c in calls if c[1] == "stop_server"] == [("src", "stop_server", "srv-1")]
+
+
+async def test_a_resumed_cutover_waits_out_a_start_nova_runs_before_it_stops_the_source(tmp_path):
+    """SDD §7.3 step 1 (review RV33-02): a source Nova still starts - the rollback's start
+    accepted, its wait cut off - reads SHUTOFF until the guest runs. The resumed cutover waits that
+    start out, then stops the source and deletes it stopped - never while it boots."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    stop, ports = src.compute.stop_server, src.network.ports
+    failing = []
+
+    def stop_then_fail_the_definition(s):
+        stop(s)
+        failing.append(1)
+
+    def neutron_once(**query):
+        if failing:
+            failing.clear()
+            raise RuntimeError("neutron: HTTP 503 Service Unavailable")
+        return ports(**query)
+
+    src.compute.stop_server, src.network.ports = stop_then_fail_the_definition, neutron_once
+    with pytest.raises((TransientStepError, PermanentStepError), match="record source definition"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.stop_server = stop
+
+    wait = src.compute.wait_for_server
+
+    def start_accepted(s):  # Nova accepts the rollback's start; the guest is not up yet
+        src.record("start_server", s.id)
+        s.task_state = "powering-on"
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.start_server, src.compute.wait_for_server = start_accepted, wait_fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.wait_for_server = wait
+    assert (server.status, server.task_state) == ("SHUTOFF", "powering-on")
+
+    reads = []
+    get = src.compute.get_server
+
+    def get_server(server_id):  # the guest is up on the third read
+        reads.append(server_id)
+        if len(reads) == 3 and server.task_state == "powering-on":
+            server.status, server.task_state = "ACTIVE", None
+        return get(server_id)
+
+    deleted_while = []
+    delete = src.compute.delete_server
+
+    def delete_server(s, ignore_missing=True):
+        found = src.servers[getattr(s, "id", s)]
+        deleted_while.append((found.status, getattr(found, "task_state", None)))
+        return delete(s, ignore_missing=ignore_missing)
+
+    src.compute.get_server, src.compute.delete_server = get_server, delete_server
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert deleted_while == [("SHUTOFF", None)], "the cutover deleted a source Nova was starting"
+    assert [c for c in calls if c[1] == "stop_server"] == [("src", "stop_server", "srv-1")] * 2
+
+
+@pytest.mark.parametrize("after", ["error", "running again"])
+async def test_a_cutover_retried_after_a_deletion_nova_accepted_sends_it_again(tmp_path, after):
+    """SDD §7.3 steps 1 and 4 (review RV33-03): a deletion Nova accepted is journaled as sent. When
+    the compute host fails it - the server reads ERROR, openstacksdk's wait times out, transient -
+    the retried step sends no stop, which Nova cannot complete on ERROR, and deletes it again. A
+    source that reads ACTIVE again (Nova's soft delete restored, an operator reset and started
+    it) is stopped first, as any source found running."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    delete, fake_wait = src.compute.delete_server, src.compute.wait_for_server
+    deletes = []
+
+    def delete_fails_on_the_host_once(s, ignore_missing=True):
+        deletes.append(1)
+        if len(deletes) == 1:
+            src.record("delete_server", s.id)
+            server.status = "ERROR" if after == "error" else "ACTIVE"
+            return None
+        found = src.servers[getattr(s, "id", s)]
+        deleted_while.append(found.status)
+        return delete(s, ignore_missing=ignore_missing)
+
+    def wait_for_delete(res, interval=2, wait=120):  # openstacksdk: until a 404, or a timeout
+        if getattr(res, "id", res) in src.servers:
+            raise RuntimeError("Timeout waiting for Server:srv-1 to delete")
+        return res
+
+    def sdk_wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        failures = ["ERROR"] if failures is None else failures
+        fresh = src.servers[s.id]  # openstacksdk's first read comes at once
+        if fresh.status == status:
+            return fresh
+        if fresh.status.lower() in [f.lower() for f in failures]:
+            raise RuntimeError(f"Server:{s.id} transitioned to failure state {fresh.status}")
+        return fake_wait(s, status=status, failures=failures, interval=interval, wait=wait)
+
+    def stop_server(s):  # Nova takes a stop of an ERROR server: powering-off, still ERROR
+        src.record("stop_server", s.id)
+        if s.status == "ERROR":
+            s.task_state = "powering-off"
+        else:
+            s.status = "SHUTOFF"
+
+    deleted_while = []
+    src.compute.delete_server, src.compute.stop_server = delete_fails_on_the_host_once, stop_server
+    src.compute.wait_for_delete, src.compute.wait_for_server = wait_for_delete, sdk_wait_for_server
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+    stops = [c for c in calls if c[1] == "stop_server"]
+    if after == "error":
+        assert stops == [("src", "stop_server", "srv-1")]  # the first stop alone
+        assert deleted_while == ["ERROR"]
+    else:
+        assert stops == [("src", "stop_server", "srv-1")] * 2
+        assert deleted_while == ["SHUTOFF"]
+
+
+async def test_a_deletion_nova_refused_never_spares_a_source_from_its_re_stop(tmp_path):
+    """SDD §7.3 steps 1 and 4 (review RV33-03): only a deletion Nova accepted is journaled as sent.
+    One it refused (HTTP 500) leaves the source to the re-stop: after a rollback whose start Nova
+    accepted - the guest booting, the start's wait failed - the retried cutover waits that start
+    out and stops the source before it deletes it."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    delete = src.compute.delete_server
+
+    def delete_refused(s, ignore_missing=True):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.delete_server = delete_refused
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+
+    wait = src.compute.wait_for_server
+
+    def start_accepted(s):
+        src.record("start_server", s.id)
+        s.task_state = "powering-on"
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.start_server, src.compute.wait_for_server = start_accepted, wait_fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.wait_for_server = wait
+
+    reads = []
+    get = src.compute.get_server
+
+    def get_server(server_id):  # the guest is up on the third read
+        reads.append(server_id)
+        if len(reads) == 3 and server.task_state == "powering-on":
+            server.status, server.task_state = "ACTIVE", None
+        return get(server_id)
+
+    deleted_while = []
+
+    def delete_server(s, ignore_missing=True):
+        found = src.servers[getattr(s, "id", s)]
+        deleted_while.append((found.status, getattr(found, "task_state", None)))
+        return delete(s, ignore_missing=ignore_missing)
+
+    src.compute.get_server, src.compute.delete_server = get_server, delete_server
+    with contextlib.suppress(TransientStepError, PermanentStepError):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert deleted_while == [("SHUTOFF", None)], "the cutover deleted a source Nova was starting"
+
+
+@pytest.mark.parametrize("restop", ["stopped", "refused", "accepted, its wait failed"])
+async def test_a_re_stop_that_finds_the_source_running_counts_a_new_outage(tmp_path, restop):
+    """SDD §5.2, §7.3 step 1 (review RV33-04): a source the resumed cutover finds running has run
+    since the first stop - that outage ended: the step closes the clock before it stops the source
+    again, and the re-stop opens a new one - at the re-stop's request when the step then ends
+    without SHUTOFF, and not at all when Nova refused the stop: the source runs."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    stop, ports = src.compute.stop_server, src.network.ports
+    failing = []
+
+    def stop_then_fail_the_definition(s):
+        stop(s)
+        failing.append(1)
+
+    def neutron_once(**query):
+        if failing:
+            failing.clear()
+            raise RuntimeError("neutron: HTTP 503 Service Unavailable")
+        return ports(**query)
+
+    src.compute.stop_server, src.network.ports = stop_then_fail_the_definition, neutron_once
+    with pytest.raises((TransientStepError, PermanentStepError), match="record source definition"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.stop_server = stop
+    wait, start = src.compute.wait_for_server, src.compute.start_server
+
+    def start_server(s):  # Nova performs the rollback's start...
+        src.record("start_server", s.id)
+        s.status = "ACTIVE"
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 503 Service Unavailable")  # ...its wait never says so
+
+    src.compute.start_server, src.compute.wait_for_server = start_server, wait_fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.start_server, src.compute.wait_for_server = start, wait
+
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    end, begin = ctx.mark_downtime_end, ctx.mark_downtime_start
+
+    async def mark_end():
+        calls.append(("clock", "end", None))
+        await end()
+
+    async def mark_start(at=None):
+        calls.append(("clock", "start", at))
+        await begin(at=at)
+
+    ctx.mark_downtime_end, ctx.mark_downtime_start = mark_end, mark_start
+    if restop == "refused":
+
+        def stop_refused(s):
+            raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+        src.compute.stop_server = stop_refused
+    elif restop == "accepted, its wait failed":
+
+        def stop_accepted(s):  # Nova accepted the stop; the guest is still going down
+            src.record("stop_server", s.id)
+            s.task_state = "powering-off"
+
+        src.compute.stop_server, src.compute.wait_for_server = stop_accepted, wait_fails
+    retried = len(calls)
+    if restop == "stopped":
+        await executor.run(StepName.CUTOVER, ctx)
+    else:
+        with pytest.raises((TransientStepError, PermanentStepError), match="stop source server"):
+            await executor.run(StepName.CUTOVER, ctx)
+    seen = [c for c in calls[retried:] if c[0] == "clock" or c[1] == "stop_server"]
+    if restop == "stopped":
+        assert seen == [
+            ("clock", "end", None),
+            ("src", "stop_server", "srv-1"),
+            ("clock", "start", None),
+        ]
+    elif restop == "refused":
+        assert seen == [("clock", "end", None)]  # no new outage: the source runs
+    else:
+        assert seen[:2] == [("clock", "end", None), ("src", "stop_server", "srv-1")]
+        assert len(seen) == 3 and seen[2][:2] == ("clock", "start") and seen[2][2] is not None
+
+
+@pytest.mark.parametrize(
+    "found", ["running", "running, its stop's wait failed", "still powering off", "stopped"]
+)
+async def test_a_retry_after_a_first_stop_never_confirmed_counts_the_run_since(tmp_path, found):
+    """SDD §5.2, §7.3 step 1 (review RV34B-04): only the first stop was journaled as sent - Nova
+    accepted it, its wait failed - and a rollback's start, its own wait failed, ran the source
+    since. The retry finds it running: that outage ended - the clock closes - and its stop opens a
+    new one, at that stop's request when its wait fails too. A stop Nova still runs, or a source
+    that stayed stopped, is the same outage."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    wait, start = src.compute.wait_for_server, src.compute.start_server
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.wait_for_server = wait_fails  # the first stop: accepted, its wait fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+
+    def start_server(s):  # Nova performs the rollback's start, whose wait fails
+        src.record("start_server", s.id)
+        s.status = "ACTIVE"
+
+    src.compute.start_server = start_server
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.start_server, src.compute.wait_for_server = start, wait
+    if found == "still powering off":
+        server.task_state = "powering-off"  # a stop Nova still runs: whose, no read tells
+    elif found == "stopped":
+        server.status = "SHUTOFF"
+
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    end, begin = ctx.mark_downtime_end, ctx.mark_downtime_start
+
+    async def mark_end():
+        calls.append(("clock", "end", None))
+        await end()
+
+    async def mark_start(at=None):
+        calls.append(("clock", "start", at))
+        await begin(at=at)
+
+    ctx.mark_downtime_end, ctx.mark_downtime_start = mark_end, mark_start
+    if found == "still powering off":
+
+        def powered_off(s, status="ACTIVE", failures=None, interval=2, wait=120):
+            s.status, s.task_state = "SHUTOFF", None  # the guest is down
+            return s
+
+        src.compute.wait_for_server = powered_off
+    elif found == "running, its stop's wait failed":
+        src.compute.wait_for_server = wait_fails
+    retried = len(calls)
+    if found == "running, its stop's wait failed":
+        with pytest.raises((TransientStepError, PermanentStepError), match="stop source server"):
+            await executor.run(StepName.CUTOVER, ctx)
+    else:
+        await executor.run(StepName.CUTOVER, ctx)
+    seen = [c for c in calls[retried:] if c[0] == "clock" or c[1] == "stop_server"]
+    if found == "running":
+        assert seen == [
+            ("clock", "end", None),
+            ("src", "stop_server", "srv-1"),
+            ("clock", "start", None),
+        ]
+    elif found == "running, its stop's wait failed":
+        journal = json.loads((executor.run_dir(ctx) / "handover-journal.json").read_text())
+        restop = datetime.fromisoformat(journal["done"]["sent:restop_source"]["at"])
+        assert seen == [
+            ("clock", "end", None),
+            ("src", "stop_server", "srv-1"),
+            ("clock", "start", restop),  # this stop's request, never the first one's
+        ]
+    else:
+        assert seen == [("clock", "start", None)]  # the first stop's outage goes on
+
+
+@pytest.mark.parametrize("first_stop", ["journaled as sent only", "confirmed"])
+async def test_a_close_that_fails_never_reopens_the_clock_at_the_first_stop(tmp_path, first_stop):
+    """SDD §5.2, §7.3 step 1 (review RV35B-03): a step that finds the source running closes the
+    clock before it stops the source again; when that close fails - its event write, or a cancel
+    landing in it - the step's failure never reopens the clock at the first stop's time: the
+    source runs, and only a re-stop Nova accepted opens a new outage."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    stop, ports = src.compute.stop_server, src.network.ports
+    wait, start = src.compute.wait_for_server, src.compute.start_server
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    if first_stop == "confirmed":
+        failing = []
+
+        def stop_then_fail_the_definition(s):
+            stop(s)
+            failing.append(1)
+
+        def neutron_once(**query):
+            if failing:
+                failing.clear()
+                raise RuntimeError("neutron: HTTP 503 Service Unavailable")
+            return ports(**query)
+
+        src.compute.stop_server, src.network.ports = stop_then_fail_the_definition, neutron_once
+        with pytest.raises((TransientStepError, PermanentStepError), match="record source"):
+            await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        src.compute.stop_server = stop
+    else:
+        src.compute.wait_for_server = wait_fails  # the first stop: accepted, its wait fails
+        with pytest.raises((TransientStepError, PermanentStepError), match="stop source server"):
+            await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+
+    def start_server(s):  # Nova performs the rollback's start, whose wait fails
+        src.record("start_server", s.id)
+        s.status = "ACTIVE"
+
+    src.compute.start_server, src.compute.wait_for_server = start_server, wait_fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.start_server, src.compute.wait_for_server = start, wait
+
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+
+    async def close_fails():
+        calls.append(("clock", "end", None))
+        raise RuntimeError("store error writing the event")
+
+    async def mark_start(at=None):
+        calls.append(("clock", "start", at))
+
+    ctx.mark_downtime_end, ctx.mark_downtime_start = close_fails, mark_start
+    retried = len(calls)
+    with pytest.raises(RuntimeError, match="store error writing the event"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert [c for c in calls[retried:] if c[0] == "clock"] == [("clock", "end", None)]
+
+
+async def test_a_refused_re_stop_never_reopens_the_clock_at_an_earlier_re_stops_time(tmp_path):
+    """SDD §5.2, §7.3 step 1 (review RV33-04): a re-stop opens a new outage only once Nova accepted
+    that re-stop - an earlier attempt's accepted re-stop, journaled, is no start for a re-stop Nova
+    refused now: the source runs, the clock stays closed."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    stop, ports = src.compute.stop_server, src.network.ports
+    wait, start = src.compute.wait_for_server, src.compute.start_server
+    failing = []
+
+    def stop_then_fail_the_definition(s):
+        stop(s)
+        failing.append(1)
+
+    def neutron_once(**query):
+        if failing:
+            failing.clear()
+            raise RuntimeError("neutron: HTTP 503 Service Unavailable")
+        return ports(**query)
+
+    def start_performed(s):
+        src.record("start_server", s.id)
+        s.status = "ACTIVE"
+
+    def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        raise RuntimeError("nova: HTTP 503 Service Unavailable")
+
+    async def rollback_whose_start_wait_fails():
+        src.compute.start_server, src.compute.wait_for_server = start_performed, wait_fails
+        with pytest.raises((TransientStepError, PermanentStepError), match="start the source"):
+            await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+        src.compute.start_server, src.compute.wait_for_server = start, wait
+
+    src.compute.stop_server, src.network.ports = stop_then_fail_the_definition, neutron_once
+    with pytest.raises((TransientStepError, PermanentStepError), match="record source definition"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.stop_server = stop
+    await rollback_whose_start_wait_fails()
+
+    def stop_accepted(s):  # the second attempt's re-stop: accepted, its wait fails
+        src.record("stop_server", s.id)
+        s.status = "SHUTOFF"
+
+    src.compute.stop_server, src.compute.wait_for_server = stop_accepted, wait_fails
+    with pytest.raises((TransientStepError, PermanentStepError), match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.stop_server, src.compute.wait_for_server = stop, wait
+    assert server.status == "SHUTOFF"
+    await rollback_whose_start_wait_fails()  # the source runs again
+
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    end, begin = ctx.mark_downtime_end, ctx.mark_downtime_start
+
+    async def mark_end():
+        calls.append(("clock", "end", None))
+        await end()
+
+    async def mark_start(at=None):
+        calls.append(("clock", "start", at))
+        await begin(at=at)
+
+    def stop_refused(s):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    ctx.mark_downtime_end, ctx.mark_downtime_start = mark_end, mark_start
+    src.compute.stop_server = stop_refused
+    third = len(calls)
+    with pytest.raises((TransientStepError, PermanentStepError), match="stop source server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert [c for c in calls[third:] if c[0] == "clock"] == [("clock", "end", None)]
+
+
+def _cutover_failing_at_the_delete(src):
+    """Nova answers 500 to the source server's deletion (step 4), after step 3 kept its volumes;
+    returns the restorer."""
+    delete = src.compute.delete_server
+
+    def delete_refused(s, ignore_missing=True):
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.delete_server = delete_refused
+
+    def restore():
+        src.compute.delete_server = delete
+
+    return restore
+
+
+@pytest.mark.parametrize("attempt", ["start performed, its wait failed", "start refused", "lost"])
+async def test_a_cutover_resumed_after_a_rollback_attempt_keeps_the_volumes_again(
+    tmp_path, attempt
+):
+    """SDD §7.3 step 3 (review RV33-01): a rollback attempt gives delete_on_termination back before
+    it starts the source. When the attempt then fails - Nova performed the start and its wait
+    failed, Nova refused the start (409), or the answer to its giving back was lost while Nova
+    applied it - the journal still holds keep. Each rollback attempt journals rb:attempt before its
+    first call, and a cutover resumed after one keeps every volume again before it deletes the
+    source: Nova never deletes the boot volume with its server."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    assert server.dot == {"vol-root": True, "vol-data": False}
+    restore = _cutover_failing_at_the_delete(src)
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    restore()
+    assert server.dot == {"vol-root": False, "vol-data": False}  # step 3 kept them
+
+    wait, start, put = src.compute.wait_for_server, src.compute.start_server, src.compute.put
+    match = "start the source server"
+    if attempt == "start performed, its wait failed":
+
+        def start_server(s):
+            src.record("start_server", s.id)
+            s.status = "ACTIVE"
+
+        def wait_fails(s, status="ACTIVE", failures=None, interval=2, wait=120):
+            raise RuntimeError("nova: HTTP 503 Service Unavailable")
+
+        src.compute.start_server, src.compute.wait_for_server = start_server, wait_fails
+    elif attempt == "start refused":
+
+        class Conflict(Exception):
+            status_code = 409
+
+        def start_refused(s):
+            raise Conflict("Service is unavailable at this time.")
+
+        src.compute.start_server = start_refused
+    else:
+
+        def put_answer_lost(url, json=None, microversion=None, **kw):
+            put(url, json=json, microversion=microversion, **kw)  # Nova applies it...
+            raise RuntimeError("nova: HTTP 502 Bad Gateway")  # ...and its answer is lost
+
+        src.compute.put = put_answer_lost
+        match = "restore delete_on_termination"
+    with pytest.raises((TransientStepError, PermanentStepError), match=match):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.wait_for_server, src.compute.start_server, src.compute.put = wait, start, put
+    assert server.dot["vol-root"] is True  # given back
+
+    result = None
+    with contextlib.suppress(TransientStepError, PermanentStepError):
+        result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.deleted_by_nova == [], "Nova deleted the source's boot volume with its server"
+    assert result is not None and result.destination_server_id == "dst-new-1"
+
+
+async def test_a_cutover_resumed_after_a_rollback_attempt_keeps_nothing_of_a_server_gone(tmp_path):
+    """SDD §7.3 step 3 (review RV33-01): the volumes are kept again only while the source server
+    exists - one the attempt before deleted, failing before it journaled that, settled its volumes
+    with it: the resumed cutover goes on."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    src.crash_wait = "status"  # dies waiting for the volumes the delete freed
+    with pytest.raises(PermanentStepError, match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "srv-1" not in src.servers
+    get = src.compute.get_server
+
+    def get_fails(server_id):  # the rollback attempt fails at its first call
+        raise RuntimeError("nova: HTTP 500 Internal Server Error")
+
+    src.compute.get_server = get_fails
+    with pytest.raises((TransientStepError, PermanentStepError, RuntimeError), match="HTTP 500"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.get_server = get
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+    # step 3's keeps of the first attempt alone: none for the server gone
+    assert sorted(c for c in calls if c[1] in ("keep", "dot")) == [
+        ("src", "keep", "vol-data"),
+        ("src", "keep", "vol-root"),
+    ]
+
+
+async def test_a_second_rollback_gives_back_what_a_resumed_cutover_kept_again(tmp_path):
+    """SDD §7.3 rollback (review RV33-01): the rollback gives delete_on_termination back for each
+    attachment whose last keep came after its last giving back - after a cutover resumed past an
+    earlier attempt kept the volumes again, a second rollback restores the source's own values."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    start = src.compute.start_server
+
+    class Conflict(Exception):
+        status_code = 409
+
+    def start_refused(s):
+        raise Conflict("Service is unavailable at this time.")
+
+    restore = _cutover_failing_at_the_delete(src)
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.start_server = start_refused
+    with pytest.raises((TransientStepError, PermanentStepError), match="start the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.start_server = start
+    # the operator retries: the cutover keeps the volumes again, and fails at the delete again
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    restore()
+    assert server.dot == {"vol-root": False, "vol-data": False}
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["source_running"] is True
+    assert server.dot == {"vol-root": True, "vol-data": False}  # the source's own values
+    assert [c for c in calls if c[1] == "dot"] == [("src", "dot", "vol-root")] * 2
+
+
 async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):
     """Crash before the server was deleted: the volumes are still attached and managed; the
     rollback sets the journaled delete_on_termination back and starts the source."""
@@ -1050,7 +2105,8 @@ async def test_handover_rollback_before_the_source_is_deleted_restores_and_start
 
 async def test_handover_rollback_after_the_source_is_deleted_recreates_it(tmp_path):
     """Crash at the first unmanage: the server is gone, both volumes still managed at the source;
-    the rollback recreates the server on the same volumes with their delete_on_termination."""
+    the rollback recreates the server on the same volumes, kept while Nova builds it, and gives
+    each its delete_on_termination back once it runs (review RV35B-04)."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
     with pytest.raises(PermanentStepError, match="unmanage"):
@@ -1061,13 +2117,319 @@ async def test_handover_rollback_after_the_source_is_deleted_recreates_it(tmp_pa
     assert ops(calls) == [
         ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
         ("src", "create_server", "web-01"),
+        ("src", "dot", "vol-root"),  # its delete_on_termination back once it runs (RV35B-04)
     ]
     bdm = clouds["src"].created[0]["block_device_mapping"]
     assert [(b["uuid"], b["boot_index"], b["delete_on_termination"]) for b in bdm] == [
-        ("vol-root", 0, True),
+        ("vol-root", 0, False),
         ("vol-data", -1, False),
     ]
+    assert clouds["src"].servers["src-new-1"].dot == {"vol-root": True, "vol-data": False}
     assert result.details["vm"]["source_id"] == "src-new-1"
+
+
+def _deletion_the_host_fails(clouds):
+    """Step 4's deletion as Nova and a broken compute host answer it: Nova accepts it, the host
+    fails it - the server left in ERROR, where Nova starts it no more - until ``fixed``; once fixed,
+    a deletion ends as Nova's, the volumes kept or deleted by their delete_on_termination."""
+    src = clouds["src"]
+    delete = src.compute.delete_server
+    host = NS(fixed=False)
+
+    def delete_server(s, ignore_missing=True):
+        sid = getattr(s, "id", s)
+        if host.fixed:
+            held = [vid for vid, _device in src.servers[sid].attachments]
+            delete(s, ignore_missing=ignore_missing)
+            for vid in held:
+                if vid in src.volumes:
+                    src.volumes[vid].status = "detaching"  # Cinder ends each detach a little later
+            return
+        src.record("delete_server", sid)
+        src.servers[sid].status = "ERROR"
+
+    settle = src.block_storage.wait_for_status
+
+    def wait_for_status(res, status="available", failures=None, interval=2, wait=120):
+        if getattr(res, "status", None) == "detaching":
+            res.status = "available"
+        return settle(res, status=status, failures=failures, interval=interval, wait=wait)
+
+    def wait_for_delete(res, interval=2, wait=120):
+        if getattr(res, "id", res) in src.servers:
+            raise RuntimeError(f"Timeout waiting for Server:{res.id} to delete")
+        return res
+
+    class Conflict(Exception):
+        status_code = 409
+
+    def start_server(s):
+        if s.status == "ERROR":
+            raise Conflict(f"Cannot 'start' instance {s.id} while it is in vm_state error")
+        src.record("start_server", s.id)
+
+    src.compute.delete_server = delete_server
+    src.compute.wait_for_delete = wait_for_delete
+    src.compute.start_server = start_server
+    src.block_storage.wait_for_status = wait_for_status
+    return host
+
+
+@pytest.mark.parametrize("host", ["fixed", "still broken"])
+async def test_a_rollback_after_nova_accepted_the_source_deletion_never_gives_its_volumes_back(
+    tmp_path, host
+):
+    """SDD §7.3 rollback (review RV34B-02): step 4's deletion was accepted - journaled as sent - and
+    the compute host failed it, the source left in ERROR. Nova starts no such server, and a deletion
+    it finishes later honours the delete_on_termination it finds: the rollback gives nothing back
+    and starts nothing. It deletes the server again, waits until it is gone and its volumes are
+    available, and recreates the source from the journaled definition; a deletion that fails again
+    fails the attempt with every volume still kept."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    compute = _deletion_the_host_fails(clouds)
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.servers["srv-1"].status == "ERROR"
+    compute.fixed = host == "fixed"
+    calls.clear()
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    if host == "fixed":
+        result = await executor.run(StepName.ROLLBACK, ctx)
+        assert "srv-1" not in src.servers and src.deleted_by_nova == []
+        bdm = src.created[0]["block_device_mapping"]
+        assert [(b["uuid"], b["delete_on_termination"]) for b in bdm] == [
+            ("vol-root", False),
+            ("vol-data", False),
+        ]
+        # given back to the recreated source only, once it runs (review RV35B-04)
+        assert src.servers["src-new-1"].dot == {"vol-root": True, "vol-data": False}
+        assert result.details["vm"]["source_id"] == "src-new-1"
+        given_back = [("src", "dot", "vol-root")]
+    else:
+        with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+            await executor.run(StepName.ROLLBACK, ctx)
+        assert src.servers["srv-1"].dot == {"vol-root": False, "vol-data": False}
+        given_back = []
+    assert [c for c in ops(calls) if c[1] in ("dot", "start_server")] == given_back, ops(calls)
+
+
+class _NovaAnswer(Exception):
+    """An answer of Nova's API with its HTTP status."""
+
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _deletion_taken_with_an_error(clouds, answer):
+    """Step 4's DELETE as Nova takes it while the executor sees no success (SDD §7.3, RV35B-01):
+    nova-api answers 500 once it saved ``task_state`` deleting (its cast to the host failed), or
+    the answer is lost while the compute host fails the deletion (ERROR); refused outright, a 409
+    changes nothing."""
+    src = clouds["src"]
+
+    def delete_server(s, ignore_missing=True):
+        server = src.servers[getattr(s, "id", s)]
+        src.record("delete_server", server.id)
+        if answer == "a 500 once it saved the deleting state":
+            server.task_state = "deleting"
+            raise _NovaAnswer("nova: HTTP 500 Internal Server Error (MessageDeliveryFailure)", 500)
+        if answer == "an answer lost while the host failed it":
+            server.status, server.task_state = "ERROR", None
+            raise _NovaAnswer("Gateway Timeout (HTTP 504)", 504)
+        raise _NovaAnswer("Cannot 'delete' instance srv-1 while it is in task_state rebooting", 409)
+
+    src.compute.delete_server = delete_server
+
+
+@pytest.mark.parametrize(
+    "answer", ["a 500 once it saved the deleting state", "an answer lost while the host failed it"]
+)
+async def test_a_deletion_nova_took_with_an_error_never_gets_its_volumes_back(tmp_path, answer):
+    """SDD §7.3 rollback (review RV35B-01): Nova took step 4's deletion though the executor saw no
+    success - nothing journaled it as sent. Step 4 journaled it as tried, and the source reads as
+    being deleted, or in ERROR: the rollback gives no delete_on_termination back and starts
+    nothing, so the deletion Nova finishes later - nova-compute resuming it, an operator clearing
+    the server - keeps every volume."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    finish = src.compute.delete_server  # Nova's own deletion: honours each attachment's flag
+    _deletion_taken_with_an_error(clouds, answer)
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    calls.clear()
+    with contextlib.suppress(TransientStepError, PermanentStepError):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert not [c for c in ops(calls) if c[1] in ("dot", "start_server")], ops(calls)
+    flags = dict(server.dot)
+    finish(server)  # the deletion Nova finishes later honours the flags it finds
+    assert src.deleted_by_nova == [], flags
+
+
+async def test_a_deletion_nova_refused_outright_still_gives_the_volumes_back(tmp_path):
+    """SDD §7.3 rollback (review RV35B-01): a DELETE Nova refused outright changes nothing - the
+    source stays SHUTOFF with no task: though step 4 tried it, the rollback gives the volumes
+    their delete_on_termination back and starts the source, as for any source that exists."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    _deletion_taken_with_an_error(clouds, "refused outright")
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.servers["srv-1"].dot == {"vol-root": True, "vol-data": False}
+    assert ("src", "start_server", "srv-1") in ops(calls)
+    assert "vm" not in result.details
+
+
+async def test_a_rollback_never_recreates_a_source_in_error_step_4_never_reached(tmp_path):
+    """SDD §7.3 rollback (review RV35B-01): ERROR counts as reached by step 4's deletion only once
+    step 4 tried it - a source that went to ERROR before (here during step 3) is no source Nova
+    deletes: the rollback neither deletes nor recreates it, and gives its volumes back."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    server = src.servers["srv-1"]
+    put = src.compute.put
+
+    def keep_fails(url, json=None, microversion=None, **kw):
+        if (
+            url.endswith("/vol-root")
+            and json["volumeAttachment"].get("delete_on_termination") is False
+        ):
+            server.status = "ERROR"  # the compute host broke meanwhile
+            return FakeResponse({"conflictingRequest": {"code": 409, "message": "busy"}}, 409)
+        return put(url, json=json, microversion=microversion, **kw)
+
+    src.compute.put = keep_fails
+    with pytest.raises((TransientStepError, PermanentStepError)):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.put = put
+    calls.clear()
+    with contextlib.suppress(TransientStepError, PermanentStepError):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert not [c for c in ops(calls) if c[1] in ("delete_server", "create_server")], ops(calls)
+    assert "srv-1" in src.servers
+
+
+async def test_a_retry_never_re_stops_a_source_step_4_reached(tmp_path):
+    """SDD §7.3 step 1 (review RV35B-01): a source in ERROR once step 4 tried its deletion - the
+    answer lost while the host failed it - has not run since the stop: the retry closes no clock
+    and sends no stop; step 4 sends the deletion again."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    delete = src.compute.delete_server
+    _deletion_taken_with_an_error(clouds, "an answer lost while the host failed it")
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.compute.delete_server = delete  # the host fixed
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+
+    async def mark_end():
+        calls.append(("clock", "end", None))
+
+    async def mark_start(at=None):
+        calls.append(("clock", "start", at))
+
+    ctx.mark_downtime_end, ctx.mark_downtime_start = mark_end, mark_start
+    retried = len(calls)
+    await executor.run(StepName.CUTOVER, ctx)
+    seen = [
+        c for c in calls[retried:] if c[0] == "clock" or c[1] in ("stop_server", "delete_server")
+    ]
+    assert seen == [("clock", "start", None), ("src", "delete_server", "srv-1")]
+    assert src.deleted_by_nova == []
+
+
+async def test_a_rollback_that_cannot_read_the_source_fails_as_its_answer_says(tmp_path):
+    """SDD §7.3 rollback (review RV34B-02): whether the source still exists decides between giving
+    its volumes back and recreating it - a read Nova does not answer fails the attempt by that
+    answer (a 503 is retried) and decides nothing."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    _deletion_the_host_fails(clouds)
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+
+    class Unavailable(Exception):
+        status_code = 503
+
+    def get_server(server_id):
+        raise Unavailable("Service Unavailable (HTTP 503)")
+
+    clouds["src"].compute.get_server = get_server
+    calls.clear()
+    with pytest.raises(TransientStepError, match="read the source server: Service Unavailable"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert not [c for c in ops(calls) if c[1] in ("create_server", "dot", "start_server")]
+
+
+async def test_a_rollback_after_nova_accepted_the_source_deletion_starts_one_that_runs(tmp_path):
+    """SDD §7.3 rollback (review RV34B-02): a source whose deletion Nova accepted still counts as
+    existing when it reads ACTIVE - started since, as step 1 has it: what the cutover kept is given
+    back and the server runs on."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    _deletion_the_host_fails(clouds)
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.servers["srv-1"].status = "ACTIVE"  # reset and started by hand
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.servers["srv-1"].dot == {"vol-root": True, "vol-data": False}
+    assert "vm" not in result.details and not src.created
+
+
+@pytest.mark.parametrize("build", ["aborted on the compute host", "left in ERROR before any host"])
+async def test_a_recreated_source_whose_build_fails_keeps_every_volume_and_is_built_again(
+    tmp_path, build
+):
+    """SDD §7.3 rollback (review RV35B-04): the rollback recreates the source with every volume
+    kept while Nova builds it - a build Nova aborts deletes each volume flagged
+    delete_on_termination, the VM's only copy of its data. A build left in ERROR is deleted on the
+    next attempt, its volumes kept, and created again; once the server runs, each volume gets its
+    journaled delete_on_termination back."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    host = _deletion_the_host_fails(clouds)
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    host.fixed = True  # the deletion sent again ends
+    create, nova_wait = src.compute.create_server, src.compute.wait_for_server
+    failing = [build]
+
+    def build_once(**params):
+        server = create(**params)
+        if failing:
+            failing.clear()
+            if build.startswith("aborted"):
+                # nova's _do_build_and_run_instance: an aborted build's _cleanup_volumes deletes
+                # each volume flagged delete_on_termination - one the build was given too
+                for b in params["block_device_mapping"]:
+                    if b["delete_on_termination"] and src.volumes.pop(b["uuid"], None) is not None:
+                        src.deleted_by_nova.append(b["uuid"])
+                    elif b["uuid"] in src.volumes:
+                        src.volumes[b["uuid"]].status = "available"
+            server.status = "ERROR"
+        return server
+
+    def wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        if s.status == "ERROR":
+            raise RuntimeError(f"Server:{s.id} transitioned to failure state ERROR")
+        return nova_wait(s, status=status, failures=failures, interval=interval, wait=wait)
+
+    src.compute.create_server, src.compute.wait_for_server = build_once, wait_for_server
+    with pytest.raises((TransientStepError, PermanentStepError), match="failure state ERROR"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.deleted_by_nova == []
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.deleted_by_nova == []
+    assert [
+        [b["delete_on_termination"] for b in created["block_device_mapping"]]
+        for created in src.created
+    ] == [[False, False], [False, False]]
+    assert "src-new-1" not in src.servers  # the failed build, deleted
+    assert src.servers["src-new-2"].dot == {"vol-root": True, "vol-data": False}
+    assert result.details["vm"]["source_id"] == "src-new-2"
 
 
 async def test_handover_journals_every_port_with_its_mac_and_addresses(tmp_path):
@@ -1572,12 +2934,20 @@ async def test_handover_resume_after_a_crash_while_unmanaging_waits_instead_of_f
     with pytest.raises(PermanentStepError):
         await executor.run(StepName.CUTOVER, ctx)
     assert "vol-data" not in clouds["src"].volumes  # Cinder did unmanage it
+    reads, get = [], clouds["src"].compute.get_server
+
+    def get_server(server_id):
+        reads.append(server_id)
+        return get(server_id)
+
+    clouds["src"].compute.get_server = get_server
     result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert result.destination_server_id == "dst-new-1"
     assert [op for op in ops(calls) if op[1] == "unmanage"] == [
         ("src", "unmanage", "vol-data"),
         ("src", "unmanage", "vol-root"),
     ]
+    assert reads == []  # past the journaled delete: no source server to stop again (§7.3 step 1)
 
 
 async def test_handover_resume_after_a_crash_while_managing_waits_for_the_same_volume(tmp_path):
@@ -1725,14 +3095,64 @@ async def test_handover_rollback_after_unmanage_manages_back_and_recreates(tmp_p
         ("src", "manage", "volume-vol-data"),
         ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
         ("src", "create_server", "web-01"),
+        ("src", "dot", "src-vol-1"),  # its delete_on_termination back once it runs
     ]
     new_vm = result.details["vm"]
     assert new_vm["source_id"] == "src-new-1"
     assert {d["id"] for d in new_vm["disks"]} == {"src-vol-1", "src-vol-2"}
-    # a second rollback finds the archived journal gone and does nothing
+    # a second rollback while the migration still names the replaced server (a stop or a failed
+    # save after the first, SDD §7.3) changes nothing and reports the same VM again (audit EX-04)
     calls.clear()
     again = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
-    assert calls == [] and again.details["note"] == "nothing to roll back"
+    assert calls == [] and again.details["vm"] == new_vm
+    # once the migration follows the recreated VM, there is nothing to roll back
+    followed = mig.model_copy(update={"vm": VMRef.model_validate(new_vm)})
+    done = await executor.run(StepName.ROLLBACK, make_ctx(plan, followed, SRC, DST, settings)[0])
+    assert calls == [] and done.details["note"] == "nothing to roll back"
+
+
+async def test_a_rollback_resumed_after_two_cycles_reports_the_newest_recreated_vm(tmp_path):
+    """SDD §7.3: a migration rolled back twice - each cycle recreating its source - reads, when its
+    second rollback's outcome was not recorded, the newest archived journal, never an older
+    cycle's (audit EX-04)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    rdir = executor.run_dir(ctx)
+    rdir.mkdir(parents=True)
+    (rdir / "source-server.json").write_text(
+        json.dumps({"server_id": "srv-1", "attachments": [{"volume_id": "vol-root"}]})
+    )
+    for stamp, server, volume in (
+        ("20261017T040000", "src-old", "src-vol-old"),
+        ("20261017T050000", "src-newest", "src-vol-newest"),
+    ):
+        done = {"rb:create_source": {"server_id": server}}
+        done["rb:manage_src:vol-root"] = {"volume_id": volume}
+        (rdir / f"handover-journal.rolled-back-{stamp}.json").write_text(
+            json.dumps({"done": done, "order": list(done)})
+        )
+    result = await executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["vm"]["source_id"] == "src-newest" and calls == []
+    assert "src-vol-newest" in {d["id"] for d in result.details["vm"]["disks"]}
+
+
+async def test_a_second_rollback_after_one_that_kept_the_source_has_nothing_to_roll_back(
+    tmp_path,
+):
+    """SDD §7.3: a rollback before the source server was deleted keeps the server and its id, so
+    a second one - its journal archived - has nothing to roll back and reports no VM (audit
+    EX-04)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="delete_server")
+    with pytest.raises(PermanentStepError, match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    first = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "vm" not in first.details
+    calls.clear()
+    again = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert calls == [] and again.details == {
+        "source_running": True,
+        "note": "nothing to roll back",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1756,6 +3176,229 @@ async def test_handover_refuses_before_stop_when_cinder_cannot_unmanage_a_volume
     with pytest.raises(PermanentStepError, match=reason):
         await executor.run(StepName.CUTOVER, ctx)
     assert calls == [] and rec.downtime_marks == 0
+
+
+@pytest.mark.parametrize(
+    ("server", "named"),
+    [
+        ({"flavor": {"original_name": "m1.big", "ephemeral": 50, "swap": 0}}, "an ephemeral"),
+        ({"flavor": {"original_name": "m1.swap", "ephemeral": 0, "swap": 1024}}, "a swap"),
+        ({"image": {"id": "img-1"}}, "a root disk from an image"),
+    ],
+)
+async def test_handover_refuses_before_stop_a_server_with_a_disk_on_its_hypervisor(
+    tmp_path, server, named
+):
+    """SDD §7.3 step 0, §4.2: a server resized since its validation onto a flavor with an
+    ephemeral or swap disk - read from the flavor Nova embeds - or booted from an image. Step 4
+    would delete that disk with the server; it is refused while the VM still runs (audit EX-15)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    for key, value in server.items():
+        setattr(clouds["src"].servers["srv-1"], key, value)
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, ctx)
+    assert named in str(refused.value) and "on its hypervisor" in str(refused.value)
+    assert calls == [] and rec.downtime_marks == 0
+
+
+@pytest.mark.parametrize(
+    ("server", "local"),
+    [
+        ({"flavor": {"original_name": "m1.big", "ephemeral": 50}}, ["an ephemeral disk of 50 GiB"]),
+        ({"flavor": {"original_name": "m1.swap", "swap": 1024}}, ["a swap disk of 1024 MiB"]),
+        (
+            {"image": {"id": "img-1"}, "flavor": {"original_name": "m1.small"}},
+            ["a root disk from an image"],
+        ),
+        ({"image": "", "flavor": {"original_name": "m1.small", "ephemeral": 0}}, []),
+        # below compute 2.47 Nova embeds no flavor: openstacksdk reads 0 and 0 - such a source is
+        # refused for lacking 2.85 anyway
+        ({"flavor": {"id": "flv-7", "links": []}}, []),
+    ],
+)
+def test_the_disks_on_the_hypervisor_are_read_from_openstacksdks_own_server(server, local):
+    """SDD §7.3 step 0, §4.2 (review RV26-09): read as the inventory reads them, from the flavor
+    Nova embeds, on openstacksdk's own Server - whose Flavor reads 0 for a field Nova left out, so
+    nothing needs a flavor looked up by id."""
+    from openstack.compute.v2.server import Server
+
+    assert handover_module.HandoverExecutor._local_disks(Server(id="srv-1", **server)) == local
+
+
+async def test_handover_refuses_before_stop_a_volume_another_server_holds_too(tmp_path):
+    """SDD §7.3 step 0: a multi-attach volume another server also holds stays in-use once step 4
+    deletes the source server, so step 5 could never unmanage it - refused while the VM runs. One
+    the source alone holds passes (audit EX-09)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    volume = clouds["src"].volumes["vol-data"]
+    volume.multiattach = True
+    volume.attachments = [{"server_id": "srv-1"}, {"server_id": "srv-db-2"}]
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, ctx)
+    assert "volume vol-data is attached to another server too (srv-db-2)" in str(refused.value)
+    assert calls == [] and rec.downtime_marks == 0
+    # an attachment without a server holds it as well
+    volume.attachments = [{"server_id": "srv-1"}, {"server_id": None}]
+    with pytest.raises(PermanentStepError, match="an attachment without a server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    # the source alone holds it: the handover goes ahead
+    volume.attachments = [{"server_id": "srv-1"}]
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+
+
+@pytest.mark.parametrize(
+    ("specs", "reported", "refused"),
+    [
+        ({"volume_backend_name": "ceph-ssd"}, True, True),
+        ({"capabilities:volume_backend_name": "ceph-ssd"}, True, True),
+        ({"volume_backend_name": "ceph-hdd"}, True, False),
+        ({}, True, False),
+        ({"volume_backend_name": "ceph-ssd"}, False, False),
+        # Cinder's operators (extra_specs_ops): the scheduler takes these for ceph-hdd...
+        ({"volume_backend_name": "<or> ceph-ssd <or> ceph-hdd"}, True, False),
+        ({"volume_backend_name": "<in> ceph"}, True, False),
+        ({"volume_backend_name": "s== ceph-hdd"}, True, False),
+        ({"capabilities:volume_backend_name": "s!= ceph-ssd"}, True, False),
+        # ...and refuses these (review RV26-08)
+        ({"volume_backend_name": "<or> ceph-ssd <or> ceph-nvme"}, True, True),
+        ({"volume_backend_name": "<in> nfs"}, True, True),
+        ({"volume_backend_name": "s== ceph-ssd"}, True, True),
+        ({"volume_backend_name": "s!= ceph-hdd"}, True, True),
+    ],
+)
+async def test_handover_refuses_before_stop_a_volume_type_the_pool_cannot_hold(
+    tmp_path, specs, reported, refused
+):
+    """SDD §7.3 step 0: vol-data is managed on hostgroup@ceph-hdd#hdd, whose backend is ceph-hdd,
+    as the mapped type rbd-hdd. A type asking for another backend is refused by Cinder's scheduler
+    at step 6, after the source server was deleted - so step 0 refuses it while the VM runs; a
+    type asking for that backend, or for none, passes, as does one whose pool reports no backend
+    to compare with (audit EX-10)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].pools = [
+        ("hostgroup@ceph-ssd#ssd", {**CEPH, "volume_backend_name": "ceph-ssd"}),
+        ("hostgroup@ceph-hdd#hdd", {**CEPH, "volume_backend_name": "ceph-hdd"}),
+    ]
+    if not reported:
+        clouds["dst"].pools = [(name, CEPH) for name, _ in clouds["dst"].pools]
+    clouds["dst"].type_specs = {"rbd-hdd": specs}
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    if not refused:
+        assert (await executor.run(StepName.CUTOVER, ctx)).destination_server_id
+        return
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refusal:
+        await executor.run(StepName.CUTOVER, ctx)
+    wanted = next(iter(specs.values()))
+    assert (
+        f"volume vol-data: RHOSO 18.0's volume type 'rbd-hdd' asks for the backend {wanted!r}, "
+        "but step 6 manages the volume on hostgroup@ceph-hdd#hdd, whose backend is 'ceph-hdd'"
+    ) in str(refusal.value)
+    assert calls == [] and rec.downtime_marks == 0
+
+
+@pytest.mark.parametrize(
+    ("specs", "refused_by"),
+    [
+        # Cinder's CapabilitiesFilter takes the pool only when every backend spec matches it
+        (
+            {
+                "volume_backend_name": "<or> ceph-hdd <or> ceph-ssd",
+                "capabilities:volume_backend_name": "ceph-ssd",
+            },
+            "ceph-ssd",
+        ),
+        (
+            {"volume_backend_name": "ceph-hdd", "capabilities:volume_backend_name": "<in> ssd"},
+            "<in> ssd",
+        ),
+        # an empty or null spec - the Cinder API accepts both - matches no backend
+        ({"volume_backend_name": "", "capabilities:volume_backend_name": "ceph-hdd"}, ""),
+        ({"volume_backend_name": None, "capabilities:volume_backend_name": "ceph-hdd"}, None),
+        # both match: the handover goes ahead
+        (
+            {"volume_backend_name": "<in> ceph", "capabilities:volume_backend_name": "ceph-hdd"},
+            False,
+        ),
+    ],
+)
+async def test_handover_refuses_a_volume_type_any_backend_spec_of_which_the_pool_fails(
+    tmp_path, specs, refused_by
+):
+    """SDD §7.3 step 0 (review RV28-02): a volume type asks for its backend with
+    volume_backend_name and with capabilities:volume_backend_name, and Cinder's scheduler takes
+    the pool only when each of them matches - step 0 matches every one, so the type one of them
+    refuses is refused while the VM runs, not at step 6 after the source server was deleted."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].pools = [
+        ("hostgroup@ceph-ssd#ssd", {**CEPH, "volume_backend_name": "ceph-ssd"}),
+        ("hostgroup@ceph-hdd#hdd", {**CEPH, "volume_backend_name": "ceph-hdd"}),
+    ]
+    clouds["dst"].type_specs = {"rbd-hdd": specs}
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    if refused_by is False:
+        assert (await executor.run(StepName.CUTOVER, ctx)).destination_server_id
+        return
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refusal:
+        await executor.run(StepName.CUTOVER, ctx)
+    assert (
+        f"volume vol-data: RHOSO 18.0's volume type 'rbd-hdd' asks for the backend "
+        f"{refused_by!r}, but step 6 manages the volume on hostgroup@ceph-hdd#hdd, whose backend "
+        "is 'ceph-hdd'"
+    ) in str(refusal.value)
+    assert calls == [] and rec.downtime_marks == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "spec", "matches"),
+    [
+        # no operator: the whole spec, as it is written
+        ("ceph-hdd", "ceph-hdd", True),
+        ("ceph-hdd", "ceph-ssd", False),
+        ("ceph hdd", "ceph hdd", True),
+        (None, None, True),
+        ("ceph-hdd", None, False),
+        # <or>: any alternative - every other word after the first
+        ("ceph-hdd", "<or> ceph-ssd <or> ceph-hdd", True),
+        ("ceph-ssd", "<or> ceph-ssd <or> ceph-hdd", True),
+        ("ceph", "<or> ceph-ssd <or> ceph-hdd", False),
+        ("ceph-hdd", "<or> ceph-hdd", True),
+        ("ceph-hdd", "<or>", False),
+        ("<or>", "<or> ceph-ssd <or> ceph-hdd", False),  # a separator is no alternative
+        (None, "<or> ceph-hdd", False),
+        (None, "s!= ceph-hdd", False),  # a backend that reports none matches no operator
+        # the string operators compare with the first word after them
+        ("ceph-hdd", "s== ceph-hdd", True),
+        ("ceph-hdd", "s!= ceph-hdd", False),
+        ("b", "s< c", True),
+        ("c", "s<= c", True),
+        ("d", "s> c", True),
+        ("c", "s>= d", False),
+        ("ceph-hdd", "<in> hdd", True),
+        ("ceph-hdd", "<in> nvme", False),
+        # numbers: "=" means at least
+        ("10", "= 8", True),
+        ("4", "= 8", False),
+        ("8", "== 8.0", True),
+        ("8", "!= 8", False),
+        ("9", ">= 8", True),
+        ("7", "<= 8", True),
+        ("ceph-hdd", "== 8", False),  # no number: no match
+        # <is>: as booleans
+        ("True", "<is> true", True),
+        ("no", "<is> True", False),
+        # an operator with nothing to compare with, or with what it cannot compare
+        ("ceph-hdd", "s==", False),
+        (8, "<in> 8", False),
+    ],
+)
+def test_a_volume_type_spec_is_matched_as_cinders_scheduler_matches_it(value, spec, matches):
+    """SDD §7.3 step 0 (review RV26-08): Cinder's CapabilitiesFilter matches each extra spec with
+    extra_specs_ops.match - a spec starting with an operator word is that comparison, any other is
+    the whole string - so step 0 refuses exactly what the scheduler refuses."""
+    assert handover_module.cinder_spec_matches(value, spec) is matches
 
 
 async def test_handover_refuses_before_stop_without_compute_microversion_2_85(tmp_path):
@@ -2020,6 +3663,214 @@ async def test_a_providers_name_never_decides_whether_a_failure_is_retried(tmp_p
         await executor._call("manage vol-1 in DC3", busy)
 
 
+def sdk_error(status, reason, body=b"", url="https://cinder.dc3.example:8776/v3/volumes"):
+    """The exception openstacksdk itself raises for an HTTP error answer (raise_from_response)."""
+    import requests
+    from openstack import exceptions
+
+    request = requests.Request("POST", url).prepare()
+    response = requests.models.Response()
+    response.status_code, response.reason, response._content = status, reason, body
+    response.request, response.url = request, request.url
+    try:
+        exceptions.raise_from_response(response)
+    except exceptions.HttpException as exc:
+        return exc
+    raise AssertionError("no exception")
+
+
+@pytest.mark.parametrize(
+    ("name", "retried"),
+    [("sdk 503", True), ("connect failure", True), ("sign-in refused", True), ("sdk 400", False)],
+)
+@pytest.mark.parametrize("step", [0, 2])
+async def test_a_cinder_pool_read_that_fails_is_retried_as_any_call(tmp_path, name, retried, step):
+    """SDD §7.3 (review RV27-05): the Cinder pools are read as any other call - an answer of 502,
+    503 or 504, a retriable connection failure, the sign-in's blip is retried; any other failure
+    stays the refusal it was. At step 0 a retried read refuses nothing; at step 2, after the stop,
+    it fails the attempt as transient instead of handing the cutover to the automatic rollback."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    dst = clouds["dst"]
+    pools, reads = dst.block_storage.backend_pools, []
+
+    def backend_pools():
+        reads.append(len(reads) + 1)
+        if len(reads) == (1 if step == 0 else 2):  # step 0 reads them, step 2 again after the stop
+            raise sdk_errors()[name]
+        return pools()
+
+    dst.block_storage.backend_pools = backend_pools
+    with pytest.raises((TransientStepError, PermanentStepError)) as failed:
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    kind = TransientStepError if retried else PermanentStepError
+    assert type(failed.value) is kind, str(failed.value)[:300]
+    assert "cannot read the Cinder pools" in str(failed.value)
+    assert (("src", "stop_server", "srv-1") in calls) == (step == 2)
+
+
+def keystone_at_sign_in(answer):
+    """What keystoneauth itself raises when a connection's first sign-in meets ``answer`` - an
+    error of the HTTP session, or a status Keystone answers - at an auth URL without its version
+    path, as many clouds.yaml carry it (the generic password plugin, openstacksdk's
+    ``password``)."""
+    import requests
+    from keystoneauth1 import session as ks_session
+    from keystoneauth1.identity import generic
+
+    class Keystone(requests.Session):
+        def request(self, method, url, **kw):
+            if isinstance(answer, BaseException):
+                raise answer
+            response = requests.models.Response()
+            response.status_code, response._content = answer, b"{}"
+            response.request = requests.Request(method, url).prepare()
+            response.url = url
+            return response
+
+    plugin = generic.Password(
+        auth_url="https://keystone.dc3.example:5000",
+        username="u",
+        password="p",
+        project_name="admin",
+        user_domain_name="Default",
+        project_domain_name="Default",
+    )
+    try:
+        ks_session.Session(auth=plugin, session=Keystone()).get_token()
+    except Exception as exc:  # noqa: BLE001 - the error under test
+        return exc
+    raise AssertionError("no error")
+
+
+def sdk_errors():
+    """What openstacksdk and keystoneauth raise themselves (the installed versions), by name."""
+    import requests
+    from keystoneauth1 import exceptions as ksa
+
+    url = "https://cinder.dc3.example:8776/v3/volumes"
+    refused = (
+        "Max retries exceeded (Caused by NewConnectionError('[Errno 111] Connection refused'))"
+    )
+    return {
+        "sdk 503": sdk_error(503, "Service Unavailable"),
+        "sdk 504": sdk_error(504, "Gateway Time-out"),
+        "sdk 502": sdk_error(502, "Bad Gateway"),
+        "keystoneauth 503": ksa.ServiceUnavailable(),
+        "keystoneauth 502": ksa.BadGateway(),
+        "connect timeout": ksa.ConnectTimeout(f"Request to {url} timed out"),
+        "connect failure": ksa.ConnectFailure(
+            f"Unable to establish connection to {url}: RemoteDisconnected('closed')"
+        ),
+        "sdk 400": sdk_error(400, "Bad Request", b'{"badRequest": {"message": "Invalid volume"}}'),
+        "sdk 404": sdk_error(404, "Not Found"),
+        "sdk 409": sdk_error(409, "Conflict"),
+        # keystoneauth's DiscoveryFailure, raised while handling what the sign-in met
+        "sign-in refused": keystone_at_sign_in(requests.exceptions.ConnectionError(refused)),
+        "sign-in 502": keystone_at_sign_in(502),
+        "sign-in certificate": keystone_at_sign_in(
+            requests.exceptions.SSLError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"
+            )
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "retried"),
+    [
+        ("sdk 503", True),
+        ("sdk 504", True),
+        ("sdk 502", True),
+        ("keystoneauth 503", True),
+        ("keystoneauth 502", True),
+        ("connect timeout", True),
+        ("connect failure", True),
+        ("sdk 400", False),
+        ("sdk 404", False),
+        ("sdk 409", False),
+        ("sign-in refused", True),
+        ("sign-in 502", True),
+        ("sign-in certificate", False),
+    ],
+)
+async def test_a_handover_call_is_retried_on_the_sdks_own_transient_errors(tmp_path, name, retried):
+    """SDD §7.3: a call answered 502, 503 or 504 - the SDK's HttpException, keystoneauth's HTTP
+    error - or failing with keystoneauth's retriable connection failures is retried, as the SDK and
+    keystoneauth word them; refusals are not (audit EX-12). A connection's first sign-in to an auth
+    URL without its version path wraps them in keystoneauth's DiscoveryFailure: a Keystone that
+    refused the connection or answered 502 is retried, a certificate it failed is not (review
+    RV26-05)."""
+    executor, *_ = setup(tmp_path)
+    error = sdk_errors()[name]
+
+    def call():
+        raise error
+
+    with pytest.raises((TransientStepError, PermanentStepError)) as failed:
+        await executor._call("manage vol-1 in RHOSO 18.0", call)
+    assert type(failed.value) is (TransientStepError if retried else PermanentStepError)
+
+
+async def test_a_handover_failure_is_judged_by_what_it_was_raised_from(tmp_path):
+    """SDD §7.3: an error raised from a retriable one, or while handling it, is retried - the
+    first error of the chain with a status decides, and one whose author cut the chain
+    (``raise ... from None``) is judged by its own text (review RV26-05)."""
+    from keystoneauth1 import exceptions as ksa
+    from openstack import exceptions as sdk
+
+    executor, *_ = setup(tmp_path)
+    url = "https://cinder.dc3.example:8776/v3/volumes"
+
+    def blip():
+        return ksa.ConnectFailure(f"Unable to establish connection to {url}: Connection refused")
+
+    def wrapped():  # as openstacksdk's cloud layer re-raises (openstacksdk_exceptions)
+        raise sdk.SDKException("Error fetching volume vol-1") from blip()
+
+    def answered():
+        try:
+            raise blip()
+        except ksa.ConnectFailure:
+            raise sdk_error(409, "Conflict")  # noqa: B904 - an answer came after all: it decides
+
+    def cut():
+        try:
+            raise blip()
+        except ksa.ConnectFailure:
+            raise RuntimeError("volume vol-1 is in use") from None
+
+    def looped():
+        first, second = RuntimeError("volume vol-1 is in use"), RuntimeError("its snapshot too")
+        first.__context__, second.__context__ = second, first
+        raise first
+
+    async def kind(fn):
+        with pytest.raises((TransientStepError, PermanentStepError)) as failed:
+            await executor._call("manage vol-1 in RHOSO 18.0", fn)
+        return type(failed.value)
+
+    assert await kind(wrapped) is TransientStepError
+    assert await kind(answered) is PermanentStepError
+    assert await kind(cut) is PermanentStepError
+    assert await kind(looped) is PermanentStepError
+
+
+@pytest.mark.parametrize(
+    ("status", "retried"), [(502, True), (503, True), (504, True), (500, False)]
+)
+async def test_a_raw_handover_call_is_retried_on_its_answers_status(tmp_path, status, retried):
+    """SDD §7.3: a raw call (Proxy.post, put) answered 502, 503 or 504 is retried by its status,
+    whatever its text says (audit EX-12)."""
+    executor, *_ = setup(tmp_path)
+
+    def call():
+        handover_module._checked(FakeResponse("Gateway Time-out", status), "Cinder refused")
+
+    with pytest.raises((TransientStepError, PermanentStepError)) as failed:
+        await executor._call("manage vol-1 in RHOSO 18.0", call)
+    assert type(failed.value) is (TransientStepError if retried else PermanentStepError)
+
+
 async def test_handover_rollback_netapp_manages_back_with_the_source_share(tmp_path):
     executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
@@ -2114,6 +3965,7 @@ async def test_handover_fails_fast_when_cinder_refuses_the_unmanage(tmp_path):
     assert ops(calls) == [
         ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
         ("src", "create_server", "web-01"),
+        ("src", "dot", "vol-root"),  # its delete_on_termination back once it runs
     ]
     assert result.details["source_running"] is True
 
@@ -2354,11 +4206,11 @@ def test_handover_step_0_reads_a_real_sources_microversion(tmp_path):
     named as major.minor (SDD §7.3 step 0)."""
     caracal = InProcessCloud(tmp_path / "caracal", compute="2.96")
     conn = caracal.connect(make_provider(cloud="dst"), caracal.settings)
-    assert HandoverExecutor._unmanage_blockers(conn, []) == []
+    assert HandoverExecutor._unmanage_blockers(conn, [], "srv-1") == []
 
     train = InProcessCloud(tmp_path / "train", compute="2.79")
     conn = train.connect(make_provider(cloud="dst"), train.settings)
-    assert HandoverExecutor._unmanage_blockers(conn, []) == [
+    assert HandoverExecutor._unmanage_blockers(conn, [], "srv-1") == [
         "the source compute API supports microversion 2.79; keeping the volumes when the source "
         "server is deleted needs 2.85"
     ]

@@ -90,6 +90,10 @@ async def test_fake_destination_inventory_and_servers():
     # the demo destination holds no port another migration could collide with (SDD §10)
     assert await dst.ports(network_id="net-1", mac_address="00:50:56:00:00:01") == []
     await dst.delete_port("port-gone")
+    # nor a kit volume a VMware rollback would delete (SDD §7.2, §10)
+    assert await dst.volumes() == []
+    await dst.delete_volume("vol-gone")
+    await dst.detach_volume("srv-conv", "vol-gone")
 
 
 def test_registry_returns_fake_in_demo():
@@ -1298,6 +1302,80 @@ async def test_vmware_power_on_and_inventory(tmp_path):
     assert inv.networks == {} and inv.projects == []  # the fake vim has no Network type
 
 
+async def test_vmware_tells_whether_vcenter_recorded_a_power_on_since_a_time(tmp_path):
+    """SDD §7.2, §10 (review RV30-03): powered_on_since asks vCenter's event manager for the VM's
+    power-on, DRS power-on and resume events since the time - its power state cannot tell a VM
+    that ran and was shut down again."""
+    from datetime import UTC, datetime
+
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = PoweredOffVM()
+    since = datetime(2026, 10, 17, 9, 0, tzinfo=UTC)
+    queries: list = []
+    found: list = []  # the events vCenter answers with
+
+    class EventFilterSpec:
+        def __init__(self, entity, time, eventTypeId):  # noqa: N803 - pyVmomi naming
+            self.entity, self.time, self.event_type_ids = entity, time, eventTypeId
+
+    EventFilterSpec.ByEntity = lambda entity, recursion: NS(entity=entity, recursion=recursion)
+    EventFilterSpec.ByTime = lambda beginTime: NS(begin=beginTime)  # noqa: N803
+
+    def service_instance(**_):
+        si = fake_service_instance([vm])
+        si.RetrieveContent().eventManager = NS(
+            QueryEvents=lambda spec: queries.append(spec) or list(found)
+        )
+        return si
+
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=service_instance,
+        vim=NS(**vars(FAKE_VIM), event=NS(EventFilterSpec=EventFilterSpec)),
+    )
+    assert await provider.powered_on_since("5012-abcd", since) is False
+    found.append(NS(createdTime=since))
+    assert await provider.powered_on_since("5012-abcd", since) is True
+    spec = queries[0]
+    assert (spec.entity.entity, spec.entity.recursion, spec.time.begin) == (vm, "self", since)
+    assert set(spec.event_type_ids) == {"VmPoweredOnEvent", "DrsVmPoweredOnEvent", "VmResumedEvent"}
+    with pytest.raises(ProviderError, match="not found"):
+        await provider.powered_on_since("missing", since)
+
+
+async def test_vmware_lists_a_vms_disk_keys_in_vcenters_device_order(tmp_path):
+    """SDD §7.2, §10 (reviews RV32A-01, RV32A-02): disk_keys answers the keys of the VM's disks in
+    vCenter's device order - config.hardware.device, as the migration kit reads them to choose the
+    disk it converts first -, never sorted, and no other device's."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = fake_vcenter_vm()
+    first, second, nic = vm.config.hardware.device
+    vm.config.hardware.device = [second, nic, first]  # vCenter lists the higher key first
+    provider = provider_for_plain(tmp_path, vm)
+    assert await provider.disk_keys("5012-abcd") == [2001, 2000]
+    with pytest.raises(ProviderError, match="not found"):
+        await provider.disk_keys("missing")
+
+
+async def test_the_demo_source_lists_its_vms_disk_keys_as_vcenter_numbers_them():
+    """SDD §10: the demo's VMware VMs answer disk_keys as vCenter numbers a VM's disks, from 2000
+    in their order - the names the kit gives their volumes (SDD §7.2)."""
+    source = FakeSourceProvider(ProviderKind.vmware, seed=42)
+    for vm in await source.list_vms():
+        assert await source.disk_keys(vm.source_id) == [2000 + i for i in range(len(vm.disks))]
+    with pytest.raises(VMNotFound):
+        await source.disk_keys("missing")
+
+
 async def test_vmware_get_vm_and_power_on_use_the_uuid_index(tmp_path):
     """One FindByUuid call instead of a walk over every VM in the vCenter."""
     secret_dir = tmp_path / "secrets" / "vcenter-dc2"
@@ -1631,6 +1709,424 @@ async def test_openstack_destination_ports_match_every_filter_and_delete_is_idem
     assert deleted == [("p1", True)]
 
 
+async def test_openstack_destination_volumes_and_a_delete_that_waits_for_the_volume(
+    monkeypatch,
+):
+    """SDD §10 (§7.2 VMware rollback, review RV28-01): volumes() lists the project's volumes with
+    their metadata and the servers holding them; delete_volume waits while a volume still detaches
+    from the server just deleted (Cinder refuses to delete it meanwhile), deletes it and waits
+    until Cinder no longer has it, within the call's bound; a volume already gone is no error, and
+    one that does not settle in time is a provider error, never a delete Cinder refuses."""
+    from seamless_migrate.providers import openstack as osp
+
+    clock = [0.0]
+
+    def tick():
+        clock[0] += 1.0
+        return clock[0]
+
+    monkeypatch.setattr(osp, "time", NS(monotonic=tick, sleep=lambda s: None))
+    statuses = {"v1": ["in-use", "detaching", "available"], "stuck": ["detaching"]}
+    calls = []
+
+    def volume(volume_id, name, status, metadata=None, holders=()):
+        return NS(
+            id=volume_id,
+            name=name,
+            status=status,
+            metadata=metadata or {},
+            attachments=[{"server_id": s, "attachment_id": f"a-{s}"} for s in holders],
+        )
+
+    class BlockStorage:
+        def volumes(self, details=True, **query):
+            calls.append(("volumes", details, query))
+            return [
+                volume("v1", "web-01-2000", "in-use", {"osm": "true", "converted": "true"}, ["d9"]),
+                volume("v2", None, "available"),
+            ]
+
+        def find_volume(self, volume_id, ignore_missing=True):
+            calls.append(("find_volume", volume_id))
+            left = statuses.get(volume_id)
+            if not left:
+                return None
+            return volume(volume_id, "x", left.pop(0) if len(left) > 1 else left[0])
+
+        def delete_volume(self, volume, ignore_missing=True):
+            assert volume.status == "available", volume.status
+            calls.append(("delete_volume", volume.id, ignore_missing))
+
+        def wait_for_delete(self, volume, interval=2, wait=120):
+            calls.append(("wait_for_delete", volume.id, wait > 0))
+            return volume
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(
+        dst, settings(), connect_fn=lambda p, s: NS(block_storage=BlockStorage())
+    )
+    assert await provider.volumes() == [
+        {
+            "id": "v1",
+            "name": "web-01-2000",
+            "status": "in-use",
+            "metadata": {"osm": "true", "converted": "true"},
+            "attachments": ["d9"],
+        },
+        {"id": "v2", "name": "", "status": "available", "metadata": {}, "attachments": []},
+    ]
+    assert calls == [("volumes", True, {})]
+    calls.clear()
+    await provider.delete_volume("v1")
+    assert calls == [
+        ("find_volume", "v1"),
+        ("find_volume", "v1"),
+        ("find_volume", "v1"),
+        ("delete_volume", "v1", True),
+        ("wait_for_delete", "v1", True),
+    ]
+    calls.clear()
+    await provider.delete_volume("gone")
+    assert calls == [("find_volume", "gone")]
+    started = clock[0]
+    with pytest.raises(ProviderError, match="volume stuck is still detaching"):
+        await provider.delete_volume("stuck")
+    assert ("delete_volume", "stuck", True) not in calls
+    assert clock[0] - started < osp.PROVIDER_CALL_TIMEOUT_S, "the wait outlived the call's bound"
+
+
+def test_the_inventory_looks_up_a_flavor_nova_did_not_embed():
+    """SDD §4.2, §10 (review RV28-08): Nova embeds the server's flavor - its original_name,
+    vCPUs, RAM, disks - from compute 2.47 on; below it (or with a clouds.yaml that pins an older
+    compute microversion) the server holds only the flavor's id. openstacksdk's Flavor then reads
+    0 for every field Nova left out, never None, so the inventory looks the flavor up by its id
+    whenever no original_name was embedded - and reads its ephemeral and swap disks from it too."""
+    from openstack.compute.v2.flavor import Flavor
+    from openstack.compute.v2.server import Server
+
+    from seamless_migrate.providers.openstack import _MapContext
+
+    looked = []
+
+    def get_flavor(flavor_id, get_extra_specs=False):
+        looked.append(flavor_id)
+        return Flavor(id=flavor_id, name="m1.big", vcpus=4, ram=8192, disk=40, ephemeral=10)
+
+    conn = NS(
+        compute=NS(get_flavor=get_flavor, volume_attachments=lambda server: []),
+        network=NS(ports=lambda **kw: [], get_network=lambda network_id: None),
+        identity=NS(get_project=lambda project_id: None),
+        image=NS(get_image=lambda image_id: None),
+    )
+    ctx = _MapContext(conn)
+    body = {"id": "srv-1", "name": "old-01", "status": "ACTIVE", "image": {"id": "img-1"}}
+    body["flavor"] = {"id": "flv-7", "links": []}
+    for server in (dict(body), Server(**body)):
+        looked.clear()
+        vm = ctx.server_to_vmref(server)
+        assert (looked, vm.vcpus, vm.ram_mb, vm.flavor) == (["flv-7"], 4, 8192, "m1.big")
+        assert [(d.kind, d.size_gb) for d in vm.disks] == [("image_root", 40), ("ephemeral", 10)]
+    # an embedded flavor (2.47+) is read as it is: no lookup
+    looked.clear()
+    embedded = {"original_name": "m1.small", "vcpus": 2, "ram": 2048, "disk": 20, "swap": 0}
+    vm = ctx.server_to_vmref(Server(**{**body, "flavor": embedded}))
+    assert (looked, vm.vcpus, vm.flavor) == ([], 2, "m1.small")
+
+    # a flavor deleted since: the server keeps what Nova gave of it, the inventory goes on
+    def gone(flavor_id, get_extra_specs=False):
+        raise RuntimeError(f"HTTP 404: flavor {flavor_id} could not be found")
+
+    conn.compute.get_flavor = gone
+    assert ctx.server_to_vmref(Server(**body)).vcpus == 0
+
+
+def _looked_up_flavors(forbidden=False):
+    """openstacksdk's get_flavor over a Nova below 2.61: a flavor without extra specs, which
+    get_extra_specs=True or Flavor.fetch_extra_specs reads from os-extra_specs - refused (403)
+    where the policy forbids the credential to read them."""
+    import openstack.exceptions
+    from openstack.compute.v2.flavor import Flavor
+
+    class LookedUp(Flavor):
+        def fetch_extra_specs(self, session):
+            if forbidden:
+                raise openstack.exceptions.ForbiddenException(
+                    "Policy doesn't allow os_compute_api:os-flavor-extra-specs:index"
+                )
+            self._update(extra_specs={"resources:VGPU": "1"})
+            return self
+
+    def get_flavor(flavor_id, get_extra_specs=False):
+        flavor = LookedUp(id=flavor_id, name="g1.large", vcpus=8, ram=16384)
+        return flavor.fetch_extra_specs(None) if get_extra_specs else flavor
+
+    return get_flavor
+
+
+def test_the_inventory_reads_the_extra_specs_of_a_flavor_it_looked_up():
+    """SDD §4.2, §9.3 (review RV31-04): below compute 2.61 Nova's flavor holds no extra specs -
+    openstacksdk fetches them (os-extra_specs) only when asked. A flavor the inventory looks up
+    because Nova did not embed it (below 2.47) is asked for them, so a vGPU or PCI-passthrough
+    VM still carries its flavor_extra_specs - and gets its VM_VGPU or VM_PCI_PASSTHROUGH blocker."""
+    from openstack.compute.v2.server import Server
+
+    from seamless_migrate.providers.openstack import _MapContext
+
+    get_flavor = _looked_up_flavors()
+
+    conn = NS(
+        compute=NS(get_flavor=get_flavor, volume_attachments=lambda server: []),
+        network=NS(ports=lambda **kw: [], get_network=lambda network_id: None),
+        identity=NS(get_project=lambda project_id: None),
+        image=NS(get_image=lambda image_id: None),
+    )
+    body = {"id": "srv-1", "name": "gpu-01", "status": "ACTIVE", "image": {"id": "img-1"}}
+    vm = _MapContext(conn).server_to_vmref(Server(**body, flavor={"id": "flv-gpu", "links": []}))
+    assert (vm.flavor, vm.flavor_extra_specs) == ("g1.large", {"resources:VGPU": "1"})
+
+
+def test_the_inventory_keeps_a_looked_up_flavor_whose_extra_specs_it_may_not_read():
+    """SDD §4.2 (review RV32B-03): a policy may forbid the credential to read flavor extra specs
+    (os-extra_specs answers 403). The flavor the inventory looked up is then kept without them -
+    its vCPUs, RAM and name - as Nova 2.47+ leaves the specs out under that policy; never a VM read
+    as 0 vCPUs and no flavor."""
+    from openstack.compute.v2.server import Server
+
+    from seamless_migrate.providers.openstack import _MapContext
+
+    conn = NS(
+        compute=NS(
+            get_flavor=_looked_up_flavors(forbidden=True), volume_attachments=lambda server: []
+        ),
+        network=NS(ports=lambda **kw: [], get_network=lambda network_id: None),
+        identity=NS(get_project=lambda project_id: None),
+        image=NS(get_image=lambda image_id: None),
+    )
+    body = {"id": "srv-1", "name": "gpu-01", "status": "ACTIVE", "image": {"id": "img-1"}}
+    vm = _MapContext(conn).server_to_vmref(Server(**body, flavor={"id": "flv-gpu", "links": []}))
+    assert (vm.vcpus, vm.ram_mb, vm.flavor) == (8, 16384, "g1.large")
+    assert not vm.flavor_extra_specs
+
+
+@pytest.mark.parametrize(
+    "case", ["deleting", "began meanwhile", "error_deleting", "gone", "maintenance"]
+)
+async def test_openstack_delete_volume_waits_for_a_deletion_cinder_runs(case):
+    """SDD §10 (review RV29-04): Cinder's delete takes only an available, error, error_restoring,
+    error_extending or error_managing volume and refuses any other with 400. A volume it is
+    already deleting - an earlier call's deletion outlived that call, or another delete began
+    between the read and this one - is waited for until it is gone, never deleted a second time;
+    one it failed to delete (error_deleting) is a provider error that names it."""
+    from openstack import exceptions
+
+    statuses = {
+        "v1": {
+            "deleting": "deleting",
+            "began meanwhile": "available",
+            "error_deleting": "error_deleting",
+            "gone": None,
+            "maintenance": "maintenance",
+        }[case]
+    }
+    reads, deletes = [0], []
+
+    class BlockStorage:
+        def find_volume(self, volume_id, ignore_missing=True):
+            reads[0] += 1
+            status = statuses.get(volume_id)
+            if status == "deleting" and reads[0] > 3:
+                statuses[volume_id] = status = None  # the backend is done
+            return None if status is None else NS(id=volume_id, status=status)
+
+        def delete_volume(self, volume, ignore_missing=True):
+            deletes.append(volume.id)
+            if case == "began meanwhile":
+                statuses[volume.id] = "deleting"  # another delete landed first
+            if statuses[volume.id] not in ("available", "error", "error_restoring"):
+                raise exceptions.BadRequestException(
+                    "400: Invalid volume: Volume status must be available or error"
+                )
+            statuses[volume.id] = "deleting"
+
+        def wait_for_delete(self, volume, interval=2, wait=120):
+            while self.find_volume(volume.id) is not None:
+                pass
+            return volume
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(
+        dst, settings(), connect_fn=lambda p, s: NS(block_storage=BlockStorage())
+    )
+    if case == "error_deleting":
+        with pytest.raises(ProviderError, match="volume v1 is error_deleting"):
+            await provider.delete_volume("v1")
+        assert deletes == []
+        return
+    if case == "maintenance":  # a refusal of its own: no deletion runs, the error stands
+        with pytest.raises(ProviderError, match="400: Invalid volume"):
+            await provider.delete_volume("v1")
+        assert deletes == ["v1"]
+        return
+    await provider.delete_volume("v1")
+    assert statuses["v1"] is None
+    assert deletes == (["v1"] if case == "began meanwhile" else [])
+
+
+async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_free():
+    """SDD §10 (§7.2 VMware rollback, review RV29-02): detach_volume removes Nova's attachment of
+    the volume to the server, ignoring one already gone, and waits until Cinder reads the volume
+    available, within the call's bound."""
+    calls = []
+
+    class Compute:
+        def delete_volume_attachment(self, server, volume, ignore_missing=True):
+            calls.append(("delete_volume_attachment", server, volume, ignore_missing))
+
+    class BlockStorage:
+        def get_volume(self, volume_id):
+            return NS(id=volume_id, status="detaching")
+
+        def wait_for_status(self, volume, status="available", failures=None, interval=2, wait=None):
+            calls.append(("wait_for_status", volume.id, status, failures, wait is not None))
+            return volume
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(
+        dst,
+        settings(),
+        connect_fn=lambda p, s: NS(compute=Compute(), block_storage=BlockStorage()),
+    )
+    await provider.detach_volume("srv-conv", "vol-1")
+    assert calls == [
+        ("delete_volume_attachment", "srv-conv", "vol-1", True),
+        ("wait_for_status", "vol-1", "available", ["error"], True),
+    ]
+
+
+async def test_openstack_destination_finds_the_server_holding_an_address():
+    """SDD §10 (§7.2 VMware rollback, review RV30-06): server_of_address takes a compute port's
+    device - by the address as one of its fixed IPs, else through Neutron's floating IP of that
+    address - and never a floating IP's own port or a router's."""
+    ports = [
+        NS(
+            id="conv-port",
+            device_id="srv-conv",
+            device_owner="compute:nova",
+            fixed_ips=[{"ip_address": "10.0.0.40"}],
+        ),
+        NS(
+            id="fip-port",
+            device_id="fip-1",
+            device_owner="network:floatingip",
+            fixed_ips=[{"ip_address": "198.51.100.40"}],
+        ),
+        NS(
+            id="router-port",
+            device_id="router-1",
+            device_owner="network:router_interface",
+            fixed_ips=[{"ip_address": "10.0.0.1"}],
+        ),
+    ]
+    floating = [NS(floating_ip_address="198.51.100.40", port_id="conv-port")]
+
+    class Network:
+        def ports(self, fixed_ips):
+            address = fixed_ips[0].split("=", 1)[1]
+            return [p for p in ports if address in [ip["ip_address"] for ip in p.fixed_ips]]
+
+        def ips(self, floating_ip_address):
+            return [f for f in floating if f.floating_ip_address == floating_ip_address]
+
+        def get_port(self, port_id):
+            return {p.id: p for p in ports}[port_id]
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: NS(network=Network()))
+    assert await provider.server_of_address("10.0.0.40") == "srv-conv"
+    assert await provider.server_of_address("198.51.100.40") == "srv-conv"
+    assert await provider.server_of_address("10.0.0.1") is None  # a router's
+    assert await provider.server_of_address("203.0.113.9") is None
+
+
+@pytest.mark.parametrize("read", ["503", "gone"])
+async def test_openstack_destination_takes_a_failed_port_read_for_no_answer(read):
+    """SDD §7.2, §10 (review RV32A-04): the port a floating IP is associated with is read through
+    Neutron; a read that fails (a 503, a timeout) is no answer - a provider error, which the
+    rollback retries - while a port gone since the listing is no server holding the address."""
+    import openstack.exceptions
+
+    floating = [NS(floating_ip_address="198.51.100.40", port_id="conv-port")]
+
+    class Network:
+        def ports(self, fixed_ips):
+            return []
+
+        def ips(self, floating_ip_address):
+            return [f for f in floating if f.floating_ip_address == floating_ip_address]
+
+        def get_port(self, port_id):
+            if read == "gone":
+                raise openstack.exceptions.NotFoundException(f"No Port found for {port_id}")
+            raise openstack.exceptions.HttpException(message="Service Unavailable", http_status=503)
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: NS(network=Network()))
+    if read == "gone":
+        assert await provider.server_of_address("198.51.100.40") is None
+        return
+    with pytest.raises(ProviderError, match="503|Service Unavailable"):
+        await provider.server_of_address("198.51.100.40")
+
+
+async def test_openstack_destination_reads_the_volumes_nova_lists_for_a_server():
+    """SDD §10 (§7.2 VMware rollback, review RV30-04): server_volumes reads Nova's record of the
+    server - no Cinder or Neutron call, so a rollback reads it before the source's power-on; a
+    server gone holds none."""
+    import openstack.exceptions
+
+    class Compute:
+        def get_server(self, server_id):
+            if server_id == "gone":
+                raise openstack.exceptions.NotFoundException("No Server found for gone")
+            return NS(attached_volumes=[{"id": "vol-1"}, NS(id="vol-2")])
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: NS(compute=Compute()))
+    assert await provider.server_volumes("srv-1") == ["vol-1", "vol-2"]
+    assert await provider.server_volumes("gone") == []
+
+
+async def test_openstack_destination_marks_a_volume_keeping_its_other_metadata():
+    """SDD §10 (§7.2 VMware, review RV30-01): set_volume_metadata sets the given keys through
+    Cinder's merge (POST /volumes/{id}/metadata), so the kit's own keys - osm, changeID - stay."""
+    calls = []
+
+    class BlockStorage:
+        def set_volume_metadata(self, volume, **metadata):
+            calls.append(("set_volume_metadata", volume, metadata))
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(
+        dst, settings(), connect_fn=lambda p, s: NS(block_storage=BlockStorage())
+    )
+    await provider.set_volume_metadata("vol-1", {"seamless_copied": "true"})
+    assert calls == [("set_volume_metadata", "vol-1", {"seamless_copied": "true"})]
+
+
 async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):
     from seamless_migrate.providers import openstack as osp
     from seamless_migrate.providers.openstack import OpenStackProvider, _MapContext
@@ -1689,7 +2185,7 @@ async def test_openstack_flavor_without_embedded_specs_is_fetched(stub_openstack
     conn = fake_conn()
     server = conn.compute.get_server("srv-1")
     server.flavor = {"id": "flv-1"}  # older Nova: no embedded vcpus/ram/disk
-    conn.compute.get_flavor = lambda flavor_id: NS(
+    conn.compute.get_flavor = lambda flavor_id, get_extra_specs=False: NS(
         id=flavor_id, name="m1.small", vcpus=2, ram=4096, disk=20, extra_specs={"hw:x": "1"}
     )
     stub_openstack(conn)
@@ -1796,7 +2292,7 @@ async def test_vmware_power_on_times_out(tmp_path, monkeypatch):
     vm = PoweredOffVM(task_state="running")
     clock = [0.0]
 
-    def fast_clock():  # every call advances 400 s: the 600 s deadline passes on the 2nd poll
+    def fast_clock():  # every call advances 400 s: the deadline (the call's, less 5 s) passes
         clock[0] += 400.0
         return clock[0]
 
@@ -1812,6 +2308,376 @@ async def test_vmware_power_on_times_out(tmp_path, monkeypatch):
     )
     with pytest.raises(ProviderError, match="timed out"):
         await provider.power_on("5012-abcd")
+
+
+class ShuttingDown:
+    """A VM whose guest VMware Tools shut down - the migration kit's ShutdownGuest: vSphere reads
+    it poweredOn for ``looks`` reads of its power state, then poweredOff; its guest reads
+    shuttingDown until the last poweredOn look, which reads notRunning (the Tools stop just before
+    vSphere powers the VM off). A power-on meanwhile would find it on and do nothing."""
+
+    def __init__(self, looks):
+        self.left, self.host = looks, NS(name="esx-01.dc2")
+
+    @property
+    def powerState(self):  # noqa: N802 - pyVmomi naming
+        if self.left > 0:
+            self.left -= 1
+            return "poweredOn"
+        return "poweredOff"
+
+
+class ShuttingDownGuest:
+    def __init__(self, runtime):
+        self.runtime = runtime
+
+    @property
+    def guestState(self):  # noqa: N802 - pyVmomi naming
+        return "shuttingDown" if self.runtime.left > 0 else "notRunning"
+
+
+def shutting_down_vm(looks):
+    vm = PoweredOffVM()
+    vm.runtime = ShuttingDown(looks)
+    vm.guest = ShuttingDownGuest(vm.runtime)
+    return vm
+
+
+async def test_a_vmware_power_on_waits_for_a_guest_still_shutting_down(tmp_path, monkeypatch):
+    """SDD §7.2 (review RV26-10): the VMware rollback powers the source on while its guest is
+    still shutting down - the kit's shutdown was cut off by the step timeout or a rollback
+    request. vSphere reads the VM poweredOn until the guest is down, so the power-on waits for
+    it to be off and then powers it on, instead of reading it as running and leaving it to go
+    off a moment later; a guest that never ends its shutdown is an error, not "running"."""
+    from seamless_migrate.providers import vmware as vmw
+
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    clock = [0.0]
+
+    def tick():
+        clock[0] += 1.0
+        return clock[0]
+
+    monkeypatch.setattr(vmw, "time", NS(monotonic=tick, sleep=lambda s: None))
+
+    def provider_for(vm):
+        return vmw.VMwareProvider(
+            make_provider(
+                id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+            ),
+            settings(secrets_dir=tmp_path / "secrets"),
+            connector=lambda **_: fake_service_instance([vm]),
+            vim=FAKE_VIM,
+        )
+
+    vm = shutting_down_vm(looks=3)
+    await provider_for(vm).power_on("5012-abcd")
+    assert len(vm.tasks) == 1, "the power-on read a guest shutting down as running"
+    assert vm.runtime.left == 0
+    # a VM running without Tools reads notRunning too: never a shutdown, nothing to wait for
+    tools_less = PoweredOffVM(state="poweredOn")
+    tools_less.guest = NS(guestState="notRunning")
+    started = clock[0]
+    await provider_for(tools_less).power_on("5012-abcd")
+    assert tools_less.tasks == [] and clock[0] - started < 2
+    stuck = shutting_down_vm(looks=10**6)
+    with pytest.raises(ProviderError, match="still shutting down"):
+        await provider_for(stuck).power_on("5012-abcd")
+    assert stuck.tasks == []
+
+
+class Reads:
+    """vSphere's answers to one attribute, read after read; the last one stays."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+
+    def next(self):
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+
+def tools_stopped_vm(power, guest, tools="guestToolsCurrent"):
+    """A VM whose power state and guest state read ``power`` and ``guest`` in turn; its VMware
+    Tools are ``tools`` (installed and current by default, but not running)."""
+    vm = PoweredOffVM()
+    power_reads, guest_reads = Reads(*power), Reads(*guest)
+
+    class Runtime:
+        host = NS(name="esx-01.dc2")
+
+        @property
+        def powerState(self):  # noqa: N802 - pyVmomi naming
+            return power_reads.next()
+
+    class Guest:
+        toolsVersionStatus2 = tools
+        toolsRunningStatus = "guestToolsNotRunning"
+
+        @property
+        def guestState(self):  # noqa: N802 - pyVmomi naming
+            return guest_reads.next()
+
+    vm.runtime, vm.guest = Runtime(), Guest()
+    return vm
+
+
+def vcenter_for(tmp_path, vm):
+    from seamless_migrate.providers import vmware as vmw
+
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True, exist_ok=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    return vmw.VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda **_: fake_service_instance([vm]),
+        vim=FAKE_VIM,
+    )
+
+
+async def test_a_vmware_power_on_looks_again_at_a_vm_whose_tools_stopped(tmp_path, monkeypatch):
+    """SDD §7.2 (review RV27-01): a guest's VMware Tools stop just before vSphere powers the VM
+    off, so a rollback whose first look falls in the last seconds of a shutdown reads the VM on
+    and its guest notRunning, as for a VM running without Tools. A VM whose installed Tools no
+    longer run is looked at again for up to 120 s: powered on once it is off, left alone once its
+    guest runs (one still starting) or when the 120 s end; a VM without Tools is left alone at
+    once, and so is a guest seen shutting down that runs again (a reboot)."""
+    from seamless_migrate.providers import vmware as vmw
+
+    clock = [0.0]
+
+    def tick():
+        clock[0] += 1.0
+        return clock[0]
+
+    monkeypatch.setattr(vmw, "time", NS(monotonic=tick, sleep=lambda s: None))
+
+    async def power_on(vm):
+        started = clock[0]
+        await vcenter_for(tmp_path, vm).power_on("5012-abcd")
+        return len(vm.tasks), clock[0] - started
+
+    # the last seconds of a shutdown: off at the next look - powered on
+    tail = tools_stopped_vm(["poweredOn", "poweredOff"], ["notRunning"])
+    assert (await power_on(tail))[0] == 1, "the power-on read a shutdown's tail as a VM running"
+    # a guest still starting: its Tools run at the third look - left alone, no 120 s wait
+    starting = tools_stopped_vm(["poweredOn"], ["notRunning", "notRunning", "running"])
+    tasks, waited = await power_on(starting)
+    assert tasks == 0 and waited < 20, waited
+    # installed Tools that never run again on a VM that stays on: left alone after 120 s
+    silent = tools_stopped_vm(["poweredOn"], ["notRunning"])
+    tasks, waited = await power_on(silent)
+    assert tasks == 0 and 120 <= waited < 150, waited
+    # no Tools at all: a VM running without them, left alone at once
+    tools_less = tools_stopped_vm(["poweredOn"], ["notRunning"], tools="guestToolsNotInstalled")
+    tasks, waited = await power_on(tools_less)
+    assert tasks == 0 and waited < 3, waited
+    # a guest seen shutting down that runs again - it rebooted: left alone once it runs
+    rebooted = tools_stopped_vm(["poweredOn"], ["shuttingDown", "notRunning", "running"])
+    tasks, waited = await power_on(rebooted)
+    assert tasks == 0 and waited < 20, waited
+
+
+async def test_a_vmware_power_on_ends_within_its_call_and_never_acts_after_it(
+    tmp_path, monkeypatch
+):
+    """SDD §7.2 (review RV27-02): every provider call is cut at its bound (300 s, SDD §8.1), and
+    the thread that runs it cannot be stopped. The wait for a guest shutdown ends within that
+    bound, less 5 s, with the "still shutting down" error the rollback retries; and a call that
+    ended - timed out or cancelled - never powers the VM on afterwards, behind the back of the
+    rollback's retry."""
+    import asyncio
+    import time as real_time
+
+    from seamless_migrate.providers import vmware as vmw
+
+    clock = [0.0]
+
+    def tick():
+        clock[0] += 1.0
+        return clock[0]
+
+    monkeypatch.setattr(vmw, "time", NS(monotonic=tick, sleep=lambda s: None))
+    stuck = shutting_down_vm(looks=10**6)
+    with pytest.raises(ProviderError, match="still shutting down"):
+        await vcenter_for(tmp_path, stuck).power_on("5012-abcd")
+    assert clock[0] < vmw.PROVIDER_CALL_TIMEOUT_S, "the wait outlived the call's bound"
+
+    # a call cancelled while the guest shuts down: the guest is down a moment later
+    real_sleep = real_time.sleep
+    monkeypatch.setattr(
+        vmw, "time", NS(monotonic=real_time.monotonic, sleep=lambda s: real_sleep(0.01))
+    )
+    off_at = real_time.monotonic() + 0.3
+    vm = tools_stopped_vm(["poweredOn"], ["shuttingDown"])
+    looks = []
+
+    class Runtime:
+        host = NS(name="esx-01.dc2")
+
+        @property
+        def powerState(self):  # noqa: N802 - pyVmomi naming
+            looks.append(1)
+            return "poweredOn" if real_time.monotonic() < off_at else "poweredOff"
+
+    vm.runtime = Runtime()
+    call = asyncio.create_task(vcenter_for(tmp_path, vm).power_on("5012-abcd"))
+    await asyncio.sleep(0.1)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    await asyncio.sleep(0.2)
+    seen = len(looks)
+    await asyncio.sleep(0.4)  # the guest is down by now
+    assert vm.tasks == [], "the call was cancelled, yet its thread powered the VM on"
+    assert len(looks) == seen, "the thread of a cancelled call went on asking vCenter"
+
+
+@pytest.mark.parametrize("later", [2, 1801])
+async def test_a_vmware_rollback_retry_remembers_the_shutdown_an_earlier_attempt_saw(
+    tmp_path, monkeypatch, later
+):
+    """SDD §7.2 (review RV29-08): a guest that does not end its shutdown within the call's bound
+    is a provider error the rollback retries. The retry's first look may read the guest
+    notRunning with its Tools stopped - the shutdown's last phase, which the provider looks at
+    for 120 s only as a guest that might be starting. The provider remembers the shutdown it saw
+    for 30 minutes: the retry waits through that phase to its own bound and powers the VM on once
+    it is off. Past the 30 minutes it looks for 120 s again. Here vmtoolsd stops 250 s into the
+    rollback and the guest powers off 180 s later."""
+    from seamless_migrate.providers import vmware as vmw
+
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(vmw, "time", NS(monotonic=lambda: clock[0], sleep=sleep))
+    vm = PoweredOffVM()
+    tools_stop = [250.0]
+
+    class Runtime:
+        host = NS(name="esx-01.dc2")
+
+        @property
+        def powerState(self):  # noqa: N802 - pyVmomi naming
+            if vm.tasks:
+                return "poweredOn"
+            return "poweredOn" if clock[0] < tools_stop[0] + 180 else "poweredOff"
+
+    class Guest:
+        toolsVersionStatus2 = "guestToolsCurrent"
+
+        @property
+        def guestState(self):  # noqa: N802 - pyVmomi naming
+            return "shuttingDown" if clock[0] < tools_stop[0] else "notRunning"
+
+    vm.runtime, vm.guest = Runtime(), Guest()
+    vcenter = vcenter_for(tmp_path, vm)
+    with pytest.raises(ProviderError, match="still shutting down"):
+        await vcenter.power_on("5012-abcd")  # the first attempt: its bound ends at 295 s
+    if later > 1800:
+        tools_stop[0] = clock[0] + later  # a new shutdown's tail, long after the remembered one
+    sleep(later)
+    await vcenter.power_on("5012-abcd")
+    sleep(240)
+    if later < 1800:
+        assert vm.tasks, "the retry returned without a power-on; the VM went off under it"
+        # powered on, the shutdown is over: a later look at the VM, its Tools stopped, is 120 s
+        started = clock[0]
+        await vcenter.power_on("5012-abcd")
+        assert len(vm.tasks) == 1 and clock[0] - started <= 125
+    else:
+        assert vm.tasks == [], "a shutdown seen 30 minutes ago still decided the look"
+
+
+async def test_a_guest_that_runs_again_ends_the_shutdown_the_provider_remembers(
+    tmp_path, monkeypatch
+):
+    """SDD §7.2 (review RV29-08): a shutdown the provider remembers ends when the guest runs
+    again - it rebooted rather than powering off: the retry leaves it alone, and a later look at
+    the VM, its Tools stopped, is the 120 s one again, never a wait to the call's bound."""
+    from seamless_migrate.providers import vmware as vmw
+
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(vmw, "time", NS(monotonic=lambda: clock[0], sleep=sleep))
+    guest_state = ["shuttingDown"]
+    vm = tools_stopped_vm(["poweredOn"], ["shuttingDown"])
+
+    class Guest:
+        toolsVersionStatus2 = "guestToolsCurrent"
+
+        @property
+        def guestState(self):  # noqa: N802 - pyVmomi naming
+            return guest_state[0]
+
+    vm.guest = Guest()
+    vcenter = vcenter_for(tmp_path, vm)
+    with pytest.raises(ProviderError, match="still shutting down"):
+        await vcenter.power_on("5012-abcd")
+    guest_state[0] = "running"  # it rebooted
+    await vcenter.power_on("5012-abcd")
+    guest_state[0] = "notRunning"  # its Tools stopped later on: no shutdown is remembered
+    started = clock[0]
+    await vcenter.power_on("5012-abcd")
+    assert vm.tasks == [] and clock[0] - started <= 125
+
+
+async def test_a_power_state_read_in_flight_when_the_power_on_call_ends_powers_nothing_on(
+    tmp_path, monkeypatch
+):
+    """SDD §7.2 (review RV29-05): "a call that ended - timed out or cancelled - powers nothing on
+    afterwards". Each power-state read is a vCenter round trip: one still in flight when the call
+    is cancelled answers poweredOff afterwards, and the thread must not then power the VM on
+    behind the back of the call that ended (and of the rollback's retry)."""
+    import asyncio
+    import threading
+    import time as real_time
+
+    from seamless_migrate.providers import vmware as vmw
+
+    real_sleep = real_time.sleep
+    monkeypatch.setattr(
+        vmw, "time", NS(monotonic=real_time.monotonic, sleep=lambda s: real_sleep(0.01))
+    )
+    in_read, answer = threading.Event(), threading.Event()
+    reads = []
+    vm = PoweredOffVM()
+
+    class Runtime:
+        host = NS(name="esx-01.dc2")
+
+        @property
+        def powerState(self):  # noqa: N802 - pyVmomi naming
+            reads.append(1)
+            if len(reads) == 1:
+                return "poweredOn"  # the first look: the guest still shuts down
+            in_read.set()  # the next look: vCenter answers slowly ...
+            answer.wait(30)  # ... only after the call ended
+            return "poweredOff"
+
+    class Guest:
+        toolsVersionStatus2 = "guestToolsCurrent"
+        guestState = "shuttingDown"
+
+    vm.runtime, vm.guest = Runtime(), Guest()
+    call = asyncio.create_task(vcenter_for(tmp_path, vm).power_on("5012-abcd"))
+    assert await asyncio.to_thread(in_read.wait, 10)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    answer.set()
+    await asyncio.sleep(0.5)
+    assert vm.tasks == [], "the call was cancelled, yet its thread powered the VM on afterwards"
 
 
 async def test_fake_destination_inventory_resolves_every_demo_nic():

@@ -508,3 +508,81 @@ This project follows a simple changelog to satisfy collection metadata validatio
   other OS fails the role with a message naming it, where it used to install
   nothing and the transfer then failed for want of nbdkit. An Ubuntu cloud
   image logs in as ``ubuntu``, not ``cloud-user``.
+- Each conversion host logs in as its own user:
+  ``os_migrate_src_conversion_host_ssh_user`` and
+  ``os_migrate_dst_conversion_host_ssh_user`` (both default to
+  ``os_migrate_conversion_host_ssh_user``) reach the source and the
+  destination host - the deployed hosts' inventory, the export, the source
+  cleanup, the warm snapshot and rollback on one side, the transfer, the
+  failure cleanup and the warm sync on the other. The transfer modules and
+  ``import_workload_warm_sync`` take ``src_ssh_user`` (default ``ssh_user``)
+  for the destination host's hop to the source host, so a RHEL source host
+  (``cloud-user``) works with an Ubuntu destination host (``ubuntu``).
+- Every stop and start of a source server waits first until Nova runs no stop
+  or start of it: the warm cutover's stop, the cold import's stop
+  (``os_migrate_workload_stop_before_migration``) and the rollback's start.
+  Nova keeps a server ``ACTIVE``, with the task state ``powering-off``, until
+  the guest is down - and ``SHUTOFF``, with ``powering-on``, until it runs -
+  and refuses a stop or a start meanwhile, while ``server_action`` decides by
+  the status alone. So a rollback after a stop that was cut off (a timeout, a
+  503 during its wait) started nothing and the source ended ``SHUTOFF``, a
+  re-run's stop was refused with 409, and a rollback retried while its first
+  start still ran was refused with 409. The wait reads the server every
+  ``os_migrate_source_stop_poll_s`` seconds (default 5), at most
+  ``os_migrate_timeout``, and once more at the latest after
+  ``os_migrate_timeout`` when the poll interval is longer: a stop or start
+  that still runs then fails the play, where a wait of no retry used to start
+  nothing and report success. Each role names it ``Wait until no stop or start
+  of the source server runs``.
+- A volume made from a server snapshot - the warm ``boot_disk_copy`` pass and
+  the cold export of an image-booted server - is as large as Cinder needs for
+  the image: the image file rounded up to whole GiB, its virtual disk (a qcow2
+  snapshot holds a larger disk than its file) and its ``min_disk``, at least
+  1 GiB. A file of 2.5 GiB with ``min_disk`` 0 (a flavor with a 0 GiB root
+  disk) asked for 2 GiB, and Cinder refused it on every pass. Where Glance
+  records no virtual size (before Victoria), a ``qcow2`` snapshot's is read
+  from the file's own header, the first bytes of a streamed download.
+- A warm pass whose record of a new destination volume cannot be written (a
+  full disk) deletes that volume, once Cinder settled it, before it fails, as
+  the cold transfer does. Before, no record named the volume, so no rollback
+  ever deleted it and the guest's data stayed in the tenant. A volume an
+  earlier pass extended to the source's grown size but could not record is
+  recorded at the size Cinder reports, rather than extended again to the size
+  it has, which Cinder refused on every later pass.
+- A warm pass first detaches from the destination conversion host the
+  recorded destination volumes a pass interrupted earlier left attached, then
+  extends one whose source volume grew. Before, the extend ran first: where
+  Cinder refuses to extend an ``in-use`` volume (its microversion or backend do
+  not allow it), every later pass failed the same way until an operator
+  detached the volume by hand; where it extends one, the pass waited until its
+  timeout for the volume to read ``available``, which an attached volume never
+  does.
+- A warm cutover's re-run finishes the destination server its warm state
+  records through ``import_workload_create_instance``'s new ``finish_only``
+  option, with which the module never creates a server: a recorded server
+  that vanished after the role looked it up fails the re-run, which names the
+  rollback. Before, the module fell through to a create with an empty block
+  device mapping - a server without the synchronised volumes, an image-booted
+  VM booting from its image - and recorded it as the destination. Without
+  ``finish_only`` (the first create, the cold import) a recorded server that
+  is gone is still replaced by the one the call creates.
+- A cold import whose transfer failed cleans the destination volumes the
+  transfer created: ``import_workload_dst_failure_cleanup`` takes the
+  workload's record (new ``warm_state_dir``; ``volume_map`` now optional) when
+  the transfer returned no map, and the role's rescue runs it whenever the
+  transfer ran. Before, the rescue skipped it when the transfer itself failed,
+  and the volumes stayed attached to the destination conversion host. Its SSH
+  check at the start no longer fails it: a conversion host it cannot reach
+  keeps the volumes it holds for the rollback, and those no server holds are
+  deleted through the API. The cleanup is best effort and never fails: a
+  detach or a deletion that fails leaves that volume, logged and named in the
+  result (``volumes_left``), and the cleanup goes on with the next one - but a
+  wait that gives up ends its phase, as each later volume would wait it out
+  again: a lock wait that gives up (the conversion host lost, or the lock
+  another conversion holds throughout, now ``LockUnavailable``) or a detach
+  Nova does not end in time (``DetachStuck``) ends the detaches, and a
+  deletion Cinder does not finish in time ends the deletions; one that cannot
+  start (its conversion host gone, a record not the workload's) says so in its
+  result. The rescue runs it before the source cleanup, so a source cleanup
+  that fails no longer keeps it from running, and a failed transfer is
+  reported and classified by its own failure, not the cleanup's.

@@ -87,6 +87,7 @@ from .executors.base import (
     StepName,
     StepResult,
     TransientStepError,
+    outlive_cancel,
 )
 from .invariants import check_invariants
 from .planning.estimator import (
@@ -1208,7 +1209,10 @@ class Orchestrator:
                 raise NotAllowed(f"a {fresh.status} plan cannot be started; validate it first")
             fresh.status = PlanStatus.running
 
-        plan = await self._update_plan(plan.id, start)
+        # PATCH /providers checks for running plans and writes under this lock (SDD §12, audit
+        # AP-07): taken last and innermost, it holds no other (§8)
+        async with self.provider_lock():
+            plan = await self._update_plan(plan.id, start)
         await self._emit("plan.started", f"{plan.name} started", plan_id=plan.id, actor=actor)
         self.wake()
         return plan
@@ -2583,6 +2587,10 @@ class Orchestrator:
             if not locked:
                 await self._mark_downtime(mid, at)
 
+        async def mark_downtime_end() -> None:
+            if not locked:
+                await outlive_cancel(self._close_clock(mid, plan))
+
         async def log_line(line: str) -> None:
             text = redact_cut(line, LOG_LINE_CHARS)
             await self._emit("migration.log", text, plan_id=m.plan_id, persist=False, migration=m)
@@ -2595,6 +2603,7 @@ class Orchestrator:
             settings=self.settings,
             report_progress=report_progress,
             mark_downtime_start=mark_downtime_start,
+            mark_downtime_end=mark_downtime_end,
             log=log_line,
             options=dict(options or {}),
         )
@@ -2637,17 +2646,48 @@ class Orchestrator:
         )
 
     async def _mark_downtime(self, mid: str, at: datetime | None = None) -> None:
+        # a cancel of the step (the step timeout, a rollback request, a shutdown) waits for the
+        # clock and its event: one that split them left an open clock unannounced - the clock is
+        # saved first, so a failed event never leaves a stopped source without it (SDD §5,
+        # review RV26-06)
+        await outlive_cancel(self._open_clock(mid, at))
+
+    async def _open_clock(self, mid: str, at: datetime | None) -> None:
         async with self._lock(mid):
             m, v = await self._load(mid)
-            if m.downtime_started_at is not None:
-                return
+            if fsm.source_stopped(m):
+                return  # open: the first stop's time stays
+            # none yet - or closed by the step that found the source running again and stops it
+            # once more: a new outage (SDD §5.2, review RV33-04)
             m.downtime_started_at = at or self._now()
+            m.downtime_ended_at = None
+            m.actual_downtime_s = None
+            m.downtime_model_s = None
             await self._save(m, v)
         await self._emit(
             "migration.downtime_started",
             f"{m.vm.name}: source VM stopped",
             migration=m,
             data={"at": m.downtime_started_at.isoformat()},
+        )
+
+    async def _close_clock(self, mid: str, plan: Plan) -> None:
+        """The source runs again inside a step - a rollback's power-on: the clock closes now, so
+        an attempt that fails after it leaves the source counted as running (SDD §5.2, review
+        RV30-03). Saved, then announced, as a rollback's end does; a closed clock stays as it is."""
+        async with self._lock(mid):
+            m, v = await self._load(mid)
+            if not fsm.source_stopped(m):
+                return
+            now = self._now()
+            m.downtime_ended_at = now
+            m.actual_downtime_s = self._rollback_downtime_s(m, now, plan)
+            await self._save(m, v)
+        await self._emit(
+            "migration.downtime_ended",
+            f"{m.vm.name}: source running again after {m.actual_downtime_s:.0f} s",
+            migration=m,
+            data={"actual_downtime_s": m.actual_downtime_s},
         )
 
     async def _run_step(
@@ -2659,8 +2699,6 @@ class Orchestrator:
         """Run ``step`` as a cancellable task with transient retries; ``None`` if cancelled or once
         the migration left the step's phase."""
         plan = await self._plan(m.plan_id)
-        source = await self.db.get("provider", plan.source_provider_id, Provider)
-        destination = await self.db.get("provider", plan.destination_provider_id, Provider)
         executor = self.executors.for_strategy(m.strategy)
         attempt = 0
         loop = asyncio.get_running_loop()
@@ -2672,6 +2710,10 @@ class Orchestrator:
                 current, _ = await self._load(m.id)
                 if current.phase != m.phase:
                     return None
+                # each attempt reads the providers anew: a retry after a credential rotation
+                # signs in with the new credentials (SDD §8, §13.3, review RV26-07)
+                source = await self.db.get("provider", plan.source_provider_id, Provider)
+                destination = await self.db.get("provider", plan.destination_provider_id, Provider)
                 ctx = self._context(current, plan, source, destination)
                 work = runner(ctx) if runner is not None else executor.run(step, ctx)
                 task = asyncio.create_task(work, name=f"{step}:{m.id}")

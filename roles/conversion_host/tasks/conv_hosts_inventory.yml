@@ -10,6 +10,8 @@
     os_migrate_conversion_ca_cert: "{{ item.os_migrate_conversion_ca_cert }}"
     os_migrate_conversion_client_cert: "{{ item.os_migrate_conversion_client_cert }}"
     os_migrate_conversion_client_key: "{{ item.os_migrate_conversion_client_key }}"
+    # each host's own side's user, under a name extra vars never set (Seamless Migrate SDD 6.5)
+    os_migrate_conversion_host_inventory_ssh_user: "{{ item.ssh_user }}"
   loop:
     - inventory_name: os_migrate_conv_src
       inventory_group: conversion_hosts_src
@@ -19,6 +21,7 @@
       os_migrate_conversion_ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
       os_migrate_conversion_client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
       os_migrate_conversion_client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+      ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
     - inventory_name: os_migrate_conv_dst
       inventory_group: conversion_hosts_dst
       os_migrate_conversion_host_name: "{{ os_migrate_dst_conversion_host_name }}"
@@ -27,6 +30,7 @@
       os_migrate_conversion_ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
       os_migrate_conversion_client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
       os_migrate_conversion_client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
+      ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
   when:
     - item["_migration_params"]["data_copy"]|default(true)
     - not item["_migration_params"]["use_nbdkit_direct"]|default(false)
@@ -43,6 +47,8 @@
     os_migrate_conversion_ca_cert: "{{ item.os_migrate_conversion_ca_cert }}"
     os_migrate_conversion_client_cert: "{{ item.os_migrate_conversion_client_cert }}"
     os_migrate_conversion_client_key: "{{ item.os_migrate_conversion_client_key }}"
+    # each host's own side's user, under a name extra vars never set (Seamless Migrate SDD 6.5)
+    os_migrate_conversion_host_inventory_ssh_user: "{{ item.ssh_user }}"
   loop:
     - inventory_name: os_migrate_conv_dst
       inventory_group: conversion_hosts_dst
@@ -52,6 +58,7 @@
       os_migrate_conversion_ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
       os_migrate_conversion_client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
       os_migrate_conversion_client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
+      ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
   when:
     - item["_migration_params"]["data_copy"]|default(true)
     - item["_migration_params"]["use_nbdkit_direct"]|default(false)

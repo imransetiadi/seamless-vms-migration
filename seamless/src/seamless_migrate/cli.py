@@ -22,6 +22,7 @@ from .config import Settings
 from .domain.enums import Phase, ProviderKind, Role, Strategy, strategies_for
 from .domain.models import (
     PLAN_EDITABLE_FIELDS,
+    REQUEST_BODY,
     Migration,
     Plan,
     PlanCreate,
@@ -296,7 +297,7 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
     if plan_id is not None and not _PLAN_ID.match(str(plan_id)):
         raise CliError(f"invalid plan id {plan_id!r}: expected plan-<8 hex digits> (SDD §4.2)")
     try:
-        spec = PlanCreate.model_validate(document)
+        spec = PlanCreate.model_validate(document, context=REQUEST_BODY)
     except ValidationError as exc:
         # SDD §12/§15: a key PlanCreate has no field for - a typo, a server-owned field, a YAML
         # key that is no string (`1:`, `yes:`) - is refused as POST and PATCH refuse it, on a

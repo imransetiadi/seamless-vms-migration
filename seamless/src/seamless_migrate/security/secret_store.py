@@ -31,6 +31,8 @@ from ..config import Settings
 _NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{0,200}$")
 _KEY = re.compile(r"^[A-Za-z0-9_]+$")
 SA_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+#: the CA the API server's certificate is checked against unless another CA file is given
+SA_CA_CERT = str(SA_DIR / "ca.crt")
 MANAGED_BY = "seamless-migrate"
 #: an operator's Secret made for providers (SDD §13.3); the store reads no other it did not write
 PROVIDER_SECRET_LABEL = "seamless.io/provider-secret"
@@ -42,9 +44,14 @@ class SecretStoreError(RuntimeError):
 
 
 class SecretStore(Protocol):
-    def read(self, name: str) -> dict[str, str] | None: ...
-    def write(self, name: str, values: Mapping[str, str], labels: Mapping[str, str]) -> None: ...
-    def delete(self, name: str) -> None: ...
+    def read(self, name: str) -> dict[str, str] | None:
+        """The secret's values; None when there is no such secret."""
+
+    def write(self, name: str, values: Mapping[str, str], labels: Mapping[str, str]) -> None:
+        """Create or replace the secret with these values and labels."""
+
+    def delete(self, name: str) -> None:
+        """Delete the secret; one already gone is no error."""
 
 
 def kubernetes_name(name: str) -> bool:
@@ -125,7 +132,7 @@ class KubernetesSecretStore:
         base_url: str | None = None,
         token: str | None = None,
         transport: httpx.BaseTransport | None = None,
-        verify: Any = None,
+        ca_cert: str = SA_CA_CERT,
     ) -> None:
         self.namespace = namespace or self._read_sa("namespace")
         host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
@@ -133,7 +140,9 @@ class KubernetesSecretStore:
         self.base_url = base_url or f"https://{host}:{port}"
         self._token = token
         self._transport = transport
-        self._verify = verify if verify is not None else str(SA_DIR / "ca.crt")
+        # the API server's certificate is checked against the ServiceAccount's CA, or the CA
+        # file given - never not at all (SDD §13.3, §17)
+        self._ca_cert = ca_cert
 
     @staticmethod
     def _read_sa(name: str) -> str:
@@ -152,7 +161,7 @@ class KubernetesSecretStore:
             headers={"Authorization": f"Bearer {token}"},
             timeout=10.0,
             transport=self._transport,
-            verify=self._verify if self._transport is None else True,
+            verify=self._ca_cert if self._transport is None else True,
             follow_redirects=False,
         )
 

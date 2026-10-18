@@ -12,6 +12,9 @@ os_migrate_rollback_delete_dest_volumes: false  # noqa: var-naming[no-role-prefi
 os_migrate_rollback_start_source: true  # noqa: var-naming[no-role-prefix]
 # false: the rollback deletes no destination port (a cancel's cleanup, SDD 5.1)
 os_migrate_rollback_delete_ports: true  # noqa: var-naming[no-role-prefix]
+# Seconds between the reads while Nova still stops a source server, before the cutover stops it
+# or the rollback starts it (SDD 6.5); the cold role's include takes the same default.
+os_migrate_source_stop_poll_s: 5  # noqa: var-naming[no-role-prefix]
 # Rollback with the catch-all workload filter (every workload of the data dir):
 # refused unless this confirms it.
 os_migrate_rollback_all: false  # noqa: var-naming[no-role-prefix]
@@ -39,6 +42,9 @@ os_migrate_rollback_match_by_name: false  # noqa: var-naming[no-role-prefix]
 # and conversion_host.
 os_migrate_conversion_keypair_private_path: "{{ os_migrate_data_dir }}/conversion/ssh.key"  # noqa: var-naming[no-role-prefix]
 os_migrate_conversion_host_ssh_user: cloud-user  # noqa: var-naming[no-role-prefix]
+# each conversion host's own SSH user, upstream's single one unless set (Seamless Migrate SDD 6.5)
+os_migrate_src_conversion_host_ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"  # noqa: var-naming[no-role-prefix]
+os_migrate_dst_conversion_host_ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"  # noqa: var-naming[no-role-prefix]
 os_migrate_src_conversion_host_name: os_migrate_conv_src  # noqa: var-naming[no-role-prefix]
 os_migrate_dst_conversion_host_name: os_migrate_conv_dst  # noqa: var-naming[no-role-prefix]
 os_migrate_timeout: 1800  # noqa: var-naming[no-role-prefix]

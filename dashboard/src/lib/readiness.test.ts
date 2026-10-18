@@ -33,4 +33,16 @@ describe('readinessFlags', () => {
     const vmw = makeVm({ id: 'vm-r3', name: 'vmw-01', disks: [{ size_gb: 20 }], nics: [{ network: 'VM Network', fixed_ips: ['10.0.0.7', 'fd00::7'] }] });
     expect(readinessFlags(vmw, 'vmware').map((f) => f.code)).not.toContain('NET_PORT_IPS');
   });
+
+  it('blocks a VMware VM whose name the migration kit keeps nothing of, as validation does (SDD §9.3 SRC_VM_NAME_UNUSABLE, review RV28-03)', () => {
+    const vm = (name: string) => makeVm({ id: 'vm-r5', name, disks: [{ size_gb: 20 }], nics: [{ network: 'VM Network', fixed_ips: ['10.0.0.7'] }] });
+    // Japanese "server": no Latin letter or digit survives the kit's naming
+    const flag = readinessFlags(vm('\u30b5\u30fc\u30d0\u30fc'), 'vmware').find((f) => f.code === 'SRC_VM_NAME_UNUSABLE');
+    expect(flag).toMatchObject({ label: 'Unusable name', severity: 'blocker' });
+    expect(flag!.detail).toMatch(/migration kit keeps no character of the name/i);
+    expect(readinessLevel(readinessFlags(vm('\u30b5\u30fc\u30d0\u30fc'), 'vmware'))).toBe('blocker');
+    // a name the kit transliterates keeps its VM ready, and an OpenStack VM is never named by the kit
+    expect(readinessFlags(vm('caf\u00e9-01'), 'vmware').map((f) => f.code)).not.toContain('SRC_VM_NAME_UNUSABLE');
+    expect(readinessFlags(vm('\u30b5\u30fc\u30d0\u30fc'), 'openstack').map((f) => f.code)).not.toContain('SRC_VM_NAME_UNUSABLE');
+  });
 });

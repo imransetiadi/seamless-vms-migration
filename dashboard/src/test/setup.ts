@@ -32,6 +32,10 @@ if (typeof window !== 'undefined') {
   }
   if (!('ResizeObserver' in window)) {
     class ResizeObserverStub {
+      readonly callback: ResizeObserverCallback;
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback;
+      }
       observe(): void {}
       unobserve(): void {}
       disconnect(): void {}

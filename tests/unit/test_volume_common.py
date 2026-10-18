@@ -548,6 +548,39 @@ def test_a_transfers_wait_for_its_exports_gives_up_after_the_ssh_window(waits_fo
     assert clock.now <= volume_common.SSH_UNREACHABLE_S + 60
 
 
+class ForwardingHost(PortShell):
+    """A destination conversion host whose forwarded exports answer at once."""
+
+    def cmd_sub(self, command, **kwargs):
+        if "-L" in command:
+            self.commands.append(list(command))
+            return mock.Mock()
+        return super().cmd_sub(command, **kwargs)
+
+
+def test_the_transfers_forward_logs_in_to_the_source_host_as_its_own_user():
+    """Seamless Migrate SDD 6.5 (audit EX-08): the destination host (ubuntu) forwards the source
+    host's NBD exports over SSH, logging in to the source host as the source's user (cloud-user),
+    not as its own."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_transfer_volumes as transfer_module,
+    )
+
+    src, dst = fake.FakeCloud("src"), cloud()
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    volume_map = {"/dev/vda": dict(cold_volume_map()["/dev/vda"], port=10809)}
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = transfer_module.OpenStackDestinationVolume(
+            dst, "dst-conv", "/keys/k", "ubuntu", "uuid-1", "10.0.0.10", volume_map,
+            workload(), timeout=1800, src_ssh_user="cloud-user",
+        )
+    transfer.shell = ForwardingHost(free=2)
+    transfer.shell.ssh_user = "ubuntu"  # the destination host, reached as its own user
+    transfer._create_forwarding_process()
+    [forward] = [c for c in transfer.shell.commands if "-L" in c]
+    assert "cloud-user@10.0.0.10" in forward and "ubuntu@10.0.0.10" not in forward
+
+
 class GoneHost(PortShell):
     """The destination conversion host, down for good from the first `qemu-img info` on: every
     ssh to it fails as ssh does - exit status 255 - each try the 10 s connect timeout."""

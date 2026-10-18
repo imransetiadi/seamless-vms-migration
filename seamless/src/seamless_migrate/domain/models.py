@@ -21,6 +21,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationInfo,
     computed_field,
     field_validator,
     model_validator,
@@ -75,8 +76,29 @@ def new_policy_id() -> str:
     return f"pol-{secrets.token_hex(6)}"
 
 
+#: the validation context of a request body (SDD §12): its unknown fields are refused at every
+#: depth, where a stored document keeps loading with the fields a later version added (§11)
+REQUEST_BODY: dict[str, bool] = {"request_body": True}
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="ignore")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_unknown_field_in_a_request(cls, data: Any, info: ValidationInfo) -> Any:
+        """A request body's field the object does not take is refused at every depth (SDD §12,
+        audit AP-01); a stored document, read without the request context, keeps loading with a
+        later version's fields (§11)."""
+        if isinstance(data, dict) and (info.context or {}).get("request_body"):
+            unknown = sorted(str(key) for key in data if key not in cls.model_fields)
+            if unknown:
+                raise PydanticCustomError(
+                    "unknown_field",
+                    "not a field of this object: {fields}",
+                    {"fields": ", ".join(unknown)},
+                )
+        return data
 
 
 class ConversionHostConfig(_Model):

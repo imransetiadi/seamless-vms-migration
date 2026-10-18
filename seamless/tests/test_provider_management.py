@@ -3,6 +3,7 @@ and the conversion-host key in the platform secret store, distributions, secret 
 
 import base64
 import errno
+import inspect
 import json
 import logging
 import os
@@ -450,6 +451,39 @@ def test_a_provider_may_not_name_another_providers_secret(api):
     assert patch(api, "/api/v1/providers/src-osp", {"conversion_host": host}).status_code == 200
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["Provider-dst-rhoso", "PROVIDER-DST-RHOSO", "provider_dst-rhoso", "provider.dst.rhoso"],
+)
+def test_a_provider_may_not_name_another_providers_secret_in_another_spelling(api, name):
+    """SDD §13.3 (audit AP-04): the readers fold a secret's name - a case-insensitive filesystem
+    (a host run on macOS or Windows) opens provider-dst-rhoso for Provider-dst-rhoso, and the
+    SEAMLESS_SECRET_ variables upper-case it and turn every other character into _ - so the guard
+    folds it too: a spelling of another provider's secret is refused like the name itself."""
+    taken = api.post(
+        "/api/v1/providers", json={**VCENTER, "id": "vc-x", "credentials_secret": name}
+    )
+    assert taken.status_code == 422, taken.text
+    assert "another provider" in taken.json()["error"]["message"]
+    host = {"manage": False, "address": "10.0.0.5", "ssh_key_secret": name + "-ssh"}
+    assert patch(api, "/api/v1/providers/src-osp", {"conversion_host": host}).status_code == 422
+
+
+def test_only_the_exact_name_of_a_providers_own_secret_is_its_own(api):
+    """SDD §13.3 (audit AP-04): a provider names its own provider-* secret exactly; another
+    spelling of it is no secret the store writes, and names that only start alike are free."""
+    own = api.post(
+        "/api/v1/providers", json={**VCENTER, "id": "vc-y", "credentials_secret": "Provider-vc-y"}
+    )
+    assert own.status_code == 422, own.text
+    for free in ("providers-dc1", "providerless", "my-provider-dc1"):
+        made = api.post(
+            "/api/v1/providers",
+            json={**VCENTER, "id": f"vc-{free[:9].strip('-')}", "credentials_secret": free},
+        )
+        assert made.status_code == 201, (free, made.text)
+
+
 def test_provider_events_name_the_secrets_it_reads(api):
     """SDD §13.3: the audit trail says which secret a provider reads, never a value."""
     created = api.post(
@@ -811,3 +845,29 @@ def test_registry_reconnects_after_new_credentials(tmp_path):
         update={"credentials_updated_at": datetime(2026, 10, 9, tzinfo=UTC)}
     )
     assert registry.get(stamped) is not first
+
+
+def test_the_kubernetes_secret_store_always_checks_the_api_servers_certificate(monkeypatch):
+    """SDD §13.3, §17 (CodeQL py/request-without-cert-validation): the store checks the API
+    server's certificate against the ServiceAccount's CA, or a CA file it is given - no parameter
+    turns the check off."""
+    import httpx
+
+    from seamless_migrate.security import secret_store
+
+    seen: list = []
+    real = httpx.Client
+
+    def client(**kwargs):
+        seen.append(kwargs.get("verify"))
+        return real(base_url=kwargs["base_url"])
+
+    monkeypatch.setattr(secret_store.httpx, "Client", client)
+    given = secret_store.KubernetesSecretStore("ns", token="t", ca_cert="/etc/pki/api-ca.crt")
+    default = secret_store.KubernetesSecretStore("ns", token="t")
+    given._client().close()
+    default._client().close()
+    assert seen == ["/etc/pki/api-ca.crt", str(secret_store.SA_DIR / "ca.crt")]
+    # no parameter can turn the check off: the store takes a CA file, never a verify switch
+    parameters = inspect.signature(secret_store.KubernetesSecretStore).parameters
+    assert "ca_cert" in parameters and "verify" not in parameters

@@ -243,6 +243,55 @@ def test_a_successful_image_copy_maps_the_copy_and_the_cleanup_removes_it():
     assert _holders(src, "vol-data1") == ["srv-1"]
 
 
+@pytest.mark.parametrize(
+    ("image", "size"),
+    [
+        (dict(size=3 * fake.GIB + 5, min_disk=20), 20),
+        (dict(size=int(2.5 * fake.GIB), min_disk=0), 3),
+        (dict(size=fake.GIB, min_disk=0, virtual_size=10 * fake.GIB), 10),
+        # no virtual size from Glance (before Victoria): the qcow2 file's header (review RV29-09)
+        (dict(size=fake.GIB, min_disk=0, disk_format="qcow2", data=fake.qcow2_header(10 * fake.GIB)), 10),
+    ],
+)
+def test_the_cold_image_copy_is_as_large_as_cinder_needs_for_the_image(image, size):
+    """Seamless Migrate SDD 6.1 (audit A-06): the cold export sizes the volume it creates from the
+    server's snapshot as the warm pass does - the file rounded up, the virtual disk, min_disk."""
+    src, data = _image_booted_vm()
+    src.server_image = image
+    host = SourceHost(src)
+
+    with mock.patch.object(volume_common.time, "sleep"):
+        exported = fake.run_module(export_module, dict(COMMON, data=data), src, host)
+    assert exported["_exit_code"] in (None, 0), exported
+    root = exported["volume_map"]["/dev/vda"]
+    assert (root["size"], src.volumes[root["source_id"]].size) == (size, size)
+
+
+@pytest.mark.parametrize(
+    ("image", "read"),
+    [
+        (dict(disk_format="qcow2", virtual_size=None), True),
+        (dict(disk_format="qcow2", virtual_size=10 * fake.GIB), False),  # Glance knows it
+        (dict(disk_format="raw", virtual_size=None), False),  # a raw file is its disk
+    ],
+)
+def test_only_a_qcow2_image_glance_knows_no_virtual_size_of_is_read(image, read):
+    """Seamless Migrate SDD 6.1 (review RV29-09): the image data is read - its first bytes, a
+    streamed download closed at once - only for a qcow2 image Glance records no virtual size of;
+    a file without qcow2's magic is not trusted for it."""
+    src = fake.FakeCloud("src")
+    snapshot = fake.Obj(id="img-1", name="snap", size=fake.GIB, min_disk=0,
+                        data=fake.qcow2_header(10 * fake.GIB), **image)
+    src.images[snapshot.id] = snapshot
+    size = volume_common.image_volume_size(snapshot, src)
+    assert size == 10 if (read or image["virtual_size"]) else size == 1
+    assert bool(src.calls_to("download_image")) == read
+    assert all(download.closed for download in src.downloads)
+    if read:  # the same bytes without the magic: no qcow2 header
+        snapshot["data"] = b"\x00" * 4 + fake.qcow2_header(10 * fake.GIB)[4:]
+        assert volume_common.image_volume_size(snapshot, src) == 1
+
+
 def test_a_failed_image_copy_leaves_no_image_behind():
     """An image-booted VM with boot_disk_copy: the export makes an image of the VM, then a volume
     from it. The image is recorded as soon as it exists, so the cleanup removes it."""

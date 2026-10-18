@@ -19,6 +19,7 @@ from seamless_migrate.domain.models import (
 from seamless_migrate.planning.platforms import destination_release
 from seamless_migrate.planning.preflight import (
     CATALOG,
+    KIT_TWIN_REMEDIATION,
     DestinationInventory,
     SourceInventory,
     fitting_flavor,
@@ -107,11 +108,33 @@ def test_the_finding_catalog_is_the_one_the_dashboards_mock_reads():
     } == shared
 
 
+def test_the_qasuite_counts_the_mocks_codes_and_the_shared_finding_cases():
+    """docs/QASuite.md FR-04 states how many of the catalog's codes the dashboard's offline mock
+    implements and how many shared finding cases hold its messages to the API's - as the suite
+    is, not as it was (CLAUDE.md §8.2, review RV28-05)."""
+    root = Path(__file__).resolve().parents[2]
+    row = next(
+        line
+        for line in (root / "docs" / "QASuite.md").read_text(encoding="utf-8").splitlines()
+        if line.startswith("| FR-04 |")
+    )
+    implemented, total = map(int, re.search(r"\((\d+) of its (\d+) codes", row).groups())
+    shared = int(re.search(r"`mockData\.test\.ts`; (\d+) cases:", row).group(1))
+    mock = (root / "dashboard" / "src" / "api" / "mockData.ts").read_text(encoding="utf-8")
+    named = {code for code in CATALOG if re.search(f"['\"`]{re.escape(code)}['\"`]", mock)}
+    assert (implemented, total, shared) == (
+        len(named),
+        len(CATALOG),
+        len(ELIGIBILITY_CASES["finding_cases"]),
+    )
+
+
 def test_catalog_is_complete():
     assert set(CATALOG) == {
         "SRC_VM_ERROR_STATE",
         "SRC_VM_TRANSITIONAL_STATE",
         "SRC_VM_DUPLICATE_NAME",
+        "SRC_VM_NAME_UNUSABLE",
         "SRC_VM_VOLUME_DETACHED",
         "SRC_VM_MULTIATTACH",
         "SRC_VM_EPHEMERAL_ROOT",
@@ -166,6 +189,12 @@ def test_finding_src_vm_duplicate_name():
     twin = make_vm(source_id="vm-2", project="hr")
     f = only(check(vm, all_vms=[vm, twin]), "SRC_VM_DUPLICATE_NAME")
     assert f.severity == Severity.blocker
+
+
+def test_finding_src_vm_name_unusable():
+    """SDD §9.3 (review RV26-04): a VMware VM's name the migration kit keeps no character of."""
+    f = only(check(make_vm(name="サーバー"), source=VMWARE), "SRC_VM_NAME_UNUSABLE")
+    assert f.severity == Severity.blocker and f.strategies == [] and "vCenter" in f.remediation
 
 
 def test_duplicate_names_blocked():
@@ -370,6 +399,21 @@ def test_finding_dst_keypair_missing_and_prestaged():
         check(make_vm(key_name=None), plan=prestage, src=src),
     ):
         assert all("KEYPAIR" not in x.code for x in quiet)
+
+
+def test_finding_map_keypair_prestaged():
+    """SDD §9.3, §7.2: pre-staging imports a keypair only where the destination credential lacks
+    it - one it owns already is used as it is, and nothing is said - and the info names the key and
+    the destination, with the catalog's "nothing to do"."""
+    vm = make_vm(key_name="ops-key")
+    src = src_inv(keypairs=["ops-key"])
+    prestage = make_plan(prestage_resources=[*DEFAULT_PRESTAGE, "keypairs"])
+    f = only(check(vm, plan=prestage, src=src), "MAP_KEYPAIR_PRESTAGED")
+    assert "'ops-key'" in f.message and DST.label in f.message
+    assert f.remediation == CATALOG["MAP_KEYPAIR_PRESTAGED"].remediation
+    assert f.remediation.startswith("Nothing to do")
+    owned = check(vm, plan=prestage, src=src, dst=dst_inv(keypairs=["ops-key"]))
+    assert all("KEYPAIR" not in x.code for x in owned)
 
 
 def test_finding_map_flavor_auto_records_resolved_mapping():
@@ -964,6 +1008,33 @@ def test_catalog_matches_sdd_9_3():
         r"^\| `([A-Z0-9_]+)` \| (blocker|warning|info)", section, re.M
     ):
         assert CATALOG[code].severity == severity, code
+
+
+def test_each_finding_code_has_a_test_named_for_it():
+    """QASuite FR-04: each finding code of SDD §9.3 has a ``test_finding_<code_lower>`` test or
+    ``test_finding_<code_lower>_<case>`` tests, and each such test is named for a code. A test
+    counts for the longest code its name begins with: MAP_NIC_OVERRIDE_INVALID's tests do not
+    stand in for MAP_NIC_OVERRIDE."""
+    import re
+    from pathlib import Path
+
+    from seamless_migrate.config import find_repo_root
+
+    sdd = (find_repo_root() / "docs" / "SDD.md").read_text(encoding="utf-8")
+    section = sdd[sdd.index("### 9.3") : sdd.index("### 9.4")]
+    codes = sorted(set(re.findall(r"`([A-Z][A-Z0-9_]{4,})`", section)), key=len, reverse=True)
+    tested, unnamed = set(), []
+    for path in sorted(Path(__file__).resolve().parent.glob("test_*.py")):
+        text = path.read_text(encoding="utf-8")
+        for name in re.findall(r"^(?:async )?def (test_finding_\w+)\(", text, re.M):
+            code = next(
+                (c for c in codes if f"{name}_".startswith(f"test_finding_{c.lower()}_")), None
+            )
+            if code is None:
+                unnamed.append(f"{path.name}::{name}")
+            tested.add(code)
+    assert sorted(set(codes) - tested) == [], "codes without a test_finding_ test"
+    assert unnamed == [], "test_finding_ tests named for no code of SDD §9.3"
 
 
 def net(network_id, name, own=True, mtu=1500, project_id=None, shared=None, external=False):
@@ -2255,10 +2326,76 @@ ELIGIBILITY_CASES = json.loads(
 def test_the_shared_handover_finding_cases(case):
     """SDD §9.3, §16 (review RV20-08): the findings as the API words them, which the dashboard's
     mock words the same way (mockData.test.ts); `others` are the plan's other selected VMs,
-    `source_kind` the source provider's kind."""
-    plan = make_plan(handover=HandoverConfig(**case["plan"]["handover"]))
+    `source_kind` the source provider's kind; a network case's `destination` gives the
+    destination's label, networks, subnets, the token's roles and the policy profile."""
+    plan = make_plan(**case["plan"])
     vm = VMRef.model_validate(case["vm"])
     others = [VMRef.model_validate(other) for other in case.get("others", [])]
     source = VMWARE if case.get("source_kind") == "vmware" else SRC
-    found = check(vm, plan=plan, all_vms=[vm, *others], source=source)
+    found = check(vm, plan=plan, all_vms=[vm, *others], source=source, **_destination(case))
     assert {f.code: f.message for f in found if f.code in case["expected"]} == case["expected"]
+
+
+def test_the_kits_names_judge_a_vmware_sources_vms_only_and_once():
+    """SDD §9.3 (reviews RV26-04, RV28-04): only a VMware source's VMs are compared by the
+    migration kit's names - an OpenStack VM keeps its own, so web.01 and web_01 are two VMs there
+    and a Japanese name is fine. From a VMware source a VM named exactly alike is a kit twin too:
+    one finding with the kit's reason and remedy names every VM written alike; two names the kit
+    keeps nothing of are no twins, each is unusable."""
+
+    def codes(vm, others, source):
+        found = check(vm, plan=make_plan(), all_vms=[vm, *others], source=source)
+        names = ("SRC_VM_DUPLICATE_NAME", "SRC_VM_NAME_UNUSABLE")
+        return [f.code for f in found if f.code in names]
+
+    dotted, underscored = (
+        make_vm(source_id="vm-1", name="web.01"),
+        make_vm(source_id="vm-2", name="web_01"),
+    )
+    assert codes(dotted, [underscored], SRC) == []
+    assert codes(make_vm(source_id="vm-3", name="サーバー"), [], SRC) == []
+    twin = make_vm(source_id="vm-4", name="web.01")
+    found = check(dotted, plan=make_plan(), all_vms=[dotted, twin, underscored], source=VMWARE)
+    duplicates = [f for f in found if f.code == "SRC_VM_DUPLICATE_NAME"]
+    assert [(f.message, f.remediation) for f in duplicates] == [
+        (
+            "Another selected VM has the name 'web_01' as the migration kit writes it "
+            "(finance/vm-2, finance/vm-4); the kit names the VM's server, ports and volumes after "
+            "it.",
+            KIT_TWIN_REMEDIATION,
+        )
+    ]
+    # an OpenStack source keeps os-migrate's reason and remedy for the same name
+    found = check(dotted, plan=make_plan(), all_vms=[dotted, twin], source=SRC)
+    assert [f.message for f in found if f.code == "SRC_VM_DUPLICATE_NAME"] == [
+        "Another selected VM is also named 'web.01' (finance/vm-4); os-migrate selects workloads "
+        "by name."
+    ]
+    japanese, cyrillic = (
+        make_vm(source_id="vm-5", name="サーバー"),
+        make_vm(source_id="vm-6", name="веб"),
+    )
+    assert codes(japanese, [cyrillic], VMWARE) == ["SRC_VM_NAME_UNUSABLE"]
+
+
+def _destination(case):
+    """check()'s destination for a finding case: its own when the case gives one (SDD §9.3)."""
+    dest = case.get("destination")
+    if dest is None:
+        return {}
+    details = dest["networks"]
+    return {
+        "dst": dst_inv(
+            networks={n["name"]: n.get("mtu") for n in details},
+            network_details=details,
+            subnets=dest.get("subnets", []),
+        ),
+        "destination": make_provider(
+            id="dst-case",
+            name=dest["label"],
+            kind=ProviderKind(dest.get("kind", "openstack")),
+            role=ProviderRole.destination,
+            cloud="dst",
+        ),
+        "dst_caps": {k: dest[k] for k in ("roles", "policy_profile") if k in dest} or None,
+    }

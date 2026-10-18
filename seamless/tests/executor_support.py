@@ -14,6 +14,7 @@ class Recorder:
     progress: list[tuple[float, int, int]] = field(default_factory=list)
     downtime_marks: int = 0
     downtime_at: list = field(default_factory=list)
+    downtime_ends: int = 0
     logs: list[str] = field(default_factory=list)
 
     async def report_progress(self, pct: float, done: int, total: int) -> None:
@@ -23,6 +24,9 @@ class Recorder:
         self.downtime_marks += 1
         # when the source stopped: the executor's time, or now as the orchestrator would take it
         self.downtime_at.append(at or utcnow())
+
+    async def mark_downtime_end(self) -> None:
+        self.downtime_ends += 1
 
     async def log(self, line: str) -> None:
         self.logs.append(line)
@@ -46,6 +50,7 @@ def make_ctx(
         settings=settings,
         report_progress=rec.report_progress,
         mark_downtime_start=rec.mark_downtime_start,
+        mark_downtime_end=rec.mark_downtime_end,
         log=rec.log,
         options=dict(options),
     )

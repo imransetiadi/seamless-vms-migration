@@ -145,6 +145,34 @@ def receive_commands(scenario):
     ]
 
 
+def test_a_warm_pass_reaches_each_conversion_host_as_its_own_user(tmp_path):
+    """Seamless Migrate SDD 6.5 (audit EX-08): the destination host is reached as its own user
+    (ubuntu), which runs the link key; the hop to the source host - the copy of blocksync, the
+    sender the receiver starts - logs in as the source host's user (cloud-user)."""
+    scenario = Scenario(tmp_path)
+    scenario.snapshot().create()
+    scenario.shells.shells = []
+    warm_migration.OpenstackWarmSync(
+        scenario.dst,
+        "dst-conv",
+        "/keys/conversion",
+        "ubuntu",
+        "uuid-1",
+        scenario.ser_server(),
+        scenario.state(),
+        SRC_CONV,
+        state_file=scenario.state_file,
+        shell_factory=scenario.shells,
+        src_ssh_user="cloud-user",
+    ).sync()
+    users = {(shell.address, shell.ssh_user) for shell in scenario.shells.shells}
+    assert users == {(DST_CONV, "ubuntu"), (SRC_CONV, "cloud-user")}
+    for receive in receive_commands(scenario):
+        words = " ".join(receive)
+        assert "-u ubuntu --" in words and "cloud-user@" + SRC_CONV in words, words
+        assert "ubuntu@" + SRC_CONV not in words, words
+
+
 # --- WarmState ------------------------------------------------------------
 
 
@@ -484,6 +512,35 @@ def test_snapshot_image_booted_server_with_boot_disk_copy(tmp_path):
     assert boot["image_id"] not in scenario.src.images
 
 
+#: a server snapshot as Glance reports it, and the volume Cinder needs for it (audit A-06)
+IMAGE_SIZES = [
+    (dict(size=3 * fake.GIB + 5, min_disk=20), 20),  # Nova's min_disk: the instance's root disk
+    (dict(size=int(2.5 * fake.GIB), min_disk=0), 3),  # a raw file of 2.5 GiB needs 3, not 2
+    (dict(size=fake.GIB, min_disk=0, virtual_size=10 * fake.GIB), 10),  # a qcow2 file holds a larger disk
+    (dict(size=None, min_disk=None), 1),
+    # Glance before Victoria records no virtual size: a qcow2 file's own header gives it
+    # (review RV29-09); a raw file is its disk; a header that cannot be read leaves the file's size
+    (dict(size=fake.GIB, min_disk=0, disk_format="qcow2", data=fake.qcow2_header(10 * fake.GIB)), 10),
+    (dict(size=int(2.5 * fake.GIB), min_disk=0, disk_format="raw", data=b"\x00" * 512), 3),
+    (dict(size=fake.GIB, min_disk=0, disk_format="qcow2", data=b""), 1),
+]
+
+
+@pytest.mark.parametrize(("image", "size"), IMAGE_SIZES)
+def test_a_boot_disk_copy_volume_is_as_large_as_cinder_needs_for_the_image(tmp_path, image, size):
+    """Seamless Migrate SDD 6.1 (audit A-06): the volume a boot_disk_copy pass creates from the
+    server's snapshot holds the image - its file rounded up to whole GiB, its virtual disk and
+    its min_disk, at least 1 GiB; Cinder refuses a smaller one on every pass."""
+    scenario = Scenario(tmp_path, image_booted=True, boot_disk_copy=True)
+    scenario.src.server_image = image
+
+    volume_map = scenario.snapshot("uuid-1").create()
+
+    boot = volume_map["/dev/vda"]
+    assert boot["size"] == size
+    assert scenario.src.volumes[boot["tmp_volume_id"]].size == size
+
+
 def test_snapshot_image_booted_server_without_boot_disk_copy(tmp_path):
     scenario = Scenario(tmp_path, image_booted=True, boot_disk_copy=False)
 
@@ -525,6 +582,92 @@ def test_sync_creates_dest_volumes_only_on_first_pass(tmp_path):
     for entry in dest.values():
         assert scenario.dst.volumes[entry["dest_id"]].attachments == []
     assert scenario.dst.devices["dst-conv"] == ["/dev/vda"]
+
+
+def test_a_destination_volume_whose_record_cannot_be_written_is_deleted(tmp_path):
+    """Seamless Migrate SDD 6.3 (audit A-05): a pass records each destination volume as soon as
+    Cinder accepted it; when that record cannot be written (a full disk), no record names the
+    volume and it would outlive every rollback - the pass deletes it, once Cinder settled it,
+    before it fails, as the cold transfer does."""
+    import errno
+
+    scenario = Scenario(tmp_path)
+    dst = scenario.dst
+    save = WarmState.save
+    # as Cinder: a volume is `creating` until it is waited for, and cannot be deleted before
+    create, wait, delete = dst.create_volume, dst.block_storage.wait_for_status, dst.delete_volume
+
+    def creating(*args, **kwargs):
+        volume = create(*args, **kwargs)
+        volume.status = "creating"
+        return volume
+
+    def settles(res, **kwargs):
+        dst.volumes[res.id].status = "available"
+        return wait(res, **kwargs)
+
+    def refuses_creating(name_or_id=None, **kwargs):
+        if dst.volumes[name_or_id].status == "creating":
+            raise RuntimeError("Invalid volume: Volume status must be available or error")
+        return delete(name_or_id=name_or_id, **kwargs)
+
+    def full_disk(state, *args, **kwargs):
+        if state.dest_volumes:  # the record of a destination volume
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return save(state, *args, **kwargs)
+
+    dst.create_volume, dst.delete_volume = creating, refuses_creating
+    dst.block_storage.wait_for_status = settles
+    with mock.patch.object(WarmState, "save", full_disk), pytest.raises(OSError, match="No space"):
+        scenario.run_pass("uuid-1")
+
+    created = scenario.dst.calls_to("create_volume")
+    assert [c[1]["name"] for c in created] == ["vm1-boot"]  # the pass stopped at its record
+    assert not [v for v in scenario.dst.volumes.values() if v.name == "vm1-boot"]
+    assert scenario.state().dest_volumes == {}
+
+
+def test_a_volume_extended_without_its_record_is_recorded_not_extended_again(tmp_path):
+    """Seamless Migrate SDD 6.3 (review RV29-07): a pass extends a destination volume to the
+    source's grown size, then records it. When that record cannot be written (a full disk), Cinder
+    holds the volume at the new size while the state file keeps the old one; the next pass reads
+    the size Cinder reports and records it - an extend to the size the volume has would be
+    refused by Cinder ("New size for extend must be greater than current size") on every pass."""
+    import errno
+
+    scenario = Scenario(tmp_path)
+    scenario.run_pass("uuid-1")
+    data_id = scenario.state().dest_volumes["/dev/vdb"]["dest_id"]
+    scenario.src.volumes["vol-data"].size = 15  # grown between passes
+    dst = scenario.dst
+    extend = dst.block_storage.extend_volume
+
+    def cinder_extend(volume, size):
+        current = dst.volumes[volume.id].size
+        if int(size) - current <= 0:
+            raise RuntimeError(
+                "BadRequestException: 400: Invalid input received: New size for extend must be "
+                "greater than current size. (current: %s, extended: %s)." % (current, size)
+            )
+        return extend(volume, size)
+
+    dst.block_storage.extend_volume = cinder_extend
+    save = WarmState.save
+
+    def full_disk(state, *args, **kwargs):
+        if (state.dest_volumes.get("/dev/vdb") or {}).get("size") == 15:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return save(state, *args, **kwargs)
+
+    with mock.patch.object(WarmState, "save", full_disk), pytest.raises(OSError, match="space"):
+        scenario.run_pass("uuid-2")
+    assert dst.volumes[data_id].size == 15  # extended at Cinder ...
+    assert scenario.state().dest_volumes["/dev/vdb"]["size"] == 10  # ... recorded at 10
+
+    scenario.run_pass("uuid-3")  # the disk has room again
+
+    assert scenario.state().dest_volumes["/dev/vdb"]["size"] == 15
+    assert len(scenario.state().passes) == 2
 
 
 def test_sync_destination_volumes_match_cold_path_params(tmp_path):
@@ -715,6 +858,45 @@ def test_sync_extends_the_destination_volume_when_the_source_grew(tmp_path):
     assert state.dest_volumes["/dev/vdb"]["size"] == 15
     assert scenario.dst.volumes[data_id].size == 15
     assert ("extend_volume", {"volume": data_id, "size": 15}) in scenario.dst.calls
+
+
+@pytest.mark.parametrize("online", [False, True], ids=["refused-in-use", "extended-online"])
+def test_a_pass_detaches_what_an_interrupted_pass_left_attached_before_it_extends(tmp_path, online):
+    """Seamless Migrate SDD 6.4 (audit A-04): a pass interrupted earlier can leave a destination
+    volume attached to the destination conversion host. When its source volume grew, the next
+    pass extends it - which Cinder refuses for an `in-use` volume unless its microversion and
+    backend allow, and after which the pass waits for `available`, which an attached volume never
+    reads. The pass detaches what the interrupted one left first, so it neither fails nor wedges
+    every later pass until an operator detaches the volume by hand."""
+    scenario = Scenario(tmp_path)
+    scenario.run_pass("uuid-1")
+    dst = scenario.dst
+    data_id = scenario.state().dest_volumes["/dev/vdb"]["dest_id"]
+    # the pass interrupted here: the volume stayed attached to the conversion host
+    dst.attach_volume(dst.servers["dst-conv"], dst.volumes[data_id])
+    scenario.src.volumes["vol-data"].size = 15  # grown between passes
+    extend = dst.block_storage.extend_volume
+
+    def cinder_extend(volume, size):
+        status = dst.volumes[volume.id].status
+        if status != "available" and not online:
+            raise RuntimeError(
+                "BadRequestException: 400: Invalid volume: Volume %s status must be "
+                "'{'status': 'available'}' to extend, currently %s." % (volume.id, status)
+            )
+        return extend(volume, size)
+
+    dst.block_storage.extend_volume = cinder_extend
+
+    scenario.run_pass("uuid-2")
+
+    state = scenario.state()
+    assert state.dest_volumes["/dev/vdb"] == {
+        "dest_id": data_id, "size": 15, "bootable": False, "name": "vm1-data",
+    }
+    assert dst.volumes[data_id].size == 15
+    assert dst.volumes[data_id].attachments == []
+    assert [p["number"] for p in state.passes] == [1, 2]
 
 
 def test_sync_recreates_a_destination_volume_that_is_gone(tmp_path, caplog):

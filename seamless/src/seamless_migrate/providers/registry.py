@@ -28,6 +28,27 @@ def build(provider: Provider, settings: Settings) -> Any:
     return OpenStackProvider(provider, settings)
 
 
+def _credentials_stamp(settings: Settings) -> str:
+    """Change marker of the mounted credential files (a rotated clouds.yaml reconnects)."""
+    if settings.clouds_yaml is None:
+        return "-"  # credentials from the secret store: the provider document's stamp moves
+    try:
+        st = os.stat(settings.clouds_yaml)
+    except OSError:
+        return "-"
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
+def connection_fingerprint(provider: Provider, settings: Settings) -> str:
+    """How ``provider`` is reached: its document without its state, and the mounted credentials'
+    change marker. A connection built for another fingerprint is built again - a credential
+    rotated while a plan runs (SDD §13.3)."""
+    fingerprint = provider.model_dump_json(exclude=_STATE_FIELDS)
+    if not settings.demo:
+        fingerprint += "|" + _credentials_stamp(settings)
+    return fingerprint
+
+
 class ProviderRegistry:
     """Caches one implementation per provider configuration (connections are reused)."""
 
@@ -36,20 +57,8 @@ class ProviderRegistry:
         self._cache: dict[str, tuple[str, Any]] = {}
         self._lock = threading.Lock()
 
-    def _credentials_stamp(self) -> str:
-        """Change marker of the mounted credential files (a rotated clouds.yaml reconnects)."""
-        if self.settings.clouds_yaml is None:
-            return "-"  # credentials from the secret store: the provider document's stamp moves
-        try:
-            st = os.stat(self.settings.clouds_yaml)
-        except OSError:
-            return "-"
-        return f"{st.st_mtime_ns}:{st.st_size}"
-
     def get(self, provider: Provider) -> Any:
-        fingerprint = provider.model_dump_json(exclude=_STATE_FIELDS)
-        if not self.settings.demo:
-            fingerprint += "|" + self._credentials_stamp()
+        fingerprint = connection_fingerprint(provider, self.settings)
         with self._lock:
             cached = self._cache.get(provider.id)
             if cached is not None and cached[0] == fingerprint:

@@ -76,6 +76,16 @@ options:
         creating a second one.
     required: false
     type: str
+  finish_only:
+    description:
+      - Only finish the destination server the warm state in
+        I(warm_state_dir) records - wait for it to be ACTIVE and add the
+        floating IPs it lacks - and never create one (a warm cutover's
+        re-run). When the state records no server, or one Nova no longer
+        has, the module fails and names the rollback.
+    required: false
+    type: bool
+    default: false
 """
 
 EXAMPLES = r"""
@@ -244,6 +254,7 @@ def run_module():
         data=dict(type="dict", required=True),
         block_device_mapping=dict(type="list", required=True, elements="dict"),
         warm_state_dir=dict(type="str", default=None),
+        finish_only=dict(type="bool", default=False),
     )
 
     result = dict(
@@ -252,6 +263,7 @@ def run_module():
 
     module = AnsibleModule(
         argument_spec=argument_spec,
+        required_if=[("finish_only", True, ("warm_state_dir",))],
     )
 
     conn = os_auth.get_connection(module)
@@ -260,6 +272,7 @@ def run_module():
     ser_server = server.Server.from_data(module.params["data"])
 
     on_create = None
+    recorded = None
     warm_state_dir = module.params["warm_state_dir"]
     if warm_state_dir:
         source_id = ser_server.info()["id"]
@@ -268,6 +281,7 @@ def run_module():
             state = warm_migration.WarmState.load(warm_state_dir, source_id)
         except ValueError as err:
             module.fail_json(msg=str(err))
+        recorded = state.destination_server_id
         if state.destination_server_id:
             existing = conn.compute.find_server(
                 state.destination_server_id, ignore_missing=True
@@ -283,6 +297,21 @@ def run_module():
                 )
 
         on_create = _destination_recorder(warm_state_dir, source_id, server_name)
+
+    if module.params["finish_only"]:
+        # a re-run finishes what its warm state records and never creates: the server may have
+        # vanished since the role looked it up, and a create would build one without the
+        # synchronised volumes and record it (Seamless Migrate SDD 6.4, audit A-07)
+        module.fail_json(
+            msg="%s: %s. Run rollback_workloads.yml (it deletes the server and starts the "
+            "source again) and cut the workload over once more."
+            % (
+                ser_server.params().get("name"),
+                "the recorded destination server %s was not found" % recorded
+                if recorded
+                else "the warm state records no destination server to finish",
+            )
+        )
 
     sdk_server = ser_server.create(conn, block_device_mapping, on_create=on_create)
     # Some info (e.g. flavor ID) will only become available after the

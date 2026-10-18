@@ -44,7 +44,7 @@
         data: "{{ item }}"
         conversion_host: "{{ import_workloads_warm_src_conversion_host.openstack_conversion_host }}"
         ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-        ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+        ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
         state_dir: "{{ os_migrate_warm_state_dir }}"
         timeout: "{{ os_migrate_timeout }}"
         state: absent
@@ -82,6 +82,10 @@
       {{ import_workloads_warm_rollback.kept_volume_ids | join(', ') }} are attached to
       another server and were kept.
   when: import_workloads_warm_rollback.kept_volume_ids | default([]) | length > 0
+
+- name: Wait until no stop or start of the source server runs
+  ansible.builtin.include_tasks: source_stop_settled.yml
+  when: os_migrate_rollback_start_source | bool
 
 - name: Start the source server
   os_migrate.os_migrate.server_action:

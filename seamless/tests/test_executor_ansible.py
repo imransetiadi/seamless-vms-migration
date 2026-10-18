@@ -98,9 +98,30 @@ class FakeImpl:
 
     async def delete_server(self, server_id):
         self.calls.append(("delete_server", server_id))
+        # as Nova: the server's volumes are detached with it (the kit's keep: no delete on
+        # termination)
+        for volume in self.registry.volumes:
+            volume["attachments"] = [s for s in volume.get("attachments", []) if s != server_id]
 
     async def power_on(self, source_id):
         self.calls.append(("power_on", source_id))
+
+    async def get_vm(self, source_id):
+        """The source VM as its provider reads it now (SDD §10): its power state."""
+        return make_vm(source_id=source_id, power_state=self.registry.source_power)
+
+    async def powered_on_since(self, source_id, since):
+        """Whether vCenter recorded a power-on of the VM since ``since`` (SDD §10)."""
+        if self.registry.powered_on is None:
+            raise ProviderError("events: HTTP 503")
+        return self.registry.powered_on
+
+    async def disk_keys(self, source_id):
+        """The keys of the VM's disks in vCenter's device order (SDD §10)."""
+        self.calls.append(("disk_keys", source_id))
+        if self.registry.disk_keys is None:
+            raise ProviderError("devices: HTTP 503")
+        return list(self.registry.disk_keys)
 
     async def ports(self, *, network_id=None, mac_address=None, ip_address=None):
         """The destination's ports matching every filter given (SDD §10)."""
@@ -117,6 +138,54 @@ class FakeImpl:
     async def delete_port(self, port_id):
         self.calls.append(("delete_port", port_id))
         self.registry.ports = [p for p in self.registry.ports if p["id"] != port_id]
+
+    async def volumes(self):
+        """The destination project's volumes (SDD §10)."""
+        if self.registry.volumes_error:
+            raise ProviderError("volumes: HTTP 503")
+        return [dict(v) for v in self.registry.volumes]
+
+    async def delete_volume(self, volume_id):
+        self.calls.append(("delete_volume", volume_id))
+        self.registry.volumes = [v for v in self.registry.volumes if v["id"] != volume_id]
+
+    async def detach_volume(self, server_id, volume_id):
+        self.calls.append(("detach_volume", server_id, volume_id))
+        for volume in self.registry.volumes:
+            if volume["id"] == volume_id:
+                volume["attachments"] = [s for s in volume["attachments"] if s != server_id]
+
+    async def server_of_address(self, address):
+        """The Nova server holding the address (SDD §10): a compute port with it as a fixed IP,
+        else the compute port its floating IP is associated with."""
+        compute = [
+            p
+            for p in self.registry.ports
+            if str(p.get("device_owner") or "").startswith("compute:") and p.get("device_id")
+        ]
+        for port in compute:
+            if address in port["fixed_ips"]:
+                return port["device_id"]
+        for fip in self.registry.floating_ips:
+            if fip["floating_ip_address"] == address:
+                for port in compute:
+                    if port["id"] == fip["port_id"]:
+                        return port["device_id"]
+        return None
+
+    async def server_volumes(self, server_id):
+        """Nova's record of the volumes attached to the server (SDD §10)."""
+        self.calls.append(("server_volumes", server_id))
+        return [v["id"] for v in self.registry.volumes if server_id in v.get("attachments", [])]
+
+    async def set_volume_metadata(self, volume_id, metadata):
+        """Cinder's merge of metadata keys into the volume's (SDD §10)."""
+        self.calls.append(("set_volume_metadata", volume_id, dict(metadata)))
+        if self.registry.set_metadata_error:
+            raise ProviderError("volume metadata: HTTP 503")
+        for volume in self.registry.volumes:
+            if volume["id"] == volume_id:
+                volume["metadata"] = {**volume["metadata"], **metadata}
 
     async def inventory(self):
         """The destination's networks, for the network references (SDD §7.2)."""
@@ -165,7 +234,19 @@ class FakeRegistry:
         self.inventory_error = False
         # the destination's ports (SDD §10 DestinationProvider.ports)
         self.ports: list[dict] = []
+        # Neutron's floating IPs: {floating_ip_address, port_id}
+        self.floating_ips: list[dict] = []
         self.ports_error = False
+        # the destination project's volumes (SDD §10 DestinationProvider.volumes)
+        self.volumes: list[dict] = []
+        self.volumes_error = False
+        self.set_metadata_error = False
+        # the source VM's power state as its provider reads it (SDD §10 SourceProvider.get_vm)
+        self.source_power = "running"
+        # whether vCenter recorded a power-on of it since the clock opened; None: unreadable
+        self.powered_on: bool | None = False
+        # its disks' keys in vCenter's device order; None: unreadable
+        self.disk_keys: list[int] | None = [2000, 2001, 2002, 2003]
         # the token's role names the destination inventory reads live; None: it could not
         # (SDD §10, review RV19-01)
         self.roles: list[str] | None = None
@@ -217,12 +298,19 @@ def env(tmp_path, monkeypatch):
 
 
 def ctx_for(
-    env, strategy=Strategy.warm, source=SRC, name="web-01", mappings=MAPPINGS, nics=None, **mig_kw
+    env,
+    strategy=Strategy.warm,
+    source=SRC,
+    name="web-01",
+    mappings=MAPPINGS,
+    nics=None,
+    destination=DST,
+    **mig_kw,
 ):
     plan = make_plan(id="plan-00c0ffee", mappings=mappings)
     vm = make_vm(source_id="srv-1", name=name, **({"nics": nics} if nics is not None else {}))
     mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy, **mig_kw)
-    return make_ctx(plan, mig, source, DST, env.settings)
+    return make_ctx(plan, mig, source, destination, env.settings)
 
 
 def run_dir(env) -> Path:
@@ -1240,6 +1328,20 @@ async def test_vmware_nics_of_one_key_take_the_subnet_the_one_with_an_address_ne
     )
 
 
+@pytest.mark.parametrize("step", [StepName.PRECOPY, StepName.SYNC])
+async def test_a_vmware_warm_pass_that_runs_the_kits_migrate_task_opens_no_clock(env, step):
+    """SDD §7.2 (review RV28-06): the kit runs its migrate task - "Migrate Guest from Vmware
+    using nbdkit <vm>", whose header opens a cutover's clock - in every run, a CBT pass too (no
+    conversion, no power-off): a pass that prints it opens no downtime clock of the VM, which
+    runs on."""
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(step, ctx)
+    assert any("Migrate Guest from Vmware using nbdkit web-01" in line for line in rec.logs), [
+        line for line in rec.logs if line.startswith("TASK [")
+    ]
+    assert rec.downtime_marks == 0
+
+
 async def test_vmware_warm_flags(env):
     ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
     await env.executor.run(StepName.PRECOPY, ctx)
@@ -1292,8 +1394,9 @@ async def test_vmware_rollback_deletes_destination_and_powers_on_source(env):
 async def test_vmware_rollback_deletes_the_kits_ports_of_the_vm(env):
     """SDD §7.2: the kit creates each port and gives Nova its id, and Nova only unbinds such a port
     when it deletes the server - it would keep the NIC's MAC and addresses and refuse the next
-    attempt. The rollback deletes, after the server, the unbound ports with one of the VM's NIC
-    MACs and the kit's name form; any other port is kept (review RT-11)."""
+    attempt. The rollback deletes, after the server and the source's power-on (review RV30-04), the
+    unbound ports with one of the VM's NIC MACs and the kit's name form; any other port is kept
+    (review RT-11)."""
     mac = "00:50:56:00:00:01"
     nic = Nic(network="app-net", mac=mac, fixed_ips=["10.0.0.5"], network_key="app-net")
 
@@ -1323,17 +1426,18 @@ async def test_vmware_rollback_deletes_the_kits_ports_of_the_vm(env):
     result = await env.executor.run(StepName.ROLLBACK, ctx)
     assert env.registry.calls == [
         ("delete_server", "dst-9"),
-        ("delete_port", "kit"),
         ("power_on", "srv-1"),
+        ("delete_port", "kit"),
     ]
     assert result.details["deleted_ports"] == ["kit"]
     assert [p["id"] for p in env.registry.ports] == ["bound", "named-otherwise", "other-mac"]
-    # ports that cannot be read: the rollback is retried, the source not yet started
+    # ports that cannot be read: the rollback is retried - with the source already running, as
+    # the ports matter only to the next attempt (review RV30-04)
     env.registry.calls.clear()
     env.registry.ports_error = True
     with pytest.raises(TransientStepError, match="rollback: ports: HTTP 503"):
         await env.executor.run(StepName.ROLLBACK, ctx)
-    assert ("power_on", "srv-1") not in env.registry.calls
+    assert env.registry.calls == [("delete_server", "dst-9"), ("power_on", "srv-1")]
 
 
 async def test_vmware_runs_refuse_a_nic_whose_mac_or_address_another_port_holds(env):
@@ -1727,6 +1831,37 @@ def test_build_vars_and_inventory_are_pure(env):
     assert inventory["migrator"]["hosts"]["localhost"]["ansible_connection"] == "local"
 
 
+@pytest.mark.parametrize("step", [StepName.PRESTAGE, StepName.CUTOVER, StepName.PRECOPY])
+def test_each_conversion_host_gets_its_own_providers_ssh_user(env, step):
+    """SDD §6.5, §21.6: a RHOSP source with a RHEL conversion host (cloud-user) and a community
+    destination with an Ubuntu one (ubuntu): each side's variable names its own provider's user -
+    the collection reaches each host with it - never the other's; a provider without a conversion
+    host config keeps the default, cloud-user (audit EX-08)."""
+    src = make_provider(
+        conversion_host=ConversionHostConfig(name="conv-src", manage=False, ssh_user="cloud-user")
+    )
+    dst = make_provider(
+        id="dst-hibiscus",
+        role=ProviderRole.destination,
+        cloud="dst",
+        release="2026.2",
+        conversion_host=ConversionHostConfig(name="conv-dst", manage=False, ssh_user="ubuntu"),
+    )
+    for source, destination, expected in (
+        (src, dst, ("cloud-user", "ubuntu")),
+        (dst.model_copy(update={"role": ProviderRole.source}), src, ("ubuntu", "cloud-user")),
+        (src.model_copy(update={"conversion_host": None}), dst, ("cloud-user", "ubuntu")),
+    ):
+        ctx, _ = ctx_for(env, strategy=Strategy.warm, source=source)
+        ctx.destination = destination
+        v = build_vars(step, ctx)
+        users = (
+            v["os_migrate_src_conversion_host_ssh_user"],
+            v["os_migrate_dst_conversion_host_ssh_user"],
+        )
+        assert users == expected, (source.id, destination.id)
+
+
 def test_build_vars_safety_pins_and_volume_types(env):
     """SDD §7.2: password SSH pinned off, SEC-03 CIDR, preserved volume types, cold rollback."""
     ctx, _ = ctx_for(env, strategy=Strategy.cold)
@@ -1802,6 +1937,9 @@ def test_stop_task_pattern():
         "TASK [os_migrate.os_migrate.import_workloads : Perform workload stop if "
         "os_migrate_workload_stop_before_migration is true] ****",
         "TASK [os_migrate.vmware_migration_kit.migration : Power off the VM] ****",
+        # the pinned kit's own: its migrate module powers the VM off inside it (review RV26-03)
+        "TASK [os_migrate.vmware_migration_kit.import_workloads : Migrate Guest from Vmware "
+        "using nbdkit web-01] ****",
         "TASK [migration : Poweroff source VM] ****",
         "TASK [migration : Shutdown VM before cutover] ****",
     ]
@@ -1812,6 +1950,44 @@ def test_stop_task_pattern():
         "TASK [conversion_host : Stop the previous export of port 10809] ****",
     ]
     assert not any(STOP_TASK.match(line) for line in misses)
+
+
+def test_only_the_collections_stop_tasks_match_the_stop_task_pattern():
+    """SDD §7.2, §6.5: the downtime clock opens at a task whose header matches STOP_TASK, so of the
+    collection's own tasks only the two that stop a source may match it - never the wait until no
+    stop or start of it runs, before them and before the rollback's start (review RV26-10), nor any
+    other."""
+    from seamless_migrate.config import find_repo_root
+
+    def names(tasks):
+        for task in tasks or []:
+            if isinstance(task, dict):
+                if task.get("name"):
+                    yield str(task["name"])
+                for key in ("block", "rescue", "always"):
+                    yield from names(task.get(key))
+
+    root, headers = find_repo_root(), []
+    for path in sorted((root / "roles").glob("*/tasks/*.yml")):
+        role = path.parent.parent.name
+        headers += [
+            (role, name, f"TASK [os_migrate.os_migrate.{role} : {name}] ****")
+            for name in names(yaml.safe_load(path.read_text(encoding="utf-8")))
+        ]
+    for path in sorted((root / "playbooks").glob("*.yml")):
+        for play in yaml.safe_load(path.read_text(encoding="utf-8")) or []:
+            for key in ("pre_tasks", "tasks", "post_tasks", "handlers"):
+                headers += [(path.name, n, f"TASK [{n}] ****") for n in names(play.get(key))]
+    assert any(
+        name == "Wait until no stop or start of the source server runs" for _, name, _ in headers
+    )
+    assert {(where, name) for where, name, header in headers if STOP_TASK.match(header)} == {
+        ("import_workloads_warm", "Stop the source server"),
+        (
+            "import_workloads",
+            "Perform workload stop if os_migrate_workload_stop_before_migration is true",
+        ),
+    }
 
 
 async def test_resolved_flavor_is_applied_to_the_export(env):
@@ -1890,6 +2066,46 @@ async def test_a_cutover_cancelled_while_its_stop_task_runs_opens_the_clock_at_i
     step.cancel()
     await asyncio.sleep(0.1)
     step.cancel()  # while the clock is being opened
+    with pytest.raises(asyncio.CancelledError):
+        await step
+    assert len(rec.downtime_at) == 1 and began <= rec.downtime_at[0] <= seen
+
+
+async def test_a_vmware_cutover_that_fails_after_the_kits_migrate_task_opens_the_clock(
+    env, monkeypatch
+):
+    """SDD §7.2 (review RV26-03): the pinned kit has no power-off task - its migrate module powers
+    the VM off inside "Migrate Guest from Vmware using nbdkit <vm>". A cutover that fails after it
+    (the kit's port or instance creation) leaves the VM off: the clock opens at that task's start,
+    so the automatic rollback powers the VM on and a cancel is refused."""
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", '{"msg": "Failed to create port: Conflict 409"}')
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_cold, source=VCENTER, nics=VMW_NICS)
+    began = utcnow()
+    with pytest.raises((PermanentStepError, TransientStepError)):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert any("Migrate Guest from Vmware using nbdkit web-01" in line for line in rec.logs)
+    assert rec.downtime_marks == 1, "the kit powered the VM off, yet no clock opened"
+    assert began <= rec.downtime_at[0] <= utcnow()
+
+
+async def test_a_vmware_cutover_cut_off_inside_the_kits_migrate_task_opens_the_clock(
+    env, monkeypatch
+):
+    """SDD §7.2 (review RV26-03, audit EX-02): a VMware cutover cut off - the step timeout, a
+    rollback request, a shutdown - while the kit's migrate task runs may have the VM powered off:
+    the clock opens at the task's start."""
+    monkeypatch.setenv("ANSIBLE_FAKE_STOP_HANG", "30")
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_cold, source=VCENTER, nics=VMW_NICS)
+    began = utcnow()
+    step = asyncio.create_task(env.executor.run(StepName.CUTOVER, ctx))
+    for _ in range(500):
+        if any("Migrate Guest from Vmware" in line for line in rec.logs):
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError(rec.logs)
+    seen = utcnow()
+    step.cancel()
     with pytest.raises(asyncio.CancelledError):
         await step
     assert len(rec.downtime_at) == 1 and began <= rec.downtime_at[0] <= seen
@@ -2010,6 +2226,15 @@ class FailingImpl:
 
     async def delete_port(self, port_id):
         raise ProviderError(f"delete port {port_id}: HTTP 503")
+
+    async def volumes(self):
+        raise ProviderError("volumes: connection refused")
+
+    async def delete_volume(self, volume_id):
+        raise ProviderError(f"delete volume {volume_id}: HTTP 503")
+
+    async def detach_volume(self, server_id, volume_id):
+        raise ProviderError(f"detach volume {volume_id}: HTTP 503")
 
 
 class FailingRegistry(FakeRegistry):
@@ -2632,6 +2857,1353 @@ async def test_a_vmware_cancels_cleanup_deletes_only_a_recorded_server(env):
     assert env.registry.calls == [("delete_server", "dst-9")]
 
 
+KIT_NAMES = json.loads((Path(__file__).parent / "fixtures" / "kit_vm_name_cases.json").read_text())
+
+
+@pytest.mark.parametrize("name", sorted(KIT_NAMES["cases"]))
+def test_kit_vm_name_names_a_vm_as_the_migration_kit_does(name):
+    """SDD §7.2: the kit (2.2.7) writes a VM's name into every name it gives through its
+    SafeVmName; the expected names are SafeVmName's own outputs (audit EX-07, EX-18)."""
+    from seamless_migrate.planning.kit import kit_vm_name
+
+    assert kit_vm_name(name) == KIT_NAMES["cases"][name]
+
+
+def kit_port(port_id, name, mac="00:50:56:00:00:01", device_id=""):
+    return {
+        "id": port_id,
+        "name": name,
+        "network_id": "net-app-net-mine",
+        "device_id": device_id,
+        "mac_address": mac,
+        "fixed_ips": ["10.0.0.5"],
+    }
+
+
+async def test_a_vmware_rollback_deletes_only_the_kit_ports_of_this_vm(env):
+    """SDD §7.2: the rollback deletes the unbound ports with one of the VM's MACs whose name starts
+    with the kit's name of this VM, then -NIC-<n>-VLAN-. Another VM's kit port that shares the MAC
+    (another vCenter, a hand-set MAC) is kept, as is one whose name only contains it (audit
+    EX-07)."""
+    nic = Nic(network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"])
+    env.registry.ports = [
+        kit_port("ours", "web01_example_com-NIC-0-VLAN-app-net"),
+        kit_port("other-vm", "db-07-NIC-0-VLAN-dc2-prod"),
+        kit_port("longer-name", "web01_example_com2-NIC-0-VLAN-app-net"),
+        kit_port("inside", "xweb01_example_com-NIC-0-VLAN-app-net"),
+    ]
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web01.example.com",
+        nics=[nic],
+        destination_server_id="dst-9",
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["deleted_ports"] == ["ours"]
+    assert [p["id"] for p in env.registry.ports] == ["other-vm", "longer-name", "inside"]
+
+
+def kit_volume(volume_id, name, converted=True, osm=True, attachments=(), copied=False):
+    metadata = {"osm": "true"} if osm else {}
+    if converted:
+        metadata["converted"] = "true"
+    if copied:  # the control plane's mark of a vmware_warm copy that completed (SDD §7.2)
+        metadata["seamless_copied"] = "true" if copied is True else copied
+    return {
+        "id": volume_id,
+        "name": name,
+        "status": "in-use" if attachments else "available",
+        "metadata": metadata,
+        "attachments": list(attachments),
+    }
+
+
+@pytest.mark.parametrize("strategy", [Strategy.vmware_cold, Strategy.vmware_warm])
+async def test_a_vmware_rollback_deletes_the_kit_volumes_its_next_run_would_take_as_migrated(
+    env, strategy
+):
+    """SDD §7.2 (review RV28-01): the kit finds a VM's volume by its name, <kit name>-<disk key>,
+    and the metadata osm; one it marked converted it takes as migrated - no copy, no power-off,
+    the new server booted from the first attempt's disk while the source runs again. The rollback
+    deletes, once the source is powered on (review RV29-01), every such volume marked converted,
+    and for a vmware_cold migration (whose kit run refuses an existing volume) any such volume; a
+    vmware_warm volume not converted stays for the next pass's CBT sync only when its copy
+    completed (marked, review RV30-01) and no destination server booted from it - here the
+    migration recorded one, which the kit created from every kit volume of the VM (review
+    RV30-02), so all go. Another VM's volume, one without the kit's metadata or of another name
+    form, and one another server holds stay."""
+    env.registry.volumes = [
+        kit_volume("converted", "web01_example_com-2000"),
+        kit_volume("detaching", "web01_example_com-2001", attachments=["dst-9"]),
+        kit_volume("unconverted", "web01_example_com-2002", converted=False, copied=True),
+        kit_volume("cut-off", "web01_example_com-2005", converted=False),
+        kit_volume("not-the-kits", "web01_example_com-2003", osm=False),
+        kit_volume("other-vm", "db-07-2000"),
+        kit_volume("longer-name", "web01_example_com2-2000"),
+        kit_volume("no-disk-key", "web01_example_com-boot"),
+        kit_volume("suffixed", "web01_example_com-2000-old"),
+        kit_volume("prefixed", "old-web01_example_com-2000"),
+        kit_volume("held", "web01_example_com-2004", attachments=["srv-other"]),
+    ]
+    ctx, _ = ctx_for(
+        env,
+        strategy=strategy,
+        source=VCENTER,
+        name="web01.example.com",
+        destination_server_id="dst-9",
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    # a recorded server booted from them all: the marked one goes too (review RV30-02)
+    gone = ["converted", "detaching", "unconverted", "cut-off"]
+    assert result.details["deleted_volumes"] == gone
+    assert env.registry.calls == [
+        ("delete_server", "dst-9"),
+        ("power_on", "srv-1"),
+        # the server booted from them: no completed copy before any deletion (review RV32A-01)
+        ("set_volume_metadata", "unconverted", {"seamless_copied": "cutover"}),
+        *[("delete_volume", v) for v in gone],
+        # "held": is its holder the kit's conversion host? (review RV29-02) - it is not
+        ("find_server", "conv-dst"),
+    ]
+    kept = {
+        "not-the-kits",
+        "other-vm",
+        "longer-name",
+        "no-disk-key",
+        "suffixed",
+        "prefixed",
+        "held",
+    }
+    assert {v["id"] for v in env.registry.volumes} == kept
+    # volumes that cannot be read: the rollback is retried, the source started all the same
+    env.registry.calls.clear()
+    env.registry.volumes_error = True
+    with pytest.raises(TransientStepError, match="rollback: volumes: HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert ("power_on", "srv-1") in env.registry.calls
+
+
+async def test_a_vmware_rollback_powers_the_source_on_before_cinder_may_refuse_a_volume(env):
+    """SDD §7.2, §8 (review RV29-01): the destination's clean-up never keeps the source stopped -
+    a kit volume Cinder will not delete (still deleting, error_deleting, a snapshot on it) fails
+    the attempt, which is retried, with the source already running: a retried power-on does
+    nothing to a running VM."""
+    env.registry.volumes = [kit_volume("converted", "web-01-2000")]
+
+    async def refuses(volume_id):
+        env.registry.calls.append(("delete_volume", volume_id))
+        raise ProviderError(f"dst: BadRequestException: 400: Invalid volume {volume_id}")
+
+    class Refusing(FakeImpl):
+        delete_volume = staticmethod(refuses)
+
+    env.registry.get = lambda provider: Refusing(env.registry)
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, destination_server_id="dst-9"
+    )
+    with pytest.raises(TransientStepError, match="rollback: dst: BadRequestException: 400"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert env.registry.calls == [
+        ("delete_server", "dst-9"),
+        ("power_on", "srv-1"),
+        ("delete_volume", "converted"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("strategy", "step", "volume", "refused"),
+    [
+        # the kit takes a converted volume as migrated: no run of either strategy may meet one
+        # while the source may have run since (here: no clock open)
+        (Strategy.vmware_cold, StepName.CUTOVER, kit_volume("v", "web-01-2000"), True),
+        (Strategy.vmware_warm, StepName.CUTOVER, kit_volume("v", "web-01-2000"), True),
+        (Strategy.vmware_warm, StepName.PRECOPY, kit_volume("v", "web-01-2000"), True),
+        (Strategy.vmware_warm, StepName.SYNC, kit_volume("v", "web-01-2000"), True),
+        # another server's: the kit would find it all the same - named with its holder
+        (
+            Strategy.vmware_cold,
+            StepName.CUTOVER,
+            kit_volume("v", "web-01-2000", attachments=["srv-other"]),
+            True,
+        ),
+        # a cold run refuses to copy onto any; a warm run syncs onto one not converted whose
+        # copy completed (review RV30-01)
+        (
+            Strategy.vmware_cold,
+            StepName.CUTOVER,
+            kit_volume("v", "web-01-2000", converted=False),
+            True,
+        ),
+        (
+            Strategy.vmware_warm,
+            StepName.CUTOVER,
+            kit_volume("v", "web-01-2000", converted=False, copied=True),
+            False,
+        ),
+        (
+            Strategy.vmware_warm,
+            StepName.PRECOPY,
+            kit_volume("v", "web-01-2000", converted=False, copied=True),
+            False,
+        ),
+        # another VM's, or not the kit's
+        (Strategy.vmware_cold, StepName.CUTOVER, kit_volume("v", "db-07-2000"), False),
+        (Strategy.vmware_cold, StepName.CUTOVER, kit_volume("v", "web-01-2000", osm=False), False),
+    ],
+)
+async def test_a_vmware_kit_run_is_refused_while_a_stale_kit_volume_of_the_vm_exists(
+    env, strategy, step, volume, refused
+):
+    """SDD §7.2 (review RV29-01): a rollback that could not delete the kit's converted volume ends
+    failed with the source running; a retry's kit run would take that volume as migrated and boot
+    the destination from it beside the source. So a VMware kit run is refused before it starts -
+    before any clock - while a volume of the VM's kit name with osm true is marked converted, or,
+    for a vmware_cold cutover, while any such volume exists; the refusal names the volume and its
+    holder, and the way out: roll the migration back again."""
+    env.registry.volumes = [volume]
+    env.registry.source_power = "stopped"  # off now, but with no clock open it may have run since
+    ctx, rec = ctx_for(env, strategy=strategy, source=VCENTER, nics=VMW_NICS)
+    if not refused:
+        await env.executor.run(step, ctx)
+        assert read_log(env.log)
+        return
+    with pytest.raises(PermanentStepError) as refusal:
+        await env.executor.run(step, ctx)
+    holder = ", attached to srv-other" if volume["attachments"] else ""
+    assert f"the kit's volume v (web-01-2000{holder})" in str(refusal.value)
+    assert "roll the migration back again" in str(refusal.value)
+    assert read_log(env.log) == [] and rec.downtime_marks == 0
+    # volumes that cannot be read are no answer: the run is retried, never started blind
+    env.registry.volumes_error = True
+    with pytest.raises(TransientStepError, match="volumes: HTTP 503"):
+        await env.executor.run(step, ctx)
+    assert read_log(env.log) == []
+
+
+async def test_a_kit_volume_refusal_says_the_way_out_before_it_names_the_volumes(env):
+    """SDD §7.2 (review RV30-08): Migration.error keeps 1000 characters and the migration.error
+    event's message 300. The refusal says the way out - roll the migration back again - before it
+    names each volume and its holder, so a VM with many disks and a long name keeps it in both."""
+    from seamless_migrate.planning.kit import kit_vm_name
+
+    name = "erp-db-cluster-node-01.datacenter2.corp.example.com"
+    env.registry.volumes = [
+        kit_volume(f"0000000{i}-1111-2222-3333-444444444444", f"{kit_vm_name(name)}-{2000 + i}")
+        for i in range(8)
+    ]
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_cold, source=VCENTER, name=name, nics=VMW_NICS)
+    with pytest.raises(PermanentStepError) as refusal:
+        await env.executor.run(StepName.CUTOVER, ctx)
+    message = str(refusal.value)
+    assert "roll the migration back again" in message[:300]
+    assert all(volume["id"] in message for volume in env.registry.volumes)
+
+
+@pytest.mark.parametrize("strategy", [Strategy.vmware_cold, Strategy.vmware_warm])
+@pytest.mark.parametrize(
+    ("source_power", "converted", "refused"),
+    [
+        ("stopped", True, False),  # off since this outage's conversion: the volume is current
+        ("running", True, True),  # a rollback powered it on, then could not delete the volume
+        ("unknown", True, True),  # vCenter does not say it is off
+        ("stopped", False, None),  # cold: the kit refuses to copy onto it; warm: CBT syncs onto it
+    ],
+)
+async def test_a_cutover_retried_while_the_source_stays_off_reuses_the_volume_the_kit_converted(
+    env, strategy, source_power, converted, refused
+):
+    """SDD §7.2 (review RV29-01): a converted kit volume is no refusal while the source has not
+    run since this outage's stop - the clock open and vCenter reading the VM off: the kit takes
+    the volume it converted in this outage as migrated, which it is (a cutover retried after a
+    failure past the conversion). Running, or not known to be off, it is refused; the clock alone
+    cannot tell, as a rollback that powered the source on and then failed leaves it open."""
+    if refused is None:
+        refused = strategy == Strategy.vmware_cold
+    env.registry.volumes = [
+        kit_volume("v", "web-01-2000", converted=converted, copied=not converted)
+    ]
+    env.registry.source_power = source_power
+    ctx, rec = ctx_for(
+        env, strategy=strategy, source=VCENTER, nics=VMW_NICS, downtime_started_at=utcnow()
+    )
+    if not refused:
+        await env.executor.run(StepName.CUTOVER, ctx)
+        assert read_log(env.log)
+        return
+    with pytest.raises(PermanentStepError, match="roll the migration back again"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []
+
+
+@pytest.mark.parametrize(
+    ("strategy", "converted", "deleted"),
+    [
+        (Strategy.vmware_cold, False, True),  # a cold run refuses any: deleted
+        (Strategy.vmware_warm, "copied", False),  # the next pass syncs onto it: kept, detached
+        (Strategy.vmware_warm, False, True),  # a first copy cut off (review RV30-01): deleted
+        (Strategy.vmware_warm, True, True),  # converted: deleted
+    ],
+)
+@pytest.mark.parametrize("found_by", ["name", "address"])
+async def test_a_vmware_rollback_detaches_the_kits_copy_from_its_conversion_host(
+    env, strategy, converted, deleted, found_by
+):
+    """SDD §7.2 (review RV29-02): a cutover cut off inside the kit's migrate task leaves the
+    kit's copy attached to the kit's own conversion host - a server of the destination project.
+    It is the kit's own volume, not another server's: the rollback detaches it from that host,
+    found by its name or else by the port holding its address, then deletes or keeps it by the
+    usual rules - a warm volume not converted whose copy completed (marked) stays, detached, for
+    the next pass's CBT sync; one not marked is a first copy cut off (review RV30-01)."""
+    if found_by == "name":
+        env.registry.existing = {"conv-dst"}  # Nova's server of the destination's conversion host
+        host = "dst-conv-dst"
+    else:
+        host = "srv-conv-7"
+        env.registry.ports = [
+            {
+                "id": "conv-port",
+                "name": "",
+                "network_id": "net-transit",
+                "device_id": host,
+                "device_owner": "compute:nova",
+                "mac_address": "fa:16:3e:00:00:99",
+                "fixed_ips": ["192.0.2.10"],
+            }
+        ]
+    env.registry.volumes = [
+        kit_volume(
+            "cut-off-copy",
+            "web-01-2000",
+            converted=converted is True,
+            attachments=[host],
+            copied=converted == "copied",
+        )
+    ]
+    ctx, _ = ctx_for(env, strategy=strategy, source=VCENTER, downtime_started_at=utcnow())
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert ("detach_volume", host, "cut-off-copy") in env.registry.calls
+    assert result.details["deleted_volumes"] == (["cut-off-copy"] if deleted else [])
+    kept = [v for v in env.registry.volumes if v["id"] == "cut-off-copy"]
+    assert kept == ([] if deleted else [{**kept[0], "attachments": []}])
+
+
+async def test_a_vmware_rollback_reads_no_cinder_before_the_power_on(env):
+    """SDD §7.2, §8 (review RV30-04): only the server's deletion comes before the source's
+    power-on; what a server found only by name held (owner question q26, review RV29-03) is read
+    from Nova's record of it. An outage of Cinder that failed the cutover fails the attempt with
+    the source running, never before its power-on."""
+    env.registry.existing = {"web-01"}
+    env.registry.volumes = [kit_volume("root", "web-01-2000", attachments=["dst-web-01"])]
+    env.registry.volumes_error = True
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, downtime_started_at=utcnow()
+    )
+    with pytest.raises(TransientStepError, match="rollback: volumes: HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert env.registry.calls == [
+        ("find_server", "web-01"),
+        ("server_volumes", "dst-web-01"),
+        ("delete_server", "dst-web-01"),
+        ("power_on", "srv-1"),
+    ]
+
+
+async def test_a_vmware_rollback_with_a_recorded_server_deletes_every_kit_volume_of_the_vm(env):
+    """SDD §7.2 (review RV30-02): the kit created the recorded destination server from every kit
+    volume of the VM, and its guest may have written to each - a journal replay, a database's
+    crash recovery, days of service - which a CBT sync, copying only what the source changed,
+    never undoes. With a recorded server the rollback deletes every one of them, a marked copy
+    too, so the next pass copies them in full - also in an attempt retried after the first one
+    deleted the server, which Nova then no longer knows."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000", attachments=["dst-9"]),
+        kit_volume("data", "web-01-2001", converted=False, copied=True, attachments=["dst-9"]),
+    ]
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_warm, source=VCENTER, destination_server_id="dst-9"
+    )
+    vcenter_down = {"failing": True}
+
+    async def power_on(source_id):
+        env.registry.calls.append(("power_on", source_id))
+        if vcenter_down["failing"]:
+            raise ProviderError("vcenter: HTTP 503")
+
+    class FailingOnce(FakeImpl):
+        pass
+
+    FailingOnce.power_on = staticmethod(power_on)
+    env.registry.get = lambda provider: FailingOnce(env.registry)
+    with pytest.raises(TransientStepError, match="vcenter: HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert [v["id"] for v in env.registry.volumes] == ["boot", "data"]  # detached, not deleted
+    vcenter_down["failing"] = False
+    result = await env.executor.run(StepName.ROLLBACK, ctx)  # the retry: dst-9 is gone
+    assert result.details["deleted_volumes"] == ["boot", "data"]
+    assert env.registry.volumes == []
+
+
+@pytest.mark.parametrize(
+    "status", ["error", "error_restoring", "error_extending", "error_managing"]
+)
+async def test_a_marked_kit_volume_cinder_cannot_attach_is_deleted(env, status):
+    """SDD §7.2 (review RV30-07): a marked vmware_warm kit volume in an error state Cinder cannot
+    attach would fail every later pass at its attach - no dashboard action gets past it. It goes
+    before a run, as a first copy cut off does, and in the rollback; an available one stays."""
+
+    def volumes():
+        return [
+            dict(kit_volume("broken", "web-01-2000", converted=False, copied=True), status=status),
+            kit_volume("fine", "web-01-2001", converted=False, copied=True),
+        ]
+
+    env.registry.volumes = volumes()
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    assert [v["id"] for v in env.registry.volumes] == ["fine"]
+    env.registry.volumes = volumes()
+    rollback, _ = ctx_for(
+        env, strategy=Strategy.vmware_warm, source=VCENTER, downtime_started_at=utcnow()
+    )
+    result = await env.executor.run(StepName.ROLLBACK, rollback)
+    assert result.details["deleted_volumes"] == ["broken"]
+    assert [v["id"] for v in env.registry.volumes] == ["fine"]
+
+
+@pytest.mark.parametrize("power_on_fails", [False, True])
+async def test_a_vmware_rollback_closes_the_clock_once_its_power_on_succeeded(env, power_on_fails):
+    """SDD §5.2 (review RV30-03): the clock closes when the source runs again - the rollback marks
+    it right after its power-on, before the kit's ports and volumes, so an attempt that fails on
+    them leaves it closed: a retry never takes the source for stopped since the outage's stop. A
+    power-on that failed closes nothing."""
+    env.registry.volumes_error = True  # Cinder fails the attempt after the power-on
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        destination_server_id="dst-9",
+        downtime_started_at=utcnow(),
+    )
+
+    async def closed():
+        env.registry.calls.append(("clock_closed",))
+
+    ctx.mark_downtime_end = closed
+    if power_on_fails:
+
+        async def power_on(source_id):
+            env.registry.calls.append(("power_on", source_id))
+            raise ProviderError("vcenter: HTTP 503")
+
+        class Failing(FakeImpl):
+            pass
+
+        Failing.power_on = staticmethod(power_on)
+        env.registry.get = lambda provider: Failing(env.registry)
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    closing = [] if power_on_fails else [("clock_closed",)]
+    # the clock open: a server of the kit's name is looked for beside the recorded one (RV32A-07)
+    lookup = [("find_server", "web-01")]
+    assert env.registry.calls == [
+        *lookup,
+        ("delete_server", "dst-9"),
+        ("power_on", "srv-1"),
+        *closing,
+    ]
+
+
+@pytest.mark.parametrize("powered_on", [True, None])
+async def test_a_converted_kit_volume_is_no_reuse_once_vcenter_powered_the_vm_on_since_the_stop(
+    env, powered_on
+):
+    """SDD §7.2 (review RV30-03): vCenter reading the VM off does not say it has not run since the
+    stop - an operator may have powered it on from vCenter and shut it down again. A converted kit
+    volume is reused only while vCenter records no power-on of the VM since the clock opened; one
+    recorded refuses the run, and events that cannot be read retry it, never start it blind."""
+    env.registry.volumes = [kit_volume("v", "web-01-2000")]
+    env.registry.source_power = "stopped"
+    env.registry.powered_on = powered_on
+    ctx, rec = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        nics=VMW_NICS,
+        downtime_started_at=utcnow(),
+    )
+    if powered_on:
+        with pytest.raises(PermanentStepError, match="roll the migration back again"):
+            await env.executor.run(StepName.CUTOVER, ctx)
+    else:
+        with pytest.raises(TransientStepError, match="events: HTTP 503"):
+            await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []
+
+
+def _kit_leaves(env, monkeypatch, volumes, *, fail=None):
+    """The kit's run, as the executor's: ``volumes`` are what it created or left in the
+    destination project; ``fail`` makes Cinder unanswering right after it (review RV30-01)."""
+    kit_run = env.executor._execute
+
+    async def run(*args, **kwargs):
+        out = await kit_run(*args, **kwargs)
+        env.registry.volumes = [dict(v, metadata=dict(v["metadata"])) for v in volumes]
+        if fail == "volumes":
+            env.registry.volumes_error = True
+        elif fail == "mark":
+            env.registry.set_metadata_error = True
+        return out
+
+    monkeypatch.setattr(env.executor, "_execute", run)
+
+
+@pytest.mark.parametrize("step", [StepName.PRECOPY, StepName.SYNC])
+async def test_a_vmware_warm_pass_marks_the_kit_copies_it_completed(env, monkeypatch, step):
+    """SDD §7.2 (review RV30-01): the kit writes a new volume's CBT changeID before its full copy
+    and marks no copy complete. After each vmware_warm pass the kit completed, the control plane
+    marks each of the VM's kit volumes that is not converted and attached to no server with
+    seamless_copied=true, which a later run keeps for its CBT sync. A converted volume, one a
+    server holds, another VM's, one without the kit's metadata and one marked already get no
+    write."""
+    _kit_leaves(
+        env,
+        monkeypatch,
+        [
+            kit_volume("new-copy", "web-01-2000", converted=False),
+            kit_volume("marked", "web-01-2001", converted=False, copied=True),
+            kit_volume("converted", "web-01-2002"),
+            kit_volume("held", "web-01-2003", converted=False, attachments=["srv-other"]),
+            kit_volume("other-vm", "db-07-2000", converted=False),
+            kit_volume("not-the-kits", "web-01-2004", converted=False, osm=False),
+        ],
+    )
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    result = await env.executor.run(step, ctx)
+    assert result.sync_pass is not None
+    assert [c for c in env.registry.calls if c[0] == "set_volume_metadata"] == [
+        ("set_volume_metadata", "new-copy", {"seamless_copied": "true"})
+    ]
+    marked = {v["id"] for v in env.registry.volumes if v["metadata"].get("seamless_copied")}
+    assert marked == {"new-copy", "marked"}
+
+
+@pytest.mark.parametrize("fail", ["volumes", "mark"])
+async def test_a_vmware_warm_pass_whose_copies_cannot_be_marked_is_retried(env, monkeypatch, fail):
+    """SDD §7.2 (review RV30-01): a marking that fails fails the pass as transient: its retry
+    deletes the unmarked volume and the kit copies the disk in full - never a pass recorded over a
+    copy that later runs cannot tell from a cut-off one."""
+    _kit_leaves(
+        env, monkeypatch, [kit_volume("new-copy", "web-01-2000", converted=False)], fail=fail
+    )
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.PRECOPY, ctx)
+
+
+@pytest.mark.parametrize("step", [StepName.PRECOPY, StepName.SYNC, StepName.CUTOVER])
+async def test_a_first_copy_cut_off_is_deleted_before_the_next_vmware_warm_run(env, step):
+    """SDD §7.2 (review RV30-01): a first copy cut off - a failed nbdcopy, the step timeout, a
+    rollback request, a restart - carries the changeID of the snapshot it never finished copying,
+    and the kit's next run would sync onto it only what the source changed since. Before every
+    vmware_warm kit run such a volume - neither converted nor marked - is detached from the
+    destination's conversion host when that host holds it and deleted, so the kit copies the disk
+    in full; a marked one stays for the CBT sync, as does one another server holds."""
+    env.registry.existing = {"conv-dst"}  # Nova's server of the destination's conversion host
+    env.registry.volumes = [
+        kit_volume("cut-off", "web-01-2000", converted=False),
+        kit_volume("cut-off-held", "web-01-2001", converted=False, attachments=["dst-conv-dst"]),
+        kit_volume("copied", "web-01-2002", converted=False, copied=True),
+        kit_volume("held", "web-01-2003", converted=False, attachments=["srv-other"]),
+        kit_volume("other-vm", "db-07-2000", converted=False),
+    ]
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(step, ctx)
+    assert read_log(env.log)  # the kit ran, onto what stayed
+    assert [c for c in env.registry.calls if c[0] in ("detach_volume", "delete_volume")] == [
+        ("delete_volume", "cut-off"),
+        ("detach_volume", "dst-conv-dst", "cut-off-held"),
+        ("delete_volume", "cut-off-held"),
+    ]
+    assert {v["id"] for v in env.registry.volumes} == {"copied", "held", "other-vm"}
+
+
+@pytest.mark.parametrize("step", [StepName.PRECOPY, StepName.SYNC, StepName.CUTOVER])
+async def test_a_marked_copy_the_conversion_host_holds_is_detached_and_kept_before_a_run(env, step):
+    """SDD §7.2 (review RV32A-03): a marked copy the destination's conversion host still holds - a
+    pass cut off during its CBT sync, or the kit's own detach that failed, which it only logs - is
+    detached from it and kept for the CBT sync before every vmware_warm run: the kit attaches it
+    again, which Nova refuses while it is attached. One another server holds stays attached."""
+    env.registry.existing = {"conv-dst"}  # Nova's server of the destination's conversion host
+    env.registry.volumes = [
+        kit_volume(
+            "copied-held", "web-01-2001", converted=False, copied=True, attachments=["dst-conv-dst"]
+        ),
+        kit_volume(
+            "copied-elsewhere", "web-01-2002", converted=False, copied=True, attachments=["srv-x"]
+        ),
+    ]
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(step, ctx)
+    assert [c for c in env.registry.calls if c[0] in ("detach_volume", "delete_volume")] == [
+        ("detach_volume", "dst-conv-dst", "copied-held")
+    ]
+    held = {v["id"]: v["attachments"] for v in env.registry.volumes}
+    assert held == {"copied-held": [], "copied-elsewhere": ["srv-x"]}
+
+
+async def test_a_vmware_warm_cutover_marks_its_copies_cutover_right_before_its_kit_run(
+    env, monkeypatch
+):
+    """SDD §7.2 (reviews RV32A-01, RV32A-02): right before a vmware_warm cutover's kit run each kit
+    copy marked completed is marked 'cutover', which no later run or rollback takes as a copy: the
+    run converts a disk in place and boots a server that writes to every one, which no CBT sync
+    undoes. Another VM's copy keeps its mark."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000", converted=False, copied=True),
+        kit_volume("data", "web-01-2001", converted=False, copied=True),
+        kit_volume("other-vm", "db-07-2000", converted=False, copied=True),
+    ]
+    seen = []
+    kit_run = env.executor._execute
+
+    async def run(*args, **kwargs):
+        seen.append({v["id"]: v["metadata"].get("seamless_copied") for v in env.registry.volumes})
+        return await kit_run(*args, **kwargs)
+
+    monkeypatch.setattr(env.executor, "_execute", run)
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert seen == [{"boot": "cutover", "data": "cutover", "other-vm": "true"}]
+
+
+async def test_a_vmware_warm_cutover_whose_copies_cannot_be_marked_never_runs_the_kit(env):
+    """SDD §7.2 (reviews RV32A-01, RV32A-02): a marking that fails fails the cutover as transient
+    before the kit runs - never a cutover over copies a later run would still take as completed."""
+    env.registry.volumes = [kit_volume("data", "web-01-2001", converted=False, copied=True)]
+    env.registry.set_metadata_error = True
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []
+
+
+@pytest.mark.parametrize(
+    ("ending", "mark"),
+    [
+        ("a failure before", "true"),
+        ("a cancel before", "true"),
+        ("a failure after", "cutover"),
+        ("a cancel after", "cutover"),
+    ],
+)
+async def test_a_cutover_kit_run_that_never_reached_its_migrate_task_marks_its_copies_back(
+    env, monkeypatch, ending, mark
+):
+    """SDD §7.2 (review RV34A-02): only the kit's migrate task writes to a volume. A cutover kit run
+    that fails - an SSH reset in the kit's checks - or is cancelled before its output shows that
+    task's header wrote to none: the copies it marked 'cutover' are marked 'true' again before its
+    failure is reported, so its retry syncs them by CBT rather than copying every disk in full
+    inside the outage. Once the header showed, they stay 'cutover': the kit may have written."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000", converted=False, copied=True),
+        kit_volume("data", "web-01-2001", converted=False, copied=True),
+    ]
+    if ending == "a failure before":
+        monkeypatch.setenv("ANSIBLE_FAKE_FAIL_BEFORE_STOP", "Connection reset by peer")
+    elif ending == "a cancel before":
+        monkeypatch.setenv("ANSIBLE_FAKE_FAIL_BEFORE_STOP", "never reached")
+        monkeypatch.setenv("ANSIBLE_FAKE_PRE_HANG", "30")
+    elif ending == "a failure after":
+        monkeypatch.setenv("ANSIBLE_FAKE_FAIL", "Connection reset by peer")
+    else:
+        monkeypatch.setenv("ANSIBLE_FAKE_STOP_HANG", "30")
+
+    class Cinder(FakeImpl):
+        async def set_volume_metadata(self, volume_id, metadata):
+            if metadata == {"seamless_copied": "true"}:
+                await asyncio.sleep(0.2)  # a marking back still running when cancelled again
+            await FakeImpl.set_volume_metadata(self, volume_id, metadata)
+
+    env.registry.get = lambda provider: Cinder(env.registry)
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    if ending.startswith("a failure"):
+        with pytest.raises(TransientStepError, match="Connection reset by peer"):
+            await env.executor.run(StepName.CUTOVER, ctx)
+    else:
+        step = asyncio.create_task(env.executor.run(StepName.CUTOVER, ctx))
+        shown = "Check the source" if ending == "a cancel before" else "Migrate Guest from Vmware"
+        for _ in range(500):
+            if any(shown in line for line in rec.logs):
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError(rec.logs)
+        step.cancel()
+        await asyncio.sleep(0.1)
+        step.cancel()  # while the copies are being marked back
+        with pytest.raises(asyncio.CancelledError):
+            await step
+    copied = {v["id"]: v["metadata"].get("seamless_copied") for v in env.registry.volumes}
+    assert copied == {"boot": mark, "data": mark}
+    if mark == "true":
+        # the retry syncs them by CBT: nothing deleted, no disk copied in full
+        monkeypatch.delenv("ANSIBLE_FAKE_FAIL_BEFORE_STOP")
+        ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+        await env.executor.run(StepName.CUTOVER, ctx)
+        assert not [c for c in env.registry.calls if c[0] == "delete_volume"]
+
+
+@pytest.mark.parametrize("failing", ["the marking back", "the marking"])
+async def test_a_cutover_whose_copies_cannot_all_be_marked_back_leaves_them_cutover(
+    env, monkeypatch, failing
+):
+    """SDD §7.2 (review RV34A-02): a marking back that fails is logged and leaves the copies not yet
+    marked back 'cutover' - copied in full later, never taken as completed - and the run's own
+    failure is what the step reports. A marking that fails before the kit runs marks back what it
+    marked."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000", converted=False, copied=True),
+        kit_volume("data", "web-01-2001", converted=False, copied=True),
+    ]
+    refused = (
+        ("boot", {"seamless_copied": "true"})
+        if failing == "the marking back"
+        else ("data", {"seamless_copied": "cutover"})
+    )
+
+    class Cinder(FakeImpl):
+        async def set_volume_metadata(self, volume_id, metadata):
+            if (volume_id, metadata) == refused:
+                self.calls.append(("set_volume_metadata", volume_id, dict(metadata)))
+                raise ProviderError("volume metadata: HTTP 503")
+            await FakeImpl.set_volume_metadata(self, volume_id, metadata)
+
+    env.registry.get = lambda provider: Cinder(env.registry)
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL_BEFORE_STOP", "Connection reset by peer")
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    expected = "Connection reset by peer" if failing == "the marking back" else "HTTP 503"
+    with pytest.raises(TransientStepError, match=expected):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    copied = {v["id"]: v["metadata"].get("seamless_copied") for v in env.registry.volumes}
+    if failing == "the marking back":
+        assert copied == {"boot": "cutover", "data": "cutover"}
+        assert any("boot, data" in line and "completed again" in line for line in rec.logs)
+    else:
+        assert copied == {"boot": "true", "data": "true"}
+        assert read_log(env.log) == []  # the kit never ran
+
+
+async def test_a_cutover_kit_run_marks_back_only_the_copies_it_marked(env, monkeypatch):
+    """SDD §7.2 (review RV34A-02): a cutover retried inside the outage keeps the copies an earlier
+    attempt marked 'cutover', which that attempt's kit wrote to: a run of the retry that fails
+    before its migrate task marks back only what it marked itself - here nothing."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000"),
+        kit_volume("data", "web-01-2001", converted=False, copied="cutover"),
+    ]
+    env.registry.source_power = "stopped"
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL_BEFORE_STOP", "Connection reset by peer")
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        nics=VMW_NICS,
+        downtime_started_at=utcnow(),
+    )
+    with pytest.raises(TransientStepError, match="Connection reset by peer"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert [v["metadata"].get("seamless_copied") for v in env.registry.volumes] == [
+        None,
+        "cutover",
+    ]
+    assert not [c for c in env.registry.calls if c[0] == "set_volume_metadata"]
+
+
+@pytest.mark.parametrize(
+    "step", [StepName.PRECOPY, StepName.SYNC, StepName.CUTOVER, StepName.ROLLBACK]
+)
+async def test_a_copy_a_cutover_marked_is_deleted_by_a_later_run_or_rollback(env, step):
+    """SDD §7.2 (reviews RV32A-01, RV32A-02): a volume marked 'cutover' is a first copy cut off for
+    every later run and rollback - a pass, a cutover outside the outage, a rollback with no server
+    recorded -: deleted, so the kit copies the disk in full."""
+    env.registry.volumes = [kit_volume("data", "web-01-2001", converted=False, copied="cutover")]
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(step, ctx)
+    assert [c for c in env.registry.calls if c[0] == "delete_volume"] == [("delete_volume", "data")]
+
+
+@pytest.mark.parametrize(
+    ("case", "deleted"),
+    [
+        ("the first disk converted", []),
+        # the kit's fallback converted another disk: the first one's conversion failed
+        ("another disk converted", ["data"]),
+        ("a server of the destination name", ["data"]),
+        ("a server recorded", ["data"]),
+        ("nothing converted", ["boot", "data"]),
+    ],
+)
+async def test_a_cutover_retried_in_the_outage_keeps_its_copies_only_after_a_first_conversion(
+    env, case, deleted
+):
+    """SDD §7.2 (reviews RV32A-01, RV32A-02): a cutover retried inside the same outage keeps the
+    volumes an earlier attempt marked 'cutover' for its CBT sync only when no server booted from
+    them - none recorded, none of the destination server's name - and the kit converted the VM's
+    first disk in vCenter's device order: that conversion succeeded on its first try, so the kit
+    converted no other disk, powered the VM off and only synced the rest. Otherwise they are
+    deleted and copied in full."""
+    first_converted = case != "nothing converted"
+    env.registry.volumes = [
+        kit_volume(
+            "boot",
+            "web-01-2000",
+            converted=first_converted,
+            copied=False if first_converted else "cutover",
+        ),
+        kit_volume("data", "web-01-2001", converted=False, copied="cutover"),
+    ]
+    if case == "another disk converted":
+        env.registry.disk_keys = [2001, 2000]
+    if case == "a server of the destination name":
+        env.registry.existing = {"web-01"}
+    env.registry.source_power = "stopped"
+    recorded = {"destination_server_id": "dst-9"} if case == "a server recorded" else {}
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        nics=VMW_NICS,
+        downtime_started_at=utcnow(),
+        **recorded,
+    )
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)  # the kit ran
+    assert [c[1] for c in env.registry.calls if c[0] == "delete_volume"] == deleted
+
+
+async def test_a_cutover_retried_in_the_outage_that_cannot_read_the_disk_order_is_retried(env):
+    """SDD §7.2 (reviews RV32A-01, RV32A-02): an unanswered read of the VM's disk order is no answer
+    - the cutover fails as transient before it deletes or runs anything."""
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000"),
+        kit_volume("data", "web-01-2001", converted=False, copied="cutover"),
+    ]
+    env.registry.disk_keys = None
+    env.registry.source_power = "stopped"
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        nics=VMW_NICS,
+        downtime_started_at=utcnow(),
+    )
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == []
+    assert not [c for c in env.registry.calls if c[0] == "delete_volume"]
+
+
+@pytest.mark.parametrize("credential", ["admin", "member"])
+async def test_a_vmware_rollback_finds_a_conversion_host_known_by_its_floating_address(
+    env, credential
+):
+    """SDD §7.2 (review RV30-06): a conversion host configured by its address alone may be known
+    by its floating IP, which Neutron puts on the floating IP's own port - an admin sees that port,
+    with the floating IP's id as its device; a project member sees none. The rollback takes the
+    server whose compute port Neutron's floating IP is associated with, detaches the copy a cut-off
+    run left there and deletes it."""
+    host = "srv-conv-7"
+    env.registry.ports = [
+        {
+            "id": "conv-port",
+            "name": "",
+            "network_id": "net-transit",
+            "device_id": host,
+            "device_owner": "compute:nova",
+            "mac_address": "fa:16:3e:00:00:99",
+            "fixed_ips": ["10.0.0.40"],
+        }
+    ]
+    if credential == "admin":
+        env.registry.ports.append(
+            {
+                "id": "fip-port",
+                "name": "",
+                "network_id": "public",
+                "device_id": "fip-1",
+                "device_owner": "network:floatingip",
+                "mac_address": "fa:16:3e:00:00:98",
+                "fixed_ips": ["198.51.100.40"],
+            }
+        )
+    env.registry.floating_ips = [{"floating_ip_address": "198.51.100.40", "port_id": "conv-port"}]
+    env.registry.volumes = [kit_volume("cut-off-copy", "web-01-2000", attachments=[host])]
+    floating = DST.model_copy(
+        update={"conversion_host": ConversionHostConfig(manage=False, address="198.51.100.40")}
+    )
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        destination=floating,
+        downtime_started_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert ("detach_volume", host, "cut-off-copy") in env.registry.calls
+    assert result.details["deleted_volumes"] == ["cut-off-copy"]
+
+
+@pytest.mark.parametrize("recorded", [False, True])
+async def test_a_vmware_rollback_keeps_what_a_server_found_only_by_name_held(env, recorded):
+    """SDD §7.2 (review RV29-03, owner question q26): with no recorded server and the clock open,
+    the rollback deletes the server it finds by the VM's kit name - possibly another plan's VM the
+    kit names alike, cut over into the same project meanwhile. What that server held before its
+    deletion stays: the other plan's migration keeps its disks, a later kit run refuses them and a
+    second rollback, finding no server holding them, deletes them. A server the migration
+    recorded is its own: what it held is deleted."""
+    env.registry.existing = {"web_01"}  # found by the kit's name of web_01
+    env.registry.volumes = [kit_volume("root", "web_01-2000", attachments=["dst-web_01"])]
+    kw = {"destination_server_id": "dst-web_01"} if recorded else {}
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web_01",
+        downtime_started_at=utcnow(),
+        **kw,
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["deleted_server"] == "dst-web_01"
+    assert result.details["deleted_volumes"] == (["root"] if recorded else [])
+    if recorded:
+        return
+    # a second rollback: no server holds the volume any more - deleted
+    env.registry.existing = set()
+    again = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert (again.details["deleted_server"], again.details["deleted_volumes"]) == (None, ["root"])
+
+
+@pytest.mark.parametrize("fails", ["delete_server", "power_on", "volumes"])
+async def test_a_retried_vmware_rollback_still_keeps_what_a_server_found_by_name_held(env, fails):
+    """SDD §7.2 (review RV30-05, owner question q26): the first attempt records what the server it
+    found by the kit's name held, then deletes it; an attempt retried after a failure from that
+    deletion on - Nova's deletion whose answer timed out, vCenter's power-on, Cinder - or resumed
+    after a restart finds no server any more and keeps what the record names. A rollback that
+    succeeds removes the record, so a later one, finding no server holding the volume, deletes it
+    (review RV29-03)."""
+    env.registry.existing = {"web_01"}
+    env.registry.volumes = [kit_volume("root", "web_01-2000", attachments=["dst-web_01"])]
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web_01",
+        downtime_started_at=utcnow(),
+    )
+    if fails == "volumes":
+        env.registry.volumes_error = True
+    elif fails == "power_on":
+
+        async def power_on(source_id):
+            env.registry.calls.append(("power_on", source_id))
+            raise ProviderError("vcenter: HTTP 503")
+
+        class Failing(FakeImpl):
+            pass
+
+        Failing.power_on = staticmethod(power_on)
+        env.registry.get = lambda provider: Failing(env.registry)
+    else:
+
+        class Deleted(FakeImpl):
+            async def delete_server(self, server_id):
+                await FakeImpl.delete_server(self, server_id)  # Nova deleted it, then
+                raise ProviderError("dst: HTTP 503")  # its answer was lost
+
+        env.registry.get = lambda provider: Deleted(env.registry)
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert (run_dir(env) / ".seamless" / "rollback-kept.json").exists()
+    env.registry.volumes_error = False
+    env.registry.get = lambda provider: FakeImpl(env.registry)
+    env.registry.existing = set()  # Nova deleted the server: no lookup finds it any more
+    retried = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert (retried.details["deleted_server"], retried.details["deleted_volumes"]) == (None, [])
+    assert [v["id"] for v in env.registry.volumes] == ["root"]
+    assert not (run_dir(env) / ".seamless" / "rollback-kept.json").exists()
+    later = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert later.details["deleted_volumes"] == ["root"]
+
+
+@pytest.mark.parametrize("server", ["recorded", "found by name", "found earlier", "none"])
+async def test_a_vmware_rollback_after_a_server_booted_leaves_no_copy_marked_completed(env, server):
+    """SDD §7.2 (review RV32A-01): whenever a server booted from the kit's volumes - recorded, or
+    found by the kit's name by this attempt or an earlier one (the keep record) - the rollback
+    marks each copy of the VM still marked completed 'cutover' right after the power-on, before it
+    deletes any port or volume: what it then cannot delete (Cinder refuses a volume with a
+    snapshot) or keeps (what a server found only by name held) is no completed copy for a later
+    run. With no server, a completed copy stays marked for the next pass's CBT sync."""
+    holder = {"recorded": ["dst-9"], "found by name": ["dst-web-01"]}.get(server, [])
+    env.registry.volumes = [
+        kit_volume("boot", "web-01-2000", attachments=holder),
+        kit_volume("data", "web-01-2001", converted=False, copied=True, attachments=holder),
+    ]
+    kw = {"downtime_started_at": utcnow()} if server != "none" else {}
+    if server == "recorded":
+        kw["destination_server_id"] = "dst-9"
+
+        class SnapshotOnTheData(FakeImpl):
+            async def delete_volume(self, volume_id):
+                if volume_id == "data":  # Cinder refuses a volume with a snapshot
+                    raise ProviderError("dst: HTTP 400: Invalid volume: ... have snapshots")
+                await FakeImpl.delete_volume(self, volume_id)
+
+        env.registry.get = lambda provider: SnapshotOnTheData(env.registry)
+    elif server == "found by name":
+        env.registry.existing = {"web-01"}
+    elif server == "found earlier":
+        record = run_dir(env) / ".seamless" / "rollback-kept.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text('{"server_id": "dst-web-01", "volumes": ["boot", "data"]}')
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, **kw)
+    if server == "recorded":
+        with pytest.raises(TransientStepError, match="have snapshots"):
+            await env.executor.run(StepName.ROLLBACK, ctx)
+    else:
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    marks = {v["id"]: v["metadata"].get("seamless_copied") for v in env.registry.volumes}
+    assert marks.get("data") == ("true" if server == "none" else "cutover")
+    calls = [c[0] for c in env.registry.calls]
+    if server != "none":
+        marked = calls.index("set_volume_metadata")
+        assert calls.index("power_on") < marked
+        assert all(calls.index(c) > marked for c in ("delete_port", "delete_volume") if c in calls)
+    else:
+        assert "set_volume_metadata" not in calls
+
+
+async def test_a_vmware_rollback_whose_copies_cannot_be_marked_fails_with_the_source_running(env):
+    """SDD §7.2 (review RV32A-01): a marking that fails fails the rollback's attempt after the
+    power-on - the source runs - and before it deletes any volume."""
+    env.registry.volumes = [
+        kit_volume("data", "web-01-2001", converted=False, copied=True, attachments=["dst-9"])
+    ]
+    env.registry.set_metadata_error = True
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        destination_server_id="dst-9",
+        downtime_started_at=utcnow(),
+    )
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    calls = [c[0] for c in env.registry.calls]
+    assert calls.index("power_on") < calls.index("set_volume_metadata")
+    assert "delete_volume" not in calls
+
+
+@pytest.mark.parametrize(
+    "case", ["a new server beside", "the recorded one", "clock never opened", "clock closed"]
+)
+async def test_a_vmware_rollback_deletes_a_server_of_the_kits_name_beside_a_recorded_one(env, case):
+    """SDD §7.2 (review RV32A-07): while the clock is open the rollback looks the server up by the
+    kit's name even when one is recorded - the recorded one may be an earlier attempt's that a
+    failed rollback already deleted, while the new attempt's cutover did not record its own. One
+    found that is not the recorded one is deleted before the power-on too, what it held kept
+    (q26): the source never runs beside it. The recorded one found by name is deleted once. With
+    the clock never opened, or closed - an earlier attempt's power-on came only after every server
+    it found was gone -, nothing is looked up by name: a server of the kit's name then is another
+    VM's (review RV34A-01)."""
+    env.registry.existing = {"web-01"}  # the kit's server of web-01, running
+    env.registry.volumes = [kit_volume("held", "web-01-2001", attachments=["dst-web-01"])]
+    live_at_power_on: list[list[str]] = []
+
+    class Nova(FakeImpl):
+        async def delete_server(self, server_id):
+            await FakeImpl.delete_server(self, server_id)
+            if server_id == "dst-web-01":
+                self.registry.existing.discard("web-01")
+
+        async def power_on(self, source_id):
+            live_at_power_on.append(sorted(self.registry.existing))
+            await FakeImpl.power_on(self, source_id)
+
+    env.registry.get = lambda provider: Nova(env.registry)
+    recorded = "dst-web-01" if case == "the recorded one" else "srv-attempt-1"
+    clock = {
+        "clock never opened": {},
+        "clock closed": {"downtime_started_at": utcnow(), "downtime_ended_at": utcnow()},
+    }.get(case, {"downtime_started_at": utcnow()})
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, destination_server_id=recorded, **clock
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    deletes = [c[1] for c in env.registry.calls if c[0] == "delete_server"]
+    if case == "a new server beside":
+        assert live_at_power_on == [[]], "the source was powered on beside the new server"
+        assert sorted(deletes) == ["dst-web-01", "srv-attempt-1"]
+        assert result.details["deleted_volumes"] == []  # what the server found by name held
+    elif case == "the recorded one":
+        assert live_at_power_on == [[]] and deletes == ["dst-web-01"]
+    else:
+        assert deletes == ["srv-attempt-1"]
+        assert ("find_server", "web-01") not in env.registry.calls
+
+
+@pytest.mark.parametrize("recorded", ["dst-9", None])
+async def test_a_vmware_rollback_after_the_clock_closed_looks_nothing_up_by_name(env, recorded):
+    """SDD §7.2 (review RV34A-01): once the clock closed - a verification with the recorded server
+    running, or an earlier attempt's power-on after it deleted every server it found - the
+    rollback looks no server up by the kit's name, with or without a recorded one: two servers of
+    that name, which Nova's lookup refuses, never keep the source stopped."""
+
+    class Nova(FakeImpl):
+        async def find_server(self, name):
+            self.calls.append(("find_server", name))
+            raise ProviderError(f"More than one Server exists with the name '{name}'.")
+
+    env.registry.get = lambda provider: Nova(env.registry)
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        destination_server_id=recorded,
+        downtime_started_at=utcnow(),
+        downtime_ended_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert not [c for c in env.registry.calls if c[0] == "find_server"]
+    deletes = [c[1] for c in env.registry.calls if c[0] == "delete_server"]
+    assert deletes == ([recorded] if recorded else [])
+    assert ("power_on", "srv-1") in env.registry.calls
+    assert result.details["source_running"] is True
+
+
+@pytest.mark.parametrize("record", ["damaged", "not a record", "a directory"])
+async def test_a_vmware_rollback_whose_keep_record_cannot_be_read_still_powers_the_source_on(
+    env, record
+):
+    """SDD §7.2 (review RV32A-08): the keep record matters only to the deletions after the
+    power-on. One that cannot be read never keeps the source stopped: what to keep is unknown, so
+    that attempt deletes no kit volume of the VM, says so in its log, and deletes the server and
+    powers the source on as any other."""
+    path = run_dir(env) / ".seamless" / "rollback-kept.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if record == "damaged":
+        path.write_text('{"server_id": "dst-web-01", "volumes": ["boot",')
+    elif record == "not a record":
+        path.write_text('["boot"]')
+    else:
+        path.mkdir()
+    env.registry.volumes = [kit_volume("cut-off", "web-01-2000", converted=False)]
+    ctx, rec = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        destination_server_id="dst-9",
+        downtime_started_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["source_running"] is True
+    assert result.details["deleted_volumes"] == []
+    calls = [c[0] for c in env.registry.calls]
+    assert calls.index("delete_server") < calls.index("power_on")
+    assert "delete_volume" not in calls
+    assert any("rollback-kept.json" in line and "stays" in line for line in rec.logs)
+
+
+@pytest.mark.parametrize("record", ["damaged", "a directory"])
+async def test_a_vmware_rollback_writes_no_keep_record_over_one_it_cannot_read(env, record):
+    """SDD §7.2 (review RV34A-03): with the clock open, a server of the kit's name found beside a
+    keep record that cannot be read is deleted and the source powered on as any other. No record
+    is written over the unreadable one: its path may refuse the write (a directory there), and
+    one written over a damaged file would let a later attempt delete what that file kept. The
+    volumes the server held are logged; while the record cannot be read no attempt deletes a kit
+    volume of the VM - here the attempt retried after a failure past the power-on."""
+    path = run_dir(env) / ".seamless" / "rollback-kept.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if record == "damaged":
+        path.write_text('{"server_id": "dst-old", "volumes": ["kept-earlier",')
+    else:
+        path.mkdir()
+    env.registry.existing = {"web-01"}  # the kit's server, found by name
+    env.registry.volumes = [
+        kit_volume("root", "web-01-2000", attachments=["dst-web-01"]),
+        # what an earlier attempt kept of a server it found by name, in the damaged record
+        kit_volume("kept-earlier", "web-01-2001", converted=False),
+    ]
+    env.registry.ports_error = True  # the first attempt fails past the power-on
+    ctx, rec = ctx_for(
+        env, strategy=Strategy.vmware_warm, source=VCENTER, downtime_started_at=utcnow()
+    )
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    calls = [c[0] for c in env.registry.calls]
+    assert calls.index("delete_server") < calls.index("power_on")
+    # the retry: the clock closed at the power-on, the server is gone
+    env.registry.ports_error = False
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        downtime_started_at=utcnow(),
+        downtime_ended_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert "delete_volume" not in [c[0] for c in env.registry.calls]
+    assert result.details["deleted_volumes"] == []
+    assert any("root" in line and "dst-web-01" in line for line in rec.logs), rec.logs
+
+
+async def test_a_vm_named_like_the_old_keep_record_never_fails_the_rollback(env):
+    """SDD §7.2 (review RV32A-08): the kit creates a guest directory {run directory}/{VM name}; a
+    VM named rollback-kept.json takes the record's old path. The record lives one level below, so
+    the rollback records and keeps what a server found by name held as for any VM."""
+    from seamless_migrate.planning.kit import kit_vm_name
+
+    guest_dir = run_dir(env) / "rollback-kept.json"
+    guest_dir.mkdir(parents=True)  # the kit's guest directory of the VM so named
+    kit = kit_vm_name("rollback-kept.json")
+    env.registry.existing = {kit}
+    env.registry.volumes = [
+        kit_volume("root", f"{kit}-2000", attachments=[f"dst-{kit}"]),
+        kit_volume("stale", f"{kit}-2001"),  # converted, no server holds it: the rules delete it
+    ]
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="rollback-kept.json",
+        downtime_started_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert (result.details["deleted_server"], result.details["deleted_volumes"]) == (
+        f"dst-{kit}",
+        ["stale"],
+    )
+    assert guest_dir.is_dir()  # the kit's directory left as it is
+
+
+async def test_a_keep_record_an_earlier_build_wrote_is_read_too(env):
+    """SDD §7.2 (review RV32A-08): a migration in flight across the upgrade keeps what its record at
+    the old path names - the rollback reads that file too, and removes it once it succeeds."""
+    old = run_dir(env) / "rollback-kept.json"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text('{"server_id": "dst-web-01", "volumes": ["root"]}')
+    env.registry.volumes = [kit_volume("root", "web-01-2000")]
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, downtime_started_at=utcnow()
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["deleted_volumes"] == []
+    assert not old.exists()
+    later = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert later.details["deleted_volumes"] == ["root"]
+
+
+async def test_a_vmware_rollback_deletes_no_volume_of_a_vm_without_a_kit_name(env):
+    """SDD §7.2, §9.3: a VM whose name the kit keeps nothing of has no kit name, and the kit's
+    names of its volumes are bare suffixes - the rollback deletes none of them."""
+    env.registry.volumes = [kit_volume("bare", "-2000")]
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="受注",
+        destination_server_id="dst-9",
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["deleted_volumes"] == []
+    assert [v["id"] for v in env.registry.volumes] == ["bare"]
+
+
+async def test_a_vmware_cutover_reports_the_server_the_kit_named_after_the_vm(env, monkeypatch):
+    """SDD §7.2: the kit names the destination server as it names the VM - web01.example.com's
+    is web01_example_com, which a lookup by the VM's own name never finds. The cutover reports
+    that server, so verification probes it (audit EX-18)."""
+    monkeypatch.setenv("ANSIBLE_FAKE_VM_NAME", "web01.example.com")
+    monkeypatch.setenv("ANSIBLE_FAKE_CREATED_NAME", "web01_example_com")
+    nic = Nic(
+        network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net"
+    )
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web01.example.com",
+        nics=[nic],
+        mappings=Mappings(),
+    )
+    result = await env.executor.run(StepName.CUTOVER, ctx)
+    assert result.destination_server_id == "dst-web01_example_com"
+
+
+async def test_a_vmware_rollback_after_the_stop_deletes_the_server_the_kit_named(env):
+    """SDD §7.2: without a recorded server, the rollback after the power-off deletes the server the
+    kit built, found by the kit's name of the VM - never left running beside the source it powers
+    on, with the same MACs and addresses (audit EX-18)."""
+    registry = FakeRegistry(existing={"web01_example_com"})
+    executor = AnsibleExecutor(env.settings, providers=registry, poll_s=0.02)
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web01.example.com",
+        downtime_started_at=utcnow(),
+    )
+    result = await executor.run(StepName.ROLLBACK, ctx)
+    assert registry.calls == [
+        ("find_server", "web01_example_com"),
+        ("server_volumes", "dst-web01_example_com"),
+        ("delete_server", "dst-web01_example_com"),
+        ("power_on", "srv-1"),
+    ]
+    assert result.details["deleted_server"] == "dst-web01_example_com"
+
+
+async def test_the_first_vmware_attempt_refuses_a_server_with_the_kits_name_of_the_vm(env):
+    """SDD §7.2: before the first attempt, a destination server named as the kit will name this
+    VM's is refused - the rollback would delete it by that name - though the VM's own name differs
+    from it (audit EX-18)."""
+    executor = AnsibleExecutor(
+        env.settings, providers=FakeRegistry(existing={"web01_example_com"}), poll_s=0.02
+    )
+    nic = Nic(
+        network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net"
+    )
+    ctx, rec = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        name="web01.example.com",
+        nics=[nic],
+        mappings=Mappings(),
+    )
+    with pytest.raises(PermanentStepError, match="a server named web01_example_com already exists"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log) == [] and rec.downtime_marks == 0
+
+
+async def test_an_openstack_migration_looks_its_server_up_by_the_vms_own_name(env):
+    """SDD §7.2: os-migrate gives the destination server the VM's own name - only the VMware kit
+    writes its own name of the VM - so a cold migration of web01.example.com refuses a server of
+    that name and lets the kit's form of it be (audit EX-18)."""
+    for existing, refused in (("web01.example.com", True), ("web01_example_com", False)):
+        registry = FakeRegistry(existing={existing})
+        executor = AnsibleExecutor(env.settings, providers=registry, poll_s=0.02)
+        ctx, _ = ctx_for(env, strategy=Strategy.cold, name="web01.example.com")
+        if refused:
+            with pytest.raises(PermanentStepError, match="a server named web01.example.com"):
+                await executor.run(StepName.CUTOVER, ctx)
+        else:
+            await executor.run(StepName.CUTOVER, ctx)
+        finds = [c for c in registry.calls if c[0] == "find_server"]
+        assert finds[0] == ("find_server", "web01.example.com"), existing
+
+
 async def test_vmware_rollback_deletes_by_name_only_after_a_stop(env):
     """Without a recorded destination server, only a cutover that powered the VM off can have
     created a same-named server; an earlier failure leaves any such server alone."""
@@ -2648,6 +4220,7 @@ async def test_vmware_rollback_deletes_by_name_only_after_a_stop(env):
     result = await executor.run(StepName.ROLLBACK, ctx)
     assert registry.calls == [
         ("find_server", "web-01"),
+        ("server_volumes", "dst-web-01"),
         ("delete_server", "dst-web-01"),
         ("power_on", "srv-1"),
     ]

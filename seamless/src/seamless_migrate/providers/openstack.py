@@ -28,6 +28,8 @@ log = logging.getLogger(__name__)
 #: openstacksdk per-request timeout and the ceiling of one provider call from the control plane
 PROVIDER_API_TIMEOUT_S = 60
 PROVIDER_CALL_TIMEOUT_S = 300.0
+#: Cinder statuses of a volume still attached to, or detaching from, a server: no delete yet
+_VOLUME_SETTLING = frozenset({"in-use", "attaching", "detaching", "reserved"})
 T = TypeVar("T")
 
 _POWER = {
@@ -238,6 +240,24 @@ class OpenStackProvider:
 
     async def delete_port(self, port_id: str) -> None:
         await self._run(self._delete_port, port_id)
+
+    async def volumes(self) -> list[dict[str, Any]]:
+        return await self._run(self._volumes)
+
+    async def delete_volume(self, volume_id: str) -> None:
+        await self._run(self._delete_volume, volume_id)
+
+    async def detach_volume(self, server_id: str, volume_id: str) -> None:
+        await self._run(self._detach_volume, server_id, volume_id)
+
+    async def server_of_address(self, address: str) -> str | None:
+        return await self._run(self._server_of_address, address)
+
+    async def server_volumes(self, server_id: str) -> list[str]:
+        return await self._run(self._server_volumes, server_id)
+
+    async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
+        await self._run(self._set_volume_metadata, volume_id, metadata)
 
     # -- implementation (runs in worker threads) ----------------------------------------------
     def _check(self) -> dict[str, Any]:
@@ -515,6 +535,114 @@ class OpenStackProvider:
     def _delete_port(self, port_id: str) -> None:
         self._connection().network.delete_port(port_id, ignore_missing=True)
 
+    def _volumes(self) -> list[dict[str, Any]]:
+        """The project's volumes, with their metadata and the servers holding them (SDD §10)."""
+        out: list[dict[str, Any]] = []
+        for volume in self._connection().block_storage.volumes(details=True):
+            metadata = _attr(volume, "metadata", default=None) or {}
+            attachments = _attr(volume, "attachments", default=None) or []
+            out.append(
+                {
+                    "id": str(_attr(volume, "id")),
+                    "name": str(_attr(volume, "name", default="") or ""),
+                    "status": str(_attr(volume, "status", default="") or ""),
+                    "metadata": {str(k): str(v) for k, v in metadata.items()},
+                    "attachments": [
+                        str(a.get("server_id")) for a in attachments if a.get("server_id")
+                    ],
+                }
+            )
+        return out
+
+    def _delete_volume(self, volume_id: str) -> None:
+        # Cinder refuses to delete a volume still detaching from the server just deleted: wait for
+        # it to settle, then for the deletion - within the call's bound (SDD §8.1, §10)
+        deadline = time.monotonic() + PROVIDER_CALL_TIMEOUT_S - 5
+        storage = self._connection().block_storage
+        while True:
+            volume = storage.find_volume(volume_id, ignore_missing=True)
+            if volume is None:
+                return
+            status = str(_attr(volume, "status", default="") or "").lower()
+            if status == "error_deleting":
+                raise ProviderError(
+                    f"{self.provider.id}: volume {volume_id} is error_deleting: Cinder failed to "
+                    "delete it - reset its state, then try again"
+                )
+            if status == "deleting":
+                break  # Cinder deletes it already: waited for, never deleted twice (RV29-04)
+            if status not in _VOLUME_SETTLING:
+                try:
+                    storage.delete_volume(volume, ignore_missing=True)
+                except Exception:
+                    # Cinder refuses a volume it began deleting meanwhile: that deletion counts
+                    again = storage.find_volume(volume_id, ignore_missing=True)
+                    if again is not None and _attr(again, "status") != "deleting":
+                        raise
+                break
+            if time.monotonic() > deadline:
+                raise ProviderError(f"{self.provider.id}: volume {volume_id} is still {status}")
+            time.sleep(2)
+        storage.wait_for_delete(volume, wait=max(1, int(deadline - time.monotonic())))
+
+    def _detach_volume(self, server_id: str, volume_id: str) -> None:
+        # the wait ends within the call's bound (SDD §8.1, §10)
+        deadline = time.monotonic() + PROVIDER_CALL_TIMEOUT_S - 5
+        conn = self._connection()
+        conn.compute.delete_volume_attachment(server_id, volume_id, ignore_missing=True)
+        volume = conn.block_storage.get_volume(volume_id)
+        conn.block_storage.wait_for_status(
+            volume,
+            status="available",
+            failures=["error"],
+            wait=max(1, int(deadline - time.monotonic())),
+        )
+
+    def _server_of_address(self, address: str) -> str | None:
+        # a compute port's device only: a floating IP's own port names the floating IP, a
+        # router's the router (SDD §7.2, §10, review RV30-06)
+        network = self._connection().network
+        canonical = _canonical_ip(address)
+
+        def server(port: Any) -> str | None:
+            owner = str(_attr(port, "device_owner", default="") or "")
+            device = _attr(port, "device_id")
+            return str(device) if owner.startswith("compute:") and device else None
+
+        for port in network.ports(fixed_ips=[f"ip_address={canonical}"]):
+            fixed = [ip.get("ip_address") for ip in _attr(port, "fixed_ips", default=None) or []]
+            if canonical in (_canonical_ip(str(a)) for a in fixed if a) and server(port):
+                return server(port)
+        import openstack.exceptions
+
+        for floating in network.ips(floating_ip_address=canonical):
+            port_id = _attr(floating, "port_id")
+            if not port_id:
+                continue
+            try:
+                port = network.get_port(port_id)
+            except openstack.exceptions.NotFoundException:
+                continue  # gone since the listing; a read that failed is no answer (RV32A-04)
+            if server(port):
+                return server(port)
+        return None
+
+    def _server_volumes(self, server_id: str) -> list[str]:
+        # Nova's record of the server (os-extended-volumes): no Cinder call, so a VMware rollback
+        # reads it before the source's power-on (SDD §7.2, §10)
+        import openstack.exceptions
+
+        try:
+            server = self._connection().compute.get_server(server_id)
+        except openstack.exceptions.NotFoundException:
+            return []  # a server gone holds none
+        attached = _attr(server, "attached_volumes", default=None) or []
+        return [str(_attr(v, "id")) for v in attached if _attr(v, "id")]
+
+    def _set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
+        # Cinder's POST /volumes/{id}/metadata merges: the kit's own keys stay (SDD §7.2, §10)
+        self._connection().block_storage.set_volume_metadata(volume_id, **metadata)
+
 
 def _os_hint(properties: Mapping[str, Any]) -> str | None:
     """``os_distro`` + ``os_version`` of image properties, else their ``os_type``."""
@@ -605,6 +733,15 @@ class _MapContext:
     def server_to_vmref(self, server: Any) -> VMRef:
         conn = self.conn
         flavor = _attr(server, "flavor", default={}) or {}
+        flavor_id = _attr(flavor, "id")
+        if not _attr(flavor, "original_name") and flavor_id:
+            # Nova embeds the flavor from compute 2.47 on; below it the server holds only the
+            # flavor's id, which openstacksdk's Flavor reads as 0 everywhere (review RV28-08) -
+            # and its extra specs only when asked, below 2.61 (review RV31-04): read apart, so a
+            # policy that forbids them keeps the flavor without them, as Nova 2.47+ does (RV32B-03)
+            looked = _try(lambda: conn.compute.get_flavor(flavor_id), None)
+            if looked is not None:
+                flavor = _try(lambda: looked.fetch_extra_specs(conn.compute), None) or looked
         vcpus, ram, disk_gb = (
             _attr(flavor, "vcpus"),
             _attr(flavor, "ram"),
@@ -612,11 +749,6 @@ class _MapContext:
         )
         flavor_name = _attr(flavor, "original_name", "name")
         extra_specs = _attr(flavor, "extra_specs", default={}) or {}
-        if vcpus is None and _attr(flavor, "id"):
-            full = conn.compute.get_flavor(_attr(flavor, "id"))
-            vcpus, ram, disk_gb = _attr(full, "vcpus"), _attr(full, "ram"), _attr(full, "disk")
-            flavor_name = _attr(full, "name", default=flavor_name)
-            extra_specs = _attr(full, "extra_specs", default={}) or {}
 
         image = _attr(server, "image", default={}) or {}
         image_booted = bool(_attr(image, "id"))

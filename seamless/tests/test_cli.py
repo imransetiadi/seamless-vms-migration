@@ -292,6 +292,33 @@ def test_plan_apply_refuses_a_create_naming_unknown_fields_like_post(env, capsys
     assert store.list("plan", Plan) == []
 
 
+def test_plan_apply_refuses_a_misspelt_nested_field_like_post(env, capsys):
+    """SDD §15/§12 (audit AP-01): a nested object's field PlanCreate does not have is refused like a
+    top-level one - a plan whose verification misspells tcp_ports is never stored without its
+    check of the application port."""
+    store = store_for(env)
+    store.put("provider", make_provider(id="src-osp"))
+    store.put(
+        "provider",
+        make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    path = env / "plan.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "name": "Finance web tier",
+                "source_provider_id": "src-osp",
+                "destination_provider_id": "dst-rhoso",
+                "vm_ids": ["vm-1"],
+                "verification": {"tcp_port": [443]},
+            }
+        )
+    )
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    assert "tcp_port" in capsys.readouterr().err
+    assert store.list("plan", Plan) == []
+
+
 def _applied_plan(env, capsys):
     store = store_for(env)
     store.put("provider", make_provider(id="src-osp"))
@@ -882,3 +909,16 @@ def test_plan_apply_names_a_non_string_key_it_cannot_change(env, capsys):
     path.write_text(path.read_text() + "1: typo\n")
     assert cli.main(["plan", "apply", "-f", str(path)]) == 1
     assert capsys.readouterr().err == "error: fields cannot be changed: 1\n"
+
+
+@pytest.mark.parametrize("origin", ["http://[127.0.0.1]:5173", "http://[::1:5173"])
+def test_a_cors_origin_python_cannot_split_ends_the_cli_with_an_error_line(
+    monkeypatch, capsys, origin
+):
+    """SDD §15.1 (review RV32B-08): a value outside its bounds refuses to start the control plane
+    with "error: ..." and exit code 1 - also a first SEAMLESS_CORS_ORIGINS entry Python's urlsplit
+    itself refuses (a bracketed IPv4 address, an unclosed bracket), never a traceback."""
+    monkeypatch.setenv("SEAMLESS_CORS_ORIGINS", origin)
+    assert cli.main(["version"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and "is not an origin" in err, err

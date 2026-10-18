@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from ..config import Settings
-from .redaction import redact, redact_payload
+from .redaction import redact, redact_cut, redact_payload
 
 log = logging.getLogger(__name__)
 
@@ -29,9 +29,18 @@ def _score(value: Any) -> float | None:
         return None
 
 
+#: how much of a hit's content and title the control plane keeps, redacted as redact_cut cuts:
+#: one hit's redaction costs a bounded time in the event loop (SDD §13.4, review RV27-06)
+HIT_CHARS = 4000
+HIT_TITLE_CHARS = 200
+
+
 def _hit(item: Any) -> MemoryHit | None:
+    """One hit as the control plane may publish it: agentmemory is an outside service, so its text
+    is redacted as it arrives, before anything cuts it (SDD §13.4, audit AP-05)."""
     if isinstance(item, str):
-        return MemoryHit(title=item[:80], content=item)
+        text = redact_cut(item, HIT_CHARS)
+        return MemoryHit(title=text[:80], content=text)
     if not isinstance(item, dict):
         return None
     sources = [item]
@@ -43,7 +52,11 @@ def _hit(item: Any) -> MemoryHit | None:
     )
     if not content:
         return None
-    title = next((str(s["title"]) for s in sources if s.get("title")), content[:80])
+    content = redact_cut(content, HIT_CHARS)
+    title = next(
+        (redact_cut(str(s["title"]), HIT_TITLE_CHARS) for s in sources if s.get("title")),
+        content[:80],
+    )
     return MemoryHit(title=title, content=content, score=_score(item.get("score")))
 
 
@@ -57,8 +70,20 @@ def parse_hits(data: Any, limit: int) -> list[MemoryHit]:
         )
     if not isinstance(items, list):
         return []
-    hits = [h for h in (_hit(i) for i in items) if h is not None]
-    return hits[: max(0, limit)]
+    hits: list[MemoryHit] = []
+    for item in items:
+        if len(hits) >= limit:  # the rest is never read (review RV27-06)
+            break
+        hit = _hit(item)
+        if hit is not None:
+            hits.append(hit)
+    return hits
+
+
+def _answer(data: Any) -> str:
+    """agentmemory's unexpected answer, for last_error: redacted before it is cut, so credentials
+    the cut would split are still found (SDD §13.4, review RV27-07)."""
+    return redact_cut(str(data), 120)
 
 
 class MemoryClient:
@@ -148,7 +173,7 @@ class MemoryClient:
                 response.raise_for_status()
                 data = response.json()
             if not isinstance(data, dict) or data.get("success") is False:
-                raise ValueError(f"unexpected answer: {str(data)[:120]}")
+                raise ValueError(f"unexpected answer: {_answer(data)}")
         except Exception as exc:
             self._failed("remember", exc)
             return False
@@ -177,7 +202,7 @@ class MemoryClient:
                 response.raise_for_status()
                 data = response.json()
             if not isinstance(data, dict) or data.get("status", "ok") != "ok":
-                raise ValueError(f"unexpected answer: {str(data)[:120]}")
+                raise ValueError(f"unexpected answer: {_answer(data)}")
         except Exception as exc:
             self._failed("health", exc)
             return False

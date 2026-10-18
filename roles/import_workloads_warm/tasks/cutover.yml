@@ -58,6 +58,9 @@
             data: "{{ item }}"
             block_device_mapping: []
             warm_state_dir: "{{ os_migrate_warm_state_dir }}"
+            # never a create: the server may vanish after the lookup above, and one built from an
+            # empty block device mapping lacks the synchronised volumes (SDD 6.4, audit A-07)
+            finish_only: true
 
         - name: Report a workload that was already cut over
           ansible.builtin.debug:
@@ -112,6 +115,9 @@
                 data: "{{ item }}"
                 dst_filters: "{{ os_migrate_dst_filters }}"
 
+            - name: Wait until no stop or start of the source server runs
+              ansible.builtin.include_tasks: source_stop_settled.yml
+
             - name: Stop the source server
               os_migrate.os_migrate.server_action:
                 cloud: src
@@ -143,7 +149,7 @@
                 data: "{{ item }}"
                 conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
                 ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-                ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+                ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
                 state_dir: "{{ os_migrate_warm_state_dir }}"
                 boot_volume_prefix: "{{ os_migrate_workload_boot_volume_prefix }}"
                 log_file: "{{ import_workloads_warm_prelim.log_file }}"
@@ -163,7 +169,8 @@
                 conversion_host: "{{ os_dst_conversion_host_info.openstack_conversion_host }}"
                 src_conversion_host_address: "{{ os_src_conversion_host_info.openstack_conversion_host.address }}"
                 ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-                ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+                ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
+                src_ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
                 state_dir: "{{ os_migrate_warm_state_dir }}"
                 transfer_uuid: "{{ import_workloads_warm_snapshot.transfer_uuid }}"
                 pass_kind: final
@@ -188,7 +195,7 @@
                 data: "{{ item }}"
                 conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
                 ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-                ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+                ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
                 state_dir: "{{ os_migrate_warm_state_dir }}"
                 log_file: "{{ import_workloads_warm_prelim.log_file }}"
                 timeout: "{{ os_migrate_timeout }}"
@@ -233,7 +240,7 @@
         data: "{{ item }}"
         conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
         ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-        ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+        ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
         state_dir: "{{ os_migrate_warm_state_dir }}"
         timeout: "{{ os_migrate_timeout }}"
         state: absent

@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# Modified by the Seamless Migrate project, 2026.
 
 
 from __future__ import absolute_import, division, print_function
@@ -93,9 +94,17 @@ options:
   volume_map:
     description:
       - Dictionary providing information about the volumes to transfer.
-      - Provided by the import_workloads_export_volumes module.
-    required: true
+      - Provided by the import_workloads_transfer_volumes module.
+      - A transfer that failed returns none; I(warm_state_dir) then names the volumes.
+    required: false
     type: dict
+  warm_state_dir:
+    description:
+      - Directory of the workloads' state files. Without I(volume_map), the destination volumes
+        the workload's record holds - the transfer recorded each as soon as Cinder created it -
+        are the ones cleaned up.
+    required: false
+    type: str
   timeout:
     description:
       - Timeout for long running operations, in seconds.
@@ -139,10 +148,15 @@ from ansible.module_utils.basic import AnsibleModule
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import os_auth
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import server
+from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_migration
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
     DEFAULT_TIMEOUT,
+    ConversionHostUnreachable,
+    DetachStuck,
+    LockUnavailable,
     OpenStackVolumeBase,
+    is_timeout,
 )
 
 
@@ -174,6 +188,92 @@ class OpenStackDstFailureCleanup(OpenStackVolumeBase):
         )
         self.volume_map = volume_map
 
+    def _check_ssh(self):
+        """The one SSH check at the start, its answer kept rather than raised: the conversion host
+        may be what failed the transfer, and the API alone still deletes the volumes no server
+        holds (Seamless Migrate SDD 6.6, audit A-08)."""
+        try:
+            self.shell.test_ssh_connection()
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning(
+                "The destination conversion host cannot be reached (%s): the volumes it holds "
+                "stay for the rollback, which deletes them by the record",
+                err,
+            )
+            self.reachable = False
+        else:
+            self.reachable = True
+
+    def delete_migrated_volumes(self):
+        """Detach the volumes from the destination conversion host - under its attach lock, only
+        when the check reached it - then delete those no server holds (SDD 6.6, audit A-08). Best
+        effort: what it cannot detach or delete is logged and left for the rollback, which
+        deletes it by the record; it never fails the rescue (reviews RV32B-02, RV32B-05). A wait
+        that gives up ends its phase: each later volume would wait it out again, the cold source
+        stopped all the while (review RV34B-01). Returns the ids of the volumes it left."""
+        if self.reachable:
+            for volume_id in [mapping["dest_id"] for mapping in self.volume_map.values()]:
+                try:
+                    self._detach_volumes_from_destination_converter(volume_ids=[volume_id])
+                except (ConversionHostUnreachable, LockUnavailable, DetachStuck) as err:
+                    # the host lost, the lock another conversion holds, a detach Nova does not
+                    # end: every other detach would wait it out again
+                    self.log.warning(
+                        "Detaching from the destination conversion host gave up (%s): what it "
+                        "holds stays for the rollback, which deletes it by the record",
+                        err,
+                    )
+                    break
+                except Exception as err:  # pylint: disable=broad-except
+                    self.log.warning(
+                        "Volume %s could not be detached (%s): it stays for the rollback",
+                        volume_id,
+                        err,
+                    )
+        return self._delete_volumes_best_effort()
+
+    def _delete_volumes_best_effort(self):
+        """Delete each volume of the map no server holds; one Cinder does not delete - or one
+        still attached - is logged and left. A deletion Cinder does not finish within the timeout
+        ends the deletions: the volumes not yet deleted are left, no deletion sent for them
+        (review RV34B-01)."""
+        self.log.info("Deleting migrated volumes from destination.")
+        left = []
+        stalled = False
+        for mapping in self.volume_map.values():
+            volume_id = mapping["dest_id"]
+            try:
+                volume = self._get_volume_maybe(volume_id)
+                if not volume:
+                    continue
+                if volume.attachments:
+                    self.log.warning(
+                        "Volume %s is still attached: it stays for the rollback", volume_id
+                    )
+                    left.append(volume_id)
+                    continue
+                if stalled:
+                    self.log.warning(
+                        "Volume %s is not deleted - a deletion before it did not finish in time: "
+                        "it stays for the rollback",
+                        volume_id,
+                    )
+                    left.append(volume_id)
+                    continue
+                self.log.info("Deleting volume %s.", volume_id)
+                self.conn.delete_volume(volume_id, timeout=self.timeout, wait=True)
+            except Exception as err:  # pylint: disable=broad-except
+                self.log.warning(
+                    "Volume %s could not be deleted (%s): it stays for the rollback",
+                    volume_id,
+                    err,
+                )
+                left.append(volume_id)
+                if is_timeout(err):
+                    # Cinder did not finish it in time: every other deletion would wait it out again
+                    stalled = True
+        return left
+
 
 def run_module():
     argument_spec = os_auth.openstack_full_argument_spec(
@@ -182,7 +282,8 @@ def run_module():
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
         transfer_uuid=dict(type="str", required=True),
-        volume_map=dict(type="dict", required=True),
+        volume_map=dict(type="dict", default=None),
+        warm_state_dir=dict(type="str", default=None),
         state_file=dict(type="str", default=None),
         log_file=dict(type="str", default=None),
         timeout=dict(type="int", default=DEFAULT_TIMEOUT),
@@ -194,6 +295,7 @@ def run_module():
 
     module = AnsibleModule(
         argument_spec=argument_spec,
+        required_one_of=[("volume_map", "warm_state_dir")],
     )
 
     conn = os_auth.get_connection(module)
@@ -206,24 +308,45 @@ def run_module():
     ssh_user = module.params["ssh_user"]
     transfer_uuid = module.params["transfer_uuid"]
     volume_map = module.params["volume_map"]
+    if volume_map is None:
+        # a transfer that failed returns no map: the volumes it recorded as Cinder created them
+        # (Seamless Migrate SDD 6.3, 6.6, audit A-08)
+        try:
+            state = warm_migration.WarmState.load(module.params["warm_state_dir"], info["id"])
+        except ValueError as err:
+            # best effort, as below: the rollback reads the same record and says what it finds
+            result["volumes_left"] = []
+            result["msg"] = "The destination cleanup cannot read the record: %s" % err
+            module.exit_json(**result)
+        volume_map = {
+            device: {"dest_id": entry["dest_id"]}
+            for device, entry in state.dest_volumes.items()
+            if entry.get("dest_id")
+        }
 
     # Optional parameters
     state_file = module.params.get("state_file", None)
     log_file = module.params.get("log_file", None)
     timeout = module.params["timeout"]
 
-    failure_cleanup = OpenStackDstFailureCleanup(
-        conn,
-        destination_conversion_host_id,
-        ssh_key_path,
-        ssh_user,
-        transfer_uuid,
-        volume_map,
-        state_file=state_file,
-        log_file=log_file,
-        timeout=timeout,
-    )
-    failure_cleanup.delete_migrated_volumes()
+    # best effort: the rescue goes on and the transfer's failure is what the run reports - this
+    # module never fails, and nothing it met is printed (Seamless Migrate SDD 6.6, RV32B-02)
+    try:
+        failure_cleanup = OpenStackDstFailureCleanup(
+            conn,
+            destination_conversion_host_id,
+            ssh_key_path,
+            ssh_user,
+            transfer_uuid,
+            volume_map,
+            state_file=state_file,
+            log_file=log_file,
+            timeout=timeout,
+        )
+        result["volumes_left"] = failure_cleanup.delete_migrated_volumes()
+    except Exception as err:  # pylint: disable=broad-except
+        result["volumes_left"] = sorted(mapping["dest_id"] for mapping in volume_map.values())
+        result["msg"] = "The destination cleanup gave up: %s" % err
 
     module.exit_json(**result)
 

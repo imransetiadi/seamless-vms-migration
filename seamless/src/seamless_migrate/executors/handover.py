@@ -13,10 +13,13 @@ No data is copied in either direction.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import operator
 import os
 import tempfile
+import time
 from collections.abc import Callable, Collection
 from datetime import datetime
 from pathlib import Path
@@ -25,10 +28,11 @@ from typing import Any, TypeVar
 from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import Strategy
-from ..domain.models import Mappings, Plan, Provider, utcnow
+from ..domain.models import Mappings, Plan, Provider, VMRef, utcnow
 from ..planning.ipam import address_refusal, requested_ips
 from ..planning.networks import policy_profile_of, port_refusal_at_run
 from ..providers.base import microversion_text
+from ..providers.registry import connection_fingerprint
 from ..storage import (
     StorageError,
     manage_reference,
@@ -37,7 +41,14 @@ from ..storage import (
     storage_family,
 )
 from .ansible import classify_failure, effective_mappings, run_dir
-from .base import PermanentStepError, StepContext, StepName, StepResult, outlive_cancel
+from .base import (
+    PermanentStepError,
+    StepContext,
+    StepName,
+    StepResult,
+    TransientStepError,
+    outlive_cancel,
+)
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -52,6 +63,18 @@ OTHER_ROOT_DEVICES = ("/dev/sda", "/dev/hda", "/dev/xvda")
 KEEP_MICROVERSION = "2.85"
 
 
+#: the answers a retry may outlive - a gateway or a service down for a moment (SDD §7.3)
+TRANSIENT_STATUS = frozenset({502, 503, 504})
+
+
+class HttpAnswerError(RuntimeError):
+    """An error answer to a raw call, with its status - as openstacksdk's HttpException has it."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def _checked(response: Any, what: str) -> Any:
     """Raise for an error answer: openstacksdk's raw Proxy calls (post/put/get) do not
     (``Proxy.request(raise_exc=False)``), so a refusal would otherwise pass silently."""
@@ -59,8 +82,38 @@ def _checked(response: Any, what: str) -> Any:
     if status >= 400:
         detail = redact_cut(str(getattr(response, "text", "") or "").strip(), 300)
         detail = detail.replace("\n", " ")
-        raise RuntimeError(f"{what}: HTTP {status}: {detail}")
+        raise HttpAnswerError(f"{what}: HTTP {status}: {detail}", status)
     return response
+
+
+def _failure_kind(exc: Exception) -> type[Exception]:
+    """Retried or not by the error itself (SDD §7.3): an answer of 502, 503 or 504 - openstacksdk's
+    HttpException, keystoneauth's HTTP error, a raw call's - and keystoneauth's retriable
+    connection failures (a connect timeout, a connection that failed) are transient, as the SDK
+    and keystoneauth word them; any other error by its own text (audit EX-12). The error is read
+    with those it was raised from or while handling, as Python chains them, the first answer
+    deciding: keystoneauth's DiscoveryFailure carries a Keystone a first sign-in could not reach
+    (review RV26-05)."""
+    try:
+        from keystoneauth1.exceptions import RetriableConnectionFailure
+    except ImportError:  # without openstacksdk no keystoneauth error can arise
+        RetriableConnectionFailure = ()  # noqa: N806
+    link: BaseException | None = exc
+    seen: set[int] = set()
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        status = getattr(link, "status_code", None) or getattr(link, "http_status", None)
+        if status is not None:  # an answer came: it decides
+            return TransientStepError if status in TRANSIENT_STATUS else classify_failure(str(exc))
+        if isinstance(link, RetriableConnectionFailure):
+            return TransientStepError
+        # the error it was raised from, else the one it was raised while handling - unless its
+        # author cut the chain (``raise ... from None``), as Python's traceback shows it
+        if link.__cause__ is not None:
+            link = link.__cause__
+        else:
+            link = None if link.__suppress_context__ else link.__context__
+    return classify_failure(str(exc))
 
 
 def _microversion(value: Any) -> tuple[int, int]:
@@ -208,6 +261,116 @@ async def _in_thread(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     return await outlive_cancel(asyncio.to_thread(fn, *args, **kwargs))
 
 
+def _stopping(server: Any) -> bool:
+    """Nova powers the server off: its task state while a stop runs, the status still ACTIVE."""
+    return str(_attr(server, "task_state") or "").lower() == "powering-off"
+
+
+def _powering(server: Any) -> bool:
+    """Nova powers the server off or on: its task state while a stop runs (the status still
+    ACTIVE) or a start runs (the status still SHUTOFF); it refuses a stop or a start meanwhile."""
+    return str(_attr(server, "task_state") or "").lower() in ("powering-off", "powering-on")
+
+
+def _starting(server: Any) -> bool:
+    """Nova powers the server on: its task state while a start runs, the status still SHUTOFF."""
+    return str(_attr(server, "task_state") or "").lower() == "powering-on"
+
+
+def _stopped(server: Any) -> bool:
+    return str(_attr(server, "status", "")).upper() == "SHUTOFF"
+
+
+def _active(server: Any) -> bool:
+    return str(_attr(server, "status", "")).upper() == "ACTIVE"
+
+
+def _reached_by_deletion(journal: _Journal, server: Any) -> bool:
+    """Whether step 4's deletion reached the source (SDD §7.3, reviews RV34B-02, RV35B-01): Nova
+    accepted it and the server does not read ACTIVE; Nova reads it as being deleted, whatever the
+    journal holds; or it is in ERROR once the deletion was tried - Nova may take a deletion whose
+    answer is an error, a 500 once it saved the deleting state, or is lost while the compute host
+    fails it. Nova starts no such server, and its deletion honours delete_on_termination."""
+    if str(_attr(server, "task_state") or "").lower() == "deleting":
+        return True
+    if journal.done("sent:delete_source"):
+        return not _active(server)
+    return journal.done("try:delete_source") and (
+        str(_attr(server, "status", "")).upper() == "ERROR"
+    )
+
+
+def _conflict(exc: BaseException) -> bool:
+    """Nova's or Cinder's 409: the action is refused in the resource's present state."""
+    return (getattr(exc, "status_code", None) or getattr(exc, "http_status", None)) == 409
+
+
+def _backend_specs(extra_specs: dict[str, Any]) -> list[str | None]:
+    """Every spec of a Cinder volume type on the backend's name - ``volume_backend_name``, also
+    scoped ``capabilities:`` - as the scheduler's CapabilitiesFilter matches each of them: an
+    empty or null one too, which no backend's name satisfies (review RV28-02)."""
+    return [
+        None if extra_specs[key] is None else str(extra_specs[key])
+        for key in ("volume_backend_name", "capabilities:volume_backend_name")
+        if key in extra_specs
+    ]
+
+
+def _boolean(text: Any) -> bool:
+    """A word read as a boolean, as oslo.utils' ``bool_from_string`` reads it (not strict)."""
+    if isinstance(text, bool):
+        return text
+    return str(text).strip().lower() in ("1", "t", "true", "on", "y", "yes")
+
+
+#: the comparison each operator word of a Cinder extra spec names (the scheduler's
+#: extra_specs_ops, SDD §7.3 step 0): a capability's value first, the spec's word second
+_SPEC_OPERATORS: dict[str, Callable[[Any, str], bool]] = {
+    "=": lambda value, word: float(value) >= float(word),
+    "==": lambda value, word: float(value) == float(word),
+    "!=": lambda value, word: float(value) != float(word),
+    ">=": lambda value, word: float(value) >= float(word),
+    "<=": lambda value, word: float(value) <= float(word),
+    "s==": operator.eq,
+    "s!=": operator.ne,
+    "s<": operator.lt,
+    "s<=": operator.le,
+    "s>": operator.gt,
+    "s>=": operator.ge,
+    "<in>": lambda value, word: word in value,
+    "<is>": lambda value, word: _boolean(value) is _boolean(word),
+}
+
+
+def cinder_spec_matches(value: Any, spec: str | None) -> bool:
+    """Whether a backend capability ``value`` satisfies the extra spec ``spec`` as Cinder's
+    scheduler decides it (CapabilitiesFilter, extra_specs_ops; SDD §7.3 step 0, review RV26-08):
+    a spec that starts with an operator word is that comparison with the word after it - ``<or>``
+    with each alternative, every other word after it - and any other spec the value itself."""
+    if spec is None:
+        return value is None
+    words = spec.split()
+    first = words[0] if words else ""
+    compare = _SPEC_OPERATORS.get(first)
+    if first != "<or>" and compare is None:
+        return bool(value == spec)
+    if value is None:
+        return False
+    if first == "<or>":
+        return value in words[1::2]
+    try:
+        return len(words) > 1 and bool(compare(value, words[1]))  # type: ignore[misc]
+    except (ValueError, TypeError):  # a number operator on what is no number
+        return False
+
+
+def _recreated_vm(vm: VMRef, server_id: str, new_ids: dict[str, str]) -> dict[str, Any]:
+    """``vm`` as the rollback recreated it: the new server's id, each disk managed back by its new
+    volume id (SDD §7.3)."""
+    disks = [d.model_copy(update={"id": new_ids.get(d.id, d.id)}) for d in vm.disks]
+    return vm.model_copy(update={"source_id": server_id, "disks": disks}).model_dump(mode="json")
+
+
 class _Journal:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -221,6 +384,15 @@ class _Journal:
 
     def get(self, key: str) -> dict[str, Any]:
         return self.data["done"].get(key) or {}
+
+    def last(self, key: str) -> int:
+        """Where the key's last mark stands in the journal's order; -1 when never marked: a step
+        and its undo tell which came last (SDD §7.3, review RV33-01)."""
+        order = self.data["order"]
+        for index in range(len(order) - 1, -1, -1):
+            if order[index] == key:
+                return index
+        return -1
 
     def mark(self, key: str, **info: Any) -> None:
         self.data["done"][key] = {"at": utcnow().isoformat(), **info}
@@ -246,7 +418,9 @@ class HandoverExecutor:
     ) -> None:
         self.settings = settings
         self._conn_factory = conn_factory or self._default_conn
-        self._conns: dict[str, Any] = {}
+        #: per provider id: the fingerprint a connection was built for, and the connection
+        self._conns: dict[str, tuple[str, Any]] = {}
+        self._conns_lock = asyncio.Lock()
         self.poll_s = poll_s
         self.wait_s = wait_s
 
@@ -265,9 +439,20 @@ class HandoverExecutor:
         return run_dir(self.settings, ctx.plan.id, ctx.migration.id)
 
     async def _conn(self, provider: Provider) -> Any:
-        if provider.id not in self._conns:
-            self._conns[provider.id] = await _in_thread(self._conn_factory, provider)
-        return self._conns[provider.id]
+        """The provider's connection, built again once how it is reached changed - a credential
+        rotated while a plan runs (SDD §13.3) - as the provider registry does (audit EX-14)."""
+        fingerprint = connection_fingerprint(provider, self.settings)
+        async with self._conns_lock:
+            cached = self._conns.get(provider.id)
+            if cached is not None and cached[0] == fingerprint:
+                return cached[1]
+            conn = await _in_thread(self._conn_factory, provider)
+            self._conns[provider.id] = (fingerprint, conn)
+        close = getattr(cached[1], "close", None) if cached is not None else None
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()  # the replaced connection must not keep its session
+        return conn
 
     async def _call(self, what: str, fn: Callable[[], T]) -> T:
         try:
@@ -278,7 +463,7 @@ class HandoverExecutor:
             message = f"{what}: {exc}"
             # retried or not by the error alone: the label names the destination provider, whose
             # name could hold a transient pattern ("... Timeout DC", review RV20-12)
-            raise classify_failure(str(exc))(message) from exc
+            raise _failure_kind(exc)(message) from exc
 
     async def run(self, step: StepName, ctx: StepContext) -> StepResult:
         step = StepName(step)
@@ -372,7 +557,9 @@ class HandoverExecutor:
         try:
             pools = list(conn.block_storage.backend_pools())
         except Exception as exc:
-            raise PermanentStepError(
+            # read as any call: a 503, a connection failure, the sign-in's blip is retried - at
+            # step 2 the source has stopped (SDD §7.3, review RV27-05)
+            raise _failure_kind(exc)(
                 f"cannot read the Cinder pools of {where} (scheduler-stats/get_pools, admin): "
                 f"{exc}; the manage reference depends on the driver family (SDD §7.3.1)"
             ) from exc
@@ -452,6 +639,14 @@ class HandoverExecutor:
             problems.extend(
                 self._lookup_problems(dst, definition, mappings or plan.mappings, cloud)
             )
+        local = self._local_disks(src.compute.get_server(server_id))
+        if local:
+            # validation rules a handover out for them, but a resize since then shows only here
+            problems.append(
+                "the server has " + ", ".join(local) + " on its hypervisor, which deleting it at "
+                "step 4 would lose: a storage handover moves Cinder volumes only - validate the "
+                "plan again for a cold or warm migration"
+            )
         if attachments and not any(a["boot"] for a in attachments):
             # the destination server could not be created, nor the source again on rollback
             problems.append(
@@ -468,15 +663,25 @@ class HandoverExecutor:
         if missing:
             problems.append(f"no handover backend for volume type(s): {missing}")
         src_pools: dict[str, dict[str, Any]] | None = None
+        dst_pools: dict[str, dict[str, Any]] = {}
         dst_backends: list[dict[str, Any]] = []
         try:
             src_pools = self._pools(src, "the source")
+            dst_pools = self._pools(dst, cloud)
             dst_backends = [
-                {"pool": name, "family": storage_family(caps)}
-                for name, caps in self._pools(dst, cloud).items()
+                {"pool": name, "family": storage_family(caps)} for name, caps in dst_pools.items()
             ]
         except PermanentStepError as exc:
             problems.append(str(exc))
+        # the backend each destination volume type asks for (step 6's manage, audit EX-10)
+        type_backends = (
+            {
+                str(_attr(t, "name")): _backend_specs(_attr(t, "extra_specs", default={}) or {})
+                for t in dst.block_storage.types()
+            }
+            if plan is not None
+            else {}
+        )
         volumes: list[dict[str, Any]] = []
         for att in attachments:
             vid, host = att["volume_id"], att.get("host")
@@ -506,10 +711,28 @@ class HandoverExecutor:
                         entry["reference"] = manage_reference(
                             family, split_host(dst_host)[1], f"volume-{vid}"
                         )
+                        if plan is not None:
+                            vtype = (mappings or plan.mappings).volume_types.get(
+                                att["volume_type"] or "", att["volume_type"]
+                            )
+                            have = (dst_pools.get(dst_host) or {}).get("volume_backend_name")
+                            refusing = [
+                                spec
+                                for spec in type_backends.get(vtype or "") or []
+                                if not cinder_spec_matches(have, spec)
+                            ]
+                            if have and refusing:
+                                problems.append(
+                                    f"volume {vid}: {cloud}'s volume type {vtype!r} asks for the "
+                                    f"backend {refusing[0]!r}, but step 6 manages the volume on "
+                                    f"{dst_host}, whose backend is {have!r}: Cinder's scheduler "
+                                    "would refuse it - map the volume type to a type of that "
+                                    "backend, or its backend to the type's"
+                                )
                     except StorageError as exc:
                         problems.append(f"volume {vid}: {exc}")
             volumes.append(entry)
-        problems.extend(self._unmanage_blockers(src, attachments))
+        problems.extend(self._unmanage_blockers(src, attachments, server_id))
         return {"server_id": server_id, "volumes": volumes, "problems": problems}
 
     async def readiness(
@@ -540,6 +763,22 @@ class HandoverExecutor:
                 destination.capabilities.get("roles"),
             ),
         )
+
+    @staticmethod
+    def _local_disks(server: Any) -> list[str]:
+        """The server's disks on its hypervisor, read as the inventory reads them (SDD §4.2): a
+        root disk from an image, the ephemeral (GiB) and swap (MiB) disks of the flavor Nova embeds
+        - from compute 2.47 on; a source without 2.85 is refused anyway (review RV26-09)."""
+        flavor = _attr(server, "flavor", default={}) or {}
+        ephemeral, swap = _attr(flavor, "ephemeral"), _attr(flavor, "swap")
+        disks = []
+        if _attr(_attr(server, "image", default={}) or {}, "id"):
+            disks.append("a root disk from an image")
+        if int(ephemeral or 0) > 0:
+            disks.append(f"an ephemeral disk of {int(ephemeral)} GiB")
+        if int(swap or 0) > 0:
+            disks.append(f"a swap disk of {int(swap)} MiB")
+        return disks
 
     @staticmethod
     def _port_problems(
@@ -685,12 +924,15 @@ class HandoverExecutor:
         return problems
 
     @staticmethod
-    def _unmanage_blockers(src: Any, attachments: list[dict[str, Any]]) -> list[str]:
-        """What would make step 3 or 5 fail, found while the VM still runs (§7.3 step 0).
+    def _unmanage_blockers(
+        src: Any, attachments: list[dict[str, Any]], server_id: str
+    ) -> list[str]:
+        """What would make step 3, 4 or 5 fail, found while the VM still runs (§7.3 step 0).
 
         Cinder refuses to unmanage encrypted volumes, volumes with snapshots and volumes in a
         group (``volume.api.API.delete(unmanage_only=True)``, Wallaby and later); keeping a volume
-        when its server is deleted needs compute microversion 2.85.
+        when its server is deleted needs compute microversion 2.85; a volume another server holds
+        too never becomes available when the source server is deleted (audit EX-09).
         """
         problems: list[str] = []
         version = _attr(src.compute.get_endpoint_data(), "max_microversion")
@@ -707,6 +949,19 @@ class HandoverExecutor:
                 problems.append(f"volume {vid} is encrypted: Cinder cannot unmanage it")
             if _attr(volume, "group_id") or _attr(volume, "consistency_group_id"):
                 problems.append(f"volume {vid} belongs to a group: remove it from the group first")
+            holders = sorted(
+                {
+                    str(_attr(a, "server_id") or "an attachment without a server")
+                    for a in _attr(volume, "attachments") or []
+                    if _attr(a, "server_id") != server_id
+                }
+            )
+            if holders:
+                problems.append(
+                    f"volume {vid} is attached to another server too ({', '.join(holders)}): it "
+                    "would never become available once the source server is deleted - detach it "
+                    "there first"
+                )
             snapshots = len(
                 list(src.block_storage.snapshots(details=False, all_projects=True, volume_id=vid))
             )
@@ -738,6 +993,17 @@ class HandoverExecutor:
             raise PermanentStepError(
                 f"Nova did not set delete_on_termination={value} on {volume_id} "
                 f"(it reports {shown.get('delete_on_termination')!r})"
+            )
+
+    def _wait_available(self, conn: Any, volume_ids: list[str]) -> None:
+        """Wait until each volume is available: Nova builds a server only on available ones."""
+        for volume_id in volume_ids:
+            conn.block_storage.wait_for_status(
+                conn.block_storage.get_volume(volume_id),
+                status="available",
+                failures=["error"],
+                interval=self.poll_s,
+                wait=self.wait_s,
             )
 
     @staticmethod
@@ -815,11 +1081,11 @@ class HandoverExecutor:
         return str(volume_id)
 
     @staticmethod
-    def _bdm(
-        attachments: list[dict[str, Any]], ids: dict[str, str], keep_original: bool = False
-    ) -> list[dict[str, Any]]:
-        """Block-device mapping in device order; the destination never deletes its volumes, a
-        recreated source keeps the journaled delete_on_termination."""
+    def _bdm(attachments: list[dict[str, Any]], ids: dict[str, str]) -> list[dict[str, Any]]:
+        """Block-device mapping in device order, every volume kept: the destination never deletes
+        its volumes, and a build Nova aborts deletes those flagged delete_on_termination - a
+        recreated source gets its journaled flags back only once it runs (SDD §7.3, review
+        RV35B-04)."""
         ordered = sorted(attachments, key=lambda a: (not a["boot"], a["device"] or ""))
         return [
             {
@@ -827,9 +1093,7 @@ class HandoverExecutor:
                 "uuid": ids[a["volume_id"]],
                 "source_type": "volume",
                 "destination_type": "volume",
-                "delete_on_termination": bool(a.get("delete_on_termination"))
-                if keep_original
-                else False,
+                "delete_on_termination": False,
             }
             for a in ordered
         ]
@@ -1036,25 +1300,98 @@ class HandoverExecutor:
                     "storage handover refused: " + "; ".join(report["problems"])
                 )
 
+        def settle(server: Any) -> Any:
+            """The server once a start Nova runs ended: a rollback's, its wait cut off, reads
+            SHUTOFF until the guest runs, and Nova refuses a stop meanwhile (SDD §7.3 step 1,
+            review RV33-02)."""
+            deadline = time.monotonic() + self.wait_s
+            while _starting(server):
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"Timeout waiting for the start of server {server_id} to end"
+                    )
+                time.sleep(self.poll_s or 0.1)
+                server = src.compute.get_server(server_id)
+            return server
+
+        def stop(server: Any, again: bool = False) -> None:
+            server = settle(server)
+            if not _stopped(server):
+                # a stop that runs - the one a retry finds, the server reading ACTIVE until the
+                # guest is down - is waited for: Nova refuses a second (409), as it refuses a stop
+                # of a server another stop ended meanwhile (RV27-03)
+                if not _stopping(server):
+                    try:
+                        src.compute.stop_server(server)
+                    except Exception as exc:
+                        if not _conflict(exc):
+                            raise
+                        again_read = src.compute.get_server(server_id)
+                        if not (_stopping(again_read) or _stopped(again_read)):
+                            raise
+                # Nova accepted a stop: should the wait fail, a rollback starts the source; the
+                # first one's time stays, the clock's start (SDD §7.3 step 1) - a re-stop's is the
+                # start of a new outage (review RV33-04)
+                if not journal.done("sent:stop_source"):
+                    journal.mark("sent:stop_source")
+                if again:
+                    journal.mark("sent:restop_source")
+            src.compute.wait_for_server(
+                server, status="SHUTOFF", interval=self.poll_s, wait=self.wait_s
+            )
+
+        def to_stop_again() -> Any:
+            # resumed past the stop: a rollback's start Nova performed while its wait failed -
+            # which journals nothing - or an operator's start runs the source again, and a later
+            # step deletes it; a source already gone was deleted by the attempt before, which
+            # failed before it journaled that (SDD §7.3 step 1, review 31)
+            server = _existing_server(src, server_id)
+            if server is None:
+                return None
+            if _reached_by_deletion(journal, server):
+                # Nova starts no server it deletes or that a failed deletion left in ERROR, and
+                # its stop of one never reads SHUTOFF - step 4 sends the deletion again (reviews
+                # RV33-03, RV35B-01)
+                return None
+            return settle(server)
+
+        restopping = False
+        restops_before = journal.last("sent:restop_source")
         try:
             if not journal.done("stop_source"):
-
-                def stop() -> None:
-                    server = src.compute.get_server(server_id)
-                    if str(_attr(server, "status", "")).upper() != "SHUTOFF":
-                        src.compute.stop_server(server)
-                        # Nova accepted it: should the wait fail, a rollback starts the source
-                        journal.mark("sent:stop_source")
-                    src.compute.wait_for_server(
-                        server, status="SHUTOFF", interval=self.poll_s, wait=self.wait_s
-                    )
-
-                await self._call("stop source server", stop)
+                server = await self._call(
+                    "stop source server", lambda: settle(src.compute.get_server(server_id))
+                )
+                if journal.done("sent:stop_source") and _active(server) and not _stopping(server):
+                    # only the first stop was journaled as sent, its wait failed or cut off: a
+                    # rollback's start Nova performed, or an operator's, ran the source since -
+                    # that outage ended and this stop opens a new one (SDD §5.2, §7.3 step 1,
+                    # review RV34B-04) - marked first: a close that fails never reopens the clock
+                    # at the first stop (review RV35B-03)
+                    restopping = True
+                    await outlive_cancel(ctx.mark_downtime_end())
+                    await self._call("stop source server", lambda: stop(server, again=True))
+                else:
+                    await self._call("stop source server", lambda: stop(server))
                 await _in_thread(journal.mark, "stop_source")
+            elif not journal.done("delete_source"):
+                server = await self._call("stop source server", to_stop_again)
+                if server is not None and not _stopped(server):
+                    # it ran since the first stop: that outage ended - the clock closes - and this
+                    # stop opens a new one (SDD §5.2, §7.3 step 1, reviews RV33-04, RV35B-03)
+                    restopping = True
+                    await outlive_cancel(ctx.mark_downtime_end())
+                    await self._call("stop source server", lambda: stop(server, again=True))
         except (Exception, asyncio.CancelledError):
             # SDD §7.3 step 1: the stop Nova accepted may have stopped the source - the clock opens
-            # at its request, so the rollback starts the source again and a cancel is refused
-            sent = journal.get("sent:stop_source")
+            # at its request, so the rollback starts the source again and a cancel is refused; a
+            # re-stop opens the new outage only once Nova accepted it (refused, the source runs)
+            if not restopping:
+                sent = journal.get("sent:stop_source")
+            elif journal.last("sent:restop_source") > restops_before:
+                sent = journal.get("sent:restop_source")
+            else:
+                sent = {}
             if sent:
                 at = datetime.fromisoformat(sent["at"])
                 await outlive_cancel(ctx.mark_downtime_start(at=at))
@@ -1082,18 +1419,30 @@ class HandoverExecutor:
         attachments: list[dict[str, Any]] = definition["attachments"]
 
         # step 3: keep every volume when the server is deleted (runs journaled before this order
-        # had detached and unmanaged volumes already: nothing to keep for those)
+        # had detached and unmanaged volumes already: nothing to keep for those). A rollback
+        # attempt since the last keep may have given delete_on_termination back - even with its
+        # answer lost: kept again while the source server exists (SDD §7.3 step 3, RV33-01)
+        exists: list[bool] = []  # read once, for the first volume a rollback attempt followed
         for att in attachments:
             vid = att["volume_id"]
             if journal.done(f"detach:{vid}") or journal.done(f"unmanage_src:{vid}"):
                 continue
             key = f"keep:{vid}"
-            if not journal.done(key):
-                await self._call(
-                    f"keep {vid} when the source server is deleted",
-                    lambda v=vid: self._set_delete_on_termination(src, server_id, v, False),
-                )
-                await _in_thread(journal.mark, key)
+            if journal.done(key):
+                if journal.done("delete_source") or journal.last(key) > journal.last("rb:attempt"):
+                    continue
+                if not exists:
+                    found = await self._call(
+                        "read the source server", lambda: _existing_server(src, server_id)
+                    )
+                    exists.append(found is not None)
+                if not exists[0]:
+                    continue  # gone: Nova settled its volumes with it
+            await self._call(
+                f"keep {vid} when the source server is deleted",
+                lambda v=vid: self._set_delete_on_termination(src, server_id, v, False),
+            )
+            await _in_thread(journal.mark, key)
 
         # step 4: delete the source server; its volumes become available
         if not journal.done("delete_source"):
@@ -1101,7 +1450,14 @@ class HandoverExecutor:
             def delete_source() -> None:
                 server = _existing_server(src, server_id)
                 if server is not None:
+                    # tried first: Nova may take the deletion while its answer is an error or
+                    # lost, which journals nothing as sent (SDD §7.3, review RV35B-01)
+                    if not journal.done("try:delete_source"):
+                        journal.mark("try:delete_source")
                     src.compute.delete_server(server, ignore_missing=True)
+                    # Nova accepted it: a retry stops no server Nova deletes (step 1, RV33-03)
+                    if not journal.done("sent:delete_source"):
+                        journal.mark("sent:delete_source")
                     src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
                 for att in attachments:
                     if journal.done(f"unmanage_src:{att['volume_id']}"):
@@ -1217,7 +1573,15 @@ class HandoverExecutor:
         server_id = ctx.migration.vm.source_id
         definition_path = rdir / DEFINITION_FILE
         if not journal.data["order"]:
+            # a rollback that archived its journal before the migration recorded what it did - a
+            # stop or a failed save in between - reports the VM it recreated again (audit EX-04)
+            recreated = await _in_thread(self._archived_outcome, rdir, ctx.migration.vm)
+            if recreated is not None:
+                return StepResult(details={"source_running": True, "vm": recreated})
             return StepResult(details={"source_running": True, "note": "nothing to roll back"})
+        # before its first call: a cutover resumed after this attempt keeps the volumes again, as
+        # it may give delete_on_termination back with Nova's answer lost (SDD §7.3, RV33-01)
+        await _in_thread(journal.mark, "rb:attempt")
         if not await _in_thread(definition_path.exists):
             # stopped but nothing else happened yet: just start the source again
             if not journal.done("rb:start_source"):
@@ -1340,9 +1704,16 @@ class HandoverExecutor:
                 await _in_thread(journal.mark, meta_key)
 
         any_unmanaged = any(journal.done(f"unmanage_src:{a['volume_id']}") for a in attachments)
-        source_gone = journal.done("delete_source") or (
-            await _in_thread(_existing_server, src, server_id) is None
-        )
+        source_gone = journal.done("delete_source")
+        if not source_gone:
+            found = await self._call(
+                "read the source server", lambda: _existing_server(src, server_id)
+            )
+            # step 4's deletion reached it - accepted, or taken with an error or a lost answer:
+            # Nova starts no such server, and a deletion it finishes honours the
+            # delete_on_termination it finds - recreated as one gone (SDD §7.3 rollback, reviews
+            # RV34B-02, RV35B-01)
+            source_gone = found is None or _reached_by_deletion(journal, found)
         new_server_id = server_id
         if any_unmanaged or source_gone:
             if not journal.done("delete_source") and not journal.done("rb:delete_stale_source"):
@@ -1352,10 +1723,28 @@ class HandoverExecutor:
                     if server is not None:
                         src.compute.delete_server(server, ignore_missing=True)
                         src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
+                    # the volumes it held, never unmanaged, carry the recreated server: Nova takes
+                    # only an available one, as after step 4 (review RV34B-02)
+                    self._wait_available(src, [v for k, v in new_ids.items() if k == v])
 
                 await self._call("delete the stale source server", delete_stale)
                 await _in_thread(journal.mark, "rb:delete_stale_source")
             if not journal.done("rb:create_source"):
+
+                def delete_failed_build() -> None:
+                    sent = journal.get("sent:rb:create_source")
+                    server = _existing_server(src, sent["server_id"]) if sent else None
+                    if server is None or str(_attr(server, "status", "")).upper() != "ERROR":
+                        return
+                    # a build Nova failed: deleted, its volumes kept, and created again below
+                    # (SDD §7.3 rollback, review RV35B-04)
+                    src.compute.delete_server(server, ignore_missing=True)
+                    src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
+                    self._wait_available(src, list(new_ids.values()))
+
+                await self._call(
+                    "delete the source server Nova failed to build", delete_failed_build
+                )
                 networks = await self._call(
                     "recreate the source ports",
                     lambda: self._source_ports(src, definition["networks"], journal),
@@ -1367,22 +1756,37 @@ class HandoverExecutor:
                         definition,
                         definition["flavor"],
                         networks,
-                        self._bdm(attachments, new_ids, keep_original=True),
+                        self._bdm(attachments, new_ids),
                         journal,
                         "sent:rb:create_source",
                     ),
                 )
                 await _in_thread(journal.mark, "rb:create_source", server_id=created)
             new_server_id = journal.get("rb:create_source")["server_id"]
+            # each volume's journaled delete_on_termination, once the recreated server runs: kept
+            # while Nova built it (SDD §7.3 rollback, review RV35B-04)
+            for att in attachments:
+                key = f"rb:created_dot:{att['volume_id']}"
+                if att.get("delete_on_termination") is True and not journal.done(key):
+                    volume_id = new_ids[att["volume_id"]]
+                    await self._call(
+                        f"restore delete_on_termination of {volume_id}",
+                        lambda v=volume_id, s=new_server_id: self._set_delete_on_termination(
+                            src, s, v, True
+                        ),
+                    )
+                    await _in_thread(journal.mark, key)
         else:
             # the server still exists: give back the delete_on_termination step 3 changed
             for att in attachments:
                 vid = att["volume_id"]
                 key = f"rb:dot:{vid}"
+                # given back unless done since its last keep - a cutover resumed after an earlier
+                # attempt keeps it again (SDD §7.3 rollback, review RV33-01)
                 if (
                     journal.done(f"keep:{vid}")
                     and att.get("delete_on_termination") is True
-                    and not journal.done(key)
+                    and journal.last(f"keep:{vid}") > journal.last(key)
                 ):
                     await self._call(
                         f"restore delete_on_termination of {vid}",
@@ -1405,16 +1809,46 @@ class HandoverExecutor:
 
         details: dict[str, Any] = {"source_running": True}
         if new_server_id != server_id or any(k != v for k, v in new_ids.items()):
-            vm = ctx.migration.vm
-            disks = [d.model_copy(update={"id": new_ids.get(d.id, d.id)}) for d in vm.disks]
-            details["vm"] = vm.model_copy(
-                update={"source_id": new_server_id, "disks": disks}
-            ).model_dump(mode="json")
+            details["vm"] = _recreated_vm(ctx.migration.vm, new_server_id, new_ids)
         await _in_thread(journal.archive, "rolled-back")
         return StepResult(details=details)
 
+    @staticmethod
+    def _archived_outcome(rdir: Path, vm: VMRef) -> dict[str, Any] | None:
+        """The VM the newest archived rollback recreated, while the migration still names the
+        server that rollback replaced (the one its definition recorded, SDD §7.3); None once the
+        migration follows it, or when no rollback recreated one."""
+        definition_path = rdir / DEFINITION_FILE
+        archives = sorted(rdir.glob("handover-journal.rolled-back-*.json"))
+        if not archives or not definition_path.exists():
+            return None
+        definition = _read_json(definition_path)
+        done = _read_json(archives[-1]).get("done") or {}
+        created = done.get("rb:create_source")
+        if definition.get("server_id") != vm.source_id or not created:
+            return None
+        new_ids = {
+            a["volume_id"]: str(done.get(f"rb:manage_src:{a['volume_id']}", {}).get("volume_id"))
+            for a in definition["attachments"]
+            if f"rb:manage_src:{a['volume_id']}" in done
+        }
+        return _recreated_vm(vm, str(created["server_id"]), new_ids)
+
     def _start(self, conn: Any, server_id: str) -> None:
         server = conn.compute.get_server(server_id)
+        deadline = time.monotonic() + self.wait_s
+        while _powering(server):
+            # Nova still powers the guest off - the server reads ACTIVE until it is down - or on
+            # - it reads SHUTOFF until it runs (an earlier attempt's start) -, and refuses a start
+            # meanwhile. Wait until that ended - SHUTOFF, or ACTIVE again when Nova gave the
+            # power-off up, ACTIVE once it booted - then start it unless it runs (RV26-01,
+            # RV27-04, RV29-06)
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Timeout waiting for the stop or start of server {server_id} to end"
+                )
+            time.sleep(self.poll_s or 0.1)
+            server = conn.compute.get_server(server_id)
         if str(_attr(server, "status", "")).upper() != "ACTIVE":
             conn.compute.start_server(server)
         conn.compute.wait_for_server(

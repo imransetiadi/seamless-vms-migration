@@ -35,6 +35,9 @@ class StepContext:
     #: ``await mark_downtime_start()`` or ``mark_downtime_start(at=<datetime>)`` when the
     #: executor learned the exact moment the source stopped (idempotent: first call wins)
     mark_downtime_start: Callable[..., Awaitable[None]]
+    #: ``await mark_downtime_end()`` once the source runs again - a rollback's power-on: the clock
+    #: closes then, not when the whole step succeeds (SDD §5.2; idempotent)
+    mark_downtime_end: Callable[[], Awaitable[None]]
     log: Callable[[str], Awaitable[None]]
     #: step options, e.g. ``{"delete_source": True}`` for FINALIZE (extension of SDD §7.1)
     options: dict[str, Any] = field(default_factory=dict)
@@ -87,8 +90,11 @@ async def outlive_cancel(work: Awaitable[T]) -> T:
 class Executor(Protocol):
     name: str
 
-    def supports(self, strategy: Strategy) -> bool: ...
+    def supports(self, strategy: Strategy) -> bool:
+        """Whether this executor runs the strategy."""
 
-    async def prestage(self, plan: Plan, source: Provider, destination: Provider) -> None: ...
+    async def prestage(self, plan: Plan, source: Provider, destination: Provider) -> None:
+        """Prestage the plan's resources in the destination before its migrations (SDD §7.1)."""
 
-    async def run(self, step: StepName, ctx: StepContext) -> StepResult: ...
+    async def run(self, step: StepName, ctx: StepContext) -> StepResult:
+        """Run one step of a migration (SDD §7.1)."""

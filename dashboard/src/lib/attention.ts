@@ -86,6 +86,16 @@ export function attentionItems(
         nextAction: 'Roll back to restart the source, or retry (operator)',
         rank: 0,
       };
+    } else if (m.phase === 'failed' && m.downtime_started_at && m.error?.startsWith('rollback: ')) {
+      // nothing the migration records tells whether its failed rollback started the source: it may still be stopped
+      // (SDD §5.2, §16, review RV34B-03)
+      item = {
+        migration: m,
+        tone: 'danger',
+        reason: `Failed: ${m.error}`,
+        nextAction: 'Check whether the source VM runs, then roll back again (operator)',
+        rank: 0,
+      };
     } else if (m.phase === 'completed' && m.source_running_at) {
       // the source watch saw it running again (SDD §8.1): what it writes no longer reaches RHOSO
       item = {
@@ -96,7 +106,14 @@ export function attentionItems(
         rank: 1,
       };
     } else if (m.phase === 'failed') {
-      item = { migration: m, tone: 'danger', reason: m.error ? `Failed: ${m.error}` : 'Failed', nextAction: 'Retry, roll back or cancel (operator)', rank: 1 };
+      // only what the migration can take: a cancel is refused once the source was stopped (SDD §5.1, §16, reviews
+      // RV32A-05, RV34B-03) - a failed rollback here never stopped its source
+      const nextAction = m.error?.startsWith('rollback: ')
+        ? 'Roll back again or cancel (operator)'
+        : m.downtime_started_at
+          ? 'Retry or roll back (operator)'
+          : 'Retry, roll back or cancel (operator)';
+      item = { migration: m, tone: 'danger', reason: m.error ? `Failed: ${m.error}` : 'Failed', nextAction, rank: 1 };
     } else if (m.review_required) {
       item = {
         migration: m,

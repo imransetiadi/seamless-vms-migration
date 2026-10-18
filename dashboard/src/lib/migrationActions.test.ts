@@ -2,7 +2,18 @@ import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import { PHASES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
 import { formatDateTime, formatDuration } from './format';
-import { approveDialog, clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, requestWaitsForApprover, uncountedReason, type MigrationActionKey } from './migrationActions';
+import {
+  approveDialog,
+  clearedByStrategyChange,
+  clearedByValidation,
+  countedApprovals,
+  migrationActions,
+  nextStep,
+  requestWaitsForApprover,
+  rollbackEffect,
+  uncountedReason,
+  type MigrationActionKey,
+} from './migrationActions';
 import { AUTH_OFF_HINT, OWN_CUTOVER, OWN_FORCE } from './roles';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
@@ -146,6 +157,63 @@ describe('migrationActions rules', () => {
     expect(cancel.enabled).toBe(false);
     expect(cancel.reason).toMatch(/roll back/i);
     expect(migrationActions(stopped, 'operator').rollback.enabled).toBe(true);
+  });
+
+  it('names no Cancel the migration cannot take, and leads a failed rollback back to the rollback (review RV32A-05)', () => {
+    const closed = { downtime_started_at: '2026-10-08T11:00:00Z', downtime_ended_at: '2026-10-08T11:20:00Z' };
+    // a VMware rollback that failed after its power-on closed the clock (SDD §5.2, RV30-03)
+    const rolled = migration('failed', { ...closed, error: 'rollback: rollback: dst: HTTP 400: Invalid volume: a snapshot depends on it' }, 'vmware_cold');
+    const step = nextStep(rolled, null);
+    expect(step.action).toBe('rollback');
+    expect(step.text).toMatch(/roll back again/i);
+    expect(step.text).not.toMatch(/cancel/i);
+    expect(migrationActions(rolled, 'operator').cancel.enabled).toBe(false);
+    // the source ran again after its stop, by no rollback: retry or roll back, never cancel
+    const ran = migration('failed', { ...closed, error: 'cutover: stop source server: HTTP 500' }, 'storage_handover');
+    expect(nextStep(ran, null).action).toBe('retry');
+    expect(nextStep(ran, null).text).not.toMatch(/cancel/i);
+    // never stopped: the cancel is offered as before
+    expect(nextStep(migration('failed', { error: 'precopy: x' }), null).text).toMatch(/or cancel/i);
+  });
+
+  it('never says a failed rollback started the source, and offers the cancel to one never stopped (review RV34B-03)', () => {
+    const closed = { downtime_started_at: '2026-10-08T11:00:00Z', downtime_ended_at: '2026-10-08T11:20:00Z' };
+    // a completed migration's rollback that failed before it started the source: its verification closed the clock
+    const verified = migration('failed', { ...closed, error: 'rollback: start the source server: HTTP 503' }, 'storage_handover');
+    const step = nextStep(verified, null);
+    expect(step.action).toBe('rollback');
+    expect(step.text).not.toMatch(/started again|runs again/i);
+    expect(step.text).toMatch(/may still be stopped/i);
+    expect(step.text).toMatch(/roll back again/i);
+    expect(migrationActions(verified, 'operator').cancel.enabled).toBe(false);
+    // the rollback of a migration never stopped failed: its source runs, and the API takes a cancel
+    const never = migration('failed', { error: 'rollback: delete the server in rhoso: HTTP 503' }, 'storage_handover');
+    const neverStep = nextStep(never, null);
+    expect(neverStep.action).toBe('rollback');
+    expect(neverStep.text).toMatch(/never stopped/i);
+    expect(neverStep.text).toMatch(/or cancel/i);
+    expect(neverStep.text).not.toMatch(/started again/i);
+    expect(migrationActions(never, 'operator').cancel.enabled).toBe(true);
+  });
+
+  it('says a storage-handover rollback deletes the destination instance before it hands the volumes back (review RV34B-05)', () => {
+    const text = rollbackEffect(migration('completed', {}, 'storage_handover'));
+    expect(text).toMatch(/^Deletes the destination instance/);
+    expect(text).toMatch(/through Neutron/i);
+    expect(text).toMatch(/back to the source cloud/i);
+    expect(text).toMatch(/new id/i);
+  });
+
+  it.each([
+    ['warm', /volumes are kept/i, null],
+    ['cold', /volumes the cold import created/i, /volumes are kept/i],
+    ['vmware_cold', /kit's volumes/i, /volumes are kept/i],
+    ['vmware_warm', /kit's volumes/i, /volumes are kept/i],
+    ['storage_handover', /back to the source cloud/i, /volumes are kept/i],
+  ] as const)('says what a rollback of a %s migration deletes (review RV32A-06)', (strategy, says, never) => {
+    const text = rollbackEffect(migration('completed', {}, strategy));
+    expect(text).toMatch(says);
+    if (never) expect(text).not.toMatch(never);
   });
 
   it('refuses Cancel in any phase while the source VM is stopped, and says what to do (SDD §5.1)', () => {

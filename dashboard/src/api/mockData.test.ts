@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import eligibilityRaw from '../../../seamless/tests/fixtures/eligibility_cases.json?raw';
 import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, makeVm, preflight, replaceNames } from './mockData';
 import { capabilityRoles } from '../lib/networks';
-import type { DestinationInventory, DestinationNetwork, Finding, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
+import type { DestinationInventory, DestinationNetwork, DestinationSubnet, Finding, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
 
 const now = Date.parse('2026-10-09T12:00:00Z');
 
@@ -633,7 +633,9 @@ interface FindingCase {
   others?: VMRef[];
   /** the source provider's kind, openstack when not given */
   source_kind?: ProviderKind;
-  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'>;
+  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'> & Partial<Pick<Plan, 'mappings' | 'prestage_resources'>>;
+  /** a network case's destination: its label, networks, subnets, the token's roles and the policy profile */
+  destination?: { label: string; networks: DestinationNetwork[]; subnets?: DestinationSubnet[]; roles?: string[]; policy_profile?: string };
   expected: Record<string, string>;
 }
 
@@ -656,7 +658,35 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
   it.each(ELIGIBILITY.finding_cases)('$why', (c) => {
     const plan = { ...base, ...c.plan } as Plan;
     const selected = [c.vm, ...(c.others ?? [])];
-    const found = preflight(c.vm, c.source_kind ?? 'openstack', plan, {}, { selected });
+    const dest = c.destination;
+    const networks = Object.fromEntries((dest?.networks ?? []).map((n) => [n.name, n.mtu]));
+    const context = dest
+      ? { selected, networkDetails: dest.networks, subnets: dest.subnets ?? [], roles: dest.roles, profile: dest.policy_profile, destination: dest.label }
+      : { selected };
+    const found = preflight(c.vm, c.source_kind ?? 'openstack', plan, networks, context);
     expect(Object.fromEntries(found.filter((f) => f.code in c.expected).map((f) => [f.code, f.message]))).toEqual(c.expected);
+  });
+
+  it("judges a VMware source's VMs by the kit's names only, once, and never two unusable names as twins, as the API (SDD §9.3, reviews RV26-04, RV28-04)", () => {
+    const plan = { ...base } as Plan;
+    const template = ELIGIBILITY.finding_cases.find((c) => c.source_kind === 'vmware')!.vm;
+    const vmOf = (source_id: string, name: string) => ({ ...template, source_id, name, project: null });
+    const judged = (vm: VMRef, others: VMRef[], kind: ProviderKind) =>
+      preflight(vm, kind, plan, {}, { selected: [vm, ...others] }).filter((f) => f.code === 'SRC_VM_DUPLICATE_NAME' || f.code === 'SRC_VM_NAME_UNUSABLE');
+    const dotted = vmOf('vm-1', 'web.01');
+    expect(judged(dotted, [vmOf('vm-2', 'web_01')], 'openstack')).toEqual([]);
+    expect(judged(vmOf('vm-3', 'サーバー'), [], 'openstack')).toEqual([]);
+    // a VM named exactly alike is a kit twin too: one finding with the kit's reason and remedy names every VM written alike
+    expect(judged(dotted, [vmOf('vm-4', 'web.01'), vmOf('vm-2', 'web_01')], 'vmware').map((f) => [f.message, f.remediation])).toEqual([
+      [
+        "Another selected VM has the name 'web_01' as the migration kit writes it (-/vm-2, -/vm-4); the kit names the VM's server, ports and volumes after it.",
+        "Rename one of the VMs in vCenter: the migration kit names a VM's server, ports and volumes after its name as it writes it, so the two would share them - in separate plans too, when they go to one destination project.",
+      ],
+    ]);
+    // an OpenStack source keeps os-migrate's reason for the same name
+    expect(judged(dotted, [vmOf('vm-4', 'web.01')], 'openstack').map((f) => f.message)).toEqual([
+      "Another selected VM is also named 'web.01' (-/vm-4); os-migrate selects workloads by name.",
+    ]);
+    expect(judged(vmOf('vm-5', 'サーバー'), [vmOf('vm-6', 'веб')], 'vmware').map((f) => f.code)).toEqual(['SRC_VM_NAME_UNUSABLE']);
   });
 });

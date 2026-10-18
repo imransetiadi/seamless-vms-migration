@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 import yaml
@@ -79,6 +80,27 @@ def load(path):
                 "destination_server_id": None}
     with open(path) as f:
         return json.load(f)
+
+
+def nova(server):
+    """Nova as upstream answers while it powers ``server`` off or on: with world "powering_off",
+    the server reads ACTIVE, task state powering-off, for that many server_info reads, then
+    SHUTOFF; with world "powering_on", SHUTOFF, task state powering-on, then ACTIVE. None for a
+    server Nova does neither to; else (reads left, counter file, reads so far, the task state,
+    the status while it runs, the status after)."""
+    for key, task, during, after in (("powering_off", "powering-off", "ACTIVE", "SHUTOFF"),
+                                     ("powering_on", "powering-on", "SHUTOFF", "ACTIVE")):
+        left = world.get(key, {}).get(server)
+        if left is not None:
+            break
+    else:
+        return None
+    path = WORLD + ".reads." + server
+    reads = 0
+    if os.path.exists(path):
+        with open(path) as f:
+            reads = int(f.read())
+    return max(left - reads, 0), path, reads, task, during, after
 
 
 def save(path, state):
@@ -192,10 +214,35 @@ elif NAME in ("import_workload_src_cleanup", "import_workload_dst_failure_cleanu
     result = {"changed": True}
 elif NAME == "server_action":
     result = {"changed": True}
+    power = nova(args["server"])
+    if power is not None and args["action"] in ("start", "stop"):
+        left, task, during, after = power[0], power[3], power[4], power[5]
+        # openstack.cloud's server_action reads the status: ACTIVE while Nova powers the server
+        # off, SHUTOFF while it powers it on - and Nova refuses an action meanwhile (409)
+        if left and (args["action"], during) in (("start", "ACTIVE"), ("stop", "SHUTOFF")):
+            result = {"changed": False}  # "already ACTIVE" / "already SHUTOFF": nothing sent
+        elif left:
+            result = {"failed": True, "msg": "ConflictException: 409: Client Error for url: "
+                      "https://nova.example.invalid/v2.1/servers/%%s/action, Cannot '%%s' "
+                      "instance while it is in task_state %%s"
+                      %% (args["server"], args["action"], task)}
+        elif (args["action"], after) in (("stop", "SHUTOFF"), ("start", "ACTIVE")):
+            result = {"changed": False}  # SHUTOFF / ACTIVE already
+    if result.get("changed"):
+        with open(WORLD + ".nova", "a") as f:
+            f.write("%%s %%s\n" %% (args["action"], args["server"]))
 elif NAME == "server_info":
     status = world.get("server_status", {}).get(args["server"], "ACTIVE")
+    task_state = None
+    power = nova(args["server"])
+    if power is not None:
+        left, path, reads, task, during, after = power
+        status, task_state = (during, task) if left else (after, None)
+        with open(path, "w") as f:
+            f.write(str(reads + 1))
     result = {"changed": False, "servers": [] if status == "MISSING" else [
-        {"id": args["server"], "name": args["server"], "status": status}]}
+        {"id": args["server"], "name": args["server"], "status": status,
+         "task_state": task_state, "access_ipv4": "10.9.9.9"}]}
 print(json.dumps(result))
 '''
 
@@ -271,6 +318,14 @@ class Env:
                 "dst": {"auth": {"auth_url": "https://dst.example.invalid:5000/v3"}},
             }}, f)
         self.world = {}
+
+    def nova_actions(self):
+        """The starts and stops Nova took (refused ones and the module's no-ops are not)."""
+        path = self.world_file + ".nova"
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return f.read().splitlines()
 
     def state(self, server_id):
         path = os.path.join(self.state_dir, server_id + ".json")
@@ -517,6 +572,29 @@ def test_cutover_rerun_finishes_a_healthy_destination_server(env):
     assert [c["args"]["server"] for c in calls if c["module"] == "server_info"] == ["dst-vm1", "dst-vm2"]
 
 
+def test_only_the_cutover_rerun_asks_create_instance_to_finish_only(env, tmp_path):
+    """SDD §6.4 (audit A-07): the re-run's call finishes the recorded server and must never create
+    one (finish_only); the first create and the cold import create the server from their block
+    device mapping, replacing a recorded server that is gone."""
+
+    def finish_only(calls):
+        return [c["args"].get("finish_only", False) for c in calls
+                if c["module"] == "import_workload_create_instance"
+                and c["args"]["data"]["params"]["name"] == "vm1"]
+
+    rc, out, first = env.run("import_workloads_cutover")
+    assert rc == 0, out
+    rc, out, rerun = env.run("import_workloads_cutover")
+    assert rc == 0, out
+    cold = Env(str(tmp_path / "cold"))
+    rc, out, cold_calls = cold.run("import_workloads", **COLD)
+    assert rc == 0, out
+
+    assert finish_only(first) == [False]
+    assert finish_only(rerun) == [True]
+    assert finish_only(cold_calls) == [False]
+
+
 def test_rollback_passes_the_destination_conversion_host(env):
     rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out
@@ -566,6 +644,132 @@ def test_a_rollback_can_leave_the_source_as_it_is(env):
     rc, out, calls = env.run("rollback_workloads", os_migrate_workloads_filter=[{"regex": "^vm2$"}])
     assert rc == 0, out
     assert modules_for(calls, "vm2", "srv-2") == ["import_workload_rollback", "server_action:start"]
+
+
+def test_a_rollback_starts_a_source_nova_still_powers_off(env):
+    """SDD 6.5, 8 (review RV26-10): Nova still powers the source off - the server reads ACTIVE,
+    task state powering-off - when the rollback comes (a cutover's stop cut off by the step
+    timeout, or one whose wait met a 503, opens the clock and starts the rollback at once).
+    server_action reads that ACTIVE as running and would start nothing, leaving the source to
+    end SHUTOFF: the rollback waits until no stop runs, then starts it."""
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+    env.world["powering_off"] = {"srv-1": 2}
+
+    rc, out, calls = env.run(
+        "rollback_workloads",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_source_stop_poll_s=0,
+    )
+
+    assert rc == 0, out
+    assert env.nova_actions() == ["start srv-1"], out
+
+
+def test_a_rollback_waits_for_a_start_nova_still_runs(env):
+    """SDD 6.5 (review RV29-06): Nova starts a server with its task state powering-on while the
+    server still reads SHUTOFF, and refuses a second start meanwhile (409). A rollback retried
+    while an earlier attempt's start still runs waits until no start runs: the source then runs,
+    and there is nothing left to start - where a start sent meanwhile failed the rollback."""
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+    env.world["powering_on"] = {"srv-1": 2}  # Nova still powers srv-1 on for two reads
+
+    rc, out, calls = env.run(
+        "rollback_workloads",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_source_stop_poll_s=0,
+    )
+
+    assert rc == 0, out
+    assert env.nova_actions() == [], out
+    assert len([c for c in calls if c["module"] == "server_info"]) == 3
+
+
+def test_each_include_of_the_settle_wait_is_named_for_what_it_waits_for():
+    """SDD 6.5 (reviews RV29-06, RV31): the shared wait reads the source until Nova runs no stop
+    or start of it - every task that includes it says so in the play's output, and no name matches
+    a stop task of the control plane's clock (SDD 7.2), which keys on "Stop the source server"."""
+    included = []
+    for role, tasks in (
+        ("import_workloads_warm", "cutover.yml"),
+        ("import_workloads_warm", "rollback.yml"),
+        ("import_workloads", "workload.yml"),
+    ):
+        with open(os.path.join(REPO, "roles", role, "tasks", tasks)) as f:
+            text = f.read()
+
+        def walk(items):
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                target = str(item.get("ansible.builtin.include_tasks") or "")
+                if target.endswith("source_stop_settled.yml"):
+                    included.append((tasks, item.get("name")))
+                for key in ("block", "rescue", "always"):
+                    walk(item.get(key))
+
+        walk(yaml.safe_load(text))
+    assert included == [
+        (tasks, "Wait until no stop or start of the source server runs")
+        for tasks in ("cutover.yml", "rollback.yml", "workload.yml")
+    ], included
+
+
+def test_a_stop_wait_whose_poll_outlasts_its_timeout_reads_the_server_again(env):
+    """SDD 6.5 (review RV27-09): the wait reads the server every os_migrate_source_stop_poll_s
+    seconds, at most os_migrate_timeout seconds - and once more at the latest after the timeout,
+    also when the poll interval is longer. Retries of timeout // poll came out 0 there, and
+    ansible-core then ran the task once without looking at `until`: the stop that still ran was
+    neither waited for nor reported, and the rollback started nothing yet ended rc 0."""
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+    env.world["powering_off"] = {"srv-1": 2}  # Nova powers srv-1 off past the timeout
+    started = time.monotonic()
+
+    rc, out, calls = env.run(
+        "rollback_workloads",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_source_stop_poll_s=60,
+        os_migrate_timeout=2,
+    )
+
+    reads = [c for c in calls if c["module"] == "server_info"]
+    assert (rc != 0, len(reads), env.nova_actions()) == (True, 2, []), (rc, len(reads), out[-1500:])
+    assert time.monotonic() - started < 30, "the wait outlived os_migrate_timeout"
+
+
+def test_a_warm_cutover_rerun_waits_for_a_stop_nova_still_runs(env):
+    """SDD 6.5 (review RV26-10): a re-run of the cutover - the retry after a 503 during the
+    stop's wait - finds Nova still powering the source off. A second stop would be refused
+    (409, a permanent failure that rolls the cutover back): the cutover waits for the stop that
+    runs, then goes on with the source SHUTOFF."""
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+    env.world["powering_off"] = {"srv-1": 2}
+
+    rc, out, calls = env.run(
+        "import_workloads_cutover",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_source_stop_poll_s=0,
+    )
+
+    assert rc == 0, out
+    assert env.state("srv-1")["destination_server_id"] == "dst-vm1"
+    assert env.nova_actions() == [], "a stop was sent while one ran"
+
+
+def test_a_cold_import_waits_for_a_stop_nova_still_runs(env):
+    """SDD 6.5 (review RV26-10): the cold import's stop - a retry after a 503 during an earlier
+    attempt's wait - finds Nova still powering the source off: it waits for that stop instead of
+    sending a second one Nova refuses."""
+    env.world["powering_off"] = {"srv-1": 2}
+
+    rc, out, calls = env.run("import_workloads", os_migrate_source_stop_poll_s=0, **COLD)
+
+    assert rc == 0, out
+    assert env.state("srv-1")["destination_server_id"] == "dst-vm1"
+    assert env.nova_actions() == [], "a stop was sent while one ran"
 
 
 def test_a_rollback_can_leave_the_ports_alone(env):
@@ -652,20 +856,49 @@ def test_a_failed_cold_import_keeps_the_record_of_the_volumes_it_created(env):
         assert env.state("srv-1")["dest_volumes"] == RECORDED
         cleaned = [c for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
         assert bool(cleaned) is cleanup
+        # the transfer returned its map: the cleanup takes it, the record beside it (audit A-08)
+        assert all(
+            c["args"]["volume_map"] and c["args"]["warm_state_dir"] == env.state_dir
+            for c in cleaned
+        )
 
 
 def test_a_cold_transfer_cut_short_leaves_the_record_of_the_volumes_it_created(env):
-    """SDD 6.3 (review lead B): the transfer created the volumes, then failed before it returned
-    its volume_map - the failure cleanup cannot see them, and a rollback deletes them by the
-    record alone."""
+    """SDD 6.3, 6.6 (review lead B, audit A-08): the transfer created the volumes, then failed
+    before it returned its volume_map. The record names them: the rescue's destination cleanup
+    takes it (warm_state_dir, no volume_map) - before, it was skipped and a hand-run import left
+    the volumes on the conversion host - and a rollback deletes by the record what it could not."""
     env.world["fail_after"] = [["import_workload_transfer_volumes", "vm1"]]
 
     rc, out, calls = env.run("import_workloads", **COLD)
 
     assert rc != 0, out
     assert env.state("srv-1")["dest_volumes"] == RECORDED
-    assert not [c for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
+    cleaned = [c["args"] for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
+    assert [(args.get("warm_state_dir"), "volume_map" in args) for args in cleaned] == [
+        (env.state_dir, False)
+    ]
     assert not [c for c in calls if c["module"] == "import_workload_create_instance"]
+
+
+@pytest.mark.parametrize("source_cleanup", ["succeeds", "fails"])
+def test_the_cold_rescue_runs_the_destination_cleanup_first_whatever_the_source_cleanup_does(
+    env, source_cleanup
+):
+    """SDD 6.6 (reviews RV32B-04, RV32B-02): the rescue runs the destination cleanup - best effort,
+    it never fails - before the source cleanup, so a source cleanup that fails (a source conversion
+    host lost past its window, a root copy Cinder will not delete) no longer keeps it from running
+    once the transfer ran."""
+    env.world["fail_after"] = [["import_workload_transfer_volumes", "vm1"]]
+    if source_cleanup == "fails":
+        env.world["fail"] = [["import_workload_src_cleanup", "vm1"]]
+
+    rc, out, calls = env.run("import_workloads", **COLD)
+
+    assert rc != 0, out
+    assert env.state("srv-1")["dest_volumes"] == RECORDED  # the transfer ran and recorded them
+    modules = [c["module"] for c in calls if c["module"].endswith("_cleanup")]
+    assert modules == ["import_workload_dst_failure_cleanup", "import_workload_src_cleanup"]
 
 
 def test_a_cold_import_without_data_copy_records_the_server_and_no_volume(env):
@@ -684,3 +917,85 @@ def test_a_cold_import_without_data_copy_records_the_server_and_no_volume(env):
     state = env.state("srv-1")
     assert state["destination_server_id"] == "dst-vm1"
     assert state["dest_volumes"] == {}
+
+
+# --- each conversion host's own SSH user (SDD 6.5, audit EX-08) ----------------------------------
+
+PER_SIDE = {
+    "os_migrate_conversion_host_ssh_user": "centos",  # upstream's single user, overridden per side
+    "os_migrate_src_conversion_host_ssh_user": "cloud-user",
+    "os_migrate_dst_conversion_host_ssh_user": "ubuntu",
+}
+
+
+def ssh_users(calls):
+    """Per conversion-host module: the (ssh_user, src_ssh_user) pairs its calls got."""
+    users = {}
+    for call in calls:
+        if "ssh_user" in call["args"]:
+            pair = (call["args"]["ssh_user"], call["args"].get("src_ssh_user"))
+            users.setdefault(call["module"], set()).add(pair)
+    return users
+
+
+def test_each_conversion_host_is_reached_as_its_own_sides_user(env):
+    """SDD 6.5 (audit EX-08): a RHEL source host (cloud-user) beside an Ubuntu destination host
+    (ubuntu). The modules that work on the source host get the source's user; those that work on
+    the destination host get the destination's, and the source's as src_ssh_user for their hop to
+    the source host - in the cold import (its failure cleanup too) and in a warm pass."""
+    env.world["fail"] = [["import_workload_create_instance", "vm1"]]
+    rc, out, calls = env.run(
+        "import_workloads", os_migrate_workload_cleanup_on_failure=True, **dict(COLD, **PER_SIDE)
+    )
+    assert rc != 0, out
+    assert ssh_users(calls) == {
+        "import_workload_export_volumes": {("cloud-user", None)},
+        "import_workload_transfer_volumes": {("ubuntu", "cloud-user")},
+        "import_workload_src_cleanup": {("cloud-user", None)},
+        "import_workload_dst_failure_cleanup": {("ubuntu", None)},
+    }
+    env.world = {}
+    rc, out, calls = env.run("import_workloads_precopy", **PER_SIDE)
+    assert rc == 0, out
+    assert ssh_users(calls) == {
+        "import_workload_warm_snapshot": {("cloud-user", None)},
+        "import_workload_warm_sync": {("ubuntu", "cloud-user")},
+    }
+
+
+def test_one_ssh_user_still_reaches_both_conversion_hosts(env):
+    """SDD 6.5: upstream's single os_migrate_conversion_host_ssh_user, set alone, still serves
+    both conversion hosts - and the hop between them (audit EX-08)."""
+    rc, out, calls = env.run("import_workloads_precopy", os_migrate_conversion_host_ssh_user="centos")
+    assert rc == 0, out
+    assert ssh_users(calls) == {
+        "import_workload_warm_snapshot": {("centos", None)},
+        "import_workload_warm_sync": {("centos", "centos")},
+    }
+
+
+def test_the_conversion_hosts_inventory_gives_each_host_its_sides_user(env):
+    """SDD 6.5 (audit EX-08): the deployed conversion hosts are added to the inventory with their
+    sides' users - which the link key's setup logs in as - however the single variable is set."""
+    real = os.path.join(REPO, "roles", "conversion_host", "tasks", "conv_hosts_inventory.yml")
+    tasks = os.path.join(env.collections, "ansible_collections", "os_migrate", "os_migrate",
+                         "roles", "conversion_host", "tasks")
+    shutil.copy(real, tasks)
+    with open(os.path.join(env.playbooks, "inventory_users.yml"), "w") as f:
+        f.write(
+            "---\n- hosts: localhost\n  gather_facts: false\n  tasks:\n"
+            "    - ansible.builtin.include_role:\n"
+            "        name: os_migrate.os_migrate.conversion_host\n"
+            "        tasks_from: conv_hosts_inventory.yml\n"
+            "    - ansible.builtin.debug:\n"
+            "        msg: \"USERS {{ hostvars['os_migrate_conv_src'].ansible_ssh_user }} "
+            "{{ hostvars['os_migrate_conv_dst'].ansible_ssh_user }}\"\n"
+        )
+    rc, out, calls = env.run(
+        "inventory_users",
+        os_migrate_src_conversion_host_name="conv-src",
+        os_migrate_dst_conversion_host_name="conv-dst",
+        **PER_SIDE,
+    )
+    assert rc == 0, out
+    assert "USERS cloud-user ubuntu" in out

@@ -36,6 +36,14 @@
       when:
         - prelim is defined and prelim.changed
 
+    # a stop that still runs is waited for, not sent again (Seamless Migrate SDD 6.5)
+    - name: Wait until no stop or start of the source server runs
+      ansible.builtin.include_tasks: "{{ role_path }}/../import_workloads_warm/tasks/source_stop_settled.yml"
+      when:
+        - prelim is defined and prelim.changed
+        - os_migrate_workload_stop_before_migration | bool
+        - item["_migration_params"]["data_copy"] | default(true)
+
     # Stop VM if not stopped and if config set to true
     - name: Perform workload stop if os_migrate_workload_stop_before_migration is true
       os_migrate.os_migrate.server_action:
@@ -89,7 +97,7 @@
         log_file: "{{ prelim.log_file }}"
         state_file: "{{ prelim.state_file }}"
         ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-        ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+        ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
         timeout: "{{ os_migrate_timeout }}"
       register: exports
       when:
@@ -126,7 +134,8 @@
         conversion_host:
           "{{ os_dst_conversion_host_info.openstack_conversion_host }}"
         ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-        ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+        ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
+        src_ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
         transfer_uuid: "{{ exports.transfer_uuid }}"
         src_conversion_host_address:
           "{{ os_src_conversion_host_info.openstack_conversion_host.address | default('') }}"
@@ -171,7 +180,7 @@
         data: "{{ item }}"
         conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
         ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-        ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+        ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
         transfer_uuid: "{{ exports.transfer_uuid }}"
         volume_map: "{{ exports.volume_map }}"
         log_file: "{{ prelim.log_file }}"
@@ -183,6 +192,35 @@
         - not item["_migration_params"]["use_nbdkit_direct"]|default(false)
 
   rescue:
+    # first, and best effort: it never fails, so the source cleanup's failure never keeps it
+    # from running, and the transfer's failure is what the run reports (Seamless Migrate SDD
+    # 6.6, reviews RV32B-02, RV32B-04)
+    - name: Clean up in the destination cloud after migration failure
+      os_migrate.os_migrate.import_workload_dst_failure_cleanup:
+        cloud: dst
+        validate_certs: "{{ os_migrate_dst_validate_certs | default(omit) }}"
+        ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
+        client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
+        client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
+        data: "{{ item }}"
+        conversion_host: "{{ os_dst_conversion_host_info.openstack_conversion_host }}"
+        ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
+        ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
+        transfer_uuid: "{{ exports.transfer_uuid }}"
+        # a transfer that failed returns no map: the cleanup takes the volumes it recorded as
+        # Cinder created them (Seamless Migrate SDD 6.6, audit A-08)
+        volume_map: "{{ transfer.volume_map | default(omit) }}"
+        warm_state_dir: "{{ os_migrate_warm_state_dir | default(os_migrate_data_dir ~ '/workload_warm') }}"
+        log_file: "{{ prelim.log_file }}"
+        state_file: "{{ prelim.state_file }}"
+        timeout: "{{ os_migrate_timeout }}"
+      when:
+        - prelim is defined and prelim.changed
+        - os_migrate_workload_cleanup_on_failure
+        - exports is defined and 'volume_map' in exports
+        - transfer is defined and transfer is not skipped
+        - item["_migration_params"]["data_copy"] | default(true)
+
     - name: Clean up in the source cloud after migration failure
       os_migrate.os_migrate.import_workload_src_cleanup:
         cloud: src
@@ -193,7 +231,7 @@
         data: "{{ item }}"
         conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
         ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-        ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+        ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
         transfer_uuid: "{{ exports.transfer_uuid }}"
         volume_map: "{{ exports.volume_map }}"
         log_file: "{{ prelim.log_file }}"
@@ -205,29 +243,6 @@
         - exports is defined and 'volume_map' in exports
         - item["_migration_params"]["data_copy"] | default(true)
         - not item["_migration_params"]["use_nbdkit_direct"]|default(false)
-
-    - name: Clean up in the destination cloud after migration failure
-      os_migrate.os_migrate.import_workload_dst_failure_cleanup:
-        cloud: dst
-        validate_certs: "{{ os_migrate_dst_validate_certs | default(omit) }}"
-        ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
-        client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
-        client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
-        data: "{{ item }}"
-        conversion_host: "{{ os_dst_conversion_host_info.openstack_conversion_host }}"
-        ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
-        ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
-        transfer_uuid: "{{ exports.transfer_uuid }}"
-        volume_map: "{{ transfer.volume_map }}"
-        log_file: "{{ prelim.log_file }}"
-        state_file: "{{ prelim.state_file }}"
-        timeout: "{{ os_migrate_timeout }}"
-      when:
-        - prelim is defined and prelim.changed
-        - os_migrate_workload_cleanup_on_failure
-        - exports is defined and 'volume_map' in exports
-        - transfer is defined and 'volume_map' in transfer
-        - item["_migration_params"]["data_copy"] | default(true)
 
     - name: Fail if there was a problem in the migration
       ansible.builtin.fail:

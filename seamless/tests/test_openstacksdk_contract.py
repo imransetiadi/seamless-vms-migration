@@ -119,3 +119,29 @@ def test_proxy_methods_the_executor_and_provider_call():
     assert "all_projects" in inspect.signature(BlockStorage.snapshots).parameters or (
         "query" in inspect.signature(BlockStorage.snapshots).parameters
     )
+    # a flavor looked up below compute 2.61 brings its extra specs only when asked, read apart
+    # from the flavor so a refused read keeps the flavor (RV31-04, RV32B-03)
+    from openstack.compute.v2.flavor import Flavor
+
+    assert "session" in inspect.signature(Flavor.fetch_extra_specs).parameters
+
+
+def test_the_calls_the_vmware_rollback_and_the_kit_copies_rely_on():
+    """SDD §7.2, §10 (reviews RV30-01, RV30-04, RV30-06): the mark of a kit copy merges its key
+    into the volume's metadata (POST, the kit's own keys kept); Nova's record of a server lists the
+    volumes attached to it; a floating IP is found by its address and names its port, and a port
+    tells its owner - a compute port's device is a server, a floating IP's own port's is not."""
+    from openstack.block_storage.v3._proxy import Proxy as BlockStorage
+    from openstack.block_storage.v3.volume import Volume
+    from openstack.common.metadata import MetadataMixin
+    from openstack.compute.v2.server import Server
+    from openstack.network.v2.floating_ip import FloatingIP
+    from openstack.network.v2.port import Port
+
+    assert callable(getattr(BlockStorage, "set_volume_metadata", None))
+    assert issubclass(Volume, MetadataMixin)
+    assert inspect.signature(MetadataMixin.set_metadata).parameters["replace"].default is False
+    assert hasattr(Server, "attached_volumes")
+    assert "floating_ip_address" in FloatingIP._query_mapping._mapping
+    assert hasattr(FloatingIP, "port_id")
+    assert hasattr(Port, "device_owner") and "fixed_ips" in Port._query_mapping._mapping

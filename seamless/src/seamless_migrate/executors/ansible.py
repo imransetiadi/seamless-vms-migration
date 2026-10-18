@@ -19,7 +19,7 @@ import re
 import signal
 import sys
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,7 @@ import yaml
 from ..ai.redaction import redact_cut, redact_tail
 from ..config import Settings
 from ..domain.enums import ProviderKind, Strategy, SyncPassKind
+from ..domain.fsm import source_stopped
 from ..domain.models import (
     Mappings,
     Migration,
@@ -40,6 +41,7 @@ from ..domain.models import (
     next_pass_number,
     utcnow,
 )
+from ..planning.kit import kit_vm_name
 from ..planning.networks import (
     kit_ipv4,
     kit_network_key,
@@ -71,8 +73,65 @@ from .base import (
 log = logging.getLogger(__name__)
 
 KIT_PLAYBOOK = "os_migrate.vmware_migration_kit.migration"
-#: the name the migration kit gives the port it creates for a NIC: "{vm}-NIC-{n}-VLAN-{network}"
-KIT_PORT_NAME = re.compile(r"-NIC-\d+-VLAN-")
+
+
+def destination_server_name(m: Migration) -> str:
+    """The name the migration's destination server gets: the VM's own from os-migrate, the kit's
+    name of it from the VMware migration kit (SDD §7.2)."""
+    return kit_vm_name(m.vm.name) if m.strategy in VMWARE else m.vm.name
+
+
+def kit_port_name(vm_name: str) -> re.Pattern[str]:
+    """The name the kit gives a port it creates for one of the VM's NICs:
+    "{kit name}-NIC-{n}-VLAN-{network}" (SDD §7.2)."""
+    return re.compile(re.escape(kit_vm_name(vm_name)) + r"-NIC-\d+-VLAN-")
+
+
+#: the control plane's mark of a vmware_warm kit copy that completed (SDD §7.2, review RV30-01)
+COPIED = {"seamless_copied": "true"}
+#: its mark once a cutover's kit run may have written to it - no completed copy (SDD §7.2,
+#: reviews RV32A-01, RV32A-02)
+CUTOVER_COPY = {"seamless_copied": "cutover"}
+
+
+def kit_volumes(vm_name: str, volumes: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The volumes the kit's next run takes as the VM's own: named "{kit name}-{disk key}" with
+    the metadata osm true - none for a VM without a kit name (SDD §7.2)."""
+    kit = kit_vm_name(vm_name)
+    if not kit:
+        return []
+    own = re.compile(re.escape(kit) + r"-[0-9]+")
+    return [v for v in volumes if own.fullmatch(str(v.get("name") or "")) and _marked(v, "osm")]
+
+
+def _marked(volume: Mapping[str, Any], key: str) -> bool:
+    """Whether the volume's metadata ``key`` reads true: the kit's ``osm`` and ``converted``, the
+    control plane's ``seamless_copied`` (SDD §7.2)."""
+    return (volume.get("metadata") or {}).get(key) == "true"
+
+
+#: Cinder states from which a volume cannot be attached - and so not synced - but is deleted
+#: without a reset (SDD §7.2, review RV30-07)
+UNATTACHABLE = frozenset({"error", "error_restoring", "error_extending", "error_managing"})
+
+
+def _cutover_copy(volume: Mapping[str, Any]) -> bool:
+    """Whether a cutover's kit run may have written to the kit volume: its copy mark reads
+    'cutover' (SDD §7.2, reviews RV32A-01, RV32A-02)."""
+    return (volume.get("metadata") or {}).get("seamless_copied") == CUTOVER_COPY["seamless_copied"]
+
+
+def _resumable(volume: Mapping[str, Any], *, cutover: bool = False) -> bool:
+    """A kit volume a vmware_warm run syncs onto by CBT: not converted, its copy completed (marked
+    copied) - or, for a cutover retried inside the outage that may keep them, marked by that
+    outage's cutover - and attachable (SDD §7.2, reviews RV30-01, RV30-07, RV32A-01, RV32A-02)."""
+    return (
+        not _marked(volume, "converted")
+        and (_marked(volume, "seamless_copied") or (cutover and _cutover_copy(volume)))
+        and str(volume.get("status") or "") not in UNATTACHABLE
+    )
+
+
 SERVER_TYPE = "openstack.compute.Server"
 OPENSTACK = frozenset({Strategy.cold, Strategy.warm})
 VMWARE = frozenset({Strategy.vmware_cold, Strategy.vmware_warm})
@@ -80,9 +139,12 @@ WARM_CHUNK_SIZE = 4194304
 WARM_WORKERS = 4
 TRANSIENT = re.compile(r"(?i)timeout|http 503|connection reset")
 #: Playbook output lines that start the source-stop task (SDD §7.2 downtime clock): the warm
-#: role's "Stop the source server", the cold role's "Perform workload stop …", the kit's power-off.
+#: role's "Stop the source server", the cold role's "Perform workload stop …", and the kit's
+#: "Migrate Guest from Vmware using nbdkit <vm>" - kit 2.2.7 has no power-off task, its migrate
+#: module powers the VM off inside that one (review RV26-03); a power-off or shut-down task too.
 STOP_TASK = re.compile(
-    r"(?i)^TASK \[[^\]]*(?:stop the source server|perform workload stop|power[ _-]?off|shut ?down)"
+    r"(?i)^TASK \[[^\]]*(?:stop the source server|perform workload stop|power[ _-]?off|shut ?down"
+    r"|migrate guest from vmware using nbdkit)"
 )
 #: Result lines of an Ansible task (default stdout callback).
 _RESULT_LINE = re.compile(r"^(ok|changed|failed|fatal|skipping|unreachable):")
@@ -464,6 +526,10 @@ def _common_openstack_vars(
         if provider.ca_cert_path:
             out[f"os_migrate_{side}_ca_cert"] = provider.ca_cert_path
         host = provider.conversion_host
+        # each conversion host is reached as its own provider's user (SDD §6.5, audit EX-08)
+        out[f"os_migrate_{side}_conversion_host_ssh_user"] = (
+            host.ssh_user if host else None
+        ) or "cloud-user"
         if host is None:
             continue
         ssh_user = host.ssh_user or ssh_user
@@ -812,12 +878,17 @@ def _ensure_record(osm: Path, server_id: str, server_name: str) -> None:
         "pending_snapshot": None,
         "destination_server_id": None,
     }
-    # as WarmState.save: mode 0600, synced, renamed into place - then the directory is synced
-    # too, so the rename outlives a crash: a missing record would let a later rollback take a
-    # same-named server by its name (review RV4-07)
+    # synced into place: a missing record would let a later rollback take a same-named server
+    # by its name (review RV4-07)
+    _write_synced_json(path, record)
+
+
+def _write_synced_json(path: Path, data: Any) -> None:
+    """As WarmState.save: mode 0600, synced, renamed into place - then the directory is synced
+    too, so the rename outlives a crash."""
     tmp = path.with_name(f".{path.name}.tmp")
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-        json.dump(record, f)
+        json.dump(data, f)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
@@ -828,15 +899,71 @@ def _ensure_record(osm: Path, server_id: str, server_name: str) -> None:
         finally:
             os.close(directory)
     except OSError as exc:
-        # some filesystems (network or FUSE mounts) cannot sync a directory: the record is written
-        # and synced all the same, and failing every cold cutover there would gain nothing
-        log.warning("could not sync %s after writing the workload record: %s", path.parent, exc)
+        # some filesystems (network or FUSE mounts) cannot sync a directory: the file is written
+        # and synced all the same, and failing every step there would gain nothing
+        log.warning("could not sync %s after writing %s: %s", path.parent, path.name, exc)
+
+
+#: the VMware rollback's record of what a server found only by name held (SDD §7.2, RV30-05):
+#: one level below the guest directories the kit creates in the run directory, {VM name}, so
+#: no VM's name is its path (review RV32A-08)
+KEPT_RECORD = Path(".seamless") / "rollback-kept.json"
+#: where an earlier build wrote it - read too, by a migration in flight across the upgrade
+LEGACY_KEPT_RECORD = "rollback-kept.json"
+
+
+class _UnreadableKeepRecord(Exception):
+    """The VMware rollback's keep record cannot be read: what to keep is unknown."""
+
+
+def _read_kept(rdir: Path) -> set[str]:
+    """The volumes earlier attempts of the VMware rollback kept: what the server they found only
+    by the kit's name held before they deleted it (SDD §7.2, review RV30-05). Raises
+    _UnreadableKeepRecord for a record that cannot be read (review RV32A-08)."""
+    kept: set[str] = set()
+    for path in (rdir / KEPT_RECORD, rdir / LEGACY_KEPT_RECORD):
+        if path.name == LEGACY_KEPT_RECORD and path.parent == rdir and not path.is_file():
+            continue  # none, or the kit's guest directory of a VM so named
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise _UnreadableKeepRecord(f"{path} cannot be read: {exc}") from None
+        if not isinstance(data, dict) or not isinstance(data.get("volumes") or [], list):
+            raise _UnreadableKeepRecord(f"{path} is no keep record")
+        kept |= {str(volume) for volume in data.get("volumes") or []}
+    return kept
+
+
+def _record_kept(rdir: Path, server_id: str, kept: Collection[str]) -> None:
+    path = rdir / KEPT_RECORD
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _write_synced_json(path, {"server_id": server_id, "volumes": sorted(kept)})
+
+
+def _remove_kept(rdir: Path) -> None:
+    """A rollback that succeeded: a later one starts from what it finds (review RV29-03) - the
+    record removed, the legacy one too, never the kit's guest directory of a VM so named."""
+    with contextlib.suppress(OSError):
+        (rdir / KEPT_RECORD).unlink(missing_ok=True)
+    legacy = rdir / LEGACY_KEPT_RECORD
+    if legacy.is_file():
+        legacy.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
 class _Playbook:
     name: str
     stops_source: bool = False
+
+
+@dataclass
+class _RunTrace:
+    """What a run's output showed: whether a playbook's source-stop task started - on VMware the
+    kit's migrate task, the only one that writes to a volume (SDD §7.2, review RV34A-02)."""
+
+    stop_task_started: bool = False
 
 
 # -- executor -----------------------------------------------------------------------------------
@@ -998,6 +1125,13 @@ class AnsibleExecutor:
             raise PermanentStepError(f"step {step} does not apply to strategy {strategy}")
         if step == StepName.CUTOVER:
             await self._refuse_name_collision(ctx)
+        if strategy in VMWARE and step in (StepName.CUTOVER, StepName.PRECOPY, StepName.SYNC):
+            volumes = await self._refuse_stale_kit_volumes(ctx, strategy)
+            if strategy == Strategy.vmware_warm:
+                cutover = step == StepName.CUTOVER and await self._keeps_cutover_copies(
+                    ctx, volumes
+                )
+                await self._delete_cut_off_kit_copies(ctx, volumes, cutover=cutover)
         if strategy == Strategy.cold and step == StepName.CUTOVER:
             await asyncio.to_thread(
                 _ensure_record, osm, ctx.migration.vm.source_id, ctx.migration.vm.name
@@ -1018,19 +1152,37 @@ class AnsibleExecutor:
         if deferred is not None and strategy == Strategy.warm:
             # the role writes it during the pass: an earlier pass's is not this one's (SDD §6.6)
             remove_quietly(refusals_file)
-        stop_skipped = await self._execute(
-            rdir,
-            osm,
-            build_vars(step, ctx, network_map),
-            ctx.source,
-            ctx.destination,
-            build_inventory(ctx),
-            playbooks,
-            ctx,
-            effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings),
-            networks,
-            deferred,
-        )
+        marked: list[str] = []  # the copies this cutover marked 'cutover'
+        trace = _RunTrace()
+        try:
+            if strategy == Strategy.vmware_warm and step == StepName.CUTOVER:
+                try:
+                    await self._mark_cutover_copies(ctx, marked)
+                except ProviderError as exc:
+                    raise TransientStepError(
+                        f"could not mark the kit's copies of {ctx.migration.vm.name} in "
+                        f"{ctx.destination.label} before its cutover: {exc}"
+                    ) from exc
+            stop_skipped = await self._execute(
+                rdir,
+                osm,
+                build_vars(step, ctx, network_map),
+                ctx.source,
+                ctx.destination,
+                build_inventory(ctx),
+                playbooks,
+                ctx,
+                effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings),
+                networks,
+                deferred,
+                trace=trace,
+            )
+        except BaseException:
+            if marked and not trace.stop_task_started:
+                # the kit never reached its migrate task, the only one that writes to a volume:
+                # what this run marked is a completed copy still (SDD §7.2, review RV34A-02)
+                await outlive_cancel(self._mark_copies_back(ctx, marked))
+            raise
         if stop_skipped and strategy == Strategy.cold:
             # the cold role skips every task (the stop included) when the destination already
             # has a server with the workload's name: nothing was migrated
@@ -1039,6 +1191,8 @@ class AnsibleExecutor:
                 f"{ctx.destination.label} already has a server with that name and nothing was "
                 "migrated; delete or rename it, or roll the migration back"
             )
+        if strategy == Strategy.vmware_warm and step in (StepName.PRECOPY, StepName.SYNC):
+            await self._mark_kit_copies(ctx)
         result = await self._result(step, strategy, ctx, osm, started, passes_before)
         if deferred is not None:
             # SDD §7.2: what this pass met that the cutover refuses before the source stops -
@@ -1050,7 +1204,8 @@ class AnsibleExecutor:
         return result
 
     async def _refuse_name_collision(self, ctx: StepContext) -> None:
-        """Before the first cutover attempt, refuse a destination server that carries the VM's name.
+        """Before the first cutover attempt, refuse a destination server that carries the name the
+        migration's server will get (the kit's name of a VMware VM, SDD §7.2).
 
         The cold role would skip the migration (and report success), the kit would fail after
         powering the VM off, and a later rollback by name would delete a server this migration
@@ -1060,20 +1215,205 @@ class AnsibleExecutor:
         m = ctx.migration
         if m.destination_server_id or m.downtime_started_at is not None:
             return
+        name = destination_server_name(m)
         try:
-            existing = await self.providers.get(ctx.destination).find_server(m.vm.name)
+            existing = await self.providers.get(ctx.destination).find_server(name)
         except ProviderError as exc:
             # an unanswered lookup is not "no such server": refuse before anything is stopped
             # (a duplicate name is a lookup error too)
             raise TransientStepError(
-                f"could not check {ctx.destination.label} for a server named {m.vm.name}: {exc}"
+                f"could not check {ctx.destination.label} for a server named {name}: {exc}"
             ) from exc
         if existing:
             raise PermanentStepError(
-                f"a server named {m.vm.name} already exists in {ctx.destination.label} "
+                f"a server named {name} already exists in {ctx.destination.label} "
                 f"({existing}) and this migration did not create it; delete or rename it before "
                 "the cutover"
             )
+
+    async def _refuse_stale_kit_volumes(
+        self, ctx: StepContext, strategy: Strategy
+    ) -> list[dict[str, Any]]:
+        """Before a VMware kit run - so before any clock - refuse while a volume of the VM's kit
+        name holds what the run would take as migrated: one marked converted, or for a cold run
+        any, onto which the kit refuses to copy. A rollback that could not delete it ended failed
+        with the source running, and the run would boot the destination from it beside the
+        source (SDD §7.2, review RV29-01). A converted volume is the kit's own of this outage
+        while the source has not run since its stop: the clock open, the VM reading off and
+        vCenter recording no power-on of it since (review RV30-03). Returns the VM's kit volumes
+        it read."""
+        m = ctx.migration
+        if not kit_vm_name(m.vm.name):
+            return []
+        where = ctx.destination.label
+        try:
+            volumes = kit_volumes(m.vm.name, await self.providers.get(ctx.destination).volumes())
+        except ProviderError as exc:
+            # an unanswered lookup is not "no such volume": refuse before the kit runs
+            raise TransientStepError(
+                f"could not check {where} for the kit's volumes of {m.vm.name}: {exc}"
+            ) from exc
+        stale = [v for v in volumes if strategy == Strategy.vmware_cold or _marked(v, "converted")]
+        if not stale:
+            return volumes
+        if source_stopped(m) and all(_marked(v, "converted") for v in stale):
+            try:
+                vm = await self.providers.get(ctx.source).get_vm(m.vm.source_id)
+            except ProviderError as exc:
+                raise TransientStepError(
+                    f"could not read {m.vm.name} from {ctx.source.label}: {exc}"
+                ) from exc
+            if vm.power_state == "stopped":
+                # off now - and not run since the clock opened? vCenter's events say; its power
+                # state alone does not, a VM run and shut down again reads off too (review RV30-03)
+                try:
+                    ran = await self.providers.get(ctx.source).powered_on_since(
+                        m.vm.source_id, m.downtime_started_at
+                    )
+                except ProviderError as exc:
+                    raise TransientStepError(
+                        f"could not read the power-ons of {m.vm.name} from {ctx.source.label}: "
+                        f"{exc}"
+                    ) from exc
+                if not ran:
+                    # converted in this outage, the source off since: the kit is right
+                    return volumes
+        named = ", ".join(
+            f"{v['id']} ({v.get('name')}"
+            + (
+                f", attached to {', '.join(map(str, v['attachments']))}"
+                if v.get("attachments")
+                else ""
+            )
+            + ")"
+            for v in stale
+        )
+        # the way out first: Migration.error keeps 1000 characters, its event 300 (review RV30-08)
+        raise PermanentStepError(
+            "roll the migration back again, which deletes the kit's volumes it may, or delete them "
+            f"in {where}: the kit would take a converted one as migrated and boot the new server "
+            f"from it, and refuses to copy a cold run onto any - {where} holds the kit's volume "
+            f"{named} of {m.vm.name}"
+        )
+
+    async def _delete_cut_off_kit_copies(
+        self, ctx: StepContext, volumes: list[dict[str, Any]], *, cutover: bool = False
+    ) -> None:
+        """Before a vmware_warm kit run, delete each first copy cut off: a kit volume of the VM
+        neither converted nor marked copied. The kit wrote its changeID before the copy it never
+        finished, and would sync onto it only what the source changed since; deleted, the disk is
+        copied in full (SDD §7.2, review RV30-01). A marked one Cinder cannot attach goes too
+        (review RV30-07), and one an earlier cutover marked - unless ``cutover``: a cutover retried
+        inside the outage keeps them (reviews RV32A-01, RV32A-02). The destination's conversion host
+        holding one - a killed run's - lets go of it first, of a copy kept too (review RV32A-03);
+        one another server holds stays."""
+        dst = self.providers.get(ctx.destination)
+        host: list[str | None] = []  # looked up once, for the first copy held
+        try:
+            for volume in volumes:
+                if _marked(volume, "converted"):
+                    continue
+                kept = _resumable(volume, cutover=cutover)
+                holders = [str(holder) for holder in volume.get("attachments") or []]
+                if holders:
+                    if not host:
+                        host.append(await self._conversion_host_server(ctx, dst))
+                    if host[0] is None or any(holder != host[0] for holder in holders):
+                        continue
+                    # a pass cut off during its sync, or the kit's own detach that failed, left
+                    # it attached: the kit attaches it again, which Nova refuses (review RV32A-03)
+                    await dst.detach_volume(host[0], volume["id"])
+                if kept:
+                    continue
+                await dst.delete_volume(volume["id"])
+                await ctx.log(
+                    f"deleted the kit's volume {volume['id']} ({volume.get('name')}): a first "
+                    "copy cut off, which the kit copies again in full"
+                )
+        except ProviderError as exc:
+            raise TransientStepError(
+                f"could not delete a first copy cut off of {ctx.migration.vm.name} in "
+                f"{ctx.destination.label}: {exc}"
+            ) from exc
+
+    async def _keeps_cutover_copies(self, ctx: StepContext, volumes: list[dict[str, Any]]) -> bool:
+        """Whether a vmware_warm cutover retried inside this outage keeps the kit volumes an earlier
+        attempt marked 'cutover' for its CBT sync (SDD §7.2, reviews RV32A-01, RV32A-02): no
+        server booted from them - the migration records none, none carries the destination
+        server's name - and the kit converted the volume of the VM's first disk in vCenter's device
+        order, so that conversion succeeded on its first try: the kit converted no other disk,
+        powered the VM off and then only synced the rest. The refusal before let a converted
+        volume through only with the clock open, the VM off and no power-on of it since."""
+        m = ctx.migration
+        if not source_stopped(m) or m.destination_server_id:
+            return False
+        if not any(_cutover_copy(v) for v in volumes):
+            return False
+        converted = {str(v.get("name")) for v in volumes if _marked(v, "converted")}
+        if not converted:
+            return False
+        try:
+            if await self.providers.get(ctx.destination).find_server(destination_server_name(m)):
+                return False
+            keys = await self.providers.get(ctx.source).disk_keys(m.vm.source_id)
+        except ProviderError as exc:
+            # an unanswered read is no answer: nothing deleted, nothing run (SDD §7.2)
+            raise TransientStepError(
+                f"could not check whether the cutover of {m.vm.name} keeps its copies: {exc}"
+            ) from exc
+        return bool(keys) and f"{kit_vm_name(m.vm.name)}-{keys[0]}" in converted
+
+    async def _mark_cutover_copies(self, ctx: StepContext, marked: list[str] | None = None) -> None:
+        """Mark each of the VM's kit copies marked completed 'cutover', no completed copy for any
+        later run or rollback (SDD §7.2, reviews RV32A-01, RV32A-02): right before a vmware_warm
+        cutover's kit run - it converts a disk in place and boots a server that writes to every
+        one, which no CBT sync undoes -, and in a rollback once a server booted from them. Each
+        one marked is added to ``marked``. Raises ProviderError; each caller fails its attempt as
+        transient."""
+        dst = self.providers.get(ctx.destination)
+        for volume in kit_volumes(ctx.migration.vm.name, await dst.volumes()):
+            if _marked(volume, "seamless_copied"):
+                await dst.set_volume_metadata(volume["id"], dict(CUTOVER_COPY))
+                if marked is not None:
+                    marked.append(volume["id"])
+
+    async def _mark_copies_back(self, ctx: StepContext, marked: Sequence[str]) -> None:
+        """A vmware_warm cutover kit run that ended before the kit's migrate task wrote to no
+        volume: the copies it marked 'cutover' are completed copies still, marked so again for the
+        retry's CBT sync. A marking back that fails is logged and leaves the rest 'cutover' (SDD
+        §7.2, review RV34A-02)."""
+        dst = self.providers.get(ctx.destination)
+        for index, volume_id in enumerate(marked):
+            try:
+                await dst.set_volume_metadata(volume_id, dict(COPIED))
+            except ProviderError as exc:
+                await ctx.log(
+                    f"could not mark the kit's copies {', '.join(marked[index:])} of "
+                    f"{ctx.migration.vm.name} completed again: {exc}; a later run copies them "
+                    "in full"
+                )
+                return
+
+    async def _mark_kit_copies(self, ctx: StepContext) -> None:
+        """After a vmware_warm pass the kit completed, mark each of the VM's kit volumes that is
+        not converted and that no server holds: its copy completed, and a later run keeps it for
+        its CBT sync (SDD §7.2, review RV30-01). A marking that fails fails the pass as
+        transient: its retry copies the unmarked volumes in full."""
+        dst = self.providers.get(ctx.destination)
+        try:
+            for volume in kit_volumes(ctx.migration.vm.name, await dst.volumes()):
+                if (
+                    _marked(volume, "converted")
+                    or _marked(volume, "seamless_copied")
+                    or volume.get("attachments")
+                ):
+                    continue
+                await dst.set_volume_metadata(volume["id"], dict(COPIED))
+        except ProviderError as exc:
+            raise TransientStepError(
+                f"could not mark the kit's copies of {ctx.migration.vm.name} in "
+                f"{ctx.destination.label}: {exc}"
+            ) from exc
 
     async def _result(
         self,
@@ -1306,27 +1646,87 @@ class AnsibleExecutor:
         return None
 
     @staticmethod
-    async def _delete_kit_ports(dst: Any, nics: list[Nic]) -> list[str]:
+    async def _delete_kit_ports(dst: Any, nics: list[Nic], vm_name: str) -> list[str]:
         """Delete the migration kit's ports of the VM (SDD §7.2): Nova only unbinds a port it did
         not create when it deletes the server, and the port would keep the NIC's MAC and addresses.
-        They are the unbound ports with one of the NICs' MACs and the kit's name form; a port bound
-        to a server is never deleted."""
+        They are the unbound ports with one of the NICs' MACs and the kit's name form for this VM;
+        a port bound to a server, or another VM's that shares a MAC, is never deleted (EX-07)."""
+        own = kit_port_name(vm_name)
         deleted: list[str] = []
         for mac in sorted({nic.mac.lower() for nic in nics if nic.mac}):
             for port in await dst.ports(mac_address=mac):
-                if port.get("device_id") or not KIT_PORT_NAME.search(str(port.get("name") or "")):
+                if port.get("device_id") or not own.match(str(port.get("name") or "")):
                     continue
                 await dst.delete_port(port["id"])
                 deleted.append(str(port["id"]))
         return deleted
 
+    async def _delete_kit_volumes(
+        self, ctx: StepContext, dst: Any, server_id: str | None, kept: Collection[str] = ()
+    ) -> list[str]:
+        """Delete the kit's volumes of the VM that its next run would take as this VM's own (SDD
+        §7.2, review RV28-01): the kit finds a VM's volume by its name, ``<kit name>-<disk key>``,
+        and the metadata ``osm``; one it marked ``converted`` it takes as migrated - no copy, no
+        power-off, the new server booted from the first attempt's disk while the source runs
+        again - and onto any other a vmware_cold run refuses to copy. A vmware_warm volume not
+        converted stays when marked copied and attachable - the next pass syncs it by CBT -, and
+        one not marked, a first copy cut off, goes (reviews RV30-01, RV30-07); with a recorded
+        server - the kit booted it from all of them - every one goes (review RV30-02). The
+        destination's conversion host holding one is the kit's copy a cut-off run left: detached
+        first (review RV29-02). A volume another server holds is never deleted, nor one of
+        ``kept`` - what a server found only by name held (review RV29-03) -, nor any of a VM
+        without a kit name."""
+        m = ctx.migration
+        if not kit_vm_name(m.vm.name):
+            return []
+        deleted: list[str] = []
+        conversion_host: list[str | None] = []  # looked up once, for the first volume held
+        for volume in kit_volumes(m.vm.name, await dst.volumes()):
+            if str(volume["id"]) in kept:
+                continue
+            holders = [str(holder) for holder in volume.get("attachments") or []]
+            if any(holder != server_id for holder in holders):
+                if not conversion_host:
+                    conversion_host.append(await self._conversion_host_server(ctx, dst))
+                host = conversion_host[0]
+                if host is not None and host in holders:
+                    await dst.detach_volume(host, volume["id"])
+                    holders = [holder for holder in holders if holder != host]
+                if any(holder != server_id for holder in holders):
+                    continue
+            if m.strategy != Strategy.vmware_cold and server_id is None and _resumable(volume):
+                # a warm copy that completed, from which no recorded server booted: the next pass
+                # syncs it by CBT (reviews RV30-01, RV30-02, RV30-07)
+                continue
+            await dst.delete_volume(volume["id"])
+            deleted.append(str(volume["id"]))
+        return deleted
+
+    @staticmethod
+    async def _conversion_host_server(ctx: StepContext, dst: Any) -> str | None:
+        """The destination conversion host's Nova server: by its name, else the server holding
+        its address - fixed, or floating through Neutron's floating IP (SDD §7.2, reviews RV29-02,
+        RV30-06)."""
+        host = ctx.destination.conversion_host
+        if host is None:
+            return None
+        if host.name:
+            found = await dst.find_server(host.name)
+            if found:
+                return str(found)
+        if host.address:
+            found = await dst.server_of_address(host.address)
+            if found:
+                return str(found)
+        return None
+
     async def _lookup_server(self, ctx: StepContext) -> str | None:
+        name = destination_server_name(ctx.migration)
         try:
-            return await self.providers.get(ctx.destination).find_server(ctx.migration.vm.name)
+            return await self.providers.get(ctx.destination).find_server(name)
         except ProviderError as exc:
             await ctx.log(
-                f"could not look up the server named {ctx.migration.vm.name} in "
-                f"{ctx.destination.label}: {exc}"
+                f"could not look up the server named {name} in {ctx.destination.label}: {exc}"
             )
             return None
 
@@ -1335,25 +1735,87 @@ class AnsibleExecutor:
         vm = m.vm
         if ctx.options.get("delete_dest_volumes"):
             return await self._vmware_cancel_cleanup(ctx)
+        rdir = run_dir(self.settings, ctx.plan.id, m.id)
         try:
             dst = self.providers.get(ctx.destination)
-            server_id = m.destination_server_id
-            if server_id is None and m.downtime_started_at is not None:
+            recorded = m.destination_server_id
+            named = None
+            # what an earlier attempt kept of a server it then deleted (review RV30-05); a record
+            # that cannot be read never keeps the source stopped: what to keep is unknown, so this
+            # attempt deletes no kit volume (SDD §7.2, review RV32A-08)
+            unreadable = None
+            try:
+                kept = await asyncio.to_thread(_read_kept, rdir)
+            except _UnreadableKeepRecord as exc:
+                kept, unreadable = set(), str(exc)
+                await ctx.log(f"rollback: {unreadable}; every kit volume of {vm.name} stays")
+            if source_stopped(m):
                 # the kit records nothing in the control plane before the cutover powers the
                 # VM off; a same-named server after that point was created by this migration
-                # (_refuse_name_collision ruled out a pre-existing one before the attempt)
-                server_id = await dst.find_server(vm.name)
-            if server_id:
-                await dst.delete_server(server_id)
-            deleted_ports = await self._delete_kit_ports(dst, vm.nics)
+                # (_refuse_name_collision ruled out a pre-existing one before the attempt) - also
+                # beside a recorded one, maybe an earlier attempt's that a failed rollback already
+                # deleted while the new attempt's cutover did not record its own (review RV32A-07).
+                # Only while the clock is open: an earlier attempt's power-on closed it only after
+                # every server it found was gone, a verification only with the recorded one
+                # running - a server of the kit's name then is another VM's (review RV34A-01)
+                found = await dst.find_server(kit_vm_name(vm.name))
+                if found and found != recorded:
+                    named = found
+                    # it may be another plan's VM the kit names alike (owner question q26): what
+                    # it holds stays, its deletion detaching it notwithstanding (review RV29-03) -
+                    # read from Nova's record, as no Cinder call comes before the power-on, and
+                    # recorded before the deletion: a retried attempt no longer finds the server
+                    held = set(await dst.server_volumes(named))
+                    kept |= held
+                    if unreadable is not None:
+                        # none written over a record that cannot be read: its path may refuse
+                        # the write, and one written over a damaged file would let a later attempt
+                        # delete what that file kept; while it cannot be read no attempt deletes a
+                        # kit volume (SDD §7.2, review RV34A-03)
+                        await ctx.log(
+                            f"rollback: what {named} holds is not recorded "
+                            f"({', '.join(sorted(held)) or 'no volume'}): the record cannot be "
+                            f"read, so no kit volume of {vm.name} is deleted"
+                        )
+                    else:
+                        try:
+                            await asyncio.to_thread(_record_kept, rdir, named, kept)
+                        except OSError as exc:
+                            raise TransientStepError(
+                                f"rollback: could not record what {named} holds: {exc}"
+                            ) from exc
+            servers = [server for server in (recorded, named) if server]
+            for server in servers:
+                await dst.delete_server(server)
+            server_id = recorded or named
+            # the source next: only the server's deletion comes before it - two live copies on
+            # a stretched network -, and the destination's clean-up never keeps it stopped - the
+            # kit's ports and volumes matter only to the next attempt, which a failure there
+            # retries with the source running (SDD §7.2, §8, reviews RV29-01, RV30-04)
             await self.providers.get(ctx.source).power_on(vm.source_id)
+            # it runs: the clock closes now, whatever fails after (SDD §5.2, review RV30-03)
+            await ctx.mark_downtime_end()
+            if servers or kept or unreadable:
+                # a server booted from the kit's volumes: what this rollback then cannot delete
+                # or keeps is no completed copy for a later run (SDD §7.2, review RV32A-01)
+                await self._mark_cutover_copies(ctx)
+            deleted_ports = await self._delete_kit_ports(dst, vm.nics, vm.name)
+            deleted_volumes = (
+                []
+                if unreadable
+                else await self._delete_kit_volumes(ctx, dst, m.destination_server_id, kept)
+            )
         except ProviderError as exc:
             raise TransientStepError(f"rollback: {exc}") from exc
+        # done: a later rollback starts from what it finds (review RV29-03)
+        await asyncio.to_thread(_remove_kept, rdir)
         return StepResult(
             details={
                 "source_running": True,
                 "deleted_server": server_id,
+                "deleted_servers": servers,
                 "deleted_ports": deleted_ports,
+                "deleted_volumes": deleted_volumes,
             }
         )
 
@@ -1446,8 +1908,11 @@ class AnsibleExecutor:
         mappings: Mappings | None,
         networks: Sequence[dict[str, Any]] | None = None,
         deferred: list[str] | None = None,
+        *,
+        trace: _RunTrace | None = None,
     ) -> bool:
-        """Run the playbooks; True when the source-stop task of one of them was skipped."""
+        """Run the playbooks; True when the source-stop task of one of them was skipped. What the
+        output showed is kept in ``trace``."""
         vars_path = workdir / "vars.yml"
         secrets_path = workdir / "secrets.yml"
         inventory_path = workdir / "inventory.yml"
@@ -1478,7 +1943,15 @@ class AnsibleExecutor:
                     # written again once the rewrite of the new export finishes (SDD §7.2)
                     remove_quietly(osm / EXPORT_RECORD)
                 stop_skipped |= await self._run_playbook(
-                    playbook, workdir, inventory_path, vars_path, secrets_path, ctx, osm, env
+                    playbook,
+                    workdir,
+                    inventory_path,
+                    vars_path,
+                    secrets_path,
+                    ctx,
+                    osm,
+                    env,
+                    trace=trace,
                 )
                 if playbook.name == "export_workloads.yml" and (ctx or mappings) is not None:
                     planned = ctx.migration.vm.source_id if ctx is not None else None
@@ -1607,6 +2080,8 @@ class AnsibleExecutor:
         ctx: StepContext | None,
         osm: Path,
         env: dict[str, str],
+        *,
+        trace: _RunTrace | None = None,
     ) -> bool:
         """Run one playbook; True when its source-stop task was seen but skipped."""
         name = playbook.name
@@ -1659,6 +2134,8 @@ class AnsibleExecutor:
                     # SDD §7.2: the downtime clock starts when the source-stop task starts…
                     watch_stop = False
                     stop_seen_at = utcnow()
+                    if trace is not None:
+                        trace.stop_task_started = True
                 elif stop_seen_at is not None and line.startswith("TASK ["):
                     # …the next task began without a result that ran: the stop was skipped
                     stop_seen_at = None

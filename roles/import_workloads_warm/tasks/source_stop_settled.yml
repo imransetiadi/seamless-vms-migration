@@ -1,0 +1,30 @@
+---
+# Wait until Nova runs no stop or start of the workload's source server (Seamless Migrate SDD 6.5,
+# reviews RV26-10, RV29-06). Nova powers a server off with its task_state "powering-off" while
+# the server still reads ACTIVE until the guest is down, and on with "powering-on" while it still
+# reads SHUTOFF until the guest runs, and refuses a stop or a start (409) meanwhile;
+# server_action reads that status as it is - a start would start nothing or be refused, a stop
+# would be refused. A stop or start cut off before its wait ended (a step timeout, a 503 during
+# the wait) leaves exactly that for the rollback or the re-run that follows. The cold role
+# includes this file too. Its task name must match none of the control plane's stop task
+# patterns (SDD 7.2).
+- name: Wait until no stop or start of the source server runs
+  os_migrate.os_migrate.server_info:
+    cloud: src
+    server: "{{ item['_info']['id'] }}"
+    validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+    ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+    client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+    client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+  register: import_workloads_warm_source_power
+  until: >-
+    import_workloads_warm_source_power.servers | default([])
+    | map(attribute='task_state', default=none) | select('in', ['powering-off', 'powering-on'])
+    | list | length == 0
+  # at least one more read, at the latest after the timeout: with retries 0 ansible-core runs the
+  # task once and never evaluates `until` (review RV27-09)
+  retries: >-
+    {{ [(os_migrate_timeout | int)
+        // ([os_migrate_source_stop_poll_s | default(5) | int, 1] | max), 1] | max }}
+  delay: >-
+    {{ [os_migrate_source_stop_poll_s | default(5) | int, os_migrate_timeout | int] | min }}

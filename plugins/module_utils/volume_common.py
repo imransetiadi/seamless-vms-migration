@@ -18,6 +18,7 @@ import time
 import fcntl
 import errno
 import functools
+import math
 
 # Default timeout for OpenStack operations
 DEFAULT_TIMEOUT = 1800
@@ -45,6 +46,54 @@ def _is_not_found(err):
     """openstacksdk's NotFoundException (a 404), whatever its version names it."""
     return getattr(err, "status_code", None) == 404 or any(
         cls.__name__ == "NotFoundException" for cls in type(err).__mro__
+    )
+
+
+def is_timeout(err):
+    """openstacksdk's ResourceTimeout - a wait that gave up, such as "Timeout waiting for Volume
+    ... to delete" -, whatever module raised it (Seamless Migrate SDD 6.6, review RV34B-01)."""
+    return any(cls.__name__ == "ResourceTimeout" for cls in type(err).__mro__)
+
+
+def _qcow2_virtual_size(conn, image):
+    """The virtual disk size the qcow2 file of ``image`` declares in its header - bytes 24 to 31,
+    big-endian - read from the first bytes of a streamed download, closed at once: Glance before
+    Victoria records no virtual_size (Seamless Migrate SDD 6.1, review RV29-09). None when the
+    file is no qcow2 or cannot be read."""
+    try:
+        response = conn.image.download_image(image, stream=True)
+    except Exception:  # no answer: the file's own size stands
+        return None
+    head = b""
+    try:
+        for chunk in response.iter_content(chunk_size=512):
+            head += chunk
+            if len(head) >= 32:
+                break
+    except Exception:  # a download cut short: the file's own size stands
+        return None
+    finally:
+        response.close()
+    if len(head) < 32 or head[:4] != b"QFI\xfb":
+        return None
+    return int.from_bytes(head[24:32], "big")
+
+
+def image_volume_size(image, conn=None):
+    """The smallest volume, in GiB, that Cinder creates from ``image`` - a server snapshot: its
+    file rounded up to whole GiB, its virtual disk (a qcow2 file holds a larger disk) and its
+    min_disk, at least 1 (Seamless Migrate SDD 6.1, audit A-06). Where Glance records no virtual
+    disk of a qcow2 image, its file's header is read through ``conn``, the image's cloud (review
+    RV29-09)."""
+    gib = 1024 ** 3
+    virtual = getattr(image, "virtual_size", None)
+    if not virtual and conn is not None and getattr(image, "disk_format", None) == "qcow2":
+        virtual = _qcow2_virtual_size(conn, image)
+    return max(
+        int(math.ceil((getattr(image, "size", None) or 0) / float(gib))),
+        int(math.ceil((virtual or 0) / float(gib))),
+        int(getattr(image, "min_disk", None) or 0),
+        1,
     )
 
 
@@ -88,7 +137,7 @@ def detach_volume_bounded(conn, server, volume, timeout):
         if server["id"] not in holders and (holders or status == "available"):
             return
         time.sleep(1)
-    raise RuntimeError(
+    raise DetachStuck(
         "Timed out after %s s waiting to detach volume %s from server %s"
         % (timeout, volume["id"], server["id"])
     )
@@ -124,6 +173,18 @@ GIVE_UP_PREFIXES = ("Lock timeout", "SSH timeout")
 class ConversionHostUnreachable(RuntimeError):
     """A wait gave up: ssh to the conversion host failed for SSH_UNREACHABLE_S
     without a break (Seamless Migrate SDD 6.6)."""
+
+
+class LockUnavailable(RuntimeError):
+    """A lock wait gave up: another conversion held the lock for the whole wait (Seamless
+    Migrate SDD 6.6, review RV34B-01)."""
+
+
+class DetachStuck(RuntimeError):
+    """A detach Nova did not end within the timeout (detach_volume_bounded; Seamless Migrate SDD
+    6.6, review RV34B-01). Named without "timeout": ansible-core before 2.19 prints an escaped
+    exception's class name, and the control plane would read the stuck detach as transient
+    (review RV35A-01)."""
 
 
 class DiskIdentityError(RuntimeError):
@@ -246,7 +307,7 @@ def use_lock(lock_file):
                     time.sleep(1)
                     self.log.info("Error waiting for lock: %s", str(err))
             else:
-                raise RuntimeError("Unable to acquire lock " + lock_file)
+                raise LockUnavailable("Unable to acquire lock " + lock_file)
             try:
                 return function(self, *args, **kwargs)
             finally:
@@ -348,6 +409,7 @@ class OpenStackVolumeBase:
         timeout=DEFAULT_TIMEOUT,
         shell_factory=None,
         preserve_volume_type=False,
+        src_ssh_user=None,
     ):
         # Required common parameters:
         # openstack_connection: OpenStack connection object
@@ -367,7 +429,11 @@ class OpenStackVolumeBase:
         # log_file: Debug log path for volume migration
         # preserve_volume_type: keep the serialized volume_type of destination
         #                       volumes instead of the destination default
+        # src_ssh_user: the source conversion host's user, for the destination
+        #               host's hop to it; ssh_user when unset (Seamless Migrate
+        #               SDD 6.5: each host keeps its own provider's user)
         self.conversion_host_address = conversion_host_address
+        self.src_ssh_user = src_ssh_user or ssh_user
         self.state_file = state_file
         self.log_file = log_file
         self.timeout = timeout
@@ -433,6 +499,23 @@ class OpenStackVolumeBase:
         if not id_maybe:
             return None
         return volume_or_none(self.conn, id_maybe)
+
+    def _delete_unrecorded_volume(self, volume, timeout):
+        """
+        Delete a volume whose record could not be written - it would outlive
+        every rollback - once Cinder settled it: a volume still being created
+        cannot be deleted. A failure here is logged; the record's error stands.
+        """
+        try:
+            self.conn.block_storage.wait_for_status(
+                volume, status="available", failures=["error"], wait=timeout
+            )
+        except Exception as err:  # an errored volume is deleted all the same
+            self.log.warning("Volume %s did not become available: %s", volume.id, err)
+        try:
+            self.conn.delete_volume(name_or_id=volume.id, wait=False)
+        except Exception as err:
+            self.log.error("Could not delete the unrecorded volume %s: %s", volume.id, err)
 
     @use_lock(ATTACH_LOCK_FILE_DESTINATION)
     def _detach_volumes_from_destination_converter(self, volume_ids=None):
@@ -1244,7 +1327,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                 image=image.id,
                 wait=False,
                 name=image.name,
-                size=max(image.size // (1024**3), image.min_disk),
+                size=image_volume_size(image, self.conn),
             )
             self.volume_map["/dev/vda"]["source_id"] = volume.id
             volume = self.conn.block_storage.wait_for_status(
@@ -1454,7 +1537,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         # It is expected that key authorization has already been set up from
         # the destination conversion host to the source conversion host!
         source_shell = RemoteShell(
-            self.source_conversion_host_address, ssh_user=self.shell.ssh_user
+            self.source_conversion_host_address, ssh_user=self.src_ssh_user
         )
         forward_ports = ["-N", "-T"]
         for path, mapping in self.volume_map.items():
@@ -1551,23 +1634,6 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             )
             if bootable is not None:
                 self.conn.block_storage.set_volume_bootable_status(new_volume, bootable)
-
-    def _delete_unrecorded_volume(self, volume, timeout):
-        """
-        Delete a volume whose record could not be written - it would outlive
-        every rollback - once Cinder settled it: a volume still being created
-        cannot be deleted. A failure here is logged; the record's error stands.
-        """
-        try:
-            self.conn.block_storage.wait_for_status(
-                volume, status="available", failures=["error"], wait=timeout
-            )
-        except Exception as err:  # an errored volume is deleted all the same
-            self.log.warning("Volume %s did not become available: %s", volume.id, err)
-        try:
-            self.conn.delete_volume(name_or_id=volume.id, wait=False)
-        except Exception as err:
-            self.log.error("Could not delete the unrecorded volume %s: %s", volume.id, err)
 
     def _before_destination_volumes_created(self):
         """

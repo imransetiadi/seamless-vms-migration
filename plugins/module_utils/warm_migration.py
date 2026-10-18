@@ -42,6 +42,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     RemoteShell,
     destination_volume_sdk_params,
     detach_volume_bounded,
+    image_volume_size,
     use_lock,
     volume_or_none,
 )
@@ -55,7 +56,6 @@ BLOCKSYNC_REMOTE_PATH = "/tmp/seamless-blocksync-{transfer_uuid}.py"
 
 _SAFE_SERVER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SAFE_TRANSFER_UUID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
-_GIB = 1024 ** 3
 
 
 def utc_now():
@@ -558,7 +558,7 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
         image = self.conn.get_image_by_id(image.id)
         if image is None or image.status != "active":
             raise RuntimeError("Could not create new image of image-based instance!")
-        size = max((image.size or 0) // _GIB, image.min_disk or 0, 1)
+        size = image_volume_size(image, self.conn)
         volume = self.conn.create_volume(
             size=size,
             image=image.id,
@@ -661,6 +661,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
         timeout=DEFAULT_TIMEOUT,
         shell_factory=None,
         preserve_volume_type=False,
+        src_ssh_user=None,
     ):
         super(OpenstackWarmSync, self).__init__(
             openstack_connection,
@@ -674,6 +675,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
             timeout=timeout,
             shell_factory=shell_factory,
             preserve_volume_type=preserve_volume_type,
+            src_ssh_user=src_ssh_user,
         )
         self.ser_server = ser_server
         self.state = state
@@ -698,6 +700,14 @@ class OpenstackWarmSync(_WarmVolumeBase):
         number = len(self.state.passes) + 1
         started_at = utc_now()
         started = time.monotonic()
+        # A pass interrupted earlier may have left volumes attached: detached
+        # before any is extended, which Cinder does for an in-use volume only
+        # where its microversion and backend allow, and whose wait for
+        # `available` an attached volume never ends (Seamless Migrate SDD 6.4,
+        # audit A-04).
+        self._detach_volumes_from_destination_converter(
+            volume_ids=[entry["dest_id"] for entry in self.state.dest_volumes.values()]
+        )
         created = self._ensure_dest_volumes(source_map)
         orphaned = sorted(set(self.state.dest_volumes) - set(source_map))
         if orphaned:
@@ -736,8 +746,6 @@ class OpenstackWarmSync(_WarmVolumeBase):
         summaries = []
         error = None
         try:
-            # A pass interrupted earlier may have left volumes attached.
-            self._detach_volumes_from_destination_converter()
             self._attach_destination_volumes()
             self._install_blocksync()
             summaries = self._run_receivers()
@@ -810,7 +818,14 @@ class OpenstackWarmSync(_WarmVolumeBase):
                         # a pass interrupted while Cinder created it
                         volume = self._wait_volume_available(volume)
                     if source["size"] and source["size"] > recorded["size"]:
-                        self._extend_dest_volume(dev, volume, source["size"])
+                        if (getattr(volume, "size", None) or 0) >= source["size"]:
+                            # an earlier pass extended it but could not record it (a full disk):
+                            # recorded now, never extended again to the size it has, which Cinder
+                            # refuses (Seamless Migrate SDD 6.3, review RV29-07)
+                            self.state.dest_volumes[dev]["size"] = int(volume.size)
+                            self.state.save()
+                        else:
+                            self._extend_dest_volume(dev, volume, source["size"])
                     if recorded.get("bootable"):
                         # set again: a pass interrupted between the create and the flag
                         # left it unset, and Nova refuses to boot from such a volume
@@ -860,7 +875,13 @@ class OpenstackWarmSync(_WarmVolumeBase):
             "bootable": bool(bootable),
             "name": params.get("name"),
         }
-        self.state.save()
+        try:
+            self.state.save()
+        except Exception:
+            # no record names the volume (a full disk): it would outlive every
+            # rollback (Seamless Migrate SDD 6.3, audit A-05)
+            self._delete_unrecorded_volume(volume, self.timeout)
+            raise
         volume = self._wait_volume_available(volume)
         if bootable is not None:
             self.conn.block_storage.set_volume_bootable_status(volume, bootable)
@@ -891,7 +912,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
 
     def _source_shell(self):
         return self.shell_factory(
-            self.source_conversion_host_address, self.ssh_user, self.ssh_key_path
+            self.source_conversion_host_address, self.src_ssh_user, self.ssh_key_path
         )
 
     def _install_blocksync(self):
@@ -937,8 +958,10 @@ class OpenstackWarmSync(_WarmVolumeBase):
         if self._cancelled.is_set():
             raise RuntimeError("cancelled after another disk failed")
         mapping = self.volume_map[dev]
+        # the receiver's hop logs in as the source host's user; it runs as this host's own,
+        # the link key's owner (SDD 6.5)
         source_ssh = RemoteShell(
-            self.source_conversion_host_address, self.ssh_user
+            self.source_conversion_host_address, self.src_ssh_user
         ).ssh_preamble()
         command = blocksync_receive_command(
             self.transfer_uuid,

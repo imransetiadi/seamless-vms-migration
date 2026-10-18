@@ -18,32 +18,38 @@ class VMNotFound(ProviderError):
 
 @runtime_checkable
 class SourceProvider(Protocol):
-    async def check(self) -> dict[str, Any]: ...
+    async def check(self) -> dict[str, Any]:
+        """The source's capabilities; ProviderError when it cannot be reached."""
 
-    async def list_vms(self) -> list[VMRef]: ...
+    async def list_vms(self) -> list[VMRef]:
+        """Every VM of the source the credential sees."""
 
-    async def get_vm(self, source_id: str) -> VMRef: ...
+    async def get_vm(self, source_id: str) -> VMRef:
+        """The VM as the source reads it now; VMNotFound when the cloud answers it has none."""
 
-    async def inventory(self) -> SourceInventory: ...
+    async def inventory(self) -> SourceInventory:
+        """The source's networks (name to MTU), projects and keypairs."""
 
 
 @runtime_checkable
 class DestinationProvider(Protocol):
-    async def check(self) -> dict[str, Any]: ...
+    async def check(self) -> dict[str, Any]:
+        """The destination's capabilities; ProviderError when it cannot be reached."""
 
-    async def inventory(self) -> DestinationInventory: ...
+    async def inventory(self) -> DestinationInventory:
+        """The destination's networks, flavors, volume types, quotas, projects and keypairs."""
 
     async def get_server(self, server_id: str) -> dict[str, Any]:
         """``{status, ports: [{status, fixed_ips, floating_ips}]}``."""
-        ...
 
-    async def console_log(self, server_id: str, lines: int = 200) -> str | None: ...
+    async def console_log(self, server_id: str, lines: int = 200) -> str | None:
+        """The last ``lines`` lines of the server's console; None when it has none."""
 
-    async def delete_server(self, server_id: str) -> None: ...
+    async def delete_server(self, server_id: str) -> None:
+        """Delete the server and wait, within the call's bound, until it is gone."""
 
     async def find_server(self, name: str) -> str | None:
         """Id of the destination server called ``name`` (extension used by executors)."""
-        ...
 
     async def ports(
         self,
@@ -54,11 +60,34 @@ class DestinationProvider(Protocol):
     ) -> list[dict[str, Any]]:
         """The ports the credential sees that match every filter given:
         ``[{id, name, network_id, device_id, mac_address, fixed_ips: [address, ...]}]``."""
-        ...
 
     async def delete_port(self, port_id: str) -> None:
         """Delete a port; one already gone is no error."""
-        ...
+
+    async def volumes(self) -> list[dict[str, Any]]:
+        """The volumes of the credential's project: ``[{id, name, status, metadata: {key: value},
+        attachments: [server_id, ...]}]`` (§7.2 VMware rollback)."""
+
+    async def delete_volume(self, volume_id: str) -> None:
+        """Delete a volume once Cinder settled it, and wait until it is gone, within the call's
+        bound; one already gone is no error."""
+
+    async def detach_volume(self, server_id: str, volume_id: str) -> None:
+        """Remove Nova's attachment of the volume to the server and wait until Cinder reads the
+        volume available, within the call's bound; one not attached to it is no error."""
+
+    async def server_of_address(self, address: str) -> str | None:
+        """The Nova server holding the address: a compute port with it as a fixed IP, else the
+        compute port Neutron's floating IP of that address is associated with; None when none
+        (§7.2)."""
+
+    async def server_volumes(self, server_id: str) -> list[str]:
+        """The ids of the volumes Nova lists as attached to the server - its record alone, no
+        Cinder or Neutron call; a server gone holds none (§7.2)."""
+
+    async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
+        """Set the given metadata keys on the volume and keep its other keys (Cinder's merge),
+        within the call's bound: the mark of a VMware kit copy that completed (§7.2)."""
 
 
 def provider_caps(provider: Provider) -> dict[str, Any]:

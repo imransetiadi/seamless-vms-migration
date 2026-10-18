@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -15,8 +16,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
+from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.responses import Response
 from starlette.routing import Match
 
 from .. import __version__
@@ -211,6 +214,21 @@ class BodyLimitMiddleware:
         return f"request body larger than {self.max_bytes} bytes"
 
 
+class EnvelopeCORSMiddleware(CORSMiddleware):
+    """Starlette's CORS, whose refused preflight is the error envelope (SDD §12, audit AP-09): the
+    CORS layer answers a preflight before any route, so no error handler sees it."""
+
+    def preflight_response(self, request_headers: Headers) -> Response:
+        response = super().preflight_response(request_headers)
+        if response.status_code < 400:
+            return response
+        refused = _error(response.status_code, "bad_request", bytes(response.body).decode())
+        for name, value in response.headers.items():  # Vary and the allowed methods stay
+            if name not in ("content-type", "content-length"):
+                refused.headers[name] = value
+        return refused
+
+
 def _install_security_headers(app: FastAPI) -> None:
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Any) -> Any:
@@ -261,6 +279,19 @@ def _api_path_takes_another_method(request: Request) -> bool:
     )
 
 
+def _dashboard_file(root: Path, full_path: str) -> str | None:
+    """The dashboard's file at ``full_path``, contained first (SDD §12): a path whose ".." leaves
+    the directory is never looked at, and a symlink inside it counts only when what it names
+    stays inside; None for any other path - the index answers it - as for a NUL byte, which
+    names no file (review RV33-05)."""
+    inside = f"{root}{os.sep}"
+    candidate = os.path.normpath(os.path.join(root, full_path))
+    if not (full_path and "\x00" not in full_path and candidate.startswith(inside)):
+        return None
+    real = os.path.realpath(candidate)
+    return real if real.startswith(inside) and os.path.isfile(real) else None
+
+
 def _install_spa(app: FastAPI, dist: Path) -> None:
     root = dist.resolve()
     index = root / "index.html"
@@ -275,10 +306,7 @@ def _install_spa(app: FastAPI, dist: Path) -> None:
             return _error(405, "method_not_allowed", "Method Not Allowed")
         if first == "api" or first in _DISABLED_DOCS:
             return _error(404, "not_found", "Not Found")
-        candidate = (root / full_path).resolve()
-        if full_path and candidate.is_file() and candidate.is_relative_to(root):
-            return FileResponse(candidate)
-        return FileResponse(index)
+        return FileResponse(_dashboard_file(root, full_path) or index)
 
 
 def build_services(
@@ -366,15 +394,16 @@ def create_app(
     # added before the security headers middleware, which therefore wraps it: a 413 carries the
     # R-05 headers too
     app.add_middleware(BodyLimitMiddleware)
-    _install_security_headers(app)
-    _install_api_docs(app, settings)
     if settings.cors_origins:
+        # inside the security headers too: the CORS layer answers preflights itself (audit AP-09)
         app.add_middleware(
-            CORSMiddleware,
+            EnvelopeCORSMiddleware,
             allow_origins=settings.cors_origins,
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
             allow_headers=["Authorization", "Content-Type"],
         )
+    _install_security_headers(app)
+    _install_api_docs(app, settings)
     for module in (
         routes_misc,
         routes_advisor,

@@ -2912,6 +2912,284 @@ async def test_downtime_clock_falls_back_to_the_cutover_step_start(tmp_path, sto
     assert h.kinds().count("migration.downtime_started") == 1
 
 
+def slow_clock_answer(store):
+    """The store saves the migration's downtime clock, but its answer is slow to come back (a busy
+    database): the returned events are set once the save landed, and the answer waits for the
+    second."""
+    import threading
+
+    held, release = threading.Event(), threading.Event()
+
+    def slowed(write):
+        def slow_answer(kind, model, *args, **kw):
+            answer = write(kind, model, *args, **kw)
+            if kind == "migration" and model.downtime_started_at is not None and not held.is_set():
+                held.set()
+                release.wait(30)
+            return answer
+
+        return slow_answer
+
+    store.put = slowed(store.put)
+    store.put_with_event = slowed(store.put_with_event)  # the clock saved with its event
+    return held, release
+
+
+async def test_a_cancelled_clock_mark_ends_once_its_clock_and_its_event_are_stored(tmp_path, store):
+    """SDD §4.3, §7.2: whichever executor opens the downtime clock, a cancel that lands while the
+    clock's save runs - the step timeout, a rollback request, a shutdown - waits for that save and
+    for its migration.downtime_started event: an open clock is never left unannounced (review
+    RV26-06)."""
+    h = build_harness(tmp_path, store, [vm(1)])
+    m = make_migration(id="mig-00000000aa", plan_id="plan-00c0ffee", vm=vm(1), phase=P.cutover)
+    store.put("migration", m)
+    held, release = slow_clock_answer(store)
+    mark = asyncio.create_task(h.orch._mark_downtime(m.id))
+    try:
+        assert await asyncio.to_thread(held.wait, 10), "the clock was never saved"
+        mark.cancel()
+        await asyncio.sleep(0.2)
+        assert not mark.done(), "the cancel cut the mark off between the clock and its event"
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await mark
+    assert (await h.migration(m.id)).downtime_started_at is not None
+    assert h.kinds().count("migration.downtime_started") == 1
+
+
+async def test_a_downtime_event_the_store_refuses_still_leaves_the_clock_open(tmp_path, store):
+    """SDD §5, §8: the clock is saved before its event - a store error writing
+    migration.downtime_started fails the mark, but leaves the clock open, so the automatic
+    rollback still restarts a source that may be stopped and a cancel is still refused (review
+    RV26-06)."""
+    h = build_harness(tmp_path, store, [vm(1)])
+    m = make_migration(id="mig-00000000aa", plan_id="plan-00c0ffee", vm=vm(1), phase=P.cutover)
+    store.put("migration", m)
+    append, put_with_event = store.append_event, store.put_with_event
+
+    def refused(event):
+        if event.kind == "migration.downtime_started":
+            raise RuntimeError("database is locked")
+
+    def refusing(event):
+        refused(event)
+        return append(event)
+
+    def refusing_with(kind, model, event, *args, **kw):
+        refused(event)  # the event written with the clock in one transaction: neither lands
+        return put_with_event(kind, model, event, *args, **kw)
+
+    store.append_event, store.put_with_event = refusing, refusing_with
+    with pytest.raises(RuntimeError, match="database is locked"):
+        await h.orch._mark_downtime(m.id)
+    assert (await h.migration(m.id)).downtime_started_at is not None
+    assert "migration.downtime_started" not in h.kinds()
+
+
+async def test_an_ansible_cutover_cut_off_while_its_clock_saves_still_announces_it_once(
+    tmp_path, store, monkeypatch
+):
+    """SDD §4.3, §7.2, §15.1: the step timeout cuts a cold cutover's playbook off while the clock
+    its stop task opened is being saved. The clock is announced once - migration.downtime_started
+    in the trail - and the automatic rollback follows (review RV26-06)."""
+    from seamless_migrate.config import find_repo_root
+    from seamless_migrate.executors.ansible import AnsibleExecutor
+    from tests.factories import make_plan
+    from tests.fake_ansible import install
+    from tests.test_executor_ansible import FakeRegistry
+
+    script = install(tmp_path / "bin")
+    monkeypatch.setenv("ANSIBLE_FAKE_LOG", str(tmp_path / "ansible.log"))
+    monkeypatch.setenv("ANSIBLE_FAKE_SLEEP", "0.05")
+    clouds = tmp_path / "clouds.yaml"
+    clouds.write_text(
+        "clouds:\n"
+        "  src:\n    auth: {auth_url: 'https://src/v3', username: su, password: spw, "
+        "project_name: finance}\n"
+        "  dst:\n    auth: {auth_url: 'https://dst/v3', username: du, password: dpw, "
+        "project_name: finance}\n"
+    )
+    settings = make_settings(
+        tmp_path,
+        ansible_playbook=str(script),
+        clouds_yaml=clouds,
+        collection_root=find_repo_root(),
+        step_timeout_s=1.0,
+        max_step_retries=0,
+    )
+    executor = AnsibleExecutor(settings, providers=FakeRegistry(), poll_s=0.02)
+    source = make_vm(source_id="srv-1", name="web-01")
+    h = build_harness(tmp_path, store, [source], executor=executor, settings=settings)
+    plan = make_plan(
+        id="plan-00c0ffee",
+        vm_ids=[source.source_id],
+        status=PlanStatus.running,
+        require_approval=False,
+        auto_cutover=True,
+    )
+    store.put("plan", plan)
+    m = make_migration(
+        id="mig-00000000aa", plan_id=plan.id, vm=source, strategy=Strategy.cold, phase=P.ready
+    )
+    store.put("migration", m)
+    held, release = slow_clock_answer(store)
+    await h.orch.start()
+    try:
+        assert await asyncio.to_thread(held.wait, 15), "the clock was never saved"
+        await asyncio.sleep(1.5)  # the step timeout cuts the step off while the save answers
+        release.set()
+        final = await h.wait_phase(m.id, P.rolled_back, P.failed, timeout=30)
+        assert final.downtime_started_at is not None and P.rolling_back in h.history(final)
+        assert h.kinds().count("migration.downtime_started") == 1, h.kinds()
+    finally:
+        release.set()
+        await h.orch.stop()
+
+
+def _vmware_kit_journey(tmp_path, store, monkeypatch, registry_class=None):
+    """A vmware_cold migration of web-01, ready, in a running plan, driven by the real
+    AnsibleExecutor over the fake kit run (tests/fake_kit.py), whose first run fails at the kit's
+    "Create network ports" after its migrate task converted the volume and powered the VM off."""
+    from seamless_migrate.config import find_repo_root
+    from seamless_migrate.executors.ansible import AnsibleExecutor
+    from tests.factories import make_plan
+    from tests.fake_kit import KitRegistry, install_kit
+    from tests.test_executor_ansible import MAPPINGS, VCENTER, VMW_NICS
+
+    state = tmp_path / "kit-state"
+    state.mkdir()
+    (state / "power").write_text("on")
+    (state / "fail_ports_once").write_text("")
+    script = install_kit(tmp_path / "bin")
+    monkeypatch.setenv("ANSIBLE_FAKE_KIT_STATE", str(state))
+    monkeypatch.setenv("ANSIBLE_FAKE_CREATED", str(tmp_path / "created.txt"))
+    clouds = tmp_path / "clouds.yaml"
+    clouds.write_text(
+        "clouds:\n"
+        "  dst:\n    auth: {auth_url: 'https://dst/v3', username: du, password: dpw, "
+        "project_name: finance}\n"
+    )
+    secret = tmp_path / "secrets" / "vcenter-dc2"
+    secret.mkdir(parents=True)
+    for key, value in (
+        ("username", "svc@vsphere.local"),
+        ("password", "vpw"),
+        ("datacenter", "DC2"),
+    ):
+        (secret / key).write_text(value)
+    settings = make_settings(
+        tmp_path,
+        ansible_playbook=str(script),
+        clouds_yaml=clouds,
+        secrets_dir=tmp_path / "secrets",
+        collection_root=find_repo_root(),
+        max_step_retries=0,
+    )
+    registry = (registry_class or KitRegistry)(state, "web-01")
+    executor = AnsibleExecutor(settings, providers=registry, poll_s=0.02)
+    vm = make_vm(source_id="vm-1", name="web-01", nics=VMW_NICS)
+    h = build_harness(tmp_path, store, [vm], executor=executor, settings=settings)
+    store.put("provider", VCENTER)
+    plan = make_plan(
+        id="plan-00c0ffee",
+        source_provider_id=VCENTER.id,
+        vm_ids=["vm-1"],
+        status=PlanStatus.running,
+        require_approval=False,
+        auto_cutover=True,
+        mappings=MAPPINGS,
+    )
+    store.put("plan", plan)
+    m = make_migration(
+        id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_cold, phase=P.ready
+    )
+    store.put("migration", m)
+    return h, m, state
+
+
+async def test_a_vmware_retry_after_the_automatic_rollback_copies_and_stops_the_source_again(
+    tmp_path, store, monkeypatch
+):
+    """SDD §7.2, §8 (review RV28-01): a VMware cutover that fails after the kit's migrate task -
+    its clock open - is rolled back automatically, and the rollback powers the VM on. The kit had
+    converted the VM's volume; on the retry its migrate task would take that volume as migrated
+    and boot the destination from it - no copy, no power-off, the source running beside it. The
+    rollback deletes that volume, so the retry copies the VM again and powers it off."""
+    h, m, state = _vmware_kit_journey(tmp_path, store, monkeypatch)
+    await h.orch.start()
+    try:
+        first = await h.wait_phase(m.id, P.rolled_back, P.failed, timeout=30)
+        assert first.phase == P.rolled_back and P.rolling_back in h.history(first), first.error
+        assert (state / "power").read_text() == "on", "the rollback powers the VM on"
+        assert not (state / "volume").exists(), "the rollback kept the kit's converted volume"
+        await h.orch.retry(m.id, "rina")
+        done = await h.wait_phase(m.id, P.completed, P.failed, P.rolled_back, timeout=30)
+        assert done.phase == P.completed, (done.phase, done.error)
+        assert (state / "power").read_text() == "off", "the cutover completed with the VM running"
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_vmware_rollback_cinder_will_not_clean_restarts_the_source_and_the_retry_waits(
+    tmp_path, store, monkeypatch
+):
+    """SDD §7.2, §8 (review RV29-01): the automatic rollback powers the source on before it
+    deletes the kit's converted volume - Cinder refusing that delete fails the rollback with the
+    source running, never stopped, and its clock closed at the power-on (SDD §5.2, review
+    RV30-03). A retry's cutover would boot the destination from that volume beside the source: it
+    is refused before the kit runs and, the source running, ends failed; the rollback the
+    operator then requests deletes the volume once Cinder does, and the next retry copies the VM
+    again and stops it."""
+    from seamless_migrate.providers.base import ProviderError
+    from tests.fake_kit import KitRegistry
+
+    refusing = [True]
+
+    class Picky(KitRegistry):
+        def get(self, provider):
+            impl = super().get(provider)
+            delete = impl.delete_volume
+
+            async def delete_volume(volume_id):
+                if refusing[0]:
+                    impl.calls.append(("delete_volume", volume_id))
+                    raise ProviderError("dst-rhoso: BadRequestException: 400: Invalid volume")
+                await delete(volume_id)
+
+            impl.delete_volume = delete_volume
+            return impl
+
+    h, m, state = _vmware_kit_journey(tmp_path, store, monkeypatch, Picky)
+    runs = lambda: len((state / "runs").read_text().split())  # noqa: E731
+    await h.orch.start()
+    try:
+        first = await h.wait_phase(m.id, P.failed, P.rolled_back, timeout=30)
+        assert first.phase == P.failed and P.rolling_back in h.history(first), first.error
+        assert (state / "power").read_text() == "on", "a refused clean-up kept the source stopped"
+        assert (state / "volume").exists() and runs() == 1
+        # the source runs again: its clock closed at the power-on, not at the rollback's end
+        assert first.downtime_ended_at is not None and first.actual_downtime_s is not None
+        kinds = [e.kind for e in h.store.events(since_seq=0, limit=1000)]
+        assert kinds.count("migration.downtime_ended") == 1
+        refusing[0] = False
+        await h.orch.retry(m.id, "rina")
+        refused = await h.wait_phase(m.id, P.rolled_back, P.failed, P.completed, timeout=30)
+        assert refused.phase == P.failed, (refused.phase, refused.error)
+        assert "roll the migration back again" in (refused.error or "")
+        assert runs() == 1, "the kit ran on the converted volume while the source ran"
+        await h.orch.rollback(m.id, "rina", "delete the kit's volume")
+        second = await h.wait_phase(m.id, P.rolled_back, P.failed, P.completed, timeout=30)
+        assert second.phase == P.rolled_back, (second.phase, second.error)
+        assert not (state / "volume").exists() and (state / "power").read_text() == "on"
+        await h.orch.retry(m.id, "rina")
+        done = await h.wait_phase(m.id, P.completed, P.failed, P.rolled_back, timeout=30)
+        assert done.phase == P.completed, (done.phase, done.error)
+        assert runs() == 2 and (state / "power").read_text() == "off"
+    finally:
+        await h.orch.stop()
+
+
 async def test_failed_cutover_auto_rolls_back(tmp_path, store):
     settings = make_settings(tmp_path)
 

@@ -131,8 +131,25 @@ SCRIPT = textwrap.dedent(
         "import_workloads_cutover.yml": "os_migrate.os_migrate.import_workloads_warm : "
                                         "Stop the source server",
     }}.get(base)
+    kit_task = ("os_migrate.vmware_migration_kit.import_workloads : "
+                "Migrate Guest from Vmware using nbdkit " + name)
     if base == "{kit}" and merged.get("cutover"):
-        stop_task = "os_migrate.vmware_migration_kit.migration : Power off the VM"
+        # kit 2.2.7 has no power-off task: its migrate module powers the VM off inside this one
+        # (a Windows guest before the copy, any other after the conversion; review RV26-03)
+        stop_task = kit_task
+    elif base == "{kit}":
+        # a CBT pass runs the same task: no conversion, no power-off (review RV28-06)
+        print("TASK [" + kit_task + "] ****")
+        print("ok: [localhost]")
+        sys.stdout.flush()
+    if stop_task and os.environ.get("ANSIBLE_FAKE_FAIL_BEFORE_STOP"):
+        # a task before the stop - the kit's checks, its SSH to the conversion host - fails, first
+        # hanging this long (a step cancelled meanwhile); review RV34A-02
+        print("TASK [" + base + " : Check the source and the conversion host] ****")
+        sys.stdout.flush()
+        time.sleep(float(os.environ.get("ANSIBLE_FAKE_PRE_HANG", "0")))
+        print("fatal: [localhost]: FAILED! => " + os.environ["ANSIBLE_FAKE_FAIL_BEFORE_STOP"])
+        sys.exit(2)
     if stop_task:
         print("TASK [" + stop_task + "] ****")
         sys.stdout.flush()
@@ -187,7 +204,8 @@ SCRIPT = textwrap.dedent(
     created = os.environ.get("ANSIBLE_FAKE_CREATED")
     if created and stop_task and not os.environ.get("ANSIBLE_FAKE_STOP_SKIPPED"):
         with open(created, "a") as fh:
-            fh.write(name + "\\n")
+            # the name the playbook gives the server: the kit's own name of the VM (SDD 7.2)
+            fh.write(os.environ.get("ANSIBLE_FAKE_CREATED_NAME", name) + "\\n")
     print("PLAY RECAP ****")
     """
 )

@@ -366,6 +366,16 @@ class FakeSourceProvider:
         await self.get_vm(source_id)
         self._power[source_id] = "running"
 
+    async def powered_on_since(self, source_id: str, since: Any) -> bool:
+        # the demo runs no VMware kit, whose cutover retry asks it (SDD §7.2)
+        await self.get_vm(source_id)
+        return False
+
+    async def disk_keys(self, source_id: str) -> list[int]:
+        # vCenter's keys of the VM's disks, in its device order: 2000 on (SDD §7.2, §10)
+        vm = await self.get_vm(source_id)
+        return [2000 + i for i in range(len(vm.disks))]
+
     async def power_off(self, source_id: str) -> None:
         await self.get_vm(source_id)
         self._power[source_id] = "stopped"
@@ -531,4 +541,23 @@ class FakeDestinationProvider:
         return []
 
     async def delete_port(self, port_id: str) -> None:
+        return None
+
+    async def volumes(self) -> list[dict[str, Any]]:
+        # nor a kit volume a VMware rollback would delete (SDD §7.2)
+        return []
+
+    async def delete_volume(self, volume_id: str) -> None:
+        return None
+
+    async def detach_volume(self, server_id: str, volume_id: str) -> None:
+        return None
+
+    async def server_of_address(self, address: str) -> str | None:
+        return None
+
+    async def server_volumes(self, server_id: str) -> list[str]:
+        return []
+
+    async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
         return None

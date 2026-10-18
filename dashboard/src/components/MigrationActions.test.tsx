@@ -19,6 +19,21 @@ function setup(vmName: string, token: string) {
 }
 
 describe('MigrationActions', () => {
+  it('says in the Roll back dialog what the rollback of a VMware migration deletes (SDD §16, review RV32A-06)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const done = server.migrations.find((x) => x.vm.name === 'web-01') as Migration;
+    const migration: Migration = { ...done, strategy: 'vmware_warm', destination_server_id: done.destination_server_id ?? 'dst-9' };
+    const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
+    const approver: Role = 'approver';
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={approver} />, { server, token: 'approver' });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    await user.click(within(group).getByRole('button', { name: /roll back/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /roll back web-01/i });
+    expect(dialog.textContent).not.toMatch(/volumes are kept/i);
+    expect(dialog.textContent).toMatch(/kit's volumes/i);
+  });
+
   it('lists the actions available now first, the next step first, and the others under "Unavailable now" (SDD §16)', () => {
     const { button } = setup('web-01', 'approver');
     const group = screen.getByRole('group', { name: /migration actions/i });

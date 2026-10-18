@@ -500,8 +500,14 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
 * Single-shot strategies (`cold`, `storage_handover`, `vmware_cold`): `ready → cutover → verifying
   → completed`.
 * **Downtime clock:** `downtime_started_at` is set when the executor stops the source VM
-  (`StepContext.mark_downtime_start()`), `downtime_ended_at` when verification passes or, on
-  rollback, when the source VM is running again. A verification that passes again — the first one was saved,
+  (`StepContext.mark_downtime_start()`) and announced by `migration.downtime_started`. A cancel of the step (the step
+  timeout, a rollback request, a shutdown) that lands while the clock is being opened takes effect once the clock is
+  saved and its event written, so an open clock is never left unannounced; the clock is saved first, so a store error
+  on the event never leaves a source that may be stopped without its clock (review RV26-06). `downtime_ended_at` is
+  set when verification passes or, on
+  rollback, when the source VM is running again - marked by the step as soon as its power-on succeeded
+  (`StepContext.mark_downtime_end()`, the VMware rollback), so an attempt that fails after it leaves the clock
+  closed: the source runs, and the next cutover counts a new outage (review RV30-03). A verification that passes again — the first one was saved,
   but a stop or a failed event write came before `completed` — keeps the end and the downtime the first one
   recorded: the outage ended then. `actual_downtime_s` = difference — except in demo mode (§7.4),
   where the downtime is in model seconds, the time base of the passes' `duration_s`, so a demo's downtime compares
@@ -513,7 +519,9 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   the clock is open. A verified
   migration's downtime is that sum plus the plan's boot time; a rollback's is that sum, plus the boot time when the
   cutover had finished (the destination booted for its verification). A clock no step reported model seconds for
-  stays in wall seconds. A retry resets a
+  stays in wall seconds. A clock the step closed because it found the source running again opens anew when the
+  same step stops the source again - a new outage, as for a storage-handover cutover resumed after a rollback's start
+  (§7.3 step 1, review RV33-04). A retry resets a
   closed clock but keeps an open one: the source has not run since it stopped, so the downtime of
   the next attempt counts from that first stop (in demo mode the kept model seconds and the next attempt's add up)
   and the stats report the VM's whole outage.
@@ -666,7 +674,11 @@ atomic during pre-copy; this is harmless because the final pass happens after sh
 Image-booted VMs (`kind == image_root`) follow os-migrate's `boot_disk_copy` semantics: when
 `boot_disk_copy` is true, every pass snapshots the server to Glance and creates a volume from that
 image (slower: documented in Performance.md); when false, only data volumes are synced and the
-destination boots from the same image name.
+destination boots from the same image name. The volume made from a server snapshot - here and in the cold export -
+is as large as Cinder needs for the image: the image file rounded up to whole GiB, its virtual disk (a qcow2 file
+holds a larger disk) and its `min_disk`, at least 1 GiB; Cinder refuses a smaller one (audit A-06). Glance records the
+virtual disk (`virtual_size`) only since Victoria: for a `qcow2` image it records none of, the size is read from the
+image file's own header - its first bytes, from a streamed download (review RV29-09).
 
 ### 6.2 Block delta sync — `plugins/module_utils/blocksync.py`
 
@@ -739,6 +751,13 @@ gets the file:
   "destination_server_id": null }
 ```
 
+A warm pass records each destination volume it creates (`dest_volumes`) as soon as Cinder accepted it, before it
+waits for it; a volume whose record cannot be written (a full disk) is deleted, once Cinder settled it, before the pass
+fails - no record would name it for a rollback (audit A-05). A destination volume a later pass extends to the source's
+grown size is recorded at that size after Cinder extended it; when an earlier pass extended it but could not record it,
+the next pass reads the size Cinder reports and records it, never extending it again to the size it has, which Cinder
+refuses (review RV29-07).
+
 The cold import (`import_workloads.yml`, §6.5) writes the same file for a workload it copies, with no pass: the
 volumes its transfer created (`dest_volumes`, each with the `dest_id`, `size`, `bootable` and `name` the warm path
 records, from the transfer's `volume_map` — never a volume it did not create, as with `data_copy: false`) each as
@@ -772,7 +791,7 @@ existed (Seamless 0.1.0) has no file.
 | Module | Cloud | Purpose |
 |---|---|---|
 | `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. |
-| `import_workload_warm_sync` | dst | Ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts (`/tmp/seamless-blocksync-{transfer_uuid}.py`), run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
+| `import_workload_warm_sync` | dst | First detach from the dst conversion host the recorded dst volumes a pass interrupted earlier left attached to it (audit A-04): the next step extends a dst volume whose source volume grew, which Cinder does for an `in-use` volume only where its microversion and backend allow, and waits for the extended volume to read `available`. Then ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts (`/tmp/seamless-blocksync-{transfer_uuid}.py`), run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
 | `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name` and no state file at all — a workload migrated before anything was recorded for it, §7 — the only same-named server; when the state file records no server, or the server it records is gone - deleted since, while a re-run's create whose answer was lost left the earlier id recorded (review RV4-04) - the single server named like the workload that holds one of the recorded volumes, attached through Nova and not to the destination conversion host: built from them, it is the migration's own even when Nova's answer to its create was lost, while a same-named server holding none of them is another one and is kept - review RV3-06; several such servers are an error) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`); a volume Cinder is already deleting — the boot volume Nova deletes with its server (`delete_on_termination`, the cold import's) — is waited for until it is gone, never deleted a second time, which Cinder refuses — and empties the warm state: the file stays, holding no volume, pass or server (`state_cleared`), as the sign that the workload's migration recorded it (§6.3), and a pending source snapshot's record stays for its cleanup; with `delete_ports` `false` (default `true`) it deletes no destination port (§6.6). Starting the source is left to the role. |
 
 **Volume types.** Upstream os-migrate drops `volume_type` when it creates destination volumes
@@ -801,8 +820,22 @@ environment block as `import_workloads.yml`):
 | Playbook | Behavior per filtered workload |
 |---|---|
 | `playbooks/import_workloads_precopy.yml` | snapshot present → warm sync (`auto`) → snapshot absent |
-| `playbooks/import_workloads_cutover.yml` | stop source (wait) → snapshot present → warm sync (`final`) → snapshot absent → `import_workload_create_instance` with the warm BDM → record `destination_server_id`. A re-run while the recorded destination server exists and is not in `ERROR` finishes it instead of creating another: `import_workload_create_instance` on the recorded server waits for it to be `ACTIVE` and adds the floating IPs it lacks — a floating IP already on the server's port for that fixed address is kept, never a second one — since the first attempt may have failed after Nova created the server (a timeout while it booted, an error while adding its floating IPs); a recorded server that is gone or in `ERROR` fails the re-run, which names the rollback as the recovery. A recorded server an operator renamed is finished like any other: a refusal would fail the cutover after the source stopped, and the automatic rollback (§8, `plan.verification.auto_rollback`, on by default) would then delete that very server - the one the rename set aside - with the recorded volumes, from which no fresh server can be built while it holds them (lead 8) |
-| `playbooks/rollback_workloads.yml` | delete destination server if recorded; when `os_migrate_rollback_delete_dest_volumes` (default false) also delete dst volumes and empty the warm state (the file stays, §6.3) — with a warm state only the volumes it records (a volume attached to the destination server later is not the migration's: kept and returned as `kept_volume_ids`, like a volume still attached to a server other than the destination conversion host; without a warm state the destination server's attachments are the migration's); start the source server, unless `os_migrate_rollback_start_source` is `false` (the cleanup before a cold cutover, §7, leaves it as it is). Refuses the catch-all filter (`os_migrate_workloads_filter` unset or `[{regex: '.*'}]`) unless `os_migrate_rollback_all: true`: a rollback reverts every cut-over workload it matches (the control plane always passes `^<name>$`) |
+| `playbooks/import_workloads_cutover.yml` | wait while a stop of the source runs (below) → stop source (wait) → snapshot present → warm sync (`final`) → snapshot absent → `import_workload_create_instance` with the warm BDM → record `destination_server_id`. A re-run while the recorded destination server exists and is not in `ERROR` finishes it instead of creating another: `import_workload_create_instance` with `finish_only: true` on the recorded server waits for it to be `ACTIVE` and adds the floating IPs it lacks — a floating IP already on the server's port for that fixed address is kept, never a second one — since the first attempt may have failed after Nova created the server (a timeout while it booted, an error while adding its floating IPs); a recorded server that is gone or in `ERROR` fails the re-run, which names the rollback as the recovery. With `finish_only` the module itself never creates a server: a recorded one that vanished between the role's lookup and the call fails it the same way, where a create would build a server without the synchronised volumes (the call passes an empty block device mapping: an image-booted VM boots from its image) and record it as the destination (audit A-07). Without it (the first create, the cold import) a recorded server that is gone is replaced by the one the call creates from the block device mapping it got. A recorded server an operator renamed is finished like any other: a refusal would fail the cutover after the source stopped, and the automatic rollback (§8, `plan.verification.auto_rollback`, on by default) would then delete that very server - the one the rename set aside - with the recorded volumes, from which no fresh server can be built while it holds them (lead 8) |
+| `playbooks/rollback_workloads.yml` | delete destination server if recorded; when `os_migrate_rollback_delete_dest_volumes` (default false) also delete dst volumes and empty the warm state (the file stays, §6.3) — with a warm state only the volumes it records (a volume attached to the destination server later is not the migration's: kept and returned as `kept_volume_ids`, like a volume still attached to a server other than the destination conversion host; without a warm state the destination server's attachments are the migration's); start the source server once no stop of it runs (below), unless `os_migrate_rollback_start_source` is `false` (the cleanup before a cold cutover, §7, leaves it as it is). Refuses the catch-all filter (`os_migrate_workloads_filter` unset or `[{regex: '.*'}]`) unless `os_migrate_rollback_all: true`: a rollback reverts every cut-over workload it matches (the control plane always passes `^<name>$`) |
+
+Every stop and start of a source server - the warm cutover's stop, the cold import's (`import_workloads.yml` with
+`os_migrate_workload_stop_before_migration`) and the rollback's start - first waits until Nova runs no stop or start
+of it: Nova powers a server off with its `task_state` `powering-off` while the server still reads `ACTIVE` until the
+guest is down, and refuses a second stop or a start (409) meanwhile, while the vendored `server_action` reads that
+`ACTIVE` as running - a start would start nothing, leaving the source to end `SHUTOFF` under a rolled-back migration,
+and a stop would be refused. Nova starts a server the same way - `task_state` `powering-on` while it still reads
+`SHUTOFF` - and refuses a stop or a second start meanwhile: the wait waits for that too (review RV29-06). A stop cut
+off before its wait ended (the step timeout, a rollback request, a 503 during the wait) leaves exactly that for the
+rollback or the retry that follows (§8). The wait reads the server (`server_info`) every
+`os_migrate_source_stop_poll_s` seconds, at most `os_migrate_timeout` seconds - and once more at the latest after
+`os_migrate_timeout` seconds, also when the poll interval is longer; a stop or start that still runs then fails the
+play (review RV27-09) -; its task names none of the stop task patterns of §7.2, so it opens no downtime clock (review
+RV26-10).
 
 Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_src_auth`,
 `os_migrate_dst_auth`, `os_migrate_workloads_filter`, conversion host variables including
@@ -821,6 +854,7 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_rollback_match_by_name` | `false` | `match_by_name` |
 | `os_migrate_rollback_start_source` | `true` | — (the rollback role's last step: start the source server) |
 | `os_migrate_rollback_delete_ports` | `true` | `delete_ports` of `import_workload_rollback` |
+| `os_migrate_source_stop_poll_s` | `5` | — (seconds between the reads of the wait above; the cold role takes the same default) |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | `conversion_host` of `import_workload_rollback` |
 
 Role `conversion_host_content` (upstream, modified; plan task T7, D15) installs the copy tools on a conversion host by
@@ -836,6 +870,16 @@ file:
 Any other OS fails the role with a message that names it and the supported ones, where it used to install nothing and
 the transfer then failed for want of nbdkit. An Ubuntu cloud image logs in as `ubuntu`: the provider's
 `conversion_host.ssh_user` (default `cloud-user`, §4.2) names it.
+
+Each conversion host is reached as its own provider's user, so a RHEL source host (`cloud-user`) works with an Ubuntu
+destination host (`ubuntu`). The control plane sets `os_migrate_src_conversion_host_ssh_user` and
+`os_migrate_dst_conversion_host_ssh_user` from each provider's `conversion_host.ssh_user`; the collection gives each
+deployed host its side's user in the inventory, passes the source's to the modules that work on the source host
+(`ssh_user` of the export, the source cleanup and the warm snapshot) and the destination's to those that work on
+the destination host, which also take the source's as `src_ssh_user`: the destination host's own user runs the link key,
+and the hop to the source host — the transfer's port forward, the warm sync's sender and its copy of blocksync —
+logs in as the source's. Both variables default to upstream's single `os_migrate_conversion_host_ssh_user`, and
+`src_ssh_user` to `ssh_user`, so a run that sets only that one works as before (audit EX-08).
 
 ### 6.6 Hardening of existing code (required)
 
@@ -985,6 +1029,30 @@ was made from undeletable (review RV8-03). The cleanup puts the data volumes bac
 copy, snapshot and image, and tries every step: what it could not do fails it at the end, naming each, so one failed
 removal never keeps a data volume off the source VM.
 
+A cold transfer that fails leaves its destination volumes to the rescue's destination cleanup (audit A-08).
+`import_workload_transfer_volumes` lets an error other than a disk's failed identity check escape, as before - what
+the control plane classifies stays as it was (owner question q8) - so its result carries no volume map:
+`import_workload_dst_failure_cleanup`, given no `volume_map`, takes the workload's record instead (`warm_state_dir`):
+the destination volumes the transfer recorded as soon as Cinder created them (§6.3). The role runs it whenever the
+transfer task ran, with the transfer's map when it returned one. The conversion host may be what failed the
+transfer: the cleanup's one SSH check at its start - every conversion-host module's - no longer fails it; a host it
+cannot reach keeps the volumes attached to it, which the rollback deletes by the record, and the cleanup takes that
+host's attach lock and detaches only after the check reached it; then it deletes, through the API, the volumes no
+server holds. Before, the rescue skipped the cleanup whenever the transfer itself failed, and a hand-run cold
+import left its volumes on the conversion host; and a conversion host the check could not reach failed the cleanup
+before it deleted anything. The cleanup is best effort and never fails the rescue: a detach that fails leaves that volume
+attached, a deletion that fails leaves that volume, and the cleanup goes on with the next one - but a wait that gives
+up ends its phase, as each later volume would wait it out again, the cold source stopped all the while (review
+RV34B-01): a lock wait that gives up - on a host lost after the check, or on a lock another conversion holds
+throughout (a stale lock file whose owner is on another host is never taken for dead) - or a detach Nova does not end
+within the timeout ends the detaches, what is still attached left so; a deletion Cinder does not finish within it
+ends the deletions, the volumes not yet deleted left as they are, no deletion sent for them. Each volume left is
+logged to the workload's log and named in the result (`volumes_left`), never printed as a failure, and the rollback
+deletes what is left by the record. The rescue runs it before the source cleanup, whose
+own failure so no longer keeps it from running. A failed transfer is so classified and reported by its own failure,
+never by the cleanup's - whose words ("Timeout waiting for Volume ... to delete", "Lock timeout") would read as
+transient in the output's tail (reviews RV32B-02, RV32B-04, RV32B-05).
+
 `import_workload_prelim` skips a workload whose name a destination server already carries only for a server of
 exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name filter as a regular expression) and
 keeps the servers whose name is equal, as the warm rollback does — an unescaped `web.01` matched an unrelated
@@ -1091,6 +1159,7 @@ class StepContext:
     plan: Plan; migration: Migration; source: Provider; destination: Provider; settings: Settings
     report_progress: Callable[[float, int, int], Awaitable[None]]   # pct, bytes_done, bytes_total
     mark_downtime_start: Callable[[], Awaitable[None]]
+    mark_downtime_end: Callable[[], Awaitable[None]]   # the source runs again (a rollback's power-on): closes the clock (§5.2)
     log: Callable[[str], Awaitable[None]]   # one whole output line; the orchestrator redacts and cuts it (§4)
 
 @dataclass
@@ -1116,7 +1185,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 ### 7.2 AnsibleExecutor (`executors/ansible.py`)
 
 * Run directory: `{data_dir}/plans/{plan_id}/migrations/{migration_id}/` with its own
-  `os_migrate_data_dir` (`osm/`) so concurrent migrations never share `workloads.yml`.
+  `os_migrate_data_dir` (`osm/`) so concurrent migrations never share `workloads.yml`, and the VMware rollback's
+  `.seamless/rollback-kept.json` (below) - one level below the guest directories the migration kit creates there,
+  `{run directory}/{VM name}`, so no VM's name is the record's (review RV32A-08).
   Plan-level prestage uses `{data_dir}/plans/{plan_id}/osm/`.
 * Secrets: `secrets.yml` (mode 0600) holds `os_migrate_src_auth`/`os_migrate_dst_auth` (resolved
   from the providers' `cloud` entries, §13.3) and is deleted in a `finally` block together with the
@@ -1148,7 +1219,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   time the playbook output showed the source-stop task starting, once the task's result line confirms
   it ran (a `skipping:` result, e.g. `data_copy: false`, starts no clock) (`TASK [... : Stop the source server]` for the
   warm role, `TASK [... : Perform workload stop if os_migrate_workload_stop_before_migration is true]`
-  for the cold role, the kit's power-off task for VMware); at the latest when the cutover step starts. A step
+  for the cold role, `TASK [os_migrate.vmware_migration_kit.import_workloads : Migrate Guest from Vmware using nbdkit
+  <vm>]` for VMware: kit 2.2.7 has no power-off task - its `migrate` module powers the VM off inside that task, a
+  Windows guest before the copy, any other guest after the copy and conversion, so for those the clock also counts the
+  copy and conversion (review RV26-03; `TODO(OWNER)`: whether their clock should start at the task's result line
+  instead); at the latest when the cutover step starts. A step
   cancelled while that task runs, before its result line (the step timeout, a rollback request, a shutdown),
   opens the clock at the task's start too: the source may be stopped, so the automatic rollback (§8) runs and a
   cancel is refused (§5.1) (audit EX-02).
@@ -1157,7 +1232,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   `/` written `%2F` and NUL written `%00` — both sides apply the same rule, so a tenant's VM name (`../x`, `/etc/x`)
   never names a file outside `workload_logs`, and two names never share a file.
 * Cold rollback passes `os_migrate_rollback_match_by_name: true` only once the source was stopped
-  (`downtime_started_at` set), as the VMware rollback looks up the server by name only then: the cold role creates
+  (`downtime_started_at` set) - the VMware rollback looks a server up by name only after the stop too, and only
+  while the clock is open, as its own power-on closes the clock once the servers it found are gone (§7.2): the cold
+  role creates
   the server after the stop, so before it a same-named destination server is not this migration's — a cutover
   refused for a name collision, or skipped by the role for one, is rolled back by starting the source alone and
   deletes nothing. A server the cold import recorded (§6.3) is found by its id first, one whose record Nova's lost answer
@@ -1267,7 +1344,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 |---|---|---|---|
 | `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` — `rollback_workloads.yml` between the two when an earlier attempt left data (below) | `rollback_workloads.yml` |
 | `warm` | `export_workloads.yml` (first time, or again by the rules above) then `import_workloads_precopy.yml` | `import_workloads_cutover.yml`, after `export_workloads.yml` when a rule above exports again | `rollback_workloads.yml` |
-| `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, then the kit's ports of the VM (below), power on source |
+| `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, power on source, then the kit's ports of the VM and the volumes the kit would take as migrated (below) - the power-on once a guest shutdown in progress ended: vSphere reads the VM `poweredOn`, its guest `shuttingDown`, until the guest is down, and a power-on then does nothing. A VM still on whose installed VMware Tools no longer run (guest `notRunning`: the last seconds of a shutdown, whose Tools stop first, or a guest still starting) is looked at again for up to 120 s, until it is off (powered on) or its guest runs (left alone); a VM without Tools is left alone at once. The wait ends within the provider call's bound (300 s, §8.1, less 5 s): a guest that does not end its shutdown by then is a provider error, which the rollback retries as transient - the provider remembers a shutdown it saw for 30 minutes, so the retry waits through the shutdown's last seconds, its Tools stopped, to its own bound rather than for 120 s (review RV29-08) -, and a call that ended - timed out or cancelled - powers nothing on afterwards (reviews RV26-10, RV27-01, RV27-02) |
 | `vmware_warm` | kit `migration` with `cbt_sync: true`, `cutover: false` | kit `migration` with `cbt_sync: true`, `cutover: true` | as `vmware_cold` |
 
 * VMware vars: `vcenter_hostname`, `vcenter_username`, `vcenter_password`, `vcenter_datacenter`
@@ -1312,12 +1389,130 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   empties it. The other problems leave the NIC no correct value in the map, which the kit reads in
   every run, and stop every run.
 
-  The rollback deletes the kit's ports of the VM after the destination server: Nova only unbinds a port it did not
+  The rollback deletes the kit's ports of the VM after the destination server and the source's power-on (below):
+  Nova only unbinds a port it did not
   create when it deletes the server (`preserve_on_delete`), so the port would keep the NIC's MAC and addresses and
   refuse the next attempt. They are the unbound ports with one of the VM's NIC MACs and a name of the kit's form
-  (`<VM name>-NIC-<n>-VLAN-<network>`), whichever network they are on; a port bound to a server is never deleted.
+  (`<kit name>-NIC-<n>-VLAN-<network>`), whichever network they are on; a port bound to a server is never deleted,
+  nor another VM's port that shares a MAC (audit EX-07). `<kit name>` is the VM name as the kit (2.2.7,
+  `SafeVmName`) writes it into every name it gives: its transliteration table applied (`é` → `e`, `ß` → `ss`, …),
+  every other character outside `[A-Za-z0-9_-]` replaced by `_`, runs of `_` and of `-` collapsed, cut to 64
+  characters, trailing `_` and `-` removed. The kit names the destination server the same way, so every lookup of a
+  VMware migration's server by name — the name-collision refusal before its first attempt, the server its cutover
+  reports, its rollback's — uses `<kit name>`: a VM named `web01.example.com` gets the server `web01_example_com`,
+  which the VM's own name never finds (audit EX-18).
   A cancel's cleanup (§5.1) deletes only the server the migration recorded: it looks up no server by name, deletes no
-  kit port and powers nothing on.
+  kit port or volume and powers nothing on.
+
+  Once the source is powered on, the rollback deletes the kit's volumes of the VM that the kit's next run would take
+  as this VM's own. The kit finds a VM's volume by its name, `<kit name>-<disk key>`, and the metadata `osm` `true`.
+  One it marked `converted` (`true`: virt-v2v converted it and the VM was powered off) it takes as migrated: it copies
+  nothing, powers nothing off and boots the new server from it - the first attempt's disk, while the source runs again
+  since the rollback powered it on (review RV28-01). Onto any other volume a `vmware_cold` run (no CBT sync) refuses
+  to copy ("volume already exists"). So once the destination server is gone, the rollback deletes every volume named
+  `<kit name>-<digits>` with `osm` `true` that is marked converted, that belongs to a `vmware_cold` migration, or that
+  is a `vmware_warm` first copy cut off - not converted and not marked `seamless_copied` `true` (below) -, and waits
+  until each is gone; a `vmware_warm` volume not converted whose copy completed - marked `seamless_copied` `true` -
+  stays, since the next pass syncs it by CBT, while one a cutover's run may have written to - marked `cutover`
+  (below) - goes.
+  Not when the migration recorded its destination server: the kit created that server from every kit volume of the
+  VM, and its guest may have written to each - a journal replay, a database's crash recovery, days of service -,
+  which a CBT sync, copying only what the source changed, never undoes; with a recorded server the rollback deletes
+  every kit volume of the VM, converted or not, so the next pass copies them in full (review RV30-02). Whenever a
+  server booted from the kit's volumes - the one the migration recorded, or one found by the kit's name, by this
+  attempt or by an earlier one (`rollback-kept.json`, below) -, the rollback marks each kit copy of the VM still
+  marked `seamless_copied` `true` as `cutover` (below) right after the power-on, before it deletes any port or
+  volume: what it then cannot delete (Cinder refuses a volume with a snapshot) or keeps (what a server found only by
+  name held) is no completed copy for any later run, nor is a copy a cutover of an earlier build left marked (review
+  RV32A-01); a marking that fails fails the attempt, with the source running. A marked
+  volume in an error state Cinder cannot attach (`error`, `error_restoring`, `error_extending`, `error_managing`)
+  goes too, here and before a run (below): every later pass would fail at its attach (review RV30-07). A volume
+  the destination's conversion host holds is the kit's own copy, left attached when a cutover was cut off inside the
+  kit's migrate task (the step timeout, a rollback request): it is detached from that host - found by the conversion
+  host's name, else as the Nova server holding its address (`server_of_address`: a fixed address on one of its
+  ports, or a floating one through the port Neutron's floating IP is associated with - never a floating IP's or a
+  router's own port, review RV30-06) - and then deleted or kept by these rules, as §6.3 treats a
+  transfer's volume the destination conversion host holds (review RV29-02). A volume attached to another server is
+  never deleted, nor is any volume when the VM has no kit name (`SRC_VM_NAME_UNUSABLE`, §9.3). The server the rollback
+  deletes counts as this migration's only when the migration recorded it: one found by the kit's name may be another
+  plan's VM the kit names alike (owner question q26), so what it held before its deletion - read from Nova's record of
+  it (`server_volumes`), as no Cinder call comes before the power-on, and recorded in the run directory
+  (`.seamless/rollback-kept.json`, written and synced before the deletion; a `rollback-kept.json` file an earlier build
+  wrote is read too) so that an attempt retried or resumed after it, which finds no server any more, keeps it too until
+  a rollback succeeds and removes the record (review RV30-05) - is kept: a later kit run refuses such a volume, and a
+  second rollback, which finds no server holding it, deletes it (review RV29-03). A record that cannot be read (a
+  damaged file) never keeps the source stopped: what to keep is then unknown, so that attempt deletes no kit volume of
+  the VM, says so in its log, and deletes the server and powers the source on as any other (review RV32A-08). No
+  record is written over one that cannot be read: for a server found by name beside it, the attempt logs the volumes
+  that server held instead - a record written over a damaged file would let a later attempt delete what that file
+  kept, and one at an unusable path (a directory there, a `.seamless/` a restore left unwritable) cannot be written
+  at all, which kept the source stopped (review RV34A-03); while the record cannot be read, no attempt deletes a kit
+  volume of the VM. The
+  rollback looks the server up by the kit's name only while the clock is open (§5.2), and then even when one is
+  recorded: the recorded one
+  may be an earlier attempt's that a failed rollback already deleted - kept recorded, as only a rollback that
+  succeeds clears it - while the new attempt's cutover did not record its own (a Nova lookup that failed, a step cut
+  off after the kit created the server). A server found by name that is not the recorded one is deleted before the
+  power-on too, what it held kept as above, so the source never runs beside it (review RV32A-07). Once the clock
+  closed it looks nothing up by name: an earlier attempt's power-on closed it only after every server that attempt
+  found was gone, a verification only with the recorded server running, so a server of the kit's name then is
+  another VM's - another plan's the kit names alike, an operator's replacement - that a lookup would delete or, as a
+  second server of that name, fail every attempt on before the power-on (review RV34A-01). A
+  volume Cinder does not delete fails the attempt, which is retried: the source already runs, and the power-on does
+  nothing to a running VM - the destination's clean-up never keeps the source stopped (§8, review RV29-01). Only the
+  server's deletion comes before the power-on - a destination server running beside the source on a stretched
+  network would be a second live copy -; the kit's ports and volumes matter only to the next attempt, so the
+  rollback reads and deletes them after it, and an outage of Neutron or Cinder that failed the cutover fails the
+  attempt with the source running, never before (review RV30-04). As a
+  rollback may so end `failed` with such a volume left, a VMware kit run - a cutover, a `vmware_warm` pass - is
+  refused before it starts, before any clock, while a volume named `<kit name>-<digits>` with `osm` `true` is marked
+  converted, or, for a `vmware_cold` cutover, while any such volume exists: the refusal names each volume and its
+  holder and tells the operator to roll the migration back again, which deletes the ones it may (review RV29-01). A
+  converted volume is no refusal while the source has not run since this outage's stop - the clock open (§5.2),
+  vCenter reading the VM off and recording no power-on of it since the clock opened (`powered_on_since`: its
+  `VmPoweredOnEvent`, `DrsVmPoweredOnEvent` and `VmResumedEvent`), as a VM that ran and was shut down again reads off
+  as well (review RV30-03) -: the kit then takes the volume it converted in this outage as migrated, which it is, as
+  when a cutover is retried after a failure past the conversion.
+
+  The kit writes a new volume's CBT `changeID` - the change id of the snapshot it copies - when it creates the
+  volume, before its full copy, and marks no copy complete; every later run with CBT copies only what the source
+  changed since that change id (2.2.7, `migrate.go`). A first copy cut off - a failed `nbdcopy`, the step timeout,
+  a rollback request, a restart - so leaves a volume that no later pass or cutover completes (review RV30-01).
+  After each `vmware_warm` pass the kit completed, the control plane therefore marks each volume named
+  `<kit name>-<digits>` with `osm` `true` that is not converted and attached to no server with the metadata
+  `seamless_copied` `true` (`DestinationProvider.set_volume_metadata`, which keeps the volume's other keys); a
+  marking that fails fails the pass as transient, and the retry copies the unmarked volumes in full. Before every
+  `vmware_warm` kit run - a pass, the cutover -, once the refusal above found nothing, such a volume neither
+  converted nor marked is a first copy cut off: it is detached from the destination's conversion host when that
+  host holds it and deleted, as is a marked one in an error state Cinder cannot attach (review RV30-07), so the kit
+  copies the disk in full; one another server holds stays. A marked one the conversion host holds - a pass cut off
+  during its sync, or the kit's own detach that failed, which it only logs - is detached from it and kept for the
+  CBT sync: the kit attaches it again, which Nova refuses while it is attached (review RV32A-03). The kit's
+  conversion rewrites a volume's metadata to `osm` and `converted` alone, so a converted volume carries no mark:
+  the rules above for converted volumes apply to it.
+
+  Right before every `vmware_warm` cutover kit run, once every check above passed, each such volume marked
+  `seamless_copied` `true` is marked `seamless_copied` `cutover`, which no rule reads as a completed copy: the
+  cutover's run rewrites in place the disk it converts - virt-v2v-in-place on the VM's first disk and, when that
+  conversion fails, on the next ones (the kit's fallback), a conversion that failed leaving its disk "in an unknown,
+  possibly corrupted state" (virt-v2v-in-place) - and the server it then boots from the volumes writes to every one
+  of them, neither of which a CBT sync, copying only what the source changed, undoes (reviews RV32A-01, RV32A-02). A
+  marking that fails fails the cutover as transient, before the kit runs. Only the kit's migrate task (`Migrate Guest
+  from Vmware using nbdkit`) writes to a volume - the tasks before it check, connect and read vCenter -, so a cutover
+  kit run that fails or is cancelled before its output shows that task's header wrote to none: before its failure is
+  reported, the volumes this run marked `cutover` are marked `true` again, and the cutover's retry - or the pass a
+  Retry runs first - syncs them by CBT rather than copying every disk in full, the retry's inside the outage (review
+  RV34A-02). A marking back that fails is logged and leaves them `cutover`; a control plane that ends abruptly during
+  the run (a SIGKILL, an OOM kill) marks nothing back - its clock may not record a migrate task that ran -, so a copy
+  the kit may have rewritten is never taken as completed. A volume marked `cutover` is a first copy
+  cut off for every later run and rollback - deleted, or left where another server holds it, by the rules above -
+  but one: a cutover retried inside the same outage keeps such volumes for its CBT sync when the clock is open,
+  vCenter reads the VM off and records no power-on of it since the clock opened (as for a converted volume above),
+  the migration records no destination server and none carries the destination server's name (`find_server`), and
+  the volume of the VM's first disk in vCenter's device order (`disk_keys`) is marked converted: that conversion
+  succeeded on its first try, so the kit converted no other disk, powered the VM off and then only synced the
+  others, and no server booted from them (2.2.7, `migrate.go`). A destination server an operator deletes by hand
+  inside the outage defeats that check.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
   migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
@@ -1331,7 +1526,18 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 
 ### 7.3 HandoverExecutor (`executors/handover.py`) — `storage_handover`
 
-Uses openstacksdk sessions (raw REST through `conn.compute` / `conn.block_storage`). Cinder
+Uses openstacksdk sessions (raw REST through `conn.compute` / `conn.block_storage`). A call that fails is retried
+(`TransientStepError`, §7.1, §8) when its answer is HTTP 502, 503 or 504 — openstacksdk's `HttpException`, keystoneauth's
+HTTP errors, or a raw call's status — or keystoneauth reports a retriable connection failure (`ConnectTimeout`:
+"Request to … timed out"; `ConnectFailure`: "Unable to establish connection to …"). The error is read together with
+those it was raised from or while handling, as Python chains them (`__cause__`, else `__context__` unless
+`raise … from None` cut the chain): the first of them that carries an HTTP status or is a retriable connection
+failure decides, another status by the error's own text as below. Keystoneauth reports a
+Keystone that a connection's first sign-in could not reach, at an auth URL without its version path, as a
+`DiscoveryFailure` raised while handling that failure, and openstacksdk's cloud layer raises its `SDKException` from
+keystoneauth's (review RV26-05). Any other error is judged by
+its own text as §7.2 judges a playbook's output, never by the provider's name the message adds (review RV20-12,
+audit EX-12). Cinder
 refuses `os-unmanage` on an attached (`in-use`) volume, and Nova deletes `delete_on_termination`
 volumes with their server, so the order is:
 
@@ -1342,8 +1548,14 @@ volumes with their server, so the order is:
    * Cinder would refuse to unmanage a volume (step 5) — it refuses encrypted volumes ("Unmanaging
      encrypted volumes is not supported"), volumes with snapshots and volumes in a group or
      consistency group (Cinder `volume.api.delete(unmanage_only=True)`, Wallaby and later);
+   * a volume is attached to another server too (a multi-attach volume): it never becomes `available` once the
+     source server is deleted (step 4), so step 5 could never unmanage it (audit EX-09);
    * no attachment is the boot volume (step 2): the destination server could not be created, nor the
      source again on rollback;
+   * the server has a disk on its hypervisor — a root disk from an image, its flavor's ephemeral or swap disk, read as
+     the inventory reads them (§4.2): step 4 deletes the server, and the disk with it, while no handover moves
+     anything but Cinder volumes. Validation rules the strategy out for such a VM (§9.2), but a resize since
+     then is seen here only (audit EX-15);
    * a port's RHOSO network (its NIC override's, else the mapped one) does not resolve with step 8's lookup. That
      lookup takes the credential's own network of that name, else the only network of that name it sees. It fails
      when there is no such network, when there are several in the credential's project, or when there are several
@@ -1366,15 +1578,43 @@ volumes with their server, so the order is:
    * the flavor step 8 creates the server with is not a RHOSO flavor (`find_flavor`, as step 8 looks it up);
    * a volume type step 6 manages a volume into is not one of RHOSO's volume types. §9.3's `MAP_VOLUME_TYPE_MISSING`
      is only a warning when the plan maps no volume type, and step 6, like step 8, runs after the source server was
-     deleted.
+     deleted;
+   * that volume type asks for a backend — `volume_backend_name` or `capabilities:volume_backend_name` in its extra
+     specs, each of them — other than the backend of the pool step 6 manages the volume on, as the pool reports it
+     (`get_pools`): Cinder's scheduler (`CapabilitiesFilter`) refuses that manage (audit EX-10). The filter takes the
+     pool only when every such spec matches it, so step 0 matches each; an empty or null spec matches no backend
+     (review RV28-02). A spec is matched as that filter matches it (`extra_specs_ops`): one that starts with an
+     operator word asks for every backend it matches - `<or> a <or> b` either, `<in> x` one whose name holds x, `s==`,
+     `s!=`, `s<`, `s<=`, `s>`, `s>=` by string, `=` (at least), `==`, `!=`, `<=`, `>=` by number, `<is>` as booleans -
+     and any other spec the backend of exactly that name (review RV26-08).
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()` — after the shutdown, which the estimate's parts
    count (§9.1) and an Ansible-driven cutover's clock does (§7.2): `TODO(LAB): confirm` whether the handover's clock
    starts at the stop request instead. The stop is journaled as sent once Nova
    accepted it (`sent:stop_source`), before the wait for `SHUTOFF`, so a step that fails while waiting leaves a
-   journal the rollback starts the source from; a stop call that itself fails leaves the journal empty. A step
+   journal the rollback starts the source from; a stop call that itself fails leaves the journal empty. A stop
+   that already runs — Nova's `task_state` `powering-off`, while the server still reads `ACTIVE` until the guest is
+   down: the one a retried step finds, or one that a stop refused with 409 shows began meanwhile — is waited for and
+   never sent again, since Nova refuses a second stop while one runs; the journal keeps the first stop's time
+   (review RV26-02). A stop refused with 409 because the server is stopped already - one that began meanwhile and
+   ended before the step's own (an operator's, or the guest's own shutdown that Nova recorded) - is taken as done:
+   the step goes on, the stop journaled as sent, as for one that runs (review RV27-03). A step
    that ends without `SHUTOFF` once the stop was journaled as sent — a failure, or a cancel (the step timeout, a
    rollback request, a shutdown) — opens the clock at that mark's time: the source may be stopped, so the
-   automatic rollback (§8) runs and a cancel is refused (§5.1) (audit EX-02).
+   automatic rollback (§8) runs and a cancel is refused (§5.1) (audit EX-02). A cutover that resumes its journal
+   past the stop - `stop_source` done, `delete_source` not - reads the source first and, unless it reads
+   `SHUTOFF`, stops it again and waits for `SHUTOFF` before any later step: a rollback's start that Nova performed
+   while its wait failed journals nothing, and an operator may start the source between attempts, so the step
+   that deletes the source would otherwise delete a running server (review 31). A source Nova still starts
+   (`task_state` `powering-on`: a rollback's start accepted, its wait cut off) reads `SHUTOFF` until it runs: that
+   start is waited out first, then the source is stopped (review RV33-02). A source already gone - deleted by the
+   attempt before, which failed before it journaled that - needs no stop, nor does one step 4's deletion reached
+   (the rollback's rule below): Nova starts no server it is deleting or that a failed deletion left in `ERROR`,
+   and its stop of one never reads `SHUTOFF` (reviews RV33-03, RV35B-01). A source found running has run since the first stop:
+   that outage ended - the step closes the clock - and the re-stop opens a new one, at the re-stop's request when
+   the step then ends without `SHUTOFF` (§5.2, review RV33-04). So has one a step finds running - once a start Nova
+   runs ended, and with no power-off in progress - when only the first stop was journaled as sent, its wait failed
+   or cut off: a rollback's start that Nova performed while its own wait failed, or an operator's, ran it since; its
+   stop is that re-stop (review RV34B-04).
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
    `plan.port_creation_mode` `"neutron"` also its security groups by name), and the volume attachments in device
@@ -1388,8 +1628,13 @@ volumes with their server, so the order is:
    `PUT /servers/{id}/os-volume_attachments/{volume_id}` `{"volumeAttachment": {"volumeId": …,
    "delete_on_termination": false}}` with compute microversion **2.85**; verify by re-reading.
    Step 0 already refused a cloud without 2.85; a rejected update aborts before any destructive
-   step (permanent error; the VM is restarted and the migration fails with a clear reason).
-4. Delete the source server; wait until every journaled volume is `available`.
+   step (permanent error; the VM is restarted and the migration fails with a clear reason). Every rollback attempt
+   journals `rb:attempt` before its first call: it may give a `delete_on_termination` back even when Nova's answer is
+   lost. A cutover resumed after such an attempt, while the source server exists, sets it to false again - and
+   journals the attachment's `keep` again - for each attachment whose last `keep` came before that attempt;
+   otherwise step 4 would delete the volume with its server (review RV33-01).
+4. Delete the source server - journaled as tried before the call, and as sent once Nova accepts the deletion -; wait
+   until every journaled volume is `available`.
 5. `POST /v3/{project}/volumes/{id}/action {"os-unmanage": null}` for each volume (source).
 6. `POST /v3/{project}/manageable_volumes` on RHOSO for each volume: `{"volume": {"host":
    <resolved destination host>, "ref": <reference for the family and destination pool, named
@@ -1421,8 +1666,23 @@ volumes with their server, so the order is:
    with the entry's addresses when it lists them (in `"nova"` mode its one address).
 
 Rollback walks the journal backwards. While the source server still exists (a failure before step 4)
-it sets every attachment's journaled `delete_on_termination` back and starts the server — also when only the stop
-was journaled as sent. An empty journal means the source was never stopped. Otherwise:
+it sets every attachment's journaled `delete_on_termination` back - each whose last `keep` came after the last time
+the rollback gave it back, as a cutover resumed after an earlier attempt keeps it again (review RV33-01) - and starts
+the server — also when only the stop was journaled as sent. A server Nova still powers off (`task_state` `powering-off`) reads `ACTIVE` and refuses a
+start until the guest is down: the rollback waits until the stop ended - `SHUTOFF`, or `ACTIVE` again when Nova gave
+the power-off up (its `task_state` back to none, the guest still running) - then starts it unless it runs (reviews
+RV26-01, RV27-04). A server Nova still powers on (`task_state` `powering-on`: an earlier attempt's start accepted, its
+wait cut off) reads `SHUTOFF` and refuses a second start: the rollback waits for that start to end too (review
+RV29-06). A source step 4's deletion reached no longer counts as existing: one whose deletion Nova accepted (step 4,
+journaled as sent) unless it reads `ACTIVE`; one Nova reads as being deleted (`task_state` `deleting`), whatever the
+journal holds; and one in `ERROR` once step 4 tried its deletion (journaled as tried) - Nova may take a deletion whose
+answer is an error, a 500 once it saved the deleting state, or is lost, while the compute host fails it (review
+RV35B-01). Nova starts no server it is deleting or that a failed deletion left in `ERROR`, and a deletion it
+then finishes - nova-compute resuming it, an operator clearing the server - honours the `delete_on_termination` it
+finds. So the rollback gives nothing back and starts nothing there: it deletes the server again, waits until it is
+gone and every journaled volume never unmanaged is `available`, and recreates the source as for one gone (below); a
+deletion that fails again fails the attempt with every volume still kept (review RV34B-02). An empty
+journal means the source was never stopped. Otherwise:
 delete the destination server; delete the destination ports step 8 created through Neutron (journaled, or
 unbound with their description: a create sent before a crash), which Nova keeps; unmanage at RHOSO; manage at the
 source with the reference for the source's family and pool, named `volume-<rhoso_volume_id>`, and the
@@ -1432,8 +1692,11 @@ the source ports with their journaled MAC, fixed IPs, security group ids and por
 required; Nova applies a server's groups only to the ports it creates). The fixed IPs leave out those on a SLAAC or
 DHCPv6-stateless subnet of the source network, whose EUI-64 address of the kept MAC the source's Neutron derives
 itself (§6.6): sent, that address is refused, or allocated twice. Then recreate the
-source server from the journaled definition with the volumes in device order and their journaled
-`delete_on_termination`; start it. Every step is
+source server from the journaled definition with the volumes in device order, each kept (`delete_on_termination`
+false) while Nova builds it - a build Nova aborts deletes every volume flagged otherwise, the VM's only copy of its
+data -, and once it is `ACTIVE` give each volume its journaled `delete_on_termination` back (the step 3 call,
+journaled per volume); a recreated server Nova left in `ERROR` is deleted on the next attempt, its volumes kept, and
+created again (review RV35B-04). Every step is
 a metadata operation — data never moves — and each sub-step is journaled
 (`handover-journal.json`, 0600) so a crash resumes at the first incomplete sub-step. Each call is a blocking
 openstacksdk call in a worker thread, which no cancel stops: a step cancelled by the step timeout (§15.1), a
@@ -1574,7 +1837,8 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
 * Failure handling: `TransientStepError` → retry with backoff `2^attempt` s (×1/demo_speed) up to
   `max_step_retries`; then `failed`. Each attempt starts under the migration's lock and only while the
   migration is still in the step's phase, so an action under that lock (a cancel) either finds the
-  attempt running or ends the retries (§5.1). If downtime had started and
+  attempt running or ends the retries (§5.1). Each attempt reads the plan's providers again, so a retry after a
+  credential rotation signs in with the new credentials (§13.3; review RV26-07). If downtime had started and
   `plan.verification.auto_rollback` is true → `rolling_back` automatically, saved in the same write as
   `failed` (the history keeps both): a restart, or an event that fails to be written, right after the
   failure resumes the rollback (`rolling_back` is resumed) and never leaves the stopped VM in `failed`.
@@ -1795,7 +2059,8 @@ Finding catalog (code — severity — condition):
 | `SRC_VM_ERROR_STATE` | blocker | `power_state == "error"` |
 | `SRC_VM_TRANSITIONAL_STATE` | blocker | `power_state == "transitioning"`: a Nova task is in flight (resize, verify-resize, migration, rescue, rebuild, reboot, build) — a stop or snapshot would fail after approval; wait until the VM is ACTIVE or SHUTOFF, then re-validate |
 | `SRC_VM_VOLUME_DETACHED` | blocker | a re-assessment of a migration whose history reached `cutover` finds a volume of its validated `vm.disks` no longer attached to the VM (an earlier attempt's cold export may have left it detached, §6.6); the volume stays among the migration's disks (§5.4) — attach it to the source VM again, then re-validate; to migrate the VM without it, cancel the migration and plan the VM anew |
-| `SRC_VM_DUPLICATE_NAME` | blocker | another selected VM has the same name (os-migrate filters by name) |
+| `SRC_VM_DUPLICATE_NAME` | blocker | another selected VM has the same name (os-migrate filters by name); from a VMware source instead one whose name the migration kit writes alike, the same name included - §7.2's `<kit name>`, e.g. `web.01` and `web_01`, or two names that differ only past its 64-character cut: the kit names each VM's server, ports and volumes after it and finds a volume again by that name, so one VM's data would go into the other's volume (review RV26-04). The message names the kit's name and every VM written alike, and its remediation says that separate plans into one destination project do not part them (review RV28-04) |
+| `SRC_VM_NAME_UNUSABLE` | blocker | a VMware VM's name of which the migration kit keeps no character (§7.2's `<kit name>` is empty: Japanese, Cyrillic, punctuation): the kit would create its server, ports and volumes without a name, after its migrate task powered the VM off (review RV26-04) |
 | `SRC_VM_MULTIATTACH` | warning (warm, storage_handover) | any multi-attach disk |
 | `SRC_VM_EPHEMERAL_ROOT` | info (warm) | root disk `image_root`/`ephemeral` |
 | `MAP_NETWORK_MISSING` | blocker | a NIC network has no mapping and no same-named destination network, and `"networks"` is not in `plan.prestage_resources` (when it is — and the source is OpenStack; VMware sources have no pre-stage step — emit `MAP_NETWORK_PRESTAGED` — info — instead: the network will be created with the same name); also when a mapping's *target* network does not exist in the destination |
@@ -1918,6 +2183,28 @@ class DestinationProvider(Protocol):
         # the ports the credential sees that match every filter given:
         # [{id, name, network_id, device_id, mac_address, fixed_ips: [address, …]}] (§7.2 VMware networks)
     async def delete_port(self, port_id: str) -> None   # a port already gone is no error
+    async def volumes(self) -> list[dict[str, Any]]
+        # the volumes of the credential's project: [{id, name, status, metadata: {key: value},
+        # attachments: [server_id, …]}] (§7.2 VMware rollback)
+    async def delete_volume(self, volume_id: str) -> None
+        # once Cinder settled it (a volume still detaching from a deleted server), and waits until it is gone,
+        # within the call's bound (§8.1); a volume already gone is no error; one Cinder is already deleting
+        # (`deleting`, or a delete it refused because it began meanwhile) is waited for, never deleted a second
+        # time, which Cinder refuses; one Cinder failed to delete (`error_deleting`) is a provider error naming
+        # it (review RV29-04)
+    async def detach_volume(self, server_id: str, volume_id: str) -> None
+        # Nova's attachment of the volume to the server removed, then waits until Cinder reads the volume
+        # available, within the call's bound (§8.1); a volume not attached to that server is no error (§7.2)
+    async def server_of_address(self, address: str) -> str | None
+        # the Nova server holding the address: a compute port (`device_owner` `compute:*`) with it as a fixed IP,
+        # else the compute port Neutron's floating IP of that address is associated with; None when none (§7.2
+        # VMware rollback, review RV30-06)
+    async def server_volumes(self, server_id: str) -> list[str]
+        # the ids of the volumes Nova lists as attached to the server - its record alone, no Cinder or Neutron
+        # call; a server gone holds none (§7.2 VMware rollback, review RV30-04)
+    async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None
+        # sets the given metadata keys on the volume and keeps its other keys (Cinder's merge), within the call's
+        # bound (§8.1): the mark of a VMware kit copy that completed (§7.2, review RV30-01)
 ```
 
 `SourceInventory {networks: dict[str, int|None] (name→mtu), projects: list[str], keypairs: list[str] (the names of
@@ -1960,7 +2247,9 @@ volume disks carry their Cinder `pool`;
 `os_type` is the most specific of the server metadata `os_type`/`os_distro`, the boot volume's
 `volume_image_metadata` or the boot image's properties (`os_distro` + `os_version`, then `os_type`)),
 `VMwareProvider` (pyVmomi,
-lazy; reports CBT, snapshots, independent disks, tools state; `os_type` is the VMware Tools pretty
+lazy; reports CBT, snapshots, independent disks, tools state; powers a VM on for a rollback (`power_on`) and tells
+whether vCenter recorded a power-on of it since a time (`powered_on_since`, its events, §7.2), and lists the keys of a VM's
+disks in vCenter's device order (`disk_keys`: `config.hardware.device`, as the migration kit reads it, §7.2); `os_type` is the VMware Tools pretty
 name when Tools report one, else the configured guest id), `FakeSourceProvider`/
 `FakeDestinationProvider` (deterministic demo data: 24 OpenStack VMs including one multi-attach,
 one vGPU flavor, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+ disks;
@@ -2106,12 +2395,16 @@ JSON everywhere; errors are `{"error": {"code": str, "message": str}}` with HTTP
 transition / conflict), 413 (`payload_too_large`, below), 422 (schema), 429 (`too_many_requests`, the
 auth lockout of §15.1), 500 (`internal_error`, message never carries internals), 502
 (`provider_error`, the redacted provider message), 503 (`/ready` while degraded). Every response,
-including error responses written by the server-error handler, carries the security headers of
-Security.md R-05.
+including error responses written by the server-error handler and the answers to CORS preflights (with
+`SEAMLESS_CORS_ORIGINS` set: the CORS layer answers them before any route, a refused one as the envelope, 400
+`bad_request` "Disallowed CORS origin"; audit AP-09), carries the security headers of Security.md R-05.
 A request body with a field the route does not take is refused with 422 (`validation_error`, naming
-the field) — on `POST /plans` and `POST /providers` as on `PATCH /plans/{id}` and `PATCH /providers/{id}`
-— so a misspelt guard (`requrie_approval`, `verify_tsl`) never silently yields a plan or provider
-without it; a stored document keeps loading with fields a later version added (§11).
+the field) — at any depth, a nested object's field too (`conversion_host.ssh_allowed_cdir`, `verification.tcp_port`,
+a probe's `expect_stauts`), on `POST /plans` and `POST /providers` as on `PATCH /plans/{id}` and
+`PATCH /providers/{id}`, on `POST` and `PUT /advisor/policies` (a misspelt `scope` would make a plan's policy a global
+one) and in `seamless plan apply` (§15) — so a misspelt guard (`requrie_approval`, `verify_tsl`) never silently yields a
+plan, provider or policy without it (audit AP-01, AP-02); a stored document keeps loading with fields a later version
+added, at any depth (§11).
 Authentication: `Authorization: Bearer <token>` (§13).
 A request body holds at most 1 MiB (1,048,576 bytes). A larger `Content-Length`, or a chunked body
 that grows past it, is refused with 413 before the body is parsed: the framework parses a route's
@@ -2134,7 +2427,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/providers` | viewer | — | `Provider[]` |
 | POST | `/providers` | admin | `Provider` (status fields ignored; a field `Provider` does not have: 422) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown` and the check report (`capabilities`) to `{}`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown` and the check report (`capabilities`) to `{}`; 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, recorded `sync_passes` of a strategy other than `cold`) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
@@ -2249,9 +2542,16 @@ The tokens file is refused at start-up (the server does not start) when an entry
 so a hand-edited file cannot add one either.
 `SEAMLESS_AUTH_DISABLED=true` maps every request to principal `anonymous` with role `admin`; the CLI
 refuses to start with it unless the bind host is loopback (`127.0.0.1`, `::1`, `localhost`).
-Demo mode on loopback disables auth by default. Every request refused for its role emits
+Demo mode on loopback disables auth by default. The loopback bind alone does not keep that admin to the machine: a
+page of any site reaches the loopback port, by DNS rebinding under its own name, or by a plain cross-site request.
+So, with authentication off, a route that takes a role refuses (403 `forbidden`, before anything else) a request whose
+`Host` names no loopback address, and a state-changing one (any method but `GET`, `HEAD` and `OPTIONS`) whose
+`Origin` names no loopback address (`null` included) or whose `Sec-Fetch-Site` is `cross-site`; a loopback name with
+any port, IPv6 included, passes, and so does a client that sends neither header - the CLI, curl (audit AP-03). Every
+request refused for its role emits
 `auth.denied` — a missing or invalid token (401), the per-address lockout (429), a role below the
-route's minimum or an approver-only plan field set below the approver role (403, §12) — with `actor`
+route's minimum, an approver-only plan field set below the approver role, or, with authentication off, a request
+another site's page may have sent (403, §12) — with `actor`
 the principal's name (`unauthenticated` without one), `message` `METHOD path: reason` and `data`
 `{path, method, reason, required_role, client}`, never the token; at most 30 per client address and
 minute are recorded.
@@ -2304,7 +2604,10 @@ the change is recorded, with its `provider.credentials_updated` event — a 409 
 new secret would leave the change unaudited; when the provider keeps changing under the write (50 conflicts in a
 row, each a check or another write that landed), the route answers 503 `unavailable` naming the secret — the store
 holds the new value, the provider does not record it yet, and the operator sends the credentials again. A provider
-deleted meanwhile answers 404, and the secret just written is removed again. `SEAMLESS_SECRET_STORE` selects it:
+deleted meanwhile answers 404, and the secret just written is removed again. A connection to a provider is built
+again once its document (its state fields aside) or the mounted `clouds.yaml` changed — the provider registry's and
+the storage handover's alike — and the replaced one is closed, so the step after a rotation signs in with the new
+credentials, a running plan's rollback included (audit EX-14). `SEAMLESS_SECRET_STORE` selects it:
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory,
   each key written to a temporary file and renamed; the directory must be writable (Compose mounts the
@@ -2325,7 +2628,10 @@ letter or digit; `POST /providers` and `PATCH /providers/{id}` refuse (422) a `c
 `conversion_host.ssh_key_secret` that is not one, instead of the connection check failing on it later. The whole name
 must match (a trailing newline does not), and it never starts with `provider-` unless it is the provider's own for that
 field (`credentials_secret`: `provider-{id}`; `ssh_key_secret`: `provider-{id}-ssh`): those name other providers' secrets, which a check would send to this provider's
-endpoint. The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
+endpoint. The name is compared as the readers fold it - a case-insensitive filesystem (a host run on macOS or
+Windows) opens `provider-x` for `Provider-x`, and the variables upper-case the name and turn every other character
+into `_` - lower-cased, with every character other than a letter or digit taken as `-`: a name that folds to one
+starting with `provider-` is refused unless it is exactly the provider's own (audit AP-04). The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
 (its own writes) or `seamless.io/provider-secret: "true"` (one an operator made for providers), never the
 deployment's own (`seamless-db`, `seamless-tokens`, …); a name that store cannot hold (upper-case, `_`) is not
 looked up there, and the variables are read next. `provider.created` and `provider.updated` name the secrets the
@@ -2374,11 +2680,19 @@ neither replacement splits the other (a VM `dc3` replaced first left `jakarta-[v
 descriptor it holds never go through it: a provider named `RHOSO` made "moving to RHOSO 18.0 18.0?" (review RV21-10). The input snapshot (§14.5) is what is sent.
 
 The control plane uses the same `redact` for the text it publishes from outside sources: step and
-provider error messages and every `migration.log` line (§4). Where it cuts such text, it redacts first,
+provider error messages, every `migration.log` line (§4), and agentmemory's search hits - an outside service that
+agents write too - redacted as they arrive, title and content, before anything cuts or publishes them: what
+`POST /advisor/similar-incidents` answers, and the `similar_incidents` a recommendation and a failure's note keep
+(§14.3, §14.4; audit AP-05). Where it cuts such text, it redacts first,
 over the cut plus 16384 characters, and cuts after (`redact_cut(text, limit)`): a secret the cut splits
 — a PEM block, a URL with credentials — is still found, at a bounded cost. The cuts: a `migration.log`
 line at 2000 characters (§4), the failing output line in an Ansible step's error at 500, a provider
-SDK's error message at 500, an HTTP error body in the handover executor at 300. The service log too:
+SDK's error message at 500, an HTTP error body in the handover executor at 300, an agentmemory hit's content at 4000
+and its title at 200 - only the first `limit` hits of an answer are read (review RV27-06). Every pattern of `redact`
+costs time linear in the text's length - each start looks at a credential key's prefix of at most 16 parts, a URL
+scheme of at most 64 characters and a CLI flag name of at most 64, and a PEM block runs from its BEGIN line to the
+first END line after it, found once -, so a bounded text holds the event loop for a bounded time (review RV27-06).
+The service log too:
 the root handler's formatter (`cli.configure_logging`) passes every record through `redact` — the
 whole line in plain mode; in JSON mode the message and the exception text before they are serialized,
 as redacting a serialized line could break its quoting — so neither a message nor the chained
@@ -2743,7 +3057,16 @@ divisor) and `SEAMLESS_JEV_TIMEOUT_S` above 0; `SEAMLESS_MAX_CONCURRENT_MIGRATIO
 `SEAMLESS_MAX_CONCURRENT_CUTOVERS` at least 1; `SEAMLESS_MAX_STEP_RETRIES` (a negative count would silently
 disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE`
 0 or more, 0 keeping the meaning each row gives it; `SEAMLESS_DEMO_FAILURE_RATE` and
-`SEAMLESS_JEV_MIN_CONFIDENCE` 0…1.
+`SEAMLESS_JEV_MIN_CONFIDENCE` 0…1. Each entry of `SEAMLESS_CORS_ORIGINS` is one origin as a browser sends it -
+`http` or `https`, a host, an optional port 1…65535, no user, path, query or fragment (not even a trailing `/`, which
+would never match) - and never `*`, which would let every page call the API (Security.md C1-12, audit AP-10). The
+comparison is exact, so an entry is written as the URL Standard's host parser serializes it, or refused naming that
+spelling (review RV27-08): the host lower-cased and in punycode, a percent-encoded host decoded, a host ending in a
+number an IPv4 address in any of its forms written dotted in decimal, an IPv6 address in hex pieces with the first
+longest run of zeros compressed, no default port. A host holding `ß`, `ς` or a zero-width joiner - whose ASCII form
+Python's IDNA 2003 writes otherwise than browsers do - is refused without a spelling, asking for the `xn--` form the
+browser sends; a host the URL Standard rejects (an IPv4 part out of range, an IPv6 zone, a character it forbids)
+is no origin a browser sends (review RV31-03).
 
 ---
 
@@ -2903,7 +3226,22 @@ disable the retries), `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_SOURCE_WATCH_S` and `
   for "The cutover will refuse {n} problem(s): fix it first.", so the approver sees it where the approval is given.
   A rolled-back migration waits for a person too — to fix the cause and retry it, or to cancel it — so Needs
   attention lists it last, after the overdue finalizes: "Rolled back — the source VM runs again", with "Fix the
-  cause, then retry or cancel (operator)".
+  cause, then retry or cancel (operator)". A failed migration is offered only what it can take, alike in Needs
+  attention and its next step: one whose rollback failed — its error from the rollback step (`rollback: …`) — with
+  its clock closed (§5.2) is offered the rollback again, but nothing the migration records tells whether that
+  rollback started the source before it failed: a completed migration's clock closed at its verification, and a
+  rollback leaves a closed clock as it is. So it never says the source runs: it says the source VM may still be
+  stopped, to be checked in the source cloud, and ranks with a stopped source, ahead of the other failed ones —
+  "Check whether the source VM runs, then roll back again (operator)"; one with no clock was never stopped, its
+  source runs: "Roll back again or cancel (operator)" (review RV34B-03). Any other whose source was stopped once
+  "Retry or roll back (operator)", as a cancel is refused once the source was stopped (§5.1); only one never stopped
+  adds the cancel (review RV32A-05). The Roll back dialog says what the rollback of the
+  migration's strategy deletes: `warm` the destination server, its volumes kept for a retry; `cold` the server and
+  the volumes the cold import recorded (§6.3); `storage_handover` the server - and the ports made for it through
+  Neutron - and hands the volumes back to the source cloud, no data moving, where the source VM is recreated under a
+  new id once the cutover deleted it (§7.3, review RV34B-05); `vmware_cold`/`vmware_warm` the server, the kit's
+  ports and the kit's volumes the next attempt cannot reuse — every one once the destination VM ran (§7.2) — and
+  each starts the source VM again (review RV32A-06).
 * Routes: `/` Overview (filtered by the plan in its address, `?plan=`: one that names no plan stays chosen and the page
   says the plan does not exist, with All plans, instead of showing its zeros as all clear; KPI tiles, phase
   distribution, throughput chart, downtime vs SLO,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from collections import Counter
 from collections.abc import Callable
 from typing import Any
@@ -15,6 +16,7 @@ from pydantic import ValidationError
 from ..domain.enums import PlanStatus, ProviderKind, ProviderRole, Role
 from ..domain.models import (
     BLANK_NAME,
+    REQUEST_BODY,
     ConversionHostConfig,
     Migration,
     Plan,
@@ -34,7 +36,13 @@ from ..security.secret_store import (
 )
 from ..security.secrets import valid_secret_name
 from ..store import ConflictError, NotFound
-from .deps import ApiError, require_role, services, validation_message
+from .deps import (
+    ApiError,
+    refuse_unknown_fields,
+    require_role,
+    services,
+    validation_message,
+)
 from .schemas import ConversionKeyRequest, ProviderCredentialsRequest
 
 log = logging.getLogger(__name__)
@@ -137,10 +145,15 @@ def _check_secret_names(provider: Provider, fields: set[str]) -> None:
         "credentials_secret": credentials_secret_name(provider.id),
         "conversion_host.ssh_key_secret": conversion_key_secret_name(provider.id),
     }
+    # compared as the readers fold the name: a case-insensitive filesystem opens provider-x for
+    # Provider-x, the SEAMLESS_SECRET_ variables upper-case it and take any other character as _
+    # (audit AP-04) - only the provider's own exact name passes
     taken = [
         field
         for field, name in names.items()
-        if name is not None and name.startswith("provider-") and name != own[field]
+        if name is not None
+        and re.sub(r"[^a-z0-9]", "-", name.lower()).startswith("provider-")
+        and name != own[field]
     ]
     if taken:
         raise ApiError(
@@ -168,6 +181,7 @@ async def create_provider(
     principal: Principal = Depends(require_role(Role.admin)),
 ) -> Provider:
     svc = services(request)
+    await refuse_unknown_fields(request, ProviderCreate)
     _check_secret_names(body, {"credentials_secret", "conversion_host"})
     provider = body.model_copy(
         update={**_SERVER_OWNED, "credentials_updated_at": None, "conversion_key_updated_at": None}
@@ -231,22 +245,28 @@ async def update_provider(
     if isinstance(body.get("name"), str) and is_blank(body["name"]):
         # at the request boundary: a provider stored blank before keeps loading (RV20-11)
         raise ApiError(422, "validation_error", f"name: {BLANK_NAME}")
-    provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
-    users = await _plans_using(request, provider_id, ACTIVE_PLAN_STATUSES)
-    if users:
-        raise ApiError(
-            409, "conflict", f"provider is used by running or paused plan(s): {', '.join(users)}"
-        )
-    try:
-        updated = Provider.model_validate(
-            {**provider.model_dump(mode="json"), **body, **_SERVER_OWNED}
-        )
-    except ValidationError as exc:
-        raise ApiError(
-            422, "validation_error", validation_message(exc.errors(), "invalid provider")
-        ) from None
-    _check_secret_names(updated, set(body))
-    await svc.db.put("provider", updated, expected_version=version)
+    # the check and the write hold the lock a plan start takes for its status write, so no start
+    # lands between them and leaves a running plan on a changed provider (SDD §12, audit AP-07)
+    async with svc.orchestrator.provider_lock():
+        provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
+        users = await _plans_using(request, provider_id, ACTIVE_PLAN_STATUSES)
+        if users:
+            raise ApiError(
+                409,
+                "conflict",
+                f"provider is used by running or paused plan(s): {', '.join(users)}",
+            )
+        try:
+            updated = Provider.model_validate(
+                {**provider.model_dump(mode="json"), **body, **_SERVER_OWNED},
+                context=REQUEST_BODY,  # a nested field unknown is refused too (audit AP-01)
+            )
+        except ValidationError as exc:
+            raise ApiError(
+                422, "validation_error", validation_message(exc.errors(), "invalid provider")
+            ) from None
+        _check_secret_names(updated, set(body))
+        await svc.db.put("provider", updated, expected_version=version)
     await emit(
         svc.store,
         svc.bus,

@@ -12,7 +12,14 @@ from ..domain.models import AdvisorPolicy, AdvisorPolicySpec, AdvisorRecommendat
 from ..events import emit
 from ..security.auth import Principal
 from ..store import ConflictError, NotFound
-from .deps import ApiError, Services, require_permission, require_role, services
+from .deps import (
+    ApiError,
+    Services,
+    refuse_unknown_fields,
+    require_permission,
+    require_role,
+    services,
+)
 from .schemas import OverrideRequest, PolicyList
 
 router = APIRouter(tags=["advisor"])
@@ -61,6 +68,7 @@ async def create_policy(
     principal: Principal = Depends(require_permission("advisor.policy.manage")),
 ) -> AdvisorPolicy:
     svc = services(request)
+    await refuse_unknown_fields(request, AdvisorPolicySpec)
     await _check_scope(svc, body)
     policy = AdvisorPolicy(**body.model_dump(), updated_by=principal.name)
     await svc.db.put("advisor_policy", policy, expected_version=0)
@@ -76,6 +84,7 @@ async def replace_policy(
     principal: Principal = Depends(require_permission("advisor.policy.manage")),
 ) -> AdvisorPolicy:
     svc = services(request)
+    await refuse_unknown_fields(request, AdvisorPolicySpec)
     await _check_scope(svc, body)
     before, version = await svc.db.get_versioned("advisor_policy", policy_id, AdvisorPolicy)
     after = AdvisorPolicy(

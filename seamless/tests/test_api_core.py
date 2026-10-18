@@ -1,11 +1,14 @@
 import inspect
 import re
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from seamless_migrate.ai.memory import MemoryClient
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, Role
+from seamless_migrate.domain.models import Provider
 from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, ROLES, SOURCE, Api, api_settings
 from tests.factories import make_migration
@@ -447,6 +450,82 @@ def test_advisor_status_and_similar_incidents_without_memory(api):
     assert res.status_code == 200 and res.json() == {"hits": []}
 
 
+LEAKED = (
+    "cutover of db-01 failed; ran --os-password Hunter2-Prod-Secret; "
+    "OS_PASSWORD=Hunter2-Prod-Secret"  # gitleaks:allow
+)
+
+
+def memory_answering(content):
+    """agentmemory answering every search with one hit whose title and content carry a password."""
+
+    def memory(request):
+        title = "db-01 OS_PASSWORD=Hunter2-Prod-Secret"  # gitleaks:allow
+        hit = {"title": title, "content": content}
+        return httpx.Response(200, json={"results": [hit]})
+
+    return MemoryClient(
+        "http://memory.example:3111",
+        None,
+        "seamless-migrate",
+        transport=httpx.MockTransport(memory),
+    )
+
+
+def test_similar_incidents_reach_operators_redacted(api):
+    """SDD §13.4 (audit AP-05): POST /advisor/similar-incidents answers agentmemory's hits - text of
+    an outside service, which agents write too - redacted."""
+    api.client.app.state.services.memory = memory_answering(LEAKED)
+    res = api.post("/api/v1/advisor/similar-incidents", Role.operator, json={"query": "db-01"})
+    assert res.status_code == 200 and res.json()["hits"], res.text
+    assert "Hunter2-Prod-Secret" not in res.text, res.text
+
+
+def test_similar_incidents_reach_viewers_redacted_in_recommendations(api):
+    """SDD §13.4, §14.4 (audit AP-05): the hits a validation stores in each recommendation, which
+    every viewer reads from GET /advisor/recommendations, are redacted before they are cut."""
+    for provider in (SOURCE, DESTINATION):
+        assert api.post("/api/v1/providers", json=provider).status_code == 201
+    api.client.app.state.services.orchestrator.knowledge.memory = memory_answering(LEAKED)
+    vm_ids = [vm["source_id"] for vm in api.get("/api/v1/providers/src-osp/inventory").json()]
+    plan = {"name": "Redacted hits", "source_provider_id": "src-osp"}
+    plan |= {"destination_provider_id": "dst-rhoso", "vm_ids": vm_ids}
+    made = api.post("/api/v1/plans", Role.operator, json=plan)
+    assert made.status_code == 201, made.text
+    validated = api.post(f"/api/v1/plans/{made.json()['id']}/validate", Role.operator)
+    assert validated.status_code == 200, validated.text
+    page = api.get("/api/v1/advisor/recommendations?limit=200", Role.viewer)
+    assert page.status_code == 200 and page.json()["total"] > 0, page.text
+    hits = [hit for rec in page.json()["items"] for hit in rec["similar_incidents"]]
+    assert hits and "Hunter2-Prod-Secret" not in page.text, hits[:1]
+
+
+def test_cors_preflight_answers_keep_the_security_headers_and_the_envelope(tmp_path):
+    """SDD §12 (audit AP-09): every response carries the R-05 security headers and every error is
+    the envelope - a CORS preflight's answer too, allowed or refused, though the CORS layer answers
+    it before any route."""
+    settings, _ = api_settings(tmp_path, cors_origins=["https://dashboard.example"])
+    store = Store(f"sqlite:///{tmp_path / 'cors.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+
+        def preflight(origin):
+            headers = {"Origin": origin, "Access-Control-Request-Method": "GET"}
+            return client.options("/api/v1/plans", headers=headers)
+
+        refused, allowed = preflight("https://evil.example"), preflight("https://dashboard.example")
+    store.dispose()
+    for res in (refused, allowed):
+        assert {"x-frame-options", "content-security-policy"} <= set(res.headers), res.headers
+    assert allowed.status_code == 200
+    assert allowed.headers["access-control-allow-origin"] == "https://dashboard.example"
+    assert refused.status_code == 400, refused.text
+    assert refused.json() == {"error": {"code": "bad_request", "message": "Disallowed CORS origin"}}
+    assert "access-control-allow-origin" not in refused.headers
+    # a cache must not answer the allowed origin with this refusal
+    assert "Origin" in refused.headers["vary"]
+
+
 def test_spa_fallback_serves_index(tmp_path):
     dist = tmp_path / "dist"
     (dist / "assets").mkdir(parents=True)
@@ -465,6 +544,60 @@ def test_spa_fallback_serves_index(tmp_path):
         api_404 = client.get("/api/v1/does-not-exist")
         assert api_404.status_code == 404 and api_404.json()["error"]["code"] == "not_found"
         assert "nope" not in client.get("/..%2Fsecret.txt").text
+    store.dispose()
+
+
+def test_the_dashboard_fallback_looks_at_no_path_outside_its_directory(tmp_path, monkeypatch):
+    """SDD §12 (CodeQL py/path-injection): a path that leaves the dashboard's directory - ".."
+    segments - is answered with the index without the file system being asked about it, and a
+    symlink inside the directory that names a file outside it is not served."""
+    import os
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>Seamless</title>")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("nope")
+    (dist / "leak.txt").symlink_to(secret)
+    settings, _ = api_settings(tmp_path, dashboard_dir=dist)
+    store = Store(f"sqlite:///{tmp_path / 'spa-paths.db'}")
+    store.create_schema()
+    looked: list[str] = []
+    stat, lstat = os.stat, os.lstat
+
+    def spying(real):
+        def call(path, *args, **kwargs):
+            looked.append(os.fspath(path) if not isinstance(path, int) else "")
+            return real(path, *args, **kwargs)
+
+        return call
+
+    with TestClient(create_app(settings, store)) as client:
+        monkeypatch.setattr(os, "stat", spying(stat))
+        monkeypatch.setattr(os, "lstat", spying(lstat))
+        outside = client.get("/..%2Fsecret.txt")
+        monkeypatch.setattr(os, "stat", stat)
+        monkeypatch.setattr(os, "lstat", lstat)
+        assert outside.status_code == 200 and "Seamless" in outside.text
+        assert str(secret) not in looked, looked
+        linked = client.get("/leak.txt")
+        assert linked.status_code == 200 and "nope" not in linked.text
+    store.dispose()
+
+
+def test_the_dashboard_fallback_answers_a_nul_path_with_the_index(tmp_path):
+    """SDD §12 (review RV33-05): a path holding a NUL byte - GET /plans%00, unauthenticated - names
+    no file: the fallback answers the index, never a 500 with a traceback in the log."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>Seamless</title>")
+    settings, _ = api_settings(tmp_path, dashboard_dir=dist)
+    store = Store(f"sqlite:///{tmp_path / 'spa-nul.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        for path in ("/plans%00", "/%00", "/assets%00/x.js"):
+            answer = client.get(path)
+            assert answer.status_code == 200 and "Seamless" in answer.text, (path, answer.text)
     store.dispose()
 
 
@@ -492,12 +625,67 @@ def test_auth_disabled_maps_to_anonymous_admin(tmp_path):
     settings, _ = api_settings(tmp_path, auth_disabled=True, tokens_file=None)
     store = Store(f"sqlite:///{tmp_path / 'anon.db'}")
     store.create_schema()
-    with TestClient(create_app(settings, store)) as client:
+    # an auth-off server is reached by a loopback name only (SDD §13.1, audit AP-03)
+    with TestClient(create_app(settings, store), base_url="http://127.0.0.1:8080") as client:
         assert client.get("/api/v1/me").json() == {"name": "anonymous", "role": "admin"}
         assert client.post("/api/v1/providers", json=SOURCE).status_code == 201
         created = [e for e in store.events(since_seq=0) if e.kind == "provider.created"]
         assert created[0].actor == "anonymous"
     store.dispose()
+
+
+def test_with_authentication_off_only_this_machines_pages_reach_the_api(tmp_path):
+    """SDD §13.1, Security.md C1-02/C1-12 (audit AP-03): with authentication off the anonymous
+    admin answers only this machine. A DNS-rebinding page reaches the loopback port under its own
+    name - a Host naming no loopback address - and another site's page sends simple cross-site
+    requests: both are refused with 403, before any side effect. Loopback names (with any port,
+    IPv6 too) and clients that send no Origin (the CLI, curl) keep working."""
+    settings, _ = api_settings(tmp_path, auth_disabled=True, tokens_file=None)
+    store = Store(f"sqlite:///{tmp_path / 'off.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store), base_url="http://127.0.0.1:8080") as client:
+        assert client.post("/api/v1/providers", json=SOURCE).status_code == 201
+        rebound = {"Host": "rebind.attacker.example:8080"}
+        listed = client.get("/api/v1/providers", headers=rebound)
+        assert listed.status_code == 403, listed.text
+        assert listed.json()["error"]["code"] == "forbidden"
+        assert "x-frame-options" in listed.headers  # R-05 headers on the refusal too
+        repointed = client.patch(
+            "/api/v1/providers/src-osp",
+            headers={**rebound, "Origin": "http://rebind.attacker.example:8080"},
+            json={"endpoint": "https://rebind.attacker.example/v3"},
+        )
+        assert repointed.status_code == 403, repointed.text
+        # a simple cross-site request reaches the loopback Host itself: its Origin gives it away
+        for cross_site in (
+            {"Origin": "https://evil.example"},
+            {"Origin": "null"},
+            {"Sec-Fetch-Site": "cross-site"},
+        ):
+            refused = client.post("/api/v1/providers/src-osp/check", headers=cross_site)
+            assert refused.status_code == 403, (cross_site, refused.text)
+        assert store.get("provider", "src-osp", Provider).endpoint == SOURCE["endpoint"]
+        denied = [e for e in store.events(since_seq=0) if e.kind == "auth.denied"]
+        assert len(denied) == 5 and all(
+            e.data["reason"].startswith("with authentication off") for e in denied
+        ), [e.message for e in denied]
+        for host in ("127.0.0.1:8080", "localhost:5173", "[::1]:8080", "127.0.0.2", "LOCALHOST"):
+            assert client.get("/api/v1/providers", headers={"Host": host}).status_code == 200, host
+        same_site = {"Origin": "http://localhost:5173", "Sec-Fetch-Site": "same-site"}
+        assert (
+            client.patch(
+                "/api/v1/providers/src-osp", headers=same_site, json={"name": "Source DC1"}
+            ).status_code
+            == 200
+        )
+    store.dispose()
+
+
+def test_with_authentication_on_any_host_is_answered(api):
+    """SDD §13.1 (audit AP-03): the loopback rule is the auth-off mode's alone - with tokens the
+    server answers the names it is reached by (a route, an ingress host)."""
+    headers = {**api.h("viewer"), "Host": "seamless.apps.example"}
+    assert api.client.get("/api/v1/providers", headers=headers).status_code == 200
 
 
 def test_health_says_whether_authentication_is_off(api, tmp_path):
