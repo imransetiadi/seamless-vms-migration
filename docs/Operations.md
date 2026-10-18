@@ -170,6 +170,9 @@ sized for 10 concurrent migrations at about 250 MiB each: above 10, raise `deplo
 the new size (`make seamless-colima-up SEAMLESS_COLIMA_MEMORY=10`); Colima takes a new CPU or memory count when it
 starts a stopped profile, never a smaller disk.
 
+The restart cuts off a cutover in flight like any stop. To let it end first, add `--drain` (section 5):
+`scripts/seamless-ctl.sh docker capacity --max-migrations 16 --drain ~/.seamless/operator.token`.
+
 ---
 
 ## 4. Tutorial: Kubernetes and OpenShift
@@ -238,6 +241,8 @@ one rollout. These are live changes: the next `up` (`apply -k`) brings the manif
 lasting change into the overlay - `deploy/openshift/configmap.yaml` and the `resources:` of
 `deploy/openshift/deployment.yaml` (or a kustomize patch of your own). The requests and limits there are sized for
 10 concurrent migrations at about 250 MiB each: above 10 without `--memory`, the script warns, as on the single host.
+The rollout restarts the control plane: add `--drain` and `--url` (section 5) to let the cutovers in flight end
+first.
 
 ---
 
@@ -270,6 +275,10 @@ end first:
 
    It prints the plans it paused. If a cutover is still in flight when the wait ends, it **stops nothing**,
    names the paused plans, and exits 1 - try again later, or stop without `--drain`.
+
+   `capacity` takes `--drain` too: it ends in a restart. Its own checks come first - `deploy/compose/.env` on the
+   single host, a server-side dry run of a cluster's limits - so a capacity that would be refused pauses no plan,
+   and a timeout changes nothing.
 
 3. **Start again, then resume the paused plans:**
 

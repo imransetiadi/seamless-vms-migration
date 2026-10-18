@@ -727,6 +727,106 @@ def test_a_drain_that_times_out_stops_nothing(tmp_path):
     assert "plan-aa" in proc.stderr and "resume" in proc.stderr
 
 
+CLUSTER_URL = "https://seamless.example.com"
+
+
+def _changes(calls) -> list[int]:
+    """The places of the calls that change the stack: make, a cluster's patch, scale or rollout -
+    never a server-side dry run."""
+    return [
+        i
+        for i, c in enumerate(calls)
+        if c["cmd"] == "make"
+        or (
+            c["cmd"] in ("kubectl", "oc")
+            and {"patch", "scale", "rollout", "set"} & set(c["args"])
+            and "--dry-run=server" not in c["args"]
+        )
+    ]
+
+
+@pytest.mark.parametrize("platform", PLATFORMS)
+def test_capacity_takes_drain_and_waits_out_the_cutovers_before_its_restart(tmp_path, platform):
+    """SDD §17.2 (review RV38B-22): capacity ends in a restart - make seamless-restart, a cluster's
+    new pod template -, so it takes --drain as restart does: the running plans are paused and the
+    cutover in flight ends before anything changes. It refused --drain. A cluster's limits are
+    checked by a server-side dry run before the drain and again after it."""
+    rules = _drain_rules([{"stdout": '[{"id": "m-1"}]'}, {"stdout": "[]"}])
+    cluster = platform in ("kubernetes", "openshift")
+    proc, calls, tree = _run(
+        tmp_path, platform, "capacity", "--max-migrations", "12", "--drain", "@TOKEN_FILE",
+        *(["--url", CLUSTER_URL, "--memory", "8Gi"] if cluster else []),
+        rules=rules, env_file=None if cluster else ENV,
+        cluster=fake_kube.cluster() if cluster else None,
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    waits = [i for i, c in enumerate(calls) if c["cmd"] == "curl" and "phase=" in c["args"][-1]]
+    assert len(waits) == 6  # cutover, verifying, rolling_back - asked twice: it waited once
+    assert waits[-1] < _changes(calls)[0], [c["cmd"] for c in calls]
+    if cluster:
+        dry = [i for i, c in enumerate(calls) if "--dry-run=server" in c["args"]]
+        assert dry[0] < waits[0] and waits[-1] < dry[-1] < _changes(calls)[0], dry
+        [pod] = fake_kube.running(_cluster_after(tmp_path))
+        assert pod["config"]["SEAMLESS_MAX_CONCURRENT_MIGRATIONS"] == "12"
+        assert pod["limits"]["memory"] == "8Gi"
+    else:
+        env = (tree / "deploy" / "compose" / ".env").read_text()
+        assert "SEAMLESS_MAX_CONCURRENT_MIGRATIONS=12" in env
+        assert _args(calls, "make")[-1].endswith("seamless-restart SEAMLESS_ENGINE=" + platform)
+    assert "plan-aa" in proc.stdout and "resume" in proc.stdout
+
+
+@pytest.mark.parametrize("platform", PLATFORMS)
+def test_a_capacity_drain_that_times_out_changes_nothing(tmp_path, platform):
+    """SDD §17.2: a cutover still in flight when --wait-timeout ends stops and changes nothing -
+    no .env rewritten, no ConfigMap or pod template patched - and the paused plans are named."""
+    rules = _drain_rules([{"stdout": '[{"id": "m-1"}]'}])
+    cluster = platform in ("kubernetes", "openshift")
+    proc, calls, tree = _run(
+        tmp_path, platform, "capacity", "--max-migrations", "12", "--drain", "@TOKEN_FILE",
+        "--wait-timeout", "0", *(["--url", CLUSTER_URL] if cluster else []),
+        rules=rules, env_file=None if cluster else ENV,
+        cluster=fake_kube.cluster() if cluster else None,
+    )  # fmt: skip
+    assert proc.returncode == 1, proc.stderr
+    assert "nothing was stopped" in proc.stderr and "plan-aa" in proc.stderr
+    assert _changes(calls) == []
+    if cluster:
+        state = _cluster_after(tmp_path)
+        assert state["configmap"]["SEAMLESS_MAX_CONCURRENT_MIGRATIONS"] == "10"
+        assert state["serial"] == 1
+    else:
+        assert (tree / "deploy" / "compose" / ".env").read_text() == ENV
+
+
+#: the API server's refusal of a limit below the request (fake_kube.py)
+BELOW_REQUEST = "must be less than or equal to"
+
+
+@pytest.mark.parametrize(
+    ("platform", "argv", "says"),
+    [
+        ("docker", [], "deploy/compose/.env is missing"),
+        ("kubernetes", ["--memory", "512Mi", "--url", CLUSTER_URL], BELOW_REQUEST),
+        ("openshift", ["--memory", "512Mi", "--url", CLUSTER_URL], BELOW_REQUEST),
+    ],
+    ids=["no .env", "kubernetes: a refused limit", "openshift: a refused limit"],
+)
+def test_a_capacity_that_would_be_refused_pauses_no_plan(tmp_path, platform, argv, says):
+    """SDD §17.2 (review RV38B-22): a capacity's checks - deploy/compose/.env on the single host,
+    the server-side dry run of a cluster's limits - run before its drain: a capacity that is
+    refused leaves every plan running, with nothing to resume."""
+    proc, calls, _ = _run(
+        tmp_path, platform, "capacity", "--max-migrations", "12", *argv, "--drain", "@TOKEN_FILE",
+        rules=_drain_rules([{"stdout": "[]"}]),
+        cluster=fake_kube.cluster() if platform != "docker" else None,
+    )  # fmt: skip
+    assert proc.returncode == 1, proc.stderr
+    assert says in proc.stderr, proc.stderr
+    assert [c for c in calls if c["cmd"] == "curl"] == []  # no plan listed, none paused
+    assert _changes(calls) == []
+
+
 @pytest.mark.parametrize(("mode", "used"), [(0o644, False), (0o600, True)], ids=["0644", "0600"])
 def test_a_symlinked_token_file_is_judged_by_the_file_it_points_to(tmp_path, mode, used):
     """SDD §17.2 (review RV38B-08): the token file must be one only its owner may read - the file a

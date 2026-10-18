@@ -33,9 +33,9 @@ ACTION
 OPTIONS
   --namespace NS     the cluster namespace (default seamless-migrate)
   --demo             docker/podman up, start, restart: the demo, with simulated clouds
-  --drain FILE       before down, stop, restart or scale 0: pause every running plan and wait until no
-                     migration is in cutover, verifying or rolling_back; FILE holds an operator's token
-                     and may be read by its owner alone (chmod 600)
+  --drain FILE       before down, stop, restart, scale 0 or capacity: pause every running plan and wait
+                     until no migration is in cutover, verifying or rolling_back; FILE holds an
+                     operator's token and may be read by its owner alone (chmod 600)
   --token-file FILE  the operator's token for resume (chmod 600)
   --url URL          the API's base URL: on docker/podman http://127.0.0.1:$SEAMLESS_HOST_PORT (8080) by
                      default; on a cluster the Route's or Ingress's URL, needed by --drain and resume
@@ -158,8 +158,8 @@ elif [ "$NARGS" != 0 ]; then
   bad_usage "$ACTION takes no argument '${ARGS[0]}'"
 fi
 if [ -n "$DRAIN" ]; then
-  case $ACTION in down | stop | restart) ;; scale) [ "${ARGS[0]}" = 0 ] || refuse "--drain goes with scale 0" ;;
-    *) refuse "--drain goes with down, stop, restart or scale 0" ;; esac
+  case $ACTION in down | stop | restart | capacity) ;; scale) [ "${ARGS[0]}" = 0 ] || refuse "--drain goes with scale 0" ;;
+    *) refuse "--drain goes with down, stop, restart, scale 0 or capacity" ;; esac
 fi
 if [ "$DEMO" = 1 ]; then
   [ "$KIND" = host ] || refuse "--demo is the single-host demo stack (docker or podman)"
@@ -276,7 +276,7 @@ host_capacity() {
   local env=$ROOT/deploy/compose/.env kv key line tmp settings=()
   [ -n "$MAX_MIGRATIONS" ] && settings+=("SEAMLESS_MAX_CONCURRENT_MIGRATIONS=$MAX_MIGRATIONS")
   [ -n "$MAX_CUTOVERS" ] && settings+=("SEAMLESS_MAX_CONCURRENT_CUTOVERS=$MAX_CUTOVERS")
-  [ -f "$env" ] || die "deploy/compose/.env is missing: run make seamless-init first"
+  capacity_check
   if [ -n "$MAX_MIGRATIONS" ] && [ "$MAX_MIGRATIONS" -gt 10 ]; then
     printf '%s: each concurrent migration needs about 250 MiB (Performance.md §8); the control plane'"'"'s memory limit in deploy/compose/compose.yaml (3g) is sized for 10 - raise deploy.resources.limits.memory there for %s\n' \
       "$PROG" "$MAX_MIGRATIONS" >&2
@@ -358,26 +358,42 @@ cluster_start() {
   fi
   control_plane_to 1
 }
+# A cluster's capacity: the ConfigMap's settings, and one new pod template - a restart annotation, as rollout restart
+# writes it, and the limits - so the pod restarts once and reads the settings as it starts, also when the limits stay
+# as they are (SDD §17.2, review RV38B-01).
+CAP_DATA='' CAP_LIMITS='' CAP_PATCH=''
+capacity_patch() {
+  local template
+  CAP_DATA='' CAP_LIMITS=''
+  [ -n "$MAX_MIGRATIONS" ] && CAP_DATA="\"SEAMLESS_MAX_CONCURRENT_MIGRATIONS\":\"$MAX_MIGRATIONS\""
+  [ -n "$MAX_CUTOVERS" ] && CAP_DATA="${CAP_DATA:+$CAP_DATA,}\"SEAMLESS_MAX_CONCURRENT_CUTOVERS\":\"$MAX_CUTOVERS\""
+  [ -n "$CPU" ] && CAP_LIMITS="\"cpu\":\"$CPU\""
+  [ -n "$MEMORY" ] && CAP_LIMITS="${CAP_LIMITS:+$CAP_LIMITS,}\"memory\":\"$MEMORY\""
+  template="\"metadata\":{\"annotations\":{\"kubectl.kubernetes.io/restartedAt\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}"
+  [ -z "$CAP_LIMITS" ] ||
+    template="$template,\"spec\":{\"containers\":[{\"name\":\"seamless\",\"resources\":{\"limits\":{$CAP_LIMITS}}}]}"
+  CAP_PATCH="{\"spec\":{\"template\":{$template}}}"
+}
+# What would refuse a capacity, checked before anything changes - and before a drain pauses a plan, so a refused
+# capacity leaves every plan running (SDD §17.2, review RV38B-22): the single host's deploy/compose/.env; a cluster's
+# limits, which the API server refuses below the requests, by a server-side dry run (review RV38B-02).
+capacity_check() {
+  if [ "$KIND" = host ]; then
+    [ -f "$ROOT/deploy/compose/.env" ] || die "deploy/compose/.env is missing: run make seamless-init first"
+  else
+    need "$KUBE" "install it and log in to the cluster"
+    capacity_patch
+    [ -z "$CAP_LIMITS" ] || kube patch deployment/seamless -p "$CAP_PATCH" --dry-run=server
+  fi
+}
 cluster_capacity() {
-  local data='' limits='' template patch
   if [ -n "$MAX_MIGRATIONS" ] && [ "$MAX_MIGRATIONS" -gt 10 ] && [ -z "$MEMORY" ]; then
     printf '%s: each concurrent migration needs about 250 MiB (Performance.md §8); the control plane'"'"'s memory limit in deploy/openshift/deployment.yaml (4Gi) is sized for 10 - give --memory for %s\n' \
       "$PROG" "$MAX_MIGRATIONS" >&2
   fi
-  [ -n "$MAX_MIGRATIONS" ] && data="\"SEAMLESS_MAX_CONCURRENT_MIGRATIONS\":\"$MAX_MIGRATIONS\""
-  [ -n "$MAX_CUTOVERS" ] && data="${data:+$data,}\"SEAMLESS_MAX_CONCURRENT_CUTOVERS\":\"$MAX_CUTOVERS\""
-  [ -n "$CPU" ] && limits="\"cpu\":\"$CPU\""
-  [ -n "$MEMORY" ] && limits="${limits:+$limits,}\"memory\":\"$MEMORY\""
-  # one new pod template - a restart annotation, as rollout restart writes it, and the limits - so the pod restarts once
-  # and reads the settings as it starts, also when the limits stay as they are (SDD §17.2, review RV38B-01)
-  template="\"metadata\":{\"annotations\":{\"kubectl.kubernetes.io/restartedAt\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}"
-  [ -z "$limits" ] ||
-    template="$template,\"spec\":{\"containers\":[{\"name\":\"seamless\",\"resources\":{\"limits\":{$limits}}}]}"
-  patch="{\"spec\":{\"template\":{$template}}}"
-  # limits the API server refuses - below the requests - change nothing: checked before the ConfigMap (review RV38B-02)
-  [ -z "$limits" ] || kube patch deployment/seamless -p "$patch" --dry-run=server
-  [ -n "$data" ] && kube patch configmap/seamless-config --type merge -p "{\"data\":{$data}}"
-  kube patch deployment/seamless -p "$patch"
+  capacity_check # again after a drain, which may have taken --wait-timeout
+  [ -n "$CAP_DATA" ] && kube patch configmap/seamless-config --type merge -p "{\"data\":{$CAP_DATA}}"
+  kube patch deployment/seamless -p "$CAP_PATCH"
   rollout deployment/seamless
   say "the next 'up' (apply -k) brings the manifests' values back: put a lasting change into $OVERLAY"
 }
@@ -438,5 +454,8 @@ if [ "$ACTION" = resume ]; then
   done
   exit 0
 fi
-[ -z "$DRAIN" ] || drain
+if [ -n "$DRAIN" ]; then
+  [ "$ACTION" != capacity ] || capacity_check
+  drain
+fi
 if [ "$KIND" = host ]; then host; else cluster; fi

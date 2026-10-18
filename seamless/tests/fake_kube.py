@@ -82,9 +82,9 @@ def selected(kind):
     return pods
 
 
-def done(out="", code=0):
+def done(out="", code=0):  # kubectl writes an error to stderr
     state_path.write_text(json.dumps(st))
-    sys.stdout.write(out)
+    (sys.stderr if code else sys.stdout).write(out)
     sys.exit(code)
 
 
