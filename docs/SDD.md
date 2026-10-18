@@ -475,7 +475,8 @@ as held: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm`
 after its last cutover began (every pass when none ran, none when its last attempt ran one) - the kit's rollback
 deletes its copies after a cutover, and a `vmware_cold` rollback keeps none (reviews RV39-02, RV40-05, RV41B-02);
 the strategy is the retried attempt's while the migration waits for its next (§9.3, review RV40-06) —
-the cancel then runs the `rollback` step once
+the cancel then runs the `rollback` step once - that attempt's, by the same strategy, never one a validation or
+`PUT …/strategy` chose since: a storage handover's step knows nothing of a warm attempt's snapshot (review RV43B-04) -
 with `delete_dest_volumes` as a best-effort cleanup of it (source snapshots, temporary and destination
 volumes): `cancelled` is terminal, so no later action could remove them. That cleanup touches only what the
 migration recorded of its own: it matches no destination server by its name alone - the one server it deletes besides
@@ -487,7 +488,9 @@ and the VM it released (§5.4) may since be another plan's, whose same-named ser
 this migration's. On VMware it deletes no kit volume either (§7.2): the kit names a VM's volumes after the VM and no
 record says which migration made them, so a `vmware_warm` copy left is one another plan's migration of the VM takes
 as its own and syncs onto - or already that plan's. After the server's deletion the cleanup reads the destination's
-kit volumes of the VM, and its `migration.action` names each as kept - `<id> (<kit name>-<disk key>)`, the ids in
+kit volumes of the VM no server holds - one a server holds is that server's disk, another plan's cut-over server of
+the VM or another VM the kit names alike (owner question q26), never named for deletion (review RV43B-01) -, and its
+`migration.action` names each as kept - `<id> (<kit name>-<disk key>)`, the ids in
 `data.kept_volumes` - for the operator to delete once no plan migrates the VM; a read that fails is named in their
 place and fails nothing: the server is gone (review RV42B, lead NP-2). The migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
@@ -1016,11 +1019,14 @@ fails the export, and so does a virtio-blk disk (`vdX`) whose serial file is gon
 loudly, as permanent (review RV12-03, RV13-02). ssh failing at the check is no such failure and is retried as
 transient: the serial read's error quotes the ssh command line, ConnectTimeout included, and the check of the by-id link
 gives up with "SSH timeout: conversion host {address} unreachable over SSH, checking the by-id link of {device}" (review
-RV14-02). A command on a conversion host that fails by itself - any exit status but ssh's own 255 - fails with a
-message naming its program and that status ("nbdkit on the conversion host exited with status 1"), never ssh's command
-line: ConnectTimeout among ssh's options read as a "timeout", so a permanent failure - the export's NBD server refused,
-with the source VM stopped - was retried as transient (review RV42B-02); its full command stays in the module's log.
-ssh's own failure keeps its command line, retried as transient as above. The export serves the disk's udev link `/dev/disk/by-id/virtio-<serial>`, but that adds no protection once the
+RV14-02). A command on a conversion host that fails by itself - a positive exit status other than ssh's own 255 -
+fails with a message naming its program and that status ("nbdkit on the conversion host exited with status 1"), never
+ssh's command line: ConnectTimeout among ssh's options read as a "timeout", so a permanent failure - the export's NBD
+server refused, with the source VM stopped - was retried as transient (review RV42B-02); the module logs its full
+command (debug) as it fails (review RV43B-06). ssh's own failure keeps its command line, retried as transient as
+above, and so does ssh killed by a signal on the host that runs it (a negative status: an OOM kill, a stray kill),
+which is no failure of the remote command (review RV43B-05).
+The export serves the disk's udev link `/dev/disk/by-id/virtio-<serial>`, but that adds no protection once the
 export runs: nbdkit resolves the path it serves once, at its start, and opens that
 device path on every later connection, so a volume taken off the host after the export started still has the transfer
 read whatever disk took its path, without an error - a residual the owner decides on (qemu-nbd keeps the descriptor it
@@ -1431,8 +1437,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   which the VM's own name never finds (audit EX-18).
   A cancel's cleanup (§5.1) deletes only the server the migration recorded: it looks up no server by name, deletes no
   kit port or volume and powers nothing on. It then reads the kit's volumes of the VM - `<kit name>-<digits>` with
-  `osm` `true`, the ones the kit's next run takes as the VM's own, whichever plan's run it is - and names each it left
-  in its outcome (§5.1).
+  `osm` `true`, the ones the kit's next run takes as the VM's own, whichever plan's run it is - and names each no
+  server holds in its outcome (§5.1); one a server holds is that server's disk, as above (review RV43B-01).
 
   Once the source is powered on, the rollback deletes the kit's volumes of the VM that the kit's next run would take
   as this VM's own. The kit finds a VM's volume by its name, `<kit name>-<disk key>`, and the metadata `osm` `true`.
@@ -2533,7 +2539,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/migrations/{id}/force-cutover` | approver | `{"reason": str}` (10–2000 characters, 422 otherwise) | `Migration` (409 outside `precopy`/`syncing` of a warm strategy, or when the migration is already forced; §5.4) |
 | POST | `/migrations/{id}/sync` | operator | — | `Migration` (only `awaiting_cutover`) |
 | POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1; 409 after a failed finalize began deleting the source, §8.1) |
-| POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; it takes its VM's wave from the plan, §9.4; it assesses nothing anew - the estimates the last validation stored stay -, but marks the stored `storage_handover` estimate ineligible with §9.2's reason while the migration holds the destination volumes an earlier attempt created, judged as `PUT …/strategy` judges it, so the dashboard's strategy choice and the advisor's options show why (review 41b's lead); 409 when a provider of that plan was deleted, and when the plan has waves and the VM is in none of them) |
+| POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; it takes its VM's wave from the plan, §9.4; it assesses nothing anew - the estimates the last validation stored stay -, but marks the stored `storage_handover` estimate ineligible with §9.2's reason while the migration holds the destination volumes an earlier attempt created, judged as `PUT …/strategy` judges it, so the dashboard's strategy choice and the advisor's options show why (review 41b's lead), and takes an earlier Retry's mark off once it holds none - the estimate eligible again when that reason was its only one (review RV43B-02); 409 when a provider of that plan was deleted, and when the plan has waves and the VM is in none of them) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
 | POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` (409 outside `completed`, and while its source VM runs again — `source_running_at` — unless its checkpoint is `finalizing`, §8.1) |
 | POST | `/plans/{id}/finalize` | approver | `{"wave_id": str\|null, "confirm": str, "delete_source": bool = false}` (`confirm`: the wave's name, or the plan's without `wave_id`; 400 otherwise; 404 for an unknown wave) | `{"finalized": [str], "skipped": [{"migration_id": str, "reason": str}]}` (409 when no migration of the scope is `completed`; §8.1) |
