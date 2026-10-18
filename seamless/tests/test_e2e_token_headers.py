@@ -170,6 +170,20 @@ def test_no_e2e_script_puts_a_bearer_token_on_a_command_line():
     assert _tokens_on_command_lines(E2E) == []
 
 
+def test_no_e2e_script_tells_its_reader_to_type_a_token():
+    """Security.md §7.2 (R-28, docs-drift DD2-01, review RV37B-06): a usage header or a message that
+    says ``export TOKEN='smg_...'`` or ``export TOKEN=<...>`` has the reader type the token into a
+    command, which the shell history keeps; each says to read it with ``read -rs`` instead."""
+    typed = re.compile(r"export\s+[A-Z_]*TOKEN=")
+    told = [
+        f"{path.name}:{number}: {line.strip()}"
+        for path in sorted(E2E.glob("*.sh"))
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if typed.search(line)
+    ]
+    assert told == []
+
+
 def test_no_e2e_script_writes_a_fixed_name_in_the_shared_temporary_directory():
     """A fixed name under ``$TMPDIR`` clobbers another run's file, follows a symlink another user
     planted there, and is left behind (audit A-16): the shared temporary directory is only ever

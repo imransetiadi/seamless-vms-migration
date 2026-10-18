@@ -4,15 +4,15 @@
 # every migration resuming to a terminal phase with contiguous event seqs and FSM-valid
 # migration.phase ordering. Run right after `make seamless-reset CONFIRM=yes && make seamless-demo`.
 #
-#   export TOKEN='smg_...'        # admin or approver token
-#   export APPROVER_TOKEN='smg_...'  # an approver of another user: the requester never approves (SDD §5.4)
+#   read -rs TOKEN && export TOKEN                    # admin or approver token
+#   read -rs APPROVER_TOKEN && export APPROVER_TOKEN  # an approver of another user: the requester never approves (SDD §5.4)
 #   tests/e2e/demo-restart.sh     # RESTART_AT=<seconds> (default 45), BASE=<url>
 # shellcheck disable=SC2034
 set -u
 R=$(cd "$(dirname "$0")/../.." && pwd)
 BASE=${BASE:-http://127.0.0.1:8080}
-: "${TOKEN:?export TOKEN=<admin or approver token>}"
-: "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
+: "${TOKEN:?read -rs TOKEN && export TOKEN: an admin or approver token}"
+: "${APPROVER_TOKEN:?read -rs APPROVER_TOKEN && export APPROVER_TOKEN: an approver token of another user (maker-checker, SDD 5.4)}"
 # shellcheck source=tests/e2e/token-headers.sh
 . "$R/tests/e2e/token-headers.sh"   # the tokens reach curl from header files, never argv
 S=$E2E_TMP                         # private, removed on exit: the event dump goes here
