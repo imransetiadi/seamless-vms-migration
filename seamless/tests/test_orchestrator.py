@@ -36,6 +36,7 @@ from seamless_migrate.domain.models import (
     ForceCutover,
     Migration,
     Nic,
+    PhaseChange,
     Plan,
     PolicyScope,
     Provider,
@@ -390,6 +391,131 @@ async def test_a_revalidation_never_counts_the_volumes_an_earlier_attempt_holds(
     assert (second.phase, blocked) == (
         (P.ready, []) if held else (P.blocked, ["DST_QUOTA_INSUFFICIENT"])
     ), how
+
+
+#: an attempt rolled back before any cutover ran, and one whose cutover ran
+UNCUT = (P.precopy, P.syncing, P.awaiting_cutover, P.rolling_back, P.rolled_back)
+CUT = (P.precopy, P.syncing, P.awaiting_cutover, P.cutover, P.rolling_back, P.rolled_back)
+
+
+def _history(*phases: Phase) -> list[PhaseChange]:
+    """Phase changes through ``phases``, a minute apart, from ready."""
+    start, before, changes = utcnow() - timedelta(hours=3), P.ready, []
+    for n, phase in enumerate(phases):
+        at = start + timedelta(minutes=n)
+        changes.append(
+            PhaseChange(from_phase=before, to_phase=phase, at=at, reason="test", actor="test")
+        )
+        before = phase
+    return changes
+
+
+def _passes(count: int) -> list[SyncPass]:
+    start = utcnow() - timedelta(hours=3)
+    return [
+        SyncPass(number=n, kind="full" if n == 1 else "delta", started_at=start, duration_s=60.0)
+        for n in range(1, count + 1)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("strategy", "phases", "passes", "held"),
+    [
+        (Strategy.warm, CUT, 2, True),
+        (Strategy.warm, UNCUT, 0, False),
+        (Strategy.vmware_warm, UNCUT, 2, True),
+        (Strategy.vmware_warm, UNCUT, 0, False),
+        (Strategy.vmware_warm, CUT, 2, False),
+        (Strategy.vmware_warm, (*CUT, P.ready, *UNCUT), 3, True),
+        (Strategy.vmware_warm, (*UNCUT, P.ready, *CUT[:4], P.failed, P.ready), 3, False),
+        (Strategy.cold, (P.cutover, P.rolling_back, P.rolled_back), 1, False),
+        (Strategy.vmware_cold, (P.cutover, P.rolling_back, P.rolled_back), 1, False),
+        (Strategy.storage_handover, (P.cutover, P.rolling_back, P.rolled_back), 0, False),
+    ],
+    ids=[
+        "warm passes: the volumes stay for the next attempt",
+        "warm with no pass copied nothing",
+        "vmware_warm rolled back before its cutover: the kit's copies stay",
+        "vmware_warm whose first copy was cut off: its rollback deleted it",
+        "vmware_warm whose cutover ran: its rollback deleted them",
+        "vmware_warm whose last attempt ran no cutover",
+        "vmware_warm retried to ready after a cutover",
+        "cold: its rollback deletes its copy",
+        "vmware_cold: its rollback deletes its copy",
+        "storage_handover: no copy",
+    ],
+)
+async def test_where_no_record_tells_warm_passes_and_an_uncut_vmware_warm_attempt_hold_volumes(
+    tmp_path, store, strategy, phases, passes, held
+):
+    """SDD §9.3, §7.2 (reviews RV38A-01, RV39-02, RV39-04): without a workload record - the demo,
+    the VMware kit - a warm migration's passes hold its destination volumes, as do a vmware_warm
+    one's when its last attempt ran no cutover (no cutover since it last entered precopy): the
+    kit's rollback deletes its copies after one, or marks them cutover. A cold, vmware_cold or
+    storage_handover rollback keeps no copy, the demo's recorded full pass notwithstanding."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=strategy,
+        phase=phases[-1],
+        phase_history=_history(*phases),
+        sync_passes=_passes(passes),
+    )
+    try:
+        assert await h.orch.holds_destination_volumes(m) is held
+    finally:
+        await h.orch.stop()
+
+
+async def test_an_unreadable_workload_record_counts_as_volumes_held(tmp_path, store):
+    """SDD §9.3 (review RV39-04): a record that cannot be read may list volumes the next attempt
+    uses: it counts as holding them, whatever the strategy's fallback would say."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    m = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=P.rolled_back)
+    record = run_dir(h.settings, plan.id, m.id) / "osm" / "workload_warm" / "vm-1.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text("{")
+    try:
+        assert await h.orch.holds_destination_volumes(m) is True
+    finally:
+        await h.orch.stop()
+
+
+@pytest.mark.parametrize("cutover_ran", [True, False], ids=["its cutover ran", "before it"])
+async def test_a_revalidation_counts_all_of_a_vmware_warm_attempt_whose_cutover_ran(
+    tmp_path, store, cutover_ran
+):
+    """SDD §9.3, §7.2 (review RV39-02): the kit writes no workload record. A vmware_warm attempt
+    whose cutover ran and then rolled back lost its kit volumes - the rollback deletes them, or
+    marks them cutover - and its next attempt copies in full: it counts all of it, and web-02,
+    for which one volume and 20 GiB are free besides, no longer fits. Rolled back before its
+    cutover, its completed copies stay for the next pass: its server alone counts, web-02 fits."""
+    dst = QuotaDestination(QUOTA_FOR_TWO)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), vm(2)],
+        {"default_strategy": Strategy.cold, "auto_cutover": False},
+        destination=dst,
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        first = await h.by_vm(plan.id, "vm-1")
+        first.strategy = Strategy.vmware_warm
+        first.phase = P.rolled_back
+        first.phase_history = [*first.phase_history, *_history(*(CUT if cutover_ran else UNCUT))]
+        first.sync_passes = _passes(2)
+        store.put("migration", first)
+        dst.free = dict(QUOTA_ONE_VOLUME_HELD)
+        report = await h.orch.validate_plan(plan.id, "alice")
+    finally:
+        await h.orch.stop()
+    second = next(i for i in report.migrations if i.vm_name == "web-02")
+    blocked = [f.code for f in second.findings if f.code == "DST_QUOTA_INSUFFICIENT"]
+    assert blocked == (["DST_QUOTA_INSUFFICIENT"] if cutover_ran else [])
 
 
 @pytest.mark.parametrize("calibrated_mib", [None, 200], ids=["planned S", "S calibrated low"])

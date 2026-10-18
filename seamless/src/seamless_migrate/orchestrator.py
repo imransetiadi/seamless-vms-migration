@@ -281,6 +281,16 @@ def _add_model_s(m: Migration, details: dict[str, Any]) -> None:
         m.downtime_model_s = (m.downtime_model_s or 0.0) + float(model_s)
 
 
+def _last_attempt_ran_a_cutover(m: Migration) -> bool:
+    """Whether ``m``'s last attempt reached its cutover: one since it last entered pre-copy."""
+    for change in reversed(m.phase_history):
+        if change.to_phase == Phase.cutover:
+            return True
+        if change.to_phase == Phase.precopy:
+            return False
+    return False
+
+
 def _phase_started(m: Migration, phase: Phase) -> datetime | None:
     """When ``m`` last entered ``phase`` (None when it never did)."""
     for change in reversed(m.phase_history):
@@ -1661,15 +1671,21 @@ class Orchestrator:
 
     async def holds_destination_volumes(self, m: Migration) -> bool:
         """Whether the migration holds destination volumes an earlier attempt created, which the
-        next attempt uses again (SDD §9.3, review RV38A-01): what its workload's record says,
-        and where no record can tell, recorded passes of a strategy other than cold (a cold
-        rollback deletes what it copied)."""
+        next attempt uses again (SDD §9.3, reviews RV38A-01, RV39-02): what its workload's record
+        says, and where no record can tell - the demo, the VMware kit - a warm migration's passes,
+        and a vmware_warm one's while its last attempt ran no cutover: the kit's rollback deletes
+        its copies after one, or marks them cutover (§7.2). A cold, vmware_cold or handover
+        rollback keeps no copy."""
         recorded = await asyncio.to_thread(
             recorded_destination_volumes, self.settings, m.plan_id, m
         )
         if recorded is not None:
             return recorded
-        return m.strategy != Strategy.cold and bool(m.sync_passes)
+        if m.strategy == Strategy.warm:
+            return bool(m.sync_passes)
+        if m.strategy == Strategy.vmware_warm:
+            return bool(m.sync_passes) and not _last_attempt_ran_a_cutover(m)
+        return False
 
     async def keeps_copied_data(self, m: Migration) -> bool:
         """A rolled-back migration that keeps copied data: a cancel of it cleans the data up, a
