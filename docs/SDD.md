@@ -1704,7 +1704,8 @@ source server from the journaled definition with the volumes in device order, ea
 false) while Nova builds it - a build Nova aborts deletes every volume flagged otherwise, the VM's only copy of its
 data -, and once it is `ACTIVE` give each volume its journaled `delete_on_termination` back (the step 3 call,
 journaled per volume); a recreated server Nova left in `ERROR` is deleted on the next attempt, its volumes kept, and
-created again (review RV35B-04). Before that deletion, each journaled port still bound to the failed build is
+created again once every journaled volume is `available` - also on an attempt that finds that build gone already,
+as for a stale source: the attempt that deleted it may have died in that wait (reviews RV35B-04, RV36B-04). Before that deletion, each journaled port still bound to the failed build is
 unbound through Neutron (its device and host cleared): Nova's deletion takes every port of the server its network
 cache no longer keeps - a build it aborted cleared that cache -, the user's own port reused included. And every
 attempt reads a journaled port again before the recreate: one gone is created again from the journaled MAC,
