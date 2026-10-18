@@ -354,6 +354,49 @@ def test_a_link_bound_delta_pass_never_lowers_the_scan_rate(sent_gib, overhead, 
     assert observed == (pytest.approx(reads_back) if reads_back else None)
 
 
+@pytest.mark.parametrize(
+    "sent_gib, duration_of, reads_back_mib",
+    [
+        (40, lambda scan_real, link: max(scan_real(250), link), 250),
+        (5, lambda scan_real, link: max(scan_real(470), link), 470),
+        (40, lambda scan_real, link: 1.1 * link, None),
+        (40, lambda scan_real, link: 1.1 * link * (1 + 1e-9), "rate"),
+    ],
+    ids=[
+        "storage at half the planned S, a large delta",
+        "a scan 6 % slower than planned, a small delta",
+        "at 10 % over its changes' time over the link: link-bound",
+        "just past the 10 %: scan-bound",
+    ],
+)
+def test_a_delta_pass_that_outlasted_its_changes_over_the_link_reads_its_scan_rate(
+    sent_gib, duration_of, reads_back_mib
+):
+    """SDD §9.1 (review RV39-01): a pass is link-bound by its own duration - at most 10 % longer
+    than its changes take over the link - never by the model's scan at the current S, which an
+    optimistic S makes short: a pass that lasted longer was bound by its scan, and its reading
+    replaces S, lower too. At the margin its reading only raises S."""
+    vm = make_vm(disks=[make_disk(id="d0", size_gb=100)])
+    sent = sent_gib * GIB
+    duration = duration_of(lambda mib: vm.disk_bytes / (mib * MIB), sent / P.link_bps)
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=duration,
+        bytes_scanned=vm.disk_bytes,
+        bytes_changed=sent,
+        bytes_transferred=sent,
+    )
+    observed = observed_scan_rate(sync_pass, vm, P)
+    if reads_back_mib is None:
+        assert observed is None
+    elif reads_back_mib == "rate":
+        assert observed == pytest.approx(vm.disk_bytes / duration)
+    else:
+        assert observed == pytest.approx(reads_back_mib * MIB)
+
+
 def test_a_pass_that_scanned_less_than_the_largest_disk_ran_one_stream():
     """SDD §9.1 (review PL-07): a pass that scanned fewer bytes than the largest disk holds read
     them in one stream at most - its S is what it scanned over its duration, never the largest

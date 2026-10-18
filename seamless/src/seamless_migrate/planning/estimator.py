@@ -33,6 +33,9 @@ class EstimatorParams:
 
 #: Fixed overhead of a VMware CBT delta pass (SDD §9.1: ``Tk = 10 + Δk/L``).
 VMWARE_PASS_OVERHEAD_S = 10.0
+#: A pass at most this much longer than its changes take over the link may have been bound by the
+#: link - the margin is the sync's own setup (SDD §9.1, review RV39-01).
+LINK_BOUND_MARGIN = 1.1
 _FIELD_TYPES = {f.name: f.type for f in fields(EstimatorParams)}
 _INT_FIELDS = frozenset({"convergence_threshold_bytes", "max_passes", "parallel_disks"})
 #: Plan fields that keep precedence over ``Plan.estimator_overrides``.
@@ -269,10 +272,12 @@ def observed_scan_rate(sync_pass: SyncPass, vm: VMRef, params: EstimatorParams) 
 
     Only delta/final passes calibrate it: pass 1 is usually link-bound and would understate it.
     ``None`` too for a pass at the aggregate ceiling (``A`` set, ``B / A >= duration_s``): it lasts
-    as long whatever ``S`` is, so it does not tell ``S``. A pass the link bound - its changes took
-    at least as long over the link as the model's scan at the current ``S`` (``params.scan_bps``,
-    the migration's calibrated one) - only bounds ``S`` from below: what it reads may raise ``S``,
-    never lower it, and ``None`` otherwise (SDD §9.1, review RV38A-02).
+    as long whatever ``S`` is, so it does not tell ``S``. A pass the link may have bound - one that
+    lasted at most ``LINK_BOUND_MARGIN`` times its changes' time over the link - only bounds ``S``
+    from below: what it reads may raise ``S`` (``params.scan_bps``, the migration's calibrated
+    one), never lower it, and ``None`` otherwise (review RV38A-02). A pass that lasted longer was
+    bound by its scan, whatever the model's scan at the current ``S`` says: what it reads replaces
+    ``S``, lower too (SDD §9.1, review RV39-01).
     """
     if sync_pass.kind == SyncPassKind.full:
         return None
@@ -286,6 +291,6 @@ def observed_scan_rate(sync_pass: SyncPass, vm: VMRef, params: EstimatorParams) 
     largest = max((d.size_gb for d in vm.disks), default=0) * GIB
     rate = max(min(largest, scanned), scanned / streams) / duration
     link = params.link_bps
-    if link and link > 0 and sync_pass.bytes_transferred / link >= scan_seconds(vm, params):
+    if link and link > 0 and duration <= LINK_BOUND_MARGIN * (sync_pass.bytes_transferred / link):
         return rate if rate > params.scan_bps else None
     return rate

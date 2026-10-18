@@ -565,6 +565,50 @@ async def test_a_link_bound_delta_pass_leaves_the_slo_rule_converging(
         assert m.observed_scan_bps == pytest.approx(312.5 * 2**20)
 
 
+async def test_a_scan_bound_delta_pass_lowers_an_optimistic_scan_rate_before_the_slo_rule(
+    tmp_path, store
+):
+    """SDD §5.3, §9.1 (review RV39-01): the storage scans at 250 MiB/s where the plan says 500. A
+    delta pass that changed 40 GiB lasts its 409.6 s scan, longer than its 327.68 s over the link:
+    the scan bound it, so the calibration takes 250 MiB/s - although the model's scan at the
+    planned S (204.8 s) is shorter than the transfer - and the final downtime, about 680 s, keeps
+    the SLO rule from converging on a 500 s SLO."""
+    from seamless_migrate.domain.models import SyncPass
+    from seamless_migrate.planning.estimator import EstimatorParams
+
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm, "downtime_slo_s": 500}
+    )
+    the_vm = make_vm(disks=[make_disk(id="d0", size_gb=100, used_gb=60.0)], change_rate_bps=None)
+    first = SyncPass(
+        number=1,
+        kind="full",
+        started_at=utcnow(),
+        duration_s=521.5,
+        bytes_scanned=the_vm.disk_bytes,
+        bytes_changed=the_vm.used_bytes,
+        bytes_transferred=the_vm.used_bytes,
+    )
+    params = EstimatorParams()
+    sent = 40 * 2**30
+    second = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=first.started_at + timedelta(seconds=1000),
+        duration_s=max(the_vm.disk_bytes / (250 * 2**20), sent / params.link_bps),
+        bytes_scanned=the_vm.disk_bytes,
+        bytes_changed=sent,
+        bytes_transferred=sent,
+    )
+    m = make_migration(plan_id=plan.id, phase=P.syncing, vm=the_vm, sync_passes=[first, second])
+    try:
+        h.orch._calibrate(m, plan, second)
+        assert m.observed_scan_bps == pytest.approx(250 * 2**20)
+        assert h.orch._converged(m, plan)[0] != "slo"
+    finally:
+        await h.orch.stop()
+
+
 async def test_validate_creates_migrations_with_findings_and_estimates(tmp_path, store):
     gpu = vm(3, "gpu-01", flavor_extra_specs={"resources:VGPU": "1"})
     vms = [vm(1), vm(2, "db-02", size_gb=600, used_gb=300.0), gpu]
