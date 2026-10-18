@@ -2200,9 +2200,15 @@ export class MockServer {
     const byVm = new Map(mine.map((m) => [m.vm.source_id, m]));
     const selected = new Set(plan.vm_ids);
     // the API's order of checks (orchestrator.validate_plan, SDD §5.4): nothing changes before they pass
-    // like the API (orchestrator._vms, SDD §12): a VM the source no longer reports is a provider error, before anything changes
+    // like the API (orchestrator._vms, SDD §5.4, §12, review PL-09): only the VMs a validation re-assesses are read from
+    // the source - a migration in any other phase counts as its recorded vm -, and one the source no longer reports is a
+    // provider error, before anything changes
     const known = new Set(((this.inventories[plan.source_provider_id] ?? []) as VMRef[]).map((v) => v.source_id));
-    const gone = plan.vm_ids.find((id) => !known.has(id));
+    const reassessed = (id: string) => {
+      const m = byVm.get(id);
+      return !m || REVALIDATABLE.has(m.phase) || m.phase === 'validating';
+    };
+    const gone = plan.vm_ids.find((id) => reassessed(id) && !known.has(id));
     if (gone !== undefined) throw new HttpError(502, 'provider_error', `VM '${gone}': VM '${gone}' not found`);
     const cancelled = plan.vm_ids.flatMap((id) => (byVm.get(id)?.phase === 'cancelled' ? [byVm.get(id)!.vm.name] : [])).sort();
     if (cancelled.length) {
@@ -2236,6 +2242,10 @@ export class MockServer {
       if (REVALIDATABLE.has(m.phase) || m.phase === 'validating') {
         if (m.phase !== 'validating') this.transition(m, 'validating', 'plan validation started', me.name);
         this.finishValidation(m, plan, me.name);
+      } else {
+        // like the API (SDD §9.4, review PL-11): left alone, but in its VM's wave in the plan, so waves planned anew
+        // reach it before the plan starts
+        m.wave_id = plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id))?.id ?? null;
       }
       validated.push(m);
     }
@@ -2459,6 +2469,17 @@ export class MockServer {
             throw new HttpError(409, 'conflict', `${m.vm.name} cannot be retried: the plan's ${role} provider '${id}' no longer exists; create a new plan for the VM`);
           }
         }
+        // like the API (SDD §9.4, §12, review PL-11): the attempt runs in its VM's wave in the plan, and a VM in no wave of
+        // a plan with waves would run at once, outside every wave's order: refused before any change
+        const wave = plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id));
+        if (plan.waves.length && !wave) {
+          throw new HttpError(
+            409,
+            'conflict',
+            `${m.vm.name} cannot be retried: it belongs to no wave of the plan; re-run the automatic wave planning or add it to a wave`,
+          );
+        }
+        m.wave_id = wave?.id ?? null;
         const reopen = plan.status === 'completed';
         this.transition(m, 'ready', 'retry requested', me.name);
         m.attempts += 1;

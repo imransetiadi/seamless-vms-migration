@@ -2844,3 +2844,56 @@ describe('providers of community destinations, like the API (SDD §4.2, §10, §
   });
 });
 
+
+describe('mock retry and validation follow the plan, like the API (SDD §5.4, §9.4, §12, reviews PL-09, PL-11, RV38A-03)', () => {
+  const inventoryOf = (server: MockServer, providerId: string) =>
+    (server as unknown as { inventories: Record<string, VMRef[]> }).inventories[providerId] ?? [];
+
+  it("a retry takes the VM's wave from the plan, never one the waves planned anew dropped", async () => {
+    const { server, client } = setup('operator');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.waves = [{ id: 'wave-new', name: 'Pilot', order: 1, vm_ids: [rolled.vm.source_id], depends_on: [], max_parallel: 5 }];
+    rolled.wave_id = 'wave-gone'; // assessed under waves planned anew since
+    const retried = await client.post<Migration>(`/migrations/${rolled.id}/retry`);
+    expect(retried.wave_id).toBe('wave-new');
+  });
+
+  it('a retry of a VM in no wave of a waved plan is refused (409) before any change', async () => {
+    const { server, client } = setup('operator');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.waves = [{ id: 'wave-other', name: 'Pilot', order: 1, vm_ids: ['some-other-vm'], depends_on: [], max_parallel: 5 }];
+    await expect(client.post(`/migrations/${rolled.id}/retry`)).rejects.toMatchObject({
+      status: 409,
+      message: `${rolled.vm.name} cannot be retried: it belongs to no wave of the plan; re-run the automatic wave planning or add it to a wave`,
+    });
+    expect(server.migrations.find((m) => m.id === rolled.id)?.phase).toBe('rolled_back');
+  });
+
+  it('a paused plan whose finished VM left the source validates again: only the VMs a validation re-assesses are read', async () => {
+    const { server, client } = setup('operator');
+    const done = server.migrations.find((m) => m.phase === 'completed' || m.phase === 'finalized')!;
+    const plan = server.plans.find((p) => p.id === done.plan_id)!;
+    plan.status = 'paused';
+    const inventory = inventoryOf(server, plan.source_provider_id);
+    inventory.splice(inventory.findIndex((v) => v.source_id === done.vm.source_id), 1); // deleted at the source
+    const report = await client.post<{ plan_id: string }>(`/plans/${plan.id}/validate`);
+    expect(report.plan_id).toBe(plan.id);
+  });
+
+  it('a validation writes the plan\'s wave into a migration it leaves alone', async () => {
+    const { server, client } = setup('operator');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.status = 'paused';
+    // a VM whose migration is cancelled cannot be validated in the plan: out of vm_ids
+    const cancelled = new Set(server.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'cancelled').map((m) => m.vm.source_id));
+    plan.vm_ids = plan.vm_ids.filter((id) => !cancelled.has(id));
+    plan.waves = [{ id: 'wave-new', name: 'Pilot', order: 1, vm_ids: [...plan.vm_ids], depends_on: [], max_parallel: 5 }];
+    rolled.wave_id = 'wave-gone';
+    await client.post(`/plans/${plan.id}/validate`);
+    const left = server.migrations.find((m) => m.id === rolled.id)!;
+    expect([left.phase, left.wave_id]).toEqual(['rolled_back', 'wave-new']);
+  });
+});
