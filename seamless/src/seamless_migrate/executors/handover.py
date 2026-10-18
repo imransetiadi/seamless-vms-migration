@@ -286,12 +286,16 @@ def _active(server: Any) -> bool:
 
 
 def _reached_by_deletion(journal: _Journal, server: Any) -> bool:
-    """Whether step 4's deletion reached the source (SDD §7.3, reviews RV34B-02, RV35B-01): Nova
-    accepted it and the server does not read ACTIVE; Nova reads it as being deleted, whatever the
-    journal holds; or it is in ERROR once the deletion was tried - Nova may take a deletion whose
-    answer is an error, a 500 once it saved the deleting state, or is lost while the compute host
-    fails it. Nova starts no such server, and its deletion honours delete_on_termination."""
-    if str(_attr(server, "task_state") or "").lower() == "deleting":
+    """Whether step 4's deletion reached the source (SDD §7.3, reviews RV34B-02, RV35B-01,
+    RV36B-01): Nova accepted it and the server does not read ACTIVE; Nova reads it as being deleted
+    or soft-deleted - a cloud with reclaim_instance_interval -, whatever the journal holds; or it
+    is in ERROR once the deletion was tried - Nova may take a deletion whose answer is an error, a
+    500 once it saved the deleting state, or is lost while the compute host fails it. Nova starts
+    no such server, and its deletion - a soft delete's reclaim too - honours
+    delete_on_termination."""
+    if str(_attr(server, "task_state") or "").lower() in ("deleting", "soft-deleting"):
+        return True
+    if str(_attr(server, "status", "")).upper() == "SOFT_DELETED":
         return True
     if journal.done("sent:delete_source"):
         return not _active(server)

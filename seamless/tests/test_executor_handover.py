@@ -2238,20 +2238,34 @@ def _deletion_taken_with_an_error(clouds, answer):
         if answer == "an answer lost while the host failed it":
             server.status, server.task_state = "ERROR", None
             raise _NovaAnswer("Gateway Timeout (HTTP 504)", 504)
+        if answer == "a soft delete whose answer was lost":
+            # a cloud with reclaim_instance_interval: Nova soft-deletes it (RV36B-01)
+            server.status, server.task_state = "SOFT_DELETED", None
+            raise _NovaAnswer("Gateway Timeout (HTTP 504)", 504)
+        if answer == "a soft delete whose answer was lost, the host still at it":
+            server.task_state = "soft-deleting"  # STOPPED + soft-deleting reads SHUTOFF
+            raise _NovaAnswer("Gateway Timeout (HTTP 504)", 504)
         raise _NovaAnswer("Cannot 'delete' instance srv-1 while it is in task_state rebooting", 409)
 
     src.compute.delete_server = delete_server
 
 
 @pytest.mark.parametrize(
-    "answer", ["a 500 once it saved the deleting state", "an answer lost while the host failed it"]
+    "answer",
+    [
+        "a 500 once it saved the deleting state",
+        "an answer lost while the host failed it",
+        "a soft delete whose answer was lost",
+        "a soft delete whose answer was lost, the host still at it",
+    ],
 )
 async def test_a_deletion_nova_took_with_an_error_never_gets_its_volumes_back(tmp_path, answer):
-    """SDD §7.3 rollback (review RV35B-01): Nova took step 4's deletion though the executor saw no
-    success - nothing journaled it as sent. Step 4 journaled it as tried, and the source reads as
-    being deleted, or in ERROR: the rollback gives no delete_on_termination back and starts
-    nothing, so the deletion Nova finishes later - nova-compute resuming it, an operator clearing
-    the server - keeps every volume."""
+    """SDD §7.3 rollback (reviews RV35B-01, RV36B-01): Nova took step 4's deletion though the
+    executor saw no success - nothing journaled it as sent. Step 4 journaled it as tried, and the
+    source reads as being deleted, soft-deleted, or in ERROR: the rollback gives no
+    delete_on_termination back and starts nothing, so the deletion Nova finishes later -
+    nova-compute resuming it, an operator clearing the server, the reclaim of a soft delete -
+    keeps every volume."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)
     src = clouds["src"]
     server = src.servers["srv-1"]
@@ -2282,6 +2296,36 @@ async def test_a_deletion_nova_refused_outright_still_gives_the_volumes_back(tmp
     assert src.servers["srv-1"].dot == {"vol-root": True, "vol-data": False}
     assert ("src", "start_server", "srv-1") in ops(calls)
     assert "vm" not in result.details
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "a soft delete whose answer was lost",
+        "a soft delete whose answer was lost, the host still at it",
+    ],
+)
+async def test_a_retry_never_re_stops_a_source_nova_soft_deleted(tmp_path, answer):
+    """SDD §7.3 step 1 (review RV36B-01): a source Nova soft-deleted - step 4's answer lost - has
+    not run since the stop: the retry closes no clock and sends no stop."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    _deletion_taken_with_an_error(clouds, answer)
+    with pytest.raises((TransientStepError, PermanentStepError), match="delete the source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+
+    async def mark_end():
+        calls.append(("clock", "end", None))
+
+    async def mark_start(at=None):
+        calls.append(("clock", "start", at))
+
+    ctx.mark_downtime_end, ctx.mark_downtime_start = mark_end, mark_start
+    retried = len(calls)
+    with contextlib.suppress(TransientStepError, PermanentStepError):
+        await executor.run(StepName.CUTOVER, ctx)  # step 4 soft-deletes it again (owner q42)
+    seen = [c for c in calls[retried:] if c[0] == "clock" or c[1] == "stop_server"]
+    assert seen == [("clock", "start", None)], seen
 
 
 async def test_a_rollback_never_recreates_a_source_in_error_step_4_never_reached(tmp_path):
