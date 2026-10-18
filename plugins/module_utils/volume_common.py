@@ -199,12 +199,12 @@ def _program(command):
 
 
 class RemoteCommandFailed(subprocess.CalledProcessError):
-    """A command on the conversion host that failed by itself - an exit status other than
-    ssh's own SSH_FAILED. Its message names the program and the status, never ssh's command
-    line: ConnectTimeout among ssh's options read as a "timeout", which the control plane
-    retries as transient, so a failure no retry fixes ran again with the source VM stopped
-    (Seamless Migrate SDD 6.6, review RV42B-02). ``cmd`` is the remote command, which the
-    module's log holds in full."""
+    """A command on the conversion host that failed by itself - a positive exit status other
+    than ssh's own SSH_FAILED. Its message names the program and the status, never ssh's
+    command line: ConnectTimeout among ssh's options read as a "timeout", which the control
+    plane retries as transient, so a failure no retry fixes ran again with the source VM
+    stopped (Seamless Migrate SDD 6.6, review RV42B-02). ``cmd`` is the remote command, which
+    RemoteShell.cmd_out logs in full as it fails (review RV43B-06)."""
 
     def __str__(self):
         return "%s on the conversion host exited with status %d" % (
@@ -1122,16 +1122,24 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
 
     def cmd_out(self, command, **kwargs):
         """Run command on the target conversion host and get the output. A command that fails
-        by itself raises RemoteCommandFailed; ssh's own failure (SSH_FAILED) subprocess's
-        CalledProcessError, whose ssh command line the control plane retries as transient
-        (Seamless Migrate SDD 6.6, review RV42B-02)."""
+        by itself - a positive exit status - raises RemoteCommandFailed, its full command logged
+        (debug); ssh's own failure (SSH_FAILED), and ssh killed by a signal on this host (a
+        negative status: no remote command failed), subprocess's CalledProcessError, whose ssh
+        command line the control plane retries as transient (Seamless Migrate SDD 6.6, reviews
+        RV42B-02, RV43B-05, RV43B-06)."""
         args = self.ssh_preamble()
         args.extend(command)
         try:
             return subprocess.check_output(args, **kwargs).decode("utf-8").strip()
         except subprocess.CalledProcessError as err:
-            if err.returncode == SSH_FAILED:
+            if err.returncode == SSH_FAILED or err.returncode < 0:
                 raise
+            logging.getLogger("osp-osp").debug(
+                "%s on the conversion host %s exited with status %d",
+                " ".join(str(part) for part in command),
+                self.address,
+                err.returncode,
+            )
             raise RemoteCommandFailed(
                 err.returncode, list(command), err.output, err.stderr
             ) from None

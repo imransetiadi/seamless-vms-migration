@@ -420,18 +420,19 @@ NBD_START_FAILURE = textwrap.dedent(
 
 @pytest.mark.parametrize(
     ("status", "expected"),
-    [(1, PermanentStepError), (255, TransientStepError)],
-    ids=["the remote command fails by itself", "ssh fails"],
+    [(1, PermanentStepError), (255, TransientStepError), (-9, TransientStepError)],
+    ids=["the remote command fails by itself", "ssh fails", "ssh killed by a signal"],
 )
 def test_a_remote_command_failing_by_itself_stays_permanent_and_ssh_failing_transient(
     tmp_path, status, expected
 ):
-    """SDD §6.6 (reviews RV15-01, RV42B-02): the cold export's NBD server fails to start on the
-    conversion host with the source VM stopped. Its error quoted ssh's whole command line,
+    """SDD §6.6 (reviews RV15-01, RV42B-02, RV43B-05): the cold export's NBD server fails to start
+    on the conversion host with the source VM stopped. Its error quoted ssh's whole command line,
     `-o ConnectTimeout=10` among its options, which TRANSIENT reads as a "timeout": a failure no
     retry fixes was retried, another export with the source stopped. A remote command failing by
-    itself names its program and status and stays permanent; ssh's own failure (255) keeps its
-    command line, retried as transient as §6.6 relies on."""
+    itself names its program and status and stays permanent; ssh's own failure (255), and ssh
+    killed by a signal on the host that runs it (no remote command failed), keep its command line,
+    retried as transient as §6.6 relies on."""
     run = subprocess.run(
         [sys.executable, "-c", NBD_START_FAILURE, str(status)],
         env={
@@ -478,7 +479,8 @@ def test_a_remote_command_failing_by_itself_stays_permanent_and_ssh_failing_tran
 
     output = _run_playbook(tmp_path, _playbook(), work)
 
-    assert ("ConnectTimeout" in output) is (status == 255), output[-2000:]
+    # ssh's command line only where ssh itself failed or was killed - no remote command failed
+    assert ("ConnectTimeout" in output) is (status == 255 or status < 0), output[-2000:]
     assert classify_failure(output) is expected
 
 

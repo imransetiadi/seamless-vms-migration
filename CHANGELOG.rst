@@ -415,10 +415,12 @@ This project follows a simple changelog to satisfy collection metadata validatio
   Ansible printed its cause, the serial read's ssh command line with its
   ConnectTimeout, which Seamless Migrate retried - two more whole cold copies
   with the source VM stopped. Every command a conversion host runs that fails
-  by itself now says only its program and exit status (``nbdkit on the
-  conversion host exited with status 1``), never ssh's command line, so the
-  export's NBD server failing to start stays permanent too; ssh's own failure
-  (exit 255) keeps its command line, which Seamless Migrate retries. After
+  by itself - a positive exit status - now says only its program and exit
+  status (``nbdkit on the conversion host exited with status 1``), never ssh's
+  command line, so the export's NBD server failing to start stays permanent
+  too, and the module's debug log holds the full command; ssh's own failure
+  (exit 255), and ssh killed by a signal on the host that runs it (a negative
+  status), keep their command line, which Seamless Migrate retries. After
   nbdcopy exits, whatever its exit, the
   transfer checks that the path it wrote is still a block device: nbdcopy
   opens its destination again with ``O_CREAT`` when the first open fails, so
