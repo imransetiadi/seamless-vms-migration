@@ -51,10 +51,21 @@ TOOLS = ("make", "kubectl", "oc", "curl", "docker", "podman")
 DOTENV = SCRIPT.parent / "dotenv-value.sh"
 
 
-def _run(tmp_path, *argv, rules=(), xtrace=False, env_file=None, token_mode=0o600, cluster=None):
+def _run(
+    tmp_path,
+    *argv,
+    rules=(),
+    xtrace=False,
+    env_file=None,
+    token_mode=0o600,
+    cluster=None,
+    tools=None,
+    cwd=None,
+):
     """Run a copy of the script in a scratch tree with the stub tools first on PATH; return the run
     and the tools' calls in order. With ``cluster`` (a fake_kube state), kubectl and oc keep it -
-    read it back with ``_cluster_after(tmp_path)``."""
+    read it back with ``_cluster_after(tmp_path)``; ``tools`` adds scripts by name to that PATH, and
+    ``cwd`` is where the script runs."""
     tree = tmp_path / "tree"
     (tree / "scripts").mkdir(parents=True, exist_ok=True)
     shutil.copy(SCRIPT, tree / "scripts" / SCRIPT.name)
@@ -69,6 +80,9 @@ def _run(tmp_path, *argv, rules=(), xtrace=False, env_file=None, token_mode=0o60
         (bin_dir / name).write_text(STUB)
         (bin_dir / name).chmod(0o755)
     fake = {} if cluster is None else fake_kube.install(bin_dir, tmp_path / "cluster.json", cluster)
+    for name, script in (tools or {}).items():
+        (bin_dir / name).write_text(script)
+        (bin_dir / name).chmod(0o755)
     token_file = tmp_path / "operator.token"
     token_file.write_text(TOKEN + "\n")
     token_file.chmod(token_mode)
@@ -88,7 +102,7 @@ def _run(tmp_path, *argv, rules=(), xtrace=False, env_file=None, token_mode=0o60
     )
     argv = [str(token_file) if a == "@TOKEN_FILE" else a for a in argv]
     cmd = ["bash", *(["-x"] if xtrace else []), str(tree / "scripts" / SCRIPT.name), *argv]
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120, cwd=cwd)
     calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     return proc, calls, tree
 
@@ -1080,6 +1094,28 @@ def test_a_symlinked_token_file_is_judged_by_the_file_it_points_to(tmp_path, mod
     else:
         assert proc.returncode == 2 and not sent, proc.stderr
         assert "may be read by others" in proc.stderr
+
+
+def test_a_token_file_named_like_an_option_is_judged_by_its_mode(tmp_path):
+    """SDD §17.2, §13.1 (review RV41A-11): a token file named `-tok` made find fail - its error
+    hidden, its empty output read as "only its owner may read it" - and a 0644 token was sent; it
+    is judged as ./-tok, and refused."""
+    (tmp_path / "-tok").write_text(TOKEN + "\n")
+    (tmp_path / "-tok").chmod(0o644)
+    proc, calls, _ = _run(tmp_path / "run", "docker", "stop", "--drain", "-tok", cwd=tmp_path)
+    assert proc.returncode == 2 and "may be read by others" in proc.stderr, proc.stderr
+    assert calls == []
+
+
+def test_a_token_file_find_cannot_judge_is_refused(tmp_path):
+    """SDD §17.2, §13.1 (review RV41A-11): the mode check fails closed - when find cannot tell who
+    may read the token file, the file is refused, never taken as private."""
+    failing_find = "#!/bin/sh\necho 'find: cannot judge' >&2\nexit 1\n"
+    proc, calls, _ = _run(
+        tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", tools={"find": failing_find}
+    )
+    assert proc.returncode == 2 and "cannot tell who may read" in proc.stderr, proc.stderr
+    assert calls == []
 
 
 @pytest.mark.parametrize("mode", [0o640, 0o644, 0o604])

@@ -211,13 +211,15 @@ fi
 # --- the operator's token: a header file in a private directory, never a command line (SDD §13.1) -------------
 HEADER=
 open_token() {
-  local file=$1 token=
+  local file=$1 token='' judged readable
   case $- in *x*) refuse "xtrace (bash -x) is on and would print the operator's token: run without it" ;; esac
   [ -f "$file" ] && [ -r "$file" ] || refuse "cannot read the token file '$file'"
-  # the mode of the file a symlink points to, never the link's own (-L; review RV38B-08)
-  if [ -n "$(find -L "$file" -prune \( -perm -040 -o -perm -004 \) -print 2>/dev/null)" ]; then
-    refuse "the token file '$file' may be read by others: chmod 600 '$file'"
-  fi
+  # the mode of the file a symlink points to, never the link's own (-L; review RV38B-08); judged by its path - a name
+  # like an option as ./-name -, and refused when find cannot tell (review RV41A-11)
+  case $file in /*) judged=$file ;; *) judged=./$file ;; esac
+  readable=$(find -L "$judged" -prune \( -perm -040 -o -perm -004 \) -print 2>/dev/null) ||
+    refuse "cannot tell who may read the token file '$file'"
+  [ -z "$readable" ] || refuse "the token file '$file' may be read by others: chmod 600 '$file'"
   if [ "$DRY" = 1 ]; then HEADER='@<private directory>/auth.header'; return; fi
   IFS= read -r token <"$file" || [ -n "$token" ] || refuse "the token file '$file' is empty"
   token=${token%$'\r'}
