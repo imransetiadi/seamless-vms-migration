@@ -2149,7 +2149,11 @@ chunked by `max_wave_size`; VMs sharing `tags["app"]` stay in the same wave (a w
 VMs go to a final wave named `Manual review`.
 `start_plan` refuses a plan with waves while a non-terminal migration belongs to no wave (a VM added
 to `vm_ids` after the waves were planned): re-run the planner or add the VM to a wave, otherwise it
-would start at once outside every wave's order and `max_parallel`.
+would start at once outside every wave's order and `max_parallel`. A migration's `wave_id` is its VM's wave in the
+plan: a validation writes it into every migration of the plan, also those it leaves alone (in flight, finished,
+`failed`, `rolled_back`), so the waves planned anew reach them before the plan starts; and a retry takes it from the
+plan and refuses (409, before any change) a migration of a plan with waves whose VM is in none of them, for the same
+reason as `start_plan` (review PL-11).
 
 ### 9.5 Guest OS catalog (`seamless_migrate/guest_os.py`)
 
@@ -2488,7 +2492,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/migrations/{id}/force-cutover` | approver | `{"reason": str}` (10–2000 characters, 422 otherwise) | `Migration` (409 outside `precopy`/`syncing` of a warm strategy, or when the migration is already forced; §5.4) |
 | POST | `/migrations/{id}/sync` | operator | — | `Migration` (only `awaiting_cutover`) |
 | POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1; 409 after a failed finalize began deleting the source, §8.1) |
-| POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
+| POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; it takes its VM's wave from the plan, §9.4; 409 when a provider of that plan was deleted, and when the plan has waves and the VM is in none of them) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
 | POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` (409 outside `completed`, and while its source VM runs again — `source_running_at` — unless its checkpoint is `finalizing`, §8.1) |
 | POST | `/plans/{id}/finalize` | approver | `{"wave_id": str\|null, "confirm": str, "delete_source": bool = false}` (`confirm`: the wave's name, or the plan's without `wave_id`; 400 otherwise; 404 for an unknown wave) | `{"finalized": [str], "skipped": [{"migration_id": str, "reason": str}]}` (409 when no migration of the scope is `completed`; §8.1) |
