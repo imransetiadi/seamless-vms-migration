@@ -56,3 +56,18 @@ def test_every_test_qasuite_names_exists():
         if not any(path == cited or path.endswith("/" + cited) for path in files)
     )
     assert absent == []
+
+
+#: the dummy secret files QASuite S-28 adds to a scratch copy for a collection build: named, never
+#: present in the repository
+S28_DUMMIES = {"tests/auth_tenant.yml", "tests/clouds.yml"}
+
+
+def test_every_tests_path_qasuite_cites_exists_from_the_repository_root():
+    """CLAUDE.md §1 (review RV37B-19): a path QASuite cites under `tests/` is the repository root's
+    tests tree - the collection's and the e2e scripts -, so it exists there; the control plane's
+    tests are cited as `seamless/tests/...`. S-28's dummy secret files are the exception."""
+    text = QASUITE.read_text(encoding="utf-8")
+    cited = set(re.findall(r"`(tests/[A-Za-z0-9_.\-/]+\.[a-z]+)`", text))
+    assert cited, "the parse found no tests/ path"
+    assert sorted(p for p in cited - S28_DUMMIES if not (ROOT / p).exists()) == []
