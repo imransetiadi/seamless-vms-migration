@@ -5935,6 +5935,73 @@ async def test_a_force_cutover_in_precopy_expects_the_running_first_pass(tmp_pat
     assert recorded > estimate_final_downtime(fast, Strategy.warm, 0.0, params)
 
 
+@pytest.mark.parametrize("strategy", [Strategy.warm, Strategy.vmware_warm])
+async def test_a_force_cutover_after_a_pass_counts_the_pass_whole_time(tmp_path, store, strategy):
+    """SDD §5.4, §9.1 (review RV39-07): after a pass ended, the recorded figure is the downtime
+    after a pass as long as that one's whole time - a warm pass records the part after its
+    snapshot, so its snapshot counts too; a CBT pass records the whole. The figure does not drop
+    when the expected first pass ends as expected."""
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    fast = vm(1).model_copy(update={"change_rate_bps": 60 * 2**20})  # the delta sets the copy
+    params = params_for_plan(plan)
+    snapshot = params.snapshot_s if strategy == Strategy.warm else 0.0
+    expected_first = first_pass_seconds(fast, strategy, params)
+    precopy = make_migration(plan_id=plan.id, vm=fast, strategy=strategy, phase=P.precopy)
+    store.put("migration", precopy)
+    before = await h.orch.force_cutover(precopy.id, "sari", "the window closes in ten minutes")
+    # the same VM whose first pass ended as expected: it records the part after its snapshot
+    ended = SyncPass(
+        number=1, kind="full", started_at=utcnow(), duration_s=expected_first - snapshot
+    )
+    syncing = make_migration(
+        plan_id=plan.id, vm=fast, strategy=strategy, phase=P.syncing, sync_passes=[ended]
+    )
+    store.put("migration", syncing)
+    after = await h.orch.force_cutover(syncing.id, "sari", "the window closes in ten minutes")
+    recorded = after.force_cutover.estimated_downtime_s
+    assert recorded == pytest.approx(
+        estimate_final_downtime(fast, strategy, ended.duration_s + snapshot, params)
+    )
+    assert recorded == pytest.approx(before.force_cutover.estimated_downtime_s)
+
+
+async def test_the_slo_rule_and_the_estimate_it_records_count_the_last_pass_whole_time(
+    tmp_path, store
+):
+    """SDD §5.3, §9.1 (review RV39-07): a warm pass records the part after its snapshot, while the
+    guest writes through the snapshot too: the final-downtime estimate after it takes its whole
+    time. A fast writer's final delta then outlasts an SLO the recorded part alone would meet, and
+    the estimate the rule records is the one after the whole pass."""
+    from seamless_migrate.planning.estimator import estimate
+
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm})
+    fast = vm(1, size_gb=200, used_gb=100.0).model_copy(update={"change_rate_bps": 100 * 2**20})
+    params = params_for_plan(plan)
+    delta = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=utcnow(),
+        duration_s=600.0,
+        bytes_scanned=fast.disk_bytes,
+        bytes_changed=40 * 2**30,
+        bytes_transferred=40 * 2**30,
+    )
+    whole = estimate_final_downtime(fast, Strategy.warm, 600.0 + params.snapshot_s, params)
+    part = estimate_final_downtime(fast, Strategy.warm, 600.0, params)
+    assert part < whole
+    between = plan.model_copy(update={"downtime_slo_s": int((part + whole) / 2)})
+    m = make_migration(
+        plan_id=plan.id, vm=fast, strategy=Strategy.warm, phase=P.syncing, sync_passes=[delta]
+    )
+    m.estimate = estimate(fast, Strategy.warm, params, between.downtime_slo_s)
+    try:
+        assert h.orch._converged(m, between)[0] != "slo"
+        h.orch._converge(m, between, "max_passes")
+        assert m.estimate.downtime_s == pytest.approx(whole)
+    finally:
+        await h.orch.stop()
+
+
 async def test_a_force_cutover_is_in_the_audit_trail(tmp_path, store):
     """SDD §14.5 (the owner's ADV-16 acceptance): a Force cutover is recorded in the audit trail
     with its approver, its reason and the migration it forced."""

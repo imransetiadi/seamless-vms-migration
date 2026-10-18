@@ -397,6 +397,26 @@ def test_a_delta_pass_that_outlasted_its_changes_over_the_link_reads_its_scan_ra
         assert observed == pytest.approx(reads_back_mib * MIB)
 
 
+@pytest.mark.parametrize(
+    "strategy, snapshot_counts", [(Strategy.warm, True), (Strategy.vmware_warm, False)]
+)
+def test_a_recorded_pass_whole_time_adds_back_its_snapshot_on_the_warm_path(
+    strategy, snapshot_counts
+):
+    """SDD §9.1 (review RV39-07): T_last is the last pass's whole time - a warm pass records the
+    part after its snapshot, a CBT pass the whole; no recorded duration counts as 0 s."""
+    from seamless_migrate.planning.estimator import whole_pass_seconds
+
+    params = replace(P, snapshot_s=45.0)
+    recorded = SyncPass(
+        number=2, kind="delta", started_at=datetime(2026, 10, 18, tzinfo=UTC), duration_s=300.0
+    )
+    added = 45.0 if snapshot_counts else 0.0
+    assert whole_pass_seconds(recorded, strategy, params) == 300.0 + added
+    unrecorded = recorded.model_copy(update={"duration_s": None})
+    assert whole_pass_seconds(unrecorded, strategy, params) == added
+
+
 def test_a_pass_that_scanned_less_than_the_largest_disk_ran_one_stream():
     """SDD §9.1 (review PL-07): a pass that scanned fewer bytes than the largest disk holds read
     them in one stream at most - its S is what it scanned over its duration, never the largest

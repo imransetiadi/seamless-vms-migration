@@ -41,10 +41,29 @@ describe("the Force cutover's estimated downtime, like the control plane (SDD §
     const pass = (number: number, duration_s: number, ended_at: string | null): SyncPass => ({
       number, kind: number === 1 ? 'full' : 'delta', started_at: at, ended_at, bytes_scanned: 0, bytes_changed: 0, bytes_transferred: 0, duration_s,
     });
-    // the pass still running is not one that ended: the last that ended counts
-    const passes = [pass(1, 1200, at), pass(2, 300, at), pass(3, 9999, null)];
+    // the pass still running is not one that ended: the last that ended counts - its whole time, a
+    // warm pass recording the part after its snapshot (SDD §9.1 T_last, review RV39-07)
+    // (1000 s: long enough for the fast writer's delta, not the scan, to set the copy)
+    const passes = [pass(1, 1200, at), pass(2, 1000, at), pass(3, 9999, null)];
     const p = paramsFor(c.plan, c.observed_scan_bps);
-    expect(forcedDowntime({ ...m, sync_passes: passes }, c.plan)).toBeCloseTo(finalDowntime(c.vm, c.strategy, 300, p), 9);
+    expect(forcedDowntime({ ...m, sync_passes: passes }, c.plan)).toBeCloseTo(finalDowntime(c.vm, c.strategy, 1000 + p.snapshot_s, p), 9);
+    // a CBT pass records its whole time
+    const cbt = { ...m, strategy: 'vmware_warm' as Strategy, sync_passes: passes };
+    expect(forcedDowntime(cbt, c.plan)).toBeCloseTo(finalDowntime(c.vm, 'vmware_warm', 1000, p), 9);
+  });
+
+  it('does not drop when the expected first pass ends as expected (SDD §5.4, review RV39-07)', () => {
+    const c = cases.find((x) => x.last_pass_s === null && x.strategy === 'warm')!;
+    const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration;
+    const m = { ...base, vm: c.vm, strategy: c.strategy, observed_scan_bps: c.observed_scan_bps, sync_passes: [] as SyncPass[] };
+    const p = paramsFor(c.plan, c.observed_scan_bps);
+    const at = '2026-10-08T11:00:00Z';
+    // the first pass as long as expected records the part after its snapshot
+    const ended: SyncPass = {
+      number: 1, kind: 'full', started_at: at, ended_at: at, bytes_scanned: 0, bytes_changed: 0, bytes_transferred: 0,
+      duration_s: firstPassSeconds(c.vm, c.strategy, p) - p.snapshot_s,
+    };
+    expect(forcedDowntime({ ...m, sync_passes: [ended] }, c.plan)).toBeCloseTo(forcedDowntime(m, c.plan), 9);
   });
 });
 

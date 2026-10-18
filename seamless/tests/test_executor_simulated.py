@@ -283,6 +283,40 @@ async def test_a_simulated_delta_pass_reads_back_the_scan_rate_it_ran_with(sizes
     assert estimate_final_downtime(m.vm, Strategy.warm, delta.duration_s, params) > 0
 
 
+@pytest.mark.parametrize("writes_mib", [100, 10], ids=["its delta sets the copy", "its scan does"])
+async def test_a_simulated_warm_cutover_takes_the_downtime_the_gate_estimates(
+    monkeypatch, writes_mib
+):
+    """SDD §7.4, §9.1 (reviews RV38A-05, RV39-05, RV39-07): the cutover's final pass of a warm
+    migration copies what the guest wrote through the last pass's whole time, takes the model's
+    snapshot + max(scan, Δf/L) - four disks scanned in parallel - and records the part after its
+    snapshot; with no jitter the source then stays down exactly as long as the final-downtime
+    estimate after that pass's whole time says."""
+    from seamless_migrate.planning.estimator import estimate_final_downtime, scan_seconds
+
+    monkeypatch.setattr(SimulatedExecutor, "_jitter", lambda self, rng: 1.0)
+    disks = [make_disk(id=f"d{i}", size_gb=100, used_gb=50.0) for i in range(4)]
+    m = make_migration(vm=make_vm(disks=disks, change_rate_bps=writes_mib * 2**20))
+    plan = make_plan()
+    p = params_for_plan(plan)
+    ex = SimulatedExecutor(FAST)
+    for step in (StepName.PRECOPY, StepName.SYNC):
+        ctx, _ = make_ctx(plan, m, SRC, DST, FAST)
+        m.sync_passes.append((await ex.run(step, ctx)).sync_pass)
+    whole = m.sync_passes[-1].duration_s + p.snapshot_s
+    ctx, _ = make_ctx(plan, m, SRC, DST, FAST)
+    result = await ex.run(StepName.CUTOVER, ctx)
+    final = result.sync_pass
+    delta = min(m.vm.disk_bytes, m.vm.change_rate_bps * whole)
+    assert final.bytes_changed == int(delta)
+    assert final.duration_s == pytest.approx(max(scan_seconds(m.vm, p), delta / p.link_bps))
+    stopped = result.details["downtime_model_s"]
+    assert stopped == pytest.approx(p.shutdown_s + p.snapshot_s + final.duration_s + p.create_s)
+    assert stopped + p.boot_s == pytest.approx(
+        estimate_final_downtime(m.vm, Strategy.warm, whole, p)
+    )
+
+
 async def test_simulated_time_is_compressed_by_demo_speed():
     slept: list[float] = []
 

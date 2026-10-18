@@ -1,4 +1,4 @@
-import type { Estimate, Migration, Plan, Strategy, VMRef } from '../api/types';
+import type { Estimate, Migration, Plan, Strategy, SyncPass, VMRef } from '../api/types';
 
 /*
  * The downtime a Force cutover records (SDD §5.4): the control plane's formula
@@ -159,8 +159,17 @@ export function finalDowntime(vm: DiskVM, strategy: Strategy, lastPassS: number,
 }
 
 /**
+ * A recorded pass's whole time, §9.1's `Tk` (`whole_pass_seconds`): a warm pass records the part after its
+ * snapshot, so its snapshot is added back; a VMware CBT pass records the whole (review RV39-07).
+ */
+export function wholePassSeconds(pass: Pick<SyncPass, 'duration_s'>, strategy: Strategy, p: EstimatorParams): number {
+  const recorded = pass.duration_s ?? 0;
+  return strategy === 'warm' ? recorded + p.snapshot_s : recorded;
+}
+
+/**
  * What a Force cutover of `m` records now (SDD §5.4): the downtime after the running pass — as long as
- * the last pass that ended, or, in pre-copy before any pass ended, the expected first pass.
+ * the last pass that ended, its whole time, or, in pre-copy before any pass ended, the expected first pass.
  */
 export function forcedDowntime(
   m: Pick<Migration, 'vm' | 'strategy' | 'sync_passes' | 'observed_scan_bps'>,
@@ -168,5 +177,5 @@ export function forcedDowntime(
 ): number {
   const p = paramsFor(plan, m.observed_scan_bps);
   const last = m.sync_passes.filter((s) => s.ended_at !== null).sort((a, b) => a.number - b.number).at(-1);
-  return finalDowntime(m.vm, m.strategy, last ? (last.duration_s ?? 0) : firstPassSeconds(m.vm, m.strategy, p), p);
+  return finalDowntime(m.vm, m.strategy, last ? wholePassSeconds(last, m.strategy, p) : firstPassSeconds(m.vm, m.strategy, p), p);
 }

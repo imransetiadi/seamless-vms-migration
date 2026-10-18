@@ -16,7 +16,12 @@ from typing import Any
 from ..config import Settings
 from ..domain.enums import WARM_STRATEGIES, Strategy, SyncPassKind
 from ..domain.models import Migration, Plan, Provider, SyncPass, next_pass_number, utcnow
-from ..planning.estimator import VMWARE_PASS_OVERHEAD_S, params_for_plan, scan_seconds
+from ..planning.estimator import (
+    VMWARE_PASS_OVERHEAD_S,
+    params_for_plan,
+    scan_seconds,
+    whole_pass_seconds,
+)
 from ..providers.base import ProviderError
 from .base import PermanentStepError, StepContext, StepName, StepResult
 
@@ -136,14 +141,12 @@ class SimulatedExecutor:
 
     def _previous_duration(self, ctx: StepContext) -> float:
         """The previous pass's whole model time: a warm pass records the part after its snapshot,
-        and the guest writes through the snapshot too (SDD §7.4, review RV38A-05)."""
+        and the guest writes through the snapshot too (SDD §7.4, §9.1, reviews RV38A-05,
+        RV39-07)."""
         passes = ctx.migration.sync_passes
         if not passes:
             return 0.0
-        recorded = float(passes[-1].duration_s or 0.0)
-        if ctx.migration.strategy == Strategy.warm:
-            return recorded + params_for_plan(ctx.plan).snapshot_s
-        return recorded
+        return whole_pass_seconds(passes[-1], ctx.migration.strategy, params_for_plan(ctx.plan))
 
     def _pass_times(self, ctx: StepContext, changed: float, first: bool) -> tuple[float, float]:
         """The pass's whole model time and the duration it records (SDD §7.4): a warm pass takes

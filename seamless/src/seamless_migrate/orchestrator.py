@@ -107,6 +107,7 @@ from .planning.estimator import (
     final_downtime_parts,
     observed_scan_rate,
     params_for_plan,
+    whole_pass_seconds,
 )
 from .planning.platforms import destination_descriptor
 from .planning.preflight import (
@@ -1417,13 +1418,14 @@ class Orchestrator:
                 )
             plan = await self._plan(m.plan_id)
             last = m.sync_passes[-1] if m.sync_passes else None
-            # after the running pass: as long as the last one that ended, or the first pass
-            # while none has (SDD §5.4)
+            params = self._params(m, plan)
+            # after the running pass: as long as the last one that ended - its whole time, §9.1
+            # T_last -, or the first pass while none has (SDD §5.4, review RV39-07)
             estimated = estimate_forced_downtime(
                 m.vm,
                 m.strategy,
-                float(last.duration_s or 0.0) if last is not None else None,
-                self._params(m, plan),
+                whole_pass_seconds(last, m.strategy, params) if last is not None else None,
+                params,
             )
             now = self._now()
             m.force_cutover = ForceCutover(
@@ -2924,8 +2926,10 @@ class Orchestrator:
         counted = Strategy(m.strategy) != Strategy.vmware_warm  # CBT passes report no bytes
         if counted and last.bytes_changed <= plan.convergence_threshold_bytes:
             return "threshold", f"converged: last pass changed {_fmt_bytes(last.bytes_changed)}"
+        params = self._params(m, plan)
+        # after a pass as long as the last one's whole time (SDD §9.1 T_last, review RV39-07)
         final = estimate_final_downtime(
-            m.vm, m.strategy, float(last.duration_s or 0.0), self._params(m, plan)
+            m.vm, m.strategy, whole_pass_seconds(last, m.strategy, params), params
         )
         if final <= plan.downtime_slo_s:
             return "slo", f"estimated final downtime {final:.0f} s is within the SLO"
@@ -2943,8 +2947,9 @@ class Orchestrator:
         with its parts (SDD §5.3, ADV-16)."""
         m.converged_by = rule
         last = m.sync_passes[-1]
+        params = self._params(m, plan)
         parts = final_downtime_parts(
-            m.vm, m.strategy, float(last.duration_s or 0.0), self._params(m, plan)
+            m.vm, m.strategy, whole_pass_seconds(last, m.strategy, params), params
         )
         if m.estimate is not None:
             downtime = sum(parts.values())

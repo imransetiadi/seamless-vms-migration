@@ -232,6 +232,16 @@ def final_downtime_parts(
     return _parts(p, p.snapshot_s + max(scan_seconds(vm, p), delta / p.link_bps), 0.0)
 
 
+def whole_pass_seconds(sync_pass: SyncPass, strategy: Strategy, params: EstimatorParams) -> float:
+    """A recorded pass's whole time, §9.1's ``Tk``: a warm pass records the part after its
+    snapshot (blocksync's summary, the demo's alike), so its snapshot is added back - the guest
+    writes through it too; a VMware CBT pass records the whole (SDD §9.1, review RV39-07)."""
+    recorded = float(sync_pass.duration_s or 0.0)
+    if Strategy(strategy) == Strategy.warm:
+        return recorded + params.snapshot_s
+    return recorded
+
+
 def estimate_final_downtime(
     vm: VMRef, strategy: Strategy, last_pass_s: float, params: EstimatorParams
 ) -> float:
