@@ -585,13 +585,20 @@ def _drain_rules(cutover_answers):
         ('KEY="1.2.3" # pinned\n', "1.2.3"),
         ("KEY='1.2.3' # pinned\n", "1.2.3"),
         ("KEY=1.2.3 # pinned\n", "1.2.3"),
-        ("KEY=1.2.3\t# pinned\n", "1.2.3"),
+        ("KEY=1.2.3\t# pinned\n", "1.2.3\t# pinned"),
         ("KEY=a#b\n", "a#b"),
         ("KEY=1\nKEY=2\n", "2"),
         ("KEYS=1\nOTHER=2\n", ""),
         ("# KEY=1\n", ""),
         ("KEY=1.2.3\r\n", "1.2.3"),
         ("KEY=\n", ""),
+        ("KEY: 1.2.3\n", "1.2.3"),
+        ("KEY : 1.2.3\n", "1.2.3"),
+        ("KEY: a=b\n", "a=b"),
+        ("KEY=a:b\n", "a:b"),
+        ("\ufeffKEY=1.2.3\n", "1.2.3"),
+        ('KEY="1.2\\"3"\n', '1.2"3'),
+        ("KEY='${PORT}'\n", "${PORT}"),
     ],
     ids=[
         "plain",
@@ -600,25 +607,93 @@ def _drain_rules(cutover_answers):
         "double quotes and a comment",
         "single quotes and a comment",
         "an inline comment",
-        "a tab before the comment",
+        "a tab before a hash is no comment",
         "a hash inside a value",
         "the last definition",
         "another key",
         "a commented line",
         "CRLF",
         "empty",
+        "a YAML-style colon",
+        "spaces around the colon",
+        "an equals sign in a colon's value",
+        "a colon in a value",
+        "a byte-order mark",
+        "an escaped quote",
+        "single quotes keep a dollar",
     ],
 )
-def test_the_dotenv_helper_reads_a_key_as_compose_does(tmp_path, dotenv, value):
-    """SDD §17.2 (reviews RV38B-07, RV38B-09): scripts/dotenv-value.sh reads deploy/compose/.env by
-    Compose's dotenv rules - an export prefix, spaces around the key and the value, quotes, an
-    inline comment after an unquoted value, the last definition winning."""
+@pytest.mark.parametrize("locale", ["C", "en_US.UTF-8"])
+def test_the_dotenv_helper_reads_a_key_as_compose_does(tmp_path, dotenv, value, locale):
+    """SDD §17.2 (reviews RV38B-07, RV38B-09, RV41A-01, RV41A-03): scripts/dotenv-value.sh reads
+    deploy/compose/.env by compose-go's dotenv rules - a byte-order mark ignored, an export
+    prefix, a key ended by '=' or ':', spaces around the key and the value, quotes, an inline
+    comment after ' #' in an unquoted value (a tab before a '#' is part of the value), the last
+    definition winning - in any locale (each case checked against compose-go v2.16.1's own
+    parser)."""
     path = tmp_path / ".env"
-    path.write_text(dotenv)
+    path.write_text(dotenv, encoding="utf-8")
     done = subprocess.run(
-        ["sh", str(DOTENV), "KEY", str(path)], capture_output=True, text=True, check=True
+        ["sh", str(DOTENV), "KEY", str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "LC_ALL": locale},
     )
     assert done.stdout == (value + "\n" if value else "")
+
+
+@pytest.mark.parametrize(
+    "dotenv",
+    [
+        "PORT=18081\nKEY=${PORT}\n",
+        'KEY="${PORT}"\n',
+        "KEY=$PORT\n",
+        "KEY=a$$b\n",
+        'KEY="unterminated\n',
+    ],
+    ids=[
+        "a braced variable",
+        "in double quotes",
+        "a bare variable",
+        "an escaped dollar",
+        "an open quote",
+    ],
+)
+def test_the_dotenv_helper_refuses_a_value_compose_would_interpolate(tmp_path, dotenv):
+    """SDD §17.2 (review RV41A-02): Compose interpolates an unquoted or double-quoted value from the
+    environment and the keys above, and refuses a quote never closed; the helper refuses either -
+    a message naming the key, exit 3, nothing printed - so no caller guesses a port or an image."""
+    path = tmp_path / ".env"
+    path.write_text(dotenv)
+    done = subprocess.run(["sh", str(DOTENV), "KEY", str(path)], capture_output=True, text=True)
+    assert (done.returncode, done.stdout) == (3, ""), done
+    assert "KEY" in done.stderr and str(path) in done.stderr
+
+
+@pytest.mark.parametrize(
+    ("dotenv", "status"),
+    [
+        ("SEAMLESS_DEMO=\n", 0),
+        ("export SEAMLESS_DEMO=false\n", 0),
+        (" SEAMLESS_DEMO = true\n", 0),
+        ("SEAMLESS_DEMO: true\n", 0),
+        ("SEAMLESS_DEMO=${X}\n", 0),
+        ("SEAMLESS_DEMO_SPEED=2\n", 1),
+        ("# SEAMLESS_DEMO=true\n", 1),
+        (None, 1),
+    ],
+)
+def test_the_dotenv_helper_tells_whether_a_key_is_set(tmp_path, dotenv, status):
+    """SDD §17.2 (review RV41A-04): --defined exits 0 when the file sets the key - an empty value or
+    one Compose would interpolate too -, 1 when it does not or there is no file."""
+    path = tmp_path / ".env"
+    if dotenv is not None:
+        path.write_text(dotenv)
+    done = subprocess.run(
+        ["sh", str(DOTENV), "--defined", "SEAMLESS_DEMO", str(path)], capture_output=True, text=True
+    )
+    assert (done.returncode, done.stdout) == (status, ""), done
 
 
 def test_status_and_drain_ask_the_port_the_stack_publishes(tmp_path):
@@ -648,6 +723,44 @@ def test_status_and_drain_ask_the_port_the_stack_publishes(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     asked = [c["args"][-1] for c in status + drain if c["cmd"] == "curl"]
+    assert asked and all(url.startswith("http://127.0.0.1:18081/") for url in asked), asked
+
+
+@pytest.mark.parametrize(
+    "port_env",
+    ["POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT: 18081\n", "\ufeffSEAMLESS_HOST_PORT=18081\nX=1\n"],
+    ids=["a YAML-style colon", "a byte-order mark before the key"],
+)
+def test_a_drain_asks_the_port_compose_reads_in_every_spelling(tmp_path, port_env):
+    """SDD §17.2 (review RV41A-01): compose-go ends a key at ':' too and drops a byte-order mark -
+    Compose publishes 18081 -, so the drain sends the operator's token there, never to 8080."""
+    rules = [
+        {"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"stdout": "[]"}]},
+        {"cmd": "curl", "has": ["phase="], "answers": [{"stdout": "[]"}]},
+    ]
+    proc, calls, _ = _run(
+        tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", env_file=port_env, rules=rules
+    )
+    assert proc.returncode == 0, proc.stderr
+    asked = [c["args"][-1] for c in calls if c["cmd"] == "curl"]
+    assert asked and all(url.startswith("http://127.0.0.1:18081/") for url in asked), asked
+
+
+@pytest.mark.parametrize("argv", [["status"], ["stop", "--drain", "@TOKEN_FILE"]])
+def test_a_port_compose_would_interpolate_asks_no_api(tmp_path, argv):
+    """SDD §17.2 (review RV41A-02): with SEAMLESS_HOST_PORT=${PORT} the script cannot tell the port
+    Compose publishes - it refuses, never guessing 8080 or asking a URL built from the raw text,
+    and runs nothing; --url still names the API."""
+    port_env = "PORT=18081\nSEAMLESS_HOST_PORT=${PORT}\n"
+    proc, calls, _ = _run(tmp_path, "docker", *argv, env_file=port_env, rules=_drain_rules([]))
+    assert proc.returncode == 1, proc.stderr
+    assert "SEAMLESS_HOST_PORT" in proc.stderr and calls == [], (proc.stderr, calls)
+    rules = [*_drain_rules([{"stdout": "[]"}]), {"cmd": "curl", "answers": [{"stdout": "{}"}]}]
+    proc, calls, _ = _run(
+        tmp_path / "url", "docker", *argv, "--url", "http://127.0.0.1:18081",
+        env_file=port_env, rules=rules,
+    )  # fmt: skip
+    asked = [c["args"][-1] for c in calls if c["cmd"] == "curl"]
     assert asked and all(url.startswith("http://127.0.0.1:18081/") for url in asked), asked
 
 
@@ -944,6 +1057,95 @@ def test_an_unknown_action_or_option_is_refused_with_the_usage(tmp_path, argv):
     assert proc.returncode == 2 and "usage:" in proc.stderr.lower() and calls == []
     proc, calls, _ = _run(tmp_path / "platform", "nomad", "up")
     assert proc.returncode == 2 and calls == []
+
+
+#: a docker whose existing control-plane container ran with SEAMLESS_DEMO=$CONTAINER_DEMO; it logs
+#: each call with the SEAMLESS_DEMO in its environment (None: not set)
+DOCKER_STUB = r"""#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["STUB_LOG"], "a") as log:
+    log.write(json.dumps({"args": args, "SEAMLESS_DEMO": os.environ.get("SEAMLESS_DEMO")}) + "\n")
+if "version" in args and "--short" in args:
+    print("2.29.0")
+elif "ps" in args and "-q" in args:
+    print("c0ffee")
+elif args[-1:] == ["c0ffee"] and "inspect" in args:
+    print("PATH=/usr/bin\nSEAMLESS_DEMO=" + os.environ["CONTAINER_DEMO"])
+"""
+
+
+def _restart(tmp_path, env_file: str, container_demo: str, **environment: str):
+    """Run the real `make seamless-restart` of a copy of the Makefile against DOCKER_STUB; return
+    the SEAMLESS_DEMO its `compose up` ran with (None: not in its environment, so Compose reads
+    .env)."""
+    tree = tmp_path / "tree"
+    (tree / "scripts").mkdir(parents=True)
+    (tree / "deploy" / "compose").mkdir(parents=True)
+    shutil.copy(ROOT / "Makefile", tree / "Makefile")
+    shutil.copy(DOTENV, tree / "scripts" / DOTENV.name)
+    for name in ("compose.yaml", "compose.linux-host.yaml"):
+        shutil.copy(ROOT / "deploy" / "compose" / name, tree / "deploy" / "compose" / name)
+    (tree / "deploy" / "compose" / ".env").write_text(env_file, encoding="utf-8")
+    (tree / "deploy" / "compose" / "tokens.yaml").write_text("tokens: []\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "docker").write_text(DOCKER_STUB)
+    (bin_dir / "curl").write_text("#!/bin/sh\nexit 0\n")
+    for tool in ("docker", "curl"):
+        (bin_dir / tool).chmod(0o755)
+    log = tmp_path / "docker.log"
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SEAMLESS_", "DOCKER_"))}
+    env.update(
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        STUB_LOG=str(log),
+        CONTAINER_DEMO=container_demo,
+        **environment,
+    )
+    argv = ["make", "-C", str(tree), "--no-print-directory", "seamless-restart"]
+    proc = subprocess.run(
+        [*argv, "SEAMLESS_HOST_OS=Linux", "SEAMLESS_DOCKER_CONTEXT=default"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    up = [c for c in calls if "up" in c["args"] and "--force-recreate" in c["args"]]
+    assert proc.returncode == 0 and len(up) == 1, (proc.stdout, proc.stderr, calls)
+    return up[0]["SEAMLESS_DEMO"]
+
+
+@pytest.mark.parametrize(
+    ("env_file", "container", "environment", "handed"),
+    [
+        ("POSTGRES_PASSWORD=x\n", "true", {}, "true"),
+        ("POSTGRES_PASSWORD=x\n", "false", {}, "false"),
+        ("POSTGRES_PASSWORD=x\nSEAMLESS_DEMO=false\n", "true", {}, None),
+        ("POSTGRES_PASSWORD=x\nexport SEAMLESS_DEMO=false\n", "true", {}, None),
+        ("POSTGRES_PASSWORD=x\nSEAMLESS_DEMO: false\n", "true", {}, None),
+        ("POSTGRES_PASSWORD=x\nSEAMLESS_DEMO=\n", "true", {}, None),
+        ("POSTGRES_PASSWORD=x\n", "true", {"SEAMLESS_DEMO": "false"}, "false"),
+    ],
+    ids=[
+        "a demo container comes back a demo",
+        "a real one comes back real",
+        "a .env line wins over the container",
+        "an export prefix too",
+        "a YAML-style colon too",
+        "an empty value too",
+        "the environment wins",
+    ],
+)
+def test_a_restart_hands_compose_the_mode_its_sources_give(
+    tmp_path, env_file, container, environment, handed
+):
+    """SDD §17.2 (reviews RV38B-18, RV41A-04, RV41A-08): make seamless-restart keeps the mode -
+    SEAMLESS_DEMO from the environment, else .env's, which Compose reads itself (whether .env sets
+    it is read by Compose's rules: an export prefix or a colon too), else the one the existing
+    container ran with, handed to compose. A grep missed `export SEAMLESS_DEMO=false` and forced
+    the container's demo mode over it."""
+    assert _restart(tmp_path, env_file, container, **environment) == handed
 
 
 def test_the_make_targets_stop_start_and_restart_the_control_plane_alone():

@@ -100,8 +100,9 @@ Every target takes the same variables (`make seamless-logs SEAMLESS_ENGINE=podma
 With Podman, the host is `host.containers.internal` (set `SEAMLESS_MEMORY_URL` in `.env` for agentmemory);
 rootless Podman keeps the named volumes in your user's storage. On SELinux hosts the token mount is
 relabelled (`selinux: z`). The targets read `SEAMLESS_HOST_PORT` and `SEAMLESS_VERSION` from `.env` as Compose
-does (an `export` prefix, spaces, quotes and inline comments included; a value in the shell still wins), so after a
-port change in `.env` the health wait polls the new port.
+does (an `export` prefix, a `KEY: value` line, spaces, quotes and inline comments included; a value in the shell still
+wins), so after a port change in `.env` the health wait polls the new port. They read plain values: a value Compose
+would interpolate (`SEAMLESS_HOST_PORT=${PORT}`) stops the targets that use it - write the value itself.
 
 ## Make targets
 

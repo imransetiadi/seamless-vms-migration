@@ -185,9 +185,22 @@ elif [ -n "$MAX_MIGRATIONS$MAX_CUTOVERS$CPU$MEMORY" ]; then
 fi
 
 if [ "$KIND" = host ]; then
-  # the port Compose publishes: the shell's, else deploy/compose/.env's, else 8080 (SDD §17.2, review RV38B-07)
-  port=${SEAMLESS_HOST_PORT-$(sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env")}
-  API=${URL:-http://127.0.0.1:${port:-8080}}
+  # the port Compose publishes: the shell's, else deploy/compose/.env's read by Compose's rules, else 8080; a value
+  # Compose would interpolate is refused, never guessed, where the API is asked (SDD §17.2, reviews RV38B-07,
+  # RV41A-01, RV41A-02)
+  if [ -n "${SEAMLESS_HOST_PORT+set}" ]; then
+    port=$SEAMLESS_HOST_PORT
+  else
+    port=$(sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env") || port='?'
+  fi
+  port=${port:-8080}
+  if [ -z "$URL" ] && { [ -n "$DRAIN" ] || [ "$ACTION" = resume ] || [ "$ACTION" = status ]; }; then
+    case $port in
+      '?') die "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value, or --url" ;;
+      *[!0-9]*) die "SEAMLESS_HOST_PORT is '$port', no port: give a plain number, or --url" ;;
+    esac
+  fi
+  API=${URL:-http://127.0.0.1:$port}
 else
   API=$URL
   if [ -n "$DRAIN" ] || [ "$ACTION" = resume ]; then

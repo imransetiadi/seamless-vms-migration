@@ -116,6 +116,8 @@ def _resolved(
         ("export SEAMLESS_VERSION=0.2.0\n", None, "0.2.0"),
         ("SEAMLESS_VERSION = 0.2.0\n", None, "0.2.0"),
         ('SEAMLESS_VERSION="0.2.0" # pinned\n', None, "0.2.0"),
+        ("SEAMLESS_VERSION: 0.2.0\n", None, "0.2.0"),
+        ("\ufeffSEAMLESS_VERSION=0.2.0\n", None, "0.2.0"),
     ],
     ids=[
         "the release",
@@ -129,6 +131,8 @@ def _resolved(
         "an export prefix",
         "spaces around =",
         "quoted with a comment",
+        "a YAML-style colon",
+        "a byte-order mark",
     ],
 )
 def test_the_runtime_check_inspects_the_image_compose_runs(
@@ -149,10 +153,64 @@ def test_the_runtime_check_inspects_the_image_compose_runs(
         ("export SEAMLESS_HOST_PORT = 18081 # moved\n", None, "18081"),
         ("SEAMLESS_HOST_PORT=18081\n", {"SEAMLESS_HOST_PORT": "18082"}, "18082"),
         ("SEAMLESS_HOST_PORT=18081\n", {"SEAMLESS_HOST_PORT": ""}, "8080"),
+        ("SEAMLESS_HOST_PORT: 18081\n", None, "18081"),
+        ("\ufeffSEAMLESS_HOST_PORT=18081\n", None, "18081"),
     ],
-    ids=["the default", "moved in .env", "as Compose reads it", "the shell over .env", "empty"],
+    ids=[
+        "the default",
+        "moved in .env",
+        "as Compose reads it",
+        "the shell over .env",
+        "empty",
+        "a YAML-style colon",
+        "a byte-order mark",
+    ],
 )
 def test_the_make_targets_wait_on_the_port_compose_publishes(tmp_path, env_file, environment, port):
-    """SDD §17.2 (review RV38B-07b): make seamless-start and seamless-restart poll the port Compose
-    publishes - the shell's, else .env's, else 8080 - never the shell's alone."""
+    """SDD §17.2 (reviews RV38B-07b, RV41A-01): make seamless-start and seamless-restart poll the
+    port Compose publishes - the shell's, else .env's read by compose-go's rules, else 8080 -
+    never the shell's alone."""
     assert _resolved(tmp_path, env_file, environment, ("SEAMLESS_HOST_PORT",)) == port
+
+
+@pytest.mark.parametrize(
+    ("target", "env_file", "key"),
+    [
+        ("seamless-up", "PORT=18081\nSEAMLESS_HOST_PORT=${PORT}\n", "SEAMLESS_HOST_PORT"),
+        ("seamless-start", 'SEAMLESS_HOST_PORT="${PORT:-18081}"\n', "SEAMLESS_HOST_PORT"),
+        ("seamless-restart", "SEAMLESS_HOST_PORT=$PORT\n", "SEAMLESS_HOST_PORT"),
+        (
+            "deploy-runtime-check",
+            "RELEASE=0.2.0\nSEAMLESS_VERSION=${RELEASE}\n",
+            "SEAMLESS_VERSION",
+        ),
+    ],
+)
+def test_a_value_compose_would_interpolate_stops_the_targets_that_use_it(
+    tmp_path, target, env_file, key
+):
+    """SDD §17.2 (review RV41A-02): Compose interpolates a '$' in an unquoted or double-quoted
+    .env value; the Make targets read plain values, so a target that uses such a value stops
+    before its recipe runs, naming it - the health wait polled port 80 for 300 s, and
+    deploy-runtime-check inspected "seamless-migrate:" and skipped the control plane. A target that
+    does not use it still runs."""
+    dotenv = tmp_path / "compose.env"
+    dotenv.write_text(env_file, encoding="utf-8")
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("SEAMLESS_VERSION", "SEAMLESS_HOST_PORT")
+    }
+
+    def dry(name):
+        return subprocess.run(
+            ["make", "-n", "--no-print-directory", name, f"SEAMLESS_ENV_FILE={dotenv}"]
+            + ["SEAMLESS_HOST_OS=Linux", "SEAMLESS_DOCKER_CONTEXT=default"],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    stopped = dry(target)
+    assert stopped.returncode != 0, stopped.stdout
+    assert f"sets {key} through a variable" in stopped.stderr, stopped.stderr
+    assert dry("seamless-stop").returncode == 0

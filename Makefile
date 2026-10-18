@@ -404,9 +404,14 @@ SEAMLESS_ON_LINUX_ENGINE = $(and $(filter Linux,$(SEAMLESS_HOST_OS)),$(filter de
 SEAMLESS_COMPOSE_DIR    := $(CURDIR)/deploy/compose
 SEAMLESS_COMPOSE_FILE   := $(SEAMLESS_COMPOSE_DIR)/compose.yaml
 SEAMLESS_ENV_FILE       := $(SEAMLESS_COMPOSE_DIR)/.env
-# the value Compose reads for the key $(1) from SEAMLESS_ENV_FILE, by its dotenv rules - an export prefix, spaces, quotes,
-# an inline comment, the last definition wins (scripts/dotenv-value.sh, SDD §17.2, review RV38B-09)
-SEAMLESS_DOTENV = $(shell sh scripts/dotenv-value.sh $(1) $(SEAMLESS_ENV_FILE) 2>/dev/null)
+# the value Compose reads for the key $(1) from SEAMLESS_ENV_FILE, by compose-go's dotenv rules - a byte-order mark, an
+# export prefix, a key ended by = or :, spaces, quotes, an inline comment after " #", the last definition wins
+# (scripts/dotenv-value.sh, SDD §17.2, reviews RV38B-09, RV41A-01)
+SEAMLESS_DOTENV = $(shell sh scripts/dotenv-value.sh $(1) $(SEAMLESS_ENV_FILE) 2>/dev/null || echo SEAMLESS_DOTENV_REFUSED)
+# a value the reader refused - Compose would interpolate it - stops a target whose recipe uses it, before the recipe
+# runs, never guessed (SDD §17.2, review RV41A-02)
+SEAMLESS_DOTENV_STOP = $(if $(filter SEAMLESS_DOTENV_REFUSED,$($(1))),$(error $(SEAMLESS_ENV_FILE) sets $(1) through \
+  a variable, which Compose interpolates: the Make targets read plain values - write the value itself (SDD 17.2)))
 SEAMLESS_TOKENS_FILE    := $(SEAMLESS_COMPOSE_DIR)/tokens.yaml
 # optional: restrict logs to one service, e.g. make seamless-logs SEAMLESS_SERVICE=seamless
 SEAMLESS_SERVICE        ?=
@@ -452,7 +457,7 @@ endif
 SEAMLESS_HOST_GATEWAY_FILE = $(if $(and $(filter Linux,$(SEAMLESS_HOST_OS)),$(filter default,$(SEAMLESS_DOCKER_CONTEXT)),$(filter docker,$(SEAMLESS_ENGINE))),$(SEAMLESS_COMPOSE_DIR)/compose.linux-host.yaml)
 SEAMLESS_COMPOSE_BASE = $(SEAMLESS_COMPOSE_CMD) -p $(SEAMLESS_PROJECT) -f $(SEAMLESS_COMPOSE_FILE)$(if $(SEAMLESS_HOST_GATEWAY_FILE), -f $(SEAMLESS_HOST_GATEWAY_FILE))$(if $(SEAMLESS_EXTRA_COMPOSE_FILE), -f $(SEAMLESS_EXTRA_COMPOSE_FILE))
 # wait until the control plane answers (both engines; Docker's --wait already covers the healthchecks)
-SEAMLESS_WAIT_HEALTH  = for i in $$(seq 1 150); do curl -fsS -o /dev/null http://127.0.0.1:$(SEAMLESS_HOST_PORT)/api/v1/health && break; \
+SEAMLESS_WAIT_HEALTH  = $(call SEAMLESS_DOTENV_STOP,SEAMLESS_HOST_PORT)for i in $$(seq 1 150); do curl -fsS -o /dev/null http://127.0.0.1:$(SEAMLESS_HOST_PORT)/api/v1/health && break; \
                         [ $$i = 150 ] && { echo "the control plane did not become healthy in 300 s: make seamless-logs"; exit 1; }; sleep 2; done
 # The stack publishes on 127.0.0.1 only, but a browser opens localhost on ::1 first: when another
 # program answers on [::1]:<port>, localhost is not this dashboard, so name the address that is.
@@ -583,7 +588,7 @@ seamless-start: seamless-check-context seamless-check-env
 # one the existing container ran with (make seamless-demo sets it for its own run only).
 seamless-restart: seamless-check-context seamless-check-env
 	@id=$$($(SEAMLESS_COMPOSE) ps -a -q seamless 2>/dev/null); mode=$${SEAMLESS_DEMO:-}; \
-	if [ -z "$$mode" ] && [ -n "$$id" ] && ! grep -q '^SEAMLESS_DEMO=' "$(SEAMLESS_ENV_FILE)"; then \
+	if [ -z "$$mode" ] && [ -n "$$id" ] && ! sh scripts/dotenv-value.sh --defined SEAMLESS_DEMO "$(SEAMLESS_ENV_FILE)"; then \
 		mode=$$($(SEAMLESS_DOCKER) inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$$id" | sed -n 's/^SEAMLESS_DEMO=//p'); \
 	fi; \
 	echo "+ $${mode:+SEAMLESS_DEMO=$$mode }$(SEAMLESS_COMPOSE_CMD) up -d --build --force-recreate --no-deps seamless"; \
@@ -627,7 +632,7 @@ endif
 override SEAMLESS_VERSION := $(or $(SEAMLESS_VERSION),$(SEAMLESS_RELEASE))
 SEAMLESS_CP_IMAGE ?= seamless-migrate:$(SEAMLESS_VERSION)
 deploy-runtime-check: seamless-check-context
-	@[ -x seamless/.venv/bin/python ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'"; exit 1; }
+	@$(call SEAMLESS_DOTENV_STOP,SEAMLESS_VERSION)[ -x seamless/.venv/bin/python ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'"; exit 1; }
 	DOCKER="$(SEAMLESS_DOCKER)" PYTHON=seamless/.venv/bin/python \
 	  CP_IMAGE="$$($(SEAMLESS_DOCKER) image inspect $(SEAMLESS_CP_IMAGE) >/dev/null 2>&1 && echo $(SEAMLESS_CP_IMAGE))" \
 	  scripts/check-readonly-runtime.sh
