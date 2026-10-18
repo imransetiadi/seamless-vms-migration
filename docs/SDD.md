@@ -1607,9 +1607,9 @@ volumes with their server, so the order is:
    that deletes the source would otherwise delete a running server (review 31). A source Nova still starts
    (`task_state` `powering-on`: a rollback's start accepted, its wait cut off) reads `SHUTOFF` until it runs: that
    start is waited out first, then the source is stopped (review RV33-02). A source already gone - deleted by the
-   attempt before, which failed before it journaled that - needs no stop, nor does one whose deletion Nova accepted
-   (step 4) unless it reads `ACTIVE`: Nova starts no server it is deleting or that a failed deletion left in `ERROR`,
-   and its stop of one never reads `SHUTOFF` (review RV33-03). A source found running has run since the first stop:
+   attempt before, which failed before it journaled that - needs no stop, nor does one step 4's deletion reached
+   (the rollback's rule below): Nova starts no server it is deleting or that a failed deletion left in `ERROR`,
+   and its stop of one never reads `SHUTOFF` (reviews RV33-03, RV35B-01). A source found running has run since the first stop:
    that outage ended - the step closes the clock - and the re-stop opens a new one, at the re-stop's request when
    the step then ends without `SHUTOFF` (§5.2, review RV33-04). So has one a step finds running - once a start Nova
    runs ended, and with no power-off in progress - when only the first stop was journaled as sent, its wait failed
@@ -1633,8 +1633,8 @@ volumes with their server, so the order is:
    lost. A cutover resumed after such an attempt, while the source server exists, sets it to false again - and
    journals the attachment's `keep` again - for each attachment whose last `keep` came before that attempt;
    otherwise step 4 would delete the volume with its server (review RV33-01).
-4. Delete the source server - journaled as sent once Nova accepts the deletion -; wait until every journaled volume
-   is `available`.
+4. Delete the source server - journaled as tried before the call, and as sent once Nova accepts the deletion -; wait
+   until every journaled volume is `available`.
 5. `POST /v3/{project}/volumes/{id}/action {"os-unmanage": null}` for each volume (source).
 6. `POST /v3/{project}/manageable_volumes` on RHOSO for each volume: `{"volume": {"host":
    <resolved destination host>, "ref": <reference for the family and destination pool, named
@@ -1673,8 +1673,11 @@ start until the guest is down: the rollback waits until the stop ended - `SHUTOF
 the power-off up (its `task_state` back to none, the guest still running) - then starts it unless it runs (reviews
 RV26-01, RV27-04). A server Nova still powers on (`task_state` `powering-on`: an earlier attempt's start accepted, its
 wait cut off) reads `SHUTOFF` and refuses a second start: the rollback waits for that start to end too (review
-RV29-06). A source whose deletion Nova accepted (step 4, journaled as sent) no longer counts as existing unless it
-reads `ACTIVE`: Nova starts no server it is deleting or that a failed deletion left in `ERROR`, and a deletion it
+RV29-06). A source step 4's deletion reached no longer counts as existing: one whose deletion Nova accepted (step 4,
+journaled as sent) unless it reads `ACTIVE`; one Nova reads as being deleted (`task_state` `deleting`), whatever the
+journal holds; and one in `ERROR` once step 4 tried its deletion (journaled as tried) - Nova may take a deletion whose
+answer is an error, a 500 once it saved the deleting state, or is lost, while the compute host fails it (review
+RV35B-01). Nova starts no server it is deleting or that a failed deletion left in `ERROR`, and a deletion it
 then finishes - nova-compute resuming it, an operator clearing the server - honours the `delete_on_termination` it
 finds. So the rollback gives nothing back and starts nothing there: it deletes the server again, waits until it is
 gone and every journaled volume never unmanaged is `available`, and recreates the source as for one gone (below); a
