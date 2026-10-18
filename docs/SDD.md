@@ -510,7 +510,10 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   it started or recreated reads `ACTIVE`, §7.3), so an attempt that fails after it leaves the clock
   closed: the source runs, and the next cutover counts a new outage (reviews RV30-03, RV36B-03). A store error
   saving that close fails the attempt as transient (`StepContext.mark_downtime_end()` raises `TransientStepError`):
-  it is retried within the step's retries, and the retry closes the clock again (review RV36B-03). A verification that passes again — the first one was saved,
+  it is retried within the step's retries, and the retry closes the clock again (review RV36B-03). A close inside a
+  step, and a rollback's at its end, is written with its `migration.downtime_ended` in one store transaction
+  (`put_with_event`, §11): a store error on either leaves neither, so the retry closes the clock and announces it -
+  never a closed outage without its end event; the open keeps its save-first order (review RV37B-01). A verification that passes again — the first one was saved,
   but a stop or a failed event write came before `completed` — keeps the end and the downtime the first one
   recorded: the outage ended then. `actual_downtime_s` = difference — except in demo mode (§7.4),
   where the downtime is in model seconds, the time base of the passes' `duration_s`, so a demo's downtime compares
