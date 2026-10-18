@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seamless-migrate"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 description = "Seamless Migrate control plane: plans, validates, estimates and orchestrates VM migrations to RHOSO 18.0"
 readme = "README.md"
 license = { text = "Apache-2.0" }
