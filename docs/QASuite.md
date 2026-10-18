@@ -609,18 +609,22 @@ ZAP (S-23) — run only against the **demo** stack, never against one connected 
 
 ```bash
 read -rs VIEWER                                 # a viewer token of the demo stack; nothing echoes
-work=$(mktemp -d)                               # private (0700): the replacer rule with the token, then the report
-(umask 077 && printf '%s\n' 'replacer.full_list(0).description=auth' 'replacer.full_list(0).enabled=true' \
-  'replacer.full_list(0).matchtype=REQ_HEADER' 'replacer.full_list(0).matchstr=Authorization' \
-  'replacer.full_list(0).regex=false' "replacer.full_list(0).replacement=Bearer $VIEWER" > "$work/auth.prop")
-docker --context colima-seamless run --rm --network seamless_frontend -v "$work:/zap/wrk:rw" \
-  ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py -t http://seamless:8080/api/openapi.json -f openapi -S \
-  -r zap-report.html -z "-configfile /zap/wrk/auth.prop"
+work=$(mktemp -d "$HOME/.zap-s23.XXXXXX")       # under $HOME: the Colima VM mounts only the home directory
+chmod 0777 "$work"                              # the image's zap user (uid 1000) writes the report; it holds no secret
+export ZAP_AUTH_HEADER_VALUE="Bearer $VIEWER"   # handed to the container by name only, below
+docker --context colima-seamless run --rm --network seamless_frontend -e ZAP_AUTH_HEADER_VALUE \
+  -v "$work:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+  zap-api-scan.py -t http://seamless:8080/api/openapi.json -f openapi -S -r zap-report.html
+unset ZAP_AUTH_HEADER_VALUE VIEWER
 cp "$work/zap-report.html" . && rm -rf "$work"
 ```
 
-ZAP reads the rule from the properties file (`-configfile`), so the token is on no command line (Security.md §7.2);
-`printf` is a shell builtin.
+ZAP's packaged scans add `ZAP_AUTH_HEADER_VALUE` as the `Authorization` header of every request; `-e` names the
+variable alone, so the token reaches the container through its environment and is on no command line and in no
+file (Security.md §7.2). The work directory lives under `$HOME` - a `mktemp -d` under `$TMPDIR` is outside the
+Colima VM's mounts on macOS, and private to the caller on Linux, so ZAP found no input and wrote no report there
+(review RV37B-05). **This form has not been run yet**: confirm it on the demo stack at the next release gate (S-23)
+and remove this sentence.
 
 S-20 hardening listing (Compose; prints only security-relevant fields, never the environment):
 
