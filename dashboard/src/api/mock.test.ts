@@ -2966,6 +2966,39 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     expect(server.migrations.find((x) => x.id === m.id)!.strategy).toBe('warm');
   });
 
+  it("leaves a migration's wave to the next validation when the waves are planned anew, as the API (review RV40-03)", async () => {
+    let clock = NOW;
+    const server = new MockServer({ now: () => clock, seed: 1 });
+    const client = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
+    const vms = freeVms(server, 'rhosp17-dc1', 5).map((v) => v.source_id);
+    const plan = await client.post<Plan>('/plans', { name: 'Re-waved', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: vms });
+    await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    await client.post(`/plans/${plan.id}/validate`);
+    const before = server.migrations.filter((m) => m.plan_id === plan.id).map((m) => [m.id, m.wave_id, m.updated_at]);
+    clock += 60_000;
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 1 });
+    expect(server.migrations.filter((m) => m.plan_id === plan.id).map((m) => [m.id, m.wave_id, m.updated_at])).toEqual(before);
+    await client.post(`/plans/${plan.id}/validate`);
+    for (const m of server.migrations.filter((x) => x.plan_id === plan.id)) {
+      expect(m.wave_id).toBe(waved.waves.find((w) => w.vm_ids.includes(m.vm.source_id))!.id);
+    }
+  });
+
+  it("plans the waves of re-assessed VMs as the source reports them, not as their migrations recorded them (review RV40-10)", async () => {
+    const { server, client } = setup('operator');
+    const vms = freeVms(server, 'rhosp17-dc1', 4);
+    const plan = await client.post<Plan>('/plans', { name: 'Grown', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: vms.map((v) => v.source_id) });
+    await client.post(`/plans/${plan.id}/validate`); // ready: re-assessed by the next validation
+    // the smallest VM's disk grew past every other at the source since: its migration still records the old size
+    const smallest = [...vms].sort((a, b) => a.disk_bytes - b.disk_bytes)[0]!;
+    const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['rhosp17-dc1']!;
+    const at = inventory.findIndex((v) => v.source_id === smallest.source_id);
+    const largest = Math.max(...vms.map((v) => v.disk_bytes));
+    inventory[at] = { ...inventory[at]!, disk_bytes: largest * 4 };
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    expect(waved.waves[0]!.vm_ids).not.toContain(smallest.source_id); // no longer among the pilot's smallest
+  });
+
   it("plans the automatic waves from the plan's VMs, a never-validated plan's too (review RV39-03)", async () => {
     const { server, client } = setup('operator');
     const vms = freeVms(server, 'rhosp17-dc1', 2).map((v) => v.source_id);

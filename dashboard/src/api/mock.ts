@@ -2160,9 +2160,9 @@ export class MockServer {
       const n = waves.length + 1;
       waves.push({ id: `wave-${n}`, name: `Wave ${n}`, order: n, vm_ids: rest.slice(i, i + size).map((vm) => vm.source_id), depends_on: [`wave-${n - 1}`], max_parallel: 5 });
     }
+    // like the API: the migrations take their VM's wave at the next validation, which a plan back in draft needs before it
+    // starts (SDD §9.4, review RV40-03)
     plan.waves = waves;
-    const mine = this.migrations.filter((m) => m.plan_id === plan.id && m.phase !== 'cancelled');
-    for (const wave of waves) for (const m of mine) if (wave.vm_ids.includes(m.vm.source_id)) m.wave_id = wave.id;
     plan.status = 'draft'; // like the API: new waves are validated again before a start (SDD §12)
     plan.updated_at = new Date(this.now()).toISOString();
     this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}": ${waves.length} waves planned`, data: { waves: waves.length } });

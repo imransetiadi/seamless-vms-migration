@@ -103,6 +103,13 @@ describe('CalibrationPanel', () => {
     expect(row('In-place conversion')).toEqual(['1m 30s', 'plan override']);
   });
 
+  it('lists the disks in parallel a plan sets on any strategy, as every other override (SDD §16, review RV40-04)', () => {
+    const { warm, plan } = fixtures();
+    const m: Migration = { ...warm, strategy: 'cold', sync_passes: [], observed_scan_bps: null };
+    render(<CalibrationPanel migration={m} plan={{ ...plan, estimator_overrides: { parallel_disks: 2 } }} />);
+    expect(row('Disks scanned in parallel')).toEqual(['2', 'plan override']);
+  });
+
   it("keeps a single-shot strategy's panel short: no disks in parallel or step time the plan does not set", () => {
     const { warm, plan } = fixtures();
     const m: Migration = { ...warm, strategy: 'cold', sync_passes: [], observed_scan_bps: null };
