@@ -170,11 +170,44 @@ def test_no_e2e_script_puts_a_bearer_token_on_a_command_line():
     assert _tokens_on_command_lines(E2E) == []
 
 
+#: a token variable given a literal value - exported, or typed before the script - where the shell
+#: history keeps it (Security.md §7.2, reviews RV37B-06, RV38B-20); a value read from a variable or
+#: a command is no literal
+TYPED_TOKEN = re.compile(r"\b[A-Z_]*TOKEN=(?![\"']?\$)\S")
+
+
+@pytest.mark.parametrize(
+    ("line", "typed"),
+    [
+        ("#   TOKEN='smg_...' APPROVER_TOKEN='smg_...' tests/e2e/smoke-demo.sh", True),
+        ("#   export TOKEN='smg_...'", True),
+        ("#   export APPROVER_TOKEN=<an approver token>", True),
+        ("#   read -rs TOKEN && export TOKEN", False),
+        (': "${TOKEN:?read -rs TOKEN && export TOKEN: the admin token}"', False),
+        ('TOKEN=$(cat "$HOME/.seamless-token")', False),
+        ('TOKEN="$ADMIN"', False),
+    ],
+    ids=[
+        "typed before",
+        "exported",
+        "exported placeholder",
+        "read",
+        "required",
+        "a command",
+        "a variable",
+    ],
+)
+def test_the_typed_token_check_flags_every_literal(line, typed):
+    """Review RV38B-20: the check matched `export ...TOKEN=` only, so a usage line typing the token
+    before the script passed; any token variable given a literal is flagged."""
+    assert bool(TYPED_TOKEN.search(line)) is typed
+
+
 def test_no_e2e_script_tells_its_reader_to_type_a_token():
     """Security.md §7.2 (R-28, docs-drift DD2-01, review RV37B-06): a usage header or a message that
     says ``export TOKEN='smg_...'`` or ``export TOKEN=<...>`` has the reader type the token into a
     command, which the shell history keeps; each says to read it with ``read -rs`` instead."""
-    typed = re.compile(r"export\s+[A-Z_]*TOKEN=")
+    typed = TYPED_TOKEN
     told = [
         f"{path.name}:{number}: {line.strip()}"
         for path in sorted(E2E.glob("*.sh"))

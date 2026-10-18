@@ -71,3 +71,14 @@ def test_every_tests_path_qasuite_cites_exists_from_the_repository_root():
     cited = set(re.findall(r"`(tests/[A-Za-z0-9_.\-/]+\.[a-z]+)`", text))
     assert cited, "the parse found no tests/ path"
     assert sorted(p for p in cited - S28_DUMMIES if not (ROOT / p).exists()) == []
+
+
+def test_every_repository_path_qasuite_cites_exists():
+    """CLAUDE.md §1 (review RV38B-21): a backticked path under one of the repository's top-level
+    directories - the control plane's tests as `seamless/tests/...` among them - exists; the
+    `tests/` guard above did not see those."""
+    text = QASUITE.read_text(encoding="utf-8")
+    tops = "seamless|dashboard|scripts|deploy|docs|roles|plugins|playbooks"
+    cited = set(re.findall(rf"`((?:{tops})/[A-Za-z0-9_.\-/]+\.[a-z]+)`", text))
+    assert any(p.startswith("seamless/tests/") for p in cited), "the parse found no such path"
+    assert sorted(p for p in cited if not (ROOT / p).exists()) == []

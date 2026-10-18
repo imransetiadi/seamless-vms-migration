@@ -427,12 +427,46 @@ def _what_ansible_core_prints_of_the_collection() -> dict[str, str]:
 
 
 def _raises(root: Path, path: str, name: str) -> bool | None:
-    """Whether the function ``name`` of ``path`` raises anything itself; ``None`` without one."""
+    """Whether a function or method named ``name`` in ``path`` raises anything itself - a raise or
+    an assert in any definition of that name: a later module-level one is the one Python binds, and
+    a method's frame is named as a function's (review RV38B-19); ``None`` without one."""
     tree = ast.parse((root / path).read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
-            return any(isinstance(inner, ast.Raise) for inner in ast.walk(node))
-    return None
+    found = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    ]
+    if not found:
+        return None
+    return any(
+        isinstance(inner, (ast.Raise, ast.Assert)) for node in found for inner in ast.walk(node)
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "raises"),
+    [
+        ("def is_timeout(err):\n    return 'timed out' in str(err)\n", False),
+        (
+            "def is_timeout(err):\n    return False\n\n\ndef is_timeout(err):\n"
+            "    raise RuntimeError(err)\n",
+            True,
+        ),
+        (
+            "def is_timeout(err):\n    return False\n\n\nclass Waiter:\n"
+            "    def is_timeout(self, err):\n        raise RuntimeError(err)\n",
+            True,
+        ),
+        ("def is_timeout(err):\n    assert err is not None, err\n    return False\n", True),
+        ("def other(err):\n    raise RuntimeError(err)\n", None),
+    ],
+    ids=["a predicate", "a raising one defined below it", "a raising method", "an assert", "none"],
+)
+def test_the_raise_check_reads_every_definition_of_the_name(tmp_path, source, raises):
+    """Review RV38B-19: a predicate the transient guard allows must raise nothing - judged over
+    every definition of its name, a method's too, an assert counted as a raise."""
+    (tmp_path / "m.py").write_text(source, encoding="utf-8")
+    assert _raises(tmp_path, "m.py", "is_timeout") is raises
 
 
 def test_nothing_ansible_core_prints_of_the_collection_reads_transient():
