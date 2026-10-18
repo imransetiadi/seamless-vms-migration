@@ -3,6 +3,7 @@ and the conversion-host key in the platform secret store, distributions, secret 
 
 import base64
 import errno
+import inspect
 import json
 import logging
 import os
@@ -867,5 +868,6 @@ def test_the_kubernetes_secret_store_always_checks_the_api_servers_certificate(m
     given._client().close()
     default._client().close()
     assert seen == ["/etc/pki/api-ca.crt", str(secret_store.SA_DIR / "ca.crt")]
-    with pytest.raises(TypeError):
-        secret_store.KubernetesSecretStore("ns", token="t", verify=False)
+    # no parameter can turn the check off: the store takes a CA file, never a verify switch
+    parameters = inspect.signature(secret_store.KubernetesSecretStore).parameters
+    assert "ca_cert" in parameters and "verify" not in parameters
