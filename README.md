@@ -321,8 +321,9 @@ scripts/seamless-ctl.sh PLATFORM ACTION [OPTIONS]      # PLATFORM: docker | podm
   scripts/seamless-ctl.sh docker start
   scripts/seamless-ctl.sh docker resume --token-file ~/.seamless/operator.token <plan-id>...
   ```
-* **After a change:** a setting in `deploy/compose/.env`, a Secret or the cluster's ConfigMap needs `restart`; a
-  new version (`git pull`) or a changed manifest needs `up`.
+* **After a change:** a setting in `deploy/compose/.env`, a Secret or the cluster's ConfigMap needs `restart` - but a
+  Jev setting (`TYPESAFE_API_KEY`, `JEV_MCP_AUTH_TOKEN`, `COMPOSE_PROFILES`) needs `up`: it is the `jev` sidecar's,
+  which `restart` leaves as it was; a new version (`git pull`) or a changed manifest needs `up`.
 * `--dry-run` prints every command and runs none; on a cluster `--namespace` picks the namespace (default
   `seamless-migrate`).
 

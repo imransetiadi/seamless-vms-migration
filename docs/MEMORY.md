@@ -212,11 +212,14 @@ words that appear in an error message — treat the memory server as an internal
   search for the offending string; ③ **rotate** the leaked secret (Security.md §7, §13); ④ find the leak's
   origin — if a Seamless payload carried it, add a failing case to `test_redact_removes_secrets` first, then
   fix `redact()` in `ai/redaction.py`; ⑤ record the incident (Security.md §13).
-* **Erasure requests:** operator identities live in L2 - the `events` trail (`actor`), the dashboard users' `user`
-  documents (the lower-cased name is the id, with the role and the token digest, SDD §13.1), and every L2 document
-  that records who acted: a migration's `approvals[].actor`, `phase_history[].actor`, `cutover_requested_by` and
-  `force_cutover.actor`, a recommendation's decision (`actor`, kind `user`) and an advisor policy's `updated_by`
-  (review RV37B-12) -, in the bootstrap tokens file's names (`GET /users` lists both kinds), and in git history;
+* **Erasure requests:** operator identities live in L2 - the `events` trail (`actor`, and the messages that name it:
+  "approved by …", "requested by …"), the dashboard users' `user` documents (the lower-cased name is the id, with the
+  role and the token digest, SDD §13.1), and every L2 document that records who acted: a migration's
+  `approvals[].actor`, `phase_history[].actor` and the reasons that name who acted (a retry, a requested delta pass,
+  a Force cutover: "Force cutover by …: …"), `cutover_requested_by` and `force_cutover.actor`, a recommendation's
+  `requested_by` (the user whose validation recorded it) and its decision (`actor`, kind `user`), and an advisor
+  policy's `updated_by` (reviews RV37B-12, RV38B-12) -, in the bootstrap tokens file's names (`GET /users` lists both
+  kinds), and in git history;
   agentmemory holds none by design. No route
   deletes a user: erasing one is a database change (delete its `user` row, Security.md §5.1), and a file token's
   name goes by editing the file (§5.1). Handle requests against L2 under change control.

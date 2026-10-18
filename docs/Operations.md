@@ -130,7 +130,8 @@ scripts/seamless-ctl.sh docker start        # or: docker scale 1 - the same cont
 
 | You changed | Run |
 |---|---|
-| a setting in `deploy/compose/.env` (ports, concurrency, log level, Jev, memory) | `restart` |
+| a setting in `deploy/compose/.env` for the control plane (ports, concurrency, log level, memory) | `restart` |
+| a Jev setting in `deploy/compose/.env` (`TYPESAFE_API_KEY`, `JEV_MCP_AUTH_TOKEN`, `COMPOSE_PROFILES=ai`) | `up` - they are the `jev` sidecar's, which `restart` (the control plane alone) leaves as it was |
 | the sources (`git pull` of a new version) or `deploy/compose/compose.yaml` | `up` (rebuilds the image, recreates what changed) |
 | `deploy/compose/tokens.yaml` (tokens added or removed with `seamless token create`) | `restart` |
 | only want the control plane to start afresh | `restart` |
@@ -277,7 +278,7 @@ end first:
    scripts/seamless-ctl.sh docker resume --token-file ~/.seamless/operator.token plan-0001 plan-0002
    ```
 
-   Or press **Start** on each plan in the dashboard. On a cluster, `resume` needs `--url` too.
+   Or press **Resume** on each plan in the dashboard. On a cluster, `resume` needs `--url` too.
 
 `--drain` and `resume` need `curl` and `python3` on the machine that runs the script. On a cluster whose Route
 or Ingress uses a private CA, point curl at it: `export CURL_CA_BUNDLE=/path/to/ca.pem`.
