@@ -1184,6 +1184,8 @@ export class MockServer {
     // like the API (SDD §5.4, §14.6): a waiting decision holds the migration from this write on
     m.advisor_hold = rec?.decision.status === 'pending_approval' ? rec.id : null;
     this.clearApprovals(m);
+    // its VM's wave in the plan, as the API's assessment writes it (SDD §9.4, review RV39-03)
+    m.wave_id = plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id))?.id ?? null;
     const blocked = m.findings.some((f) => f.severity === 'blocker');
     this.transition(m, blocked ? 'blocked' : 'ready', blocked ? 'blocker findings present' : 'pre-flight passed', actor);
     if (rec) {
@@ -2094,6 +2096,23 @@ export class MockServer {
     return ok(plan);
   }
 
+  /**
+   * The plan's VMs as a validation and the wave planner read them (orchestrator._vms, SDD §5.4, review PL-09): from the
+   * source each VM with no migration yet or one a validation re-assesses, any other migration's recorded vm; a VM the
+   * source no longer reports is a provider error.
+   */
+  private planVms(plan: Plan): VMRef[] {
+    const byVm = new Map(this.migrations.filter((m) => m.plan_id === plan.id).map((m) => [m.vm.source_id, m]));
+    const inventory = (this.inventories[plan.source_provider_id] ?? []) as VMRef[];
+    return plan.vm_ids.map((id) => {
+      const m = byVm.get(id);
+      if (m && !REVALIDATABLE.has(m.phase) && m.phase !== 'validating') return m.vm;
+      const vm = inventory.find((v) => v.source_id === id);
+      if (!vm) throw new HttpError(502, 'provider_error', `VM '${id}': VM '${id}' not found`);
+      return vm;
+    });
+  }
+
   private autoWaves(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
     // like the API (SDD §12): the body is checked first, an integer from 1 to 1000, never clamped
     const size = input.max_wave_size ?? 10;
@@ -2103,16 +2122,19 @@ export class MockServer {
     // like the API (SDD §12): draft, validated or paused, and the plan returns to draft
     if (!['draft', 'validated', 'paused'].includes(plan.status)) throw new HttpError(409, 'conflict', `waves cannot change while the plan is ${plan.status}`);
     this.refuseInFlight(plan, 're-planning the waves');
-    const mine = this.migrations.filter((m) => m.plan_id === plan.id && m.phase !== 'cancelled').sort((a, b) => a.vm.disk_bytes - b.vm.disk_bytes);
-    const pilot = mine.slice(0, Math.min(3, mine.length));
-    const rest = mine.slice(pilot.length);
+    // the plan's VMs as the API's planner reads them (orchestrator._vms, SDD §9.4, review RV39-03): every VM of vm_ids,
+    // a fresh plan's and one added since too - a migration a validation leaves alone as its recorded vm
+    const vms = this.planVms(plan).sort((a, b) => a.disk_bytes - b.disk_bytes);
+    const pilot = vms.slice(0, Math.min(3, vms.length));
+    const rest = vms.slice(pilot.length);
     const waves: Wave[] = [];
-    if (pilot.length) waves.push({ id: 'wave-1', name: 'Pilot', order: 1, vm_ids: pilot.map((m) => m.vm.source_id), depends_on: [], max_parallel: 5 });
+    if (pilot.length) waves.push({ id: 'wave-1', name: 'Pilot', order: 1, vm_ids: pilot.map((vm) => vm.source_id), depends_on: [], max_parallel: 5 });
     for (let i = 0; i < rest.length; i += size) {
       const n = waves.length + 1;
-      waves.push({ id: `wave-${n}`, name: `Wave ${n}`, order: n, vm_ids: rest.slice(i, i + size).map((m) => m.vm.source_id), depends_on: [`wave-${n - 1}`], max_parallel: 5 });
+      waves.push({ id: `wave-${n}`, name: `Wave ${n}`, order: n, vm_ids: rest.slice(i, i + size).map((vm) => vm.source_id), depends_on: [`wave-${n - 1}`], max_parallel: 5 });
     }
     plan.waves = waves;
+    const mine = this.migrations.filter((m) => m.plan_id === plan.id && m.phase !== 'cancelled');
     for (const wave of waves) for (const m of mine) if (wave.vm_ids.includes(m.vm.source_id)) m.wave_id = wave.id;
     plan.status = 'draft'; // like the API: new waves are validated again before a start (SDD §12)
     plan.updated_at = new Date(this.now()).toISOString();
@@ -2244,8 +2266,12 @@ export class MockServer {
         this.finishValidation(m, plan, me.name);
       } else {
         // like the API (SDD §9.4, review PL-11): left alone, but in its VM's wave in the plan, so waves planned anew
-        // reach it before the plan starts
-        m.wave_id = plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id))?.id ?? null;
+        // reach it before the plan starts - saved, its updated_at stamped, only when that changes it (review RV39-08)
+        const wave = plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id))?.id ?? null;
+        if (m.wave_id !== wave) {
+          m.wave_id = wave;
+          m.updated_at = new Date(this.now()).toISOString();
+        }
       }
       validated.push(m);
     }

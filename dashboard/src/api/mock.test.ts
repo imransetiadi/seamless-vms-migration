@@ -2896,4 +2896,63 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     const left = server.migrations.find((m) => m.id === rolled.id)!;
     expect([left.phase, left.wave_id]).toEqual(['rolled_back', 'wave-new']);
   });
+
+  it("plans the automatic waves from the plan's VMs, a never-validated plan's too (review RV39-03)", async () => {
+    const { server, client } = setup('operator');
+    const vms = freeVms(server, 'rhosp17-dc1', 2).map((v) => v.source_id);
+    const plan = await client.post<Plan>('/plans', { name: 'Fresh', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: vms });
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    expect(waved.waves.flatMap((w) => w.vm_ids).sort()).toEqual([...vms].sort());
+  });
+
+  it('plans the waves of a plan whose finalized VM left the source: its recorded vm counts (review RV39-03)', async () => {
+    const { server, client } = setup('operator');
+    const [a, b] = freeVms(server, 'rhosp17-dc1', 2).map((v) => v.source_id);
+    const plan = await client.post<Plan>('/plans', { name: 'Half done', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [a, b] });
+    await client.post(`/plans/${plan.id}/validate`);
+    // a finalize with delete_source deleted its source VM
+    server.migrations.find((m) => m.plan_id === plan.id && m.vm.source_id === a)!.phase = 'finalized';
+    const inventory = inventoryOf(server, 'rhosp17-dc1');
+    inventory.splice(inventory.findIndex((v) => v.source_id === a), 1);
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    expect(waved.waves.flatMap((w) => w.vm_ids).sort()).toEqual([a, b].sort());
+  });
+
+  it('a VM added after the waves were planned gets its wave from the next planning and validation, and the plan starts (review RV39-03)', async () => {
+    const { server, client } = setup('operator');
+    const [a, b, c] = freeVms(server, 'rhosp17-dc1', 3).map((v) => v.source_id);
+    const plan = await client.post<Plan>('/plans', { name: 'Grows', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [a, b] });
+    await client.post(`/plans/${plan.id}/validate`);
+    await client.patch(`/plans/${plan.id}`, { vm_ids: [a, b, c] });
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    const wave = waved.waves.find((w) => w.vm_ids.includes(c!));
+    expect(wave).toBeDefined();
+    await client.post(`/plans/${plan.id}/validate`);
+    const added = server.migrations.find((m) => m.plan_id === plan.id && m.vm.source_id === c);
+    expect(added?.wave_id).toBe(wave!.id);
+    await expect(client.post<Plan>(`/plans/${plan.id}/start`)).resolves.toMatchObject({ status: 'running' });
+  });
+
+  it("stamps a left-alone migration's updated_at when a validation moves it to another wave, and only then (review RV39-08)", async () => {
+    let clock = NOW;
+    const server = new MockServer({ now: () => clock, seed: 1 });
+    const client = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.status = 'paused';
+    const cancelled = new Set(server.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'cancelled').map((m) => m.vm.source_id));
+    plan.vm_ids = plan.vm_ids.filter((id) => !cancelled.has(id));
+    plan.waves = [{ id: 'wave-new', name: 'Pilot', order: 1, vm_ids: [...plan.vm_ids], depends_on: [], max_parallel: 5 }];
+    rolled.wave_id = 'wave-gone';
+    clock += 60_000;
+    await client.post(`/plans/${plan.id}/validate`);
+    const moved = server.migrations.find((m) => m.id === rolled.id)!;
+    expect([moved.wave_id, moved.updated_at]).toEqual(['wave-new', new Date(clock).toISOString()]);
+    // a validation that leaves its wave as it is saves nothing
+    const stamped = moved.updated_at;
+    clock += 60_000;
+    plan.status = 'paused';
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(server.migrations.find((m) => m.id === rolled.id)!.updated_at).toBe(stamped);
+  });
 });
