@@ -23,7 +23,15 @@ import random
 import time
 import weakref
 from collections import Counter, defaultdict
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Literal
@@ -137,6 +145,9 @@ APPROVABLE = frozenset(
 )
 CUTOVER_REQUESTABLE = frozenset({P.ready, P.precopy, P.syncing, P.awaiting_cutover})
 REVALIDATABLE = frozenset({P.pending, P.blocked, P.ready})
+#: the migrations a validation re-assesses - one left in validating is an interrupted validation's
+#: (plan lock) -, whose VMs it reads from the source; any other counts as its recorded vm (§5.4)
+REASSESSED = REVALIDATABLE | {P.validating}
 #: phases whose migration validation cancels when its VM leaves ``vm_ids`` (SDD §5.4); a
 #: migration it finds in validating is a leftover of an interrupted validation (plan lock)
 REMOVABLE = REVALIDATABLE | {P.failed, P.validating}
@@ -604,9 +615,17 @@ class Orchestrator:
             raise BadRequest(f"provider {provider.id} check failed: {checked.status_message}")
         return {**checked.capabilities, "conversion_host": checked.conversion_host is not None}
 
-    async def _vms(self, plan: Plan, impl: Any) -> list[VMRef]:
+    async def _vms(self, plan: Plan, impl: Any, existing: Mapping[str, Migration]) -> list[VMRef]:
+        """The plan's VMs as a validation and the wave planner read them (SDD §5.4): from the source
+        each VM with no migration yet or one a validation re-assesses; any other migration's
+        recorded vm - a VM that left the source, deleted by a storage handover or a finalize with
+        delete_source, keeps its plan valid (review PL-09)."""
         vms = []
         for vm_id in plan.vm_ids:
+            m = existing.get(vm_id)
+            if m is not None and m.phase not in REASSESSED:
+                vms.append(m.vm)
+                continue
             try:
                 vms.append(await impl.get_vm(vm_id))
             except ProviderError as exc:
@@ -687,10 +706,10 @@ class Orchestrator:
             dst_inv = await dst_impl.inventory()
         except ProviderError as exc:
             raise ProviderError(f"inventory failed: {exc}") from None  # 502, redacted (SDD §12)
-        vms = await self._vms(plan, src_impl)
         existing = {
             m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)
         }
+        vms = await self._vms(plan, src_impl, existing)
         cancelled = sorted(
             m.vm.name for vm in vms if (m := existing.get(vm.source_id)) and m.phase == P.cancelled
         )
@@ -1136,7 +1155,10 @@ class Orchestrator:
         if max_wave_size < 1:
             raise BadRequest("max_wave_size must be >= 1")
         source = await self._provider(plan.source_provider_id, ProviderRole.source)
-        vms = await self._vms(plan, self.providers.get(source))
+        existing = {
+            m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)
+        }
+        vms = await self._vms(plan, self.providers.get(source), existing)
         if self.advisor is not None:
             tiers, note = await self.advisor.classify_workloads(vms)
         else:

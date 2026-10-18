@@ -123,6 +123,63 @@ async def run_plan(h, plan):
     await h.orch.start()
 
 
+async def _a_paused_plan_whose_finished_vm_left_the_source(tmp_path, store):
+    """SDD §5.4 (review PL-09): web-01 is cut over, completed and finalized with delete_source - its
+    VM gone from the source, as a storage handover's step 4 leaves it too -, and its plan paused
+    with web-02 still ready. Returns the harness, the plan and the source's reads from then on."""
+    vms = [vm(1), vm(2)]
+    h, plan = await setup(
+        tmp_path, store, vms, plan_kw={"default_strategy": Strategy.cold, "auto_cutover": False}
+    )
+    await run_plan(h, plan)
+    first = await h.by_vm(plan.id, "vm-1")
+    await h.orch.request_cutover(first.id, "sari")
+    await h.wait_phase(first.id, P.completed)
+    await h.orch.pause_plan(plan.id, "alice")
+    await h.orch.finalize(first.id, "sari", delete_source=True, confirm="web-01")
+    del h.source.vms["vm-1"]  # the finalize deleted the source server
+    reads: list[str] = []
+    get_vm = h.source.get_vm
+
+    async def counted(source_id):
+        reads.append(source_id)
+        return await get_vm(source_id)
+
+    h.source.get_vm = counted
+    return h, plan, reads
+
+
+async def test_a_plan_whose_finished_vm_left_the_source_validates_again(tmp_path, store):
+    """SDD §5.4 (review PL-09): a validation reads from the source only the VMs it re-assesses; a
+    finished migration counts as its recorded VM, so its plan validates again once that VM left
+    the source - never 502 "VM ... not found" - and the finished migration stays as it is."""
+    h, plan, reads = await _a_paused_plan_whose_finished_vm_left_the_source(tmp_path, store)
+    try:
+        report = await h.orch.validate_plan(plan.id, "alice")
+    finally:
+        await h.orch.stop()
+    assert sorted((i.vm_name, i.phase) for i in report.migrations) == [
+        ("web-01", P.finalized),
+        ("web-02", P.ready),
+    ]
+    assert reads == ["vm-2"]
+
+
+async def test_the_waves_of_a_plan_whose_finished_vm_left_the_source_are_planned_again(
+    tmp_path, store
+):
+    """SDD §5.4, §9.4 (review PL-09): the wave planner reads the plan's VMs as a validation does -
+    a finished migration's VM as recorded -, so the waves of a plan whose finished VM left the
+    source are planned again, every VM in one."""
+    h, plan, reads = await _a_paused_plan_whose_finished_vm_left_the_source(tmp_path, store)
+    try:
+        planned = await h.orch.auto_waves(plan.id, 10, "alice")
+    finally:
+        await h.orch.stop()
+    assert sorted(v for w in planned.waves for v in w.vm_ids) == ["vm-1", "vm-2"]
+    assert reads == ["vm-2"]
+
+
 async def test_validate_creates_migrations_with_findings_and_estimates(tmp_path, store):
     gpu = vm(3, "gpu-01", flavor_extra_specs={"resources:VGPU": "1"})
     vms = [vm(1), vm(2, "db-02", size_gb=600, used_gb=300.0), gpu]
@@ -355,10 +412,10 @@ def _park_vms(h, monkeypatch):
     entered, release = asyncio.Event(), asyncio.Event()
     original = h.orch._vms
 
-    async def parked(plan, impl):
+    async def parked(*args):
         entered.set()
         await release.wait()
-        return await original(plan, impl)
+        return await original(*args)
 
     monkeypatch.setattr(h.orch, "_vms", parked)
     return entered, release
@@ -529,6 +586,19 @@ async def test_a_validation_takes_over_a_migration_an_interrupted_one_left_valid
     h, plan, stuck = await _left_validating(tmp_path, store)
     report = await h.orch.validate_plan(plan.id, "alice")
     assert {item.migration_id: item.phase for item in report.migrations}[stuck.id] == P.ready
+
+
+async def test_a_validation_reads_the_source_vm_of_a_migration_left_validating(tmp_path, store):
+    """SDD §5.4 (review PL-09): a migration an interrupted validation left in validating is
+    re-assessed, so its VM is read from the source again - a disk added since counts -, never taken
+    as recorded as a finished migration's is."""
+    h, plan, stuck = await _left_validating(tmp_path, store)
+    grown = h.source.vms["vm-2"]
+    extra = make_disk(id="vol-2b", size_gb=50, used_gb=5.0)
+    h.source.vms["vm-2"] = grown.model_copy(update={"disks": [*grown.disks, extra]})
+    await h.orch.validate_plan(plan.id, "alice")
+    taken = await h.migration(stuck.id)
+    assert (taken.phase, [d.id for d in taken.vm.disks]) == (P.ready, ["vol-2", "vol-2b"])
     taken = await h.migration(stuck.id)
     assert taken.phase == P.ready
     # taken over as it was: one transition, written once
