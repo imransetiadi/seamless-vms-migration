@@ -632,15 +632,32 @@ async def test_a_workload_record_without_volumes_wins_over_warm_passes(tmp_path,
         await h.orch.stop()
 
 
-@pytest.mark.parametrize("held", [True, False], ids=["volumes held", "nothing held"])
+@pytest.mark.parametrize(
+    ("record", "passes", "held"),
+    [
+        ({"dest_volumes": {"vol-1": "dst-vol-1"}}, 2, True),
+        ({"dest_volumes": {"vol-1": "dst-vol-1"}}, 0, True),
+        ({"dest_volumes": {}, "pending_snapshot": "snap-1"}, 0, False),
+        (None, 0, False),
+    ],
+    ids=[
+        "volumes held",
+        "volumes held by the record alone: its first pass failed after creating them",
+        "a pending source snapshot alone holds no destination volume",
+        "nothing held",
+    ],
+)
 async def test_a_strategy_change_to_a_handover_is_refused_while_an_earlier_attempt_holds_volumes(
-    tmp_path, store, held
+    tmp_path, store, record, passes, held
 ):
-    """SDD §12, §9.2 (review RV40-01): a Retry puts a rolled-back warm attempt back in ready
-    without re-assessing the estimates the first validation stored - storage_handover eligible
-    then, nothing held -, and a paused plan starts without a new validation: the strategy change
-    judges the held volumes itself and refuses the handover, which would leave them behind. With
-    nothing held it is accepted."""
+    """SDD §12, §9.2, §9.3 (reviews RV40-01, RV41B-03): a Retry puts a rolled-back warm attempt
+    back in ready without re-assessing the estimates the first validation stored -
+    storage_handover eligible then, nothing held -, and a paused plan starts without a new
+    validation: the strategy change judges the held volumes itself - its record first, which holds
+    them also when the first pass failed after creating them (RV3-05) - and refuses the handover,
+    which would leave them behind; cold, which removes them first, and warm, which uses them, stay
+    open. A pending source snapshot alone holds no destination volume, and with nothing held the
+    handover is accepted."""
     from seamless_migrate.executors.ansible import run_dir
     from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
 
@@ -655,14 +672,14 @@ async def test_a_strategy_change_to_a_handover_is_refused_while_an_earlier_attem
         await h.orch.validate_plan(plan.id, "alice")
         first = await h.by_vm(plan.id, "vm-1")
         assert first.estimate_for(Strategy.storage_handover).eligible
-        # the warm attempt ran its pre-copy and was rolled back; its record keeps the volumes
+        # the warm attempt ran its pre-copy and was rolled back; its record tells what it keeps
         first.phase = P.rolled_back
         first.phase_history = [*first.phase_history, *_history(*UNCUT)]
-        if held:
-            first.sync_passes = _passes(2, first.phase_history)
-            record = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
-            record.parent.mkdir(parents=True, exist_ok=True)
-            record.write_text(json.dumps({"dest_volumes": {"vol-1": "dst-vol-1"}}))
+        first.sync_passes = _passes(passes, first.phase_history)
+        if record is not None:
+            path = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(record))
         store.put("migration", first)
         paused = await h.orch._plan(plan.id)
         paused.status = PlanStatus.paused
@@ -674,9 +691,10 @@ async def test_a_strategy_change_to_a_handover_is_refused_while_an_earlier_attem
             left = await h.migration(first.id)
             assert left.strategy == Strategy.warm
             assert (await h.plan(plan.id)).strategy_overrides == {}
-            # another strategy is not held out: cold removes the volumes first (COLD-02)
-            changed = await h.orch.set_strategy(first.id, Strategy.cold, "alice")
-            assert changed.strategy == Strategy.cold
+            # the other strategies are not held out: cold removes the volumes first (COLD-02),
+            # warm uses them
+            for other in (Strategy.cold, Strategy.warm):
+                assert (await h.orch.set_strategy(first.id, other, "alice")).strategy == other
         else:
             changed = await h.orch.set_strategy(first.id, Strategy.storage_handover, "alice")
             assert changed.strategy == Strategy.storage_handover
@@ -5065,6 +5083,46 @@ async def test_an_advisor_decision_takes_no_handover_while_an_earlier_attempt_ho
             rec.id, "warm", "the owner chose warm", "rina"
         )
         assert overridden.decision.final_option == "warm"
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_pending_source_snapshot_alone_leaves_a_handover_to_an_advisor_override(
+    tmp_path, store
+):
+    """SDD §14.6, §9.2 (review RV41B-03): what holds a handover out is destination volumes an
+    earlier attempt created - a pending source snapshot alone holds none, so an override to the
+    handover stands after a Retry."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    advisor, _ = _tie_advisor("warm", 0.99)
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1, size_gb=4, used_gb=1.0)],
+        {"handover": handover, "auto_cutover": False},
+        advisor=advisor,
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        [rec] = _recommendations(store)
+        first = await h.by_vm(plan.id, "vm-1")
+        first.phase = P.rolled_back
+        first.phase_history = [*first.phase_history, *_history(*UNCUT)]
+        record = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"dest_volumes": {}, "pending_snapshot": "snap-1"}))
+        store.put("migration", first)
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        await h.orch.retry(first.id, "alice")
+        assert await h.orch.copied_data(first) is True  # the snapshot is copied data, no volume
+        overridden = await h.orch.override_recommendation(
+            rec.id, "storage_handover", "the owner wants the handover", "rina"
+        )
+        assert overridden.decision.final_option == "storage_handover"
     finally:
         await h.orch.stop()
 

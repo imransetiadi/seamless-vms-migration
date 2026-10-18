@@ -3030,6 +3030,9 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
         'storage_handover is not eligible for analytics-node-3: an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first.',
     });
     expect(server.migrations.find((x) => x.id === m.id)!.strategy).toBe('warm');
+    // warm, which uses the held volumes, stays open (review RV41B-03)
+    const warm = await client.put<Migration>(`/migrations/${m.id}/strategy`, { strategy: 'warm' });
+    expect(warm.strategy).toBe('warm');
   });
 
   it.each(['override', 'approve'] as const)(
