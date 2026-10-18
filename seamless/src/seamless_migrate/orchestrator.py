@@ -310,6 +310,14 @@ def _kept_after_rollback(m: Migration) -> bool:
     return False
 
 
+def _held_out(est: Estimate) -> Estimate:
+    """``est`` ineligible with §9.2's reason when it is an eligible storage handover (SDD §12)."""
+    if est.strategy != Strategy.storage_handover or not est.eligible:
+        return est
+    reasons = [*est.reasons, HELD_VOLUMES_REASON]
+    return est.model_copy(update={"eligible": False, "reasons": reasons})
+
+
 def _phase_started(m: Migration, phase: Phase) -> datetime | None:
     """When ``m`` last entered ``phase`` (None when it never did)."""
     for change in reversed(m.phase_history):
@@ -1585,6 +1593,13 @@ class Orchestrator:
             # the strategy of the attempt being retried: the evidence names it (SDD §14.4), even
             # after a later validation chose another
             m.attempt_strategies = [*m.attempt_strategies, m.strategy]
+            # nothing is assessed anew - the estimates the last validation stored stay -, but a
+            # handover is ineligible while the attempt's destination volumes are held, which the
+            # dashboard's strategy choice and the advisor's options then show (SDD §12, §9.2)
+            if await self.holds_destination_volumes(m):
+                m.estimates = [_held_out(e) for e in m.estimates]
+                if m.estimate is not None:
+                    m.estimate = _held_out(m.estimate)
             m.error = None
             # a new attempt is requested anew: the window bypass granted with the old request goes
             # with it, approvals stay (SDD §5.1, §5.4)
@@ -2171,10 +2186,14 @@ class Orchestrator:
             eligible = tuple(e.strategy.value for e in m.estimates if e.eligible)
             handover = Strategy.storage_handover.value
             chosen = action.option if isinstance(action, Override) else rec.recommendation.option
+            stored = m.estimate_for(Strategy.storage_handover)
             if (
                 chosen == handover
-                and handover in eligible
-                and await self.holds_destination_volumes(m)
+                and stored is not None
+                and (
+                    HELD_VOLUMES_REASON in stored.reasons  # a Retry or a validation saw them held
+                    or (stored.eligible and await self.holds_destination_volumes(m))
+                )
             ):
                 # §9.2 judged now, as PUT …/strategy: a Retry does not re-assess the estimates
                 # the last validation stored, and a handover would leave the held volumes behind

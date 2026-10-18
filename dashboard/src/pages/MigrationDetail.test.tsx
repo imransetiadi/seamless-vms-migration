@@ -12,6 +12,26 @@ function renderMigration(id: string) {
 }
 
 describe('MigrationDetail', () => {
+  it("shows a retried migration's storage handover ineligible, with the reason, while an earlier attempt holds its volumes (SDD §12, §9.2, §16)", async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!;
+    expect(m.estimates.find((e) => e.strategy === 'storage_handover')!.eligible).toBe(true);
+    // a warm attempt rolled back with its pass - its volumes kept for the next attempt -, then a Retry
+    m.strategy = 'warm';
+    m.phase = 'rolled_back';
+    m.approvals = [];
+    m.cutover_requested = false;
+    m.sync_passes = [
+      { number: 1, kind: 'full', started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 },
+    ];
+    await createTestClient(server, 'operator').post(`/migrations/${m.id}/retry`, {});
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const use = await screen.findByRole('button', { name: `Use ${STRATEGY_LABELS.storage_handover}` });
+    expect(use).toHaveAttribute('aria-disabled', 'true');
+    const row = use.closest('tr')!;
+    expect(within(row).getByText(/an earlier attempt keeps its destination volumes for a retry/)).toBeInTheDocument();
+  });
+
   it('says when a requested cutover may start outside the cutover window (SDD §16)', async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a12')!;

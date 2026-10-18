@@ -340,6 +340,12 @@ function passesSinceTheKitReleasedItsCopies(m: Migration): Migration['sync_passe
  * with no cutover leaves them marked for the next run's CBT sync); a cold, vmware_cold or handover rollback keeps no copy.
  * It is the destination volumes a migration holds (§9.3) and the copied data it keeps (§5.1).
  */
+/** `est` ineligible with §9.2's reason when it is an eligible storage handover (the API's `_held_out`, SDD §12). */
+function heldOut(est: Estimate): Estimate {
+  if (est.strategy !== 'storage_handover' || !est.eligible) return est;
+  return { ...est, eligible: false, reasons: [...est.reasons, HELD_VOLUMES_REASON] };
+}
+
 function keptAfterRollback(m: Migration): boolean {
   if (m.strategy === 'warm') return m.sync_passes.length > 0;
   if (m.strategy === 'vmware_warm') return passesSinceTheKitReleasedItsCopies(m).length > 0;
@@ -1691,7 +1697,9 @@ export class MockServer {
     if (action === 'approve' && rec.decision.status === 'approved') throw new HttpError(409, 'conflict', 'The decision is already approved.');
     const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy as string);
     const chosen = action === 'override' ? input.option : rec.recommendation.option;
-    if (chosen === 'storage_handover' && eligible.includes(chosen) && keptAfterRollback(m)) {
+    const stored = m.estimates.find((e) => e.strategy === 'storage_handover');
+    // a Retry or a validation saw the volumes held, or they are now (SDD §14.6, §9.2)
+    if (chosen === 'storage_handover' && stored && (stored.reasons.includes(HELD_VOLUMES_REASON) || (stored.eligible && keptAfterRollback(m)))) {
       // like the API (SDD §14.6, §9.2, review RV41B-01): judged now, as PUT …/strategy - a Retry re-assesses no stored
       // estimate, and a handover would leave an earlier attempt's volumes behind
       const refusal = `storage_handover is not eligible for ${m.vm.name}: ${HELD_VOLUMES_REASON}.`;
@@ -2551,6 +2559,12 @@ export class MockServer {
           );
         }
         m.wave_id = wave?.id ?? null;
+        // like the API (SDD §12, §9.2): nothing is assessed anew, but a handover is ineligible while the attempt's
+        // destination volumes are held, which the strategy choice and the advisor's options then show
+        if (keptAfterRollback(m)) {
+          m.estimates = m.estimates.map(heldOut);
+          if (m.estimate) m.estimate = heldOut(m.estimate);
+        }
         const reopen = plan.status === 'completed';
         this.transition(m, 'ready', 'retry requested', me.name);
         m.attempts += 1;

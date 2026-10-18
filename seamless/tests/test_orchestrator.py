@@ -702,6 +702,65 @@ async def test_a_strategy_change_to_a_handover_is_refused_while_an_earlier_attem
         await h.orch.stop()
 
 
+@pytest.mark.parametrize(
+    ("record", "passes", "held"),
+    [
+        ({"dest_volumes": {"vol-1": "dst-vol-1"}}, 2, True),
+        ({"dest_volumes": {"vol-1": "dst-vol-1"}}, 0, True),
+        ({"dest_volumes": {}, "pending_snapshot": "snap-1"}, 0, False),
+        (None, 0, False),
+    ],
+    ids=[
+        "volumes held",
+        "volumes held by the record alone",
+        "a pending source snapshot alone",
+        "nothing held",
+    ],
+)
+async def test_a_retry_marks_the_handover_ineligible_while_volumes_are_held(
+    tmp_path, store, record, passes, held
+):
+    """SDD §12, §9.2 (review 41b's lead): a Retry assesses nothing anew, but it marks the stored
+    storage_handover estimate ineligible with §9.2's reason while the migration holds an earlier
+    attempt's destination volumes - the dashboard offered "Use Storage handover", and only a
+    refusal told why. The other estimates stay as the last validation stored them."""
+    from seamless_migrate.executors.ansible import run_dir
+    from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
+
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"handover": handover, "auto_cutover": False, "default_strategy": Strategy.warm},
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        first = await h.by_vm(plan.id, "vm-1")
+        before = {e.strategy: (e.eligible, list(e.reasons)) for e in first.estimates}
+        assert before[Strategy.storage_handover] == (True, [])
+        first.phase = P.rolled_back
+        first.phase_history = [*first.phase_history, *_history(*UNCUT)]
+        first.sync_passes = _passes(passes, first.phase_history)
+        if record is not None:
+            path = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(record))
+        store.put("migration", first)
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        await h.orch.retry(first.id, "alice")
+        after = {
+            e.strategy: (e.eligible, list(e.reasons))
+            for e in (await h.migration(first.id)).estimates
+        }
+        expected = (False, [HELD_VOLUMES_REASON]) if held else (True, [])
+        assert after == {**before, Strategy.storage_handover: expected}
+    finally:
+        await h.orch.stop()
+
+
 async def test_an_unreadable_workload_record_counts_as_volumes_held(tmp_path, store):
     """SDD §9.3 (review RV39-04): a record that cannot be read may list volumes the next attempt
     uses: it counts as holding them, whatever the strategy's fallback would say."""
@@ -5023,8 +5082,9 @@ async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_
         "an approve of its recommendation after a cold rollback that kept the volumes",
     ],
 )
+@pytest.mark.parametrize("marked", [True, False], ids=["marked by the Retry", "stored before"])
 async def test_an_advisor_decision_takes_no_handover_while_an_earlier_attempt_holds_volumes(
-    tmp_path, store, action, answer, attempt, passes
+    tmp_path, store, action, answer, attempt, passes, marked
 ):
     """SDD §14.6, §9.2 (review RV41B-01): approve and override judge eligible at the request, as
     PUT …/strategy does (RV40-01). After an attempt whose record keeps its destination volumes - a
@@ -5033,7 +5093,9 @@ async def test_an_advisor_decision_takes_no_handover_while_an_earlier_attempt_ho
     override to it is refused (422), an approve of a recommendation of it (the advisor's
     below-threshold answer, the rules having chosen cold) too (409), each naming the held volumes,
     and neither the strategy nor the plan changes - a paused plan's Start would have run the
-    handover over them. Another option is still a person's call."""
+    handover over them. Another option is still a person's call. The Retry marks the stored
+    estimate ineligible (review 41b's lead); one stored before - an upgraded deployment's - is
+    judged at the request all the same."""
     from seamless_migrate.executors.ansible import run_dir
     from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
 
@@ -5066,7 +5128,16 @@ async def test_an_advisor_decision_takes_no_handover_while_an_earlier_attempt_ho
         paused.status = PlanStatus.paused
         store.put("plan", paused)
         retried = await h.orch.retry(first.id, "alice")
-        assert retried.estimate_for(Strategy.storage_handover).eligible  # as stored
+        marking = retried.estimate_for(Strategy.storage_handover)
+        assert (marking.eligible, marking.reasons) == (False, [HELD_VOLUMES_REASON])
+        if not marked:  # the estimate as a version before the marking stored it
+            retried.estimates = [
+                e.model_copy(update={"eligible": True, "reasons": []})
+                if e.strategy == Strategy.storage_handover
+                else e
+                for e in retried.estimates
+            ]
+            store.put("migration", retried)
         if action == "override":
             with pytest.raises(Unprocessable, match=HELD_VOLUMES_REASON):
                 await h.orch.override_recommendation(

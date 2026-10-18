@@ -3035,9 +3035,37 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     expect(warm.strategy).toBe('warm');
   });
 
-  it.each(['override', 'approve'] as const)(
-    'takes no storage handover by an advisor decision (%s) while an earlier attempt holds its volumes, as the API (SDD §14.6, review RV41B-01)',
-    async (action) => {
+  it.each([
+    ['held', 1, false],
+    ['nothing held', 0, true],
+  ] as const)("marks a retried migration's storage handover ineligible while its volumes are held: %s, as the API (SDD §12, §9.2)", async (_, passes, eligible) => {
+    const { server, client } = setup('operator');
+    const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!; // ready, its handover estimate eligible
+    const before = m.estimates.map((e) => ({ ...e }));
+    expect(before.find((e) => e.strategy === 'storage_handover')!.eligible).toBe(true);
+    // a warm attempt rolled back - with a pass the mock reads as volumes kept (it keeps no record) - then a Retry
+    m.strategy = 'warm';
+    m.phase = 'rolled_back';
+    m.sync_passes = passes
+      ? [{ number: 1, kind: 'full', started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 }]
+      : [];
+    await client.post(`/migrations/${m.id}/retry`, {});
+    const handover = m.estimates.find((e) => e.strategy === 'storage_handover')!;
+    expect([handover.eligible, handover.reasons]).toEqual(eligible ? [true, []] : [false, [
+      'an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first',
+    ]]);
+    // the other estimates as the last validation stored them
+    expect(m.estimates.filter((e) => e.strategy !== 'storage_handover')).toEqual(before.filter((e) => e.strategy !== 'storage_handover'));
+  });
+
+  it.each([
+    ['override', true],
+    ['approve', true],
+    ['override', false],
+    ['approve', false],
+  ] as const)(
+    'takes no storage handover by an advisor decision (%s; the Retry marked it: %s) while an earlier attempt holds its volumes, as the API (SDD §14.6, review RV41B-01)',
+    async (action, marked) => {
       const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
       const as = (token: string) => new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
       const eligible = (m: Migration, s: Strategy) => m.estimates.find((e) => e.strategy === s)?.eligible === true;
@@ -3067,7 +3095,11 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
         })),
       ];
       await as('operator').post(`/migrations/${m.id}/retry`, {});
-      expect([m.phase, eligible(m, 'storage_handover')]).toEqual(['ready', true]); // as stored
+      expect([m.phase, eligible(m, 'storage_handover')]).toEqual(['ready', false]); // the Retry marks it
+      if (!marked) {
+        // the estimate as a version before the marking stored it: judged at the request all the same
+        m.estimates = m.estimates.map((e) => (e.strategy === 'storage_handover' ? { ...e, eligible: true, reasons: [] } : e));
+      }
       const refusal = `storage_handover is not eligible for ${m.vm.name}: an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first.`;
       if (action === 'override') {
         await expect(
