@@ -263,9 +263,11 @@ for plan in json.load(sys.stdin):
     case $id in
       '' | .* | *[!A-Za-z0-9._-]*) drain_failed "the API returned a plan id this script will not use: '$id'" ;;
     esac
-    curl -fsS --max-time 30 -X POST -H "$HEADER" -o /dev/null "$API/api/v1/plans/$id/pause" ||
-      drain_failed "cannot pause plan $id"
+    # named before its answer: a pause the API applied whose answer never came - a timeout, an interrupt - leaves the
+    # plan paused, and resume starts a running plan as it is (SDD §17.2, review RV42A-06)
     PAUSED+=("$id")
+    curl -fsS --max-time 30 -X POST -H "$HEADER" -o /dev/null "$API/api/v1/plans/$id/pause" ||
+      drain_failed "cannot pause plan $id - it may be paused all the same"
   done
   if [ ${#PAUSED[@]} -gt 0 ]; then say "paused: ${PAUSED[*]}"; else say "no plan was running"; fi
   deadline=$(($(date +%s) + WAIT_TIMEOUT))

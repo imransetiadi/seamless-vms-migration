@@ -586,6 +586,20 @@ def test_a_refused_rollout_is_undone_also_when_the_settings_cannot_be_put_back(t
 
 
 @pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+@pytest.mark.parametrize("action", ["start", "restart", "up", "down", "stop"])
+def test_a_cluster_dry_run_calls_no_tool_and_changes_nothing(tmp_path, platform, action):
+    """SDD §17.2 (reviews RV38B-17, RV42A-08): --dry-run prints a cluster action's commands and runs
+    none - start's dry run, rewritten for PostgreSQL's extra pods, read the cluster or scaled it for
+    real in mutants no test noticed. A stopped stack with PostgreSQL scaled out stays as it was."""
+    state = fake_kube.cluster(replicas=0, postgres=2)
+    proc, calls, _ = _run(tmp_path, platform, action, "--dry-run", cluster=state)
+    assert proc.returncode == 0, proc.stderr
+    assert calls == []
+    assert _cluster_after(tmp_path) == state
+    assert [line for line in proc.stdout.splitlines() if line.startswith("+ ")], proc.stdout
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
 def test_a_cluster_capacity_dry_run_changes_nothing(tmp_path, platform):
     """SDD §17.2 (reviews RV38B-17, RV41A-08): --dry-run prints every command of a cluster's
     capacity - the server-side dry run, the ConfigMap's patch, the template's, the rollout - and
@@ -1035,6 +1049,21 @@ def test_a_drain_pauses_no_plan_for_a_restart_its_make_target_refuses(tmp_path, 
     )  # fmt: skip
     assert proc.returncode == 0, proc.stderr
     assert [c["cmd"] for c in calls][-1] == "make"
+
+
+def test_a_pause_that_got_no_answer_is_named_for_resume(tmp_path):
+    """SDD §17.2 (review RV42A-06): a pause the API applied while its answer never came - curl's
+    --max-time, a Route's timeout - leaves the plan paused; it is named for resume with the plans
+    paused before it. It was named only once its answer came."""
+    rules = [
+        {"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"stdout": RUNNING}]},
+        {"cmd": "curl", "has": ["plan-bb/pause"], "answers": [{"exit": 28}]},
+    ]
+    proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", rules=rules)
+    assert proc.returncode == 1, proc.stderr
+    assert "cannot pause plan plan-bb" in proc.stderr and "may be paused" in proc.stderr
+    assert f"resume --token-file {tmp_path / 'operator.token'} plan-aa plan-bb" in proc.stderr
+    assert not [c for c in calls if c["cmd"] == "make"]
 
 
 def test_an_interrupted_drain_names_the_plans_it_paused(tmp_path):
