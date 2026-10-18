@@ -919,6 +919,24 @@ def test_resume_starts_the_plans_a_drain_paused(tmp_path):
     assert proc.returncode == 2 and calls == []
 
 
+def test_resume_starts_every_plan_and_names_the_ones_start_refuses(tmp_path):
+    """SDD §17.2 (review RV38B-14): resume tries every plan it is given - one Start refuses (409:
+    cancelled meanwhile, or a migration blocked) is named, the others start all the same - and
+    exits 1. It stopped at the first refusal: the plans after it stayed paused, unnamed."""
+    rules = [{"cmd": "curl", "has": ["plan-bb/start"], "answers": [{"exit": 22}]}]
+    plans = ["plan-aa", "plan-bb", "plan-cc"]
+    proc, calls, _ = _run(
+        tmp_path, "podman", "resume", "--token-file", "@TOKEN_FILE", *plans, rules=rules
+    )
+    tried = [c["args"][-1].rsplit("/", 2)[-2] for c in calls if c["cmd"] == "curl"]
+    assert tried == plans, (tried, proc.stderr)
+    assert proc.returncode == 1
+    assert "started: plan-aa" in proc.stdout and "started: plan-cc" in proc.stdout
+    assert "started: plan-bb" not in proc.stdout
+    assert "cannot start plan plan-bb" in proc.stderr, proc.stderr
+    assert "plan-aa" not in proc.stderr and "plan-cc" not in proc.stderr
+
+
 @pytest.mark.parametrize("argv", [["dance"], ["up", "--bogus"], [], ["status", "--namespace"]])
 def test_an_unknown_action_or_option_is_refused_with_the_usage(tmp_path, argv):
     """SDD §17.2: a mistyped action or option runs nothing and says how to call the script."""

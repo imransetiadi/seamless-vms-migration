@@ -458,11 +458,18 @@ if [ -n "$DRAIN" ] || [ "$ACTION" = resume ]; then
   open_token "${DRAIN:-$TOKEN_FILE}"
 fi
 if [ "$ACTION" = resume ]; then
+  # every plan given: one Start refuses (409: cancelled meanwhile, a migration blocked) is named, the others start all
+  # the same (SDD §17.2, review RV38B-14)
+  refused=0
   for id in "${ARGS[@]}"; do
-    api -X POST -H "$HEADER" -o /dev/null "$API/api/v1/plans/$id/start" || die "cannot start plan $id"
-    say "started: $id"
+    if api -X POST -H "$HEADER" -o /dev/null "$API/api/v1/plans/$id/start"; then
+      say "started: $id"
+    else
+      printf '%s: cannot start plan %s: see it in the dashboard\n' "$PROG" "$id" >&2
+      refused=1
+    fi
   done
-  exit 0
+  exit "$refused"
 fi
 if [ -n "$DRAIN" ]; then
   [ "$ACTION" != capacity ] || capacity_check

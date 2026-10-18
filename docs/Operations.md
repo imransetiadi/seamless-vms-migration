@@ -287,7 +287,9 @@ end first:
    scripts/seamless-ctl.sh docker resume --token-file ~/.seamless/operator.token plan-0001 plan-0002
    ```
 
-   Or press **Resume** on each plan in the dashboard. On a cluster, `resume` needs `--url` too.
+   Or press **Resume** on each plan in the dashboard. On a cluster, `resume` needs `--url` too. A plan Start
+   refuses - cancelled meanwhile, or one whose migration was blocked (409) - is named, the others start all the
+   same, and the script exits 1: see that plan in the dashboard.
 
 `--drain` and `resume` need `curl` and `python3` on the machine that runs the script. On a cluster whose Route
 or Ingress uses a private CA, point curl at it: `export CURL_CA_BUNDLE=/path/to/ca.pem`.
