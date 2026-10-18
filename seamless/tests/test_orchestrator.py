@@ -3205,6 +3205,84 @@ async def test_a_cancel_after_a_failed_first_pass_removes_what_its_record_holds(
     assert rollbacks == [{"delete_dest_volumes": True}]
 
 
+@pytest.mark.parametrize("restarted", [False, True])
+async def test_a_cancels_cleanup_runs_the_step_of_the_attempt_whose_data_remains(
+    tmp_path, store, restarted
+):
+    """SDD §5.1 (review RV43B-04): a warm attempt failed with a pending source snapshot in its
+    record - no destination volume, so after the Retry the storage handover stays open and
+    PUT …/strategy takes it. The cancel's cleanup is still the warm attempt's rollback step, run
+    as warm: the handover's step knows nothing of that snapshot and would report 'nothing to roll
+    back'. A cleanup the orchestrator runs again at its start, the cancel cut short, does the
+    same."""
+    from seamless_migrate.executors.ansible import run_dir
+    from seamless_migrate.executors.router import ExecutorRouter
+
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"handover": handover, "auto_cutover": False, "default_strategy": Strategy.warm},
+    )
+    calls: list[tuple[str, str, dict]] = []
+
+    class Recorder:
+        def __init__(self, name):
+            self.name = name
+
+        def supports(self, strategy):
+            return True
+
+        async def run(self, step, ctx):
+            calls.append((self.name, str(ctx.migration.strategy), dict(ctx.options)))
+            return StepResult(details={"source_running": True})
+
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        m = await h.by_vm(plan.id, "vm-1")
+        m.phase = P.failed
+        m.phase_history = [*m.phase_history, *_history(P.precopy, P.failed)]
+        store.put("migration", m)
+        path = run_dir(h.settings, plan.id, m.id) / "osm" / "workload_warm" / "vm-1.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "server_id": "vm-1",
+                    "dest_volumes": {},
+                    "passes": [],
+                    "pending_snapshot": {"transfer_uuid": "t-1", "volume_map": {}},
+                    "destination_server_id": None,
+                }
+            )
+        )
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        await h.orch.retry(m.id, "alice")
+        await h.orch.set_strategy(m.id, Strategy.storage_handover, "alice")
+        h.orch.executors = ExecutorRouter(
+            h.settings, ansible=Recorder("ansible"), handover=Recorder("storage_handover")
+        )
+        if restarted:
+            # the cancel saved its mark, then the control plane stopped before the cleanup ran
+            h.orch._stopping = True
+            await h.orch.cancel(m.id, "rina", "not migrated after all")
+            await h.orch.stop()
+            assert calls == []
+            await h.orch.start()
+        else:
+            await h.orch.cancel(m.id, "rina", "not migrated after all")
+        assert (await _settled(h, m.id))[-1] == "cleanup"
+    finally:
+        await h.orch.stop()
+    assert calls == [("ansible", "warm", {"delete_dest_volumes": True})]
+    left = store.get("migration", m.id, Migration)
+    assert left.strategy == Strategy.storage_handover  # the stored choice is untouched
+    assert left.checkpoint == "cleaned"
+
+
 async def test_a_rolled_back_cold_migrations_cancel_runs_no_cleanup(tmp_path, store):
     """SDD §5.1 (review RV3-07): a cold cutover lists a full pass, but the cold rollback deleted
     what the cold import recorded - its record holds nothing, so a cancel has no data path and

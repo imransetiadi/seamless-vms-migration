@@ -302,13 +302,25 @@ def _passes_since_the_kit_released_its_copies(m: Migration) -> list[SyncPass]:
 WAITING_FOR_AN_ATTEMPT = frozenset({Phase.pending, Phase.validating, Phase.blocked, Phase.ready})
 
 
-def _copies_strategy(m: Migration) -> Strategy:
-    """The strategy of the attempt whose copies remain: while ``m`` waits for its next attempt,
-    the one a Retry recorded - a validation or a strategy change may have chosen another for the
-    next attempt since -, else its own (SDD §9.3, review RV40-06)."""
-    if m.phase in WAITING_FOR_AN_ATTEMPT and m.attempt_strategies:
+def _copies_strategy(m: Migration, phase: Phase | None = None) -> Strategy:
+    """The strategy of the attempt whose copies remain: while ``m`` waits for its next attempt -
+    in ``phase``, its own by default -, the one a Retry recorded - a validation or a strategy
+    change may have chosen another for the next attempt since -, else its own (SDD §9.3, review
+    RV40-06)."""
+    if (m.phase if phase is None else phase) in WAITING_FOR_AN_ATTEMPT and m.attempt_strategies:
         return m.attempt_strategies[-1]
     return m.strategy
+
+
+def _cleanup_strategy(m: Migration) -> Strategy:
+    """The strategy whose rollback step cleans up after ``m``'s cancel: the attempt's whose data
+    the cancel decided to clean, judged in the phase the cancel left - never one a validation or
+    ``PUT …/strategy`` chose since: a storage handover's step knows nothing of a warm attempt's
+    snapshot (SDD §5.1, review RV43B-04)."""
+    left = next(
+        (c.from_phase for c in reversed(m.phase_history) if c.to_phase == Phase.cancelled), None
+    )
+    return _copies_strategy(m, left)
 
 
 def _kept_after_rollback(m: Migration) -> bool:
@@ -1776,10 +1788,17 @@ class Orchestrator:
                 plan = await self._plan(m.plan_id)
                 source = await self.db.get("provider", plan.source_provider_id, Provider)
                 destination = await self.db.get("provider", plan.destination_provider_id, Provider)
+                # the step of the attempt whose data it cleans, run as that attempt (SDD §5.1)
+                strategy = _cleanup_strategy(m)
                 ctx = self._context(
-                    m, plan, source, destination, options={"delete_dest_volumes": True}, locked=True
+                    m.model_copy(update={"strategy": strategy}),
+                    plan,
+                    source,
+                    destination,
+                    options={"delete_dest_volumes": True},
+                    locked=True,
                 )
-                result = await self.executors.for_strategy(m.strategy).run(StepName.ROLLBACK, ctx)
+                result = await self.executors.for_strategy(strategy).run(StepName.ROLLBACK, ctx)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
