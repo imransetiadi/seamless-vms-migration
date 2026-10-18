@@ -2033,9 +2033,12 @@ for `link_bps` and must be a finite positive number (422 otherwise). After every
 completed warm pass the orchestrator calibrates the migration in place and re-estimates it:
 `vm.change_rate_bps = bytes_changed / (pass.started_at − previous_pass.started_at)` (delta passes
 only; the interval is the time between the two snapshots), and the observed per-stream scan rate
-`bytes_scanned / duration_s / min(P, V)` — taken from **delta/final passes only** (pass 1 is
-usually link-bound and would understate it) — replaces `scan_bps` for that migration's estimate
-(stored as `Migration.observed_scan_bps: float | null`). `migration.estimate` is recomputed with
+— the `S` under which the scan model gives the pass's duration, `max(min(Dmax, B), B / min(P, V)) / duration_s`
+with `B = bytes_scanned` (the pass lasts as long as its largest disk's scan or its streams' share, whichever is
+longer, so a pass that ran as predicted reads back the `S` it was predicted with; review PL-07), taken from
+**delta/final passes only** (pass 1 is usually link-bound and would understate it) — replaces `scan_bps` for that
+migration's estimate (stored as `Migration.observed_scan_bps: float | null`). A pass at the aggregate ceiling
+(`A` set and `B / A >= duration_s`) does not tell `S`: it leaves the calibration as it was. `migration.estimate` is recomputed with
 the calibrated values, so `downtime_s` converges on reality before the cutover is approved.
 
 Worked example (defaults, S = 500 MiB/s, L = 125 MiB/s, c = 2 MiB/s): a 200 GiB single-disk VM
