@@ -1436,18 +1436,20 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   never deleted, nor is any volume when the VM has no kit name (`SRC_VM_NAME_UNUSABLE`, §9.3). The server the rollback
   deletes counts as this migration's only when the migration recorded it: one found by the kit's name may be another
   plan's VM the kit names alike (owner question q26), so what it held before its deletion - read from Nova's record of
-  it (`server_volumes`), as no Cinder call comes before the power-on, and recorded in the run directory
-  (`.seamless/rollback-kept.json`, written and synced before the deletion; a `rollback-kept.json` file an earlier build
-  wrote is read too) so that an attempt retried or resumed after it, which finds no server any more, keeps it too until
-  a rollback succeeds and removes the record (review RV30-05) - is kept: a later kit run refuses such a volume, and a
-  second rollback, which finds no server holding it, deletes it (review RV29-03). A record that cannot be read (a
-  damaged file) never keeps the source stopped: what to keep is then unknown, so that attempt deletes no kit volume of
-  the VM, says so in its log, and deletes the server and powers the source on as any other (review RV32A-08). No
-  record is written over one that cannot be read: for a server found by name beside it, the attempt logs the volumes
-  that server held instead - a record written over a damaged file would let a later attempt delete what that file
-  kept, and one at an unusable path (a directory there, a `.seamless/` a restore left unwritable) cannot be written
-  at all, which kept the source stopped (review RV34A-03); while the record cannot be read, no attempt deletes a kit
-  volume of the VM. The
+  it (`server_volumes`), as no Cinder call comes before the power-on, and recorded in the run directory - each attempt
+  in a record of its own in `.seamless/` (`rollback-kept.<server>.<unique>.json`), written and synced before the
+  deletion and never over another record; the single `.seamless/rollback-kept.json` and the run directory's
+  `rollback-kept.json` earlier builds wrote are read too - so that an attempt retried or resumed after it, which finds
+  no server any more, keeps it too until a rollback succeeds and removes every record (reviews RV30-05, RV35A-02) - is
+  kept: a later kit run refuses such a volume, and a second rollback, which finds no server holding it, deletes it
+  (review RV29-03). A record that cannot be read (a damaged file, a read that fails) never keeps the source stopped:
+  what to keep is then unknown, so that attempt deletes no kit volume of the VM, says so in its log, and deletes the
+  server and powers the source on as any other (review RV32A-08); it still records what a server it found by name
+  held, in a record of its own - a damaged one stays as it is (review RV34A-03) -, so an attempt whose read succeeds
+  again keeps that too (review RV35A-02). A record that cannot be written (a `.seamless/` a restore left unwritable, a
+  full or read-only volume) never keeps the source stopped either: the attempt logs the volumes the server held,
+  deletes it and powers the source on, and deletes no kit volume of the VM; an attempt after it can no more tell what
+  that server held than a rollback after one that succeeded (review RV35A-03). The
   rollback looks the server up by the kit's name only while the clock is open (§5.2), and then even when one is
   recorded: the recorded one
   may be an earlier attempt's that a failed rollback already deleted - kept recorded, as only a rollback that
