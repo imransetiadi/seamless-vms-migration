@@ -1840,9 +1840,17 @@ class AnsibleExecutor:
             # a stretched network -, and the destination's clean-up never keeps it stopped - the
             # kit's ports and volumes matter only to the next attempt, which a failure there
             # retries with the source running (SDD §7.2, §8, reviews RV29-01, RV30-04)
-            await self.providers.get(ctx.source).power_on(vm.source_id)
-            # it runs: the clock closes now, whatever fails after (SDD §5.2, review RV30-03)
-            await ctx.mark_downtime_end()
+            source = self.providers.get(ctx.source)
+
+            async def power_on_and_close() -> None:
+                await source.power_on(vm.source_id)
+                # it runs: the clock closes now, whatever fails after (SDD §5.2, review RV30-03)
+                await ctx.mark_downtime_end()
+
+            # one unit, which a cancel - the step timeout, a shutdown - waits out: a power-on
+            # vCenter finishes never leaves the clock open while the VM runs (SDD §5.2, review
+            # RV38A-04)
+            await outlive_cancel(power_on_and_close())
             if servers or kept or unreadable:
                 # a server booted from the kit's volumes: what this rollback then cannot delete
                 # or keeps is no completed copy for a later run (SDD §7.2, review RV32A-01)

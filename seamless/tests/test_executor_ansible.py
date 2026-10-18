@@ -3337,6 +3337,52 @@ async def test_a_vmware_rollback_whose_clock_close_the_store_refused_is_retried(
     assert env.registry.calls[-2:] == [("power_on", "srv-1"), ("clock_refused",)]
 
 
+@pytest.mark.parametrize(
+    "cancelled", [True, False], ids=["cancelled during the power-on", "not cancelled"]
+)
+async def test_a_vmware_rollback_closes_the_clock_once_vcenter_powered_the_vm_on(env, cancelled):
+    """SDD §5.2 (review RV38A-04): the power-on and the clock's close run as one. A cancel - the
+    step timeout, a shutdown - landing while vCenter runs the PowerOnVM_Task, whose wait reads no
+    cancel, waits for the task and the close: the VM runs, and its clock is closed, never left
+    open while it runs."""
+    import contextlib
+    import threading
+
+    ctx, rec = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        destination_server_id="dst-9",
+        downtime_started_at=utcnow(),
+    )
+    submitted, release, powered = threading.Event(), threading.Event(), []
+
+    async def power_on(source_id):
+        """VMwareProvider.power_on's shape: the vCenter work in a thread under the call's bound."""
+        env.registry.calls.append(("power_on", source_id))
+
+        def work():
+            submitted.set()  # PowerOnVM_Task submitted
+            release.wait(5)  # vCenter runs the task
+            powered.append(source_id)  # the VM runs
+
+        await asyncio.wait_for(asyncio.to_thread(work), 600)
+
+    class Slow(FakeImpl):
+        pass
+
+    Slow.power_on = staticmethod(power_on)
+    env.registry.get = lambda provider: Slow(env.registry)
+    step = asyncio.create_task(env.executor.run(StepName.ROLLBACK, ctx))
+    assert await asyncio.to_thread(submitted.wait, 5)
+    if cancelled:
+        step.cancel()
+    release.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        await step
+    assert (powered, rec.downtime_ends) == (["srv-1"], 1)
+
+
 @pytest.mark.parametrize("powered_on", [True, None])
 async def test_a_converted_kit_volume_is_no_reuse_once_vcenter_powered_the_vm_on_since_the_stop(
     env, powered_on
