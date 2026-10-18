@@ -388,16 +388,38 @@ def destination_project(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) ->
     return vm.project
 
 
-def resource_demand(vm: VMRef, plan: Plan | None = None) -> dict[str, int]:
+def destination_flavor(
+    vm: VMRef, plan: Plan, dst_inv: DestinationInventory
+) -> dict[str, Any] | None:
+    """The destination flavor ``vm``'s server is created with (SDD §9.3, review PL-01): the mapped
+    one, else the same-named or automatically matched one. ``None`` for a VM without a flavor (a
+    VMware VM: the migration kit chooses), for a flavor pre-staging creates with the source's
+    size, and when none resolves."""
+    if not vm.flavor or flavor_prestaged(vm, plan, dst_inv):
+        return None
+    target = plan.mappings.flavors.get(vm.flavor)
+    if target is not None:
+        return next((f for f in dst_inv.flavors if f.get("name") == target), None)
+    return fitting_flavor(vm, dst_inv)
+
+
+def resource_demand(
+    vm: VMRef, plan: Plan | None = None, dst_inv: DestinationInventory | None = None
+) -> dict[str, int]:
     """Quota the VM needs at the destination. An ``image_root`` disk becomes a destination volume
-    on the warm path (``boot_disk_copy``), so it counts unless the plan is cold-only."""
+    on the warm path (``boot_disk_copy``), so it counts unless the plan is cold-only. Its cores and
+    RAM are those of the destination flavor its server is created with, when one resolves (SDD
+    §9.3, review PL-01)."""
     kinds = {"volume", "vmdk"}
     if plan is None or plan.default_strategy != Strategy.cold:
         kinds.add("image_root")
     volumes = [d for d in vm.disks if d.kind in kinds]
+    flavor = (
+        destination_flavor(vm, plan, dst_inv) if plan is not None and dst_inv is not None else None
+    )
     return {
-        "cores": vm.vcpus,
-        "ram_mb": vm.ram_mb,
+        "cores": int(flavor.get("vcpus") or 0) if flavor else vm.vcpus,
+        "ram_mb": int(flavor.get("ram_mb") or 0) if flavor else vm.ram_mb,
         "instances": 1,
         "volumes": len(volumes),
         "gigabytes": sum(d.size_gb for d in volumes),
@@ -416,12 +438,17 @@ NOTHING_STILL_TO_COME = frozenset(
 )
 
 
-def remaining_demand(vm: VMRef, plan: Plan | None, phase: Phase | None) -> dict[str, int]:
+def remaining_demand(
+    vm: VMRef,
+    plan: Plan | None,
+    phase: Phase | None,
+    dst_inv: DestinationInventory | None = None,
+) -> dict[str, int]:
     """What a cutover of ``vm`` will still create at the destination, by its migration's phase
     (SDD §9.3, review PL-02): all of it with no migration (``None``) or one that runs, or runs
     again, from ready; its server alone once its destination volumes exist or are being created;
     nothing once what it holds is in use, or being released."""
-    demand = resource_demand(vm, plan)
+    demand = resource_demand(vm, plan, dst_inv)
     if phase in NOTHING_STILL_TO_COME:
         return dict.fromkeys(demand, 0)
     if phase in SERVER_STILL_TO_COME:
@@ -442,7 +469,7 @@ def _quota_shortfall(
     totals = dict.fromkeys(_QUOTA_KEYS, 0)
     for other in all_vms:
         if destination_project(other, plan, dst_inv) == project:
-            share = remaining_demand(other, plan, phases.get(other.source_id))
+            share = remaining_demand(other, plan, phases.get(other.source_id), dst_inv)
             for key, value in share.items():
                 totals[key] += value
     free = dst_inv.quotas[project]

@@ -182,7 +182,8 @@ async def test_the_waves_of_a_plan_whose_finished_vm_left_the_source_are_planned
 
 class QuotaDestination(StaticDestination):
     """A destination whose free quota is what Nova and Cinder report for the project: the limit
-    less what its servers and volumes already use (providers/openstack.py)."""
+    less what its servers and volumes already use (providers/openstack.py), and whose m1.small is
+    the test VMs' size - the flavor the quota prices them with (SDD §9.3, review PL-01)."""
 
     def __init__(self, free: dict[str, int]) -> None:
         super().__init__()
@@ -190,6 +191,9 @@ class QuotaDestination(StaticDestination):
 
     async def inventory(self):
         inv = await super().inventory()
+        inv.flavors = [
+            {"name": "m1.small", "vcpus": 2, "ram_mb": 4096, "disk_gb": 20, "extra_specs": {}}
+        ]
         inv.quotas = {"finance": dict(self.free)}
         return inv
 

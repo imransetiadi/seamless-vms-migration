@@ -874,6 +874,67 @@ def test_the_quota_counts_what_a_cutover_will_still_create(phase):
         assert f"{key} {value} > {value - 1} free" in short.message
 
 
+#: the destination flavors of the PL-01 tests: a larger one, and one named like the source's
+#: m1.small with another size
+SIZED_FLAVORS = [
+    {"name": "m1.small", "vcpus": 4, "ram_mb": 8192, "disk_gb": 20, "extra_specs": {}},
+    {"name": "m1.large", "vcpus": 8, "ram_mb": 16384, "disk_gb": 80, "extra_specs": {}},
+]
+
+
+PRICED_CASES = [
+    ("the mapped flavor", {}, {"mappings": Mappings(flavors={"m1.small": "m1.large"})}, (8, 16384)),
+    (
+        "the automatically matched flavor",
+        {"flavor": "c5.medium", "vcpus": 5, "ram_mb": 6144},
+        {},
+        (8, 16384),
+    ),
+    ("the same-named flavor's own size", {}, {}, (4, 8192)),
+    (
+        "a flavor pre-staging creates: the VM's size",
+        {"flavor": "c3.medium", "vcpus": 3, "ram_mb": 6144},
+        {"prestage_resources": ["flavors"]},
+        (3, 6144),
+    ),
+    ("a VMware VM: the VM's size", {"flavor": None, "vcpus": 3, "ram_mb": 6144}, {}, (3, 6144)),
+    (
+        "no fitting flavor: the VM's size",
+        {"flavor": "x9.huge", "vcpus": 32, "ram_mb": 6144},
+        {},
+        (32, 6144),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "case, vm_kw, plan_kw, priced", PRICED_CASES, ids=[c[0] for c in PRICED_CASES]
+)
+def test_the_quota_prices_a_vm_with_its_destination_flavor(case, vm_kw, plan_kw, priced):
+    """SDD §9.3 (review PL-01): Nova charges the flavor the server is created with - the mapped
+    one, else the same-named or automatically matched one -, so a VM's cores and ram are that
+    flavor's; its own for a flavor pre-staging creates with the source's size, a VMware VM (the
+    migration kit chooses) and when no destination flavor resolves."""
+    vm = make_vm(**vm_kw)
+    plan = make_plan(**plan_kw)
+    cores, ram_mb = priced
+
+    def assessed(quota):
+        return check(vm, plan=plan, dst=dst_inv(flavors=SIZED_FLAVORS, quotas={"finance": quota}))
+
+    tight = {"cores": cores - 1, "ram_mb": ram_mb, "instances": 5, "volumes": 5, "gigabytes": 1000}
+    short = only(assessed(tight), "DST_QUOTA_INSUFFICIENT")
+    assert f"cores {cores} > {cores - 1} free" in short.message, case
+    short = only(
+        assessed({**tight, "cores": cores, "ram_mb": ram_mb - 1}), "DST_QUOTA_INSUFFICIENT"
+    )
+    assert f"ram_mb {ram_mb} > {ram_mb - 1} free" in short.message, case
+    fits = {**tight, "cores": cores}
+    assert "DST_QUOTA_INSUFFICIENT" not in [f.code for f in assessed(fits)], case
+    demand = resource_demand(vm, plan, dst_inv(flavors=SIZED_FLAVORS))
+    assert (demand["cores"], demand["ram_mb"]) == priced, case
+
+
 def test_finding_net_mtu_shrink():
     f = only(check(dst=dst_inv(networks={"app-net": 1442})), "NET_MTU_SHRINK")
     assert f.severity == Severity.warning and "1442" in f.message
