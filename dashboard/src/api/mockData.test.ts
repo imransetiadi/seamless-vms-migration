@@ -623,6 +623,8 @@ interface EligibilityCase {
   source: ProviderSide;
   destination: ProviderSide;
   findings: { code: string; severity: Severity }[];
+  /** The migration holds the destination volumes an earlier attempt created (SDD §9.2, §9.3); false when not given. */
+  holds_volumes?: boolean;
   expected: Record<string, string[]>;
 }
 
@@ -651,7 +653,9 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
     const plan = { ...base, ...c.plan } as Plan;
     const findings = c.findings.map((f) => ({ code: f.code, severity: f.severity, message: '', remediation: null, strategies: [] }) as Finding);
     const destinationKind: ProviderKind = c.source_kind === 'vmware' ? 'rhoso' : 'openstack';
-    const reasons = eligibility(c.vm, c.source_kind, plan, provider('src', c.source_kind, c.source), provider('dst', destinationKind, c.destination), findings);
+    const reasons = eligibility(
+      c.vm, c.source_kind, plan, provider('src', c.source_kind, c.source), provider('dst', destinationKind, c.destination), findings, c.holds_volumes ?? false,
+    );
     expect(reasons).toEqual(c.expected);
   });
 

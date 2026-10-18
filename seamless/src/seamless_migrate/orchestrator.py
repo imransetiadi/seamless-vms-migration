@@ -726,10 +726,12 @@ class Orchestrator:
         # what a cutover of each VM will still create - its server alone when an earlier attempt
         # holds its destination volumes (SDD §9.3, reviews PL-02, RV38A-01)
         shares: dict[str, QuotaShare] = {}
+        holding_volumes: set[str] = set()
         for vm_id, m in existing.items():
             share = quota_share(m.phase)
             if share == "all" and await self.holds_destination_volumes(m):
                 share = quota_share(m.phase, holds_volumes=True)
+                holding_volumes.add(vm_id)
             shares[vm_id] = share
         cancelled = sorted(
             m.vm.name for vm in vms if (m := existing.get(vm.source_id)) and m.phase == P.cancelled
@@ -812,7 +814,15 @@ class Orchestrator:
             findings = [*findings, *detached]
             resolved = resolve_mappings(vm, plan, dst_inv)
             reasons = eligibility(
-                vm, source.kind, plan, src_caps, dst_caps, findings, destination.label
+                vm,
+                source.kind,
+                plan,
+                src_caps,
+                dst_caps,
+                findings,
+                destination.label,
+                # what an earlier attempt left at the destination (SDD §9.2, review 39 lead L1)
+                holds_volumes=vm.source_id in holding_volumes,
             )
             estimates = [
                 estimate(vm, strategy, params, plan.downtime_slo_s).model_copy(

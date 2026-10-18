@@ -314,6 +314,15 @@ const DATA_SENT: DataSentItem[] = [
   { decision_type: 'console_screening', tool: 'jev_screen', fields: [{ key: 'console', label: 'The last 6,000 characters of the console, redacted' }], sent: false, note: LOCAL_CONSOLE },
 ];
 
+/**
+ * Whether an OpenStack migration holds the destination volumes an earlier attempt created (SDD §9.3, review RV38A-01):
+ * the mock keeps no workload record, so as the API without one - a warm migration's passes. (A VMware source has no
+ * storage handover, the one strategy this keeps out.)
+ */
+function holdsDestinationVolumes(m: Migration): boolean {
+  return m.strategy === 'warm' && m.sync_passes.length > 0;
+}
+
 /** Drop the cutover request with its requester and the window bypass granted with it (SDD §5.4). */
 function clearRequest(m: Migration): void {
   m.cutover_requested = false;
@@ -1151,7 +1160,8 @@ export class MockServer {
     const roles = capabilityRoles(destination.capabilities);
     const profile = policyProfileOf(destination.capabilities, destination);
     m.findings = preflight(m.vm, source.kind, plan, networks, { subnets, selected, networkDetails, roles, profile, destination: providerLabel(destination) });
-    const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings);
+    // what an earlier attempt left at the destination keeps a handover out (SDD §9.2, review 39 lead L1)
+    const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings, holdsDestinationVolumes(m));
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
     m.estimate = m.estimates.find((e) => e.strategy === m.strategy) ?? null;

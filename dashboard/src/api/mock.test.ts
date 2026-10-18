@@ -2897,6 +2897,28 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     expect([left.phase, left.wave_id]).toEqual(['rolled_back', 'wave-new']);
   });
 
+  it('makes a storage handover ineligible while an earlier attempt holds its volumes, as the API words it (SDD §9.2, review 39 lead L1)', async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!; // a shared Ceph handover plan
+    const warm = server.migrations.find((m) => m.id === 'mig-b2c4d6e872')!;
+    const other = server.migrations.find((m) => m.id === 'mig-b2c4d6e870')!;
+    // what a rolled-back warm attempt leaves once a Retry put it back in ready: its passes (the mock keeps no record);
+    // a warm one without a pass holds nothing
+    warm.strategy = 'warm';
+    other.strategy = 'warm';
+    warm.sync_passes = [
+      { number: 1, kind: 'full', started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 },
+    ];
+    await client.post(`/plans/${plan.id}/validate`);
+    const handover = (m: Migration) => server.migrations.find((x) => x.id === m.id)!.estimates.find((e) => e.strategy === 'storage_handover')!;
+    expect([handover(warm).eligible, handover(warm).reasons]).toEqual([
+      false,
+      ['an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first'],
+    ]);
+    expect(server.migrations.find((m) => m.id === warm.id)!.strategy).not.toBe('storage_handover');
+    expect(handover(other).eligible).toBe(true);
+  });
+
   it("plans the automatic waves from the plan's VMs, a never-validated plan's too (review RV39-03)", async () => {
     const { server, client } = setup('operator');
     const vms = freeVms(server, 'rhosp17-dc1', 2).map((v) => v.source_id);

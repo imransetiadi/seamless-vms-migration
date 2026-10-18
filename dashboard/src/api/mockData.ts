@@ -840,6 +840,10 @@ const diskIds = (disks: VMRef['disks']) => disks.map((d) => d.name || d.id).join
  * Every strategy of the source's family with its ineligibility reasons, word for word as the API's
  * planning/selector.eligibility (SDD §9.2, §16): the shared eligibility_cases.json pins both (review RV20-08).
  */
+/** Why a migration that holds an earlier attempt's destination volumes takes no storage handover: the API's words (SDD §9.2). */
+export const HELD_VOLUMES_REASON =
+  'an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first';
+
 export function eligibility(
   vm: VMRef,
   sourceKind: ProviderKind,
@@ -847,6 +851,7 @@ export function eligibility(
   source: Provider,
   destination: Provider,
   findings: Finding[],
+  holdsVolumes = false,
 ): Partial<Record<Strategy, string[]>> {
   const result: Partial<Record<Strategy, string[]>> = {};
   const multiattach = vm.disks.filter((d) => d.multiattach);
@@ -892,6 +897,8 @@ export function eligibility(
         `the source's compute API ${String(source.capabilities.compute_microversion)} is below ${HANDOVER_COMPUTE_FLOOR} (the handover's delete_on_termination update of the source server)`,
       );
     }
+    // a handover never removes what an earlier attempt left at the destination (SDD §9.2, review 39 lead L1)
+    if (holdsVolumes) handover.push(HELD_VOLUMES_REASON);
     result.storage_handover = handover;
   }
   for (const finding of findings) {

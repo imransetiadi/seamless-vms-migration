@@ -484,6 +484,48 @@ async def test_an_unreadable_workload_record_counts_as_volumes_held(tmp_path, st
         await h.orch.stop()
 
 
+@pytest.mark.parametrize(
+    "held",
+    ["its record holds volumes", "warm passes without a record", "nothing held"],
+)
+async def test_a_handover_is_ineligible_while_an_earlier_attempt_holds_its_volumes(
+    tmp_path, store, held
+):
+    """SDD §9.2, §9.3 (review 39, lead L1): a warm attempt Retry put back in ready keeps its
+    destination volumes - its workload record says so, or, with no record (the demo), its passes.
+    A storage handover manages the source's volumes and never removes those, so it is ineligible
+    then, saying what to run instead; with nothing held it stays eligible."""
+    from seamless_migrate.executors.ansible import run_dir
+    from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
+
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(tmp_path, store, [vm(1)], {"handover": handover, "auto_cutover": False})
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        first = await h.by_vm(plan.id, "vm-1")
+        assert first.estimate_for(Strategy.storage_handover).eligible
+        # what a rolled-back warm attempt leaves once a Retry put it back in ready
+        first.strategy = Strategy.warm
+        first.phase = P.ready
+        if held == "its record holds volumes":
+            record = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+            record.parent.mkdir(parents=True, exist_ok=True)
+            record.write_text(json.dumps({"dest_volumes": {"vol-1": "dst-vol-1"}}))
+        elif held == "warm passes without a record":
+            first.sync_passes = _passes(2)
+        store.put("migration", first)
+        await h.orch.validate_plan(plan.id, "alice")
+        again = await h.by_vm(plan.id, "vm-1")
+    finally:
+        await h.orch.stop()
+    estimate = again.estimate_for(Strategy.storage_handover)
+    if held == "nothing held":
+        assert estimate.eligible
+    else:
+        assert (estimate.eligible, estimate.reasons) == (False, [HELD_VOLUMES_REASON])
+        assert again.strategy != Strategy.storage_handover
+
+
 @pytest.mark.parametrize("cutover_ran", [True, False], ids=["its cutover ran", "before it"])
 async def test_a_revalidation_counts_all_of_a_vmware_warm_attempt_whose_cutover_ran(
     tmp_path, store, cutover_ran
