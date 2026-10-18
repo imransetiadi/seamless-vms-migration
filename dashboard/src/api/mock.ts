@@ -1679,6 +1679,10 @@ export class MockServer {
 
   /** Approve or override an advisor decision, like the API (SDD §14.6). */
   private decideRecommendation(me: Me, recId: string, action: 'approve' | 'override', input: Record<string, unknown>): MockResponse {
+    // like the API's body model (SDD §12, review RV42B-01): an override's option is a strategy name, refused before anything
+    if (action === 'override' && !STRATEGIES.includes(input.option as Strategy)) {
+      throw new HttpError(422, 'validation_error', 'Unknown strategy.');
+    }
     if (recId.startsWith('rec-legacy-')) throw new HttpError(409, 'conflict', 'a legacy entry is history: it cannot be approved or overridden');
     const index = this.recommendations.findIndex((r) => r.id === recId);
     if (index < 0) throw notFound('recommendation', recId);

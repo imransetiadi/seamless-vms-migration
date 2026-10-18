@@ -3058,6 +3058,24 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     expect(m.estimates.filter((e) => e.strategy !== 'storage_handover')).toEqual(before.filter((e) => e.strategy !== 'storage_handover'));
   });
 
+  it.each([[['storage_handover']], [42], [null]])(
+    'refuses an override whose option is no strategy name (%j) with 422 before anything, as the API (SDD §12, §14.6, review RV42B-01)',
+    async (option) => {
+      const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+      const as = (token: string) => new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+      await as('operator').patch('/plans/plan-c81d44a0', { downtime_slo_s: 60 });
+      await as('operator').post('/plans/plan-c81d44a0/validate');
+      const m = server.migrations.find((x) => x.plan_id === 'plan-c81d44a0' && x.advisor_hold !== null)!;
+      const rec = server.recommendations.filter((r) => r.migration_id === m.id).at(-1)!;
+      const before = { strategy: m.strategy, decision: { ...server.recommendations.find((r) => r.id === rec.id)!.decision } };
+      await expect(as('admin').post(`/advisor/recommendations/${rec.id}/override`, { option, reason: 'the owner wants it' })).rejects.toMatchObject({
+        status: 422,
+        code: 'validation_error',
+      });
+      expect({ strategy: m.strategy, decision: server.recommendations.find((r) => r.id === rec.id)!.decision }).toEqual(before);
+    },
+  );
+
   it.each([
     ['override', true],
     ['approve', true],
