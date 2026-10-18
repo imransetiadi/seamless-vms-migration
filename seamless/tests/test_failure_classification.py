@@ -228,9 +228,10 @@ def _workload(name: str, image_properties: dict) -> dict:
 
 @pytest.mark.parametrize("role", sorted(INCLUDES))
 def test_a_stuck_detach_fails_permanently_whatever_the_workload_data_holds(tmp_path, role):
-    """A VM whose name and boot image properties say "timeout" - Nova's standard
-    os_shutdown_timeout - still fails permanently on a stuck detach: the include line names the
-    workload by its id only."""
+    """The include line names the workload by its id only: a VM whose name and boot image
+    properties say "timeout" - Nova's standard os_shutdown_timeout - adds nothing transient to it,
+    and the stuck detach fails permanently through this stand-in rescue. The roles' own rescue
+    messages and progress lines still name the VM - owner question q8 (review RV36A-01)."""
     workload = _workload("web-timeout-01", {"os_distro": "rhel", "os_shutdown_timeout": "60"})
 
     output = _import_output(tmp_path, role, workload)
@@ -395,3 +396,42 @@ def test_no_collection_error_reads_transient_by_its_class_name():
     errors = _collection_error_classes()
     assert "ConversionHostUnreachable" in errors and "DiskIdentityError" in errors
     assert {name: path for name, path in errors.items() if TRANSIENT.search(name)} == {}
+
+
+#: may match TRANSIENT: a predicate on an exception that raises nothing itself, so no traceback
+#: ever shows its frame (review RV36A-02)
+RAISES_NOTHING = {"is_timeout"}
+
+
+def _what_ansible_core_prints_of_the_collection() -> dict[str, str]:
+    """What ansible-core before 2.19 can print of the collection's code in the output the executor
+    classifies, with the file defining it: a raised class qualified by its module's dotted path
+    (ansible_collections.os_migrate.os_migrate.plugins.<dir>.<module>.<Class>), and an escaped
+    error's traceback - each frame's file path and function or method name."""
+    root = find_repo_root()
+    found: dict[str, str] = {}
+    for path in sorted((root / "plugins").rglob("*.py")):
+        relative = path.relative_to(root)
+        module = ".".join(relative.with_suffix("").parts)
+        found[module] = str(relative)
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ClassDef):
+                found[f"{module}.{node.name}"] = str(relative)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                found[node.name] = str(relative)
+    return found
+
+
+def test_nothing_ansible_core_prints_of_the_collection_reads_transient():
+    """SDD §6.6 (owner question q8, reviews RV35A-01, RV36A-02): beside a raised class's own name,
+    ansible-core before 2.19 prints its module path, and an escaped error's traceback names each
+    frame's file and function - a module, class, function or method of the collection whose name
+    matches TRANSIENT so turns a permanent failure transient, a stuck detach retried with the cold
+    source stopped. None may, but a predicate that raises nothing."""
+    found = _what_ansible_core_prints_of_the_collection()
+    assert "plugins.module_utils.volume_common.DetachStuck" in found and "wait_for_lock" in found
+    assert {
+        name: path
+        for name, path in found.items()
+        if TRANSIENT.search(name) and name not in RAISES_NOTHING
+    } == {}
