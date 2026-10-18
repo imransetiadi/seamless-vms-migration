@@ -911,9 +911,8 @@ def _write_synced_json(path: Path, data: Any) -> None:
 #: (review RV32A-08)
 KEPT_DIR = Path(".seamless")
 KEPT_PREFIX = "rollback-kept"
-#: the single record earlier builds wrote, below and in the run directory - read too, by a
-#: migration in flight across the upgrade
-KEPT_RECORD = KEPT_DIR / "rollback-kept.json"
+#: the single record earlier builds wrote in the run directory - read too, by a migration in flight
+#: across the upgrade; the one they wrote in KEPT_DIR carries the prefix, read with the others
 LEGACY_KEPT_RECORD = "rollback-kept.json"
 
 

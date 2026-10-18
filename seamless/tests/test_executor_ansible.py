@@ -4094,6 +4094,18 @@ async def test_a_vmware_rollback_writes_no_keep_record_over_one_it_cannot_read(e
     assert any("root" in line and "dst-web-01" in line for line in rec.logs), rec.logs
 
 
+def test_the_sdd_names_the_vmware_keep_records_one_way():
+    """SDD §7.2 (review RV36A-03): the run-directory bullet and the cutover-copy paragraph name the
+    VMware rollback's keep records as the paragraph that defines them does - one per attempt,
+    rollback-kept.<server>.<unique>.json -, never the single record earlier builds wrote."""
+    sdd = (find_repo_root() / "docs" / "SDD.md").read_text(encoding="utf-8")
+    section = sdd[sdd.index("### 7.2 AnsibleExecutor") : sdd.index("### 7.3 HandoverExecutor")]
+    bullet = section[section.index("* Run directory:") : section.index("* Secrets:")]
+    assert "`rollback-kept.<server>.<unique>.json`" in bullet, bullet
+    assert "(`rollback-kept.json`, below)" not in section
+    assert "rollback's\n  `.seamless/rollback-kept.json`" not in section
+
+
 @pytest.mark.parametrize("failing_at", ["the record", "the listing"])
 async def test_a_vmware_rollback_whose_record_read_failed_once_keeps_what_it_found(
     env, monkeypatch, failing_at
