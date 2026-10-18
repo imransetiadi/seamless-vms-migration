@@ -3825,14 +3825,15 @@ async def test_a_retried_vmware_rollback_still_keeps_what_a_server_found_by_name
         env.registry.get = lambda provider: Deleted(env.registry)
     with pytest.raises(TransientStepError, match="HTTP 503"):
         await env.executor.run(StepName.ROLLBACK, ctx)
-    assert (run_dir(env) / ".seamless" / "rollback-kept.json").exists()
+    # a record of its own for the attempt (review RV35A-02)
+    assert list((run_dir(env) / ".seamless").glob("rollback-kept.dst-web_01.*.json"))
     env.registry.volumes_error = False
     env.registry.get = lambda provider: FakeImpl(env.registry)
     env.registry.existing = set()  # Nova deleted the server: no lookup finds it any more
     retried = await env.executor.run(StepName.ROLLBACK, ctx)
     assert (retried.details["deleted_server"], retried.details["deleted_volumes"]) == (None, [])
     assert [v["id"] for v in env.registry.volumes] == ["root"]
-    assert not (run_dir(env) / ".seamless" / "rollback-kept.json").exists()
+    assert not list((run_dir(env) / ".seamless").glob("rollback-kept*"))
     later = await env.executor.run(StepName.ROLLBACK, ctx)
     assert later.details["deleted_volumes"] == ["root"]
 
@@ -3982,22 +3983,34 @@ async def test_a_vmware_rollback_after_the_clock_closed_looks_nothing_up_by_name
     assert result.details["source_running"] is True
 
 
-@pytest.mark.parametrize("record", ["damaged", "not a record", "a directory"])
+@pytest.mark.parametrize("record", ["damaged", "not a record", "a directory", "not listed"])
 async def test_a_vmware_rollback_whose_keep_record_cannot_be_read_still_powers_the_source_on(
-    env, record
+    env, monkeypatch, record
 ):
-    """SDD §7.2 (review RV32A-08): the keep record matters only to the deletions after the
-    power-on. One that cannot be read never keeps the source stopped: what to keep is unknown, so
-    that attempt deletes no kit volume of the VM, says so in its log, and deletes the server and
-    powers the source on as any other."""
+    """SDD §7.2 (reviews RV32A-08, RV35A-02): the keep record matters only to the deletions after
+    the power-on. One that cannot be read - nor the listing of them - never keeps the source
+    stopped: what to keep is unknown, so that attempt deletes no kit volume of the VM, says so in
+    its log, and deletes the server and powers the source on as any other."""
+    import errno
+
     path = run_dir(env) / ".seamless" / "rollback-kept.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     if record == "damaged":
         path.write_text('{"server_id": "dst-web-01", "volumes": ["boot",')
     elif record == "not a record":
         path.write_text('["boot"]')
-    else:
+    elif record == "a directory":
         path.mkdir()
+    else:
+        path.write_text('{"server_id": "dst-web-01", "volumes": ["boot"]}')
+        real_scandir = os.scandir
+
+        def scandir(where="."):
+            if str(where).endswith(".seamless"):
+                raise OSError(errno.EMFILE, os.strerror(errno.EMFILE), str(where))
+            return real_scandir(where)
+
+        monkeypatch.setattr(os, "scandir", scandir)
     env.registry.volumes = [kit_volume("cut-off", "web-01-2000", converted=False)]
     ctx, rec = ctx_for(
         env,
@@ -4012,17 +4025,18 @@ async def test_a_vmware_rollback_whose_keep_record_cannot_be_read_still_powers_t
     calls = [c[0] for c in env.registry.calls]
     assert calls.index("delete_server") < calls.index("power_on")
     assert "delete_volume" not in calls
-    assert any("rollback-kept.json" in line and "stays" in line for line in rec.logs)
+    shown = ".seamless" if record == "not listed" else "rollback-kept.json"
+    assert any(shown in line and "stays" in line for line in rec.logs), rec.logs
 
 
 @pytest.mark.parametrize("record", ["damaged", "a directory"])
 async def test_a_vmware_rollback_writes_no_keep_record_over_one_it_cannot_read(env, record):
-    """SDD §7.2 (review RV34A-03): with the clock open, a server of the kit's name found beside a
-    keep record that cannot be read is deleted and the source powered on as any other. No record
-    is written over the unreadable one: its path may refuse the write (a directory there), and
-    one written over a damaged file would let a later attempt delete what that file kept. The
-    volumes the server held are logged; while the record cannot be read no attempt deletes a kit
-    volume of the VM - here the attempt retried after a failure past the power-on."""
+    """SDD §7.2 (reviews RV34A-03, RV35A-02): with the clock open, a server of the kit's name found
+    beside a keep record that cannot be read is deleted and the source powered on as any other.
+    No record is written over the unreadable one - one written over a damaged file would let a
+    later attempt delete what that file kept -: what the server held goes into a record of its
+    own, and is logged. While a record cannot be read no attempt deletes a kit volume of the VM -
+    here the attempt retried after a failure past the power-on."""
     path = run_dir(env) / ".seamless" / "rollback-kept.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     if record == "damaged":
@@ -4054,6 +4068,100 @@ async def test_a_vmware_rollback_writes_no_keep_record_over_one_it_cannot_read(e
     )
     result = await env.executor.run(StepName.ROLLBACK, ctx)
     assert "delete_volume" not in [c[0] for c in env.registry.calls]
+    assert result.details["deleted_volumes"] == []
+    assert any("root" in line and "dst-web-01" in line for line in rec.logs), rec.logs
+
+
+@pytest.mark.parametrize("failing_at", ["the record", "the listing"])
+async def test_a_vmware_rollback_whose_record_read_failed_once_keeps_what_it_found(
+    env, monkeypatch, failing_at
+):
+    """SDD §7.2 (review RV35A-02): an attempt whose read of the keep records failed - EMFILE, the
+    control plane briefly out of descriptors, at a record or at the listing of them - deletes no
+    kit volume, and still records what the server it found by the kit's name held, in a record of
+    its own: the retry, whose read succeeds, keeps that server's volumes as well as what an earlier
+    attempt kept."""
+    import errno
+    import pathlib
+
+    earlier = run_dir(env) / ".seamless" / "rollback-kept.json"  # as an earlier build wrote it
+    earlier.parent.mkdir(parents=True, exist_ok=True)
+    earlier.write_text('{"server_id": "dst-old", "volumes": ["kept-earlier"]}')
+    env.registry.existing = {"web-01"}  # a server of the kit's name, found by name
+    env.registry.volumes = [
+        kit_volume("held-root", "web-01-2000", attachments=["dst-web-01"]),
+        kit_volume("held-data", "web-01-2001", converted=False, attachments=["dst-web-01"]),
+        kit_volume("kept-earlier", "web-01-2002", converted=False),
+    ]
+    real_read_text, real_scandir = pathlib.Path.read_text, os.scandir
+    failing = [True]
+
+    def read_text(self, *args, **kwargs):
+        if failing and failing_at == "the record" and self.name.startswith("rollback-kept"):
+            raise OSError(errno.EMFILE, os.strerror(errno.EMFILE), str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    def scandir(path="."):
+        if failing and failing_at == "the listing" and str(path).endswith(".seamless"):
+            raise OSError(errno.EMFILE, os.strerror(errno.EMFILE), str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", read_text)
+    monkeypatch.setattr(os, "scandir", scandir)
+    env.registry.ports_error = True  # the first attempt fails past the power-on
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_warm, source=VCENTER, downtime_started_at=utcnow()
+    )
+    with pytest.raises(TransientStepError, match="HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert ("delete_server", "dst-web-01") in env.registry.calls
+    # the step's retry, its context reloaded: the clock closed at the power-on
+    failing.clear()
+    env.registry.ports_error = False
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        downtime_started_at=utcnow(),
+        downtime_ended_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert [c[1] for c in env.registry.calls if c[0] == "delete_volume"] == []
+    assert result.details["deleted_volumes"] == []
+    assert not list((run_dir(env) / ".seamless").glob("rollback-kept*"))  # removed on success
+
+
+async def test_a_vmware_rollback_whose_keep_record_cannot_be_written_still_powers_the_source_on(
+    env, monkeypatch, caplog
+):
+    """SDD §7.2, §8 (review RV35A-03): a keep record that cannot be written - a .seamless/ a
+    restore left unwritable, a full or read-only volume - never keeps the source stopped: the
+    attempt logs the volumes the server found by name held, deletes it and powers the source on,
+    and deletes no kit volume of the VM."""
+    import errno
+
+    import seamless_migrate.executors.ansible as ansible_executor
+
+    real_write = ansible_executor._write_synced_json
+
+    def read_only(path, data):
+        if path.name.startswith("rollback-kept"):
+            raise OSError(errno.EROFS, os.strerror(errno.EROFS), str(path))
+        real_write(path, data)
+
+    monkeypatch.setattr(ansible_executor, "_write_synced_json", read_only)
+    env.registry.existing = {"web-01"}  # the kit's server, found by name with the clock open
+    env.registry.volumes = [
+        kit_volume("root", "web-01-2000", attachments=["dst-web-01"]),
+        kit_volume("cut-off", "web-01-2001", converted=False),
+    ]
+    ctx, rec = ctx_for(
+        env, strategy=Strategy.vmware_warm, source=VCENTER, downtime_started_at=utcnow()
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    calls = [c[0] for c in env.registry.calls]
+    assert calls.index("delete_server") < calls.index("power_on")
+    assert "delete_volume" not in calls
     assert result.details["deleted_volumes"] == []
     assert any("root" in line and "dst-web-01" in line for line in rec.logs), rec.logs
 

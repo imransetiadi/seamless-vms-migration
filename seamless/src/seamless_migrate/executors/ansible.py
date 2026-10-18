@@ -18,6 +18,7 @@ import os
 import re
 import signal
 import sys
+import uuid
 from collections import deque
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -904,11 +905,15 @@ def _write_synced_json(path: Path, data: Any) -> None:
         log.warning("could not sync %s after writing %s: %s", path.parent, path.name, exc)
 
 
-#: the VMware rollback's record of what a server found only by name held (SDD §7.2, RV30-05):
-#: one level below the guest directories the kit creates in the run directory, {VM name}, so
-#: no VM's name is its path (review RV32A-08)
-KEPT_RECORD = Path(".seamless") / "rollback-kept.json"
-#: where an earlier build wrote it - read too, by a migration in flight across the upgrade
+#: the VMware rollback's records of what a server found only by name held (SDD §7.2, RV30-05):
+#: one file per attempt, never written over another (review RV35A-02), one level below the guest
+#: directories the kit creates in the run directory, {VM name}, so no VM's name is its path
+#: (review RV32A-08)
+KEPT_DIR = Path(".seamless")
+KEPT_PREFIX = "rollback-kept"
+#: the single record earlier builds wrote, below and in the run directory - read too, by a
+#: migration in flight across the upgrade
+KEPT_RECORD = KEPT_DIR / "rollback-kept.json"
 LEGACY_KEPT_RECORD = "rollback-kept.json"
 
 
@@ -916,14 +921,34 @@ class _UnreadableKeepRecord(Exception):
     """The VMware rollback's keep record cannot be read: what to keep is unknown."""
 
 
+def _kept_records(rdir: Path) -> list[Path]:
+    """Every keep record of the run directory: the one an earlier build wrote there - never the
+    kit's guest directory of a VM so named -, then each in .seamless/. Raises OSError for a
+    listing that fails."""
+    legacy = rdir / LEGACY_KEPT_RECORD
+    paths = [legacy] if legacy.is_file() else []
+    try:
+        names = sorted(entry.name for entry in os.scandir(rdir / KEPT_DIR))
+    except FileNotFoundError:
+        names = []
+    return paths + [
+        rdir / KEPT_DIR / name
+        for name in names
+        if name.startswith(KEPT_PREFIX) and name.endswith(".json")
+    ]
+
+
 def _read_kept(rdir: Path) -> set[str]:
-    """The volumes earlier attempts of the VMware rollback kept: what the server they found only
-    by the kit's name held before they deleted it (SDD §7.2, review RV30-05). Raises
-    _UnreadableKeepRecord for a record that cannot be read (review RV32A-08)."""
+    """The volumes earlier attempts of the VMware rollback kept: what the servers they found only
+    by the kit's name held before they deleted them (SDD §7.2, review RV30-05). Raises
+    _UnreadableKeepRecord for a record - or a listing of them - that cannot be read (review
+    RV32A-08)."""
+    try:
+        paths = _kept_records(rdir)
+    except OSError as exc:
+        raise _UnreadableKeepRecord(f"{rdir / KEPT_DIR} cannot be listed: {exc}") from None
     kept: set[str] = set()
-    for path in (rdir / KEPT_RECORD, rdir / LEGACY_KEPT_RECORD):
-        if path.name == LEGACY_KEPT_RECORD and path.parent == rdir and not path.is_file():
-            continue  # none, or the kit's guest directory of a VM so named
+    for path in paths:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -936,20 +961,24 @@ def _read_kept(rdir: Path) -> set[str]:
     return kept
 
 
-def _record_kept(rdir: Path, server_id: str, kept: Collection[str]) -> None:
-    path = rdir / KEPT_RECORD
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _write_synced_json(path, {"server_id": server_id, "volumes": sorted(kept)})
+def _record_kept(rdir: Path, server_id: str, held: Collection[str]) -> None:
+    """What a server found only by the kit's name held, in a record of its own - never over
+    another, so a damaged one stays as it is and every other still counts (SDD §7.2, reviews
+    RV34A-03, RV35A-02)."""
+    directory = rdir / KEPT_DIR
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    name = re.sub(r"[^A-Za-z0-9-]", "_", server_id)[:64]
+    path = directory / f"{KEPT_PREFIX}.{name}.{uuid.uuid4().hex}.json"
+    _write_synced_json(path, {"server_id": server_id, "volumes": sorted(held)})
 
 
 def _remove_kept(rdir: Path) -> None:
-    """A rollback that succeeded: a later one starts from what it finds (review RV29-03) - the
-    record removed, the legacy one too, never the kit's guest directory of a VM so named."""
+    """A rollback that succeeded: a later one starts from what it finds (review RV29-03) - every
+    record removed, never the kit's guest directory of a VM so named."""
     with contextlib.suppress(OSError):
-        (rdir / KEPT_RECORD).unlink(missing_ok=True)
-    legacy = rdir / LEGACY_KEPT_RECORD
-    if legacy.is_file():
-        legacy.unlink(missing_ok=True)
+        for path in _kept_records(rdir):
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -1743,7 +1772,7 @@ class AnsibleExecutor:
             # what an earlier attempt kept of a server it then deleted (review RV30-05); a record
             # that cannot be read never keeps the source stopped: what to keep is unknown, so this
             # attempt deletes no kit volume (SDD §7.2, review RV32A-08)
-            unreadable = None
+            unreadable = unrecorded = None
             try:
                 kept = await asyncio.to_thread(_read_kept, rdir)
             except _UnreadableKeepRecord as exc:
@@ -1767,23 +1796,19 @@ class AnsibleExecutor:
                     # recorded before the deletion: a retried attempt no longer finds the server
                     held = set(await dst.server_volumes(named))
                     kept |= held
-                    if unreadable is not None:
-                        # none written over a record that cannot be read: its path may refuse
-                        # the write, and one written over a damaged file would let a later attempt
-                        # delete what that file kept; while it cannot be read no attempt deletes a
-                        # kit volume (SDD §7.2, review RV34A-03)
+                    holds = ", ".join(sorted(held)) or "no volume"
+                    try:
+                        # a record of its own, also after a read that failed (review RV35A-02)
+                        await asyncio.to_thread(_record_kept, rdir, named, held)
+                    except OSError as exc:
+                        # never keeps the source stopped: this attempt deletes no kit volume
+                        # (SDD §7.2, §8, review RV35A-03)
+                        unrecorded = f"could not record what {named} holds ({holds}): {exc}"
                         await ctx.log(
-                            f"rollback: what {named} holds is not recorded "
-                            f"({', '.join(sorted(held)) or 'no volume'}): the record cannot be "
-                            f"read, so no kit volume of {vm.name} is deleted"
+                            f"rollback: {unrecorded}; every kit volume of {vm.name} stays"
                         )
                     else:
-                        try:
-                            await asyncio.to_thread(_record_kept, rdir, named, kept)
-                        except OSError as exc:
-                            raise TransientStepError(
-                                f"rollback: could not record what {named} holds: {exc}"
-                            ) from exc
+                        await ctx.log(f"rollback: what {named} holds stays: {holds}")
             servers = [server for server in (recorded, named) if server]
             for server in servers:
                 await dst.delete_server(server)
@@ -1802,7 +1827,7 @@ class AnsibleExecutor:
             deleted_ports = await self._delete_kit_ports(dst, vm.nics, vm.name)
             deleted_volumes = (
                 []
-                if unreadable
+                if unreadable or unrecorded
                 else await self._delete_kit_volumes(ctx, dst, m.destination_server_id, kept)
             )
         except ProviderError as exc:
