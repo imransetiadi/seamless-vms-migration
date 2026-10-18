@@ -41,8 +41,9 @@ async def test_simulated_warm_pass_deltas_shrink():
         m.sync_passes.append(result.sync_pass)
     assert [p.number for p in passes] == [1, 2, 3]
     assert passes[0].bytes_changed > passes[1].bytes_changed > passes[2].bytes_changed
-    # bytes_changed = min(disk, change_rate * previous duration) (with jitter)
-    expected = 2 * 2**20 * passes[0].duration_s
+    # bytes_changed = min(disk, change_rate * the previous pass's whole time, its snapshot
+    # included - a warm pass records the part after it (SDD §7.4, review RV38A-05)) (with jitter)
+    expected = 2 * 2**20 * (passes[0].duration_s + params_for_plan(make_plan()).snapshot_s)
     assert passes[1].bytes_changed == pytest.approx(expected, rel=0.11)
     assert rec.progress and rec.progress[-1][0] == 100.0
     assert rec.downtime_marks == 0, "pre-copy never stops the source"
@@ -261,6 +262,27 @@ async def test_a_rollback_reports_the_model_seconds_of_the_cutover_it_interrupte
     assert (await ex.run(StepName.ROLLBACK, rb)).details["downtime_model_s"] == 90.0
 
 
+@pytest.mark.parametrize("sizes_gb", [[20], [20, 200]], ids=["20 GiB", "20+200 GiB"])
+async def test_a_simulated_delta_pass_reads_back_the_scan_rate_it_ran_with(sizes_gb):
+    """SDD §7.4, §9.1 (review RV38A-05): a simulated warm pass takes the model's
+    snapshot + max(scan, Δ/L), its scan as §9.1 models it, and records the part after the snapshot
+    as the collection's warm sync does: the calibration reads back the plan's S, and the
+    final-downtime estimate after it is the one the plan's S gives."""
+    from seamless_migrate.planning.estimator import estimate_final_downtime, observed_scan_rate
+
+    disks = [make_disk(id=f"d{i}", size_gb=gb, used_gb=gb / 2) for i, gb in enumerate(sizes_gb)]
+    m = make_migration(vm=make_vm(disks=disks, change_rate_bps=2 * 2**20))
+    plan = make_plan()
+    ex = SimulatedExecutor(FAST)
+    for step in (StepName.PRECOPY, StepName.SYNC):
+        ctx, _ = make_ctx(plan, m, SRC, DST, FAST)
+        m.sync_passes.append((await ex.run(step, ctx)).sync_pass)
+    delta = m.sync_passes[-1]
+    params = params_for_plan(plan)
+    assert observed_scan_rate(delta, m.vm, params) == pytest.approx(params.scan_bps)
+    assert estimate_final_downtime(m.vm, Strategy.warm, delta.duration_s, params) > 0
+
+
 async def test_simulated_time_is_compressed_by_demo_speed():
     slept: list[float] = []
 
@@ -271,7 +293,9 @@ async def test_simulated_time_is_compressed_by_demo_speed():
     ex = SimulatedExecutor(settings, sleep=fake_sleep)
     m = mig()
     result = await ex.run(StepName.PRECOPY, make_ctx(make_plan(), m, SRC, DST, settings)[0])
-    assert sum(slept) == pytest.approx(result.sync_pass.duration_s / 60, rel=1e-6)
+    # the pass's whole time: its snapshot and the part after it, which it records (SDD §7.4)
+    whole = result.sync_pass.duration_s + params_for_plan(make_plan()).snapshot_s
+    assert sum(slept) == pytest.approx(whole / 60, rel=1e-6)
 
 
 async def test_a_simulated_final_sync_starts_once_the_source_is_stopped():
