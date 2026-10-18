@@ -854,6 +854,7 @@ async def test_a_cancelled_handover_step_ends_only_after_its_call_returned(tmp_p
         ("src", "manage", "volume-dst-vol-1"),
         ("src", "create_port", "fa:16:3e:00:00:01"),
         ("src", "create_server", "web-01"),
+        ("src", "dot", "src-vol-1"),  # its delete_on_termination back once it runs
     ]
     assert result.details["vm"]["source_id"] == "src-new-1"
 
@@ -1041,6 +1042,7 @@ async def test_handover_rollback_reverses_order(tmp_path):
         ("src", "manage", "volume-dst-vol-1"),
         ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
         ("src", "create_server", "web-01"),
+        ("src", "dot", "src-vol-1"),  # its delete_on_termination back once it runs
     ]
     src_manage = clouds["src"].managed
     assert [m["host"] for m in src_manage] == [
@@ -1048,9 +1050,11 @@ async def test_handover_rollback_reverses_order(tmp_path):
         "overcloud@tripleo_ceph#hdd",
     ]
     params = clouds["src"].created[0]
+    # every volume kept while Nova builds it, the boot volume's flag given back once it runs
     assert [
         (b["boot_index"], b["delete_on_termination"]) for b in params["block_device_mapping"]
-    ] == [(0, True), (-1, False)]
+    ] == [(0, False), (-1, False)]
+    assert clouds["src"].servers["src-new-1"].dot == {"src-vol-1": True, "src-vol-2": False}
     # the recreated source VM has new ids; the executor reports them to the orchestrator
     assert result.details["source_running"] is True
     new_vm = result.details["vm"]
@@ -2101,7 +2105,8 @@ async def test_handover_rollback_before_the_source_is_deleted_restores_and_start
 
 async def test_handover_rollback_after_the_source_is_deleted_recreates_it(tmp_path):
     """Crash at the first unmanage: the server is gone, both volumes still managed at the source;
-    the rollback recreates the server on the same volumes with their delete_on_termination."""
+    the rollback recreates the server on the same volumes, kept while Nova builds it, and gives
+    each its delete_on_termination back once it runs (review RV35B-04)."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
     with pytest.raises(PermanentStepError, match="unmanage"):
@@ -2112,12 +2117,14 @@ async def test_handover_rollback_after_the_source_is_deleted_recreates_it(tmp_pa
     assert ops(calls) == [
         ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
         ("src", "create_server", "web-01"),
+        ("src", "dot", "vol-root"),  # its delete_on_termination back once it runs (RV35B-04)
     ]
     bdm = clouds["src"].created[0]["block_device_mapping"]
     assert [(b["uuid"], b["boot_index"], b["delete_on_termination"]) for b in bdm] == [
-        ("vol-root", 0, True),
+        ("vol-root", 0, False),
         ("vol-data", -1, False),
     ]
+    assert clouds["src"].servers["src-new-1"].dot == {"vol-root": True, "vol-data": False}
     assert result.details["vm"]["source_id"] == "src-new-1"
 
 
@@ -2192,15 +2199,19 @@ async def test_a_rollback_after_nova_accepted_the_source_deletion_never_gives_it
         assert "srv-1" not in src.servers and src.deleted_by_nova == []
         bdm = src.created[0]["block_device_mapping"]
         assert [(b["uuid"], b["delete_on_termination"]) for b in bdm] == [
-            ("vol-root", True),
+            ("vol-root", False),
             ("vol-data", False),
         ]
+        # given back to the recreated source only, once it runs (review RV35B-04)
+        assert src.servers["src-new-1"].dot == {"vol-root": True, "vol-data": False}
         assert result.details["vm"]["source_id"] == "src-new-1"
+        given_back = [("src", "dot", "vol-root")]
     else:
         with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
             await executor.run(StepName.ROLLBACK, ctx)
         assert src.servers["srv-1"].dot == {"vol-root": False, "vol-data": False}
-    assert not [c for c in ops(calls) if c[1] in ("dot", "start_server")], ops(calls)
+        given_back = []
+    assert [c for c in ops(calls) if c[1] in ("dot", "start_server")] == given_back, ops(calls)
 
 
 class _NovaAnswer(Exception):
@@ -2366,6 +2377,59 @@ async def test_a_rollback_after_nova_accepted_the_source_deletion_starts_one_tha
     result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert src.servers["srv-1"].dot == {"vol-root": True, "vol-data": False}
     assert "vm" not in result.details and not src.created
+
+
+@pytest.mark.parametrize("build", ["aborted on the compute host", "left in ERROR before any host"])
+async def test_a_recreated_source_whose_build_fails_keeps_every_volume_and_is_built_again(
+    tmp_path, build
+):
+    """SDD §7.3 rollback (review RV35B-04): the rollback recreates the source with every volume
+    kept while Nova builds it - a build Nova aborts deletes each volume flagged
+    delete_on_termination, the VM's only copy of its data. A build left in ERROR is deleted on the
+    next attempt, its volumes kept, and created again; once the server runs, each volume gets its
+    journaled delete_on_termination back."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    host = _deletion_the_host_fails(clouds)
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    host.fixed = True  # the deletion sent again ends
+    create, nova_wait = src.compute.create_server, src.compute.wait_for_server
+    failing = [build]
+
+    def build_once(**params):
+        server = create(**params)
+        if failing:
+            failing.clear()
+            if build.startswith("aborted"):
+                # nova's _do_build_and_run_instance: an aborted build's _cleanup_volumes deletes
+                # each volume flagged delete_on_termination - one the build was given too
+                for b in params["block_device_mapping"]:
+                    if b["delete_on_termination"] and src.volumes.pop(b["uuid"], None) is not None:
+                        src.deleted_by_nova.append(b["uuid"])
+                    elif b["uuid"] in src.volumes:
+                        src.volumes[b["uuid"]].status = "available"
+            server.status = "ERROR"
+        return server
+
+    def wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        if s.status == "ERROR":
+            raise RuntimeError(f"Server:{s.id} transitioned to failure state ERROR")
+        return nova_wait(s, status=status, failures=failures, interval=interval, wait=wait)
+
+    src.compute.create_server, src.compute.wait_for_server = build_once, wait_for_server
+    with pytest.raises((TransientStepError, PermanentStepError), match="failure state ERROR"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.deleted_by_nova == []
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert src.deleted_by_nova == []
+    assert [
+        [b["delete_on_termination"] for b in created["block_device_mapping"]]
+        for created in src.created
+    ] == [[False, False], [False, False]]
+    assert "src-new-1" not in src.servers  # the failed build, deleted
+    assert src.servers["src-new-2"].dot == {"vol-root": True, "vol-data": False}
+    assert result.details["vm"]["source_id"] == "src-new-2"
 
 
 async def test_handover_journals_every_port_with_its_mac_and_addresses(tmp_path):
@@ -3031,6 +3095,7 @@ async def test_handover_rollback_after_unmanage_manages_back_and_recreates(tmp_p
         ("src", "manage", "volume-vol-data"),
         ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
         ("src", "create_server", "web-01"),
+        ("src", "dot", "src-vol-1"),  # its delete_on_termination back once it runs
     ]
     new_vm = result.details["vm"]
     assert new_vm["source_id"] == "src-new-1"
@@ -3900,6 +3965,7 @@ async def test_handover_fails_fast_when_cinder_refuses_the_unmanage(tmp_path):
     assert ops(calls) == [
         ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
         ("src", "create_server", "web-01"),
+        ("src", "dot", "vol-root"),  # its delete_on_termination back once it runs
     ]
     assert result.details["source_running"] is True
 

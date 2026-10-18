@@ -995,6 +995,17 @@ class HandoverExecutor:
                 f"(it reports {shown.get('delete_on_termination')!r})"
             )
 
+    def _wait_available(self, conn: Any, volume_ids: list[str]) -> None:
+        """Wait until each volume is available: Nova builds a server only on available ones."""
+        for volume_id in volume_ids:
+            conn.block_storage.wait_for_status(
+                conn.block_storage.get_volume(volume_id),
+                status="available",
+                failures=["error"],
+                interval=self.poll_s,
+                wait=self.wait_s,
+            )
+
     @staticmethod
     def _set_boot_properties(conn: Any, volume_id: str, metadata: dict[str, str]) -> None:
         _checked(
@@ -1070,11 +1081,11 @@ class HandoverExecutor:
         return str(volume_id)
 
     @staticmethod
-    def _bdm(
-        attachments: list[dict[str, Any]], ids: dict[str, str], keep_original: bool = False
-    ) -> list[dict[str, Any]]:
-        """Block-device mapping in device order; the destination never deletes its volumes, a
-        recreated source keeps the journaled delete_on_termination."""
+    def _bdm(attachments: list[dict[str, Any]], ids: dict[str, str]) -> list[dict[str, Any]]:
+        """Block-device mapping in device order, every volume kept: the destination never deletes
+        its volumes, and a build Nova aborts deletes those flagged delete_on_termination - a
+        recreated source gets its journaled flags back only once it runs (SDD §7.3, review
+        RV35B-04)."""
         ordered = sorted(attachments, key=lambda a: (not a["boot"], a["device"] or ""))
         return [
             {
@@ -1082,9 +1093,7 @@ class HandoverExecutor:
                 "uuid": ids[a["volume_id"]],
                 "source_type": "volume",
                 "destination_type": "volume",
-                "delete_on_termination": bool(a.get("delete_on_termination"))
-                if keep_original
-                else False,
+                "delete_on_termination": False,
             }
             for a in ordered
         ]
@@ -1716,20 +1725,26 @@ class HandoverExecutor:
                         src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
                     # the volumes it held, never unmanaged, carry the recreated server: Nova takes
                     # only an available one, as after step 4 (review RV34B-02)
-                    for att in attachments:
-                        if new_ids.get(att["volume_id"]) != att["volume_id"]:
-                            continue
-                        src.block_storage.wait_for_status(
-                            src.block_storage.get_volume(att["volume_id"]),
-                            status="available",
-                            failures=["error"],
-                            interval=self.poll_s,
-                            wait=self.wait_s,
-                        )
+                    self._wait_available(src, [v for k, v in new_ids.items() if k == v])
 
                 await self._call("delete the stale source server", delete_stale)
                 await _in_thread(journal.mark, "rb:delete_stale_source")
             if not journal.done("rb:create_source"):
+
+                def delete_failed_build() -> None:
+                    sent = journal.get("sent:rb:create_source")
+                    server = _existing_server(src, sent["server_id"]) if sent else None
+                    if server is None or str(_attr(server, "status", "")).upper() != "ERROR":
+                        return
+                    # a build Nova failed: deleted, its volumes kept, and created again below
+                    # (SDD §7.3 rollback, review RV35B-04)
+                    src.compute.delete_server(server, ignore_missing=True)
+                    src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
+                    self._wait_available(src, list(new_ids.values()))
+
+                await self._call(
+                    "delete the source server Nova failed to build", delete_failed_build
+                )
                 networks = await self._call(
                     "recreate the source ports",
                     lambda: self._source_ports(src, definition["networks"], journal),
@@ -1741,13 +1756,26 @@ class HandoverExecutor:
                         definition,
                         definition["flavor"],
                         networks,
-                        self._bdm(attachments, new_ids, keep_original=True),
+                        self._bdm(attachments, new_ids),
                         journal,
                         "sent:rb:create_source",
                     ),
                 )
                 await _in_thread(journal.mark, "rb:create_source", server_id=created)
             new_server_id = journal.get("rb:create_source")["server_id"]
+            # each volume's journaled delete_on_termination, once the recreated server runs: kept
+            # while Nova built it (SDD §7.3 rollback, review RV35B-04)
+            for att in attachments:
+                key = f"rb:created_dot:{att['volume_id']}"
+                if att.get("delete_on_termination") is True and not journal.done(key):
+                    volume_id = new_ids[att["volume_id"]]
+                    await self._call(
+                        f"restore delete_on_termination of {volume_id}",
+                        lambda v=volume_id, s=new_server_id: self._set_delete_on_termination(
+                            src, s, v, True
+                        ),
+                    )
+                    await _in_thread(journal.mark, key)
         else:
             # the server still exists: give back the delete_on_termination step 3 changed
             for att in attachments:

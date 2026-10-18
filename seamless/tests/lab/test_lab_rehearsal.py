@@ -71,5 +71,7 @@ async def test_lab_module_runs_end_to_end_against_the_doubles(rehearsal, tmp_pat
     await lab_module.test_lab_handover_cutover_then_rollback(lab)
     ops = [(cloud, op) for cloud, op, _ in calls]
     assert ("dst", "manage") in ops and ("dst", "create_server") in ops
-    assert ops[-1] == ("src", "create_server"), "rolled back: the source server was recreated"
+    # rolled back: the source server was recreated, its boot volume's delete_on_termination given
+    # back once it ran (SDD §7.3, review RV35B-04)
+    assert ops[-2:] == [("src", "create_server"), ("src", "dot")], ops
     assert src.deleted_by_nova == []
