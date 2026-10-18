@@ -693,6 +693,78 @@ async def test_a_workload_record_without_volumes_wins_over_warm_passes(tmp_path,
         await h.orch.stop()
 
 
+
+@pytest.mark.parametrize(
+    "other_reason", [None, "admin rights are required on the source cloud"], ids=["only", "other"]
+)
+async def test_a_retry_takes_an_earlier_retrys_held_mark_off_once_nothing_is_held(
+    tmp_path, store, other_reason
+):
+    """SDD §12 (review RV43B-02): a Retry marks the stored storage_handover estimate ineligible
+    while an earlier attempt's destination volumes are held - and takes that mark off once none
+    are: a warm attempt rolled back with its pass (held: marked), then a cold attempt - whose
+    cutover removes the warm copies first and whose rollback keeps none - rolled back, and a
+    second Retry. The estimate is eligible again when §9.2's held reason was its only one, and
+    keeps its other reasons otherwise; PUT …/strategy judges the same."""
+    from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
+
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"handover": handover, "auto_cutover": False, "default_strategy": Strategy.warm},
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        m = await h.by_vm(plan.id, "vm-1")
+        if other_reason is not None:
+            m.estimates = [
+                e.model_copy(update={"eligible": False, "reasons": [other_reason]})
+                if e.strategy == Strategy.storage_handover
+                else e
+                for e in m.estimates
+            ]
+        m.phase = P.rolled_back
+        m.phase_history = [*m.phase_history, *_history(*UNCUT)]
+        m.sync_passes = _passes(1, m.phase_history)
+        store.put("migration", m)
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        await h.orch.retry(m.id, "alice")
+        m = await h.migration(m.id)
+        if other_reason is None:  # an eligible one is marked; an ineligible one stays as it is
+            marked = m.estimate_for(Strategy.storage_handover)
+            assert (marked.eligible, marked.reasons) == (False, [HELD_VOLUMES_REASON])
+        else:
+            m.estimates = [
+                e.model_copy(update={"reasons": [other_reason, HELD_VOLUMES_REASON]})
+                if e.strategy == Strategy.storage_handover
+                else e
+                for e in m.estimates
+            ]  # as a validation that saw them held stores it
+            store.put("migration", m)
+        await h.orch.set_strategy(m.id, Strategy.cold, "alice")
+        m = await h.migration(m.id)
+        m.phase = P.rolled_back
+        m.phase_history = [*m.phase_history, *_history(P.cutover, P.rolling_back, P.rolled_back)]
+        store.put("migration", m)
+        await h.orch.retry(m.id, "alice")
+        m = await h.migration(m.id)
+        assert not await h.orch.holds_destination_volumes(m)
+        est = m.estimate_for(Strategy.storage_handover)
+        if other_reason is None:
+            assert (est.eligible, est.reasons) == (True, [])
+            await h.orch.set_strategy(m.id, Strategy.storage_handover, "alice")
+            assert (await h.migration(m.id)).strategy == Strategy.storage_handover
+        else:
+            assert (est.eligible, est.reasons) == (False, [other_reason])
+            with pytest.raises(BadRequest, match=other_reason):
+                await h.orch.set_strategy(m.id, Strategy.storage_handover, "alice")
+    finally:
+        await h.orch.stop()
+
 @pytest.mark.parametrize(
     ("record", "passes", "held"),
     [

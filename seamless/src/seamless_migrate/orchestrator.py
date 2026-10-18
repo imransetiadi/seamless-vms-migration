@@ -344,6 +344,15 @@ def _held_out(est: Estimate) -> Estimate:
     return est.model_copy(update={"eligible": False, "reasons": reasons})
 
 
+def _held_in(est: Estimate) -> Estimate:
+    """``est`` without §9.2's held reason once nothing is held: eligible again when that reason
+    was its only one, its other reasons kept (SDD §12, review RV43B-02)."""
+    if est.strategy != Strategy.storage_handover or HELD_VOLUMES_REASON not in est.reasons:
+        return est
+    reasons = [reason for reason in est.reasons if reason != HELD_VOLUMES_REASON]
+    return est.model_copy(update={"eligible": not reasons, "reasons": reasons})
+
+
 def _phase_started(m: Migration, phase: Phase) -> datetime | None:
     """When ``m`` last entered ``phase`` (None when it never did)."""
     for change in reversed(m.phase_history):
@@ -1626,6 +1635,11 @@ class Orchestrator:
                 m.estimates = [_held_out(e) for e in m.estimates]
                 if m.estimate is not None:
                     m.estimate = _held_out(m.estimate)
+            else:
+                # an earlier Retry's mark comes off once nothing is held (SDD §12, RV43B-02)
+                m.estimates = [_held_in(e) for e in m.estimates]
+                if m.estimate is not None:
+                    m.estimate = _held_in(m.estimate)
             m.error = None
             # a new attempt is requested anew: the window bypass granted with the old request goes
             # with it, approvals stay (SDD §5.1, §5.4)

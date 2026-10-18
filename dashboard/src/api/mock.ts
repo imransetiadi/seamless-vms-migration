@@ -347,6 +347,16 @@ function heldOut(est: Estimate): Estimate {
 }
 
 /**
+ * `est` without §9.2's held reason once nothing is held: eligible again when that reason was its only one, its other
+ * reasons kept (the API's `_held_in`, SDD §12, review RV43B-02).
+ */
+function heldIn(est: Estimate): Estimate {
+  if (est.strategy !== 'storage_handover' || !est.reasons.includes(HELD_VOLUMES_REASON)) return est;
+  const reasons = est.reasons.filter((reason) => reason !== HELD_VOLUMES_REASON);
+  return { ...est, eligible: reasons.length === 0, reasons };
+}
+
+/**
  * The strategy of the attempt whose copies remain (the API's `_copies_strategy`, SDD §9.3, review RV40-06): while `m`
  * waits for its next attempt, the one a Retry recorded - a validation or a strategy change may have chosen another
  * since -, else its own.
@@ -2579,6 +2589,10 @@ export class MockServer {
         if (keptAfterRollback(m)) {
           m.estimates = m.estimates.map(heldOut);
           if (m.estimate) m.estimate = heldOut(m.estimate);
+        } else {
+          // an earlier Retry's mark comes off once nothing is held (review RV43B-02)
+          m.estimates = m.estimates.map(heldIn);
+          if (m.estimate) m.estimate = heldIn(m.estimate);
         }
         const reopen = plan.status === 'completed';
         this.transition(m, 'ready', 'retry requested', me.name);

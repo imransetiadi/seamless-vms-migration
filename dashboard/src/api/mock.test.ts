@@ -11,6 +11,7 @@ import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { createMockFetch, MockServer, PLAN_EDITABLE_FIELDS } from './mock';
+import { HELD_VOLUMES_REASON } from './mockData';
 import { summaryOf } from '../lib/summary';
 import { streamEvents } from './stream';
 import {
@@ -3162,6 +3163,51 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
       const put = client.put<Migration>(`/migrations/${m.id}/strategy`, { strategy: 'storage_handover' });
       if (held) await expect(put).rejects.toMatchObject({ status: 400, message: expect.stringContaining('an earlier attempt keeps its destination volumes') });
       else expect((await put).strategy).toBe('storage_handover');
+    },
+  );
+
+  it.each([[null], ['admin rights are required on the source cloud']] as const)(
+    "takes an earlier Retry's held mark off once nothing is held (another reason: %s), as the API (SDD §12, review RV43B-02)",
+    async (other) => {
+      const { server, client } = setup('operator');
+      const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!; // its handover estimate eligible
+      const handover = () => m.estimates.find((e) => e.strategy === 'storage_handover')!;
+      const withReasons = (reasons: string[], eligible?: boolean) =>
+        m.estimates.map((e) => (e.strategy === 'storage_handover' ? { ...e, reasons, ...(eligible === undefined ? {} : { eligible }) } : e));
+      if (other) m.estimates = withReasons([other], false);
+      // a warm attempt rolled back with its pass - its copies kept -, then a Retry
+      m.strategy = 'warm';
+      m.phase = 'rolled_back';
+      m.approvals = [];
+      m.cutover_requested = false;
+      m.sync_passes = [
+        { number: 1, kind: 'full', started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 },
+      ];
+      await client.post(`/migrations/${m.id}/retry`, {});
+      if (other) m.estimates = withReasons([other, HELD_VOLUMES_REASON]); // as a validation that saw them held stores it
+      else expect([handover().eligible, handover().reasons]).toEqual([false, [HELD_VOLUMES_REASON]]);
+      // the operator runs it cold - its cutover removes the warm copies first, its rollback keeps none -, then a second Retry
+      await client.put(`/migrations/${m.id}/strategy`, { strategy: 'cold' });
+      m.phase = 'rolled_back';
+      m.phase_history = [
+        ...m.phase_history,
+        ...(['cutover', 'rolling_back', 'rolled_back'] as const).map((to_phase, i, all) => ({
+          from_phase: i ? all[i - 1]! : ('ready' as const),
+          to_phase,
+          at: `2026-10-08T11:0${i}:00Z`,
+          reason: 'test',
+          actor: 'test',
+        })),
+      ];
+      await client.post(`/migrations/${m.id}/retry`, {});
+      const put = client.put<Migration>(`/migrations/${m.id}/strategy`, { strategy: 'storage_handover' });
+      if (other) {
+        expect([handover().eligible, handover().reasons]).toEqual([false, [other]]);
+        await expect(put).rejects.toMatchObject({ status: 400, message: expect.stringContaining(other) });
+      } else {
+        expect([handover().eligible, handover().reasons]).toEqual([true, []]);
+        expect((await put).strategy).toBe('storage_handover');
+      }
     },
   );
 
