@@ -1762,6 +1762,11 @@ class HandoverExecutor:
                 def delete_failed_build() -> None:
                     sent = journal.get("sent:rb:create_source")
                     server = _existing_server(src, sent["server_id"]) if sent else None
+                    if server is None and sent:
+                        # gone already: the attempt that deleted it may have died in the wait
+                        # below, Cinder still detaching its volumes - waited for, as for a stale
+                        # source (SDD §7.3 rollback, review RV36B-04)
+                        self._wait_available(src, list(new_ids.values()))
                     if server is None or str(_attr(server, "status", "")).upper() != "ERROR":
                         return
                     # a build Nova failed: deleted, its volumes kept, and created again below

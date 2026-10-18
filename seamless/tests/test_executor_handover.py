@@ -2486,6 +2486,47 @@ async def test_a_recreated_source_whose_build_fails_keeps_every_volume_and_is_bu
     assert result.details["vm"]["source_id"] == "src-new-2"
 
 
+async def test_a_rollback_resumed_in_the_failed_builds_volume_wait_waits_again(tmp_path):
+    """SDD §7.3 rollback (review RV36B-04): the attempt that deletes a recreated build Nova left in
+    ERROR dies while it waits for the volumes - a restart, or a wait that timed out and is retried.
+    The next attempt finds the build gone and still waits until every volume is available, as for
+    a stale source, before it creates the source again."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    src = clouds["src"]
+    host = _deletion_the_host_fails(clouds)
+    with pytest.raises(TransientStepError, match="Timeout waiting for Server:srv-1 to delete"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    host.fixed = True
+    create, nova_wait = src.compute.create_server, src.compute.wait_for_server
+    failing = [1]
+
+    def build_once(**params):
+        server = create(**params)
+        if failing:
+            failing.clear()
+            server.status = "ERROR"  # NoValidHost: the volumes stay reserved for it
+        return server
+
+    def wait_for_server(s, status="ACTIVE", failures=None, interval=2, wait=120):
+        if s.status == "ERROR":
+            raise RuntimeError(f"Server:{s.id} transitioned to failure state ERROR")
+        return nova_wait(s, status=status, failures=failures, interval=interval, wait=wait)
+
+    src.compute.create_server, src.compute.wait_for_server = build_once, wait_for_server
+    with pytest.raises(PermanentStepError, match="failure state ERROR"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    src.crash_wait = "status"  # dies in the volume wait, once Nova deleted the failed build
+    with pytest.raises(
+        (TransientStepError, PermanentStepError),
+        match="delete the source server Nova failed to build",
+    ):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "src-new-1" not in src.servers  # the failed build is gone
+    assert "detaching" in {v.status for v in src.volumes.values()}  # Cinder is still at it
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["vm"]["source_id"] == "src-new-2"
+
+
 async def _a_failed_build_holding_its_port(tmp_path, port):
     """RV36B-02's start: the recreated source's build is aborted while Neutron is flaky - the
     VIF plugging times out -; its cleanup could not unbind the port it was given and cleared the
