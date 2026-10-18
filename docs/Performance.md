@@ -464,11 +464,14 @@ is left to the operator is the plan-level starting point, so that the very first
    query for the gates.
 
 6. Estimate accuracy (G2) is judged on the final, calibrated estimate of migrations that had at least one delta
-   pass; the others are reported separately:
+   pass with byte counts - the only kind the orchestrator calibrates from (SDD §9.1); the migration kit's
+   `vmware_warm` passes carry none, so no VMware estimate is calibrated (review RV37B-13). The others are reported
+   separately:
 
    ```bash
    curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/migrations | jq '
-     def delta_calibrated: any(.sync_passes[]?; .kind == "delta");
+     def delta_calibrated: any(.sync_passes[]?; .kind == "delta"
+       and ((.bytes_scanned // 0) > 0 or (.bytes_changed // 0) > 0 or (.bytes_transferred // 0) > 0));
      def within30: ((.actual_downtime_s - .estimate.downtime_s) | fabs) / .estimate.downtime_s <= 0.3;
      def succeeded: (.phase == "completed" or .phase == "finalized");
      [ .[] | select(succeeded and .actual_downtime_s != null and .estimate != null and .estimate.downtime_s > 0) ]
