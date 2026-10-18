@@ -325,12 +325,18 @@ host() {
 
 # --- a cluster: the manifests through kubectl or oc (SDD §17) ---------------------------------------------------
 kube() { run "$KUBE" -n "$NS" "$@"; }
-# Wait until no pod of the named app is left - none at all needs no wait.
+# Wait until no running pod of the named app is left - none at all needs no wait. A pod that failed or succeeded (one
+# evicted) stays until the pod GC removes it, never by the scale-down: it is not waited for (SDD §17.2, review RV38B-03).
+ACTIVE='status.phase!=Failed,status.phase!=Succeeded'
 wait_gone() {
   local selector="app.kubernetes.io/name=$1" pods
-  if [ "$DRY" = 1 ]; then kube wait --for=delete pod -l "$selector" "--timeout=${TIMEOUT}s"; return; fi
-  pods=$("$KUBE" -n "$NS" get pods -l "$selector" -o name)
-  [ -z "$pods" ] || "$KUBE" -n "$NS" wait --for=delete pod -l "$selector" "--timeout=${TIMEOUT}s"
+  if [ "$DRY" = 1 ]; then
+    kube wait --for=delete pod -l "$selector" "--field-selector=$ACTIVE" "--timeout=${TIMEOUT}s"
+    return
+  fi
+  pods=$("$KUBE" -n "$NS" get pods -l "$selector" "--field-selector=$ACTIVE" -o name)
+  [ -z "$pods" ] ||
+    "$KUBE" -n "$NS" wait --for=delete pod -l "$selector" "--field-selector=$ACTIVE" "--timeout=${TIMEOUT}s"
 }
 rollout() { kube rollout status "$1" "--timeout=${TIMEOUT}s"; }
 control_plane_to() {
@@ -352,21 +358,25 @@ cluster_start() {
   control_plane_to 1
 }
 cluster_capacity() {
-  local data='' limits=''
+  local data='' limits='' template patch
   if [ -n "$MAX_MIGRATIONS" ] && [ "$MAX_MIGRATIONS" -gt 10 ] && [ -z "$MEMORY" ]; then
     printf '%s: each concurrent migration needs about 250 MiB (Performance.md §8); the control plane'"'"'s memory limit in deploy/openshift/deployment.yaml (4Gi) is sized for 10 - give --memory for %s\n' \
       "$PROG" "$MAX_MIGRATIONS" >&2
   fi
   [ -n "$MAX_MIGRATIONS" ] && data="\"SEAMLESS_MAX_CONCURRENT_MIGRATIONS\":\"$MAX_MIGRATIONS\""
   [ -n "$MAX_CUTOVERS" ] && data="${data:+$data,}\"SEAMLESS_MAX_CONCURRENT_CUTOVERS\":\"$MAX_CUTOVERS\""
+  [ -n "$CPU" ] && limits="\"cpu\":\"$CPU\""
+  [ -n "$MEMORY" ] && limits="${limits:+$limits,}\"memory\":\"$MEMORY\""
+  # one new pod template - a restart annotation, as rollout restart writes it, and the limits - so the pod restarts once
+  # and reads the settings as it starts, also when the limits stay as they are (SDD §17.2, review RV38B-01)
+  template="\"metadata\":{\"annotations\":{\"kubectl.kubernetes.io/restartedAt\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}"
+  [ -z "$limits" ] ||
+    template="$template,\"spec\":{\"containers\":[{\"name\":\"seamless\",\"resources\":{\"limits\":{$limits}}}]}"
+  patch="{\"spec\":{\"template\":{$template}}}"
+  # limits the API server refuses - below the requests - change nothing: checked before the ConfigMap (review RV38B-02)
+  [ -z "$limits" ] || kube patch deployment/seamless -p "$patch" --dry-run=server
   [ -n "$data" ] && kube patch configmap/seamless-config --type merge -p "{\"data\":{$data}}"
-  [ -n "$CPU" ] && limits="cpu=$CPU"
-  [ -n "$MEMORY" ] && limits="${limits:+$limits,}memory=$MEMORY"
-  if [ -n "$limits" ]; then
-    kube set resources deployment/seamless -c seamless "--limits=$limits" # a new pod template: one rollout
-  else
-    kube rollout restart deployment/seamless # the settings are read when the pod starts
-  fi
+  kube patch deployment/seamless -p "$patch"
   rollout deployment/seamless
   say "the next 'up' (apply -k) brings the manifests' values back: put a lasting change into $OVERLAY"
 }
@@ -390,8 +400,15 @@ cluster() {
     stop) control_plane_to 0 ;;
     start) cluster_start ;;
     restart)
-      kube rollout restart deployment/seamless # Recreate: the old pod ends before the new one starts
-      rollout deployment/seamless
+      # a control plane stopped at 0 replicas starts, as the single host's restart creates and starts it (SDD §17.2,
+      # review RV38B-04)
+      if [ "$DRY" != 1 ] && [ "$("$KUBE" -n "$NS" get deployment/seamless -o 'jsonpath={.spec.replicas}')" = 0 ]; then
+        control_plane_to 1
+      else
+        [ "$DRY" != 1 ] || say "# when the control plane is at 0 replicas: scale it to 1 instead"
+        kube rollout restart deployment/seamless # Recreate: the old pod ends before the new one starts
+        rollout deployment/seamless
+      fi
       ;;
     scale) if [ "${ARGS[0]}" = 0 ]; then control_plane_to 0; else cluster_start; fi ;;
     capacity) cluster_capacity ;;

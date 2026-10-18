@@ -5,6 +5,7 @@ never reaches a command line."""
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -12,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from seamless_migrate.config import find_repo_root
+from tests import fake_kube
 
 ROOT = find_repo_root()
 SCRIPT = ROOT / "scripts" / "seamless-ctl.sh"
@@ -48,9 +50,10 @@ TOOLS = ("make", "kubectl", "oc", "curl", "docker", "podman")
 DOTENV = SCRIPT.parent / "dotenv-value.sh"
 
 
-def _run(tmp_path, *argv, rules=(), xtrace=False, env_file=None, token_mode=0o600):
+def _run(tmp_path, *argv, rules=(), xtrace=False, env_file=None, token_mode=0o600, cluster=None):
     """Run a copy of the script in a scratch tree with the stub tools first on PATH; return the run
-    and the tools' calls in order."""
+    and the tools' calls in order. With ``cluster`` (a fake_kube state), kubectl and oc keep it -
+    read it back with ``_cluster_after(tmp_path)``."""
     tree = tmp_path / "tree"
     (tree / "scripts").mkdir(parents=True, exist_ok=True)
     shutil.copy(SCRIPT, tree / "scripts" / SCRIPT.name)
@@ -64,6 +67,7 @@ def _run(tmp_path, *argv, rules=(), xtrace=False, env_file=None, token_mode=0o60
     for name in TOOLS:
         (bin_dir / name).write_text(STUB)
         (bin_dir / name).chmod(0o755)
+    fake = {} if cluster is None else fake_kube.install(bin_dir, tmp_path / "cluster.json", cluster)
     token_file = tmp_path / "operator.token"
     token_file.write_text(TOKEN + "\n")
     token_file.chmod(token_mode)
@@ -79,12 +83,18 @@ def _run(tmp_path, *argv, rules=(), xtrace=False, env_file=None, token_mode=0o60
         STUB_LOG=str(log),
         STUB_RULES=str(tmp_path / "rules.json"),
         TMPDIR=str(tmp_path),
+        **fake,
     )
     argv = [str(token_file) if a == "@TOKEN_FILE" else a for a in argv]
     cmd = ["bash", *(["-x"] if xtrace else []), str(tree / "scripts" / SCRIPT.name), *argv]
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
     calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     return proc, calls, tree
+
+
+def _cluster_after(tmp_path) -> dict:
+    """The fake cluster's state after a ``_run(..., cluster=...)``."""
+    return json.loads((tmp_path / "cluster.json").read_text())
 
 
 def _compact(value) -> str:
@@ -96,6 +106,8 @@ def _args(calls, cmd):
 
 
 PLATFORMS = ["docker", "podman", "kubernetes", "openshift"]
+#: the pods a stop waits for: the running ones, never one that failed (SDD §17.2, review RV38B-03)
+ACTIVE = "--field-selector=status.phase!=Failed,status.phase!=Succeeded"
 
 
 @pytest.mark.parametrize("platform", PLATFORMS)
@@ -176,11 +188,12 @@ def test_a_cluster_down_stops_the_control_plane_before_postgresql_and_deletes_no
     ns = "-n seamless-migrate"
     assert _args(calls, tool) == [
         f"{ns} scale deployment/seamless --replicas=0",
-        f"{ns} get pods -l app.kubernetes.io/name=seamless -o name",
-        f"{ns} wait --for=delete pod -l app.kubernetes.io/name=seamless --timeout=600s",
+        f"{ns} get pods -l app.kubernetes.io/name=seamless {ACTIVE} -o name",
+        f"{ns} wait --for=delete pod -l app.kubernetes.io/name=seamless {ACTIVE} --timeout=600s",
         f"{ns} scale statefulset/seamless-postgres --replicas=0",
-        f"{ns} get pods -l app.kubernetes.io/name=seamless-postgres -o name",
-        f"{ns} wait --for=delete pod -l app.kubernetes.io/name=seamless-postgres --timeout=600s",
+        f"{ns} get pods -l app.kubernetes.io/name=seamless-postgres {ACTIVE} -o name",
+        f"{ns} wait --for=delete pod -l app.kubernetes.io/name=seamless-postgres {ACTIVE} "
+        "--timeout=600s",
     ]
     assert not any("delete" in " ".join(c["args"]).replace("--for=delete", "") for c in calls)
 
@@ -237,17 +250,19 @@ def test_a_cluster_stop_and_scale_zero_leave_postgresql_running(tmp_path, platfo
         assert proc.returncode == 0, proc.stderr
         assert _args(calls, tool) == [
             "-n seamless-migrate scale deployment/seamless --replicas=0",
-            "-n seamless-migrate get pods -l app.kubernetes.io/name=seamless -o name",
+            f"-n seamless-migrate get pods -l app.kubernetes.io/name=seamless {ACTIVE} -o name",
         ]
 
 
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
 def test_a_cluster_restart_rolls_the_deployment_and_waits(tmp_path, platform, tool, overlay):
     """SDD §17.2: restart is a rollout restart of the Deployment - Recreate ends the old pod before
-    the new one starts, so one orchestrator at a time -, awaited."""
+    the new one starts, so one orchestrator at a time -, awaited; it asks first whether the
+    control plane is stopped (review RV38B-04)."""
     proc, calls, _ = _run(tmp_path, platform, "restart")
     assert proc.returncode == 0, proc.stderr
     assert _args(calls, tool) == [
+        "-n seamless-migrate get deployment/seamless -o jsonpath={.spec.replicas}",
         "-n seamless-migrate rollout restart deployment/seamless",
         "-n seamless-migrate rollout status deployment/seamless --timeout=600s",
     ]
@@ -258,7 +273,9 @@ def test_cluster_capacity_patches_the_configmap_and_sets_the_limits_in_one_rollo
     tmp_path, platform, tool, overlay
 ):
     """SDD §17.2: capacity scales the one control plane up or down - its concurrency settings in the
-    ConfigMap, its CPU and memory limits - in a single rollout, awaited."""
+    ConfigMap, its CPU and memory limits - in a single rollout, awaited: the limits checked by a
+    server-side dry run first, then the ConfigMap, then one patch of the pod template - the limits
+    and a restart annotation (reviews RV38B-01, RV38B-02)."""
     proc, calls, _ = _run(
         tmp_path,
         platform,
@@ -273,22 +290,45 @@ def test_cluster_capacity_patches_the_configmap_and_sets_the_limits_in_one_rollo
         "8Gi",
     )
     assert proc.returncode == 0, proc.stderr
-    ns = "-n seamless-migrate"
+    ns = ["-n", "seamless-migrate"]
     data = {"SEAMLESS_MAX_CONCURRENT_MIGRATIONS": "20", "SEAMLESS_MAX_CONCURRENT_CUTOVERS": "4"}
-    assert _args(calls, tool) == [
-        f"{ns} patch configmap/seamless-config --type merge -p {_compact({'data': data})}",
-        f"{ns} set resources deployment/seamless -c seamless --limits=cpu=8,memory=8Gi",
-        f"{ns} rollout status deployment/seamless --timeout=600s",
+    made = [c["args"] for c in calls if c["cmd"] == tool]
+    patches = [
+        args[args.index("-p") + 1] for args in made if args[2:4] == ["patch", "deployment/seamless"]
     ]
-    # settings alone change no pod template: a rollout restart reads the ConfigMap again
+    assert made == [
+        [*ns, "patch", "deployment/seamless", "-p", patches[0], "--dry-run=server"],
+        [
+            *ns,
+            "patch",
+            "configmap/seamless-config",
+            "--type",
+            "merge",
+            "-p",
+            _compact({"data": data}),
+        ],
+        [*ns, "patch", "deployment/seamless", "-p", patches[1]],
+        [*ns, "rollout", "status", "deployment/seamless", "--timeout=600s"],
+    ]
+    assert patches[0] == patches[1]
+    template = json.loads(patches[1])["spec"]["template"]
+    limits = {"cpu": "8", "memory": "8Gi"}
+    assert template["spec"] == {
+        "containers": [{"name": "seamless", "resources": {"limits": limits}}]
+    }
+    [(annotation, at)] = template["metadata"]["annotations"].items()
+    assert annotation == "kubectl.kubernetes.io/restartedAt"
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", at)
+    # settings alone: no limit to check, the restart annotation alone - the pod reads the ConfigMap
     proc, calls, _ = _run(tmp_path / "settings", platform, "capacity", "--max-cutovers", "2")
     assert proc.returncode == 0, proc.stderr
-    assert _args(calls, tool) == [
-        f"{ns} patch configmap/seamless-config --type merge -p "
-        + _compact({"data": {"SEAMLESS_MAX_CONCURRENT_CUTOVERS": "2"}}),
-        f"{ns} rollout restart deployment/seamless",
-        f"{ns} rollout status deployment/seamless --timeout=600s",
+    made = [c["args"] for c in calls if c["cmd"] == tool]
+    assert [args[2:4] for args in made] == [
+        ["patch", "configmap/seamless-config"],
+        ["patch", "deployment/seamless"],
+        ["rollout", "status"],
     ]
+    assert list(json.loads(made[1][-1])["spec"]["template"]) == ["metadata"]
 
 
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
@@ -303,10 +343,99 @@ def test_cluster_capacity_warns_when_more_migrations_than_its_memory_limit_was_s
     assert proc.returncode == 0, proc.stderr
     assert "about 250 MiB" in proc.stderr and "deploy/openshift/deployment.yaml" in proc.stderr
     assert "--memory" in proc.stderr
-    assert "-n seamless-migrate rollout restart deployment/seamless" in _args(calls, tool)
+    assert any(
+        args.startswith("-n seamless-migrate patch deployment/seamless")
+        for args in _args(calls, tool)
+    )
     for argv in (["--max-migrations", "20", "--memory", "8Gi"], ["--max-migrations", "10"]):
         proc, _, _ = _run(tmp_path / argv[-1], platform, "capacity", *argv)
         assert proc.returncode == 0 and "250 MiB" not in proc.stderr, (argv, proc.stderr)
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_cluster_down_waits_for_the_running_pod_only_then_stops_postgresql(tmp_path, platform):
+    """SDD §17.2 (review RV38B-03): a pod evicted days before (phase Failed) stays until the pod
+    GC - the scale-down never deletes it -, so down waits for the running pod alone, then stops
+    PostgreSQL; it waited for the evicted one until its timeout and never stopped PostgreSQL."""
+    proc, _, _ = _run(tmp_path, platform, "down", cluster=fake_kube.cluster(evicted=True))
+    state = _cluster_after(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert fake_kube.running(state) == [] and state["statefulset"]["replicas"] == 0
+    assert fake_kube.running(state, "statefulset") == []
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_cluster_restart_of_a_stopped_control_plane_starts_it(tmp_path, platform):
+    """SDD §17.2 (review RV38B-04): after stop, restart starts the control plane - one pod - as the
+    single host's restart creates and starts it; it rolled an empty Deployment and reported
+    success with nothing running. A running one restarts as before: one new pod."""
+    proc, _, _ = _run(tmp_path, platform, "restart", cluster=fake_kube.cluster(replicas=0))
+    assert proc.returncode == 0, proc.stderr
+    assert len(fake_kube.running(_cluster_after(tmp_path))) == 1
+    proc, _, _ = _run(tmp_path / "running", platform, "restart", cluster=fake_kube.cluster())
+    [pod] = fake_kube.running(_cluster_after(tmp_path / "running"))
+    assert proc.returncode == 0 and pod["name"] != "seamless-1", proc.stderr
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--max-migrations", "30", "--memory", "4Gi"],
+        ["--max-migrations", "30", "--cpu", "4", "--memory", "4Gi"],
+        ["--max-migrations", "30"],
+        ["--max-migrations", "30", "--memory", "8Gi"],
+    ],
+    ids=["the same memory", "the same limits", "settings alone", "a new limit"],
+)
+def test_cluster_capacity_restarts_the_pod_once_with_the_new_settings(tmp_path, platform, argv):
+    """SDD §17.2 (review RV38B-01): capacity restarts the control plane once, and its new pod
+    reads the new settings - also when the limits stay as they are, where `set resources`
+    patched nothing and no pod ever read them."""
+    proc, _, _ = _run(tmp_path, platform, "capacity", *argv, cluster=fake_kube.cluster())
+    state = _cluster_after(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    [pod] = fake_kube.running(state)
+    assert pod["config"]["SEAMLESS_MAX_CONCURRENT_MIGRATIONS"] == "30"
+    assert state["serial"] == 2  # one new pod: a single restart
+    if "--memory" in argv:
+        assert pod["limits"]["memory"] == argv[argv.index("--memory") + 1]
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_capacity_limit_the_api_server_refuses_changes_nothing(tmp_path, platform):
+    """SDD §17.2 (review RV38B-02): a limit below the manifests' requests (1Gi) is refused by the
+    API server - checked by a server-side dry run before anything changes, so the ConfigMap keeps
+    its values for the next pod start and the running pod keeps running."""
+    proc, _, _ = _run(
+        tmp_path,
+        platform,
+        "capacity",
+        "--max-migrations",
+        "20",
+        "--memory",
+        "512Mi",
+        cluster=fake_kube.cluster(),
+    )
+    state = _cluster_after(tmp_path)
+    assert proc.returncode != 0
+    assert state["configmap"]["SEAMLESS_MAX_CONCURRENT_MIGRATIONS"] == "10"
+    assert [p["name"] for p in fake_kube.running(state)] == ["seamless-1"]
+
+
+def test_the_documented_dry_run_of_a_cluster_down_is_what_the_script_prints():
+    """Operations.md §2 shows `kubernetes down --dry-run`'s output: it is what the script prints
+    (review 38b, a check of its own made a test)."""
+    ops = (find_repo_root() / "docs" / "Operations.md").read_text(encoding="utf-8")
+    block = ops[ops.index("scripts/seamless-ctl.sh kubernetes down --dry-run") :]
+    documented = [line for line in block.split("```", 1)[0].splitlines() if line.startswith("+ ")]
+    out = subprocess.run(
+        ["bash", str(SCRIPT), "kubernetes", "down", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert out == documented
 
 
 ENV = "".join(

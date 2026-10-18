@@ -53,12 +53,12 @@ Compose, deleting the namespace or its PVCs on a cluster.
 | Action | What it does | docker / podman | kubernetes / openshift |
 |---|---|---|---|
 | `up` | deploy or update everything, then wait until it runs | `make seamless-up` (`--demo`: `seamless-demo`) - builds, creates or recreates what changed | `apply -k` the overlay, then PostgreSQL and the control plane at one replica each, both rollouts awaited |
-| `down` | stop everything; the data stays | `make seamless-down` - containers removed, volumes kept | control plane to 0 (its pod gone), then PostgreSQL to 0 |
+| `down` | stop everything; the data stays | `make seamless-down` - containers removed, volumes kept | control plane to 0 (its running pod gone; an evicted pod is not waited for), then PostgreSQL to 0 |
 | `stop` | stop the control plane alone | `make seamless-stop` | control plane to 0 replicas |
 | `start` | start the control plane again | `make seamless-start` - the stopped container as it was, or a new one after `down` | PostgreSQL to 1 first when it is at 0, then the control plane |
-| `restart` | restart the control plane from its current configuration | `make seamless-restart` - recreated from `.env`, the compose files and the sources | `rollout restart` (the old pod ends before the new one starts) |
+| `restart` | restart the control plane from its current configuration | `make seamless-restart` - recreated from `.env`, the compose files and the sources | `rollout restart` (the old pod ends before the new one starts); a stopped control plane is started instead |
 | `scale 0` / `scale 1` | the control plane's replicas | `stop` / `start` | `stop` / `start` |
-| `capacity` | scale the one control plane up or down | `--max-migrations`, `--max-cutovers` into `deploy/compose/.env`, then `restart` | the same settings into the ConfigMap, `--cpu`/`--memory` as its limits, one rollout |
+| `capacity` | scale the one control plane up or down | `--max-migrations`, `--max-cutovers` into `deploy/compose/.env`, then `restart` | `--cpu`/`--memory` checked by a server-side dry run (a refused limit changes nothing), the same settings into the ConfigMap, then one patch of the pod template - its limits and a restart -, one rollout |
 | `status` | what runs, and the API's health | `make seamless-ps` + `GET /api/v1/health` | the Deployment, the StatefulSet, the pods (+ health with `--url`) |
 | `logs` | follow the control plane's log | `make seamless-logs` | `logs deployment/seamless -f` |
 | `resume` | start again the plans a `--drain` paused | `POST /plans/{id}/start` | the same, through `--url` |
@@ -71,9 +71,9 @@ running any:
 ```bash
 scripts/seamless-ctl.sh kubernetes down --dry-run
 + kubectl -n seamless-migrate scale deployment/seamless --replicas=0
-+ kubectl -n seamless-migrate wait --for=delete pod -l app.kubernetes.io/name=seamless --timeout=600s
++ kubectl -n seamless-migrate wait --for=delete pod -l app.kubernetes.io/name=seamless '--field-selector=status.phase!=Failed,status.phase!=Succeeded' --timeout=600s
 + kubectl -n seamless-migrate scale statefulset/seamless-postgres --replicas=0
-+ kubectl -n seamless-migrate wait --for=delete pod -l app.kubernetes.io/name=seamless-postgres --timeout=600s
++ kubectl -n seamless-migrate wait --for=delete pod -l app.kubernetes.io/name=seamless-postgres '--field-selector=status.phase!=Failed,status.phase!=Succeeded' --timeout=600s
 ```
 
 Exit status: `0` done, `1` a step failed, `2` a usage error or a refusal (nothing was run).
