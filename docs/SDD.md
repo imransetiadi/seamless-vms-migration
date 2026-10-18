@@ -3686,8 +3686,8 @@ read from the developer's environment (`TYPESAFE_API_KEY`) at init time and neve
 bind mount; `.env` is 0600.
 `Makefile` targets: `seamless-colima-up` (macOS: `colima start seamless --activate=false --cpu 4 --memory 6
 --disk 40` — `--activate=false` keeps the developer's current Docker context),
-`seamless-init`, `seamless-up` / `seamless-down` / `seamless-ps` / `seamless-logs` / `seamless-reset`
-(all through the engine and context below), `seamless-demo` (control plane started with `SEAMLESS_DEMO=true`
+`seamless-init`, `seamless-up` / `seamless-down` / `seamless-stop` / `seamless-start` / `seamless-restart` /
+`seamless-ps` / `seamless-logs` / `seamless-reset` (all through the engine and context below; §17.2), `seamless-demo` (control plane started with `SEAMLESS_DEMO=true`
 against PostgreSQL), `seamless-test` and `seamless-check` (the CI checks that need only the venv and the
 dashboard's `node_modules`: the control plane with its coverage gate, ruff and DEMO-07, the collection, the
 scanners that are installed, the dashboard's unit tests and build; its comment, `make seamless-help` and the README
@@ -3723,6 +3723,45 @@ CI (QASuite §14.5) proves the Linux path:
 * A pull-request job runs `scripts/compose-init.sh` and the targets' dry runs in Rocky Linux 9, AlmaLinux 9,
   Debian 12, Ubuntu 24.04 and Fedora containers.
 
+### 17.2 Operations: up, down, stop, start, restart and scale
+
+`scripts/seamless-ctl.sh PLATFORM ACTION [options]` runs a deployment's lifecycle the same way on every platform:
+`docker` and `podman` drive the single-host stack of §17.1 through its Make targets (`SEAMLESS_ENGINE`), and
+`kubernetes` and `openshift` drive the manifests of §17 through `kubectl` or `oc` in one namespace (`--namespace`,
+default `seamless-migrate`). It never runs a second orchestrator and never deletes data - removing the volumes stays
+`make seamless-reset CONFIRM=yes`, and on a cluster deleting the namespace or its PVCs stays a manual act.
+
+| Action | `docker`, `podman` | `kubernetes`, `openshift` |
+|---|---|---|
+| `up` | `make seamless-up` (`--demo`: `seamless-demo`): build, create or recreate what changed, wait until healthy | `apply -k` the overlay (`deploy/kubernetes`, `deploy/openshift`), then PostgreSQL and the control plane scaled to one replica each - an apply restores no replica count an earlier `down` set - and both rollouts awaited |
+| `down` | `make seamless-down`: the containers removed, the volumes kept | the control plane to 0 replicas and its pod gone, then PostgreSQL to 0; PVCs, Secrets and the ConfigMap kept |
+| `stop` | `make seamless-stop`: the control plane's container stopped, PostgreSQL left running | the control plane to 0 replicas and its pod gone |
+| `start` | `make seamless-start`: the stopped container started as it was, or created when `down` removed it, then waited for | PostgreSQL back to one replica when it is at 0, then the control plane to one, both rollouts awaited |
+| `restart` | `make seamless-restart`: the control plane recreated from the current `.env`, compose files and sources (`up -d --build --force-recreate --no-deps seamless`), then waited for | `rollout restart` of the Deployment - `Recreate` ends the old pod before the new one starts -, then awaited |
+| `scale N` | `N` 0 is `stop`, 1 is `start` | the same |
+| `capacity` | `--max-migrations N` and `--max-cutovers N` written to `deploy/compose/.env` as `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` and `SEAMLESS_MAX_CONCURRENT_CUTOVERS` (§15.1, at least 1), then `restart` | the same settings patched into the ConfigMap `seamless-config`, `--cpu` and `--memory` set as the container's limits, then one rollout, awaited; the next `apply -k` brings the manifests' values back, so a lasting change goes into them |
+| `status` | `make seamless-ps` and `GET /api/v1/health` | the Deployment, the StatefulSet and their pods, and `GET /api/v1/health` at `--url` when given |
+| `logs` | `make seamless-logs` for the control plane | the control plane's log, followed |
+
+* **Scale.** `scale` takes 0 or 1 and refuses any other count: the orchestrator is a singleton (§17, D2), and a
+  second replica would run two orchestrators against one database. Scaling up is capacity - concurrency slots and
+  CPU and memory for the one control plane, each concurrent migration costing about 250 MiB (Performance.md §8) -,
+  while the conversion hosts move the data (Performance.md).
+* **The mode a restart keeps.** `make seamless-start` and `seamless-restart` keep the mode the control plane ran in:
+  without `SEAMLESS_DEMO` in their environment they read it from the running or stopped container, so a demo
+  stack comes back a demo stack and a real one a real one.
+* **Stopping safely.** A stop is safe at any time (§8): running steps end within the stop grace and resume from
+  their checkpoint once the control plane runs again. `--drain TOKEN_FILE` makes a planned stop quieter: before
+  `down`, `stop`, `restart` or `scale 0` it pauses every running plan (`POST /plans/{id}/pause`), so no new
+  migration starts, and waits until no migration is in `cutover`, `verifying` or `rolling_back` - a cutover ends
+  rather than resuming after the restart - for at most `--wait-timeout` seconds (default 1800; a timeout stops
+  nothing). It prints the plans it paused, which `resume --token-file TOKEN_FILE PLAN_ID...` starts again (`POST
+  /plans/{id}/start`). The operator's token is read from a file only its owner may read - any other mode is refused
+  - and reaches curl through a header file in a private directory, never a command line (§13.1); the API is
+  `http://127.0.0.1:<SEAMLESS_HOST_PORT>` on the single host and the Route's or Ingress's URL (`--url`) on a
+  cluster. `--drain` and `resume` need `python3` to read the API's JSON.
+* `--dry-run` prints every command and runs none. The tutorial is `docs/Operations.md`.
+
 ---
 
 ## 18. Observability
@@ -3752,11 +3791,11 @@ tests/unit/test_warm_playbooks.py             tests/perf/bench_blocksync.py
 seamless/ (pyproject.toml, Containerfile, src/seamless_migrate/…, tests/…)
 dashboard/ (package.json, src/…, design-system/…, e2e/…)
 deploy/openshift/   deploy/openshift/backup/   deploy/kubernetes/   deploy/compose/   tests/e2e/
-scripts/compose-init.sh   scripts/check-readonly-runtime.sh   scripts/collection-sanity.sh   scripts/vendor-openstack-cloud.sh
+scripts/compose-init.sh   scripts/seamless-ctl.sh   scripts/check-readonly-runtime.sh   scripts/collection-sanity.sh   scripts/vendor-openstack-cloud.sh
 .github/workflows/{ci,codeql}.yml   .github/dependabot.yml   .pre-commit-config.yaml   .gitleaks.toml   .gitleaks-tree.toml
 .dockerignore   seamless/.containerignore   RELEASING.md   NOTICE   CONTRIBUTING.md   SECURITY.md   CODE_OF_CONDUCT.md   CONTRIBUTORS.md   CODEOWNERS
 docs/advisor/   docs/audits/   docs/UI-UX-AUDIT-2026-10-15.md   AUDIT-UI-UX-BY-GEMINI.md
-docs/{PRD,SDD,MEMORY,QASuite,Security,Performance}.md
+docs/{PRD,SDD,MEMORY,QASuite,Security,Performance,Operations}.md
 docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 .mcp.json   .claude/settings.json   CLAUDE.md
 ```
