@@ -51,6 +51,7 @@ const VMWARE_LINUX: Record<string, [string, string]> = {
   centos64guest: ['centos', '4/5'],
   slesguest: ['sles', '9'],
   sles64guest: ['sles', '9'],
+  redhatguest: ['rhel', '2.1'], // govmomi: "Red Hat Linux 2.1" (review RV38A-06)
 };
 
 type Pair = [string | null, string | null];

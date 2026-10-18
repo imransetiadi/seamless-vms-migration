@@ -106,6 +106,7 @@ _VMWARE_LINUX = {
     "centos64guest": ("centos", "4/5"),
     "slesguest": ("sles", "9"),
     "sles64guest": ("sles", "9"),
+    "redhatguest": ("rhel", "2.1"),  # govmomi: "Red Hat Linux 2.1" (review RV38A-06)
 }
 _SERVER_YEAR = re.compile(r"(2003|2008|2012|2016|2019|2022|2025)")
 _LIBOSINFO = re.compile(r"^win2k(\d{1,2})(r2)?$")

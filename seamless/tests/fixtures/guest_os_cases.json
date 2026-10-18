@@ -62,6 +62,7 @@
     {"in": "sles64Guest", "family": "linux", "distro": "sles", "version": "9", "label": "SLES 9", "lifecycle": "legacy", "v2v": "unverified"},
     {"in": "centos9_64Guest", "family": "linux", "distro": "centos-stream", "version": "9", "label": "CentOS Stream 9", "lifecycle": "current", "v2v": "unverified"},
     {"in": "centos 10", "family": "linux", "distro": "centos-stream", "version": "10", "label": "CentOS Stream 10", "lifecycle": "current", "v2v": "unverified"},
+    {"in": "redhatGuest", "family": "linux", "distro": "rhel", "version": "2.1", "label": "RHEL 2.1", "lifecycle": "legacy", "v2v": "unsupported"},
     {"in": "windows", "family": "windows", "distro": null, "version": null, "label": "Windows", "lifecycle": "unknown", "v2v": "unknown"},
     {"in": null, "family": "unknown", "distro": null, "version": null, "label": "Unknown OS", "lifecycle": "unknown", "v2v": "unknown"},
     {"in": "", "family": "unknown", "distro": null, "version": null, "label": "Unknown OS", "lifecycle": "unknown", "v2v": "unknown"},
