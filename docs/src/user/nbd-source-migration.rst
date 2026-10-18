@@ -93,12 +93,12 @@ After running import_from_hypervisor, your workload definition will be updated w
         use_nbdkit_direct: true
         nbdkit_disks:
           - device: "/dev/vda"
-            uri: "nbd://compute-01.example.com:10809"
+            uri: "nbd://192.0.2.10:10809"
             port: 10809
             size: 10
             bootable: true
           - device: "/dev/vdb"
-            uri: "nbd://compute-01.example.com:10810"
+            uri: "nbd://192.0.2.10:10810"
             port: 10810
             size: 10
             bootable: false
@@ -106,7 +106,9 @@ After running import_from_hypervisor, your workload definition will be updated w
 Each entry in the list represents one disk with:
 
 * ``device``: The device name on the destination instance
-* ``uri``: The NBD URI to connect to
+* ``uri``: The NBD URI to connect to - its host is the address qemu-nbd listens on
+  (``os_migrate_nbdkit_bind_address``, here ``192.0.2.10``), and the hypervisor's name only when it listens on
+  every interface (``0.0.0.0`` or ``::``)
 * ``port``: The qemu-nbd port number
 * ``size``: Disk size in GiB: the exact byte count ``qemu-img info`` reports, rounded up, so the
   destination volume is never smaller than the disk; a disk whose size cannot be read stops the export
@@ -125,9 +127,10 @@ You can customize the role behavior using these variables in your playbook or in
     # Protocol: 'tcp' or 'ssh'
     os_migrate_nbdkit_protocol: tcp
 
-    # Address qemu-nbd listens on: 127.0.0.1 by default; tcp needs the hypervisor's
-    # migration-network IP, and the role refuses the loopback default there
-    os_migrate_nbdkit_bind_address: 192.0.2.10
+    # Address qemu-nbd listens on: 127.0.0.1 by default, which the ssh protocol keeps;
+    # tcp needs each hypervisor's own migration-network IP (below), and the role
+    # refuses the loopback default there
+    os_migrate_nbdkit_bind_address: 127.0.0.1
 
     # SSH user (only for ssh protocol)
     os_migrate_nbdkit_ssh_user: stack
@@ -137,6 +140,19 @@ You can customize the role behavior using these variables in your playbook or in
 
     # Nova instances directory on hypervisor
     os_migrate_nbdkit_nova_instances_dir: /var/lib/nova/instances
+
+With the ``tcp`` protocol each hypervisor listens on its own migration-network IP: set it as a host variable of
+each hypervisor in the inventory, which wins over the global setting - one global address would give every other
+hypervisor an address it does not have:
+
+.. code-block:: yaml
+
+    hypervisors:
+      hosts:
+        compute-01.example.com:
+          os_migrate_nbdkit_bind_address: 192.0.2.10
+        compute-02.example.com:
+          os_migrate_nbdkit_bind_address: 192.0.2.11
 
 Manual hypervisor preparation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -158,16 +174,18 @@ If you want to skip the import_from_hypervisor role and prepare the hypervisor m
     cat /var/lib/nova/instances/<uuid>/disk.info
     qemu-img info -f qcow2 /var/lib/nova/instances/<uuid>/disk
 
-3. Start qemu-nbd for each disk, with the format ``disk.info`` records for it:
+3. Start qemu-nbd for each disk, with the format ``disk.info`` records for it, listening on the hypervisor's
+   migration-network IP only (``-b``; without it qemu-nbd listens on every interface), or on ``127.0.0.1`` when the
+   conversion host reaches it over SSH:
 
 .. code-block:: bash
 
     # Boot disk on port 10809
-    sudo qemu-nbd -f qcow2 -p 10809 --read-only \
+    sudo qemu-nbd -f qcow2 -b 192.0.2.10 -p 10809 --read-only \
       /var/lib/nova/instances/<uuid>/disk
 
     # First ephemeral disk on port 10810 (if present)
-    sudo qemu-nbd -f qcow2 -p 10810 --read-only \
+    sudo qemu-nbd -f qcow2 -b 192.0.2.10 -p 10810 --read-only \
       /var/lib/nova/instances/<uuid>/disk.eph0
 
 4. Manually update your workloads.yml with the nbdkit_disks structure shown above.
@@ -212,10 +230,10 @@ Each disk is transferred in parallel using nbdcopy:
 .. code-block:: bash
 
     # Boot disk transfer
-    nbdcopy nbd://compute-01:10809 /dev/vde --progress
+    nbdcopy nbd://192.0.2.10:10809 /dev/vde --progress
 
     # Ephemeral disk transfer
-    nbdcopy nbd://compute-01:10810 /dev/vdf --progress
+    nbdcopy nbd://192.0.2.10:10810 /dev/vdf --progress
 
 Progress is tracked in the state file for each workload, allowing you to monitor the transfer.
 
@@ -241,9 +259,11 @@ When using NBD direct mode:
 
 4. Ensure firewall rules allow the destination conversion host to connect to ports 10809+ on your hypervisors.
 
-5. qemu-nbd listens on ``os_migrate_nbdkit_bind_address``, ``127.0.0.1`` by default, so an export is not reachable
-   from the network. The ``tcp`` protocol needs the hypervisor's migration-network IP there - the role refuses the
-   loopback default for it -; keep firewall rules that let only the destination conversion host reach that address.
+5. With the import_from_hypervisor role, qemu-nbd listens on ``os_migrate_nbdkit_bind_address``, ``127.0.0.1`` by
+   default, so an export is not reachable from the network. The ``tcp`` protocol needs the hypervisor's
+   migration-network IP there - the role refuses the loopback default for it -; keep firewall rules that let only
+   the destination conversion host reach that address. A qemu-nbd started by hand listens on every interface unless
+   it is given ``-b`` (manual preparation, above).
 
 Complete workflow example
 -------------------------
@@ -291,8 +311,8 @@ Test connectivity:
 
 .. code-block:: bash
 
-    # From destination conversion host
-    qemu-img info nbd://hypervisor-hostname:10809
+    # From destination conversion host: the uri the role recorded in nbdkit_disks
+    qemu-img info nbd://192.0.2.10:10809
 
 Check firewall rules on the hypervisor and verify qemu-nbd is listening:
 
