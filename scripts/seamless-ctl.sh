@@ -238,8 +238,9 @@ for plan in json.load(sys.stdin):
         print(plan["id"])') || die "cannot read the plans the API returned"
   for id in $ids; do
     case $id in '' | .* | *[!A-Za-z0-9._-]*) die "the API returned a plan id this script will not use: '$id'" ;; esac
+    # the plans already paused stay paused: named, with the way to resume them (SDD §17.2, review RV38B-05)
     curl -fsS --max-time 30 -X POST -H "$HEADER" -o /dev/null "$API/api/v1/plans/$id/pause" ||
-      die "cannot pause plan $id"
+      die "cannot pause plan $id: nothing was stopped.$(resume_hint)"
     PAUSED+=("$id")
   done
   if [ ${#PAUSED[@]} -gt 0 ]; then say "paused: ${PAUSED[*]}"; else say "no plan was running"; fi

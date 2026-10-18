@@ -602,6 +602,23 @@ def test_status_and_drain_ask_the_port_the_stack_publishes(tmp_path):
     assert asked and all(url.startswith("http://127.0.0.1:18081/") for url in asked), asked
 
 
+def test_a_drain_whose_pause_fails_names_the_plans_it_already_paused(tmp_path):
+    """SDD §17.2 (review RV38B-05): --drain prints the plans it paused - also when it stops
+    half-way: plan-bb's pause failed (it completed meanwhile, 409) after plan-aa's succeeded, and
+    plan-aa, paused for good, is named with the resume command, as a drain that times out names
+    them; it died naming none, and a second drain lists running plans only."""
+    rules = [
+        {"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"stdout": RUNNING}]},
+        {"cmd": "curl", "has": ["plan-bb/pause"], "answers": [{"exit": 22}]},
+    ]
+    proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", rules=rules)
+    paused = [c for c in calls if c["cmd"] == "curl" and c["args"][-1].endswith("plan-aa/pause")]
+    assert proc.returncode == 1 and paused
+    assert "cannot pause plan plan-bb" in proc.stderr
+    assert "resume" in proc.stderr and "plan-aa" in proc.stderr, proc.stderr
+    assert not [c for c in calls if c["cmd"] == "make"]  # nothing was stopped
+
+
 @pytest.mark.parametrize("timeout", ["08", "09"])
 def test_a_drain_reads_a_leading_zero_wait_timeout_as_decimal_seconds(tmp_path, timeout):
     """SDD §17.2 (review RV38B-06): --wait-timeout takes seconds, 08 being eight. Bash reads a
