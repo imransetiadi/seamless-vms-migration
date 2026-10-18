@@ -1058,7 +1058,13 @@ class Orchestrator:
             # SDD §5.4: one left in validating by an interrupted validation is taken over as it is
             # (validations of a plan run one at a time under its lock: none is at work on it)
             if m.phase not in REVALIDATABLE and m.phase != P.validating:
-                return m  # already in flight or finished: leave it alone
+                # already in flight or finished: left alone, but in its VM's wave in the plan, so
+                # waves planned anew reach it before the plan starts (SDD §9.4, review PL-11)
+                wave = plan.wave_of(m.vm.source_id)
+                if m.wave_id != (wave.id if wave else None):
+                    m.wave_id = wave.id if wave else None
+                    await self._save(m, v)
+                return m
             steps: list[tuple[Phase, str, dict[str, Any] | None]] = []
             if m.phase != P.validating:
                 steps.append((P.validating, "pre-flight validation", None))
@@ -1504,6 +1510,16 @@ class Orchestrator:
                     f"{m.vm.name} cannot be retried: the plan's {role} provider "
                     f"{provider_id!r} no longer exists; create a new plan for the VM"
                 )
+            wave = plan.wave_of(m.vm.source_id)
+            if plan.waves and wave is None:
+                # it would run at once, outside every wave's order and max_parallel (SDD §9.4)
+                raise NotAllowed(
+                    f"{m.vm.name} cannot be retried: it belongs to no wave of the plan; re-run the "
+                    "automatic wave planning or add it to a wave"
+                )
+            # the attempt runs in its VM's wave in the plan, never in one the waves planned anew
+            # dropped - the tick reads that as no wave (SDD §9.4, review PL-11)
+            m.wave_id = wave.id if wave else None
             if m.phase == P.rolled_back:
                 # the FSM counts failed -> ready only; a retry after an automatic rollback
                 # is still a new attempt of the cutover (executors key their behaviour on it)

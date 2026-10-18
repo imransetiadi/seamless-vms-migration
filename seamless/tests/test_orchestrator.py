@@ -225,6 +225,86 @@ async def test_a_revalidation_never_counts_a_completed_migration_again(tmp_path,
     assert (second.phase, [f.code for f in second.findings]) == (P.ready, [])
 
 
+async def _a_plan_in_two_waves(tmp_path, store):
+    """web-01 in the Pilot (wave-1), web-02 in wave-3, validated; web-02's migration then failed
+    before its source stopped, as a cutover refused by the destination leaves it."""
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)], {"default_strategy": Strategy.cold})
+    plan.waves = [
+        Wave(id="wave-1", name="Pilot", order=1, vm_ids=["vm-1"]),
+        Wave(id="wave-3", name="Wave 3", order=3, vm_ids=["vm-2"], depends_on=["wave-1"]),
+    ]
+    store.put("plan", plan)
+    await h.orch.validate_plan(plan.id, "alice")
+    failed = await h.by_vm(plan.id, "vm-2")
+    assert failed.wave_id == "wave-3"
+    failed.phase = P.failed
+    store.put("migration", failed)
+    return h, plan, failed
+
+
+async def test_a_validation_writes_the_plans_wave_into_a_migration_it_leaves_alone(tmp_path, store):
+    """SDD §9.4 (review PL-11): the waves planned anew put web-02 in the Pilot; the validation
+    that every wave change needs writes that wave into its failed migration too, which it does not
+    re-assess - so the plan starts, never refused as one whose migration "belongs to no wave"."""
+    h, plan, failed = await _a_plan_in_two_waves(tmp_path, store)
+    try:
+        replanned = await h.orch.auto_waves(plan.id, 10, "alice")
+        [pilot] = replanned.waves
+        assert pilot.vm_ids == ["vm-1", "vm-2"]
+        await h.orch.validate_plan(plan.id, "alice")
+        left = await h.migration(failed.id)
+        assert (left.phase, left.wave_id) == (P.failed, pilot.id)
+        assert (await h.orch.start_plan(plan.id, "alice")).status == PlanStatus.running
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_validation_clears_the_wave_of_a_migration_whose_vm_left_every_wave(
+    tmp_path, store
+):
+    """SDD §9.4 (review PL-11): waves edited so that web-02 is in none: the validation writes no
+    wave into its failed migration either - never one the plan no longer has - and start_plan
+    names it as belonging to no wave."""
+    h, plan, failed = await _a_plan_in_two_waves(tmp_path, store)
+    edited = await h.plan(plan.id)
+    edited.waves = [w for w in edited.waves if w.id == "wave-1"]
+    edited.status = PlanStatus.draft
+    store.put("plan", edited)
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        assert (await h.migration(failed.id)).wave_id is None
+        with pytest.raises(NotAllowed, match="belong to no wave: web-02"):
+            await h.orch.start_plan(plan.id, "alice")
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_retry_takes_the_wave_the_plan_gives_its_vm(tmp_path, store):
+    """SDD §9.4, §12 (review PL-11): a retried migration runs in its VM's wave in the plan, never
+    in a wave it was assessed under that the plan no longer has - the tick would read that as no
+    wave and cut it over at once, before the Pilot."""
+    h, plan, failed = await _a_plan_in_two_waves(tmp_path, store)
+    stale = await h.migration(failed.id)
+    stale.wave_id = "wave-gone"  # the waves it was assessed under, planned anew since
+    store.put("migration", stale)
+    retried = await h.orch.retry(failed.id, "bayu")
+    assert (retried.phase, retried.wave_id) == (P.ready, "wave-3")
+
+
+async def test_a_retry_refuses_a_vm_in_no_wave_of_the_plan(tmp_path, store):
+    """SDD §9.4, §12 (review PL-11): a retry refuses (409, before any change) a migration of a plan
+    with waves whose VM is in none of them, as start_plan does: it would run at once, outside every
+    wave's order and max_parallel."""
+    h, plan, failed = await _a_plan_in_two_waves(tmp_path, store)
+    edited = await h.plan(plan.id)
+    edited.waves = [w for w in edited.waves if w.id == "wave-1"]
+    store.put("plan", edited)
+    with pytest.raises(NotAllowed, match="belongs to no wave"):
+        await h.orch.retry(failed.id, "bayu")
+    left = await h.migration(failed.id)
+    assert (left.phase, left.wave_id) == (P.failed, "wave-3")
+
+
 async def test_validate_creates_migrations_with_findings_and_estimates(tmp_path, store):
     gpu = vm(3, "gpu-01", flavor_extra_specs={"resources:VGPU": "1"})
     vms = [vm(1), vm(2, "db-02", size_gb=600, used_gb=300.0), gpu]
