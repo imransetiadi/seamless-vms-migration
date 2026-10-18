@@ -598,7 +598,11 @@ Approvals, `cutover_requested` (with its requester) and a pending `force_window`
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
 `blocked` and `ready`, and one left in `validating`: a plan's validations run one at a time under
-its lock, so no other validation is still at work on it. A re-assessment of a migration whose history reached
+its lock, so no other validation is still at work on it. It reads from the source only those VMs and the ones with
+no migration yet; a migration in any other phase counts as its recorded `vm` wherever the whole plan does (duplicate
+names, the addresses a NIC override must not take, the quota, §9.3), and the wave planner (§9.4) reads the plan's VMs
+the same way - so a VM that left the source, deleted by a storage handover (§7.3 step 4) or by a finalize with
+`delete_source` (§8.1), never fails its plan's validation or wave planning (review PL-09). A re-assessment of a migration whose history reached
 `cutover` keeps each volume of its validated `vm.disks` that the VM no longer lists - a cold export detaches the data
 volumes, and one that failed may have left them so when its rescue failed too (§6.6) - among the migration's disks,
 as the blocker `SRC_VM_VOLUME_DETACHED` (§9.3): neither a validation nor the export check (§7.2) drops a disk the
