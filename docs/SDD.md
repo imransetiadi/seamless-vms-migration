@@ -3654,7 +3654,11 @@ is no origin a browser sends (review RV31-03).
   cancelled by the next batch, so a slow API still answers while events keep coming, and a query whose refresh
   was under way is refreshed again once it is done, so an event that came after its request still shows.
   `VITE_SEAMLESS_MOCK=1` switches to an in-browser mock adapter (`src/api/mock.ts`) with fixture data
-  that exercises every phase.
+  that exercises every phase. Its estimates are §9.1's, as a validation computes them: the control plane's `estimate`
+  with the plan's parameters (`params_for_plan`: the plan's overrides, its own link, threshold and pass limit),
+  ported to `src/lib/forcedEstimate.ts` and checked against a case table the control plane generates
+  (`seamless/tests/fixtures/estimate_cases.json`); the mock shows each part rounded to 0.1 s, the downtime as their
+  sum, and the API's `meets_slo`.
 * Dev: `npm run dev` proxies `/api` to `http://127.0.0.1:8080`. Build output `dashboard/dist`.
 
 ---
