@@ -33,7 +33,7 @@ def test_health_public_reports_db(api, monkeypatch):
     # demo_speed: the dashboard runs a demo's downtime clock in model time (SDD §12, ADV-16)
     assert body == {
         "status": "ok",
-        "version": "0.1.0-rc.1",
+        "version": "0.1.0-rc.2",
         "demo": True,
         "demo_speed": 1e7,
         "auth_disabled": False,

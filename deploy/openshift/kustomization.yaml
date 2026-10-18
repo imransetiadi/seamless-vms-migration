@@ -3,7 +3,7 @@
 #
 # Deploy:
 #   1. Build and push the image from the repository root:
-#        podman build -f seamless/Containerfile -t <registry>/seamless-migrate:0.1.0-rc.1 .
+#        podman build -f seamless/Containerfile -t <registry>/seamless-migrate:0.1.0-rc.2 .
 #        (run `make dashboard-build` first so the UI is baked into the image)
 #   2. Set newName/newTag (or digest) in the images: section below.
 #   3. Create the Secrets seamless-db, seamless-tokens (required) and seamless-clouds, seamless-vmware,
@@ -37,14 +37,14 @@ resources:
 labels:
   - pairs:
       app.kubernetes.io/part-of: seamless-migrate
-      app.kubernetes.io/version: 0.1.0-rc.1
+      app.kubernetes.io/version: 0.1.0-rc.2
     includeSelectors: false
 
 images:
   - name: seamless-migrate
     # default: the OpenShift internal registry of this namespace
     newName: image-registry.openshift-image-registry.svc:5000/seamless-migrate/seamless-migrate
-    newTag: 0.1.0-rc.1
+    newTag: 0.1.0-rc.2
     # production: pin by digest instead of a tag
     # digest: sha256:<digest-of-the-pushed-image>
   - name: registry.redhat.io/rhel9/postgresql-16
