@@ -15,7 +15,13 @@ kubectl and the API server do (review 38b, read from their sources):
   resources`` with limits equal to the current ones patches nothing (``set_resources.go``), nor
   does a patch that leaves the template as it is;
 * the API server refuses limits below the requests, a dry run (``--dry-run=server``) too, and
-  applies nothing then.
+  applies nothing then;
+* a LimitRange (``limitrange``: a container's maximum) judges the pod, not the Deployment: a
+  template above it patches and rolls - Recreate ends the old pod -, the new pod is never created,
+  and ``rollout status`` fails once the progress deadline passes; ``rollout undo`` brings the
+  previous template back, as a new one;
+* ``unavailable`` set, every real (not dry-run) patch of the Deployment fails as the API server
+  restarting does.
 """
 
 from __future__ import annotations
@@ -55,10 +61,16 @@ def qty(value):
 
 
 def new_pod(kind):
-    st["serial"] += 1
     obj = st[kind]
+    limits = dict(obj.get("limits", {}))
+    for key, most in st.get("limitrange", {}).items():  # LimitRanger admits the pod or none
+        if key in limits and qty(limits[key]) > qty(most):
+            obj["failed_create"] = (f"maximum {key} usage per Container is {most}, but limit is "
+                                    f"{limits[key]}")
+            return None
+    st["serial"] += 1
     pod = {"name": f"{obj['name']}-{st['serial']}", "phase": "Running",
-           "config": dict(st["configmap"]), "limits": dict(obj.get("limits", {}))}
+           "config": dict(st["configmap"]), "limits": limits}
     if kind == "deployment":
         pod["databases"] = [p["name"] for p in st["statefulset"]["pods"] if p["phase"] == "Running"]
     return pod
@@ -73,11 +85,15 @@ def reconcile(kind):
     for pod in active(kind)[obj["replicas"]:]:  # a scale-down deletes active pods only
         pod["terminating"] = True
     while len(active(kind)) < obj["replicas"]:
-        obj["pods"].append(new_pod(kind))
+        pod = new_pod(kind)
+        if pod is None:
+            break
+        obj["pods"].append(pod)
 
 
 def new_template():  # Recreate: the old pod ends, a new one reads the ConfigMap as it starts
     obj = st["deployment"]
+    obj.pop("failed_create", None)
     obj["pods"] = [p for p in obj["pods"] if p["phase"] != "Running"]
     reconcile("deployment")
 
@@ -111,6 +127,10 @@ if verb == "scale":
     done(f"{words[1]} scaled\n")
 if verb == "get" and words[1] in KINDS:
     done(str(st[KINDS[words[1]]]["replicas"]))
+# -o go-template={{index .data "KEY"}}: the value, or "<no value>" for a key the ConfigMap lacks
+if verb == "get" and words[1] == "configmap/seamless-config":
+    key = re.search(r'index \.data "([^"]+)"', flags["-o"]).group(1)
+    done(st["configmap"].get(key, "<no value>"))
 if verb == "get" and words[1] == "pods":
     done("".join(f"pod/{p['name']}\n" for p in selected(label_kind())))
 if verb == "wait":
@@ -122,12 +142,28 @@ if verb == "wait":
         done(f"error: timed out waiting for the condition on pods/{left[0]}\n", 1)
     done()
 if verb == "rollout" and words[1] == "status":
+    kind = KINDS[words[2]]
+    if len(active(kind)) < st[kind]["replicas"]:
+        done(f'error: deployment "seamless" exceeded its progress deadline\n', 1)
     done(f"{words[2]} successfully rolled out\n")
 if verb == "rollout" and words[1] == "restart":
+    obj = st["deployment"]
+    obj.setdefault("history", []).append(
+        {"limits": dict(obj["limits"]), "annotations": dict(obj.get("annotations", {}))})
     new_template()
     done("deployment.apps/seamless restarted\n")
-if verb == "patch" and words[1] == "configmap/seamless-config":
-    st["configmap"].update(json.loads(flags["-p"])["data"])
+if verb == "rollout" and words[1] == "undo":
+    obj = st["deployment"]
+    previous = obj.get("history", []).pop()
+    obj["limits"], obj["annotations"] = previous["limits"], previous["annotations"]
+    new_template()
+    done("deployment.apps/seamless rolled back\n")
+if verb == "patch" and words[1] == "configmap/seamless-config":  # a merge patch: null removes
+    for key, value in json.loads(flags["-p"])["data"].items():
+        if value is None:
+            st["configmap"].pop(key, None)
+        else:
+            st["configmap"][key] = value
     done("configmap/seamless-config patched\n")
 if verb == "patch" and words[1] == "deployment/seamless":
     obj = st["deployment"]
@@ -145,8 +181,13 @@ if verb == "patch" and words[1] == "deployment/seamless":
                  f' of {limits[key]}\n', 1)
     if flags.get("--dry-run") == "server":
         done("deployment.apps/seamless patched (server dry run)\n")
+    if st.get("unavailable"):
+        done("Error from server (ServiceUnavailable): the server is currently unable to handle the "
+             "request\n", 1)
     if (limits, annotations) == (obj["limits"], obj.get("annotations", {})):
         done("deployment.apps/seamless patched (no change)\n")  # the same template: no rollout
+    obj.setdefault("history", []).append(
+        {"limits": dict(obj["limits"]), "annotations": dict(obj.get("annotations", {}))})
     obj["limits"], obj["annotations"] = limits, annotations
     new_template()
     done("deployment.apps/seamless patched\n")

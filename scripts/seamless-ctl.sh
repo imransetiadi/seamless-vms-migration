@@ -419,10 +419,48 @@ cluster_capacity() {
       "$PROG" "$MAX_MIGRATIONS" >&2
   fi
   capacity_check # again after a drain, which may have taken --wait-timeout
-  [ -n "$CAP_DATA" ] && kube patch configmap/seamless-config --type merge -p "{\"data\":{$CAP_DATA}}"
-  kube patch deployment/seamless -p "$CAP_PATCH"
-  rollout deployment/seamless
+  local before=''
+  if [ -n "$CAP_DATA" ]; then
+    if [ "$DRY" != 1 ]; then
+      before=$(capacity_settings_now) || die "cannot read seamless-config: nothing was changed"
+    fi
+    kube patch configmap/seamless-config --type merge -p "{\"data\":{$CAP_DATA}}"
+  fi
+  # a template patch or a rollout that fails puts the settings and the template back, so the control plane runs
+  # again as it was - a LimitRange or a quota judges the pod, which no dry run of the Deployment shows (SDD §17.2,
+  # reviews RV41A-06, RV41A-07)
+  kube patch deployment/seamless -p "$CAP_PATCH" || capacity_failed "the pod template could not be patched"
+  rollout deployment/seamless || capacity_failed "the new pod did not start - a LimitRange or a quota may refuse \
+its limits (kubectl -n $NS describe replicaset -l app.kubernetes.io/name=seamless)" undo
   say "the next 'up' (apply -k) brings the manifests' values back: put a lasting change into $OVERLAY"
+}
+# The settings seamless-config holds for the keys capacity changes, as merge-patch data - a key it lacks as null, which
+# removes it again (SDD §17.2, review RV41A-06).
+capacity_settings_now() {
+  local key value data=''
+  for key in SEAMLESS_MAX_CONCURRENT_MIGRATIONS SEAMLESS_MAX_CONCURRENT_CUTOVERS; do
+    case $CAP_DATA in *"\"$key\""*) ;; *) continue ;; esac
+    value=$("$KUBE" -n "$NS" get configmap/seamless-config -o "go-template={{index .data \"$key\"}}") || return 1
+    case $value in
+      '<no value>' | '') value=null ;;
+      *) value="\"$(printf '%s' "$value" | sed 's/[\\"]/\\&/g')\"" ;;
+    esac
+    data="${data:+$data,}\"$key\":$value"
+  done
+  printf '%s' "$data"
+}
+# Put back what a failed capacity changed - the ConfigMap's settings (cluster_capacity's $before) and, after a
+# rollout, the template - then stop.
+capacity_failed() {
+  if [ -n "$before" ]; then
+    kube patch configmap/seamless-config --type merge -p "{\"data\":{$before}}" ||
+      die "$1, and seamless-config could not be put back: set its concurrency settings yourself"
+  fi
+  if [ "${2-}" = undo ]; then
+    { kube rollout undo deployment/seamless && rollout deployment/seamless; } ||
+      die "$1, and the rollout could not be undone: $KUBE -n $NS rollout undo deployment/seamless"
+  fi
+  die "$1: seamless-config and the pod template are put back as they were"
 }
 
 cluster() {

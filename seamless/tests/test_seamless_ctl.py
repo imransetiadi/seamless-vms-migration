@@ -314,8 +314,9 @@ def test_cluster_capacity_patches_the_configmap_and_sets_the_limits_in_one_rollo
 ):
     """SDD §17.2: capacity scales the one control plane up or down - its concurrency settings in the
     ConfigMap, its CPU and memory limits - in a single rollout, awaited: the limits checked by a
-    server-side dry run first, then the ConfigMap, then one patch of the pod template - the limits
-    and a restart annotation (reviews RV38B-01, RV38B-02)."""
+    server-side dry run first, then the ConfigMap - the settings it changes read first, to be put
+    back on a failure -, then one patch of the pod template - the limits and a restart annotation
+    (reviews RV38B-01, RV38B-02, RV41A-06)."""
     proc, calls, _ = _run(
         tmp_path,
         platform,
@@ -336,8 +337,11 @@ def test_cluster_capacity_patches_the_configmap_and_sets_the_limits_in_one_rollo
     patches = [
         args[args.index("-p") + 1] for args in made if args[2:4] == ["patch", "deployment/seamless"]
     ]
+    read = [*ns, "get", "configmap/seamless-config", "-o"]
     assert made == [
         [*ns, "patch", "deployment/seamless", "-p", patches[0], "--dry-run=server"],
+        [*read, 'go-template={{index .data "SEAMLESS_MAX_CONCURRENT_MIGRATIONS"}}'],
+        [*read, 'go-template={{index .data "SEAMLESS_MAX_CONCURRENT_CUTOVERS"}}'],
         [
             *ns,
             "patch",
@@ -364,11 +368,12 @@ def test_cluster_capacity_patches_the_configmap_and_sets_the_limits_in_one_rollo
     assert proc.returncode == 0, proc.stderr
     made = [c["args"] for c in calls if c["cmd"] == tool]
     assert [args[2:4] for args in made] == [
+        ["get", "configmap/seamless-config"],
         ["patch", "configmap/seamless-config"],
         ["patch", "deployment/seamless"],
         ["rollout", "status"],
     ]
-    assert list(json.loads(made[1][-1])["spec"]["template"]) == ["metadata"]
+    assert list(json.loads(made[2][-1])["spec"]["template"]) == ["metadata"]
 
 
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
@@ -461,6 +466,57 @@ def test_a_capacity_limit_the_api_server_refuses_changes_nothing(tmp_path, platf
     assert proc.returncode != 0
     assert state["configmap"]["SEAMLESS_MAX_CONCURRENT_MIGRATIONS"] == "10"
     assert [p["name"] for p in fake_kube.running(state)] == ["seamless-1"]
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+@pytest.mark.parametrize(
+    "argv",
+    [["--max-migrations", "20"], ["--max-migrations", "20", "--memory", "8Gi"]],
+    ids=["settings alone", "with a limit"],
+)
+def test_a_capacity_whose_template_patch_fails_puts_the_settings_back(tmp_path, platform, argv):
+    """SDD §17.2 (review RV41A-06): the template patch failing after the ConfigMap's - the API
+    server restarting - left the new concurrency in the ConfigMap, unsaid, for the next pod start
+    to take with the old limits. The settings the ConfigMap held are put back, the running pod
+    runs on, and the script exits 1 saying so."""
+    state = fake_kube.cluster()
+    state["unavailable"] = True
+    proc, _, _ = _run(tmp_path, platform, "capacity", *argv, cluster=state)
+    after = _cluster_after(tmp_path)
+    assert proc.returncode == 1, proc.stderr
+    assert "put back" in proc.stderr, proc.stderr
+    assert after["configmap"]["SEAMLESS_MAX_CONCURRENT_MIGRATIONS"] == "10"
+    assert [p["name"] for p in fake_kube.running(after)] == ["seamless-1"]
+
+
+def test_a_failed_capacity_removes_a_setting_the_configmap_lacked(tmp_path):
+    """SDD §17.2 (review RV41A-06): putting the settings back removes a key the ConfigMap did not
+    hold before - the manifests' default applies again, as before the change."""
+    state = fake_kube.cluster()
+    state["unavailable"] = True
+    del state["configmap"]["SEAMLESS_MAX_CONCURRENT_CUTOVERS"]
+    proc, _, _ = _run(tmp_path, "kubernetes", "capacity", "--max-cutovers", "5", cluster=state)
+    assert proc.returncode == 1, proc.stderr
+    assert _cluster_after(tmp_path)["configmap"] == {"SEAMLESS_MAX_CONCURRENT_MIGRATIONS": "10"}
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_capacity_limit_a_limitrange_refuses_is_rolled_back(tmp_path, platform):
+    """SDD §17.2 (review RV41A-07): a LimitRange judges the pod, not the Deployment - the dry run
+    passed, Recreate ended the running pod, the new pod was refused, and the control plane stayed
+    down until someone patched the limit back. The failed rollout is undone - the previous
+    template, the settings the ConfigMap held - so the control plane runs again as it was, and the
+    script exits 1 naming the refusal."""
+    state = fake_kube.cluster()
+    state["limitrange"] = {"memory": "4Gi"}
+    argv = ["capacity", "--max-migrations", "20", "--memory", "8Gi"]
+    proc, _, _ = _run(tmp_path, platform, *argv, cluster=state)
+    after = _cluster_after(tmp_path)
+    assert proc.returncode == 1, proc.stderr
+    assert "LimitRange" in proc.stderr, proc.stderr
+    [pod] = fake_kube.running(after)
+    assert pod["limits"]["memory"] == "4Gi"
+    assert pod["config"]["SEAMLESS_MAX_CONCURRENT_MIGRATIONS"] == "10"
 
 
 @pytest.mark.parametrize("platform", ["kubernetes", "openshift"])

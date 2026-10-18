@@ -58,7 +58,7 @@ Compose, deleting the namespace or its PVCs on a cluster.
 | `start` | start the control plane again | `make seamless-start` - the stopped container as it was, or a new one after `down` | PostgreSQL back to 1 first when it is not at 1 - each extra replica is a database of its own: named, awaited gone, its PVC kept -, then the control plane |
 | `restart` | restart the control plane from its current configuration | `make seamless-restart` - recreated from `.env`, the compose files and the sources | `rollout restart` (the old pod ends before the new one starts); a stopped control plane is started instead |
 | `scale 0` / `scale 1` | the control plane's replicas | `stop` / `start` | `stop` / `start` |
-| `capacity` | scale the one control plane up or down | `--max-migrations`, `--max-cutovers` into `deploy/compose/.env`, then `restart` | `--cpu`/`--memory` checked by a server-side dry run (a refused limit changes nothing), the same settings into the ConfigMap, then one patch of the pod template - its limits and a restart -, one rollout |
+| `capacity` | scale the one control plane up or down | `--max-migrations`, `--max-cutovers` into `deploy/compose/.env`, then `restart` | `--cpu`/`--memory` checked by a server-side dry run (a limit the API server refuses changes nothing), the same settings into the ConfigMap, then one patch of the pod template - its limits and a restart -, one rollout; a failed patch or rollout - a LimitRange or quota refusing the new pod - is rolled back, the settings put back |
 | `status` | what runs, and the API's health | `make seamless-ps` + `GET /api/v1/health` | the Deployment, the StatefulSet, the pods (+ health with `--url`) |
 | `logs` | follow the control plane's log | `make seamless-logs` | `logs deployment/seamless -f` |
 | `resume` | start again the plans a `--drain` paused | `POST /plans/{id}/start` | the same, through `--url` |
@@ -242,7 +242,9 @@ lasting change into the overlay - `deploy/openshift/configmap.yaml` and the `res
 `deploy/openshift/deployment.yaml` (or a kustomize patch of your own). The requests and limits there are sized for
 10 concurrent migrations at about 250 MiB each: above 10 without `--memory`, the script warns, as on the single host.
 The rollout restarts the control plane: add `--drain` and `--url` (section 5) to let the cutovers in flight end
-first.
+first. A namespace's LimitRange or quota judges the new pod, not the Deployment the dry run checks: when the new pod
+does not start within `--timeout`, the script rolls the template back and puts the settings back, so the control
+plane runs again as it was, and exits 1 - check `kubectl describe replicaset` for the refusal.
 
 ---
 
