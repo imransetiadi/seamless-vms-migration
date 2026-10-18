@@ -41,6 +41,20 @@ def test_heuristic_tier():
     assert heuristic_tier(vm("12", "shop-web", app="shop")) == "stateless_web"
 
 
+def test_an_os_name_is_never_a_service():
+    """SDD §9.4 (review PL-03): os_type decides legacy_os only; the service keywords match the name
+    and the tag values. An Oracle Linux guest's OS names "oracle", which is no Oracle database: its
+    web servers stay web servers, and a VM its name calls a database still is one."""
+    for os_type in ("Oracle Linux Server 8.9", "oracleLinux9_64Guest", "ol9"):
+        assert heuristic_tier(vm("1", "web-01", os_type=os_type)) == "stateless_web", os_type
+        assert heuristic_tier(vm("2", "xyz-42", os_type=os_type)) == "manual_review", os_type
+    assert heuristic_tier(vm("3", "ora-db-01", os_type="oracleLinux9_64Guest")) == (
+        "stateful_database"
+    )
+    # and a legacy OS still decides, by os_type
+    assert heuristic_tier(vm("4", "web-01", os_type="oracleLinux64Guest")) == "legacy_os"
+
+
 def test_pilot_wave_first():
     vms = [
         vm("db", "db-01", 500),

@@ -63,7 +63,8 @@ _SERVICES: tuple[tuple[str, tuple[str, ...], frozenset[str], AppProbe], ...] = (
 
 
 def _text(vm: VMRef) -> str:
-    return " ".join([vm.name, *vm.tags.values(), vm.os_type or ""]).lower()
+    # the name and tag values, never the OS: an OS name is no service (SDD §9.6, review PL-03)
+    return " ".join([vm.name, *vm.tags.values()]).lower()
 
 
 def suggest_probes(vm: VMRef) -> list[AppProbe]:

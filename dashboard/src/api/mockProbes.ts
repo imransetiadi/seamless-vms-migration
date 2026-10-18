@@ -61,8 +61,9 @@ const SERVICES: ReadonlyArray<readonly [Tier, readonly string[], ReadonlySet<str
   ['infrastructure_service', ['kerberos'], new Set(), tcp(88)],
 ];
 
+/** The name and tag values the service keywords match - never the OS, an OS name is no service (SDD §9.4, §9.6, review PL-03). */
 function describe(vm: VMRef): { text: string; tokens: Set<string> } {
-  const text = [vm.name, ...Object.values(vm.tags), vm.os_type ?? ''].join(' ').toLowerCase();
+  const text = [vm.name, ...Object.values(vm.tags)].join(' ').toLowerCase();
   return { text, tokens: new Set(text.split(/[^a-z0-9]+/)) };
 }
 

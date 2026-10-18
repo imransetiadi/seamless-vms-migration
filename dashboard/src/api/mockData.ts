@@ -1402,7 +1402,7 @@ const PLAN_SPECS: PlanSpec[] = [
           option: 'warm', confidence: 0.83, status: 'auto_applied', deterministic: 'cold',
           then: { kind: 'override', user: 'bayu', option: 'cold', reason: 'Domain controllers move cold: the AD replication window was rehearsed that way', after: 40 * 60 },
         },
-        notes: [{ kind: 'classification', source: 'rules', summary: 'Classified as infrastructure_service: os_type windows2019 and tag app=active-directory.', confidence: null, data: { tier: 'infrastructure_service' }, ago: 3 * D }],
+        notes: [{ kind: 'classification', source: 'rules', summary: 'Classified as infrastructure_service: tag app=active-directory.', confidence: null, data: { tier: 'infrastructure_service' }, ago: 3 * D }],
       },
       { id: 'mig-7a9b1c3d40', vm: 'os-0b22', strategy: 'cold', phase: 'validating', wave: 'wave-3', enteredAgo: 6 },
       { id: 'mig-7a9b1c3d41', vm: 'os-0b32', strategy: 'warm', phase: 'pending', wave: 'wave-3', enteredAgo: 40 * 60 },
