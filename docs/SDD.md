@@ -2085,7 +2085,11 @@ strategy ineligible):
   `src_caps["storage_backends"]`: a family other than `other`, and — when `dst_caps` lists
   `storage_backends` — a destination pool that resolves (§7.3.1); with `plan.port_creation_mode` `"nova"`, no NIC
   with more than one fixed IP (the destination server then gets one fixed IP per port, so the others would be
-  dropped without a word; `"neutron"` keeps them, §7.3 step 8).
+  dropped without a word; `"neutron"` keeps them, §7.3 step 8); and the migration not holding the destination
+  volumes an earlier attempt created (§9.3's rule: its workload record, else a warm attempt's passes): a handover
+  manages the source's volumes and never removes them, so they would be left behind, their quota counted twice - the
+  reason says to run it warm again, which uses them, or cold, whose cutover removes them first (§7.2; review
+  RV39, lead L1).
 * `vmware_cold`: ineligible if `power_state` is `"error"` or `"transitioning"`.
 * `vmware_warm`: requires `cbt_enabled is True` and no `independent` disk.
 * Blocker findings (§9.3) make **all** strategies ineligible.
