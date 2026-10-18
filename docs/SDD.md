@@ -506,8 +506,9 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   on the event never leaves a source that may be stopped without its clock (review RV26-06). `downtime_ended_at` is
   set when verification passes or, on
   rollback, when the source VM is running again - marked by the step as soon as its power-on succeeded
-  (`StepContext.mark_downtime_end()`, the VMware rollback), so an attempt that fails after it leaves the clock
-  closed: the source runs, and the next cutover counts a new outage (review RV30-03). A verification that passes again — the first one was saved,
+  (`StepContext.mark_downtime_end()`: the VMware rollback, and the storage-handover rollback once the source server
+  it started or recreated reads `ACTIVE`, §7.3), so an attempt that fails after it leaves the clock
+  closed: the source runs, and the next cutover counts a new outage (reviews RV30-03, RV36B-03). A verification that passes again — the first one was saved,
   but a stop or a failed event write came before `completed` — keeps the end and the downtime the first one
   recorded: the outage ended then. `actual_downtime_s` = difference — except in demo mode (§7.4),
   where the downtime is in model seconds, the time base of the passes' `duration_s`, so a demo's downtime compares
@@ -1707,7 +1708,13 @@ cache no longer keeps - a build it aborted cleared that cache -, the user's own 
 attempt reads a journaled port again before the recreate: one gone is created again from the journaled MAC,
 addresses, security groups and port-security flag, and journaled anew - a user's own port so loses what the
 definition does not record, such as a floating IP's association -; one still bound to a server that is gone is
-unbound (review RV36B-02). Every step is
+unbound (review RV36B-02). The downtime clock closes once the recreated server is `ACTIVE` - on every attempt
+that finds it journaled, before the give-back - and once the start of a source that still exists succeeded (§5.2):
+an attempt that fails after it, a give-back Nova refuses, leaves the source counted as running, and the migration
+names the server it replaced until a Roll back succeeds. A cutover resumed on a journal whose rollback recreated the
+source - a Retry after that failed attempt - refuses before any call and before the clock opens ("a rollback
+attempt recreated the source server <id>, which runs: roll back to finish it"): that rollback unmanaged every volume
+at RHOSO, so the journal's cutover can never complete, and the source runs (review RV36B-03). Every step is
 a metadata operation — data never moves — and each sub-step is journaled
 (`handover-journal.json`, 0600) so a crash resumes at the first incomplete sub-step. Each call is a blocking
 openstacksdk call in a worker thread, which no cancel stops: a step cancelled by the step timeout (§15.1), a
