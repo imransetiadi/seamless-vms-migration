@@ -1692,8 +1692,11 @@ the source ports with their journaled MAC, fixed IPs, security group ids and por
 required; Nova applies a server's groups only to the ports it creates). The fixed IPs leave out those on a SLAAC or
 DHCPv6-stateless subnet of the source network, whose EUI-64 address of the kept MAC the source's Neutron derives
 itself (§6.6): sent, that address is refused, or allocated twice. Then recreate the
-source server from the journaled definition with the volumes in device order and their journaled
-`delete_on_termination`; start it. Every step is
+source server from the journaled definition with the volumes in device order, each kept (`delete_on_termination`
+false) while Nova builds it - a build Nova aborts deletes every volume flagged otherwise, the VM's only copy of its
+data -, and once it is `ACTIVE` give each volume its journaled `delete_on_termination` back (the step 3 call,
+journaled per volume); a recreated server Nova left in `ERROR` is deleted on the next attempt, its volumes kept, and
+created again (review RV35B-04). Every step is
 a metadata operation — data never moves — and each sub-step is journaled
 (`handover-journal.json`, 0600) so a crash resumes at the first incomplete sub-step. Each call is a blocking
 openstacksdk call in a worker thread, which no cancel stops: a step cancelled by the step timeout (§15.1), a
