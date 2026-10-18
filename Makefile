@@ -574,7 +574,9 @@ lab-handover:
 
 # The manifests' security context at runtime (QASuite §14.5): static scans cannot see what an image writes
 # when it starts. PostgreSQL always; the control plane when its image exists locally (make seamless-demo builds it).
-SEAMLESS_CP_IMAGE ?= seamless-migrate:0.1.0
+# SEAMLESS_VERSION is the release's (RELEASING.md §1; seamless/tests/test_release_versions.py keeps it so).
+SEAMLESS_VERSION ?= 0.1.0-rc.2
+SEAMLESS_CP_IMAGE ?= seamless-migrate:$(SEAMLESS_VERSION)
 deploy-runtime-check: seamless-check-context
 	@[ -x seamless/.venv/bin/python ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'"; exit 1; }
 	DOCKER="$(SEAMLESS_DOCKER)" PYTHON=seamless/.venv/bin/python \
