@@ -305,6 +305,93 @@ async def test_a_retry_refuses_a_vm_in_no_wave_of_the_plan(tmp_path, store):
     assert (left.phase, left.wave_id) == (P.failed, "wave-3")
 
 
+#: two VMs of 2 vCPUs, 4 GiB and one 20 GiB volume each fit the project exactly; once web-01's
+#: attempt holds its 20 GiB destination volume, Cinder reports one volume and 20 GiB less free
+QUOTA_FOR_TWO = {"cores": 4, "ram_mb": 8192, "instances": 2, "volumes": 2, "gigabytes": 40}
+QUOTA_ONE_VOLUME_HELD = {**QUOTA_FOR_TWO, "volumes": 1, "gigabytes": 20}
+
+
+async def _a_cutover_failing_after_the_stop(ctx):
+    await ctx.mark_downtime_start()
+    raise PermanentStepError("create the server in the destination: HTTP 500")
+
+
+async def _a_first_pass_failing(ctx):
+    raise PermanentStepError("the first pass failed after creating its destination volumes")
+
+
+@pytest.mark.parametrize(
+    "how",
+    [
+        "rolled back after its passes",
+        "failed with its volumes recorded",
+        "retried back to ready",
+        "failed before creating anything",
+        "failed with a record of no volume",
+    ],
+)
+async def test_a_revalidation_never_counts_the_volumes_an_earlier_attempt_holds(
+    tmp_path, store, how
+):
+    """SDD §9.3 (review RV38A-01): web-01's warm attempt keeps the destination volume it created
+    for the next attempt - a rollback deletes the server only, a first pass that failed after
+    creating it leaves it (its workload record says so), and a Retry puts the migration back in
+    ready with it -, so Cinder counts it in use and the re-validation counts web-01's server alone:
+    web-02 fits. An attempt that created nothing counts all of it - a record holding no destination
+    volume, a pending source snapshot alone, too -, and web-02 does not fit."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    dst = QuotaDestination(QUOTA_FOR_TWO)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), vm(2)],
+        {
+            "default_strategy": Strategy.warm,
+            "strategy_overrides": {"vm-2": Strategy.cold},  # web-02 waits in ready
+            "auto_cutover": False,
+        },
+        destination=dst,
+    )
+    fails_first_pass = how.startswith("failed")
+    if fails_first_pass:
+        h.executor.hooks[StepName.PRECOPY] = _a_first_pass_failing
+    else:
+        h.executor.hooks[StepName.CUTOVER] = _a_cutover_failing_after_the_stop
+    await run_plan(h, plan)
+    try:
+        first = await h.by_vm(plan.id, "vm-1")
+        if fails_first_pass:
+            await h.wait_phase(first.id, P.failed, timeout=20)
+        else:
+            await h.wait_phase(first.id, P.awaiting_cutover, timeout=20)
+            await h.orch.request_cutover(first.id, "sari")
+            await h.wait_phase(first.id, P.rolled_back, timeout=20)
+        await h.orch.pause_plan(plan.id, "alice")
+        if how == "retried back to ready":
+            assert (await h.orch.retry(first.id, "bayu")).phase == P.ready
+        written = {
+            "failed with its volumes recorded": {"dest_volumes": {"vol-1": "dst-vol-1"}},
+            "failed with a record of no volume": {"dest_volumes": {}, "pending_snapshot": "snap-1"},
+        }
+        if how in written:
+            record = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+            record.parent.mkdir(parents=True, exist_ok=True)
+            record.write_text(json.dumps(written[how]))
+        held = how not in ("failed before creating anything", "failed with a record of no volume")
+        # one volume in use: web-01's when it holds one - and when it holds nothing, the control,
+        # counting all of web-01 leaves web-02 no room
+        dst.free = dict(QUOTA_ONE_VOLUME_HELD)
+        report = await h.orch.validate_plan(plan.id, "alice")
+    finally:
+        await h.orch.stop()
+    second = next(i for i in report.migrations if i.vm_name == "web-02")
+    blocked = [f.code for f in second.findings if f.code == "DST_QUOTA_INSUFFICIENT"]
+    assert (second.phase, blocked) == (
+        (P.ready, []) if held else (P.blocked, ["DST_QUOTA_INSUFFICIENT"])
+    ), how
+
+
 async def test_validate_creates_migrations_with_findings_and_estimates(tmp_path, store):
     gpu = vm(3, "gpu-01", flavor_extra_specs={"resources:VGPU": "1"})
     vms = [vm(1), vm(2, "db-02", size_gb=600, used_gb=300.0), gpu]

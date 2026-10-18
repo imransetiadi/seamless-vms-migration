@@ -6,7 +6,7 @@ import ipaddress
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from ..domain.enums import Phase, ProviderKind, Severity, Strategy
 from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
@@ -439,20 +439,35 @@ NOTHING_STILL_TO_COME = frozenset(
 )
 
 
+#: what a cutover of a VM will still create at the destination: all of it, its server alone, or
+#: nothing (SDD §9.3)
+QuotaShare = Literal["all", "server", "nothing"]
+
+
+def quota_share(phase: Phase | None, *, holds_volumes: bool = False) -> QuotaShare:
+    """What a cutover of a VM whose migration is in ``phase`` (``None``: no migration yet) will
+    still create at the destination (SDD §9.3, reviews PL-02, RV38A-01): nothing once what it holds
+    is in use, or being released; its server alone while its destination volumes exist or are
+    being created, and when it holds the destination volumes an earlier attempt created, which
+    the next attempt uses again; all of it otherwise."""
+    if phase in NOTHING_STILL_TO_COME:
+        return "nothing"
+    if phase in SERVER_STILL_TO_COME or holds_volumes:
+        return "server"
+    return "all"
+
+
 def remaining_demand(
     vm: VMRef,
     plan: Plan | None,
-    phase: Phase | None,
+    share: QuotaShare,
     dst_inv: DestinationInventory | None = None,
 ) -> dict[str, int]:
-    """What a cutover of ``vm`` will still create at the destination, by its migration's phase
-    (SDD §9.3, review PL-02): all of it with no migration (``None``) or one that runs, or runs
-    again, from ready; its server alone once its destination volumes exist or are being created;
-    nothing once what it holds is in use, or being released."""
+    """The part of ``vm``'s demand its ``share`` counts (SDD §9.3, reviews PL-02, RV38A-01)."""
     demand = resource_demand(vm, plan, dst_inv)
-    if phase in NOTHING_STILL_TO_COME:
+    if share == "nothing":
         return dict.fromkeys(demand, 0)
-    if phase in SERVER_STILL_TO_COME:
+    if share == "server":
         return {**demand, "volumes": 0, "gigabytes": 0}
     return demand
 
@@ -462,7 +477,7 @@ def _quota_shortfall(
     plan: Plan,
     dst_inv: DestinationInventory,
     all_vms: Sequence[VMRef],
-    phases: Mapping[str, Phase],
+    shares: Mapping[str, QuotaShare],
 ) -> tuple[str, list[str]] | None:
     project = destination_project(vm, plan, dst_inv)
     if project is None or project not in dst_inv.quotas:
@@ -470,7 +485,7 @@ def _quota_shortfall(
     totals = dict.fromkeys(_QUOTA_KEYS, 0)
     for other in all_vms:
         if destination_project(other, plan, dst_inv) == project:
-            share = remaining_demand(other, plan, phases.get(other.source_id), dst_inv)
+            share = remaining_demand(other, plan, shares.get(other.source_id, "all"), dst_inv)
             for key, value in share.items():
                 totals[key] += value
     free = dst_inv.quotas[project]
@@ -767,13 +782,13 @@ def run_preflight(
     source: Provider | None = None,
     destination: Provider | None = None,
     dst_caps: Mapping[str, Any] | None = None,
-    phases: Mapping[str, Phase] | None = None,
+    shares: Mapping[str, QuotaShare] | None = None,
 ) -> list[Finding]:
     """Evaluate the SDD §9.3 catalog for ``vm`` within ``plan``.
 
     ``all_vms`` are the plan's selected VMs (for duplicate names and cumulative quotas);
-    ``phases`` the phase of each one's migration by source id, none for a VM without one (the
-    quota counts what a cutover will still create);
+    ``shares`` what a cutover of each one will still create, by source id - all of it for a VM
+    without one (``quota_share``; the quota counts what a cutover will still create);
     ``source``/``destination`` enable the conversion-host check; ``dst_caps`` are the
     destination's capabilities as validation's check just reported them (its token's roles).
     """
@@ -1103,7 +1118,7 @@ def run_preflight(
                     f"project, and {where} has {len(dst_inv.projects)} projects.",
                 )
             )
-    shortfall = _quota_shortfall(vm, plan, dst_inv, selected, phases or {})
+    shortfall = _quota_shortfall(vm, plan, dst_inv, selected, shares or {})
     if shortfall is not None:
         project, short = shortfall
         out.append(

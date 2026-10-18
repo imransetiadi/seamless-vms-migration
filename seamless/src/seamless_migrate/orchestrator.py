@@ -88,7 +88,7 @@ from .domain.models import (
     utcnow,
 )
 from .events import EventBus, emit, new_event, put_and_emit
-from .executors.ansible import recorded_copied_data
+from .executors.ansible import recorded_copied_data, recorded_destination_volumes
 from .executors.base import (
     PermanentStepError,
     StepContext,
@@ -110,10 +110,12 @@ from .planning.estimator import (
 )
 from .planning.platforms import destination_descriptor
 from .planning.preflight import (
+    QuotaShare,
     flavor_prestaged,
     has_blocker,
     keep_detached_volumes,
     keypair_prestaged,
+    quota_share,
     resolve_mappings,
     run_preflight,
 )
@@ -710,7 +712,14 @@ class Orchestrator:
             m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)
         }
         vms = await self._vms(plan, src_impl, existing)
-        phases = {vm_id: m.phase for vm_id, m in existing.items()}
+        # what a cutover of each VM will still create - its server alone when an earlier attempt
+        # holds its destination volumes (SDD §9.3, reviews PL-02, RV38A-01)
+        shares: dict[str, QuotaShare] = {}
+        for vm_id, m in existing.items():
+            share = quota_share(m.phase)
+            if share == "all" and await self.holds_destination_volumes(m):
+                share = quota_share(m.phase, holds_volumes=True)
+            shares[vm_id] = share
         cancelled = sorted(
             m.vm.name for vm in vms if (m := existing.get(vm.source_id)) and m.phase == P.cancelled
         )
@@ -787,7 +796,7 @@ class Orchestrator:
                 destination=destination,
                 dst_caps=dst_caps,
                 # the quota counts what a cutover will still create (SDD §9.3, review PL-02)
-                phases=phases,
+                shares=shares,
             )
             findings = [*findings, *detached]
             resolved = resolve_mappings(vm, plan, dst_inv)
@@ -1646,6 +1655,18 @@ class Orchestrator:
         says - destination volumes or a pending source snapshot - and, where no record can tell,
         recorded passes of a strategy other than cold (a cold rollback deletes what it copied)."""
         recorded = await asyncio.to_thread(recorded_copied_data, self.settings, m.plan_id, m)
+        if recorded is not None:
+            return recorded
+        return m.strategy != Strategy.cold and bool(m.sync_passes)
+
+    async def holds_destination_volumes(self, m: Migration) -> bool:
+        """Whether the migration holds destination volumes an earlier attempt created, which the
+        next attempt uses again (SDD §9.3, review RV38A-01): what its workload's record says,
+        and where no record can tell, recorded passes of a strategy other than cold (a cold
+        rollback deletes what it copied)."""
+        recorded = await asyncio.to_thread(
+            recorded_destination_volumes, self.settings, m.plan_id, m
+        )
         if recorded is not None:
             return recorded
         return m.strategy != Strategy.cold and bool(m.sync_passes)

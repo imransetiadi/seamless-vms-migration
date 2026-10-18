@@ -855,6 +855,30 @@ def recorded_copied_data(settings: Settings, plan_id: str, migration: Migration)
     return bool(record.get("dest_volumes") or record.get("pending_snapshot"))
 
 
+def recorded_destination_volumes(
+    settings: Settings, plan_id: str, migration: Migration
+) -> bool | None:
+    """Whether the workload's record (SDD §6.3) holds destination volumes - an attempt created
+    them, and the next one uses them again (SDD §9.3, review RV38A-01); None without a record or
+    for an id the collection would refuse as a file name. An unreadable record counts as volumes
+    held, as recorded_copied_data counts it as data kept."""
+    if not _STATE_FILE_ID.match(migration.vm.source_id):
+        return None
+    path = (
+        run_dir(settings, plan_id, migration.id)
+        / "osm"
+        / "workload_warm"
+        / f"{migration.vm.source_id}.json"
+    )
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return True
+    return bool(record.get("dest_volumes"))
+
+
 #: a source id the collection accepts as a state file name (warm_migration._SAFE_SERVER_ID)
 _STATE_FILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 

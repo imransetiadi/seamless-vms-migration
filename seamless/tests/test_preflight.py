@@ -23,6 +23,7 @@ from seamless_migrate.planning.preflight import (
     DestinationInventory,
     SourceInventory,
     fitting_flavor,
+    quota_share,
     resolve_mappings,
     resource_demand,
     run_preflight,
@@ -862,22 +863,38 @@ PHASE_SHARES = {
 }
 
 
+#: the same, for a migration that holds the destination volumes an earlier attempt created (review
+#: RV38A-01): its server alone wherever it would count all of it
+HELD_SHARES = {
+    phase: "nothing" if PHASE_SHARES[phase] == "nothing" else "server" for phase in Phase
+}
+SHARE_CASES = [(phase, False, share) for phase, share in PHASE_SHARES.items()] + [
+    (phase, True, share) for phase, share in HELD_SHARES.items()
+]
+
+
 def test_every_phase_has_a_quota_share():
     assert set(PHASE_SHARES) == {None, *Phase}
 
 
-@pytest.mark.parametrize("phase", list(PHASE_SHARES), ids=str)
-def test_the_quota_counts_what_a_cutover_will_still_create(phase):
-    """SDD §9.3 (review PL-02): the free quota is the limit less what is in use, so each VM counts
-    what a cutover will still create - all of it while its migration runs, or runs again, from
-    ready; its server alone while its destination volumes exist or are being created; nothing once
-    what it holds is in use, or being released. A free quota of exactly the assessed VM's demand
-    and the other VM's share fits; one unit less of any key does not."""
+@pytest.mark.parametrize(
+    "phase, holds_volumes, expected",
+    SHARE_CASES,
+    ids=[f"{phase}{' holding its volumes' if held else ''}" for phase, held, _ in SHARE_CASES],
+)
+def test_the_quota_counts_what_a_cutover_will_still_create(phase, holds_volumes, expected):
+    """SDD §9.3 (reviews PL-02, RV38A-01): the free quota is the limit less what is in use, so each
+    VM counts what a cutover will still create - all of it while its migration runs, or runs again,
+    from ready, but its server alone when it holds the destination volumes an earlier attempt
+    created; its server alone while its destination volumes exist or are being created; nothing
+    once what it holds is in use, or being released. A free quota of exactly the assessed VM's
+    demand and the other VM's share fits; one unit less of any key does not."""
+    assert quota_share(phase, holds_volumes=holds_volumes) == expected
     a = make_vm(source_id="a", name="a")
     b = make_vm(source_id="b", name="b")
-    share = QUOTA_SHARES[PHASE_SHARES[phase]]
+    share = QUOTA_SHARES[expected]
     free = {key: QUOTA_SHARES["all"][key] + share[key] for key in share}
-    phases = {} if phase is None else {"b": phase}
+    shares = {} if phase is None else {"b": quota_share(phase, holds_volumes=holds_volumes)}
 
     def assessed(quota):
         return run_preflight(
@@ -888,7 +905,7 @@ def test_the_quota_counts_what_a_cutover_will_still_create(phase):
             [a, b],
             source=SRC,
             destination=DST,
-            phases=phases,
+            shares=shares,
         )
 
     assert "DST_QUOTA_INSUFFICIENT" not in [f.code for f in assessed(free)]
