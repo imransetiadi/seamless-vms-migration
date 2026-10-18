@@ -1,0 +1,105 @@
+{
+ "_comment": "POST /advisor/recommendations/{id}/override (SDD §12, §14.6): what the API's request model OverrideRequest (option: Strategy, reason: str | None at most 2000 characters, extra fields forbidden) refuses from the body alone - before the route looks the recommendation up, so for one it does not know too -, then the 404 a valid body gets for an unknown id. A 422's message is validation_message over pydantic's errors: the model's fields in their order, then the extra inputs, five at most. \"[2001]\" stands for a reason of 2001 characters. Shared by seamless/tests/test_api_advisor.py and dashboard/src/api/mock.test.ts (reviews RV42B-01, RV43B-07).",
+ "cases": [
+  {
+   "note": "an option that is a list",
+   "body": {
+    "option": [
+     "storage_handover"
+    ],
+    "reason": "the owner wants it"
+   },
+   "status": 422,
+   "message": "option: Input should be 'cold', 'warm', 'storage_handover', 'vmware_cold' or 'vmware_warm'"
+  },
+  {
+   "note": "no option",
+   "body": {
+    "reason": "the owner wants it"
+   },
+   "status": 422,
+   "message": "option: Field required"
+  },
+  {
+   "note": "an option that is null",
+   "body": {
+    "option": null
+   },
+   "status": 422,
+   "message": "option: Input should be 'cold', 'warm', 'storage_handover', 'vmware_cold' or 'vmware_warm'"
+  },
+  {
+   "note": "an option that is a number",
+   "body": {
+    "option": 42,
+    "reason": "the owner wants it"
+   },
+   "status": 422,
+   "message": "option: Input should be 'cold', 'warm', 'storage_handover', 'vmware_cold' or 'vmware_warm'"
+  },
+  {
+   "note": "an option in capitals",
+   "body": {
+    "option": "COLD"
+   },
+   "status": 422,
+   "message": "option: Input should be 'cold', 'warm', 'storage_handover', 'vmware_cold' or 'vmware_warm'"
+  },
+  {
+   "note": "a reason that is no string",
+   "body": {
+    "option": "cold",
+    "reason": 42
+   },
+   "status": 422,
+   "message": "reason: Input should be a valid string"
+  },
+  {
+   "note": "a reason past 2000 characters",
+   "body": {
+    "option": "cold",
+    "reason": "[2001]"
+   },
+   "status": 422,
+   "message": "reason: String should have at most 2000 characters"
+  },
+  {
+   "note": "a field the model does not have",
+   "body": {
+    "option": "cold",
+    "reason": "the owner wants it",
+    "comment": "an extra field"
+   },
+   "status": 422,
+   "message": "comment: Extra inputs are not permitted"
+  },
+  {
+   "note": "every problem, in the model's order, then the extra inputs",
+   "body": {
+    "zzz": 1,
+    "reason": 42,
+    "aaa": 2
+   },
+   "status": 422,
+   "message": "option: Field required; reason: Input should be a valid string; zzz: Extra inputs are not permitted; aaa: Extra inputs are not permitted"
+  },
+  {
+   "note": "a valid body with a null reason: the recommendation is looked up",
+   "body": {
+    "option": "cold",
+    "reason": null
+   },
+   "status": 404,
+   "message": null
+  },
+  {
+   "note": "a valid body: the recommendation is looked up",
+   "body": {
+    "option": "cold",
+    "reason": "the owner wants it"
+   },
+   "status": 404,
+   "message": null
+  }
+ ]
+}

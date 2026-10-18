@@ -7,6 +7,7 @@ import nameRaw from '../../../seamless/tests/fixtures/provider_name_cases.json?r
 import dataSentRaw from '../../../seamless/tests/fixtures/data_sent.json?raw';
 // what PUT /providers/{id}/credentials and /conversion-key answer for a body: one case table for the API and the mock
 import credentialBodyRaw from '../../../seamless/tests/fixtures/credential_body_cases.json?raw';
+import overrideBodyRaw from '../../../seamless/tests/fixtures/override_body_cases.json?raw';
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
@@ -45,6 +46,10 @@ const NOW = Date.parse('2026-10-08T12:00:00Z');
 const CHECK_KEYS = JSON.parse(checkKeysRaw) as { openstack: string[]; destination: string[] };
 const NAME_CASES = (
   JSON.parse(nameRaw) as { cases: Array<{ route: 'POST' | 'PATCH'; body: { name?: unknown }; status: number; message: string | null; note: string }> }
+).cases;
+
+const OVERRIDE_BODY_CASES = (
+  JSON.parse(overrideBodyRaw) as { cases: Array<{ note: string; body: Record<string, unknown>; status: number; message: string | null }> }
 ).cases;
 
 const CREDENTIAL_BODY_CASES = (
@@ -3097,6 +3102,17 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     // the other estimates as the last validation stored them
     expect(m.estimates.filter((e) => e.strategy !== 'storage_handover')).toEqual(before.filter((e) => e.strategy !== 'storage_handover'));
   });
+
+  it.each(OVERRIDE_BODY_CASES.map((c) => [c.note, c] as const))(
+    'judges an override body by its model before it looks the recommendation up, as the API: %s (SDD §12, §14.6, review RV43B-07)',
+    (_name, c) => {
+      const server = new MockServer({ now: () => NOW, seed: 1 });
+      const body = Object.fromEntries(Object.entries(c.body).map(([k, v]) => [k, v === '[2001]' ? 'x'.repeat(2001) : v]));
+      const res = server.handle('POST', '/advisor/recommendations/rec-ghost/override', new URLSearchParams(), body, 'admin');
+      const message = res.status < 300 ? null : (res.body as { error: { message: string } }).error.message;
+      expect({ status: res.status, message: c.message === null ? null : message }).toEqual({ status: c.status, message: c.message });
+    },
+  );
 
   it.each([[['storage_handover']], [42], [null]])(
     'refuses an override whose option is no strategy name (%j) with 422 before anything, as the API (SDD §12, §14.6, review RV42B-01)',

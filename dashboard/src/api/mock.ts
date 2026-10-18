@@ -172,6 +172,27 @@ function refuseCredentialBody(route: 'credentials' | 'conversion-key', input: Re
   if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
 }
 
+/**
+ * An override body as the API's request model OverrideRequest reads it (SDD §12, §14.6, reviews RV42B-01, RV43B-07):
+ * `option` a strategy name, `reason` a string of at most 2000 characters or null, nothing else - refused before the
+ * recommendation is looked up, worded as its validation_message over pydantic's errors: the model's fields in their
+ * order, then the extra inputs, five at most.
+ */
+function refuseOverrideBody(input: Record<string, unknown>): void {
+  const quoted = STRATEGIES.map((s) => `'${s}'`);
+  const problems: string[] = [];
+  if (!Object.hasOwn(input, 'option')) problems.push('option: Field required');
+  else if (!STRATEGIES.includes(input.option as Strategy)) {
+    problems.push(`option: Input should be ${quoted.slice(0, -1).join(', ')} or ${quoted.at(-1)}`);
+  }
+  if (Object.hasOwn(input, 'reason') && input.reason !== null) {
+    if (typeof input.reason !== 'string') problems.push('reason: Input should be a valid string');
+    else if ([...input.reason].length > 2000) problems.push('reason: String should have at most 2000 characters');
+  }
+  for (const key of Object.keys(input)) if (key !== 'option' && key !== 'reason') problems.push(`${key}: Extra inputs are not permitted`);
+  if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
+}
+
 /** The secrets a provider reads, by name, for its audit events - never a value: the API's _secret_names (SDD §13.3). */
 function secretNames(provider: Provider): Record<string, string> {
   return {
@@ -1689,10 +1710,8 @@ export class MockServer {
 
   /** Approve or override an advisor decision, like the API (SDD §14.6). */
   private decideRecommendation(me: Me, recId: string, action: 'approve' | 'override', input: Record<string, unknown>): MockResponse {
-    // like the API's body model (SDD §12, review RV42B-01): an override's option is a strategy name, refused before anything
-    if (action === 'override' && !STRATEGIES.includes(input.option as Strategy)) {
-      throw new HttpError(422, 'validation_error', 'Unknown strategy.');
-    }
+    // like the API's body model (SDD §12, reviews RV42B-01, RV43B-07): an override's body is judged before anything
+    if (action === 'override') refuseOverrideBody(input);
     if (recId.startsWith('rec-legacy-')) throw new HttpError(409, 'conflict', 'a legacy entry is history: it cannot be approved or overridden');
     const index = this.recommendations.findIndex((r) => r.id === recId);
     if (index < 0) throw notFound('recommendation', recId);
