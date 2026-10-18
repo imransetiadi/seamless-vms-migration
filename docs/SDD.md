@@ -508,7 +508,9 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   rollback, when the source VM is running again - marked by the step as soon as its power-on succeeded
   (`StepContext.mark_downtime_end()`: the VMware rollback, and the storage-handover rollback once the source server
   it started or recreated reads `ACTIVE`, §7.3), so an attempt that fails after it leaves the clock
-  closed: the source runs, and the next cutover counts a new outage (reviews RV30-03, RV36B-03). A verification that passes again — the first one was saved,
+  closed: the source runs, and the next cutover counts a new outage (reviews RV30-03, RV36B-03). A store error
+  saving that close fails the attempt as transient (`StepContext.mark_downtime_end()` raises `TransientStepError`):
+  it is retried within the step's retries, and the retry closes the clock again (review RV36B-03). A verification that passes again — the first one was saved,
   but a stop or a failed event write came before `completed` — keeps the end and the downtime the first one
   recorded: the outage ended then. `actual_downtime_s` = difference — except in demo mode (§7.4),
   where the downtime is in model seconds, the time base of the passes' `duration_s`, so a demo's downtime compares
