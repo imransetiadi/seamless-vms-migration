@@ -180,7 +180,7 @@ Prerequisites: [Colima](https://github.com/abiosoft/colima), the Docker CLI with
 
 ```bash
 make seamless-colima-up          # start profile "seamless" (4 CPU / 6 GiB / 40 GiB), idempotent, keeps your Docker context
-make dashboard-build             # optional: the image builds the UI itself; a build here is reused (faster)
+make dashboard-build             # optional: the image builds the UI itself; a build here is copied as it is - rebuild it after the dashboard changed
 
 # Generate .env + tokens.yaml once. TYPESAFE_API_KEY (Jev) and AGENTMEMORY_SECRET are optional and are
 # read from the environment of your shell (never typed on a command line); they are written only to the

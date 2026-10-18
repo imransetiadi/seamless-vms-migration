@@ -4,8 +4,9 @@
 # Deploy:
 #   1. Build and push the image from the repository root:
 #        podman build -f seamless/Containerfile -t <registry>/seamless-migrate:0.1.0-rc.2 .
-#        (the image builds the dashboard when the context has no dashboard/dist; `make dashboard-build`
-#        first only makes later builds faster)
+#        (the image builds the dashboard when the context has no dashboard/dist; a dashboard/dist in the
+#        context is copied as it is - run `make dashboard-build` again, or delete it, after the dashboard
+#        changed, or the image ships the old UI)
 #   2. Set newName/newTag (or digest) in the images: section below.
 #   3. Create the Secrets seamless-db, seamless-tokens (required) and seamless-clouds, seamless-vmware,
 #      seamless-ai (optional) in the namespace - see secret-example.yaml. They are deliberately NOT

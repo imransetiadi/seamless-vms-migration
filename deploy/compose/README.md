@@ -55,7 +55,8 @@ make seamless-up             # or: make seamless-demo   (simulated clouds, SEAML
 ```
 
 The first build takes several minutes. When the build context has no built dashboard (`dashboard/dist`), the
-image builds one with its own Node 22; `make dashboard-build` beforehand only makes later builds faster.
+image builds one with its own Node 22; a `dashboard/dist` in the context is copied as it is (SDD §17.1), so run
+`make dashboard-build` again - or delete `dashboard/dist` - after the dashboard changed, or the image ships the old UI.
 
 Then open <http://127.0.0.1:8080/> and sign in at `/login` with the admin token. On a Linux server, tunnel to it
 from your workstation first (`ssh -L 8080:127.0.0.1:8080 you@server`). Or call the API:
