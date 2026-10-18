@@ -2041,7 +2041,10 @@ with `B = bytes_scanned` (the pass lasts as long as its largest disk's scan or i
 longer, so a pass that ran as predicted reads back the `S` it was predicted with; review PL-07), taken from
 **delta/final passes only** (pass 1 is usually link-bound and would understate it) — replaces `scan_bps` for that
 migration's estimate (stored as `Migration.observed_scan_bps: float | null`). A pass at the aggregate ceiling
-(`A` set and `B / A >= duration_s`) does not tell `S`: it leaves the calibration as it was. `migration.estimate` is recomputed with
+(`A` set and `B / A >= duration_s`) does not tell `S`: it leaves the calibration as it was. Nor does a pass the link
+bound - its changes took at least as long over the link (`bytes_transferred / L`) as the model's scan at the
+migration's current `S`: the `S` it reads is only a lower bound, which may raise the calibrated `S` but never lower
+it (review RV38A-02). `migration.estimate` is recomputed with
 the calibrated values, so `downtime_s` converges on reality before the cutover is approved.
 
 Worked example (defaults, S = 500 MiB/s, L = 125 MiB/s, c = 2 MiB/s): a 200 GiB single-disk VM
