@@ -1676,10 +1676,13 @@ the power-off up (its `task_state` back to none, the guest still running) - then
 RV26-01, RV27-04). A server Nova still powers on (`task_state` `powering-on`: an earlier attempt's start accepted, its
 wait cut off) reads `SHUTOFF` and refuses a second start: the rollback waits for that start to end too (review
 RV29-06). A source step 4's deletion reached no longer counts as existing: one whose deletion Nova accepted (step 4,
-journaled as sent) unless it reads `ACTIVE`; one Nova reads as being deleted (`task_state` `deleting`), whatever the
-journal holds; and one in `ERROR` once step 4 tried its deletion (journaled as tried) - Nova may take a deletion whose
-answer is an error, a 500 once it saved the deleting state, or is lost, while the compute host fails it (review
-RV35B-01). Nova starts no server it is deleting or that a failed deletion left in `ERROR`, and a deletion it
+journaled as sent) unless it reads `ACTIVE`; one Nova reads as being deleted or soft-deleted (`task_state` `deleting`
+or `soft-deleting`, or `SOFT_DELETED` on a cloud with `reclaim_instance_interval`, whose reclaim later deletes the
+server with its volumes by their `delete_on_termination`), whatever the journal holds (review RV36B-01); and one in
+`ERROR` once step 4 tried its deletion (journaled as tried) - Nova may take a deletion whose answer is an error, a 500
+once it saved the deleting state, or is lost, while the compute host fails it (review RV35B-01). A soft-deleted source
+is sent its deletion again - another soft delete - and the rollback waits for it in vain: the VM stays down until
+restored by hand, every volume kept (owner question q42). Nova starts no server it is deleting or that a failed deletion left in `ERROR`, and a deletion it
 then finishes - nova-compute resuming it, an operator clearing the server - honours the `delete_on_termination` it
 finds. So the rollback gives nothing back and starts nothing there: it deletes the server again, waits until it is
 gone and every journaled volume never unmanaged is `available`, and recreates the source as for one gone (below); a
