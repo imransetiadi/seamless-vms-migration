@@ -47,7 +47,7 @@ reason, never silently.
 | B — control plane | `seamless/` |
 | C — dashboard | `dashboard/` |
 | A — collection warm path (also) | `tests/sanity/`, `tests/func/`, `meta/`, `requirements*.txt`, `requirements.yml`, `bindep.txt`, `docs/src/`, `aee/`, `builder/`, `inventory/` |
-| D — tooling, deploy, docs | `deploy/`, `scripts/`, `Makefile`, `README.md`, `RELEASING.md`, `NOTICE`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTORS.md`, `CODEOWNERS`, `.github/`, `.pre-commit-config.yaml`, `.gitleaks.toml`, `.gitleaks-tree.toml`, `.gitleaksignore`, `.dockerignore`, `seamless/Containerfile`, `seamless/.containerignore`, `.mcp.json`, `.claude/`, `CLAUDE.md`, `.gitignore`, `tests/e2e/`, `docs/MEMORY.md`, `docs/QASuite.md`, `docs/Security.md`, `docs/Performance.md` |
+| D — tooling, deploy, docs | `deploy/`, `scripts/`, `Makefile`, `README.md`, `RELEASING.md`, `NOTICE`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTORS.md`, `CODEOWNERS`, `.github/`, `.pre-commit-config.yaml`, `.gitleaks.toml`, `.gitleaks-tree.toml`, `.gitleaksignore`, `.dockerignore`, `seamless/Containerfile`, `seamless/.containerignore`, `.mcp.json`, `.claude/`, `CLAUDE.md`, `.gitignore`, `tests/e2e/`, `docs/MEMORY.md`, `docs/QASuite.md`, `docs/Security.md`, `docs/Performance.md`, `docs/Operations.md` |
 
 `docs/SDD.md`, `docs/PRD.md`, `docs/advisor/` and `docs/audits/` are owned by the controller. Work in the git worktree of your
 track (`.worktrees/track-*`), never in another track's tree — and **one session per worktree**: a second session in a
