@@ -295,6 +295,23 @@ def test_error_envelope_shape(api):
     envelope(api.client.delete("/api/v1/health"), 405, "method_not_allowed")
 
 
+def test_metrics_exposes_every_family_sdd_18_names(api):
+    """SDD §18 (QASuite FR-23, review RV37B-14): /metrics declares every metric family the SDD
+    names - a summary's _sum/_count as its family, a label set as nothing more - so a renamed
+    metric fails here, not only on a dashboard that stopped drawing."""
+    from seamless_migrate.config import find_repo_root
+
+    sdd = (find_repo_root() / "docs" / "SDD.md").read_text(encoding="utf-8")
+    section = sdd[sdd.index("## 18. Observability") : sdd.index("\n## 19.")]
+    families = set()
+    for name in re.findall(r"`(seamless_[a-z_]+)(?:/_count)?(?:\{[^}`]*\})?`", section):
+        families.add(name.removesuffix("_sum") if name.endswith("_seconds_sum") else name)
+    assert "seamless_tick_seconds_max" in families and "seamless_tick_seconds" in families
+    text = api.get("/api/v1/metrics").text
+    declared = set(re.findall(r"^# TYPE (\S+) ", text, re.MULTILINE))
+    assert families - declared == set()
+
+
 def test_metrics_format(api, tmp_path):
     api.post("/api/v1/providers", json=SOURCE)
     res = api.get("/api/v1/metrics")
@@ -310,7 +327,10 @@ def test_metrics_format(api, tmp_path):
         "seamless_downtime_seconds_count 0",
         "seamless_downtime_seconds_max 0",
         "# TYPE seamless_tick_seconds summary",
+        "seamless_tick_seconds_sum",
         "seamless_tick_seconds_count",
+        "# TYPE seamless_tick_seconds_max gauge",
+        "seamless_tick_seconds_max",
         "# TYPE seamless_tick_slow_total counter",
         "# TYPE seamless_step_duration_seconds summary",
         "# TYPE seamless_advisor_calls_total counter",
