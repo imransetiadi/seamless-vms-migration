@@ -2679,7 +2679,9 @@ class Orchestrator:
     async def _close_clock(self, mid: str, plan: Plan) -> None:
         """The source runs again inside a step - a rollback's power-on: the clock closes now, so
         an attempt that fails after it leaves the source counted as running (SDD §5.2, review
-        RV30-03). Saved, then announced, as a rollback's end does; a closed clock stays as it is."""
+        RV30-03). The close and its event are one store transaction, as a rollback's end writes
+        them: a store error leaves neither, and the retry closes and announces it (review
+        RV37B-01). A closed clock stays as it is."""
         async with self._lock(mid):
             m, v = await self._load(mid)
             if not fsm.source_stopped(m):
@@ -2687,13 +2689,13 @@ class Orchestrator:
             now = self._now()
             m.downtime_ended_at = now
             m.actual_downtime_s = self._rollback_downtime_s(m, now, plan)
-            await self._save(m, v)
-        await self._emit(
-            "migration.downtime_ended",
-            f"{m.vm.name}: source running again after {m.actual_downtime_s:.0f} s",
-            migration=m,
-            data={"actual_downtime_s": m.actual_downtime_s},
-        )
+            await self._save_with_event(
+                m,
+                v,
+                "migration.downtime_ended",
+                f"{m.vm.name}: source running again after {m.actual_downtime_s:.0f} s",
+                {"actual_downtime_s": m.actual_downtime_s},
+            )
 
     async def _run_step(
         self,
@@ -3106,14 +3108,19 @@ class Orchestrator:
                 cur.actual_downtime_s = self._rollback_downtime_s(cur, now, plan)
             cur.destination_server_id = None
             cur.checkpoint = "rolled_back"
-            v = await self._save(cur, v)
             if ended:
-                await self._emit(
+                # the close and its event in one store transaction: a store error leaves neither,
+                # and the resumed rollback closes the clock and announces it (SDD §5.2, review
+                # RV37B-01)
+                v = await self._save_with_event(
+                    cur,
+                    v,
                     "migration.downtime_ended",
                     f"{cur.vm.name}: source running again after {cur.actual_downtime_s:.0f} s",
-                    migration=cur,
-                    data={"actual_downtime_s": cur.actual_downtime_s},
+                    {"actual_downtime_s": cur.actual_downtime_s},
                 )
+            else:
+                v = await self._save(cur, v)
             cur, v = await self._transition(
                 cur, v, P.rolled_back, "rollback finished; the source VM runs again"
             )

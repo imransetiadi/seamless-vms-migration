@@ -2987,12 +2987,22 @@ async def test_a_downtime_event_the_store_refuses_still_leaves_the_clock_open(tm
     assert "migration.downtime_started" not in h.kinds()
 
 
+#: each half of the clock's close, refused in turn when it runs (reviews RV36B-03, RV37B-01): the
+#: migration's UPDATE, or its migration.downtime_ended's INSERT
+CLOSE_HALVES = {
+    "clock": ("UPDATE documents", "migration"),
+    "event": ("INSERT INTO events", "migration.downtime_ended"),
+}
+
+
+@pytest.mark.parametrize("half", list(CLOSE_HALVES))
 async def test_a_store_error_closing_the_clock_inside_a_step_retries_the_attempt(
-    tmp_path, store, refuse_write
+    tmp_path, store, refuse_write, half
 ):
-    """SDD §5.2 (review RV36B-03): a rollback closes the clock inside its step once the source runs;
-    a store error saving that close fails the attempt as transient - retried within the step's
-    retries, the retry closes the clock again -, never the rollback."""
+    """SDD §5.2 (reviews RV36B-03, RV37B-01): a rollback closes the clock inside its step once the
+    source runs; a store error on either half of that close - the clock's save, its event - fails
+    the attempt as transient, never the rollback, and leaves neither: the retry closes the clock
+    and announces it, once."""
     settings = make_settings(tmp_path)
     attempts: list[int] = []
     refused: list[list[str]] = []
@@ -3004,7 +3014,7 @@ async def test_a_store_error_closing_the_clock_inside_a_step_retries_the_attempt
     async def rollback(ctx):
         attempts.append(len(attempts) + 1)
         if len(attempts) == 1:
-            refused.append(refuse_write(store, "UPDATE documents", "migration"))
+            refused.append(refuse_write(store, *CLOSE_HALVES[half]))
         await ctx.mark_downtime_end()
         return StepResult(details={"source_running": True})
 
@@ -3016,9 +3026,85 @@ async def test_a_store_error_closing_the_clock_inside_a_step_retries_the_attempt
     m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back, P.failed)
     await h.orch.stop()
     assert m.phase == P.rolled_back, (h.history(m), m.error)
-    assert refused[0] == ["UPDATE documents migration"] and attempts == [1, 2]
-    assert m.downtime_ended_at is not None
-    assert h.kinds().count("migration.downtime_ended") == 1
+    assert refused[0] == [" ".join(CLOSE_HALVES[half])] and attempts == [1, 2]
+    assert m.downtime_ended_at is not None and m.actual_downtime_s is not None
+    assert h.kinds().count("migration.downtime_started") == 1
+    assert h.kinds().count("migration.downtime_ended") == 1, h.kinds()
+
+
+@pytest.mark.parametrize("half", list(CLOSE_HALVES))
+async def test_a_restop_whose_close_the_store_refused_announces_each_outage_end(
+    tmp_path, store, refuse_write, half
+):
+    """SDD §5.2, §7.3 step 1 (reviews RV33-04, RV37B-01): a cutover attempt finds the source it
+    stopped running again, closes that outage's clock and stops the source once more - a new
+    outage. A store error on either half of the close retries the attempt, whose close then lands
+    with its event: each outage reads its start and its end, never two starts in a row."""
+    settings = make_settings(tmp_path)
+    attempts: list[int] = []
+    refused: list[list[str]] = []
+
+    async def cutover(ctx):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            await ctx.mark_downtime_start()
+            raise TransientStepError("Timeout waiting for the stop of the source server")
+        if len(attempts) == 2:
+            refused.append(refuse_write(store, *CLOSE_HALVES[half]))
+        await ctx.mark_downtime_end()  # the source ran again: that outage ended
+        await ctx.mark_downtime_start()  # and the re-stop starts a new one
+        return StepResult(destination_server_id="dst-1")
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: cutover})
+    h, plan = await setup(tmp_path, store, [vm(1)], executor=executor, settings=settings)
+    await run_plan(h, plan)
+    m = await h.wait_phase(
+        (await h.by_vm(plan.id, "vm-1")).id, P.completed, P.failed, P.rolled_back
+    )
+    await h.orch.stop()
+    assert m.phase == P.completed, (h.history(m), m.error)
+    assert refused[0] == [" ".join(CLOSE_HALVES[half])] and attempts == [1, 2, 3]
+    assert [k for k in h.kinds() if k.startswith("migration.downtime")] == [
+        "migration.downtime_started",
+        "migration.downtime_ended",
+        "migration.downtime_started",
+        "migration.downtime_ended",
+    ]
+
+
+@pytest.mark.parametrize("half", list(CLOSE_HALVES))
+async def test_a_rollback_whose_closing_write_the_store_refused_resumes_and_announces_it(
+    tmp_path, store, refuse_write, half
+):
+    """SDD §5.2, §8 (review RV37B-01): a rollback whose step leaves the clock to its end - the
+    rollback's own close - and whose closing write the store refuses, on either half (the
+    migration's save, its migration.downtime_ended), writes neither: its driver resumes it, and
+    the close lands with its event - rolled_back, the outage announced once."""
+    settings = make_settings(tmp_path)
+    attempts: list[int] = []
+    refused: list[list[str]] = []
+
+    async def cutover(ctx):
+        await ctx.mark_downtime_start()
+        raise PermanentStepError("the destination refused the server")
+
+    async def rollback(ctx):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:  # the next write of the migration is the rollback's close
+            refused.append(refuse_write(store, *CLOSE_HALVES[half]))
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.CUTOVER: cutover, StepName.ROLLBACK: rollback}
+    )
+    h, plan = await setup(tmp_path, store, [vm(1)], executor=executor, settings=settings)
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back, P.failed)
+    await h.orch.stop()
+    assert m.phase == P.rolled_back, (h.history(m), m.error)
+    assert refused[0] == [" ".join(CLOSE_HALVES[half])] and attempts == [1, 2]
+    assert m.downtime_ended_at is not None and m.actual_downtime_s is not None
+    assert h.kinds().count("migration.downtime_ended") == 1, h.kinds()
 
 
 async def test_an_ansible_cutover_cut_off_while_its_clock_saves_still_announces_it_once(
