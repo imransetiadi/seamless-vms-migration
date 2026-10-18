@@ -710,6 +710,7 @@ class Orchestrator:
             m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)
         }
         vms = await self._vms(plan, src_impl, existing)
+        phases = {vm_id: m.phase for vm_id, m in existing.items()}
         cancelled = sorted(
             m.vm.name for vm in vms if (m := existing.get(vm.source_id)) and m.phase == P.cancelled
         )
@@ -773,6 +774,8 @@ class Orchestrator:
                 source=source,
                 destination=destination,
                 dst_caps=dst_caps,
+                # the quota counts what a cutover will still create (SDD §9.3, review PL-02)
+                phases=phases,
             )
             resolved = resolve_mappings(vm, plan, dst_inv)
             reasons = eligibility(

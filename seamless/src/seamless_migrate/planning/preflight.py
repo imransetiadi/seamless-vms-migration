@@ -7,7 +7,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from ..domain.enums import ProviderKind, Severity, Strategy
+from ..domain.enums import Phase, ProviderKind, Severity, Strategy
 from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
 from .ipam import address_refusal
@@ -404,8 +404,37 @@ def resource_demand(vm: VMRef, plan: Plan | None = None) -> dict[str, int]:
     }
 
 
+#: the phases whose migration has created its destination volumes, or is creating them: its
+#: server is still to come (SDD §9.3, review PL-02)
+SERVER_STILL_TO_COME = frozenset(
+    {Phase.precopy, Phase.syncing, Phase.awaiting_cutover, Phase.cutover}
+)
+#: the phases whose migration holds what it created, or is releasing it - in use, so already off
+#: the free quota (SDD §9.3, review PL-02)
+NOTHING_STILL_TO_COME = frozenset(
+    {Phase.verifying, Phase.completed, Phase.finalized, Phase.rolling_back, Phase.cancelled}
+)
+
+
+def remaining_demand(vm: VMRef, plan: Plan | None, phase: Phase | None) -> dict[str, int]:
+    """What a cutover of ``vm`` will still create at the destination, by its migration's phase
+    (SDD §9.3, review PL-02): all of it with no migration (``None``) or one that runs, or runs
+    again, from ready; its server alone once its destination volumes exist or are being created;
+    nothing once what it holds is in use, or being released."""
+    demand = resource_demand(vm, plan)
+    if phase in NOTHING_STILL_TO_COME:
+        return dict.fromkeys(demand, 0)
+    if phase in SERVER_STILL_TO_COME:
+        return {**demand, "volumes": 0, "gigabytes": 0}
+    return demand
+
+
 def _quota_shortfall(
-    vm: VMRef, plan: Plan, dst_inv: DestinationInventory, all_vms: Sequence[VMRef]
+    vm: VMRef,
+    plan: Plan,
+    dst_inv: DestinationInventory,
+    all_vms: Sequence[VMRef],
+    phases: Mapping[str, Phase],
 ) -> tuple[str, list[str]] | None:
     project = destination_project(vm, plan, dst_inv)
     if project is None or project not in dst_inv.quotas:
@@ -413,7 +442,8 @@ def _quota_shortfall(
     totals = dict.fromkeys(_QUOTA_KEYS, 0)
     for other in all_vms:
         if destination_project(other, plan, dst_inv) == project:
-            for key, value in resource_demand(other, plan).items():
+            share = remaining_demand(other, plan, phases.get(other.source_id))
+            for key, value in share.items():
                 totals[key] += value
     free = dst_inv.quotas[project]
     short = []
@@ -708,10 +738,13 @@ def run_preflight(
     source: Provider | None = None,
     destination: Provider | None = None,
     dst_caps: Mapping[str, Any] | None = None,
+    phases: Mapping[str, Phase] | None = None,
 ) -> list[Finding]:
     """Evaluate the SDD §9.3 catalog for ``vm`` within ``plan``.
 
     ``all_vms`` are the plan's selected VMs (for duplicate names and cumulative quotas);
+    ``phases`` the phase of each one's migration by source id, none for a VM without one (the
+    quota counts what a cutover will still create);
     ``source``/``destination`` enable the conversion-host check; ``dst_caps`` are the
     destination's capabilities as validation's check just reported them (its token's roles).
     """
@@ -1039,7 +1072,7 @@ def run_preflight(
                     f"project, and {where} has {len(dst_inv.quotas)} projects.",
                 )
             )
-    shortfall = _quota_shortfall(vm, plan, dst_inv, selected)
+    shortfall = _quota_shortfall(vm, plan, dst_inv, selected, phases or {})
     if shortfall is not None:
         project, short = shortfall
         out.append(

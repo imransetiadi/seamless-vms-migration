@@ -180,6 +180,47 @@ async def test_the_waves_of_a_plan_whose_finished_vm_left_the_source_are_planned
     assert reads == ["vm-2"]
 
 
+class QuotaDestination(StaticDestination):
+    """A destination whose free quota is what Nova and Cinder report for the project: the limit
+    less what its servers and volumes already use (providers/openstack.py)."""
+
+    def __init__(self, free: dict[str, int]) -> None:
+        super().__init__()
+        self.free = dict(free)
+
+    async def inventory(self):
+        inv = await super().inventory()
+        inv.quotas = {"finance": dict(self.free)}
+        return inv
+
+
+async def test_a_revalidation_never_counts_a_completed_migration_again(tmp_path, store):
+    """SDD §9.3, §5.4 (review PL-02): two VMs fit the project exactly. Once web-01 is cut over and
+    completed, its server and volume are in use - the destination reports that much less free -,
+    so the re-validation of the paused plan counts web-02 alone: it stays ready."""
+    full = {"cores": 4, "ram_mb": 8192, "instances": 2, "volumes": 2, "gigabytes": 40}
+    dst = QuotaDestination(full)  # two VMs of 2 vCPUs, 4 GiB, one 20 GiB volume each
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), vm(2)],
+        {"default_strategy": Strategy.cold, "auto_cutover": False},
+        destination=dst,
+    )
+    await run_plan(h, plan)
+    try:
+        first = await h.by_vm(plan.id, "vm-1")
+        await h.orch.request_cutover(first.id, "sari")
+        await h.wait_phase(first.id, P.completed)
+        await h.orch.pause_plan(plan.id, "alice")
+        dst.free = {"cores": 2, "ram_mb": 4096, "instances": 1, "volumes": 1, "gigabytes": 20}
+        report = await h.orch.validate_plan(plan.id, "alice")
+    finally:
+        await h.orch.stop()
+    second = next(i for i in report.migrations if i.vm_name == "web-02")
+    assert (second.phase, [f.code for f in second.findings]) == (P.ready, [])
+
+
 async def test_validate_creates_migrations_with_findings_and_estimates(tmp_path, store):
     gpu = vm(3, "gpu-01", flavor_extra_specs={"resources:VGPU": "1"})
     vms = [vm(1), vm(2, "db-02", size_gb=600, used_gb=300.0), gpu]

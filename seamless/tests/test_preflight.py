@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Severity, Strategy
+from seamless_migrate.domain.enums import Phase, ProviderKind, ProviderRole, Severity, Strategy
 from seamless_migrate.domain.models import (
     DEFAULT_PRESTAGE,
     AppProbe,
@@ -810,6 +810,68 @@ def test_quota_aggregates_across_plan():
         f.code != "DST_QUOTA_INSUFFICIENT"
         for f in check(a, dst=dst_inv(quotas=unlimited), all_vms=vms)
     )
+
+
+#: what each phase of a VM's migration still asks of the destination's quota (SDD §9.3, review
+#: PL-02), for a VM of 2 vCPUs, 4 GiB and one 20 GiB volume
+QUOTA_SHARES = {
+    "all": {"cores": 2, "ram_mb": 4096, "instances": 1, "volumes": 1, "gigabytes": 20},
+    "server": {"cores": 2, "ram_mb": 4096, "instances": 1, "volumes": 0, "gigabytes": 0},
+    "nothing": {"cores": 0, "ram_mb": 0, "instances": 0, "volumes": 0, "gigabytes": 0},
+}
+PHASE_SHARES = {
+    None: "all",
+    Phase.pending: "all",
+    Phase.validating: "all",
+    Phase.blocked: "all",
+    Phase.ready: "all",
+    Phase.failed: "all",
+    Phase.rolled_back: "all",
+    Phase.precopy: "server",
+    Phase.syncing: "server",
+    Phase.awaiting_cutover: "server",
+    Phase.cutover: "server",
+    Phase.verifying: "nothing",
+    Phase.completed: "nothing",
+    Phase.finalized: "nothing",
+    Phase.rolling_back: "nothing",
+    Phase.cancelled: "nothing",
+}
+
+
+def test_every_phase_has_a_quota_share():
+    assert set(PHASE_SHARES) == {None, *Phase}
+
+
+@pytest.mark.parametrize("phase", list(PHASE_SHARES), ids=str)
+def test_the_quota_counts_what_a_cutover_will_still_create(phase):
+    """SDD §9.3 (review PL-02): the free quota is the limit less what is in use, so each VM counts
+    what a cutover will still create - all of it while its migration runs, or runs again, from
+    ready; its server alone while its destination volumes exist or are being created; nothing once
+    what it holds is in use, or being released. A free quota of exactly the assessed VM's demand
+    and the other VM's share fits; one unit less of any key does not."""
+    a = make_vm(source_id="a", name="a")
+    b = make_vm(source_id="b", name="b")
+    share = QUOTA_SHARES[PHASE_SHARES[phase]]
+    free = {key: QUOTA_SHARES["all"][key] + share[key] for key in share}
+    phases = {} if phase is None else {"b": phase}
+
+    def assessed(quota):
+        return run_preflight(
+            a,
+            make_plan(),
+            src_inv(),
+            dst_inv(quotas={"finance": quota}),
+            [a, b],
+            source=SRC,
+            destination=DST,
+            phases=phases,
+        )
+
+    assert "DST_QUOTA_INSUFFICIENT" not in [f.code for f in assessed(free)]
+    for key, value in free.items():
+        short = only(assessed({**free, key: value - 1}), "DST_QUOTA_INSUFFICIENT")
+        assert f"{key} {value} > {value - 1} free" in short.message
 
 
 def test_finding_net_mtu_shrink():
