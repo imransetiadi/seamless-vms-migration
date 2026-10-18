@@ -1189,8 +1189,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 
 * Run directory: `{data_dir}/plans/{plan_id}/migrations/{migration_id}/` with its own
   `os_migrate_data_dir` (`osm/`) so concurrent migrations never share `workloads.yml`, and the VMware rollback's
-  `.seamless/rollback-kept.json` (below) - one level below the guest directories the migration kit creates there,
-  `{run directory}/{VM name}`, so no VM's name is the record's (review RV32A-08).
+  keep records, one per attempt, in `.seamless/` (`rollback-kept.<server>.<unique>.json`, below) - one level below
+  the guest directories the migration kit creates there, `{run directory}/{VM name}`, so no VM's name is a record's
+  (reviews RV32A-08, RV36A-03).
   Plan-level prestage uses `{data_dir}/plans/{plan_id}/osm/`.
 * Secrets: `secrets.yml` (mode 0600) holds `os_migrate_src_auth`/`os_migrate_dst_auth` (resolved
   from the providers' `cloud` entries, §13.3) and is deleted in a `finally` block together with the
@@ -1423,7 +1424,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   which a CBT sync, copying only what the source changed, never undoes; with a recorded server the rollback deletes
   every kit volume of the VM, converted or not, so the next pass copies them in full (review RV30-02). Whenever a
   server booted from the kit's volumes - the one the migration recorded, or one found by the kit's name, by this
-  attempt or by an earlier one (`rollback-kept.json`, below) -, the rollback marks each kit copy of the VM still
+  attempt or by an earlier one (its keep record, below) -, the rollback marks each kit copy of the VM still
   marked `seamless_copied` `true` as `cutover` (below) right after the power-on, before it deletes any port or
   volume: what it then cannot delete (Cinder refuses a volume with a snapshot) or keeps (what a server found only by
   name held) is no completed copy for any later run, nor is a copy a cutover of an earlier build left marked (review
