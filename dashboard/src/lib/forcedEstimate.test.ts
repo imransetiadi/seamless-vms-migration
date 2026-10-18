@@ -1,9 +1,17 @@
 import { describe, expect, it } from 'vitest';
 // One case table for the control plane and the dashboard (SDD §5.4, §16)
 import raw from '../../../seamless/tests/fixtures/forced_estimate_cases.json?raw';
-import { buildFixtures } from '../api/mockData';
-import type { Migration, Strategy, SyncPass, VMRef } from '../api/types';
-import { finalDowntime, firstPassSeconds, forcedDowntime, paramsFor, type PlanEstimatorSettings } from './forcedEstimate';
+import estimateRaw from '../../../seamless/tests/fixtures/estimate_cases.json?raw';
+import { buildFixtures, estimate as mockEstimate } from '../api/mockData';
+import { DOWNTIME_PARTS, type Estimate, type Migration, type Plan, type Strategy, type SyncPass, type VMRef } from '../api/types';
+import {
+  estimateStrategy,
+  finalDowntime,
+  firstPassSeconds,
+  forcedDowntime,
+  paramsFor,
+  type PlanEstimatorSettings,
+} from './forcedEstimate';
 
 interface Case {
   name: string;
@@ -37,5 +45,48 @@ describe("the Force cutover's estimated downtime, like the control plane (SDD §
     const passes = [pass(1, 1200, at), pass(2, 300, at), pass(3, 9999, null)];
     const p = paramsFor(c.plan, c.observed_scan_bps);
     expect(forcedDowntime({ ...m, sync_passes: passes }, c.plan)).toBeCloseTo(finalDowntime(c.vm, c.strategy, 300, p), 9);
+  });
+});
+
+interface EstimateCase {
+  name: string;
+  vm: VMRef;
+  strategy: Strategy;
+  plan: PlanEstimatorSettings & Pick<Plan, 'downtime_slo_s'>;
+  expected: Omit<Estimate, 'eligible' | 'reasons'>;
+}
+
+// One case table for the control plane's estimate and the dashboard's port of it (SDD §9.1, §16)
+const estimateCases = JSON.parse(estimateRaw) as EstimateCase[];
+const tenth = (n: number) => Math.round(n * 10) / 10;
+
+describe("each strategy's estimate, as a validation of the control plane computes it (SDD §9.1, §16)", () => {
+  it.each(estimateCases.map((c) => [c.name, c] as const))('%s', (_name, c) => {
+    const got = estimateStrategy(c.vm, c.strategy, paramsFor(c.plan), c.plan.downtime_slo_s);
+    const want = c.expected;
+    expect([got.strategy, got.passes, got.final_delta_bytes, got.meets_slo]).toEqual([want.strategy, want.passes, want.final_delta_bytes, want.meets_slo]);
+    for (const key of ['precopy_s', 'downtime_s', 'total_s'] as const) expect(got[key]).toBeCloseTo(want[key], 9);
+    for (const part of DOWNTIME_PARTS) expect(got.downtime_parts[part]).toBeCloseTo(want.downtime_parts[part]!, 9);
+  });
+});
+
+describe("the offline mock's estimates: the control plane's, each part rounded to 0.1 s (SDD §16)", () => {
+  const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).plans[0] as Plan;
+
+  it.each(estimateCases.map((c) => [c.name, c] as const))('%s', (_name, c) => {
+    const shown = mockEstimate(c.vm, c.strategy, { ...base, ...c.plan }, []);
+    const want = c.expected;
+    expect([shown.strategy, shown.passes, shown.final_delta_bytes, shown.meets_slo]).toEqual([want.strategy, want.passes, want.final_delta_bytes, want.meets_slo]);
+    for (const part of DOWNTIME_PARTS) expect(shown.downtime_parts[part]).toBe(tenth(want.downtime_parts[part]!));
+    // the downtime is the sum of the parts shown, so they add up (ADV-16)
+    expect(shown.downtime_s).toBe(tenth(DOWNTIME_PARTS.reduce((sum, part) => sum + shown.downtime_parts[part]!, 0)));
+    expect(shown.precopy_s).toBe(tenth(want.precopy_s));
+    expect(shown.total_s).toBe(tenth(want.precopy_s + shown.downtime_s));
+  });
+
+  it('says why a strategy is not eligible, with the same figures', () => {
+    const c = estimateCases[0]!;
+    const shown = mockEstimate(c.vm, c.strategy, { ...base, ...c.plan }, ['a reason']);
+    expect([shown.eligible, shown.reasons, shown.passes]).toEqual([false, ['a reason'], c.expected.passes]);
   });
 });

@@ -1,10 +1,11 @@
-import type { Migration, Plan, Strategy, VMRef } from '../api/types';
+import type { Estimate, Migration, Plan, Strategy, VMRef } from '../api/types';
 
 /*
  * The downtime a Force cutover records (SDD §5.4): the control plane's formula
  * (seamless_migrate.planning.estimator — params_for_plan, scan_seconds, final_downtime_parts,
  * first_pass_seconds, estimate_forced_downtime), ported so the Force cutover dialog shows the figure
  * the API will record, and checked against the case table the control plane generates (§16).
+ * Its `estimate` too, the figures the offline mock shows (§9.1, §16), against a table of its own.
  */
 
 const GIB = 2 ** 30;
@@ -65,6 +66,84 @@ export function firstPassSeconds(vm: DiskVM, strategy: Strategy, p: EstimatorPar
   if (strategy === 'warm') return p.snapshot_s + Math.max(vm.used_bytes / p.link_bps, scanSeconds(vm, p));
   if (strategy === 'vmware_warm') return vm.used_bytes / p.link_bps;
   throw new Error(`${strategy} has no pre-copy passes`);
+}
+
+/** Fixed overhead of a VMware CBT delta pass (SDD §9.1: `Tk = 10 + Δk/L`). */
+const VMWARE_PASS_OVERHEAD_S = 10;
+
+/**
+ * The convergence loop (`_precopy_passes`): pass k (k ≥ 2) transfers `Δk = min(D, c·T(k−1))` and runs while
+ * the pass before it carried more than the threshold (Δ1 = the first pass's data) and k ≤ the pass limit —
+ * the runtime rule of SDD §5.3. Returns the passes' durations and the final delta Δf.
+ */
+function precopyPasses(
+  firstPassS: number,
+  firstPassBytes: number,
+  nextPassS: (delta: number) => number,
+  diskBytes: number,
+  rate: number,
+  p: EstimatorParams,
+): [number[], number] {
+  const durations = [firstPassS];
+  let last = firstPassS;
+  let previous = firstPassBytes;
+  while (previous > p.convergence_threshold_bytes && durations.length < p.max_passes) {
+    const delta = Math.min(diskBytes, rate * last);
+    last = nextPassS(delta);
+    durations.push(last);
+    previous = delta;
+  }
+  return [durations, Math.min(diskBytes, rate * last)];
+}
+
+/** One strategy's estimate as the control plane's `estimate` computes it (SDD §9.1); eligibility is the selector's. */
+export function estimateStrategy(vm: DiskVM, strategy: Strategy, p: EstimatorParams, sloS: number): Omit<Estimate, 'eligible' | 'reasons'> {
+  const rate = vm.change_rate_bps ?? p.change_rate_bps;
+  const link = p.link_bps;
+  let durations: number[] = [];
+  let finalDelta = 0;
+  let copy: number;
+  let conversion = 0;
+  switch (strategy) {
+    case 'cold':
+      copy = p.snapshot_s + vm.used_bytes / link;
+      break;
+    case 'warm': {
+      const scan = scanSeconds(vm, p);
+      const next = (delta: number) => p.snapshot_s + Math.max(scan, delta / link);
+      [durations, finalDelta] = precopyPasses(firstPassSeconds(vm, strategy, p), vm.used_bytes, next, vm.disk_bytes, rate, p);
+      copy = p.snapshot_s + Math.max(scan, finalDelta / link);
+      break;
+    }
+    case 'storage_handover':
+      copy = vm.disks.length * p.handover_per_volume_s;
+      break;
+    case 'vmware_cold':
+      copy = vm.used_bytes / link;
+      conversion = p.v2v_s;
+      break;
+    case 'vmware_warm': {
+      const next = (delta: number) => VMWARE_PASS_OVERHEAD_S + delta / link;
+      [durations, finalDelta] = precopyPasses(firstPassSeconds(vm, strategy, p), vm.used_bytes, next, vm.disk_bytes, rate, p);
+      copy = finalDelta / link;
+      conversion = p.v2v_inplace_s;
+      break;
+    }
+  }
+  const parts = { shutdown_s: p.shutdown_s, copy_s: copy, conversion_s: conversion, create_s: p.create_s, boot_s: p.boot_s };
+  // summed in the control plane's order: shutdown, copy, conversion, create, boot
+  const downtime = parts.shutdown_s + parts.copy_s + parts.conversion_s + parts.create_s + parts.boot_s;
+  const precopy = durations.reduce((sum, d) => sum + d, 0);
+  return {
+    strategy,
+    precopy_s: precopy,
+    passes: durations.length,
+    downtime_s: downtime,
+    total_s: precopy + downtime,
+    final_delta_bytes: Math.trunc(finalDelta),
+    meets_slo: downtime <= sloS,
+    downtime_parts: parts,
+  };
 }
 
 /** The downtime if cut over after a pass of `lastPassS` seconds (`estimate_final_downtime`, SDD §5.3). */

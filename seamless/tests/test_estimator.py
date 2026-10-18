@@ -430,3 +430,31 @@ def test_the_shared_forced_estimate_cases(case):
     vm = VMRef.model_validate(case["vm"])
     got = estimate_forced_downtime(vm, Strategy(case["strategy"]), case["last_pass_s"], params)
     assert got == pytest.approx(case["expected_s"], rel=1e-12)
+
+
+#: shared with the dashboard's port of the estimate, which its offline mock shows
+#: (forcedEstimate.test.ts): SDD §9.1, §16. A change to §9.1 recomputes each case's ``expected``
+#: with ``estimate`` and ports the change to dashboard/src/lib/forcedEstimate.ts
+ESTIMATE_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "estimate_cases.json").read_text()
+)
+
+
+@pytest.mark.parametrize("case", ESTIMATE_CASES, ids=[c["name"] for c in ESTIMATE_CASES])
+def test_the_shared_estimate_cases(case):
+    """What a validation estimates for each case, with the plan's parameters (params_for_plan) -
+    the dashboard's port, the figures of its offline mock, is checked against the same table."""
+    plan = make_plan(**case["plan"])
+    vm = VMRef.model_validate(case["vm"])
+    got = estimate(vm, Strategy(case["strategy"]), params_for_plan(plan), plan.downtime_slo_s)
+    got, want = got.model_dump(mode="json"), case["expected"]
+    for key in ("strategy", "passes", "final_delta_bytes", "meets_slo"):
+        assert got[key] == want[key], key
+    for key in ("precopy_s", "downtime_s", "total_s"):
+        assert got[key] == pytest.approx(want[key], rel=1e-12), key
+    assert got["downtime_parts"] == pytest.approx(want["downtime_parts"], rel=1e-12)
+
+
+def test_the_shared_estimate_cases_cover_every_strategy():
+    """Each strategy's formula is in the table the dashboard's port is checked against."""
+    assert {c["strategy"] for c in ESTIMATE_CASES} == {s.value for s in Strategy}

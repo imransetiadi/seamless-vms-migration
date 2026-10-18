@@ -2,7 +2,7 @@
  * Deterministic fixture data for the in-browser mock adapter (VITE_SEAMLESS_MOCK=1).
  * Covers every Phase, Strategy, PlanStatus, provider status, finding Severity and advisor note
  * kind/source so the whole UI can be exercised without the control plane.
- * Estimates follow SDD §9.1, eligibility §9.2 and findings a subset of §9.3.
+ * Estimates are the API's §9.1 formula (lib/forcedEstimate), eligibility §9.2 and findings a subset of §9.3.
  */
 import type {
   AdvisorNote,
@@ -33,7 +33,9 @@ import type {
   VerificationRecord,
   VMRef,
 } from './types';
+import { DOWNTIME_PARTS } from './types';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
+import { estimateStrategy, paramsFor } from '../lib/forcedEstimate';
 import { pyNames, pyRepr } from '../lib/format';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
@@ -785,97 +787,20 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
 // Estimator (SDD §9.1) and eligibility (§9.2)
 // -------------------------------------------------------------------------------------------
 
-const PARAMS = {
-  scan_bps: 524288000,
-  change_rate_bps: 2097152,
-  shutdown_s: 60,
-  boot_s: 120,
-  create_s: 60,
-  snapshot_s: 30,
-  handover_per_volume_s: 20,
-  v2v_s: 300,
-  v2v_inplace_s: 120,
-};
-
+/** A strategy's estimate as the API's validation computes it (§9.1, §16), each part shown to 0.1 s. */
 export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: string[]): Estimate {
-  const D = vm.disk_bytes;
-  const U = vm.used_bytes;
-  const c = vm.change_rate_bps ?? PARAMS.change_rate_bps;
-  const L = plan.link_bps;
-  const S = PARAMS.scan_bps;
-  const V = vm.disks.length;
-  const threshold = plan.convergence_threshold_bytes;
-  const maxPasses = plan.max_sync_passes;
-  let precopy = 0;
-  let passes = 0;
-  let finalDelta = 0;
-
-  // the copy, or final sync, and the conversion: the parts of the downtime besides the fixed steps (SDD §9.1)
-  let copy = 0;
-  let conversion = 0;
-  switch (strategy) {
-    case 'cold':
-      copy = PARAMS.snapshot_s + U / L;
-      break;
-    case 'warm': {
-      let t = PARAMS.snapshot_s + Math.max(U / L, D / S);
-      precopy = t;
-      passes = 1;
-      let delta = Math.min(D, c * t);
-      while (delta > threshold && passes < maxPasses) {
-        t = PARAMS.snapshot_s + Math.max(D / S, delta / L);
-        precopy += t;
-        passes += 1;
-        delta = Math.min(D, c * t);
-      }
-      finalDelta = delta;
-      copy = PARAMS.snapshot_s + Math.max(D / S, finalDelta / L);
-      break;
-    }
-    case 'storage_handover':
-      copy = V * PARAMS.handover_per_volume_s;
-      break;
-    case 'vmware_cold':
-      copy = U / L;
-      conversion = PARAMS.v2v_s;
-      break;
-    case 'vmware_warm': {
-      let t = U / L;
-      precopy = t;
-      passes = 1;
-      let delta = Math.min(D, c * t);
-      while (delta > threshold && passes < maxPasses) {
-        t = 10 + delta / L;
-        precopy += t;
-        passes += 1;
-        delta = Math.min(D, c * t);
-      }
-      finalDelta = delta;
-      copy = finalDelta / L;
-      conversion = PARAMS.v2v_inplace_s;
-      break;
-    }
-  }
+  const e = estimateStrategy(vm, strategy, paramsFor(plan), plan.downtime_slo_s);
   const round = (n: number) => Math.round(n * 10) / 10;
   // the API's keys (SDD §4, ADV-16): the rounded parts add up to the downtime
-  const downtime_parts = {
-    shutdown_s: PARAMS.shutdown_s,
-    copy_s: round(copy),
-    conversion_s: round(conversion),
-    create_s: PARAMS.create_s,
-    boot_s: PARAMS.boot_s,
-  };
-  const downtime = round(Object.values(downtime_parts).reduce((a, b) => a + b, 0));
+  const downtime_parts = Object.fromEntries(DOWNTIME_PARTS.map((part) => [part, round(e.downtime_parts[part] ?? 0)]));
+  const downtime = round(DOWNTIME_PARTS.reduce((sum, part) => sum + (downtime_parts[part] ?? 0), 0));
   return {
-    strategy,
+    ...e,
     eligible: reasons.length === 0,
     reasons,
-    precopy_s: round(precopy),
-    passes,
+    precopy_s: round(e.precopy_s),
     downtime_s: downtime,
-    total_s: round(precopy + downtime),
-    final_delta_bytes: Math.round(finalDelta),
-    meets_slo: downtime <= plan.downtime_slo_s,
+    total_s: round(e.precopy_s + downtime),
     downtime_parts,
   };
 }
