@@ -693,7 +693,6 @@ async def test_a_workload_record_without_volumes_wins_over_warm_passes(tmp_path,
         await h.orch.stop()
 
 
-
 @pytest.mark.parametrize(
     "other_reason", [None, "admin rights are required on the source cloud"], ids=["only", "other"]
 )
@@ -764,6 +763,7 @@ async def test_a_retry_takes_an_earlier_retrys_held_mark_off_once_nothing_is_hel
                 await h.orch.set_strategy(m.id, Strategy.storage_handover, "alice")
     finally:
         await h.orch.stop()
+
 
 @pytest.mark.parametrize(
     ("record", "passes", "held"),
