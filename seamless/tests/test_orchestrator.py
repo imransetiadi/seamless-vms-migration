@@ -2987,6 +2987,40 @@ async def test_a_downtime_event_the_store_refuses_still_leaves_the_clock_open(tm
     assert "migration.downtime_started" not in h.kinds()
 
 
+async def test_a_store_error_closing_the_clock_inside_a_step_retries_the_attempt(
+    tmp_path, store, refuse_write
+):
+    """SDD §5.2 (review RV36B-03): a rollback closes the clock inside its step once the source runs;
+    a store error saving that close fails the attempt as transient - retried within the step's
+    retries, the retry closes the clock again -, never the rollback."""
+    settings = make_settings(tmp_path)
+    attempts: list[int] = []
+    refused: list[list[str]] = []
+
+    async def cutover(ctx):
+        await ctx.mark_downtime_start()
+        raise PermanentStepError("the destination refused the server")
+
+    async def rollback(ctx):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            refused.append(refuse_write(store, "UPDATE documents", "migration"))
+        await ctx.mark_downtime_end()
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.CUTOVER: cutover, StepName.ROLLBACK: rollback}
+    )
+    h, plan = await setup(tmp_path, store, [vm(1)], executor=executor, settings=settings)
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back, P.failed)
+    await h.orch.stop()
+    assert m.phase == P.rolled_back, (h.history(m), m.error)
+    assert refused[0] == ["UPDATE documents migration"] and attempts == [1, 2]
+    assert m.downtime_ended_at is not None
+    assert h.kinds().count("migration.downtime_ended") == 1
+
+
 async def test_an_ansible_cutover_cut_off_while_its_clock_saves_still_announces_it_once(
     tmp_path, store, monkeypatch
 ):

@@ -2608,6 +2608,118 @@ async def test_a_journaled_port_still_bound_to_a_build_gone_is_unbound(tmp_path)
     assert result.details["source_running"] is True
 
 
+def the_give_back_refused(src):
+    """nova-api restarting while a rollback gives delete_on_termination back to the server it
+    recreated: each such PUT is answered 503 until ``refusing["on"]`` is cleared (RV36B-03)."""
+    put = src.compute.put
+    refusing = {"on": True}
+
+    def put_503(url, json=None, microversion=None, **kw):
+        body = (json or {}).get("volumeAttachment", {})
+        if refusing["on"] and body.get("delete_on_termination") is True and "/src-new-" in url:
+            return FakeResponse({"message": "Service Unavailable"}, 503)
+        return put(url, json=json, microversion=microversion, **kw)
+
+    src.compute.put = put_503
+    return refusing
+
+
+def _clock_in_calls(calls, plan, mig, settings):
+    """A context whose clock marks land among the clouds' calls, to read their order."""
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    start, end = ctx.mark_downtime_start, ctx.mark_downtime_end
+
+    async def mark_downtime_start(at=None):
+        calls.append(("ctx", "downtime_start", None))
+        await start(at=at)
+
+    async def mark_downtime_end():
+        calls.append(("ctx", "downtime_end", None))
+        await end()
+
+    ctx.mark_downtime_start, ctx.mark_downtime_end = mark_downtime_start, mark_downtime_end
+    return ctx, rec
+
+
+async def test_a_rollback_closes_the_clock_once_the_recreated_source_runs(tmp_path):
+    """SDD §5.2, §7.3 rollback (review RV36B-03): the clock closes once the recreated source server
+    is ACTIVE, before the give-back of delete_on_termination - an attempt whose give-back Nova
+    refuses leaves the source counted as running -, and again on the attempt that finishes."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="manage")
+    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO 18.0"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    refusing = the_give_back_refused(clouds["src"])
+    calls.clear()
+    ctx, rec = _clock_in_calls(calls, plan, mig, settings)
+    with pytest.raises(
+        (TransientStepError, PermanentStepError), match="restore delete_on_termination"
+    ):
+        await executor.run(StepName.ROLLBACK, ctx)
+    order = [op[1] for op in ops(calls)]
+    assert rec.downtime_ends == 1 and order.index("create_server") < order.index("downtime_end")
+    refusing["on"] = False
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    result = await executor.run(StepName.ROLLBACK, ctx)
+    assert rec.downtime_ends == 1 and result.details["vm"]["source_id"] == "src-new-1"
+
+
+@pytest.mark.parametrize("failed_at", ["the wait for SHUTOFF", "the deletion"])
+async def test_a_rollback_closes_the_clock_once_the_source_it_started_runs(tmp_path, failed_at):
+    """SDD §5.2, §7.3 rollback (review RV36B-03): a source that still exists - the cutover failed
+    before its deletion, or before it recorded the definition - closes the clock once its start
+    succeeded."""
+    if failed_at == "the deletion":
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="delete_server")
+    else:
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+        clouds["src"].crash_wait = "server"  # the stop sent, its wait dies: no definition yet
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    calls.clear()
+    ctx, rec = _clock_in_calls(calls, plan, mig, settings)
+    result = await executor.run(StepName.ROLLBACK, ctx)
+    order = [op[1] for op in ops(calls)]
+    assert result.details["source_running"] is True and "create_server" not in order
+    assert rec.downtime_ends == 1 and order.index("start_server") < order.index("downtime_end")
+
+
+async def test_a_cutover_resumed_after_a_rollback_recreated_the_source_refuses(tmp_path):
+    """SDD §7.3 (review RV36B-03): a Retry after a rollback attempt that recreated the source - its
+    give-back refused - would resume a cutover that can never complete, that rollback having
+    unmanaged every volume at RHOSO: it refuses before any call and before the clock opens, naming
+    Roll back, which then finishes."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="manage")
+    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO 18.0"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    refusing = the_give_back_refused(clouds["src"])
+    with pytest.raises(
+        (TransientStepError, PermanentStepError), match="restore delete_on_termination"
+    ):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    refusing["on"] = False
+    calls.clear()
+    reads = {name: cloud.compute.get_server for name, cloud in clouds.items()}
+
+    def no_read(server_id):
+        raise AssertionError(f"read {server_id}")
+
+    for cloud in clouds.values():
+        cloud.compute.get_server = no_read
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(
+        PermanentStepError,
+        match="a rollback attempt recreated the source server src-new-1, which runs: roll back "
+        "to finish it",
+    ):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert calls == [] and rec.downtime_marks == 0 and rec.downtime_ends == 0
+    for name, cloud in clouds.items():
+        cloud.compute.get_server = reads[name]
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["vm"]["source_id"] == "src-new-1"
+    assert clouds["src"].servers["src-new-1"].dot["src-vol-1"] is True
+
+
 async def test_handover_journals_every_port_with_its_mac_and_addresses(tmp_path):
     """SDD §7.3 step 2: every port with its id, MAC and every fixed IP (IPv4 and IPv6)."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)

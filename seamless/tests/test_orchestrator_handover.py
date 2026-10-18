@@ -19,6 +19,7 @@ from tests.test_executor_handover import (
     sdk_error,
     setup,
     shared_pool,
+    the_give_back_refused,
 )
 
 P = Phase
@@ -188,15 +189,17 @@ async def test_a_rollback_resumed_after_it_archived_its_journal_still_reports_th
     so the migration and its plan name the same, existing server (audit EX-04)."""
     h, calls, clouds, mig = handover_harness(tmp_path, store)
     clouds["dst"].crash_on = "create_server"  # step 8 fails once the source server was deleted
-    create = clouds["src"].compute.create_server
+    put = clouds["src"].compute.put
     refused = []
 
-    def recreate(**params):
-        # the next save of the migration - the one after the plan's rewrite - fails
-        refused.append(refuse_write(store, "UPDATE documents", "migration"))
-        return create(**params)
+    def give_back(url, json=None, microversion=None, **kw):
+        # past the clock's close: the next save of the migration - the one after the plan's
+        # rewrite - fails
+        if not refused and (json or {}).get("volumeAttachment", {}).get("delete_on_termination"):
+            refused.append(refuse_write(store, "UPDATE documents", "migration"))
+        return put(url, json=json, microversion=microversion, **kw)
 
-    clouds["src"].compute.create_server = recreate
+    clouds["src"].compute.put = give_back
     await h.orch.start()
     try:
         final = await h.wait_phase(mig.id, P.rolled_back, P.failed, timeout=20)
@@ -206,6 +209,32 @@ async def test_a_rollback_resumed_after_it_archived_its_journal_still_reports_th
         assert final.vm.source_id == plan.vm_ids[0] == "src-new-1", (final.vm, plan.vm_ids)
     finally:
         await h.orch.stop()
+
+
+async def test_a_store_error_closing_the_clock_in_a_handover_rollback_is_retried(
+    tmp_path, store, refuse_write
+):
+    """SDD §5.2, §7.3 (review RV36B-03): the rollback closes the clock once the recreated source
+    runs; the store refusing that save fails the attempt as transient - the retry resumes from the
+    journal and closes the clock again -, and the rollback ends rolled_back."""
+    h, calls, clouds, mig = handover_harness(tmp_path, store)
+    clouds["dst"].crash_on = "create_server"  # step 8 fails once the source server was deleted
+    create = clouds["src"].compute.create_server
+    refused = []
+
+    def recreate(**params):
+        refused.append(refuse_write(store, "UPDATE documents", "migration"))  # the clock's close
+        return create(**params)
+
+    clouds["src"].compute.create_server = recreate
+    await h.orch.start()
+    try:
+        final = await h.wait_phase(mig.id, P.rolled_back, P.failed, timeout=20)
+    finally:
+        await h.orch.stop()
+    assert refused == [["UPDATE documents migration"]]
+    assert final.phase == P.rolled_back, (h.history(final), final.error)
+    assert final.vm.source_id == "src-new-1" and final.downtime_ended_at is not None
 
 
 async def test_a_handover_retries_a_manage_cinder_answered_503_and_completes(tmp_path, store):
@@ -355,6 +384,66 @@ async def test_a_retry_after_a_failed_handover_rollback_keeps_the_boot_volume(tm
         await h.orch.stop()
     assert src.deleted_by_nova == [], (final.phase, final.error)
     assert final.phase == P.completed, (h.history(final), final.error)
+
+
+async def test_a_rollback_failing_after_the_recreate_leaves_the_clock_closed(tmp_path, store):
+    """SDD §5.2, §7.3 rollback (review RV36B-03), end to end: step 8 fails at RHOSO after step 4
+    deleted the source; the automatic rollback recreates the source while nova-api restarts and
+    its give-back is refused on the attempt and both retries. The migration is failed with the
+    clock closed - the recreated source runs -, and the operator's Roll back an hour later records
+    no downtime for that hour."""
+    h, calls, clouds, mig = handover_harness(tmp_path, store)
+    src = clouds["src"]
+    clouds["dst"].crash_on = "create_server"  # step 8 fails once the source server was deleted
+    refusing = the_give_back_refused(src)
+    await h.orch.start()
+    try:
+        failed = await _failed_after_its_rollback(h, mig.id)
+        assert {sid: s.status for sid, s in src.servers.items()} == {"src-new-1": "ACTIVE"}
+        assert failed.downtime_ended_at is not None and failed.actual_downtime_s is not None
+        assert "restore delete_on_termination" in failed.error
+        h.clock.advance(3600)  # an hour before the operator rolls back again
+        refusing["on"] = False
+        await h.orch.rollback(mig.id, "rina", "finish the rollback")
+        final = await h.wait_phase(mig.id, P.rolled_back, P.failed, timeout=20)
+    finally:
+        await h.orch.stop()
+    assert final.phase == P.rolled_back, (h.history(final), final.error)
+    assert final.vm.source_id == "src-new-1"
+    assert final.actual_downtime_s == failed.actual_downtime_s  # that hour is no downtime
+    assert src.servers["src-new-1"].dot["src-vol-1"] is True
+
+
+async def test_a_retry_after_a_rollback_recreated_the_source_asks_for_a_roll_back(tmp_path, store):
+    """SDD §7.3 (review RV36B-03), end to end: after a rollback that recreated the source failed at
+    its give-back, the operator's Retry is refused before any call - the cutover can never
+    complete - with no clock opened and no automatic rollback; the Roll back it names finishes,
+    following the recreated source."""
+    h, calls, clouds, mig = handover_harness(tmp_path, store)
+    src = clouds["src"]
+    clouds["dst"].crash_on = "create_server"
+    refusing = the_give_back_refused(src)
+    await h.orch.start()
+    try:
+        await _failed_after_its_rollback(h, mig.id)
+        refusing["on"] = False
+        before = len(calls)
+        await h.orch.retry(mig.id, "rina")
+        refused = await h.wait_phase(mig.id, P.failed, timeout=20)
+        assert (
+            "a rollback attempt recreated the source server src-new-1, which runs: roll back"
+            in (refused.error)
+        )
+        assert calls[before:] == []  # no call, at the source or at RHOSO
+        assert refused.downtime_started_at is None  # no outage opened while src-new-1 runs
+        assert h.history(refused)[-2:] == [P.cutover, P.failed]  # no automatic rollback
+        await h.orch.rollback(mig.id, "rina", "roll back to finish it")
+        final = await h.wait_phase(mig.id, P.rolled_back, P.failed, timeout=20)
+    finally:
+        await h.orch.stop()
+    assert final.phase == P.rolled_back, (h.history(final), final.error)
+    assert final.vm.source_id == "src-new-1"
+    assert "src-new-1" in (await h.plan(mig.plan_id)).vm_ids
 
 
 async def test_a_retried_handover_cutover_that_finds_the_source_running_counts_a_new_outage(

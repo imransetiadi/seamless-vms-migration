@@ -1299,6 +1299,15 @@ class HandoverExecutor:
     async def _cutover(self, ctx: StepContext) -> StepResult:
         rdir = self.run_dir(ctx)
         journal = await _in_thread(_Journal, rdir / JOURNAL_FILE)
+        if journal.done("rb:create_source"):
+            # a Retry after a rollback attempt that recreated the source: that rollback unmanaged
+            # every volume at RHOSO, so this journal's cutover can never complete, and the source
+            # runs - refused before any call and before the clock opens (SDD §7.3, RV36B-03)
+            recreated = journal.get("rb:create_source")["server_id"]
+            raise PermanentStepError(
+                f"a rollback attempt recreated the source server {recreated}, which runs: roll "
+                "back to finish it"
+            )
         src = await self._conn(ctx.source)
         dst = await self._conn(ctx.destination)
         # the plan's mappings overlaid with the flavor preflight matched: what steps 6 and 8 apply
@@ -1603,6 +1612,8 @@ class HandoverExecutor:
             # stopped but nothing else happened yet: just start the source again
             if not journal.done("rb:start_source"):
                 await self._call("start the source server", lambda: self._start(src, server_id))
+                # it runs: the clock closes now (SDD §5.2, §7.3, review RV36B-03)
+                await outlive_cancel(ctx.mark_downtime_end())
                 await _in_thread(journal.mark, "rb:start_source")
             await _in_thread(journal.archive, "rolled-back")
             return StepResult(details={"source_running": True})
@@ -1785,6 +1796,9 @@ class HandoverExecutor:
                 )
                 await _in_thread(journal.mark, "rb:create_source", server_id=created)
             new_server_id = journal.get("rb:create_source")["server_id"]
+            # it runs: the clock closes now, on every attempt that finds it, so one whose give-back
+            # fails leaves the source counted as running (SDD §5.2, §7.3, review RV36B-03)
+            await outlive_cancel(ctx.mark_downtime_end())
             # each volume's journaled delete_on_termination, once the recreated server runs: kept
             # while Nova built it (SDD §7.3 rollback, review RV35B-04)
             for att in attachments:
@@ -1827,6 +1841,8 @@ class HandoverExecutor:
                     await _in_thread(journal.mark, key)
             if not journal.done("rb:start_source"):
                 await self._call("start the source server", lambda: self._start(src, server_id))
+                # it runs: the clock closes now (SDD §5.2, §7.3, review RV36B-03)
+                await outlive_cancel(ctx.mark_downtime_end())
                 await _in_thread(journal.mark, "rb:start_source")
 
         details: dict[str, Any] = {"source_running": True}

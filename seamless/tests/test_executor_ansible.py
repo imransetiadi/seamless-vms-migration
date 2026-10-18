@@ -3315,6 +3315,28 @@ async def test_a_vmware_rollback_closes_the_clock_once_its_power_on_succeeded(en
     ]
 
 
+async def test_a_vmware_rollback_whose_clock_close_the_store_refused_is_retried(env):
+    """SDD §5.2 (review RV36B-03): a store error saving the clock's close after the power-on reaches
+    the orchestrator as the transient error the step context raises - the attempt is retried and
+    closes the clock again -, never swallowed or turned into a permanent one."""
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        destination_server_id="dst-9",
+        downtime_started_at=utcnow(),
+    )
+
+    async def refused():
+        env.registry.calls.append(("clock_refused",))
+        raise TransientStepError("close the downtime clock: the store was briefly unavailable")
+
+    ctx.mark_downtime_end = refused
+    with pytest.raises(TransientStepError, match="close the downtime clock"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert env.registry.calls[-2:] == [("power_on", "srv-1"), ("clock_refused",)]
+
+
 @pytest.mark.parametrize("powered_on", [True, None])
 async def test_a_converted_kit_volume_is_no_reuse_once_vcenter_powered_the_vm_on_since_the_stop(
     env, powered_on

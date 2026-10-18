@@ -2589,7 +2589,12 @@ class Orchestrator:
 
         async def mark_downtime_end() -> None:
             if not locked:
-                await outlive_cancel(self._close_clock(mid, plan))
+                try:
+                    await outlive_cancel(self._close_clock(mid, plan))
+                except Exception as exc:
+                    # the source runs: a store error saving the close is retried with the
+                    # attempt, which closes the clock again (SDD §5.2, review RV36B-03)
+                    raise TransientStepError(f"close the downtime clock: {exc}") from exc
 
         async def log_line(line: str) -> None:
             text = redact_cut(line, LOG_LINE_CHARS)
