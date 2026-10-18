@@ -17,6 +17,14 @@ export type ReadinessLevel = 'ready' | 'attention' | 'blocker';
 
 const SRIOV = new Set(['direct', 'direct-physical', 'macvtap']);
 
+/** A vGPU request in a flavor's extra specs, bare or in one of Nova's request groups (`resources1:VGPU`): SDD §9.3 VM_VGPU, review PL-08. */
+export const VGPU_SPEC = /^resources[A-Za-z0-9_-]*:VGPU$/;
+
+/** The extra-spec keys of a flavor that request a vGPU, in the API's order. */
+export function vgpuRequests(specs: Record<string, string>): string[] {
+  return Object.keys(specs).filter((k) => VGPU_SPEC.test(k)).sort();
+}
+
 /** NICs os-migrate cannot recreate through Nova, which takes exactly one fixed IP per port (SDD §9.2). */
 export function portsWithoutOneFixedIp(vm: VMRef): Nic[] {
   return vm.nics.filter((n) => n.fixed_ips.length !== 1);
@@ -33,7 +41,7 @@ export function readinessFlags(vm: VMRef, kind: ProviderKind): ReadinessFlag[] {
 
   if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', 'Error state', 'blocker', 'The source VM is in ERROR state.');
   if (vm.power_state === 'transitioning') add('SRC_VM_TRANSITIONAL_STATE', 'Task in flight', 'blocker', 'A Nova task (resize, migration, rescue, rebuild, reboot) is in flight.');
-  if ('resources:VGPU' in vm.flavor_extra_specs) add('VM_VGPU', 'vGPU', 'blocker', 'The flavor requests a vGPU.');
+  if (vgpuRequests(vm.flavor_extra_specs).length) add('VM_VGPU', 'vGPU', 'blocker', 'The flavor requests a vGPU.');
   if ('pci_passthrough:alias' in vm.flavor_extra_specs) add('VM_PCI_PASSTHROUGH', 'PCI passthrough', 'blocker', 'The flavor requests PCI passthrough.');
   if (vm.disks.some((d) => d.multiattach)) add('SRC_VM_MULTIATTACH', 'Multi-attach', 'warning', 'A multi-attach volume rules out warm and storage handover.');
   if (vm.disks.some((d) => d.encrypted)) add('VOL_ENCRYPTED', 'Encrypted volume', 'warning', 'The Barbican key must be re-created on the destination.');

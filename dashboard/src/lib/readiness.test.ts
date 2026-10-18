@@ -45,4 +45,14 @@ describe('readinessFlags', () => {
     expect(readinessFlags(vm('caf\u00e9-01'), 'vmware').map((f) => f.code)).not.toContain('SRC_VM_NAME_UNUSABLE');
     expect(readinessFlags(vm('\u30b5\u30fc\u30d0\u30fc'), 'openstack').map((f) => f.code)).not.toContain('SRC_VM_NAME_UNUSABLE');
   });
+
+  it('blocks a vGPU requested bare or in a request group, as validation does (SDD §9.3 VM_VGPU, review PL-08)', () => {
+    const vm = (specs: Record<string, string>) =>
+      makeVm({ id: 'os-r6', name: 'gpu-02', disks: [{ size_gb: 20 }], nics: [{ network: 'app-net', fixed_ips: ['10.0.0.8'] }], flavor_extra_specs: specs });
+    for (const key of ['resources:VGPU', 'resources1:VGPU', 'resources_GPU-a:VGPU'])
+      expect(readinessFlags(vm({ [key]: '1' }), 'openstack').find((f) => f.code === 'VM_VGPU')).toMatchObject({ label: 'vGPU', severity: 'blocker' });
+    // another resource class, or a trait, in a request group is no vGPU
+    for (const key of ['resources1:VCPU', 'resources:CUSTOM_VGPU_X', 'resources1:VGPU_DISPLAY_HEAD', 'trait1:CUSTOM_VGPU'])
+      expect(readinessFlags(vm({ [key]: '1' }), 'openstack').map((f) => f.code)).not.toContain('VM_VGPU');
+  });
 });

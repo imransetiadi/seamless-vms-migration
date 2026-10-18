@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -508,19 +509,20 @@ def _flavor_size(flavor: dict[str, Any]) -> tuple[int, int, int, str]:
     )
 
 
-#: Extra-spec prefixes that make a destination flavor unsuitable for automatic matching: it
-#: would pin the server to special hardware or hosts (SDD §9.3 ``MAP_FLAVOR_AUTO``).
-_CONSTRAINED_SPEC_PREFIXES = (
-    "pci_passthrough:",
-    "resources:",
-    "trait:",
-    "aggregate_instance_extra_specs:",
+#: Extra specs that make a destination flavor unsuitable for automatic matching: it would pin the
+#: server to special hardware or hosts (SDD §9.3 ``MAP_FLAVOR_AUTO``) - a resource or trait request,
+#: bare or in one of Nova's request groups (``resources<suffix>:``, ``trait<suffix>:``, review
+#: PL-08), a PCI alias, an aggregate pin.
+_CONSTRAINED_SPEC = re.compile(
+    r"^(?:(?:resources|trait)[A-Za-z0-9_-]*:|pci_passthrough:|aggregate_instance_extra_specs:)"
 )
+#: A vGPU request, bare or in a request group (SDD §9.3 ``VM_VGPU``, review PL-08).
+_VGPU_SPEC = re.compile(r"^resources[A-Za-z0-9_-]*:VGPU$")
 
 
 def _constrained(flavor: dict[str, Any]) -> bool:
     specs = flavor.get("extra_specs") or {}
-    return any(str(k).startswith(_CONSTRAINED_SPEC_PREFIXES) for k in specs)
+    return any(_CONSTRAINED_SPEC.match(str(k)) for k in specs)
 
 
 def _hw_specs(vm: VMRef) -> list[str]:
@@ -1210,8 +1212,9 @@ def run_preflight(
                 f"({vm.flavor_extra_specs['pci_passthrough:alias']}).",
             )
         )
-    if "resources:VGPU" in vm.flavor_extra_specs:
-        out.append(finding("VM_VGPU", "Flavor requests a vGPU (resources:VGPU)."))
+    vgpu = sorted(k for k in vm.flavor_extra_specs if _VGPU_SPEC.match(str(k)))
+    if vgpu:
+        out.append(finding("VM_VGPU", f"Flavor requests a vGPU ({', '.join(vgpu)})."))
 
     encrypted = [d.name or d.id for d in vm.disks if d.encrypted]
     if encrypted:

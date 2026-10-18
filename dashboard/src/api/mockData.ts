@@ -41,7 +41,7 @@ import { kitVmName } from '../lib/kitName';
 import { addressRefusal, canonicalIp, ipInCidr, mappedNetwork, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
 import { kitSubnet, networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
 import { destinationRelease, parseMicroversion, type PolicyProfile } from '../lib/platforms';
-import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
+import { describePorts, portsWithoutOneFixedIp, vgpuRequests } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { providerLabel } from '../lib/providerUse';
 import { buildStrategyEvidence } from './mockEvidence';
@@ -1205,8 +1205,9 @@ export function preflight(
     add(code, message);
   if ('pci_passthrough:alias' in vm.flavor_extra_specs)
     add('VM_PCI_PASSTHROUGH', `Flavor requests PCI passthrough (${vm.flavor_extra_specs['pci_passthrough:alias']}).`);
-  if ('resources:VGPU' in vm.flavor_extra_specs)
-    add('VM_VGPU', 'Flavor requests a vGPU (resources:VGPU).');
+  const vgpu = vgpuRequests(vm.flavor_extra_specs);
+  if (vgpu.length)
+    add('VM_VGPU', `Flavor requests a vGPU (${vgpu.join(', ')}).`);
   const encrypted = vm.disks.filter((d) => d.encrypted).map((d) => d.name || d.id);
   if (encrypted.length)
     add('VOL_ENCRYPTED', `Encrypted disk(s): ${pyNames(encrypted)}.`);

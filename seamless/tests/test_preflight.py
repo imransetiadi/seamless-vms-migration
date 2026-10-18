@@ -955,6 +955,51 @@ def test_finding_vm_vgpu():
     assert only(check(vm), "VM_VGPU").severity == Severity.blocker
 
 
+@pytest.mark.parametrize("key", ["resources1:VGPU", "resources_GPU-a:VGPU"])
+def test_finding_vm_vgpu_in_a_request_group(key):
+    """SDD §9.3 (review PL-08): a vGPU requested in a request group - resources<suffix>:VGPU, Nova's
+    granular form - blocks as the bare resources:VGPU does."""
+    assert only(check(make_vm(flavor_extra_specs={key: "1"})), "VM_VGPU").severity == (
+        Severity.blocker
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "resources1:VCPU",
+        "resources:CUSTOM_VGPU_X",
+        "resources1:VGPU_DISPLAY_HEAD",
+        "trait1:CUSTOM_VGPU",
+    ],
+)
+def test_finding_vm_vgpu_names_the_vgpu_class_only(key):
+    """SDD §9.3 (review PL-08): another resource class, or a trait, in a request group is no
+    vGPU."""
+    assert "VM_VGPU" not in [f.code for f in check(make_vm(flavor_extra_specs={key: "1"}))]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"resources1:VGPU": "1"},
+        {"trait1:CUSTOM_NVIDIA_A40": "required"},
+        {"resources_GPU:CUSTOM_FPGA": "1"},
+        {"trait:HW_CPU_X86_AVX512F": "required"},
+    ],
+    ids=lambda spec: next(iter(spec)),
+)
+def test_flavor_auto_match_skips_request_group_flavors(spec):
+    """SDD §9.3 (review PL-08): a flavor with a resource or trait request in a request group -
+    resources<suffix>:*, trait<suffix>:* - pins the server to special hardware as the bare forms
+    do: it is never matched automatically, though it is the smallest flavor that fits."""
+    vm = make_vm(flavor="c2.small")  # no destination flavor of that name
+    special = {"name": "g1.small", "vcpus": 2, "ram_mb": 4096, "disk_gb": 20, "extra_specs": spec}
+    plain = {"name": "m1.large", "vcpus": 8, "ram_mb": 16384, "disk_gb": 80, "extra_specs": {}}
+    chosen = fitting_flavor(vm, dst_inv(flavors=[special, plain]))
+    assert chosen is not None and chosen["name"] == "m1.large"
+
+
 def test_finding_vol_encrypted():
     vm = make_vm(disks=[make_disk(encrypted=True)])
     assert only(check(vm), "VOL_ENCRYPTED").severity == Severity.warning
