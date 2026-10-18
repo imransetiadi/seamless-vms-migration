@@ -96,9 +96,20 @@ _VMWARE_WINDOWS = {
     "windows864guest": ("windows", "8"),
     "windows764guest": ("windows", "7"),
     "windows7guest": ("windows", "7"),
+    "windows8guest": ("windows", "8"),
+}
+# VMware guest ids without a version: the releases govmomi gives each (SDD §9.5, review PL-04)
+_VMWARE_LINUX = {
+    "oraclelinuxguest": ("oracle", "4/5"),
+    "oraclelinux64guest": ("oracle", "4/5"),
+    "centosguest": ("centos", "4/5"),
+    "centos64guest": ("centos", "4/5"),
+    "slesguest": ("sles", "9"),
+    "sles64guest": ("sles", "9"),
 }
 _SERVER_YEAR = re.compile(r"(2003|2008|2012|2016|2019|2022|2025)")
 _LIBOSINFO = re.compile(r"^win2k(\d{1,2})(r2)?$")
+_LIBOSINFO_CLIENT = re.compile(r"^win(11|10|8\.1|8|7)$")
 _CLIENT = re.compile(r"windows[\s_-]*(11|10|8\.1|8|7)\b")
 _NUMBER = re.compile(r"(\d+(?:\.\d+)?)")
 
@@ -122,6 +133,9 @@ def _windows(low: str, compact: str) -> tuple[str | None, str | None]:
         short = int(lib.group(1))
         year = 2000 + short
         return "windows-server", f"{year}{' R2' if lib.group(2) else ''}"
+    client = _LIBOSINFO_CLIENT.match(low.strip())
+    if client:  # libosinfo's client ids (SDD §9.5, review PL-04)
+        return "windows", client.group(1)
     year = _SERVER_YEAR.search(low)
     if year:
         r2 = re.search(r"r2", low[year.end() :]) is not None
@@ -133,6 +147,9 @@ def _windows(low: str, compact: str) -> tuple[str | None, str | None]:
 
 
 def _linux(low: str) -> tuple[str | None, str | None]:
+    compact = re.sub(r"[^a-z0-9]", "", low)
+    if compact in _VMWARE_LINUX:
+        return _VMWARE_LINUX[compact]
     text = re.sub(r"_?64guest$|guest$", "", low)
     for distro, pattern in _LINUX:
         match = re.search(pattern, text)
@@ -140,6 +157,9 @@ def _linux(low: str) -> tuple[str | None, str | None]:
             continue
         number = _NUMBER.search(text[match.end() :])
         version = number.group(1) if number else None
+        if distro == "centos" and (_major(version) or 0) >= 9:
+            # CentOS Linux ended with 8: a 9 or later is CentOS Stream (SDD §9.5, review PL-05)
+            distro = "centos-stream"
         if distro == "debian" and version:
             version = version.split(".")[0]
         if version is None:

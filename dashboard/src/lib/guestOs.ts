@@ -41,6 +41,16 @@ const VMWARE_WINDOWS: Record<string, [string, string]> = {
   windows864guest: ['windows', '8'],
   windows764guest: ['windows', '7'],
   windows7guest: ['windows', '7'],
+  windows8guest: ['windows', '8'],
+};
+/** VMware guest ids without a version: the releases govmomi gives each (SDD §9.5, review PL-04). */
+const VMWARE_LINUX: Record<string, [string, string]> = {
+  oraclelinuxguest: ['oracle', '4/5'],
+  oraclelinux64guest: ['oracle', '4/5'],
+  centosguest: ['centos', '4/5'],
+  centos64guest: ['centos', '4/5'],
+  slesguest: ['sles', '9'],
+  sles64guest: ['sles', '9'],
 };
 
 type Pair = [string | null, string | null];
@@ -56,6 +66,9 @@ function windows(low: string, compact: string): Pair {
   if (compact.startsWith('winnet')) return ['windows-server', '2003'];
   const lib = compact.match(/^win2k(\d{1,2})(r2)?$/);
   if (lib) return ['windows-server', `${2000 + Number(lib[1])}${lib[2] ? ' R2' : ''}`];
+  // libosinfo's client ids (SDD §9.5, review PL-04)
+  const libClient = low.trim().match(/^win(11|10|8\.1|8|7)$/);
+  if (libClient) return ['windows', libClient[1]!];
   const year = /(2003|2008|2012|2016|2019|2022|2025)/.exec(low);
   if (year) {
     const r2 = low.slice(year.index + year[0].length).includes('r2');
@@ -67,12 +80,16 @@ function windows(low: string, compact: string): Pair {
 }
 
 function linux(low: string): Pair {
+  const compact = low.replace(/[^a-z0-9]/g, '');
+  if (compact in VMWARE_LINUX) return VMWARE_LINUX[compact]!;
   const text = low.replace(/_?64guest$|guest$/, '');
   for (const [distro, pattern] of LINUX) {
     const match = pattern.exec(text);
     if (!match) continue;
     const number = text.slice(match.index + match[0].length).match(/(\d+(?:\.\d+)?)/);
     let version: string | null = number ? number[1]! : null;
+    // CentOS Linux ended with 8: a 9 or later is CentOS Stream (SDD §9.5, review PL-05)
+    if (distro === 'centos' && (major(version) ?? 0) >= 9) return ['centos-stream', version];
     if (distro === 'debian' && version) version = version.split('.')[0]!;
     if (version === null) {
       const names = distro === 'ubuntu' ? UBUNTU_CODENAMES : DEBIAN_CODENAMES;
