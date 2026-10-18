@@ -1078,9 +1078,11 @@ def run_preflight(
             )
         )
 
-    if dst_inv.quotas:
+    # the projects the destination inventory lists, never the quota table, which the provider
+    # leaves empty when its quota calls fail (SDD §9.3, review PL-06)
+    if dst_inv.projects:
         mapped_project = maps.projects.get(vm.project or "")
-        if mapped_project is not None and mapped_project not in dst_inv.quotas:
+        if mapped_project is not None and mapped_project not in dst_inv.projects:
             out.append(
                 finding(
                     "DST_PROJECT_MISSING",
@@ -1091,14 +1093,14 @@ def run_preflight(
         elif (
             vm.project  # VMware VMs report none: the kit charges the credential's project
             and mapped_project is None
-            and vm.project not in dst_inv.quotas
-            and len(dst_inv.quotas) != 1
+            and vm.project not in dst_inv.projects
+            and len(dst_inv.projects) != 1
         ):
             out.append(
                 finding(
                     "DST_PROJECT_MISSING",
                     f"No destination project for {vm.project!r}: no mapping, no same-named "
-                    f"project, and {where} has {len(dst_inv.quotas)} projects.",
+                    f"project, and {where} has {len(dst_inv.projects)} projects.",
                 )
             )
     shortfall = _quota_shortfall(vm, plan, dst_inv, selected, phases or {})

@@ -244,8 +244,31 @@ def test_finding_src_vm_transitional_state():
     assert all(x.code != "SRC_VM_TRANSITIONAL_STATE" for x in check(make_vm(power_state="stopped")))
 
 
+@pytest.mark.parametrize("quotas", [{}, None], ids=["quotas unreadable", "quotas read"])
+def test_finding_dst_project_missing_against_the_listed_projects(quotas):
+    """SDD §9.3 (review PL-06): the destination project is judged against the projects the
+    inventory lists, not the quota table - which the provider leaves empty when its quota calls
+    fail while it still lists the project: a mapping to a project the destination does not list
+    blocks either way, and one to a listed project does not."""
+    kw = {} if quotas is None else {"quotas": quotas}
+    remapped = make_plan(mappings=Mappings(projects={"finance": "fin-rhoso"}))
+    blocker = only(check(plan=remapped, dst=dst_inv(**kw)), "DST_PROJECT_MISSING")
+    assert "'fin-rhoso'" in blocker.message
+    listed = make_plan(mappings=Mappings(projects={"finance": "finance"}))
+    assert "DST_PROJECT_MISSING" not in [f.code for f in check(plan=listed, dst=dst_inv(**kw))]
+
+
+def test_finding_dst_project_missing_judges_nothing_without_a_project_list():
+    """SDD §9.3 (review PL-06): a destination that lists no project gives nothing to judge by."""
+    remapped = make_plan(mappings=Mappings(projects={"finance": "fin-rhoso"}))
+    findings = check(plan=remapped, dst=dst_inv(projects=[], quotas={}))
+    assert "DST_PROJECT_MISSING" not in [f.code for f in findings]
+
+
 def test_finding_dst_project_missing_and_image_root_quota():
     dst = dst_inv(
+        # the projects the destination lists, which the check judges by (review PL-06)
+        projects=["finance-rhoso", "shop-rhoso"],
         quotas={
             "finance-rhoso": {
                 "cores": 100,
@@ -261,7 +284,7 @@ def test_finding_dst_project_missing_and_image_root_quota():
                 "volumes": 10,
                 "gigabytes": 10**4,
             },
-        }
+        },
     )
     vm = make_vm(project="finance")
     # mapped to a project the destination does not list
