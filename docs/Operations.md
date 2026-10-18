@@ -274,7 +274,8 @@ end first:
    ```
 
    It prints the plans it paused. If a cutover is still in flight when the wait ends, it **stops nothing**,
-   names the paused plans, and exits 1 - try again later, or stop without `--drain`.
+   names the paused plans, and exits 1 - try again later, or stop without `--drain`. Any other end before the
+   stop does the same: the API not answering during the wait, an interrupt (Ctrl-C).
 
    `capacity` takes `--drain` too: it ends in a restart. Its own checks come first - `deploy/compose/.env` on the
    single host, a server-side dry run of a cluster's limits - so a capacity that would be refused pauses no plan,

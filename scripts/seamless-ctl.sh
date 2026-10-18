@@ -249,11 +249,15 @@ import json, sys
 for plan in json.load(sys.stdin):
     if plan.get("status") == "running":
         print(plan["id"])') || die "cannot read the plans the API returned"
+  # every way the drain ends before its stop - a failure, an interrupt - stops nothing, and the plans it paused stay
+  # paused: named, with the way to resume them (SDD §17.2, reviews RV38B-05, RV41A-05)
+  trap 'drain_failed "interrupted"' INT TERM
   for id in $ids; do
-    case $id in '' | .* | *[!A-Za-z0-9._-]*) die "the API returned a plan id this script will not use: '$id'" ;; esac
-    # the plans already paused stay paused: named, with the way to resume them (SDD §17.2, review RV38B-05)
+    case $id in
+      '' | .* | *[!A-Za-z0-9._-]*) drain_failed "the API returned a plan id this script will not use: '$id'" ;;
+    esac
     curl -fsS --max-time 30 -X POST -H "$HEADER" -o /dev/null "$API/api/v1/plans/$id/pause" ||
-      die "cannot pause plan $id: nothing was stopped.$(resume_hint)"
+      drain_failed "cannot pause plan $id"
     PAUSED+=("$id")
   done
   if [ ${#PAUSED[@]} -gt 0 ]; then say "paused: ${PAUSED[*]}"; else say "no plan was running"; fi
@@ -262,20 +266,18 @@ for plan in json.load(sys.stdin):
     busy=
     for phase in cutover verifying rolling_back; do
       out=$(curl -fsS --max-time 30 -H "$HEADER" "$API/api/v1/migrations?phase=$phase&view=summary&limit=1") ||
-        die "cannot list the migrations at $API"
+        drain_failed "cannot list the migrations at $API"
       [ "$(printf '%s' "$out" | count_items)" = 0 ] || busy="$busy $phase"
     done
     [ -n "$busy" ] || break
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      printf '%s: a migration is still in%s after %ss: nothing was stopped.%s\n' "$PROG" "$busy" "$WAIT_TIMEOUT" \
-        "$(resume_hint)" >&2
-      exit 1
-    fi
+    [ "$(date +%s)" -lt "$deadline" ] || drain_failed "a migration is still in$busy after ${WAIT_TIMEOUT}s"
     say "waiting: a migration is in$busy"
     sleep 5
   done
+  trap - INT TERM
   [ ${#PAUSED[@]} -eq 0 ] || say "the paused plans stay paused.$(resume_hint)"
 }
+drain_failed() { die "$1: nothing was stopped.$(resume_hint)"; }
 resume_hint() {
   [ ${#PAUSED[@]} -gt 0 ] || return 0
   printf ' Resume them once the control plane runs: scripts/seamless-ctl.sh %s resume --token-file %s%s %s' \

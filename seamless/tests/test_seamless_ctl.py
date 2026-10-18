@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 
@@ -803,6 +804,93 @@ def test_a_drain_whose_pause_fails_names_the_plans_it_already_paused(tmp_path):
     assert "cannot pause plan plan-bb" in proc.stderr
     assert "resume" in proc.stderr and "plan-aa" in proc.stderr, proc.stderr
     assert not [c for c in calls if c["cmd"] == "make"]  # nothing was stopped
+
+
+@pytest.mark.parametrize(
+    ("rules", "paused"),
+    [
+        (
+            [
+                {"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"stdout": RUNNING}]},
+                {"cmd": "curl", "has": ["phase=cutover"], "answers": [{"exit": 22}]},
+            ],
+            ["plan-aa", "plan-bb"],
+        ),
+        (
+            [
+                {
+                    "cmd": "curl",
+                    "has": ["/plans?status=running"],
+                    "answers": [
+                        {
+                            "stdout": json.dumps(
+                                [
+                                    {"id": "plan-aa", "status": "running"},
+                                    {"id": "../plan-bb", "status": "running"},
+                                ]
+                            )
+                        }
+                    ],
+                },
+            ],
+            ["plan-aa"],
+        ),
+    ],
+    ids=["the migrations list fails during the wait", "a later plan id is refused"],
+)
+def test_a_drain_that_fails_after_a_pause_names_the_plans_it_paused(tmp_path, rules, paused):
+    """SDD §17.2 (reviews RV38B-05, RV41A-05): every way a drain fails after a pause stops
+    nothing and names the plans it paused, with the resume command - it died naming none, the
+    plans paused until someone noticed."""
+    proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", rules=rules)
+    assert proc.returncode == 1, proc.stderr
+    assert "nothing was stopped" in proc.stderr, proc.stderr
+    assert f"resume --token-file {tmp_path / 'operator.token'} {' '.join(paused)}" in proc.stderr
+    assert not [c for c in calls if c["cmd"] == "make"]
+
+
+def test_an_interrupted_drain_names_the_plans_it_paused(tmp_path):
+    """SDD §17.2 (review RV41A-05): an interrupt (Ctrl-C) while the drain waits for a cutover stops
+    nothing and names the paused plans with the resume command."""
+    rules = _drain_rules([{"stdout": '[{"id": "m-1"}]'}])
+    tree = tmp_path / "tree"
+    (tree / "scripts").mkdir(parents=True)
+    shutil.copy(SCRIPT, tree / "scripts" / SCRIPT.name)
+    shutil.copy(DOTENV, tree / "scripts" / DOTENV.name)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in TOOLS:
+        (bin_dir / name).write_text(STUB)
+        (bin_dir / name).chmod(0o755)
+    token_file = tmp_path / "operator.token"
+    token_file.write_text(TOKEN + "\n")
+    token_file.chmod(0o600)
+    (tmp_path / "rules.json").write_text(json.dumps(rules))
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SEAMLESS_", "DOCKER_"))}
+    env.update(
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        STUB_LOG=str(tmp_path / "calls.log"),
+        STUB_RULES=str(tmp_path / "rules.json"),
+        TMPDIR=str(tmp_path),
+    )
+    argv = ["bash", str(tree / "scripts" / SCRIPT.name), "docker", "stop", "--drain"]
+    proc = subprocess.Popen(
+        [*argv, str(token_file)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:  # the drain waits for the cutover in flight
+        if line.startswith("waiting:"):
+            break
+    os.killpg(proc.pid, signal.SIGINT)  # what Ctrl-C sends: the script and its sleep
+    _, err = proc.communicate(timeout=30)
+    assert proc.returncode == 1, err
+    assert "nothing was stopped" in err and "resume" in err and "plan-aa plan-bb" in err, err
+    assert not [c for c in (tmp_path / "calls.log").read_text().splitlines() if '"make"' in c]
 
 
 @pytest.mark.parametrize("timeout", ["08", "09"])
