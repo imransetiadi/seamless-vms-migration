@@ -178,7 +178,7 @@ The "Automated tests" column uses the plan's test names; §4 maps every name to 
 | NFR-07 AI safety | B5 tests, S-14…S-16, R-03; redaction in linear time, finding what it found before (reviews RV27-06, RV31-01, RV31-02): `test_redact_costs_time_linear_in_the_text`, `test_redact_still_finds_what_its_linear_patterns_could_hide`, `test_four_times_the_text_costs_redact_about_four_times_the_time`, `test_redact_finds_a_credential_word_glued_into_a_cli_flag` and `test_redact_finds_a_cli_flag_after_an_escaped_line_break` (review RV32B-01; the timing test's units include flags glued after words), `test_redact_finds_a_jwt_glued_after_a_dash` (review RV32B-06; and JWT headers, halves and JWTs after dashes as timing units) |
 | NFR-08 usability | S-UI, `contrast.test.ts`, §12 (UI-15: no sideways scroll at 320 px); SSE latency ≤ 2 s measured in PERF-CP-03 |
 | NFR-09 observability | `test_metrics_format`, `test_events_since`; timeline completeness check in `tests/e2e/smoke-demo.sh` |
-| NFR-10 portability | environment matrix (§3), compose and kustomize checks |
+| NFR-10 portability | environment matrix (§3), compose and kustomize checks; one release, one version: `test_every_version_location_of_a_release_names_one_version` (every location of RELEASING.md §1, the Makefile's `SEAMLESS_VERSION` - the image `make deploy-runtime-check` runs - included; docs-drift DD2-06) |
 | NFR-11 maintainability | coverage gate ≥ 85 % (§13), `ruff check`, ansible-lint |
 | NFR-12 compatibility | §7.1 M7–M12 per release candidate; `test_the_sdd_support_table_matches_the_code_series_table` (S-DST) keeps SDD §21.1 and the code's series table equal |
 
@@ -1166,10 +1166,10 @@ control-plane part in the `image` job; locally:
 
 ```bash
 make deploy-runtime-check    # DOCKER="docker --context colima-seamless" PYTHON=seamless/.venv/bin/python
-                             # CP_IMAGE=seamless-migrate:0.1.0 (when built) scripts/check-readonly-runtime.sh
+                             # CP_IMAGE=seamless-migrate:$(SEAMLESS_VERSION) (when built) scripts/check-readonly-runtime.sh
 ```
 
-Expected: `ready` four times and `failed checks: 0` (the exit status counts failures). PostgreSQL — the image
+Expected: `ready` four times - twice when the control-plane image is not built, whose part is then skipped - and `failed checks: 0` (the exit status counts failures). PostgreSQL — the image
 pinned in `deploy/kubernetes/kustomization.yaml` — is ready when `check-container` passes; the control plane
 (demo mode, the ConfigMap's settings) when `/api/v1/health` answers `ok` and Ansible runs with the executor's
 `ANSIBLE_HOME` under the data directory. Without the StatefulSet's `/var/lib/pgsql` emptyDir (the manifest

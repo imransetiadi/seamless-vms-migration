@@ -79,11 +79,14 @@ by the support tiers of [SDD §21](docs/SDD.md), which follow the upstream lifec
 | 3 | 2024.2 Dalmatian, 2023.2 Bobcat | End of Life | capability checks only, with a warning |
 | Outside | Zed and older; series newer than 2026.2 | — | capability checks only, with a warning |
 
-From 0.2.0 a missing capability blocks a plan whatever the tier ([SDD §21.4](docs/SDD.md)). Mind the policy
-defaults now: under the secure-RBAC defaults (upstream's default from 2023.2) a VM that keeps a fixed IP on another
-project's network needs the `service` or `admin` role on the destination — `advsvc` no longer does — while
-Seamless's validation judges the older rule until 0.2.0 ([SDD §21.5](docs/SDD.md)). Use a CentOS Stream 9 or
-RHEL 9 conversion host image until 0.2.0 adds others ([SDD §21.6](docs/SDD.md)).
+A destination below the capability floor - Compute 2.60, Block Storage 3.0 - is refused whatever its tier
+(`DST_CAPABILITY_MISSING`), and a gap only one strategy has makes that strategy ineligible
+([SDD §21.4](docs/SDD.md)). Mind the policy defaults: under the secure-RBAC defaults (upstream's default from 2023.2)
+a VM that keeps a fixed IP on another project's network needs the `service` or `admin` role on the destination —
+`advsvc` no longer does —, and the validation judges each destination by its policy profile
+([SDD §21.5](docs/SDD.md)). Conversion host images: the RHEL family (RHEL, CentOS Stream 9 and 10, Rocky Linux 9,
+AlmaLinux 9) and Ubuntu 24.04 ([SDD §21.6](docs/SDD.md)). The lab validation of community destinations (plan task
+T10) is planned for 0.2.0.
 
 ## Guest OS support
 
@@ -100,7 +103,7 @@ Hat's virt-v2v support matrix):
 | Rocky, AlmaLinux, Oracle Linux, CentOS 7/Stream | migrates | works, not supported by Red Hat — test a copy | Rocky/Alma/Oracle 8+ current |
 | Ubuntu (all releases), Debian (all releases) | migrates | Technology Preview — test a copy | Ubuntu 22.04/24.04/26.04 and Debian 12/13 current |
 | SLES, openSUSE | migrates | works, not supported; btrfs roots are not convertible | SLES 15 current |
-| Windows Server 2016, 2019, 2022, 2025; Windows 10/11 | migrates; verified on RDP/WinRM | supported | 2016+ current |
+| Windows Server 2016, 2019, 2022, 2025; Windows 10/11 | migrates; verified on RDP/WinRM | supported | Server 2016+ and Windows 11 current; Windows 10 legacy |
 | Windows Server 2003, 2008, 2008 R2, 2012, 2012 R2; Windows 7/8 | migrates; verified on RDP/WinRM | needs virtio-win drivers from an older release installed first | legacy |
 
 Legacy releases are flagged (`GUEST_OS_LEGACY`), never blocked. Set `os_distro`/`os_version` image properties
@@ -201,7 +204,8 @@ SEAMLESS_TEST_PG_URL='postgresql+psycopg://<user>:<password>@127.0.0.1:55432/<db
 seamless/.venv/bin/pip install pip-audit && seamless/.venv/bin/pip-audit && npm --prefix dashboard audit --omit=dev --audit-level=high
                                  # the dependency audits, as CI runs them (pip-audit; npm audit)
 trivy config --severity HIGH,CRITICAL --exit-code 1 deploy   # trivy's configuration scan of the manifests (needs trivy)
-make deploy-runtime-check        # PostgreSQL and the built image under the manifests' security context; kubeconform,
+make deploy-runtime-check        # PostgreSQL, and the control-plane image seamless-migrate:$(SEAMLESS_VERSION) when built
+                                 # (a missing image skips its part), under the manifests' security context; kubeconform,
                                  # trivy's image scan and the SBOM need those tools (see .github/workflows/ci.yml)
 pre-commit install               # gitleaks, ruff, shellcheck, actionlint on each commit (.pre-commit-config.yaml)
 ```
@@ -249,7 +253,7 @@ Kustomize manifests live in [`deploy/openshift/`](deploy/openshift/) (Namespace,
 PVC, PostgreSQL 16 StatefulSet + Service, single-replica Deployment with a hardened security context, Service,
 edge-TLS Route, default-deny NetworkPolicies). Secrets are **not** part of the kustomization — create them
 from the placeholders in `secret-example.yaml` (or an external secret store), build and push the image
-(`podman build -f seamless/Containerfile -t <registry>/seamless-migrate:0.1.0 .` from the repository root),
+(`podman build -f seamless/Containerfile -t <registry>/seamless-migrate:<version> .` from the repository root),
 set the image in `kustomization.yaml`, then:
 
 ```bash
@@ -289,7 +293,7 @@ them against the Kubernetes 1.30 schemas.
 
 | Document | Contents |
 |---|---|
-| [docs/PRD.md](docs/PRD.md) | Problem, goals, personas, journeys, requirements `FR-01…FR-28`, `NFR-01…NFR-11` |
+| [docs/PRD.md](docs/PRD.md) | Problem, goals, personas, journeys, requirements `FR-01…FR-34`, `NFR-01…NFR-12` |
 | [docs/SDD.md](docs/SDD.md) | **Binding design**: architecture, strategies, state machine, blocksync protocol, REST API, security model, AI integration, deployment |
 | [docs/MEMORY.md](docs/MEMORY.md) | Memory architecture (agentmemory, PostgreSQL audit memory, contributor memory), redaction, governance, decision log |
 | [docs/QASuite.md](docs/QASuite.md) | Test strategy, traceability `FR → test`, acceptance scenarios, lab matrix, security/resilience tests, exact commands |
