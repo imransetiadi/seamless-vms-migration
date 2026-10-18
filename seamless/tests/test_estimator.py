@@ -281,6 +281,67 @@ def test_calibration_helpers():
     assert observed_scan_rate(empty, two_disks, P) is None
 
 
+@pytest.mark.parametrize(
+    "sizes_gb",
+    [[20, 200], [20, 20], [100] * 8, [50, 10, 10, 10, 10, 10], [300]],
+    ids=lambda sizes: "+".join(map(str, sizes)),
+)
+@pytest.mark.parametrize("scan_mib", [500, 120])
+def test_the_scan_rate_calibration_reads_back_the_rate_its_model_used(sizes_gb, scan_mib):
+    """SDD §9.1 (review PL-07): the scan model reads a pass as max(Dmax/S, D/min(S·P, A)) - the
+    disks are read concurrently, so a pass lasts as long as its largest disk or its streams' share.
+    A delta pass that ran exactly as the model predicts reads back the S it was predicted with:
+    unequal disks too (a 20 + 200 GiB VM, which the old rule calibrated from 500 to 275 MiB/s), and
+    more disks than streams."""
+    vm = make_vm(disks=[make_disk(id=f"d{i}", size_gb=gb) for i, gb in enumerate(sizes_gb)])
+    used = replace(P, scan_bps=scan_mib * MIB)
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=scan_seconds(vm, used),
+        bytes_scanned=vm.disk_bytes,
+    )
+    assert observed_scan_rate(sync_pass, vm, P) == pytest.approx(scan_mib * MIB)
+
+
+def test_a_pass_at_the_aggregate_ceiling_leaves_the_scan_rate_as_it_was():
+    """SDD §9.1 (review PL-07): with the aggregate ceiling A binding - eight 100 GiB disks, four
+    streams of 500 MiB/s against 1000 MiB/s - a pass lasts D/A whatever S is, so it does not tell S
+    and calibrates nothing; a pass slower than the ceiling does, as the model reads it."""
+    vm = make_vm(disks=[make_disk(id=f"d{i}", size_gb=100) for i in range(8)])
+    ceiling = replace(P, max_aggregate_scan_bps=1000.0 * MIB)
+    at_ceiling = scan_seconds(vm, ceiling)
+    assert at_ceiling == pytest.approx(vm.disk_bytes / (1000 * MIB))
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=at_ceiling,
+        bytes_scanned=vm.disk_bytes,
+    )
+    assert observed_scan_rate(sync_pass, vm, ceiling) is None
+    slower = sync_pass.model_copy(update={"duration_s": 2 * at_ceiling})
+    rate = observed_scan_rate(slower, vm, ceiling)
+    assert rate == pytest.approx(125 * MIB)
+    assert scan_seconds(vm, replace(ceiling, scan_bps=rate)) == pytest.approx(2 * at_ceiling)
+
+
+def test_a_pass_that_scanned_less_than_the_largest_disk_ran_one_stream():
+    """SDD §9.1 (review PL-07): a pass that scanned fewer bytes than the largest disk holds read
+    them in one stream at most - its S is what it scanned over its duration, never the largest
+    disk's size."""
+    vm = make_vm(disks=[make_disk(id="root", size_gb=20), make_disk(id="data", size_gb=200)])
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=100.0,
+        bytes_scanned=50 * GIB,
+    )
+    assert observed_scan_rate(sync_pass, vm, P) == pytest.approx(50 * GIB / 100)
+
+
 PART_KEYS = {"shutdown_s", "copy_s", "conversion_s", "create_s", "boot_s"}
 
 

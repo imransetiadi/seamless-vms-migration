@@ -263,13 +263,22 @@ def calibrated_change_rate(
 
 
 def observed_scan_rate(sync_pass: SyncPass, vm: VMRef, params: EstimatorParams) -> float | None:
-    """Per-stream scan throughput of a pass: ``bytes_scanned / duration_s / min(P, V)``.
+    """Per-stream scan throughput of a pass: the ``S`` under which the scan model gives its
+    duration, ``max(min(Dmax, B), B / min(P, V)) / duration_s`` with ``B = bytes_scanned`` - a
+    pass lasts as long as its largest disk's scan or its streams' share (SDD §9.1, review PL-07).
 
     Only delta/final passes calibrate it: pass 1 is usually link-bound and would understate it.
+    ``None`` too for a pass at the aggregate ceiling (``A`` set, ``B / A >= duration_s``): it lasts
+    as long whatever ``S`` is, so it does not tell ``S``.
     """
     if sync_pass.kind == SyncPassKind.full:
         return None
-    if not sync_pass.duration_s or sync_pass.duration_s <= 0 or sync_pass.bytes_scanned <= 0:
+    duration, scanned = sync_pass.duration_s, sync_pass.bytes_scanned
+    if not duration or duration <= 0 or scanned <= 0:
+        return None
+    ceiling = params.max_aggregate_scan_bps
+    if ceiling is not None and ceiling > 0 and scanned / ceiling >= duration:
         return None
     streams = max(1, min(int(params.parallel_disks), len(vm.disks) or 1))
-    return sync_pass.bytes_scanned / sync_pass.duration_s / streams
+    largest = max((d.size_gb for d in vm.disks), default=0) * GIB
+    return max(min(largest, scanned), scanned / streams) / duration
