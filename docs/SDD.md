@@ -2895,8 +2895,15 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 `redact(text, names=None)` removes:
 
 * passwords and secrets in key/value pairs — `key=value`, `key: value`, JSON `"key": "value"`, the key
-  possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`) — and in CLI flags
-  (`--os-password x`);
+  possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`), also where it starts a line of a
+  JSON-escaped multi-line string (`\npassword: x`) — and in CLI flags (`--os-password x`). A quoted value is read
+  in every quoting it may be in: JSON's and the shell's double quotes, a Python repr's, YAML's (`''`) and the
+  shell's single quotes - with what the shell glues to a closed word (`'a'b`, `'a'\''b'`, `'a'"'"'b'`) -, any of
+  them inside JSON strings, however deep. Where the readings disagree on where it ends - a backslash before a
+  quote escapes it in a repr (`\'`, inside JSON `\\'`), not in YAML or the shell (`'C:\'`) - the value runs
+  on to the longest reading's end, so no part of a secret stays: at worst the rest of its line goes with it, and
+  it stops before a quoted credential key (`'token':`) so that one is redacted too. A `[REDACTED]` already
+  written stays as it is, so a second pass changes nothing (reviews RV51-02 to RV51-05, RV51-20, RV51-21);
 * `Authorization` headers and bearer tokens;
 * API keys: named ones (`api_key`, `TYPESAFE_API_KEY=`), AWS access key ids, GitHub tokens, `sk-` keys
   and Slack tokens;
