@@ -2535,6 +2535,14 @@ before_seq=None)` (`kinds` serves `GET /events?audit=true`). SQLite runs with WA
 callers. `Store.ping() -> bool` backs the health routes (`GET /api/v1/health` reports
 `"db": "ok"|"error"` and the orchestrator loop; `GET /api/v1/ready` answers 503 while degraded).
 
+**What PostgreSQL cannot hold.** PostgreSQL stores no NUL character - psycopg refuses one in a text parameter and
+JSONB refuses `\u0000` - so the store strips NUL from every string it writes: the keys and values of a document's
+data, and an event's message, actor, `plan_id`, `migration_id` and the keys and values of its data. SQLite stores
+the same, so a test sees what production keeps (Security.md C1-05; review ST-03, ST-04). No stored id or field then
+holds a NUL, so a lookup, a delete or a filter by a value holding one finds nothing without sending it. An event's
+actor is cut to the column's 128 characters, its start kept - `user:` and a name of 124-128 characters (§13.1,
+§14.5) -, so the event is always written with its change (review ST-02).
+
 ---
 
 ## 12. REST API (`/api/v1`)
@@ -2702,8 +2710,9 @@ request refused for its role emits
 route's minimum, an approver-only plan field set below the approver role, or, with authentication off, a request
 another site's page may have sent (403, §12) — with `actor`
 the principal's name (`unauthenticated` without one), `message` `METHOD path: reason` and `data`
-`{path, method, reason, required_role, client}`, never the token; at most 30 per client address and
-minute are recorded.
+`{path, method, reason, required_role, client}` - the path as the client sent it, percent-encoded, so a NUL reads
+`%00` and the record is written on PostgreSQL too (§11, review ST-03) -, never the token; at most 30 per client
+address and minute are recorded.
 
 Admins can add people from Dashboard **Users** (`POST /users`). Names are 1-128 ASCII letters,
 digits, dots, underscores, `@` or hyphens, starting with a letter or digit; surrounding whitespace
