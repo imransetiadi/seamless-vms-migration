@@ -711,6 +711,32 @@ async def test_every_openstack_check_reports_the_shared_keys(tmp_path):
         assert sorted(caps) == destination, provider.kind
 
 
+async def test_every_vmware_check_reports_the_shared_keys(tmp_path):
+    """SDD §10 (review PV-06): the real vCenter check and the demo's fake vCenter report the keys of
+    check_report_keys.json's vmware list, the file the dashboard's mock is held to as well: the
+    demo's providers page showed an "Admin access" no vCenter check computes, and missed the
+    version and the VM count every real check reports."""
+    keys = json.loads((VERSIONS.parent / "check_report_keys.json").read_text(encoding="utf-8"))
+    expected = sorted(keys["vmware"])
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    real = VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda **_: fake_service_instance([fake_vcenter_vm()]),
+        vim=FAKE_VIM,
+    )
+    assert sorted(await real.check()) == expected
+    demo = FakeSourceProvider(ProviderKind.vmware)
+    caps = await demo.check()
+    assert sorted(caps) == expected
+    assert caps["vm_count"] == len(await demo.list_vms())
+
+
 def _versions(conn, compute, block_storage):
     conn.compute.get_endpoint_data = lambda: NS(max_microversion=compute)
     conn.block_storage.get_endpoint_data = lambda: NS(max_microversion=block_storage)

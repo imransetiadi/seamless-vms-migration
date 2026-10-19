@@ -332,9 +332,11 @@ class FakeSourceProvider:
 
     async def check(self) -> dict[str, Any]:
         if self.kind == ProviderKind.vmware:
+            # the real vCenter check's keys (VMwareProvider.check, SDD §10, review PV-06)
             return {
-                "admin": True,
                 "api_version": "8.0.2.0",
+                "version": "8.0.2",
+                "vm_count": len(self._vms),
                 "cbt_enabled_vms": sum(1 for v in self._vms if v.cbt_enabled),
                 "vms_with_snapshots": sum(1 for v in self._vms if v.snapshot_count),
                 "vms_with_independent_disks": sum(
