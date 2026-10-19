@@ -3169,7 +3169,8 @@ async def test_a_cancels_cleanup_names_the_kit_volumes_it_keeps(tmp_path, store,
     read of them that failed is named, and the cleanup stands."""
     details = {
         "kept": {"kept_volumes": [
-            {"id": "vol-a", "name": "web-01-2000"}, {"id": "vol-b", "name": "web-01-2001"}
+            {"id": "vol-a", "name": "web-01-2000"}, {"id": "vol-b", "name": "web-01-2001"},
+            {"id": "vol-c", "name": "web-01-2002", "on_conversion_host": True},
         ]},
         "none": {"kept_volumes": []},
         "unread": {"kept_volumes": None, "kept_volumes_unread": "volumes: HTTP 503 " + "x" * 400},
@@ -3205,9 +3206,12 @@ async def test_a_cancels_cleanup_names_the_kit_volumes_it_keeps(tmp_path, store,
         assert "kept_volumes" not in event.data
     elif read == "kept":
         assert event.message.startswith(head + "; ")
-        assert "vol-a (web-01-2000), vol-b (web-01-2001)" in event.message
+        assert (
+            "vol-a (web-01-2000), vol-b (web-01-2001), "
+            "vol-c (web-01-2002, attached to the conversion host)"
+        ) in event.message  # the kit's copy a cut-off pass left there (RV44B-01)
         assert "delete them once no plan migrates the VM" in event.message
-        assert event.data["kept_volumes"] == ["vol-a", "vol-b"]
+        assert event.data["kept_volumes"] == ["vol-a", "vol-b", "vol-c"]
     else:
         assert event.message.startswith(head + "; ")
         # cut as the cleanup's failure is: 300 characters of the provider's answer

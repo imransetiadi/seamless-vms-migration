@@ -1836,10 +1836,17 @@ class Orchestrator:
             kept = result.details.get("kept_volumes")
             unread = result.details.get("kept_volumes_unread")
             if kept:
+
+                def named(volume: dict[str, Any]) -> str:
+                    # the kit's copy a cut-off pass left on the conversion host (RV44B-01)
+                    held = volume.get("on_conversion_host")
+                    where = ", attached to the conversion host" if held else ""
+                    return f"{volume['id']} ({volume['name']}{where})"
+
                 data["kept_volumes"] = [v["id"] for v in kept]
                 message += (
                     f"; {destination.label} keeps the migration kit's volumes of the VM, "
-                    + ", ".join(f"{v['id']} ({v['name']})" for v in kept)
+                    + ", ".join(named(v) for v in kept)
                     + ": another plan's migration of the VM takes them as its own - delete them "
                     "once no plan migrates the VM"
                 )

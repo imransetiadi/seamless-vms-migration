@@ -1883,7 +1883,9 @@ class AnsibleExecutor:
         the operator deletes them once none migrates it; a read that fails is named and fails
         nothing, the server being gone (review RV42B, lead NP-2). One a server holds is that
         server's disk - another plan's cut-over server of the VM, another VM the kit names alike
-        -, never named for deletion (review RV43B-01)."""
+        -, never named for deletion (review RV43B-01); one the destination's conversion host alone
+        holds is the kit's copy a pass the cancel cut off left there: named as attached to it, left
+        attached - another plan's pass of the VM may sync onto it (review RV44B-01)."""
         server_id = ctx.migration.destination_server_id
         dst = self.providers.get(ctx.destination)
         if server_id:
@@ -1898,11 +1900,22 @@ class AnsibleExecutor:
             return StepResult(
                 details={**details, "kept_volumes": None, "kept_volumes_unread": str(exc)}
             )
-        details["kept_volumes"] = [
-            {"id": str(v["id"]), "name": str(v.get("name"))}
-            for v in kit_volumes(ctx.migration.vm.name, volumes)
-            if not v.get("attachments")
-        ]
+        kept: list[dict[str, Any]] = []
+        conversion_host: list[str | None] = []  # looked up once, for the first kit volume held
+        for volume in kit_volumes(ctx.migration.vm.name, volumes):
+            entry: dict[str, Any] = {"id": str(volume["id"]), "name": str(volume.get("name"))}
+            holders = [str(holder) for holder in volume.get("attachments") or []]
+            if holders:
+                if not conversion_host:
+                    try:
+                        conversion_host.append(await self._conversion_host_server(ctx, dst))
+                    except ProviderError:
+                        conversion_host.append(None)  # unknown: no holder is taken for it
+                if conversion_host[0] is None or holders != [conversion_host[0]]:
+                    continue
+                entry["on_conversion_host"] = True
+            kept.append(entry)
+        details["kept_volumes"] = kept
         return StepResult(details=details)
 
     async def _finalize(self, ctx: StepContext) -> StepResult:

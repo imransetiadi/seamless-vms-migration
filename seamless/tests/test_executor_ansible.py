@@ -2864,23 +2864,43 @@ async def test_a_vmware_cancels_cleanup_names_the_kit_volumes_of_the_vm_it_keeps
     -, but it reads the ones the kit's next run takes as the VM's own and names them for the
     operator; a read that fails is named and fails nothing, the server being gone. One a server
     holds - another plan's cut-over server of the VM, or another VM the kit names alike - is that
-    server's disk, never named for deletion (review RV43B-01)."""
+    server's disk, never named for deletion (review RV43B-01); one the destination's conversion
+    host alone holds is the kit's copy a pass the cancel cut off left there, named as attached to
+    it and left attached (review RV44B-01)."""
+    env.registry.existing = {"conv-dst"}  # Nova's server of the destination's conversion host
     env.registry.volumes = [
         kit_volume("vol-copy", "web-01-2000", converted=False, copied=True),
         kit_volume("vol-conv", "web-01-2001", attachments=["dst-plan-b"]),  # plan B's server
         kit_volume("vol-noosm", "web-01-2002", osm=False),  # not the kit's: no osm mark
         kit_volume("vol-other", "web-02-2000", converted=False, copied=True),  # another VM's
         kit_volume("vol-boot", "web-01-boot"),  # not <kit name>-<digits>
-    ]
+        kit_volume("vol-cut", "web-01-2003", converted=False, copied=True,
+                   attachments=["dst-conv-dst"]),  # a pass cut off left it on the conversion host
+    ]  # fmt: skip
     ctx, _ = ctx_for(env, strategy=strategy, source=VCENTER, destination_server_id="dst-9")
     ctx.options["delete_dest_volumes"] = True
     result = await env.executor.run(StepName.ROLLBACK, ctx)
-    assert env.registry.calls == [("delete_server", "dst-9")]
-    assert result.details["kept_volumes"] == [{"id": "vol-copy", "name": "web-01-2000"}]
+    assert env.registry.calls == [("delete_server", "dst-9"), ("find_server", "conv-dst")]
+    assert result.details["kept_volumes"] == [
+        {"id": "vol-copy", "name": "web-01-2000"},
+        {"id": "vol-cut", "name": "web-01-2003", "on_conversion_host": True},
+    ]
     assert "kept_volumes_unread" not in result.details
     assert [v["id"] for v in env.registry.volumes] == [
-        "vol-copy", "vol-conv", "vol-noosm", "vol-other", "vol-boot"
+        "vol-copy", "vol-conv", "vol-noosm", "vol-other", "vol-boot", "vol-cut"
     ]  # fmt: skip
+    assert next(v for v in env.registry.volumes if v["id"] == "vol-cut")["attachments"] == [
+        "dst-conv-dst"
+    ]  # named, never detached: another plan's pass of the VM may sync onto it
+
+    # the conversion host's lookup failing: what it holds goes unnamed, the cleanup stands
+    async def lookup_fails(self, name):
+        raise ProviderError("servers: HTTP 503")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(FakeImpl, "find_server", lookup_fails)
+        result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["kept_volumes"] == [{"id": "vol-copy", "name": "web-01-2000"}]
 
     # none of the kit's: an empty list, nothing to name
     env.registry.volumes = [kit_volume("vol-other", "web-02-2000")]
