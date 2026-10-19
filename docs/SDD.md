@@ -1954,11 +1954,13 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   holding its plan's lock while it waits would hold up the tick, which starts that plan's steps under it. For the
   same reason a validation refuses a running plan (409) under the plan's lock before it waits for the claim lock.
   A strategy change (`set_strategy`, `PUT …/strategy`) takes the plan's lock, then the migration's, as the advisor's
-  override does (§14.6): it waits for a running validation, and under it the plan's `strategy_overrides` entry is
-  written first and the migration's strategy after it, so no validation undoes the change: a failure between the two
-  writes leaves the plan pinning the strategy asked, which the next validation applies (review ST-08). It and an
-  advisor
-  decision refuse a migration whose phase they cannot change (not `pending`, `ready` or `blocked`) before they take
+  override does (§14.6): it waits for a running validation, and under it the plan's `strategy_overrides` entry, the
+  migration's strategy and their `migration.action` and `plan.updated` events are written in one transaction
+  (`put_all_with_events`, §11), so no validation undoes the change and a failure leaves none of them - the retry
+  makes the whole change, its events with it (reviews ST-08, RV48-02). A document another writer moved meanwhile -
+  the plan, which several drivers write - is read again and the change retried, every check with it, as
+  `_update_plan` retries; after its attempts a 409 asks to run the action again. It and an advisor decision refuse a
+  migration whose phase they cannot change (not `pending`, `ready` or `blocked`) before they take
   the plan's lock — the check repeats under it — so neither waits, holding the lock the tick needs, behind a finalize
   that holds the migration's lock across a provider deletion. Plan documents are written by several drivers and the tick loop
   (ids rewritten after a rollback, status changes, strategy overrides): those read-modify-writes
@@ -2530,6 +2532,10 @@ policy's delete, review ST-05),
 `get_versioned(kind, id, model_cls) -> (model, version)` (one read that returns the version too: `plan apply`'s
 compare-and-write, §15), `put_with_event(kind, model, event, expected_version) -> (version, Event)` (a versioned
 update and its event in one transaction, a `ConflictError` as `put`'s: the source watch's flag and alert, §8.1),
+`put_all_with_events(writes, events) -> (versions, events)` (several versioned writes, `(kind, model,
+expected_version)` each, and their events in one transaction: all are written or none, a `ConflictError` naming
+the document that moved; a strategy change and an advisor decision, §8, §14.6; `put_with_event` is its one
+document's case),
 `create_user(user, actor) -> Event` (§13.1: the `user` document and its `user.created` event in
 one transaction; a `ConflictError` for a name that exists in any case), `delete_events_before(before) -> int` (`events
 prune`, §15),
@@ -3146,16 +3152,18 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   to the final option, clears `advisor_hold` and — when the strategy changes — the approvals, the cutover
   request and `force_window` (§5.4). An override also records the option in `plan.strategy_overrides`, like
   `PUT …/strategy`, so a later validation keeps it — under the plan's lock, with the decision, so a validation
-  waiting for that lock sees the override and asks no one again. The writes come in the order a failure between them
-  can only complete: an override's plan entry first, then the migration (strategy, `advisor_hold` cleared), then the
-  decision and its event - a decision is never stored `approved` while its migration stays held, and an approver's
-  retry after a failure decides again, its one event following its write (review ST-07). Neither acts while the plan
-  sets the VM's strategy (`strategy_overrides` names it: a person chose it in the plan, §9.2, and a validation
-  honours that without recording a recommendation, so the newest one no longer stands — 409 "The plan sets the
-  strategy of <vm> (<option>): change it in the plan.") - save an override that chooses the option the plan sets:
-  the retry of an override a failure cut off after its plan entry was written, which then records the decision
-  (review ST-07) -, and an approve of a decision already `approved` is refused (409 "The decision is already
-  approved."): one event per decision status change (§14.5).
+  waiting for that lock sees the override and asks no one again. A decision's writes are one transaction
+  (`put_all_with_events`, §11): an override's plan entry, the migration (strategy, `advisor_hold` cleared), the
+  recommendation with its decision, and their events (`plan.updated`, the decision's, `migration.action`). A failure
+  leaves none of them - no migration starts released while its decision is unwritten, no decision is stored without
+  its event - and an approver's retry decides again (reviews ST-07, RV48-01, RV48-13); a document another writer
+  moved meanwhile is read again and the decision retried, every check with it, as a strategy change retries (§8).
+  Neither acts while the plan sets the VM's strategy (`strategy_overrides` names it: a person chose it in the plan,
+  §9.2, and a validation honours that without recording a recommendation, so the newest one no longer stands — 409
+  "The plan sets the strategy of <vm> (<option>): change it in the plan."; no failure leaves an override's plan
+  entry without its decision, so an override choosing that option is refused too, review RV48-03), and an approve of
+  a decision already `approved` is refused (409 "The decision is already approved."): one event per decision status
+  change (§14.5).
 * **Maker-checker** (ADV-17): a recommendation recorded by a validation names the validating user in `requested_by`
   (the demo's own validations: `demo`). When the policy in force requires a distinct approver (the default, the
   built-in `global-default` too), that user neither approves nor overrides the decision: 409 "You requested this
