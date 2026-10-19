@@ -635,9 +635,12 @@ Approvals, `cutover_requested` (with its requester) and a pending `force_window`
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
 `blocked` and `ready`, and one left in `validating`: a plan's validations run one at a time under
-its lock, so no other validation is still at work on it. One whose source is stopped - its downtime clock open
-(§5.2), a migration retried after a failed cutover - it leaves as it is, like one in flight: a re-assessment could
-move it to `blocked`, where no action restarts its source, which its next cutover or a rollback does (audit OC-02).
+its lock, so no other validation is still at work on it. One in `ready` whose source is stopped - its downtime clock
+open (§5.2), a migration retried after a failed cutover - it leaves as it is, like one in flight: a re-assessment could
+move it to `blocked`, where no action restarts its source, which its next cutover or a rollback does (audit OC-02). One
+already `blocked`, or left in `validating`, with its source stopped - as an earlier version's validation could leave
+it - it re-assesses: a cancel, a rollback and a retry are refused there, so a validation once its blocker is resolved
+is its one way back to `ready` (review RV51-01).
 It reads from the source only those VMs and the ones with no migration yet; a migration in any other phase counts as
 its recorded `vm` wherever the whole plan does (duplicate names, the addresses a NIC override must not take, the
 quota, §9.3), and the wave planner (§9.4) reads the plan's VMs
@@ -661,7 +664,9 @@ re-validated inside the plan: `validate_plan` refuses with the VM names (remove 
 plan them anew). It refuses a `vm_ids` list that repeats a VM (a plan written before the API check,
 or by `seamless plan apply`): two migrations of one VM would both cut it over - and so, with the VM named, a plan two of
 whose migrations name one VM, as a stop inside an earlier version's rollback that recreated the source could leave
-them, and a retry refuses a migration whose VM another migration of its plan names (audit OC-06). It cancels the
+them, and a retry refuses a migration whose VM another migration of its plan names (audit OC-06); `start_plan` refuses
+such a plan with the same reason, and the tick starts no pre-copy or cutover of a VM two migrations of its running plan
+name, cancelled ones aside - a plan an earlier version left running so (review RV51-18). It cancels the
 migrations of VMs removed from `vm_ids` — `pending`, `blocked`, `ready`, and `failed` ones too, or a
 failed one would hold its VM and keep the plan from completing, and one an interrupted validation left in
 `validating`, which would otherwise hold its VM for good with no action to release it — so it also refuses — before
@@ -1941,9 +1946,16 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   runs (a pause that returned starts nothing more), the phase, the gate of a cutover (§5.4) and the
   strategy: a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
   single-shot one, since `set_strategy` may have changed it meanwhile. A running plan is pre-staged (`prestage`, §7.2)
-  before its first migration starts, and again after each start - pre-staging is idempotent and creates only what the
-  destination lacks, so a VM added since is pre-staged too, as its validation said (`MAP_FLAVOR_PRESTAGED`, §9.3;
-  audit OC-05); when pre-staging fails a plan that still runs becomes `failed` (event `plan.updated`,
+  before its first migration starts, and again before a `ready` migration starts whose assessment no pre-staging
+  covered - pre-staging is idempotent and creates only what the destination lacks, so a VM added since, or one
+  validated again or given a strategy that needs a conversion host since, is pre-staged too, as its validation said
+  (`MAP_FLAVOR_PRESTAGED`, §9.3; audit OC-05). A migration's assessment is its last move to `validating` and whether
+  its strategy needs a conversion host (`cold`, `warm`); a pre-staging covers the assessments of the plan's migrations
+  it read when it began, and the tick reads the migrations from the store - a validation during a pre-staging, or in
+  another process (§15), is seen -, so a plan paused and resumed with nothing assessed anew is not pre-staged again and
+  its gates and steps go on at once (review RV51-17, RV51-19). After a restart a running plan whose work started counts
+  as pre-staged for its migrations' assessments; any other plan is pre-staged again when it next runs with a `ready`
+  migration. When pre-staging fails a plan that still runs becomes `failed` (event `plan.updated`,
   "pre-staging failed"), and `start_plan` accepts a `failed` plan as it does a `validated` or `paused`
   one, pre-staging it again. A plan paused, validated again or edited while pre-staging ran keeps its status:
   the failure is recorded (the same event, without a status) and pre-staging runs again at its next start —
