@@ -635,9 +635,12 @@ Approvals, `cutover_requested` (with its requester) and a pending `force_window`
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
 `blocked` and `ready`, and one left in `validating`: a plan's validations run one at a time under
-its lock, so no other validation is still at work on it. It reads from the source only those VMs and the ones with
-no migration yet; a migration in any other phase counts as its recorded `vm` wherever the whole plan does (duplicate
-names, the addresses a NIC override must not take, the quota, §9.3), and the wave planner (§9.4) reads the plan's VMs
+its lock, so no other validation is still at work on it. One whose source is stopped - its downtime clock open
+(§5.2), a migration retried after a failed cutover - it leaves as it is, like one in flight: a re-assessment could
+move it to `blocked`, where no action restarts its source, which its next cutover or a rollback does (audit OC-02).
+It reads from the source only those VMs and the ones with no migration yet; a migration in any other phase counts as
+its recorded `vm` wherever the whole plan does (duplicate names, the addresses a NIC override must not take, the
+quota, §9.3), and the wave planner (§9.4) reads the plan's VMs
 the same way - so a VM that left the source, deleted by a storage handover (§7.3 step 4) or by a finalize with
 `delete_source` (§8.1), never fails its plan's validation or wave planning (review PL-09). A re-assessment of a migration whose history reached
 `cutover` keeps each volume of its validated `vm.disks` that the VM no longer lists - a cold export detaches the data
@@ -656,7 +659,9 @@ RV49-06). Only an earlier version wrote the two transitions apart, so that a dat
 them could leave a migration in `validating`. A VM whose migration is `cancelled` (terminal) cannot be
 re-validated inside the plan: `validate_plan` refuses with the VM names (remove them from `vm_ids` or
 plan them anew). It refuses a `vm_ids` list that repeats a VM (a plan written before the API check,
-or by `seamless plan apply`): two migrations of one VM would both cut it over. It cancels the
+or by `seamless plan apply`): two migrations of one VM would both cut it over - and so, with the VM named, a plan two of
+whose migrations name one VM, as a stop inside an earlier version's rollback that recreated the source could leave
+them, and a retry refuses a migration whose VM another migration of its plan names (audit OC-06). It cancels the
 migrations of VMs removed from `vm_ids` — `pending`, `blocked`, `ready`, and `failed` ones too, or a
 failed one would hold its VM and keep the plan from completing, and one an interrupted validation left in
 `validating`, which would otherwise hold its VM for good with no action to release it — so it also refuses — before
@@ -1826,9 +1831,10 @@ it resumes by waiting for that server instead of creating a second one on the sa
 knows is created again), and the rollback deletes a sent destination server before it unmanages the volumes it
 holds. A recreated source server has a new id, and the plan follows it — `vm_ids`, the waves'
 `vm_ids`, `strategy_overrides`, `probe_overrides` and `nic_overrides` (event `plan.updated`, data `{"vm_id_changed": {"from",
-"to"}}`) — before the migration becomes `rolled_back` (it then carries the new `vm`): a stop in between resumes
-`rolling_back` and repeats the rewrite, which changes nothing once done, so a rolled-back migration's plan never
-names a VM that no longer exists. QASuite marks handover as **lab-verification required** before production use.
+"to"}}`) — in one transaction with the migration's new `vm` (§11), before the migration becomes `rolled_back`: a stop
+before it leaves both naming the old VM and resumes `rolling_back`, after it both name the new one, so a validation
+meanwhile never plans a second migration of the VM (audit OC-06), and a rolled-back migration's plan never names a VM
+that no longer exists. QASuite marks handover as **lab-verification required** before production use.
 
 #### 7.3.1 Storage references per driver family
 
@@ -1934,8 +1940,10 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   under the plan's lock and then the migration's, what the decision rested on — that the plan still
   runs (a pause that returned starts nothing more), the phase, the gate of a cutover (§5.4) and the
   strategy: a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
-  single-shot one, since `set_strategy` may have changed it meanwhile. A running plan is pre-staged once (`prestage`, §7.2) before
-  its first migration starts; when pre-staging fails a plan that still runs becomes `failed` (event `plan.updated`,
+  single-shot one, since `set_strategy` may have changed it meanwhile. A running plan is pre-staged (`prestage`, §7.2)
+  before its first migration starts, and again after each start - pre-staging is idempotent and creates only what the
+  destination lacks, so a VM added since is pre-staged too, as its validation said (`MAP_FLAVOR_PRESTAGED`, §9.3;
+  audit OC-05); when pre-staging fails a plan that still runs becomes `failed` (event `plan.updated`,
   "pre-staging failed"), and `start_plan` accepts a `failed` plan as it does a `validated` or `paused`
   one, pre-staging it again. A plan paused, validated again or edited while pre-staging ran keeps its status:
   the failure is recorded (the same event, without a status) and pre-staging runs again at its next start —
@@ -2656,7 +2664,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
 | POST | `/plans/{id}/start` | operator | — | `Plan` (from `validated`, `paused` or `failed` — a failed plan pre-stages again; 409 when any migration is `blocked`) |
 | POST | `/plans/{id}/pause` | operator | — | `Plan` |
-| POST | `/plans/{id}/cancel` | operator | `{"reason": str?}` | `Plan` — retires a plan none of whose migrations started: each is `pending`, `blocked`, `ready` or `cancelled`. Under the plan's lock and the VM-claim lock (§5.4, §8) it cancels each one as `POST /migrations/{id}/cancel` does (§5.1: its lock, its event, and the cleanup of a data path an earlier attempt left), then sets the plan `cancelled` and emits `plan.cancelled`. Nothing is deleted (§11): the plan and its history stay, its VMs are free for another plan and its providers for deletion, and pre-staged destination resources stay, as after a finished plan. `cancelled` is terminal: no edit, validation, waves, start or pause; a cancelled plan answers again as it is. 409 while the plan is `running` ("pause the plan before cancelling it": the tick starts its steps) and while a migration has started, naming each VM and its phase (at most 10, then how many more) — a `failed` or `rolled_back` one is cancelled on its own first, which cleans up what it copied - on VMware it names the kit's copies it keeps (§5.1) -, and a plan with a migration that completed or was finalized keeps its status — and while a migration that has not started has its source stopped, naming each VM: an open downtime clock, which a retry after a failed cutover keeps (§5.2), and a cancel cannot restart a stopped source (§5.1), so it is cut over first. Both are checked before any migration is cancelled: a refused plan cancel changes nothing |
+| POST | `/plans/{id}/cancel` | operator | `{"reason": str?}` | `Plan` — retires a plan none of whose migrations started: each is `pending`, `blocked`, `ready` or `cancelled`. Under the plan's lock and the VM-claim lock (§5.4, §8) it cancels each one as `POST /migrations/{id}/cancel` does (§5.1: its lock, its event, and the cleanup of a data path an earlier attempt left), then sets the plan `cancelled` and emits `plan.cancelled`. Nothing is deleted (§11): the plan and its history stay, its VMs are free for another plan and its providers for deletion, and pre-staged destination resources stay, as after a finished plan; a pre-staging that still runs (the plan was paused while it ran) is stopped first - the executor kills its playbook, as for a step - so a cancelled plan pre-stages nothing more (audit OC-07). `cancelled` is terminal: no edit, validation, waves, start or pause; a cancelled plan answers again as it is. 409 while the plan is `running` ("pause the plan before cancelling it": the tick starts its steps) and while a migration has started, naming each VM and its phase (at most 10, then how many more) — a `failed` or `rolled_back` one is cancelled on its own first, which cleans up what it copied - on VMware it names the kit's copies it keeps (§5.1) -, and a plan with a migration that completed or was finalized keeps its status — and while a migration that has not started has its source stopped, naming each VM: an open downtime clock, which a retry after a failed cutover keeps (§5.2), and a cancel cannot restart a stopped source (§5.1), so it is cut over first. Both are checked before any migration is cancelled: a refused plan cancel changes nothing |
 | GET | `/migrations` | viewer | query `plan_id`, `phase`, `wave_id`, `limit` (1…5000, default all), `offset` (default 0), `view` (`full`, the default, or `summary`); creation order | `Migration[]`; with `view=summary` `MigrationSummary[]` (§4) |
 | GET | `/migrations/{id}` | viewer | — | `Migration` |
 | POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` (409 from the cutover's requester, or from the approver who forced it, when the plan requires a distinct approver, §5.4) |
