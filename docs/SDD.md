@@ -2297,6 +2297,13 @@ class DestinationProvider(Protocol):
     async def get_server(self, server_id: str) -> dict[str, Any]   # {status, ports:[{status, fixed_ips, floating_ips}]}
     async def console_log(self, server_id: str, lines: int = 200) -> str | None
     async def delete_server(self, server_id: str) -> None
+    async def find_server(self, name: str) -> str | None
+        # the id of the credential's project's server named exactly `name`, None when none, a provider error when
+        # more than one: Nova reads its `name` filter as a regular expression searched anywhere in the name
+        # (MySQL/MariaDB REGEXP after Nova escapes `|`, PostgreSQL `~`), so the lookup sends `^...$` with every
+        # ASCII character but a letter, a digit, a space, `_` and `-` as `.` - no alternation, group, class or
+        # escape on any backend, nothing Nova refuses as an invalid expression - and keeps the server whose name is
+        # exactly `name` (review PV-01)
     async def ports(self, *, network_id: str | None = None, mac_address: str | None = None,
                     ip_address: str | None = None) -> list[dict[str, Any]]
         # the ports the credential sees that match every filter given:
