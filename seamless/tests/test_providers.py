@@ -2310,6 +2310,123 @@ async def test_vmware_power_on_times_out(tmp_path, monkeypatch):
         await provider.power_on("5012-abcd")
 
 
+@pytest.mark.parametrize("verify, ca_cert", [(True, None), (True, "vcenter-ca.crt"), (False, None)])
+def test_vmware_connector_bounds_every_request_and_the_version_probe(
+    monkeypatch, caplog, verify, ca_cert
+):
+    """Every request of a vCenter connection gives up after the provider API timeout: pyVmomi's
+    ``httpConnectionTimeout`` bounds its SOAP requests, and the SSL context bounds every socket it
+    wraps without a timeout of its own - SmartConnect's version probe opens one and takes no
+    timeout. pyVmomi's own unverified context (``disableSslCertValidation``) would replace that
+    context, so verify_tls=false hands an unverified one of the provider's (SDD §10, review
+    PV-02)."""
+    import socket
+    import ssl
+
+    from seamless_migrate.providers import openstack as osp
+    from seamless_migrate.providers import vmware as vmw
+
+    seen: dict = {}
+    cafiles: list = []
+    real_default_context = ssl.create_default_context
+
+    def create_default_context(cafile=None):
+        cafiles.append(cafile)
+        return real_default_context()
+
+    def smart_connect(**kwargs):
+        seen.update(kwargs)
+        return NS()
+
+    monkeypatch.setattr(vmw, "_import_pyvmomi", lambda: (smart_connect, lambda si: None, NS()))
+    monkeypatch.setattr(vmw.ssl, "create_default_context", create_default_context)
+    vmw.default_connector("vcenter.example.org", 443, "svc", "placeholder", verify, ca_cert)
+
+    assert seen["httpConnectionTimeout"] == osp.PROVIDER_API_TIMEOUT_S
+    assert "disableSslCertValidation" not in seen
+    context = seen["sslContext"]
+    assert (context.verify_mode, context.check_hostname) == (
+        (ssl.CERT_REQUIRED, True) if verify else (ssl.CERT_NONE, False)
+    )
+    assert cafiles == ([ca_cert] if verify else [])
+    assert ("TLS certificate verification is disabled" in caplog.text) is not verify
+    # a socket without a timeout reads with the provider API timeout; one with its own keeps it
+    for own, expected in ((None, osp.PROVIDER_API_TIMEOUT_S), (5.0, 5.0)):
+        left, right = socket.socketpair()
+        left.settimeout(own)
+        wrapped = context.wrap_socket(
+            left, server_hostname="vcenter.example.org", do_handshake_on_connect=False
+        )
+        try:
+            assert wrapped.gettimeout() == expected
+        finally:
+            wrapped.close()
+            right.close()
+
+
+async def test_a_vcenter_that_accepts_and_never_answers_frees_the_worker_thread(
+    tmp_path, monkeypatch
+):
+    """A vCenter that accepts connections and never answers - an appliance hung while it is
+    patched - fails the call once a request gives up, the version probe of pyVmomi's real
+    SmartConnect included, and so frees the worker thread: provider calls share asyncio's default
+    executor with the store's, which a thread pinned per call would starve. The error names the
+    request's bound, not the call's (SDD §10, review PV-02)."""
+    import asyncio
+    import socket
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    pytest.importorskip("pyVim.connect")
+    from seamless_migrate.providers import vmware as vmw
+
+    server = socket.create_server(("127.0.0.1", 0))
+    server.settimeout(0.1)
+    held: list = []
+    stop = threading.Event()
+
+    def accept() -> None:  # accepts every connection, answers none
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except TimeoutError:
+                continue
+            held.append(conn)
+
+    acceptor = threading.Thread(target=accept, daemon=True)
+    acceptor.start()
+    monkeypatch.setattr(vmw, "PROVIDER_API_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(vmw, "PROVIDER_CALL_TIMEOUT_S", 3.0)
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    provider = vmw.VMwareProvider(
+        make_provider(
+            id="vcenter",
+            kind=ProviderKind.vmware,
+            credentials_secret="vcenter-dc2",
+            endpoint=f"https://127.0.0.1:{server.getsockname()[1]}/sdk",
+            cloud=None,
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+    )
+    executor = ThreadPoolExecutor(max_workers=1)  # the store's only thread as well
+    asyncio.get_running_loop().set_default_executor(executor)
+    try:
+        with pytest.raises(ProviderError, match=r"^vcenter: vCenter did not answer within 0\.2 s$"):
+            await provider.get_vm("5012-abcd")
+        assert held, "the call never reached the vCenter"
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: "stored"), 2.0) == "stored"
+    finally:
+        stop.set()
+        acceptor.join()
+        server.close()
+        for conn in held:
+            conn.close()
+        executor.shutdown(wait=True)
+
+
 class ShuttingDown:
     """A VM whose guest VMware Tools shut down - the migration kit's ShutdownGuest: vSphere reads
     it poweredOn for ``looks`` reads of its power state, then poweredOff; its guest reads
