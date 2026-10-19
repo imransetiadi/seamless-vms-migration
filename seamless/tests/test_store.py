@@ -5,12 +5,13 @@ from datetime import UTC, datetime
 import pytest
 import sqlalchemy as sa
 
-from seamless_migrate.domain.enums import Phase, PlanStatus
-from seamless_migrate.domain.models import Event, Migration, Plan, Provider
+from seamless_migrate.domain.enums import Phase, PlanStatus, Role
+from seamless_migrate.domain.models import Disk, Event, Migration, Nic, Plan, Provider
 from seamless_migrate.events import AUDIT_KINDS
-from seamless_migrate.store import ConflictError, NotFound, Store
+from seamless_migrate.security.auth import DashboardUser
+from seamless_migrate.store import ConflictError, NotFound, Store, events
 from tests.conftest import PG_URL
-from tests.factories import make_migration, make_plan, make_provider
+from tests.factories import make_migration, make_plan, make_provider, make_vm
 
 
 def test_put_get_roundtrip(any_store: Store):
@@ -671,3 +672,108 @@ def test_a_role_with_a_schema_of_its_own_starts_once_the_owner_created_the_table
             conn.execute(sa.text(f"DROP ROLE {role}"))
         owner.truncate_for_tests()
         owner.dispose()
+
+
+def _sent_values(store: Store) -> list:
+    """Every parameter value the store sends to its database from now on."""
+    sent: list = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        for row in parameters if executemany else [parameters]:
+            if isinstance(row, dict):
+                sent.extend(row.values())
+            elif isinstance(row, list | tuple):
+                sent.extend(row)
+            else:
+                sent.append(row)
+
+    sa.event.listen(store.engine, "before_cursor_execute", record)
+    return sent
+
+
+def _holds_nul(value) -> bool:
+    if isinstance(value, str):
+        return "\x00" in value or "\\u0000" in value
+    return isinstance(value, bytes) and b"\x00" in value
+
+
+def test_the_store_writes_no_nul_and_finds_nothing_by_one(any_store: Store):
+    """SDD §11 (reviews ST-03, ST-04): PostgreSQL stores no NUL - psycopg refuses one in a text
+    parameter, JSONB refuses \\u0000 - while SQLite stored it: a tenant's volume, network or
+    keypair name with a NUL failed a whole plan's validation there, and a refused request with
+    %00 in its path lost its audit event to a 500. The store strips NUL from every string it
+    writes - a document's data, an event's message, actor, plan id and data, keys included - and
+    as no stored string holds one, a lookup, a delete or a filter by a value holding one finds
+    nothing, without sending it."""
+    vm = make_vm(
+        disks=[Disk(id="vol-1", name="da\x00ta", size_gb=10, bootable=True)],
+        nics=[Nic(network="app\x00-net", mac="fa:16:3e:00:00:01")],
+        key_name="ops\x00key",
+    )
+    m = make_migration(vm=vm)
+    sent = _sent_values(any_store)
+    any_store.put("migration", m, expected_version=0)
+    any_store.append_event(
+        Event(
+            kind="auth.denied",
+            actor="un\x00known",
+            message="GET /x\x00y: no token",
+            plan_id="p\x00",
+            data={"pa\x00th": ["/x\x00y"]},
+        )
+    )
+    stored = any_store.get("migration", m.id, Migration).vm
+    stored_names = ("data", "app-net", "opskey")
+    assert (stored.disks[0].name, stored.nics[0].network, stored.key_name) == stored_names
+    # a versioned write and its event in one transaction strip it alike
+    any_store.put_with_event("migration", m, Event(kind="migration.updated", message="m"), 1)
+    again = any_store.get("migration", m.id, Migration).vm
+    assert (again.disks[0].name, again.nics[0].network, again.key_name) == stored_names
+    [event] = any_store.events(kinds=["auth.denied"])
+    assert (event.actor, event.message, event.plan_id, event.data) == (
+        "unknown",
+        "GET /xy: no token",
+        "p",
+        {"path": ["/xy"]},
+    )
+    user = DashboardUser(id="u-1", name="op\x00erator", role=Role.operator, sha256="0" * 64)
+    created = any_store.create_user(user, actor="ad\x00min")
+    assert any_store.get("user", "u-1", DashboardUser).name == "operator"
+    [audited] = any_store.events(kinds=["user.created"])
+    assert (audited.seq, audited.actor, audited.message) == (
+        created.seq,
+        "admin",
+        "User operator created",
+    )
+    with pytest.raises(NotFound):
+        any_store.get("migration", m.id + "\x00", Migration)
+    with pytest.raises(NotFound):
+        any_store.delete("migration", m.id + "\x00")
+    assert any_store.list("migration", Migration, plan_id=m.plan_id + "\x00") == []
+    assert any_store.get_many("migration", [m.id + "\x00"], Migration) == {}
+    assert any_store.plan_phases([m.plan_id + "\x00"]) == {}
+    assert any_store.events(plan_id="p\x00") == []
+    assert any_store.events(migration_id="m\x00") == []
+    assert any_store.events(kinds=["auth.denied\x00"]) == []
+    assert not [v for v in sent if _holds_nul(v)], [v for v in sent if _holds_nul(v)]
+
+
+def test_an_events_actor_is_cut_to_its_column(any_store: Store):
+    """SDD §11 (review ST-02): events.actor is VARCHAR(128) while the advisor records
+    user:<name> for names of up to 128 characters - on PostgreSQL the policy or decision was
+    stored and its audit event refused. Every event write cuts the actor to the column, its start
+    kept, so the event is always written."""
+    actor = "user:" + "a" * 128
+    width = events.c.actor.type.length
+    any_store.append_event(Event(kind="policy.created", actor=actor, message="appended"))
+    plan = make_plan()
+    any_store.put("plan", plan, expected_version=0)
+    any_store.put_with_event(
+        "plan", plan, Event(kind="plan.updated", actor=actor, message="with its change"), 1
+    )
+    cut = [
+        (e.kind, e.actor)
+        for e in any_store.events()
+        if e.kind in ("policy.created", "plan.updated")
+    ]
+    assert cut == [("policy.created", actor[:width]), ("plan.updated", actor[:width])]

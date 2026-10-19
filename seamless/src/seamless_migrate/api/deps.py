@@ -187,14 +187,18 @@ async def _audit_denied(
     if not svc.allow_audit(client):
         log.warning("auth.denied events throttled for %s", client)
         return
+    # the path as the client sent it, percent-encoded: a NUL reads %00, never one the store must
+    # strip - the record shows what was asked (SDD §13.1, review ST-03)
+    raw = request.scope.get("raw_path")
+    path = raw.decode("latin-1") if isinstance(raw, bytes) and raw else request.url.path
     await emit(
         svc.store,
         svc.bus,
         "auth.denied",
-        f"{request.method} {request.url.path}: {reason}",
+        f"{request.method} {path}: {reason}",
         actor=principal.name if principal else "unauthenticated",
         data={
-            "path": request.url.path,
+            "path": path,
             "method": request.method,
             "reason": reason,
             "required_role": str(required),

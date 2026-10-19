@@ -147,10 +147,14 @@ def _as_strings(wanted: Any) -> list[str] | None:
 
 
 def _sql_filter(name: str, wanted: Any) -> Any:
-    """A WHERE clause on the JSON field ``name`` for string filters, else ``None``."""
+    """A WHERE clause on the JSON field ``name`` for string filters, else ``None``; a value holding
+    a NUL matches no stored string and is never sent (SDD §11)."""
     values = _as_strings(wanted)
     if not values or not name.isidentifier():
         return None
+    values = [v for v in values if not _has_nul(v)]
+    if not values:
+        return sa.false()
     column = documents.c.data[name].as_string()
     return column == values[0] if len(values) == 1 else column.in_(values)
 
@@ -161,6 +165,39 @@ def _matches(value: Any, wanted: Any) -> bool:
     if isinstance(wanted, Collection) and not isinstance(wanted, str | bytes):
         return any(_matches(value, w) for w in wanted)
     return value == wanted
+
+
+def _no_nul(value: Any) -> Any:
+    """``value`` with NUL stripped from every string, the keys of its maps included: PostgreSQL
+    stores none - psycopg refuses one in a text parameter, JSONB refuses ``\\u0000`` - and SQLite
+    stores what PostgreSQL would (SDD §11, reviews ST-03, ST-04)."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {_no_nul(k): _no_nul(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_no_nul(v) for v in value]
+    return value
+
+
+def _has_nul(value: str | None) -> bool:
+    """Whether a lookup value holds a NUL - which no stored string does (SDD §11)."""
+    return value is not None and "\x00" in value
+
+
+def _event_row(event: Event) -> dict[str, Any]:
+    """The ``events`` row of ``event``: no NUL in any string, the actor cut to its column, its start
+    kept - ``user:`` and a name of up to 128 characters (SDD §11, reviews ST-02, ST-03)."""
+    actor = _no_nul(event.actor)[: events.c.actor.type.length]
+    return {
+        "ts": event.ts,
+        "kind": _no_nul(event.kind),
+        "plan_id": _no_nul(event.plan_id),
+        "migration_id": _no_nul(event.migration_id),
+        "actor": actor,
+        "message": _no_nul(event.message),
+        "data": _no_nul(event.model_dump(mode="json")["data"]),
+    }
 
 
 def _index_names(conn: sa.Connection) -> set[str]:
@@ -232,20 +269,12 @@ class Store:
                         kind="user",
                         id=user.id,
                         version=1,
-                        data=user.model_dump(mode="json"),
+                        data=_no_nul(user.model_dump(mode="json")),
                         created_at=event.ts,
                         updated_at=event.ts,
                     )
                 )
-                result = conn.execute(
-                    events.insert().values(
-                        ts=event.ts,
-                        kind=event.kind,
-                        actor=event.actor,
-                        message=event.message,
-                        data=event.data,
-                    )
-                )
+                result = conn.execute(events.insert().values(**_event_row(event)))
                 seq = int(result.inserted_primary_key[0])
         except IntegrityError:
             raise ConflictError("a user with this name already exists") from None
@@ -258,7 +287,7 @@ class Store:
         ``n > 0`` requires the stored version to be ``n`` (else :class:`ConflictError`).
         """
         doc_id = str(model.id)  # type: ignore[attr-defined]
-        data = model.model_dump(mode="json")
+        data = _no_nul(model.model_dump(mode="json"))
         attempts = 5 if expected_version is None else 1
         for _ in range(attempts):
             try:
@@ -336,30 +365,21 @@ class Store:
         error. The source watch's flag and its alert (§8.1, review RV21-04)."""
         doc_id = str(model.id)  # type: ignore[attr-defined]
         key = (documents.c.kind == kind) & (documents.c.id == doc_id)
-        payload = event.model_dump(mode="json")
         with self.engine.begin() as conn:
             updated = conn.execute(
                 documents.update()
                 .where(key & (documents.c.version == expected_version))
                 .values(
                     version=expected_version + 1,
-                    data=model.model_dump(mode="json"),
+                    data=_no_nul(model.model_dump(mode="json")),
                     updated_at=_now(),
                 )
             )
             seq = (
                 int(
-                    conn.execute(
-                        events.insert().values(
-                            ts=event.ts,
-                            kind=event.kind,
-                            plan_id=event.plan_id,
-                            migration_id=event.migration_id,
-                            actor=event.actor,
-                            message=event.message,
-                            data=payload["data"],
-                        )
-                    ).inserted_primary_key[0]
+                    conn.execute(events.insert().values(**_event_row(event))).inserted_primary_key[
+                        0
+                    ]
                 )
                 if updated.rowcount == 1
                 else None
@@ -381,6 +401,8 @@ class Store:
         )
 
     def get_versioned(self, kind: str, id_: str, model_cls: type[M]) -> tuple[M, int]:
+        if _has_nul(id_):
+            raise NotFound(kind, id_)  # no stored id holds a NUL (SDD §11)
         with self.engine.connect() as conn:
             row = conn.execute(
                 sa.select(documents.c.data, documents.c.version).where(
@@ -466,7 +488,7 @@ class Store:
         self, kind: str, ids: Collection[str], model_cls: type[M]
     ) -> dict[str, tuple[int, M]]:
         """``{id: (version, document)}`` for the ``ids`` that exist (SDD §11)."""
-        wanted = list(dict.fromkeys(ids))
+        wanted = [id_ for id_ in dict.fromkeys(ids) if not _has_nul(id_)]
         out: dict[str, tuple[int, M]] = {}
         with self.engine.connect() as conn:
             for start in range(0, len(wanted), _GET_MANY_CHUNK):
@@ -482,7 +504,7 @@ class Store:
         """Each plan's migration phases with how many of its migrations are in each (SDD §8.1,
         §11): one ``SELECT ... GROUP BY`` over the indexed ``plan_id`` and ``phase`` expressions; no
         document is loaded or validated. A plan without migrations is absent from the result."""
-        wanted = list(plan_ids)
+        wanted = [plan_id for plan_id in plan_ids if not _has_nul(plan_id)]
         if not wanted:
             return {}
         plan_col = documents.c.data["plan_id"].as_string()
@@ -499,6 +521,8 @@ class Store:
         return out
 
     def delete(self, kind: str, id_: str) -> None:
+        if _has_nul(id_):
+            raise NotFound(kind, id_)  # no stored id holds a NUL (SDD §11)
         with self.engine.begin() as conn:
             result = conn.execute(
                 documents.delete().where((documents.c.kind == kind) & (documents.c.id == id_))
@@ -508,19 +532,8 @@ class Store:
 
     # -- events ------------------------------------------------------------------------------
     def append_event(self, event: Event) -> Event:
-        payload = event.model_dump(mode="json")
         with self.engine.begin() as conn:
-            result = conn.execute(
-                events.insert().values(
-                    ts=event.ts,
-                    kind=event.kind,
-                    plan_id=event.plan_id,
-                    migration_id=event.migration_id,
-                    actor=event.actor,
-                    message=event.message,
-                    data=payload["data"],
-                )
-            )
+            result = conn.execute(events.insert().values(**_event_row(event)))
             seq = int(result.inserted_primary_key[0])
         return event.model_copy(update={"seq": seq})
 
@@ -536,7 +549,14 @@ class Store:
     ) -> list[Event]:
         """Matching events after ``since_seq`` (and below ``before_seq``) in ascending ``seq``: the
         first ``limit`` of them, or with ``tail`` the newest ``limit`` — with ``before_seq``, the
-        page before an event (SDD §12)."""
+        page before an event (SDD §12). A filter value holding a NUL matches no stored event and is
+        never sent (SDD §11)."""
+        if _has_nul(plan_id) or _has_nul(migration_id):
+            return []
+        if kinds is not None:
+            kinds = [kind for kind in kinds if not _has_nul(kind)]
+            if not kinds:
+                return []
         query = sa.select(events).where(events.c.seq > since_seq)
         if before_seq is not None:
             query = query.where(events.c.seq < before_seq)

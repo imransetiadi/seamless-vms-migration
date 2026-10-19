@@ -144,6 +144,38 @@ def test_me_and_forbidden_audit(api):
     assert denied[-1].actor == "operator-user" and denied[-1].data["required_role"] == "admin"
 
 
+def test_a_denied_request_records_its_path_as_sent(api):
+    """SDD §13.1 (review ST-03): auth.denied records the path as the client sent it,
+    percent-encoded - the decoded one put a NUL into the event, which PostgreSQL refuses, so the
+    401 became a 500 and the probe left no audit record."""
+    res = api.client.get("/api/v1/providers/x%00y")
+    assert res.status_code == 401
+    [denied] = [e for e in api.store.events(since_seq=0) if e.kind == "auth.denied"]
+    assert denied.data["path"] == "/api/v1/providers/x%00y"
+    assert denied.message == "GET /api/v1/providers/x%00y: missing or invalid bearer token"
+
+
+def test_a_128_character_admins_policy_change_is_audited(api):
+    """SDD §11, §14.5 (review ST-02): names are 1-128 characters and the advisor's audit events
+    name user:<name> - 133 characters for a 128-character admin against events.actor's 128. The
+    change and its audit event are both written, the actor cut to the column."""
+    name = "a" * 128
+    created = api.post("/api/v1/users", Role.admin, json={"name": name, "role": "admin"})
+    assert created.status_code == 201, created.text
+    headers = {"Authorization": f"Bearer {created.json()['token']}"}
+    spec = {
+        "name": "long-named admin",
+        "scope": {"provider_ids": [], "plan_ids": []},
+        "decision_types": ["migration_strategy"],
+        "mode": "always_require_approval",
+        "threshold": 0.6,
+    }
+    res = api.client.post("/api/v1/advisor/policies", headers=headers, json=spec)
+    assert res.status_code == 201, res.text
+    [audited] = [e for e in api.store.events(since_seq=0) if e.kind == "policy.created"]
+    assert audited.actor == f"user:{name}"[:128]
+
+
 ROUTES = [
     ("GET", "/api/v1/me", Role.viewer, None),
     ("GET", "/api/v1/users", Role.admin, None),
