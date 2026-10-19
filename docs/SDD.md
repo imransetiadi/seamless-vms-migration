@@ -311,7 +311,9 @@ AdvisorModelInfo { name: "jev"|"rules", version: str, deployment: "on_prem"|"rem
                    endpoint_host: str|null }   # Jev's answers: SEAMLESS_JEV_DEPLOYMENT / _ENDPOINT_HOST (§13.4)
 
 RecommendedOption { option: str|null, confidence: float|null,   # 0..1, the only number compared with a threshold
-                    distribution: dict[str, float] = {} }       # raw probabilities, shown only in Details
+                    distribution: dict[str, float] = {},        # raw probabilities, shown only in Details
+                    unusable: str|null = null }  # why the answer could not be applied when it was recorded (§14.4
+                                                 # rule 2), null when it could: no approve takes it (§14.6, AD-03)
 
 Decision { final_option: str|null, status: DecisionStatus, reason_code: ReasonCode, reason_text: str|null,
            actor: AdvisorActor, policy_id: str|null, threshold_used: float|null, decided_at: datetime,
@@ -3159,8 +3161,11 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   shows a hold as waiting only while the migration is `pending`, `blocked` or `ready`, where it can be decided.
 * **Approve** and **override** (`advisor.approve`) act on the migration's newest stored recommendation while the
   migration is `pending`, `blocked` or `ready`: approve → `approved`, final = the recommended option, which must
-  be usable and eligible now; override → `overridden`, final = the chosen eligible option, `reason_text` = the
-  reason (required, at least 10 characters - code points, an emoji one, the dashboard counting as the API does (audit
+  be usable and eligible now - one the recommendation recorded as `unusable` (escalated, invalid, escaped, outside
+  the advisor's scope, §14.4 rule 2) never is: 409 "nothing to approve: <why>", while an override to that option
+  stays a person's call, with its reason (audit AD-03); override → `overridden`, final = the chosen eligible option,
+  `reason_text` = the reason (required, at least 10 characters - code points, an emoji one, the dashboard counting
+  as the API does (audit
   AD-10) - when the policy in force says so — the API refuses with 422, not only
   the dashboard). Eligible is judged at the request, as `PUT …/strategy` judges it (§12): a Retry does not
   re-assess the estimates the last validation stored, so `storage_handover` is not eligible while the migration
@@ -3176,12 +3181,16 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   leaves none of them - no migration starts released while its decision is unwritten, no decision is stored without
   its event - and an approver's retry decides again (reviews ST-07, RV48-01, RV48-13); a document another writer
   moved meanwhile is read again and the decision retried, every check with it, as a strategy change retries (§8).
-  Neither acts while the plan sets the VM's strategy (`strategy_overrides` names it: a person chose it in the plan,
-  §9.2, and a validation honours that without recording a recommendation, so the newest one no longer stands — 409
-  "The plan sets the strategy of <vm> (<option>): change it in the plan."; no failure leaves an override's plan
-  entry without its decision, so an override choosing that option is refused too, review RV48-03), and an approve of
-  a decision already `approved` is refused (409 "The decision is already approved."): one event per decision status
-  change (§14.5).
+  Neither acts while the plan sets the VM's strategy (`strategy_overrides` names it, or its `default_strategy` is not
+  `auto`: a person chose it in the plan, §9.2, and a validation honours that without recording a recommendation, so
+  the newest one no longer stands — 409 "The plan sets the strategy of <vm> (<option>): change it in the plan."; no
+  failure leaves an override's plan entry without its decision, so an override choosing that option is refused too;
+  reviews RV48-03, audit AD-04), nor while the migration's `advisor_hold` names another recommendation - a
+  validation of another process that held it after this one was listed (409 "a newer recommendation (<id>) replaced
+  <rec>", review RV49-04) -, and an approve of a decision already `approved` is refused (409 "The decision is already
+  approved."): one event per decision status change (§14.5). A person's decision records, as its `policy_id`, the
+  policy whose rules it follows - the recorded decision's when it carries them, the policy in force otherwise - and
+  the override reason's 422 names that policy (audit AD-06).
 * **Maker-checker** (ADV-17): a recommendation recorded by a validation names the validating user in `requested_by`
   (the demo's own validations: `demo`). When the policy in force requires a distinct approver (the default, the
   built-in `global-default` too), that user neither approves nor overrides the decision: 409 "You requested this
