@@ -433,7 +433,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
   command line, so the export's NBD server failing to start stays permanent
   too, and the module's debug log holds the full command; ssh's own failure
   (exit 255), and ssh killed by a signal on the host that runs it (a negative
-  status), keep their command line, which Seamless Migrate retries. After
+  status), keep their command line, which Seamless Migrate retries - and every
+  check that tells ssh's failure from the command's reads both alike: the disk
+  identity check, the check after a copy, the port map's read and
+  initialisation (which now gives up as "SSH timeout" as the read does) and
+  the outage windows. After
   nbdcopy exits, whatever its exit, the
   transfer checks that the path it wrote is still a block device: nbdcopy
   opens its destination again with ``O_CREAT`` when the first open fails, so

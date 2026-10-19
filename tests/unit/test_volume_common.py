@@ -840,14 +840,17 @@ class PortMapGone(PortShell):
     "status,message",
     [
         (volume_common.SSH_FAILED, "SSH timeout: conversion host %s unreachable over SSH, reading the port map" % CONV),
+        (-9, "SSH timeout: conversion host %s unreachable over SSH, reading the port map" % CONV),
         (1, "Unable to read the port map"),
     ],
+    ids=["ssh failing", "ssh killed by a signal", "cat failing"],
 )
 def test_a_port_map_read_that_fails_gives_up_with_its_own_error(status, message):
     """Audit A-17: the read of the port map under the port lock fell through to an unbound
     variable when the command failed, so a transient ssh failure between taking the lock and the
     read surfaced as a Python error instead of the "SSH timeout" give-up the control plane retries
-    (SDD 6.6); any other failure of the read names the port map. Neither claims a port."""
+    (SDD 6.6); any other failure of the read names the port map. Neither claims a port. ssh killed
+    by a signal on the migrator (a negative status) is ssh's failure too (review RV44B-03)."""
     dst = cloud()
     with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst])):
         transfer = volume_common.OpenstackVolumeTransfer(
@@ -860,6 +863,52 @@ def test_a_port_map_read_that_fails_gives_up_with_its_own_error(status, message)
 
     assert transfer.claimed_ports == []
     assert not any(c[:4] == ["timeout", "1", "nc", "-l"] for c in transfer.shell.commands)
+
+
+@pytest.mark.parametrize("status", [volume_common.SSH_FAILED, -9], ids=["ssh failing", "ssh killed"])
+def test_ssh_failing_at_the_port_map_init_gives_up_as_an_ssh_timeout(status):
+    """Seamless Migrate SDD 6.6 (review RV44B-03): the port map's initialisation under the port
+    lock turned any failure of its ssh into "Unable to initialize port map file!" - permanent -
+    where the read right after it gives ssh's own failure up as "SSH timeout", which the control
+    plane retries."""
+
+    class InitFails(PortMapGone):
+        def cmd_out(self, command, **kwargs):
+            if command[:3] == ["sudo", "bash", "-c"] and "test -e" in command[3]:
+                raise subprocess.CalledProcessError(self.status, ["ssh", self.address] + list(command))
+            return super().cmd_out(command, **kwargs)
+
+    dst = cloud()
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst])):
+        transfer = volume_common.OpenstackVolumeTransfer(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1"
+        )
+    transfer.shell = InitFails(status)
+    with pytest.raises(RuntimeError, match="SSH timeout: conversion host %s unreachable over SSH" % CONV):
+        transfer._find_free_port()
+    assert transfer.claimed_ports == []
+
+
+def test_ssh_killed_at_the_post_copy_disk_check_is_no_volume_that_left():
+    """Seamless Migrate SDD 6.6 (review RV44B-03): after a whole copy (nbdcopy exit 0) ssh failing
+    at the check that the path is still a disk gives up as "SSH timeout"; subprocess.call answers
+    a killed ssh with a negative status, which the check read as the volume gone - permanent, on
+    the cold path with the source stopped."""
+
+    class KilledAtTheCheck:
+        address = CONV
+
+        def cmd_val(self, command, **kwargs):
+            if command[:2] == ["test", "-b"]:
+                return -9  # ssh killed by SIGKILL on the migrator
+            return 1  # test -f: no regular file there
+
+    check = object.__new__(volume_common.OpenstackVolumeTransfer)
+    check.log, check.shell = mock.Mock(), KilledAtTheCheck()
+    with pytest.raises(RuntimeError) as caught:
+        check._check_still_a_disk("dvol-1", "/dev/vdc", 0)
+    assert not isinstance(caught.value, volume_common.DiskIdentityError), str(caught.value)
+    assert "SSH timeout: conversion host %s unreachable over SSH" % CONV in str(caught.value)
 
 
 class PortLockHeldElsewhere:
@@ -1283,6 +1332,30 @@ def _transfer_module_failing_with(transfer_exports):
     with mock.patch.object(transfer_module, "OpenStackDestinationVolume") as destination:
         destination.return_value.transfer_exports.side_effect = transfer_exports
         return fake.run_module(transfer_module, dict(TRANSFER_ARGS), fake.FakeCloud("dst"))
+
+
+def test_ssh_killed_at_the_serial_read_is_no_disk_that_left_the_host():
+    """Seamless Migrate SDD 6.6 (review RV44B-03): ssh failing at the identity check is no failure
+    of the disk and is retried as transient - and so is ssh killed by a signal on the migrator: the
+    real RemoteShell.cmd_out re-raises the negative status as ssh's own failure, its command line
+    kept; the check read it as cat failing - the disk left the host, permanent."""
+
+    def killed(args, **kwargs):
+        raise subprocess.CalledProcessError(-9, args)
+
+    def transfer_exports():
+        check = object.__new__(volume_common.OpenstackVolumeTransfer)
+        check.log = mock.Mock()
+        check.shell = volume_common.RemoteShell(CONV, "cloud-user", "/keys/k")
+        with mock.patch.object(volume_common.subprocess, "check_output", killed):
+            check._identified_path("dvol-1", "/dev/vdc")
+
+    # ssh's own failure leaves the module as before, never as an identity failure's message: the
+    # escaped error keeps ssh's command line, ConnectTimeout and all, which the control plane retries
+    with pytest.raises(subprocess.CalledProcessError) as raised:
+        _transfer_module_failing_with(transfer_exports)
+    assert not isinstance(raised.value, volume_common.RemoteCommandFailed)
+    assert raised.value.returncode == -9 and "ConnectTimeout=10" in str(raised.value)
 
 
 @pytest.mark.parametrize(

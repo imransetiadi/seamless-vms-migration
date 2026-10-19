@@ -173,6 +173,14 @@ SSH_UNREACHABLE_S = 900
 GIVE_UP_PREFIXES = ("Lock timeout", "SSH timeout")
 
 
+def ssh_failed(status):
+    """Whether a command's exit status is ssh's own failure, no failure of the remote command:
+    ssh's SSH_FAILED, or a negative status - ssh killed by a signal on the host that runs it (an
+    OOM kill, a stray kill). Every caller telling the two apart reads it here, so the control plane
+    retries both (Seamless Migrate SDD 6.6, reviews RV43B-05, RV44B-03)."""
+    return status == SSH_FAILED or status < 0
+
+
 class ConversionHostUnreachable(RuntimeError):
     """A wait gave up: ssh to the conversion host failed for SSH_UNREACHABLE_S
     without a break (Seamless Migrate SDD 6.6)."""
@@ -321,7 +329,7 @@ def use_lock(lock_file):
                     # the conversion host cannot be reached: give up after 15 minutes
                     # of that rather than try 1800 times; the control plane retries
                     # a "timeout" (Seamless Migrate SDD 6.6, QASuite R-07)
-                    outage.seen(result == SSH_FAILED)
+                    outage.seen(ssh_failed(result))
                     if result == 16:
                         self.log.info("Another conversion has the lock.")
                     elif result == 17:
@@ -924,6 +932,12 @@ class OpenStackVolumeBase:
             if result:
                 self.log.debug("Port write result: %s", result)
         except subprocess.CalledProcessError as err:
+            # ssh's own failure gives up as the read below does, retried (review RV44B-03)
+            if ssh_failed(err.returncode):
+                raise RuntimeError(
+                    "SSH timeout: conversion host %s unreachable over SSH, initializing the port map"
+                    % getattr(self.shell, "address", "?")
+                ) from err
             raise RuntimeError("Unable to initialize port map file!") from err
 
         try:  # Try to read in the set of used ports
@@ -939,7 +953,7 @@ class OpenStackVolumeBase:
         except subprocess.CalledProcessError as err:
             # ssh's own failure is transient: a give-up the control plane retries, as the
             # waits of SDD 6.6 end; any other failure of the read is the port map's (audit A-17)
-            if err.returncode == SSH_FAILED:
+            if ssh_failed(err.returncode):
                 raise RuntimeError(
                     "SSH timeout: conversion host %s unreachable over SSH, reading the port map"
                     % getattr(self.shell, "address", "?")
@@ -996,7 +1010,7 @@ class OpenStackVolumeBase:
         try:
             serial = self.shell.cmd_out(["cat", "/sys/block/%s/serial" % name]).strip()
         except subprocess.CalledProcessError as err:
-            if err.returncode == SSH_FAILED:
+            if ssh_failed(err.returncode):
                 raise
             if name.startswith("vd"):
                 raise DiskIdentityError(
@@ -1014,7 +1028,7 @@ class OpenStackVolumeBase:
             )
         link = "/dev/disk/by-id/virtio-" + serial
         found = self.shell.cmd_val(["test", "-b", link])
-        if found == SSH_FAILED:
+        if ssh_failed(found):
             # a give-up the control plane retries, as the serial read's own error is (RV14-02)
             raise RuntimeError(
                 "SSH timeout: conversion host %s unreachable over SSH, checking the by-id link of %s"
@@ -1081,7 +1095,7 @@ class OpenStackVolumeBase:
         """
         result = self.shell.cmd_val(["timeout", "1", "nc", "-l", str(port)])
         if outage is not None:
-            outage.seen(result == SSH_FAILED)
+            outage.seen(ssh_failed(result))
         # The 'timeout' command returns 124 when the command times out, meaning
         # nc was successful and the port is free.
         return result == 124
@@ -1132,7 +1146,7 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
         try:
             return subprocess.check_output(args, **kwargs).decode("utf-8").strip()
         except subprocess.CalledProcessError as err:
-            if err.returncode == SSH_FAILED or err.returncode < 0:
+            if ssh_failed(err.returncode):
                 raise
             logging.getLogger("osp-osp").debug(
                 "%s on the conversion host %s exited with status %d",
@@ -1509,7 +1523,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                     image_info = self.shell.cmd_out(cmd)
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                 except subprocess.CalledProcessError as error:
-                    outage.seen(error.returncode == SSH_FAILED)
+                    outage.seen(ssh_failed(error.returncode))
                     self.log.info("Got exception: %s", error)
                     self.log.info("Trying again.")
                     time.sleep(1)
@@ -1563,7 +1577,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                     pending_disks.remove(disk)
             except subprocess.CalledProcessError as error:
-                outage.seen(error.returncode == SSH_FAILED)
+                outage.seen(ssh_failed(error.returncode))
                 self.log.info("Got exception: %s", error)
                 self.log.info("Trying again.")
                 time.sleep(1)
@@ -1610,7 +1624,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                     pending_disks.remove(disk)
             except subprocess.CalledProcessError as error:
-                outage.seen(error.returncode == SSH_FAILED)
+                outage.seen(ssh_failed(error.returncode))
                 self.log.info("Got exception: %s", error)
                 self.log.info("Trying again.")
                 time.sleep(1)
@@ -1807,8 +1821,8 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         if found == 0:
             return
         address = getattr(self.shell, "address", "?")
-        if found == SSH_FAILED:
-            if nbdcopy_exit not in (0, SSH_FAILED):
+        if ssh_failed(found):
+            if nbdcopy_exit != 0 and not ssh_failed(nbdcopy_exit):
                 raise RuntimeError(
                     "Failed to copy volume with nbdcopy! Return code: %d; whether %s on %s is still a "
                     "disk could not be checked (ssh failed): look for a regular file there"
@@ -1824,7 +1838,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             what = "left the host before nbdcopy opened it, and nbdcopy copied into a regular file in its place, "
             if removed == 0:
                 what += "now removed; the volume was not written"
-            elif removed == SSH_FAILED:
+            elif ssh_failed(removed):
                 what += (
                     "and ssh failed at the removal: check %s on %s and remove it by hand if it is "
                     "there, as udev 252 will not make the volume's link over it; the volume was not "
@@ -1836,7 +1850,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     "252 will not make the volume's link over it; the volume was not written"
                     % (removed, path, address)
                 )
-        elif regular == SSH_FAILED:
+        elif ssh_failed(regular):
             what = (
                 "left the host, and whether nbdcopy left a regular file in its place could not be "
                 "checked (ssh failed): remove one found at %s on %s by hand; the volume was not "
@@ -1992,7 +2006,7 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
             try:
                 return self.shell.test_ssh_connection()
             except subprocess.CalledProcessError as err:
-                if err.returncode != SSH_FAILED:
+                if not ssh_failed(err.returncode):
                     raise
                 outage.seen(True)
                 self.log.info("Conversion host unreachable, waiting: %s", err)
