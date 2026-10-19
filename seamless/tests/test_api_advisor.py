@@ -304,12 +304,17 @@ def test_an_override_body_is_judged_by_its_model_before_the_recommendation_is_lo
         assert answer.json()["error"]["message"] == case["message"]
 
 
-@pytest.mark.parametrize("index", ["\u00b2", "\u0663", "00", "+0", " 0"])
+@pytest.mark.parametrize(
+    "index",
+    ["\u00b2", "\u0663", "00", "+0", " 0", "1" * 4301],
+    ids=["superscript-two", "arabic-indic-three", "leading-zero", "plus", "space", "4301-digits"],
+)
 def test_a_legacy_id_whose_index_is_no_plain_number_is_unknown(api, index):
-    """SDD §12 (audit AD-07): a legacy entry's id ends in its index, a plain decimal number; the
-    index was read with str.isdigit, True for a superscript two that int() then refused - an
-    unhandled 500 - and an Arabic-Indic three or a leading zero named an entry under a second id.
-    Any other index is an unknown id: 404."""
+    """SDD §12 (audit AD-07, review RV50-02): a legacy entry's id ends in its index, a plain
+    decimal number; the index was read with str.isdigit, True for a superscript two that int()
+    then refused - an unhandled 500 - and an Arabic-Indic three or a leading zero named an entry
+    under a second id; int() refuses more than 4300 digits too. Any other index is an unknown
+    id: 404."""
     from seamless_migrate.domain.models import AdvisorNote
 
     api.store.put(

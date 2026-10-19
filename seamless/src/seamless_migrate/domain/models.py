@@ -837,6 +837,27 @@ class AdvisorRecommendation(_Model):
     #: Jev's reasons that name one of the evidence keys
     reasons: list[AdvisorReason] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _unusable_stored_before_the_field(cls, data: Any) -> Any:
+        """A recommendation stored before ``unusable`` (v0.1.0-rc.2) whose decision fell back
+        reads as ``unusable`` the why that decision recorded: no approve takes an answer that
+        could not be applied (SDD §4.2, §14.6, review RV50-07)."""
+        if not isinstance(data, dict):
+            return data
+        option, decision = data.get("recommendation"), data.get("decision")
+        if (
+            isinstance(option, dict)
+            and option.get("unusable") is None
+            and isinstance(decision, dict)
+            and decision.get("status") == DecisionStatus.fallback_rules
+        ):
+            why = decision.get("reason_text")
+            if not isinstance(why, str) or not why:
+                why = "the advisor's answer could not be applied"
+            data = {**data, "recommendation": {**option, "unusable": why}}
+        return data
+
 
 class AdvisorSnapshot(_Model):
     """A redacted advisor input, stored once under the SHA-256 of its canonical JSON (SDD §14.5)."""

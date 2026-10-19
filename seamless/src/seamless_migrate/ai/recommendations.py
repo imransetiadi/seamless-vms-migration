@@ -91,14 +91,11 @@ def legacy_recommendations(migration: Migration) -> list[AdvisorRecommendation]:
 def legacy_by_id(rec_id: str, migration: Migration) -> AdvisorRecommendation | None:
     """The legacy entry ``rec-legacy-<migration id>-<index>`` of ``migration``, if it exists."""
     _, _, index = rec_id.removeprefix(LEGACY_PREFIX).rpartition("-")
-    entries = legacy_recommendations(migration)
-    # a plain decimal number, as the id was written: str.isdigit takes "²", which int() refuses,
-    # and an Arabic-Indic digit or a leading zero would name an entry twice (SDD §12, audit AD-07)
-    if not (index.isascii() and index.isdecimal()) or str(int(index)) != index:
-        return None
-    if int(index) >= len(entries):
-        return None
-    return entries[int(index)]
+    # the index as the id was written, compared as text with the entries' own: int() refuses "²"
+    # and more than 4300 digits, and an Arabic-Indic digit or a leading zero would name an entry
+    # twice (SDD §12, audit AD-07, review RV50-02)
+    entries = {str(n): entry for n, entry in enumerate(legacy_recommendations(migration))}
+    return entries.get(index)
 
 
 def listing(

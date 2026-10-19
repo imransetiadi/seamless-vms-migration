@@ -5716,6 +5716,74 @@ async def test_a_usable_answer_records_nothing_unusable(tmp_path, store):
     assert (rec.decision.status, rec.recommendation.unusable) == (DecisionStatus.auto_applied, None)
 
 
+@pytest.mark.parametrize("stored", ["absent", "null", "absent-without-a-why"])
+async def test_a_fallback_stored_before_unusable_is_never_approved(tmp_path, store, stored):
+    """SDD §4.2, §14.6 (review RV50-07): v0.1.0-rc.2 stored a recommendation without `unusable`;
+    its fallback decision recorded why the answer could not be applied, which nothing read - the
+    approve ran Jev's escalated option. Such a record reads that why as `unusable`: no approve
+    takes it, an override to that option stays a person's call, and the record keeps the why."""
+    import re
+
+    import sqlalchemy as sa
+
+    from seamless_migrate.store import documents
+
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.9, status="escalate"))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    why = "the advisor's answer was escalate"
+    data = rec.model_dump(mode="json")
+    if stored == "null":
+        data["recommendation"]["unusable"] = None
+    else:
+        del data["recommendation"]["unusable"]  # as rc.2 wrote it: no such field yet
+    if stored == "absent-without-a-why":
+        data["decision"]["reason_text"] = None
+        why = "the advisor's answer could not be applied"
+    with store.engine.begin() as conn:
+        conn.execute(
+            sa.update(documents)
+            .where(documents.c.kind == "recommendation", documents.c.id == rec.id)
+            .values(data=data)
+        )
+    assert store.get("recommendation", rec.id, AdvisorRecommendation).recommendation.unusable == why
+    with pytest.raises(NotAllowed, match=f"^nothing to approve: {re.escape(why)}$"):
+        await h.orch.approve_recommendation(rec.id, "rina")
+    reason = "The owner chose warm after the review"
+    overridden = await h.orch.override_recommendation(rec.id, "warm", reason, "rina")
+    assert (overridden.decision.status, overridden.decision.final_option) == (
+        DecisionStatus.overridden,
+        "warm",
+    )
+    kept = store.get("recommendation", rec.id, AdvisorRecommendation)
+    assert kept.recommendation.unusable == why
+
+
+async def test_a_held_migration_stays_decidable_after_the_clock_steps_back(tmp_path, store):
+    """SDD §14.6 (review RV50-09): a decision acted on the newest recommendation by created_at,
+    the wall clock, and not on one the migration's hold did not name. After the clock stepped
+    back between two validations (an NTP step, a VM resumed from a snapshot) the hold named the
+    second while the first was newer by time: each check refused the other, and the held VM never
+    started. The hold names the one to decide, whatever its time."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    h.clock.advance(-60)
+    await h.orch.validate_plan(plan.id, "alice")
+    stale, held = sorted(_recommendations(store), key=lambda r: r.created_at, reverse=True)
+    assert (await h.by_vm(plan.id, "vm-1")).advisor_hold == held.id
+    assert stale.created_at > held.created_at
+    with pytest.raises(NotAllowed, match=rf"^a newer recommendation \({held.id}\) replaced "):
+        await h.orch.approve_recommendation(stale.id, "rina")
+    approved = await h.orch.approve_recommendation(held.id, "rina")
+    assert approved.decision.status == DecisionStatus.approved
+    assert (await h.by_vm(plan.id, "vm-1")).advisor_hold is None
+
+
 async def test_no_decision_once_the_plans_default_strategy_decides(tmp_path, store):
     """SDD §14.6 (audit AD-04): a validation honours the plan's default_strategy as it honours an
     override, recording no recommendation - the earlier one no longer stands. It stayed the newest

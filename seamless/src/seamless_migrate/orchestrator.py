@@ -2314,10 +2314,18 @@ class Orchestrator:
         makes one transaction - a failure leaves none of them, so no migration starts released
         while its decision is unwritten, and the retry decides again (SDD §14.6, reviews ST-07,
         RV48-01, RV48-02, RV48-13)."""
-        stored = await self.db.list("recommendation", AdvisorRecommendation, migration_id=mid)
-        newest = max(stored, key=lambda r: (r.created_at, r.id))
-        if newest.id != rec_id:
-            raise NotAllowed(f"a newer recommendation ({newest.id}) replaced {rec_id}")
+        m, v = await self._load(mid)
+        if m.advisor_hold is not None:
+            # SDD §14.6: the hold names the one to decide - written with it, so whatever its time
+            # after the clock stepped back; another process's validation may have held it for a
+            # newer one (reviews RV49-04, RV50-09)
+            if m.advisor_hold != rec_id:
+                raise NotAllowed(f"a newer recommendation ({m.advisor_hold}) replaced {rec_id}")
+        else:
+            stored = await self.db.list("recommendation", AdvisorRecommendation, migration_id=mid)
+            newest = max(stored, key=lambda r: (r.created_at, r.id))
+            if newest.id != rec_id:
+                raise NotAllowed(f"a newer recommendation ({newest.id}) replaced {rec_id}")
         rec, rec_version = await self.db.get_versioned(
             "recommendation", rec_id, AdvisorRecommendation
         )
@@ -2347,10 +2355,6 @@ class Orchestrator:
                 raise Unprocessable(
                     f"policy {ruling} requires an override reason of at least 10 characters"
                 )
-        m, v = await self._load(mid)
-        if m.advisor_hold is not None and m.advisor_hold != rec_id:
-            # SDD §14.6 (review RV49-04): another process's validation held it for a newer one
-            raise NotAllowed(f"a newer recommendation ({m.advisor_hold}) replaced {rec_id}")
         if m.phase not in REVALIDATABLE:
             raise NotAllowed(f"the strategy cannot change in {m.phase}")
         pinned = plan.strategy_overrides.get(m.vm.source_id)
