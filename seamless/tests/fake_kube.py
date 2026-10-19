@@ -28,7 +28,11 @@ kubectl and the API server do (review 38b, read from their sources):
   undo keeps it (the controller's sync.go) - ``wait --for=condition=Available`` judges the pods;
 * ``apply -k`` restores no replica count (its three-way merge patches only what the manifests
   changed); ``apply_rolls`` set, the overlay changes the pod template - a new image - and the
-  apply rolls the Deployment at once: Recreate ends the old pod, a new one starts.
+  apply rolls the Deployment at once: Recreate ends the old pod, a new one starts;
+* a namespace the manifests were never applied to (``empty()``, a first ``up``) has no Deployment,
+  StatefulSet or ConfigMap: a read answers NotFound (exit 1) - nothing, exit 0, with
+  ``--ignore-not-found`` -, a scale or a rollout status fails so, and ``apply -k`` creates them as
+  the manifests define them, PostgreSQL's first; a StatefulSet names a new pod by its ordinal.
 """
 
 from __future__ import annotations
@@ -48,6 +52,17 @@ with open(os.environ["STUB_LOG"], "a") as log:
 UNITS = {"m": 1e-3, "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "k": 1e3, "M": 1e6, "G": 1e9}
 KINDS = {"deployment/seamless": "deployment", "statefulset/seamless-postgres": "statefulset"}
 LABELS = {"seamless": "deployment", "seamless-postgres": "statefulset"}
+#: what apply -k creates where it is missing (deploy/openshift: deployment.yaml, configmap.yaml)
+MANIFEST = {
+    "configmap": {"SEAMLESS_MAX_CONCURRENT_MIGRATIONS": "10",
+                  "SEAMLESS_MAX_CONCURRENT_CUTOVERS": "3"},
+    "statefulset": {"name": "seamless-postgres", "replicas": 1, "pods": []},
+    "deployment": {"name": "seamless", "replicas": 1, "pods": [],
+                   "requests": {"cpu": "500m", "memory": "1Gi"},
+                   "limits": {"cpu": "4", "memory": "4Gi"}},
+}
+NOT_FOUND = {"deployment": 'deployments.apps "seamless"',
+             "statefulset": 'statefulsets.apps "seamless-postgres"'}
 
 words, flags = [], {}
 args = list(argv)
@@ -55,6 +70,8 @@ while args:
     arg = args.pop(0)
     if arg in ("-n", "-l", "--selector", "-p", "--type", "-c", "-o"):
         flags[arg] = args.pop(0)
+    elif arg == "--ignore-not-found":
+        flags[arg] = True
     elif arg.startswith("--") and "=" in arg:
         key, value = arg.split("=", 1)
         flags[key] = value
@@ -76,10 +93,15 @@ def new_pod(kind):
                                     f"{limits[key]}")
             return None
     st["serial"] += 1
-    pod = {"name": f"{obj['name']}-{st['serial']}", "phase": "Running",
-           "config": dict(st["configmap"]), "limits": limits}
+    name = f"{obj['name']}-{st['serial']}"
+    if kind == "statefulset":  # a StatefulSet names its pods by ordinal, the lowest free one first
+        taken = {p["name"] for p in obj["pods"]}
+        name = next(f"{obj['name']}-{i}" for i in range(len(taken) + 1)
+                    if f"{obj['name']}-{i}" not in taken)
+    pod = {"name": name, "phase": "Running", "config": dict(st["configmap"]), "limits": limits}
     if kind == "deployment":
-        pod["databases"] = [p["name"] for p in st["statefulset"]["pods"] if p["phase"] == "Running"]
+        postgres = (st["statefulset"] or {}).get("pods", [])
+        pod["databases"] = [p["name"] for p in postgres if p["phase"] == "Running"]
     return pod
 
 
@@ -108,7 +130,7 @@ def new_template(keep_progress=False):  # Recreate: the old pod ends, a new one 
 
 
 def selected(kind):
-    pods = st[kind]["pods"]
+    pods = (st[kind] or {}).get("pods", [])
     field = flags.get("--field-selector", "")
     for clause in filter(None, field.split(",")):
         key, value = clause.split("!=", 1)
@@ -128,7 +150,20 @@ def label_kind():
     return LABELS[selector.split("=", 1)[1]]
 
 
+def found(kind):  # the object, or kubectl's NotFound
+    if st[kind] is None:
+        done(f"Error from server (NotFound): {NOT_FOUND[kind]} not found\n", 1)
+    return st[kind]
+
+
 verb = words[0]
+missing = verb == "get" and words[1] in KINDS and st[KINDS[words[1]]] is None
+if missing and flags.get("--ignore-not-found"):
+    done()
+if verb in ("get", "scale") and words[1] in KINDS:
+    found(KINDS[words[1]])
+if verb == "rollout" and words[1] == "status":
+    found(KINDS[words[2]])
 if verb == "scale":
     kind = KINDS[words[1]]
     st[kind]["replicas"] = int(flags["--replicas"])
@@ -226,7 +261,12 @@ if verb == "set" and words[1] == "resources":
     new_template()
     done("deployment.apps/seamless resource requirements updated\n")
 if verb == "apply":
-    if st.get("apply_rolls"):
+    made = [kind for kind in ("configmap", "statefulset", "deployment") if st[kind] is None]
+    for kind in made:  # a first up: created, PostgreSQL before the control plane
+        st[kind] = json.loads(json.dumps(MANIFEST[kind]))
+        if kind != "configmap":
+            reconcile(kind)
+    if st.get("apply_rolls") and "deployment" not in made:
         new_template()
     done("configured\n")
 done()
@@ -264,6 +304,12 @@ def cluster(
             ],
         },
     }
+
+
+def empty() -> dict:
+    """A namespace the manifests were never applied to - a first ``up``: no ConfigMap, StatefulSet
+    or Deployment until ``apply -k`` creates them."""
+    return {"serial": 1, "configmap": None, "deployment": None, "statefulset": None}
 
 
 def install(bin_dir: Path, state_file: Path, state: dict) -> dict[str, str]:

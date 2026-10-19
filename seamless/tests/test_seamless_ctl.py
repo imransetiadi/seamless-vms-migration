@@ -10,6 +10,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -21,7 +23,9 @@ ROOT = find_repo_root()
 SCRIPT = ROOT / "scripts" / "seamless-ctl.sh"
 TOKEN = "smg_" + "t0ken" * 8  # a test token: never an argument of any tool
 
-#: a tool that records its call - with the header files curl was handed - and answers by the rules
+#: a tool that records its call - with the header files curl was handed - and answers by the rules;
+#: unless a rule says otherwise, curl answers as an API that took the request: `-w %{http_code}` the
+#: status (200, or 000 for an answer that exits non-zero), GET /api/v1/me an operator's token
 STUB = r"""#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
@@ -35,6 +39,7 @@ if headers:
 with open(os.environ["STUB_LOG"], "a") as log:
     log.write(json.dumps(record) + "\n")
 joined = " ".join(args)
+status = name == "curl" and "%{http_code}" in args
 for n, rule in enumerate(json.loads(Path(os.environ["STUB_RULES"]).read_text())):
     if rule["cmd"] == name and all(part in joined for part in rule.get("has", [])):
         counter = Path(os.environ["STUB_LOG"] + f".{n}")
@@ -42,8 +47,13 @@ for n, rule in enumerate(json.loads(Path(os.environ["STUB_RULES"]).read_text()))
         counter.write_text(str(seen + 1))
         answers = rule.get("answers", [{}])
         answer = answers[min(seen, len(answers) - 1)]
-        sys.stdout.write(answer.get("stdout", ""))
+        code = ("000" if answer.get("exit", 0) else "200") if status else ""
+        sys.stdout.write(answer.get("stdout", code))
         sys.exit(answer.get("exit", 0))
+if status:
+    sys.stdout.write("200")
+elif name == "curl" and args[-1:] and args[-1].endswith("/api/v1/me"):
+    sys.stdout.write(json.dumps({"name": "ops", "role": "operator"}))
 """
 TOOLS = ("make", "kubectl", "oc", "curl", "docker", "podman")
 #: the Route's or Ingress's URL a cluster's drain and resume take (SDD §17.2)
@@ -234,11 +244,13 @@ def test_a_cluster_up_applies_the_overlay_and_scales_both_back_to_one(
     the apply (review RV43A-01) -, applies the overlay, then scales PostgreSQL and the control
     plane to one replica each - an apply restores no replica count an earlier down set - and
     waits for both rollouts."""
-    proc, calls, tree = _run(tmp_path, platform, "up", "--namespace", "migrations")
+    rules = [{"cmd": tool, "has": ["get statefulset"], "answers": [{"stdout": "1"}]}]
+    proc, calls, tree = _run(tmp_path, platform, "up", "--namespace", "migrations", rules=rules)
     assert proc.returncode == 0, proc.stderr
     ns = "-n migrations"
     assert _args(calls, tool) == [
-        f"{ns} get statefulset/seamless-postgres -o jsonpath={{.spec.replicas}}",
+        # a first up's NotFound reads as nothing, any other failure stops up (review RV44A-04)
+        f"{ns} get statefulset/seamless-postgres --ignore-not-found -o jsonpath={{.spec.replicas}}",
         f"{ns} get pods -l app.kubernetes.io/name=seamless-postgres {OTHER_DATABASES} -o name",
         f"{ns} apply -k {tree / overlay}",
         f"{ns} scale statefulset/seamless-postgres --replicas=1",
@@ -267,7 +279,7 @@ def test_a_cluster_start_brings_postgresql_back_first_when_it_is_down(
         f"{ns} rollout status statefulset/seamless-postgres --timeout=600s",
     ]
     assert _args(calls, tool) == [
-        f"{ns} get statefulset/seamless-postgres -o jsonpath={{.spec.replicas}}",
+        f"{ns} get statefulset/seamless-postgres --ignore-not-found -o jsonpath={{.spec.replicas}}",
         *(database if postgres == "0" else []),
         # the others judged by their pods, whatever the count says (review RV42A-01)
         f"{ns} get pods -l app.kubernetes.io/name=seamless-postgres {OTHER_DATABASES} -o name",
@@ -828,6 +840,7 @@ def test_dry_run_prints_every_command_and_runs_none(tmp_path):
     )
     assert proc.returncode == 0 and calls == [], proc.stderr
     assert "/plans?status=running" in proc.stdout and "then wait" in proc.stdout
+    assert "/api/v1/me" in proc.stdout  # the token's role, asked first (review RV44A-02)
 
 
 API = "http://127.0.0.1:8080/api/v1"
@@ -1057,24 +1070,26 @@ def test_a_drain_waits_while_a_migration_verifies_or_rolls_back_too(tmp_path):
     assert [c for c in calls if c["cmd"] == "make"], "stopped once all three were clear"
 
 
-def test_a_drain_whose_pause_fails_names_the_plans_it_already_paused(tmp_path):
+@pytest.mark.parametrize("status", ["404", "409"])
+def test_a_drain_whose_pause_fails_names_the_plans_it_already_paused(tmp_path, status):
     """SDD §17.2 (reviews RV38B-05, RV43A-04): --drain prints the plans it paused - also when it
     stops half-way: plan-bb's pause was refused (it completed meanwhile, 409) after plan-aa's
     succeeded, and plan-aa, paused for good, is named with the resume command, as a drain that
     times out names them; it died naming none, and a second drain lists running plans only. The
-    API answered plan-bb's pause with an error - curl -f's exit 22 -, so it was not paused, and is
-    not named: resume would start a plan that failed meanwhile again."""
+    API refused plan-bb's pause - 409, or 404 for a plan gone -, so it was not paused, and is not
+    named: resume would start a plan that failed meanwhile again (review RV44A-02: the status, not
+    curl -f's 22 for any error)."""
     rules = [
-        {"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"stdout": RUNNING}]},
-        {"cmd": "curl", "has": ["plan-bb/pause"], "answers": [{"exit": 22}]},
+        {"cmd": "curl", "has": ["plan-bb/pause"], "answers": [{"stdout": status}]},
+        *_drain_rules([{"stdout": "[]"}]),
     ]
     proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", rules=rules)
     paused = [c for c in calls if c["cmd"] == "curl" and c["args"][-1].endswith("plan-aa/pause")]
     assert proc.returncode == 1 and paused
-    assert "the API refused to pause plan plan-bb" in proc.stderr, proc.stderr
+    assert f"the API refused to pause plan plan-bb (HTTP {status})" in proc.stderr, proc.stderr
     assert "may be paused" not in proc.stderr, proc.stderr
     assert f"resume --token-file {tmp_path / 'operator.token'} plan-aa\n" in proc.stderr
-    assert not [c for c in calls if c["cmd"] == "make"]  # nothing was stopped
+    assert not [a for a in _args(calls, "make") if "seamless-stop" in a]  # nothing was stopped
 
 
 @pytest.mark.parametrize(
@@ -1117,7 +1132,7 @@ def test_a_drain_that_fails_after_a_pause_names_the_plans_it_paused(tmp_path, ru
     assert proc.returncode == 1, proc.stderr
     assert "nothing was stopped" in proc.stderr, proc.stderr
     assert f"resume --token-file {tmp_path / 'operator.token'} {' '.join(paused)}" in proc.stderr
-    assert not [c for c in calls if c["cmd"] == "make"]
+    assert not [a for a in _args(calls, "make") if "seamless-stop" in a]  # nothing was stopped
 
 
 @pytest.mark.parametrize(
@@ -1241,7 +1256,8 @@ def test_a_failed_make_target_after_a_drain_exits_1_naming_it(tmp_path):
     its Make target after the drain paused every plan and capacity rewrote .env is a failed step:
     exit 1, naming the target, not make's own 2."""
     env = "POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT=8080\n"
-    rules = [*_drain_rules([{"stdout": "[]"}]), {"cmd": "make", "answers": [{"exit": 2}]}]
+    restart = {"cmd": "make", "has": ["seamless-restart"], "answers": [{"exit": 2}]}
+    rules = [*_drain_rules([{"stdout": "[]"}]), restart]
     proc, _, tree = _run(
         tmp_path, "docker", "capacity", "--max-migrations", "20", "--drain", "@TOKEN_FILE",
         env_file=env, rules=rules,
@@ -1263,7 +1279,7 @@ def test_a_pause_that_got_no_answer_is_named_for_resume(tmp_path):
     assert proc.returncode == 1, proc.stderr
     assert "cannot pause plan plan-bb" in proc.stderr and "may be paused" in proc.stderr
     assert f"resume --token-file {tmp_path / 'operator.token'} plan-aa plan-bb" in proc.stderr
-    assert not [c for c in calls if c["cmd"] == "make"]
+    assert not [a for a in _args(calls, "make") if "seamless-stop" in a]  # nothing was stopped
 
 
 def test_an_interrupted_drain_names_the_plans_it_paused(tmp_path):
@@ -1307,7 +1323,8 @@ def test_an_interrupted_drain_names_the_plans_it_paused(tmp_path):
     _, err = proc.communicate(timeout=30)
     assert proc.returncode == 1, err
     assert "nothing was stopped" in err and "resume" in err and "plan-aa plan-bb" in err, err
-    assert not [c for c in (tmp_path / "calls.log").read_text().splitlines() if '"make"' in c]
+    calls = (tmp_path / "calls.log").read_text().splitlines()
+    assert not [c for c in calls if "seamless-stop" in c]  # its checks ran, the stop never
 
 
 @pytest.mark.parametrize("timeout", ["08", "09"])
@@ -1322,11 +1339,11 @@ def test_a_drain_reads_a_leading_zero_wait_timeout_as_decimal_seconds(tmp_path, 
     )
     assert proc.returncode == 0, proc.stderr
     order = [
-        "ask" if c["cmd"] == "curl" and "phase=cutover" in " ".join(c["args"]) else c["cmd"]
+        "ask" if c["cmd"] == "curl" else "stop"
         for c in calls
-        if c["cmd"] == "make" or "phase=cutover" in " ".join(c["args"])
+        if "seamless-stop" in c["args"] or "phase=cutover" in " ".join(c["args"])
     ]
-    assert order == ["ask", "make"], (order, proc.stderr)
+    assert order == ["ask", "stop"], (order, proc.stderr)
 
 
 def test_a_drain_pauses_the_running_plans_and_waits_until_no_cutover_is_in_flight(tmp_path):
@@ -1338,13 +1355,14 @@ def test_a_drain_pauses_the_running_plans_and_waits_until_no_cutover_is_in_fligh
     assert proc.returncode == 0, proc.stderr
     curl = _args(calls, "curl")
     header = [a for c in calls if c["cmd"] == "curl" for a in c["args"] if a.startswith("@")]
-    assert curl[0] == f"-fsS --max-time 30 -H {header[0]} {API}/plans?status=running"
-    assert (
-        f"-fsS --max-time 30 -X POST -H {header[0]} -o /dev/null {API}/plans/plan-aa/pause" in curl
-    )
-    assert (
-        f"-fsS --max-time 30 -X POST -H {header[0]} -o /dev/null {API}/plans/plan-bb/pause" in curl
-    )
+    # the token's role first (review RV44A-02), then the running plans
+    assert curl[:2] == [
+        f"-fsS --max-time 30 -H {header[0]} {API}/me",
+        f"-fsS --max-time 30 -H {header[0]} {API}/plans?status=running",
+    ]
+    # each pause's HTTP status read, never curl -f's 22 for any error (review RV44A-02)
+    pause = f"-sS --max-time 30 -X POST -H {header[0]} -o /dev/null -w %{{http_code}} {API}/plans"
+    assert f"{pause}/plan-aa/pause" in curl and f"{pause}/plan-bb/pause" in curl
     assert sum("phase=cutover" in a for a in curl) == 2  # waited once
     assert [c["cmd"] for c in calls][-1] == "make" and _args(calls, "make")[-1].endswith(
         "seamless-stop SEAMLESS_ENGINE=docker"
@@ -1366,17 +1384,22 @@ def test_a_drain_that_times_out_stops_nothing(tmp_path):
         "--wait-timeout", "0", rules=rules,
     )  # fmt: skip
     assert proc.returncode == 1
-    assert _args(calls, "kubectl") == [] and "nothing was stopped" in proc.stderr
+    # read before the drain (review RV44A-01), nothing changed after it
+    assert _args(calls, "kubectl") == [
+        "-n seamless-migrate get deployment/seamless -o name",
+        "-n seamless-migrate get statefulset/seamless-postgres -o name",
+    ]
+    assert "nothing was stopped" in proc.stderr
     assert "plan-aa" in proc.stderr and "resume" in proc.stderr
 
 
 def _changes(calls) -> list[int]:
-    """The places of the calls that change the stack: make, a cluster's patch, scale or rollout -
-    never a server-side dry run."""
+    """The places of the calls that change the stack: make - never its read-only checks -, a
+    cluster's patch, scale or rollout - never a server-side dry run."""
     return [
         i
         for i, c in enumerate(calls)
-        if c["cmd"] == "make"
+        if (c["cmd"] == "make" and "seamless-check-context" not in c["args"])
         or (
             c["cmd"] in ("kubectl", "oc")
             and {"patch", "scale", "rollout", "set"} & set(c["args"])
@@ -1704,3 +1727,405 @@ def test_the_make_targets_stop_start_and_restart_the_control_plane_alone():
     assert ran.startswith("env ${mode:+SEAMLESS_DEMO=$mode} "), ran
     podman = dry("seamless-restart", "SEAMLESS_ENGINE=podman")
     assert "podman compose" in podman and "--wait" not in podman.split("seamless-restart")[0]
+
+
+# --- review 44a: every drain checks first, a pause's answer read by its status -------------------
+CLUSTER_DRAINS = [["restart"], ["stop"], ["down"], ["scale", "0"]]
+
+
+@pytest.mark.parametrize(("platform", "tool"), [("kubernetes", "kubectl"), ("openshift", "oc")])
+@pytest.mark.parametrize("action", CLUSTER_DRAINS, ids=[" ".join(a) for a in CLUSTER_DRAINS])
+def test_every_cluster_drain_reads_the_cluster_before_it_pauses_a_plan(
+    tmp_path, platform, tool, action
+):
+    """SDD §17.2 (review RV44A-01): a cluster's restart, stop, down or scale 0 with --drain paused
+    every running plan - the drain goes to --url - before its first kubectl or oc call, so an
+    expired login or a mistyped --namespace showed only then, every plan paused. The Deployment is
+    read first: every call failing as an expired login does, nothing is listed or paused, exit 2."""
+    rules = [
+        {"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"stdout": RUNNING}]},
+        {"cmd": "curl", "has": ["phase="], "answers": [{"stdout": "[]"}]},
+        {"cmd": tool, "answers": [{"exit": 1}]},  # error: You must be logged in to the server
+    ]
+    proc, calls, _ = _run(
+        tmp_path, platform, *action, "--drain", "@TOKEN_FILE", "--url", CLUSTER_URL,
+        "--namespace", "seamles-migrate", rules=rules,
+    )  # fmt: skip
+    assert proc.returncode == 2, proc.stderr
+    assert _args(calls, tool) == ["-n seamles-migrate get deployment/seamless -o name"]
+    assert not [c for c in calls if c["cmd"] == "curl"], calls  # no plan listed or paused
+    assert "cannot read deployment/seamless in namespace seamles-migrate" in proc.stderr
+
+
+@pytest.mark.parametrize(("platform", "tool"), [("kubernetes", "kubectl"), ("openshift", "oc")])
+def test_a_cluster_down_drain_reads_postgresql_too_before_it_pauses_a_plan(
+    tmp_path, platform, tool
+):
+    """SDD §17.2 (review RV44A-01): down scales PostgreSQL's StatefulSet as well: one the namespace
+    cannot be read for refuses the down before its drain - nothing listed or paused, exit 2."""
+    rules = [
+        *_drain_rules([{"stdout": "[]"}]),
+        {"cmd": tool, "has": ["get statefulset"], "answers": [{"exit": 1}]},
+    ]
+    proc, calls, _ = _run(
+        tmp_path, platform, "down", "--drain", "@TOKEN_FILE", "--url", CLUSTER_URL, rules=rules
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert not [c for c in calls if c["cmd"] == "curl"], calls
+    assert "cannot read statefulset/seamless-postgres in namespace seamless-migrate" in proc.stderr
+
+
+HOST_DRAINS = [
+    ["stop"],
+    ["scale", "0"],
+    ["down"],
+    ["restart"],
+    ["capacity", "--max-migrations", "20"],
+]
+
+
+@pytest.mark.parametrize("engine", ["docker", "podman"])
+@pytest.mark.parametrize("argv", HOST_DRAINS, ids=[" ".join(a[:2]) for a in HOST_DRAINS])
+def test_every_single_host_drain_runs_the_make_targets_checks_before_it(tmp_path, argv, engine):
+    """SDD §17.2 (review RV44A-01): the Make target a drain precedes first runs its read-only
+    prerequisites - seamless-check-context (the Docker context, or Podman) and, but for down's,
+    seamless-check-env (.env and tokens.yaml). A shell without the SEAMLESS_DOCKER_CONTEXT the stack
+    was started with reached the API on 127.0.0.1 all the same: the drain paused every plan, then
+    the target refused. They run before the drain: refused there - make's 2 -, nothing is listed
+    or paused, exit 2; passed, the drain and the target follow."""
+    env = "POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT=8080\n"
+    checks = "seamless-check-context" + ("" if argv == ["down"] else " seamless-check-env")
+    rules = [
+        *_drain_rules([{"stdout": "[]"}]),
+        {"cmd": "make", "has": [checks], "answers": [{"exit": 2}]},
+    ]
+    proc, calls, tree = _run(
+        tmp_path, engine, *argv, "--drain", "@TOKEN_FILE", env_file=env, rules=rules
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert _args(calls, "make") == [
+        f"-C {tree} --no-print-directory {checks} SEAMLESS_ENGINE={engine}"
+    ]
+    assert [c["cmd"] for c in calls] == ["make"], calls  # no plan listed or paused
+    assert f"make {checks} refused (exit 2): nothing was changed" in proc.stderr, proc.stderr
+    assert (tree / "deploy" / "compose" / ".env").read_text() == env
+    proc, calls, _ = _run(
+        tmp_path / "passed", engine, *argv, "--drain", "@TOKEN_FILE", env_file=env,
+        rules=_drain_rules([{"stdout": "[]"}]),
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    order = [c["cmd"] if c["cmd"] == "make" else "curl" for c in calls]
+    assert order[0] == "make" and order[-1] == "make" and "curl" in order, order
+    assert checks in _args(calls, "make")[0]
+
+
+@CAPACITY_OR_RESTART
+@pytest.mark.parametrize("port", ["80800", "65536", "0"])
+def test_a_port_compose_cannot_publish_is_refused_before_the_drain(tmp_path, argv, port):
+    """SDD §17.2 (review RV44A-06): Compose publishes a host port from 1 to 65535 - "Invalid
+    hostPort: 80800" -, and 0 picks a random one the restart's health wait never asks. Any plain
+    number passed the check before the drain: with --url - the old port while .env names a
+    mistyped new one - every plan was paused, then the restart's Compose refused. Nothing is
+    paused, exit 2."""
+    env = f"POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT={port}\n"
+    rules = [*_drain_rules([{"stdout": "[]"}]), {"cmd": "make", "answers": [{"exit": 2}]}]
+    proc, calls, _ = _run(
+        tmp_path, "docker", *argv, "--drain", "@TOKEN_FILE", "--url", "http://127.0.0.1:8080",
+        env_file=env, rules=rules,
+    )  # fmt: skip
+    assert proc.returncode == 2, proc.stderr
+    assert calls == [], (calls, proc.stderr)
+    assert f"SEAMLESS_HOST_PORT is '{port}'" in proc.stderr and "1 to 65535" in proc.stderr
+    assert "integer expression" not in proc.stderr, proc.stderr  # judged, not a test's own error
+
+
+@pytest.mark.parametrize("port", ["80800", "0"])
+def test_a_drain_refuses_a_port_out_of_range_where_it_asks_the_api(tmp_path, port):
+    """SDD §17.2 (review RV44A-06): a drain without --url asks the API at the port the stack
+    publishes: one out of 1-65535 is refused there too, naming --url - curl failed on it, exit 1."""
+    env = f"POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT={port}\n"
+    proc, calls, _ = _run(
+        tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", env_file=env, rules=_drain_rules([])
+    )
+    assert proc.returncode == 2 and calls == [], proc.stderr
+    assert f"SEAMLESS_HOST_PORT is '{port}'" in proc.stderr and "or --url" in proc.stderr
+
+
+@pytest.mark.parametrize("status", ["500", "502", "504"])
+def test_a_pause_answered_with_a_server_error_is_named_for_resume(tmp_path, status):
+    """SDD §17.2 (review RV44A-02): the API commits a pause before it answers - a failure after the
+    commit answers 500 for a plan paused -, and a Route answers 502 when the pod dies mid-request,
+    504 on its own timeout. curl -f's 22 - any status from 400 - read as "the API refused, not
+    paused" dropped such a plan from resume. The status is read: a 5xx may have paused it, and it
+    is named for resume with the plans paused before it."""
+    rules = [
+        {"cmd": "curl", "has": ["plan-bb/pause"], "answers": [{"stdout": status}]},
+        *_drain_rules([{"stdout": "[]"}]),
+    ]
+    proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", rules=rules)
+    assert proc.returncode == 1, proc.stderr
+    assert f"answered HTTP {status} to the pause of plan plan-bb" in proc.stderr, proc.stderr
+    assert "may be paused" in proc.stderr
+    assert f"resume --token-file {tmp_path / 'operator.token'} plan-aa plan-bb" in proc.stderr
+    assert not [a for a in _args(calls, "make") if "seamless-stop" in a]  # nothing was stopped
+
+
+class _PausingApi(BaseHTTPRequestHandler):
+    """An operator's /me and the two running plans of RUNNING; a pause is answered with the status
+    ``server.answers`` gives its plan (200 by default), applied first unless that is a 409."""
+
+    def log_message(self, *args):  # quiet
+        pass
+
+    def _reply(self, code: int, body: str) -> None:
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):  # noqa: N802
+        if self.path == "/api/v1/me":
+            self._reply(200, json.dumps({"name": "ops", "role": "operator"}))
+        elif self.path == "/api/v1/plans?status=running":
+            self._reply(200, RUNNING)
+        else:
+            self._reply(200, "[]")
+
+    def do_POST(self):  # noqa: N802
+        plan = self.path.split("/")[-2]
+        code = self.server.answers.get(plan, 200)
+        if code != 409:
+            self.server.paused.append(plan)
+        self._reply(code, "{}")
+
+
+@pytest.mark.parametrize(("status", "named"), [(409, ["plan-aa"]), (504, ["plan-aa", "plan-bb"])])
+def test_the_real_curl_names_for_resume_what_a_pause_may_have_paused(tmp_path, status, named):
+    """SDD §17.2 (review RV44A-02), with the real curl against a local API: a pause answered 409 -
+    the plan no longer running - paused nothing and is not named; one a gateway answers 504 may
+    have been applied behind it, and is named for resume with the plans paused before it."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _PausingApi)
+    server.paused, server.answers = [], {"plan-bb": status}
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    real_curl = shutil.which("curl")
+    try:
+        proc, calls, _ = _run(
+            tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE",
+            "--url", f"http://127.0.0.1:{server.server_address[1]}",
+            tools={"curl": f'#!/bin/sh\nexec "{real_curl}" "$@"\n'},
+        )  # fmt: skip
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert proc.returncode == 1, proc.stderr
+    resume = re.search(r"resume --token-file \S+ --url \S+ (.*)$", proc.stderr, re.M)
+    assert resume and resume.group(1).split() == named, proc.stderr
+    assert server.paused == named
+    assert not [a for a in _args(calls, "make") if "seamless-stop" in a]  # nothing was stopped
+
+
+@pytest.mark.parametrize("role", ["viewer", "nobody"])
+def test_a_drain_refuses_a_token_below_the_operator_role(tmp_path, role):
+    """SDD §17.2 (review RV44A-02): GET /plans takes a viewer's token, a pause an operator's: a
+    viewer's listed the running plans, then the first pause was refused (403) - and explained as a
+    plan no longer running. The token's role (GET /api/v1/me) is asked before any plan is listed:
+    below an operator's, nothing is listed or paused, exit 2."""
+    me = {"cmd": "curl", "has": ["/api/v1/me"], "answers": [{"stdout": json.dumps({"role": role})}]}
+    rules = [me, *_drain_rules([{"stdout": "[]"}])]
+    proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", rules=rules)
+    assert proc.returncode == 2, proc.stderr
+    asked = [c["args"][-1] for c in calls if c["cmd"] == "curl"]
+    assert asked == [f"{API}/me"], asked
+    assert f"the token's role is '{role}'" in proc.stderr and "operator" in proc.stderr
+    assert not [a for a in _args(calls, "make") if "seamless-stop" in a]
+
+
+#: kubectl/oc in front of the fake: PostgreSQL's StatefulSet read fails as a transient error does
+FLAKY_STATEFULSET_READ = r"""#!/bin/sh
+case " $* " in *" get statefulset/seamless-postgres "*)
+  echo "Unable to connect to the server: net/http: TLS handshake timeout" >&2
+  exit 1 ;;
+esac
+exec "$REAL_FAKE" "$@"
+"""
+#: kubectl/oc in front of the fake: rollout undo fails as an API server that is unavailable fails it
+FAILING_UNDO = r"""#!/bin/sh
+case " $* " in *" rollout undo "*)
+  echo "error: the server is currently unable to handle the request" >&2
+  exit 1 ;;
+esac
+exec "$REAL_FAKE" "$@"
+"""
+
+
+def _wrapped(tmp_path, tool: str, wrapper: str) -> dict:
+    """``tools`` and ``environment`` for ``_run``: ``wrapper`` as ``tool``, the fake behind it."""
+    real = tmp_path / "fake" / tool
+    real.parent.mkdir()
+    real.write_text(fake_kube.SCRIPT)
+    real.chmod(0o755)
+    return {"tools": {tool: wrapper}, "environment": {"REAL_FAKE": str(real)}}
+
+
+@pytest.mark.parametrize(("platform", "tool"), [("kubernetes", "kubectl"), ("openshift", "oc")])
+def test_a_failed_statefulset_read_stops_up_before_its_apply(tmp_path, platform, tool):
+    """SDD §17.2 (review RV44A-04): up took every failure of PostgreSQL's StatefulSet read for a
+    first up - nothing to bring back to one -, so a transient API error let the apply roll the
+    control plane onto every database, and up exited 0. Only NotFound is a first up; any other
+    failure is refused before the apply, nothing changed, exit 2."""
+    state = fake_kube.cluster(replicas=1, postgres=3)
+    state["apply_rolls"] = True
+    proc, calls, _ = _run(
+        tmp_path, platform, "up", cluster=state, **_wrapped(tmp_path, tool, FLAKY_STATEFULSET_READ)
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert not [c for c in calls if "apply" in c["args"]], calls
+    assert _cluster_after(tmp_path) == state
+    assert "cannot read statefulset/seamless-postgres in namespace seamless-migrate" in proc.stderr
+
+
+@pytest.mark.parametrize(("platform", "tool"), [("kubernetes", "kubectl"), ("openshift", "oc")])
+def test_a_first_up_reads_no_statefulset_and_applies_the_overlay(tmp_path, platform, tool):
+    """SDD §17.2 (review RV44A-04): in a namespace the manifests were never applied to - a first up
+    - PostgreSQL's StatefulSet read finds nothing: up goes on to the apply, which creates it, and
+    the control plane starts against one database. No test gave that read kubectl's NotFound."""
+    proc, calls, _ = _run(tmp_path, platform, "up", cluster=fake_kube.empty())
+    after = _cluster_after(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert [c["args"][2] for c in calls][:2] == ["get", "apply"], _args(calls, tool)
+    [pod] = fake_kube.running(after)
+    assert pod["databases"] == ["seamless-postgres-0"]
+
+
+@pytest.mark.parametrize(("platform", "tool"), [("kubernetes", "kubectl"), ("openshift", "oc")])
+@pytest.mark.parametrize(
+    ("answer", "says", "not_said"),
+    [
+        ({"stdout": ""}, "no StatefulSet seamless-postgres in namespace seamles-migrate: run up",
+         "cannot read"),
+        ({"exit": 1}, "cannot read statefulset/seamless-postgres in namespace seamles-migrate",
+         "run up first"),
+    ],
+    ids=["not found", "a failed read"],
+)  # fmt: skip
+def test_a_start_without_postgresql_is_refused_before_anything_changed(
+    tmp_path, platform, tool, answer, says, not_said
+):
+    """SDD §17.2 (review RV44A-08): start's first step reads PostgreSQL's StatefulSet; a namespace
+    without it ("run up first") and a read that failed both exited 1, a failed step, though
+    nothing had changed - and the failed read was said to be a missing StatefulSet. Both are
+    refused, exit 2, each said as what it is."""
+    rules = [{"cmd": tool, "has": ["get statefulset"], "answers": [answer]}]
+    proc, calls, _ = _run(
+        tmp_path, platform, "start", "--namespace", "seamles-migrate", rules=rules
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert _args(calls, tool) == [
+        "-n seamles-migrate get statefulset/seamless-postgres --ignore-not-found "
+        "-o jsonpath={.spec.replicas}"
+    ]
+    assert says in proc.stderr and not_said not in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize(("platform", "tool"), [("kubernetes", "kubectl"), ("openshift", "oc")])
+def test_a_failed_put_back_after_a_failed_undo_puts_the_settings_back_before_the_rollback(
+    tmp_path, platform, tool
+):
+    """SDD §17.2 (review RV44A-07): the settings' put-back and the undo both failing - an API
+    server that is unavailable fails both -, the message named a restart for "the pod the undo
+    started" - no undo started a pod - before the rollback by hand, so the refused template was
+    restarted first. The settings are put back first, then the rollback, whose pod reads them; no
+    restart is named."""
+    state = fake_kube.cluster()
+    state["limitrange"] = {"memory": "4Gi"}
+    state["fail_configmap_patch"] = 2  # the put-back
+    proc, _, _ = _run(
+        tmp_path, platform, "capacity", "--max-migrations", "20", "--memory", "8Gi",
+        cluster=state, **_wrapped(tmp_path, tool, FAILING_UNDO),
+    )  # fmt: skip
+    assert proc.returncode == 1, proc.stderr
+    assert "the pod the undo started" not in proc.stderr, proc.stderr
+    assert f"seamless-ctl.sh {platform} restart" not in proc.stderr, proc.stderr
+    put_back = proc.stderr.index(
+        'set {"SEAMLESS_MAX_CONCURRENT_MIGRATIONS":"10"} in it yourself first'
+    )
+    assert put_back < proc.stderr.index("--to-revision"), proc.stderr
+    assert "the pod it starts reads the settings put back" in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_failed_put_back_after_an_undo_whose_pod_is_not_available_restarts_once_it_is(
+    tmp_path, platform
+):
+    """SDD §17.2 (review RV44A-07): the undo done but its pod not available - a LimitRange added
+    since the last rollout refuses the restored template's pod too -, a restart named at once
+    fails as that pod does. It is named for once the control plane's pod is available."""
+    state = fake_kube.cluster()
+    state["limitrange"] = {"memory": "2Gi"}
+    state["fail_configmap_patch"] = 2  # the put-back
+    proc, _, _ = _run(tmp_path, platform, "capacity", "--max-migrations", "20", cluster=state)
+    assert proc.returncode == 1, proc.stderr
+    assert "the template is back as it was" in proc.stderr, proc.stderr
+    assert (
+        f"then, once the control plane's pod is available, scripts/seamless-ctl.sh {platform} "
+        "restart" in proc.stderr
+    ), proc.stderr
+
+
+@pytest.mark.parametrize("platform", ["docker", "kubernetes"])
+def test_a_resume_dry_run_names_no_plan_as_started(tmp_path, platform):
+    """SDD §17.2 (review RV44A-09): --dry-run prints every command and runs none - resume's dry run
+    printed "started: plan-aa" for a POST it never sent."""
+    url = ["--url", CLUSTER_URL] if platform == "kubernetes" else []
+    proc, calls, _ = _run(
+        tmp_path, platform, "resume", "--token-file", "@TOKEN_FILE", *url, "plan-aa", "--dry-run"
+    )
+    assert proc.returncode == 0 and calls == [], proc.stderr
+    assert "/plans/plan-aa/start" in proc.stdout
+    assert "started:" not in proc.stdout, proc.stdout
+
+
+def _troubleshooting_row(message: str) -> str:
+    """The row of docs/Operations.md §7 that explains ``message``."""
+    ops = (ROOT / "docs" / "Operations.md").read_text(encoding="utf-8")
+    return next(line for line in ops.splitlines() if line.startswith(f"| `{message}"))
+
+
+@pytest.mark.parametrize("cause", ["a broken link", "a directory the user cannot enter"])
+def test_operations_md_explains_a_token_file_it_cannot_read_by_causes_that_give_it(tmp_path, cause):
+    """docs/Operations.md §7 (review RV44A-11) explained "cannot tell who may read the token
+    file" by an unreadable directory or a broken link, which stop at the readability check before
+    it - "cannot read the token file", a message no row explained. Each cause its row names gives
+    that row's message."""
+    assert cause in _troubleshooting_row("cannot read the token file"), cause
+    if cause != "a broken link" and os.geteuid() == 0:
+        pytest.skip("root enters any directory")
+    token = tmp_path / "token"
+    if cause == "a broken link":
+        token.symlink_to(tmp_path / "missing")
+    else:
+        token = tmp_path / "locked" / "token"
+        token.parent.mkdir()
+        token.write_text(TOKEN + "\n")
+        token.chmod(0o600)
+        token.parent.chmod(0o000)
+    try:
+        proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", str(token), "--dry-run")
+    finally:
+        token.parent.chmod(0o700)
+    assert proc.returncode == 2 and calls == [], proc.stderr
+    assert "cannot read the token file" in proc.stderr, proc.stderr
+
+
+def test_operations_md_explains_who_may_read_the_token_file_by_find_failing(tmp_path):
+    """docs/Operations.md §7 (review RV44A-11): "cannot tell who may read the token file" comes
+    from a find that itself fails while judging the file's mode - its row says so."""
+    assert "`find` itself failed" in _troubleshooting_row("cannot tell who may read the token file")
+    proc, calls, _ = _run(
+        tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", "--dry-run",
+        tools={"find": "#!/bin/sh\necho 'find: I/O error' >&2\nexit 1\n"},
+    )  # fmt: skip
+    assert proc.returncode == 2 and calls == [], proc.stderr
+    assert "cannot tell who may read the token file" in proc.stderr, proc.stderr

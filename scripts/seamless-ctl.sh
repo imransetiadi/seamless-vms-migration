@@ -83,6 +83,13 @@ run() {
 }
 need() { [ "$DRY" = 1 ] || command -v "$1" >/dev/null 2>&1 || check_failed "$1 is needed for this action: $2"; }
 is_count() { case $1 in '' | *[!0-9]*) return 1 ;; esac; }
+# A host port Compose publishes: 1 to 65535 - it refuses more, and 0 picks a random one (SDD §17.2, review RV44A-06).
+is_port() {
+  local digits
+  is_count "$1" || return 1
+  digits=${1#"${1%%[!0]*}"} # without leading zeros
+  [ -n "$digits" ] && [ ${#digits} -le 5 ] && [ "$digits" -le 65535 ]
+}
 
 # --- arguments ----------------------------------------------------------------------------------------------
 [ $# -ge 1 ] || bad_usage "a platform is needed"
@@ -210,11 +217,13 @@ if [ "$KIND" = host ]; then
           *) refuse "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value, or --url" ;;
         esac
         ;;
-      *[!0-9]*)
-        case $ACTION in
-          restart | capacity) refuse "SEAMLESS_HOST_PORT is '$port', no port: give a plain number" ;;
-          *) refuse "SEAMLESS_HOST_PORT is '$port', no port: give a plain number, or --url" ;;
-        esac
+      *)
+        if ! is_port "$port"; then
+          case $ACTION in
+            restart | capacity) refuse "SEAMLESS_HOST_PORT is '$port', no port: give a number from 1 to 65535" ;;
+            *) refuse "SEAMLESS_HOST_PORT is '$port', no port: give a number from 1 to 65535, or --url" ;;
+          esac
+        fi
         ;;
     esac
   fi
@@ -249,19 +258,36 @@ open_token() {
   HEADER="@$PRIVATE/auth.header"
 }
 api() { run curl -fsS --max-time 30 "$@"; }
+# A plan's pause, the HTTP status it got on stdout - 000 for none, curl's own failure its exit: curl -f's 22 is any
+# status from 400, 5xx too, which may answer a pause applied (SDD §17.2, review RV44A-02).
+pause_plan() {
+  run curl -sS --max-time 30 -X POST -H "$HEADER" -o /dev/null -w '%{http_code}' "$API/api/v1/plans/$1/pause"
+}
 count_items() { python3 -c 'import json, sys; print(len(json.load(sys.stdin)))'; }
 
 # Pause every running plan, then wait until no migration is in cutover, verifying or rolling_back (SDD §17.2). The plans
 # it paused are named in PAUSED (defined with check_failed).
 drain() {
-  local plans ids id phase out busy deadline rc
+  local me role plans ids id phase out busy deadline rc code
   if [ "$DRY" = 1 ]; then
+    api -H "$HEADER" "$API/api/v1/me"
+    say "# refused unless the token is an operator's or higher"
     api -H "$HEADER" "$API/api/v1/plans?status=running"
     say "# then, for each running plan:"
-    api -X POST -H "$HEADER" -o /dev/null "$API/api/v1/plans/PLAN_ID/pause"
+    pause_plan PLAN_ID
     say "# then wait until no migration is in cutover, verifying or rolling_back (at most ${WAIT_TIMEOUT}s)"
     return
   fi
+  # the token's role before any plan is listed: a viewer's lists them, then every pause is refused (SDD §17.2,
+  # review RV44A-02)
+  me=$(curl -fsS --max-time 30 -H "$HEADER" "$API/api/v1/me") ||
+    die "cannot ask the API at $API whose token this is (is the control plane up, and the token valid?)"
+  role=$(printf '%s' "$me" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("role", ""))') ||
+    die "cannot read the API's answer to GET /api/v1/me"
+  case $role in
+    operator | approver | admin) ;;
+    *) refuse "the token's role is '$role': a drain pauses plans, which takes an operator's token or higher" ;;
+  esac
   plans=$(curl -fsS --max-time 30 -H "$HEADER" "$API/api/v1/plans?status=running") ||
     die "cannot list the running plans at $API (is the control plane up, and the token an operator's?)"
   ids=$(printf '%s' "$plans" | python3 -c '
@@ -276,18 +302,21 @@ for plan in json.load(sys.stdin):
     case $id in
       '' | .* | *[!A-Za-z0-9._-]*) drain_failed "the API returned a plan id this script will not use: '$id'" ;;
     esac
-    # named before its answer: a pause the API applied whose answer never came - a timeout, an interrupt - leaves the
-    # plan paused, and resume starts a running plan as it is (SDD §17.2, review RV42A-06). An error the API answered -
-    # curl -f's 22: a plan no longer running - paused nothing, and resume would start a plan failed meanwhile again: it
-    # is named no more (review RV43A-04).
+    # named before its answer: a pause the API applied whose answer never came - a timeout, an interrupt - or came as
+    # an error after it - a 5xx, a gateway's 502 or 504 - leaves the plan paused, and resume starts a running plan as
+    # it is (SDD §17.2, reviews RV42A-06, RV44A-02). One the API refused - 404 or 409: a plan no longer running -
+    # paused nothing, and resume would start a plan failed meanwhile again: it is named no more (review RV43A-04).
     PAUSED+=("$id")
     rc=0
-    curl -fsS --max-time 30 -X POST -H "$HEADER" -o /dev/null "$API/api/v1/plans/$id/pause" || rc=$?
-    if [ "$rc" = 22 ]; then
-      unset "PAUSED[$((${#PAUSED[@]} - 1))]"
-      drain_failed "the API refused to pause plan $id"
-    fi
-    [ "$rc" = 0 ] || drain_failed "cannot pause plan $id - it may be paused all the same"
+    code=$(pause_plan "$id") || rc=$?
+    case $rc:$code in
+      0:2[0-9][0-9]) ;;
+      0:404 | 0:409)
+        unset "PAUSED[$((${#PAUSED[@]} - 1))]"
+        drain_failed "the API refused to pause plan $id (HTTP $code): it is no longer running" ;;
+      0:*) drain_failed "the API answered HTTP $code to the pause of plan $id - it may be paused all the same" ;;
+      *) drain_failed "cannot pause plan $id - it may be paused all the same" ;;
+    esac
   done
   if [ ${#PAUSED[@]} -gt 0 ]; then say "paused: ${PAUSED[*]}"; else say "no plan was running"; fi
   deadline=$(($(date +%s) + WAIT_TIMEOUT))
@@ -406,7 +435,8 @@ control_plane_to() {
 }
 # Before an up's apply, PostgreSQL scaled out of band back to one replica and its other pods awaited gone, judged by the
 # pods as start judges them: the apply may roll the control plane's pod at once - a new image in the overlay - onto
-# every database. A namespace without the StatefulSet yet (a first up) has none (SDD §17.2, review RV43A-01).
+# every database. A namespace without the StatefulSet yet (a first up), which its read finds not there, has none; any
+# other failure of that read stops up before the apply (SDD §17.2, reviews RV43A-01, RV44A-04).
 postgres_one_before_apply() {
   local replicas
   if [ "$DRY" = 1 ]; then
@@ -415,7 +445,9 @@ postgres_one_before_apply() {
     postgres_others_gone
     return
   fi
-  replicas=$("$KUBE" -n "$NS" get statefulset/seamless-postgres -o 'jsonpath={.spec.replicas}' 2>/dev/null) || return 0
+  replicas=$("$KUBE" -n "$NS" get statefulset/seamless-postgres --ignore-not-found -o 'jsonpath={.spec.replicas}') ||
+    check_failed "cannot read statefulset/seamless-postgres in namespace $NS: nothing was changed"
+  [ -n "$replicas" ] || return 0 # a first up
   if is_count "$replicas" && [ "$replicas" -gt 1 ]; then kube scale statefulset/seamless-postgres --replicas=1; fi
   postgres_others_gone
 }
@@ -424,8 +456,10 @@ cluster_start() {
   if [ "$DRY" = 1 ]; then
     say "# when PostgreSQL is not at 1 replica:"
   else
-    replicas=$("$KUBE" -n "$NS" get statefulset/seamless-postgres -o 'jsonpath={.spec.replicas}') ||
-      die "no StatefulSet seamless-postgres in namespace $NS: run up first"
+    # a namespace without it and a read that failed are refusals, told apart (SDD §17.2, review RV44A-08)
+    replicas=$("$KUBE" -n "$NS" get statefulset/seamless-postgres --ignore-not-found -o 'jsonpath={.spec.replicas}') ||
+      check_failed "cannot read statefulset/seamless-postgres in namespace $NS: nothing was changed"
+    [ -n "$replicas" ] || check_failed "no StatefulSet seamless-postgres in namespace $NS: run up first"
     is_count "$replicas" || die "seamless-postgres reports '$replicas' replicas"
   fi
   if [ "$replicas" != 1 ]; then
@@ -473,8 +507,9 @@ capacity_check() {
 }
 # What the single host's restart - capacity's last step - needs, which its Make target refuses: make, deploy/compose/.env
 # and tokens.yaml (seamless-check-env), and a SEAMLESS_HOST_PORT it reads - one Compose would interpolate it refuses
-# (SEAMLESS_DOTENV_STOP) - and Compose publishes: a plain number; the shell's own port wins there, as here. Checked
-# before a drain, so no plan is paused for a restart that would stop (SDD §17.2, reviews RV42A-04, RV43A-05, RV43A-06).
+# (SEAMLESS_DOTENV_STOP) - and Compose publishes: 1 to 65535; the shell's own port wins there, as here. Checked before a
+# drain, so no plan is paused for a restart that would stop (SDD §17.2, reviews RV42A-04, RV43A-05, RV43A-06,
+# RV44A-06).
 host_restart_check() {
   local value
   need make "install GNU make"
@@ -488,10 +523,34 @@ host_restart_check() {
       check_failed "the restart's Make target cannot read SEAMLESS_HOST_PORT in deploy/compose/.env: give it a" \
         "plain value; nothing was changed"
   fi
-  case $value in
-    *[!0-9]*) check_failed "SEAMLESS_HOST_PORT is '$value', no port Compose publishes: give a plain number;" \
-      "nothing was changed" ;;
-  esac
+  is_port "${value:-8080}" ||
+    check_failed "SEAMLESS_HOST_PORT is '$value', no port Compose publishes: give a number from 1 to 65535;" \
+      "nothing was changed"
+}
+# What an action's first steps need, checked before its drain pauses a plan, so a refused action leaves every plan
+# running (SDD §17.2, reviews RV43A-06, RV44A-01): capacity's own checks; on the single host make, the restart's port
+# and the Make targets' own read-only prerequisites - the Docker context or Podman, and .env and tokens.yaml unless
+# the action is down -; on a cluster kubectl or oc and a read of the Deployment - and of the StatefulSet down scales -,
+# where a mistyped namespace or an expired login shows.
+drain_check() {
+  local checks=seamless-check-context
+  if [ "$KIND" = host ]; then
+    need make "install GNU make"
+    [ "$ACTION" = down ] || checks="$checks seamless-check-env"
+    case $ACTION in restart | capacity) host_restart_check ;; esac
+    # shellcheck disable=SC2086 # the target names, one word each
+    run make -C "$ROOT" --no-print-directory $checks "SEAMLESS_ENGINE=$PLATFORM" ||
+      check_failed "make $checks refused (exit $?): nothing was changed"
+  elif [ "$ACTION" = capacity ]; then
+    capacity_check
+  else
+    need "$KUBE" "install it and log in to the cluster"
+    [ "$DRY" != 1 ] || return 0
+    "$KUBE" -n "$NS" get deployment/seamless -o name >/dev/null ||
+      check_failed "cannot read deployment/seamless in namespace $NS: nothing was changed"
+    [ "$ACTION" != down ] || "$KUBE" -n "$NS" get statefulset/seamless-postgres -o name >/dev/null ||
+      check_failed "cannot read statefulset/seamless-postgres in namespace $NS: nothing was changed"
+  fi
 }
 cluster_capacity() {
   if [ -n "$MAX_MIGRATIONS" ] && [ "$MAX_MIGRATIONS" -gt 10 ] && [ -z "$MEMORY" ]; then
@@ -531,11 +590,13 @@ capacity_settings_now() {
 }
 # Put back what a failed capacity changed, then stop: the ConfigMap's settings (cluster_capacity's $before) first, so
 # the pod the undo starts reads them as they were, and after a rollout the template - all the same when the put-back
-# fails, which is named with the restart the settings then need: the undo's pod read the new ones (SDD §17.2, reviews
-# RV41A-06, RV41A-07, RV42A-03, RV43A-03). The undo is awaited by the Deployment becoming Available: its Progressing
-# condition keeps a passed deadline after an undo, which rollout status reads as failed at once (review RV42A-07). An
-# undo done whose pod is not Available is said as such: after an undo the newest revision is the restored one, so a
-# revision is advised only when the undo itself failed - never a second undo (review RV43A-02).
+# fails, which is named with what the settings then need: put back by hand, then after an undo done a restart once
+# its pod is available - that pod read the new ones -, after an undo that failed before the rollback by hand, whose
+# pod reads them (SDD §17.2, reviews RV41A-06, RV41A-07, RV42A-03, RV43A-03, RV44A-07). The undo is awaited by the
+# Deployment becoming Available: its Progressing condition keeps a passed deadline after an undo, which rollout status
+# reads as failed at once (review RV42A-07). An undo done whose pod is not Available is said as such: after an undo
+# the newest revision is the restored one, so a revision is advised only when the undo itself failed - never a second
+# undo (review RV43A-02).
 capacity_failed() {
   local left='' kept=''
   if [ -n "$before" ]; then
@@ -546,11 +607,16 @@ capacity_failed() {
     if ! kube rollout undo deployment/seamless; then
       left="the template was not rolled back: find the revision before this capacity with $KUBE -n $NS rollout \
 history deployment/seamless and roll back to it (--to-revision)"
+      [ -z "$kept" ] || { kept="$kept first"; left="$left - the pod it starts reads the settings put back"; }
     elif ! kube wait --for=condition=Available deployment/seamless "--timeout=${TIMEOUT}s"; then
       left="the template is back as it was, but its pod is not available after ${TIMEOUT}s - see $KUBE -n $NS \
 describe replicaset -l app.kubernetes.io/name=seamless; roll back no further"
+      [ -z "$kept" ] || kept="$kept, then, once the control plane's pod is available, scripts/seamless-ctl.sh \
+$PLATFORM restart: a pod that started before then read the new ones"
+    else
+      [ -z "$kept" ] || kept="$kept, then scripts/seamless-ctl.sh $PLATFORM restart: the pod the undo started read \
+the new ones"
     fi
-    [ -z "$kept" ] || kept="$kept, then scripts/seamless-ctl.sh $PLATFORM restart: the pod the undo started read the new ones"
   fi
   [ -z "$kept$left" ] || die "$1, and $kept${kept:+${left:+; }}$left"
   die "$1: seamless-config and the pod template are put back as they were"
@@ -613,7 +679,7 @@ if [ "$ACTION" = resume ]; then
   refused=0
   for id in "${ARGS[@]}"; do
     if api -X POST -H "$HEADER" -o /dev/null "$API/api/v1/plans/$id/start"; then
-      say "started: $id"
+      [ "$DRY" = 1 ] || say "started: $id" # a dry run sent nothing (SDD §17.2, review RV44A-09)
     else
       printf '%s: cannot start plan %s: see it in the dashboard\n' "$PROG" "$id" >&2
       refused=1
@@ -622,8 +688,7 @@ if [ "$ACTION" = resume ]; then
   exit "$refused"
 fi
 if [ -n "$DRAIN" ]; then
-  [ "$ACTION" != capacity ] || capacity_check
-  [ "$KIND$ACTION" != hostrestart ] || host_restart_check
+  drain_check
   drain
 fi
 if [ "$KIND" = host ]; then host; else cluster; fi

@@ -285,13 +285,16 @@ end first:
    It prints the plans it paused. If a cutover is still in flight when the wait ends, it **stops nothing**,
    names the paused plans, and exits 1 - try again later, or stop without `--drain`. Any other end before the
    stop does the same: the API not answering during the wait, an interrupt (Ctrl-C). A plan whose pause got no
-   answer may be paused all the same: it is named too. One whose pause the API refused - it is no longer running -
-   was not paused, and is not named.
+   answer, or an error from the server or a gateway (a 5xx), may be paused all the same: it is named too. One
+   whose pause the API refused - 404 or 409: it is no longer running - was not paused, and is not named.
 
-   `capacity` takes `--drain` too: it ends in a restart. Its own checks come first - on the single host `make`,
-   `deploy/compose/.env` and `tokens.yaml`, and a `SEAMLESS_HOST_PORT` there that is a plain number; on a cluster
-   the Deployment and `seamless-config` read, and a server-side dry run of the limits - so a capacity that would
-   be refused pauses no plan, and a timeout changes nothing. A single host's `restart --drain` checks the same.
+   Every drain first checks what its action needs, so an action that would be refused pauses no plan: the
+   token's role - an operator's or higher -; on the single host `make` and the Make targets' own checks (the
+   Docker context or Podman, `deploy/compose/.env` and `tokens.yaml`); on a cluster `kubectl` or `oc` and a read
+   of the Deployment - and of PostgreSQL's StatefulSet for `down` -, where an expired login or a mistyped
+   `--namespace` shows. `capacity` takes `--drain` too: it ends in a restart. For it and `restart` the single
+   host also checks that `SEAMLESS_HOST_PORT` is a port from 1 to 65535; on a cluster `capacity` also reads
+   `seamless-config` and makes a server-side dry run of the limits - and a timeout changes nothing.
 
 3. **Start again, then resume the paused plans:**
 
@@ -327,11 +330,17 @@ version, then resume the plans.
 | `a migration is still in cutover after 1800s: nothing was stopped` | A cutover outlasted `--wait-timeout`. Nothing was stopped and the plans stay paused: wait and retry, or raise `--wait-timeout`. |
 | `on kubernetes the API is reached through the Route or Ingress: give its URL with --url` | `--drain`, `resume` and the health check need the external URL on a cluster. |
 | `cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value` | `deploy/compose/.env` sets `SEAMLESS_HOST_PORT` through a variable (a `$`) or an unclosed quote, which Compose would read differently: write the number itself. |
-| `SEAMLESS_HOST_PORT is '...', no port ...` | The value is no port number Compose can publish (an address in front, a stray character): write the number alone. |
+| `SEAMLESS_HOST_PORT is '...', no port ...` | The value is no port Compose can publish (an address in front, a stray character, a number outside 1-65535): write the number alone. |
 | `the restart's Make target cannot read SEAMLESS_HOST_PORT ...` | The same, found before a `--drain`: nothing was paused or changed. |
 | `deploy/compose/.env is missing` / `tokens.yaml is missing` | `make seamless-init` first; nothing was paused or changed. |
-| `cannot tell who may read the token file ...` | `find` could not judge the file's mode (an unreadable directory, a broken link): fix the path or the permissions. |
-| `the API refused to pause plan ...` | That plan was no longer running (it completed or failed meanwhile): it was not paused and is not named for `resume`. |
+| `cannot read the token file ...` | The path names no file this user can read: a typo, a broken link, a directory the user cannot enter. Fix the path or the permissions; nothing was paused. |
+| `cannot tell who may read the token file ...` | `find` itself failed while judging the file's mode (not installed, an I/O error): fix that, then run again; nothing was paused. |
+| `the token's role is 'viewer' ...` | A drain pauses plans: give an operator's token or higher. Nothing was listed or paused. |
+| `make seamless-check-context seamless-check-env refused ...` | The Make targets' own checks refused before the drain - the line above says why (the Colima profile or Docker context, `.env` or `tokens.yaml`): nothing was paused or changed. |
+| `cannot read deployment/seamless in namespace ...` | `kubectl` or `oc` cannot read the namespace - an expired login, a mistyped `--namespace`, no access: nothing was paused or changed. |
+| `no StatefulSet seamless-postgres in namespace ...: run up first` | `start` found no PostgreSQL there: run `up` first, or check `--namespace`. |
+| `the API refused to pause plan ...` | That plan was no longer running (404 or 409: it completed, failed or was cancelled meanwhile): it was not paused and is not named for `resume`. |
+| `the API answered HTTP 5xx to the pause of plan ... - it may be paused all the same` | The API or a gateway (a Route's 502 or 504) answered an error after the request reached it: the plan may be paused, so it is named for `resume`; nothing was stopped. |
 | `Colima profile 'seamless' is not running. Run: make seamless-colima-up` | macOS: start the profile first. |
 | `Docker Engine does not answer ...` | Linux: `sudo systemctl enable --now docker` and join the `docker` group. |
 | `the namespace from the provided object ... does not match` | `--namespace` differs from the kustomization's `namespace:`; change both (section 4.1). |
