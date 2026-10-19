@@ -3872,18 +3872,23 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   `cutover`, `verifying` or `rolling_back` - a cutover ends rather than resuming after the restart - for at most
   `--wait-timeout` seconds (default 1800; a timeout stops and changes nothing). An action that would be refused
   pauses no plan: before the drain every action runs what its first steps need (reviews RV42A-04, RV43A-05,
-  RV43A-06, RV44A-01) - on the single host `make` and the Make targets' own read-only prerequisites
-  (`seamless-check-context`, `seamless-check-env`: the Docker context, `deploy/compose/.env` and `tokens.yaml`),
-  and for `restart` and `capacity` a `SEAMLESS_HOST_PORT` the restart's target reads and Compose publishes, a port
-  number from 1 to 65535 (review RV44A-06); on a cluster `kubectl` or `oc` and a read of the Deployment - and of the
-  StatefulSet for `down` -, so a mistyped namespace or an expired login shows before the drain, and for `capacity`
-  `seamless-config` for the concurrency settings and the server-side dry run of its limits, again after the drain. A
-  plan whose pause got no answer - a timeout, an interrupt - may be paused all the same: it is named for `resume` too
-  (review RV42A-06); one the API refused - 404 or 409: a plan no longer running - was not paused, and is not named
-  (review RV43A-04), while an error a pause may still have been applied before - a 5xx, a gateway's 502 or 504 - is
-  named as a pause with no answer (review RV44A-02). The token is judged before any plan is listed: one below the
-  operator role (`GET /api/v1/me`) is refused, as its pauses would be (review RV44A-02). It prints the plans it
-  paused - also when it fails or is interrupted after a pause, which stops nothing (reviews RV38B-05, RV41A-05) -, which
+  RV43A-06, RV44A-01) - on the single host `make`, the Make targets' own read-only prerequisites
+  (`seamless-check-context`, `seamless-check-env`: the Docker context, `deploy/compose/.env` and `tokens.yaml`) and
+  a `SEAMLESS_HOST_PORT` Compose can load, a port number from 1 to 65535 - every Compose command loads the whole
+  project, its published port included (reviews RV44A-06, RV45A-01); on a cluster `kubectl` or `oc`, a read of the
+  Deployment - and of the StatefulSet for `down` - and a server-side dry run of the writes the action starts with -
+  the Deployment's scale, or its rollout restart when it runs, and the StatefulSet's scale for `down` -, so a
+  mistyped namespace, an expired login or a login that may read but not write shows before the drain (review
+  RV45A-02), and for `capacity` `seamless-config` for the concurrency settings and the server-side dry run of its
+  ConfigMap and template patches, again after the drain. A plan whose pause got no answer - a timeout, an
+  interrupt - may be paused all the same: it is named for `resume` too (review RV42A-06); one the API refused - any 4xx: a
+  plan no longer running, a token it no longer takes, a plan another writer keeps changing - was not paused, and is
+  not named (reviews RV43A-04, RV45A-06), while an error a pause may still have been applied before - a 5xx, a
+  gateway's 502 or 504 - is named as a pause with no answer (review RV44A-02). The token is judged before any plan
+  is listed: one below the operator role (`GET /api/v1/me`) is refused, as its pauses would be (review RV44A-02),
+  and so is one the API does not take (401, 403), and an API that cannot answer that question or list the running
+  plans stops the drain the same way - nothing changed: 2 (review RV45A-07). It prints the plans it paused - also
+  when it fails or is interrupted after a pause, which stops nothing (reviews RV38B-05, RV41A-05) -, which
   `resume --token-file TOKEN_FILE PLAN_ID...` starts again (`POST /plans/{id}/start`) - every plan it is given: one
   that Start refuses (cancelled meanwhile, or a migration blocked: 409) is named, the others start all the same, and
   the script then exits 1 (review RV38B-14). The operator's token is read from a file only its owner may read - any
