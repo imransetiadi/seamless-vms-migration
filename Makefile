@@ -101,7 +101,7 @@ help:
 	@echo "  test-ansible-units    - Launch ansible-test unit tests"
 	@echo "  test-e2e-tenant       - Launch e2e tenant tests"
 	@echo "  generate-auth-files   - Generate auth files for e2e tests"
-	@echo "  seamless-help         - Seamless Migrate stack on Colima/Compose (make seamless-help)"
+	@echo "  seamless-help         - Seamless Migrate single-host stack: Docker Compose on Linux, Colima on macOS, or Podman"
 	@echo ""
 	@echo "  create-centos-container - Create the CentOS container (if needed)"
 	@echo "  clean-centos-container  - Stop and remove the CentOS container"
