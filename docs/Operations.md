@@ -65,8 +65,9 @@ Compose, deleting the namespace or its PVCs on a cluster.
 
 Options: `--namespace NS` (clusters; default `seamless-migrate`), `--demo` (docker/podman `up`, `start`,
 `restart`), `--drain FILE` and `--token-file FILE` (section 5), `--url URL`, `--wait-timeout S`, `--timeout S`
-(how long a cluster rollout may take; default 600), and `--dry-run`, which prints every command without
-running any:
+(how long a cluster rollout or wait may take; default 600, at least 1), and `--dry-run`, which prints every command
+without running any. The exit status is 0 when done, 1 when a step failed, and 2 for a usage error or a refusal,
+before anything changed:
 
 ```bash
 scripts/seamless-ctl.sh kubernetes down --dry-run
@@ -243,8 +244,12 @@ lasting change into the overlay - `deploy/openshift/configmap.yaml` and the `res
 10 concurrent migrations at about 250 MiB each: above 10 without `--memory`, the script warns, as on the single host.
 The rollout restarts the control plane: add `--drain` and `--url` (section 5) to let the cutovers in flight end
 first. A namespace's LimitRange or quota judges the new pod, not the Deployment the dry run checks: when the new pod
-does not start within `--timeout`, the script rolls the template back and puts the settings back, so the control
-plane runs again as it was, and exits 1 - check `kubectl describe replicaset` for the refusal.
+does not start within `--timeout`, the script puts the settings back and rolls the template back, so the control
+plane runs again as it was, and exits 1 - check `kubectl describe replicaset` for the refusal. When the restored
+pod is refused too - a LimitRange or a quota tightened since the last rollout -, the script says the template is
+back but its pod is not available: roll back no further, and fix the limit or the quota. When the settings could not
+be put back, it names them: set them in `seamless-config`, then `restart`, since the pod the rollback started read
+the new ones.
 
 ---
 

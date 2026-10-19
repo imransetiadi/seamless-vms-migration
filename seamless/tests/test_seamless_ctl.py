@@ -608,6 +608,39 @@ def test_a_refused_rollout_is_undone_also_when_the_settings_cannot_be_put_back(t
     assert pod["limits"]["memory"] == "4Gi"  # the template rolled back, the control plane running
     assert "seamless-config could not be put back" in proc.stderr, proc.stderr
     assert "SEAMLESS_MAX_CONCURRENT_MIGRATIONS" in proc.stderr  # what to set back
+    # the pod the undo started read the new settings: the restart they then need is named (RV43A-03)
+    assert pod["config"]["SEAMLESS_MAX_CONCURRENT_MIGRATIONS"] == "20"
+    assert f"then scripts/seamless-ctl.sh {platform} restart" in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_done_undo_whose_pod_is_not_available_says_the_template_is_back(tmp_path, platform):
+    """SDD §17.2 (review RV43A-02): a LimitRange added since the last rollout refuses the running
+    template's pod too. The undo is done - the template before this capacity is back - but its pod
+    is not Available within --timeout. That is said as such, with where to look; no revision is
+    advised: after an undo the newest revision is the restored one, so "the revision before this
+    capacity" would be the refused template - a second undo."""
+    state = fake_kube.cluster()  # limits 4 CPU / 4Gi
+    state["limitrange"] = {"memory": "2Gi"}  # added after the last rollout: the old pod ran
+    proc, calls, _ = _run(tmp_path, platform, "capacity", "--max-migrations", "20", cluster=state)
+    after = _cluster_after(tmp_path)
+    tool = "oc" if platform == "openshift" else "kubectl"
+    assert proc.returncode == 1, proc.stderr
+    assert "-n seamless-migrate rollout undo deployment/seamless" in _args(calls, tool)
+    assert after["deployment"]["annotations"] == {}  # the template before this capacity
+    assert after["deployment"]["limits"] == {"cpu": "4", "memory": "4Gi"}
+    assert "the template is back as it was" in proc.stderr, proc.stderr
+    assert f"{tool} -n seamless-migrate describe replicaset" in proc.stderr, proc.stderr
+    assert "was not rolled back" not in proc.stderr and "--to-revision" not in proc.stderr
+
+
+def test_a_timeout_of_zero_is_refused(tmp_path):
+    """SDD §17.2 (review RV43A-02): --timeout takes at least one second - kubectl wait reads 0 as a
+    single check, rollout status as no bound at all, so 0 meant neither."""
+    argv = ["capacity", "--max-migrations", "20", "--timeout", "0"]
+    proc, calls, _ = _run(tmp_path, "kubernetes", *argv)
+    assert proc.returncode == 2 and calls == [], proc.stderr
+    assert "--timeout takes at least 1 second" in proc.stderr, proc.stderr
 
 
 @pytest.mark.parametrize("platform", ["kubernetes", "openshift"])

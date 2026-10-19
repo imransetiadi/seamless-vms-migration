@@ -138,6 +138,8 @@ is_count "$WAIT_TIMEOUT" || refuse "--wait-timeout takes seconds, not '$WAIT_TIM
 is_count "$TIMEOUT" || refuse "--timeout takes seconds, not '$TIMEOUT'"
 # in decimal: bash's $(( )) reads a leading zero as octal, where 08 and 09 are errors (review RV38B-06)
 WAIT_TIMEOUT=$((10#$WAIT_TIMEOUT)) TIMEOUT=$((10#$TIMEOUT))
+# kubectl wait reads 0 as a single check, rollout status as no bound at all (SDD §17.2, review RV43A-02)
+[ "$TIMEOUT" -ge 1 ] || refuse "--timeout takes at least 1 second: kubectl wait reads 0 as one check"
 if [ -n "$URL" ]; then
   case $URL in http://* | https://*) URL=${URL%/} ;; *) refuse "--url must start with http:// or https://" ;; esac
 fi
@@ -490,22 +492,28 @@ capacity_settings_now() {
 }
 # Put back what a failed capacity changed, then stop: the ConfigMap's settings (cluster_capacity's $before) first, so
 # the pod the undo starts reads them as they were, and after a rollout the template - all the same when the put-back
-# fails, which is named (SDD §17.2, reviews RV41A-06, RV41A-07, RV42A-03). The undo is awaited by the Deployment
-# becoming Available: its Progressing condition keeps a passed deadline after an undo, which rollout status reads as
-# failed at once (review RV42A-07); a second bare undo would bring the refused template back, so none is advised.
+# fails, which is named with the restart the settings then need: the undo's pod read the new ones (SDD §17.2, reviews
+# RV41A-06, RV41A-07, RV42A-03, RV43A-03). The undo is awaited by the Deployment becoming Available: its Progressing
+# condition keeps a passed deadline after an undo, which rollout status reads as failed at once (review RV42A-07). An
+# undo done whose pod is not Available is said as such: after an undo the newest revision is the restored one, so a
+# revision is advised only when the undo itself failed - never a second undo (review RV43A-02).
 capacity_failed() {
-  local left=''
+  local left='' kept=''
   if [ -n "$before" ]; then
     kube patch configmap/seamless-config --type merge -p "{\"data\":{$before}}" ||
-      left="seamless-config could not be put back: set {$before} in it yourself"
+      kept="seamless-config could not be put back: set {$before} in it yourself"
   fi
-  if [ "${2-}" = undo ] &&
-    ! { kube rollout undo deployment/seamless && kube wait --for=condition=Available deployment/seamless \
-      "--timeout=${TIMEOUT}s"; }; then
-    left="${left:+$left; }the template was not rolled back: find the revision before this capacity with $KUBE -n $NS \
-rollout history deployment/seamless and roll back to it (--to-revision)"
+  if [ "${2-}" = undo ]; then
+    if ! kube rollout undo deployment/seamless; then
+      left="the template was not rolled back: find the revision before this capacity with $KUBE -n $NS rollout \
+history deployment/seamless and roll back to it (--to-revision)"
+    elif ! kube wait --for=condition=Available deployment/seamless "--timeout=${TIMEOUT}s"; then
+      left="the template is back as it was, but its pod is not available after ${TIMEOUT}s - see $KUBE -n $NS \
+describe replicaset -l app.kubernetes.io/name=seamless; roll back no further"
+    fi
+    [ -z "$kept" ] || kept="$kept, then scripts/seamless-ctl.sh $PLATFORM restart: the pod the undo started read the new ones"
   fi
-  [ -z "$left" ] || die "$1, and $left"
+  [ -z "$kept$left" ] || die "$1, and $kept${kept:+${left:+; }}$left"
   die "$1: seamless-config and the pod template are put back as they were"
 }
 
