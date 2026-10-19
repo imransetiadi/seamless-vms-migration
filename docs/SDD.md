@@ -2329,9 +2329,12 @@ class DestinationProvider(Protocol):
         # within the call's bound (§8.1); Cinder's `error` is a provider error; a volume not attached to that server
         # is no error and is neither detached nor waited for (§7.2, review PV-03)
     async def server_of_address(self, address: str) -> str | None
-        # the Nova server holding the address: a compute port (`device_owner` `compute:*`) with it as a fixed IP,
-        # else the compute port Neutron's floating IP of that address is associated with; None when none (§7.2
-        # VMware rollback, review RV30-06)
+        # the Nova server of the credential's project holding the address - where the kit's conversion host and its
+        # volumes live; an admin credential sees every project's ports, and tenant networks overlap: a compute port
+        # (`device_owner` `compute:*`) of that project with it as a fixed IP, else the compute port of that project
+        # Neutron's floating IP of that address is associated with; None when none; two servers holding it (two
+        # networks of one subnet, or a credential whose project cannot be read) are a provider error naming them
+        # (§7.2 VMware rollback, reviews RV30-06, PV-04)
     async def server_volumes(self, server_id: str) -> list[str]
         # the ids of the volumes Nova lists as attached to the server - its record alone, no Cinder or Neutron
         # call; a server gone holds none (§7.2 VMware rollback, review RV30-04)
