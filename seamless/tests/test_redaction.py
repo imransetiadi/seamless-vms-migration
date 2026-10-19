@@ -301,3 +301,100 @@ def test_redact_writes_nul_and_lone_surrogates_as_the_replacement_character():
         "evidence": ["da�ta"],
         "o�k": "v�",
     }
+
+
+#: a synthetic secret with a space and both quote kinds (review RV50-10)
+QUOTED_SECRET = "Fake Pass'Word\"-9x"  # gitleaks:allow
+
+
+def _nested(payload: dict, levels: int) -> str:
+    """``payload`` as JSON, then put into a JSON string ``levels - 1`` more times - a command's
+    stdout holding JSON, inside a task result, inside Ansible's callback."""
+    text = json.dumps(payload)
+    for _ in range(levels - 1):
+        text = json.dumps({"stdout": text})
+    return text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        *(_nested({"password": QUOTED_SECRET}, levels) for levels in (1, 2, 3, 4)),
+        repr({"password": QUOTED_SECRET}),
+        f"password={QUOTED_SECRET!r}",
+        json.dumps({"msg": repr({"password": QUOTED_SECRET})}),
+        "password: 'Fake Pass''Word\"\n  -9x'\n",
+    ],
+    ids=[
+        "json",
+        "json-in-json",
+        "json-in-json-in-json",
+        "four-levels",
+        "repr-dict",
+        "repr-value",
+        "repr-in-json",
+        "yaml-over-lines",
+    ],
+)
+def test_a_quoted_secret_is_removed_whole_at_any_escape_level(text):
+    """SDD §13.4 (review RV50-10): a quoted value runs to its own closing quote, read as its
+    quoting reads it - at the escape level of its key, however many JSON strings hold it, and in a
+    Python repr, whose single-quoted strings escape a quote with a backslash, and over lines in
+    YAML. Three levels kept everything after the secret's first space, and a repr's \' ended the
+    value early."""
+    out = redact(text)
+    assert "[REDACTED]" in out and "Pass" not in out and "-9x" not in out, out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{password: 'FakeAlpha\\', token: 'FakeWhiskey-23'}",
+        "export OS_PASSWORD='FakeAlpha\\'; export OS_TOKEN='FakeWhiskey-23'",
+        "password: 'FakeAlpha\\'\ntoken: 'FakeWhiskey-23'\n",
+        "{'password': 'FakeAlpha\\\\', 'token': 'FakeWhiskey-23'}",
+    ],
+    ids=["yaml-flow", "shell", "yaml-lines", "repr-backslash"],
+)
+def test_a_backslash_ending_a_single_quoted_value_hides_no_later_secret(text):
+    """SDD §13.4 (review RV50-10): YAML and the shell keep a backslash before a single quote, a
+    Python repr reads it as an escape - read either way, neither the value nor a credential after
+    it on its line or the next survives."""
+    out = redact(text)
+    assert "FakeAlpha" not in out and "Whiskey" not in out, out
+
+
+@pytest.mark.parametrize(
+    ("text", "kept"),
+    [
+        # a secret ending in a backslash: 2E + 2 backslashes for it, then the E of the close
+        *(
+            (
+                _nested({"password": "FakeEnd\\", "port": 5432}, levels),
+                "[REDACTED], " + "\\" * (2 ** (levels - 1) - 1) + '"port',
+            )
+            for levels in (2, 3, 4)
+        ),
+        # a bare quote ends a string inside JSON strings: it is no longer inside one
+        ('password=\\"FakeEnd raw" port 5432', '[REDACTED]" port 5432'),
+        # one that never closes - a cut, a broken quote - is removed to its line's end
+        ('{\\"password\\": \\"FakeEnd raw\nport 5432', "[REDACTED]\nport 5432"),
+        ("{'password': 'FakeEnd', 'port': 5432}", "[REDACTED], 'port': 5432"),
+        ("password: 'FakeEnd'. port 5432", "[REDACTED]. port 5432"),
+    ],
+    ids=[
+        "json-in-json",
+        "json-in-json-in-json",
+        "four-levels",
+        "bare-quote",
+        "unclosed",
+        "repr",
+        "prose",
+    ],
+)
+def test_what_follows_a_quoted_secret_stays(text, kept):
+    """SDD §13.4 (review RV50-10): a quoted value ends at its own close - the text after it is
+    kept, the next field of the same JSON object whole - and a string inside JSON strings that
+    never closes is removed to the end of its line."""
+    out = redact(text)
+    assert "FakeEnd" not in out and "raw" not in out and kept in out, out

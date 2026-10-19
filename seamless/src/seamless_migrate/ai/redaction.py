@@ -33,6 +33,15 @@ _PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]+-----")
 _PEM_END = re.compile(r"-----END [A-Z0-9 ]+-----")
 
 
+#: What may follow a single-quoted value: a delimiter, a closing bracket, a double quote or a
+#: backslash - the string holding it ends, a JSON escape follows -, or nothing.
+_VALUE_END = r"(?:[\s,;&})\].:\"\\]|\Z)"
+#: Where a string inside JSON strings closes: the backslashes that opened it before a quote, after
+#: any number of the 2E + 2 each of its own backslashes became (E the opening's backslashes); a
+#: quote of its own has 2E + 1 before it.
+_ESCAPED_CLOSE = r"(?:(?P=escape){2}\\\\)*+(?P=escape)\""
+
+
 def _auth_block(match: re.Match[str]) -> str:
     end = "\n" if match.group(0).endswith("\n") else ""
     return f"{match.group(1)}auth: {REDACTED}{end}"
@@ -85,15 +94,24 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     # key=value / key: value / "key": "value" (the key possibly prefixed, e.g. OS_PASSWORD), which
     # also covers X-Auth-Token / X-Subject-Token headers and Password=...; in connection strings.
     # A quoted value runs to its own closing quote, read as its quoting reads it, each run once:
-    # JSON's \" and YAML's '' stay inside it, and JSON inside a JSON string, as Ansible's output
-    # carries it (\"key\": \"value\"), ends at the first \" that no escape holds (SDD §13.4,
-    # audit AD-08)
+    # JSON's \" and YAML's '' stay inside it, a Python repr's \' too, and a string inside JSON
+    # strings - Ansible's output carries JSON in JSON (\"key\": \"value\") - closes at the
+    # escape that opened it, however deep. A key's quote is looked for where its backslashes
+    # start, so a run of them costs time linear in its length (SDD §13.4, audit AD-08, reviews
+    # RV50-01, RV50-10)
     (
         re.compile(
-            r"(?i)((?:\\*[\"'])?" + _SCANNED_KEY + r"(?:\\*[\"'])?\s*[:=]\s*)"
+            r"(?i)((?:(?<!\\)\\*+[\"'])?" + _SCANNED_KEY + r"(?:\\*+[\"'])?\s*[:=]\s*)"
             r"(\"(?:[^\"\\]|\\.)*+\""  # a JSON or a shell string
-            r"|'(?:[^']|'')*+'"  # a YAML single-quoted string
-            r"|\\\"(?:[^\"\\]|\\[^\"\\]|\\\\(?:[^\"\\]|\\\\|\\\"))*+\\\""  # inside a JSON string
+            # a Python, YAML or shell string on one line: a backslash escapes, '' is a quote, and
+            # a close glued to more text read an escaped quote as one, so the value runs on to a
+            # close that ends it - YAML's 'C:\' and a repr inside JSON (\\') leave nothing out
+            r"|'(?:[^'\\\n]|\\.|'')*+'"
+            r"(?:(?!" + _VALUE_END + r")(?:[^'\n]|'(?!" + _VALUE_END + r"))*+(?:'|(?=\n)|\Z))?"
+            r"|'(?:[^']|'')*+'"  # a YAML single-quoted string over lines
+            # a string inside JSON strings, to its close, a bare quote or its line's end
+            r"|(?P<escape>\\++)\"(?:[^\"\\\n]|(?!" + _ESCAPED_CLOSE + r")\\++\"?)*+"
+            r"(?:" + _ESCAPED_CLOSE + r"|(?=[\n\"])|\Z)"
             r"|[^\s,;&}]+)"
         ),
         r"\1" + REDACTED,

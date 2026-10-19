@@ -213,6 +213,14 @@ def test_memory_hits_are_redacted_where_they_enter():
         'password: \\"x ' * 2520,
         "password: '" + "''" * 16384,
         'password: "' + '\\"' * 16384,
+        # a run of backslashes: a key's quote may follow one, read once from its start (RV50-01)
+        "\\" * 32768,
+        "\\" * 32767 + '"',
+        # single-quoted values whose close is glued to text, or comes lines later, and strings
+        # inside JSON strings each one level deeper: every value is read once (RV50-10)
+        "password: 'a'x " * 2340,
+        "password: 'a\n" * 2730,
+        "".join("password: " + "\\" * depth + '"a ' for depth in range(1, 220)),
     ],
     ids=[
         "key prefix",
@@ -223,6 +231,11 @@ def test_memory_hits_are_redacted_where_they_enter():
         "escaped quotes",
         "doubled quotes",
         "quotes escaped in a string",
+        "backslash run",
+        "backslash run then a quote",
+        "glued single-quoted closes",
+        "single-quoted values over lines",
+        "deeper and deeper escapes",
     ],
 )
 def test_redact_costs_time_linear_in_the_text(text):
@@ -248,6 +261,7 @@ def test_redact_costs_time_linear_in_the_text(text):
         "a.",
         "-",
         "ab.",
+        "\\",
     ],
     ids=[
         "jwt starts",
@@ -259,6 +273,7 @@ def test_redact_costs_time_linear_in_the_text(text):
         "key prefix",
         "dash line",
         "dotted words",
+        "backslashes",
     ],
 )
 def test_four_times_the_text_costs_redact_about_four_times_the_time(unit):
