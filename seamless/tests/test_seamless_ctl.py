@@ -1022,10 +1022,12 @@ def test_a_drain_waits_while_a_migration_verifies_or_rolls_back_too(tmp_path):
 
 
 def test_a_drain_whose_pause_fails_names_the_plans_it_already_paused(tmp_path):
-    """SDD §17.2 (review RV38B-05): --drain prints the plans it paused - also when it stops
-    half-way: plan-bb's pause failed (it completed meanwhile, 409) after plan-aa's succeeded, and
-    plan-aa, paused for good, is named with the resume command, as a drain that times out names
-    them; it died naming none, and a second drain lists running plans only."""
+    """SDD §17.2 (reviews RV38B-05, RV43A-04): --drain prints the plans it paused - also when it
+    stops half-way: plan-bb's pause was refused (it completed meanwhile, 409) after plan-aa's
+    succeeded, and plan-aa, paused for good, is named with the resume command, as a drain that
+    times out names them; it died naming none, and a second drain lists running plans only. The
+    API answered plan-bb's pause with an error - curl -f's exit 22 -, so it was not paused, and is
+    not named: resume would start a plan that failed meanwhile again."""
     rules = [
         {"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"stdout": RUNNING}]},
         {"cmd": "curl", "has": ["plan-bb/pause"], "answers": [{"exit": 22}]},
@@ -1033,8 +1035,9 @@ def test_a_drain_whose_pause_fails_names_the_plans_it_already_paused(tmp_path):
     proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", rules=rules)
     paused = [c for c in calls if c["cmd"] == "curl" and c["args"][-1].endswith("plan-aa/pause")]
     assert proc.returncode == 1 and paused
-    assert "cannot pause plan plan-bb" in proc.stderr
-    assert "resume" in proc.stderr and "plan-aa" in proc.stderr, proc.stderr
+    assert "the API refused to pause plan plan-bb" in proc.stderr, proc.stderr
+    assert "may be paused" not in proc.stderr, proc.stderr
+    assert f"resume --token-file {tmp_path / 'operator.token'} plan-aa\n" in proc.stderr
     assert not [c for c in calls if c["cmd"] == "make"]  # nothing was stopped
 
 

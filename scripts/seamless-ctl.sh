@@ -243,7 +243,7 @@ count_items() { python3 -c 'import json, sys; print(len(json.load(sys.stdin)))';
 # Pause every running plan, then wait until no migration is in cutover, verifying or rolling_back (SDD §17.2).
 PAUSED=()
 drain() {
-  local plans ids id phase out busy deadline
+  local plans ids id phase out busy deadline rc
   if [ "$DRY" = 1 ]; then
     api -H "$HEADER" "$API/api/v1/plans?status=running"
     say "# then, for each running plan:"
@@ -266,10 +266,17 @@ for plan in json.load(sys.stdin):
       '' | .* | *[!A-Za-z0-9._-]*) drain_failed "the API returned a plan id this script will not use: '$id'" ;;
     esac
     # named before its answer: a pause the API applied whose answer never came - a timeout, an interrupt - leaves the
-    # plan paused, and resume starts a running plan as it is (SDD §17.2, review RV42A-06)
+    # plan paused, and resume starts a running plan as it is (SDD §17.2, review RV42A-06). An error the API answered -
+    # curl -f's 22: a plan no longer running - paused nothing, and resume would start a plan failed meanwhile again: it
+    # is named no more (review RV43A-04).
     PAUSED+=("$id")
-    curl -fsS --max-time 30 -X POST -H "$HEADER" -o /dev/null "$API/api/v1/plans/$id/pause" ||
-      drain_failed "cannot pause plan $id - it may be paused all the same"
+    rc=0
+    curl -fsS --max-time 30 -X POST -H "$HEADER" -o /dev/null "$API/api/v1/plans/$id/pause" || rc=$?
+    if [ "$rc" = 22 ]; then
+      unset "PAUSED[$((${#PAUSED[@]} - 1))]"
+      drain_failed "the API refused to pause plan $id"
+    fi
+    [ "$rc" = 0 ] || drain_failed "cannot pause plan $id - it may be paused all the same"
   done
   if [ ${#PAUSED[@]} -gt 0 ]; then say "paused: ${PAUSED[*]}"; else say "no plan was running"; fi
   deadline=$(($(date +%s) + WAIT_TIMEOUT))
