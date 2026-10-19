@@ -23,9 +23,9 @@ function names(list: string[]): string {
 
 /**
  * Plan actions (SDD §12: all need `operator`). Status rules: PATCH-like actions (auto waves) only in
- * draft/validated; validate anything that is not running or completed; start validated or paused
- * plans (the API answers 409 while a migration is blocked or, in a plan with waves, belongs to no wave);
- * pause running plans.
+ * draft/validated; validate anything that is not running or cancelled, as `validate_plan` refuses those two - a
+ * completed plan is validated again, then editable (SDD §8.1, §16); start validated or paused plans (the API
+ * answers 409 while a migration is blocked or, in a plan with waves, belongs to no wave); pause running plans.
  */
 export function planActions(plan: Plan, role: Role | undefined, migrations: readonly MigrationLike[]): Record<PlanActionKey, Availability> {
   const finalizeGate = (): Availability => {
@@ -109,13 +109,11 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: read
   };
 
   return {
+    // like validate_plan (SDD §8.1, §16): only a running plan (paused first) and a cancelled one are refused - a plan
+    // whose every VM rolled back over a plan setting is validated again, then edited (audit DB-01)
     validate: gate(
-      status !== 'running' && status !== 'completed' && status !== 'cancelled',
-      status === 'running'
-        ? 'Pause the plan before re-validating it.'
-        : status === 'cancelled'
-          ? 'A cancelled plan cannot be validated.'
-          : 'A completed plan cannot be re-validated.',
+      status !== 'running' && status !== 'cancelled',
+      status === 'running' ? 'Pause the plan before re-validating it.' : 'A cancelled plan cannot be validated.',
     ),
     // like the API (SDD §12): draft, validated or paused; the plan then returns to draft
     waves: gate(

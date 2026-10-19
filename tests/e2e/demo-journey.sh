@@ -2,13 +2,13 @@
 # demo-journey.sh - AC-1 shape in demo mode (QASuite §14.7, FR-17): wait for a warm migration that waits
 # for its cutover, cut it over, assert the outcome and print its audit trail.
 #
-#   export TOKEN='smg_...'            # an admin or approver token (never printed)
-#   export APPROVER_TOKEN='smg_...'   # an approver of another user: the requester never approves (SDD §5.4)
+#   read -rs TOKEN && export TOKEN                    # an admin or approver token (never printed)
+#   read -rs APPROVER_TOKEN && export APPROVER_TOKEN  # an approver of another user: the requester never approves (SDD §5.4)
 #   tests/e2e/demo-journey.sh         # BASE defaults to http://127.0.0.1:8080/api/v1
 set -euo pipefail
 BASE=${BASE:-http://127.0.0.1:8080/api/v1}
-: "${TOKEN:?export TOKEN=<admin or approver token>}"
-: "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
+: "${TOKEN:?read -rs TOKEN && export TOKEN: an admin or approver token}"
+: "${APPROVER_TOKEN:?read -rs APPROVER_TOKEN && export APPROVER_TOKEN: an approver token of another user (maker-checker, SDD 5.4)}"
 # shellcheck source=tests/e2e/token-headers.sh
 . "$(dirname "$0")/token-headers.sh"   # the tokens reach curl from header files, never argv
 H=$(token_header admin "$TOKEN")

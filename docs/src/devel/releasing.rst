@@ -27,9 +27,12 @@ equal to galaxy.yml's) and any hardcoded values in functional tests:
 
 .. code:: bash
 
-   sed -i -e "s/^version: $OLD_VERSION/version: $NEW_VERSION/" .//galaxy.yml
-   sed -i -e "s/^OS_MIGRATE_VERSION = \"$OLD_VERSION\"/OS_MIGRATE_VERSION = \"$NEW_VERSION\"/" plugins/module_utils/const.py
-   grep -lr "os_migrate_version: $OLD_VERSION" ./tests | xargs sed -i -e "s/^os_migrate_version: $OLD_VERSION/os_migrate_version: $NEW_VERSION/"
+   # perl -pi: one form for GNU and BSD (macOS) alike - BSD sed -i -e would leave "-e" backup files
+   perl -pi -e "s/^version: \Q$OLD_VERSION\E/version: $NEW_VERSION/" galaxy.yml
+   perl -pi -e "s/^OS_MIGRATE_VERSION = \"\Q$OLD_VERSION\E\"/OS_MIGRATE_VERSION = \"$NEW_VERSION\"/" plugins/module_utils/const.py
+   grep -lr "os_migrate_version: $OLD_VERSION" ./tests | while read -r f; do
+     perl -pi -e "s/^os_migrate_version: \Q$OLD_VERSION\E/os_migrate_version: $NEW_VERSION/" "$f"
+   done
 
 Create a pull request with these changes. Once it's merged, check out
 the merge commit and release to galaxy. ``scripts/publish.sh`` builds the

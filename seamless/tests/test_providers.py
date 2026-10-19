@@ -559,6 +559,31 @@ async def test_openstack_transitional_nova_states_are_reported(stub_openstack):
     assert vm.power_state == "transitioning"
 
 
+@pytest.mark.parametrize(
+    "status, task",
+    [
+        ("ACTIVE", "image_uploading"),
+        ("ACTIVE", "powering-off"),
+        ("SHUTOFF", "image_snapshot"),
+        ("ACTIVE", None),
+    ],
+)
+async def test_openstack_a_task_in_flight_is_read_apart_from_the_power_state(
+    stub_openstack, status, task
+):
+    """SDD §4.2 (review PV-05): Nova runs a task under a steady status - a backup's image snapshot
+    or its upload, a stop in flight - and reports it as OS-EXT-STS:task_state. The VM carries it
+    as task_state, and its power state stays what the status says: the source watch still reads a
+    running guest a backup snapshots as running (§8.1)."""
+    conn = fake_conn()
+    [server] = conn.compute._servers.values()
+    server.status, server.task_state = status, task
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    power = {"ACTIVE": "running", "SHUTOFF": "stopped"}[status]
+    assert (vm.power_state, vm.task_state) == (power, task)
+
+
 async def test_openstack_get_vm_tells_a_server_the_cloud_lacks_from_a_failing_cloud(stub_openstack):
     """SDD §8.1, §10: the source watch clears a source that ran again once its cloud says the VM is
     gone - a 404 is VMNotFound; any other failure stays a plain ProviderError (not gone)."""
@@ -684,6 +709,32 @@ async def test_every_openstack_check_reports_the_shared_keys(tmp_path):
     for provider in (community, community.model_copy(update={"kind": ProviderKind.rhoso})):
         caps = await FakeDestinationProvider(provider=provider).check()
         assert sorted(caps) == destination, provider.kind
+
+
+async def test_every_vmware_check_reports_the_shared_keys(tmp_path):
+    """SDD §10 (review PV-06): the real vCenter check and the demo's fake vCenter report the keys of
+    check_report_keys.json's vmware list, the file the dashboard's mock is held to as well: the
+    demo's providers page showed an "Admin access" no vCenter check computes, and missed the
+    version and the VM count every real check reports."""
+    keys = json.loads((VERSIONS.parent / "check_report_keys.json").read_text(encoding="utf-8"))
+    expected = sorted(keys["vmware"])
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    real = VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda **_: fake_service_instance([fake_vcenter_vm()]),
+        vim=FAKE_VIM,
+    )
+    assert sorted(await real.check()) == expected
+    demo = FakeSourceProvider(ProviderKind.vmware)
+    caps = await demo.check()
+    assert sorted(caps) == expected
+    assert caps["vm_count"] == len(await demo.list_vms())
 
 
 def _versions(conn, compute, block_storage):
@@ -1652,6 +1703,79 @@ def test_openstack_connect_builds_kwargs_from_clouds_yaml(monkeypatch, tmp_path)
     assert osp._truthy(1) and not osp._truthy(0)
 
 
+#: server names Nova reads differently as a regular expression - a group, a quantifier, an
+#: alternation, a class, an escape, anchors, any character - and names that hold no such character
+NOVA_NAMES = [
+    "app (blue)",
+    "db+1",
+    "web(1",
+    "a|b",
+    "a|",
+    "x?",
+    "web[2]",
+    "c:\\temp",
+    "^lead",
+    "tail$",
+    "dot.name",
+    "web-01",
+    "em\u2014dash (2)",
+    "\u65e5\u672c-\u30b5\u30fc\u30d0",
+]
+
+
+@pytest.mark.parametrize("nova_db", ["postgresql", "mysql"])
+@pytest.mark.parametrize("name", NOVA_NAMES)
+async def test_openstack_find_server_finds_a_name_nova_reads_as_a_regular_expression(
+    tmp_path, name, nova_db
+):
+    """Nova reads the ``name`` filter of its server list as a regular expression searched anywhere
+    in the name - on MySQL/MariaDB after escaping ``|`` itself, on PostgreSQL as sent - and refuses
+    one that is none with 400: the lookup finds the server named exactly so, never one whose name
+    holds it or differs where the pattern reads any character (SDD §10, review PV-01)."""
+    servers = [
+        {"id": "srv-1", "name": name},
+        {"id": "srv-2", "name": "unrelated"},
+        {"id": "srv-3", "name": f"{name}-old"},
+        {"id": "srv-4", "name": f"old-{name}"},
+    ]
+    similar = "".join("Z" if c.isascii() and not (c.isalnum() or c in " _-") else c for c in name)
+    if similar != name:
+        servers.append({"id": "srv-5", "name": similar})
+    cloud = InProcessCloud(tmp_path, servers=servers, nova_db=nova_db)
+    dst = make_provider(id="dst", role=ProviderRole.destination, endpoint=AUTH_URL, cloud="dst")
+    provider = OpenStackProvider(dst, cloud.settings, connect_fn=cloud.connect)
+
+    assert await provider.find_server(name) == "srv-1"
+
+
+async def test_openstack_find_server_sends_an_anchored_pattern_and_refuses_two_of_a_name(tmp_path):
+    """The lookup sends Nova ``^...$`` with every ASCII character but a letter, a digit, a space,
+    ``_`` and ``-`` as ``.``: no alternation, group, class or escape on any backend. No server of
+    the name is None; two are a provider error (SDD §10, review PV-01)."""
+    import urllib.parse
+
+    cloud = InProcessCloud(
+        tmp_path,
+        servers=[{"id": "srv-1", "name": "app (blue)_1-a"}, {"id": "srv-2", "name": "web-01"}],
+    )
+    dst = make_provider(id="dst", role=ProviderRole.destination, endpoint=AUTH_URL, cloud="dst")
+    provider = OpenStackProvider(dst, cloud.settings, connect_fn=cloud.connect)
+
+    assert await provider.find_server("app (blue)_1-a") == "srv-1"
+    assert await provider.find_server("absent") is None
+    # no metacharacter outside ASCII
+    assert await provider.find_server("caf\u00e9\u2014(2)") is None
+    sent = [
+        urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["name"][0]
+        for method, url in cloud.seen
+        if method == "GET" and "name=" in url
+    ]
+    assert sent == ["^app .blue._1-a$", "^absent$", "^caf\u00e9\u2014.2.$"]
+    cloud.servers.append({"id": "srv-3", "name": "web-01"})
+    with pytest.raises(ProviderError, match=r"^dst: more than one server is named 'web-01'$"):
+        await provider.find_server("web-01")
+
+
 async def test_openstack_destination_ports_match_every_filter_and_delete_is_idempotent():
     """SDD §10 (§7.2 VMware networks, review RT-11): ports() returns the ports matching every
     filter given, checked again here in case the server ignores one, with the MAC compared in
@@ -1976,11 +2100,15 @@ async def test_openstack_delete_volume_waits_for_a_deletion_cinder_runs(case):
     assert deletes == (["v1"] if case == "began meanwhile" else [])
 
 
-async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_free():
-    """SDD §10 (§7.2 VMware rollback, review RV29-02): detach_volume removes Nova's attachment of
-    the volume to the server, ignoring one already gone, and waits until Cinder reads the volume
-    available, within the call's bound."""
-    calls = []
+def _detaching(monkeypatch, reads, calls, *, step=0.0):
+    """An OpenStackProvider whose Cinder answers ``reads`` (the volume, read after read) and whose
+    clock advances ``step`` seconds a look; ``calls`` records what it asked."""
+    from openstack import exceptions
+
+    from seamless_migrate.providers import openstack as osp
+
+    answered = [0]
+    clock = [0.0]
 
     class Compute:
         def delete_volume_attachment(self, server, volume, ignore_missing=True):
@@ -1988,25 +2116,118 @@ async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_fre
 
     class BlockStorage:
         def get_volume(self, volume_id):
-            return NS(id=volume_id, status="detaching")
+            calls.append(("get_volume", volume_id))
+            answered[0] += 1
+            return reads[min(answered[0], len(reads)) - 1]  # the last answer stays
 
         def wait_for_status(self, volume, status="available", failures=None, interval=2, wait=None):
-            calls.append(("wait_for_status", volume.id, status, failures, wait is not None))
-            return volume
+            # openstacksdk's wait: reads the volume until it reads the status, else times out
+            for _ in range(3):
+                volume = self.get_volume(volume.id)
+                if volume.status == status:
+                    return volume
+            raise exceptions.ResourceTimeout(
+                f"Timeout waiting for Volume:{volume.id} to transition to {status}"
+            )
 
+    def tick():
+        clock[0] += step
+        return clock[0]
+
+    monkeypatch.setattr(osp, "time", NS(monotonic=tick, sleep=lambda s: calls.append(("sleep", s))))
     dst = make_provider(
         id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
     )
-    provider = OpenStackProvider(
+    return OpenStackProvider(
         dst,
         settings(),
         connect_fn=lambda p, s: NS(compute=Compute(), block_storage=BlockStorage()),
     )
+
+
+def _volume(status, *holders):
+    return NS(id="vol-1", status=status, attachments=[{"server_id": s} for s in holders])
+
+
+async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_free(monkeypatch):
+    """SDD §10 (§7.2 VMware rollback, reviews RV29-02, PV-03): detach_volume removes Nova's
+    attachment of the volume to the server, ignoring one already gone, and waits until Cinder no
+    longer lists the server among the volume's attachments, within the call's bound."""
+    calls = []
+    reads = [
+        _volume("in-use", "srv-conv"),
+        _volume("detaching", "srv-conv"),
+        _volume("available"),
+    ]
+    provider = _detaching(monkeypatch, reads, calls)
     await provider.detach_volume("srv-conv", "vol-1")
     assert calls == [
+        ("get_volume", "vol-1"),
         ("delete_volume_attachment", "srv-conv", "vol-1", True),
-        ("wait_for_status", "vol-1", "available", ["error"], True),
+        ("get_volume", "vol-1"),
+        ("sleep", 2),
+        ("get_volume", "vol-1"),
     ]
+
+
+@pytest.mark.parametrize(
+    "holders", [(), ("srv-dst",)], ids=["attached nowhere", "held by another server"]
+)
+async def test_openstack_detach_volume_of_a_volume_the_server_does_not_hold_is_no_error(
+    monkeypatch, holders
+):
+    """SDD §10 (review PV-03): a volume not attached to that server - attached nowhere, or held by
+    another server only - is no error, and is neither detached nor waited for: Cinder never reads
+    such a volume available from this detach, so the wait ran out its whole bound, then failed."""
+    calls = []
+    provider = _detaching(
+        monkeypatch, [_volume("in-use" if holders else "available", *holders)], calls
+    )
+    await provider.detach_volume("srv-conv", "vol-1")
+    assert calls == [("get_volume", "vol-1")]
+
+
+async def test_openstack_detach_volume_of_a_multiattach_volume_ends_once_that_server_lets_go(
+    monkeypatch,
+):
+    """SDD §10 (review PV-03): a multi-attach volume another server still holds stays in-use after
+    the detach - the wait ends once Cinder no longer lists the server, never waiting for
+    available."""
+    calls = []
+    reads = [_volume("in-use", "srv-conv", "srv-dst"), _volume("in-use", "srv-dst")]
+    provider = _detaching(monkeypatch, reads, calls)
+    await provider.detach_volume("srv-conv", "vol-1")
+    assert calls == [
+        ("get_volume", "vol-1"),
+        ("delete_volume_attachment", "srv-conv", "vol-1", True),
+        ("get_volume", "vol-1"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "case, reads, message",
+    [
+        (
+            "still held",
+            [_volume("in-use", "srv-conv")] * 5,
+            r"^dst: volume vol-1 is still attached to srv-conv$",
+        ),
+        (
+            "cinder failed",
+            [_volume("in-use", "srv-conv"), _volume("error", "srv-conv")],
+            r"^dst: volume vol-1 is in error: Cinder failed to detach it from srv-conv$",
+        ),
+    ],
+)
+async def test_openstack_detach_volume_names_a_volume_the_server_keeps(
+    monkeypatch, case, reads, message
+):
+    """SDD §10 (review PV-03): a volume the server still holds when the call's bound ends, or one
+    Cinder reads in error, is a provider error naming the volume and the server."""
+    calls = []
+    provider = _detaching(monkeypatch, reads, calls, step=100.0)
+    with pytest.raises(ProviderError, match=message):
+        await provider.detach_volume("srv-conv", "vol-1")
 
 
 async def test_openstack_destination_finds_the_server_holding_an_address():
@@ -2054,6 +2275,93 @@ async def test_openstack_destination_finds_the_server_holding_an_address():
     assert await provider.server_of_address("198.51.100.40") == "srv-conv"
     assert await provider.server_of_address("10.0.0.1") is None  # a router's
     assert await provider.server_of_address("203.0.113.9") is None
+
+
+def _compute_port(port_id, server, project, address):
+    return NS(
+        id=port_id,
+        device_id=server,
+        device_owner="compute:nova",
+        project_id=project,
+        fixed_ips=[{"ip_address": address}],
+    )
+
+
+async def test_openstack_server_of_address_names_only_the_credentials_projects_server():
+    """SDD §10 (§7.2 VMware rollback, review PV-04): an admin credential sees every project's ports,
+    and tenant networks overlap - the server holding the address is the credential's project's,
+    where the kit's conversion host and volumes live: its listing asks Neutron for that project,
+    what Neutron returns is checked again, and a floating IP counts only through a port of that
+    project. Two of the project's servers holding the address (two networks of one subnet) are a
+    provider error naming them."""
+    ports = [
+        _compute_port("other-port", "srv-of-another-project", "p-other", "10.0.0.5"),
+        _compute_port("conv-port", "srv-conversion-host", "p1", "10.0.0.5"),
+    ]
+    floating = [NS(floating_ip_address="198.51.100.7", port_id="other-port")]
+    asked = []
+
+    class Network:
+        def ports(self, fixed_ips, **query):
+            asked.append(query)
+            address = fixed_ips[0].split("=", 1)[1]
+            # every project's ports whatever the query: the check after the listing decides
+            return [p for p in ports if address in [ip["ip_address"] for ip in p.fixed_ips]]
+
+        def ips(self, floating_ip_address):
+            return [f for f in floating if f.floating_ip_address == floating_ip_address]
+
+        def get_port(self, port_id):
+            return {p.id: p for p in ports}[port_id]
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    conn = NS(network=Network(), current_project_id="p1")
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: conn)
+
+    assert await provider.server_of_address("10.0.0.5") == "srv-conversion-host"
+    assert asked == [{"project_id": "p1"}]
+    # a floating IP associated with another project's server is none of the project's
+    assert await provider.server_of_address("198.51.100.7") is None
+    ports.append(_compute_port("twin-port", "srv-twin", "p1", "10.0.0.5"))
+    twins = r"^dst: more than one server holds 10\.0\.0\.5: srv-conversion-host, srv-twin$"
+    with pytest.raises(ProviderError, match=twins):
+        await provider.server_of_address("10.0.0.5")
+
+
+async def test_openstack_server_of_address_without_the_project_refuses_two_servers():
+    """SDD §10 (review PV-04): a credential whose project cannot be read lists every project's
+    ports it sees; two servers holding the address are a provider error, never the first one
+    Neutron lists."""
+    ports = [
+        _compute_port("other-port", "srv-of-another-project", "p-other", "10.0.0.5"),
+        _compute_port("conv-port", "srv-conversion-host", "p1", "10.0.0.5"),
+    ]
+    asked = []
+
+    class Network:
+        def ports(self, fixed_ips, **query):
+            asked.append(query)
+            address = fixed_ips[0].split("=", 1)[1]
+            return [p for p in ports if address in [ip["ip_address"] for ip in p.fixed_ips]]
+
+        def ips(self, floating_ip_address):
+            return []
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: NS(network=Network()))
+    both = (
+        r"^dst: more than one server holds 10\.0\.0\.5: "
+        r"srv-conversion-host, srv-of-another-project$"
+    )
+    with pytest.raises(ProviderError, match=both):
+        await provider.server_of_address("10.0.0.5")
+    assert asked == [{}]
+    ports.pop(0)
+    assert await provider.server_of_address("10.0.0.5") == "srv-conversion-host"
 
 
 @pytest.mark.parametrize("read", ["503", "gone"])
@@ -2308,6 +2616,123 @@ async def test_vmware_power_on_times_out(tmp_path, monkeypatch):
     )
     with pytest.raises(ProviderError, match="timed out"):
         await provider.power_on("5012-abcd")
+
+
+@pytest.mark.parametrize("verify, ca_cert", [(True, None), (True, "vcenter-ca.crt"), (False, None)])
+def test_vmware_connector_bounds_every_request_and_the_version_probe(
+    monkeypatch, caplog, verify, ca_cert
+):
+    """Every request of a vCenter connection gives up after the provider API timeout: pyVmomi's
+    ``httpConnectionTimeout`` bounds its SOAP requests, and the SSL context bounds every socket it
+    wraps without a timeout of its own - SmartConnect's version probe opens one and takes no
+    timeout. pyVmomi's own unverified context (``disableSslCertValidation``) would replace that
+    context, so verify_tls=false hands an unverified one of the provider's (SDD §10, review
+    PV-02)."""
+    import socket
+    import ssl
+
+    from seamless_migrate.providers import openstack as osp
+    from seamless_migrate.providers import vmware as vmw
+
+    seen: dict = {}
+    cafiles: list = []
+    real_default_context = ssl.create_default_context
+
+    def create_default_context(cafile=None):
+        cafiles.append(cafile)
+        return real_default_context()
+
+    def smart_connect(**kwargs):
+        seen.update(kwargs)
+        return NS()
+
+    monkeypatch.setattr(vmw, "_import_pyvmomi", lambda: (smart_connect, lambda si: None, NS()))
+    monkeypatch.setattr(vmw.ssl, "create_default_context", create_default_context)
+    vmw.default_connector("vcenter.example.org", 443, "svc", "placeholder", verify, ca_cert)
+
+    assert seen["httpConnectionTimeout"] == osp.PROVIDER_API_TIMEOUT_S
+    assert "disableSslCertValidation" not in seen
+    context = seen["sslContext"]
+    assert (context.verify_mode, context.check_hostname) == (
+        (ssl.CERT_REQUIRED, True) if verify else (ssl.CERT_NONE, False)
+    )
+    assert cafiles == ([ca_cert] if verify else [])
+    assert ("TLS certificate verification is disabled" in caplog.text) is not verify
+    # a socket without a timeout reads with the provider API timeout; one with its own keeps it
+    for own, expected in ((None, osp.PROVIDER_API_TIMEOUT_S), (5.0, 5.0)):
+        left, right = socket.socketpair()
+        left.settimeout(own)
+        wrapped = context.wrap_socket(
+            left, server_hostname="vcenter.example.org", do_handshake_on_connect=False
+        )
+        try:
+            assert wrapped.gettimeout() == expected
+        finally:
+            wrapped.close()
+            right.close()
+
+
+async def test_a_vcenter_that_accepts_and_never_answers_frees_the_worker_thread(
+    tmp_path, monkeypatch
+):
+    """A vCenter that accepts connections and never answers - an appliance hung while it is
+    patched - fails the call once a request gives up, the version probe of pyVmomi's real
+    SmartConnect included, and so frees the worker thread: provider calls share asyncio's default
+    executor with the store's, which a thread pinned per call would starve. The error names the
+    request's bound, not the call's (SDD §10, review PV-02)."""
+    import asyncio
+    import socket
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    pytest.importorskip("pyVim.connect")
+    from seamless_migrate.providers import vmware as vmw
+
+    server = socket.create_server(("127.0.0.1", 0))
+    server.settimeout(0.1)
+    held: list = []
+    stop = threading.Event()
+
+    def accept() -> None:  # accepts every connection, answers none
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except TimeoutError:
+                continue
+            held.append(conn)
+
+    acceptor = threading.Thread(target=accept, daemon=True)
+    acceptor.start()
+    monkeypatch.setattr(vmw, "PROVIDER_API_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(vmw, "PROVIDER_CALL_TIMEOUT_S", 3.0)
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    provider = vmw.VMwareProvider(
+        make_provider(
+            id="vcenter",
+            kind=ProviderKind.vmware,
+            credentials_secret="vcenter-dc2",
+            endpoint=f"https://127.0.0.1:{server.getsockname()[1]}/sdk",
+            cloud=None,
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+    )
+    executor = ThreadPoolExecutor(max_workers=1)  # the store's only thread as well
+    asyncio.get_running_loop().set_default_executor(executor)
+    try:
+        with pytest.raises(ProviderError, match=r"^vcenter: vCenter did not answer within 0\.2 s$"):
+            await provider.get_vm("5012-abcd")
+        assert held, "the call never reached the vCenter"
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: "stored"), 2.0) == "stored"
+    finally:
+        stop.set()
+        acceptor.join()
+        server.close()
+        for conn in held:
+            conn.close()
+        executor.shutdown(wait=True)
 
 
 class ShuttingDown:

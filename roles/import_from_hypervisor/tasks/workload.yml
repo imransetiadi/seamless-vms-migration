@@ -176,20 +176,135 @@
   ansible.builtin.set_fact:
     import_from_hypervisor_base_port: "{{ workload_item._migration_params.nbdkit_port | default(os_migrate_nbdkit_port) }}"
 
-- name: Process each disk
-  ansible.builtin.include_tasks: process_disk.yml
-  loop: "{{ import_from_hypervisor_disks_found }}"
-  loop_control:
-    loop_var: disk_item
-    index_var: disk_loop_index
-    label: "{{ disk_item | basename }}"
+# Every port this workload's disks would take, judged before its first export: one another disk of this run exports
+# on this hypervisor refuses the workload with nothing of it exported (Seamless Migrate SDD 6.6, upstream intake
+# UP-04a, review RV44B-05).
+- name: Refuse a workload whose ports another disk of this run exports on this hypervisor
+  ansible.builtin.assert:
+    that: import_from_hypervisor_port_clash | length == 0
+    fail_msg: >-
+      the disks of {{ import_from_hypervisor_instance_id }} would take port
+      {{ import_from_hypervisor_port_clash | join(', port ') }} on {{ import_from_hypervisor_host }},
+      which another disk of this run exports: give each workload on one hypervisor its own
+      _migration_params.nbdkit_port, its disks' ports apart
+    quiet: true
   vars:
-    # disk -> /dev/vda; disk.ephN (listed after disk) and others keep their order.
-    disk_device_name: >-
-      {{ '/dev/vda' if (disk_item | basename) == 'disk'
-         else '/dev/vd' ~ 'bcdefghijklmnopqrstuvwxyz'[disk_loop_index - 1
-           if 'disk.eph' in (disk_item | basename) else disk_loop_index] }}
-    disk_is_bootable: "{{ (disk_item | basename) == 'disk' }}"
+    import_from_hypervisor_port_clash: >-
+      {{ range(import_from_hypervisor_base_port | int,
+               (import_from_hypervisor_base_port | int) + (import_from_hypervisor_disks_found | length))
+         | list
+         | intersect(import_from_hypervisor_ports_taken[import_from_hypervisor_host] | default([])) }}
+
+# An earlier run's live export of another disk on one of this workload's ports refuses the workload here too, before its
+# first export: judged disk by disk in process_disk.yml, it refused only after the workload's earlier disks were
+# exported, and those stayed served, recorded nowhere (Seamless Migrate SDD 6.6, reviews RV44B-04, RV45B-01). The test
+# is process_disk.yml's: the qemu-nbd its port's PID file names, started with that PID file, serving another disk than
+# the one this workload's disk at that port is.
+- name: Find an earlier run's export of another disk on this workload's ports
+  ansible.builtin.raw: |
+    another() {
+      port=$1
+      disk=$2
+      pidfile={{ os_migrate_nbdkit_log_dir | quote }}/qemu-nbd-$port.pid
+      sudo test -s "$pidfile" || return 0
+      pid=$(sudo cat "$pidfile")
+      case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+      args=$(ps -ww -p "$pid" -o args= 2>/dev/null)
+      case "$args" in
+        *qemu-nbd*"--pid-file=$pidfile"*" $disk") ;;
+        *qemu-nbd*"--pid-file=$pidfile"*) echo "SERVES ANOTHER DISK: $port $args" ;;
+      esac
+    }
+    {% for disk in import_from_hypervisor_disks_found %}
+    another {{ (import_from_hypervisor_base_port | int) + loop.index0 }} {{ disk | quote }}
+    {% endfor %}
+  delegate_to: "{{ import_from_hypervisor_host }}"
+  register: import_from_hypervisor_earlier_exports
+  changed_when: false
+
+- name: Refuse a workload whose port an earlier run's export of another disk holds
+  ansible.builtin.assert:
+    that: import_from_hypervisor_held_ports | length == 0
+    fail_msg: >-
+      port {{ import_from_hypervisor_held_ports | join(', port ') }} on {{ import_from_hypervisor_host }} serves
+      another disk, an earlier run's export whose record still names it, which a disk of
+      {{ import_from_hypervisor_instance_id }} would stop: give this workload its own _migration_params.nbdkit_port,
+      or stop that export (its PID file {{ os_migrate_nbdkit_log_dir }}/qemu-nbd-<port>.pid) once its VM's import
+      is done
+    quiet: true
+  vars:
+    import_from_hypervisor_held_ports: >-
+      {{ import_from_hypervisor_earlier_exports.stdout_lines
+         | select('match', '^SERVES ANOTHER DISK: [0-9]+ ')
+         | map('regex_replace', '^SERVES ANOTHER DISK: ([0-9]+) .*$', '\1')
+         | list }}
+
+# A later disk refused or failing - sized at zero bytes or unreadable, its port held by a listener no PID file names, an
+# export that does not start - came after the workload's earlier disks were exported, and those ran on, recorded
+# nowhere: a failure of any disk stops the workload's exports no record names before the run fails, so none of its
+# disks stays exported and unrecorded; an export its record names - a rerun's - keeps serving what the record says
+# (Seamless Migrate SDD 6.6, reviews RV44B-05, RV45B-01, RV46B-01).
+- name: Export each disk, and stop what the workload exported if one fails
+  block:
+    - name: Process each disk
+      ansible.builtin.include_tasks: process_disk.yml
+      loop: "{{ import_from_hypervisor_disks_found }}"
+      loop_control:
+        loop_var: disk_item
+        index_var: disk_loop_index
+        label: "{{ disk_item | basename }}"
+      vars:
+        # disk -> /dev/vda; disk.ephN (listed after disk) and others keep their order.
+        disk_device_name: >-
+          {{ '/dev/vda' if (disk_item | basename) == 'disk'
+             else '/dev/vd' ~ 'bcdefghijklmnopqrstuvwxyz'[disk_loop_index - 1
+               if 'disk.eph' in (disk_item | basename) else disk_loop_index] }}
+        disk_is_bootable: "{{ (disk_item | basename) == 'disk' }}"
+  rescue:
+    - name: Stop the workload's exports no record names
+      ansible.builtin.raw: |
+        unrecorded() {
+          port=$1
+          disk=$2
+          pidfile={{ os_migrate_nbdkit_log_dir | quote }}/qemu-nbd-$port.pid
+          sudo test -s "$pidfile" || return 0
+          pid=$(sudo cat "$pidfile")
+          case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+          args=$(ps -ww -p "$pid" -o args= 2>/dev/null)
+          case "$args" in
+            *qemu-nbd*"--pid-file=$pidfile"*" $disk")
+              echo "Stopping the export of $disk on port $port (qemu-nbd $pid)"
+              sudo kill "$pid"
+              n=0
+              while ps -p "$pid" > /dev/null 2>&1 && [ "$n" -lt 10 ]; do
+                sleep 1
+                n=$((n + 1))
+              done
+              if ps -p "$pid" > /dev/null 2>&1; then sudo kill -9 "$pid"; fi
+              sudo rm -f "$pidfile"
+              ;;
+          esac
+        }
+        {% for disk in import_from_hypervisor_disks_found %}
+        {% set port = (import_from_hypervisor_base_port | int) + loop.index0 %}
+        {% set kept = namespace(found=false) %}
+        {% for recorded in (workload_item._migration_params.nbdkit_disks | default([], true)) %}
+        {% if (recorded.port | int) == port and recorded.disk_path == disk %}{% set kept.found = true %}{% endif %}
+        {% endfor %}
+        {% if not kept.found %}
+        unrecorded {{ port }} {{ disk | quote }}
+        {% endif %}
+        {% endfor %}
+      delegate_to: "{{ import_from_hypervisor_host }}"
+      changed_when: "'Stopping the export' in import_from_hypervisor_stopped.stdout"
+      register: import_from_hypervisor_stopped
+
+    - name: Fail as the disk did
+      ansible.builtin.fail:
+        msg: >-
+          {{ ansible_failed_result.msg | default('the export of a disk failed') }}{{
+          (': ' ~ (ansible_failed_result.stdout | trim))
+          if (ansible_failed_result.stdout | default('') | trim) else '' }}
 
 - name: Update workload with multiple nbdkit URIs
   os_migrate.os_migrate.update_workload_nbdkit_uris:

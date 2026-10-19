@@ -6,6 +6,7 @@ import asyncio
 import logging
 import math
 import re
+import socket
 import ssl
 import threading
 import time
@@ -20,7 +21,7 @@ from ..domain.models import Disk, Nic, Provider, VMRef
 from ..planning.preflight import SourceInventory
 from ..security.secrets import SecretNotFound, resolve
 from .base import ProviderError, VMNotFound, missing_dependency
-from .openstack import PROVIDER_CALL_TIMEOUT_S
+from .openstack import PROVIDER_API_TIMEOUT_S, PROVIDER_CALL_TIMEOUT_S
 
 log = logging.getLogger(__name__)
 
@@ -65,18 +66,44 @@ def _import_pyvmomi() -> tuple[Any, Any, Any]:
     return SmartConnect, Disconnect, vim
 
 
+def _bounded(context: ssl.SSLContext) -> ssl.SSLContext:
+    """The context, giving every socket it wraps without a timeout the provider API timeout:
+    SmartConnect's version probe opens its connection with none and takes no timeout of its own
+    (SDD §10, review PV-02)."""
+    wrap = context.wrap_socket
+
+    def wrap_socket(sock: socket.socket, *args: Any, **kwargs: Any) -> ssl.SSLSocket:
+        if sock.gettimeout() is None:
+            sock.settimeout(PROVIDER_API_TIMEOUT_S)
+        return wrap(sock, *args, **kwargs)
+
+    context.wrap_socket = wrap_socket  # type: ignore[method-assign]
+    return context
+
+
 def default_connector(
     host: str, port: int, user: str, pwd: str, verify: bool, ca_cert: str | None
 ) -> Any:
     smart_connect, _, _ = _import_pyvmomi()
-    if not verify:
-        log.warning("%s: TLS certificate verification is disabled (verify_tls=false)", host)
     if verify:
-        context = ssl.create_default_context(cafile=ca_cert) if ca_cert else None
-        if context is not None:
-            return smart_connect(host=host, port=port, user=user, pwd=pwd, sslContext=context)
-        return smart_connect(host=host, port=port, user=user, pwd=pwd)
-    return smart_connect(host=host, port=port, user=user, pwd=pwd, disableSslCertValidation=True)
+        context = ssl.create_default_context(cafile=ca_cert)
+    else:
+        log.warning("%s: TLS certificate verification is disabled (verify_tls=false)", host)
+        # the provider's own unverified context: pyVmomi's (disableSslCertValidation) would
+        # replace the bounded one
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    # every request, the version probe included, gives up after the provider API timeout: a
+    # vCenter that never answers must not pin the worker thread for ever (SDD §10, review PV-02)
+    return smart_connect(
+        host=host,
+        port=port,
+        user=user,
+        pwd=pwd,
+        sslContext=_bounded(context),
+        httpConnectionTimeout=PROVIDER_API_TIMEOUT_S,
+    )
 
 
 def parse_endpoint(endpoint: str) -> tuple[str, int]:
@@ -272,11 +299,18 @@ class VMwareProvider:
 
     async def _run(self, fn: Callable[[Any, Any], Any]) -> Any:
         def work() -> Any:
-            si = self._connect()
             try:
-                return fn(si.RetrieveContent(), self._vim())
-            finally:
-                self._disconnect(si)
+                si = self._connect()
+                try:
+                    return fn(si.RetrieveContent(), self._vim())
+                finally:
+                    self._disconnect(si)
+            except TimeoutError:
+                # a request's own bound, not the call's (SDD §10, review PV-02)
+                raise ProviderError(
+                    f"{self.provider.id}: vCenter did not answer within "
+                    f"{PROVIDER_API_TIMEOUT_S:g} s"
+                ) from None
 
         try:
             return await asyncio.wait_for(asyncio.to_thread(work), PROVIDER_CALL_TIMEOUT_S)

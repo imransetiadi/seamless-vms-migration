@@ -90,12 +90,28 @@ def connect(provider: Provider, settings: Settings) -> Any:
     return openstack.connect(**kwargs)
 
 
+def _name_pattern(name: str) -> str:
+    """Nova's ``name`` filter for the servers named ``name``: Nova reads it as a regular expression
+    searched anywhere in the name (MySQL/MariaDB after escaping ``|`` itself, PostgreSQL as sent),
+    so every ASCII character but a letter, a digit, a space, ``_`` and ``-`` stands as ``.`` - no
+    alternation, group, class or escape on any backend - and the caller keeps the exact name
+    (SDD §10, review PV-01)."""
+    kept = (c if not c.isascii() or c.isalnum() or c in " _-" else "." for c in name)
+    return "^" + "".join(kept) + "$"
+
+
 def _attr(obj: Any, *names: str, default: Any = None) -> Any:
     for name in names:
         value = obj.get(name) if isinstance(obj, Mapping) else getattr(obj, name, None)
         if value is not None:
             return value
     return default
+
+
+def _holders(volume: Any) -> list[str]:
+    """The servers Cinder lists among the volume's attachments (SDD §10)."""
+    attachments = _attr(volume, "attachments", default=None) or []
+    return [str(a.get("server_id")) for a in attachments if a.get("server_id")]
 
 
 def _canonical_ip(address: str) -> str:
@@ -488,8 +504,14 @@ class OpenStackProvider:
 
     def _find_server(self, name: str) -> str | None:
         conn = self._connection()
-        server = conn.compute.find_server(name, ignore_missing=True)
-        return None if server is None else str(_attr(server, "id"))
+        found = [
+            server
+            for server in conn.compute.servers(details=False, name=_name_pattern(name))
+            if _attr(server, "name") == name
+        ]
+        if len(found) > 1:
+            raise ProviderError(f"{self.provider.id}: more than one server is named {name!r}")
+        return str(_attr(found[0], "id")) if found else None
 
     def _ports(
         self, network_id: str | None, mac_address: str | None, ip_address: str | None
@@ -540,16 +562,13 @@ class OpenStackProvider:
         out: list[dict[str, Any]] = []
         for volume in self._connection().block_storage.volumes(details=True):
             metadata = _attr(volume, "metadata", default=None) or {}
-            attachments = _attr(volume, "attachments", default=None) or []
             out.append(
                 {
                     "id": str(_attr(volume, "id")),
                     "name": str(_attr(volume, "name", default="") or ""),
                     "status": str(_attr(volume, "status", default="") or ""),
                     "metadata": {str(k): str(v) for k, v in metadata.items()},
-                    "attachments": [
-                        str(a.get("server_id")) for a in attachments if a.get("server_id")
-                    ],
+                    "attachments": _holders(volume),
                 }
             )
         return out
@@ -589,30 +608,59 @@ class OpenStackProvider:
         # the wait ends within the call's bound (SDD §8.1, §10)
         deadline = time.monotonic() + PROVIDER_CALL_TIMEOUT_S - 5
         conn = self._connection()
+        if server_id not in _holders(conn.block_storage.get_volume(volume_id)):
+            return  # not attached to that server: no error, nothing to wait for (review PV-03)
         conn.compute.delete_volume_attachment(server_id, volume_id, ignore_missing=True)
-        volume = conn.block_storage.get_volume(volume_id)
-        conn.block_storage.wait_for_status(
-            volume,
-            status="available",
-            failures=["error"],
-            wait=max(1, int(deadline - time.monotonic())),
-        )
+        # until Cinder no longer lists the server: available, or in-use with another holder - a
+        # multi-attach volume another server holds never reads available (SDD §10, review PV-03)
+        while True:
+            volume = conn.block_storage.get_volume(volume_id)
+            if str(_attr(volume, "status", default="") or "").lower() == "error":
+                raise ProviderError(
+                    f"{self.provider.id}: volume {volume_id} is in error: Cinder failed to detach "
+                    f"it from {server_id}"
+                )
+            if server_id not in _holders(volume):
+                return
+            if time.monotonic() > deadline:
+                raise ProviderError(
+                    f"{self.provider.id}: volume {volume_id} is still attached to {server_id}"
+                )
+            time.sleep(2)
 
     def _server_of_address(self, address: str) -> str | None:
         # a compute port's device only: a floating IP's own port names the floating IP, a
-        # router's the router (SDD §7.2, §10, review RV30-06)
-        network = self._connection().network
+        # router's the router (SDD §7.2, §10, review RV30-06); of the credential's project only,
+        # where the kit's conversion host and volumes live - an admin credential sees every
+        # project's ports, and tenant networks overlap (review PV-04)
+        conn = self._connection()
+        network = conn.network
         canonical = _canonical_ip(address)
+        project = _attr(conn, "current_project_id", default=None)
 
         def server(port: Any) -> str | None:
             owner = str(_attr(port, "device_owner", default="") or "")
             device = _attr(port, "device_id")
-            return str(device) if owner.startswith("compute:") and device else None
+            ours = not project or _attr(port, "project_id") == project
+            return str(device) if owner.startswith("compute:") and device and ours else None
 
-        for port in network.ports(fixed_ips=[f"ip_address={canonical}"]):
+        def one(holders: set[str]) -> str | None:
+            if len(holders) > 1:  # two networks of one subnet: no answer to guess (PV-04)
+                raise ProviderError(
+                    f"{self.provider.id}: more than one server holds {address}: "
+                    f"{', '.join(sorted(holders))}"
+                )
+            return next(iter(holders), None)
+
+        scope = {"project_id": project} if project else {}
+        holders: set[str] = set()
+        for port in network.ports(fixed_ips=[f"ip_address={canonical}"], **scope):
             fixed = [ip.get("ip_address") for ip in _attr(port, "fixed_ips", default=None) or []]
-            if canonical in (_canonical_ip(str(a)) for a in fixed if a) and server(port):
-                return server(port)
+            held = server(port)
+            if held and canonical in (_canonical_ip(str(a)) for a in fixed if a):
+                holders.add(held)
+        if holders:
+            return one(holders)
         import openstack.exceptions
 
         for floating in network.ips(floating_ip_address=canonical):
@@ -623,9 +671,10 @@ class OpenStackProvider:
                 port = network.get_port(port_id)
             except openstack.exceptions.NotFoundException:
                 continue  # gone since the listing; a read that failed is no answer (RV32A-04)
-            if server(port):
-                return server(port)
-        return None
+            held = server(port)
+            if held:
+                holders.add(held)
+        return one(holders)
 
     def _server_volumes(self, server_id: str) -> list[str]:
         # Nova's record of the server (os-extended-volumes): no Cinder call, so a VMware rollback
@@ -857,6 +906,9 @@ class _MapContext:
             disks=disks,
             nics=nics,
             power_state=_POWER.get(str(_attr(server, "status", default="")).upper(), "unknown"),  # type: ignore[arg-type]
+            # a task under a steady status - an image snapshot, a stop in flight - is no power
+            # state: the source watch reads a running guest as running (SDD §4.2, review PV-05)
+            task_state=str(_attr(server, "task_state", default="") or "") or None,
             os_type=os_type,
             host=_attr(server, "compute_host", "hypervisor_hostname", "host"),
             tags=metadata,

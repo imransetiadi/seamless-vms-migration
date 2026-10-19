@@ -145,10 +145,10 @@ QASuite case that exercises the control.
 | ID | STRIDE | Threat | Controls | Status | Res. |
 |---|---|---|---|---|---|
 | C4-01 | Info disclosure | Credential theft from the mounted Secret or run directory | Secret volumes `defaultMode 0440`, read-only mounts, non-root container, run-dir temp files 0600 and deleted; credentials **never** in DB/API (SDD §13.3); Keystone **application credentials** (project-scoped, revocable, no password) recommended | Impl + Cfg | M |
-| C4-02 | Spoofing | Spoofed Keystone/vCenter endpoint when TLS verification is off | `verify_tls` defaults to `true`; CA bundle per provider; both connectors log a warning on every connection opened with `verify_tls=false` (`test_openstack_tls_off_is_logged_and_calls_are_bounded`); the dashboard's Providers page shows "Verification off" and names the endpoints a check found on plain HTTP | Impl | L |
+| C4-02 | Spoofing | Spoofed Keystone/vCenter endpoint when TLS verification is off | `verify_tls` defaults to `true`; CA bundle per provider; both connectors log a warning on every connection opened with `verify_tls=false` (`test_openstack_tls_off_is_logged_and_calls_are_bounded`, `test_vmware_connector_bounds_every_request_and_the_version_probe`); the dashboard's Providers page shows "Verification off" and names the endpoints a check found on plain HTTP | Impl | L |
 | C4-03 | Elevation | Over-privileged credentials | Tenant (`member`) credentials for tenant workloads; admin only where SDD §9.2 requires it (handover, some pre-staging — creating flavors needs admin at RHOSO, and only the plan's flavors RHOSO lacks are created, never an existing one changed, SDD §7.2), and at RHOSO for a VM whose NIC goes to another project's shared or external network: Neutron lets only the `admin` or `advsvc` role, or the network's project, choose a port's address or MAC there, and every recreated port does (validation reports `NET_PORT_NOT_PERMITTED`, the cutover refuses it before the stop, SDD §6.6). An external network that is not shared needs the `admin` role at RHOSO even when it is the credential's own: Nova attaches one to a server only for `network:attach_external_network`, admin by default, and `advsvc` does not count there. Another project's private network takes no port whatever the role: an admin credential sees every project's networks, and the VM must not land on another tenant's; separate application credentials per cloud | Cfg | M |
 | C4-04 | Repudiation | Cloud-side actions cannot be attributed to Seamless | Dedicated service identity per cloud so Keystone/Nova audit logs show Seamless | Cfg | L |
-| C4-05 | Denial of service | API throttling or outage | Transient error classification and backoff; per-provider status in `Provider.status` | Impl | L |
+| C4-05 | Denial of service | API throttling or outage | Transient error classification and backoff; per-provider status in `Provider.status`; every provider request gives up after the provider API timeout (60 s: openstacksdk's `api_timeout`, pyVmomi's `httpConnectionTimeout` and a bounded SSL context, SmartConnect's version probe included), so an endpoint that accepts and never answers frees the worker threads the store's calls share (SDD §10, review PV-02: `test_a_vcenter_that_accepts_and_never_answers_frees_the_worker_thread`) | Impl | L |
 | C4-06 | Elevation / Denial of service | A community destination's policy profile differs from what the checks assume: under the secure-RBAC defaults (the upstream default from 2023.2) Neutron counts `admin` or `service` for a port's address or MAC on another project's network, and `advsvc` no longer, so a credential that passed the legacy rule is refused when the cutover recreates the port; an operator then reaches for `admin` | The permission checks judge by the destination's policy profile (SDD §21.5); least privilege: a credential of the network's own project (`member`) where the network allows it, else `service` on the destination project for the migration window only, revoked after finalize; never `admin` for this alone | Done (0.2.0, plan task T5): the pre-flight, the executors' checks before the stop and the collection's destination check count `service` under secure-RBAC, `advsvc` under legacy, `admin` alone when the profile is unknown; a check report reset by new credentials or a provider change reads the provider's declarations, never legacy by default (review RV18-04), and the VMware kit's map judges the token's roles read live with the destination inventory, refusing a NIC that needs a role when none can be read (review RV19-01); the refusal's remediation names the least role its profile counts - `service`, `advsvc`, or under `unknown` check the provider or declare its profile or series (reviews 19, RV20-09) - never `admin` for this alone (review RV18-10); since T8 the dashboard's NIC picker and its offline mock judge by the profile too | M |
 
 ### 4.5 PostgreSQL (C5)
@@ -399,6 +399,7 @@ malicious, corruption).
 |---|---|---|---|
 | Admin and operator API tokens | `compose-init.sh`, `seamless token create` | holder's password manager; hash in `tokens.yaml` / Secret `seamless-tokens` | §5.1 |
 | Dashboard users' tokens | an admin's **Users > Add user** (`POST /users`) | holder's password manager; digest in the database (`documents`, kind `user`) | §5.1: delete the user's row (no restart), create the user again |
+| The operator token file of `seamless-ctl.sh --drain` and `resume` | the operator, from their password manager (docs/Operations.md §5) | a file only its owner may read - the script refuses any other mode, and hands curl the token through a header file in a private directory, never a command line (SDD §17.2) | with the token it holds (§5.1); remove the file after the planned stop |
 | `POSTGRES_PASSWORD` | `compose-init.sh` (`openssl rand -hex 24`) / `oc create secret` | `.env` (0600) / Secret `seamless-db` | annually or on suspicion: `ALTER USER seamless PASSWORD '…'` **and** update `SEAMLESS_DB_URL`; Compose `--rotate-db-password` only for a *new* DB |
 | `JEV_MCP_AUTH_TOKEN` | `compose-init.sh` | `.env` | any time: `compose-init.sh --force --keep-token` (plain `--force` also replaces the admin token), recreate the stack |
 | `TYPESAFE_API_KEY` | provider console | caller's environment → `.env` / Secret `seamless-ai` | quarterly, on staff change, on suspicion; issue separate keys per environment; revoke the old key at the provider |
@@ -798,6 +799,8 @@ repository at commit `fbf3509` (upstream os-migrate `main` after 1.0.5, the fork
       `seamless events prune --older-than-days N --confirm`); alerting on `auth.denied` bursts.
 - [ ] Dependency and image scans run monthly and before releases (QASuite §10).
 - [ ] Incident contacts and the playbooks in §13 rehearsed once per release.
+- [ ] An operator token file kept for `seamless-ctl.sh --drain`/`resume` is mode 0600, holds a token of the operator
+      role, and is removed after the planned stop (the script refuses a file others may read).
 
 ---
 
@@ -866,15 +869,19 @@ from `GET /migrations`); revoke the link key (SEC-06); rebuild hosts with new ke
 from `checkpoint`).
 
 **E. Suspected data corruption or tampering:** pause the plan; do not finalize; run the checksum comparison
-(QASuite §8) on the affected disks; keep the source VM available (it is untouched until finalize) and use
+(QASuite §8) on the affected disks; keep the source VM available (it is stopped, never deleted, until finalize - a storage handover deletes its
+server at cutover and keeps its volumes, and its rollback recreates it, SDD §7.3) and use
 `rollback` if verification is in doubt; collect `blocksync` logs and manifests; open an S1 defect.
 
 **F. Database exposed or tampered:** rotate the DB password (`ALTER USER … PASSWORD …` and the Secret); compare
 `events` with the last export/backup; treat `approvals` in the DB as untrusted — pause all plans and re-approve
 in-flight migrations; restore from a known-good backup if rows were altered. The database also holds the dashboard
 users' digests: a write can plant a `user` row — a working token, with no `user.created` event to compare — or
-replace a digest. List them (`GET /users`, admin), delete every row you cannot account for (playbook A), then issue
-every dashboard user again (delete and create, §5.1) and rotate the bootstrap tokens.
+replace a digest, and a planted row needs no key of the API's form, which `GET /users` (names and roles only) cannot
+show. Through psql as in playbook A, keep the rows for the investigation —
+`SELECT id, data->>'name', data->>'role' FROM documents WHERE kind = 'user';` —, then remove them all —
+`DELETE FROM documents WHERE kind = 'user';` —, issue every dashboard user again (Users > Add user, §5.1) and rotate
+the bootstrap tokens (review RV37B-08).
 
 **G. Injection attempt detected** (event `advisor.verification` with a `screen` note, or
 `review_required` with the reason "console output contained instructions aimed at an AI agent"): no AI action

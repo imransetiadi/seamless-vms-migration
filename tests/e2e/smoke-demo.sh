@@ -3,8 +3,8 @@
 # smoke-demo.sh - E2 smoke test of the running Seamless Migrate demo stack (QASuite §14.6/14.8).
 #
 #   make seamless-demo
-#   export TOKEN='smg_...'            # the admin token printed once by scripts/compose-init.sh
-#   export APPROVER_TOKEN='smg_...'   # an approver of another user: a requester never approves their own
+#   read -rs TOKEN && export TOKEN                    # the admin token printed once by scripts/compose-init.sh
+#   read -rs APPROVER_TOKEN && export APPROVER_TOKEN  # an approver of another user: a requester never approves their own
 #                                     # cutover (maker-checker, SDD §5.4) — seamless token create --role approver
 #   tests/e2e/smoke-demo.sh           # BASE defaults to http://127.0.0.1:8080; SMOKE_WAIT_S (600) bounds the
 #                                     # wait for the seeded demo flow to settle
@@ -17,8 +17,8 @@
 # Never prints the tokens, nor puts them on a command line. Exit code = number of failed checks.
 set -u
 BASE=${BASE:-http://127.0.0.1:8080}
-: "${TOKEN:?export TOKEN=<admin token from compose-init.sh>}"
-: "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
+: "${TOKEN:?read -rs TOKEN && export TOKEN: the admin token from compose-init.sh}"
+: "${APPROVER_TOKEN:?read -rs APPROVER_TOKEN && export APPROVER_TOKEN: an approver token of another user (maker-checker, SDD 5.4)}"
 # shellcheck source=tests/e2e/token-headers.sh
 . "$(dirname "$0")/token-headers.sh"   # the tokens reach curl from header files, never argv
 H=$(token_header admin "$TOKEN") || exit 2

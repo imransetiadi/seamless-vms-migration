@@ -444,5 +444,6 @@ def test_the_shared_eligibility_cases(case):
         caps(case["destination"]),
         findings,
         case["destination"]["name"],
+        holds_volumes=case.get("holds_volumes", False),
     )
     assert {str(strategy): r for strategy, r in reasons.items()} == case["expected"]

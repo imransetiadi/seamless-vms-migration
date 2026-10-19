@@ -209,6 +209,11 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
         flavor_extra_specs: dict[str,str] = {}, cbt_enabled: bool|null = null,
         snapshot_count: int = 0, tools_ok: bool|null = null,
         change_rate_bps: float|null = null,
+        task_state: str|null = null,  # OpenStack: the task Nova runs on the server whatever its status
+                                      # (OS-EXT-STS:task_state: image_uploading, powering-off, ...), which
+                                      # power_state does not read - a running guest a backup snapshots stays
+                                      # running for the source watch (§8.1); null for none, for VMware and on
+                                      # a VM validated before it was recorded (review PV-05)
         key_name: str|null = null }   # the Nova keypair the server boots with (OpenStack); VMware: null
    derived (properties, also serialized): disk_bytes: int, used_bytes: int, guest_os: GuestOS
    (used_bytes = Σ used_gb·2^30 when every disk has used_gb, else ⌊disk_bytes·0.6⌋;
@@ -470,8 +475,13 @@ no further attempt starts. Whenever the migration has a data path — it was can
 workload's record (§6.3) holds destination volumes or a pending source snapshot (a warm migration cancelled in
 `awaiting_cutover`, after a retry, a failed pass or its rollback - a first pass that failed after creating its
 destination volumes recorded no pass but left them, review RV3-05; a cold rollback deleted what the cold import
-recorded, review RV3-07), or, where no record can tell (the simulator, VMware, a storage handover), it recorded
-`sync_passes` of a strategy other than `cold` — the cancel then runs the `rollback` step once
+recorded, review RV3-07), or, where no record can tell (the simulator, VMware, a storage handover), what §9.3 counts
+as held: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt
+after its last cutover began (every pass when none ran, none when its last attempt ran one) - the kit's rollback
+deletes its copies after a cutover, and a `vmware_cold` rollback keeps none (reviews RV39-02, RV40-05, RV41B-02);
+the strategy is the retried attempt's while the migration waits for its next (§9.3, review RV40-06) —
+the cancel then runs the `rollback` step once - that attempt's, by the same strategy, never one a validation or
+`PUT …/strategy` chose since: a storage handover's step knows nothing of a warm attempt's snapshot (review RV43B-04) -
 with `delete_dest_volumes` as a best-effort cleanup of it (source snapshots, temporary and destination
 volumes): `cancelled` is terminal, so no later action could remove them. That cleanup touches only what the
 migration recorded of its own: it matches no destination server by its name alone - the one server it deletes besides
@@ -480,7 +490,18 @@ a recorded one is the single server named like the VM that holds a volume it rec
 is (`os_migrate_rollback_start_source: false` and `os_migrate_rollback_delete_ports: false`, §6.5; on VMware no
 power-on and no kit port, §7.2) — whatever server and ports its cutover made went with its rollback, its source runs,
 and the VM it released (§5.4) may since be another plan's, whose same-named server, ports and stopped source are not
-this migration's. The migration stays
+this migration's. On VMware it deletes no kit volume either (§7.2): the kit names a VM's volumes after the VM and no
+record says which migration made them, so a `vmware_warm` copy left is one another plan's migration of the VM takes
+as its own and syncs onto - or already that plan's. After the server's deletion the cleanup reads the destination's
+kit volumes of the VM no server holds, and those the destination's conversion host alone holds - the kit's copy a
+pass the cancel cut off left attached there, named as attached to it (review RV44B-01); one another server holds is
+that server's disk, another plan's cut-over server of the VM or another VM the kit names alike (owner question q26),
+never named for deletion (review RV43B-01) -, and its `migration.action` names each as kept - `<id> (<kit
+name>-<disk key>)`, `, attached to the conversion host` added for one it holds, the ids in
+`data.kept_volumes` - for the operator to delete once no plan migrates the VM; a read that fails is named in their
+place and fails nothing - so is a conversion host it cannot look up: the kit volumes a server holds are then named as
+held by a server it could not tell, with the error, each to be checked before it is deleted (review RV45B-02) -: the
+server is gone (review RV42B, lead NP-2). The migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
 `migration.error` naming the manual `rollback_workloads.yml` run. The cancel saves `checkpoint: "cleanup"`
 in the same write as `cancelled`: a cleanup that a stop or a crash interrupts is run again when the
@@ -508,7 +529,10 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   rollback, when the source VM is running again - marked by the step as soon as its power-on succeeded
   (`StepContext.mark_downtime_end()`: the VMware rollback, and the storage-handover rollback once the source server
   it started or recreated reads `ACTIVE`, §7.3), so an attempt that fails after it leaves the clock
-  closed: the source runs, and the next cutover counts a new outage (reviews RV30-03, RV36B-03). A store error
+  closed: the source runs, and the next cutover counts a new outage (reviews RV30-03, RV36B-03). Both rollbacks run
+  the power-on and that close as one, which a cancel - the step timeout, a shutdown - waits out as it does the call
+  alone: a power-on vCenter or Nova finishes never leaves the clock open while the source runs (reviews RV37A-01,
+  RV38A-04). A store error
   saving that close fails the attempt as transient (`StepContext.mark_downtime_end()` raises `TransientStepError`):
   it is retried within the step's retries, and the retry closes the clock again (review RV36B-03). A close inside a
   step, and a rollback's at its end, is written with its `migration.downtime_ended` in one store transaction
@@ -536,7 +560,8 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
 
 After each pass, the migration moves to `awaiting_cutover` when **any** of these holds:
 `last_pass.bytes_changed <= plan.convergence_threshold_bytes`, or
-`estimate_final_downtime(last pass) <= plan.downtime_slo_s`, or `passes >= plan.max_sync_passes`.
+`estimate_final_downtime(last pass) <= plan.downtime_slo_s` (after a pass as long as the last one's whole time, §9.1
+`T_last`), or `passes >= plan.max_sync_passes`.
 Otherwise another delta pass runs. The rule that moved the migration is recorded in `Migration.converged_by`
 (`threshold`, `slo`, `max_passes`, or `force` for a Force cutover, §5.4), and its estimate becomes the one that rule
 used — the final-downtime estimate with its parts (a final pass does not recalibrate it), so the Downtime panel compares
@@ -585,7 +610,7 @@ dropped and its `bytes_transferred` moves to `sync_bytes_dropped`. `bytes_transf
 characters) is the only way to cut over before convergence. In `precopy` or `syncing` of a warm migration it records
 `Migration.force_cutover` — actor, time, reason, the last pass's `bytes_changed` and the estimated final downtime: the
 downtime if cut over after the running pass, `final_downtime_parts` (§5.3) after a pass as long as the last one that
-ended or — in `precopy`, before any pass ended — as long as the first pass's expected duration (§9.1:
+ended - its whole time, §9.1 `T_last` - or — in `precopy`, before any pass ended — as long as the first pass's expected duration (§9.1:
 `snapshot_s + max(used/L, scan)`, VMware `used/L`) — and a
 cutover request (its requester the forcer when none), and emits `migration.force_cutover` (audit). The running pass
 finishes, then the migration moves to `awaiting_cutover` with `converged_by: "force"`; the gate still applies — an
@@ -898,7 +923,10 @@ logs in as the source's. Both variables default to upstream's single `os_migrate
 `os_migrate_nbdkit_bind_address` (default `127.0.0.1`; set the hypervisor's migration-network IP for
 TCP mode — the role refuses the loopback default there), with `--shared=1` and quoted paths. Log and
 PID files live in `os_migrate_nbdkit_log_dir` (default `/var/log/os-migrate-nbd`) and a previous
-export is stopped only through its PID file (never `pkill -f`). The cold path's nbdkit export of
+export is stopped only through its PID file (never `pkill -f`), and only when it serves this same disk: one serving
+another disk - an earlier run's export of another VM, whose record still names that port - refuses the workload instead
+(review RV44B-04), judged for all of its ports before its first export, as this run's own clashes are, so the refused
+workload leaves no disk of its own exported (review RV45B-01). The cold path's nbdkit export of
 source volumes on the conversion hosts is `--readonly` as well. See Security.md §6.
 
 The role never lets qemu guess a disk's format. It reads the instance directory's `disk.info`, where Nova records
@@ -914,13 +942,29 @@ spawn (it builds the drive after the XML that resolves the other disks), and the
 from Nova when it asks for one — carried over as a plain data disk it would put a second `config-2` filesystem with
 the source's metadata in front of cloud-init.
 
+A disk's size is the exact byte count `qemu-img info` prints, rounded up to whole GiB; a disk whose byte count it
+cannot read, or reads as zero - an empty or unparsable image -, is refused: a zero-sized destination volume would lose
+it (upstream intake UP-01, after os-migrate 33aca993e4). Each disk's export port is the workload's base port
+(`_migration_params.nbdkit_port`, else `os_migrate_nbdkit_port`) plus its index, and its PID file is named by that
+port: so two disks of one run on one hypervisor that would share a port are refused before the second's workload
+exports anything - all of a workload's ports are judged before its first export, against this run's exports and an
+earlier run's live export of another disk alike, so a refusal leaves none of its disks exported and unrecorded
+(reviews RV44B-05, RV45B-01); a later disk refused or failing on its own - sized at zero bytes or unreadable, its port
+held by a listener no PID file names, an export that does not start - stops the workload's exports no record names
+before the run fails, an export its record names (a rerun's) left serving what the record says (review RV46B-01) -:
+the second would stop the first one's export through that PID file, and the first VM's recorded URI, which names no
+export, would then serve the second VM's disk, copied into the first VM's volume without an error, across
+projects too (upstream intake UP-04a, after os-migrate f1d254cb8b). Give each workload on one hypervisor its own
+base port; how ports could be allocated instead is owner question q49.
+
 Attach locks (`volume_common.use_lock`) serialize attaches and detaches per conversion host with `flock` and a
 `{lock}.lock` file that names its owner as `{migrator hostname}:{pid}`. Before it waits, a module removes such a file
 whose owner ran on its own host and is no longer alive — a module killed by a cancel or a step timeout never
 releases its lock, and every later attach on that host would wait for it in vain; a pid is checked only on the host
 it belongs to (the conversion host's process table knows nothing of the migrator's pids), so a lock of another
 host, or one in the earlier bare-pid form, is never removed by this check. A lock wait gives up once ssh to the conversion
-host has failed for 15 minutes without a break (ssh's own exit status 255), with "Lock timeout: conversion host
+host has failed for 15 minutes without a break (ssh's own exit status 255, or a negative status: ssh killed by a
+signal on the migrator, review RV45B-05), with "Lock timeout: conversion host
 {address} unreachable over SSH for {n} s, waiting for {lock}": the wait tried up to 1800 times, each try up to the 10 s
 connect timeout, about 5.5 h, while a cold cutover's source stays stopped. The window rides out a conversion host reboot or
 a network blip, which the step then completes as if nothing happened (QASuite R-07): a first window of one minute gave up
@@ -1003,7 +1047,17 @@ fails the export, and so does a virtio-blk disk (`vdX`) whose serial file is gon
 loudly, as permanent (review RV12-03, RV13-02). ssh failing at the check is no such failure and is retried as
 transient: the serial read's error quotes the ssh command line, ConnectTimeout included, and the check of the by-id link
 gives up with "SSH timeout: conversion host {address} unreachable over SSH, checking the by-id link of {device}" (review
-RV14-02). The export serves the disk's udev link `/dev/disk/by-id/virtio-<serial>`, but that adds no protection once the
+RV14-02). A command on a conversion host that fails by itself - a positive exit status other than ssh's own 255 -
+fails with a message naming its program and that status ("nbdkit on the conversion host exited with status 1"), never
+ssh's command line: ConnectTimeout among ssh's options read as a "timeout", so a permanent failure - the export's NBD
+server refused, with the source VM stopped - was retried as transient (review RV42B-02); the module logs its full
+command (debug) as it fails (review RV43B-06). ssh's own failure keeps its command line, retried as transient as
+above, and so does ssh killed by a signal on the host that runs it (a negative status: an OOM kill, a stray kill),
+which is no failure of the remote command (review RV43B-05). So do the cold export's probes for its NBD server -
+`which qemu-nbd`, `which nbdkit`, nbdkit's `file` plugin -: ssh failing at one gives up as "SSH timeout", retried,
+never a tool missing, which picked the other tool on a guess or failed the export as "No supported NBD export tool
+available!", permanent (review 45b, lead 4).
+The export serves the disk's udev link `/dev/disk/by-id/virtio-<serial>`, but that adds no protection once the
 export runs: nbdkit resolves the path it serves once, at its start, and opens that
 device path on every later connection, so a volume taken off the host after the export started still has the transfer
 read whatever disk took its path, without an error - a residual the owner decides on (qemu-nbd keeps the descriptor it
@@ -1022,9 +1076,10 @@ ENOSPC. So after nbdcopy exits, whether it succeeded or not, the transfer checks
 a block device. If it is not, the transfer removes a regular file found there - udev 252 (RHEL 9) will not make the
 volume's link over one, where udev 239 (RHEL 8) replaces it - and fails as permanent, saying whether the file was
 removed, could not be removed or could not be checked. Ssh failing at the check gives up as "SSH timeout: ..." and is
-retried when nbdcopy finished its copy (exit 0) or ssh broke it (exit 255); after nbdcopy failed on its own (any other
-exit) every answer the check could give is permanent, so the transfer keeps nbdcopy's failure, permanent, and says the
-path could not be checked (review RV15-02, RV16-02, RV16-03, RV17-01). A path that is still a disk leaves nbdcopy's own
+retried when nbdcopy finished its copy (exit 0) or ssh broke it (exit 255, or a negative status: ssh killed, review
+RV45B-05); after nbdcopy failed on its own (any other positive exit) every answer the check could give is permanent,
+so the transfer keeps nbdcopy's failure, permanent, and says the path could not be checked (review RV15-02, RV16-02,
+RV16-03, RV17-01). A path that is still a disk leaves nbdcopy's own
 exit to decide. Telling the
 two attachments apart
 needs this export's own Cinder attachment id, which a lost answer never gave it: Nova shows the id only from
@@ -1413,7 +1468,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   reports, its rollback's — uses `<kit name>`: a VM named `web01.example.com` gets the server `web01_example_com`,
   which the VM's own name never finds (audit EX-18).
   A cancel's cleanup (§5.1) deletes only the server the migration recorded: it looks up no server by name, deletes no
-  kit port or volume and powers nothing on.
+  kit port or volume and powers nothing on. It then reads the kit's volumes of the VM - `<kit name>-<digits>` with
+  `osm` `true`, the ones the kit's next run takes as the VM's own, whichever plan's run it is - and names in its
+  outcome each no server holds, and each the destination's conversion host alone holds - the kit's copy a cut-off
+  pass left, as above - (§5.1); one another server holds is that server's disk, as above (reviews RV43B-01,
+  RV44B-01).
 
   Once the source is powered on, the rollback deletes the kit's volumes of the VM that the kit's next run would take
   as this VM's own. The kit finds a VM's volume by its name, `<kit name>-<disk key>`, and the metadata `osm` `true`.
@@ -1778,7 +1837,10 @@ shares, or the FlexVol inside its pool search pattern.
 Used by `--demo` and tests. Time is compressed by `settings.demo_speed` (default 60). Byte counts
 follow the estimator model (§9.1) with seeded jitter (`settings.demo_seed`). Each pass reports
 `bytes_changed = min(disk_bytes, change_rate_bps · previous_pass_duration)`; a warm cutover's `final` pass starts once the
-source is stopped. A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
+source is stopped. A `warm` pass takes the model's `snapshot + max(scan, Δ/L)` (the scan as §9.1 models it) and records as
+its `duration_s` the part after the snapshot, as the collection's warm sync does, so a pass that ran as the model predicts
+reads back the plan's `S`; `previous_pass_duration` is the previous pass's whole time, its snapshot included (review
+RV38A-05). A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
 cutover its shutdown — its clock starts when it stops the source, as an Ansible-driven cutover's does (§7.2), so its
 downtime has the parts its estimate has — its copy, conversion and create; a failed cutover up to its failure, in its
 `PermanentStepError`'s `details` — and the rollback its own 90 s, plus the model seconds of a cutover it interrupted
@@ -2023,6 +2085,10 @@ disks, and the **scan time** `scan = max(Dmax / S, D / min(S·P, A))`.
 
 `total_s = precopy_s + downtime_s`; `final_delta_bytes = Δf` (0 for single-shot);
 `meets_slo = downtime_s <= slo_s`. Ineligible strategies still get numbers with `eligible=false`.
+`T_last` is the last pass's whole time, as `Tk` is: a `warm` pass records as its `duration_s` the part after its
+snapshot (the collection's sync reports it, §6.2, and the demo records the same, §7.4), so the final-downtime estimate after a recorded pass -
+the SLO rule's (§5.3), the estimate it records, a Force cutover's figure (§5.4) and the dashboard's port of it - takes
+`duration_s + snapshot` for a `warm` pass and `duration_s` for a `vmware_warm` one (review RV39-07).
 
 **Configuration and calibration (PRD G2).** `EstimatorParams` gains `parallel_disks: int = 4`.
 `Plan.estimator_overrides: dict[str, float] = {}` overrides any `EstimatorParams` field for that plan
@@ -2033,9 +2099,17 @@ for `link_bps` and must be a finite positive number (422 otherwise). After every
 completed warm pass the orchestrator calibrates the migration in place and re-estimates it:
 `vm.change_rate_bps = bytes_changed / (pass.started_at − previous_pass.started_at)` (delta passes
 only; the interval is the time between the two snapshots), and the observed per-stream scan rate
-`bytes_scanned / duration_s / min(P, V)` — taken from **delta/final passes only** (pass 1 is
-usually link-bound and would understate it) — replaces `scan_bps` for that migration's estimate
-(stored as `Migration.observed_scan_bps: float | null`). `migration.estimate` is recomputed with
+— the `S` under which the scan model gives the pass's duration, `max(min(Dmax, B), B / min(P, V)) / duration_s`
+with `B = bytes_scanned` (the pass lasts as long as its largest disk's scan or its streams' share, whichever is
+longer, so a pass that ran as predicted reads back the `S` it was predicted with; review PL-07), taken from
+**delta/final passes only** (pass 1 is usually link-bound and would understate it) — replaces `scan_bps` for that
+migration's estimate (stored as `Migration.observed_scan_bps: float | null`). A pass at the aggregate ceiling
+(`A` set and `B / A >= duration_s`) does not tell `S`: it leaves the calibration as it was. Nor does a pass the link
+may have bound - one that lasted at most 10 % longer than its changes take over the link (`duration_s <=
+1.1 · bytes_transferred / L`, a margin for the sync's own setup): the `S` it reads is only a lower bound, which may
+raise the calibrated `S` but never lower it (review RV38A-02). A pass that lasted longer was bound by its scan,
+whatever the model's scan at the migration's current `S` says: the `S` it reads replaces it, lower too (review
+RV39-01). `migration.estimate` is recomputed with
 the calibrated values, so `downtime_s` converges on reality before the cutover is approved.
 
 Worked example (defaults, S = 500 MiB/s, L = 125 MiB/s, c = 2 MiB/s): a 200 GiB single-disk VM
@@ -2066,7 +2140,11 @@ strategy ineligible):
   `src_caps["storage_backends"]`: a family other than `other`, and — when `dst_caps` lists
   `storage_backends` — a destination pool that resolves (§7.3.1); with `plan.port_creation_mode` `"nova"`, no NIC
   with more than one fixed IP (the destination server then gets one fixed IP per port, so the others would be
-  dropped without a word; `"neutron"` keeps them, §7.3 step 8).
+  dropped without a word; `"neutron"` keeps them, §7.3 step 8); and the migration not holding the destination
+  volumes an earlier attempt created (§9.3's rule: its workload record, else a warm attempt's passes): a handover
+  manages the source's volumes and never removes them, so they would be left behind, their quota counted twice - the
+  reason says to run it warm again, which uses them, or cold, whose cutover removes them first (§7.2; review
+  RV39, lead L1).
 * `vmware_cold`: ineligible if `power_state` is `"error"` or `"transitioning"`.
 * `vmware_warm`: requires `cbt_enabled is True` and no `independent` disk.
 * Blocker findings (§9.3) make **all** strategies ineligible.
@@ -2093,7 +2171,7 @@ Finding catalog (code — severity — condition):
 | Code | Severity | Condition |
 |---|---|---|
 | `SRC_VM_ERROR_STATE` | blocker | `power_state == "error"` |
-| `SRC_VM_TRANSITIONAL_STATE` | blocker | `power_state == "transitioning"`: a Nova task is in flight (resize, verify-resize, migration, rescue, rebuild, reboot, build) — a stop or snapshot would fail after approval; wait until the VM is ACTIVE or SHUTOFF, then re-validate |
+| `SRC_VM_TRANSITIONAL_STATE` | blocker | `power_state == "transitioning"` or a `task_state`: a Nova task is in flight (resize, verify-resize, migration, rescue, rebuild, reboot, build; under ACTIVE or SHUTOFF an image snapshot or its upload, a stop or a start, named in the message) — a stop or snapshot would fail after approval; wait until the VM is ACTIVE or SHUTOFF with no task, then re-validate (review PV-05) |
 | `SRC_VM_VOLUME_DETACHED` | blocker | a re-assessment of a migration whose history reached `cutover` finds a volume of its validated `vm.disks` no longer attached to the VM (an earlier attempt's cold export may have left it detached, §6.6); the volume stays among the migration's disks (§5.4) — attach it to the source VM again, then re-validate; to migrate the VM without it, cancel the migration and plan the VM anew |
 | `SRC_VM_DUPLICATE_NAME` | blocker | another selected VM has the same name (os-migrate filters by name); from a VMware source instead one whose name the migration kit writes alike, the same name included - §7.2's `<kit name>`, e.g. `web.01` and `web_01`, or two names that differ only past its 64-character cut: the kit names each VM's server, ports and volumes after it and finds a volume again by that name, so one VM's data would go into the other's volume (review RV26-04). The message names the kit's name and every VM written alike, and its remediation says that separate plans into one destination project do not part them (review RV28-04) |
 | `SRC_VM_NAME_UNUSABLE` | blocker | a VMware VM's name of which the migration kit keeps no character (§7.2's `<kit name>` is empty: Japanese, Cyrillic, punctuation): the kit would create its server, ports and volumes without a name, after its migrate task powered the VM off (review RV26-04) |
@@ -2101,9 +2179,9 @@ Finding catalog (code — severity — condition):
 | `SRC_VM_EPHEMERAL_ROOT` | info (warm) | root disk `image_root`/`ephemeral` |
 | `MAP_NETWORK_MISSING` | blocker | a NIC network has no mapping and no same-named destination network, and `"networks"` is not in `plan.prestage_resources` (when it is — and the source is OpenStack; VMware sources have no pre-stage step — emit `MAP_NETWORK_PRESTAGED` — info — instead: the network will be created with the same name); also when a mapping's *target* network does not exist in the destination |
 | `MAP_FLAVOR_PRESTAGED` | info | `"flavors"` is in `plan.prestage_resources`, the source is OpenStack, and the VM's flavor has no mapping and no same-named destination flavor: pre-staging creates it in RHOSO with the same name, size and extra specs, so nothing is matched automatically (`resolved_mappings` stays empty for it, and neither `MAP_FLAVOR_MISSING` nor `MAP_FLAVOR_AUTO` is emitted) |
-| `MAP_FLAVOR_MISSING` | blocker | no flavor mapping and no destination flavor with ≥ vcpus, ≥ ram, ≥ root disk — flavors carrying `pci_passthrough:*`, `resources:*`, `trait:*` or `aggregate_instance_extra_specs:*` extra specs are never matched automatically (when one fits, the smallest fitting flavor is recorded in `Migration.resolved_mappings.flavors` and `MAP_FLAVOR_AUTO` names it: info, or **warning** when the source flavor carries `hw:*` extra specs the match drops; VMware VMs carry no flavor and get no `MAP_FLAVOR_AUTO`, the migration kit sizes the server); also when a mapping's *target* flavor does not exist in the destination |
+| `MAP_FLAVOR_MISSING` | blocker | no flavor mapping and no destination flavor with ≥ vcpus, ≥ ram, ≥ root disk — flavors carrying `pci_passthrough:*`, `resources:*`, `trait:*` (or their request-group forms `resources<suffix>:*`, `trait<suffix>:*`, review PL-08) or `aggregate_instance_extra_specs:*` extra specs are never matched automatically (when one fits, the smallest fitting flavor is recorded in `Migration.resolved_mappings.flavors` and `MAP_FLAVOR_AUTO` names it: info, or **warning** when the source flavor carries `hw:*` extra specs the match drops; VMware VMs carry no flavor and get no `MAP_FLAVOR_AUTO`, the migration kit sizes the server); also when a mapping's *target* flavor does not exist in the destination |
 | `MAP_VOLUME_TYPE_MISSING` | warning; **blocker** when `plan.mappings.volume_types` is non-empty, and when a mapping's *target* type does not exist in the destination | a disk volume type has no mapping and no same-named destination type (with mapped volume types the executor preserves them, §6.4, so an unmapped type would fail volume creation after the source was stopped) |
-| `DST_QUOTA_INSUFFICIENT` | blocker | cumulative demand of the plan's VMs per destination project exceeds free quota (cores, ram, instances, volumes, gigabytes); an `image_root` disk counts as a volume unless `plan.default_strategy` is `cold` (the warm path's `boot_disk_copy` creates a destination volume) |
+| `DST_QUOTA_INSUFFICIENT` | blocker | cumulative demand of the plan's VMs per destination project exceeds free quota (cores, ram, instances, volumes, gigabytes); an `image_root` disk counts as a volume unless `plan.default_strategy` is `cold` (the warm path's `boot_disk_copy` creates a destination volume). The free quota is the limit less what is in use, so each VM counts what a cutover will still create (review PL-02): all of it with no migration yet or one in `pending`, `validating`, `blocked`, `ready`, `failed` or `rolled_back` (it runs, or runs again, from `ready`) - but one of these that holds the destination volumes an earlier attempt created, which the next attempt uses again (a failed or rolled-back warm attempt, or one a Retry put back in `ready`; its workload record's destination volumes - an unreadable record counts as holding them -, and where no record tells - the demo, the VMware kit - recorded passes of a `warm` migration (its rollback keeps them for every later attempt), or passes a `vmware_warm` one recorded since the kit last released its copies (a pass that started once the attempt after its last `cutover` entered `precopy`, every pass when no `cutover` ran, none when its last attempt ran one) - the strategy being the one of the attempt whose copies remain: while the migration waits for its next attempt (`pending`, `validating`, `blocked`, `ready`), the retried attempt's, whatever a validation or `PUT …/strategy` chose since (the VMware kit keeps no record, so a `vmware_warm` migration switched to `vmware_cold` still holds the kit's copies, review RV40-06) -: the kit's rollback deletes its copies after a cutover, or marks them `cutover`, and a later attempt's first copy cut off - no copy completed - is deleted too, while the copies an attempt with no cutover completed stay, marked, and the next attempt's first run syncs them by CBT - cut off, it keeps them (§7.2, reviews RV40-05, RV41B-02) -; a `cold`, `vmware_cold` or `storage_handover` rollback keeps no copy), counts its server alone (reviews RV38A-01, RV39-02); its server alone (cores, ram, instances) in `precopy`, `syncing`, `awaiting_cutover` or `cutover` (its destination volumes exist or are being created); nothing in `verifying`, `completed`, `finalized`, `rolling_back` or `cancelled` (what it holds is in use, or being released). A VM's cores and ram are those of the destination flavor its server is created with - the mapped one, else the same-named or automatically matched one (`MAP_FLAVOR_AUTO`) -, and its own for a flavor pre-staging creates with the source's size, for a VMware VM (the migration kit chooses the flavor, §7.2) and when no destination flavor resolves (review PL-01) |
 | `DST_KEYPAIR_MISSING` | blocker | an OpenStack VM's `key_name` names no keypair of the destination credential and pre-staging does not create it: `"keypairs"` is not in `plan.prestage_resources`, or the source credential does not own it (its owner is another user: create the keypair, its public key, for the destination credential). Without this check the cutover fails after validation, in its destination check |
 | `MAP_KEYPAIR_PRESTAGED` | info | `"keypairs"` is pre-staged and the VM's `key_name`, owned by the source credential, has no keypair of the destination credential: pre-staging imports it (the same name and public key) |
 | `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
@@ -2118,7 +2196,7 @@ Finding catalog (code — severity — condition):
 | `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one, resolved by the rule of §7.3 step 0; its `DestinationInventory.subnets` by `network_id`) or is no host address there — as Neutron's `check_subnet_ip` rules for a port created with no owner, an IPv4 subnet's network address (at any prefix length) and its broadcast address below a /31 (a /31 or /32 has none), while an IPv6 subnet's first address is taken (§6.6); on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode, and no address in `"nova"` mode (§6.6); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
 | `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
-| `VM_VGPU` | blocker | extra spec `resources:VGPU` present (VMware: a shared-PCI vGPU device, reported the same way) |
+| `VM_VGPU` | blocker | extra spec `resources:VGPU` present, or its request-group form `resources<suffix>:VGPU` (Nova's granular requests, e.g. `resources1:VGPU`; the suffix is `[A-Za-z0-9_-]`, review PL-08) (VMware: a shared-PCI vGPU device, reported the same way) |
 | `VOL_ENCRYPTED` | warning | encrypted disk (Barbican key must be re-created) |
 | `GUEST_OS_LEGACY` | warning | `guest_os.lifecycle == "legacy"` (§9.5: out of the vendor's standard support; it still migrates — test the application on RHOSO) |
 | `GUEST_OS_UNKNOWN` | info | `guest_os.family == "unknown"`: no OS identified — set the `os_distro`/`os_version` image properties (OpenStack) or run VMware Tools; verification uses the Linux profile |
@@ -2135,7 +2213,9 @@ Finding catalog (code — severity — condition):
 ### 9.4 Wave planner (`planning/waves.py`)
 
 `plan_waves(vms: list[VMRef], tiers: dict[str, str], max_wave_size: int = 10) -> list[Wave]`.
-Tiers (from the advisor, §14.2; deterministic fallback by regex on name/tags/os_type):
+Tiers (from the advisor, §14.2; deterministic fallback by regex: `os_type` decides `legacy_os` (§9.5), and the service
+keywords match the name and the tag values only - an OS name is never a service: an Oracle Linux guest is no Oracle
+database, review PL-03):
 `stateless_web`, `middleware_queue`, `infrastructure_service`, `stateful_database`, `legacy_os`,
 `manual_review`. Wave 1 is a **pilot** of up to 3 lowest-risk VMs (`stateless_web` first, smallest
 disks first): app groups are taken whole in that order while they fit, and once one does not fit, only
@@ -2146,7 +2226,11 @@ chunked by `max_wave_size`; VMs sharing `tags["app"]` stay in the same wave (a w
 VMs go to a final wave named `Manual review`.
 `start_plan` refuses a plan with waves while a non-terminal migration belongs to no wave (a VM added
 to `vm_ids` after the waves were planned): re-run the planner or add the VM to a wave, otherwise it
-would start at once outside every wave's order and `max_parallel`.
+would start at once outside every wave's order and `max_parallel`. A migration's `wave_id` is its VM's wave in the
+plan: a validation writes it into every migration of the plan, also those it leaves alone (in flight, finished,
+`failed`, `rolled_back`), so the waves planned anew reach them before the plan starts; and a retry takes it from the
+plan and refuses (409, before any change) a migration of a plan with waves whose VM is in none of them, for the same
+reason as `start_plan` (review PL-11).
 
 ### 9.5 Guest OS catalog (`seamless_migrate/guest_os.py`)
 
@@ -2156,7 +2240,11 @@ libosinfo short ids (`win2k19`, `debian12`), VMware guest ids (`rhel9_64Guest`,
 `windows2019srvNext_64Guest`, `ubuntu64Guest`) and VMware Tools names (`Ubuntu 22.04.4 LTS`,
 `Microsoft Windows Server 2019 Standard`). Distributions: RHEL, CentOS (Linux and Stream), Rocky,
 AlmaLinux, Oracle Linux, Ubuntu (versions and code names), Debian (versions and code names), SLES,
-openSUSE, Fedora, Windows Server 2003–2025 and Windows client 7–11. The case table shared by both test
+openSUSE, Fedora, Windows Server 2003–2025 and Windows client 7–11 (also by the libosinfo client ids `win7`,
+`win8`, `win8.1`, `win10`, `win11`). A VMware guest id without a version names the releases govmomi gives it:
+`windows8Guest` Windows 8, `oracleLinuxGuest`/`oracleLinux64Guest` Oracle Linux 4/5, `centosGuest`/`centos64Guest`
+CentOS 4/5, `slesGuest`/`sles64Guest` SLES 9, `redhatGuest` Red Hat Linux 2.1 (review RV38A-06). A CentOS of version 9 or later is CentOS Stream (`centos9_64Guest`,
+`centos 9`): CentOS Linux ended with 8 (reviews PL-04, PL-05). The case table shared by both test
 suites is `seamless/tests/fixtures/guest_os_cases.json`.
 
 Lifecycle as of 2026-10 (`legacy` = out of standard vendor support): RHEL/Oracle ≤ 7, CentOS Linux
@@ -2172,10 +2260,10 @@ guests boot unchanged when the boot properties travel with the volumes (§6, §7
 
 ### 9.6 Probe suggestions (`planning/probes.py`, ADV-18)
 
-`suggest_probes(vm) -> list[AppProbe]` — from the VM's tier (§9.4's rules) and the service its name, tags or OS
-names:
+`suggest_probes(vm) -> list[AppProbe]` — from the VM's tier (§9.4's rules) and the service its name or tags name
+(never its OS, §9.4):
 
-| Tier | Service (name, tag or OS contains) | Probe |
+| Tier | Service (name or tag contains) | Probe |
 |---|---|---|
 | `stateful_database` | PostgreSQL (`postgres`, `pgsql`, token `pg`) | tcp 5432 |
 | | MySQL, MariaDB, Galera | tcp 3306 |
@@ -2214,6 +2302,13 @@ class DestinationProvider(Protocol):
     async def get_server(self, server_id: str) -> dict[str, Any]   # {status, ports:[{status, fixed_ips, floating_ips}]}
     async def console_log(self, server_id: str, lines: int = 200) -> str | None
     async def delete_server(self, server_id: str) -> None
+    async def find_server(self, name: str) -> str | None
+        # the id of the credential's project's server named exactly `name`, None when none, a provider error when
+        # more than one: Nova reads its `name` filter as a regular expression searched anywhere in the name
+        # (MySQL/MariaDB REGEXP after Nova escapes `|`, PostgreSQL `~`), so the lookup sends `^...$` with every
+        # ASCII character but a letter, a digit, a space, `_` and `-` as `.` - no alternation, group, class or
+        # escape on any backend, nothing Nova refuses as an invalid expression - and keeps the server whose name is
+        # exactly `name` (review PV-01)
     async def ports(self, *, network_id: str | None = None, mac_address: str | None = None,
                     ip_address: str | None = None) -> list[dict[str, Any]]
         # the ports the credential sees that match every filter given:
@@ -2229,12 +2324,17 @@ class DestinationProvider(Protocol):
         # time, which Cinder refuses; one Cinder failed to delete (`error_deleting`) is a provider error naming
         # it (review RV29-04)
     async def detach_volume(self, server_id: str, volume_id: str) -> None
-        # Nova's attachment of the volume to the server removed, then waits until Cinder reads the volume
-        # available, within the call's bound (§8.1); a volume not attached to that server is no error (§7.2)
+        # Nova's attachment of the volume to the server removed, then waits until Cinder no longer lists the server
+        # among the volume's attachments - `available`, or `in-use` with another holder, a multi-attach volume -
+        # within the call's bound (§8.1); Cinder's `error` is a provider error; a volume not attached to that server
+        # is no error and is neither detached nor waited for (§7.2, review PV-03)
     async def server_of_address(self, address: str) -> str | None
-        # the Nova server holding the address: a compute port (`device_owner` `compute:*`) with it as a fixed IP,
-        # else the compute port Neutron's floating IP of that address is associated with; None when none (§7.2
-        # VMware rollback, review RV30-06)
+        # the Nova server of the credential's project holding the address - where the kit's conversion host and its
+        # volumes live; an admin credential sees every project's ports, and tenant networks overlap: a compute port
+        # (`device_owner` `compute:*`) of that project with it as a fixed IP, else the compute port of that project
+        # Neutron's floating IP of that address is associated with; None when none; two servers holding it (two
+        # networks of one subnet, or a credential whose project cannot be read) are a provider error naming them
+        # (§7.2 VMware rollback, reviews RV30-06, PV-04)
     async def server_volumes(self, server_id: str) -> list[str]
         # the ids of the volumes Nova lists as attached to the server - its record alone, no Cinder or Neutron
         # call; a server gone holds none (§7.2 VMware rollback, review RV30-04)
@@ -2283,7 +2383,10 @@ volume disks carry their Cinder `pool`;
 `os_type` is the most specific of the server metadata `os_type`/`os_distro`, the boot volume's
 `volume_image_metadata` or the boot image's properties (`os_distro` + `os_version`, then `os_type`)),
 `VMwareProvider` (pyVmomi,
-lazy; reports CBT, snapshots, independent disks, tools state; powers a VM on for a rollback (`power_on`) and tells
+lazy; reports CBT, snapshots, independent disks, tools state - its `check()` reports `api_version`, `version`,
+`vm_count`, `cbt_enabled_vms`, `vms_with_snapshots`, `vms_with_independent_disks` and `vms_without_tools`, the keys
+the demo's fake vCenter and the dashboard's mock report too (review PV-06); powers a VM on for a rollback
+(`power_on`) and tells
 whether vCenter recorded a power-on of it since a time (`powered_on_since`, its events, §7.2), and lists the keys of a VM's
 disks in vCenter's device order (`disk_keys`: `config.hardware.device`, as the migration kit reads it, §7.2); `os_type` is the VMware Tools pretty
 name when Tools report one, else the configured guest id), `FakeSourceProvider`/
@@ -2300,6 +2403,16 @@ the finance plan takes 22 of the 24 OpenStack
 VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (one VM, one migration
 across plans, §5.4) — and the VMware plan 12 of the 13 VMware VMs: `dc2-portal-02` stays unplanned,
 for the operator to plan warm (§7.4). No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
+
+**Bounds.** Each provider call runs its blocking SDK calls in a worker thread and is bounded (300 s, §8.1); the
+bound ends the wait, not the thread, so every request a call sends is bounded by the provider API timeout (60 s) as
+well: an endpoint that accepts a connection and never answers frees the thread once its requests give up (a
+vCenter's best-effort logout after a failed request among them) instead of pinning it for ever; the store's calls
+run in the same thread pool (review PV-02). `OpenStackProvider` sets openstacksdk's `api_timeout`; `VMwareProvider`
+passes pyVmomi's `httpConnectionTimeout` and an SSL context that sets the timeout on every socket it wraps without
+one, since pyVmomi's version probe at connect takes no timeout of its own (a TCP connect stays bounded by the
+operating system). A vCenter request not answered in time is a `ProviderError` that names the 60 s, told apart from
+the call's 300 s bound.
 
 ### 10.1 Destination release series (`seamless_migrate.planning.platforms`)
 
@@ -2466,7 +2579,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown` and the check report (`capabilities`) to `{}`; 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
-| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, recorded `sync_passes` of a strategy other than `cold`) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
+| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
@@ -2477,7 +2590,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
 | POST | `/plans/{id}/start` | operator | — | `Plan` (from `validated`, `paused` or `failed` — a failed plan pre-stages again; 409 when any migration is `blocked`) |
 | POST | `/plans/{id}/pause` | operator | — | `Plan` |
-| POST | `/plans/{id}/cancel` | operator | `{"reason": str?}` | `Plan` — retires a plan none of whose migrations started: each is `pending`, `blocked`, `ready` or `cancelled`. Under the plan's lock and the VM-claim lock (§5.4, §8) it cancels each one as `POST /migrations/{id}/cancel` does (§5.1: its lock, its event, and the cleanup of a data path an earlier attempt left), then sets the plan `cancelled` and emits `plan.cancelled`. Nothing is deleted (§11): the plan and its history stay, its VMs are free for another plan and its providers for deletion, and pre-staged destination resources stay, as after a finished plan. `cancelled` is terminal: no edit, validation, waves, start or pause; a cancelled plan answers again as it is. 409 while the plan is `running` ("pause the plan before cancelling it": the tick starts its steps) and while a migration has started, naming each VM and its phase (at most 10, then how many more) — a `failed` or `rolled_back` one is cancelled on its own first, which cleans up what it copied, and a plan with a migration that completed or was finalized keeps its status — and while a migration that has not started has its source stopped, naming each VM: an open downtime clock, which a retry after a failed cutover keeps (§5.2), and a cancel cannot restart a stopped source (§5.1), so it is cut over first. Both are checked before any migration is cancelled: a refused plan cancel changes nothing |
+| POST | `/plans/{id}/cancel` | operator | `{"reason": str?}` | `Plan` — retires a plan none of whose migrations started: each is `pending`, `blocked`, `ready` or `cancelled`. Under the plan's lock and the VM-claim lock (§5.4, §8) it cancels each one as `POST /migrations/{id}/cancel` does (§5.1: its lock, its event, and the cleanup of a data path an earlier attempt left), then sets the plan `cancelled` and emits `plan.cancelled`. Nothing is deleted (§11): the plan and its history stay, its VMs are free for another plan and its providers for deletion, and pre-staged destination resources stay, as after a finished plan. `cancelled` is terminal: no edit, validation, waves, start or pause; a cancelled plan answers again as it is. 409 while the plan is `running` ("pause the plan before cancelling it": the tick starts its steps) and while a migration has started, naming each VM and its phase (at most 10, then how many more) — a `failed` or `rolled_back` one is cancelled on its own first, which cleans up what it copied - on VMware it names the kit's copies it keeps (§5.1) -, and a plan with a migration that completed or was finalized keeps its status — and while a migration that has not started has its source stopped, naming each VM: an open downtime clock, which a retry after a failed cutover keeps (§5.2), and a cancel cannot restart a stopped source (§5.1), so it is cut over first. Both are checked before any migration is cancelled: a refused plan cancel changes nothing |
 | GET | `/migrations` | viewer | query `plan_id`, `phase`, `wave_id`, `limit` (1…5000, default all), `offset` (default 0), `view` (`full`, the default, or `summary`); creation order | `Migration[]`; with `view=summary` `MigrationSummary[]` (§4) |
 | GET | `/migrations/{id}` | viewer | — | `Migration` |
 | POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` (409 from the cutover's requester, or from the approver who forced it, when the plan requires a distinct approver, §5.4) |
@@ -2485,12 +2598,12 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/migrations/{id}/force-cutover` | approver | `{"reason": str}` (10–2000 characters, 422 otherwise) | `Migration` (409 outside `precopy`/`syncing` of a warm strategy, or when the migration is already forced; §5.4) |
 | POST | `/migrations/{id}/sync` | operator | — | `Migration` (only `awaiting_cutover`) |
 | POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1; 409 after a failed finalize began deleting the source, §8.1) |
-| POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
+| POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; it takes its VM's wave from the plan, §9.4; it assesses nothing anew - the estimates the last validation stored stay -, but marks the stored `storage_handover` estimate ineligible with §9.2's reason while the migration holds the destination volumes an earlier attempt created, judged as `PUT …/strategy` judges it, so the dashboard's strategy choice and the advisor's options show why (review 41b's lead), and takes an earlier Retry's mark off once it holds none - the estimate eligible again when that reason was its only one (review RV43B-02); 409 when a provider of that plan was deleted, and when the plan has waves and the VM is in none of them) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
 | POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` (409 outside `completed`, and while its source VM runs again — `source_running_at` — unless its checkpoint is `finalizing`, §8.1) |
 | POST | `/plans/{id}/finalize` | approver | `{"wave_id": str\|null, "confirm": str, "delete_source": bool = false}` (`confirm`: the wave's name, or the plan's without `wave_id`; 400 otherwise; 404 for an unknown wave) | `{"finalized": [str], "skipped": [{"migration_id": str, "reason": str}]}` (409 when no migration of the scope is `completed`; §8.1) |
 | POST | `/demo/vms/{source_id}/power` | operator | `{"state": "on"\|"off"}` | `VMRef` (demo mode only, 404 otherwise; the fake source VM's power state, §8.1) |
-| PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible; 409 while `advisor_hold` is set: approve or override the decision, §14.6) | `Migration` |
+| PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible; `storage_handover` is refused (400, §9.2's reason) while the migration holds the destination volumes an earlier attempt created, judged at the request - a Retry does not re-assess the estimates the last validation stored (review RV40-01); 409 while `advisor_hold` is set: approve or override the decision, §14.6) | `Migration` |
 | GET | `/events` | viewer | query `since` (seq), `before` (seq: only events below it — with `tail`, the newest `limit` of them, the page before the oldest one shown), `plan_id`, `migration_id`, `limit` (≤ 1000), `tail` (bool = false), `audit` (bool = false: only the audit events of §14.5) | `Event[]` (ascending `seq`); no route updates or deletes an event |
 | GET | `/events/stream` | viewer | query `since` | `text/event-stream` (below) |
 | GET | `/stats` | viewer | query `plan_id` | `Stats` |
@@ -2985,7 +3098,10 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   migration is `pending`, `blocked` or `ready`: approve → `approved`, final = the recommended option, which must
   be usable and eligible now; override → `overridden`, final = the chosen eligible option, `reason_text` = the
   reason (required, at least 10 characters, when the policy in force says so — the API refuses with 422, not only
-  the dashboard). The new decision replaces the recommendation's (the earlier one stays in the audit trail as
+  the dashboard). Eligible is judged at the request, as `PUT …/strategy` judges it (§12): a Retry does not
+  re-assess the estimates the last validation stored, so `storage_handover` is not eligible while the migration
+  holds the destination volumes an earlier attempt created (§9.2) — an approve of it is refused with 409, an
+  override to it with 422, each naming that reason (review RV41B-01). The new decision replaces the recommendation's (the earlier one stays in the audit trail as
   `before`), emits `decision.approved` or `decision.overridden` (actor `user:<name>`), sets `migration.strategy`
   to the final option, clears `advisor_hold` and — when the strategy changes — the approvals, the cutover
   request and `force_window` (§5.4). An override also records the option in `plan.strategy_overrides`, like
@@ -3358,7 +3474,10 @@ is no origin a browser sends (review RV31-03).
   and its VM table names, as the Inventory's does, the plan that holds each VM with the Plan filter — the plan being
   edited never holding its own VMs — so the free VMs are picked before any warning; Start on a `failed` plan says pre-staging failed and starts
   it again (§8); Start is unavailable, saying why and naming the VMs, while a migration is `blocked` or — in a plan
-  with waves — a migration that has not finished belongs to no wave (§9.4), as `start_plan` refuses both; Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
+  with waves — a migration that has not finished belongs to no wave (§9.4), as `start_plan` refuses both; Validate is
+  unavailable only on a running plan (pause it first) and a cancelled one, as `validate_plan` refuses both — a
+  completed plan, say one whose every VM rolled back over a plan setting, is validated again and then editable (§8.1,
+  audit DB-01); Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (its Findings
   and Estimates panels addressable as `#findings` and `#estimates`, which the page scrolls to and focuses once
   loaded, ADV-02; phase
@@ -3376,7 +3495,13 @@ is no origin a browser sends (review RV31-03).
   and that the bytes they transferred stay counted, §5.4), downtime clock (in demo mode it runs in model time,
   `/health` `demo_speed`; it counts whole seconds while it runs, and once the downtime ended it shows the actual
   downtime rounded to the second, as every other view and the text under it give it; the estimate's parts — shutdown, final sync or copy, conversion, create, boot — and the
-  difference between estimate and actual, ADV-16), a "Data inconsistent" badge with the issues (§5.5), Force cutover
+  difference between estimate and actual, ADV-16), a "Data inconsistent" badge with the issues (§5.5), an Estimate
+  inputs panel — what the downtime estimate rests on (§9.1): the guest write rate and the scan rate per disk stream,
+  each with its source (measured by a delta pass, from the inventory, a plan override or the planning default; VMware
+  CBT needs no scan rate), the plan's link speed, every other estimator override the plan sets with its value
+  (disks scanned in parallel, aggregate scan cap, source shutdown, snapshot, volume create, boot, handover per volume,
+  conversion, in-place conversion), and on the OpenStack warm path the disks scanned in parallel even when the plan
+  sets none (the planning default, 4); the planning defaults are the API's `EstimatorParams` —, Force cutover
   for an approver in `precopy`/`syncing` of a warm migration — the dialog shows the last pass's change and the
   estimated downtime the Force cutover records (the API's formula, §5.4, ported and checked against a case table the
   control plane generates) and asks for the reason (§5.4) —,
@@ -3385,7 +3510,8 @@ is no origin a browser sends (review RV31-03).
   roll back (§8.1) — and Finalize unavailable then, saying so, as the API refuses it (a finalize that began deleting
   the source stays available, §8.1), the time in Completed and the finalize reminder past the plan's `finalize_warning_h`, and in
   demo mode "Power on the source VM" / "Power off" for an operator on a completed migration (`POST /demo/vms/…`), so
-  the alert can be shown,
+  the alert can be shown - its label follows the source's power as the migration records it, a press holding only
+  until the migration's phase, attempt or recorded power changes (audit DB-02),
   findings (before pre-flight ran: that it runs at validation, or is running), a Verification panel — the VM's
   a Network panel — each NIC with its source network, MAC and addresses and where it goes in RHOSO (the mapped
   network or its override, with the addresses it keeps or gets). Edit is for an operator on an OpenStack source:
@@ -3411,7 +3537,9 @@ is no origin a browser sends (review RV31-03).
   "Unavailable now", each still focusable and saying why (a button that changes rows as the migration moves keeps
   the focus) — finalize
   requires typing the VM name; Cancel says that the data copied so far is removed when the migration
-  has a data path (§5.1: it recorded passes or is in `precopy`/`syncing`); Retry says, when the plan has
+  has a data path (§5.1: it recorded passes or is in `precopy`/`syncing`) - on VMware that the destination server
+  the migration recorded is removed and the migration kit's volumes stay, named in the timeline for the operator to
+  delete once no plan migrates the VM (§5.1, §7.2, docs-drift DD3-02); Retry says, when the plan has
   completed, that the retry reopens it (§5.1); the approvals list the cutover request and each approval in time
   order — "Requested by {user}", "Approved by {user}" with its comment — and say when an approval does not count
   and why: the requester's own ("{user} requested the cutover") or the forcer's ("{user} forced the cutover"), §5.4;
@@ -3632,7 +3760,11 @@ is no origin a browser sends (review RV31-03).
   cancelled by the next batch, so a slow API still answers while events keep coming, and a query whose refresh
   was under way is refreshed again once it is done, so an event that came after its request still shows.
   `VITE_SEAMLESS_MOCK=1` switches to an in-browser mock adapter (`src/api/mock.ts`) with fixture data
-  that exercises every phase.
+  that exercises every phase. Its estimates are §9.1's, as a validation computes them: the control plane's `estimate`
+  with the plan's parameters (`params_for_plan`: the plan's overrides, its own link, threshold and pass limit),
+  ported to `src/lib/forcedEstimate.ts` and checked against a case table the control plane generates
+  (`seamless/tests/fixtures/estimate_cases.json`); the mock shows each part rounded to 0.1 s, the downtime as their
+  sum, and the API's `meets_slo`.
 * Dev: `npm run dev` proxies `/api` to `http://127.0.0.1:8080`. Build output `dashboard/dist`.
 
 ---
@@ -3747,13 +3879,13 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
 
 | Action | `docker`, `podman` | `kubernetes`, `openshift` |
 |---|---|---|
-| `up` | `make seamless-up` (`--demo`: `seamless-demo`): build, create or recreate what changed, wait until healthy | `apply -k` the overlay (`deploy/kubernetes`, `deploy/openshift`), then PostgreSQL and the control plane scaled to one replica each - an apply restores no replica count an earlier `down` set - and both rollouts awaited |
-| `down` | `make seamless-down`: the containers removed, the volumes kept | the control plane to 0 replicas and its pod gone, then PostgreSQL to 0; PVCs, Secrets and the ConfigMap kept |
-| `stop` | `make seamless-stop`: the control plane's container stopped, PostgreSQL left running | the control plane to 0 replicas and its pod gone |
-| `start` | `make seamless-start`: the stopped container started as it was, or created when `down` removed it, then waited for | PostgreSQL back to one replica when it is at 0, then the control plane to one, both rollouts awaited |
-| `restart` | `make seamless-restart`: the control plane recreated from the current `.env`, compose files and sources (`up -d --build --force-recreate --no-deps seamless`), then waited for | `rollout restart` of the Deployment - `Recreate` ends the old pod before the new one starts -, then awaited |
+| `up` | `make seamless-up` (`--demo`: `seamless-demo`): build, create or recreate what changed, wait until healthy | PostgreSQL scaled out of band brought back to one replica first, its extra pods awaited gone as `start` awaits them - before the apply, which may roll the control plane's pod at once (a new image in the overlay) onto every database (reviews RV42A-02, RV43A-01); a namespace without the StatefulSet yet - a first `up`, which the read answers as not found - has none, and any other failure of that read is refused (2) before the apply (review RV44A-04) -, then `apply -k` the overlay (`deploy/kubernetes`, `deploy/openshift`), then PostgreSQL and the control plane scaled to one replica each - an apply restores no replica count an earlier `down` set - and both rollouts awaited |
+| `down` | `make seamless-down`: the containers removed, the volumes kept | the control plane to 0 replicas and its running pod gone - a pod that failed or succeeded (one evicted) is not waited for: the scale-down never deletes it (review RV38B-03) -, then PostgreSQL to 0; PVCs, Secrets and the ConfigMap kept |
+| `stop` | `make seamless-stop`: the control plane's container stopped, PostgreSQL left running | the control plane to 0 replicas and its running pod gone |
+| `start` | `make seamless-start`: the stopped container started as it was, or created when `down` removed it, then waited for | PostgreSQL back to one replica when it is not at one - at 0 after `down`, or scaled out of band, where each replica is a database of its own (a PVC each) behind the one headless Service the control plane connects to: their number is named, the extra pods are awaited gone before the control plane starts - judged by the pods, never by the replica count alone: a scale-down by hand, or a start run again after its wait gave up, leaves the count at one with the pods still there - and their PVCs are kept (reviews RV38B-15, RV42A-01) -, then the control plane to one, both rollouts awaited; a namespace without the StatefulSet is refused ("run up first"), and any other failure of that first read is refused as such, both with 2 before anything changed (review RV44A-08) |
+| `restart` | `make seamless-restart`: the control plane recreated from the current `.env`, compose files and sources (`up -d --build --force-recreate --no-deps seamless`), then waited for | `rollout restart` of the Deployment - `Recreate` ends the old pod before the new one starts -, then awaited; a control plane at 0 replicas (`stop`) is scaled to one instead, as the single host's restart creates and starts it (review RV38B-04) |
 | `scale N` | `N` 0 is `stop`, 1 is `start` | the same |
-| `capacity` | `--max-migrations N` and `--max-cutovers N` written to `deploy/compose/.env` as `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` and `SEAMLESS_MAX_CONCURRENT_CUTOVERS` (§15.1, at least 1), then `restart` | the same settings patched into the ConfigMap `seamless-config`, `--cpu` and `--memory` set as the container's limits, then one rollout, awaited; the next `apply -k` brings the manifests' values back, so a lasting change goes into them |
+| `capacity` | `--max-migrations N` and `--max-cutovers N` written to `deploy/compose/.env` as `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` and `SEAMLESS_MAX_CONCURRENT_CUTOVERS` (§15.1, at least 1), then `restart` | `--cpu` and `--memory` first checked by a server-side dry run of the Deployment's patch (a limit below the requests changes nothing, review RV38B-02), then the settings patched into the ConfigMap `seamless-config`, then one patch of the pod template - the limits and a restart annotation, so the pod restarts once and reads the settings even when the limits stay as they are (review RV38B-01) -, awaited. When that patch fails, or its rollout does - a LimitRange or a quota refusing the new pod's limits, which the Deployment's dry run cannot see (admission judges the pod) -, the settings the ConfigMap held are put back and the template rolled back (`rollout undo`, after the put-back so the pod it starts reads the settings as they were, awaited by the Deployment becoming `Available`: its `Progressing` condition keeps a passed deadline after an undo, review RV42A-07) - a put-back that fails still has the template rolled back, its failure named with what the settings then need: put back by hand, and after an undo done a restart once the undo's pod is available - that pod read the new ones (reviews RV42A-03, RV43A-03) -; after an undo that failed, put back first, as the pod of the rollback by hand reads them, and no restart (review RV44A-07) -, so the control plane runs again as it was, and the script exits 1 naming what failed and anything it could not put back, never advising a second undo: an undo done whose pod is not `Available` within `--timeout` is named as such - the template is back, and its pod's refusal shows in the ReplicaSet's events -, and only an undo that failed names the revision to roll back to (reviews RV41A-06, RV41A-07, RV43A-02); the next `apply -k` brings the manifests' values back, so a lasting change goes into them |
 | `status` | `make seamless-ps` and `GET /api/v1/health` | the Deployment, the StatefulSet and their pods, and `GET /api/v1/health` at `--url` when given |
 | `logs` | `make seamless-logs` for the control plane | the control plane's log, followed |
 
@@ -3762,19 +3894,59 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   CPU and memory for the one control plane, each concurrent migration costing about 250 MiB (Performance.md §8) -,
   while the conversion hosts move the data (Performance.md).
 * **The mode a restart keeps.** `make seamless-start` and `seamless-restart` keep the mode the control plane ran in:
-  without `SEAMLESS_DEMO` in their environment they read it from the running or stopped container, so a demo
-  stack comes back a demo stack and a real one a real one.
+  without `SEAMLESS_DEMO` in their environment or in `.env` - whether `.env` sets it is read as Compose reads it
+  (below, review RV41A-04) - they read it from the running or stopped container, so a demo stack comes back a demo
+  stack and a real one a real one.
 * **Stopping safely.** A stop is safe at any time (§8): running steps end within the stop grace and resume from
   their checkpoint once the control plane runs again. `--drain TOKEN_FILE` makes a planned stop quieter: before
-  `down`, `stop`, `restart` or `scale 0` it pauses every running plan (`POST /plans/{id}/pause`), so no new
-  migration starts, and waits until no migration is in `cutover`, `verifying` or `rolling_back` - a cutover ends
-  rather than resuming after the restart - for at most `--wait-timeout` seconds (default 1800; a timeout stops
-  nothing). It prints the plans it paused, which `resume --token-file TOKEN_FILE PLAN_ID...` starts again (`POST
-  /plans/{id}/start`). The operator's token is read from a file only its owner may read - any other mode is refused
-  - and reaches curl through a header file in a private directory, never a command line (§13.1); the API is
-  `http://127.0.0.1:<SEAMLESS_HOST_PORT>` on the single host and the Route's or Ingress's URL (`--url`) on a
-  cluster. `--drain` and `resume` need `python3` to read the API's JSON.
-* `--dry-run` prints every command and runs none. The tutorial is `docs/Operations.md`.
+  `down`, `stop`, `restart`, `scale 0` or `capacity` - which ends in a restart (review RV38B-22) - it pauses every
+  running plan (`POST /plans/{id}/pause`), so no new migration starts, and waits until no migration is in
+  `cutover`, `verifying` or `rolling_back` - a cutover ends rather than resuming after the restart - for at most
+  `--wait-timeout` seconds (default 1800; a timeout stops and changes nothing). An action that would be refused
+  pauses no plan: before the drain every action runs what its first steps need (reviews RV42A-04, RV43A-05,
+  RV43A-06, RV44A-01) - on the single host `make`, the Make targets' own read-only prerequisites
+  (`seamless-check-context`, `seamless-check-env`: the Docker context, `deploy/compose/.env` and `tokens.yaml`) and
+  a `SEAMLESS_HOST_PORT` Compose can load, a port number from 1 to 65535 - every Compose command loads the whole
+  project, its published port included (reviews RV44A-06, RV45A-01): a value Compose would interpolate only Compose
+  can judge, refused for `restart` and `capacity`, whose Make target refuses it, while a quote never closed on any
+  line of `deploy/compose/.env` - whatever the shell sets, and whatever a later line defines - which Compose refuses
+  with the whole file for every command, is refused before every drain, naming its key (reviews RV46A-01, RV47-01):
+  only `resume`, which runs no Compose, is advised `--url` for it (review RV47-02), and the Make targets refuse it
+  as such, never as a value Compose interpolates (review RV47-03); on a cluster `kubectl` or
+  `oc`, a read of the Deployment - and of the StatefulSet for `down` - and a server-side dry run of the writes the
+  action starts with -
+  the Deployment's scale, or its rollout restart when it runs, and the StatefulSet's scale for `down` -, so a
+  mistyped namespace, an expired login or a login that may read but not write shows before the drain (review
+  RV45A-02), and for `capacity` `seamless-config` for the concurrency settings and the server-side dry run of its
+  ConfigMap and template patches, again after the drain. A plan whose pause got no answer - a timeout, an
+  interrupt - may be paused all the same: it is named for `resume` too (review RV42A-06); one the API refused - any 4xx: a
+  plan no longer running, a token it no longer takes, a plan another writer keeps changing - was not paused, and is
+  not named (reviews RV43A-04, RV45A-06), while an error a pause may still have been applied before - a 5xx, a
+  gateway's 502 or 504 - is named as a pause with no answer (review RV44A-02). The token is judged before any plan
+  is listed: one below the operator role (`GET /api/v1/me`) is refused, as its pauses would be (review RV44A-02),
+  and so is one the API does not take (401, 403) or an address it locks out (429, §13.1: named as such, review
+  RV46A-07), and an API that cannot answer that question or list the running plans stops the drain the same way -
+  nothing changed: 2 (review RV45A-07). It prints the plans it paused - also
+  when it fails or is interrupted after a pause, which stops nothing (reviews RV38B-05, RV41A-05) -, which
+  `resume --token-file TOKEN_FILE PLAN_ID...` starts again (`POST /plans/{id}/start`) - every plan it is given: one
+  that Start refuses (cancelled meanwhile, or a migration blocked: 409) is named, the others start all the same, and
+  the script then exits 1 (review RV38B-14). The operator's token is read from a file only its owner may read - any
+  other mode is refused - and reaches curl through a header file in a private directory, never a command line
+  (§13.1); the API is `http://127.0.0.1:<SEAMLESS_HOST_PORT>` on the single host - the port Compose publishes:
+  the shell's, else
+  `deploy/compose/.env`'s, else 8080, the file read by Compose's dotenv rules (a leading
+  byte-order mark ignored, an `export ` prefix, a key ended by `=` or `:`, spaces around it, quotes, an inline comment
+  after ` #` in an unquoted value, the last definition wins - reviews RV41A-01, RV41A-03); a value Compose would
+  interpolate - a `$` in an unquoted or double-quoted value - is refused, never guessed: the script and the Make
+  targets that use the value stop and name it (review RV41A-02). So the token never goes to a port the stack does not
+  publish (review RV38B-07); the Make targets read `SEAMLESS_HOST_PORT` and `SEAMLESS_VERSION` the same way
+  (RV38B-07b, RV38B-09) - and the Route's or Ingress's URL (`--url`) on a cluster. `--drain` and `resume` need
+  `python3` to read the API's JSON.
+* `--dry-run` prints every command and runs none, and says no request was answered: `resume --dry-run` names no
+  plan as started (review RV44A-09). The tutorial is `docs/Operations.md`.
+* It exits 0 when done, 1 when a step failed - a Make target's failure too -, and 2 for a usage error or a refusal,
+  before anything changed (review RV43A-07). `--timeout S` (default 600) bounds each wait and takes at least 1 second:
+  `kubectl wait` reads 0 as a single check, `rollout status` as no bound at all (review RV43A-02).
 
 ---
 
@@ -3805,7 +3977,8 @@ tests/unit/test_warm_playbooks.py             tests/perf/bench_blocksync.py
 seamless/ (pyproject.toml, Containerfile, src/seamless_migrate/…, tests/…)
 dashboard/ (package.json, src/…, design-system/…, e2e/…)
 deploy/openshift/   deploy/openshift/backup/   deploy/kubernetes/   deploy/compose/   tests/e2e/
-scripts/compose-init.sh   scripts/seamless-ctl.sh   scripts/check-readonly-runtime.sh   scripts/collection-sanity.sh   scripts/vendor-openstack-cloud.sh
+scripts/compose-init.sh   scripts/seamless-ctl.sh   scripts/dotenv-value.sh   scripts/check-readonly-runtime.sh
+scripts/collection-sanity.sh   scripts/vendor-openstack-cloud.sh   scripts/image-dashboard.sh
 .github/workflows/{ci,codeql}.yml   .github/dependabot.yml   .pre-commit-config.yaml   .gitleaks.toml   .gitleaks-tree.toml
 .dockerignore   seamless/.containerignore   RELEASING.md   NOTICE   CONTRIBUTING.md   SECURITY.md   CODE_OF_CONDUCT.md   CONTRIBUTORS.md   CODEOWNERS
 docs/advisor/   docs/audits/   docs/UI-UX-AUDIT-2026-10-15.md   AUDIT-UI-UX-BY-GEMINI.md

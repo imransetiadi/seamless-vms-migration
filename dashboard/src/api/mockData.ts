@@ -2,7 +2,7 @@
  * Deterministic fixture data for the in-browser mock adapter (VITE_SEAMLESS_MOCK=1).
  * Covers every Phase, Strategy, PlanStatus, provider status, finding Severity and advisor note
  * kind/source so the whole UI can be exercised without the control plane.
- * Estimates follow SDD §9.1, eligibility §9.2 and findings a subset of §9.3.
+ * Estimates are the API's §9.1 formula (lib/forcedEstimate), eligibility §9.2 and findings a subset of §9.3.
  */
 import type {
   AdvisorNote,
@@ -33,7 +33,9 @@ import type {
   VerificationRecord,
   VMRef,
 } from './types';
+import { DOWNTIME_PARTS } from './types';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
+import { estimateStrategy, paramsFor } from '../lib/forcedEstimate';
 import { pyNames, pyRepr } from '../lib/format';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
@@ -41,7 +43,7 @@ import { kitVmName } from '../lib/kitName';
 import { addressRefusal, canonicalIp, ipInCidr, mappedNetwork, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
 import { kitSubnet, networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
 import { destinationRelease, parseMicroversion, type PolicyProfile } from '../lib/platforms';
-import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
+import { describePorts, portsWithoutOneFixedIp, vgpuRequests } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { providerLabel } from '../lib/providerUse';
 import { buildStrategyEvidence } from './mockEvidence';
@@ -443,8 +445,9 @@ const CLOUDS: Record<string, { role: ProviderRole; kind: ProviderKind; storage: 
  */
 export function vmwareCheck(vms: readonly VMRef[]): Record<string, unknown> {
   return {
-    admin: true,
     api_version: '8.0.2.0',
+    version: '8.0.2',
+    vm_count: vms.length,
     cbt_enabled_vms: vms.filter((v) => v.cbt_enabled).length,
     vms_with_snapshots: vms.filter((v) => v.snapshot_count).length,
     vms_with_independent_disks: vms.filter((v) => v.disks.some((d) => d.independent)).length,
@@ -785,97 +788,20 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
 // Estimator (SDD §9.1) and eligibility (§9.2)
 // -------------------------------------------------------------------------------------------
 
-const PARAMS = {
-  scan_bps: 524288000,
-  change_rate_bps: 2097152,
-  shutdown_s: 60,
-  boot_s: 120,
-  create_s: 60,
-  snapshot_s: 30,
-  handover_per_volume_s: 20,
-  v2v_s: 300,
-  v2v_inplace_s: 120,
-};
-
+/** A strategy's estimate as the API's validation computes it (§9.1, §16), each part shown to 0.1 s. */
 export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: string[]): Estimate {
-  const D = vm.disk_bytes;
-  const U = vm.used_bytes;
-  const c = vm.change_rate_bps ?? PARAMS.change_rate_bps;
-  const L = plan.link_bps;
-  const S = PARAMS.scan_bps;
-  const V = vm.disks.length;
-  const threshold = plan.convergence_threshold_bytes;
-  const maxPasses = plan.max_sync_passes;
-  let precopy = 0;
-  let passes = 0;
-  let finalDelta = 0;
-
-  // the copy, or final sync, and the conversion: the parts of the downtime besides the fixed steps (SDD §9.1)
-  let copy = 0;
-  let conversion = 0;
-  switch (strategy) {
-    case 'cold':
-      copy = PARAMS.snapshot_s + U / L;
-      break;
-    case 'warm': {
-      let t = PARAMS.snapshot_s + Math.max(U / L, D / S);
-      precopy = t;
-      passes = 1;
-      let delta = Math.min(D, c * t);
-      while (delta > threshold && passes < maxPasses) {
-        t = PARAMS.snapshot_s + Math.max(D / S, delta / L);
-        precopy += t;
-        passes += 1;
-        delta = Math.min(D, c * t);
-      }
-      finalDelta = delta;
-      copy = PARAMS.snapshot_s + Math.max(D / S, finalDelta / L);
-      break;
-    }
-    case 'storage_handover':
-      copy = V * PARAMS.handover_per_volume_s;
-      break;
-    case 'vmware_cold':
-      copy = U / L;
-      conversion = PARAMS.v2v_s;
-      break;
-    case 'vmware_warm': {
-      let t = U / L;
-      precopy = t;
-      passes = 1;
-      let delta = Math.min(D, c * t);
-      while (delta > threshold && passes < maxPasses) {
-        t = 10 + delta / L;
-        precopy += t;
-        passes += 1;
-        delta = Math.min(D, c * t);
-      }
-      finalDelta = delta;
-      copy = finalDelta / L;
-      conversion = PARAMS.v2v_inplace_s;
-      break;
-    }
-  }
+  const e = estimateStrategy(vm, strategy, paramsFor(plan), plan.downtime_slo_s);
   const round = (n: number) => Math.round(n * 10) / 10;
   // the API's keys (SDD §4, ADV-16): the rounded parts add up to the downtime
-  const downtime_parts = {
-    shutdown_s: PARAMS.shutdown_s,
-    copy_s: round(copy),
-    conversion_s: round(conversion),
-    create_s: PARAMS.create_s,
-    boot_s: PARAMS.boot_s,
-  };
-  const downtime = round(Object.values(downtime_parts).reduce((a, b) => a + b, 0));
+  const downtime_parts = Object.fromEntries(DOWNTIME_PARTS.map((part) => [part, round(e.downtime_parts[part] ?? 0)]));
+  const downtime = round(DOWNTIME_PARTS.reduce((sum, part) => sum + (downtime_parts[part] ?? 0), 0));
   return {
-    strategy,
+    ...e,
     eligible: reasons.length === 0,
     reasons,
-    precopy_s: round(precopy),
-    passes,
+    precopy_s: round(e.precopy_s),
     downtime_s: downtime,
-    total_s: round(precopy + downtime),
-    final_delta_bytes: Math.round(finalDelta),
-    meets_slo: downtime <= plan.downtime_slo_s,
+    total_s: round(e.precopy_s + downtime),
     downtime_parts,
   };
 }
@@ -915,6 +841,10 @@ const diskIds = (disks: VMRef['disks']) => disks.map((d) => d.name || d.id).join
  * Every strategy of the source's family with its ineligibility reasons, word for word as the API's
  * planning/selector.eligibility (SDD §9.2, §16): the shared eligibility_cases.json pins both (review RV20-08).
  */
+/** Why a migration that holds an earlier attempt's destination volumes takes no storage handover: the API's words (SDD §9.2). */
+export const HELD_VOLUMES_REASON =
+  'an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first';
+
 export function eligibility(
   vm: VMRef,
   sourceKind: ProviderKind,
@@ -922,6 +852,7 @@ export function eligibility(
   source: Provider,
   destination: Provider,
   findings: Finding[],
+  holdsVolumes = false,
 ): Partial<Record<Strategy, string[]>> {
   const result: Partial<Record<Strategy, string[]>> = {};
   const multiattach = vm.disks.filter((d) => d.multiattach);
@@ -967,6 +898,8 @@ export function eligibility(
         `the source's compute API ${String(source.capabilities.compute_microversion)} is below ${HANDOVER_COMPUTE_FLOOR} (the handover's delete_on_termination update of the source server)`,
       );
     }
+    // a handover never removes what an earlier attempt left at the destination (SDD §9.2, review 39 lead L1)
+    if (holdsVolumes) handover.push(HELD_VOLUMES_REASON);
     result.storage_handover = handover;
   }
   for (const finding of findings) {
@@ -1088,8 +1021,12 @@ export function preflight(
 
   // every message below as the API words it, over the shared finding cases (SDD §9.3, §16)
   if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', `Source VM ${vm.name} is in error state.`);
-  else if (vm.power_state === 'transitioning')
-    add('SRC_VM_TRANSITIONAL_STATE', `Source VM ${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot); a stop or snapshot would fail.`);
+  // a task Nova runs whatever the status is named, and meets its condition beside an error (SDD §9.3, review PV-05)
+  if (vm.power_state === 'transitioning' || vm.task_state)
+    add(
+      'SRC_VM_TRANSITIONAL_STATE',
+      `Source VM ${vm.name} has a Nova task in flight (${vm.task_state || 'resize, migration, rescue, rebuild or reboot'}); a stop or snapshot would fail.`,
+    );
   // the migration kit names a VMware VM's server, ports and volumes after its name as it writes it, and finds a volume
   // again by that name: from a VMware source the kit's names decide, the same name included (SDD §7.2, §9.3, reviews
   // RV26-04, RV28-04)
@@ -1205,8 +1142,9 @@ export function preflight(
     add(code, message);
   if ('pci_passthrough:alias' in vm.flavor_extra_specs)
     add('VM_PCI_PASSTHROUGH', `Flavor requests PCI passthrough (${vm.flavor_extra_specs['pci_passthrough:alias']}).`);
-  if ('resources:VGPU' in vm.flavor_extra_specs)
-    add('VM_VGPU', 'Flavor requests a vGPU (resources:VGPU).');
+  const vgpu = vgpuRequests(vm.flavor_extra_specs);
+  if (vgpu.length)
+    add('VM_VGPU', `Flavor requests a vGPU (${vgpu.join(', ')}).`);
   const encrypted = vm.disks.filter((d) => d.encrypted).map((d) => d.name || d.id);
   if (encrypted.length)
     add('VOL_ENCRYPTED', `Encrypted disk(s): ${pyNames(encrypted)}.`);
@@ -1401,7 +1339,7 @@ const PLAN_SPECS: PlanSpec[] = [
           option: 'warm', confidence: 0.83, status: 'auto_applied', deterministic: 'cold',
           then: { kind: 'override', user: 'bayu', option: 'cold', reason: 'Domain controllers move cold: the AD replication window was rehearsed that way', after: 40 * 60 },
         },
-        notes: [{ kind: 'classification', source: 'rules', summary: 'Classified as infrastructure_service: os_type windows2019 and tag app=active-directory.', confidence: null, data: { tier: 'infrastructure_service' }, ago: 3 * D }],
+        notes: [{ kind: 'classification', source: 'rules', summary: 'Classified as infrastructure_service: tag app=active-directory.', confidence: null, data: { tier: 'infrastructure_service' }, ago: 3 * D }],
       },
       { id: 'mig-7a9b1c3d40', vm: 'os-0b22', strategy: 'cold', phase: 'validating', wave: 'wave-3', enteredAgo: 6 },
       { id: 'mig-7a9b1c3d41', vm: 'os-0b32', strategy: 'warm', phase: 'pending', wave: 'wave-3', enteredAgo: 40 * 60 },

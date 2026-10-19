@@ -1,6 +1,8 @@
 """GET /advisor/recommendations: stored and legacy recommendations (SDD §12, §14.4, ADV-01)."""
 
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -281,3 +283,21 @@ def test_lists_every_migrations_advisor_notes_but_strategy_notes_newest_first(ap
 def test_advisor_notes_need_a_token_and_any_role(api):
     assert api.get("/api/v1/advisor/notes", role=None).status_code == 401
     assert api.get("/api/v1/advisor/notes", role=Role.viewer).status_code == 200
+
+
+OVERRIDE_BODY_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "override_body_cases.json").read_text(encoding="utf-8")
+)["cases"]
+
+
+@pytest.mark.parametrize("case", OVERRIDE_BODY_CASES, ids=[c["note"] for c in OVERRIDE_BODY_CASES])
+def test_an_override_body_is_judged_by_its_model_before_the_recommendation_is_looked_up(api, case):
+    """SDD §12, §14.6 (reviews RV42B-01, RV43B-07): the override's body model refuses what the
+    body alone gets wrong - with pydantic's messages, the model's fields first - before the route
+    looks the recommendation up; the cases the dashboard's mock answers the same way
+    (override_body_cases.json)."""
+    body = {k: "x" * 2001 if v == "[2001]" else v for k, v in case["body"].items()}
+    answer = api.post("/api/v1/advisor/recommendations/rec-ghost/override", json=body)
+    assert answer.status_code == case["status"], answer.text
+    if case["message"] is not None:
+        assert answer.json()["error"]["message"] == case["message"]

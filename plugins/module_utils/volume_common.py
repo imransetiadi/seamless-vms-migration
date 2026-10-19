@@ -49,9 +49,12 @@ def _is_not_found(err):
     )
 
 
-def is_timeout(err):
+def gave_up_waiting(err):
     """openstacksdk's ResourceTimeout - a wait that gave up, such as "Timeout waiting for Volume
-    ... to delete" -, whatever module raised it (Seamless Migrate SDD 6.6, review RV34B-01)."""
+    ... to delete" -, whatever module raised it (Seamless Migrate SDD 6.6, review RV34B-01). Its
+    name reads as no timeout: ansible-core before 2.19 prints an escaped error's traceback, each
+    frame's function named, and Seamless Migrate classifies a failure whose output says "timeout"
+    as transient (review RV41A-09)."""
     return any(cls.__name__ == "ResourceTimeout" for cls in type(err).__mro__)
 
 
@@ -170,6 +173,14 @@ SSH_UNREACHABLE_S = 900
 GIVE_UP_PREFIXES = ("Lock timeout", "SSH timeout")
 
 
+def ssh_failed(status):
+    """Whether a command's exit status is ssh's own failure, no failure of the remote command:
+    ssh's SSH_FAILED, or a negative status - ssh killed by a signal on the host that runs it (an
+    OOM kill, a stray kill). Every caller telling the two apart reads it here, so the control plane
+    retries both (Seamless Migrate SDD 6.6, reviews RV43B-05, RV44B-03)."""
+    return status == SSH_FAILED or status < 0
+
+
 class ConversionHostUnreachable(RuntimeError):
     """A wait gave up: ssh to the conversion host failed for SSH_UNREACHABLE_S
     without a break (Seamless Migrate SDD 6.6)."""
@@ -185,6 +196,29 @@ class DetachStuck(RuntimeError):
     6.6, review RV34B-01). Named without "timeout": ansible-core before 2.19 prints an escaped
     exception's class name, and the control plane would read the stuck detach as transient
     (review RV35A-01)."""
+
+
+def _program(command):
+    """The program a remote command runs: its first word past sudo and options."""
+    for word in " ".join(str(part) for part in command).split():
+        if word != "sudo" and not word.startswith("-"):
+            return word.rsplit("/", 1)[-1]
+    return "a command"
+
+
+class RemoteCommandFailed(subprocess.CalledProcessError):
+    """A command on the conversion host that failed by itself - a positive exit status other
+    than ssh's own SSH_FAILED. Its message names the program and the status, never ssh's
+    command line: ConnectTimeout among ssh's options read as a "timeout", which the control
+    plane retries as transient, so a failure no retry fixes ran again with the source VM
+    stopped (Seamless Migrate SDD 6.6, review RV42B-02). ``cmd`` is the remote command, which
+    RemoteShell.cmd_out logs in full as it fails (review RV43B-06)."""
+
+    def __str__(self):
+        return "%s on the conversion host exited with status %d" % (
+            _program(self.cmd),
+            self.returncode,
+        )
 
 
 class DiskIdentityError(RuntimeError):
@@ -207,8 +241,9 @@ def _checked_give_up_prefix(prefix):
 
 class SshOutage:
     """
-    How long ssh to a conversion host has failed without a break, its own exit
-    status 255: a wait that meets it gives up once that reaches
+    How long ssh to a conversion host has failed without a break - its own exit
+    status 255, or a negative status: ssh killed by a signal on the migrator
+    (ssh_failed; review RV45B-05) -: a wait that meets it gives up once that reaches
     SSH_UNREACHABLE_S, with "{prefix}: conversion host {address} unreachable
     over SSH for {n} s, waiting for {what}", which the control plane retries
     (Seamless Migrate SDD 6.6, review RV8-01, RV9-02, RV9-04); the prefix is
@@ -295,7 +330,7 @@ def use_lock(lock_file):
                     # the conversion host cannot be reached: give up after 15 minutes
                     # of that rather than try 1800 times; the control plane retries
                     # a "timeout" (Seamless Migrate SDD 6.6, QASuite R-07)
-                    outage.seen(result == SSH_FAILED)
+                    outage.seen(ssh_failed(result))
                     if result == 16:
                         self.log.info("Another conversion has the lock.")
                     elif result == 17:
@@ -898,6 +933,12 @@ class OpenStackVolumeBase:
             if result:
                 self.log.debug("Port write result: %s", result)
         except subprocess.CalledProcessError as err:
+            # ssh's own failure gives up as the read below does, retried (review RV44B-03)
+            if ssh_failed(err.returncode):
+                raise RuntimeError(
+                    "SSH timeout: conversion host %s unreachable over SSH, initializing the port map"
+                    % getattr(self.shell, "address", "?")
+                ) from err
             raise RuntimeError("Unable to initialize port map file!") from err
 
         try:  # Try to read in the set of used ports
@@ -913,7 +954,7 @@ class OpenStackVolumeBase:
         except subprocess.CalledProcessError as err:
             # ssh's own failure is transient: a give-up the control plane retries, as the
             # waits of SDD 6.6 end; any other failure of the read is the port map's (audit A-17)
-            if err.returncode == SSH_FAILED:
+            if ssh_failed(err.returncode):
                 raise RuntimeError(
                     "SSH timeout: conversion host %s unreachable over SSH, reading the port map"
                     % getattr(self.shell, "address", "?")
@@ -970,7 +1011,7 @@ class OpenStackVolumeBase:
         try:
             serial = self.shell.cmd_out(["cat", "/sys/block/%s/serial" % name]).strip()
         except subprocess.CalledProcessError as err:
-            if err.returncode == SSH_FAILED:
+            if ssh_failed(err.returncode):
                 raise
             if name.startswith("vd"):
                 raise DiskIdentityError(
@@ -988,7 +1029,7 @@ class OpenStackVolumeBase:
             )
         link = "/dev/disk/by-id/virtio-" + serial
         found = self.shell.cmd_val(["test", "-b", link])
-        if found == SSH_FAILED:
+        if ssh_failed(found):
             # a give-up the control plane retries, as the serial read's own error is (RV14-02)
             raise RuntimeError(
                 "SSH timeout: conversion host %s unreachable over SSH, checking the by-id link of %s"
@@ -1055,7 +1096,7 @@ class OpenStackVolumeBase:
         """
         result = self.shell.cmd_val(["timeout", "1", "nc", "-l", str(port)])
         if outage is not None:
-            outage.seen(result == SSH_FAILED)
+            outage.seen(ssh_failed(result))
         # The 'timeout' command returns 124 when the command times out, meaning
         # nc was successful and the port is free.
         return result == 124
@@ -1095,10 +1136,28 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
         return preamble
 
     def cmd_out(self, command, **kwargs):
-        """Run command on the target conversion host and get the output."""
+        """Run command on the target conversion host and get the output. A command that fails
+        by itself - a positive exit status - raises RemoteCommandFailed, its full command logged
+        (debug); ssh's own failure (SSH_FAILED), and ssh killed by a signal on this host (a
+        negative status: no remote command failed), subprocess's CalledProcessError, whose ssh
+        command line the control plane retries as transient (Seamless Migrate SDD 6.6, reviews
+        RV42B-02, RV43B-05, RV43B-06)."""
         args = self.ssh_preamble()
         args.extend(command)
-        return subprocess.check_output(args, **kwargs).decode("utf-8").strip()
+        try:
+            return subprocess.check_output(args, **kwargs).decode("utf-8").strip()
+        except subprocess.CalledProcessError as err:
+            if ssh_failed(err.returncode):
+                raise
+            logging.getLogger("osp-osp").debug(
+                "%s on the conversion host %s exited with status %d",
+                " ".join(str(part) for part in command),
+                self.address,
+                err.returncode,
+            )
+            raise RemoteCommandFailed(
+                err.returncode, list(command), err.output, err.stderr
+            ) from None
 
     def cmd_val(self, command, **kwargs):
         """Run command on the target conversion host and get return code."""
@@ -1379,6 +1438,20 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             mark="source_attached",
         )
 
+    def _tool_present(self, probe):
+        """Whether a probe for an NBD export tool succeeds on the source conversion host. Ssh
+        failing at the probe tells nothing of the tool: it gives up as an ssh timeout, which the
+        control plane retries - read as the tool missing, it picked the other tool on a guess, or
+        failed the export as "No supported NBD export tool available!" (Seamless Migrate SDD 6.6,
+        review 45b lead 4)."""
+        status = self.shell.cmd_val(probe)
+        if ssh_failed(status):
+            raise RuntimeError(
+                "SSH timeout: conversion host %s unreachable over SSH, probing the NBD export tools"
+                % getattr(self.shell, "address", "?")
+            )
+        return status == 0
+
     def _export_volumes_from_converter(self):
         """
         SSH to source conversion host and start an NBD export. Volume mapping
@@ -1398,11 +1471,11 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             self.log.info("Exporting %s from volume %s", disk, volume_id)
 
             # Fall back to qemu-nbd if nbdkit is not present
-            qemu_nbd_present = self.shell.cmd_val(["which", "qemu-nbd"]) == 0
-            nbdkit_present = self.shell.cmd_val(["which", "nbdkit"]) == 0
+            qemu_nbd_present = self._tool_present(["which", "qemu-nbd"])
+            nbdkit_present = self._tool_present(["which", "nbdkit"])
             if nbdkit_present:
                 dump_plugin = ["nbdkit", "--dump-plugin", "file"]
-                file_plugin_present = self.shell.cmd_val(dump_plugin) == 0
+                file_plugin_present = self._tool_present(dump_plugin)
                 if not file_plugin_present:
                     self.log.info("Found nbdkit, but without file plugin.")
             else:
@@ -1465,7 +1538,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                     image_info = self.shell.cmd_out(cmd)
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                 except subprocess.CalledProcessError as error:
-                    outage.seen(error.returncode == SSH_FAILED)
+                    outage.seen(ssh_failed(error.returncode))
                     self.log.info("Got exception: %s", error)
                     self.log.info("Trying again.")
                     time.sleep(1)
@@ -1519,7 +1592,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                     pending_disks.remove(disk)
             except subprocess.CalledProcessError as error:
-                outage.seen(error.returncode == SSH_FAILED)
+                outage.seen(ssh_failed(error.returncode))
                 self.log.info("Got exception: %s", error)
                 self.log.info("Trying again.")
                 time.sleep(1)
@@ -1566,7 +1639,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                     pending_disks.remove(disk)
             except subprocess.CalledProcessError as error:
-                outage.seen(error.returncode == SSH_FAILED)
+                outage.seen(ssh_failed(error.returncode))
                 self.log.info("Got exception: %s", error)
                 self.log.info("Trying again.")
                 time.sleep(1)
@@ -1754,17 +1827,18 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         not make the volume's link over one, where udev 239 (RHEL 8) replaces
         it - and the error says whether it was removed, could not be removed or
         could not be checked. Ssh failing at the check gives up as SSH timeout
-        after a whole copy (``nbdcopy_exit`` 0) or one ssh broke (255); after
-        nbdcopy failed on its own every answer would be permanent, so its
-        failure stays (Seamless Migrate SDD 6.6, review RV15-02, RV16-02,
-        RV16-03, RV17-01, RV17-04).
+        after a whole copy (``nbdcopy_exit`` 0) or one ssh broke (255, or a
+        negative status: ssh killed, ssh_failed); after nbdcopy failed on its
+        own (a positive exit) every answer would be permanent, so its failure
+        stays (Seamless Migrate SDD 6.6, review RV15-02, RV16-02, RV16-03,
+        RV17-01, RV17-04, RV45B-05).
         """
         found = self.shell.cmd_val(["test", "-b", path])
         if found == 0:
             return
         address = getattr(self.shell, "address", "?")
-        if found == SSH_FAILED:
-            if nbdcopy_exit not in (0, SSH_FAILED):
+        if ssh_failed(found):
+            if nbdcopy_exit != 0 and not ssh_failed(nbdcopy_exit):
                 raise RuntimeError(
                     "Failed to copy volume with nbdcopy! Return code: %d; whether %s on %s is still a "
                     "disk could not be checked (ssh failed): look for a regular file there"
@@ -1780,7 +1854,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             what = "left the host before nbdcopy opened it, and nbdcopy copied into a regular file in its place, "
             if removed == 0:
                 what += "now removed; the volume was not written"
-            elif removed == SSH_FAILED:
+            elif ssh_failed(removed):
                 what += (
                     "and ssh failed at the removal: check %s on %s and remove it by hand if it is "
                     "there, as udev 252 will not make the volume's link over it; the volume was not "
@@ -1792,7 +1866,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     "252 will not make the volume's link over it; the volume was not written"
                     % (removed, path, address)
                 )
-        elif regular == SSH_FAILED:
+        elif ssh_failed(regular):
             what = (
                 "left the host, and whether nbdcopy left a regular file in its place could not be "
                 "checked (ssh failed): remove one found at %s on %s by hand; the volume was not "
@@ -1948,7 +2022,7 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
             try:
                 return self.shell.test_ssh_connection()
             except subprocess.CalledProcessError as err:
-                if err.returncode != SSH_FAILED:
+                if not ssh_failed(err.returncode):
                     raise
                 outage.seen(True)
                 self.log.info("Conversion host unreachable, waiting: %s", err)

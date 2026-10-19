@@ -232,6 +232,9 @@ export interface VMRef {
   snapshot_count: number;
   tools_ok: boolean | null;
   change_rate_bps: number | null;
+  /** The task Nova runs on the server whatever its status (OS-EXT-STS:task_state), apart from `power_state`; null or
+   *  absent for none, for VMware and from older control planes (SDD §4.2, review PV-05). */
+  task_state?: string | null;
   /** The Nova keypair the server boots with (OpenStack); absent or null for VMware (SDD §4.1). */
   key_name?: string | null;
   /** Derived and serialized: Σ size_gb · 2^30. */

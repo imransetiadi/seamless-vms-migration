@@ -16,7 +16,12 @@ from typing import Any
 from ..config import Settings
 from ..domain.enums import WARM_STRATEGIES, Strategy, SyncPassKind
 from ..domain.models import Migration, Plan, Provider, SyncPass, next_pass_number, utcnow
-from ..planning.estimator import VMWARE_PASS_OVERHEAD_S, params_for_plan
+from ..planning.estimator import (
+    VMWARE_PASS_OVERHEAD_S,
+    params_for_plan,
+    scan_seconds,
+    whole_pass_seconds,
+)
 from ..providers.base import ProviderError
 from .base import PermanentStepError, StepContext, StepName, StepResult
 
@@ -135,15 +140,24 @@ class SimulatedExecutor:
         return vm.change_rate_bps if vm.change_rate_bps is not None else params.change_rate_bps
 
     def _previous_duration(self, ctx: StepContext) -> float:
+        """The previous pass's whole model time: a warm pass records the part after its snapshot,
+        and the guest writes through the snapshot too (SDD §7.4, §9.1, reviews RV38A-05,
+        RV39-07)."""
         passes = ctx.migration.sync_passes
-        return float(passes[-1].duration_s or 0.0) if passes else 0.0
+        if not passes:
+            return 0.0
+        return whole_pass_seconds(passes[-1], ctx.migration.strategy, params_for_plan(ctx.plan))
 
-    def _pass_duration(self, ctx: StepContext, changed: float, first: bool) -> float:
+    def _pass_times(self, ctx: StepContext, changed: float, first: bool) -> tuple[float, float]:
+        """The pass's whole model time and the duration it records (SDD §7.4): a warm pass takes
+        the model's snapshot + max(scan, Δ/L), its scan as §9.1 models it, and records the part
+        after the snapshot, as the collection's warm sync does (review RV38A-05)."""
         p = params_for_plan(ctx.plan)
-        disk = ctx.migration.vm.disk_bytes
         if ctx.migration.strategy == Strategy.vmware_warm:
-            return changed / p.link_bps if first else VMWARE_PASS_OVERHEAD_S + changed / p.link_bps
-        return p.snapshot_s + max(disk / p.scan_bps, changed / p.link_bps)
+            took = changed / p.link_bps if first else VMWARE_PASS_OVERHEAD_S + changed / p.link_bps
+            return took, took
+        sync = max(scan_seconds(ctx.migration.vm, p), changed / p.link_bps)
+        return p.snapshot_s + sync, sync
 
     async def _pass(self, step: StepName, ctx: StepContext) -> StepResult:
         vm = ctx.migration.vm
@@ -155,10 +169,10 @@ class SimulatedExecutor:
         else:
             changed = self._change_rate(ctx) * self._previous_duration(ctx) * self._jitter(rng)
         changed = float(min(vm.disk_bytes, changed))
-        duration = self._pass_duration(ctx, changed, first)
+        took, duration = self._pass_times(ctx, changed, first)
         started = utcnow()
         await ctx.log(f"simulated {'full' if first else 'delta'} pass {number} started")
-        await self._elapse(ctx, duration, int(changed))
+        await self._elapse(ctx, took, int(changed))
         result = StepResult(
             sync_pass=SyncPass(
                 number=number,
@@ -204,7 +218,9 @@ class SimulatedExecutor:
                 self._change_rate(ctx) * self._previous_duration(ctx) * self._jitter(rng),
             )
             if m.strategy == Strategy.warm:
-                copy_s = p.snapshot_s + max(vm.disk_bytes / p.scan_bps, changed / p.link_bps)
+                # the model's final pass: its snapshot, then its scan as §9.1 models it or its
+                # transfer (SDD §7.4, review RV38A-05)
+                copy_s = p.snapshot_s + max(scan_seconds(vm, p), changed / p.link_bps)
             else:
                 copy_s = changed / p.link_bps + p.v2v_inplace_s
             kind, number = SyncPassKind.final, next_pass_number(m)
@@ -239,7 +255,8 @@ class SimulatedExecutor:
                 bytes_scanned=vm.disk_bytes,
                 bytes_changed=int(changed),
                 bytes_transferred=int(changed),
-                duration_s=copy_s,
+                # a warm final pass records the part after its snapshot, as the others do
+                duration_s=copy_s - p.snapshot_s if m.strategy == Strategy.warm else copy_s,
             )
         await self._elapse(ctx, p.create_s, 0, stopped=True)
         self._stopped.pop(m.id, None)

@@ -33,6 +33,9 @@ class EstimatorParams:
 
 #: Fixed overhead of a VMware CBT delta pass (SDD §9.1: ``Tk = 10 + Δk/L``).
 VMWARE_PASS_OVERHEAD_S = 10.0
+#: A pass at most this much longer than its changes take over the link may have been bound by the
+#: link - the margin is the sync's own setup (SDD §9.1, review RV39-01).
+LINK_BOUND_MARGIN = 1.1
 _FIELD_TYPES = {f.name: f.type for f in fields(EstimatorParams)}
 _INT_FIELDS = frozenset({"convergence_threshold_bytes", "max_passes", "parallel_disks"})
 #: Plan fields that keep precedence over ``Plan.estimator_overrides``.
@@ -229,6 +232,16 @@ def final_downtime_parts(
     return _parts(p, p.snapshot_s + max(scan_seconds(vm, p), delta / p.link_bps), 0.0)
 
 
+def whole_pass_seconds(sync_pass: SyncPass, strategy: Strategy, params: EstimatorParams) -> float:
+    """A recorded pass's whole time, §9.1's ``Tk``: a warm pass records the part after its
+    snapshot (blocksync's summary, the demo's alike), so its snapshot is added back - the guest
+    writes through it too; a VMware CBT pass records the whole (SDD §9.1, review RV39-07)."""
+    recorded = float(sync_pass.duration_s or 0.0)
+    if Strategy(strategy) == Strategy.warm:
+        return recorded + params.snapshot_s
+    return recorded
+
+
 def estimate_final_downtime(
     vm: VMRef, strategy: Strategy, last_pass_s: float, params: EstimatorParams
 ) -> float:
@@ -263,13 +276,31 @@ def calibrated_change_rate(
 
 
 def observed_scan_rate(sync_pass: SyncPass, vm: VMRef, params: EstimatorParams) -> float | None:
-    """Per-stream scan throughput of a pass: ``bytes_scanned / duration_s / min(P, V)``.
+    """Per-stream scan throughput of a pass: the ``S`` under which the scan model gives its
+    duration, ``max(min(Dmax, B), B / min(P, V)) / duration_s`` with ``B = bytes_scanned`` - a
+    pass lasts as long as its largest disk's scan or its streams' share (SDD §9.1, review PL-07).
 
     Only delta/final passes calibrate it: pass 1 is usually link-bound and would understate it.
+    ``None`` too for a pass at the aggregate ceiling (``A`` set, ``B / A >= duration_s``): it lasts
+    as long whatever ``S`` is, so it does not tell ``S``. A pass the link may have bound - one that
+    lasted at most ``LINK_BOUND_MARGIN`` times its changes' time over the link - only bounds ``S``
+    from below: what it reads may raise ``S`` (``params.scan_bps``, the migration's calibrated
+    one), never lower it, and ``None`` otherwise (review RV38A-02). A pass that lasted longer was
+    bound by its scan, whatever the model's scan at the current ``S`` says: what it reads replaces
+    ``S``, lower too (SDD §9.1, review RV39-01).
     """
     if sync_pass.kind == SyncPassKind.full:
         return None
-    if not sync_pass.duration_s or sync_pass.duration_s <= 0 or sync_pass.bytes_scanned <= 0:
+    duration, scanned = sync_pass.duration_s, sync_pass.bytes_scanned
+    if not duration or duration <= 0 or scanned <= 0:
+        return None
+    ceiling = params.max_aggregate_scan_bps
+    if ceiling is not None and ceiling > 0 and scanned / ceiling >= duration:
         return None
     streams = max(1, min(int(params.parallel_disks), len(vm.disks) or 1))
-    return sync_pass.bytes_scanned / sync_pass.duration_s / streams
+    largest = max((d.size_gb for d in vm.disks), default=0) * GIB
+    rate = max(min(largest, scanned), scanned / streams) / duration
+    link = params.link_bps
+    if link and link > 0 and duration <= LINK_BOUND_MARGIN * (sync_pass.bytes_transferred / link):
+        return rate if rate > params.scan_bps else None
+    return rate

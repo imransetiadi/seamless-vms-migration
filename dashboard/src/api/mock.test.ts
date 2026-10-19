@@ -7,10 +7,12 @@ import nameRaw from '../../../seamless/tests/fixtures/provider_name_cases.json?r
 import dataSentRaw from '../../../seamless/tests/fixtures/data_sent.json?raw';
 // what PUT /providers/{id}/credentials and /conversion-key answer for a body: one case table for the API and the mock
 import credentialBodyRaw from '../../../seamless/tests/fixtures/credential_body_cases.json?raw';
+import overrideBodyRaw from '../../../seamless/tests/fixtures/override_body_cases.json?raw';
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { createMockFetch, MockServer, PLAN_EDITABLE_FIELDS } from './mock';
+import { HELD_VOLUMES_REASON } from './mockData';
 import { summaryOf } from '../lib/summary';
 import { streamEvents } from './stream';
 import {
@@ -35,14 +37,19 @@ import {
   type PlanFinalizeResult,
   type RecommendationPage,
   type Stats,
+  type Strategy,
   type VMRef,
   type Wave,
 } from './types';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
-const CHECK_KEYS = JSON.parse(checkKeysRaw) as { openstack: string[]; destination: string[] };
+const CHECK_KEYS = JSON.parse(checkKeysRaw) as { openstack: string[]; destination: string[]; vmware: string[] };
 const NAME_CASES = (
   JSON.parse(nameRaw) as { cases: Array<{ route: 'POST' | 'PATCH'; body: { name?: unknown }; status: number; message: string | null; note: string }> }
+).cases;
+
+const OVERRIDE_BODY_CASES = (
+  JSON.parse(overrideBodyRaw) as { cases: Array<{ note: string; body: Record<string, unknown>; status: number; message: string | null }> }
 ).cases;
 
 const CREDENTIAL_BODY_CASES = (
@@ -540,6 +547,45 @@ describe('mock API', () => {
     expect(actions(cold.id)).not.toContain('cleanup');
   });
 
+  it("decides a cancel's cleanup by the copies the API reads as kept, not by any recorded pass (SDD §5.1, §9.3, review RV43B-03)", async () => {
+    const { server, client } = setup('operator');
+    const actions = (id: string) =>
+      server.events.filter((e) => e.migration_id === id && e.kind === 'migration.action').map((e) => e.data.action);
+    const pass = { number: 1, kind: 'full' as const, started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 };
+    const change = (from_phase: Migration['phase'], to_phase: Migration['phase'], at: string) => ({ from_phase, to_phase, at, reason: 'test', actor: 'test' });
+    // a warm attempt recorded a pass, the retried cold attempt released its copies, and warm is chosen since: the copies
+    // follow the retried attempt's strategy - cold keeps none
+    const released = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!;
+    expect(released.phase).toBe('ready');
+    released.attempt_strategies = ['warm', 'cold'];
+    released.strategy = 'warm';
+    released.sync_passes = [pass];
+    await client.post(`/migrations/${released.id}/cancel`, {});
+    expect(actions(released.id).at(-1)).toBe('cancel');
+    // a vmware_warm migration whose last attempt ran a cutover, rolled back: the kit's rollback released its copies
+    const cutOver = server.migrations.find((m) => m.vm.name === 'ad-dc-01')!;
+    Object.assign(cutOver, {
+      strategy: 'vmware_warm',
+      phase: 'rolled_back',
+      attempt_strategies: [],
+      sync_passes: [pass],
+      approvals: [],
+      cutover_requested: false,
+      downtime_started_at: null,
+      downtime_ended_at: null,
+      phase_history: [
+        change('ready', 'precopy', '2026-10-08T08:59:00Z'),
+        change('precopy', 'syncing', '2026-10-08T09:31:00Z'),
+        change('syncing', 'awaiting_cutover', '2026-10-08T09:32:00Z'),
+        change('awaiting_cutover', 'cutover', '2026-10-08T09:40:00Z'),
+        change('cutover', 'rolling_back', '2026-10-08T09:50:00Z'),
+        change('rolling_back', 'rolled_back', '2026-10-08T09:55:00Z'),
+      ],
+    });
+    await client.post(`/migrations/${cutOver.id}/cancel`, {});
+    expect(actions(cutOver.id).at(-1)).toBe('cancel');
+  });
+
   it('cancels a rolled-back migration and cleans up the data path its rollback kept, like the API (SDD §5.1)', async () => {
     const { server, client } = setup('operator');
     const actions = (id: string) =>
@@ -1016,6 +1062,24 @@ describe('mock API', () => {
     });
   });
 
+  it("validates a completed plan, then takes its edit, and refuses a running one in the API's words (SDD §8.1, §16, audit DB-01)", async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    // every VM rolled back over a plan setting: the tick stored the plan completed
+    plan.status = 'completed';
+    for (const m of server.migrations.filter((x) => x.plan_id === plan.id)) {
+      m.phase = 'rolled_back';
+      m.downtime_started_at = '2026-10-08T10:00:00Z';
+      m.downtime_ended_at = '2026-10-08T10:05:00Z';
+    }
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(plan.status).toBe('validated');
+    const edited = await client.patch<Plan>(`/plans/${plan.id}`, { name: 'Fixed after the rollbacks' });
+    expect(edited.name).toBe('Fixed after the rollbacks');
+    plan.status = 'running';
+    await expect(client.post(`/plans/${plan.id}/validate`)).rejects.toMatchObject({ status: 409, message: 'pause the plan before validating it again' });
+  });
+
   it('answers 502 for a VM the source no longer reports, before changing anything, like the API (SDD §12)', async () => {
     const { server, client } = setup('operator');
     const [keep] = freeVms(server, 'rhosp17-dc1', 1);
@@ -1361,6 +1425,7 @@ describe('mock API', () => {
     const started = call('plan-7b3e0d52');
     expect(started.status).toBe(409);
     expect((started.body as { error: { message: string } }).error.message).toMatch(/^only a plan whose migrations have not started can be cancelled: .+ \(syncing\)/);
+    expect((started.body as { error: { message: string } }).error.message).toMatch(/which cleans up what it copied - on VMware it names the kit's copies it keeps$/);
     const before = server.events.length;
     const done = call('plan-c81d44a0');
     expect(done.status).toBe(200);
@@ -1513,10 +1578,105 @@ describe('mock API', () => {
     rolled.strategy = 'cold';
     expect(remove().status).toBe(204);
     server.providers.push(provider);
+    // so does a vmware_cold one, whose demo cutover lists a pass; the kit's rollback after a cutover deletes its copies, and
+    // one before its cutover keeps them for the next CBT pass (SDD §5.1, §9.3, §12, review RV39-02)
+    const at = '2026-10-08T09:00:00Z';
+    const through = (...phases: Migration['phase'][]) =>
+      phases.map((to_phase, i) => ({ from_phase: i ? phases[i - 1]! : ('ready' as const), to_phase, at, reason: 'test', actor: 'test' }));
+    rolled.strategy = 'vmware_cold';
+    expect(remove().status).toBe(204);
+    server.providers.push(provider);
+    rolled.strategy = 'vmware_warm';
+    rolled.phase_history = through('precopy', 'syncing', 'awaiting_cutover', 'cutover', 'rolling_back', 'rolled_back');
+    expect(remove().status).toBe(204);
+    server.providers.push(provider);
+    rolled.phase_history = through('precopy', 'syncing', 'awaiting_cutover', 'rolling_back', 'rolled_back');
+    expect(remove().status).toBe(409);
+    // only the last attempt counts: an earlier one's cutover, then a Retry whose attempt rolled back before its own - one
+    // that converged from its first pass, never syncing, too (review RV40-07)
+    rolled.phase_history = through('precopy', 'cutover', 'rolling_back', 'rolled_back', 'ready', 'precopy', 'syncing', 'rolling_back', 'rolled_back');
+    expect(remove().status).toBe(409);
+    rolled.phase_history = through('precopy', 'cutover', 'rolling_back', 'rolled_back', 'ready', 'precopy', 'awaiting_cutover', 'rolling_back', 'rolled_back');
+    expect(remove().status).toBe(409);
+    // and only its passes: the earlier attempt's passes, its cutover, then a first copy cut off with no pass (review RV40-05)
+    const later = new Date(Math.max(...passes.map((p) => Date.parse(p.started_at))) + 60_000).toISOString();
+    rolled.phase_history = [
+      ...through('precopy', 'cutover', 'rolling_back', 'rolled_back', 'ready'),
+      { from_phase: 'ready', to_phase: 'precopy', at: later, reason: 'test', actor: 'test' },
+      { from_phase: 'precopy', to_phase: 'failed', at: later, reason: 'test', actor: 'test' },
+      { from_phase: 'failed', to_phase: 'rolled_back', at: later, reason: 'test', actor: 'test' },
+    ];
+    expect(remove().status).toBe(204);
+    server.providers.push(provider);
     rolled.strategy = 'warm';
     // the cancel cleans up what the rollback kept (the mock's cleanup ends at once): the provider goes
     await client.post<Migration>(`/migrations/${rolled.id}/cancel`, { reason: 'not migrated after all' });
     expect(remove().status).toBe(204);
+  });
+
+  it('holds a vmware_warm migration\'s kit copies through the passes since the kit last released them, as the API (SDD §9.3, §7.2, reviews RV41B-02, RV41B-04)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const rolled = server.migrations.find((m) => m.phase === 'rolled_back')!;
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    const id = plan.destination_provider_id;
+    const users = server.plans.filter((p) => p.source_provider_id === id || p.destination_provider_id === id);
+    for (const p of users) p.status = 'completed';
+    for (const m of server.migrations.filter((x) => users.some((p) => p.id === x.plan_id))) m.phase = 'finalized';
+    const provider = server.providers.find((p) => p.id === id)!;
+    const remove = () => {
+      const status = server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin').status;
+      if (status === 204) server.providers.push(provider);
+      return status;
+    };
+    rolled.phase = 'rolled_back';
+    rolled.strategy = 'vmware_warm';
+    const step = (from_phase: Migration['phase'], to_phase: Migration['phase'], at: string) => ({ from_phase, to_phase, at, reason: 'test', actor: 'test' });
+    const pass = (number: number, started_at: string, kind: 'full' | 'delta' | 'final' = number === 1 ? 'full' : 'delta') => ({
+      number, kind, started_at, ended_at: started_at, bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 60,
+    });
+    // attempt 1 completed two passes and ran no cutover: the kit marked its copies, its rollback kept them; attempt 2's
+    // first run - a CBT sync of those copies - was cut off before a pass: they stay (RV41B-02)
+    const uncut = [
+      step('ready', 'precopy', '2026-10-08T08:00:00Z'),
+      step('precopy', 'syncing', '2026-10-08T08:30:00Z'),
+      step('syncing', 'awaiting_cutover', '2026-10-08T09:00:00Z'),
+      step('awaiting_cutover', 'rolling_back', '2026-10-08T09:10:00Z'),
+      step('rolling_back', 'rolled_back', '2026-10-08T09:11:00Z'),
+      step('rolled_back', 'ready', '2026-10-08T10:00:00Z'),
+    ];
+    rolled.sync_passes = [pass(1, '2026-10-08T08:00:01Z'), pass(2, '2026-10-08T08:30:01Z')];
+    rolled.phase_history = [...uncut, step('ready', 'precopy', '2026-10-08T10:01:00Z'), step('precopy', 'rolling_back', '2026-10-08T10:05:00Z'), step('rolling_back', 'rolled_back', '2026-10-08T10:06:00Z')];
+    expect(remove()).toBe(409);
+    rolled.phase_history = [...uncut, step('ready', 'precopy', '2026-10-08T10:01:00Z'), step('precopy', 'failed', '2026-10-08T10:05:00Z'), step('failed', 'rolled_back', '2026-10-08T10:06:00Z')];
+    expect(remove()).toBe(409);
+    // attempt 1 ran its cutover - its rollback deleted the copies, its own final pass with them -, attempt 2's first copy
+    // was cut off: nothing since the kit released them
+    const cut = [
+      step('ready', 'precopy', '2026-10-08T08:00:00Z'),
+      step('precopy', 'awaiting_cutover', '2026-10-08T09:00:00Z'),
+      step('awaiting_cutover', 'cutover', '2026-10-08T09:10:00Z'),
+      step('cutover', 'rolling_back', '2026-10-08T09:20:00Z'),
+      step('rolling_back', 'rolled_back', '2026-10-08T09:21:00Z'),
+      step('rolled_back', 'ready', '2026-10-08T10:00:00Z'),
+      step('ready', 'precopy', '2026-10-08T10:01:00Z'),
+    ];
+    rolled.sync_passes = [pass(1, '2026-10-08T08:00:01Z'), pass(2, '2026-10-08T09:10:05Z', 'final')];
+    rolled.phase_history = [...cut, step('precopy', 'rolling_back', '2026-10-08T10:05:00Z'), step('rolling_back', 'rolled_back', '2026-10-08T10:06:00Z')];
+    expect(remove()).toBe(204);
+    // a pass that started as attempt 2 entered pre-copy - the mock's seeds stamp pass 1 so - holds them (RV41B-04)
+    rolled.sync_passes = [...rolled.sync_passes, pass(3, '2026-10-08T10:01:00Z', 'full')];
+    expect(remove()).toBe(409);
+    // attempt 2 completed it and ran no cutover; attempt 3's first run was cut off: the copies stay
+    rolled.phase_history = [
+      ...cut,
+      step('precopy', 'rolling_back', '2026-10-08T10:05:00Z'),
+      step('rolling_back', 'rolled_back', '2026-10-08T10:06:00Z'),
+      step('rolled_back', 'ready', '2026-10-08T11:00:00Z'),
+      step('ready', 'precopy', '2026-10-08T11:01:00Z'),
+      step('precopy', 'failed', '2026-10-08T11:02:00Z'),
+      step('failed', 'rolled_back', '2026-10-08T11:03:00Z'),
+    ];
+    expect(remove()).toBe(409);
   });
 
   it('refuses a rollback whose provider no longer exists, like the API: nothing changes (SDD §5.1)', async () => {
@@ -2806,17 +2966,18 @@ describe('providers of community destinations, like the API (SDD §4.2, §10, §
     expect((source.storage_backends as { pool: string }[]).map((b) => b.pool)).toContain('overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1');
   });
 
-  it("a vCenter's check reports the API demo's VMware keys, never an OpenStack service (review RV19-05)", () => {
+  it("a vCenter's check reports the API demo's VMware keys, never an OpenStack service (reviews RV19-05, PV-06)", () => {
     const { server } = setup('admin');
     const vcenter = { ...base, id: 'vc-9', name: 'vCenter 9', kind: 'vmware', role: 'source', distribution: 'vmware' };
     expect(call(server, 'POST', '/providers', vcenter).status).toBe(201);
-    // FakeSourceProvider.check for vmware: its VMs counted; no Nova, OVN or Cinder
-    const VMWARE_KEYS = ['admin', 'api_version', 'cbt_enabled_vms', 'vms_with_independent_disks', 'vms_with_snapshots', 'vms_without_tools'];
+    // FakeSourceProvider.check for vmware - the real check's keys (check_report_keys.json): its version and its VMs
+    // counted; no Nova, OVN or Cinder, and no 'admin', which no vCenter check computes (SDD §10)
+    const VMWARE_KEYS = [...CHECK_KEYS.vmware].sort();
     expect(keysOf((call(server, 'POST', '/providers/vc-9/check').body as Provider).capabilities)).toEqual(VMWARE_KEYS);
     // the seeded vCenter reports what a check of it reads, counted from its VMs
     const hq = server.providers.find((p) => p.id === 'vcenter-hq')!.capabilities;
     expect(keysOf(hq)).toEqual(VMWARE_KEYS);
-    expect(hq).toMatchObject({ admin: true, api_version: '8.0.2.0' });
+    expect(hq).toMatchObject({ api_version: '8.0.2.0', version: '8.0.2', vm_count: (server.inventories['vcenter-hq'] as VMRef[]).length });
     expect(hq.cbt_enabled_vms).toBeGreaterThan(0);
     // an OpenStack declaration on vmware: the API's message, pydantic's "Value error, " included
     expect(call(server, 'POST', '/providers', { ...vcenter, id: 'vc-8', release: '2026.2' })).toMatchObject({
@@ -2844,3 +3005,376 @@ describe('providers of community destinations, like the API (SDD §4.2, §10, §
   });
 });
 
+
+describe('mock retry and validation follow the plan, like the API (SDD §5.4, §9.4, §12, reviews PL-09, PL-11, RV38A-03)', () => {
+  const inventoryOf = (server: MockServer, providerId: string) =>
+    (server as unknown as { inventories: Record<string, VMRef[]> }).inventories[providerId] ?? [];
+
+  it("a retry takes the VM's wave from the plan, never one the waves planned anew dropped", async () => {
+    const { server, client } = setup('operator');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.waves = [{ id: 'wave-new', name: 'Pilot', order: 1, vm_ids: [rolled.vm.source_id], depends_on: [], max_parallel: 5 }];
+    rolled.wave_id = 'wave-gone'; // assessed under waves planned anew since
+    const retried = await client.post<Migration>(`/migrations/${rolled.id}/retry`);
+    expect(retried.wave_id).toBe('wave-new');
+  });
+
+  it('a retry of a VM in no wave of a waved plan is refused (409) before any change', async () => {
+    const { server, client } = setup('operator');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.waves = [{ id: 'wave-other', name: 'Pilot', order: 1, vm_ids: ['some-other-vm'], depends_on: [], max_parallel: 5 }];
+    await expect(client.post(`/migrations/${rolled.id}/retry`)).rejects.toMatchObject({
+      status: 409,
+      message: `${rolled.vm.name} cannot be retried: it belongs to no wave of the plan; re-run the automatic wave planning or add it to a wave`,
+    });
+    expect(server.migrations.find((m) => m.id === rolled.id)?.phase).toBe('rolled_back');
+  });
+
+  it('a paused plan whose finished VM left the source validates again: only the VMs a validation re-assesses are read', async () => {
+    const { server, client } = setup('operator');
+    const done = server.migrations.find((m) => m.phase === 'completed' || m.phase === 'finalized')!;
+    const plan = server.plans.find((p) => p.id === done.plan_id)!;
+    plan.status = 'paused';
+    const inventory = inventoryOf(server, plan.source_provider_id);
+    inventory.splice(inventory.findIndex((v) => v.source_id === done.vm.source_id), 1); // deleted at the source
+    const report = await client.post<{ plan_id: string }>(`/plans/${plan.id}/validate`);
+    expect(report.plan_id).toBe(plan.id);
+  });
+
+  it('a validation writes the plan\'s wave into a migration it leaves alone', async () => {
+    const { server, client } = setup('operator');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.status = 'paused';
+    // a VM whose migration is cancelled cannot be validated in the plan: out of vm_ids
+    const cancelled = new Set(server.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'cancelled').map((m) => m.vm.source_id));
+    plan.vm_ids = plan.vm_ids.filter((id) => !cancelled.has(id));
+    plan.waves = [{ id: 'wave-new', name: 'Pilot', order: 1, vm_ids: [...plan.vm_ids], depends_on: [], max_parallel: 5 }];
+    rolled.wave_id = 'wave-gone';
+    await client.post(`/plans/${plan.id}/validate`);
+    const left = server.migrations.find((m) => m.id === rolled.id)!;
+    expect([left.phase, left.wave_id]).toEqual(['rolled_back', 'wave-new']);
+  });
+
+  it('makes a storage handover ineligible while an earlier attempt holds its volumes, as the API words it (SDD §9.2, review 39 lead L1)', async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!; // a shared Ceph handover plan
+    const warm = server.migrations.find((m) => m.id === 'mig-b2c4d6e872')!;
+    const other = server.migrations.find((m) => m.id === 'mig-b2c4d6e870')!;
+    // what a rolled-back warm attempt leaves once a Retry put it back in ready: its passes (the mock keeps no record);
+    // a warm one without a pass holds nothing
+    warm.strategy = 'warm';
+    other.strategy = 'warm';
+    warm.sync_passes = [
+      { number: 1, kind: 'full', started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 },
+    ];
+    await client.post(`/plans/${plan.id}/validate`);
+    const handover = (m: Migration) => server.migrations.find((x) => x.id === m.id)!.estimates.find((e) => e.strategy === 'storage_handover')!;
+    expect([handover(warm).eligible, handover(warm).reasons]).toEqual([
+      false,
+      ['an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first'],
+    ]);
+    expect(server.migrations.find((m) => m.id === warm.id)!.strategy).not.toBe('storage_handover');
+    expect(handover(other).eligible).toBe(true);
+  });
+
+  it('refuses a strategy change to a storage handover while an earlier attempt holds its volumes, as the API (SDD §12, review RV40-01)', async () => {
+    const { server, client } = setup('operator');
+    const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!; // ready, its handover estimate eligible
+    expect(m.estimates.find((e) => e.strategy === 'storage_handover')?.eligible).toBe(true);
+    // what a Retry leaves of a rolled-back warm attempt, which re-assesses nothing: its passes (the mock keeps no record)
+    m.strategy = 'warm';
+    m.sync_passes = [
+      { number: 1, kind: 'full', started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 },
+    ];
+    await expect(client.put(`/migrations/${m.id}/strategy`, { strategy: 'storage_handover' })).rejects.toMatchObject({
+      status: 400,
+      message:
+        'storage_handover is not eligible for analytics-node-3: an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first.',
+    });
+    expect(server.migrations.find((x) => x.id === m.id)!.strategy).toBe('warm');
+    // warm, which uses the held volumes, stays open (review RV41B-03)
+    const warm = await client.put<Migration>(`/migrations/${m.id}/strategy`, { strategy: 'warm' });
+    expect(warm.strategy).toBe('warm');
+  });
+
+  it.each([
+    ['held', 1, false],
+    ['nothing held', 0, true],
+  ] as const)("marks a retried migration's storage handover ineligible while its volumes are held: %s, as the API (SDD §12, §9.2)", async (_, passes, eligible) => {
+    const { server, client } = setup('operator');
+    const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!; // ready, its handover estimate eligible
+    const before = m.estimates.map((e) => ({ ...e }));
+    expect(before.find((e) => e.strategy === 'storage_handover')!.eligible).toBe(true);
+    // a warm attempt rolled back - with a pass the mock reads as volumes kept (it keeps no record) - then a Retry
+    m.strategy = 'warm';
+    m.phase = 'rolled_back';
+    m.sync_passes = passes
+      ? [{ number: 1, kind: 'full', started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 }]
+      : [];
+    await client.post(`/migrations/${m.id}/retry`, {});
+    const handover = m.estimates.find((e) => e.strategy === 'storage_handover')!;
+    expect([handover.eligible, handover.reasons]).toEqual(eligible ? [true, []] : [false, [
+      'an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first',
+    ]]);
+    // the other estimates as the last validation stored them
+    expect(m.estimates.filter((e) => e.strategy !== 'storage_handover')).toEqual(before.filter((e) => e.strategy !== 'storage_handover'));
+  });
+
+  it.each(OVERRIDE_BODY_CASES.map((c) => [c.note, c] as const))(
+    'judges an override body by its model before it looks the recommendation up, as the API: %s (SDD §12, §14.6, review RV43B-07)',
+    (_name, c) => {
+      const server = new MockServer({ now: () => NOW, seed: 1 });
+      const body = Object.fromEntries(Object.entries(c.body).map(([k, v]) => [k, v === '[2001]' ? 'x'.repeat(2001) : v]));
+      const res = server.handle('POST', '/advisor/recommendations/rec-ghost/override', new URLSearchParams(), body, 'admin');
+      const message = res.status < 300 ? null : (res.body as { error: { message: string } }).error.message;
+      expect({ status: res.status, message: c.message === null ? null : message }).toEqual({ status: c.status, message: c.message });
+    },
+  );
+
+  it.each([[['storage_handover']], [42], [null]])(
+    'refuses an override whose option is no strategy name (%j) with 422 before anything, as the API (SDD §12, §14.6, review RV42B-01)',
+    async (option) => {
+      const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+      const as = (token: string) => new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+      await as('operator').patch('/plans/plan-c81d44a0', { downtime_slo_s: 60 });
+      await as('operator').post('/plans/plan-c81d44a0/validate');
+      const m = server.migrations.find((x) => x.plan_id === 'plan-c81d44a0' && x.advisor_hold !== null)!;
+      const rec = server.recommendations.filter((r) => r.migration_id === m.id).at(-1)!;
+      const before = { strategy: m.strategy, decision: { ...server.recommendations.find((r) => r.id === rec.id)!.decision } };
+      await expect(as('admin').post(`/advisor/recommendations/${rec.id}/override`, { option, reason: 'the owner wants it' })).rejects.toMatchObject({
+        status: 422,
+        code: 'validation_error',
+      });
+      expect({ strategy: m.strategy, decision: server.recommendations.find((r) => r.id === rec.id)!.decision }).toEqual(before);
+    },
+  );
+
+  it.each([
+    ['override', true],
+    ['approve', true],
+    ['override', false],
+    ['approve', false],
+  ] as const)(
+    'takes no storage handover by an advisor decision (%s; the Retry marked it: %s) while an earlier attempt holds its volumes, as the API (SDD §14.6, review RV41B-01)',
+    async (action, marked) => {
+      const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+      const as = (token: string) => new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+      const eligible = (m: Migration, s: Strategy) => m.estimates.find((e) => e.strategy === s)?.eligible === true;
+      // the handover plan under an SLO no strategy meets: the advisor chooses between every eligible strategy, and the
+      // Finance policy holds each decision for a person
+      await as('operator').patch('/plans/plan-c81d44a0', { downtime_slo_s: 60 });
+      await as('operator').post('/plans/plan-c81d44a0/validate');
+      const m = server.migrations.find(
+        (x) => x.plan_id === 'plan-c81d44a0' && x.advisor_hold !== null && (['storage_handover', 'warm', 'cold'] as const).every((s) => eligible(x, s)),
+      )!;
+      const rec = server.recommendations.filter((r) => r.migration_id === m.id).at(-1)!;
+      await as('admin').post(`/advisor/recommendations/${rec.id}/approve`, {}); // warm: no plan override
+      expect([m.strategy, m.advisor_hold]).toEqual(['warm', null]);
+      // the warm attempt ran its pre-copy and was rolled back; a Retry re-assesses nothing (the mock keeps no record)
+      m.sync_passes = [
+        { number: 1, kind: 'full', started_at: '2026-10-08T11:00:30Z', ended_at: '2026-10-08T11:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1770 },
+      ];
+      m.phase = 'rolled_back';
+      m.phase_history = [
+        ...m.phase_history,
+        ...(['precopy', 'syncing', 'awaiting_cutover', 'rolling_back', 'rolled_back'] as const).map((to_phase, i, all) => ({
+          from_phase: i ? all[i - 1]! : ('ready' as const),
+          to_phase,
+          at: `2026-10-08T11:0${i}:00Z`,
+          reason: 'test',
+          actor: 'test',
+        })),
+      ];
+      await as('operator').post(`/migrations/${m.id}/retry`, {});
+      expect([m.phase, eligible(m, 'storage_handover')]).toEqual(['ready', false]); // the Retry marks it
+      if (!marked) {
+        // the estimate as a version before the marking stored it: judged at the request all the same
+        m.estimates = m.estimates.map((e) => (e.strategy === 'storage_handover' ? { ...e, eligible: true, reasons: [] } : e));
+      }
+      const refusal = `storage_handover is not eligible for ${m.vm.name}: an earlier attempt keeps its destination volumes for a retry, which a storage handover would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes them first.`;
+      if (action === 'override') {
+        await expect(
+          as('admin').post(`/advisor/recommendations/${rec.id}/override`, { option: 'storage_handover', reason: 'the owner wants the handover' }),
+        ).rejects.toMatchObject({ status: 422, message: refusal });
+      } else {
+        // the newest recommendation recommends the handover, its decision one a person may still approve
+        const newest = server.recommendations.find((r) => r.id === rec.id)!;
+        newest.recommendation.option = 'storage_handover';
+        newest.decision.status = 'below_threshold';
+        await expect(as('admin').post(`/advisor/recommendations/${rec.id}/approve`, {})).rejects.toMatchObject({
+          status: 409,
+          message: `nothing to approve: ${refusal}`,
+        });
+      }
+      expect(m.strategy).toBe('warm');
+      expect(server.plans.find((p) => p.id === m.plan_id)!.strategy_overrides[m.vm.source_id]).toBeUndefined();
+      // another option is still a person's call
+      const cold = await as('admin').post<AdvisorRecommendation>(`/advisor/recommendations/${rec.id}/override`, {
+        option: 'cold',
+        reason: 'the owner chose cold',
+      });
+      expect(cold.decision.final_option).toBe('cold');
+    },
+  );
+
+  it.each([
+    ['warm', 'cold', true],
+    ['vmware_warm', 'vmware_cold', true],
+    ['cold', 'warm', false],
+  ] as const)(
+    "reads a retried %s attempt's copies by its own strategy, not the %s chosen since, as the API (SDD §9.3, review RV40-06)",
+    async (attempted, chosen, held) => {
+      const { server, client } = setup('operator');
+      const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!; // ready, its handover estimate eligible
+      // the retried attempt recorded a pass; a validation or a strategy change chose another strategy since
+      m.attempt_strategies = [attempted];
+      m.strategy = chosen;
+      m.sync_passes = [
+        { number: 1, kind: 'full', started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 },
+      ];
+      const put = client.put<Migration>(`/migrations/${m.id}/strategy`, { strategy: 'storage_handover' });
+      if (held) await expect(put).rejects.toMatchObject({ status: 400, message: expect.stringContaining('an earlier attempt keeps its destination volumes') });
+      else expect((await put).strategy).toBe('storage_handover');
+    },
+  );
+
+  it.each([[null], ['admin rights are required on the source cloud']] as const)(
+    "takes an earlier Retry's held mark off once nothing is held (another reason: %s), as the API (SDD §12, review RV43B-02)",
+    async (other) => {
+      const { server, client } = setup('operator');
+      const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!; // its handover estimate eligible
+      const handover = () => m.estimates.find((e) => e.strategy === 'storage_handover')!;
+      const withReasons = (reasons: string[], eligible?: boolean) =>
+        m.estimates.map((e) => (e.strategy === 'storage_handover' ? { ...e, reasons, ...(eligible === undefined ? {} : { eligible }) } : e));
+      if (other) m.estimates = withReasons([other], false);
+      // a warm attempt rolled back with its pass - its copies kept -, then a Retry
+      m.strategy = 'warm';
+      m.phase = 'rolled_back';
+      m.approvals = [];
+      m.cutover_requested = false;
+      m.sync_passes = [
+        { number: 1, kind: 'full', started_at: '2026-10-08T09:00:00Z', ended_at: '2026-10-08T09:30:00Z', bytes_scanned: 1, bytes_changed: 1, bytes_transferred: 1, duration_s: 1800 },
+      ];
+      await client.post(`/migrations/${m.id}/retry`, {});
+      if (other) m.estimates = withReasons([other, HELD_VOLUMES_REASON]); // as a validation that saw them held stores it
+      else expect([handover().eligible, handover().reasons]).toEqual([false, [HELD_VOLUMES_REASON]]);
+      // the operator runs it cold - its cutover removes the warm copies first, its rollback keeps none -, then a second Retry
+      await client.put(`/migrations/${m.id}/strategy`, { strategy: 'cold' });
+      m.phase = 'rolled_back';
+      m.phase_history = [
+        ...m.phase_history,
+        ...(['cutover', 'rolling_back', 'rolled_back'] as const).map((to_phase, i, all) => ({
+          from_phase: i ? all[i - 1]! : ('ready' as const),
+          to_phase,
+          at: `2026-10-08T11:0${i}:00Z`,
+          reason: 'test',
+          actor: 'test',
+        })),
+      ];
+      await client.post(`/migrations/${m.id}/retry`, {});
+      const put = client.put<Migration>(`/migrations/${m.id}/strategy`, { strategy: 'storage_handover' });
+      if (other) {
+        expect([handover().eligible, handover().reasons]).toEqual([false, [other]]);
+        await expect(put).rejects.toMatchObject({ status: 400, message: expect.stringContaining(other) });
+      } else {
+        expect([handover().eligible, handover().reasons]).toEqual([true, []]);
+        expect((await put).strategy).toBe('storage_handover');
+      }
+    },
+  );
+
+  it("leaves a migration's wave to the next validation when the waves are planned anew, as the API (review RV40-03)", async () => {
+    let clock = NOW;
+    const server = new MockServer({ now: () => clock, seed: 1 });
+    const client = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
+    const vms = freeVms(server, 'rhosp17-dc1', 5).map((v) => v.source_id);
+    const plan = await client.post<Plan>('/plans', { name: 'Re-waved', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: vms });
+    await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    await client.post(`/plans/${plan.id}/validate`);
+    const before = server.migrations.filter((m) => m.plan_id === plan.id).map((m) => [m.id, m.wave_id, m.updated_at]);
+    clock += 60_000;
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 1 });
+    expect(server.migrations.filter((m) => m.plan_id === plan.id).map((m) => [m.id, m.wave_id, m.updated_at])).toEqual(before);
+    await client.post(`/plans/${plan.id}/validate`);
+    for (const m of server.migrations.filter((x) => x.plan_id === plan.id)) {
+      expect(m.wave_id).toBe(waved.waves.find((w) => w.vm_ids.includes(m.vm.source_id))!.id);
+    }
+  });
+
+  it("plans the waves of re-assessed VMs as the source reports them, not as their migrations recorded them (review RV40-10)", async () => {
+    const { server, client } = setup('operator');
+    const vms = freeVms(server, 'rhosp17-dc1', 4);
+    const plan = await client.post<Plan>('/plans', { name: 'Grown', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: vms.map((v) => v.source_id) });
+    await client.post(`/plans/${plan.id}/validate`); // ready: re-assessed by the next validation
+    // the smallest VM's disk grew past every other at the source since: its migration still records the old size
+    const smallest = [...vms].sort((a, b) => a.disk_bytes - b.disk_bytes)[0]!;
+    const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['rhosp17-dc1']!;
+    const at = inventory.findIndex((v) => v.source_id === smallest.source_id);
+    const largest = Math.max(...vms.map((v) => v.disk_bytes));
+    inventory[at] = { ...inventory[at]!, disk_bytes: largest * 4 };
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    expect(waved.waves[0]!.vm_ids).not.toContain(smallest.source_id); // no longer among the pilot's smallest
+  });
+
+  it("plans the automatic waves from the plan's VMs, a never-validated plan's too (review RV39-03)", async () => {
+    const { server, client } = setup('operator');
+    const vms = freeVms(server, 'rhosp17-dc1', 2).map((v) => v.source_id);
+    const plan = await client.post<Plan>('/plans', { name: 'Fresh', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: vms });
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    expect(waved.waves.flatMap((w) => w.vm_ids).sort()).toEqual([...vms].sort());
+  });
+
+  it('plans the waves of a plan whose finalized VM left the source: its recorded vm counts (review RV39-03)', async () => {
+    const { server, client } = setup('operator');
+    const [a, b] = freeVms(server, 'rhosp17-dc1', 2).map((v) => v.source_id);
+    const plan = await client.post<Plan>('/plans', { name: 'Half done', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [a, b] });
+    await client.post(`/plans/${plan.id}/validate`);
+    // a finalize with delete_source deleted its source VM
+    server.migrations.find((m) => m.plan_id === plan.id && m.vm.source_id === a)!.phase = 'finalized';
+    const inventory = inventoryOf(server, 'rhosp17-dc1');
+    inventory.splice(inventory.findIndex((v) => v.source_id === a), 1);
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    expect(waved.waves.flatMap((w) => w.vm_ids).sort()).toEqual([a, b].sort());
+  });
+
+  it('a VM added after the waves were planned gets its wave from the next planning and validation, and the plan starts (review RV39-03)', async () => {
+    const { server, client } = setup('operator');
+    const [a, b, c] = freeVms(server, 'rhosp17-dc1', 3).map((v) => v.source_id);
+    const plan = await client.post<Plan>('/plans', { name: 'Grows', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [a, b] });
+    await client.post(`/plans/${plan.id}/validate`);
+    await client.patch(`/plans/${plan.id}`, { vm_ids: [a, b, c] });
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    const wave = waved.waves.find((w) => w.vm_ids.includes(c!));
+    expect(wave).toBeDefined();
+    await client.post(`/plans/${plan.id}/validate`);
+    const added = server.migrations.find((m) => m.plan_id === plan.id && m.vm.source_id === c);
+    expect(added?.wave_id).toBe(wave!.id);
+    await expect(client.post<Plan>(`/plans/${plan.id}/start`)).resolves.toMatchObject({ status: 'running' });
+  });
+
+  it("stamps a left-alone migration's updated_at when a validation moves it to another wave, and only then (review RV39-08)", async () => {
+    let clock = NOW;
+    const server = new MockServer({ now: () => clock, seed: 1 });
+    const client = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.status = 'paused';
+    const cancelled = new Set(server.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'cancelled').map((m) => m.vm.source_id));
+    plan.vm_ids = plan.vm_ids.filter((id) => !cancelled.has(id));
+    plan.waves = [{ id: 'wave-new', name: 'Pilot', order: 1, vm_ids: [...plan.vm_ids], depends_on: [], max_parallel: 5 }];
+    rolled.wave_id = 'wave-gone';
+    clock += 60_000;
+    await client.post(`/plans/${plan.id}/validate`);
+    const moved = server.migrations.find((m) => m.id === rolled.id)!;
+    expect([moved.wave_id, moved.updated_at]).toEqual(['wave-new', new Date(clock).toISOString()]);
+    // a validation that leaves its wave as it is saves nothing
+    const stamped = moved.updated_at;
+    clock += 60_000;
+    plan.status = 'paused';
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(server.migrations.find((m) => m.id === rolled.id)!.updated_at).toBe(stamped);
+  });
+});

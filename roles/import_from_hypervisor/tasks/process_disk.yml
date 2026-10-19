@@ -31,12 +31,16 @@
     import_from_hypervisor_size_match: >-
       {{ import_from_hypervisor_qemu_img_info.stdout | regex_search('virtual size: [^(]*[(]([0-9]+) bytes[)]', '\1') }}
 
-- name: Refuse a disk whose virtual size cannot be read
+# an empty or unparsable image reads as 0 bytes: refused like an unreadable size (Seamless Migrate SDD 6.6,
+# upstream intake UP-01, after os-migrate 33aca993e4)
+- name: Refuse a disk whose virtual size cannot be read or is zero
   ansible.builtin.assert:
-    that: (import_from_hypervisor_size_match | default([], true) | length) > 0
+    that:
+      - (import_from_hypervisor_size_match | default([], true) | length) > 0
+      - (import_from_hypervisor_size_match | first | int) > 0
     fail_msg: >-
-      cannot read the virtual size of {{ disk_item }} from qemu-img info; a zero-sized
-      destination volume would lose the disk
+      cannot read the virtual size of {{ disk_item }} from qemu-img info, or cannot read a
+      virtual size above zero; a zero-sized destination volume would lose the disk
     quiet: true
 
 - name: Set disk properties
@@ -56,6 +60,17 @@
 - name: Calculate NBD port for this disk
   ansible.builtin.set_fact:
     import_from_hypervisor_nbd_port: "{{ import_from_hypervisor_base_port | int + import_from_hypervisor_disk_index | int }}"
+
+# Two disks of one run on one hypervisor never share a port - workload.yml judges all of a workload's ports before
+# its first export: the second's start would stop the first's export through the PID file named by the port, and
+# the first VM's recorded URI - naming no export - would serve the second VM's disk, copied into the first VM's
+# volume without an error (Seamless Migrate SDD 6.6, upstream intake UP-04a, after os-migrate f1d254cb8b).
+- name: Take the port for this run
+  ansible.builtin.set_fact:
+    import_from_hypervisor_ports_taken: >-
+      {{ import_from_hypervisor_ports_taken | combine({import_from_hypervisor_host:
+         (import_from_hypervisor_ports_taken[import_from_hypervisor_host] | default([]))
+         + [import_from_hypervisor_nbd_port | int]}) }}
 
 - name: Set the log and PID files of the export
   ansible.builtin.set_fact:
@@ -80,16 +95,28 @@
 
 # Only the qemu-nbd recorded in this port's PID file is stopped, and only
 # if that process really is a qemu-nbd started with this PID file (a stale
-# PID may belong to an unrelated process by now).
+# PID may belong to an unrelated process by now) serving this same disk:
+# one serving another disk - an earlier run's export of another VM, whose
+# record still names this port - is left running and refuses this disk
+# (Seamless Migrate SDD 6.6, review RV44B-04).
 - name: "Stop the previous export of port {{ import_from_hypervisor_nbd_port }}"
   ansible.builtin.raw: |
     pidfile={{ import_from_hypervisor_nbd_pid_file | quote }}
+    disk={{ disk_item | quote }}
     if sudo test -s "$pidfile"; then
       pid=$(sudo cat "$pidfile")
       case "$pid" in
         ''|*[!0-9]*) ;;
         *)
-          case "$(ps -ww -p "$pid" -o args= 2>/dev/null)" in
+          args=$(ps -ww -p "$pid" -o args= 2>/dev/null)
+          case "$args" in
+            *qemu-nbd*"--pid-file=$pidfile"*" $disk") ;;
+            *qemu-nbd*"--pid-file=$pidfile"*)
+              echo "SERVES ANOTHER DISK: $args"
+              exit 0
+              ;;
+          esac
+          case "$args" in
             *qemu-nbd*"--pid-file=$pidfile"*)
               echo "Stopping qemu-nbd $pid"
               sudo kill "$pid"
@@ -106,7 +133,19 @@
       sudo rm -f "$pidfile"
     fi
   delegate_to: "{{ import_from_hypervisor_host }}"
+  register: import_from_hypervisor_previous_export
   changed_when: false
+
+- name: Refuse a port an earlier run's export of another disk holds
+  ansible.builtin.assert:
+    that: "'SERVES ANOTHER DISK:' not in import_from_hypervisor_previous_export.stdout"
+    fail_msg: >-
+      port {{ import_from_hypervisor_nbd_port }} on {{ import_from_hypervisor_host }} serves another
+      disk, an earlier run's export whose record still names it, which this disk of
+      {{ import_from_hypervisor_instance_id }} would stop: give this workload its own
+      _migration_params.nbdkit_port, or stop that export (its PID file
+      {{ import_from_hypervisor_nbd_pid_file }}) once its VM's import is done
+    quiet: true
 
 - name: "Check that the export port is free: {{ import_from_hypervisor_nbd_port }}"
   ansible.builtin.raw: |

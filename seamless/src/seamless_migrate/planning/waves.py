@@ -113,12 +113,14 @@ _RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
 
 
 def _describe(vm: VMRef) -> str:
-    parts = [vm.name, *vm.tags.values(), vm.os_type or ""]
-    return " ".join(parts).lower()
+    """The text the service keywords match: the VM's name and tag values. Never its os_type, an OS
+    name that is no service - an Oracle Linux guest is no Oracle database (SDD §9.4, review
+    PL-03); os_type decides legacy_os only."""
+    return " ".join([vm.name, *vm.tags.values()]).lower()
 
 
 def heuristic_tier(vm: VMRef) -> str:
-    """Deterministic tier from an explicit ``tier`` tag, the guest OS, name and tags."""
+    """Deterministic tier: an explicit ``tier`` tag, a legacy guest OS, then the name and tags."""
     explicit = vm.tags.get("tier") or vm.tags.get("seamless/tier")
     if explicit in TIERS:
         return str(explicit)

@@ -2857,6 +2857,83 @@ async def test_a_vmware_cancels_cleanup_deletes_only_a_recorded_server(env):
     assert env.registry.calls == [("delete_server", "dst-9")]
 
 
+@pytest.mark.parametrize("strategy", [Strategy.vmware_warm, Strategy.vmware_cold])
+async def test_a_vmware_cancels_cleanup_names_the_kit_volumes_of_the_vm_it_keeps(env, strategy):
+    """SDD §5.1, §7.2 (review RV42B, lead NP-2): a cancel's cleanup on VMware deletes no kit
+    volume - the kit names them after the VM, so they are another plan's migration's to sync onto
+    -, but it reads the ones the kit's next run takes as the VM's own and names them for the
+    operator; a read that fails is named and fails nothing, the server being gone. One a server
+    holds - another plan's cut-over server of the VM, or another VM the kit names alike - is that
+    server's disk, never named for deletion (review RV43B-01); one the destination's conversion
+    host alone holds is the kit's copy a pass the cancel cut off left there, named as attached to
+    it and left attached (review RV44B-01) - one it holds with another server stays that server's
+    (review RV45B-04). A conversion host it cannot look up leaves each held volume one of a holder
+    it could not tell, named with the error, never unnamed (review RV45B-02)."""
+    env.registry.existing = {"conv-dst"}  # Nova's server of the destination's conversion host
+    env.registry.volumes = [
+        kit_volume("vol-copy", "web-01-2000", converted=False, copied=True),
+        kit_volume("vol-conv", "web-01-2001", attachments=["dst-plan-b"]),  # plan B's server
+        kit_volume("vol-noosm", "web-01-2002", osm=False),  # not the kit's: no osm mark
+        kit_volume("vol-other", "web-02-2000", converted=False, copied=True),  # another VM's
+        kit_volume("vol-boot", "web-01-boot"),  # not <kit name>-<digits>
+        kit_volume("vol-cut", "web-01-2003", converted=False, copied=True,
+                   attachments=["dst-conv-dst"]),  # a pass cut off left it on the conversion host
+        kit_volume("vol-shared", "web-01-2004", converted=False, copied=True,
+                   attachments=["dst-conv-dst", "dst-plan-b"]),  # multi-attach: plan B's disk too
+    ]  # fmt: skip
+    ctx, _ = ctx_for(env, strategy=strategy, source=VCENTER, destination_server_id="dst-9")
+    ctx.options["delete_dest_volumes"] = True
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert env.registry.calls == [("delete_server", "dst-9"), ("find_server", "conv-dst")]
+    assert result.details["kept_volumes"] == [
+        {"id": "vol-copy", "name": "web-01-2000"},
+        {"id": "vol-cut", "name": "web-01-2003", "on_conversion_host": True},
+    ]
+    assert "kept_volumes_unread" not in result.details
+    assert [v["id"] for v in env.registry.volumes] == [
+        "vol-copy", "vol-conv", "vol-noosm", "vol-other", "vol-boot", "vol-cut", "vol-shared"
+    ]  # fmt: skip
+    assert next(v for v in env.registry.volumes if v["id"] == "vol-cut")["attachments"] == [
+        "dst-conv-dst"
+    ]  # named, never detached: another plan's pass of the VM may sync onto it
+
+    # the conversion host's lookup failing: each held volume is one of a holder it could not tell,
+    # named with the error - the copy a cut-off pass left there among them -, the cleanup stands
+    async def lookup_fails(self, name):
+        raise ProviderError("servers: HTTP 503")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(FakeImpl, "find_server", lookup_fails)
+        result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["kept_volumes"] == [{"id": "vol-copy", "name": "web-01-2000"}]
+    assert result.details["unsure_volumes"] == [
+        {"id": "vol-conv", "name": "web-01-2001"},
+        {"id": "vol-cut", "name": "web-01-2003"},
+        {"id": "vol-shared", "name": "web-01-2004"},
+    ]
+    assert result.details["unsure_why"] == "servers: HTTP 503"
+
+    # no conversion host to find is no failed read: what servers hold is theirs
+    env.registry.existing = set()
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["kept_volumes"] == [{"id": "vol-copy", "name": "web-01-2000"}]
+    assert "unsure_volumes" not in result.details
+    env.registry.existing = {"conv-dst"}
+
+    # none of the kit's: an empty list, nothing to name
+    env.registry.volumes = [kit_volume("vol-other", "web-02-2000")]
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert result.details["kept_volumes"] == []
+
+    # Cinder unreadable: named, and the cleanup stands - the server it deleted is gone
+    env.registry.calls.clear()
+    env.registry.volumes_error = True
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert env.registry.calls == [("delete_server", "dst-9")]
+    assert result.details["kept_volumes"] is None
+    assert result.details["kept_volumes_unread"] == "volumes: HTTP 503"
+
+
 KIT_NAMES = json.loads((Path(__file__).parent / "fixtures" / "kit_vm_name_cases.json").read_text())
 
 
@@ -3335,6 +3412,52 @@ async def test_a_vmware_rollback_whose_clock_close_the_store_refused_is_retried(
     with pytest.raises(TransientStepError, match="close the downtime clock"):
         await env.executor.run(StepName.ROLLBACK, ctx)
     assert env.registry.calls[-2:] == [("power_on", "srv-1"), ("clock_refused",)]
+
+
+@pytest.mark.parametrize(
+    "cancelled", [True, False], ids=["cancelled during the power-on", "not cancelled"]
+)
+async def test_a_vmware_rollback_closes_the_clock_once_vcenter_powered_the_vm_on(env, cancelled):
+    """SDD §5.2 (review RV38A-04): the power-on and the clock's close run as one. A cancel - the
+    step timeout, a shutdown - landing while vCenter runs the PowerOnVM_Task, whose wait reads no
+    cancel, waits for the task and the close: the VM runs, and its clock is closed, never left
+    open while it runs."""
+    import contextlib
+    import threading
+
+    ctx, rec = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        destination_server_id="dst-9",
+        downtime_started_at=utcnow(),
+    )
+    submitted, release, powered = threading.Event(), threading.Event(), []
+
+    async def power_on(source_id):
+        """VMwareProvider.power_on's shape: the vCenter work in a thread under the call's bound."""
+        env.registry.calls.append(("power_on", source_id))
+
+        def work():
+            submitted.set()  # PowerOnVM_Task submitted
+            release.wait(5)  # vCenter runs the task
+            powered.append(source_id)  # the VM runs
+
+        await asyncio.wait_for(asyncio.to_thread(work), 600)
+
+    class Slow(FakeImpl):
+        pass
+
+    Slow.power_on = staticmethod(power_on)
+    env.registry.get = lambda provider: Slow(env.registry)
+    step = asyncio.create_task(env.executor.run(StepName.ROLLBACK, ctx))
+    assert await asyncio.to_thread(submitted.wait, 5)
+    if cancelled:
+        step.cancel()
+    release.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        await step
+    assert (powered, rec.downtime_ends) == (["srv-1"], 1)
 
 
 @pytest.mark.parametrize("powered_on", [True, None])

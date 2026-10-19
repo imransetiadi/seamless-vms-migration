@@ -12,8 +12,10 @@
 # the Jev provider API). No secret is stored in this file: .env and tokens.yaml are generated and git-ignored.
 #
 # Address this stack through the engine it runs on (the Make targets pick it per host): on macOS the Docker
-# context colima-seamless, on Linux the default one:
+# context colima-seamless, on Linux the default one, and Podman with SEAMLESS_ENGINE=podman:
 #   docker --context colima-seamless compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env ps
+#   docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env ps     # Linux, Docker Engine
+#   podman compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env ps     # Podman
 #
 # Precedence: Compose lets a variable exported in your shell win over --env-file. The Make targets unset the
 # variables that .env owns (POSTGRES_PASSWORD, JEV_MCP_AUTH_TOKEN, TYPESAFE_API_KEY, COMPOSE_PROFILES,
@@ -46,7 +48,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set - run scripts/compose-init.sh}
       # initdb defaults to "trust" for the unix socket and loopback inside the container; require a password
       # everywhere (the entrypoint exports PGPASSWORD for its own init-time psql calls when local auth needs one).
-      # The application user is the bootstrap superuser of this throw-away local database.
+      # The application user is the bootstrap superuser of this database: accepted for a throw-away local stack, open
+      # for a long-lived single-host deployment - use the two-role model there (docs/Security.md C5-07, §9.4).
       POSTGRES_INITDB_ARGS: "--data-checksums --auth-local=scram-sha-256 --auth-host=scram-sha-256"
     volumes:
       - pgdata:/var/lib/postgresql/data

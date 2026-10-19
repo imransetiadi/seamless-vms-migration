@@ -12,7 +12,7 @@
  */
 import { DEFAULT_API_BASE } from './client';
 import { forcedDowntime } from '../lib/forcedEstimate';
-import { canTransition, hasDataPath } from '../lib/fsm';
+import { canTransition } from '../lib/fsm';
 import { guestOsOf } from '../lib/guestOs';
 import { capabilityRoles, policyProfileOf } from '../lib/networks';
 import { canonicalIp, isIpAddress } from '../lib/nics';
@@ -48,6 +48,7 @@ import {
   type StrategyDecision,
   checkOf,
   vmwareCheck,
+  HELD_VOLUMES_REASON,
 } from './mockData';
 import { buildStrategyEvidence, evidenceCount } from './mockEvidence';
 import { derivePlanStatus } from './mockPlanStatus';
@@ -168,6 +169,27 @@ function refuseCredentialBody(route: 'credentials' | 'conversion-key', input: Re
   }
   const known = new Set(fields.map(([key]) => key));
   for (const key of Object.keys(input)) if (!known.has(key)) problems.push(`${key}: Extra inputs are not permitted`);
+  if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
+}
+
+/**
+ * An override body as the API's request model OverrideRequest reads it (SDD §12, §14.6, reviews RV42B-01, RV43B-07):
+ * `option` a strategy name, `reason` a string of at most 2000 characters or null, nothing else - refused before the
+ * recommendation is looked up, worded as its validation_message over pydantic's errors: the model's fields in their
+ * order, then the extra inputs, five at most.
+ */
+function refuseOverrideBody(input: Record<string, unknown>): void {
+  const quoted = STRATEGIES.map((s) => `'${s}'`);
+  const problems: string[] = [];
+  if (!Object.hasOwn(input, 'option')) problems.push('option: Field required');
+  else if (!STRATEGIES.includes(input.option as Strategy)) {
+    problems.push(`option: Input should be ${quoted.slice(0, -1).join(', ')} or ${quoted.at(-1)}`);
+  }
+  if (Object.hasOwn(input, 'reason') && input.reason !== null) {
+    if (typeof input.reason !== 'string') problems.push('reason: Input should be a valid string');
+    else if ([...input.reason].length > 2000) problems.push('reason: String should have at most 2000 characters');
+  }
+  for (const key of Object.keys(input)) if (key !== 'option' && key !== 'reason') problems.push(`${key}: Extra inputs are not permitted`);
   if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
 }
 
@@ -313,6 +335,64 @@ const DATA_SENT: DataSentItem[] = [
   },
   { decision_type: 'console_screening', tool: 'jev_screen', fields: [{ key: 'console', label: 'The last 6,000 characters of the console, redacted' }], sent: false, note: LOCAL_CONSOLE },
 ];
+
+/**
+ * A vmware_warm `m`'s passes since the kit last released its copies (the API's `_passes_since_the_kit_released_its_copies`,
+ * SDD §9.3, §7.2, reviews RV40-05, RV41B-02): those that started once the attempt after its last cutover entered pre-copy -
+ * a cutover's own final pass not among them -, every pass when no cutover ran, none when its last attempt ran one.
+ */
+function passesSinceTheKitReleasedItsCopies(m: Migration): Migration['sync_passes'] {
+  let entered: string | undefined; // when the first attempt after the last cutover entered pre-copy
+  for (const change of [...m.phase_history].reverse()) {
+    if (change.to_phase === 'cutover') {
+      if (entered === undefined) return [];
+      const since = Date.parse(entered);
+      return m.sync_passes.filter((p) => Date.parse(p.started_at) >= since);
+    }
+    if (change.to_phase === 'precopy') entered = change.at;
+  }
+  return m.sync_passes;
+}
+
+/** `est` ineligible with §9.2's reason when it is an eligible storage handover (the API's `_held_out`, SDD §12). */
+function heldOut(est: Estimate): Estimate {
+  if (est.strategy !== 'storage_handover' || !est.eligible) return est;
+  return { ...est, eligible: false, reasons: [...est.reasons, HELD_VOLUMES_REASON] };
+}
+
+/**
+ * `est` without §9.2's held reason once nothing is held: eligible again when that reason was its only one, its other
+ * reasons kept (the API's `_held_in`, SDD §12, review RV43B-02).
+ */
+function heldIn(est: Estimate): Estimate {
+  if (est.strategy !== 'storage_handover' || !est.reasons.includes(HELD_VOLUMES_REASON)) return est;
+  const reasons = est.reasons.filter((reason) => reason !== HELD_VOLUMES_REASON);
+  return { ...est, eligible: reasons.length === 0, reasons };
+}
+
+/**
+ * The strategy of the attempt whose copies remain (the API's `_copies_strategy`, SDD §9.3, review RV40-06): while `m`
+ * waits for its next attempt, the one a Retry recorded - a validation or a strategy change may have chosen another
+ * since -, else its own.
+ */
+function copiesStrategy(m: Migration): Strategy {
+  const waiting = ['pending', 'validating', 'blocked', 'ready'].includes(m.phase);
+  return waiting && m.attempt_strategies.length ? m.attempt_strategies[m.attempt_strategies.length - 1]! : m.strategy;
+}
+
+/**
+ * What a rollback kept of `m`'s copies (SDD §5.1, §9.3, reviews RV39-02, RV40-05, RV41B-02): the mock keeps no workload
+ * record, so as the API without one (`_kept_after_rollback`) - a warm migration's passes, and a vmware_warm one's passes
+ * since the kit last released its copies (its rollback deletes them after a cutover, or marks them cutover; an attempt
+ * with no cutover leaves them marked for the next run's CBT sync); a cold, vmware_cold or handover rollback keeps no copy.
+ * It is the destination volumes a migration holds (§9.3) and the copied data it keeps (§5.1).
+ */
+function keptAfterRollback(m: Migration): boolean {
+  const strategy = copiesStrategy(m);
+  if (strategy === 'warm') return m.sync_passes.length > 0;
+  if (strategy === 'vmware_warm') return passesSinceTheKitReleasedItsCopies(m).length > 0;
+  return false;
+}
 
 /** Drop the cutover request with its requester and the window bypass granted with it (SDD §5.4). */
 function clearRequest(m: Migration): void {
@@ -1151,7 +1231,8 @@ export class MockServer {
     const roles = capabilityRoles(destination.capabilities);
     const profile = policyProfileOf(destination.capabilities, destination);
     m.findings = preflight(m.vm, source.kind, plan, networks, { subnets, selected, networkDetails, roles, profile, destination: providerLabel(destination) });
-    const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings);
+    // what an earlier attempt left at the destination keeps a handover out (SDD §9.2, review 39 lead L1)
+    const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings, keptAfterRollback(m));
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
     m.estimate = m.estimates.find((e) => e.strategy === m.strategy) ?? null;
@@ -1184,6 +1265,8 @@ export class MockServer {
     // like the API (SDD §5.4, §14.6): a waiting decision holds the migration from this write on
     m.advisor_hold = rec?.decision.status === 'pending_approval' ? rec.id : null;
     this.clearApprovals(m);
+    // its VM's wave in the plan, as the API's assessment writes it (SDD §9.4, review RV39-03)
+    m.wave_id = plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id))?.id ?? null;
     const blocked = m.findings.some((f) => f.severity === 'blocker');
     this.transition(m, blocked ? 'blocked' : 'ready', blocked ? 'blocker findings present' : 'pre-flight passed', actor);
     if (rec) {
@@ -1627,6 +1710,8 @@ export class MockServer {
 
   /** Approve or override an advisor decision, like the API (SDD §14.6). */
   private decideRecommendation(me: Me, recId: string, action: 'approve' | 'override', input: Record<string, unknown>): MockResponse {
+    // like the API's body model (SDD §12, reviews RV42B-01, RV43B-07): an override's body is judged before anything
+    if (action === 'override') refuseOverrideBody(input);
     if (recId.startsWith('rec-legacy-')) throw new HttpError(409, 'conflict', 'a legacy entry is history: it cannot be approved or overridden');
     const index = this.recommendations.findIndex((r) => r.id === recId);
     if (index < 0) throw notFound('recommendation', recId);
@@ -1655,6 +1740,16 @@ export class MockServer {
     if (pinned) throw new HttpError(409, 'conflict', `The plan sets the strategy of ${m.vm.name} (${pinned}): change it in the plan.`);
     if (action === 'approve' && rec.decision.status === 'approved') throw new HttpError(409, 'conflict', 'The decision is already approved.');
     const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy as string);
+    const chosen = action === 'override' ? input.option : rec.recommendation.option;
+    const stored = m.estimates.find((e) => e.strategy === 'storage_handover');
+    // a Retry or a validation saw the volumes held, or they are now (SDD §14.6, §9.2)
+    if (chosen === 'storage_handover' && stored && (stored.reasons.includes(HELD_VOLUMES_REASON) || (stored.eligible && keptAfterRollback(m)))) {
+      // like the API (SDD §14.6, §9.2, review RV41B-01): judged now, as PUT …/strategy - a Retry re-assesses no stored
+      // estimate, and a handover would leave an earlier attempt's volumes behind
+      const refusal = `storage_handover is not eligible for ${m.vm.name}: ${HELD_VOLUMES_REASON}.`;
+      if (action === 'override') throw new HttpError(422, 'validation_error', refusal);
+      throw new HttpError(409, 'conflict', `nothing to approve: ${refusal}`);
+    }
     const at = new Date(this.now()).toISOString();
     let decided: AdvisorRecommendation;
     if (action === 'approve') {
@@ -2046,9 +2141,8 @@ export class MockServer {
       if (p.status !== 'completed') return [`${p.id} ("${p.name}", ${p.status})`];
       const mine = this.migrations.filter((m) => m.plan_id === p.id);
       const n = mine.filter((m) => !RELEASES_VM.has(m.phase)).length;
-      // the mock keeps no record: like the API without one, passes of a strategy other than cold - a cold rollback deleted
-      // what it copied (SDD §5.1, §12)
-      const kept = mine.filter((m) => m.phase === 'rolled_back' && m.strategy !== 'cold' && m.sync_passes.length > 0).length;
+      // the mock keeps no record: like the API without one, what the rollback kept (SDD §5.1, §9.3, §12, review RV39-02)
+      const kept = mine.filter((m) => m.phase === 'rolled_back' && keptAfterRollback(m)).length;
       const why = [
         ...(n ? [`${n} VM${n === 1 ? '' : 's'} not finalized`] : []),
         ...(kept ? [`${kept} rolled-back VM${kept === 1 ? ' keeping its' : 's keeping their'} copied data`] : []),
@@ -2094,6 +2188,23 @@ export class MockServer {
     return ok(plan);
   }
 
+  /**
+   * The plan's VMs as a validation and the wave planner read them (orchestrator._vms, SDD §5.4, review PL-09): from the
+   * source each VM with no migration yet or one a validation re-assesses, any other migration's recorded vm; a VM the
+   * source no longer reports is a provider error.
+   */
+  private planVms(plan: Plan): VMRef[] {
+    const byVm = new Map(this.migrations.filter((m) => m.plan_id === plan.id).map((m) => [m.vm.source_id, m]));
+    const inventory = (this.inventories[plan.source_provider_id] ?? []) as VMRef[];
+    return plan.vm_ids.map((id) => {
+      const m = byVm.get(id);
+      if (m && !REVALIDATABLE.has(m.phase) && m.phase !== 'validating') return m.vm;
+      const vm = inventory.find((v) => v.source_id === id);
+      if (!vm) throw new HttpError(502, 'provider_error', `VM '${id}': VM '${id}' not found`);
+      return vm;
+    });
+  }
+
   private autoWaves(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
     // like the API (SDD §12): the body is checked first, an integer from 1 to 1000, never clamped
     const size = input.max_wave_size ?? 10;
@@ -2103,17 +2214,20 @@ export class MockServer {
     // like the API (SDD §12): draft, validated or paused, and the plan returns to draft
     if (!['draft', 'validated', 'paused'].includes(plan.status)) throw new HttpError(409, 'conflict', `waves cannot change while the plan is ${plan.status}`);
     this.refuseInFlight(plan, 're-planning the waves');
-    const mine = this.migrations.filter((m) => m.plan_id === plan.id && m.phase !== 'cancelled').sort((a, b) => a.vm.disk_bytes - b.vm.disk_bytes);
-    const pilot = mine.slice(0, Math.min(3, mine.length));
-    const rest = mine.slice(pilot.length);
+    // the plan's VMs as the API's planner reads them (orchestrator._vms, SDD §9.4, review RV39-03): every VM of vm_ids,
+    // a fresh plan's and one added since too - a migration a validation leaves alone as its recorded vm
+    const vms = this.planVms(plan).sort((a, b) => a.disk_bytes - b.disk_bytes);
+    const pilot = vms.slice(0, Math.min(3, vms.length));
+    const rest = vms.slice(pilot.length);
     const waves: Wave[] = [];
-    if (pilot.length) waves.push({ id: 'wave-1', name: 'Pilot', order: 1, vm_ids: pilot.map((m) => m.vm.source_id), depends_on: [], max_parallel: 5 });
+    if (pilot.length) waves.push({ id: 'wave-1', name: 'Pilot', order: 1, vm_ids: pilot.map((vm) => vm.source_id), depends_on: [], max_parallel: 5 });
     for (let i = 0; i < rest.length; i += size) {
       const n = waves.length + 1;
-      waves.push({ id: `wave-${n}`, name: `Wave ${n}`, order: n, vm_ids: rest.slice(i, i + size).map((m) => m.vm.source_id), depends_on: [`wave-${n - 1}`], max_parallel: 5 });
+      waves.push({ id: `wave-${n}`, name: `Wave ${n}`, order: n, vm_ids: rest.slice(i, i + size).map((vm) => vm.source_id), depends_on: [`wave-${n - 1}`], max_parallel: 5 });
     }
+    // like the API: the migrations take their VM's wave at the next validation, which a plan back in draft needs before it
+    // starts (SDD §9.4, review RV40-03)
     plan.waves = waves;
-    for (const wave of waves) for (const m of mine) if (wave.vm_ids.includes(m.vm.source_id)) m.wave_id = wave.id;
     plan.status = 'draft'; // like the API: new waves are validated again before a start (SDD §12)
     plan.updated_at = new Date(this.now()).toISOString();
     this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}": ${waves.length} waves planned`, data: { waves: waves.length } });
@@ -2194,15 +2308,22 @@ export class MockServer {
   }
 
   private validatePlan(me: Me, plan: Plan): MockResponse {
-    if (['running', 'completed'].includes(plan.status)) throw new HttpError(409, 'conflict', `A ${plan.status} plan cannot be re-validated.`);
+    // like orchestrator.validate_plan (SDD §8.1, §16): a completed plan is validated again (audit DB-01)
+    if (plan.status === 'running') throw new HttpError(409, 'conflict', 'pause the plan before validating it again');
     if (plan.status === 'cancelled') throw new HttpError(409, 'conflict', 'a cancelled plan cannot be validated');
     const mine = this.migrations.filter((m) => m.plan_id === plan.id);
     const byVm = new Map(mine.map((m) => [m.vm.source_id, m]));
     const selected = new Set(plan.vm_ids);
     // the API's order of checks (orchestrator.validate_plan, SDD §5.4): nothing changes before they pass
-    // like the API (orchestrator._vms, SDD §12): a VM the source no longer reports is a provider error, before anything changes
+    // like the API (orchestrator._vms, SDD §5.4, §12, review PL-09): only the VMs a validation re-assesses are read from
+    // the source - a migration in any other phase counts as its recorded vm -, and one the source no longer reports is a
+    // provider error, before anything changes
     const known = new Set(((this.inventories[plan.source_provider_id] ?? []) as VMRef[]).map((v) => v.source_id));
-    const gone = plan.vm_ids.find((id) => !known.has(id));
+    const reassessed = (id: string) => {
+      const m = byVm.get(id);
+      return !m || REVALIDATABLE.has(m.phase) || m.phase === 'validating';
+    };
+    const gone = plan.vm_ids.find((id) => reassessed(id) && !known.has(id));
     if (gone !== undefined) throw new HttpError(502, 'provider_error', `VM '${gone}': VM '${gone}' not found`);
     const cancelled = plan.vm_ids.flatMap((id) => (byVm.get(id)?.phase === 'cancelled' ? [byVm.get(id)!.vm.name] : [])).sort();
     if (cancelled.length) {
@@ -2236,6 +2357,14 @@ export class MockServer {
       if (REVALIDATABLE.has(m.phase) || m.phase === 'validating') {
         if (m.phase !== 'validating') this.transition(m, 'validating', 'plan validation started', me.name);
         this.finishValidation(m, plan, me.name);
+      } else {
+        // like the API (SDD §9.4, review PL-11): left alone, but in its VM's wave in the plan, so waves planned anew
+        // reach it before the plan starts - saved, its updated_at stamped, only when that changes it (review RV39-08)
+        const wave = plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id))?.id ?? null;
+        if (m.wave_id !== wave) {
+          m.wave_id = wave;
+          m.updated_at = new Date(this.now()).toISOString();
+        }
       }
       validated.push(m);
     }
@@ -2294,7 +2423,7 @@ export class MockServer {
         409,
         'conflict',
         `only a plan whose migrations have not started can be cancelled: ${named.slice(0, 10).join(', ')}${rest > 0 ? ` and ${rest} more` : ''}; ` +
-          'cancel a failed or rolled-back migration on its own first, which cleans up what it copied',
+          "cancel a failed or rolled-back migration on its own first, which cleans up what it copied - on VMware it names the kit's copies it keeps",
       );
     }
     const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;
@@ -2327,6 +2456,11 @@ export class MockServer {
     }
     const est: Estimate | undefined = m.estimates.find((e) => e.strategy === strategy);
     if (!est || !est.eligible) throw new HttpError(400, 'bad_request', `${strategy} is not eligible for ${m.vm.name}${est?.reasons.length ? `: ${est.reasons.join('; ')}` : ''}.`);
+    // like the API (SDD §12, §9.2, review RV40-01): judged now - a Retry re-assesses no stored estimate, and a handover
+    // would leave an earlier attempt's volumes behind
+    if (strategy === 'storage_handover' && keptAfterRollback(m)) {
+      throw new HttpError(400, 'bad_request', `${strategy} is not eligible for ${m.vm.name}: ${HELD_VOLUMES_REASON}.`);
+    }
     m.strategy = strategy;
     m.estimate = est;
     this.clearApprovals(m);
@@ -2459,6 +2593,27 @@ export class MockServer {
             throw new HttpError(409, 'conflict', `${m.vm.name} cannot be retried: the plan's ${role} provider '${id}' no longer exists; create a new plan for the VM`);
           }
         }
+        // like the API (SDD §9.4, §12, review PL-11): the attempt runs in its VM's wave in the plan, and a VM in no wave of
+        // a plan with waves would run at once, outside every wave's order: refused before any change
+        const wave = plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id));
+        if (plan.waves.length && !wave) {
+          throw new HttpError(
+            409,
+            'conflict',
+            `${m.vm.name} cannot be retried: it belongs to no wave of the plan; re-run the automatic wave planning or add it to a wave`,
+          );
+        }
+        m.wave_id = wave?.id ?? null;
+        // like the API (SDD §12, §9.2): nothing is assessed anew, but a handover is ineligible while the attempt's
+        // destination volumes are held, which the strategy choice and the advisor's options then show
+        if (keptAfterRollback(m)) {
+          m.estimates = m.estimates.map(heldOut);
+          if (m.estimate) m.estimate = heldOut(m.estimate);
+        } else {
+          // an earlier Retry's mark comes off once nothing is held (review RV43B-02)
+          m.estimates = m.estimates.map(heldIn);
+          if (m.estimate) m.estimate = heldIn(m.estimate);
+        }
         const reopen = plan.status === 'completed';
         this.transition(m, 'ready', 'retry requested', me.name);
         m.attempts += 1;
@@ -2501,8 +2656,9 @@ export class MockServer {
         }
         if (m.phase === 'failed' && m.downtime_started_at) throw new HttpError(409, 'conflict', 'The source VM was stopped; roll back instead of cancelling.');
         const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : 'cancelled by operator';
-        // like the API (SDD §5.1): the data copied so far is cleaned up after the cancel
-        const cleanup = hasDataPath(m);
+        // like the API (SDD §5.1): the data copied so far is cleaned up after the cancel - a pass that runs, or the copies
+        // the API reads as kept where no record tells (its `copied_data`, §9.3, review RV43B-03), not any recorded pass
+        const cleanup = m.phase === 'precopy' || m.phase === 'syncing' || keptAfterRollback(m);
         this.transition(m, 'cancelled', reason, me.name);
         record('cancelled', { reason });
         if (cleanup) record('temporary resources of the cancelled migration removed', { action: 'cleanup' });

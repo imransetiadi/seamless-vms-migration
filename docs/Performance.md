@@ -45,13 +45,16 @@ p95 the largest.
 with `Plan.estimator_overrides` (unknown, non-positive and plan-owned keys are rejected with 400; `Plan.link_bps` keeps precedence for
 `link_bps`). After every completed warm pass the orchestrator calibrates the migration and re-estimates it:
 `vm.change_rate_bps = bytes_changed / (pass.started_at − previous_pass.started_at)` for delta passes, and the
-observed per-stream scan rate `bytes_scanned / duration_s / min(P, V)` replaces `scan_bps` for that migration
-(`Migration.observed_scan_bps`). The estimate an approver sees therefore converges on reality after the first
-delta pass.
+observed per-stream scan rate - the `S` under which the scan model gives the pass's duration,
+`max(min(Dmax, B), B / min(P, V)) / duration_s` with `B = bytes_scanned` - replaces `scan_bps` for that migration
+(`Migration.observed_scan_bps`). A pass at the aggregate ceiling (`A` set and `B / A >= duration_s`) leaves the
+calibration as it was, and one the link may have bound (`duration_s <= 1.1 · bytes_transferred / L`) may raise `S`
+but never lower it (SDD §9.1, reviews PL-07, RV38A-02, RV39-01). A `warm` pass records as its `duration_s` the part
+after its snapshot. The estimate an approver sees therefore converges on reality after the first delta pass.
 
 > **Why delta passes only.** A *full* first pass is usually bound by moving the used data (`U/L`), not by
 > scanning, so `bytes_scanned / duration_s` of that pass underestimates `S`: for the 200 GiB worked example of
-> §4.2 it gives 202 MiB/s instead of 500, and an estimate calibrated on it would show 21.4 min instead of 11.3.
+> §4.2 it gives 208 MiB/s instead of 500, and an estimate calibrated on it would show 20.9 min instead of 11.3.
 > SDD §9.1 therefore takes the scan rate from delta/final passes only (`test_first_pass_alone_does_not_calibrate`);
 > a migration that converges after a single full pass keeps the planning defaults. PERF-E2E-G2 reports
 > calibrated and uncalibrated migrations separately for this reason.
@@ -185,9 +188,9 @@ Derived properties worth knowing:
    `shutdown + Δf/L + v2v_inplace + create + boot` regardless of disk size.
 6. **Calibration changes the number the approver sees.** The defaults describe an idealized host; after the first
    delta pass the observed per-stream scan rate and change rate replace them (§1). Example: four 125 GiB disks
-   behind a 1,190 MiB/s storage path — the defaults predict 8.8 min; the first delta pass observes ≈ 280–300 MiB/s
-   per stream (the pass duration includes the 30 s snapshot) and re-estimates 11.7–12.2 min, which is what such a
-   host delivers (§4.3).
+   behind a 1,190 MiB/s storage path — the defaults predict 8.8 min; the first delta pass, its recorded duration
+   the part after the 30 s snapshot, observes ≈ 298 MiB/s per stream and re-estimates ≈ 11.7 min, which is what
+   such a host delivers (§4.3).
 
 ### 4.2 Worked example — 200 GiB single-disk VM, 120 GiB used, `c` = 2 MiB/s (*model*)
 
@@ -464,11 +467,14 @@ is left to the operator is the plan-level starting point, so that the very first
    query for the gates.
 
 6. Estimate accuracy (G2) is judged on the final, calibrated estimate of migrations that had at least one delta
-   pass; the others are reported separately:
+   pass with byte counts - the only kind the orchestrator calibrates from (SDD §9.1); the migration kit's
+   `vmware_warm` passes carry none, so no VMware estimate is calibrated (review RV37B-13). The others are reported
+   separately:
 
    ```bash
    curl -fsS -H @"$hdr" http://127.0.0.1:8080/api/v1/migrations | jq '
-     def delta_calibrated: any(.sync_passes[]?; .kind == "delta");
+     def delta_calibrated: any(.sync_passes[]?; .kind == "delta"
+       and ((.bytes_scanned // 0) > 0 or (.bytes_changed // 0) > 0 or (.bytes_transferred // 0) > 0));
      def within30: ((.actual_downtime_s - .estimate.downtime_s) | fabs) / .estimate.downtime_s <= 0.3;
      def succeeded: (.phase == "completed" or .phase == "finalized");
      [ .[] | select(succeeded and .actual_downtime_s != null and .estimate != null and .estimate.downtime_s > 0) ]
@@ -822,7 +828,9 @@ and the unit tests `test_cold_downtime_formula`, `test_warm_converges_and_counts
 The parallel-disk scan term, `Plan.estimator_overrides` and the per-pass calibration are covered by
 `test_warm_scan_uses_largest_disk_and_parallel_streams`, `test_sdd_worked_example`,
 `test_estimate_final_downtime_uses_scan_term`, `test_estimator_overrides_with_plan_precedence`,
-`test_invalid_estimator_overrides`, `test_calibration_helpers` (`seamless/tests/test_estimator.py`) and
-`test_warm_passes_calibrate_change_rate_scan_rate_and_estimate`, `test_first_pass_alone_does_not_calibrate`
+`test_invalid_estimator_overrides`, `test_calibration_helpers`, `test_the_scan_rate_calibration_reads_back_the_rate_its_model_used`,
+`test_a_pass_at_the_aggregate_ceiling_leaves_the_scan_rate_as_it_was`, `test_a_link_bound_delta_pass_never_lowers_the_scan_rate`
+(`seamless/tests/test_estimator.py`) and `test_warm_passes_calibrate_change_rate_scan_rate_and_estimate`,
+`test_first_pass_alone_does_not_calibrate`, `test_a_scan_bound_delta_pass_lowers_an_optimistic_scan_rate_before_the_slo_rule`
 (`seamless/tests/test_orchestrator.py`); the 400 on unknown or non-positive overrides is asserted in
 `test_plan_create_validate_start_flow` (`seamless/tests/test_api_resources.py`).

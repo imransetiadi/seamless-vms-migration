@@ -8,23 +8,29 @@ import { ErrorBanner } from './ErrorBanner';
 
 /**
  * Demo mode only (SDD §8.1, §16): powers a completed migration's fake source VM on or off, so the source
- * watch shows its alert on its next check. Mount it per migration (`key`): what the last press set wins
- * over `source_running_at`, which the watch updates only on its next check.
+ * watch shows its alert on its next check. Mount it per migration (`key`). The last press wins over
+ * `source_running_at`, which the watch updates only on its next check - until the migration's phase, attempt
+ * or recorded power changes: a rollback, a retried cutover or another tab's press is then what the label follows
+ * (audit DB-02).
  */
 export function DemoSourcePower({ migration: m, role }: { migration: Migration; role: Role | undefined }) {
   const health = useHealth();
   const power = useDemoPower();
-  const [set, setSet] = useState<boolean | null>(null);
+  const [set, setSet] = useState<{ on: boolean; basis: string } | null>(null);
   const [announcement, setAnnouncement] = useState('');
+  // what a press is measured against: the migration as the page showed it then; once that changes the press is
+  // dropped for good - a power back where it was at the press is the record's, not the press's
+  const basis = `${m.phase}|${m.attempts}|${m.source_running_at ?? ''}`;
+  if (set && set.basis !== basis) setSet(null);
   if (!health.data?.demo || m.phase !== 'completed') return null;
-  const running = set ?? Boolean(m.source_running_at);
+  const running = set ? set.on : Boolean(m.source_running_at);
   const press = () =>
     power.mutate(
       { sourceId: m.vm.source_id, on: !running },
       {
         onSuccess: (vm) => {
           const on = vm.power_state === 'running';
-          setSet(on);
+          setSet({ on, basis });
           setAnnouncement(on ? 'The source VM is running: the source watch flags it on its next check.' : 'The source VM is stopped.');
         },
       },

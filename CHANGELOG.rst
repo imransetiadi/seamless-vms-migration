@@ -222,6 +222,26 @@ This project follows a simple changelog to satisfy collection metadata validatio
   (``disk.config``): Nova gives the destination server its own. Disks are
   picked by file name only: an instances path containing ``disk``, any
   character, then ``info`` no longer hides every disk.
+- ``import_from_hypervisor`` refuses a disk ``qemu-img info`` sizes at zero
+  bytes - an empty or unparsable image -, as it refuses one whose size it
+  cannot read: it was recorded with size 0 and the run failed later, at the
+  volume create (after os-migrate 33aca993e4).
+- ``import_from_hypervisor`` refuses two disks of one run on one hypervisor
+  that would share an export port - two workloads with the default base port,
+  each disk taking it plus its index. The second stopped the first's export
+  through the PID file named by that port, and the first VM's recorded ``nbd``
+  URI, which names no export, then served the second VM's disk: the import
+  copied it into the first VM's volume without an error. All of a workload's
+  ports are judged before its first export - against this run's exports and
+  an earlier run's live export of another disk alike -, so a refused workload
+  exports nothing, and a later disk refused or failing on its own (a disk
+  sized at zero bytes or unreadable, a port another listener holds, an export
+  that does not start) stops the workload's exports no record names before
+  the run fails; a previous export is stopped only when it serves the same
+  disk, so a rerun never stops an earlier run's export of another VM. Give
+  each workload on one hypervisor its own ``_migration_params.nbdkit_port``
+  (after os-migrate f1d254cb8b, whose run-wide counter this fork does not
+  take).
 - The cold import (``import_workloads``) records its workload for a rollback,
   in the state file the warm path keeps: each volume its transfer creates, as
   soon as Cinder created it and before its data is copied
@@ -414,7 +434,21 @@ This project follows a simple changelog to satisfy collection metadata validatio
   Migrate fails it as permanent: the transfer let the error escape, and
   Ansible printed its cause, the serial read's ssh command line with its
   ConnectTimeout, which Seamless Migrate retried - two more whole cold copies
-  with the source VM stopped. After nbdcopy exits, whatever its exit, the
+  with the source VM stopped. Every command a conversion host runs that fails
+  by itself - a positive exit status - now says only its program and exit
+  status (``nbdkit on the conversion host exited with status 1``), never ssh's
+  command line, so the export's NBD server failing to start stays permanent
+  too, and the module's debug log holds the full command; ssh's own failure
+  (exit 255), and ssh killed by a signal on the host that runs it (a negative
+  status), keep their command line, which Seamless Migrate retries - and every
+  check that tells ssh's failure from the command's reads both alike: the disk
+  identity check, the check after a copy, the port map's read and
+  initialisation (which now gives up as "SSH timeout" as the read does), the
+  outage windows, and the cold export's probes for its NBD server (``which
+  qemu-nbd``, ``which nbdkit``, nbdkit's file plugin), which read ssh's failure
+  as a missing tool: the export picked the other tool on a guess, or failed as
+  permanent with "No supported NBD export tool available!". After
+  nbdcopy exits, whatever its exit, the
   transfer checks that the path it wrote is still a block device: nbdcopy
   opens its destination again with ``O_CREAT`` when the first open fails, so
   a volume that left the host before that open had its disk copied into a
@@ -581,7 +615,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   again: a lock wait that gives up (the conversion host lost, or the lock
   another conversion holds throughout, now ``LockUnavailable``) or a detach
   Nova does not end in time (``DetachStuck``) ends the detaches, and a
-  deletion Cinder does not finish in time ends the deletions; one that cannot
+  deletion Cinder does not finish in time ends the deletions - no name of
+  the collection reads as a timeout, as ansible-core before 2.19 prints an
+  escaped error's frames, which Seamless Migrate would read as transient
+  (the predicate is ``gave_up_waiting``); one that cannot
   start (its conversion host gone, a record not the workload's) says so in its
   result. The rescue runs it before the source cleanup, so a source cleanup
   that fails no longer keeps it from running, and a failed transfer is

@@ -52,28 +52,29 @@ Compose, deleting the namespace or its PVCs on a cluster.
 
 | Action | What it does | docker / podman | kubernetes / openshift |
 |---|---|---|---|
-| `up` | deploy or update everything, then wait until it runs | `make seamless-up` (`--demo`: `seamless-demo`) - builds, creates or recreates what changed | `apply -k` the overlay, then PostgreSQL and the control plane at one replica each, both rollouts awaited |
-| `down` | stop everything; the data stays | `make seamless-down` - containers removed, volumes kept | control plane to 0 (its pod gone), then PostgreSQL to 0 |
+| `up` | deploy or update everything, then wait until it runs | `make seamless-up` (`--demo`: `seamless-demo`) - builds, creates or recreates what changed | `apply -k` the overlay, then PostgreSQL and the control plane at one replica each, both rollouts awaited - PostgreSQL's extra pods, if it was scaled out, gone first |
+| `down` | stop everything; the data stays | `make seamless-down` - containers removed, volumes kept | control plane to 0 (its running pod gone; an evicted pod is not waited for), then PostgreSQL to 0 |
 | `stop` | stop the control plane alone | `make seamless-stop` | control plane to 0 replicas |
-| `start` | start the control plane again | `make seamless-start` - the stopped container as it was, or a new one after `down` | PostgreSQL to 1 first when it is at 0, then the control plane |
-| `restart` | restart the control plane from its current configuration | `make seamless-restart` - recreated from `.env`, the compose files and the sources | `rollout restart` (the old pod ends before the new one starts) |
+| `start` | start the control plane again | `make seamless-start` - the stopped container as it was, or a new one after `down` | PostgreSQL back to 1 first when it is not at 1 - each extra replica is a database of its own: named, awaited gone (by its pods, also when the count already reads 1), its PVC kept -, then the control plane |
+| `restart` | restart the control plane from its current configuration | `make seamless-restart` - recreated from `.env`, the compose files and the sources | `rollout restart` (the old pod ends before the new one starts); a stopped control plane is started instead |
 | `scale 0` / `scale 1` | the control plane's replicas | `stop` / `start` | `stop` / `start` |
-| `capacity` | scale the one control plane up or down | `--max-migrations`, `--max-cutovers` into `deploy/compose/.env`, then `restart` | the same settings into the ConfigMap, `--cpu`/`--memory` as its limits, one rollout |
+| `capacity` | scale the one control plane up or down | `--max-migrations`, `--max-cutovers` into `deploy/compose/.env`, then `restart` | `--cpu`/`--memory` checked by a server-side dry run (a limit the API server refuses changes nothing), the same settings into the ConfigMap, then one patch of the pod template - its limits and a restart -, one rollout; a failed patch or rollout - a LimitRange or quota refusing the new pod - is rolled back, the settings put back |
 | `status` | what runs, and the API's health | `make seamless-ps` + `GET /api/v1/health` | the Deployment, the StatefulSet, the pods (+ health with `--url`) |
 | `logs` | follow the control plane's log | `make seamless-logs` | `logs deployment/seamless -f` |
 | `resume` | start again the plans a `--drain` paused | `POST /plans/{id}/start` | the same, through `--url` |
 
 Options: `--namespace NS` (clusters; default `seamless-migrate`), `--demo` (docker/podman `up`, `start`,
 `restart`), `--drain FILE` and `--token-file FILE` (section 5), `--url URL`, `--wait-timeout S`, `--timeout S`
-(how long a cluster rollout may take; default 600), and `--dry-run`, which prints every command without
-running any:
+(how long a cluster rollout or wait may take; default 600, at least 1), and `--dry-run`, which prints every command
+without running any. The exit status is 0 when done, 1 when a step failed, and 2 for a usage error or a refusal,
+before anything changed:
 
 ```bash
 scripts/seamless-ctl.sh kubernetes down --dry-run
 + kubectl -n seamless-migrate scale deployment/seamless --replicas=0
-+ kubectl -n seamless-migrate wait --for=delete pod -l app.kubernetes.io/name=seamless --timeout=600s
++ kubectl -n seamless-migrate wait --for=delete pod -l app.kubernetes.io/name=seamless '--field-selector=status.phase!=Failed,status.phase!=Succeeded' --timeout=600s
 + kubectl -n seamless-migrate scale statefulset/seamless-postgres --replicas=0
-+ kubectl -n seamless-migrate wait --for=delete pod -l app.kubernetes.io/name=seamless-postgres --timeout=600s
++ kubectl -n seamless-migrate wait --for=delete pod -l app.kubernetes.io/name=seamless-postgres '--field-selector=status.phase!=Failed,status.phase!=Succeeded' --timeout=600s
 ```
 
 Exit status: `0` done, `1` a step failed, `2` a usage error or a refusal (nothing was run).
@@ -130,25 +131,28 @@ scripts/seamless-ctl.sh docker start        # or: docker scale 1 - the same cont
 
 | You changed | Run |
 |---|---|
-| a setting in `deploy/compose/.env` (ports, concurrency, log level, Jev, memory) | `restart` |
+| a setting in `deploy/compose/.env` for the control plane (ports, concurrency, log level, memory) | `restart` |
+| a Jev setting in `deploy/compose/.env` (`TYPESAFE_API_KEY`, `JEV_MCP_AUTH_TOKEN`, `COMPOSE_PROFILES=ai`) | `up` - they are the `jev` sidecar's, which `restart` (the control plane alone) leaves as it was |
 | the sources (`git pull` of a new version) or `deploy/compose/compose.yaml` | `up` (rebuilds the image, recreates what changed) |
-| `deploy/compose/tokens.yaml` (tokens added or removed with `seamless token create`) | `restart` |
+| `deploy/compose/tokens.yaml` (an entry added or removed by hand; `seamless token create` prints a new one) | `restart` |
 | only want the control plane to start afresh | `restart` |
 
 ```bash
 git pull --ff-only
 scripts/seamless-ctl.sh docker up           # new version: the image is rebuilt, the control plane recreated
+scripts/seamless-ctl.sh docker up --demo    # ... the same for a demo stack
 ```
 
 `restart` keeps the mode the control plane ran in: a stack started with `up --demo` comes back a demo, a real
-one a real one (`SEAMLESS_DEMO` in your environment or in `.env` wins when you set it).
+one a real one (`SEAMLESS_DEMO` in your environment or in `.env` wins when you set it). `up` does not: without
+`--demo` it recreates the control plane in real mode, over the demo's database - give a demo stack `up --demo`.
 
 ### 3.5 Down for maintenance, and back
 
 ```bash
 scripts/seamless-ctl.sh docker down         # every container removed; the pgdata and data volumes stay
 # ... maintain the host: OS updates, a reboot, Docker updates ...
-scripts/seamless-ctl.sh docker up
+scripts/seamless-ctl.sh docker up           # a demo stack: up --demo
 ```
 
 Take a backup before a change you cannot undo: the `pg_dump` recipe of
@@ -168,6 +172,9 @@ sized for 10 concurrent migrations at about 250 MiB each: above 10, raise `deplo
 (`SEAMLESS_COLIMA_MEMORY`): to give the VM more, stop the profile (`colima stop seamless`) and start it again with
 the new size (`make seamless-colima-up SEAMLESS_COLIMA_MEMORY=10`); Colima takes a new CPU or memory count when it
 starts a stopped profile, never a smaller disk.
+
+The restart cuts off a cutover in flight like any stop. To let it end first, add `--drain` (section 5):
+`scripts/seamless-ctl.sh docker capacity --max-migrations 16 --drain ~/.seamless/operator.token`.
 
 ---
 
@@ -236,7 +243,15 @@ The concurrency settings are patched into the ConfigMap and `--cpu`/`--memory` b
 one rollout. These are live changes: the next `up` (`apply -k`) brings the manifests' values back, so put a
 lasting change into the overlay - `deploy/openshift/configmap.yaml` and the `resources:` of
 `deploy/openshift/deployment.yaml` (or a kustomize patch of your own). The requests and limits there are sized for
-10 concurrent migrations.
+10 concurrent migrations at about 250 MiB each: above 10 without `--memory`, the script warns, as on the single host.
+The rollout restarts the control plane: add `--drain` and `--url` (section 5) to let the cutovers in flight end
+first. A namespace's LimitRange or quota judges the new pod, not the Deployment the dry run checks: when the new pod
+does not start within `--timeout`, the script puts the settings back and rolls the template back, so the control
+plane runs again as it was, and exits 1 - check `kubectl describe replicaset` for the refusal. When the restored
+pod is refused too - a LimitRange or a quota tightened since the last rollout -, the script says the template is
+back but its pod is not available: roll back no further, and fix the limit or the quota. When the settings could not
+be put back, it names them: set them in `seamless-config`, then `restart`, since the pod the rollback started read
+the new ones.
 
 ---
 
@@ -268,7 +283,19 @@ end first:
    ```
 
    It prints the plans it paused. If a cutover is still in flight when the wait ends, it **stops nothing**,
-   names the paused plans, and exits 1 - try again later, or stop without `--drain`.
+   names the paused plans, and exits 1 - try again later, or stop without `--drain`. Any other end before the
+   stop does the same: the API not answering during the wait, an interrupt (Ctrl-C). A plan whose pause got no
+   answer, or an error from the server or a gateway (a 5xx), may be paused all the same: it is named too. One
+   whose pause the API refused - any 4xx, answered before anything was applied - was not paused, and is not named.
+
+   Every drain first checks what its action needs, so an action that would be refused pauses no plan: the
+   token - one the API takes, an operator's or higher -; on the single host `make`, the Make targets' own checks
+   (the Docker context or Podman, `deploy/compose/.env` and `tokens.yaml`) and a `SEAMLESS_HOST_PORT` that is a
+   port from 1 to 65535, which Compose loads for every command; on a cluster `kubectl` or `oc`, a read of the
+   Deployment - and of PostgreSQL's StatefulSet for `down` - and a server-side dry run of the action's first
+   writes, so an expired login, a mistyped `--namespace` or a login that may read but not write shows before any
+   plan is paused. `capacity` takes `--drain` too: it ends in a restart; on a cluster it also reads
+   `seamless-config` and dry-runs its patches - and a timeout changes nothing.
 
 3. **Start again, then resume the paused plans:**
 
@@ -277,7 +304,9 @@ end first:
    scripts/seamless-ctl.sh docker resume --token-file ~/.seamless/operator.token plan-0001 plan-0002
    ```
 
-   Or press **Start** on each plan in the dashboard. On a cluster, `resume` needs `--url` too.
+   Or press **Resume** on each plan in the dashboard. On a cluster, `resume` needs `--url` too. A plan Start
+   refuses - cancelled meanwhile, or one whose migration was blocked (409) - is named, the others start all the
+   same, and the script exits 1: see that plan in the dashboard.
 
 `--drain` and `resume` need `curl` and `python3` on the machine that runs the script. On a cluster whose Route
 or Ingress uses a private CA, point curl at it: `export CURL_CA_BUNDLE=/path/to/ca.pem`.
@@ -301,6 +330,31 @@ version, then resume the plans.
 | `xtrace (bash -x) is on ...` | Run without `bash -x`: it would print the token. |
 | `a migration is still in cutover after 1800s: nothing was stopped` | A cutover outlasted `--wait-timeout`. Nothing was stopped and the plans stay paused: wait and retry, or raise `--wait-timeout`. |
 | `on kubernetes the API is reached through the Route or Ingress: give its URL with --url` | `--drain`, `resume` and the health check need the external URL on a cluster. |
+| `cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value` | `deploy/compose/.env` sets `SEAMLESS_HOST_PORT` through a variable (a `$`), which only Compose can resolve: write the number itself. |
+| `deploy/compose/.env gives KEY a quote it never closes, which Compose refuses with the whole file ...` | A line of `.env` - the named key's, whatever the shell sets and whatever a later line defines - opens a quote it never closes, and Compose refuses the whole file for every command, `make` included: close the quote. Nothing was paused or changed; only `resume`, which runs no Compose, can take `--url` past it. |
+| `SEAMLESS_HOST_PORT is '...', no port ...` | The value is no port Compose can publish (an address in front, a stray character, a number outside 1-65535): write the number alone. |
+| `the restart's Make target cannot read SEAMLESS_HOST_PORT ...` | The same, found before a `--drain`: nothing was paused or changed. |
+| `deploy/compose/.env is missing` / `tokens.yaml is missing` | `make seamless-init` first; nothing was paused or changed. |
+| `the token file '...' is empty` | The token file holds no token on its first line: write the operator's token into it (section 5); nothing was paused. |
+| `... is needed for this action: ...` | A tool the action uses is not installed - `make`, `curl` and `python3` for a drain, `kubectl` or `oc` on a cluster: install it, and log in to the cluster; nothing was paused. |
+| `cannot read the token file ...` | The path names no file this user can read: a typo, a broken link, a directory the user cannot enter. Fix the path or the permissions; nothing was paused. |
+| `cannot tell who may read the token file ...` | `find` itself failed while judging the file's mode (not installed, an I/O error): fix that, then run again; nothing was paused. |
+| `the token's role is 'viewer' ...` | A drain pauses plans: give an operator's token or higher. Nothing was listed or paused. |
+| `the API at ... does not take this token (HTTP 401) ...` | The API refused the token itself (401: unknown or revoked; 403: it may not ask): give a current operator's token. Nothing was listed or paused. |
+| `cannot ask the API at ... whose token this is (HTTP ...)` | The API did not answer `GET /api/v1/me` (HTTP 000: no answer; a 5xx: an error): is the control plane up, is `--url` right? Nothing was listed or paused. |
+| `cannot read the API's answer to GET /api/v1/me` | The API answered something that is not its `/me` JSON - `--url` names another service. Nothing was listed or paused. |
+| `cannot list the running plans at ...` | The API did not list the running plans: is the control plane up? Nothing was paused. |
+| `cannot read the plans the API returned` | The listing answered something that is not the API's JSON - `--url` names another service, or a proxy answered with its own page. Nothing was paused. |
+| `the API at ... locks this address out after failed attempts (HTTP 429)` | Too many failed sign-ins from this address (Security.md, the lockout): wait a minute, check the token, drain again. Nothing was listed or paused. |
+| `make seamless-check-context ... refused ...` | The Make targets' own checks refused before the drain (`down` runs `seamless-check-context` alone, the others `seamless-check-env` too) - the line above says why (the Colima profile or Docker context, `.env` or `tokens.yaml`): nothing was paused or changed. |
+| `cannot read deployment/seamless in namespace ...` | `kubectl` or `oc` cannot read the namespace - an expired login, a mistyped `--namespace`, no access: nothing was paused or changed. |
+| `cannot read statefulset/seamless-postgres in namespace ...` | The same for PostgreSQL's StatefulSet, which `up`, `start` and a `down --drain` read first: nothing was paused or changed. |
+| `kubectl may not ... (a server-side dry run refused it)` / `oc may not ...` | The login may read the namespace but not change it (the `view` role): the drain dry-runs the action's first writes before it pauses a plan. Log in with a role that may scale and patch the Deployment (and PostgreSQL's StatefulSet for `down`); nothing was paused or changed. |
+| `a server-side dry run refused the pod template's patch ...` | `capacity`'s patch of the Deployment was refused before anything changed - a limit below the request, an admission rule (a LimitRange, a quota), or a login that may not patch the Deployment; the API server's line above says which. Nothing was paused or changed. |
+| `cannot read seamless-config in namespace ...` | `capacity` cannot read the ConfigMap whose settings it changes - a mistyped `--namespace`, no access: nothing was paused or changed. |
+| `no StatefulSet seamless-postgres in namespace ...: run up first` | `start` found no PostgreSQL there: run `up` first, or check `--namespace`. |
+| `the API refused to pause plan ... (HTTP 4xx): it was not paused` | The API answered before it applied anything - the plan no longer running, a token it no longer takes, a plan another writer keeps changing: it was not paused and is not named for `resume`. Nothing was stopped; look at that plan, then drain again. |
+| `the API answered HTTP 5xx to the pause of plan ... - it may be paused all the same` | The API or a gateway (a Route's 502 or 504) answered an error after the request reached it: the plan may be paused, so it is named for `resume`; nothing was stopped. |
 | `Colima profile 'seamless' is not running. Run: make seamless-colima-up` | macOS: start the profile first. |
 | `Docker Engine does not answer ...` | Linux: `sudo systemctl enable --now docker` and join the `docker` group. |
 | `the namespace from the provided object ... does not match` | `--namespace` differs from the kustomization's `namespace:`; change both (section 4.1). |

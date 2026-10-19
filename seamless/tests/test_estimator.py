@@ -1,10 +1,12 @@
 import json
+import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from seamless_migrate.config import find_repo_root
 from seamless_migrate.domain.enums import Strategy
 from seamless_migrate.domain.models import SyncPass, VMRef
 from seamless_migrate.planning.estimator import (
@@ -135,6 +137,30 @@ def test_sdd_worked_example():
     fast = estimate(vm, Strategy.warm, replace(P, link_bps=1250 * MIB), slo_s=600)
     assert (fast.passes, fast.downtime_s) == (2, pytest.approx(warm.downtime_s))
     assert fast.precopy_s == pytest.approx(2 * 440.0, abs=1.5)
+
+
+def test_performance_md_why_delta_passes_only_divides_the_recorded_first_pass():
+    """Performance.md §1's "Why delta passes only" (review RV44A-10): a warm pass records as its
+    duration_s the part after its snapshot (SDD §9.1), so the rate a full first pass would give is
+    bytes_scanned over that part - the box divided by the pass with its snapshot: 202 MiB/s and
+    21.4 min instead of 208 MiB/s and 20.9 min."""
+    text = (find_repo_root() / "docs" / "Performance.md").read_text(encoding="utf-8")
+    match = re.search(
+        r"it gives (\d+) MiB/s instead of 500, and an estimate calibrated on it would show "
+        r"(\d+\.\d) min instead of (\d+\.\d)",
+        text,
+    )
+    assert match, "the box moved"
+    vm = vm_with(200, 120.0)  # §4.2's worked example
+    recorded = first_pass_seconds(vm, Strategy.warm, P) - P.snapshot_s
+    rate = 200 * GIB / recorded  # bytes_scanned / duration_s
+    calibrated = estimate(vm, Strategy.warm, replace(P, scan_bps=rate), slo_s=600).downtime_s
+    planned = estimate(vm, Strategy.warm, P, slo_s=600).downtime_s
+    assert (int(match[1]), float(match[2]), float(match[3])) == (
+        round(rate / MIB),
+        round(calibrated / 60, 1),
+        round(planned / 60, 1),
+    )
 
 
 def test_handover_downtime_independent_of_size():
@@ -281,6 +307,176 @@ def test_calibration_helpers():
     assert observed_scan_rate(empty, two_disks, P) is None
 
 
+@pytest.mark.parametrize(
+    "sizes_gb",
+    [[20, 200], [20, 20], [100] * 8, [50, 10, 10, 10, 10, 10], [300]],
+    ids=lambda sizes: "+".join(map(str, sizes)),
+)
+@pytest.mark.parametrize("scan_mib", [500, 120])
+def test_the_scan_rate_calibration_reads_back_the_rate_its_model_used(sizes_gb, scan_mib):
+    """SDD §9.1 (review PL-07): the scan model reads a pass as max(Dmax/S, D/min(S·P, A)) - the
+    disks are read concurrently, so a pass lasts as long as its largest disk or its streams' share.
+    A delta pass that ran exactly as the model predicts reads back the S it was predicted with:
+    unequal disks too (a 20 + 200 GiB VM, which the old rule calibrated from 500 to 275 MiB/s), and
+    more disks than streams."""
+    vm = make_vm(disks=[make_disk(id=f"d{i}", size_gb=gb) for i, gb in enumerate(sizes_gb)])
+    used = replace(P, scan_bps=scan_mib * MIB)
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=scan_seconds(vm, used),
+        bytes_scanned=vm.disk_bytes,
+    )
+    assert observed_scan_rate(sync_pass, vm, P) == pytest.approx(scan_mib * MIB)
+
+
+def test_a_pass_at_the_aggregate_ceiling_leaves_the_scan_rate_as_it_was():
+    """SDD §9.1 (review PL-07): with the aggregate ceiling A binding - eight 100 GiB disks, four
+    streams of 500 MiB/s against 1000 MiB/s - a pass lasts D/A whatever S is, so it does not tell S
+    and calibrates nothing; a pass slower than the ceiling does, as the model reads it."""
+    vm = make_vm(disks=[make_disk(id=f"d{i}", size_gb=100) for i in range(8)])
+    ceiling = replace(P, max_aggregate_scan_bps=1000.0 * MIB)
+    at_ceiling = scan_seconds(vm, ceiling)
+    assert at_ceiling == pytest.approx(vm.disk_bytes / (1000 * MIB))
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=at_ceiling,
+        bytes_scanned=vm.disk_bytes,
+    )
+    assert observed_scan_rate(sync_pass, vm, ceiling) is None
+    slower = sync_pass.model_copy(update={"duration_s": 2 * at_ceiling})
+    rate = observed_scan_rate(slower, vm, ceiling)
+    assert rate == pytest.approx(125 * MIB)
+    assert scan_seconds(vm, replace(ceiling, scan_bps=rate)) == pytest.approx(2 * at_ceiling)
+
+
+@pytest.mark.parametrize(
+    "sent_gib, overhead, reads_back",
+    [(40, 1.0, None), (40, 1.05, None), (10, 1.0, 500 * MIB)],
+    ids=["link-bound as predicted", "link-bound with 5% fixed work", "scan-bound"],
+)
+def test_a_link_bound_delta_pass_never_lowers_the_scan_rate(sent_gib, overhead, reads_back):
+    """SDD §9.1 (review RV38A-02): the model runs a delta pass as max(scan, Δ/L) - scan and
+    transfer overlap -, so a pass whose changes took at least as long over the link as the model's
+    scan at the current S lasts Δ/L whatever S is: what it reads only bounds S from below and
+    never lowers it - with or without the pass's fixed work. A pass the scan bound still reads
+    back its S."""
+    vm = make_vm(disks=[make_disk(id="d0", size_gb=100)])
+    scan = scan_seconds(vm, P)  # 204.8 s at 500 MiB/s
+    sent = sent_gib * GIB
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=max(scan, sent / P.link_bps) * overhead,
+        bytes_scanned=vm.disk_bytes,
+        bytes_changed=sent,
+        bytes_transferred=sent,
+    )
+    observed = observed_scan_rate(sync_pass, vm, P)
+    assert observed == (pytest.approx(reads_back) if reads_back else None)
+
+
+@pytest.mark.parametrize(
+    "sent_gib, duration_of, reads_back_mib",
+    [
+        (40, lambda scan_real, link: max(scan_real(250), link), 250),
+        (5, lambda scan_real, link: max(scan_real(470), link), 470),
+        (40, lambda scan_real, link: 1.1 * link, None),
+        (40, lambda scan_real, link: 1.1 * link * (1 + 1e-9), "rate"),
+    ],
+    ids=[
+        "storage at half the planned S, a large delta",
+        "a scan 6 % slower than planned, a small delta",
+        "at 10 % over its changes' time over the link: link-bound",
+        "just past the 10 %: scan-bound",
+    ],
+)
+def test_a_delta_pass_that_outlasted_its_changes_over_the_link_reads_its_scan_rate(
+    sent_gib, duration_of, reads_back_mib
+):
+    """SDD §9.1 (review RV39-01): a pass is link-bound by its own duration - at most 10 % longer
+    than its changes take over the link - never by the model's scan at the current S, which an
+    optimistic S makes short: a pass that lasted longer was bound by its scan, and its reading
+    replaces S, lower too. At the margin its reading only raises S."""
+    vm = make_vm(disks=[make_disk(id="d0", size_gb=100)])
+    sent = sent_gib * GIB
+    duration = duration_of(lambda mib: vm.disk_bytes / (mib * MIB), sent / P.link_bps)
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=duration,
+        bytes_scanned=vm.disk_bytes,
+        bytes_changed=sent,
+        bytes_transferred=sent,
+    )
+    observed = observed_scan_rate(sync_pass, vm, P)
+    if reads_back_mib is None:
+        assert observed is None
+    elif reads_back_mib == "rate":
+        assert observed == pytest.approx(vm.disk_bytes / duration)
+    else:
+        assert observed == pytest.approx(reads_back_mib * MIB)
+
+
+@pytest.mark.parametrize(
+    "strategy, snapshot_counts", [(Strategy.warm, True), (Strategy.vmware_warm, False)]
+)
+def test_a_recorded_pass_whole_time_adds_back_its_snapshot_on_the_warm_path(
+    strategy, snapshot_counts
+):
+    """SDD §9.1 (review RV39-07): T_last is the last pass's whole time - a warm pass records the
+    part after its snapshot, a CBT pass the whole; no recorded duration counts as 0 s."""
+    from seamless_migrate.planning.estimator import whole_pass_seconds
+
+    params = replace(P, snapshot_s=45.0)
+    recorded = SyncPass(
+        number=2, kind="delta", started_at=datetime(2026, 10, 18, tzinfo=UTC), duration_s=300.0
+    )
+    added = 45.0 if snapshot_counts else 0.0
+    assert whole_pass_seconds(recorded, strategy, params) == 300.0 + added
+    unrecorded = recorded.model_copy(update={"duration_s": None})
+    assert whole_pass_seconds(unrecorded, strategy, params) == added
+
+
+def test_a_pass_is_link_bound_by_what_crossed_the_link_not_what_changed():
+    """SDD §9.1 (review RV40-09): the margin is 1.1 times the pass's bytes_transferred over L -
+    what crossed the link -, not bytes_changed: zero blocks are skipped. 40 GiB changed, 20 GiB
+    sent in a 200 s pass at 125 MiB/s outlasted the 163.84 s those take by more than 10 %: the
+    scan bound it, and its reading replaces an optimistic S."""
+    vm = make_vm(disks=[make_disk(id="d0", size_gb=100, used_gb=60.0)])
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=200.0,
+        bytes_scanned=100 * GIB,
+        bytes_changed=40 * GIB,
+        bytes_transferred=20 * GIB,
+    )
+    optimistic = replace(P, scan_bps=1000 * MIB)
+    assert observed_scan_rate(sync_pass, vm, optimistic) == pytest.approx(100 * GIB / 200.0)
+
+
+def test_a_pass_that_scanned_less_than_the_largest_disk_ran_one_stream():
+    """SDD §9.1 (review PL-07): a pass that scanned fewer bytes than the largest disk holds read
+    them in one stream at most - its S is what it scanned over its duration, never the largest
+    disk's size."""
+    vm = make_vm(disks=[make_disk(id="root", size_gb=20), make_disk(id="data", size_gb=200)])
+    sync_pass = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=datetime(2026, 10, 18, tzinfo=UTC),
+        duration_s=100.0,
+        bytes_scanned=50 * GIB,
+    )
+    assert observed_scan_rate(sync_pass, vm, P) == pytest.approx(50 * GIB / 100)
+
+
 PART_KEYS = {"shutdown_s", "copy_s", "conversion_s", "create_s", "boot_s"}
 
 
@@ -342,3 +538,31 @@ def test_the_shared_forced_estimate_cases(case):
     vm = VMRef.model_validate(case["vm"])
     got = estimate_forced_downtime(vm, Strategy(case["strategy"]), case["last_pass_s"], params)
     assert got == pytest.approx(case["expected_s"], rel=1e-12)
+
+
+#: shared with the dashboard's port of the estimate, which its offline mock shows
+#: (forcedEstimate.test.ts): SDD §9.1, §16. A change to §9.1 recomputes each case's ``expected``
+#: with ``estimate`` and ports the change to dashboard/src/lib/forcedEstimate.ts
+ESTIMATE_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "estimate_cases.json").read_text()
+)
+
+
+@pytest.mark.parametrize("case", ESTIMATE_CASES, ids=[c["name"] for c in ESTIMATE_CASES])
+def test_the_shared_estimate_cases(case):
+    """What a validation estimates for each case, with the plan's parameters (params_for_plan) -
+    the dashboard's port, the figures of its offline mock, is checked against the same table."""
+    plan = make_plan(**case["plan"])
+    vm = VMRef.model_validate(case["vm"])
+    got = estimate(vm, Strategy(case["strategy"]), params_for_plan(plan), plan.downtime_slo_s)
+    got, want = got.model_dump(mode="json"), case["expected"]
+    for key in ("strategy", "passes", "final_delta_bytes", "meets_slo"):
+        assert got[key] == want[key], key
+    for key in ("precopy_s", "downtime_s", "total_s"):
+        assert got[key] == pytest.approx(want[key], rel=1e-12), key
+    assert got["downtime_parts"] == pytest.approx(want["downtime_parts"], rel=1e-12)
+
+
+def test_the_shared_estimate_cases_cover_every_strategy():
+    """Each strategy's formula is in the table the dashboard's port is checked against."""
+    assert {c["strategy"] for c in ESTIMATE_CASES} == {s.value for s in Strategy}

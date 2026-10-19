@@ -16,7 +16,8 @@ This role is part of the nbdkit direct mode migration workflow. It:
 2. Filters workloads with `use_nbdkit_direct: true`
 3. For each workload (which must be SHUTOFF):
    - Connects to the hypervisor (from `hypervisor_hostname` in workload data)
-   - Finds the instance disks (`disk`, `disk.eph*`; the config drive `disk.config` is not exported)
+   - Finds the instance disks: every `disk*` file but `disk.info` and the config drive `disk.config` - `disk`,
+     `disk.eph*`, `disk.swap`, `disk.local` (the config drive is not exported)
    - Takes each disk's format from the instance's `disk.info`, where Nova recorded it, and reads its size with
      `qemu-img info -f <format>` - qemu never guesses a format; the role stops before any export when `disk.info`
      is missing or unreadable, or records no single format for a disk (Seamless Migrate SDD §6.6)
@@ -89,7 +90,7 @@ The exports carry whole guest disks, so they are locked down by default:
 | `os_migrate_nbdkit_protocol` | `tcp` | `tcp` or `ssh`, see above |
 | `os_migrate_nbdkit_bind_address` | `127.0.0.1` | address `qemu-nbd` listens on (host variables of the hypervisor win) |
 | `os_migrate_nbdkit_readonly` | `true` | export the disks read-only |
-| `os_migrate_nbdkit_port` | `10809` | port of the first disk (`_migration_params.nbdkit_port` overrides it per workload) |
+| `os_migrate_nbdkit_port` | `10809` | port of the first disk (`_migration_params.nbdkit_port` overrides it per workload); each disk takes it plus its index, and a workload whose ports another disk of the run exports on the hypervisor is refused before its first export - give each workload on one hypervisor its own `nbdkit_port`, its disks' ports apart; a previous export of a port is stopped only when it serves the same disk |
 | `os_migrate_nbdkit_ssh_user` | `stack` | user in `nbd+ssh://` URIs |
 | `os_migrate_nbdkit_log_dir` | `/var/log/os-migrate-nbd` | private directory for logs and PID files on the hypervisor |
 | `os_migrate_nbdkit_nova_instances_dir` | `/var/lib/nova/instances` | Nova instances directory on the hypervisor |

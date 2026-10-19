@@ -123,6 +123,10 @@ async def test_a_disk_an_earlier_attempt_left_detached_never_leaves_the_vm_by_a_
                 "SRC_VM_VOLUME_DETACHED"
             ]
             assert [d.id for d in blocked.vm.disks] == ["vol-1", "vol-data"]
+            # the blocker reaches the eligibility: no strategy stays eligible, and the estimates
+            # count the kept volume (SDD §9.2, review PL-10)
+            assert [e.strategy for e in blocked.estimates if e.eligible] == []
+            assert blocked.error and blocked.error.startswith("no eligible strategy")
 
         # attached again: the validation clears, and the cutover imports both disks
         h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"disks": list(DISKS)})

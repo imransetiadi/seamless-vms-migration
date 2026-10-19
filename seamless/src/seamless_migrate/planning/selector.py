@@ -33,6 +33,15 @@ def _ids(disks: Iterable[Any]) -> str:
     return ", ".join(d.name or d.id for d in disks)
 
 
+#: why a migration that holds an earlier attempt's destination volumes takes no storage handover
+#: (SDD §9.2, review 39 lead L1)
+HELD_VOLUMES_REASON = (
+    "an earlier attempt keeps its destination volumes for a retry, which a storage handover "
+    "would leave behind: migrate it warm again, which uses them, or cold, whose cutover removes "
+    "them first"
+)
+
+
 def eligibility(
     vm: VMRef,
     source_kind: ProviderKind | str,
@@ -41,12 +50,16 @@ def eligibility(
     dst_caps: Mapping[str, Any],
     findings: Sequence[Finding] = (),
     destination: str = "the destination",
+    *,
+    holds_volumes: bool = False,
 ) -> dict[Strategy, list[str]]:
     """Map every strategy applicable to the source family to its ineligibility reasons.
 
     An empty list means eligible. ``src_caps``/``dst_caps`` are the providers' capabilities plus
     ``conversion_host`` (truthy when the provider has a conversion host configured); a reason
     about the destination cloud names its provider, ``destination`` (SDD §1 naming).
+    ``holds_volumes``: the migration holds the destination volumes an earlier attempt created
+    (SDD §9.3's rule), which a storage handover would leave behind (§9.2).
     """
     kind = ProviderKind(source_kind)
     out: dict[Strategy, list[str]] = {s: [] for s in strategies_for(kind)}
@@ -129,6 +142,10 @@ def eligibility(
                 f"{HANDOVER_COMPUTE_FLOOR} (the handover's delete_on_termination update of the "
                 "source server)"
             )
+        if holds_volumes:
+            # a handover never removes what an earlier attempt left at the destination (SDD §9.2,
+            # review 39 lead L1)
+            handover.append(HELD_VOLUMES_REASON)
 
     for finding in findings:
         if finding.severity == Severity.blocker:

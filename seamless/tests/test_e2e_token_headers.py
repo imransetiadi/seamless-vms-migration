@@ -170,6 +170,70 @@ def test_no_e2e_script_puts_a_bearer_token_on_a_command_line():
     assert _tokens_on_command_lines(E2E) == []
 
 
+#: a token variable given a literal value - exported, or typed before the script, an ANSI-C $'...'
+#: or a single-quoted '$...' one too - where the shell history keeps it (Security.md §7.2, reviews
+#: RV37B-06, RV38B-20, RV41A-12); a variable or a command - $VAR, "$VAR", $(...), `...` - or an
+#: empty value is no literal
+TYPED_TOKEN = re.compile(r"\b[A-Z_]*TOKEN=(?!\"?\$(?!')|`|\"\"|''|\s|$)")
+
+
+@pytest.mark.parametrize(
+    ("line", "typed"),
+    [
+        ("#   TOKEN='smg_...' APPROVER_TOKEN='smg_...' tests/e2e/smoke-demo.sh", True),
+        ("#   export TOKEN='smg_...'", True),
+        ("#   export APPROVER_TOKEN=<an approver token>", True),
+        ("#   read -rs TOKEN && export TOKEN", False),
+        (': "${TOKEN:?read -rs TOKEN && export TOKEN: the admin token}"', False),
+        ('TOKEN=$(cat "$HOME/.seamless-token")', False),
+        ('TOKEN="$ADMIN"', False),
+        ("export TOKEN=$'smg_abc123'", True),
+        ("TOKEN='$typed'", True),
+        ('TOKEN=`cat "$HOME/.seamless-token"`', False),
+        ('TOKEN="$1"', False),
+        ('TOKEN=""', False),
+        ("TOKEN=''", False),
+        ("TOKEN=", False),
+    ],
+    ids=[
+        "typed before",
+        "exported",
+        "exported placeholder",
+        "read",
+        "required",
+        "a command",
+        "a variable",
+        "an ANSI-C quoted literal",
+        "a single-quoted dollar",
+        "a backquoted command",
+        "a positional parameter",
+        "empty in double quotes",
+        "empty in single quotes",
+        "empty",
+    ],
+)
+def test_the_typed_token_check_flags_every_literal(line, typed):
+    """Reviews RV38B-20, RV41A-12: the check matched `export ...TOKEN=` only, so a usage line typing
+    the token before the script passed; any token variable given a literal is flagged - an ANSI-C
+    `$'...'` or a single-quoted `'$...'` one too -, never a variable, a command or an empty
+    value."""
+    assert bool(TYPED_TOKEN.search(line)) is typed
+
+
+def test_no_e2e_script_tells_its_reader_to_type_a_token():
+    """Security.md §7.2 (R-28, docs-drift DD2-01, review RV37B-06): a usage header or a message that
+    says ``export TOKEN='smg_...'`` or ``export TOKEN=<...>`` has the reader type the token into a
+    command, which the shell history keeps; each says to read it with ``read -rs`` instead."""
+    typed = TYPED_TOKEN
+    told = [
+        f"{path.name}:{number}: {line.strip()}"
+        for path in sorted(E2E.glob("*.sh"))
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if typed.search(line)
+    ]
+    assert told == []
+
+
 def test_no_e2e_script_writes_a_fixed_name_in_the_shared_temporary_directory():
     """A fixed name under ``$TMPDIR`` clobbers another run's file, follows a symlink another user
     planted there, and is left behind (audit A-16): the shared temporary directory is only ever

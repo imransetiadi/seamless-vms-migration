@@ -36,6 +36,7 @@ from seamless_migrate.domain.models import (
     ForceCutover,
     Migration,
     Nic,
+    PhaseChange,
     Plan,
     PolicyScope,
     Provider,
@@ -178,6 +179,902 @@ async def test_the_waves_of_a_plan_whose_finished_vm_left_the_source_are_planned
         await h.orch.stop()
     assert sorted(v for w in planned.waves for v in w.vm_ids) == ["vm-1", "vm-2"]
     assert reads == ["vm-2"]
+
+
+class QuotaDestination(StaticDestination):
+    """A destination whose free quota is what Nova and Cinder report for the project: the limit
+    less what its servers and volumes already use (providers/openstack.py), and whose m1.small is
+    the test VMs' size - the flavor the quota prices them with (SDD §9.3, review PL-01)."""
+
+    def __init__(self, free: dict[str, int]) -> None:
+        super().__init__()
+        self.free = dict(free)
+
+    async def inventory(self):
+        inv = await super().inventory()
+        inv.flavors = [
+            {"name": "m1.small", "vcpus": 2, "ram_mb": 4096, "disk_gb": 20, "extra_specs": {}}
+        ]
+        inv.quotas = {"finance": dict(self.free)}
+        return inv
+
+
+async def test_a_revalidation_never_counts_a_completed_migration_again(tmp_path, store):
+    """SDD §9.3, §5.4 (review PL-02): two VMs fit the project exactly. Once web-01 is cut over and
+    completed, its server and volume are in use - the destination reports that much less free -,
+    so the re-validation of the paused plan counts web-02 alone: it stays ready."""
+    full = {"cores": 4, "ram_mb": 8192, "instances": 2, "volumes": 2, "gigabytes": 40}
+    dst = QuotaDestination(full)  # two VMs of 2 vCPUs, 4 GiB, one 20 GiB volume each
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), vm(2)],
+        {"default_strategy": Strategy.cold, "auto_cutover": False},
+        destination=dst,
+    )
+    await run_plan(h, plan)
+    try:
+        first = await h.by_vm(plan.id, "vm-1")
+        await h.orch.request_cutover(first.id, "sari")
+        await h.wait_phase(first.id, P.completed)
+        await h.orch.pause_plan(plan.id, "alice")
+        dst.free = {"cores": 2, "ram_mb": 4096, "instances": 1, "volumes": 1, "gigabytes": 20}
+        report = await h.orch.validate_plan(plan.id, "alice")
+    finally:
+        await h.orch.stop()
+    second = next(i for i in report.migrations if i.vm_name == "web-02")
+    assert (second.phase, [f.code for f in second.findings]) == (P.ready, [])
+
+
+async def _a_plan_in_two_waves(tmp_path, store):
+    """web-01 in the Pilot (wave-1), web-02 in wave-3, validated; web-02's migration then failed
+    before its source stopped, as a cutover refused by the destination leaves it."""
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)], {"default_strategy": Strategy.cold})
+    plan.waves = [
+        Wave(id="wave-1", name="Pilot", order=1, vm_ids=["vm-1"]),
+        Wave(id="wave-3", name="Wave 3", order=3, vm_ids=["vm-2"], depends_on=["wave-1"]),
+    ]
+    store.put("plan", plan)
+    await h.orch.validate_plan(plan.id, "alice")
+    failed = await h.by_vm(plan.id, "vm-2")
+    assert failed.wave_id == "wave-3"
+    failed.phase = P.failed
+    store.put("migration", failed)
+    return h, plan, failed
+
+
+async def test_a_validation_writes_the_plans_wave_into_a_migration_it_leaves_alone(tmp_path, store):
+    """SDD §9.4 (review PL-11): the waves planned anew put web-02 in the Pilot; the validation
+    that every wave change needs writes that wave into its failed migration too, which it does not
+    re-assess - so the plan starts, never refused as one whose migration "belongs to no wave"."""
+    h, plan, failed = await _a_plan_in_two_waves(tmp_path, store)
+    try:
+        replanned = await h.orch.auto_waves(plan.id, 10, "alice")
+        [pilot] = replanned.waves
+        assert pilot.vm_ids == ["vm-1", "vm-2"]
+        await h.orch.validate_plan(plan.id, "alice")
+        left = await h.migration(failed.id)
+        assert (left.phase, left.wave_id) == (P.failed, pilot.id)
+        assert (await h.orch.start_plan(plan.id, "alice")).status == PlanStatus.running
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_validation_clears_the_wave_of_a_migration_whose_vm_left_every_wave(
+    tmp_path, store
+):
+    """SDD §9.4 (review PL-11): waves edited so that web-02 is in none: the validation writes no
+    wave into its failed migration either - never one the plan no longer has - and start_plan
+    names it as belonging to no wave."""
+    h, plan, failed = await _a_plan_in_two_waves(tmp_path, store)
+    edited = await h.plan(plan.id)
+    edited.waves = [w for w in edited.waves if w.id == "wave-1"]
+    edited.status = PlanStatus.draft
+    store.put("plan", edited)
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        assert (await h.migration(failed.id)).wave_id is None
+        with pytest.raises(NotAllowed, match="belong to no wave: web-02"):
+            await h.orch.start_plan(plan.id, "alice")
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_retry_takes_the_wave_the_plan_gives_its_vm(tmp_path, store):
+    """SDD §9.4, §12 (review PL-11): a retried migration runs in its VM's wave in the plan, never
+    in a wave it was assessed under that the plan no longer has - the tick would read that as no
+    wave and cut it over at once, before the Pilot."""
+    h, plan, failed = await _a_plan_in_two_waves(tmp_path, store)
+    stale = await h.migration(failed.id)
+    stale.wave_id = "wave-gone"  # the waves it was assessed under, planned anew since
+    store.put("migration", stale)
+    retried = await h.orch.retry(failed.id, "bayu")
+    assert (retried.phase, retried.wave_id) == (P.ready, "wave-3")
+
+
+async def test_a_retry_refuses_a_vm_in_no_wave_of_the_plan(tmp_path, store):
+    """SDD §9.4, §12 (review PL-11): a retry refuses (409, before any change) a migration of a plan
+    with waves whose VM is in none of them, as start_plan does: it would run at once, outside every
+    wave's order and max_parallel."""
+    h, plan, failed = await _a_plan_in_two_waves(tmp_path, store)
+    edited = await h.plan(plan.id)
+    edited.waves = [w for w in edited.waves if w.id == "wave-1"]
+    store.put("plan", edited)
+    with pytest.raises(NotAllowed, match="belongs to no wave"):
+        await h.orch.retry(failed.id, "bayu")
+    left = await h.migration(failed.id)
+    assert (left.phase, left.wave_id) == (P.failed, "wave-3")
+
+
+#: two VMs of 2 vCPUs, 4 GiB and one 20 GiB volume each fit the project exactly; once web-01's
+#: attempt holds its 20 GiB destination volume, Cinder reports one volume and 20 GiB less free
+QUOTA_FOR_TWO = {"cores": 4, "ram_mb": 8192, "instances": 2, "volumes": 2, "gigabytes": 40}
+QUOTA_ONE_VOLUME_HELD = {**QUOTA_FOR_TWO, "volumes": 1, "gigabytes": 20}
+
+
+async def _a_cutover_failing_after_the_stop(ctx):
+    await ctx.mark_downtime_start()
+    raise PermanentStepError("create the server in the destination: HTTP 500")
+
+
+async def _a_first_pass_failing(ctx):
+    raise PermanentStepError("the first pass failed after creating its destination volumes")
+
+
+@pytest.mark.parametrize(
+    "how",
+    [
+        "rolled back after its passes",
+        "failed with its volumes recorded",
+        "retried back to ready",
+        "failed before creating anything",
+        "failed with a record of no volume",
+    ],
+)
+async def test_a_revalidation_never_counts_the_volumes_an_earlier_attempt_holds(
+    tmp_path, store, how
+):
+    """SDD §9.3 (review RV38A-01): web-01's warm attempt keeps the destination volume it created
+    for the next attempt - a rollback deletes the server only, a first pass that failed after
+    creating it leaves it (its workload record says so), and a Retry puts the migration back in
+    ready with it -, so Cinder counts it in use and the re-validation counts web-01's server alone:
+    web-02 fits. An attempt that created nothing counts all of it - a record holding no destination
+    volume, a pending source snapshot alone, too -, and web-02 does not fit."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    dst = QuotaDestination(QUOTA_FOR_TWO)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), vm(2)],
+        {
+            "default_strategy": Strategy.warm,
+            "strategy_overrides": {"vm-2": Strategy.cold},  # web-02 waits in ready
+            "auto_cutover": False,
+        },
+        destination=dst,
+    )
+    fails_first_pass = how.startswith("failed")
+    if fails_first_pass:
+        h.executor.hooks[StepName.PRECOPY] = _a_first_pass_failing
+    else:
+        h.executor.hooks[StepName.CUTOVER] = _a_cutover_failing_after_the_stop
+    await run_plan(h, plan)
+    try:
+        first = await h.by_vm(plan.id, "vm-1")
+        if fails_first_pass:
+            await h.wait_phase(first.id, P.failed, timeout=20)
+        else:
+            await h.wait_phase(first.id, P.awaiting_cutover, timeout=20)
+            await h.orch.request_cutover(first.id, "sari")
+            await h.wait_phase(first.id, P.rolled_back, timeout=20)
+        await h.orch.pause_plan(plan.id, "alice")
+        if how == "retried back to ready":
+            assert (await h.orch.retry(first.id, "bayu")).phase == P.ready
+        written = {
+            "failed with its volumes recorded": {"dest_volumes": {"vol-1": "dst-vol-1"}},
+            "failed with a record of no volume": {"dest_volumes": {}, "pending_snapshot": "snap-1"},
+        }
+        if how in written:
+            record = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+            record.parent.mkdir(parents=True, exist_ok=True)
+            record.write_text(json.dumps(written[how]))
+        held = how not in ("failed before creating anything", "failed with a record of no volume")
+        # one volume in use: web-01's when it holds one - and when it holds nothing, the control,
+        # counting all of web-01 leaves web-02 no room
+        dst.free = dict(QUOTA_ONE_VOLUME_HELD)
+        report = await h.orch.validate_plan(plan.id, "alice")
+    finally:
+        await h.orch.stop()
+    second = next(i for i in report.migrations if i.vm_name == "web-02")
+    blocked = [f.code for f in second.findings if f.code == "DST_QUOTA_INSUFFICIENT"]
+    assert (second.phase, blocked) == (
+        (P.ready, []) if held else (P.blocked, ["DST_QUOTA_INSUFFICIENT"])
+    ), how
+
+
+#: an attempt rolled back before any cutover ran, and one whose cutover ran
+UNCUT = (P.precopy, P.syncing, P.awaiting_cutover, P.rolling_back, P.rolled_back)
+CUT = (P.precopy, P.syncing, P.awaiting_cutover, P.cutover, P.rolling_back, P.rolled_back)
+
+
+def _history(*phases: Phase) -> list[PhaseChange]:
+    """Phase changes through ``phases``, a minute apart, from ready."""
+    start, before, changes = utcnow() - timedelta(hours=3), P.ready, []
+    for n, phase in enumerate(phases):
+        at = start + timedelta(minutes=n)
+        changes.append(
+            PhaseChange(from_phase=before, to_phase=phase, at=at, reason="test", actor="test")
+        )
+        before = phase
+    return changes
+
+
+def _passes(count: int, history: list[PhaseChange] | None = None) -> list[SyncPass]:
+    """``count`` passes, started in the last attempt of ``history`` - after it last entered
+    precopy - or three hours ago without one."""
+    precopy = [c.at for c in history or [] if c.to_phase == P.precopy]
+    start = precopy[-1] + timedelta(seconds=1) if precopy else utcnow() - timedelta(hours=3)
+    return [
+        SyncPass(
+            number=n,
+            kind="full" if n == 1 else "delta",
+            started_at=start + timedelta(seconds=n),
+            duration_s=60.0,
+        )
+        for n in range(1, count + 1)
+    ]
+
+
+#: what a rollback kept, where no workload record tells (SDD §5.1, §9.3, review RV39-02): strategy,
+#: the phases of the migration's history, its recorded passes, and whether its copies remain
+NO_RECORD_CASES = pytest.mark.parametrize(
+    ("strategy", "phases", "passes", "held"),
+    [
+        (Strategy.warm, CUT, 2, True),
+        (Strategy.warm, UNCUT, 0, False),
+        (Strategy.vmware_warm, UNCUT, 2, True),
+        (Strategy.vmware_warm, UNCUT, 0, False),
+        (Strategy.vmware_warm, CUT, 2, False),
+        (Strategy.vmware_warm, (*CUT, P.ready, *UNCUT), 3, True),
+        (
+            Strategy.vmware_warm,
+            (*CUT, P.ready, P.precopy, P.awaiting_cutover, P.rolling_back, P.rolled_back),
+            3,
+            True,
+        ),
+        (Strategy.vmware_warm, (*UNCUT, P.ready, *CUT[:4], P.failed, P.ready), 3, False),
+        (Strategy.cold, (P.cutover, P.rolling_back, P.rolled_back), 1, False),
+        (Strategy.vmware_cold, (P.cutover, P.rolling_back, P.rolled_back), 1, False),
+        (Strategy.storage_handover, (P.cutover, P.rolling_back, P.rolled_back), 0, False),
+    ],
+    ids=[
+        "warm passes: the volumes stay for the next attempt",
+        "warm with no pass copied nothing",
+        "vmware_warm rolled back before its cutover: the kit's copies stay",
+        "vmware_warm whose first copy was cut off: its rollback deleted it",
+        "vmware_warm whose cutover ran: its rollback deleted them",
+        "vmware_warm whose last attempt ran no cutover",
+        "vmware_warm whose last attempt converged from its first pass",
+        "vmware_warm retried to ready after a cutover",
+        "cold: its rollback deletes its copy",
+        "vmware_cold: its rollback deletes its copy",
+        "storage_handover: no copy",
+    ],
+)
+
+
+@NO_RECORD_CASES
+async def test_where_no_record_tells_warm_passes_and_an_uncut_vmware_warm_attempt_hold_volumes(
+    tmp_path, store, strategy, phases, passes, held
+):
+    """SDD §9.3, §7.2 (reviews RV38A-01, RV39-02, RV39-04): without a workload record - the demo,
+    the VMware kit - a warm migration's passes hold its destination volumes, as do a vmware_warm
+    one's when its last attempt ran no cutover (no cutover since it last entered precopy): the
+    kit's rollback deletes its copies after one, or marks them cutover. A cold, vmware_cold or
+    storage_handover rollback keeps no copy, the demo's recorded full pass notwithstanding."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*phases)
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=strategy,
+        phase=phases[-1],
+        phase_history=history,
+        sync_passes=_passes(passes, history),
+    )
+    try:
+        assert await h.orch.holds_destination_volumes(m) is held
+    finally:
+        await h.orch.stop()
+
+
+@NO_RECORD_CASES
+async def test_where_no_record_tells_copied_data_is_what_a_rollback_kept(
+    tmp_path, store, strategy, phases, passes, held
+):
+    """SDD §5.1, §12 (review RV39-02's rule for copied data): without a workload record a
+    rolled-back migration keeps copied data - its cancel cleans it up, its providers stay - as
+    §9.3 counts it held: a warm migration's passes, a vmware_warm one's while its last attempt ran
+    no cutover. The kit's rollback deleted its copies after one, and a vmware_cold rollback keeps
+    none."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*phases)
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=strategy,
+        phase=phases[-1],
+        phase_history=history,
+        sync_passes=_passes(passes, history),
+    )
+    try:
+        assert await h.orch.copied_data(m) is held
+    finally:
+        await h.orch.stop()
+
+
+@pytest.mark.parametrize(
+    ("strategy", "held"), [(Strategy.vmware_warm, False), (Strategy.warm, True)]
+)
+async def test_an_earlier_attempts_passes_hold_no_kit_copy_of_a_later_attempt(
+    tmp_path, store, strategy, held
+):
+    """SDD §9.3, §5.1 (reviews RV40-05, RV41B-02): attempt 1 recorded its passes and ran its
+    cutover - the kit's rollback deleted its copies, the cutover's own final pass with them -,
+    attempt 2's first copy was cut off with no pass recorded (the kit deletes it too): no pass
+    since the kit released its copies, so it holds nothing. A warm migration's rollback keeps its
+    volumes for every later attempt: its passes still hold them."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*CUT, P.ready, P.precopy, P.failed, P.ready)
+    first_attempt = history[: len(CUT)]
+    # the cutover's own final pass, recorded while it ran (review RV41B-02): released all the same
+    cut_at = next(c.at for c in history if c.to_phase == P.cutover)
+    final = SyncPass(
+        number=3, kind="final", started_at=cut_at + timedelta(seconds=5), duration_s=30.0
+    )
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=strategy,
+        phase=P.ready,
+        phase_history=history,
+        sync_passes=[*_passes(2, first_attempt), final],
+    )
+    try:
+        assert await h.orch.holds_destination_volumes(m) is held
+        assert await h.orch.copied_data(m) is held
+    finally:
+        await h.orch.stop()
+
+
+@pytest.mark.parametrize(
+    ("earlier", "later"),
+    [
+        ((), (P.ready, P.precopy, P.rolling_back, P.rolled_back, P.ready)),
+        ((), (P.ready, P.precopy, P.failed, P.ready)),
+        ((*CUT, P.ready), (P.ready, P.precopy, P.failed, P.ready)),
+    ],
+    ids=[
+        "attempt 2 rolled back during its first run",
+        "attempt 2's first run failed",
+        "after a cutover's attempt, the next one's copies through a third cut off",
+    ],
+)
+async def test_an_uncut_attempts_kit_copies_stay_through_a_later_attempt_cut_off(
+    tmp_path, store, earlier, later
+):
+    """SDD §9.3, §7.2, §5.1 (review RV41B-02): attempt 1 completed its passes and ran no cutover -
+    the kit marked its copies seamless_copied true, and its rollback kept them -, attempt 2's
+    first run, a CBT sync of those copies, was cut off before it recorded a pass: the copies stay,
+    so the kit still holds them - only a cutover releases them (RV40-05). The rule took attempt 2's
+    passes alone and read them released: a false quota shortfall for another VM, a provider
+    deleted under a rolled-back VM's copies."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*earlier, *UNCUT, *later)
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=Strategy.vmware_warm,
+        phase=later[-1],
+        phase_history=history,
+        sync_passes=_passes(2, history[: len(earlier) + len(UNCUT)]),
+    )
+    try:
+        assert await h.orch.holds_destination_volumes(m) is True
+        assert await h.orch.copied_data(m) is True
+    finally:
+        await h.orch.stop()
+
+
+#: a retried attempt, the strategy chosen since, the phases through now: are its copies held
+RETRIED_CASES = pytest.mark.parametrize(
+    ("attempted", "chosen", "phases", "held"),
+    [
+        (Strategy.vmware_warm, Strategy.vmware_cold, (*UNCUT, P.ready), True),
+        (Strategy.warm, Strategy.cold, (*UNCUT, P.ready), True),
+        (Strategy.warm, Strategy.cold, (*UNCUT, P.ready, P.validating, P.blocked), True),
+        (Strategy.cold, Strategy.warm, (P.cutover, P.rolling_back, P.rolled_back, P.ready), False),
+        (
+            Strategy.vmware_warm,
+            Strategy.vmware_cold,
+            (*UNCUT, P.ready, P.cutover, P.rolling_back, P.rolled_back),
+            False,
+        ),
+        (
+            Strategy.cold,
+            Strategy.warm,
+            (P.cutover, P.rolling_back, P.rolled_back, P.ready, *UNCUT),
+            True,
+        ),
+    ],
+    ids=[
+        "vmware_warm switched to vmware_cold: the kit's copies stay",
+        "warm switched to cold, ready",
+        "warm switched to cold, blocked by a validation",
+        "cold switched to warm: its rollback deleted its copy",
+        "the vmware_cold attempt ran and was rolled back: its rollback deleted them",
+        "the warm attempt chosen after a cold one ran its passes: they hold",
+    ],
+)
+
+
+@RETRIED_CASES
+async def test_where_no_record_tells_the_retried_attempts_strategy_holds_its_copies(
+    tmp_path, store, attempted, chosen, phases, held
+):
+    """SDD §9.3, §5.1 (review RV40-06): a Retry puts a migration back with its attempt's copies
+    kept, and a validation or PUT .../strategy may choose another strategy for the next attempt;
+    while it waits for that attempt the copies are the retried attempt's - the VMware kit keeps
+    no record, so a vmware_warm migration switched to vmware_cold read as holding nothing. Once
+    the next attempt ran, its own strategy tells."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*phases)
+    # the passes of the warm attempt: the retried one's, or the later one's after a cold attempt
+    warm = attempted in (Strategy.warm, Strategy.vmware_warm)
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=chosen,
+        phase=phases[-1],
+        phase_history=history,
+        attempt_strategies=[attempted],
+        sync_passes=_passes(2, history[: phases.index(P.ready)] if warm else history),
+    )
+    try:
+        assert await h.orch.holds_destination_volumes(m) is held
+        assert await h.orch.copied_data(m) is held
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_pass_that_started_as_the_attempt_after_a_cutover_began_holds_kit_copies(
+    tmp_path, store
+):
+    """SDD §9.3 (review RV41B-04): the passes since the kit last released its copies are those
+    that started once the attempt after the last cutover entered pre-copy - one that started at
+    that very instant among them."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    history = _history(*CUT, P.ready, *UNCUT)
+    entered = history[len(CUT) + 1].at
+    assert history[len(CUT) + 1].to_phase == P.precopy
+    m = make_migration(
+        plan_id=plan.id,
+        vm=vm(1),
+        strategy=Strategy.vmware_warm,
+        phase=P.rolled_back,
+        phase_history=history,
+        sync_passes=[SyncPass(number=1, kind="full", started_at=entered, duration_s=60.0)],
+    )
+    try:
+        assert await h.orch.holds_destination_volumes(m) is True
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_workload_record_without_volumes_wins_over_warm_passes(tmp_path, store):
+    """SDD §9.3, §5.1 (review RV40-08): the record tells, and the fallback applies only where none
+    can: a record whose destination volumes are gone - a cold cutover's cleanup or rollback
+    emptied it (COLD-02) - holds nothing and keeps no copied data, whatever warm passes the
+    migration lists."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    m = make_migration(
+        plan_id=plan.id, vm=vm(1), strategy=Strategy.warm, phase=P.ready, sync_passes=_passes(2)
+    )
+    record = run_dir(h.settings, plan.id, m.id) / "osm" / "workload_warm" / "vm-1.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"dest_volumes": {}}))
+    try:
+        assert await h.orch.holds_destination_volumes(m) is False
+        assert await h.orch.copied_data(m) is False
+    finally:
+        await h.orch.stop()
+
+
+@pytest.mark.parametrize(
+    "other_reason", [None, "admin rights are required on the source cloud"], ids=["only", "other"]
+)
+async def test_a_retry_takes_an_earlier_retrys_held_mark_off_once_nothing_is_held(
+    tmp_path, store, other_reason
+):
+    """SDD §12 (review RV43B-02): a Retry marks the stored storage_handover estimate ineligible
+    while an earlier attempt's destination volumes are held - and takes that mark off once none
+    are: a warm attempt rolled back with its pass (held: marked), then a cold attempt - whose
+    cutover removes the warm copies first and whose rollback keeps none - rolled back, and a
+    second Retry. The estimate is eligible again when §9.2's held reason was its only one, and
+    keeps its other reasons otherwise; PUT …/strategy judges the same."""
+    from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
+
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"handover": handover, "auto_cutover": False, "default_strategy": Strategy.warm},
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        m = await h.by_vm(plan.id, "vm-1")
+        if other_reason is not None:
+            m.estimates = [
+                e.model_copy(update={"eligible": False, "reasons": [other_reason]})
+                if e.strategy == Strategy.storage_handover
+                else e
+                for e in m.estimates
+            ]
+        m.phase = P.rolled_back
+        m.phase_history = [*m.phase_history, *_history(*UNCUT)]
+        m.sync_passes = _passes(1, m.phase_history)
+        store.put("migration", m)
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        await h.orch.retry(m.id, "alice")
+        m = await h.migration(m.id)
+        if other_reason is None:  # an eligible one is marked; an ineligible one stays as it is
+            marked = m.estimate_for(Strategy.storage_handover)
+            assert (marked.eligible, marked.reasons) == (False, [HELD_VOLUMES_REASON])
+        else:
+            m.estimates = [
+                e.model_copy(update={"reasons": [other_reason, HELD_VOLUMES_REASON]})
+                if e.strategy == Strategy.storage_handover
+                else e
+                for e in m.estimates
+            ]  # as a validation that saw them held stores it
+            store.put("migration", m)
+        await h.orch.set_strategy(m.id, Strategy.cold, "alice")
+        m = await h.migration(m.id)
+        m.phase = P.rolled_back
+        m.phase_history = [*m.phase_history, *_history(P.cutover, P.rolling_back, P.rolled_back)]
+        store.put("migration", m)
+        await h.orch.retry(m.id, "alice")
+        m = await h.migration(m.id)
+        assert not await h.orch.holds_destination_volumes(m)
+        est = m.estimate_for(Strategy.storage_handover)
+        if other_reason is None:
+            assert (est.eligible, est.reasons) == (True, [])
+            await h.orch.set_strategy(m.id, Strategy.storage_handover, "alice")
+            assert (await h.migration(m.id)).strategy == Strategy.storage_handover
+        else:
+            assert (est.eligible, est.reasons) == (False, [other_reason])
+            with pytest.raises(BadRequest, match=other_reason):
+                await h.orch.set_strategy(m.id, Strategy.storage_handover, "alice")
+    finally:
+        await h.orch.stop()
+
+
+@pytest.mark.parametrize(
+    ("record", "passes", "held"),
+    [
+        ({"dest_volumes": {"vol-1": "dst-vol-1"}}, 2, True),
+        ({"dest_volumes": {"vol-1": "dst-vol-1"}}, 0, True),
+        ({"dest_volumes": {}, "pending_snapshot": "snap-1"}, 0, False),
+        (None, 0, False),
+    ],
+    ids=[
+        "volumes held",
+        "volumes held by the record alone: its first pass failed after creating them",
+        "a pending source snapshot alone holds no destination volume",
+        "nothing held",
+    ],
+)
+async def test_a_strategy_change_to_a_handover_is_refused_while_an_earlier_attempt_holds_volumes(
+    tmp_path, store, record, passes, held
+):
+    """SDD §12, §9.2, §9.3 (reviews RV40-01, RV41B-03): a Retry puts a rolled-back warm attempt
+    back in ready without re-assessing the estimates the first validation stored -
+    storage_handover eligible then, nothing held -, and a paused plan starts without a new
+    validation: the strategy change judges the held volumes itself - its record first, which holds
+    them also when the first pass failed after creating them (RV3-05) - and refuses the handover,
+    which would leave them behind; cold, which removes them first, and warm, which uses them, stay
+    open. A pending source snapshot alone holds no destination volume, and with nothing held the
+    handover is accepted."""
+    from seamless_migrate.executors.ansible import run_dir
+    from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
+
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"handover": handover, "auto_cutover": False, "default_strategy": Strategy.warm},
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        first = await h.by_vm(plan.id, "vm-1")
+        assert first.estimate_for(Strategy.storage_handover).eligible
+        # the warm attempt ran its pre-copy and was rolled back; its record tells what it keeps
+        first.phase = P.rolled_back
+        first.phase_history = [*first.phase_history, *_history(*UNCUT)]
+        first.sync_passes = _passes(passes, first.phase_history)
+        if record is not None:
+            path = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(record))
+        store.put("migration", first)
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        await h.orch.retry(first.id, "alice")
+        if held:
+            with pytest.raises(BadRequest, match=HELD_VOLUMES_REASON):
+                await h.orch.set_strategy(first.id, Strategy.storage_handover, "alice")
+            left = await h.migration(first.id)
+            assert left.strategy == Strategy.warm
+            assert (await h.plan(plan.id)).strategy_overrides == {}
+            # the other strategies are not held out: cold removes the volumes first (COLD-02),
+            # warm uses them
+            for other in (Strategy.cold, Strategy.warm):
+                assert (await h.orch.set_strategy(first.id, other, "alice")).strategy == other
+        else:
+            changed = await h.orch.set_strategy(first.id, Strategy.storage_handover, "alice")
+            assert changed.strategy == Strategy.storage_handover
+    finally:
+        await h.orch.stop()
+
+
+@pytest.mark.parametrize(
+    ("record", "passes", "held"),
+    [
+        ({"dest_volumes": {"vol-1": "dst-vol-1"}}, 2, True),
+        ({"dest_volumes": {"vol-1": "dst-vol-1"}}, 0, True),
+        ({"dest_volumes": {}, "pending_snapshot": "snap-1"}, 0, False),
+        (None, 0, False),
+    ],
+    ids=[
+        "volumes held",
+        "volumes held by the record alone",
+        "a pending source snapshot alone",
+        "nothing held",
+    ],
+)
+async def test_a_retry_marks_the_handover_ineligible_while_volumes_are_held(
+    tmp_path, store, record, passes, held
+):
+    """SDD §12, §9.2 (review 41b's lead): a Retry assesses nothing anew, but it marks the stored
+    storage_handover estimate ineligible with §9.2's reason while the migration holds an earlier
+    attempt's destination volumes - the dashboard offered "Use Storage handover", and only a
+    refusal told why. The other estimates stay as the last validation stored them."""
+    from seamless_migrate.executors.ansible import run_dir
+    from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
+
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"handover": handover, "auto_cutover": False, "default_strategy": Strategy.warm},
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        first = await h.by_vm(plan.id, "vm-1")
+        before = {e.strategy: (e.eligible, list(e.reasons)) for e in first.estimates}
+        assert before[Strategy.storage_handover] == (True, [])
+        first.phase = P.rolled_back
+        first.phase_history = [*first.phase_history, *_history(*UNCUT)]
+        first.sync_passes = _passes(passes, first.phase_history)
+        if record is not None:
+            path = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(record))
+        store.put("migration", first)
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        await h.orch.retry(first.id, "alice")
+        after = {
+            e.strategy: (e.eligible, list(e.reasons))
+            for e in (await h.migration(first.id)).estimates
+        }
+        expected = (False, [HELD_VOLUMES_REASON]) if held else (True, [])
+        assert after == {**before, Strategy.storage_handover: expected}
+    finally:
+        await h.orch.stop()
+
+
+async def test_an_unreadable_workload_record_counts_as_volumes_held(tmp_path, store):
+    """SDD §9.3 (review RV39-04): a record that cannot be read may list volumes the next attempt
+    uses: it counts as holding them, whatever the strategy's fallback would say."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    m = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=P.rolled_back)
+    record = run_dir(h.settings, plan.id, m.id) / "osm" / "workload_warm" / "vm-1.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text("{")
+    try:
+        assert await h.orch.holds_destination_volumes(m) is True
+    finally:
+        await h.orch.stop()
+
+
+@pytest.mark.parametrize(
+    "held",
+    ["its record holds volumes", "warm passes without a record", "nothing held"],
+)
+async def test_a_handover_is_ineligible_while_an_earlier_attempt_holds_its_volumes(
+    tmp_path, store, held
+):
+    """SDD §9.2, §9.3 (review 39, lead L1): a warm attempt Retry put back in ready keeps its
+    destination volumes - its workload record says so, or, with no record (the demo), its passes.
+    A storage handover manages the source's volumes and never removes those, so it is ineligible
+    then, saying what to run instead; with nothing held it stays eligible."""
+    from seamless_migrate.executors.ansible import run_dir
+    from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
+
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(tmp_path, store, [vm(1)], {"handover": handover, "auto_cutover": False})
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        first = await h.by_vm(plan.id, "vm-1")
+        assert first.estimate_for(Strategy.storage_handover).eligible
+        # what a rolled-back warm attempt leaves once a Retry put it back in ready
+        first.strategy = Strategy.warm
+        first.phase = P.ready
+        if held == "its record holds volumes":
+            record = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+            record.parent.mkdir(parents=True, exist_ok=True)
+            record.write_text(json.dumps({"dest_volumes": {"vol-1": "dst-vol-1"}}))
+        elif held == "warm passes without a record":
+            first.sync_passes = _passes(2)
+        store.put("migration", first)
+        await h.orch.validate_plan(plan.id, "alice")
+        again = await h.by_vm(plan.id, "vm-1")
+    finally:
+        await h.orch.stop()
+    estimate = again.estimate_for(Strategy.storage_handover)
+    if held == "nothing held":
+        assert estimate.eligible
+    else:
+        assert (estimate.eligible, estimate.reasons) == (False, [HELD_VOLUMES_REASON])
+        assert again.strategy != Strategy.storage_handover
+
+
+@pytest.mark.parametrize("cutover_ran", [True, False], ids=["its cutover ran", "before it"])
+async def test_a_revalidation_counts_all_of_a_vmware_warm_attempt_whose_cutover_ran(
+    tmp_path, store, cutover_ran
+):
+    """SDD §9.3, §7.2 (review RV39-02): the kit writes no workload record. A vmware_warm attempt
+    whose cutover ran and then rolled back lost its kit volumes - the rollback deletes them, or
+    marks them cutover - and its next attempt copies in full: it counts all of it, and web-02,
+    for which one volume and 20 GiB are free besides, no longer fits. Rolled back before its
+    cutover, its completed copies stay for the next pass: its server alone counts, web-02 fits."""
+    dst = QuotaDestination(QUOTA_FOR_TWO)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), vm(2)],
+        {"default_strategy": Strategy.cold, "auto_cutover": False},
+        destination=dst,
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        first = await h.by_vm(plan.id, "vm-1")
+        first.strategy = Strategy.vmware_warm
+        first.phase = P.rolled_back
+        first.phase_history = [*first.phase_history, *_history(*(CUT if cutover_ran else UNCUT))]
+        first.sync_passes = _passes(2, first.phase_history)
+        store.put("migration", first)
+        dst.free = dict(QUOTA_ONE_VOLUME_HELD)
+        report = await h.orch.validate_plan(plan.id, "alice")
+    finally:
+        await h.orch.stop()
+    second = next(i for i in report.migrations if i.vm_name == "web-02")
+    blocked = [f.code for f in second.findings if f.code == "DST_QUOTA_INSUFFICIENT"]
+    assert blocked == (["DST_QUOTA_INSUFFICIENT"] if cutover_ran else [])
+
+
+@pytest.mark.parametrize("calibrated_mib", [None, 200], ids=["planned S", "S calibrated low"])
+async def test_a_link_bound_delta_pass_leaves_the_slo_rule_converging(
+    tmp_path, store, calibrated_mib
+):
+    """SDD §5.3, §9.1 (review RV38A-02): after a delta pass the link bound - the guest wrote 40 GiB
+    in the 1000 s between the snapshots, sent in 327.68 s at 125 MiB/s, its 100 GiB scan 204.8 s -
+    the calibration keeps the planned scan rate, so the final downtime stays within the 500 s SLO
+    and the rule converges by slo: no extra pass for a pass that ran as predicted. Judged at the
+    migration's own S: one an earlier pass calibrated low (200 MiB/s, a scan of 512 s the pass
+    could not have lasted) is raised to what the pass reads, 312.5 MiB/s."""
+    from seamless_migrate.domain.models import SyncPass
+    from seamless_migrate.planning.estimator import EstimatorParams, scan_seconds
+
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm, "downtime_slo_s": 500}
+    )
+    the_vm = make_vm(disks=[make_disk(id="d0", size_gb=100, used_gb=60.0)], change_rate_bps=None)
+    first = SyncPass(
+        number=1,
+        kind="full",
+        started_at=utcnow(),
+        duration_s=521.5,
+        bytes_scanned=the_vm.disk_bytes,
+        bytes_changed=the_vm.used_bytes,
+        bytes_transferred=the_vm.used_bytes,
+    )
+    params = EstimatorParams()
+    sent = 40 * 2**30
+    second = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=first.started_at + timedelta(seconds=1000),
+        duration_s=max(scan_seconds(the_vm, params), sent / params.link_bps),
+        bytes_scanned=the_vm.disk_bytes,
+        bytes_changed=sent,
+        bytes_transferred=sent,
+    )
+    m = make_migration(plan_id=plan.id, phase=P.syncing, vm=the_vm, sync_passes=[first, second])
+    m.observed_scan_bps = calibrated_mib * 2**20 if calibrated_mib else None
+    h.orch._calibrate(m, plan, second)
+    if calibrated_mib is None:
+        assert m.observed_scan_bps is None
+        assert h.orch._converged(m, plan)[0] == "slo"
+    else:
+        assert m.observed_scan_bps == pytest.approx(312.5 * 2**20)
+
+
+async def test_a_scan_bound_delta_pass_lowers_an_optimistic_scan_rate_before_the_slo_rule(
+    tmp_path, store
+):
+    """SDD §5.3, §9.1 (review RV39-01): the storage scans at 250 MiB/s where the plan says 500. A
+    delta pass that changed 40 GiB lasts its 409.6 s scan, longer than its 327.68 s over the link:
+    the scan bound it, so the calibration takes 250 MiB/s - although the model's scan at the
+    planned S (204.8 s) is shorter than the transfer - and the final downtime, about 680 s, keeps
+    the SLO rule from converging on a 500 s SLO."""
+    from seamless_migrate.domain.models import SyncPass
+    from seamless_migrate.planning.estimator import EstimatorParams
+
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm, "downtime_slo_s": 500}
+    )
+    the_vm = make_vm(disks=[make_disk(id="d0", size_gb=100, used_gb=60.0)], change_rate_bps=None)
+    first = SyncPass(
+        number=1,
+        kind="full",
+        started_at=utcnow(),
+        duration_s=521.5,
+        bytes_scanned=the_vm.disk_bytes,
+        bytes_changed=the_vm.used_bytes,
+        bytes_transferred=the_vm.used_bytes,
+    )
+    params = EstimatorParams()
+    sent = 40 * 2**30
+    second = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=first.started_at + timedelta(seconds=1000),
+        duration_s=max(the_vm.disk_bytes / (250 * 2**20), sent / params.link_bps),
+        bytes_scanned=the_vm.disk_bytes,
+        bytes_changed=sent,
+        bytes_transferred=sent,
+    )
+    m = make_migration(plan_id=plan.id, phase=P.syncing, vm=the_vm, sync_passes=[first, second])
+    try:
+        h.orch._calibrate(m, plan, second)
+        assert m.observed_scan_bps == pytest.approx(250 * 2**20)
+        assert h.orch._converged(m, plan)[0] != "slo"
+    finally:
+        await h.orch.stop()
 
 
 async def test_validate_creates_migrations_with_findings_and_estimates(tmp_path, store):
@@ -2264,6 +3161,84 @@ async def test_a_rolled_back_migrations_cancel_cleanup_touches_only_its_own_data
     assert cleanup["vars"]["os_migrate_rollback_delete_ports"] is False
 
 
+@pytest.mark.parametrize("read", ["kept", "none", "unread", "unsure"])
+async def test_a_cancels_cleanup_names_the_kit_volumes_it_keeps(tmp_path, store, read):
+    """SDD §5.1 (review RV42B, lead NP-2): a VMware cancel's cleanup keeps the kit's copies of
+    the VM - another plan's migration of it takes them as its own - and its migration.action names
+    each, the ids in data.kept_volumes, for the operator to delete once no plan migrates the VM; a
+    read of them that failed is named, and the cleanup stands. The volumes held by a server it
+    could not tell - the conversion host's lookup failed - are named with the error, to be checked
+    before any is deleted, beside the ones it keeps (review RV45B-02)."""
+    details = {
+        "kept": {"kept_volumes": [
+            {"id": "vol-a", "name": "web-01-2000"}, {"id": "vol-b", "name": "web-01-2001"},
+            {"id": "vol-c", "name": "web-01-2002", "on_conversion_host": True},
+        ]},
+        "none": {"kept_volumes": []},
+        "unread": {"kept_volumes": None, "kept_volumes_unread": "volumes: HTTP 503 " + "x" * 400},
+        "unsure": {
+            "kept_volumes": [{"id": "vol-a", "name": "web-01-2000"}],
+            "unsure_volumes": [{"id": "vol-c", "name": "web-01-2002"}],
+            "unsure_why": "servers: HTTP 503 " + "y" * 400,
+        },
+    }[read]  # fmt: skip
+
+    async def rollback(ctx):
+        if ctx.options.get("delete_dest_volumes"):
+            return StepResult(details={"deleted_server": None, "deleted_ports": [], **details})
+        return StepResult(details={"source_running": True})
+
+    settings = make_settings(tmp_path)
+    executor = ScriptedExecutor(settings, hooks={StepName.ROLLBACK: rollback})
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.rollback(m.id, "rina", "the application owner wants it back")
+    m = await h.wait_phase(m.id, P.rolled_back)
+    await h.orch.cancel(m.id, "rina", "this VM is not migrated after all")
+    assert (await _settled(h, m.id))[-2:] == ["cancel", "cleanup"]
+    await h.orch.stop()
+    [event] = [
+        e
+        for e in h.store.events(since_seq=0, limit=1000)
+        if e.kind == "migration.action" and e.data.get("action") == "cleanup"
+    ]
+    assert store.get("migration", m.id, Migration).checkpoint == "cleaned"
+    head = f"{m.vm.name}: temporary resources of the cancelled migration removed"
+    if read == "none":
+        assert event.message == head
+        assert "kept_volumes" not in event.data
+    elif read == "kept":
+        assert event.message.startswith(head + "; ")
+        assert (
+            "vol-a (web-01-2000), vol-b (web-01-2001), "
+            "vol-c (web-01-2002, attached to the conversion host)"
+        ) in event.message  # the kit's copy a cut-off pass left there (RV44B-01)
+        assert "delete them once no plan migrates the VM" in event.message
+        assert event.data["kept_volumes"] == ["vol-a", "vol-b", "vol-c"]
+    elif read == "unread":
+        assert event.message.startswith(head + "; ")
+        # cut as the cleanup's failure is: 300 characters of the provider's answer
+        assert "(volumes: HTTP 503 " + "x" * 282 + ")" in event.message
+        assert "delete them once no plan migrates the VM" in event.message
+        assert "kept_volumes" not in event.data
+    else:
+        # the ones it keeps as ever, and the ones of a holder it could not tell after them: never
+        # among the volumes to delete - each may be another server's disk (RV45B-02)
+        assert event.message.startswith(head + "; ")
+        assert "vol-a (web-01-2000)" in event.message
+        assert event.data["kept_volumes"] == ["vol-a"]
+        assert (
+            "it could not tell which server holds vol-c (web-01-2002) (servers: HTTP 503 "
+            + "y" * 282
+            + "): each may be the copy a cut-off pass left on the conversion host or another "
+            "server's disk - check which server holds it before deleting it"
+        ) in event.message
+
+
 def _write_record(settings, plan_id, m, **record):
     """The workload's record (SDD §6.3), as the collection keeps it in the migration's run dir."""
     from seamless_migrate.executors.ansible import run_dir
@@ -2323,6 +3298,84 @@ async def test_a_cancel_after_a_failed_first_pass_removes_what_its_record_holds(
     assert (await _settled(h, m.id))[-2:] == ["cancel", "cleanup"]
     await h.orch.stop()
     assert rollbacks == [{"delete_dest_volumes": True}]
+
+
+@pytest.mark.parametrize("restarted", [False, True])
+async def test_a_cancels_cleanup_runs_the_step_of_the_attempt_whose_data_remains(
+    tmp_path, store, restarted
+):
+    """SDD §5.1 (review RV43B-04): a warm attempt failed with a pending source snapshot in its
+    record - no destination volume, so after the Retry the storage handover stays open and
+    PUT …/strategy takes it. The cancel's cleanup is still the warm attempt's rollback step, run
+    as warm: the handover's step knows nothing of that snapshot and would report 'nothing to roll
+    back'. A cleanup the orchestrator runs again at its start, the cancel cut short, does the
+    same."""
+    from seamless_migrate.executors.ansible import run_dir
+    from seamless_migrate.executors.router import ExecutorRouter
+
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"handover": handover, "auto_cutover": False, "default_strategy": Strategy.warm},
+    )
+    calls: list[tuple[str, str, dict]] = []
+
+    class Recorder:
+        def __init__(self, name):
+            self.name = name
+
+        def supports(self, strategy):
+            return True
+
+        async def run(self, step, ctx):
+            calls.append((self.name, str(ctx.migration.strategy), dict(ctx.options)))
+            return StepResult(details={"source_running": True})
+
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        m = await h.by_vm(plan.id, "vm-1")
+        m.phase = P.failed
+        m.phase_history = [*m.phase_history, *_history(P.precopy, P.failed)]
+        store.put("migration", m)
+        path = run_dir(h.settings, plan.id, m.id) / "osm" / "workload_warm" / "vm-1.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "server_id": "vm-1",
+                    "dest_volumes": {},
+                    "passes": [],
+                    "pending_snapshot": {"transfer_uuid": "t-1", "volume_map": {}},
+                    "destination_server_id": None,
+                }
+            )
+        )
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        await h.orch.retry(m.id, "alice")
+        await h.orch.set_strategy(m.id, Strategy.storage_handover, "alice")
+        h.orch.executors = ExecutorRouter(
+            h.settings, ansible=Recorder("ansible"), handover=Recorder("storage_handover")
+        )
+        if restarted:
+            # the cancel saved its mark, then the control plane stopped before the cleanup ran
+            h.orch._stopping = True
+            await h.orch.cancel(m.id, "rina", "not migrated after all")
+            await h.orch.stop()
+            assert calls == []
+            await h.orch.start()
+        else:
+            await h.orch.cancel(m.id, "rina", "not migrated after all")
+        assert (await _settled(h, m.id))[-1] == "cleanup"
+    finally:
+        await h.orch.stop()
+    assert calls == [("ansible", "warm", {"delete_dest_volumes": True})]
+    left = store.get("migration", m.id, Migration)
+    assert left.strategy == Strategy.storage_handover  # the stored choice is untouched
+    assert left.checkpoint == "cleaned"
 
 
 async def test_a_rolled_back_cold_migrations_cancel_runs_no_cleanup(tmp_path, store):
@@ -4305,6 +5358,135 @@ async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_
     assert overridden.decision.status == DecisionStatus.overridden
 
 
+@pytest.mark.parametrize(
+    ("action", "answer", "attempt", "passes"),
+    [
+        ("override", ("warm", 0.99), UNCUT, 2),
+        ("override", ("warm", 0.99), (P.precopy, P.rolling_back, P.rolled_back), 0),
+        ("approve", ("storage_handover", 0.5), (P.cutover, P.rolling_back, P.rolled_back), 0),
+    ],
+    ids=[
+        "an override to it after a warm attempt's passes",
+        "an override to it after a warm attempt rolled back in its first pass",
+        "an approve of its recommendation after a cold rollback that kept the volumes",
+    ],
+)
+@pytest.mark.parametrize("marked", [True, False], ids=["marked by the Retry", "stored before"])
+async def test_an_advisor_decision_takes_no_handover_while_an_earlier_attempt_holds_volumes(
+    tmp_path, store, action, answer, attempt, passes, marked
+):
+    """SDD §14.6, §9.2 (review RV41B-01): approve and override judge eligible at the request, as
+    PUT …/strategy does (RV40-01). After an attempt whose record keeps its destination volumes - a
+    warm one's passes, a first pass cut off after creating them, a cold rollback that could not
+    delete them - and a Retry, the stored estimates still call storage_handover eligible: an
+    override to it is refused (422), an approve of a recommendation of it (the advisor's
+    below-threshold answer, the rules having chosen cold) too (409), each naming the held volumes,
+    and neither the strategy nor the plan changes - a paused plan's Start would have run the
+    handover over them. Another option is still a person's call. The Retry marks the stored
+    estimate ineligible (review 41b's lead); one stored before - an upgraded deployment's - is
+    judged at the request all the same."""
+    from seamless_migrate.executors.ansible import run_dir
+    from seamless_migrate.planning.selector import HELD_VOLUMES_REASON
+
+    advisor, _ = _tie_advisor(*answer)
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1, size_gb=4, used_gb=1.0)],
+        {"handover": handover, "auto_cutover": False},
+        advisor=advisor,
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        [rec] = _recommendations(store)
+        first = await h.by_vm(plan.id, "vm-1")
+        assert (rec.recommendation.option, first.strategy) == (
+            answer[0],
+            Strategy.warm if action == "override" else Strategy.cold,
+        )
+        assert first.estimate_for(Strategy.storage_handover).eligible  # nothing held then
+        first.phase = P.rolled_back
+        first.phase_history = [*first.phase_history, *_history(*attempt)]
+        first.sync_passes = _passes(passes, first.phase_history)
+        record = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"dest_volumes": {"vol-1": "dst-vol-1"}}))
+        store.put("migration", first)
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        retried = await h.orch.retry(first.id, "alice")
+        marking = retried.estimate_for(Strategy.storage_handover)
+        assert (marking.eligible, marking.reasons) == (False, [HELD_VOLUMES_REASON])
+        if not marked:  # the estimate as a version before the marking stored it
+            retried.estimates = [
+                e.model_copy(update={"eligible": True, "reasons": []})
+                if e.strategy == Strategy.storage_handover
+                else e
+                for e in retried.estimates
+            ]
+            store.put("migration", retried)
+        if action == "override":
+            with pytest.raises(Unprocessable, match=HELD_VOLUMES_REASON):
+                await h.orch.override_recommendation(
+                    rec.id, "storage_handover", "the owner wants the handover", "rina"
+                )
+        else:
+            with pytest.raises(NotAllowed, match=HELD_VOLUMES_REASON):
+                await h.orch.approve_recommendation(rec.id, "rina")
+        left = await h.migration(first.id)
+        assert left.strategy == first.strategy
+        assert (await h.plan(plan.id)).strategy_overrides == {}
+        assert store.get("recommendation", rec.id, AdvisorRecommendation).decision == rec.decision
+        overridden = await h.orch.override_recommendation(
+            rec.id, "warm", "the owner chose warm", "rina"
+        )
+        assert overridden.decision.final_option == "warm"
+    finally:
+        await h.orch.stop()
+
+
+async def test_a_pending_source_snapshot_alone_leaves_a_handover_to_an_advisor_override(
+    tmp_path, store
+):
+    """SDD §14.6, §9.2 (review RV41B-03): what holds a handover out is destination volumes an
+    earlier attempt created - a pending source snapshot alone holds none, so an override to the
+    handover stands after a Retry."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    advisor, _ = _tie_advisor("warm", 0.99)
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1, size_gb=4, used_gb=1.0)],
+        {"handover": handover, "auto_cutover": False},
+        advisor=advisor,
+    )
+    try:
+        await h.orch.validate_plan(plan.id, "alice")
+        [rec] = _recommendations(store)
+        first = await h.by_vm(plan.id, "vm-1")
+        first.phase = P.rolled_back
+        first.phase_history = [*first.phase_history, *_history(*UNCUT)]
+        record = run_dir(h.settings, plan.id, first.id) / "osm" / "workload_warm" / "vm-1.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"dest_volumes": {}, "pending_snapshot": "snap-1"}))
+        store.put("migration", first)
+        paused = await h.orch._plan(plan.id)
+        paused.status = PlanStatus.paused
+        store.put("plan", paused)
+        await h.orch.retry(first.id, "alice")
+        assert await h.orch.copied_data(first) is True  # the snapshot is copied data, no volume
+        overridden = await h.orch.override_recommendation(
+            rec.id, "storage_handover", "the owner wants the handover", "rina"
+        )
+        assert overridden.decision.final_option == "storage_handover"
+    finally:
+        await h.orch.stop()
+
+
 async def test_a_decision_keeps_the_rules_of_the_policy_that_took_it(tmp_path, store):
     """SDD §14.6 (advisor Phase 1 audit, A3): a policy change applies from the next validation and
     never rewrites a decision - switching maker-checker or the override reason off afterwards lets
@@ -5504,6 +6686,73 @@ async def test_a_force_cutover_in_precopy_expects_the_running_first_pass(tmp_pat
     recorded = forced.force_cutover.estimated_downtime_s
     assert recorded == pytest.approx(estimate_final_downtime(fast, Strategy.warm, first, params))
     assert recorded > estimate_final_downtime(fast, Strategy.warm, 0.0, params)
+
+
+@pytest.mark.parametrize("strategy", [Strategy.warm, Strategy.vmware_warm])
+async def test_a_force_cutover_after_a_pass_counts_the_pass_whole_time(tmp_path, store, strategy):
+    """SDD §5.4, §9.1 (review RV39-07): after a pass ended, the recorded figure is the downtime
+    after a pass as long as that one's whole time - a warm pass records the part after its
+    snapshot, so its snapshot counts too; a CBT pass records the whole. The figure does not drop
+    when the expected first pass ends as expected."""
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    fast = vm(1).model_copy(update={"change_rate_bps": 60 * 2**20})  # the delta sets the copy
+    params = params_for_plan(plan)
+    snapshot = params.snapshot_s if strategy == Strategy.warm else 0.0
+    expected_first = first_pass_seconds(fast, strategy, params)
+    precopy = make_migration(plan_id=plan.id, vm=fast, strategy=strategy, phase=P.precopy)
+    store.put("migration", precopy)
+    before = await h.orch.force_cutover(precopy.id, "sari", "the window closes in ten minutes")
+    # the same VM whose first pass ended as expected: it records the part after its snapshot
+    ended = SyncPass(
+        number=1, kind="full", started_at=utcnow(), duration_s=expected_first - snapshot
+    )
+    syncing = make_migration(
+        plan_id=plan.id, vm=fast, strategy=strategy, phase=P.syncing, sync_passes=[ended]
+    )
+    store.put("migration", syncing)
+    after = await h.orch.force_cutover(syncing.id, "sari", "the window closes in ten minutes")
+    recorded = after.force_cutover.estimated_downtime_s
+    assert recorded == pytest.approx(
+        estimate_final_downtime(fast, strategy, ended.duration_s + snapshot, params)
+    )
+    assert recorded == pytest.approx(before.force_cutover.estimated_downtime_s)
+
+
+async def test_the_slo_rule_and_the_estimate_it_records_count_the_last_pass_whole_time(
+    tmp_path, store
+):
+    """SDD §5.3, §9.1 (review RV39-07): a warm pass records the part after its snapshot, while the
+    guest writes through the snapshot too: the final-downtime estimate after it takes its whole
+    time. A fast writer's final delta then outlasts an SLO the recorded part alone would meet, and
+    the estimate the rule records is the one after the whole pass."""
+    from seamless_migrate.planning.estimator import estimate
+
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm})
+    fast = vm(1, size_gb=200, used_gb=100.0).model_copy(update={"change_rate_bps": 100 * 2**20})
+    params = params_for_plan(plan)
+    delta = SyncPass(
+        number=2,
+        kind="delta",
+        started_at=utcnow(),
+        duration_s=600.0,
+        bytes_scanned=fast.disk_bytes,
+        bytes_changed=40 * 2**30,
+        bytes_transferred=40 * 2**30,
+    )
+    whole = estimate_final_downtime(fast, Strategy.warm, 600.0 + params.snapshot_s, params)
+    part = estimate_final_downtime(fast, Strategy.warm, 600.0, params)
+    assert part < whole
+    between = plan.model_copy(update={"downtime_slo_s": int((part + whole) / 2)})
+    m = make_migration(
+        plan_id=plan.id, vm=fast, strategy=Strategy.warm, phase=P.syncing, sync_passes=[delta]
+    )
+    m.estimate = estimate(fast, Strategy.warm, params, between.downtime_slo_s)
+    try:
+        assert h.orch._converged(m, between)[0] != "slo"
+        h.orch._converge(m, between, "max_passes")
+        assert m.estimate.downtime_s == pytest.approx(whole)
+    finally:
+        await h.orch.stop()
 
 
 async def test_a_force_cutover_is_in_the_audit_trail(tmp_path, store):

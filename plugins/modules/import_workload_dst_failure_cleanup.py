@@ -156,7 +156,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     DetachStuck,
     LockUnavailable,
     OpenStackVolumeBase,
-    is_timeout,
+    gave_up_waiting,
 )
 
 
@@ -269,7 +269,7 @@ class OpenStackDstFailureCleanup(OpenStackVolumeBase):
                     err,
                 )
                 left.append(volume_id)
-                if is_timeout(err):
+                if gave_up_waiting(err):
                     # Cinder did not finish it in time: every other deletion would wait it out again
                     stalled = True
         return left

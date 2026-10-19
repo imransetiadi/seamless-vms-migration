@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Severity, Strategy
+from seamless_migrate.domain.enums import Phase, ProviderKind, ProviderRole, Severity, Strategy
 from seamless_migrate.domain.models import (
     DEFAULT_PRESTAGE,
     AppProbe,
@@ -23,6 +23,7 @@ from seamless_migrate.planning.preflight import (
     DestinationInventory,
     SourceInventory,
     fitting_flavor,
+    quota_share,
     resolve_mappings,
     resource_demand,
     run_preflight,
@@ -244,8 +245,48 @@ def test_finding_src_vm_transitional_state():
     assert all(x.code != "SRC_VM_TRANSITIONAL_STATE" for x in check(make_vm(power_state="stopped")))
 
 
+@pytest.mark.parametrize("power_state", ["running", "stopped", "transitioning"])
+def test_a_nova_task_in_flight_is_a_transitional_blocker_naming_the_task(power_state):
+    """SDD §9.3 (review PV-05): a task Nova runs whatever the status - a backup's image upload under
+    ACTIVE, a stop in flight - is a blocker before approval, naming the task: the stop or the
+    snapshot would meet Nova's 409 after it."""
+    vm = make_vm(power_state=power_state, task_state="image_uploading")
+    f = only(check(vm), "SRC_VM_TRANSITIONAL_STATE")
+    assert f.severity == Severity.blocker
+    assert f.message == (
+        "Source VM web-01 has a Nova task in flight (image_uploading); a stop or snapshot "
+        "would fail."
+    )
+    # a server in error with a task - a delete Nova runs on it - meets both conditions (SDD §9.3)
+    codes = {x.code for x in check(make_vm(power_state="error", task_state="deleting"))}
+    assert {"SRC_VM_ERROR_STATE", "SRC_VM_TRANSITIONAL_STATE"} <= codes
+
+
+@pytest.mark.parametrize("quotas", [{}, None], ids=["quotas unreadable", "quotas read"])
+def test_finding_dst_project_missing_against_the_listed_projects(quotas):
+    """SDD §9.3 (review PL-06): the destination project is judged against the projects the
+    inventory lists, not the quota table - which the provider leaves empty when its quota calls
+    fail while it still lists the project: a mapping to a project the destination does not list
+    blocks either way, and one to a listed project does not."""
+    kw = {} if quotas is None else {"quotas": quotas}
+    remapped = make_plan(mappings=Mappings(projects={"finance": "fin-rhoso"}))
+    blocker = only(check(plan=remapped, dst=dst_inv(**kw)), "DST_PROJECT_MISSING")
+    assert "'fin-rhoso'" in blocker.message
+    listed = make_plan(mappings=Mappings(projects={"finance": "finance"}))
+    assert "DST_PROJECT_MISSING" not in [f.code for f in check(plan=listed, dst=dst_inv(**kw))]
+
+
+def test_finding_dst_project_missing_judges_nothing_without_a_project_list():
+    """SDD §9.3 (review PL-06): a destination that lists no project gives nothing to judge by."""
+    remapped = make_plan(mappings=Mappings(projects={"finance": "fin-rhoso"}))
+    findings = check(plan=remapped, dst=dst_inv(projects=[], quotas={}))
+    assert "DST_PROJECT_MISSING" not in [f.code for f in findings]
+
+
 def test_finding_dst_project_missing_and_image_root_quota():
     dst = dst_inv(
+        # the projects the destination lists, which the check judges by (review PL-06)
+        projects=["finance-rhoso", "shop-rhoso"],
         quotas={
             "finance-rhoso": {
                 "cores": 100,
@@ -261,7 +302,7 @@ def test_finding_dst_project_missing_and_image_root_quota():
                 "volumes": 10,
                 "gigabytes": 10**4,
             },
-        }
+        },
     )
     vm = make_vm(project="finance")
     # mapped to a project the destination does not list
@@ -812,6 +853,145 @@ def test_quota_aggregates_across_plan():
     )
 
 
+#: what each phase of a VM's migration still asks of the destination's quota (SDD §9.3, review
+#: PL-02), for a VM of 2 vCPUs, 4 GiB and one 20 GiB volume
+QUOTA_SHARES = {
+    "all": {"cores": 2, "ram_mb": 4096, "instances": 1, "volumes": 1, "gigabytes": 20},
+    "server": {"cores": 2, "ram_mb": 4096, "instances": 1, "volumes": 0, "gigabytes": 0},
+    "nothing": {"cores": 0, "ram_mb": 0, "instances": 0, "volumes": 0, "gigabytes": 0},
+}
+PHASE_SHARES = {
+    None: "all",
+    Phase.pending: "all",
+    Phase.validating: "all",
+    Phase.blocked: "all",
+    Phase.ready: "all",
+    Phase.failed: "all",
+    Phase.rolled_back: "all",
+    Phase.precopy: "server",
+    Phase.syncing: "server",
+    Phase.awaiting_cutover: "server",
+    Phase.cutover: "server",
+    Phase.verifying: "nothing",
+    Phase.completed: "nothing",
+    Phase.finalized: "nothing",
+    Phase.rolling_back: "nothing",
+    Phase.cancelled: "nothing",
+}
+
+
+#: the same, for a migration that holds the destination volumes an earlier attempt created (review
+#: RV38A-01): its server alone wherever it would count all of it
+HELD_SHARES = {
+    phase: "nothing" if PHASE_SHARES[phase] == "nothing" else "server" for phase in Phase
+}
+SHARE_CASES = [(phase, False, share) for phase, share in PHASE_SHARES.items()] + [
+    (phase, True, share) for phase, share in HELD_SHARES.items()
+]
+
+
+def test_every_phase_has_a_quota_share():
+    assert set(PHASE_SHARES) == {None, *Phase}
+
+
+@pytest.mark.parametrize(
+    "phase, holds_volumes, expected",
+    SHARE_CASES,
+    ids=[f"{phase}{' holding its volumes' if held else ''}" for phase, held, _ in SHARE_CASES],
+)
+def test_the_quota_counts_what_a_cutover_will_still_create(phase, holds_volumes, expected):
+    """SDD §9.3 (reviews PL-02, RV38A-01): the free quota is the limit less what is in use, so each
+    VM counts what a cutover will still create - all of it while its migration runs, or runs again,
+    from ready, but its server alone when it holds the destination volumes an earlier attempt
+    created; its server alone while its destination volumes exist or are being created; nothing
+    once what it holds is in use, or being released. A free quota of exactly the assessed VM's
+    demand and the other VM's share fits; one unit less of any key does not."""
+    assert quota_share(phase, holds_volumes=holds_volumes) == expected
+    a = make_vm(source_id="a", name="a")
+    b = make_vm(source_id="b", name="b")
+    share = QUOTA_SHARES[expected]
+    free = {key: QUOTA_SHARES["all"][key] + share[key] for key in share}
+    shares = {} if phase is None else {"b": quota_share(phase, holds_volumes=holds_volumes)}
+
+    def assessed(quota):
+        return run_preflight(
+            a,
+            make_plan(),
+            src_inv(),
+            dst_inv(quotas={"finance": quota}),
+            [a, b],
+            source=SRC,
+            destination=DST,
+            shares=shares,
+        )
+
+    assert "DST_QUOTA_INSUFFICIENT" not in [f.code for f in assessed(free)]
+    for key, value in free.items():
+        short = only(assessed({**free, key: value - 1}), "DST_QUOTA_INSUFFICIENT")
+        assert f"{key} {value} > {value - 1} free" in short.message
+
+
+#: the destination flavors of the PL-01 tests: a larger one, and one named like the source's
+#: m1.small with another size
+SIZED_FLAVORS = [
+    {"name": "m1.small", "vcpus": 4, "ram_mb": 8192, "disk_gb": 20, "extra_specs": {}},
+    {"name": "m1.large", "vcpus": 8, "ram_mb": 16384, "disk_gb": 80, "extra_specs": {}},
+]
+
+
+PRICED_CASES = [
+    ("the mapped flavor", {}, {"mappings": Mappings(flavors={"m1.small": "m1.large"})}, (8, 16384)),
+    (
+        "the automatically matched flavor",
+        {"flavor": "c5.medium", "vcpus": 5, "ram_mb": 6144},
+        {},
+        (8, 16384),
+    ),
+    ("the same-named flavor's own size", {}, {}, (4, 8192)),
+    (
+        "a flavor pre-staging creates: the VM's size",
+        {"flavor": "c3.medium", "vcpus": 3, "ram_mb": 6144},
+        {"prestage_resources": ["flavors"]},
+        (3, 6144),
+    ),
+    ("a VMware VM: the VM's size", {"flavor": None, "vcpus": 3, "ram_mb": 6144}, {}, (3, 6144)),
+    (
+        "no fitting flavor: the VM's size",
+        {"flavor": "x9.huge", "vcpus": 32, "ram_mb": 6144},
+        {},
+        (32, 6144),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "case, vm_kw, plan_kw, priced", PRICED_CASES, ids=[c[0] for c in PRICED_CASES]
+)
+def test_the_quota_prices_a_vm_with_its_destination_flavor(case, vm_kw, plan_kw, priced):
+    """SDD §9.3 (review PL-01): Nova charges the flavor the server is created with - the mapped
+    one, else the same-named or automatically matched one -, so a VM's cores and ram are that
+    flavor's; its own for a flavor pre-staging creates with the source's size, a VMware VM (the
+    migration kit chooses) and when no destination flavor resolves."""
+    vm = make_vm(**vm_kw)
+    plan = make_plan(**plan_kw)
+    cores, ram_mb = priced
+
+    def assessed(quota):
+        return check(vm, plan=plan, dst=dst_inv(flavors=SIZED_FLAVORS, quotas={"finance": quota}))
+
+    tight = {"cores": cores - 1, "ram_mb": ram_mb, "instances": 5, "volumes": 5, "gigabytes": 1000}
+    short = only(assessed(tight), "DST_QUOTA_INSUFFICIENT")
+    assert f"cores {cores} > {cores - 1} free" in short.message, case
+    short = only(
+        assessed({**tight, "cores": cores, "ram_mb": ram_mb - 1}), "DST_QUOTA_INSUFFICIENT"
+    )
+    assert f"ram_mb {ram_mb} > {ram_mb - 1} free" in short.message, case
+    fits = {**tight, "cores": cores}
+    assert "DST_QUOTA_INSUFFICIENT" not in [f.code for f in assessed(fits)], case
+    demand = resource_demand(vm, plan, dst_inv(flavors=SIZED_FLAVORS))
+    assert (demand["cores"], demand["ram_mb"]) == priced, case
+
+
 def test_finding_net_mtu_shrink():
     f = only(check(dst=dst_inv(networks={"app-net": 1442})), "NET_MTU_SHRINK")
     assert f.severity == Severity.warning and "1442" in f.message
@@ -830,6 +1010,51 @@ def test_finding_vm_pci_passthrough():
 def test_finding_vm_vgpu():
     vm = make_vm(flavor_extra_specs={"resources:VGPU": "1"})
     assert only(check(vm), "VM_VGPU").severity == Severity.blocker
+
+
+@pytest.mark.parametrize("key", ["resources1:VGPU", "resources_GPU-a:VGPU"])
+def test_finding_vm_vgpu_in_a_request_group(key):
+    """SDD §9.3 (review PL-08): a vGPU requested in a request group - resources<suffix>:VGPU, Nova's
+    granular form - blocks as the bare resources:VGPU does."""
+    assert only(check(make_vm(flavor_extra_specs={key: "1"})), "VM_VGPU").severity == (
+        Severity.blocker
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "resources1:VCPU",
+        "resources:CUSTOM_VGPU_X",
+        "resources1:VGPU_DISPLAY_HEAD",
+        "trait1:CUSTOM_VGPU",
+    ],
+)
+def test_finding_vm_vgpu_names_the_vgpu_class_only(key):
+    """SDD §9.3 (review PL-08): another resource class, or a trait, in a request group is no
+    vGPU."""
+    assert "VM_VGPU" not in [f.code for f in check(make_vm(flavor_extra_specs={key: "1"}))]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"resources1:VGPU": "1"},
+        {"trait1:CUSTOM_NVIDIA_A40": "required"},
+        {"resources_GPU:CUSTOM_FPGA": "1"},
+        {"trait:HW_CPU_X86_AVX512F": "required"},
+    ],
+    ids=lambda spec: next(iter(spec)),
+)
+def test_flavor_auto_match_skips_request_group_flavors(spec):
+    """SDD §9.3 (review PL-08): a flavor with a resource or trait request in a request group -
+    resources<suffix>:*, trait<suffix>:* - pins the server to special hardware as the bare forms
+    do: it is never matched automatically, though it is the smallest flavor that fits."""
+    vm = make_vm(flavor="c2.small")  # no destination flavor of that name
+    special = {"name": "g1.small", "vcpus": 2, "ram_mb": 4096, "disk_gb": 20, "extra_specs": spec}
+    plain = {"name": "m1.large", "vcpus": 8, "ram_mb": 16384, "disk_gb": 80, "extra_specs": {}}
+    chosen = fitting_flavor(vm, dst_inv(flavors=[special, plain]))
+    assert chosen is not None and chosen["name"] == "m1.large"
 
 
 def test_finding_vol_encrypted():

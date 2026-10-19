@@ -88,7 +88,7 @@ from .domain.models import (
     utcnow,
 )
 from .events import EventBus, emit, new_event, put_and_emit
-from .executors.ansible import recorded_copied_data
+from .executors.ansible import recorded_copied_data, recorded_destination_volumes
 from .executors.base import (
     PermanentStepError,
     StepContext,
@@ -107,18 +107,21 @@ from .planning.estimator import (
     final_downtime_parts,
     observed_scan_rate,
     params_for_plan,
+    whole_pass_seconds,
 )
 from .planning.platforms import destination_descriptor
 from .planning.preflight import (
+    QuotaShare,
     flavor_prestaged,
     has_blocker,
     keep_detached_volumes,
     keypair_prestaged,
+    quota_share,
     resolve_mappings,
     run_preflight,
 )
 from .planning.probes import suggest_probes
-from .planning.selector import eligibility, select_strategy
+from .planning.selector import HELD_VOLUMES_REASON, eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
 from .providers.base import ProviderError, VMNotFound
 from .store import AsyncStore, ConflictError, NotFound, Store, VersionedDocuments
@@ -218,7 +221,8 @@ def started_refusal(started: Iterable[Migration], limit: int = 10) -> str:
     listed = ", ".join(named[:limit]) + (f" and {rest} more" if rest > 0 else "")
     return (
         f"only a plan whose migrations have not started can be cancelled: {listed}; cancel a "
-        "failed or rolled-back migration on its own first, which cleans up what it copied"
+        "failed or rolled-back migration on its own first, which cleans up what it copied - on "
+        "VMware it names the kit's copies it keeps"
     )
 
 
@@ -277,6 +281,77 @@ def _add_model_s(m: Migration, details: dict[str, Any]) -> None:
     model_s = details.get("downtime_model_s")
     if isinstance(model_s, int | float):
         m.downtime_model_s = (m.downtime_model_s or 0.0) + float(model_s)
+
+
+def _passes_since_the_kit_released_its_copies(m: Migration) -> list[SyncPass]:
+    """A vmware_warm ``m``'s passes since the kit last released its copies (SDD §9.3, §7.2,
+    reviews RV40-05, RV41B-02): those that started once the attempt after its last cutover entered
+    pre-copy - a cutover's own final pass not among them -, every pass when no cutover ran, none
+    when its last attempt ran one. The kit's rollback deletes its copies after a cutover, or marks
+    them cutover; the copies an attempt with no cutover completed stay, marked, and a later run cut
+    off - a CBT sync of them - keeps them."""
+    entered = None  # when the first attempt after the last cutover entered pre-copy
+    for change in reversed(m.phase_history):
+        if change.to_phase == Phase.cutover:
+            return [] if entered is None else [p for p in m.sync_passes if p.started_at >= entered]
+        if change.to_phase == Phase.precopy:
+            entered = change.at
+    return list(m.sync_passes)
+
+
+#: the phases in which a migration waits for its next attempt (SDD §9.3)
+WAITING_FOR_AN_ATTEMPT = frozenset({Phase.pending, Phase.validating, Phase.blocked, Phase.ready})
+
+
+def _copies_strategy(m: Migration, phase: Phase | None = None) -> Strategy:
+    """The strategy of the attempt whose copies remain: while ``m`` waits for its next attempt -
+    in ``phase``, its own by default -, the one a Retry recorded - a validation or a strategy
+    change may have chosen another for the next attempt since -, else its own (SDD §9.3, review
+    RV40-06)."""
+    if (m.phase if phase is None else phase) in WAITING_FOR_AN_ATTEMPT and m.attempt_strategies:
+        return m.attempt_strategies[-1]
+    return m.strategy
+
+
+def _cleanup_strategy(m: Migration) -> Strategy:
+    """The strategy whose rollback step cleans up after ``m``'s cancel: the attempt's whose data
+    the cancel decided to clean, judged in the phase the cancel left - never one a validation or
+    ``PUT …/strategy`` chose since: a storage handover's step knows nothing of a warm attempt's
+    snapshot (SDD §5.1, review RV43B-04)."""
+    left = next(
+        (c.from_phase for c in reversed(m.phase_history) if c.to_phase == Phase.cancelled), None
+    )
+    return _copies_strategy(m, left)
+
+
+def _kept_after_rollback(m: Migration) -> bool:
+    """What a rollback kept of ``m``'s copies where no workload record tells - the demo, the VMware
+    kit (SDD §5.1, §9.3, reviews RV39-02, RV40-05, RV40-06, RV41B-02): a warm attempt's passes,
+    and a vmware_warm one's passes since the kit last released its copies (§7.2) - the attempt
+    whose copies remain -; a cold, vmware_cold or handover rollback keeps no copy."""
+    strategy = _copies_strategy(m)
+    if strategy == Strategy.warm:
+        return bool(m.sync_passes)
+    if strategy == Strategy.vmware_warm:
+        return bool(_passes_since_the_kit_released_its_copies(m))
+    return False
+
+
+def _held_out(est: Estimate) -> Estimate:
+    """``est`` ineligible with §9.2's reason when it is an eligible storage handover (SDD §12)."""
+    if est.strategy != Strategy.storage_handover or not est.eligible:
+        return est
+    reasons = [*est.reasons, HELD_VOLUMES_REASON]
+    return est.model_copy(update={"eligible": False, "reasons": reasons})
+
+
+def _held_in(est: Estimate) -> Estimate:
+    """``est`` without §9.2's held reason once nothing is held: eligible again when that reason
+    was its only one, its other reasons kept (SDD §12, review RV43B-02)."""
+    if est.strategy != Strategy.storage_handover or HELD_VOLUMES_REASON not in est.reasons:
+        return est
+    reasons = [reason for reason in est.reasons if reason != HELD_VOLUMES_REASON]
+    return est.model_copy(update={"eligible": not reasons, "reasons": reasons})
 
 
 def _phase_started(m: Migration, phase: Phase) -> datetime | None:
@@ -710,6 +785,16 @@ class Orchestrator:
             m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)
         }
         vms = await self._vms(plan, src_impl, existing)
+        # what a cutover of each VM will still create - its server alone when an earlier attempt
+        # holds its destination volumes (SDD §9.3, reviews PL-02, RV38A-01)
+        shares: dict[str, QuotaShare] = {}
+        holding_volumes: set[str] = set()
+        for vm_id, m in existing.items():
+            share = quota_share(m.phase)
+            if share == "all" and await self.holds_destination_volumes(m):
+                share = quota_share(m.phase, holds_volumes=True)
+                holding_volumes.add(vm_id)
+            shares[vm_id] = share
         cancelled = sorted(
             m.vm.name for vm in vms if (m := existing.get(vm.source_id)) and m.phase == P.cancelled
         )
@@ -762,6 +847,18 @@ class Orchestrator:
         # a memory outage is met once per validation: the search is not repeated for every VM
         memory_up = True
         for vm in vms:
+            current = existing.get(vm.source_id)
+            detached: list[Finding] = []
+            if (
+                current is not None
+                and current.phase in REASSESSED
+                and any(change.to_phase == P.cutover for change in current.phase_history)
+            ):
+                # a disk the VM had at a cutover attempt never leaves the migration by a
+                # validation - an attempt's cold export may have left it detached (SDD §5.4) -,
+                # and its blocker and the kept disk reach the eligibility and the estimates
+                # (SDD §9.2, review PL-10)
+                vm, detached = keep_detached_volumes(current.vm, vm)
             # dst_caps: what the check above just read (its token's roles, SDD §9.3), not the
             # capabilities `destination` held before it
             findings = run_preflight(
@@ -773,10 +870,21 @@ class Orchestrator:
                 source=source,
                 destination=destination,
                 dst_caps=dst_caps,
+                # the quota counts what a cutover will still create (SDD §9.3, review PL-02)
+                shares=shares,
             )
+            findings = [*findings, *detached]
             resolved = resolve_mappings(vm, plan, dst_inv)
             reasons = eligibility(
-                vm, source.kind, plan, src_caps, dst_caps, findings, destination.label
+                vm,
+                source.kind,
+                plan,
+                src_caps,
+                dst_caps,
+                findings,
+                destination.label,
+                # what an earlier attempt left at the destination (SDD §9.2, review 39 lead L1)
+                holds_volumes=vm.source_id in holding_volumes,
             )
             estimates = [
                 estimate(vm, strategy, params, plan.downtime_slo_s).model_copy(
@@ -790,7 +898,6 @@ class Orchestrator:
             )
             # SDD §14.4: validation makes no choice for a migration in flight or finished (it
             # leaves it alone), so the advisor is not asked about it
-            current = existing.get(vm.source_id)
             chooses = current is None or current.phase in (*REVALIDATABLE, P.validating)
             advice = None
             if self.advisor is not None and automatic and chooses:
@@ -1055,15 +1162,16 @@ class Orchestrator:
             # SDD §5.4: one left in validating by an interrupted validation is taken over as it is
             # (validations of a plan run one at a time under its lock: none is at work on it)
             if m.phase not in REVALIDATABLE and m.phase != P.validating:
-                return m  # already in flight or finished: leave it alone
+                # already in flight or finished: left alone, but in its VM's wave in the plan, so
+                # waves planned anew reach it before the plan starts (SDD §9.4, review PL-11)
+                wave = plan.wave_of(m.vm.source_id)
+                if m.wave_id != (wave.id if wave else None):
+                    m.wave_id = wave.id if wave else None
+                    await self._save(m, v)
+                return m
             steps: list[tuple[Phase, str, dict[str, Any] | None]] = []
             if m.phase != P.validating:
                 steps.append((P.validating, "pre-flight validation", None))
-            if any(change.to_phase == P.cutover for change in m.phase_history):
-                # a disk the VM had at a cutover attempt never leaves the migration by a
-                # validation: an attempt's cold export may have left it detached (SDD §5.4)
-                vm, detached = keep_detached_volumes(m.vm, vm)
-                findings = [*findings, *detached]
             final = self._assess(m, plan, vm, strategy, why, estimates, findings, resolved, hold)
             # both transitions in one write (SDD §5.4)
             m, v = await self._transitions(m, v, [*steps, final], actor)
@@ -1382,13 +1490,14 @@ class Orchestrator:
                 )
             plan = await self._plan(m.plan_id)
             last = m.sync_passes[-1] if m.sync_passes else None
-            # after the running pass: as long as the last one that ended, or the first pass
-            # while none has (SDD §5.4)
+            params = self._params(m, plan)
+            # after the running pass: as long as the last one that ended - its whole time, §9.1
+            # T_last -, or the first pass while none has (SDD §5.4, review RV39-07)
             estimated = estimate_forced_downtime(
                 m.vm,
                 m.strategy,
-                float(last.duration_s or 0.0) if last is not None else None,
-                self._params(m, plan),
+                whole_pass_seconds(last, m.strategy, params) if last is not None else None,
+                params,
             )
             now = self._now()
             m.force_cutover = ForceCutover(
@@ -1501,6 +1610,16 @@ class Orchestrator:
                     f"{m.vm.name} cannot be retried: the plan's {role} provider "
                     f"{provider_id!r} no longer exists; create a new plan for the VM"
                 )
+            wave = plan.wave_of(m.vm.source_id)
+            if plan.waves and wave is None:
+                # it would run at once, outside every wave's order and max_parallel (SDD §9.4)
+                raise NotAllowed(
+                    f"{m.vm.name} cannot be retried: it belongs to no wave of the plan; re-run the "
+                    "automatic wave planning or add it to a wave"
+                )
+            # the attempt runs in its VM's wave in the plan, never in one the waves planned anew
+            # dropped - the tick reads that as no wave (SDD §9.4, review PL-11)
+            m.wave_id = wave.id if wave else None
             if m.phase == P.rolled_back:
                 # the FSM counts failed -> ready only; a retry after an automatic rollback
                 # is still a new attempt of the cutover (executors key their behaviour on it)
@@ -1510,6 +1629,18 @@ class Orchestrator:
             # the strategy of the attempt being retried: the evidence names it (SDD §14.4), even
             # after a later validation chose another
             m.attempt_strategies = [*m.attempt_strategies, m.strategy]
+            # nothing is assessed anew - the estimates the last validation stored stay -, but a
+            # handover is ineligible while the attempt's destination volumes are held, which the
+            # dashboard's strategy choice and the advisor's options then show (SDD §12, §9.2)
+            if await self.holds_destination_volumes(m):
+                m.estimates = [_held_out(e) for e in m.estimates]
+                if m.estimate is not None:
+                    m.estimate = _held_out(m.estimate)
+            else:
+                # an earlier Retry's mark comes off once nothing is held (SDD §12, RV43B-02)
+                m.estimates = [_held_in(e) for e in m.estimates]
+                if m.estimate is not None:
+                    m.estimate = _held_in(m.estimate)
             m.error = None
             # a new attempt is requested anew: the window bypass granted with the old request goes
             # with it, approvals stay (SDD §5.1, §5.4)
@@ -1618,11 +1749,22 @@ class Orchestrator:
     async def copied_data(self, m: Migration) -> bool:
         """Whether the migration keeps copied data (SDD §5.1, §12): what its workload's record
         says - destination volumes or a pending source snapshot - and, where no record can tell,
-        recorded passes of a strategy other than cold (a cold rollback deletes what it copied)."""
+        what its rollback kept (§9.3, review RV39-02)."""
         recorded = await asyncio.to_thread(recorded_copied_data, self.settings, m.plan_id, m)
         if recorded is not None:
             return recorded
-        return m.strategy != Strategy.cold and bool(m.sync_passes)
+        return _kept_after_rollback(m)
+
+    async def holds_destination_volumes(self, m: Migration) -> bool:
+        """Whether the migration holds destination volumes an earlier attempt created, which the
+        next attempt uses again (SDD §9.3, reviews RV38A-01, RV39-02): what its workload's record
+        says, and where no record can tell what its rollback kept."""
+        recorded = await asyncio.to_thread(
+            recorded_destination_volumes, self.settings, m.plan_id, m
+        )
+        if recorded is not None:
+            return recorded
+        return _kept_after_rollback(m)
 
     async def keeps_copied_data(self, m: Migration) -> bool:
         """A rolled-back migration that keeps copied data: a cancel of it cleans the data up, a
@@ -1661,10 +1803,17 @@ class Orchestrator:
                 plan = await self._plan(m.plan_id)
                 source = await self.db.get("provider", plan.source_provider_id, Provider)
                 destination = await self.db.get("provider", plan.destination_provider_id, Provider)
+                # the step of the attempt whose data it cleans, run as that attempt (SDD §5.1)
+                strategy = _cleanup_strategy(m)
                 ctx = self._context(
-                    m, plan, source, destination, options={"delete_dest_volumes": True}, locked=True
+                    m.model_copy(update={"strategy": strategy}),
+                    plan,
+                    source,
+                    destination,
+                    options={"delete_dest_volumes": True},
+                    locked=True,
                 )
-                await self.executors.for_strategy(m.strategy).run(StepName.ROLLBACK, ctx)
+                result = await self.executors.for_strategy(strategy).run(StepName.ROLLBACK, ctx)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1680,15 +1829,47 @@ class Orchestrator:
                     ),
                 )
                 return
+            message = f"{m.vm.name}: temporary resources of the cancelled migration removed"
+            data: dict[str, Any] = {"action": "cleanup"}
+            # the migration kit's volumes of the VM a VMware cleanup keeps: another plan's
+            # migration of the VM takes them as its own (SDD §5.1, §7.2, review RV42B, lead NP-2)
+            kept = result.details.get("kept_volumes")
+            unread = result.details.get("kept_volumes_unread")
+            if kept:
+
+                def named(volume: dict[str, Any]) -> str:
+                    # the kit's copy a cut-off pass left on the conversion host (RV44B-01)
+                    held = volume.get("on_conversion_host")
+                    where = ", attached to the conversion host" if held else ""
+                    return f"{volume['id']} ({volume['name']}{where})"
+
+                data["kept_volumes"] = [v["id"] for v in kept]
+                message += (
+                    f"; {destination.label} keeps the migration kit's volumes of the VM, "
+                    + ", ".join(named(v) for v in kept)
+                    + ": another plan's migration of the VM takes them as its own - delete them "
+                    "once no plan migrates the VM"
+                )
+            elif unread:
+                message += (
+                    "; the migration kit's volumes of the VM it keeps could not be read from "
+                    f"{destination.label} ({redact_cut(unread, 300)}): another plan's migration "
+                    "of the VM takes them as its own - delete them once no plan migrates the VM"
+                )
+            # held by a server it could not tell - the conversion host's lookup failed: named with
+            # the error, never among the volumes to delete (SDD §5.1, review RV45B-02)
+            unsure = result.details.get("unsure_volumes")
+            if unsure:
+                message += (
+                    "; it could not tell which server holds "
+                    + ", ".join(f"{v['id']} ({v['name']})" for v in unsure)
+                    + f" ({redact_cut(str(result.details.get('unsure_why') or ''), 300)}): each "
+                    "may be the copy a cut-off pass left on the conversion host or another "
+                    "server's disk - check which server holds it before deleting it"
+                )
             await record(
                 "cleaned",
-                self._emit(
-                    "migration.action",
-                    f"{m.vm.name}: temporary resources of the cancelled migration removed",
-                    migration=m,
-                    actor=actor,
-                    data={"action": "cleanup"},
-                ),
+                self._emit("migration.action", message, migration=m, actor=actor, data=data),
             )
         except asyncio.CancelledError:
             # a shutdown interrupted the cleanup before its outcome was recorded: its mark stays,
@@ -1989,6 +2170,10 @@ class Orchestrator:
                 raise BadRequest(f"strategy {strategy} does not apply to this VM (validate first)")
             if not est.eligible:
                 raise BadRequest(f"strategy {strategy} is not eligible: {'; '.join(est.reasons)}")
+            if strategy == Strategy.storage_handover and await self.holds_destination_volumes(m):
+                # §9.2 judged now: a Retry does not re-assess the estimates the last validation
+                # stored, and a handover would leave the held volumes behind (SDD §12, RV40-01)
+                raise BadRequest(f"strategy {strategy} is not eligible: {HELD_VOLUMES_REASON}")
             m.strategy = strategy
             m.estimate = est
             m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
@@ -2079,6 +2264,24 @@ class Orchestrator:
             if isinstance(action, Approve) and rec.decision.status == DecisionStatus.approved:
                 raise NotAllowed("The decision is already approved.")  # one event per change
             eligible = tuple(e.strategy.value for e in m.estimates if e.eligible)
+            handover = Strategy.storage_handover.value
+            chosen = action.option if isinstance(action, Override) else rec.recommendation.option
+            stored = m.estimate_for(Strategy.storage_handover)
+            if (
+                chosen == handover
+                and stored is not None
+                and (
+                    HELD_VOLUMES_REASON in stored.reasons  # a Retry or a validation saw them held
+                    or (stored.eligible and await self.holds_destination_volumes(m))
+                )
+            ):
+                # §9.2 judged now, as PUT …/strategy: a Retry does not re-assess the estimates
+                # the last validation stored, and a handover would leave the held volumes behind
+                # (SDD §14.6, review RV41B-01)
+                refusal = f"strategy {handover} is not eligible: {HELD_VOLUMES_REASON}"
+                if isinstance(action, Override):
+                    raise Unprocessable(refusal)
+                raise NotAllowed(f"nothing to approve: {refusal}")
             advice = Advice(
                 option=rec.recommendation.option,
                 confidence=rec.recommendation.confidence,
@@ -2815,7 +3018,9 @@ class Orchestrator:
             if rate is not None:
                 m.vm = m.vm.model_copy(update={"change_rate_bps": rate})
         if m.strategy == Strategy.warm:
-            observed = observed_scan_rate(sync_pass, m.vm, params_for_plan(plan))
+            # the migration's current S: a pass the link bound may only raise it (SDD §9.1,
+            # review RV38A-02)
+            observed = observed_scan_rate(sync_pass, m.vm, self._params(m, plan))
             if observed is not None:
                 m.observed_scan_bps = observed
         if sync_pass.kind == SyncPassKind.final:
@@ -2859,8 +3064,10 @@ class Orchestrator:
         counted = Strategy(m.strategy) != Strategy.vmware_warm  # CBT passes report no bytes
         if counted and last.bytes_changed <= plan.convergence_threshold_bytes:
             return "threshold", f"converged: last pass changed {_fmt_bytes(last.bytes_changed)}"
+        params = self._params(m, plan)
+        # after a pass as long as the last one's whole time (SDD §9.1 T_last, review RV39-07)
         final = estimate_final_downtime(
-            m.vm, m.strategy, float(last.duration_s or 0.0), self._params(m, plan)
+            m.vm, m.strategy, whole_pass_seconds(last, m.strategy, params), params
         )
         if final <= plan.downtime_slo_s:
             return "slo", f"estimated final downtime {final:.0f} s is within the SLO"
@@ -2878,8 +3085,9 @@ class Orchestrator:
         with its parts (SDD §5.3, ADV-16)."""
         m.converged_by = rule
         last = m.sync_passes[-1]
+        params = self._params(m, plan)
         parts = final_downtime_parts(
-            m.vm, m.strategy, float(last.duration_s or 0.0), self._params(m, plan)
+            m.vm, m.strategy, whole_pass_seconds(last, m.strategy, params), params
         )
         if m.estimate is not None:
             downtime = sum(parts.values())

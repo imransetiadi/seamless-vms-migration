@@ -855,6 +855,30 @@ def recorded_copied_data(settings: Settings, plan_id: str, migration: Migration)
     return bool(record.get("dest_volumes") or record.get("pending_snapshot"))
 
 
+def recorded_destination_volumes(
+    settings: Settings, plan_id: str, migration: Migration
+) -> bool | None:
+    """Whether the workload's record (SDD §6.3) holds destination volumes - an attempt created
+    them, and the next one uses them again (SDD §9.3, review RV38A-01); None without a record or
+    for an id the collection would refuse as a file name. An unreadable record counts as volumes
+    held, as recorded_copied_data counts it as data kept."""
+    if not _STATE_FILE_ID.match(migration.vm.source_id):
+        return None
+    path = (
+        run_dir(settings, plan_id, migration.id)
+        / "osm"
+        / "workload_warm"
+        / f"{migration.vm.source_id}.json"
+    )
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return True
+    return bool(record.get("dest_volumes"))
+
+
 #: a source id the collection accepts as a state file name (warm_migration._SAFE_SERVER_ID)
 _STATE_FILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -1816,9 +1840,17 @@ class AnsibleExecutor:
             # a stretched network -, and the destination's clean-up never keeps it stopped - the
             # kit's ports and volumes matter only to the next attempt, which a failure there
             # retries with the source running (SDD §7.2, §8, reviews RV29-01, RV30-04)
-            await self.providers.get(ctx.source).power_on(vm.source_id)
-            # it runs: the clock closes now, whatever fails after (SDD §5.2, review RV30-03)
-            await ctx.mark_downtime_end()
+            source = self.providers.get(ctx.source)
+
+            async def power_on_and_close() -> None:
+                await source.power_on(vm.source_id)
+                # it runs: the clock closes now, whatever fails after (SDD §5.2, review RV30-03)
+                await ctx.mark_downtime_end()
+
+            # one unit, which a cancel - the step timeout, a shutdown - waits out: a power-on
+            # vCenter finishes never leaves the clock open while the VM runs (SDD §5.2, review
+            # RV38A-04)
+            await outlive_cancel(power_on_and_close())
             if servers or kept or unreadable:
                 # a server booted from the kit's volumes: what this rollback then cannot delete
                 # or keeps is no completed copy for a later run (SDD §7.2, review RV32A-01)
@@ -1845,15 +1877,57 @@ class AnsibleExecutor:
 
     async def _vmware_cancel_cleanup(self, ctx: StepContext) -> StepResult:
         """A cancel's cleanup on VMware deletes only a server the migration recorded: no lookup by
-        name, no kit port, no power-on - the VM it released may since be another plan's (SDD §5.1,
-        §7.2, review RV-01, RV-02)."""
+        name, no kit port or volume, no power-on - the VM it released may since be another plan's
+        (SDD §5.1, §7.2, review RV-01, RV-02). The kit's volumes of the VM it keeps it names: the
+        kit names them after the VM, so another plan's migration of it takes them as its own, and
+        the operator deletes them once none migrates it; a read that fails is named and fails
+        nothing, the server being gone (review RV42B, lead NP-2). One a server holds is that
+        server's disk - another plan's cut-over server of the VM, another VM the kit names alike
+        -, never named for deletion (review RV43B-01); one the destination's conversion host alone
+        holds is the kit's copy a pass the cancel cut off left there: named as attached to it, left
+        attached - another plan's pass of the VM may sync onto it (review RV44B-01). A conversion
+        host it cannot look up leaves each held volume one of a holder it could not tell
+        (`unsure_volumes`), named with the error (`unsure_why`), never unnamed (review RV45B-02)."""
         server_id = ctx.migration.destination_server_id
+        dst = self.providers.get(ctx.destination)
         if server_id:
             try:
-                await self.providers.get(ctx.destination).delete_server(server_id)
+                await dst.delete_server(server_id)
             except ProviderError as exc:
                 raise TransientStepError(f"rollback: {exc}") from exc
-        return StepResult(details={"deleted_server": server_id, "deleted_ports": []})
+        details: dict[str, Any] = {"deleted_server": server_id, "deleted_ports": []}
+        try:
+            volumes = await dst.volumes()
+        except ProviderError as exc:
+            return StepResult(
+                details={**details, "kept_volumes": None, "kept_volumes_unread": str(exc)}
+            )
+        kept: list[dict[str, Any]] = []
+        unsure: list[dict[str, Any]] = []  # held by a server it could not tell
+        conversion_host: list[str | None] = []  # looked up once, for the first kit volume held
+        lookup_error: str | None = None
+        for volume in kit_volumes(ctx.migration.vm.name, volumes):
+            entry: dict[str, Any] = {"id": str(volume["id"]), "name": str(volume.get("name"))}
+            holders = [str(holder) for holder in volume.get("attachments") or []]
+            if holders:
+                if not conversion_host:
+                    try:
+                        conversion_host.append(await self._conversion_host_server(ctx, dst))
+                    except ProviderError as exc:
+                        conversion_host.append(None)
+                        lookup_error = str(exc)
+                if lookup_error is not None:
+                    unsure.append(entry)  # the conversion host's copy, or another server's disk
+                    continue
+                if conversion_host[0] is None or holders != [conversion_host[0]]:
+                    continue
+                entry["on_conversion_host"] = True
+            kept.append(entry)
+        details["kept_volumes"] = kept
+        if unsure:
+            details["unsure_volumes"] = unsure
+            details["unsure_why"] = lookup_error
+        return StepResult(details=details)
 
     async def _finalize(self, ctx: StepContext) -> StepResult:
         if not ctx.options.get("delete_source"):

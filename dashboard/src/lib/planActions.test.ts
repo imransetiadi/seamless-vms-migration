@@ -16,7 +16,8 @@ const EXPECTED: Record<PlanStatus, Record<PlanActionKey, boolean>> = {
   running: { validate: false, waves: false, start: false, pause: true, edit: false, finalize: false, cancel: false },
   // the API plans waves on a paused plan too, returning it to draft (SDD §12)
   paused: { validate: true, waves: true, start: true, pause: false, edit: false, finalize: false, cancel: true },
-  completed: { validate: false, waves: false, start: false, pause: false, edit: false, finalize: false, cancel: true },
+  // validated again as the API does, then editable (SDD §8.1, §16, audit DB-01)
+  completed: { validate: true, waves: false, start: false, pause: false, edit: false, finalize: false, cancel: true },
   // a plan fails when its pre-staging fails; Start pre-stages it again (SDD §8)
   failed: { validate: true, waves: false, start: true, pause: false, edit: false, finalize: false, cancel: true },
   // terminal (SDD §12): nothing more is done with it
@@ -53,6 +54,19 @@ describe('planActions', () => {
     // a closed clock (the cutover ended, or a rollback restarted the source) does not hold it
     const closed = stopped.map((m, i) => (i === 1 ? { ...m, downtime_ended_at: '2026-10-08T10:05:00Z' } : m));
     expect(planActions(planWith('paused'), 'operator', closed).cancel.enabled).toBe(true);
+  });
+
+  it('validates a completed plan whose VMs rolled back, then lets it be edited, as the API does (SDD §8.1, §16, audit DB-01)', () => {
+    // every VM rolled back over a plan setting: the tick stored the plan completed, and only Validate reopens it
+    const rolledBack = ready.map((m) => ({ ...m, phase: 'rolled_back' as const, downtime_started_at: '2026-10-08T10:00:00Z', downtime_ended_at: '2026-10-08T10:05:00Z' }));
+    const completed = { ...planWith('completed'), derived_status: 'completed' as const };
+    expect(planActions(completed, 'operator', rolledBack).validate).toEqual({ enabled: true, reason: null });
+    expect(planActions(completed, 'operator', rolledBack).edit.enabled).toBe(false);
+    // the validation stores the plan validated: Edit is offered then
+    expect(planActions({ ...completed, status: 'validated' }, 'operator', rolledBack).edit).toEqual({ enabled: true, reason: null });
+    // a running plan is paused first, a cancelled one never validated again, as validate_plan refuses both
+    expect(planActions(planWith('running'), 'operator', ready).validate.reason).toBe('Pause the plan before re-validating it.');
+    expect(planActions(planWith('cancelled'), 'operator', ready).validate.reason).toBe('A cancelled plan cannot be validated.');
   });
 
   it('asks to validate a draft before starting', () => {

@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
-# demo-restart.sh - DEMO-04 and DEMO-06 (QASuite §14.3) against a freshly started demo stack:
-# every phase shows up in GET /stats by_phase, and a `compose restart seamless` mid-run leaves
-# every migration resuming to a terminal phase with contiguous event seqs and FSM-valid
-# migration.phase ordering. Run right after `make seamless-reset CONFIRM=yes && make seamless-demo`.
+# demo-restart.sh - DEMO-04 and DEMO-06 (QASuite §6.6, run as §14.7 says) against a freshly started demo stack:
+# every phase shows up in GET /stats by_phase - one that never does fails DEMO-04 (review RV44A-12) -, and a
+# restart of the control plane mid-run - `make seamless-stop` then `make seamless-start`, which pick this host's
+# engine and Docker context (SDD §17.1), the container's mode kept - leaves every migration resuming to a terminal
+# phase with contiguous event seqs and FSM-valid migration.phase ordering; a restart that does not happen fails
+# DEMO-06 (docs-drift DD3-03). Run right after `make seamless-reset CONFIRM=yes && make seamless-demo`;
+# SEAMLESS_ENGINE=podman reaches the Make targets.
 #
-#   export TOKEN='smg_...'        # admin or approver token
-#   export APPROVER_TOKEN='smg_...'  # an approver of another user: the requester never approves (SDD §5.4)
+#   read -rs TOKEN && export TOKEN                    # admin or approver token
+#   read -rs APPROVER_TOKEN && export APPROVER_TOKEN  # an approver of another user: the requester never approves (SDD §5.4)
 #   tests/e2e/demo-restart.sh     # RESTART_AT=<seconds> (default 45), BASE=<url>
 # shellcheck disable=SC2034
 set -u
 R=$(cd "$(dirname "$0")/../.." && pwd)
 BASE=${BASE:-http://127.0.0.1:8080}
-: "${TOKEN:?export TOKEN=<admin or approver token>}"
-: "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
+: "${TOKEN:?read -rs TOKEN && export TOKEN: an admin or approver token}"
+: "${APPROVER_TOKEN:?read -rs APPROVER_TOKEN && export APPROVER_TOKEN: an approver token of another user (maker-checker, SDD 5.4)}"
 # shellcheck source=tests/e2e/token-headers.sh
 . "$R/tests/e2e/token-headers.sh"   # the tokens reach curl from header files, never argv
 S=$E2E_TMP                         # private, removed on exit: the event dump goes here
 H=$(token_header admin "$TOKEN") || exit 2
 HA=$(token_header approver "$APPROVER_TOKEN") || exit 2
-C="docker --context colima-seamless compose -p seamless -f $R/deploy/compose/compose.yaml --env-file $R/deploy/compose/.env"
+# the control plane's container stopped, then started as it was, through the Make targets (SDD §17.1, §17.2)
+restart_seamless() {
+  make -C "$R" --no-print-directory seamless-stop >"$S/restart.log" 2>&1 &&
+    make -C "$R" --no-print-directory seamless-start >>"$S/restart.log" 2>&1
+}
 seen=""
 restart_at=${RESTART_AT:-45}
 restarted=0
@@ -40,7 +47,12 @@ while [ $SECONDS -lt $deadline ]; do
   if [ $restarted = 0 ] && [ $SECONDS -ge $restart_at ]; then
     active=$(python3 -c 'import json,sys; ms=json.load(sys.stdin); print(sum(1 for m in ms if m["phase"] in ("precopy","syncing","cutover","verifying","rolling_back")))' <<<"$migs")
     echo "t=${SECONDS}s restarting seamless with $active migration(s) in an active step"
-    env -u DOCKER_HOST $C restart seamless >/dev/null 2>&1 && restarted=1
+    if ! restart_seamless; then
+      echo "t=${SECONDS}s the restart failed:"
+      cat "$S/restart.log"
+      break
+    fi
+    restarted=1
     until curl -fsS -m 2 "$BASE/api/v1/health" >/dev/null 2>&1; do sleep 1; done
     echo "t=${SECONDS}s control plane back"
   fi
@@ -74,5 +86,16 @@ print("migrations with phase events:", len(by), "invalid transitions:", bad)
 sys.exit(1 if gaps or bad else 0)
 EOF
 status=$?
+# DEMO-04: every phase of QASuite §6.6 seen in GET /stats by_phase during the run
+missing=""
+for phase in precopy syncing awaiting_cutover cutover verifying completed; do
+  case " $seen " in *" $phase "*) ;; *) missing="$missing $phase" ;; esac
+done
+[ -z "$missing" ] && echo "DEMO-04 OK" || echo "DEMO-04 FAILED: GET /stats by_phase never showed$missing"
+if [ "$restarted" != 1 ]; then
+  echo "DEMO-06 FAILED: the control plane was not restarted (see above)"
+  exit 1
+fi
 [ "$status" = 0 ] && echo "DEMO-06 OK" || echo "DEMO-06 FAILED (gaps or invalid transitions above)"
+[ -z "$missing" ] || exit 1
 exit $status

@@ -35,6 +35,11 @@
   ansible.builtin.debug:
     msg: "Found {{ import_from_hypervisor_workloads | length }} workload(s) with use_nbdkit_direct enabled"
 
+# the ports each hypervisor's exports of this run took (process_disk.yml; Seamless Migrate SDD 6.6)
+- name: Start the run with no port taken
+  ansible.builtin.set_fact:
+    import_from_hypervisor_ports_taken: {}
+
 - name: Process each workload with nbdkit direct mode
   ansible.builtin.include_tasks: workload.yml
   loop: "{{ import_from_hypervisor_workloads }}"

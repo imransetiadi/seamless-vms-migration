@@ -55,7 +55,8 @@ make seamless-up             # or: make seamless-demo   (simulated clouds, SEAML
 ```
 
 The first build takes several minutes. When the build context has no built dashboard (`dashboard/dist`), the
-image builds one with its own Node 22; `make dashboard-build` beforehand only makes later builds faster.
+image builds one with its own Node 22; a `dashboard/dist` in the context is copied as it is (SDD §17.1), so run
+`make dashboard-build` again - or delete `dashboard/dist` - after the dashboard changed, or the image ships the old UI.
 
 Then open <http://127.0.0.1:8080/> and sign in at `/login` with the admin token. On a Linux server, tunnel to it
 from your workstation first (`ssh -L 8080:127.0.0.1:8080 you@server`). Or call the API:
@@ -98,8 +99,10 @@ After `--force`, recreate the stack so the control plane reloads the files: `mak
 Every target takes the same variables (`make seamless-logs SEAMLESS_ENGINE=podman`, `make seamless-down …`).
 With Podman, the host is `host.containers.internal` (set `SEAMLESS_MEMORY_URL` in `.env` for agentmemory);
 rootless Podman keeps the named volumes in your user's storage. On SELinux hosts the token mount is
-relabelled (`selinux: z`). If you changed `SEAMLESS_HOST_PORT` in `.env`, pass it to make too so the health
-wait polls the right port.
+relabelled (`selinux: z`). The targets read `SEAMLESS_HOST_PORT` and `SEAMLESS_VERSION` from `.env` as Compose
+does (an `export` prefix, a `KEY: value` line, spaces, quotes and inline comments included; a value in the shell still
+wins), so after a port change in `.env` the health wait polls the new port. They read plain values: a value Compose
+would interpolate (`SEAMLESS_HOST_PORT=${PORT}`) stops the targets that use it - write the value itself.
 
 ## Make targets
 

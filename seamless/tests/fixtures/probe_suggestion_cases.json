@@ -1,5 +1,5 @@
 {
- "_comment": "Application probe suggestions (SDD §9.6, ADV-18), shared by seamless/tests/test_probes.py and dashboard/src/api/mockProbes.test.ts. Each case: a VM's name, tags and os_type -> the probes the rules suggest. A database that names no engine, an old OS or an unknown role gets none; the service must be of the VM's tier (ldap-db-01 is no LDAP server). An empty tier tag falls back to seamless/tier, as heuristic_tier reads them (review RV25-02).",
+ "_comment": "Application probe suggestions (SDD §9.6, ADV-18), shared by seamless/tests/test_probes.py and dashboard/src/api/mockProbes.test.ts. Each case: a VM's name, tags and os_type -> the probes the rules suggest. A database that names no engine, an old OS or an unknown role gets none; the service must be of the VM's tier (ldap-db-01 is no LDAP server). An empty tier tag falls back to seamless/tier, as heuristic_tier reads them (review RV25-02). The OS names no service: an Oracle Linux web server is a web server (review PL-03).",
  "cases": [
   {
    "name": "ledger-db-01",
@@ -303,6 +303,64 @@
     "seamless/tier": "stateful_database"
    },
    "os_type": "rhel9",
+   "probes": []
+  },
+  {
+   "name": "web-01",
+   "tags": {},
+   "os_type": "Oracle Linux Server 8.9",
+   "probes": [
+    {
+     "kind": "http",
+     "port": 80,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "web-02",
+   "tags": {},
+   "os_type": "oracleLinux9_64Guest",
+   "probes": [
+    {
+     "kind": "http",
+     "port": 80,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "ora-db-01",
+   "tags": {},
+   "os_type": "oracleLinux9_64Guest",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 1521,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "events-mongo-2",
+   "tags": {},
+   "os_type": "oracleLinux9_64Guest",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 27017,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "billing-db-02",
+   "tags": {},
+   "os_type": "Oracle Linux Server 8.9",
    "probes": []
   }
  ]

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Literal
 
-from ..domain.enums import ProviderKind, Severity, Strategy
+from ..domain.enums import Phase, ProviderKind, Severity, Strategy
 from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
 from .ipam import address_refusal
@@ -388,24 +389,95 @@ def destination_project(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) ->
     return vm.project
 
 
-def resource_demand(vm: VMRef, plan: Plan | None = None) -> dict[str, int]:
+def destination_flavor(
+    vm: VMRef, plan: Plan, dst_inv: DestinationInventory
+) -> dict[str, Any] | None:
+    """The destination flavor ``vm``'s server is created with (SDD §9.3, review PL-01): the mapped
+    one, else the same-named or automatically matched one. ``None`` for a VM without a flavor (a
+    VMware VM: the migration kit chooses), for a flavor pre-staging creates with the source's
+    size, and when none resolves."""
+    if not vm.flavor or flavor_prestaged(vm, plan, dst_inv):
+        return None
+    target = plan.mappings.flavors.get(vm.flavor)
+    if target is not None:
+        return next((f for f in dst_inv.flavors if f.get("name") == target), None)
+    return fitting_flavor(vm, dst_inv)
+
+
+def resource_demand(
+    vm: VMRef, plan: Plan | None = None, dst_inv: DestinationInventory | None = None
+) -> dict[str, int]:
     """Quota the VM needs at the destination. An ``image_root`` disk becomes a destination volume
-    on the warm path (``boot_disk_copy``), so it counts unless the plan is cold-only."""
+    on the warm path (``boot_disk_copy``), so it counts unless the plan is cold-only. Its cores and
+    RAM are those of the destination flavor its server is created with, when one resolves (SDD
+    §9.3, review PL-01)."""
     kinds = {"volume", "vmdk"}
     if plan is None or plan.default_strategy != Strategy.cold:
         kinds.add("image_root")
     volumes = [d for d in vm.disks if d.kind in kinds]
+    flavor = (
+        destination_flavor(vm, plan, dst_inv) if plan is not None and dst_inv is not None else None
+    )
     return {
-        "cores": vm.vcpus,
-        "ram_mb": vm.ram_mb,
+        "cores": int(flavor.get("vcpus") or 0) if flavor else vm.vcpus,
+        "ram_mb": int(flavor.get("ram_mb") or 0) if flavor else vm.ram_mb,
         "instances": 1,
         "volumes": len(volumes),
         "gigabytes": sum(d.size_gb for d in volumes),
     }
 
 
+#: the phases whose migration has created its destination volumes, or is creating them: its
+#: server is still to come (SDD §9.3, review PL-02)
+SERVER_STILL_TO_COME = frozenset(
+    {Phase.precopy, Phase.syncing, Phase.awaiting_cutover, Phase.cutover}
+)
+#: the phases whose migration holds what it created, or is releasing it - in use, so already off
+#: the free quota (SDD §9.3, review PL-02)
+NOTHING_STILL_TO_COME = frozenset(
+    {Phase.verifying, Phase.completed, Phase.finalized, Phase.rolling_back, Phase.cancelled}
+)
+
+
+#: what a cutover of a VM will still create at the destination: all of it, its server alone, or
+#: nothing (SDD §9.3)
+QuotaShare = Literal["all", "server", "nothing"]
+
+
+def quota_share(phase: Phase | None, *, holds_volumes: bool = False) -> QuotaShare:
+    """What a cutover of a VM whose migration is in ``phase`` (``None``: no migration yet) will
+    still create at the destination (SDD §9.3, reviews PL-02, RV38A-01): nothing once what it holds
+    is in use, or being released; its server alone while its destination volumes exist or are
+    being created, and when it holds the destination volumes an earlier attempt created, which
+    the next attempt uses again; all of it otherwise."""
+    if phase in NOTHING_STILL_TO_COME:
+        return "nothing"
+    if phase in SERVER_STILL_TO_COME or holds_volumes:
+        return "server"
+    return "all"
+
+
+def remaining_demand(
+    vm: VMRef,
+    plan: Plan | None,
+    share: QuotaShare,
+    dst_inv: DestinationInventory | None = None,
+) -> dict[str, int]:
+    """The part of ``vm``'s demand its ``share`` counts (SDD §9.3, reviews PL-02, RV38A-01)."""
+    demand = resource_demand(vm, plan, dst_inv)
+    if share == "nothing":
+        return dict.fromkeys(demand, 0)
+    if share == "server":
+        return {**demand, "volumes": 0, "gigabytes": 0}
+    return demand
+
+
 def _quota_shortfall(
-    vm: VMRef, plan: Plan, dst_inv: DestinationInventory, all_vms: Sequence[VMRef]
+    vm: VMRef,
+    plan: Plan,
+    dst_inv: DestinationInventory,
+    all_vms: Sequence[VMRef],
+    shares: Mapping[str, QuotaShare],
 ) -> tuple[str, list[str]] | None:
     project = destination_project(vm, plan, dst_inv)
     if project is None or project not in dst_inv.quotas:
@@ -413,7 +485,8 @@ def _quota_shortfall(
     totals = dict.fromkeys(_QUOTA_KEYS, 0)
     for other in all_vms:
         if destination_project(other, plan, dst_inv) == project:
-            for key, value in resource_demand(other, plan).items():
+            share = remaining_demand(other, plan, shares.get(other.source_id, "all"), dst_inv)
+            for key, value in share.items():
                 totals[key] += value
     free = dst_inv.quotas[project]
     short = []
@@ -451,19 +524,20 @@ def _flavor_size(flavor: dict[str, Any]) -> tuple[int, int, int, str]:
     )
 
 
-#: Extra-spec prefixes that make a destination flavor unsuitable for automatic matching: it
-#: would pin the server to special hardware or hosts (SDD §9.3 ``MAP_FLAVOR_AUTO``).
-_CONSTRAINED_SPEC_PREFIXES = (
-    "pci_passthrough:",
-    "resources:",
-    "trait:",
-    "aggregate_instance_extra_specs:",
+#: Extra specs that make a destination flavor unsuitable for automatic matching: it would pin the
+#: server to special hardware or hosts (SDD §9.3 ``MAP_FLAVOR_AUTO``) - a resource or trait request,
+#: bare or in one of Nova's request groups (``resources<suffix>:``, ``trait<suffix>:``, review
+#: PL-08), a PCI alias, an aggregate pin.
+_CONSTRAINED_SPEC = re.compile(
+    r"^(?:(?:resources|trait)[A-Za-z0-9_-]*:|pci_passthrough:|aggregate_instance_extra_specs:)"
 )
+#: A vGPU request, bare or in a request group (SDD §9.3 ``VM_VGPU``, review PL-08).
+_VGPU_SPEC = re.compile(r"^resources[A-Za-z0-9_-]*:VGPU$")
 
 
 def _constrained(flavor: dict[str, Any]) -> bool:
     specs = flavor.get("extra_specs") or {}
-    return any(str(k).startswith(_CONSTRAINED_SPEC_PREFIXES) for k in specs)
+    return any(_CONSTRAINED_SPEC.match(str(k)) for k in specs)
 
 
 def _hw_specs(vm: VMRef) -> list[str]:
@@ -708,10 +782,13 @@ def run_preflight(
     source: Provider | None = None,
     destination: Provider | None = None,
     dst_caps: Mapping[str, Any] | None = None,
+    shares: Mapping[str, QuotaShare] | None = None,
 ) -> list[Finding]:
     """Evaluate the SDD §9.3 catalog for ``vm`` within ``plan``.
 
     ``all_vms`` are the plan's selected VMs (for duplicate names and cumulative quotas);
+    ``shares`` what a cutover of each one will still create, by source id - all of it for a VM
+    without one (``quota_share``; the quota counts what a cutover will still create);
     ``source``/``destination`` enable the conversion-host check; ``dst_caps`` are the
     destination's capabilities as validation's check just reported them (its token's roles).
     """
@@ -723,12 +800,15 @@ def run_preflight(
 
     if vm.power_state == "error":
         out.append(finding("SRC_VM_ERROR_STATE", f"Source VM {vm.name} is in error state."))
-    elif vm.power_state == "transitioning":
+    if vm.power_state == "transitioning" or vm.task_state:
+        # a task Nova runs whatever the status - an image upload under ACTIVE, a stop in flight, a
+        # delete of a server in error - is named (SDD §9.3, review PV-05)
+        task = vm.task_state or "resize, migration, rescue, rebuild or reboot"
         out.append(
             finding(
                 "SRC_VM_TRANSITIONAL_STATE",
-                f"Source VM {vm.name} has a Nova task in flight (resize, migration, rescue, "
-                "rebuild or reboot); a stop or snapshot would fail.",
+                f"Source VM {vm.name} has a Nova task in flight ({task}); a stop or snapshot "
+                "would fail.",
             )
         )
 
@@ -1016,9 +1096,11 @@ def run_preflight(
             )
         )
 
-    if dst_inv.quotas:
+    # the projects the destination inventory lists, never the quota table, which the provider
+    # leaves empty when its quota calls fail (SDD §9.3, review PL-06)
+    if dst_inv.projects:
         mapped_project = maps.projects.get(vm.project or "")
-        if mapped_project is not None and mapped_project not in dst_inv.quotas:
+        if mapped_project is not None and mapped_project not in dst_inv.projects:
             out.append(
                 finding(
                     "DST_PROJECT_MISSING",
@@ -1029,17 +1111,17 @@ def run_preflight(
         elif (
             vm.project  # VMware VMs report none: the kit charges the credential's project
             and mapped_project is None
-            and vm.project not in dst_inv.quotas
-            and len(dst_inv.quotas) != 1
+            and vm.project not in dst_inv.projects
+            and len(dst_inv.projects) != 1
         ):
             out.append(
                 finding(
                     "DST_PROJECT_MISSING",
                     f"No destination project for {vm.project!r}: no mapping, no same-named "
-                    f"project, and {where} has {len(dst_inv.quotas)} projects.",
+                    f"project, and {where} has {len(dst_inv.projects)} projects.",
                 )
             )
-    shortfall = _quota_shortfall(vm, plan, dst_inv, selected)
+    shortfall = _quota_shortfall(vm, plan, dst_inv, selected, shares or {})
     if shortfall is not None:
         project, short = shortfall
         out.append(
@@ -1150,8 +1232,9 @@ def run_preflight(
                 f"({vm.flavor_extra_specs['pci_passthrough:alias']}).",
             )
         )
-    if "resources:VGPU" in vm.flavor_extra_specs:
-        out.append(finding("VM_VGPU", "Flavor requests a vGPU (resources:VGPU)."))
+    vgpu = sorted(k for k in vm.flavor_extra_specs if _VGPU_SPEC.match(str(k)))
+    if vgpu:
+        out.append(finding("VM_VGPU", f"Flavor requests a vGPU ({', '.join(vgpu)})."))
 
     encrypted = [d.name or d.id for d in vm.disks if d.encrypted]
     if encrypted:

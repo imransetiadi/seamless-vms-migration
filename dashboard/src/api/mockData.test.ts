@@ -623,6 +623,8 @@ interface EligibilityCase {
   source: ProviderSide;
   destination: ProviderSide;
   findings: { code: string; severity: Severity }[];
+  /** The migration holds the destination volumes an earlier attempt created (SDD §9.2, §9.3); false when not given. */
+  holds_volumes?: boolean;
   expected: Record<string, string[]>;
 }
 
@@ -651,7 +653,9 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
     const plan = { ...base, ...c.plan } as Plan;
     const findings = c.findings.map((f) => ({ code: f.code, severity: f.severity, message: '', remediation: null, strategies: [] }) as Finding);
     const destinationKind: ProviderKind = c.source_kind === 'vmware' ? 'rhoso' : 'openstack';
-    const reasons = eligibility(c.vm, c.source_kind, plan, provider('src', c.source_kind, c.source), provider('dst', destinationKind, c.destination), findings);
+    const reasons = eligibility(
+      c.vm, c.source_kind, plan, provider('src', c.source_kind, c.source), provider('dst', destinationKind, c.destination), findings, c.holds_volumes ?? false,
+    );
     expect(reasons).toEqual(c.expected);
   });
 
@@ -665,6 +669,17 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
       : { selected };
     const found = preflight(c.vm, c.source_kind ?? 'openstack', plan, networks, context);
     expect(Object.fromEntries(found.filter((f) => f.code in c.expected).map((f) => [f.code, f.message]))).toEqual(c.expected);
+  });
+
+  it('raises both source-state blockers for a server in error with a Nova task, naming the task, as the API (SDD §9.3, review PV-05)', () => {
+    const plan = { ...base } as Plan;
+    const template = ELIGIBILITY.finding_cases.find((c) => c.vm.task_state)!.vm;
+    const vm: VMRef = { ...template, power_state: 'error', task_state: 'deleting' };
+    const found = preflight(vm, 'openstack', plan, {}, { selected: [vm] });
+    expect(found.map((f) => f.code)).toEqual(expect.arrayContaining(['SRC_VM_ERROR_STATE', 'SRC_VM_TRANSITIONAL_STATE']));
+    expect(found.find((f) => f.code === 'SRC_VM_TRANSITIONAL_STATE')!.message).toBe(
+      'Source VM backup-01 has a Nova task in flight (deleting); a stop or snapshot would fail.',
+    );
   });
 
   it("judges a VMware source's VMs by the kit's names only, once, and never two unusable names as twins, as the API (SDD §9.3, reviews RV26-04, RV28-04)", () => {
