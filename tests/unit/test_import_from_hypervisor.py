@@ -12,6 +12,7 @@ __metaclass__ = type
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -479,6 +480,14 @@ def _second_port_held_by_a_listener_no_pid_file_names(hv):
     return "Port 10810 is in use by another process"
 
 
+def _final_failure(out):
+    """The task and the fatal line the run ended on."""
+    lines = out.splitlines()
+    fatal = [i for i, line in enumerate(lines) if line.startswith("fatal:")]
+    task = next(line for line in reversed(lines[:fatal[-1]]) if line.startswith("TASK ["))
+    return task, lines[fatal[-1]]
+
+
 LATER_REFUSALS = {
     "a second disk sized at zero bytes": _second_disk_sized_at_zero,
     "a second disk whose size cannot be read": _second_disk_size_unreadable,
@@ -496,6 +505,9 @@ def test_a_workload_a_later_disk_refuses_leaves_none_of_its_disks_exported(hyper
     said = LATER_REFUSALS[refusal](hypervisor)
     rc, out = hypervisor.run()
     assert rc != 0 and said in out, out[-3000:]
+    # the run ends on the rescue's failure, which carries the disk's own message (review RV47-08)
+    task, fatal = _final_failure(out)
+    assert "Fail as the disk did" in task and said in fatal, (task, fatal)
     assert _recorded(hypervisor, "srv-1") is None
     srv1 = hypervisor.disk_dir + os.sep
     assert {port: disk for port, disk in _served(hypervisor).items() if disk.startswith(srv1)} == {}, out[-1500:]
@@ -528,6 +540,110 @@ def test_a_rerun_a_later_disk_refuses_keeps_the_exports_its_record_names(hypervi
     assert rc != 0 and "cannot read a virtual size above zero" in out, out[-3000:]
     assert {d["port"]: d["disk_path"] for d in _recorded(hypervisor, "srv-1")} == recorded
     assert _served(hypervisor) == recorded, out[-1500:]
+
+
+def _unrecorded(hv, *instances):
+    """The live exports no record of the given workloads names, port -> disk."""
+    recorded = {}
+    for instance in instances:
+        for d in _recorded(hv, instance) or []:
+            recorded[d["port"]] = d["disk_path"]
+    return {port: disk for port, disk in _served(hv).items() if recorded.get(port) != disk}
+
+
+def _kill_exports(hv):
+    """A hypervisor reboot: every export of the earlier runs gone, their PID files left."""
+    for entry in hv.started():
+        if alive(entry["pid"]):
+            os.kill(entry["pid"], signal.SIGKILL)
+    for name in os.listdir(hv.listening):
+        os.remove(os.path.join(hv.listening, name))
+
+
+def test_a_rerun_on_a_new_base_port_a_later_disk_refuses_leaves_no_unrecorded_export(hypervisor):
+    """Seamless Migrate SDD 6.6 (reviews RV46B-01, RV47-06): the refusal's way out - a base port of
+    the workload's own - between two runs. Run 1 exported and recorded srv-1 on 10809 and 10810;
+    run 2 moves srv-1 to 10900 and is refused at its second disk after its root disk was exported
+    on 10900. The record names the root disk on 10809, so the export on 10900 is one no record
+    names and is stopped: a rescue that compared the disk alone kept it, unrecorded."""
+    rc, out = hypervisor.run()
+    assert rc == 0, out
+    _set_params(hypervisor, "srv-1", nbdkit_port=10900)
+    _second_disk_sized_at_zero(hypervisor)
+    rc, out = hypervisor.run()
+    assert rc != 0 and "cannot read a virtual size above zero" in out, out[-3000:]
+    assert _unrecorded(hypervisor, "srv-1") == {}, out[-1500:]
+
+
+def test_a_disk_added_since_the_record_is_stopped_on_the_port_the_record_gives_another_disk(hypervisor):
+    """Seamless Migrate SDD 6.6 (reviews RV46B-01, RV47-06): run 1 exported and recorded srv-1's disk
+    (10809) and disk.swap (10810); the hypervisor rebooted - the exports gone, their PID files left -
+    and srv-1 got disk.eph0, which sorts between them. Run 2 exports disk 10809, disk.eph0 10810 and
+    is refused at disk.swap: the export of disk.eph0 on 10810, the port srv-1's record gives
+    disk.swap, is stopped - a rescue that compared the port alone kept it, and the record's 10810
+    URI, the swap volume's, would serve disk.eph0."""
+    os.remove(os.path.join(hypervisor.disk_dir, "disk.eph0"))
+    swap = os.path.join(hypervisor.disk_dir, "disk.swap")
+    with open(swap, "wb") as f:
+        f.write(b"QFI\xfb\x00\x00\x00\x03")
+    hypervisor.record_formats({"disk": "qcow2", "disk.swap": "qcow2"})
+    rc, out = hypervisor.run()
+    assert rc == 0, out
+    recorded = {d["port"]: d["disk_path"] for d in _recorded(hypervisor, "srv-1")}
+    assert recorded == {10809: os.path.join(hypervisor.disk_dir, "disk"), 10810: swap}
+    _kill_exports(hypervisor)
+    eph0 = os.path.join(hypervisor.disk_dir, "disk.eph0")
+    with open(eph0, "wb") as f:
+        f.write(b"QFI\xfb\x00\x00\x00\x03")
+    hypervisor.record_formats({"disk": "qcow2", "disk.eph0": "qcow2", "disk.swap": "qcow2"})
+    with open(swap, "w") as f:  # what the qemu-img shim prints
+        f.write("virtual size: 0 B (0 bytes)\n")
+    rc, out = hypervisor.run()
+    assert rc != 0 and "cannot read a virtual size above zero" in out, out[-3000:]
+    assert eph0 not in _served(hypervisor).values(), out[-1500:]
+    assert _unrecorded(hypervisor, "srv-1") == {}, out[-1500:]
+
+
+#: a qemu-nbd that exits at once for disk.eph0 - an export that does not start
+QEMU_NBD_FAILS_FOR_EPH0 = """#!/bin/sh
+case "$*" in *disk.eph0) echo "qemu-nbd: Failed to blk_new_open: Permission denied" >&2; exit 1 ;; esac
+exec "$(dirname "$0")/qemu-nbd.real" "$@"
+"""
+
+
+def test_an_export_that_does_not_start_stops_the_workloads_earlier_exports(hypervisor):
+    """Seamless Migrate SDD 6.6 (reviews RV46B-01, RV47-06): an export that does not start is a later
+    disk's failure too: srv-1's second disk's qemu-nbd exits at once, the run fails with that disk's
+    message, and the root disk's export on 10809 is stopped, nothing recorded."""
+    shim = os.path.join(hypervisor.bin, "qemu-nbd")
+    os.rename(shim, shim + ".real")
+    with open(shim, "w") as f:
+        f.write(QEMU_NBD_FAILS_FOR_EPH0)
+    os.chmod(shim, 0o755)
+    rc, out = hypervisor.run()
+    assert rc != 0 and "qemu-nbd failed to start" in out, out[-3000:]
+    task = _final_failure(out)[0]
+    assert "Fail as the disk did" in task, task
+    assert _served(hypervisor) == {}, out[-1500:]
+    assert _recorded(hypervisor, "srv-1") is None
+
+
+def test_a_later_workloads_refusal_keeps_an_earlier_workloads_exports(hypervisor):
+    """Seamless Migrate SDD 6.6 (reviews RV46B-01, RV47-06): two workloads in one run - srv-1 exported
+    and recorded on 10809 and 10810, srv-2 on its own base 10900 refused at its second disk. srv-2's
+    rescue stops its own export on 10900 only: srv-1's exports keep serving what its record says."""
+    _add_instance(hypervisor, "srv-2", "vm2", {"nbdkit_port": 10900}, disks=("disk", "disk.eph0"))
+    with open(os.path.join(hypervisor.instances, "srv-2", "disk.eph0"), "w") as f:
+        f.write("virtual size: 0 B (0 bytes)\n")
+    rc, out = hypervisor.run()
+    assert rc != 0 and "cannot read a virtual size above zero" in out, out[-3000:]
+    srv1 = {d["port"]: d["disk_path"] for d in _recorded(hypervisor, "srv-1")}
+    assert srv1 == {
+        10809: os.path.join(hypervisor.disk_dir, "disk"),
+        10810: os.path.join(hypervisor.disk_dir, "disk.eph0"),
+    }
+    assert _served(hypervisor) == srv1, out[-1500:]
+    assert _recorded(hypervisor, "srv-2") is None
 
 
 def test_the_format_comes_from_nova_disk_info_never_from_the_disk(hypervisor):
