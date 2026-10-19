@@ -355,6 +355,33 @@ def test_an_override_cut_short_by_a_failed_write_is_completed_by_the_retry(api, 
     )
 
 
+def test_a_policy_replaced_during_its_delete_is_not_deleted_unseen(api, land_first):
+    """SDD §12, §14.5 (review ST-05): DELETE /advisor/policies/{id} deletes the version it read: a
+    replace landing between its read and its delete answers 409 and the replaced policy stays.
+    Deleted by key, it was removed unseen and policy.deleted named the older version as before."""
+    created = api.post("/api/v1/advisor/policies", json=SPEC)
+    assert created.status_code == 201, created.text
+    pid = created.json()["id"]
+    stored, version = api.store.get_versioned("advisor_policy", pid, AdvisorPolicy)
+    replaced = stored.model_copy(update={"threshold": 0.95})
+    land_first(
+        api.store,
+        "DELETE FROM documents",
+        "advisor_policy",
+        lambda: api.store.put("advisor_policy", replaced, expected_version=version),
+    )
+    url = f"/api/v1/advisor/policies/{pid}"
+    res = api.client.delete(url, headers=api.h(Role.admin))
+    assert res.status_code == 409, res.text
+    assert res.json()["error"]["message"] == f"policy {pid} changed meanwhile; try again"
+    assert api.store.get("advisor_policy", pid, AdvisorPolicy).threshold == 0.95
+    assert api.store.events(kinds=["policy.deleted"]) == []
+    # the admin deletes what is there now, and the audit event names it
+    assert api.client.delete(url, headers=api.h(Role.admin)).status_code == 204
+    [deleted] = api.store.events(kinds=["policy.deleted"])
+    assert deleted.data["before"]["threshold"] == 0.95
+
+
 def test_a_legacy_entry_cannot_be_approved(api):
     response = api.post(
         "/api/v1/advisor/recommendations/rec-legacy-mig-0000000001-0/approve", json={}

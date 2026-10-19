@@ -88,7 +88,15 @@ def test_out_of_range_query_integers_are_422(api):
         res = api.get(path)
         assert res.status_code == 422, path
         assert res.json()["error"]["code"] == "validation_error"
-    assert api.get("/api/v1/events?since=9223372036854775807").status_code == 200
+    # events.seq is PostgreSQL's integer: one past its width is a 422, never a 500 there (SDD §12,
+    # review ST-01)
+    assert api.get("/api/v1/events?since=2147483647").status_code == 200
+    for path in (
+        "/api/v1/events?since=2147483648",
+        "/api/v1/events?tail=true&before=2147483648",
+        "/api/v1/events/stream?since=2147483648",
+    ):
+        assert api.get(path).status_code == 422, path
 
 
 def test_provider_errors_are_redacted_in_the_api(api, monkeypatch):

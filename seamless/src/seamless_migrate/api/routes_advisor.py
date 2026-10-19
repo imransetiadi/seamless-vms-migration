@@ -110,11 +110,17 @@ async def delete_policy(
     principal: Principal = Depends(require_permission("advisor.policy.manage")),
 ) -> Response:
     svc = services(request)
-    before = await svc.db.get("advisor_policy", policy_id, AdvisorPolicy)
+    before, version = await svc.db.get_versioned("advisor_policy", policy_id, AdvisorPolicy)
     try:
-        await svc.db.delete("advisor_policy", policy_id)
+        # the version read: a replace landing in between is refused, never deleted unseen with a
+        # stale before in its audit event (SDD §12, §14.5, review ST-05)
+        await svc.db.delete("advisor_policy", policy_id, expected_version=version)
     except NotFound:
         raise  # deleted meanwhile
+    except ConflictError:
+        raise ApiError(
+            409, "conflict", f"policy {policy_id} changed meanwhile; try again"
+        ) from None
     await _audit(svc, "policy.deleted", principal, policy_id, before, None)
     return Response(status_code=204)
 

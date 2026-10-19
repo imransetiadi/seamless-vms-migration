@@ -61,3 +61,9 @@ def test_api_journey_on_every_store_backend(any_store, tmp_path):
         later = api.get(f"/api/v1/events?since={seqs[len(seqs) // 2]}").json()
         assert all(e["seq"] > seqs[len(seqs) // 2] for e in later)
         assert api.get("/api/v1/events?since=99999999999999999999").status_code == 422
+        # the widest seq events.seq holds answers; one past it is a 422 - PostgreSQL's integer
+        # cast refused it with a 500 (SDD §12, review ST-01)
+        assert api.get("/api/v1/events?since=2147483647").status_code == 200
+        assert api.get("/api/v1/events?tail=true&before=2147483647").status_code == 200
+        for query in ("since=2147483648", "before=2147483648"):
+            assert api.get(f"/api/v1/events?{query}").status_code == 422, query

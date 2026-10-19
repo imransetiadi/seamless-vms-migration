@@ -520,13 +520,28 @@ class Store:
                 out.setdefault(plan_id, {})[Phase(phase)] = int(count)
         return out
 
-    def delete(self, kind: str, id_: str) -> None:
+    def delete(self, kind: str, id_: str, expected_version: int | None = None) -> None:
+        """Delete the document; with ``expected_version`` only at that version - a write landing
+        after the caller read it is a ``ConflictError``, never deleted unseen (SDD §11, review
+        ST-05). A document gone is ``NotFound``."""
         if _has_nul(id_):
             raise NotFound(kind, id_)  # no stored id holds a NUL (SDD §11)
+        key = (documents.c.kind == kind) & (documents.c.id == id_)
+        if expected_version is not None:
+            key = key & (documents.c.version == expected_version)
         with self.engine.begin() as conn:
-            result = conn.execute(
-                documents.delete().where((documents.c.kind == kind) & (documents.c.id == id_))
-            )
+            result = conn.execute(documents.delete().where(key))
+        if result.rowcount == 0 and expected_version is not None:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    sa.select(documents.c.version).where(
+                        (documents.c.kind == kind) & (documents.c.id == id_)
+                    )
+                ).first()
+            if row is not None:
+                raise ConflictError(
+                    f"{kind} {id_!r} is at version {int(row.version)}, expected {expected_version}"
+                )
         if result.rowcount == 0:
             raise NotFound(kind, id_)
 
@@ -737,8 +752,8 @@ class AsyncStore:
     async def plan_phases(self, plan_ids: Collection[str]) -> dict[str, dict[Phase, int]]:
         return await asyncio.to_thread(self.sync.plan_phases, plan_ids)
 
-    async def delete(self, kind: str, id_: str) -> None:
-        await asyncio.to_thread(self.sync.delete, kind, id_)
+    async def delete(self, kind: str, id_: str, expected_version: int | None = None) -> None:
+        await asyncio.to_thread(self.sync.delete, kind, id_, expected_version)
 
     async def append_event(self, event: Event) -> Event:
         return await asyncio.to_thread(self.sync.append_event, event)

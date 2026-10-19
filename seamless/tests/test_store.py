@@ -777,3 +777,17 @@ def test_an_events_actor_is_cut_to_its_column(any_store: Store):
         if e.kind in ("policy.created", "plan.updated")
     ]
     assert cut == [("policy.created", actor[:width]), ("plan.updated", actor[:width])]
+
+
+def test_a_delete_at_a_version_refuses_a_document_that_moved(any_store: Store):
+    """SDD §11 (review ST-05): a delete may name the version it read - DELETE ... WHERE
+    version = n -, so a write landing in between is refused, never deleted unseen; a document
+    gone is NotFound."""
+    plan = make_plan()
+    any_store.put("plan", plan, expected_version=0)
+    any_store.put("plan", plan, expected_version=1)
+    with pytest.raises(ConflictError, match="is at version 2, expected 1"):
+        any_store.delete("plan", plan.id, expected_version=1)
+    any_store.delete("plan", plan.id, expected_version=2)
+    with pytest.raises(NotFound):
+        any_store.delete("plan", plan.id, expected_version=2)
