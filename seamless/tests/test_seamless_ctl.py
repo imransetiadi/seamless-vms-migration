@@ -1314,6 +1314,10 @@ def test_an_interrupted_drain_names_the_plans_it_paused(tmp_path):
         text=True,
         env=env,
         start_new_session=True,
+        # SIGINT as Ctrl-C leaves it: a shell that runs this suite as a background job starts its
+        # children with SIGINT ignored, which bash can then neither trap nor reset - the drain
+        # waited on, never interrupted
+        preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
     )
     assert proc.stdout is not None
     for line in proc.stdout:  # the drain waits for the cutover in flight
