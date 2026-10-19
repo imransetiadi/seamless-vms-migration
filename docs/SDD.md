@@ -488,9 +488,11 @@ and the VM it released (§5.4) may since be another plan's, whose same-named ser
 this migration's. On VMware it deletes no kit volume either (§7.2): the kit names a VM's volumes after the VM and no
 record says which migration made them, so a `vmware_warm` copy left is one another plan's migration of the VM takes
 as its own and syncs onto - or already that plan's. After the server's deletion the cleanup reads the destination's
-kit volumes of the VM no server holds - one a server holds is that server's disk, another plan's cut-over server of
-the VM or another VM the kit names alike (owner question q26), never named for deletion (review RV43B-01) -, and its
-`migration.action` names each as kept - `<id> (<kit name>-<disk key>)`, the ids in
+kit volumes of the VM no server holds, and those the destination's conversion host alone holds - the kit's copy a
+pass the cancel cut off left attached there, named as attached to it (review RV44B-01); one another server holds is
+that server's disk, another plan's cut-over server of the VM or another VM the kit names alike (owner question q26),
+never named for deletion (review RV43B-01) -, and its `migration.action` names each as kept - `<id> (<kit
+name>-<disk key>)`, `, attached to the conversion host` added for one it holds, the ids in
 `data.kept_volumes` - for the operator to delete once no plan migrates the VM; a read that fails is named in their
 place and fails nothing: the server is gone (review RV42B, lead NP-2). The migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
@@ -914,7 +916,9 @@ logs in as the source's. Both variables default to upstream's single `os_migrate
 `os_migrate_nbdkit_bind_address` (default `127.0.0.1`; set the hypervisor's migration-network IP for
 TCP mode — the role refuses the loopback default there), with `--shared=1` and quoted paths. Log and
 PID files live in `os_migrate_nbdkit_log_dir` (default `/var/log/os-migrate-nbd`) and a previous
-export is stopped only through its PID file (never `pkill -f`). The cold path's nbdkit export of
+export is stopped only through its PID file (never `pkill -f`), and only when it serves this same disk: one serving
+another disk - an earlier run's export of another VM, whose record still names that port - refuses this disk instead
+(review RV44B-04). The cold path's nbdkit export of
 source volumes on the conversion hosts is `--readonly` as well. See Security.md §6.
 
 The role never lets qemu guess a disk's format. It reads the instance directory's `disk.info`, where Nova records
@@ -934,8 +938,10 @@ A disk's size is the exact byte count `qemu-img info` prints, rounded up to whol
 cannot read, or reads as zero - an empty or unparsable image -, is refused: a zero-sized destination volume would lose
 it (upstream intake UP-01, after os-migrate 33aca993e4). Each disk's export port is the workload's base port
 (`_migration_params.nbdkit_port`, else `os_migrate_nbdkit_port`) plus its index, and its PID file is named by that
-port: so two disks of one run on one hypervisor that would share a port are refused, at the second, before its
-export starts - it would stop the first one's export through that PID file, and the first VM's recorded URI, which
+port: so two disks of one run on one hypervisor that would share a port are refused before the second's workload
+exports anything - all of a workload's ports are judged before its first export, so a refusal leaves none of its disks
+exported and unrecorded (review RV44B-05) -: the second would stop the first one's export through that PID file, and
+the first VM's recorded URI, which
 names no export, would then serve the second VM's disk, copied into the first VM's volume without an error, across
 projects too (upstream intake UP-04a, after os-migrate f1d254cb8b). Give each workload on one hypervisor its own
 base port; how ports could be allocated instead is owner question q49.
@@ -1447,8 +1453,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   which the VM's own name never finds (audit EX-18).
   A cancel's cleanup (§5.1) deletes only the server the migration recorded: it looks up no server by name, deletes no
   kit port or volume and powers nothing on. It then reads the kit's volumes of the VM - `<kit name>-<digits>` with
-  `osm` `true`, the ones the kit's next run takes as the VM's own, whichever plan's run it is - and names each no
-  server holds in its outcome (§5.1); one a server holds is that server's disk, as above (review RV43B-01).
+  `osm` `true`, the ones the kit's next run takes as the VM's own, whichever plan's run it is - and names in its
+  outcome each no server holds, and each the destination's conversion host alone holds - the kit's copy a cut-off
+  pass left, as above - (§5.1); one another server holds is that server's disk, as above (reviews RV43B-01,
+  RV44B-01).
 
   Once the source is powered on, the rollback deletes the kit's volumes of the VM that the kit's next run would take
   as this VM's own. The kit finds a VM's volume by its name, `<kit name>-<disk key>`, and the metadata `osm` `true`.
