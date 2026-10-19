@@ -46,6 +46,8 @@ for n, rule in enumerate(json.loads(Path(os.environ["STUB_RULES"]).read_text()))
         sys.exit(answer.get("exit", 0))
 """
 TOOLS = ("make", "kubectl", "oc", "curl", "docker", "podman")
+#: the Route's or Ingress's URL a cluster's drain and resume take (SDD §17.2)
+CLUSTER_URL = "https://seamless.example.com"
 
 
 #: the helper that reads deploy/compose/.env as Compose does (SDD §17.2)
@@ -656,14 +658,35 @@ def test_a_timeout_of_zero_is_refused(tmp_path):
     assert "--timeout takes at least 1 second" in proc.stderr, proc.stderr
 
 
+DRY_RUN_CLUSTER_ACTIONS = [
+    ["start"],
+    ["restart"],
+    ["up"],
+    ["down"],
+    ["stop"],
+    ["scale", "0"],
+    ["scale", "1"],
+    ["status", "--url", CLUSTER_URL],
+    ["logs"],
+    ["capacity", "--max-migrations", "20", "--memory", "8Gi"],
+    ["stop", "--drain", "@TOKEN_FILE", "--url", CLUSTER_URL],
+    ["capacity", "--max-migrations", "20", "--drain", "@TOKEN_FILE", "--url", CLUSTER_URL],
+    ["resume", "--token-file", "@TOKEN_FILE", "--url", CLUSTER_URL, "plan-aa"],
+]
+
+
 @pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
-@pytest.mark.parametrize("action", ["start", "restart", "up", "down", "stop"])
-def test_a_cluster_dry_run_calls_no_tool_and_changes_nothing(tmp_path, platform, action):
-    """SDD §17.2 (reviews RV38B-17, RV42A-08): --dry-run prints a cluster action's commands and runs
-    none - start's dry run, rewritten for PostgreSQL's extra pods, read the cluster or scaled it for
-    real in mutants no test noticed. A stopped stack with PostgreSQL scaled out stays as it was."""
+@pytest.mark.parametrize(
+    "argv", DRY_RUN_CLUSTER_ACTIONS, ids=[" ".join(a[:2]) for a in DRY_RUN_CLUSTER_ACTIONS]
+)
+def test_a_cluster_dry_run_calls_no_tool_and_changes_nothing(tmp_path, platform, argv):
+    """SDD §17.2 (reviews RV38B-17, RV42A-08, RV43A-08): --dry-run prints a cluster action's
+    commands and runs none - start's dry run, rewritten for PostgreSQL's extra pods, read the
+    cluster or scaled it for real in mutants no test noticed, and a status calling kubectl directly
+    passed every test. Every cluster action, a drain's and resume's API calls too: no tool runs,
+    and a stopped stack with PostgreSQL scaled out stays as it was."""
     state = fake_kube.cluster(replicas=0, postgres=2)
-    proc, calls, _ = _run(tmp_path, platform, action, "--dry-run", cluster=state)
+    proc, calls, _ = _run(tmp_path, platform, *argv, "--dry-run", cluster=state)
     assert proc.returncode == 0, proc.stderr
     assert calls == []
     assert _cluster_after(tmp_path) == state
@@ -1345,9 +1368,6 @@ def test_a_drain_that_times_out_stops_nothing(tmp_path):
     assert proc.returncode == 1
     assert _args(calls, "kubectl") == [] and "nothing was stopped" in proc.stderr
     assert "plan-aa" in proc.stderr and "resume" in proc.stderr
-
-
-CLUSTER_URL = "https://seamless.example.com"
 
 
 def _changes(calls) -> list[int]:
