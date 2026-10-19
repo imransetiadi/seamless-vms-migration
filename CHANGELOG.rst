@@ -234,8 +234,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
   copied it into the first VM's volume without an error. All of a workload's
   ports are judged before its first export - against this run's exports and
   an earlier run's live export of another disk alike -, so a refused workload
-  exports nothing, and a previous export is stopped only when it serves the
-  same disk, so a rerun never stops an earlier run's export of another VM. Give
+  exports nothing, and a later disk refused or failing on its own (a disk
+  sized at zero bytes or unreadable, a port another listener holds, an export
+  that does not start) stops the workload's exports no record names before
+  the run fails; a previous export is stopped only when it serves the same
+  disk, so a rerun never stops an earlier run's export of another VM. Give
   each workload on one hypervisor its own ``_migration_params.nbdkit_port``
   (after os-migrate f1d254cb8b, whose run-wide counter this fork does not
   take).

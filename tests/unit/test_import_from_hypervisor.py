@@ -462,6 +462,74 @@ def test_a_workload_an_earlier_runs_export_refuses_exports_none_of_its_disks(hyp
     assert _served(hypervisor) == recorded, out
 
 
+def _second_disk_sized_at_zero(hv):
+    with open(os.path.join(hv.disk_dir, "disk.eph0"), "w") as f:  # what the qemu-img shim prints
+        f.write("virtual size: 0 B (0 bytes)\n")
+    return "cannot read a virtual size above zero"
+
+
+def _second_disk_size_unreadable(hv):
+    with open(os.path.join(hv.disk_dir, "disk.eph0"), "w") as f:
+        f.write("virtual size: unavailable\n")
+    return "cannot read the virtual size"
+
+
+def _second_port_held_by_a_listener_no_pid_file_names(hv):
+    open(os.path.join(hv.listening, "10810"), "w").close()  # an older qemu-nbd, say, without a PID file
+    return "Port 10810 is in use by another process"
+
+
+LATER_REFUSALS = {
+    "a second disk sized at zero bytes": _second_disk_sized_at_zero,
+    "a second disk whose size cannot be read": _second_disk_size_unreadable,
+    "the second port held by a listener no PID file names": _second_port_held_by_a_listener_no_pid_file_names,
+}
+
+
+@pytest.mark.parametrize("refusal", list(LATER_REFUSALS))
+def test_a_workload_a_later_disk_refuses_leaves_none_of_its_disks_exported(hypervisor, refusal):
+    """Seamless Migrate SDD 6.6 (review RV46B-01): srv-1's two disks take 10809 and 10810; its second
+    disk is refused after its root disk's export started - sized at zero bytes, a size qemu-img
+    cannot give, its port held by a listener no PID file names. The root disk's export ran on,
+    recorded nowhere. A failure of any disk stops the exports of the workload no record names
+    before the run fails: nothing of srv-1 stays exported, and the run says why."""
+    said = LATER_REFUSALS[refusal](hypervisor)
+    rc, out = hypervisor.run()
+    assert rc != 0 and said in out, out[-3000:]
+    assert _recorded(hypervisor, "srv-1") is None
+    srv1 = hypervisor.disk_dir + os.sep
+    assert {port: disk for port, disk in _served(hypervisor).items() if disk.startswith(srv1)} == {}, out[-1500:]
+
+
+def test_a_refused_workloads_exports_are_stopped_behind_a_quoted_log_dir(hypervisor):
+    """Seamless Migrate SDD 6.6 (review RV46B-01): the stop that follows a later disk's refusal
+    reads the PID files as process_disk.yml does - with os_migrate_nbdkit_log_dir holding a space
+    and a quote too."""
+    log_dir = os.path.join(hypervisor.root, "var", "log", "os migrate's nbd")
+    _second_disk_sized_at_zero(hypervisor)
+    rc, out = hypervisor.run(os_migrate_nbdkit_log_dir=log_dir)
+    assert rc != 0 and "cannot read a virtual size above zero" in out, out[-3000:]
+    srv1 = hypervisor.disk_dir + os.sep
+    assert {port: disk for port, disk in _served(hypervisor).items() if disk.startswith(srv1)} == {}, out[-1500:]
+
+
+def test_a_rerun_a_later_disk_refuses_keeps_the_exports_its_record_names(hypervisor):
+    """Seamless Migrate SDD 6.6 (review RV46B-01): run 1 exported and recorded srv-1's two disks; a
+    rerun is refused at the second disk, after the root disk's export was restarted on its recorded
+    port. Only exports no record names are stopped: the record still names a live export of each of
+    srv-1's disks."""
+    rc, out = hypervisor.run()
+    assert rc == 0, out
+    recorded = {d["port"]: d["disk_path"] for d in _recorded(hypervisor, "srv-1")}
+    assert _served(hypervisor) == recorded, out
+
+    _second_disk_sized_at_zero(hypervisor)
+    rc, out = hypervisor.run()
+    assert rc != 0 and "cannot read a virtual size above zero" in out, out[-3000:]
+    assert {d["port"]: d["disk_path"] for d in _recorded(hypervisor, "srv-1")} == recorded
+    assert _served(hypervisor) == recorded, out[-1500:]
+
+
 def test_the_format_comes_from_nova_disk_info_never_from_the_disk(hypervisor):
     """SDD §6.6: a raw disk's first block is the guest's. A qcow2 header the guest wrote there must
     not make qemu-nbd, run with sudo, follow a backing file of the guest's choosing."""
