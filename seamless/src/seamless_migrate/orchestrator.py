@@ -36,7 +36,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
-from .ai.decision import Advice, Approve, Override, decide
+from .ai.decision import Advice, Approve, Override, decide, unusable
 from .ai.evidence import build_strategy_evidence, evidence_count, keep_reasons
 from .ai.policies import resolve_policy
 from .ai.recommendations import LEGACY_PREFIX
@@ -1226,6 +1226,7 @@ class Orchestrator:
                 option=advice.option,
                 confidence=advice.confidence,
                 distribution=dict(advice.distribution),
+                unusable=unusable(advice),
             ),
             decision=decision,
             input_snapshot_sha256=snapshot,
@@ -2279,25 +2280,35 @@ class Orchestrator:
             policies, plan.id, plan.source_provider_id, rec.decision_type, self.settings
         )
         # SDD §14.6: the rules of the policy that took the decision, as they were then; the
-        # policy in force only for a decision that recorded none (the fallback, older data)
+        # policy in force only for a decision that recorded none (the fallback, older data) - and
+        # the decision names the policy whose rules it follows (audit AD-06)
         distinct = rec.decision.require_distinct_approver
         if distinct is None:
             distinct = policy.require_distinct_approver
         reason_required = rec.decision.require_override_reason
         if reason_required is None:
             reason_required = policy.require_override_reason
+        recorded_rules = (
+            rec.decision.require_distinct_approver is not None
+            or rec.decision.require_override_reason is not None
+        )
+        ruling = (rec.decision.policy_id if recorded_rules else None) or policy.id
         if distinct and rec.requested_by == actor:
             raise NotAllowed(OWN_DECISION)  # maker-checker (SDD §14.6, ADV-17)
         if isinstance(action, Override) and reason_required:
             if len(action.reason or "") < 10:
                 raise Unprocessable(
-                    f"policy {rec.decision.policy_id or policy.id} requires an override "
-                    "reason of at least 10 characters"
+                    f"policy {ruling} requires an override reason of at least 10 characters"
                 )
         m, v = await self._load(mid)
+        if m.advisor_hold is not None and m.advisor_hold != rec_id:
+            # SDD §14.6 (review RV49-04): another process's validation held it for a newer one
+            raise NotAllowed(f"a newer recommendation ({m.advisor_hold}) replaced {rec_id}")
         if m.phase not in REVALIDATABLE:
             raise NotAllowed(f"the strategy cannot change in {m.phase}")
         pinned = plan.strategy_overrides.get(m.vm.source_id)
+        if pinned is None and plan.default_strategy != "auto":
+            pinned = plan.default_strategy  # a validation honours it as an override (audit AD-04)
         if pinned is not None:
             # SDD §14.6: a person set the strategy in the plan, which a validation honours
             # without a recommendation - the newest one no longer stands, whatever option a
@@ -2307,6 +2318,10 @@ class Orchestrator:
             )
         if isinstance(action, Approve) and rec.decision.status == DecisionStatus.approved:
             raise NotAllowed("The decision is already approved.")  # one event per change
+        if isinstance(action, Approve) and rec.recommendation.unusable:
+            # SDD §14.6 (audit AD-03): an answer that could not be applied stays unapplied - an
+            # override to its option is a person's call, with its reason
+            raise NotAllowed(f"nothing to approve: {rec.recommendation.unusable}")
         eligible = tuple(e.strategy.value for e in m.estimates if e.eligible)
         handover = Strategy.storage_handover.value
         chosen = action.option if isinstance(action, Override) else rec.recommendation.option
@@ -2344,6 +2359,7 @@ class Orchestrator:
             update={
                 "require_distinct_approver": distinct,
                 "require_override_reason": reason_required,
+                "policy_id": ruling,
             }
         )
         rec = rec.model_copy(update={"decision": decision})

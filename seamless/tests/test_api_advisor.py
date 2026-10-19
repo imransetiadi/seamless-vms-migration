@@ -108,6 +108,7 @@ def test_lists_stored_and_legacy_recommendations_newest_first(api):
         "option": "warm",
         "confidence": 0.57,
         "distribution": {"warm": 0.75, "cold": 0.2, "none": 0.05},
+        "unusable": None,  # a legacy entry is history: no decision takes it (SDD §4.2, §14.6)
     }
     assert (legacy["decision"]["status"], legacy["decision"]["final_option"]) == (
         "below_threshold",

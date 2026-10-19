@@ -456,6 +456,47 @@ def test_a_decision_another_writer_moved_the_plan_under_is_made_again_keeping_bo
     assert _events_of(api, *DECISION_EVENTS) == ["plan.updated", "decision.overridden"]
 
 
+def test_a_decision_never_releases_a_migration_another_recommendation_holds(api):
+    """SDD §14.6 (review RV49-04): a decision read the recommendations before the migration and
+    cleared whatever hold it found. `seamless plan validate` in another process writing the
+    migration (held for its new recommendation) and that recommendation between those reads was
+    seen by half: the approve released the migration while the newer recommendation still
+    waited. A hold naming another recommendation refuses the decision as a newer one's."""
+    import sqlalchemy as sa
+
+    mid, rid = _held_for_a_decision(api)
+    other = Store(api.store.url)  # the CLI's own engine on the same database
+    newer = "rec-000001bb0002"
+    fired: list[str] = []
+
+    def cli_validates(conn, cursor, statement, parameters, context, executemany):
+        params = context.compiled_parameters[0].values() if context.compiled_parameters else ()
+        if fired or not statement.lstrip().upper().startswith("SELECT"):
+            return
+        if "advisor_policy" not in params:
+            return
+        fired.append("validated")
+        m, version = other.get_versioned("migration", mid, Migration)
+        other.put("migration", m.model_copy(update={"advisor_hold": newer}), version)
+        rec = other.get("recommendation", rid, AdvisorRecommendation)
+        later = rec.created_at.replace(minute=rec.created_at.minute + 1)
+        other.put("recommendation", rec.model_copy(update={"id": newer, "created_at": later}), 0)
+
+    sa.event.listen(api.store.engine, "before_cursor_execute", cli_validates)
+    try:
+        answer = api.post(f"/api/v1/advisor/recommendations/{rid}/approve", json={})
+    finally:
+        sa.event.remove(api.store.engine, "before_cursor_execute", cli_validates)
+        other.dispose()
+    m = api.store.get("migration", mid, Migration)
+    assert fired == ["validated"]
+    assert (answer.status_code, answer.json()["error"]["message"], m.advisor_hold) == (
+        409,
+        f"a newer recommendation ({newer}) replaced {rid}",
+        newer,
+    )
+
+
 def test_a_policy_replaced_during_its_delete_is_not_deleted_unseen(api, land_first):
     """SDD §12, §14.5 (review ST-05): DELETE /advisor/policies/{id} deletes the version it read: a
     replace landing between its read and its delete answers 409 and the replaced policy stays.

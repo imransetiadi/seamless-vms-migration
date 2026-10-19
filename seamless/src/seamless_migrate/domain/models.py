@@ -741,6 +741,9 @@ class RecommendedOption(_Model):
     confidence: float | None = None
     #: raw probabilities per option, shown only in Details
     distribution: dict[str, float] = Field(default_factory=dict)
+    #: why the answer could not be applied when it was recorded (§14.4 rule 2), else None: no
+    #: approve takes it (SDD §4.2, §14.6, audit AD-03)
+    unusable: str | None = None
 
 
 class Decision(_Model):

@@ -5579,6 +5579,125 @@ async def test_an_approval_cut_short_on_a_running_plan_leaves_its_migration_held
     )
 
 
+def _decide_answer(selected: str = "warm", confidence: float = 0.99, **extra) -> dict:
+    decide = load_fixture("decide")
+    decide["recommendation"].update(selected=selected, confidence=confidence, **extra)
+    return decide
+
+
+def _policy(pid: str, mode: str, **kw) -> AdvisorPolicy:
+    return AdvisorPolicy(id=pid, name=pid, mode=mode, threshold=0.6, updated_by="rina", **kw)
+
+
+@pytest.mark.parametrize(
+    ("extra", "why"),
+    [
+        ({"status": "escalate"}, "the advisor's answer was escalate"),
+        ({"status": "invalid_response"}, "the advisor's answer was invalid_response"),
+        ({"escaped": True}, "the advisor answered warm, not an option"),
+    ],
+    ids=["escalate", "invalid_response", "escaped"],
+)
+async def test_an_answer_that_could_not_be_applied_is_never_approved_later(
+    tmp_path, store, extra, why
+):
+    """SDD §4.2, §14.6 (audit AD-03): an answer Jev escalated, marked invalid or escaped was
+    recorded as fallback_rules, but nothing stored said it could not be applied: a later approve
+    ran the option Jev itself would not stand behind - and, under a policy that requires an
+    override reason, without one. The recommendation keeps why; no approve takes it, while an
+    override to that option stays a person's call, with its reason."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.9, **extra))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    store.put(
+        "advisor_policy",
+        _policy("pol-reason", "auto_apply_above_threshold", require_override_reason=True),
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert (rec.decision.status, rec.decision.reason_text, rec.recommendation.unusable) == (
+        DecisionStatus.fallback_rules,
+        why,
+        why,
+    )
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.approve_recommendation(rec.id, "rina")
+    assert str(refused.value) == f"nothing to approve: {why}"
+    with pytest.raises(Unprocessable):
+        await h.orch.override_recommendation(rec.id, "warm", None, "rina")
+    reason = "The owner chose warm after the review"
+    overridden = await h.orch.override_recommendation(rec.id, "warm", reason, "rina")
+    assert overridden.decision.status == DecisionStatus.overridden
+
+
+async def test_a_usable_answer_records_nothing_unusable(tmp_path, store):
+    """SDD §4.2: a recommendation whose answer could be applied records `unusable` null."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert (rec.decision.status, rec.recommendation.unusable) == (DecisionStatus.auto_applied, None)
+
+
+async def test_no_decision_once_the_plans_default_strategy_decides(tmp_path, store):
+    """SDD §14.6 (audit AD-04): a validation honours the plan's default_strategy as it honours an
+    override, recording no recommendation - the earlier one no longer stands. It stayed the newest
+    and approvable: an approve set the migration to warm against the plan, which the next
+    validation silently set back. Approve and override are refused as for a pinned VM."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert (await h.by_vm(plan.id, "vm-1")).advisor_hold == rec.id
+    fresh = store.get("plan", plan.id, Plan)
+    fresh.default_strategy, fresh.status = Strategy.cold, PlanStatus.draft
+    store.put("plan", fresh)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.strategy, m.advisor_hold, len(_recommendations(store))) == (Strategy.cold, None, 1)
+    for decide in (
+        lambda: h.orch.approve_recommendation(rec.id, "rina"),
+        lambda: h.orch.override_recommendation(rec.id, "warm", "the owner chose warm", "rina"),
+    ):
+        with pytest.raises(NotAllowed) as refused:
+            await decide()
+        assert str(refused.value) == (
+            "The plan sets the strategy of web-01 (cold): change it in the plan."
+        )
+    assert (await h.migration(m.id)).strategy == Strategy.cold
+
+
+async def test_a_persons_decision_names_the_policy_whose_rules_it_follows(tmp_path, store):
+    """SDD §14.5, §14.6 (audit AD-06): a person's decision follows the rules its decision recorded
+    - pol-strict's, which a later policy does not rewrite - but recorded the policy in force,
+    pol-relaxed, as its policy_id, and the reason's 422 named pol-relaxed, which requires none.
+    It names the policy whose rules it follows."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    strict = _policy("pol-strict", "always_require_approval", require_override_reason=True)
+    store.put("advisor_policy", strict)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    store.delete("advisor_policy", "pol-strict")
+    relaxed = _policy(
+        "pol-relaxed",
+        "auto_apply_above_threshold",
+        require_override_reason=False,
+        require_distinct_approver=False,
+    )
+    store.put("advisor_policy", relaxed)
+    approved = await h.orch.approve_recommendation(rec.id, "rina")
+    assert (approved.decision.policy_id, approved.decision.require_override_reason) == (
+        "pol-strict",
+        True,
+    )
+    events = [e for e in _audit(store) if e.kind == "decision.approved"]
+    assert [e.data["after"]["policy_id"] for e in events] == ["pol-strict"]
+    with pytest.raises(Unprocessable) as refused:
+        await h.orch.override_recommendation(rec.id, "cold", "too short", "rina")
+    assert str(refused.value).startswith("policy pol-strict requires an override reason")
+
+
 async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_approve(
     tmp_path, store
 ):
