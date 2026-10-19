@@ -2384,6 +2384,16 @@ VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (
 across plans, §5.4) — and the VMware plan 12 of the 13 VMware VMs: `dc2-portal-02` stays unplanned,
 for the operator to plan warm (§7.4). No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
 
+**Bounds.** Each provider call runs its blocking SDK calls in a worker thread and is bounded (300 s, §8.1); the
+bound ends the wait, not the thread, so every request a call sends is bounded by the provider API timeout (60 s) as
+well: an endpoint that accepts a connection and never answers frees the thread once its requests give up (a
+vCenter's best-effort logout after a failed request among them) instead of pinning it for ever; the store's calls
+run in the same thread pool (review PV-02). `OpenStackProvider` sets openstacksdk's `api_timeout`; `VMwareProvider`
+passes pyVmomi's `httpConnectionTimeout` and an SSL context that sets the timeout on every socket it wraps without
+one, since pyVmomi's version probe at connect takes no timeout of its own (a TCP connect stays bounded by the
+operating system). A vCenter request not answered in time is a `ProviderError` that names the 60 s, told apart from
+the call's 300 s bound.
+
 ### 10.1 Destination release series (`seamless_migrate.planning.platforms`)
 
 A pure module (no I/O) holding the series table of §21.1 and the detection and tier rules of §21.3 (plan task T1,
