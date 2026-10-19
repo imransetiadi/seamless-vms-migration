@@ -1,10 +1,12 @@
 import json
+import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from seamless_migrate.config import find_repo_root
 from seamless_migrate.domain.enums import Strategy
 from seamless_migrate.domain.models import SyncPass, VMRef
 from seamless_migrate.planning.estimator import (
@@ -135,6 +137,30 @@ def test_sdd_worked_example():
     fast = estimate(vm, Strategy.warm, replace(P, link_bps=1250 * MIB), slo_s=600)
     assert (fast.passes, fast.downtime_s) == (2, pytest.approx(warm.downtime_s))
     assert fast.precopy_s == pytest.approx(2 * 440.0, abs=1.5)
+
+
+def test_performance_md_why_delta_passes_only_divides_the_recorded_first_pass():
+    """Performance.md §1's "Why delta passes only" (review RV44A-10): a warm pass records as its
+    duration_s the part after its snapshot (SDD §9.1), so the rate a full first pass would give is
+    bytes_scanned over that part - the box divided by the pass with its snapshot: 202 MiB/s and
+    21.4 min instead of 208 MiB/s and 20.9 min."""
+    text = (find_repo_root() / "docs" / "Performance.md").read_text(encoding="utf-8")
+    match = re.search(
+        r"it gives (\d+) MiB/s instead of 500, and an estimate calibrated on it would show "
+        r"(\d+\.\d) min instead of (\d+\.\d)",
+        text,
+    )
+    assert match, "the box moved"
+    vm = vm_with(200, 120.0)  # §4.2's worked example
+    recorded = first_pass_seconds(vm, Strategy.warm, P) - P.snapshot_s
+    rate = 200 * GIB / recorded  # bytes_scanned / duration_s
+    calibrated = estimate(vm, Strategy.warm, replace(P, scan_bps=rate), slo_s=600).downtime_s
+    planned = estimate(vm, Strategy.warm, P, slo_s=600).downtime_s
+    assert (int(match[1]), float(match[2]), float(match[3])) == (
+        round(rate / MIB),
+        round(calibrated / 60, 1),
+        round(planned / 60, 1),
+    )
 
 
 def test_handover_downtime_independent_of_size():

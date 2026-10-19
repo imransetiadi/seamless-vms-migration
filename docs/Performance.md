@@ -54,7 +54,7 @@ after its snapshot. The estimate an approver sees therefore converges on reality
 
 > **Why delta passes only.** A *full* first pass is usually bound by moving the used data (`U/L`), not by
 > scanning, so `bytes_scanned / duration_s` of that pass underestimates `S`: for the 200 GiB worked example of
-> §4.2 it gives 202 MiB/s instead of 500, and an estimate calibrated on it would show 21.4 min instead of 11.3.
+> §4.2 it gives 208 MiB/s instead of 500, and an estimate calibrated on it would show 20.9 min instead of 11.3.
 > SDD §9.1 therefore takes the scan rate from delta/final passes only (`test_first_pass_alone_does_not_calibrate`);
 > a migration that converges after a single full pass keeps the planning defaults. PERF-E2E-G2 reports
 > calibrated and uncalibrated migrations separately for this reason.
