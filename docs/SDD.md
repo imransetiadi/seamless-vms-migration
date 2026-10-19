@@ -494,7 +494,9 @@ that server's disk, another plan's cut-over server of the VM or another VM the k
 never named for deletion (review RV43B-01) -, and its `migration.action` names each as kept - `<id> (<kit
 name>-<disk key>)`, `, attached to the conversion host` added for one it holds, the ids in
 `data.kept_volumes` - for the operator to delete once no plan migrates the VM; a read that fails is named in their
-place and fails nothing: the server is gone (review RV42B, lead NP-2). The migration stays
+place and fails nothing - so is a conversion host it cannot look up: the kit volumes a server holds are then named as
+held by a server it could not tell, with the error, each to be checked before it is deleted (review RV45B-02) -: the
+server is gone (review RV42B, lead NP-2). The migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
 `migration.error` naming the manual `rollback_workloads.yml` run. The cancel saves `checkpoint: "cleanup"`
 in the same write as `cancelled`: a cleanup that a stop or a crash interrupts is run again when the
@@ -917,8 +919,9 @@ logs in as the source's. Both variables default to upstream's single `os_migrate
 TCP mode — the role refuses the loopback default there), with `--shared=1` and quoted paths. Log and
 PID files live in `os_migrate_nbdkit_log_dir` (default `/var/log/os-migrate-nbd`) and a previous
 export is stopped only through its PID file (never `pkill -f`), and only when it serves this same disk: one serving
-another disk - an earlier run's export of another VM, whose record still names that port - refuses this disk instead
-(review RV44B-04). The cold path's nbdkit export of
+another disk - an earlier run's export of another VM, whose record still names that port - refuses the workload instead
+(review RV44B-04), judged for all of its ports before its first export, as this run's own clashes are, so the refused
+workload leaves no disk of its own exported (review RV45B-01). The cold path's nbdkit export of
 source volumes on the conversion hosts is `--readonly` as well. See Security.md §6.
 
 The role never lets qemu guess a disk's format. It reads the instance directory's `disk.info`, where Nova records
@@ -939,8 +942,9 @@ cannot read, or reads as zero - an empty or unparsable image -, is refused: a ze
 it (upstream intake UP-01, after os-migrate 33aca993e4). Each disk's export port is the workload's base port
 (`_migration_params.nbdkit_port`, else `os_migrate_nbdkit_port`) plus its index, and its PID file is named by that
 port: so two disks of one run on one hypervisor that would share a port are refused before the second's workload
-exports anything - all of a workload's ports are judged before its first export, so a refusal leaves none of its disks
-exported and unrecorded (review RV44B-05) -: the second would stop the first one's export through that PID file, and
+exports anything - all of a workload's ports are judged before its first export, against this run's exports and an
+earlier run's live export of another disk alike, so a refusal leaves none of its disks exported and unrecorded
+(reviews RV44B-05, RV45B-01) -: the second would stop the first one's export through that PID file, and
 the first VM's recorded URI, which
 names no export, would then serve the second VM's disk, copied into the first VM's volume without an error, across
 projects too (upstream intake UP-04a, after os-migrate f1d254cb8b). Give each workload on one hypervisor its own
@@ -952,7 +956,8 @@ whose owner ran on its own host and is no longer alive — a module killed by a 
 releases its lock, and every later attach on that host would wait for it in vain; a pid is checked only on the host
 it belongs to (the conversion host's process table knows nothing of the migrator's pids), so a lock of another
 host, or one in the earlier bare-pid form, is never removed by this check. A lock wait gives up once ssh to the conversion
-host has failed for 15 minutes without a break (ssh's own exit status 255), with "Lock timeout: conversion host
+host has failed for 15 minutes without a break (ssh's own exit status 255, or a negative status: ssh killed by a
+signal on the migrator, review RV45B-05), with "Lock timeout: conversion host
 {address} unreachable over SSH for {n} s, waiting for {lock}": the wait tried up to 1800 times, each try up to the 10 s
 connect timeout, about 5.5 h, while a cold cutover's source stays stopped. The window rides out a conversion host reboot or
 a network blip, which the step then completes as if nothing happened (QASuite R-07): a first window of one minute gave up
@@ -1041,7 +1046,10 @@ ssh's command line: ConnectTimeout among ssh's options read as a "timeout", so a
 server refused, with the source VM stopped - was retried as transient (review RV42B-02); the module logs its full
 command (debug) as it fails (review RV43B-06). ssh's own failure keeps its command line, retried as transient as
 above, and so does ssh killed by a signal on the host that runs it (a negative status: an OOM kill, a stray kill),
-which is no failure of the remote command (review RV43B-05).
+which is no failure of the remote command (review RV43B-05). So do the cold export's probes for its NBD server -
+`which qemu-nbd`, `which nbdkit`, nbdkit's `file` plugin -: ssh failing at one gives up as "SSH timeout", retried,
+never a tool missing, which picked the other tool on a guess or failed the export as "No supported NBD export tool
+available!", permanent (review 45b, lead 4).
 The export serves the disk's udev link `/dev/disk/by-id/virtio-<serial>`, but that adds no protection once the
 export runs: nbdkit resolves the path it serves once, at its start, and opens that
 device path on every later connection, so a volume taken off the host after the export started still has the transfer
@@ -1061,9 +1069,10 @@ ENOSPC. So after nbdcopy exits, whether it succeeded or not, the transfer checks
 a block device. If it is not, the transfer removes a regular file found there - udev 252 (RHEL 9) will not make the
 volume's link over one, where udev 239 (RHEL 8) replaces it - and fails as permanent, saying whether the file was
 removed, could not be removed or could not be checked. Ssh failing at the check gives up as "SSH timeout: ..." and is
-retried when nbdcopy finished its copy (exit 0) or ssh broke it (exit 255); after nbdcopy failed on its own (any other
-exit) every answer the check could give is permanent, so the transfer keeps nbdcopy's failure, permanent, and says the
-path could not be checked (review RV15-02, RV16-02, RV16-03, RV17-01). A path that is still a disk leaves nbdcopy's own
+retried when nbdcopy finished its copy (exit 0) or ssh broke it (exit 255, or a negative status: ssh killed, review
+RV45B-05); after nbdcopy failed on its own (any other positive exit) every answer the check could give is permanent,
+so the transfer keeps nbdcopy's failure, permanent, and says the path could not be checked (review RV15-02, RV16-02,
+RV16-03, RV17-01). A path that is still a disk leaves nbdcopy's own
 exit to decide. Telling the
 two attachments apart
 needs this export's own Cinder attachment id, which a lost answer never gave it: Nova shows the id only from
