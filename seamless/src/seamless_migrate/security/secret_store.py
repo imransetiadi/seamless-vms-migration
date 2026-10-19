@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import fcntl
 import os
 import re
 import shutil
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -84,6 +85,17 @@ class FileSecretStore:
             if not entry.name.startswith(".") and _KEY.match(entry.name) and entry.is_file()
         }
 
+    @contextlib.contextmanager
+    def _locked(self, name: str) -> Iterator[None]:
+        """One writer or deleter of ``name`` at a time, in this process and the others on the host
+        (SDD §13.3, audit AA-02): ``flock`` on ``{root}/.{name}.lock``, released as it closes."""
+        fd = os.open(self.root / f".{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
     def write(self, name: str, values: Mapping[str, str], labels: Mapping[str, str]) -> None:
         _check(name, values)
         try:
@@ -92,23 +104,26 @@ class FileSecretStore:
                 # created or owned: the secret names are not for other local users; a mount
                 # the store does not own keeps its mode (SDD §13.3)
                 os.chmod(self.root, 0o700)
-            directory = self.root / name
-            directory.mkdir(mode=0o700, exist_ok=True)
-            os.chmod(directory, 0o700)
-            for stale in directory.iterdir():  # a secret is replaced as a whole
-                if stale.is_file() and stale.name not in values:
-                    stale.unlink()
-            for key, value in values.items():
-                fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                        handle.write(value)
-                    os.chmod(tmp, 0o600)
-                    os.replace(tmp, directory / key)
-                except BaseException:
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(tmp)
-                    raise
+            # a secret is replaced as a whole, so two writes at once take turns: interleaved,
+            # each one's stale pass ran before the other wrote, and both secrets' keys stayed
+            with self._locked(name):
+                directory = self.root / name
+                directory.mkdir(mode=0o700, exist_ok=True)
+                os.chmod(directory, 0o700)
+                for stale in directory.iterdir():
+                    if stale.is_file() and stale.name not in values:
+                        stale.unlink()
+                for key, value in values.items():
+                    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                            handle.write(value)
+                        os.chmod(tmp, 0o600)
+                        os.replace(tmp, directory / key)
+                    except BaseException:
+                        with contextlib.suppress(FileNotFoundError):
+                            os.unlink(tmp)
+                        raise
         except OSError as exc:
             # the default directory is one a user cannot write on a host run (SDD §13.3)
             raise SecretStoreError(
@@ -118,8 +133,16 @@ class FileSecretStore:
 
     def delete(self, name: str) -> None:
         _check(name)
-        with contextlib.suppress(FileNotFoundError):
-            shutil.rmtree(self.root / name)
+        if not (self.root / name).exists():
+            return  # one already gone is no error
+        try:
+            with self._locked(name), contextlib.suppress(FileNotFoundError):
+                shutil.rmtree(self.root / name)
+        except OSError as exc:
+            # a directory the store cannot change answers as a write it cannot make (audit AA-03)
+            raise SecretStoreError(
+                f"cannot delete {name} from the secret store at {self.root}: {exc.strerror}"
+            ) from None
 
 
 class KubernetesSecretStore:

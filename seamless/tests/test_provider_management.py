@@ -2,6 +2,7 @@
 and the conversion-host key in the platform secret store, distributions, secret resolution."""
 
 import base64
+import contextlib
 import errno
 import inspect
 import json
@@ -576,6 +577,30 @@ def test_deleting_a_provider_deletes_its_managed_secrets(api):
     assert not (root / "provider-vc-dc2").exists() and not (root / "provider-vc-dc2-ssh").exists()
 
 
+def test_a_provider_deletion_the_store_cannot_finish_is_audited_naming_what_it_left(api):
+    """SDD §12, §13.2 (audit AA-03): the files store let an OSError other than "not found" out of
+    a deletion - a root remounted read-only, another owner's mount -, so DELETE /providers/{id}
+    answered 500 after the provider was gone, wrote no provider.deleted, and stopped before the
+    conversion key. Each secret is tried, the deletion is audited, and the event names what the
+    store left."""
+    assert api.post("/api/v1/providers", json=VCENTER).status_code == 201
+    put(api, "/api/v1/providers/vc-dc2/credentials", {"username": "u", "password": "p"})
+    put(api, "/api/v1/providers/vc-dc2/conversion-key", {"private_key": KEY})
+    root = api.settings.secrets_dir
+    os.chmod(root, 0o500)  # the store's root turned read-only
+    try:
+        res = api.client.delete("/api/v1/providers/vc-dc2", headers=api.h(Role.admin))
+    finally:
+        os.chmod(root, 0o700)
+    assert res.status_code == 204, res.text
+    assert api.get("/api/v1/providers/vc-dc2").status_code == 404
+    [deleted] = [e for e in api.store.events() if e.kind == "provider.deleted"]
+    assert deleted.data == {
+        "provider_id": "vc-dc2",
+        "secrets_left": ["provider-vc-dc2", "provider-vc-dc2-ssh"],
+    }
+
+
 def test_an_unwritable_store_answers_503(tmp_path):
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("x")
@@ -639,6 +664,109 @@ def test_file_store_roundtrip(tmp_path):
             store.write(bad, {"a": "b"}, {})
     with pytest.raises(SecretStoreError):
         store.write("ok", {"bad key": "v"}, {})
+
+
+def test_two_writes_of_one_secret_at_once_leave_one_secret_whole(tmp_path, monkeypatch):
+    """SDD §13.3 (audit AA-02): two writes of one secret - a password rotation and a switch to an
+    application credential, saved at once - each ran its stale-key pass before the other wrote:
+    both answered and the secret held the keys of both, the replaced password stored beside the
+    credential the connection then signs in with. A secret is written under a lock of its name:
+    the last write's secret stands whole."""
+    import tempfile as real_tempfile
+    import threading
+
+    met = threading.Barrier(2)
+    first = threading.local()
+
+    class MeetFirst:
+        """Each writer waits for the other once, past its stale-key pass: unlocked, both meet there
+        and write over each other; locked, the second waits for the lock and the first goes on."""
+
+        @staticmethod
+        def mkstemp(*args, **kwargs):
+            if not getattr(first, "met", False):
+                first.met = True
+                with contextlib.suppress(threading.BrokenBarrierError):
+                    met.wait(timeout=0.5)
+            return real_tempfile.mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(secret_store_module, "tempfile", MeetFirst)
+    store = FileSecretStore(tmp_path)
+    password = {"username": "ops", "password": "Old-Password-1", "project_name": "finance"}
+    app_cred = {"application_credential_id": "ac-1", "application_credential_secret": "s3cr3t"}
+    writers = [
+        threading.Thread(target=store.write, args=("provider-x", values, {}))
+        for values in (password, app_cred)
+    ]
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join(10)
+    assert store.read("provider-x") in (password, app_cred)
+    assert not list((tmp_path / "provider-x").glob(".tmp-*"))
+
+
+def test_a_deletion_of_a_secret_waits_for_its_write(tmp_path, monkeypatch):
+    """SDD §13.3 (audit AA-02): a deletion takes the secret's lock too - one landing while a write
+    is under way would take the directory from under it, and the write would fail halfway, its
+    keys partly written. It waits, then deletes the whole secret."""
+    import tempfile as real_tempfile
+    import threading
+    import time
+
+    entered, go = threading.Event(), threading.Event()
+
+    class Pause:
+        @staticmethod
+        def mkstemp(*args, **kwargs):
+            if not entered.is_set():
+                entered.set()
+                go.wait(timeout=5)
+            return real_tempfile.mkstemp(*args, **kwargs)
+
+    store = FileSecretStore(tmp_path)
+    store.write("provider-x", {"username": "old"}, {})
+    monkeypatch.setattr(secret_store_module, "tempfile", Pause)
+    errors: list[BaseException] = []
+
+    def write():
+        try:
+            store.write("provider-x", {"username": "u", "password": "p"}, {})
+        except BaseException as exc:  # noqa: BLE001 - what the write met
+            errors.append(exc)
+
+    writer = threading.Thread(target=write)
+    writer.start()
+    assert entered.wait(5)
+    deleter = threading.Thread(target=store.delete, args=("provider-x",))
+    deleter.start()
+    time.sleep(0.2)  # unlocked, the deletion runs now, under the paused write
+    go.set()
+    writer.join(10)
+    deleter.join(10)
+    assert errors == []
+    assert store.read("provider-x") is None
+
+
+def test_a_secret_the_file_store_cannot_remove_is_a_store_error(tmp_path):
+    """SDD §13.3 (audit AA-03): a directory the store cannot change answers as a write it cannot
+    make - a SecretStoreError naming the store, never a bare OSError (its keys may be gone, the
+    directory left) -, a deletion once it can finishes, and one already gone is no error."""
+    store = FileSecretStore(tmp_path)
+    store.write("provider-x", {"username": "u"}, {})
+    os.chmod(tmp_path, 0o500)
+    try:
+        with pytest.raises(SecretStoreError, match=f"secret store at {tmp_path}"):
+            store.delete("provider-x")
+    finally:
+        os.chmod(tmp_path, 0o700)
+    assert (tmp_path / "provider-x").is_dir()
+    store.delete("provider-x")
+    store.delete("provider-x")
+    assert store.read("provider-x") is None
+    # nothing to delete in a store not written yet: no error, and nothing created for it
+    FileSecretStore(tmp_path / "none").delete("provider-x")
+    assert not (tmp_path / "none").exists()
 
 
 def test_file_store_that_cannot_write_says_which_setting_to_change(tmp_path, monkeypatch):
