@@ -621,9 +621,12 @@ characters) is the only way to cut over before convergence. In `precopy` or `syn
 downtime if cut over after the running pass, `final_downtime_parts` (§5.3) after a pass as long as the last one that
 ended - its whole time, §9.1 `T_last` - or — in `precopy`, before any pass ended — as long as the first pass's expected duration (§9.1:
 `snapshot_s + max(used/L, scan)`, VMware `used/L`) — and a
-cutover request (its requester the forcer when none), and emits `migration.force_cutover` (audit). The running pass
-finishes, then the migration moves to `awaiting_cutover` with `converged_by: "force"`; the gate still applies — an
-approval by another approver (maker-checker), the window, the cutover slots. A request alone (`POST …/cutover`) never
+cutover request (its requester the forcer when none), and emits `migration.force_cutover` (audit) - the migration and
+its event in one transaction (§11), as an approval and a cutover request are written with their `migration.approved`
+and `migration.action`: a store error leaves neither, so no force and no approval that opens the gate lacks its record,
+and a retry is taken anew (audit OC-03). The running pass finishes, then the migration moves to `awaiting_cutover`
+with `converged_by: "force"`; the gate still applies — an approval by another approver (maker-checker), the window, the
+cutover slots. A request alone (`POST …/cutover`) never
 forces: it waits for convergence. A migration is forced once: while `force_cutover` is recorded, another Force
 cutover answers 409 ("Already forced by {user}: the cutover follows the running pass.") — a second forcer would
 take the first one's place, whose approval would then count again, and the migration would lose the first record;
@@ -2039,8 +2042,10 @@ minutes — and emits `migration.source_running` (data `{"power_state"}`): the V
 writes data RHOSO no longer receives — stop it, or roll back. While `source_running_at` is set, `POST …/finalize`
 answers 409 "the source VM runs again: stop it, or roll it back, before finalizing" (the owner's choice, 2026-10-13):
 a finalize would keep a source that diverged, or delete it with what it wrote since. A migration whose checkpoint is
-`finalizing` is the exception — its finalize began deleting the source, and a rollback is refused then, so finalizing
-it again from its own page is its way out; a bulk finalize skips every migration whose source VM runs again, that one
+`finalizing` is the exception for a finalize that deletes the source (`delete_source: true`) — its finalize began
+deleting it, and a rollback is refused then, so finalizing it again from its own page, deleting the source, is its way
+out; one that would keep the source answers the same 409, and the dashboard's Finalize of such a migration deletes it,
+its box checked and fixed (audit OC-09); a bulk finalize skips every migration whose source VM runs again, that one
 too, so what it finalizes is known from the plan's summaries (§4), which carry no checkpoint. Seen stopped again,
 `source_running_at` clears and the
 migration emits `migration.source_stopped` (data `{"power_state"}`), so every view drops the alert without a reload and
