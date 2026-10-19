@@ -429,6 +429,39 @@ def test_a_workload_refused_for_a_shared_port_exports_none_of_its_disks(hypervis
     assert _served(hypervisor) == recorded, out
 
 
+def test_a_workload_an_earlier_runs_export_refuses_exports_none_of_its_disks(hypervisor):
+    """Seamless Migrate SDD 6.6 (reviews RV44B-04, RV45B-01): run 1 exported and recorded srv-2
+    alone on its own base port 10810; run 2 enables srv-1 (the default base port: 10809, 10810).
+    The earlier run's export of srv-2 behind qemu-nbd-10810.pid was found disk by disk: srv-1's
+    root disk was exported on 10809 first, then its second disk was refused - the root disk's
+    export ran on, recorded nowhere, and the refusal's way out (a base port of its own) moved srv-1
+    off 10809, so no later run stopped it. All of a workload's ports are judged against an earlier
+    run's exports before its first export too: srv-1 exports nothing, and after its way out every
+    live export is one a record names."""
+    _set_params(hypervisor, "srv-1", use_nbdkit_direct=False)
+    second = _add_instance(hypervisor, "srv-2", "vm2", {"nbdkit_port": 10810})
+    rc, out = hypervisor.run()
+    assert rc == 0, out
+    assert _served(hypervisor) == {10810: second}, out
+
+    _set_params(hypervisor, "srv-1", use_nbdkit_direct=True)
+    rc, out = hypervisor.run()
+    assert rc != 0 and "port 10810" in out and "serves another disk" in out, out
+    srv1 = os.path.join(hypervisor.instances, "srv-1")
+    assert not [e for e in hypervisor.started() if e["argv"][-1].startswith(srv1)], out
+    assert _recorded(hypervisor, "srv-1") is None
+
+    _set_params(hypervisor, "srv-1", nbdkit_port=10900)  # the refusal's way out
+    rc, out = hypervisor.run()
+    assert rc == 0, out
+    recorded = {
+        d["port"]: d["disk_path"]
+        for instance in ("srv-1", "srv-2")
+        for d in _recorded(hypervisor, instance)
+    }
+    assert _served(hypervisor) == recorded, out
+
+
 def test_the_format_comes_from_nova_disk_info_never_from_the_disk(hypervisor):
     """SDD §6.6: a raw disk's first block is the guest's. A qcow2 header the guest wrote there must
     not make qemu-nbd, run with sudo, follow a backing file of the guest's choosing."""

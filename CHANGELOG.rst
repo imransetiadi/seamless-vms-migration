@@ -232,9 +232,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   through the PID file named by that port, and the first VM's recorded ``nbd``
   URI, which names no export, then served the second VM's disk: the import
   copied it into the first VM's volume without an error. All of a workload's
-  ports are judged before its first export, so a refused workload exports
-  nothing, and a previous export is stopped only when it serves the same
-  disk, so a rerun never stops an earlier run's export of another VM. Give
+  ports are judged before its first export - against this run's exports and
+  an earlier run's live export of another disk alike -, so a refused workload
+  exports nothing, and a previous export is stopped only when it serves the
+  same disk, so a rerun never stops an earlier run's export of another VM. Give
   each workload on one hypervisor its own ``_migration_params.nbdkit_port``
   (after os-migrate f1d254cb8b, whose run-wide counter this fork does not
   take).

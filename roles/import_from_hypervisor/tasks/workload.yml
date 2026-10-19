@@ -195,6 +195,50 @@
          | list
          | intersect(import_from_hypervisor_ports_taken[import_from_hypervisor_host] | default([])) }}
 
+# An earlier run's live export of another disk on one of this workload's ports refuses the workload here too, before its
+# first export: judged disk by disk in process_disk.yml, it refused only after the workload's earlier disks were
+# exported, and those stayed served, recorded nowhere (Seamless Migrate SDD 6.6, reviews RV44B-04, RV45B-01). The test
+# is process_disk.yml's: the qemu-nbd its port's PID file names, started with that PID file, serving another disk than
+# the one this workload's disk at that port is.
+- name: Find an earlier run's export of another disk on this workload's ports
+  ansible.builtin.raw: |
+    another() {
+      port=$1
+      disk=$2
+      pidfile={{ os_migrate_nbdkit_log_dir | quote }}/qemu-nbd-$port.pid
+      sudo test -s "$pidfile" || return 0
+      pid=$(sudo cat "$pidfile")
+      case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+      args=$(ps -ww -p "$pid" -o args= 2>/dev/null)
+      case "$args" in
+        *qemu-nbd*"--pid-file=$pidfile"*" $disk") ;;
+        *qemu-nbd*"--pid-file=$pidfile"*) echo "SERVES ANOTHER DISK: $port $args" ;;
+      esac
+    }
+    {% for disk in import_from_hypervisor_disks_found %}
+    another {{ (import_from_hypervisor_base_port | int) + loop.index0 }} {{ disk | quote }}
+    {% endfor %}
+  delegate_to: "{{ import_from_hypervisor_host }}"
+  register: import_from_hypervisor_earlier_exports
+  changed_when: false
+
+- name: Refuse a workload whose port an earlier run's export of another disk holds
+  ansible.builtin.assert:
+    that: import_from_hypervisor_held_ports | length == 0
+    fail_msg: >-
+      port {{ import_from_hypervisor_held_ports | join(', port ') }} on {{ import_from_hypervisor_host }} serves
+      another disk, an earlier run's export whose record still names it, which a disk of
+      {{ import_from_hypervisor_instance_id }} would stop: give this workload its own _migration_params.nbdkit_port,
+      or stop that export (its PID file {{ os_migrate_nbdkit_log_dir }}/qemu-nbd-<port>.pid) once its VM's import
+      is done
+    quiet: true
+  vars:
+    import_from_hypervisor_held_ports: >-
+      {{ import_from_hypervisor_earlier_exports.stdout_lines
+         | select('match', '^SERVES ANOTHER DISK: [0-9]+ ')
+         | map('regex_replace', '^SERVES ANOTHER DISK: ([0-9]+) .*$', '\1')
+         | list }}
+
 - name: Process each disk
   ansible.builtin.include_tasks: process_disk.yml
   loop: "{{ import_from_hypervisor_disks_found }}"
