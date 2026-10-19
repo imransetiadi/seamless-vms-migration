@@ -120,6 +120,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const [reason, setReason] = useState('');
   const [forceWindow, setForceWindow] = useState(false);
   const [deleteSource, setDeleteSource] = useState(false);
+  // its finalize began deleting the source, which runs again: only a finalize that deletes it is taken (SDD §8.1,
+  // audit OC-09)
+  const mustDeleteSource = m.checkpoint === 'finalizing' && Boolean(m.source_running_at);
   const [announcement, setAnnouncement] = useState('');
   const forceId = useId();
   const deleteId = useId();
@@ -459,13 +462,24 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         description="Finalizing is irreversible: rollback is no longer possible and the source VM's temporary resources are cleaned up."
         confirmLabel="Finalize"
         requireText={m.vm.name}
-        onConfirm={() => submit({ action: 'finalize', body: { confirm: m.vm.name, delete_source: deleteSource } })}
+        onConfirm={() => submit({ action: 'finalize', body: { confirm: m.vm.name, delete_source: deleteSource || mustDeleteSource } })}
       >
         <label htmlFor={deleteId} className="flex min-h-11 cursor-pointer items-start gap-2.5 text-sm">
-          <input id={deleteId} type="checkbox" className="mt-1 size-4 accent-accent" checked={deleteSource} onChange={(e) => setDeleteSource(e.target.checked)} />
+          <input
+            id={deleteId}
+            type="checkbox"
+            className="mt-1 size-4 accent-accent"
+            checked={deleteSource || mustDeleteSource}
+            disabled={mustDeleteSource}
+            onChange={(e) => setDeleteSource(e.target.checked)}
+          />
           <span>
             Also delete the source VM
-            <span className="block text-xs text-muted-foreground">Leave unchecked to keep the stopped source VM for a while.</span>
+            <span className="block text-xs text-muted-foreground">
+              {mustDeleteSource
+                ? 'The finalize began deleting the source VM, which runs again: only deleting it finalizes it.'
+                : 'Leave unchecked to keep the stopped source VM for a while.'}
+            </span>
           </span>
         </label>
       </ConfirmDialog>

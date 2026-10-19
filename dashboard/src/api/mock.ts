@@ -2679,8 +2679,9 @@ export class MockServer {
       case 'finalize': {
         // like the API (SDD §12): the phase first, then the typed name
         if (m.phase !== 'completed') throw new HttpError(409, 'conflict', `only completed migrations can be finalized (${m.phase})`);
-        // like the API (SDD §8.1): not while the source runs again, unless a finalize began deleting it
-        if (m.source_running_at && m.checkpoint !== 'finalizing') {
+        // like the API (SDD §8.1, audit OC-09): not while the source runs again, unless a finalize began
+        // deleting it - and this one deletes it too
+        if (m.source_running_at && !(m.checkpoint === 'finalizing' && input.delete_source)) {
           throw new HttpError(409, 'conflict', SOURCE_RUNS_AGAIN);
         }
         if (input.confirm !== m.vm.name) throw new HttpError(400, 'bad_request', `Type the VM name "${m.vm.name}" exactly to finalize.`);

@@ -336,6 +336,26 @@ describe('MigrationActions', () => {
     expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('completed');
   });
 
+  it('finalizes a migration whose finalize began deleting its source, now running again, by deleting it - the only finalize the API takes (SDD §8.1, audit OC-09)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.vm.name === 'web-cache-01') as Migration;
+    Object.assign(migration, { checkpoint: 'finalizing', source_running_at: '2026-10-08T11:00:00Z' });
+    const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
+    const role: Role = 'approver';
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
+    await user.click(within(screen.getByRole('group', { name: /migration actions/i })).getByRole('button', { name: /^finalize$/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /finalize web-cache-01/i });
+    const box = within(dialog).getByRole('checkbox', { name: /also delete the source vm/i });
+    expect(box).toBeChecked();
+    expect(box).toBeDisabled();
+    expect(box).toHaveAccessibleName(/runs again: only deleting it finalizes it/i);
+    await user.type(within(dialog).getByLabelText(/type web-cache-01 to confirm/i), 'web-cache-01');
+    await user.click(within(dialog).getByRole('button', { name: /^finalize$/i }));
+    await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('finalized'));
+    expect(server.events.find((e) => e.migration_id === migration.id && e.data.action === 'finalize')?.data.delete_source).toBe(true);
+  });
+
   it('says a retry starts the migration over, not from a checkpoint (the API clears it)', async () => {
     const user = userEvent.setup({ delay: null });
     const { button } = setup('legacy-rhel6-app', 'operator');

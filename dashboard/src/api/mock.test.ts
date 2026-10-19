@@ -2628,6 +2628,21 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
   }
   const byName = (server: MockServer, name: string) => server.migrations.find((m) => m.vm.name === name)!;
 
+  it('finalizes a source that runs again only by deleting it, once a finalize began deleting it, like the API (SDD §8.1, audit OC-09)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = byName(server, 'web-cache-01');
+    expect(m.phase).toBe('completed');
+    Object.assign(m, { checkpoint: 'finalizing', source_running_at: '2026-10-08T11:00:00Z' });
+    const approver = as(server, 'approver');
+    await expect(approver.post(`/migrations/${m.id}/finalize`, { confirm: m.vm.name, delete_source: false })).rejects.toMatchObject({
+      status: 409,
+      message: 'the source VM runs again: stop it, or roll it back, before finalizing',
+    });
+    expect(m.phase).toBe('completed');
+    await approver.post(`/migrations/${m.id}/finalize`, { confirm: m.vm.name, delete_source: true });
+    expect(m.phase).toBe('finalized');
+  });
+
   it('returns every plan with its derived status and the finalize reminder', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const pilot = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
