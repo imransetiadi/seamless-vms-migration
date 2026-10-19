@@ -1407,6 +1407,7 @@ describe('mock API', () => {
     const started = call('plan-7b3e0d52');
     expect(started.status).toBe(409);
     expect((started.body as { error: { message: string } }).error.message).toMatch(/^only a plan whose migrations have not started can be cancelled: .+ \(syncing\)/);
+    expect((started.body as { error: { message: string } }).error.message).toMatch(/which cleans up what it copied - on VMware it names the kit's copies it keeps$/);
     const before = server.events.length;
     const done = call('plan-c81d44a0');
     expect(done.status).toBe(200);

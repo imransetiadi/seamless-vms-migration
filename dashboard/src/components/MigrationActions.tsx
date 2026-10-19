@@ -424,9 +424,12 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         tone="danger"
         title={`Cancel ${m.vm.name}?`}
         description={
-          hasDataPath(m)
-            ? 'The migration stops for good and is removed from its wave. The source VM keeps running; the data copied so far — destination volumes and source snapshots — is then removed, and the timeline reports the outcome.'
-            : 'The migration stops for good and is removed from its wave. The source VM is not touched.'
+          !hasDataPath(m)
+            ? 'The migration stops for good and is removed from its wave. The source VM is not touched.'
+            : m.strategy === 'vmware_warm' || m.strategy === 'vmware_cold'
+              ? // a VMware cancel deletes no kit volume: the kit names them after the VM (SDD §5.1, §7.2, §16)
+                "The migration stops for good and is removed from its wave. The source VM keeps running; the destination server it recorded is removed, and the migration kit's volumes stay, named in the timeline — delete them once no plan migrates the VM."
+              : 'The migration stops for good and is removed from its wave. The source VM keeps running; the data copied so far — destination volumes and source snapshots — is then removed, and the timeline reports the outcome.'
         }
         confirmLabel="Cancel migration"
         cancelLabel="Keep migration"

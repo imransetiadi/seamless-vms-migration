@@ -2422,7 +2422,7 @@ export class MockServer {
         409,
         'conflict',
         `only a plan whose migrations have not started can be cancelled: ${named.slice(0, 10).join(', ')}${rest > 0 ? ` and ${rest} more` : ''}; ` +
-          'cancel a failed or rolled-back migration on its own first, which cleans up what it copied',
+          "cancel a failed or rolled-back migration on its own first, which cleans up what it copied - on VMware it names the kit's copies it keeps",
       );
     }
     const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;

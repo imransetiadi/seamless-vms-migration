@@ -397,6 +397,18 @@ describe('MigrationActions', () => {
     expect(dialog).not.toHaveTextContent(/data copied so far/i);
   });
 
+  it("says a VMware cancel removes the recorded server and keeps the kit's volumes, named in the timeline (SDD §5.1, §7.2, §16, docs-drift DD3-02)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const { button, migration } = setup('vm-erp-app-01', 'operator');
+    expect([migration.strategy, migration.phase]).toEqual(['vmware_warm', 'syncing']);
+    await user.click(button(/^cancel/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /cancel vm-erp-app-01/i });
+    expect(dialog).toHaveTextContent(/the source VM keeps running/i);
+    expect(dialog).toHaveTextContent(/the destination server it recorded is removed/i);
+    expect(dialog).toHaveTextContent(/the migration kit's volumes stay, named in the timeline/i);
+    expect(dialog).not.toHaveTextContent(/destination volumes and source snapshots/i);
+  });
+
   it('asks for a reason before rolling back', async () => {
     const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('legacy-rhel6-app', 'operator');

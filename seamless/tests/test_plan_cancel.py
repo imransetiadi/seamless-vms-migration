@@ -136,6 +136,11 @@ def test_a_plan_whose_migration_started_is_not_cancelled_and_names_it(api):
     message = res.json()["error"]["message"]
     assert f"{started.vm.name} ({Phase.failed})" in message
     assert waiting.vm.name not in message
+    # what cancelling it on its own does, a VMware one's included (SDD §12, §5.1, docs-drift DD3-02)
+    assert message.endswith(
+        "cancel a failed or rolled-back migration on its own first, which cleans up what it "
+        "copied - on VMware it names the kit's copies it keeps"
+    ), message
     # nothing changed: the plan and its waiting migration are as they were
     assert api.get(f"/api/v1/plans/{plan_id}").json()["status"] == "validated"
     phases = {m.id: m.phase for m in migrations(api, plan_id)}

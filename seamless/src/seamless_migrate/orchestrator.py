@@ -221,7 +221,8 @@ def started_refusal(started: Iterable[Migration], limit: int = 10) -> str:
     listed = ", ".join(named[:limit]) + (f" and {rest} more" if rest > 0 else "")
     return (
         f"only a plan whose migrations have not started can be cancelled: {listed}; cancel a "
-        "failed or rolled-back migration on its own first, which cleans up what it copied"
+        "failed or rolled-back migration on its own first, which cleans up what it copied - on "
+        "VMware it names the kit's copies it keeps"
     )
 
 
