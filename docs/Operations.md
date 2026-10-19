@@ -286,9 +286,10 @@ end first:
    answer may be paused all the same: it is named too. One whose pause the API refused - it is no longer running -
    was not paused, and is not named.
 
-   `capacity` takes `--drain` too: it ends in a restart. Its own checks come first - `deploy/compose/.env` on the
-   single host, a server-side dry run of a cluster's limits - so a capacity that would be refused pauses no plan,
-   and a timeout changes nothing.
+   `capacity` takes `--drain` too: it ends in a restart. Its own checks come first - on the single host `make`,
+   `deploy/compose/.env` and `tokens.yaml`, and a `SEAMLESS_HOST_PORT` there that is a plain number; on a cluster
+   the Deployment and `seamless-config` read, and a server-side dry run of the limits - so a capacity that would
+   be refused pauses no plan, and a timeout changes nothing. A single host's `restart --drain` checks the same.
 
 3. **Start again, then resume the paused plans:**
 

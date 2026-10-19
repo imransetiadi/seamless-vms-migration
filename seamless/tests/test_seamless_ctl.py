@@ -9,6 +9,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -62,11 +63,15 @@ def _run(
     tools=None,
     cwd=None,
     environment=None,
+    tokens_yaml=True,
+    path=None,
 ):
     """Run a copy of the script in a scratch tree with the stub tools first on PATH; return the run
     and the tools' calls in order. With ``cluster`` (a fake_kube state), kubectl and oc keep it -
     read it back with ``_cluster_after(tmp_path)``; ``tools`` adds scripts by name to that PATH,
-    ``cwd`` is where the script runs, and ``environment`` is exported to it."""
+    ``cwd`` is where the script runs, and ``environment`` is exported to it. ``env_file`` writes
+    deploy/compose/.env and, as make seamless-init does, a tokens.yaml beside it (synthetic, no
+    token) unless ``tokens_yaml`` is false; ``path`` replaces the PATH after the stubs."""
     tree = tmp_path / "tree"
     (tree / "scripts").mkdir(parents=True, exist_ok=True)
     shutil.copy(SCRIPT, tree / "scripts" / SCRIPT.name)
@@ -75,6 +80,8 @@ def _run(
         (tree / "deploy" / "compose").mkdir(parents=True, exist_ok=True)
         (tree / "deploy" / "compose" / ".env").write_text(env_file)
         (tree / "deploy" / "compose" / ".env").chmod(0o600)
+        if tokens_yaml:
+            (tree / "deploy" / "compose" / "tokens.yaml").write_text("tokens: []\n")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     for name in TOOLS:
@@ -95,7 +102,7 @@ def _run(
         if not k.startswith(("SEAMLESS_", "KUBECONFIG", "DOCKER_"))
     }
     env.update(
-        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        PATH=f"{bin_dir}:{path or os.environ['PATH']}",
         STUB_LOG=str(log),
         STUB_RULES=str(tmp_path / "rules.json"),
         TMPDIR=str(tmp_path),
@@ -380,10 +387,11 @@ def test_cluster_capacity_patches_the_configmap_and_sets_the_limits_in_one_rollo
     tmp_path, platform, tool, overlay
 ):
     """SDD §17.2: capacity scales the one control plane up or down - its concurrency settings in the
-    ConfigMap, its CPU and memory limits - in a single rollout, awaited: the limits checked by a
-    server-side dry run first, then the ConfigMap - the settings it changes read first, to be put
-    back on a failure -, then one patch of the pod template - the limits and a restart annotation
-    (reviews RV38B-01, RV38B-02, RV41A-06)."""
+    ConfigMap, its CPU and memory limits - in a single rollout, awaited: the Deployment and the
+    settings read first - a mistyped namespace or an expired login shows before anything changes
+    (review RV43A-06) -, the limits checked by a server-side dry run, then the ConfigMap - the
+    settings it changes read again, to be put back on a failure -, then one patch of the pod
+    template - the limits and a restart annotation (reviews RV38B-01, RV38B-02, RV41A-06)."""
     proc, calls, _ = _run(
         tmp_path,
         platform,
@@ -406,6 +414,9 @@ def test_cluster_capacity_patches_the_configmap_and_sets_the_limits_in_one_rollo
     ]
     read = [*ns, "get", "configmap/seamless-config", "-o"]
     assert made == [
+        [*ns, "get", "deployment/seamless", "-o", "name"],
+        [*read, 'go-template={{index .data "SEAMLESS_MAX_CONCURRENT_MIGRATIONS"}}'],
+        [*read, 'go-template={{index .data "SEAMLESS_MAX_CONCURRENT_CUTOVERS"}}'],
         [*ns, "patch", "deployment/seamless", "-p", patches[0], "--dry-run=server"],
         [*read, 'go-template={{index .data "SEAMLESS_MAX_CONCURRENT_MIGRATIONS"}}'],
         [*read, 'go-template={{index .data "SEAMLESS_MAX_CONCURRENT_CUTOVERS"}}'],
@@ -435,12 +446,14 @@ def test_cluster_capacity_patches_the_configmap_and_sets_the_limits_in_one_rollo
     assert proc.returncode == 0, proc.stderr
     made = [c["args"] for c in calls if c["cmd"] == tool]
     assert [args[2:4] for args in made] == [
+        ["get", "deployment/seamless"],
+        ["get", "configmap/seamless-config"],
         ["get", "configmap/seamless-config"],
         ["patch", "configmap/seamless-config"],
         ["patch", "deployment/seamless"],
         ["rollout", "status"],
     ]
-    assert list(json.loads(made[2][-1])["spec"]["template"]) == ["metadata"]
+    assert list(json.loads(made[4][-1])["spec"]["template"]) == ["metadata"]
 
 
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
@@ -986,7 +999,7 @@ def test_a_port_compose_would_interpolate_asks_no_api(tmp_path, argv):
     and runs nothing; --url still names the API."""
     port_env = "PORT=18081\nSEAMLESS_HOST_PORT=${PORT}\n"
     proc, calls, _ = _run(tmp_path, "docker", *argv, env_file=port_env, rules=_drain_rules([]))
-    assert proc.returncode == 1, proc.stderr
+    assert proc.returncode == 2, proc.stderr  # a refusal: nothing ran (RV43A-07)
     assert "SEAMLESS_HOST_PORT" in proc.stderr and calls == [], (proc.stderr, calls)
     rules = [*_drain_rules([{"stdout": "[]"}]), {"cmd": "curl", "answers": [{"stdout": "{}"}]}]
     proc, calls, _ = _run(
@@ -1099,7 +1112,7 @@ def test_a_drain_pauses_no_plan_for_a_restart_its_make_target_refuses(tmp_path, 
         tmp_path, "docker", *argv, "--drain", "@TOKEN_FILE", "--url", "http://127.0.0.1:18081",
         env_file=port_env, rules=_drain_rules([{"stdout": "[]"}]),
     )  # fmt: skip
-    assert proc.returncode == 1, proc.stderr
+    assert proc.returncode == 2, proc.stderr  # a refusal: nothing ran (RV43A-07)
     assert "SEAMLESS_HOST_PORT" in proc.stderr and "nothing was changed" in proc.stderr, proc.stderr
     assert calls == []  # no plan listed or paused, no make
     assert (tree / "deploy" / "compose" / ".env").read_text() == port_env
@@ -1110,6 +1123,109 @@ def test_a_drain_pauses_no_plan_for_a_restart_its_make_target_refuses(tmp_path, 
     )  # fmt: skip
     assert proc.returncode == 0, proc.stderr
     assert [c["cmd"] for c in calls][-1] == "make"
+
+
+CAPACITY_OR_RESTART = pytest.mark.parametrize(
+    "argv", [["capacity", "--max-migrations", "20"], ["restart"]], ids=["capacity", "restart"]
+)
+
+
+def _paused(calls) -> list[str]:
+    return [c["args"][-1] for c in calls if c["cmd"] == "curl" and "/pause" in c["args"][-1]]
+
+
+@CAPACITY_OR_RESTART
+@pytest.mark.parametrize("url", [False, True], ids=["by the port", "with --url"])
+def test_a_port_compose_would_refuse_is_refused_before_the_drain(tmp_path, argv, url):
+    """SDD §17.2 (review RV43A-05): the restart's Compose publishes SEAMLESS_HOST_PORT - a value
+    that is no number it refuses (0.0.0.0:8081 gives "too many colons"). That is refused before the
+    drain, --url or not - the URL the drain uses changes nothing for Compose -, and never advises
+    --url for restart and capacity; nothing is paused or changed, exit 2."""
+    port_env = "POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT=0.0.0.0:8081\n"
+    proc, calls, tree = _run(
+        tmp_path, "docker", *argv, "--drain", "@TOKEN_FILE",
+        *(["--url", "http://127.0.0.1:8080"] if url else []),
+        env_file=port_env, rules=_drain_rules([{"stdout": "[]"}]),
+    )  # fmt: skip
+    assert proc.returncode == 2, proc.stderr
+    assert calls == [], proc.stderr  # no plan listed or paused, no make
+    assert "SEAMLESS_HOST_PORT is '0.0.0.0:8081'" in proc.stderr, proc.stderr
+    assert "or --url" not in proc.stderr, proc.stderr
+    assert (tree / "deploy" / "compose" / ".env").read_text() == port_env
+
+
+@CAPACITY_OR_RESTART
+@pytest.mark.parametrize("missing", [".env", "tokens.yaml"])
+def test_the_files_the_restart_needs_are_checked_before_the_drain(tmp_path, argv, missing):
+    """SDD §17.2 (review RV43A-06): the restart's Make target refuses a missing deploy/compose/.env
+    or tokens.yaml (seamless-check-env); both are checked before the drain - the drain paused every
+    plan and capacity rewrote .env before make refused. Nothing is paused, exit 2."""
+    env = "POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT=8080\n"
+    proc, calls, _ = _run(
+        tmp_path, "docker", *argv, "--drain", "@TOKEN_FILE",
+        env_file=None if missing == ".env" else env, tokens_yaml=missing != "tokens.yaml",
+        rules=_drain_rules([{"stdout": "[]"}]),
+    )  # fmt: skip
+    assert proc.returncode == 2, proc.stderr
+    assert not _paused(calls) and calls == [], (calls, proc.stderr)
+    assert f"deploy/compose/{missing} is missing" in proc.stderr, proc.stderr
+
+
+@CAPACITY_OR_RESTART
+def test_make_missing_is_found_before_the_drain(tmp_path, monkeypatch, argv):
+    """SDD §17.2 (review RV43A-06): make itself was asked for only after the drain."""
+    keep = tmp_path / "keep"
+    keep.mkdir()
+    os.symlink(os.path.realpath(sys.executable), keep / "python3")
+    for tool in ("sh", "bash", "awk", "find", "mktemp", "date", "sed", "grep", "mv", "rm", "cat",
+                 "env", "dirname", "basename", "tr", "sleep", "chmod"):  # fmt: skip
+        found = shutil.which(tool)
+        assert found, tool
+        os.symlink(found, keep / tool)
+    monkeypatch.setattr(sys.modules[__name__], "TOOLS", tuple(t for t in TOOLS if t != "make"))
+    env = "POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT=8080\n"
+    proc, calls, _ = _run(
+        tmp_path, "docker", *argv, "--drain", "@TOKEN_FILE", env_file=env, path=str(keep),
+        rules=_drain_rules([{"stdout": "[]"}]),
+    )  # fmt: skip
+    assert proc.returncode == 2, proc.stderr
+    assert not _paused(calls), proc.stderr
+    assert "make is needed" in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize(("platform", "tool"), [("kubernetes", "kubectl"), ("openshift", "oc")])
+def test_a_cluster_capacity_reads_the_cluster_before_its_drain(tmp_path, platform, tool):
+    """SDD §17.2 (review RV43A-06): a capacity without --cpu or --memory has no dry run, so it asked
+    the cluster nothing before its drain - a mistyped namespace (the drain itself goes to --url) or
+    an expired login showed only after every plan was paused. It reads the Deployment and the
+    ConfigMap first: nothing is paused, exit 2."""
+    rules = [
+        {"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"stdout": RUNNING}]},
+        {"cmd": "curl", "has": ["phase="], "answers": [{"stdout": "[]"}]},
+        {"cmd": tool, "answers": [{"exit": 1}]},  # Error from server (NotFound): namespaces ...
+    ]
+    proc, calls, _ = _run(
+        tmp_path, platform, "capacity", "--max-migrations", "20", "--drain", "@TOKEN_FILE",
+        "--url", CLUSTER_URL, "--namespace", "seamles-migrate", rules=rules,
+    )  # fmt: skip
+    assert proc.returncode == 2, proc.stderr
+    assert not _paused(calls) and not [c for c in calls if c["cmd"] == "curl"], proc.stderr
+    assert "cannot read deployment/seamless in namespace seamles-migrate" in proc.stderr
+
+
+def test_a_failed_make_target_after_a_drain_exits_1_naming_it(tmp_path):
+    """SDD §17.2 (review RV43A-07): exit 2 means a refusal, nothing ran. A restart that fails in
+    its Make target after the drain paused every plan and capacity rewrote .env is a failed step:
+    exit 1, naming the target, not make's own 2."""
+    env = "POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT=8080\n"
+    rules = [*_drain_rules([{"stdout": "[]"}]), {"cmd": "make", "answers": [{"exit": 2}]}]
+    proc, _, tree = _run(
+        tmp_path, "docker", "capacity", "--max-migrations", "20", "--drain", "@TOKEN_FILE",
+        env_file=env, rules=rules,
+    )  # fmt: skip
+    assert "SEAMLESS_MAX_CONCURRENT_MIGRATIONS=20" in (tree / "deploy/compose/.env").read_text()
+    assert proc.returncode == 1, (proc.returncode, proc.stderr)
+    assert "make seamless-restart failed" in proc.stderr, proc.stderr
 
 
 def test_a_pause_that_got_no_answer_is_named_for_resume(tmp_path):
@@ -1325,7 +1441,7 @@ def test_a_capacity_that_would_be_refused_pauses_no_plan(tmp_path, platform, arg
         rules=_drain_rules([{"stdout": "[]"}]),
         cluster=fake_kube.cluster() if platform != "docker" else None,
     )  # fmt: skip
-    assert proc.returncode == 1, proc.stderr
+    assert proc.returncode == 2, proc.stderr  # a refusal: nothing ran (RV43A-07)
     assert says in proc.stderr, proc.stderr
     assert [c for c in calls if c["cmd"] == "curl"] == []  # no plan listed, none paused
     assert _changes(calls) == []

@@ -55,6 +55,10 @@ USAGE
 say() { printf '%s\n' "$*"; }
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 refuse() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+# A check that stops the action: a refusal (2) while nothing changed, a failed step (1) once a drain paused a plan
+# (SDD §17.2, review RV43A-07).
+PAUSED=()
+check_failed() { [ ${#PAUSED[@]} -eq 0 ] || die "$*"; refuse "$*"; }
 bad_usage() { printf '%s: %s\n\n' "$PROG" "$*" >&2; usage >&2; exit 2; }
 
 DRY=0
@@ -77,7 +81,7 @@ run() {
     "$@"
   fi
 }
-need() { [ "$DRY" = 1 ] || command -v "$1" >/dev/null 2>&1 || die "$1 is needed for this action: $2"; }
+need() { [ "$DRY" = 1 ] || command -v "$1" >/dev/null 2>&1 || check_failed "$1 is needed for this action: $2"; }
 is_count() { case $1 in '' | *[!0-9]*) return 1 ;; esac; }
 
 # --- arguments ----------------------------------------------------------------------------------------------
@@ -197,14 +201,21 @@ if [ "$KIND" = host ]; then
   fi
   port=${port:-8080}
   if [ -z "$URL" ] && { [ -n "$DRAIN" ] || [ "$ACTION" = resume ] || [ "$ACTION" = status ]; }; then
+    # restart and capacity end in the restart's Make target, whose Compose publishes this port: --url gets past
+    # nothing there (SDD §17.2, reviews RV42A-04, RV43A-05)
     case $port in
       '?')
         case $ACTION in
-          restart | capacity) die "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value" ;;
-          *) die "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value, or --url" ;;
+          restart | capacity) refuse "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value" ;;
+          *) refuse "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value, or --url" ;;
         esac
         ;;
-      *[!0-9]*) die "SEAMLESS_HOST_PORT is '$port', no port: give a plain number, or --url" ;;
+      *[!0-9]*)
+        case $ACTION in
+          restart | capacity) refuse "SEAMLESS_HOST_PORT is '$port', no port: give a plain number" ;;
+          *) refuse "SEAMLESS_HOST_PORT is '$port', no port: give a plain number, or --url" ;;
+        esac
+        ;;
     esac
   fi
   API=${URL:-http://127.0.0.1:$port}
@@ -240,8 +251,8 @@ open_token() {
 api() { run curl -fsS --max-time 30 "$@"; }
 count_items() { python3 -c 'import json, sys; print(len(json.load(sys.stdin)))'; }
 
-# Pause every running plan, then wait until no migration is in cutover, verifying or rolling_back (SDD §17.2).
-PAUSED=()
+# Pause every running plan, then wait until no migration is in cutover, verifying or rolling_back (SDD §17.2). The plans
+# it paused are named in PAUSED (defined with check_failed).
 drain() {
   local plans ids id phase out busy deadline rc
   if [ "$DRY" = 1 ]; then
@@ -303,7 +314,8 @@ resume_hint() {
 }
 
 # --- the single-host stack: its Make targets (SDD §17.1) --------------------------------------------------------
-target() { run make -C "$ROOT" --no-print-directory "$1" "SEAMLESS_ENGINE=$PLATFORM" ${2+"${@:2}"}; }
+# A Make target that fails is a failed step - exit 1, naming it -, never make's own 2, a refusal's (SDD §17.2, RV43A-07).
+target() { run make -C "$ROOT" --no-print-directory "$1" "SEAMLESS_ENGINE=$PLATFORM" ${2+"${@:2}"} || die "make $1 failed (exit $?)"; }
 
 host_capacity() {
   local env=$ROOT/deploy/compose/.env kv key line tmp settings=()
@@ -440,26 +452,46 @@ capacity_patch() {
   CAP_PATCH="{\"spec\":{\"template\":{$template}}}"
 }
 # What would refuse a capacity, checked before anything changes - and before a drain pauses a plan, so a refused
-# capacity leaves every plan running (SDD §17.2, review RV38B-22): the single host's deploy/compose/.env; a cluster's
-# limits, which the API server refuses below the requests, by a server-side dry run (review RV38B-02).
+# capacity leaves every plan running (SDD §17.2, reviews RV38B-22, RV43A-06): on the single host what its restart
+# needs; on a cluster the Deployment and the ConfigMap read - a mistyped namespace or an expired login shows here -
+# and its limits, which the API server refuses below the requests, by a server-side dry run (review RV38B-02).
 capacity_check() {
   if [ "$KIND" = host ]; then
-    [ -f "$ROOT/deploy/compose/.env" ] || die "deploy/compose/.env is missing: run make seamless-init first"
-    restart_port_readable
+    host_restart_check
   else
     need "$KUBE" "install it and log in to the cluster"
     capacity_patch
-    [ -z "$CAP_LIMITS" ] || kube patch deployment/seamless -p "$CAP_PATCH" --dry-run=server
+    if [ "$DRY" != 1 ]; then
+      "$KUBE" -n "$NS" get deployment/seamless -o name >/dev/null ||
+        check_failed "cannot read deployment/seamless in namespace $NS: nothing was changed"
+      [ -z "$CAP_DATA" ] || capacity_settings_now >/dev/null ||
+        check_failed "cannot read seamless-config in namespace $NS: nothing was changed"
+    fi
+    [ -z "$CAP_LIMITS" ] || kube patch deployment/seamless -p "$CAP_PATCH" --dry-run=server ||
+      check_failed "the API server refuses those limits: nothing was changed"
   fi
 }
-# The single host's restart - capacity's last step - waits on the port its Make target reads, which it refuses when
-# Compose would interpolate it (Makefile's SEAMLESS_DOTENV_STOP); the shell's own port wins there, as here. Checked
-# before a drain, so no plan is paused for a restart that would stop (SDD §17.2, review RV42A-04).
-restart_port_readable() {
-  [ -z "${SEAMLESS_HOST_PORT+set}" ] || return 0
-  sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env" >/dev/null ||
-    die "the restart's Make target cannot read SEAMLESS_HOST_PORT in deploy/compose/.env: give it a plain value;" \
-      "nothing was changed"
+# What the single host's restart - capacity's last step - needs, which its Make target refuses: make, deploy/compose/.env
+# and tokens.yaml (seamless-check-env), and a SEAMLESS_HOST_PORT it reads - one Compose would interpolate it refuses
+# (SEAMLESS_DOTENV_STOP) - and Compose publishes: a plain number; the shell's own port wins there, as here. Checked
+# before a drain, so no plan is paused for a restart that would stop (SDD §17.2, reviews RV42A-04, RV43A-05, RV43A-06).
+host_restart_check() {
+  local value
+  need make "install GNU make"
+  [ -f "$ROOT/deploy/compose/.env" ] || check_failed "deploy/compose/.env is missing: run make seamless-init first"
+  [ -f "$ROOT/deploy/compose/tokens.yaml" ] ||
+    check_failed "deploy/compose/tokens.yaml is missing: run make seamless-init first"
+  if [ -n "${SEAMLESS_HOST_PORT+set}" ]; then
+    value=$SEAMLESS_HOST_PORT
+  else
+    value=$(sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env") ||
+      check_failed "the restart's Make target cannot read SEAMLESS_HOST_PORT in deploy/compose/.env: give it a" \
+        "plain value; nothing was changed"
+  fi
+  case $value in
+    *[!0-9]*) check_failed "SEAMLESS_HOST_PORT is '$value', no port Compose publishes: give a plain number;" \
+      "nothing was changed" ;;
+  esac
 }
 cluster_capacity() {
   if [ -n "$MAX_MIGRATIONS" ] && [ "$MAX_MIGRATIONS" -gt 10 ] && [ -z "$MEMORY" ]; then
@@ -591,7 +623,7 @@ if [ "$ACTION" = resume ]; then
 fi
 if [ -n "$DRAIN" ]; then
   [ "$ACTION" != capacity ] || capacity_check
-  [ "$KIND$ACTION" != hostrestart ] || restart_port_readable
+  [ "$KIND$ACTION" != hostrestart ] || host_restart_check
   drain
 fi
 if [ "$KIND" = host ]; then host; else cluster; fi
