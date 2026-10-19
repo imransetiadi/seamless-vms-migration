@@ -286,6 +286,73 @@ def test_a_disk_whose_size_cannot_be_read_fails_the_export(hypervisor):
     assert hypervisor.nbdkit_disks() is None
 
 
+def test_a_disk_qemu_img_sizes_at_zero_bytes_fails_the_export(hypervisor):
+    """Seamless Migrate SDD 6.6 (upstream intake UP-01, after os-migrate 33aca993e4): an empty or
+    unparsable image qemu-img sizes at 0 bytes is refused before its export - it was recorded with
+    size 0 and the run failed later, at the destination volume's create."""
+    with open(os.path.join(hypervisor.disk_dir, "disk"), "w") as f:
+        f.write("virtual size: 0 B (0 bytes)\n")
+    rc, out = hypervisor.run()
+    assert rc != 0, out
+    assert "cannot read a virtual size above zero" in out, out
+    assert hypervisor.nbdkit_disks() is None
+    assert hypervisor.started() == []
+
+
+def _add_instance(hypervisor, instance_id, name, migration_params=None):
+    """Another SHUTOFF instance on the same hypervisor, its one qcow2 disk recorded in disk.info."""
+    disk_dir = os.path.join(hypervisor.instances, instance_id)
+    os.makedirs(disk_dir)
+    with open(os.path.join(disk_dir, "disk"), "wb") as f:
+        f.write(QCOW2_HEADER)
+    with open(os.path.join(disk_dir, "disk.info"), "w") as f:
+        f.write(json.dumps({os.path.join(disk_dir, "disk"): "qcow2"}) + "\n")
+    with open(hypervisor.workloads) as f:
+        data = yaml.safe_load(f)
+    data["resources"].append({
+        "type": "openstack.compute.Server",
+        "params": {"name": name},
+        "_info": {"id": instance_id, "status": "SHUTOFF", "hypervisor_hostname": "hv-test"},
+        "_migration_params": {"use_nbdkit_direct": True, **(migration_params or {})},
+    })
+    with open(hypervisor.workloads, "w") as f:
+        yaml.safe_dump(data, f)
+    return os.path.join(disk_dir, "disk")
+
+
+def test_two_disks_of_a_run_sharing_a_port_on_one_hypervisor_are_refused(hypervisor):
+    """Seamless Migrate SDD 6.6 (upstream intake UP-04a, after os-migrate f1d254cb8b): srv-1's and
+    srv-2's first disks both took the default base port 10809 on hv-test. The second's start
+    stopped the first's export through the PID file named by that port, and srv-1's recorded URI -
+    naming no export - then served srv-2's disk, which the import copied into srv-1's volume
+    without an error. The second is refused before its export starts; the first stays served."""
+    second = _add_instance(hypervisor, "srv-2", "vm2")
+    rc, out = hypervisor.run()
+    assert rc != 0, out
+    assert "port 10809" in out and "another disk of this run" in out, out
+    started = hypervisor.started()
+    assert second not in [entry["argv"][-1] for entry in started], out
+    first = [e for e in started if e["argv"][-1] == os.path.join(hypervisor.disk_dir, "disk")]
+    assert first and alive(first[0]["pid"]), out  # srv-1's export was never stopped
+
+
+def test_workloads_on_one_hypervisor_with_their_own_base_ports_are_each_exported(hypervisor):
+    """The way out the refusal names: a base port of its own per workload on one hypervisor."""
+    second = _add_instance(hypervisor, "srv-2", "vm2", {"nbdkit_port": 10900})
+    rc, out = hypervisor.run()
+    assert rc == 0, out
+    served = {
+        int(next(a for a in e["argv"] if a.startswith("--port="))[len("--port="):]): e["argv"][-1]
+        for e in hypervisor.started()
+        if alive(e["pid"])
+    }
+    assert served == {
+        10809: os.path.join(hypervisor.disk_dir, "disk"),
+        10810: os.path.join(hypervisor.disk_dir, "disk.eph0"),
+        10900: second,
+    }, out
+
+
 def test_the_format_comes_from_nova_disk_info_never_from_the_disk(hypervisor):
     """SDD §6.6: a raw disk's first block is the guest's. A qcow2 header the guest wrote there must
     not make qemu-nbd, run with sudo, follow a backing file of the guest's choosing."""

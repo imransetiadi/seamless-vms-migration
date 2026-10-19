@@ -31,12 +31,16 @@
     import_from_hypervisor_size_match: >-
       {{ import_from_hypervisor_qemu_img_info.stdout | regex_search('virtual size: [^(]*[(]([0-9]+) bytes[)]', '\1') }}
 
-- name: Refuse a disk whose virtual size cannot be read
+# an empty or unparsable image reads as 0 bytes: refused like an unreadable size (Seamless Migrate SDD 6.6,
+# upstream intake UP-01, after os-migrate 33aca993e4)
+- name: Refuse a disk whose virtual size cannot be read or is zero
   ansible.builtin.assert:
-    that: (import_from_hypervisor_size_match | default([], true) | length) > 0
+    that:
+      - (import_from_hypervisor_size_match | default([], true) | length) > 0
+      - (import_from_hypervisor_size_match | first | int) > 0
     fail_msg: >-
-      cannot read the virtual size of {{ disk_item }} from qemu-img info; a zero-sized
-      destination volume would lose the disk
+      cannot read the virtual size of {{ disk_item }} from qemu-img info, or cannot read a
+      virtual size above zero; a zero-sized destination volume would lose the disk
     quiet: true
 
 - name: Set disk properties
@@ -56,6 +60,28 @@
 - name: Calculate NBD port for this disk
   ansible.builtin.set_fact:
     import_from_hypervisor_nbd_port: "{{ import_from_hypervisor_base_port | int + import_from_hypervisor_disk_index | int }}"
+
+# Two disks of one run on one hypervisor never share a port: the second's start would stop the first's export
+# through the PID file named by the port, and the first VM's recorded URI - naming no export - would serve the
+# second VM's disk, copied into the first VM's volume without an error (Seamless Migrate SDD 6.6, upstream intake
+# UP-04a, after os-migrate f1d254cb8b).
+- name: Refuse a port another disk of this run exports on this hypervisor
+  ansible.builtin.assert:
+    that: >-
+      (import_from_hypervisor_nbd_port | int) not in
+      (import_from_hypervisor_ports_taken[import_from_hypervisor_host] | default([]))
+    fail_msg: >-
+      port {{ import_from_hypervisor_nbd_port }} on {{ import_from_hypervisor_host }} is the export of
+      another disk of this run, which this disk of {{ import_from_hypervisor_instance_id }} would stop:
+      give each workload on one hypervisor its own _migration_params.nbdkit_port, its disks' ports apart
+    quiet: true
+
+- name: Take the port for this run
+  ansible.builtin.set_fact:
+    import_from_hypervisor_ports_taken: >-
+      {{ import_from_hypervisor_ports_taken | combine({import_from_hypervisor_host:
+         (import_from_hypervisor_ports_taken[import_from_hypervisor_host] | default([]))
+         + [import_from_hypervisor_nbd_port | int]}) }}
 
 - name: Set the log and PID files of the export
   ansible.builtin.set_fact:

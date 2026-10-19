@@ -90,7 +90,7 @@ The exports carry whole guest disks, so they are locked down by default:
 | `os_migrate_nbdkit_protocol` | `tcp` | `tcp` or `ssh`, see above |
 | `os_migrate_nbdkit_bind_address` | `127.0.0.1` | address `qemu-nbd` listens on (host variables of the hypervisor win) |
 | `os_migrate_nbdkit_readonly` | `true` | export the disks read-only |
-| `os_migrate_nbdkit_port` | `10809` | port of the first disk (`_migration_params.nbdkit_port` overrides it per workload) |
+| `os_migrate_nbdkit_port` | `10809` | port of the first disk (`_migration_params.nbdkit_port` overrides it per workload); each disk takes it plus its index, and two disks of one run on one hypervisor that would share a port are refused - give each workload on one hypervisor its own `nbdkit_port`, its disks' ports apart |
 | `os_migrate_nbdkit_ssh_user` | `stack` | user in `nbd+ssh://` URIs |
 | `os_migrate_nbdkit_log_dir` | `/var/log/os-migrate-nbd` | private directory for logs and PID files on the hypervisor |
 | `os_migrate_nbdkit_nova_instances_dir` | `/var/lib/nova/instances` | Nova instances directory on the hypervisor |

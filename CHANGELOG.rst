@@ -222,6 +222,19 @@ This project follows a simple changelog to satisfy collection metadata validatio
   (``disk.config``): Nova gives the destination server its own. Disks are
   picked by file name only: an instances path containing ``disk``, any
   character, then ``info`` no longer hides every disk.
+- ``import_from_hypervisor`` refuses a disk ``qemu-img info`` sizes at zero
+  bytes - an empty or unparsable image -, as it refuses one whose size it
+  cannot read: it was recorded with size 0 and the run failed later, at the
+  volume create (after os-migrate 33aca993e4).
+- ``import_from_hypervisor`` refuses two disks of one run on one hypervisor
+  that would share an export port - two workloads with the default base port,
+  each disk taking it plus its index -, at the second, before its export
+  starts. The second stopped the first's export through the PID file named by
+  that port, and the first VM's recorded ``nbd`` URI, which names no export,
+  then served the second VM's disk: the import copied it into the first VM's
+  volume without an error. Give each workload on one hypervisor its own
+  ``_migration_params.nbdkit_port`` (after os-migrate f1d254cb8b, whose
+  run-wide counter this fork does not take).
 - The cold import (``import_workloads``) records its workload for a rollback,
   in the state file the warm path keeps: each volume its transfer creates, as
   soon as Cinder created it and before its data is copied
