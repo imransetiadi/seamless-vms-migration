@@ -249,11 +249,20 @@ class Advisor:
         )
 
     # -- classification ----------------------------------------------------------------------
-    def _describe_vm(self, vm: VMRef) -> str:
-        # rendered from the declared field specs (SDD §13.4, ADV-06)
-        return self._redact(payloads.render_workload(vm), [vm.name])
+    def _describe_vm(
+        self, vm: VMRef, destination_name: str | None = None, destination: str = ""
+    ) -> str:
+        # rendered from the declared field specs, then the strategy question's one pass: secrets,
+        # the VM's name while names are redacted, the destination provider's name by its kind and
+        # series whatever the setting (SDD §13.4, ADV-06, audit AD-09)
+        return self._for_strategy(payloads.render_workload(vm), vm, destination_name, destination)
 
-    async def classify_workloads(self, vms: Sequence[VMRef]) -> tuple[dict[str, str], AdvisorNote]:
+    async def classify_workloads(
+        self,
+        vms: Sequence[VMRef],
+        destination_name: str | None = None,
+        destination: str = "",
+    ) -> tuple[dict[str, str], AdvisorNote]:
         tiers = {vm.source_id: heuristic_tier(vm) for vm in vms}
         if not self.jev_enabled or not vms:
             return tiers, AdvisorNote(
@@ -271,7 +280,7 @@ class Advisor:
             # never leaves; the answer maps back through it
             keys = {f"item-{n}": vm.source_id for n, vm in enumerate(batch, 1)}
             items = [
-                {"id": key, "text": self._describe_vm(vm)}
+                {"id": key, "text": self._describe_vm(vm, destination_name, destination)}
                 for key, vm in zip(keys, batch, strict=True)
             ]
             try:

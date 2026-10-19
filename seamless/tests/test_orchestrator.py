@@ -5348,6 +5348,39 @@ async def test_a_tenants_metadata_value_never_fails_the_whole_validation(tmp_pat
     assert sorted(m.vm.name for m in await h.migrations(plan.id)) == ["web-01", "web-02"]
 
 
+@pytest.mark.parametrize("redact_names", [False, True])
+async def test_auto_waves_never_send_the_destination_providers_name_to_jev(
+    tmp_path, store, redact_names
+):
+    """SDD §13.4 (audit AD-09): the destination provider's name never reaches Jev, whatever
+    SEAMLESS_MEMORY_REDACT_NAMES says. The strategy question replaced it even inside a VM's name;
+    jev_classify's items did not - a VM named after the destination site sent it as it is. The
+    classification replaces it by the destination's kind and series, as the strategy question
+    does, the VM's own name too while names are redacted."""
+    jev_settings = Settings(jev_mode="stdio", memory_redact_names=redact_names)
+    factory, session = session_factory(fixture_responder({}))
+    advisor = Advisor(JevClient(jev_settings, session_factory=factory), jev_settings)
+    h, plan = await setup(tmp_path, store, [vm(1, name="jakarta-dc3-prod-db01")], advisor=advisor)
+    store.put("provider", DST_PROVIDER.model_copy(update={"name": "jakarta-dc3-prod"}))
+    await h.orch.auto_waves(plan.id, 10, "alice")
+    [(_, arguments, _)] = [c for c in session.calls if c[0] == "jev_classify"]
+    sent = json.dumps(arguments)
+    assert "jakarta" not in sent, arguments["items"]
+    [item] = arguments["items"]
+    assert item["text"].startswith("name=[vm] " if redact_names else "name=RHOSO 18.0-db01 ")
+
+
+async def test_auto_waves_need_no_destination_to_name(tmp_path, store):
+    """SDD §13.4 (audit AD-09): the classification names the destination by kind and series; a
+    plan whose destination provider is gone meanwhile has no name to leave either - its waves
+    are planned as before."""
+    advisor, _ = _answering_advisor()
+    h, plan = await setup(tmp_path, store, [vm(1)], advisor=advisor)
+    store.delete("provider", DST_PROVIDER.id)
+    await h.orch.auto_waves(plan.id, 10, "alice")
+    assert (await h.plan(plan.id)).waves
+
+
 async def test_advisor_tie_break_recorded(tmp_path, store):
     """SDD §14.4: the tie is recorded as a recommendation and its decision; the strategy note of
     earlier versions is no longer written."""

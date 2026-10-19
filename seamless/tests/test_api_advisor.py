@@ -302,3 +302,32 @@ def test_an_override_body_is_judged_by_its_model_before_the_recommendation_is_lo
     assert answer.status_code == case["status"], answer.text
     if case["message"] is not None:
         assert answer.json()["error"]["message"] == case["message"]
+
+
+@pytest.mark.parametrize("index", ["\u00b2", "\u0663", "00", "+0", " 0"])
+def test_a_legacy_id_whose_index_is_no_plain_number_is_unknown(api, index):
+    """SDD §12 (audit AD-07): a legacy entry's id ends in its index, a plain decimal number; the
+    index was read with str.isdigit, True for a superscript two that int() then refused - an
+    unhandled 500 - and an Arabic-Indic three or a leading zero named an entry under a second id.
+    Any other index is an unknown id: 404."""
+    from seamless_migrate.domain.models import AdvisorNote
+
+    api.store.put(
+        "migration",
+        make_migration(
+            id="mig-0000000001",
+            plan_id="plan-1",
+            vm=make_vm(name="web-01", source_id="src-1"),
+            advisor_notes=[
+                AdvisorNote(
+                    kind="strategy",
+                    source="jev",
+                    summary="Jev suggested warm",
+                    data={"selected": "warm", "deterministic": "cold"},
+                )
+            ],
+        ),
+    )
+    url = "/api/v1/advisor/recommendations/rec-legacy-mig-0000000001-"
+    assert api.get(url + "0").json()["legacy"] is True
+    assert api.get(url + index).status_code == 404

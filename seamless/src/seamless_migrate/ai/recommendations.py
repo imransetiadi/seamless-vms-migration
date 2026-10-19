@@ -92,7 +92,11 @@ def legacy_by_id(rec_id: str, migration: Migration) -> AdvisorRecommendation | N
     """The legacy entry ``rec-legacy-<migration id>-<index>`` of ``migration``, if it exists."""
     _, _, index = rec_id.removeprefix(LEGACY_PREFIX).rpartition("-")
     entries = legacy_recommendations(migration)
-    if not index.isdigit() or int(index) >= len(entries):
+    # a plain decimal number, as the id was written: str.isdigit takes "²", which int() refuses,
+    # and an Arabic-Indic digit or a leading zero would name an entry twice (SDD §12, audit AD-07)
+    if not (index.isascii() and index.isdecimal()) or str(int(index)) != index:
+        return None
+    if int(index) >= len(entries):
         return None
     return entries[int(index)]
 

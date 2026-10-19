@@ -1308,7 +1308,16 @@ class Orchestrator:
         }
         vms = await self._vms(plan, self.providers.get(source), existing)
         if self.advisor is not None:
-            tiers, note = await self.advisor.classify_workloads(vms)
+            # the destination by kind and series: its provider's name never leaves for Jev
+            # (SDD §13.4, audit AD-09); one gone meanwhile has no name to leave
+            try:
+                destination = await self._provider(
+                    plan.destination_provider_id, ProviderRole.destination
+                )
+                named = (destination.label, destination_descriptor(destination))
+            except BadRequest:
+                named = (None, "")
+            tiers, note = await self.advisor.classify_workloads(vms, *named)
         else:
             tiers = {vm.source_id: heuristic_tier(vm) for vm in vms}
             note = AdvisorNote(
