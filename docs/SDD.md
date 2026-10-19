@@ -4052,8 +4052,10 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   (§13.1); the API is `http://127.0.0.1:<SEAMLESS_HOST_PORT>` on the single host - the port Compose publishes:
   the shell's, else
   `deploy/compose/.env`'s, else 8080, the file read by Compose's dotenv rules (a leading
-  byte-order mark ignored, an `export ` prefix, a key ended by `=` or `:`, spaces around it, quotes, an inline comment
-  after ` #` in an unquoted value, the last definition wins - reviews RV41A-01, RV41A-03); a value Compose would
+  byte-order mark ignored, an `export ` prefix, a key ended by `=` or `:`, white space around it and the value - the
+  Latin-1 white space compose-go trims: the space, tab, vertical tab, form feed, carriage return, NEL and the no-break
+  space -, quotes, a statement after a closing quote read as the next assignment, an inline comment after ` #` in an
+  unquoted value, the last definition wins - reviews RV41A-01, RV41A-03, RV42A-05); a value Compose would
   interpolate - a `$` in an unquoted or double-quoted value - is refused, never guessed: the script and the Make
   targets that use the value stop and name it (review RV41A-02). So the token never goes to a port the stack does not
   publish (review RV38B-07); the Make targets read `SEAMLESS_HOST_PORT` and `SEAMLESS_VERSION` the same way
