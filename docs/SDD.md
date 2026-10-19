@@ -218,6 +218,9 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
    derived (properties, also serialized): disk_bytes: int, used_bytes: int, guest_os: GuestOS
    (used_bytes = Σ used_gb·2^30 when every disk has used_gb, else ⌊disk_bytes·0.6⌋;
     guest_os = identify(os_type), §9.5)
+   free text: a NUL or a lone surrogate in tags and flavor_extra_specs (keys and values), os_type or host
+   is written U+FFFD as the model is built - no export filter or mapping reads them -; name, project,
+   flavor, a NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02)
 
 GuestOS { family: "linux"|"windows"|"unknown", distro: str|null, version: str|null, label: str,
           lifecycle: "current"|"legacy"|"unknown",
@@ -2554,9 +2557,12 @@ whose document data - its keys and values at any depth - or whose event - its me
 is kept. A name, a map's key, an actor a later comparison reads and a snapshot's digested content are stored as
 given or not at all (reviews ST-03, ST-04, RV48-04, RV48-05, RV48-08). What the control plane is given stops before
 that refusal: a request body holding either is refused before its route runs (§12), the tokens file refuses such a
-name (§13.1), and the text it takes from outside sources passes `redact`, which writes either as U+FFFD (§13.4).
-What reaches it is a source cloud's name holding one - Neutron's names are free strings, Nova's and vSphere's cannot
-hold one -, whose write fails naming the field rather than keep a name the source does not have. No stored id or
+name (§13.1), and the text it takes from outside sources passes `redact`, which writes either as U+FFFD
+(§13.4) - as every string of Jev's answers does (§14.1), and a source VM's free text that no export filter or
+mapping reads, its tags and flavor extra specs, keys and values, its `os_type` and `host` (§4.2; review RV49-02).
+What reaches it is a name a cutover reads - a VM's, a project's, a flavor's, a network's, a volume type's - holding
+one, which Nova's server and flavor names and vSphere's cannot, a Neutron network's can: its write fails naming the
+field rather than keep a name the source does not have. No stored id or
 field then holds either, so a lookup, a delete or a filter by a value holding one finds nothing without sending it.
 Nor does `events` send a seq outside `events.seq`'s range, 1 to 2^31 - 1: a `since_seq` at or beyond its end answers
 nothing and one below 0 reads as 0, a `before_seq` beyond its end reads as no bound and one at or below 1 answers
@@ -2588,8 +2594,10 @@ added, at any depth (§11).
 A request body holding a NUL character or a lone surrogate in a string - a key or a value, at any depth - is refused
 with 422 (`validation_error`, naming where: `mappings.networks: a key holds a NUL character`) once the caller's
 token and role are checked, before the route runs, so no route writes part of it (the store keeps neither, §11;
-reviews RV48-07, RV48-08). When the store refuses a value a route writes (`UnstorableValue`, §11: a source cloud's
-name holding one), the route answers 422 `validation_error` with the store's message.
+reviews RV48-07, RV48-08); it walks the body without recursion, so a body nested however deep is answered as its
+route answers it, never with a 500 (review RV49-05). When the store refuses a value a route writes
+(`UnstorableValue`, §11: a source cloud's name holding one), the route answers 422 `validation_error` with the
+store's message.
 Authentication: `Authorization: Bearer <token>` (§13).
 A request body holds at most 1 MiB (1,048,576 bytes). A larger `Content-Length`, or a chunked body
 that grows past it, is refused with 413 before the body is parsed: the framework parses a route's
@@ -2876,8 +2884,8 @@ agents write too - redacted as they arrive, title and content, before anything c
 `POST /advisor/similar-incidents` answers, and the `similar_incidents` a recommendation and a failure's note keep
 (§14.3, §14.4; audit AP-05).
 `redact` also writes each NUL and each lone surrogate as U+FFFD, the replacement character, so such text is kept
-wherever it goes (§11); Jev's reasons (§14.4), text from an outside service too, pass that replacement as they
-arrive.
+wherever it goes (§11); every string of Jev's answers - its reasons (§14.4) among them -, text from an outside
+service too, passes that replacement as it arrives (§14.1).
 Where it cuts such text, it redacts first,
 over the cut plus 16384 characters, and cuts after (`redact_cut(text, limit)`): a secret the cut splits
 — a PEM block, a URL with credentials — is still found, at a bounded cost. The cuts: a `migration.log`
@@ -2952,6 +2960,15 @@ fixtures live in `seamless/tests/fixtures/jev_*_response.json`):
 | `jev_classify` | `results[] {id, classification, confidence, margin, decision: "auto"\|"review", status?}` |
 | `jev_verify` | `results[] {id, claim, verdict: "verified"\|"contradicted"\|"unsupported", confidence, action: "auto"\|"review"}`, `summary` |
 | `jev_screen` | `recommendation.action: "pass"\|"review"\|"block"\|"skip"`, `recommendation.reason`, `probabilities.injection` |
+
+An answer is checked as it arrives (audit AD-01, AD-02; reviews RV49-01, RV49-06). `parse_result` refuses text that
+is no JSON object, or JSON holding `NaN` or `Infinity`, which no JSON number is, as an invalid response
+(`JevUnavailable`), and writes every string of the answer - keys and values, at any depth - with its NUL and lone
+surrogates as U+FFFD, so no answer stalls the write that keeps it (§11, §13.4). A field of another shape than the
+table's - a `recommendation` that is no object; a `selected`, `status` or `model` that is no string; `probabilities`
+that is no object; a `confidence` that is no number from 0 to 1, a JSON `true` none either; `results` that is no
+list, or a result that is no object - makes the answer `invalid_response`: the strategy question falls back to the
+rules (§14.4 rule 2), and a classification's items to the heuristic (§14.2).
 
 ### 14.2 Advisor (`ai/advisor.py`)
 
@@ -3143,7 +3160,8 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
 * **Approve** and **override** (`advisor.approve`) act on the migration's newest stored recommendation while the
   migration is `pending`, `blocked` or `ready`: approve → `approved`, final = the recommended option, which must
   be usable and eligible now; override → `overridden`, final = the chosen eligible option, `reason_text` = the
-  reason (required, at least 10 characters, when the policy in force says so — the API refuses with 422, not only
+  reason (required, at least 10 characters - code points, an emoji one, the dashboard counting as the API does (audit
+  AD-10) - when the policy in force says so — the API refuses with 422, not only
   the dashboard). Eligible is judged at the request, as `PUT …/strategy` judges it (§12): a Retry does not
   re-assess the estimates the last validation stored, so `storage_handover` is not eligible while the migration
   holds the destination volumes an earlier attempt created (§9.2) — an approve of it is refused with 409, an
