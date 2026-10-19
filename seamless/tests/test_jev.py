@@ -214,3 +214,36 @@ def test_parse_result_rejects_camel_case_errors_and_non_objects():
     with pytest.raises(JevUnavailable, match="no text content"):
         parse_result(NS(content=[]))
     assert parse_result(NS(content=[NS(text='{"status": "ok"}')])) == {"status": "ok"}
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_an_answer_holding_nan_or_infinity_is_an_invalid_response(constant):
+    """SDD §14.1 (audit AD-02): json.loads reads NaN and Infinity, which no JSON number is - a
+    confidence of NaN passed every threshold, and PostgreSQL's JSONB refuses the value. An answer
+    holding one is an invalid response, as any other text that is no JSON."""
+    from seamless_migrate.ai.jev import parse_result
+
+    text = '{"recommendation": {"selected": "warm", "confidence": ' + constant + "}}"
+    with pytest.raises(JevUnavailable, match="invalid response"):
+        parse_result(tool_result(text))
+
+
+def test_every_string_of_an_answer_arrives_without_nul_or_lone_surrogates():
+    """SDD §11, §14.1 (reviews RV49-01, RV49-06): Jev's screen reason, verify results and decide
+    model reached the store as sent - a NUL, or the lone half of an emoji a JavaScript service cut
+    through, refused the verifying save on every attempt or left a hold on a recommendation never
+    stored. Every string of an answer, keys and values at any depth, arrives with them written
+    U+FFFD; an emoji whole stays itself."""
+    from seamless_migrate.ai.jev import parse_result
+
+    text = (
+        '{"recommendation": {"reason": "booted\\u0000 \\ud83d", "action": "pass"}, '
+        '"results": [{"claim": "up\\u0000", "k\\u0000": ["\\udc00", "\\ud83d\\ude00"]}], '
+        '"model": "jev-1.13.0\\ud83d", "n": 0.5}'
+    )
+    assert parse_result(tool_result(text)) == {
+        "recommendation": {"reason": "booted� �", "action": "pass"},
+        "results": [{"claim": "up�", "k�": ["�", "\U0001f600"]}],
+        "model": "jev-1.13.0�",
+        "n": 0.5,
+    }

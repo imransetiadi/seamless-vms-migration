@@ -96,6 +96,15 @@ def _check_state(check: dict[str, Any]) -> str:
     return "ok" if check.get("ok") else "FAILED"
 
 
+def _probability(value: Any) -> float | None:
+    """``value`` when it is a probability - a real number from 0 to 1, never a bool -, else
+    ``None`` (SDD §4.2, §14.1, audit AD-02)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    return number if 0.0 <= number <= 1.0 else None
+
+
 class Advisor:
     def __init__(self, jev: JevClient | None, settings: Settings) -> None:
         self.jev = jev
@@ -205,20 +214,34 @@ class Advisor:
             response = await self.jev.decide(**request)
         except JevUnavailable as exc:
             return Advice(option=None, confidence=None, unavailable=str(exc), **base)
-        rec = response.get("recommendation") or {}
+        raw = response.get("recommendation")
+        rec = raw if isinstance(raw, dict) else {}
         selected = rec.get("selected")
         confidence = rec.get("confidence")
-        probabilities = rec.get("probabilities") or {}
+        probabilities = rec.get("probabilities")
+        status = rec.get("status") or response.get("status")
         model = response.get("model")
+        # SDD §14.1 (audit AD-01, AD-02): a field of another shape than the tool's, or a
+        # confidence that is no probability, makes the answer invalid_response - it falls back
+        # (§14.4 rule 2) instead of raising out of the validation or passing a threshold
+        malformed = (
+            (raw is not None and not isinstance(raw, dict))
+            or (selected is not None and not isinstance(selected, str))
+            or (confidence is not None and _probability(confidence) is None)
+            or (probabilities is not None and not isinstance(probabilities, dict))
+            or (status is not None and not isinstance(status, str))
+            or (model is not None and not isinstance(model, str))
+        )
+        distribution = probabilities if isinstance(probabilities, dict) else {}
         # jev_decide gives no reasons today; any it gives are checked against the evidence (ADV-02)
         reasons = rec.get("reasons", response.get("reasons"))
         return Advice(
             option=selected if isinstance(selected, str) else None,
-            confidence=float(confidence) if isinstance(confidence, int | float) else None,
+            confidence=_probability(confidence),
             distribution={
-                k: float(v) for k, v in probabilities.items() if isinstance(v, int | float)
+                k: p for k, v in distribution.items() if (p := _probability(v)) is not None
             },
-            status=rec.get("status") or response.get("status"),
+            status="invalid_response" if malformed else status,
             escaped=bool(rec.get("escaped")),
             model_version=model if isinstance(model, str) else None,
             reasons=tuple(reasons) if isinstance(reasons, list) else (),
@@ -258,7 +281,18 @@ class Advisor:
             except JevUnavailable as exc:
                 errors.append(str(exc))
                 continue
-            for result in response.get("results") or []:
+            results = response.get("results")
+            if results is None:
+                results = []
+            if not isinstance(results, list):
+                # SDD §14.1 (audit AD-01): an answer of another shape - its items keep the heuristic
+                errors.append("invalid response: results is no list")
+                continue
+            if not all(isinstance(result, dict) for result in results):
+                errors.append("invalid response: a result is no object")
+            for result in results:
+                if not isinstance(result, dict):
+                    continue  # its item keeps the heuristic (§14.1)
                 rid = keys.get(str(result.get("id")))
                 tier = result.get("classification")
                 if (

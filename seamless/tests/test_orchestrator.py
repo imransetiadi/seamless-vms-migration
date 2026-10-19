@@ -70,7 +70,7 @@ from seamless_migrate.providers.base import ProviderError
 from seamless_migrate.store import ConflictError, NotFound, Store, UnstorableValue
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_vm
-from tests.jev_fakes import fixture_responder, load_fixture, session_factory
+from tests.jev_fakes import fixture_responder, load_fixture, session_factory, tool_result
 from tests.orch_support import (
     DST_PROVIDER,
     SRC_PROVIDER,
@@ -5172,6 +5172,146 @@ def _recommendations(store) -> list[AdvisorRecommendation]:
 
 def _audit(store) -> list[Event]:
     return store.events(since_seq=0, limit=1000, kinds=AUDIT_KINDS)
+
+
+def _answering_advisor(**answers):
+    """A Jev that answers each tool with ``answers[tool]``: a payload, or a responder of its
+    arguments; the others with their recorded fixtures."""
+    jev_settings = Settings(jev_mode="stdio")
+    factory, session = session_factory(fixture_responder(answers))
+    return Advisor(JevClient(jev_settings, session_factory=factory), jev_settings), session
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"recommendation": {"selected": "warm", "confidence": 0.9, "status": ["escalate"]}},
+        {"recommendation": {"selected": "warm", "confidence": 0.9, "probabilities": ["warm"]}},
+        {"recommendation": "warm"},
+        {"recommendation": {"selected": ["warm"], "confidence": 0.9}},
+        {"recommendation": {"selected": "warm", "confidence": 0.9}, "model": 1},
+    ],
+    ids=["status-a-list", "probabilities-a-list", "a-string", "selected-a-list", "model-a-number"],
+)
+async def test_a_strategy_answer_of_another_shape_falls_back_to_the_rules(tmp_path, store, answer):
+    """SDD §14.1, §14.4 rule 2 (audit AD-01): Jev is an outside service. An answer of another
+    shape - a list where a string goes, a string where an object goes - raised out of the
+    validation, a 500 for every validation while Jev answered so. It is invalid_response: the
+    validation records fallback_rules and keeps the deterministic option."""
+    advisor, _ = _answering_advisor(decide=answer)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (rec.decision.status, m.strategy) == (DecisionStatus.fallback_rules, Strategy.cold)
+    assert "invalid_response" in (rec.decision.reason_text or ""), rec.decision.reason_text
+
+
+@pytest.mark.parametrize(
+    ("answer", "error"),
+    [
+        ({"results": ["item-1"]}, ["invalid response: a result is no object"]),
+        (
+            {"results": {"item-1": {"classification": "stateless_web"}}},
+            ["invalid response: results is no list"],
+        ),
+        ({"results": [{"id": "item-1", "classification": ["db"], "decision": "auto"}]}, []),
+    ],
+    ids=["a-result-a-string", "results-a-mapping", "a-classification-a-list"],
+)
+async def test_a_classification_answer_of_another_shape_falls_back_to_the_heuristic(
+    tmp_path, store, answer, error
+):
+    """SDD §14.1, §14.2 (audit AD-01): a result that is no object, or a classification that is no
+    tier, raised out of auto-waves; such an answer's items take the heuristic's tier, the note
+    names the invalid response, and the waves are planned."""
+    advisor, _ = _answering_advisor(classify=answer)
+    h, plan = await setup(tmp_path, store, [vm(1)], advisor=advisor)
+    await h.orch.auto_waves(plan.id, 10, "alice")
+    assert (await h.plan(plan.id)).waves
+    events = store.events(since_seq=0, limit=1000, kinds=["advisor.classification"])
+    assert [(e.data["fallback"], e.data["errors"]) for e in events] == [(["vm-1"], error)]
+
+
+@pytest.mark.parametrize("confidence", ["NaN", "Infinity", "true", "1.5", "-0.1"])
+async def test_a_confidence_that_is_no_probability_is_never_applied(tmp_path, store, confidence):
+    """SDD §4.2, §14.1, §14.4 (audit AD-02): a confidence is a number from 0 to 1, the only number
+    compared with a threshold. NaN, Infinity, a JSON true and 1.5 all passed 'confidence <
+    threshold' and the global default applied Jev's option; such an answer falls back."""
+    decide = load_fixture("decide")
+    decide["recommendation"].update(selected="warm", confidence=0.25)
+    text = json.dumps(decide).replace('"confidence": 0.25', f'"confidence": {confidence}')
+    assert f'"confidence": {confidence}' in text
+    advisor, _ = _answering_advisor(decide=lambda arguments: tool_result(text))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (rec.decision.status, m.strategy) == (DecisionStatus.fallback_rules, Strategy.cold)
+
+
+@pytest.mark.parametrize("bad", ["\x00", "\ud83d"], ids=["nul", "lone-surrogate"])
+async def test_a_jev_model_name_never_holds_a_migration_for_a_missing_recommendation(
+    tmp_path, store, bad
+):
+    """SDD §11, §14.1 (review RV49-06): Jev's model name went into the recommendation as sent; with
+    a NUL or a lone surrogate the recommendation's write was refused after the migration's, which
+    it already held: approve answered 404 and the strategy could not change. The answer's strings
+    arrive replaced, so the recommendation is stored and approvable."""
+    decide = load_fixture("decide")
+    decide["recommendation"].update(selected="warm", confidence=0.99)
+    decide["model"] = "jev-1.13.0" + bad
+    advisor, _ = _answering_advisor(decide=decide)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    [rec] = _recommendations(store)
+    assert (m.advisor_hold, rec.model.version) == (rec.id, "jev-1.13.0�")
+    approved = await h.orch.approve_recommendation(rec.id, "rina")
+    assert approved.decision.status == DecisionStatus.approved
+
+
+@pytest.mark.parametrize(
+    ("where", "bad"),
+    [("screen", "\x00"), ("screen", "\ud83d"), ("verify", "\x00"), ("verify", "\ud83d")],
+    ids=["screen-nul", "screen-lone", "verify-nul", "verify-lone"],
+)
+async def test_a_jev_verification_answer_never_stalls_a_cut_over_migration(
+    tmp_path, store, where, bad
+):
+    """SDD §11, §14.1 (review RV49-01): Jev's screen reason and verify results went into the
+    migration's advisor note as sent; with a NUL or a lone surrogate the verifying save was refused
+    on every attempt - the driver crashed, resumed, verified and crashed again, the cut-over VM
+    (source stopped) never completing. The answer's strings arrive replaced: it completes."""
+    jev_settings = Settings(jev_mode="stdio", jev_deployment="on_prem")
+    answers: dict = {"screen": {"recommendation": {"action": "pass", "reason": "ok"}}}
+    if where == "screen":
+        answers["screen"] = {
+            "recommendation": {"action": "pass", "reason": f"booted to a login prompt {bad}"}
+        }
+    else:
+        verify = load_fixture("verify")
+        verify["results"][0]["claim"] = f"The guest operating system finished booting {bad}"
+        answers["verify"] = verify
+    factory, _ = session_factory(fixture_responder(answers))
+    advisor = Advisor(JevClient(jev_settings, session_factory=factory), jev_settings)
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold}, advisor=advisor
+    )
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    try:
+        await h.wait_phase(mid, P.completed, P.failed, timeout=5.0)
+    except AssertionError:
+        pass
+    finally:
+        crashes = h.orch._driver_crashes.get(mid, (0, 0.0))[0]
+        await h.orch.stop()
+    errors = [e for e in h.store.events(since_seq=0, limit=10000) if e.kind == "migration.error"]
+    assert ((await h.migration(mid)).phase, crashes, errors) == (P.completed, 0, [])
 
 
 async def test_advisor_tie_break_recorded(tmp_path, store):
