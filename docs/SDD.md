@@ -3897,7 +3897,8 @@ tests/unit/test_warm_playbooks.py             tests/perf/bench_blocksync.py
 seamless/ (pyproject.toml, Containerfile, src/seamless_migrate/…, tests/…)
 dashboard/ (package.json, src/…, design-system/…, e2e/…)
 deploy/openshift/   deploy/openshift/backup/   deploy/kubernetes/   deploy/compose/   tests/e2e/
-scripts/compose-init.sh   scripts/seamless-ctl.sh   scripts/check-readonly-runtime.sh   scripts/collection-sanity.sh   scripts/vendor-openstack-cloud.sh
+scripts/compose-init.sh   scripts/seamless-ctl.sh   scripts/dotenv-value.sh   scripts/check-readonly-runtime.sh
+scripts/collection-sanity.sh   scripts/vendor-openstack-cloud.sh   scripts/image-dashboard.sh
 .github/workflows/{ci,codeql}.yml   .github/dependabot.yml   .pre-commit-config.yaml   .gitleaks.toml   .gitleaks-tree.toml
 .dockerignore   seamless/.containerignore   RELEASING.md   NOTICE   CONTRIBUTING.md   SECURITY.md   CODE_OF_CONDUCT.md   CONTRIBUTORS.md   CODEOWNERS
 docs/advisor/   docs/audits/   docs/UI-UX-AUDIT-2026-10-15.md   AUDIT-UI-UX-BY-GEMINI.md
