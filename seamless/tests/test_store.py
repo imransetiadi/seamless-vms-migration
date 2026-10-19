@@ -8,7 +8,15 @@ import pytest
 import sqlalchemy as sa
 
 from seamless_migrate.domain.enums import Phase, PlanStatus, Role
-from seamless_migrate.domain.models import Event, Mappings, Migration, Nic, Plan, Provider
+from seamless_migrate.domain.models import (
+    AdvisorNote,
+    Event,
+    Mappings,
+    Migration,
+    Nic,
+    Plan,
+    Provider,
+)
 from seamless_migrate.events import AUDIT_KINDS
 from seamless_migrate.security.auth import DashboardUser
 from seamless_migrate.store import ConflictError, NotFound, Store, UnstorableValue, events
@@ -789,6 +797,35 @@ def test_the_store_refuses_nul_and_lone_surrogates_and_finds_nothing_by_one(
     assert any_store.events(migration_id=f"m{bad}") == []
     assert any_store.events(kinds=[f"plan.created{bad}"]) == []
     assert not [v for v in sent if _unstorable_sent(v)], [v for v in sent if _unstorable_sent(v)]
+
+
+@pytest.mark.parametrize(
+    ("bad", "what"),
+    [(float("nan"), "NaN"), (float("inf"), "an infinity"), (float("-inf"), "an infinity")],
+    ids=["nan", "infinity", "-infinity"],
+)
+def test_the_store_refuses_nan_and_the_infinities_naming_the_field(
+    any_store: Store, bad: float, what: str
+):
+    """SDD §11 (review RV50-04): PostgreSQL's JSONB holds no NaN and no infinity, which Python's
+    json writes as NaN and Infinity and SQLite keeps - a verification note's confidence of inf
+    failed the verifying save on PostgreSQL only. A write whose document or event holds one is
+    refused on every backend before any statement, naming the field, and nothing of it is kept."""
+    note = AdvisorNote(kind="verification", source="jev", summary="s", confidence=bad)
+    m = make_migration(advisor_notes=[note])
+    with pytest.raises(UnstorableValue) as refused:
+        any_store.put("migration", m, expected_version=0)
+    assert str(refused.value) == (
+        f"migration {m.id}: advisor_notes.0.confidence: is {what}, which the store cannot keep"
+    )
+    with pytest.raises(NotFound):
+        any_store.get("migration", m.id, Migration)
+    with pytest.raises(UnstorableValue, match=rf"^plan\.created event: data\.hits\.0: is {what},"):
+        any_store.append_event(Event(kind="plan.created", data={"hits": [bad]}))
+    assert any_store.events() == []
+    # an integer of any length is a JSON number, kept as it is
+    any_store.append_event(Event(kind="plan.created", data={"bytes": 10**30}))
+    assert [e.data for e in any_store.events()] == [{"bytes": 10**30}]
 
 
 def test_the_unstorable_walk_reads_a_value_nested_however_deep():

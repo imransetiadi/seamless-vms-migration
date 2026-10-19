@@ -316,7 +316,9 @@ async def _refuse_unstorable_body(request: Request) -> None:
         body = await request.json()
     except (ValueError, RecursionError):  # no body, none in JSON or past the parser: the route's
         return
-    found = unstorable(body)
+    # a number is its route's to check - an estimator override's NaN is a 400 (§9.1) -, and the
+    # store refuses one no route checks (§11, review RV50-04)
+    found = unstorable(body, numbers=False)
     if found is not None:
         where, what = found
         raise ApiError(422, "validation_error", f"{where}: {what}" if where else what)

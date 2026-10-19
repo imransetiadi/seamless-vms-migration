@@ -1758,14 +1758,22 @@ async def test_validate_refuses_invalid_verification_settings(tmp_path, store):
 
 
 async def test_validate_refuses_an_infinite_link_bps(tmp_path, store):
-    """A stored plan with link_bps = inf (written before the API check) still loads, and
-    validation refuses it instead of estimating every transfer as instant (SDD §9.1)."""
+    """A stored plan with link_bps = inf (written on SQLite before the API check, which the store
+    now refuses too, SDD §11) still loads, and validation refuses it instead of estimating every
+    transfer as instant (SDD §9.1)."""
+    import sqlalchemy as sa
+
     from seamless_migrate.domain.models import Plan
+    from seamless_migrate.store import documents
 
     h, plan = await setup(tmp_path, store, [vm(1)])
-    current = store.get("plan", plan.id, Plan)
-    current.link_bps = float("inf")
-    store.put("plan", current)
+    data = {**store.get("plan", plan.id, Plan).model_dump(mode="json"), "link_bps": float("inf")}
+    with store.engine.begin() as conn:  # as an earlier version wrote it: Infinity in the JSON
+        conn.execute(
+            sa.update(documents)
+            .where(documents.c.kind == "plan", documents.c.id == plan.id)
+            .values(data=data)
+        )
     assert store.get("plan", plan.id, Plan).link_bps == float("inf")
     with pytest.raises(BadRequest, match="link_bps must be a finite positive number"):
         await h.orch.validate_plan(plan.id, "alice")
@@ -5207,8 +5215,23 @@ def _answering_advisor(**answers):
         {"recommendation": "warm"},
         {"recommendation": {"selected": ["warm"], "confidence": 0.9}},
         {"recommendation": {"selected": "warm", "confidence": 0.9}, "model": 1},
+        # a status that is falsy is no absent one (review RV50-03)
+        *(
+            {"recommendation": {"selected": "warm", "confidence": 0.99, "status": status}}
+            for status in ([], {}, 0, False)
+        ),
     ],
-    ids=["status-a-list", "probabilities-a-list", "a-string", "selected-a-list", "model-a-number"],
+    ids=[
+        "status-a-list",
+        "probabilities-a-list",
+        "a-string",
+        "selected-a-list",
+        "model-a-number",
+        "status-an-empty-list",
+        "status-an-empty-map",
+        "status-zero",
+        "status-false",
+    ],
 )
 async def test_a_strategy_answer_of_another_shape_falls_back_to_the_rules(tmp_path, store, answer):
     """SDD §14.1, §14.4 rule 2 (audit AD-01): Jev is an outside service. An answer of another
@@ -5250,11 +5273,16 @@ async def test_a_classification_answer_of_another_shape_falls_back_to_the_heuris
     assert [(e.data["fallback"], e.data["errors"]) for e in events] == [(["vm-1"], error)]
 
 
-@pytest.mark.parametrize("confidence", ["NaN", "Infinity", "true", "1.5", "-0.1"])
+@pytest.mark.parametrize(
+    "confidence",
+    ["NaN", "Infinity", "true", "1.5", "-0.1", "1" + "0" * 400, "-1" + "0" * 400, "1e999"],
+    ids=["NaN", "Infinity", "true", "1.5", "-0.1", "400-digits", "-400-digits", "1e999"],
+)
 async def test_a_confidence_that_is_no_probability_is_never_applied(tmp_path, store, confidence):
-    """SDD §4.2, §14.1, §14.4 (audit AD-02): a confidence is a number from 0 to 1, the only number
-    compared with a threshold. NaN, Infinity, a JSON true and 1.5 all passed 'confidence <
-    threshold' and the global default applied Jev's option; such an answer falls back."""
+    """SDD §4.2, §14.1, §14.4 (audit AD-02, review RV50-03): a confidence is a number from 0 to 1,
+    the only number compared with a threshold. NaN, Infinity, a JSON true and 1.5 all passed
+    'confidence < threshold' and the global default applied Jev's option; an integer of 400
+    digits raised OverflowError out of the validation. Such an answer falls back."""
     decide = load_fixture("decide")
     decide["recommendation"].update(selected="warm", confidence=0.25)
     text = json.dumps(decide).replace('"confidence": 0.25', f'"confidence": {confidence}')
@@ -8817,3 +8845,101 @@ async def test_jev_reasons_that_name_no_evidence_key_are_dropped_and_logged(
         ("downtime_estimate", "The warm estimate fits the SLO.")
     ]
     assert any("licence" in message for message in caplog.messages)
+
+
+def _stored_json(store: Store, kind: str, doc_id: str) -> object:
+    """A document as the store wrote it, read as JSON that holds no NaN or infinity - what
+    PostgreSQL's JSONB takes (SDD §11)."""
+    import sqlalchemy as sa
+
+    def refuse(name: str) -> object:
+        raise ValueError(f"{name} is no JSON number")
+
+    with store.engine.connect() as conn:
+        raw = conn.execute(
+            sa.text("SELECT CAST(data AS TEXT) FROM documents WHERE kind = :k AND id = :i"),
+            {"k": kind, "i": doc_id},
+        ).scalar_one()
+    return json.loads(raw, parse_constant=refuse)
+
+
+@pytest.mark.parametrize(
+    ("literal", "summary"),
+    [
+        ("1e999", "invalid response"),
+        ("-1e999", "invalid response"),
+        ("1" + "0" * 400, "Boot verified"),
+    ],
+    ids=["1e999", "-1e999", "400-digits"],
+)
+async def test_a_jev_verification_number_past_a_float_never_reaches_the_store(
+    tmp_path, store, literal, summary
+):
+    """SDD §11, §14.1 (reviews RV50-03, RV50-04): json.loads reads the literal 1e999 as an
+    infinity, with no NaN or Infinity token: a verify answer whose claims carried it gave the
+    migration's note the confidence inf, which SQLite kept as Infinity and PostgreSQL's JSONB
+    refuses - the verifying save of the cut-over VM would fail there on every attempt. Such an
+    answer is an invalid response; a claim's confidence of 400 digits, which no float holds, is
+    no probability and counts for none. The cut-over VM completes, and its document is JSON
+    PostgreSQL takes."""
+    verify = load_fixture("verify")
+    for result in verify["results"]:
+        result["confidence"] = 0.25
+    text = json.dumps(verify).replace('"confidence": 0.25', f'"confidence": {literal}')
+    assert text.count(literal) == len(verify["results"])
+    jev_settings = Settings(jev_mode="stdio", jev_deployment="on_prem")
+    answers = {
+        "screen": {"recommendation": {"action": "pass", "reason": "ok"}},
+        "verify": lambda arguments: tool_result(text),
+    }
+    factory, _ = session_factory(fixture_responder(answers))
+    advisor = Advisor(JevClient(jev_settings, session_factory=factory), jev_settings)
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold}, advisor=advisor
+    )
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    try:
+        await h.wait_phase(mid, P.completed, P.failed, timeout=5.0)
+    finally:
+        await h.orch.stop()
+    m = await h.migration(mid)
+    [note] = [n for n in m.advisor_notes if n.kind == "verification"]
+    assert (m.phase, note.confidence) == (P.completed, None)
+    assert summary in note.summary, note.summary
+    _stored_json(store, "migration", mid)
+
+
+@pytest.mark.parametrize(
+    "score",
+    ["NaN", "Infinity", "-Infinity", "1e999", '"nan"', '"inf"', "true", "1" + "0" * 400],
+    ids=["nan", "infinity", "-infinity", "1e999", "nan-text", "inf-text", "true", "400-digits"],
+)
+async def test_an_agentmemory_score_that_is_no_finite_number_never_reaches_the_store(
+    tmp_path, store, score
+):
+    """SDD §11, §14.3 (review RV50-04): agentmemory is an outside service whose answer httpx reads
+    with NaN and Infinity, and a hit's score went through float() - "nan" too. The
+    recommendation's similar incidents kept a NaN score, which SQLite wrote as NaN and
+    PostgreSQL's JSONB refuses: there the validation failed for as long as agentmemory answered
+    so. Such a score is none."""
+    body = (
+        '{"results": [{"title": "warm pre-copy", "content": "a warm pre-copy timed out", '
+        f'"score": {score}}}]}}'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("smart-search"):
+            return httpx.Response(
+                200, content=body.encode(), headers={"content-type": "application/json"}
+            )
+        return httpx.Response(201, json={"success": True})
+
+    memory = MemoryClient("http://m", None, "p", transport=httpx.MockTransport(handler))
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    h.orch.knowledge = KnowledgeService(memory, store, h.bus)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert [i.score for i in rec.similar_incidents] == [None]
+    _stored_json(store, "recommendation", rec.id)

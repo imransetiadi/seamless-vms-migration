@@ -216,10 +216,11 @@ def test_parse_result_rejects_camel_case_errors_and_non_objects():
     assert parse_result(NS(content=[NS(text='{"status": "ok"}')])) == {"status": "ok"}
 
 
-@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity", "1e999", "-1e999"])
 def test_an_answer_holding_nan_or_infinity_is_an_invalid_response(constant):
-    """SDD §14.1 (audit AD-02): json.loads reads NaN and Infinity, which no JSON number is - a
-    confidence of NaN passed every threshold, and PostgreSQL's JSONB refuses the value. An answer
+    """SDD §14.1 (audit AD-02, review RV50-04): json.loads reads NaN and Infinity, which no JSON
+    number is - a confidence of NaN passed every threshold, and PostgreSQL's JSONB refuses the
+    value -, and a number past a float's range (1e999) as an infinity all the same. An answer
     holding one is an invalid response, as any other text that is no JSON."""
     from seamless_migrate.ai.jev import parse_result
 

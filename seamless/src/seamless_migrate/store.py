@@ -11,6 +11,7 @@ import contextlib
 import fcntl
 import hashlib
 import logging
+import math
 import threading
 from collections.abc import AsyncIterator, Collection, Iterable, Sequence
 from datetime import UTC, datetime
@@ -190,6 +191,14 @@ def _unstorable_text(text: str) -> str | None:
     return "a NUL character" if found.group() == "\x00" else "a lone surrogate"
 
 
+def _unstorable_number(number: float) -> str | None:
+    """What a float is when JSONB cannot store it - NaN or an infinity, which Python's json writes
+    and SQLite keeps -, else None (SDD §11, review RV50-04)."""
+    if math.isnan(number):
+        return "NaN"
+    return "an infinity" if math.isinf(number) else None
+
+
 def _unsendable(value: str | None) -> bool:
     """Whether a lookup value holds what no stored string does (SDD §11)."""
     return value is not None and _unstorable_text(value) is not None
@@ -208,14 +217,18 @@ def _children(item: Any) -> list[tuple[str, Any, Any]] | None:
     return None
 
 
-def _holds_unstorable(value: Any) -> bool:
-    """Whether a string of ``value``, a map's key included, holds what PostgreSQL cannot store -
-    the cheap pass every write takes: no recursion, no path built (review RV49-05)."""
+def _holds_unstorable(value: Any, numbers: bool) -> bool:
+    """Whether a string of ``value``, a map's key included, holds what PostgreSQL cannot store, or
+    with ``numbers`` a float of it is NaN or an infinity - the cheap pass every write takes: no
+    recursion, no path built (review RV49-05)."""
     stack = [value]
     while stack:
         item = stack.pop()
         if isinstance(item, str):
             if UNSTORABLE.search(item):
+                return True
+        elif isinstance(item, float):
+            if numbers and not math.isfinite(item):
                 return True
         elif (children := _children(item)) is not None:
             for _, child, key in children:
@@ -225,12 +238,14 @@ def _holds_unstorable(value: Any) -> bool:
     return False
 
 
-def unstorable(value: Any) -> tuple[str, str] | None:
+def unstorable(value: Any, *, numbers: bool = True) -> tuple[str, str] | None:
     """Where ``value`` first holds a NUL or a lone surrogate, and what: ``("vm.nics.0.network",
     "holds a NUL character")``, ``("vm.tags", "a key holds a lone surrogate")``, else None - what
-    the store refuses, and the API before any route runs (SDD §11, §12). Walked without recursion,
-    depth first in document order, so a value nested however deep is read (review RV49-05)."""
-    if not _holds_unstorable(value):
+    the store refuses, and the API before any route runs (SDD §11, §12) -, or with ``numbers`` a
+    float that is no JSON number: ``("advisor_notes.0.confidence", "is an infinity")`` - what
+    the store refuses too (review RV50-04). Walked without recursion, depth first in document
+    order, so a value nested however deep is read (review RV49-05)."""
+    if not _holds_unstorable(value, numbers):
         return None
     stack: list[tuple[tuple[str, ...], Any, Any]] = [((), value, None)]
     while stack:
@@ -240,6 +255,9 @@ def unstorable(value: Any) -> tuple[str, str] | None:
         if isinstance(item, str):
             if what := _unstorable_text(item):
                 return ".".join(path), f"holds {what}"
+        elif isinstance(item, float):
+            if numbers and (what := _unstorable_number(item)):
+                return ".".join(path), f"is {what}"
         elif (children := _children(item)) is not None:
             stack.extend(((*path, part), child, key) for part, child, key in reversed(children))
     return None

@@ -98,11 +98,11 @@ def _check_state(check: dict[str, Any]) -> str:
 
 def _probability(value: Any) -> float | None:
     """``value`` when it is a probability - a real number from 0 to 1, never a bool -, else
-    ``None`` (SDD §4.2, §14.1, audit AD-02)."""
+    ``None`` (SDD §4.2, §14.1, audit AD-02). Compared as it stands, so an integer of 400 digits,
+    which no float holds, is none either (review RV50-03)."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    number = float(value)
-    return number if 0.0 <= number <= 1.0 else None
+    return float(value) if 0 <= value <= 1 else None
 
 
 class Advisor:
@@ -219,7 +219,11 @@ class Advisor:
         selected = rec.get("selected")
         confidence = rec.get("confidence")
         probabilities = rec.get("probabilities")
-        status = rec.get("status") or response.get("status")
+        # the recommendation's status, else the answer's: one of another shape - false, 0, [] or
+        # {} - is no absent one (review RV50-03)
+        status = rec.get("status")
+        if status is None:
+            status = response.get("status")
         model = response.get("model")
         # SDD §14.1 (audit AD-01, AD-02): a field of another shape than the tool's, or a
         # confidence that is no probability, makes the answer invalid_response - it falls back
@@ -401,9 +405,8 @@ class Advisor:
             reasons.append(f"advisor contradicted: {contradicted[0].get('claim')}")
         review_required = bool(reasons)
         review_reason = "; ".join(reasons) or None
-        confidences = [
-            float(i["confidence"]) for i in results if isinstance(i.get("confidence"), int | float)
-        ]
+        # a claim's confidence that is no probability counts for none (SDD §14.1, review RV50-03)
+        confidences = [p for i in results if (p := _probability(i.get("confidence"))) is not None]
         # each verdict once, in the order seen: never "verified, verified" (ADV-18)
         verdicts = list(dict.fromkeys(str(i.get("verdict")) for i in results))
         if review_required:

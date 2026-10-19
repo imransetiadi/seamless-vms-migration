@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import shlex
 import time
@@ -55,6 +56,16 @@ def _no_json_number(name: str) -> Any:
     raise ValueError(f"{name} is no JSON number")
 
 
+def _finite(text: str) -> float:
+    """A JSON number with a fraction or an exponent as a float, refused past a float's range:
+    json reads ``1e999`` as an infinity, which the store keeps no more than ``Infinity`` (SDD
+    §11, §14.1, review RV50-04)."""
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError(f"{text} is past a float's range")
+    return number
+
+
 def _storable(value: Any) -> Any:
     """``value`` with every string - keys and values, at any depth - written without NUL and lone
     surrogates (U+FFFD): an answer never stalls the write that keeps it (SDD §11, §14.1)."""
@@ -72,8 +83,9 @@ def _storable(value: Any) -> Any:
 
 def parse_result(result: Any) -> dict[str, Any]:
     """Parse ``content[0].text`` of a ``CallToolResult`` as a JSON object, checked as it arrives:
-    ``NaN`` and ``Infinity`` are no JSON numbers, and every string is written without NUL and lone
-    surrogates (SDD §14.1, audit AD-02, reviews RV49-01, RV49-06)."""
+    ``NaN``, ``Infinity`` and a number past a float's range are no JSON numbers, and every string
+    is written without NUL and lone surrogates (SDD §14.1, audit AD-02, reviews RV49-01, RV49-06,
+    RV50-04)."""
     content = getattr(result, "content", None) or []
     text = getattr(content[0], "text", None) if content else None
     if getattr(result, "is_error", False) or getattr(result, "isError", False):
@@ -81,11 +93,11 @@ def parse_result(result: Any) -> dict[str, Any]:
     if not isinstance(text, str):
         raise JevUnavailable("invalid response: no text content")
     try:
-        payload = json.loads(text, parse_constant=_no_json_number)
+        payload = json.loads(text, parse_constant=_no_json_number, parse_float=_finite)
         if not isinstance(payload, dict):
             raise JevUnavailable("invalid response: not a JSON object")
         return _storable(payload)
-    except (ValueError, RecursionError):  # not JSON, NaN or Infinity, nested past any answer
+    except (ValueError, RecursionError):  # no JSON, no JSON number, nested past any answer
         raise JevUnavailable("invalid response: not JSON") from None
 
 

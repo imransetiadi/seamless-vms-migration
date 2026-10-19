@@ -505,3 +505,38 @@ async def test_memory_health_and_from_settings():
         Settings(memory_url="http://localhost:3111", memory_project="x", memory_redact_names=True)
     )
     assert built.project == "x" and built.redact_names is True
+
+
+@pytest.mark.parametrize(
+    ("score", "kept"),
+    [
+        (float("nan"), None),
+        (float("inf"), None),
+        (float("-inf"), None),
+        ("nan", None),
+        ("-inf", None),
+        (True, None),
+        (10**400, None),
+        ("0.82", 0.82),
+        (0.5, 0.5),
+        (1, 1.0),
+    ],
+    ids=[
+        "nan",
+        "inf",
+        "-inf",
+        "nan-text",
+        "-inf-text",
+        "true",
+        "400-digits",
+        "text",
+        "float",
+        "int",
+    ],
+)
+def test_a_hit_score_is_a_finite_number_or_none(score, kept):
+    """SDD §11, §14.3 (review RV50-04): a hit's score is a finite number or a number's text;
+    NaN, an infinity - as the answer's token, a number past a float's range or text -, a JSON
+    true and an integer no float holds are no score: the store keeps no such number."""
+    [hit] = parse_hits({"results": [{"title": "t", "content": "c", "score": score}]}, 5)
+    assert hit.score == kept
