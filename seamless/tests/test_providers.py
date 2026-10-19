@@ -2251,6 +2251,93 @@ async def test_openstack_destination_finds_the_server_holding_an_address():
     assert await provider.server_of_address("203.0.113.9") is None
 
 
+def _compute_port(port_id, server, project, address):
+    return NS(
+        id=port_id,
+        device_id=server,
+        device_owner="compute:nova",
+        project_id=project,
+        fixed_ips=[{"ip_address": address}],
+    )
+
+
+async def test_openstack_server_of_address_names_only_the_credentials_projects_server():
+    """SDD §10 (§7.2 VMware rollback, review PV-04): an admin credential sees every project's ports,
+    and tenant networks overlap - the server holding the address is the credential's project's,
+    where the kit's conversion host and volumes live: its listing asks Neutron for that project,
+    what Neutron returns is checked again, and a floating IP counts only through a port of that
+    project. Two of the project's servers holding the address (two networks of one subnet) are a
+    provider error naming them."""
+    ports = [
+        _compute_port("other-port", "srv-of-another-project", "p-other", "10.0.0.5"),
+        _compute_port("conv-port", "srv-conversion-host", "p1", "10.0.0.5"),
+    ]
+    floating = [NS(floating_ip_address="198.51.100.7", port_id="other-port")]
+    asked = []
+
+    class Network:
+        def ports(self, fixed_ips, **query):
+            asked.append(query)
+            address = fixed_ips[0].split("=", 1)[1]
+            # every project's ports whatever the query: the check after the listing decides
+            return [p for p in ports if address in [ip["ip_address"] for ip in p.fixed_ips]]
+
+        def ips(self, floating_ip_address):
+            return [f for f in floating if f.floating_ip_address == floating_ip_address]
+
+        def get_port(self, port_id):
+            return {p.id: p for p in ports}[port_id]
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    conn = NS(network=Network(), current_project_id="p1")
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: conn)
+
+    assert await provider.server_of_address("10.0.0.5") == "srv-conversion-host"
+    assert asked == [{"project_id": "p1"}]
+    # a floating IP associated with another project's server is none of the project's
+    assert await provider.server_of_address("198.51.100.7") is None
+    ports.append(_compute_port("twin-port", "srv-twin", "p1", "10.0.0.5"))
+    twins = r"^dst: more than one server holds 10\.0\.0\.5: srv-conversion-host, srv-twin$"
+    with pytest.raises(ProviderError, match=twins):
+        await provider.server_of_address("10.0.0.5")
+
+
+async def test_openstack_server_of_address_without_the_project_refuses_two_servers():
+    """SDD §10 (review PV-04): a credential whose project cannot be read lists every project's
+    ports it sees; two servers holding the address are a provider error, never the first one
+    Neutron lists."""
+    ports = [
+        _compute_port("other-port", "srv-of-another-project", "p-other", "10.0.0.5"),
+        _compute_port("conv-port", "srv-conversion-host", "p1", "10.0.0.5"),
+    ]
+    asked = []
+
+    class Network:
+        def ports(self, fixed_ips, **query):
+            asked.append(query)
+            address = fixed_ips[0].split("=", 1)[1]
+            return [p for p in ports if address in [ip["ip_address"] for ip in p.fixed_ips]]
+
+        def ips(self, floating_ip_address):
+            return []
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: NS(network=Network()))
+    both = (
+        r"^dst: more than one server holds 10\.0\.0\.5: "
+        r"srv-conversion-host, srv-of-another-project$"
+    )
+    with pytest.raises(ProviderError, match=both):
+        await provider.server_of_address("10.0.0.5")
+    assert asked == [{}]
+    ports.pop(0)
+    assert await provider.server_of_address("10.0.0.5") == "srv-conversion-host"
+
+
 @pytest.mark.parametrize("read", ["503", "gone"])
 async def test_openstack_destination_takes_a_failed_port_read_for_no_answer(read):
     """SDD §7.2, §10 (review RV32A-04): the port a floating IP is associated with is read through

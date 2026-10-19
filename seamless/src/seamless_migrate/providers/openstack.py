@@ -630,19 +630,37 @@ class OpenStackProvider:
 
     def _server_of_address(self, address: str) -> str | None:
         # a compute port's device only: a floating IP's own port names the floating IP, a
-        # router's the router (SDD §7.2, §10, review RV30-06)
-        network = self._connection().network
+        # router's the router (SDD §7.2, §10, review RV30-06); of the credential's project only,
+        # where the kit's conversion host and volumes live - an admin credential sees every
+        # project's ports, and tenant networks overlap (review PV-04)
+        conn = self._connection()
+        network = conn.network
         canonical = _canonical_ip(address)
+        project = _attr(conn, "current_project_id", default=None)
 
         def server(port: Any) -> str | None:
             owner = str(_attr(port, "device_owner", default="") or "")
             device = _attr(port, "device_id")
-            return str(device) if owner.startswith("compute:") and device else None
+            ours = not project or _attr(port, "project_id") == project
+            return str(device) if owner.startswith("compute:") and device and ours else None
 
-        for port in network.ports(fixed_ips=[f"ip_address={canonical}"]):
+        def one(holders: set[str]) -> str | None:
+            if len(holders) > 1:  # two networks of one subnet: no answer to guess (PV-04)
+                raise ProviderError(
+                    f"{self.provider.id}: more than one server holds {address}: "
+                    f"{', '.join(sorted(holders))}"
+                )
+            return next(iter(holders), None)
+
+        scope = {"project_id": project} if project else {}
+        holders: set[str] = set()
+        for port in network.ports(fixed_ips=[f"ip_address={canonical}"], **scope):
             fixed = [ip.get("ip_address") for ip in _attr(port, "fixed_ips", default=None) or []]
-            if canonical in (_canonical_ip(str(a)) for a in fixed if a) and server(port):
-                return server(port)
+            held = server(port)
+            if held and canonical in (_canonical_ip(str(a)) for a in fixed if a):
+                holders.add(held)
+        if holders:
+            return one(holders)
         import openstack.exceptions
 
         for floating in network.ips(floating_ip_address=canonical):
@@ -653,9 +671,10 @@ class OpenStackProvider:
                 port = network.get_port(port_id)
             except openstack.exceptions.NotFoundException:
                 continue  # gone since the listing; a read that failed is no answer (RV32A-04)
-            if server(port):
-                return server(port)
-        return None
+            held = server(port)
+            if held:
+                holders.add(held)
+        return one(holders)
 
     def _server_volumes(self, server_id: str) -> list[str]:
         # Nova's record of the server (os-extended-volumes): no Cinder call, so a VMware rollback
