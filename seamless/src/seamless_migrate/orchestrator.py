@@ -380,10 +380,12 @@ SOURCE_RUNS_AGAIN = "the source VM runs again: stop it, or roll it back, before 
 
 def reassessed(m: Migration) -> bool:
     """Whether a validation re-assesses ``m`` (SDD §5.4): pending, blocked or ready, or left in
-    validating - unless its source is stopped, its downtime clock open (§5.2): a re-assessment
-    could block it, where no action restarts the source; it is left as it is, like one in flight
-    (audit OC-02)."""
-    return m.phase in REASSESSED and not fsm.source_stopped(m)
+    validating - unless it is ready with its source stopped, its downtime clock open (§5.2): a
+    re-assessment could block it, where no action restarts the source; it is left as it is, like
+    one in flight (audit OC-02). One already blocked or left in validating is re-assessed whatever
+    its source: cancel, rollback and retry are refused there, a validation is its way back to ready
+    (review RV51-01)."""
+    return m.phase in REASSESSED and not (m.phase == P.ready and fsm.source_stopped(m))
 
 
 def _named_twice(migrations: Iterable[Migration]) -> str | None:
@@ -398,6 +400,20 @@ def _named_twice(migrations: Iterable[Migration]) -> str | None:
         return None
     named = "; ".join(f"{ms[0].vm.name} ({', '.join(sorted(m.id for m in ms))})" for ms in twice)
     return f"two migrations of one VM would both cut it over: {named}; cancel all but one first"
+
+
+def _assessment(m: Migration) -> tuple[str, datetime | None, bool]:
+    """What a pre-staging covers of ``m`` (SDD §8, reviews RV51-17, RV51-19): its last move to
+    validating - the VM that validation read, the flavor and keypair it promised pre-staged - and
+    whether its strategy needs a conversion host."""
+    validated = next((c.at for c in reversed(m.phase_history) if c.to_phase == P.validating), None)
+    return m.id, validated, m.strategy in (Strategy.cold, Strategy.warm)
+
+
+def _vms_named_twice(migrations: Iterable[Migration]) -> set[str]:
+    """The VMs two of these migrations, cancelled ones aside, name (SDD §5.4, review RV51-18)."""
+    named = Counter(m.vm.source_id for m in migrations if m.phase != P.cancelled)
+    return {vm_id for vm_id, count in named.items() if count > 1}
 
 
 def _by_vm(migrations: Iterable[Migration]) -> dict[str, Migration]:
@@ -519,7 +535,8 @@ class Orchestrator:
         #: migration id -> (crashes in a row, monotonic time of the last one): relaunch backoff
         self._driver_crashes: dict[str, tuple[int, float]] = {}
         self._steps: dict[str, asyncio.Task[Any]] = {}
-        self._prestage_done: set[str] = set()
+        #: per plan, the assessments its pre-stagings in this process covered (SDD §8)
+        self._prestage_done: dict[str, set[tuple[str, datetime | None, bool]]] = {}
         self._prestage_tasks: dict[str, asyncio.Task[None]] = {}
         #: best-effort rollback of the data path after a cancel in precopy/syncing (SDD §7.2)
         self._cleanups: dict[str, asyncio.Task[None]] = {}
@@ -1427,6 +1444,9 @@ class Orchestrator:
         blocked = [m.vm.name for m in migrations if m.phase == P.blocked]
         if blocked:
             raise NotAllowed(f"{len(blocked)} migration(s) are blocked: {', '.join(blocked[:10])}")
+        twice = _named_twice(migrations)
+        if twice is not None:
+            raise NotAllowed(twice)  # SDD §5.4 (review RV51-18): as the validation refuses it
         if plan.waves:
             wave_ids = {w.id for w in plan.waves}
             stray = [
@@ -1452,9 +1472,8 @@ class Orchestrator:
         # AP-07): taken last and innermost, it holds no other (§8)
         async with self.provider_lock():
             plan = await self._update_plan(plan.id, start)
-        # SDD §8 (audit OC-05): pre-staged again - idempotent, it creates what a VM added since
-        # needs, as its validation said (MAP_FLAVOR_PRESTAGED, §9.3)
-        self._prestage_done.discard(plan.id)
+        # the tick pre-stages it again for any migration assessed since its last pre-staging, a VM
+        # added included - not for a plan merely resumed (SDD §8, reviews OC-05, RV51-19)
         await self._emit("plan.started", f"{plan.name} started", plan_id=plan.id, actor=actor)
         self.wake()
         return plan
@@ -2551,7 +2570,9 @@ class Orchestrator:
             return
         self._stopping = False
         self._wake = asyncio.Event()
-        for m in await self.db.list("migration", Migration):
+        running = {p.id for p in await self.db.list("plan", Plan) if p.status == PlanStatus.running}
+        migrations = await self.db.list("migration", Migration)
+        for m in migrations:
             if m.phase in fsm.RESUMABLE_PHASES:
                 self._launch(m.id)
             elif cleanup_pending(m) and m.id not in self._cleanups:
@@ -2559,8 +2580,17 @@ class Orchestrator:
                 self._cleanups[m.id] = asyncio.create_task(
                     self._cleanup_after_cancel(m, None, "system"), name=f"cleanup:{m.id}"
                 )
-            if any(c.to_phase in (P.precopy, P.cutover) for c in m.phase_history):
-                self._prestage_done.add(m.plan_id)  # work started: resources were pre-staged
+        # work started: a running plan was pre-staged for its migrations' assessments; any other
+        # is pre-staged again when it next runs with a ready migration (SDD §8)
+        started = {
+            m.plan_id
+            for m in migrations
+            if m.plan_id in running
+            and any(c.to_phase in (P.precopy, P.cutover) for c in m.phase_history)
+        }
+        for m in migrations:
+            if m.plan_id in started:
+                self._prestage_done.setdefault(m.plan_id, set()).add(_assessment(m))
         self._tick_task = asyncio.create_task(self._loop(), name="seamless-orchestrator")
         self._started = True
 
@@ -2691,9 +2721,17 @@ class Orchestrator:
     ) -> None:
         if not migs:
             return
-        if plan.id not in self._prestage_done:
+        covered = self._prestage_done.get(plan.id)
+        if covered is None or any(
+            _assessment(m) not in covered for m in migs if m.phase == P.ready
+        ):
+            # a migration assessed since the last pre-staging - a VM added, validated again or
+            # given a strategy that needs a conversion host - waits for one (SDD §8)
             self._ensure_prestage(plan, migs)
             return
+        # two migrations of one VM, as an earlier version left a running plan: neither starts
+        # (SDD §5.4, review RV51-18)
+        twice = _vms_named_twice(migs)
         waves = {w.id: w for w in plan.waves}
         complete = {
             w.id
@@ -2714,7 +2752,7 @@ class Orchestrator:
 
         limit_steps = self.settings.max_concurrent_migrations
         ordered = sorted(
-            (m for m in migs if is_active(m)),
+            (m for m in migs if is_active(m) and m.vm.source_id not in twice),
             key=lambda m: (waves[m.wave_id].order if m.wave_id in waves else 0, m.created_at),
         )
         gate_open: set[str] = set()
@@ -2884,7 +2922,8 @@ class Orchestrator:
                             }
                         )
                 await executor.prestage(plan, source, destination, **kwargs)
-            self._prestage_done.add(plan.id)
+            # what it read when it began: a migration assessed meanwhile waits for the next one
+            self._prestage_done.setdefault(plan.id, set()).update(_assessment(m) for m in migs)
             await self._emit(
                 "plan.updated",
                 f"{plan.name}: resources pre-staged",

@@ -34,6 +34,7 @@ from seamless_migrate.domain.models import (
     Approval,
     CutoverWindow,
     Event,
+    Finding,
     ForceCutover,
     Migration,
     Nic,
@@ -7347,6 +7348,44 @@ async def test_a_plan_holding_two_migrations_of_one_vm_is_refused(tmp_path, stor
     assert [(i.migration_id, i.phase) for i in report.migrations] == [(first.id, P.ready)]
 
 
+async def test_a_start_refuses_a_plan_holding_two_migrations_of_one_vm(tmp_path, store):
+    """SDD §5.4 (review RV51-18): a plan an earlier version validated with two ready migrations of
+    one VM - its recreating rollback's second migration beside the first one, retried - was
+    started, and the tick cut the VM over twice. The start is refused as the validation is, and
+    the tick starts neither of a plan an earlier version left running so - until one is
+    cancelled."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    first = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=P.ready)
+    second = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=P.ready)
+    store.put("migration", first)
+    store.put("migration", second)
+    validated = await h.plan(plan.id)
+    validated.status = PlanStatus.validated  # as the earlier version's validation left it
+    store.put("plan", validated)
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.start_plan(plan.id, "alice")
+    assert "web-01" in str(refused.value)
+    assert first.id in str(refused.value) and second.id in str(refused.value)
+    assert (await h.plan(plan.id)).status == PlanStatus.validated
+    running = await h.plan(plan.id)
+    running.status = PlanStatus.running  # as the earlier version's start left it
+    store.put("plan", running)
+    await h.orch.start()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while plan.id not in h.orch._prestage_done:
+        assert loop.time() < deadline, "the plan was never pre-staged"
+        await asyncio.sleep(0.01)
+    for _ in range(30):  # ticks enough to cut both over
+        h.orch.wake()
+        await asyncio.sleep(0.01)
+    assert [mid for mid, step in h.executor.calls if step == StepName.CUTOVER] == []
+    await h.orch.cancel(second.id, "sari", "a second migration of web-01")
+    await h.wait_phase(first.id, P.completed)
+    await h.orch.stop()
+    assert [mid for mid, step in h.executor.calls if step == StepName.CUTOVER] == [first.id]
+
+
 async def test_a_validation_leaves_a_stopped_source_as_it_is(tmp_path, store):
     """SDD §5.4 (audit OC-02): a migration retried after a failed cutover keeps its stopped
     source (§5.2). A validation re-assessed it: the volume the failed export left detached moved
@@ -7407,6 +7446,69 @@ async def test_a_validation_leaves_a_stopped_source_as_it_is(tmp_path, store):
     assert started.status == PlanStatus.running
 
 
+@pytest.mark.parametrize("left_in", [P.blocked, P.validating], ids=["blocked", "validating"])
+async def test_a_stopped_source_migration_an_earlier_version_left_blocked_is_re_assessed(
+    tmp_path, store, left_in
+):
+    """SDD §5.4 (review RV51-01): an earlier version's validation re-assessed a migration retried
+    after a failed cutover, its source still stopped: the volume the failed export left detached
+    moved it to blocked - or an interrupted validation left it in validating. Cancel, rollback,
+    retry and start are refused there, so leaving it as it is would keep its source stopped for
+    good: once the volume is attached again a validation frees it, and the plan starts."""
+    settings = make_settings(tmp_path)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {
+            "default_strategy": Strategy.cold,
+            "auto_cutover": False,
+            "verification": VerificationConfig(timeout_s=2, auto_rollback=False),
+        },
+        executor=_stopping_cutover(settings),
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m = await h.by_vm(plan.id, "vm-1")
+    await h.orch.request_cutover(m.id, "sari")
+    m = await h.wait_phase(m.id, P.failed)
+    await h.orch.retry(m.id, "sari")  # keeps the open clock (SDD §5.2)
+    await h.orch.pause_plan(plan.id, "alice")
+    m = await h.migration(m.id)
+    assert m.phase == P.ready and m.downtime_started_at and m.downtime_ended_at is None
+    # what the earlier version's validation left: blocked by the detached volume, or validating
+    m.phase_history.append(
+        PhaseChange(from_phase=P.ready, to_phase=P.validating, reason="validation", actor="alice")
+    )
+    if left_in == P.blocked:
+        m.phase_history.append(
+            PhaseChange(
+                from_phase=P.validating, to_phase=P.blocked, reason="1 blocker", actor="alice"
+            )
+        )
+        detached = Finding(
+            code="SRC_VM_VOLUME_DETACHED",
+            severity="blocker",
+            message="vol-1b is detached from the source VM",
+        )
+        m.findings = [*m.findings, detached]
+    m.phase = left_in
+    store.put("migration", m)
+    if left_in == P.blocked:
+        with pytest.raises(NotAllowed, match="blocked: web-01"):
+            await h.orch.start_plan(plan.id, "alice")
+    # the volume is attached again: the source VM is as validated
+    await h.orch.validate_plan(plan.id, "alice")
+    freed = await h.migration(m.id)
+    assert freed.phase == P.ready
+    assert [c.to_phase for c in freed.phase_history][-2:] == [P.validating, P.ready]
+    assert "SRC_VM_VOLUME_DETACHED" not in {f.code for f in freed.findings}
+    assert (freed.downtime_started_at, freed.downtime_ended_at) == (m.downtime_started_at, None)
+    started = await h.orch.start_plan(plan.id, "alice")
+    await h.orch.stop()
+    assert started.status == PlanStatus.running
+
+
 @dataclasses.dataclass
 class _PrestageRecorder(ScriptedExecutor):
     """Records the flavors each pre-staging run was asked to create."""
@@ -7421,7 +7523,7 @@ async def test_a_vm_added_after_the_first_start_gets_its_flavor_pre_staged(tmp_p
     """SDD §8, §9.3 (audit OC-05): a plan was pre-staged once per process: a VM added after its
     first start was validated ready on MAP_FLAVOR_PRESTAGED's promise - pre-staging creates the
     flavor - and its flavor was never created, so each pass or cutover of it failed the
-    destination check. A plan is pre-staged again after each start."""
+    destination check. A plan is pre-staged again for a migration validated since."""
     settings = make_settings(tmp_path)
     executor = _PrestageRecorder(settings)
     big = vm(2, flavor="m1.xlarge")  # no such flavor at the destination, no mapping
@@ -7457,6 +7559,267 @@ async def test_a_vm_added_after_the_first_start_gets_its_flavor_pre_staged(tmp_p
         await asyncio.sleep(0.01)
     await h.orch.stop()
     assert executor.flavors[-1] == ["m1.xlarge"]
+
+
+@dataclasses.dataclass
+class _GatedPrestageRecorder(ScriptedExecutor):
+    """Records the flavors each pre-staging was asked for; the first one runs until released."""
+
+    flavors: list[list[str]] = dataclasses.field(default_factory=list)
+    started: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    release: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+
+    async def prestage(self, plan, source, destination, *, prestage_flavors=None):
+        first = not self.flavors
+        self.flavors.append(list(prestage_flavors or []))
+        if first:
+            self.started.set()
+            await self.release.wait()
+
+
+def _flavor_plan():
+    """web-01 planned cold, its flavor at the destination; web-02 not yet in the plan, its flavor
+    one the destination lacks and no mapping names (MAP_FLAVOR_PRESTAGED when planned)."""
+    return (
+        [vm(1), vm(2, flavor="m1.xlarge")],
+        {
+            "vm_ids": ["vm-1"],
+            "default_strategy": Strategy.cold,
+            "auto_cutover": False,
+            "prestage_resources": ["networks", "flavors"],
+        },
+    )
+
+
+def _add_web_02(store, plan):
+    """What PATCH /plans/{id} (or `seamless plan apply`) does to the paused plan: web-02 added,
+    the plan back to draft."""
+    edited = store.get("plan", plan.id, Plan)
+    edited.vm_ids = ["vm-1", "vm-2"]
+    edited.status = PlanStatus.draft
+    store.put("plan", edited)
+
+
+async def test_a_vm_validated_while_the_plan_pre_stages_is_pre_staged_too(tmp_path, store):
+    """SDD §8 (review RV51-17): a plan paused, edited, validated and started again while its first
+    pre-staging still ran: that pre-staging, which read the VMs before the edit, marked the plan
+    pre-staged when it ended, and the added VM's flavor (MAP_FLAVOR_PRESTAGED) was never
+    created. A pre-staging covers only the assessments it read: the tick pre-stages again."""
+    settings = make_settings(tmp_path)
+    executor = _GatedPrestageRecorder(settings)
+    vms, plan_kw = _flavor_plan()
+    h, plan = await setup(tmp_path, store, vms, plan_kw, executor=executor, settings=settings)
+    await run_plan(h, plan)
+    await asyncio.wait_for(executor.started.wait(), 10)  # the first pre-staging runs
+    await h.orch.pause_plan(plan.id, "alice")
+    _add_web_02(store, plan)
+    await h.orch.validate_plan(plan.id, "alice")
+    added = await h.by_vm(plan.id, "vm-2")
+    assert added.phase == P.ready and "MAP_FLAVOR_PRESTAGED" in {f.code for f in added.findings}
+    await h.orch.start_plan(plan.id, "alice")
+    executor.release.set()  # the first pre-staging ends now
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while ["m1.xlarge"] not in executor.flavors:
+        assert loop.time() < deadline, executor.flavors
+        h.orch.wake()
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.flavors == [[], ["m1.xlarge"]]
+
+
+async def test_a_vm_another_process_validated_is_pre_staged_by_the_servers_tick(tmp_path, store):
+    """SDD §8, §15 (review RV51-17): the pre-staged mark was the process's own: `seamless plan
+    validate` and `seamless plan start` beside the running server (the CLI opens the store
+    directly) added a VM, and the server's tick, which read the plan as pre-staged since its first
+    start, never created its flavor. The tick reads the assessments from the store."""
+    settings = make_settings(tmp_path)
+    executor = _PrestageRecorder(settings)
+    vms, plan_kw = _flavor_plan()
+    h, plan = await setup(tmp_path, store, vms, plan_kw, executor=executor, settings=settings)
+    await run_plan(h, plan)  # the server
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while not executor.flavors:
+        assert loop.time() < deadline, "the plan was never pre-staged"
+        await asyncio.sleep(0.01)
+    await h.orch.pause_plan(plan.id, "alice")  # POST /plans/{id}/pause
+    _add_web_02(store, plan)
+    cli = build_harness(tmp_path, store, vms, settings=settings)  # the CLI's process
+    await cli.orch.validate_plan(plan.id, "cli")
+    await cli.orch.start_plan(plan.id, "cli")
+    while len(executor.flavors) < 2:
+        assert loop.time() < deadline + 5, executor.flavors
+        h.orch.wake()  # the server's next tick
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.flavors == [[], ["m1.xlarge"]]
+
+
+async def test_a_vm_validated_again_with_another_flavor_is_pre_staged_again(tmp_path, store):
+    """SDD §8: a migration's assessment is its last move to validating. web-01, resized at the
+    source while its plan was paused, is validated again with a flavor the destination lacks
+    (MAP_FLAVOR_PRESTAGED): the same migration, assessed anew, is pre-staged again."""
+    settings = make_settings(tmp_path)
+    executor = _PrestageRecorder(settings)
+    vms, plan_kw = _flavor_plan()
+    h, plan = await setup(tmp_path, store, vms, plan_kw, executor=executor, settings=settings)
+    await run_plan(h, plan)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while not executor.flavors:
+        assert loop.time() < deadline, "the plan was never pre-staged"
+        await asyncio.sleep(0.01)
+    await h.orch.pause_plan(plan.id, "alice")
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"flavor": "m1.xlarge"})
+    await h.orch.validate_plan(plan.id, "alice")
+    resized = await h.by_vm(plan.id, "vm-1")
+    assert "MAP_FLAVOR_PRESTAGED" in {f.code for f in resized.findings}
+    await h.orch.start_plan(plan.id, "alice")
+    while len(executor.flavors) < 2:
+        assert loop.time() < deadline + 5, executor.flavors
+        h.orch.wake()
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.flavors == [[], ["m1.xlarge"]]
+
+
+@dataclasses.dataclass
+class _CountingPrestage(ScriptedExecutor):
+    """Counts the pre-stagings; each after the first fails, as a destination API blip would."""
+
+    runs: int = 0
+
+    async def prestage(self, plan, source, destination):
+        self.runs += 1
+        if self.runs > 1:
+            raise RuntimeError("destination API briefly unavailable")
+
+
+async def test_a_plan_paused_and_resumed_is_not_pre_staged_again(tmp_path, store):
+    """SDD §8 (review RV51-19): each start pre-staged the whole plan again, so a plan merely paused
+    and resumed - nothing added or validated, web-01 completed - held every gate and step until
+    the pre-staging (minutes of playbooks) ended, and a pre-staging error failed it. Nothing was
+    assessed anew: web-02's requested cutover starts at once, and the plan keeps running."""
+    settings = make_settings(tmp_path)
+    executor = _CountingPrestage(settings)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), vm(2)],
+        {"default_strategy": Strategy.cold, "auto_cutover": False},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    first = await h.by_vm(plan.id, "vm-1")
+    await h.orch.request_cutover(first.id, "sari")
+    await h.wait_phase(first.id, P.completed)
+    await h.orch.pause_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")  # resumed: nothing was added or changed
+    second = await h.by_vm(plan.id, "vm-2")
+    await h.orch.request_cutover(second.id, "sari")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while (second.id, StepName.CUTOVER) not in h.executor.calls:
+        status = (await h.plan(plan.id)).status
+        assert status == PlanStatus.running, f"{status}: a second pre-staging failed the plan"
+        assert loop.time() < deadline, "web-02's cutover waits for a second pre-staging"
+        h.orch.wake()
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.runs == 1
+
+
+@dataclasses.dataclass
+class _HostsRecorder(ScriptedExecutor):
+    """Records whether each pre-staging was asked to deploy the conversion hosts."""
+
+    hosts: list[bool] = dataclasses.field(default_factory=list)
+
+    async def prestage(self, plan, source, destination, *, deploy_conversion_hosts=None):
+        self.hosts.append(bool(deploy_conversion_hosts))
+
+
+async def test_a_strategy_that_needs_a_conversion_host_pre_stages_the_plan_again(tmp_path, store):
+    """SDD §8 (review RV51-19): an assessment holds whether the migration's strategy needs a
+    conversion host. A storage handover plan was pre-staged without one; a migration given the cold
+    strategy while the plan runs is pre-staged again - the hosts deployed - before it starts."""
+    settings = make_settings(tmp_path)
+    executor = _HostsRecorder(settings)
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {
+            "handover": handover,
+            "auto_cutover": False,
+            "default_strategy": Strategy.storage_handover,
+        },
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while not executor.hosts:
+        assert loop.time() < deadline, "the plan was never pre-staged"
+        await asyncio.sleep(0.01)
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.strategy, executor.hosts) == (Strategy.storage_handover, [False])
+    await h.orch.set_strategy(m.id, Strategy.cold, "alice")
+    while len(executor.hosts) < 2:
+        assert loop.time() < deadline + 5, executor.hosts
+        h.orch.wake()
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.hosts == [False, True]
+
+
+async def test_a_restart_keeps_a_running_plan_pre_staged(tmp_path, store):
+    """SDD §8: after a restart a running plan whose work started counts as pre-staged for its
+    migrations' assessments - web-02's requested cutover starts without a pre-staging -, and a
+    plan paused across a restart is pre-staged again when it next runs with a ready migration."""
+    settings = make_settings(tmp_path)
+    vms = [vm(1), vm(2), vm(3)]
+    h, plan = await setup(
+        tmp_path,
+        store,
+        vms,
+        {"default_strategy": Strategy.cold, "auto_cutover": False},
+        executor=_PrestageRecorder(settings),
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    first = await h.by_vm(plan.id, "vm-1")
+    await h.orch.request_cutover(first.id, "sari")
+    await h.wait_phase(first.id, P.completed)
+    await h.orch.stop()
+    assert len(h.executor.flavors) == 1
+    restarted = build_harness(
+        tmp_path, store, vms, executor=_PrestageRecorder(settings), settings=settings
+    )
+    await restarted.orch.start()
+    second = await restarted.by_vm(plan.id, "vm-2")
+    await restarted.orch.request_cutover(second.id, "sari")
+    await restarted.wait_phase(second.id, P.completed)
+    await restarted.orch.pause_plan(plan.id, "alice")
+    await restarted.orch.stop()
+    assert restarted.executor.flavors == []
+    again = build_harness(
+        tmp_path, store, vms, executor=_PrestageRecorder(settings), settings=settings
+    )
+    await again.orch.start()
+    await again.orch.start_plan(plan.id, "alice")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while not again.executor.flavors:
+        assert loop.time() < deadline, "web-03's plan was never pre-staged again"
+        again.orch.wake()
+        await asyncio.sleep(0.01)
+    await again.orch.stop()
+    assert len(again.executor.flavors) == 1
 
 
 @dataclasses.dataclass
