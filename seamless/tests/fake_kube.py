@@ -25,7 +25,10 @@ kubectl and the API server do (review 38b, read from their sources):
 * a rollout that passes its progress deadline (``rollout status`` with fewer running pods than
   replicas) leaves the Deployment's Progressing condition at ProgressDeadlineExceeded: a later
   ``rollout status`` fails at once (kubectl's rollout_status.go), a new template resets it, an
-  undo keeps it (the controller's sync.go) - ``wait --for=condition=Available`` judges the pods.
+  undo keeps it (the controller's sync.go) - ``wait --for=condition=Available`` judges the pods;
+* ``apply -k`` restores no replica count (its three-way merge patches only what the manifests
+  changed); ``apply_rolls`` set, the overlay changes the pod template - a new image - and the
+  apply rolls the Deployment at once: Recreate ends the old pod, a new one starts.
 """
 
 from __future__ import annotations
@@ -223,6 +226,8 @@ if verb == "set" and words[1] == "resources":
     new_template()
     done("deployment.apps/seamless resource requirements updated\n")
 if verb == "apply":
+    if st.get("apply_rolls"):
+        new_template()
     done("configured\n")
 done()
 """

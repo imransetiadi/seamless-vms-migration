@@ -221,13 +221,16 @@ def test_a_cluster_down_stops_the_control_plane_before_postgresql_and_deletes_no
 def test_a_cluster_up_applies_the_overlay_and_scales_both_back_to_one(
     tmp_path, platform, tool, overlay
 ):
-    """SDD §17.2: up applies the overlay, then scales PostgreSQL and the control plane to one
-    replica each - an apply restores no replica count an earlier down set - and waits for both
-    rollouts."""
+    """SDD §17.2: up looks at PostgreSQL first - out of band scaled out, it is back to one before
+    the apply (review RV43A-01) -, applies the overlay, then scales PostgreSQL and the control
+    plane to one replica each - an apply restores no replica count an earlier down set - and
+    waits for both rollouts."""
     proc, calls, tree = _run(tmp_path, platform, "up", "--namespace", "migrations")
     assert proc.returncode == 0, proc.stderr
     ns = "-n migrations"
     assert _args(calls, tool) == [
+        f"{ns} get statefulset/seamless-postgres -o jsonpath={{.spec.replicas}}",
+        f"{ns} get pods -l app.kubernetes.io/name=seamless-postgres {OTHER_DATABASES} -o name",
         f"{ns} apply -k {tree / overlay}",
         f"{ns} scale statefulset/seamless-postgres --replicas=1",
         f"{ns} rollout status statefulset/seamless-postgres --timeout=600s",
@@ -322,6 +325,28 @@ def test_a_cluster_up_from_postgresql_scaled_out_waits_for_the_extra_databases(t
     assert proc.returncode == 0, proc.stderr
     [pod] = fake_kube.running(after)
     assert pod["databases"] == ["seamless-postgres-0"]
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_cluster_up_on_a_running_stack_brings_postgresql_back_to_one_before_its_apply(
+    tmp_path, platform
+):
+    """SDD §17.2 (review RV43A-01): a running control plane, PostgreSQL scaled out by hand, up
+    with a new image in the overlay - the documented upgrade: the apply rolls the control plane's
+    pod at once, so PostgreSQL is back to one, its others gone, before the apply. The pod the
+    apply starts finds one database."""
+    state = fake_kube.cluster(replicas=1, postgres=3)
+    state["apply_rolls"] = True
+    proc, calls, _ = _run(tmp_path, platform, "up", cluster=state)
+    after = _cluster_after(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    [pod] = fake_kube.running(after)
+    assert pod["databases"] == ["seamless-postgres-0"], (pod, proc.stderr)
+    tool = "oc" if platform == "openshift" else "kubectl"
+    lines = _args(calls, tool)
+    apply = next(i for i, line in enumerate(lines) if " apply -k " in line)
+    assert "-n seamless-migrate scale statefulset/seamless-postgres --replicas=1" in lines[:apply]
+    assert "PostgreSQL ran 3 replicas" in proc.stderr, proc.stderr
 
 
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)

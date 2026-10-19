@@ -383,6 +383,21 @@ control_plane_to() {
   kube scale deployment/seamless "--replicas=$1"
   if [ "$1" = 0 ]; then wait_gone seamless; else rollout deployment/seamless; fi
 }
+# Before an up's apply, PostgreSQL scaled out of band back to one replica and its other pods awaited gone, judged by the
+# pods as start judges them: the apply may roll the control plane's pod at once - a new image in the overlay - onto
+# every database. A namespace without the StatefulSet yet (a first up) has none (SDD §17.2, review RV43A-01).
+postgres_one_before_apply() {
+  local replicas
+  if [ "$DRY" = 1 ]; then
+    say "# when PostgreSQL's StatefulSet exists and runs more than one replica:"
+    kube scale statefulset/seamless-postgres --replicas=1
+    postgres_others_gone
+    return
+  fi
+  replicas=$("$KUBE" -n "$NS" get statefulset/seamless-postgres -o 'jsonpath={.spec.replicas}' 2>/dev/null) || return 0
+  if is_count "$replicas" && [ "$replicas" -gt 1 ]; then kube scale statefulset/seamless-postgres --replicas=1; fi
+  postgres_others_gone
+}
 cluster_start() {
   local replicas=0
   if [ "$DRY" = 1 ]; then
@@ -498,6 +513,7 @@ cluster() {
   need "$KUBE" "install it and log in to the cluster"
   case $ACTION in
     up)
+      postgres_one_before_apply
       kube apply -k "$ROOT/$OVERLAY"
       # an apply restores no replica count an earlier down set (SDD §17.2)
       kube scale statefulset/seamless-postgres --replicas=1
