@@ -10,6 +10,8 @@ the text a test double would hand (review RV18-01, RV18-02). Every credential is
 from __future__ import annotations
 
 import json
+import re
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,7 +34,12 @@ CATALOG = {
 class InProcessCloud:
     """A cloud whose compute API's maximum is ``compute`` and block storage's ``block_storage``;
     ``roles`` are its token's, ``catalog`` replaces endpoints, ``auth_url`` is where the clouds.yaml
-    entry signs in. ``connect`` is what OpenStackProvider takes as ``connect_fn``."""
+    entry signs in. ``servers`` are Nova's servers of the credential's project (``{id, name}``),
+    which ``GET /servers`` and ``GET /servers/detail`` list with a ``name`` filter read as Nova
+    reads it: a regular expression searched anywhere in the name - after Nova's escape of ``|``
+    when ``nova_db`` is ``mysql`` (MySQL/MariaDB REGEXP), as sent when ``postgresql`` (``~``) - and
+    a 400 for one that is no regular expression (the API schema's ``regex`` format). ``connect``
+    is what OpenStackProvider takes as ``connect_fn``."""
 
     root: Path
     compute: str = "2.96"
@@ -41,6 +48,8 @@ class InProcessCloud:
     auth_url: str = AUTH_URL
     catalog: dict[str, str] = field(default_factory=dict)
     seen: list[tuple[str, str]] = field(default_factory=list)
+    servers: list[dict[str, Any]] = field(default_factory=list)
+    nova_db: str = "postgresql"
 
     def __post_init__(self) -> None:
         pytest.importorskip("requests")
@@ -147,12 +156,12 @@ class InProcessCloud:
 
         from seamless_migrate.providers.openstack import connect
 
-        routes, seen = self._routes(), self.seen
+        routes, seen, servers = self._routes(), self.seen, self._servers_answer
 
         class Transport(requests.adapters.BaseAdapter):
             def send(self, request, **kwargs):
                 seen.append((request.method, request.url))
-                status, body, headers = routes.get(
+                status, body, headers = servers(request.method, request.url) or routes.get(
                     (request.method, request.url.rstrip("/")), (404, {"error": "none"}, {})
                 )
                 response = requests.models.Response()
@@ -173,3 +182,24 @@ class InProcessCloud:
         for scheme in ("http://", "https://"):
             conn.session.session.mount(scheme, Transport())
         return conn
+
+    def _servers_answer(self, method: str, url: str) -> tuple[int, Any, dict[str, str]] | None:
+        """Nova's answer to a list of the project's servers, None for any other request."""
+        compute = {**CATALOG, **self.catalog}["compute"].rstrip("/")
+        parts = urllib.parse.urlsplit(url)
+        path = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")
+        if method != "GET" or path not in (compute + "/servers", compute + "/servers/detail"):
+            return None
+        found = list(self.servers)
+        names = urllib.parse.parse_qs(parts.query).get("name")
+        if names:
+            pattern = names[0]
+            try:
+                re.compile(pattern)
+            except re.error:
+                return 400, {"badRequest": {"code": 400, "message": "Invalid input"}}, {}
+            if self.nova_db == "mysql":
+                pattern = pattern.replace("|", "\\|")  # nova/db/utils.py _safe_regex_mysql
+            found = [s for s in found if re.search(pattern, s["name"])]
+        body = {"servers": [{"id": s["id"], "name": s["name"], "links": []} for s in found]}
+        return 200, body, {}

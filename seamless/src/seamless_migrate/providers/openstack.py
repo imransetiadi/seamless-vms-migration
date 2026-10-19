@@ -90,6 +90,16 @@ def connect(provider: Provider, settings: Settings) -> Any:
     return openstack.connect(**kwargs)
 
 
+def _name_pattern(name: str) -> str:
+    """Nova's ``name`` filter for the servers named ``name``: Nova reads it as a regular expression
+    searched anywhere in the name (MySQL/MariaDB after escaping ``|`` itself, PostgreSQL as sent),
+    so every ASCII character but a letter, a digit, a space, ``_`` and ``-`` stands as ``.`` - no
+    alternation, group, class or escape on any backend - and the caller keeps the exact name
+    (SDD §10, review PV-01)."""
+    kept = (c if not c.isascii() or c.isalnum() or c in " _-" else "." for c in name)
+    return "^" + "".join(kept) + "$"
+
+
 def _attr(obj: Any, *names: str, default: Any = None) -> Any:
     for name in names:
         value = obj.get(name) if isinstance(obj, Mapping) else getattr(obj, name, None)
@@ -488,8 +498,14 @@ class OpenStackProvider:
 
     def _find_server(self, name: str) -> str | None:
         conn = self._connection()
-        server = conn.compute.find_server(name, ignore_missing=True)
-        return None if server is None else str(_attr(server, "id"))
+        found = [
+            server
+            for server in conn.compute.servers(details=False, name=_name_pattern(name))
+            if _attr(server, "name") == name
+        ]
+        if len(found) > 1:
+            raise ProviderError(f"{self.provider.id}: more than one server is named {name!r}")
+        return str(_attr(found[0], "id")) if found else None
 
     def _ports(
         self, network_id: str | None, mac_address: str | None, ip_address: str | None

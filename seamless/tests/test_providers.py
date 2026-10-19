@@ -1652,6 +1652,78 @@ def test_openstack_connect_builds_kwargs_from_clouds_yaml(monkeypatch, tmp_path)
     assert osp._truthy(1) and not osp._truthy(0)
 
 
+#: server names Nova reads differently as a regular expression - a group, a quantifier, an
+#: alternation, a class, an escape, anchors, any character - and names that hold no such character
+NOVA_NAMES = [
+    "app (blue)",
+    "db+1",
+    "web(1",
+    "a|b",
+    "a|",
+    "x?",
+    "web[2]",
+    "c:\\temp",
+    "^lead",
+    "tail$",
+    "dot.name",
+    "web-01",
+    "em\u2014dash (2)",
+    "\u65e5\u672c-\u30b5\u30fc\u30d0",
+]
+
+
+@pytest.mark.parametrize("nova_db", ["postgresql", "mysql"])
+@pytest.mark.parametrize("name", NOVA_NAMES)
+async def test_openstack_find_server_finds_a_name_nova_reads_as_a_regular_expression(
+    tmp_path, name, nova_db
+):
+    """Nova reads the ``name`` filter of its server list as a regular expression searched anywhere
+    in the name - on MySQL/MariaDB after escaping ``|`` itself, on PostgreSQL as sent - and refuses
+    one that is none with 400: the lookup finds the server named exactly so, never one whose name
+    holds it or differs where the pattern reads any character (SDD §10, review PV-01)."""
+    servers = [
+        {"id": "srv-1", "name": name},
+        {"id": "srv-2", "name": "unrelated"},
+        {"id": "srv-3", "name": f"{name}-old"},
+        {"id": "srv-4", "name": f"old-{name}"},
+    ]
+    similar = "".join("Z" if c.isascii() and not (c.isalnum() or c in " _-") else c for c in name)
+    if similar != name:
+        servers.append({"id": "srv-5", "name": similar})
+    cloud = InProcessCloud(tmp_path, servers=servers, nova_db=nova_db)
+    dst = make_provider(id="dst", role=ProviderRole.destination, endpoint=AUTH_URL, cloud="dst")
+    provider = OpenStackProvider(dst, cloud.settings, connect_fn=cloud.connect)
+
+    assert await provider.find_server(name) == "srv-1"
+
+
+async def test_openstack_find_server_sends_an_anchored_pattern_and_refuses_two_of_a_name(tmp_path):
+    """The lookup sends Nova ``^...$`` with every ASCII character but a letter, a digit, a space,
+    ``_`` and ``-`` as ``.``: no alternation, group, class or escape on any backend. No server of
+    the name is None; two are a provider error (SDD §10, review PV-01)."""
+    import urllib.parse
+
+    cloud = InProcessCloud(
+        tmp_path,
+        servers=[{"id": "srv-1", "name": "app (blue)_1-a"}, {"id": "srv-2", "name": "web-01"}],
+    )
+    dst = make_provider(id="dst", role=ProviderRole.destination, endpoint=AUTH_URL, cloud="dst")
+    provider = OpenStackProvider(dst, cloud.settings, connect_fn=cloud.connect)
+
+    assert await provider.find_server("app (blue)_1-a") == "srv-1"
+    assert await provider.find_server("absent") is None
+    assert await provider.find_server("caf\u00e9\u2014(2)") is None  # no metacharacter outside ASCII
+    sent = [
+        urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["name"][0]
+        for method, url in cloud.seen
+        if method == "GET" and "name=" in url
+    ]
+    assert sent == ["^app .blue._1-a$", "^absent$", "^caf\u00e9\u2014.2.$"]
+    cloud.servers.append({"id": "srv-3", "name": "web-01"})
+    with pytest.raises(ProviderError, match=r"^dst: more than one server is named 'web-01'$"):
+        await provider.find_server("web-01")
+
+
 async def test_openstack_destination_ports_match_every_filter_and_delete_is_idempotent():
     """SDD §10 (§7.2 VMware networks, review RT-11): ports() returns the ports matching every
     filter given, checked again here in case the server ignores one, with the MAC compared in
