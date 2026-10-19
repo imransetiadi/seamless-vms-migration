@@ -1284,14 +1284,19 @@ async def test_a_retry_never_writes_a_ready_migration_that_carries_the_old_reque
     m.phase = P.failed
     store.put("migration", m)
     written: list[Migration] = []
-    save = h.orch._save
+    save, write_all = h.orch._save, h.orch.store.put_all_with_events
 
     async def recording_save(doc, version):
         if doc.id == m.id:
             written.append(doc.model_copy(deep=True))
         return await save(doc, version)
 
+    def recording_write(writes, appended):  # a transition: the migration with its events
+        written.extend(d.model_copy(deep=True) for k, d, _ in writes if k == "migration")
+        return write_all(writes, appended)
+
     h.orch._save = recording_save
+    h.orch.store.put_all_with_events = recording_write
     again = await h.orch.retry(m.id, "bayu")
     assert again.phase == P.ready
     assert [w.phase for w in written] == [P.ready]  # one write
@@ -1589,23 +1594,26 @@ async def test_a_failed_validation_write_leaves_no_migration_in_validating(tmp_p
     """SDD §5.4: the one write lands or not - a database error leaves a new VM without a migration
     and an existing migration as it was, never in validating."""
     h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
-    put = h.orch.db.put
+    write_all = h.orch.store.put_all_with_events
 
-    async def failing_put(kind, model, expected_version=None):
+    def failing_write(writes, appended):
         # the write that lands the assessment (an earlier version wrote validating before it)
-        if kind == "migration" and model.vm.source_id == "vm-2" and model.phase != P.validating:
+        if any(
+            kind == "migration" and model.vm.source_id == "vm-2" and model.phase != P.validating
+            for kind, model, _ in writes
+        ):
             raise ConnectionError("database connection lost")
-        return await put(kind, model, expected_version)
+        return write_all(writes, appended)
 
-    h.orch.db.put = failing_put
+    h.orch.store.put_all_with_events = failing_write
     with pytest.raises(ConnectionError):
         await h.orch.validate_plan(plan.id, "alice")
     assert [m.vm.source_id for m in await h.migrations(plan.id)] == ["vm-1"]
-    h.orch.db.put = put
+    h.orch.store.put_all_with_events = write_all
     await h.orch.validate_plan(plan.id, "alice")
     ready = await h.by_vm(plan.id, "vm-2")
     _, version = store.get_versioned("migration", ready.id, Migration)
-    h.orch.db.put = failing_put
+    h.orch.store.put_all_with_events = failing_write
     with pytest.raises(ConnectionError):
         await h.orch.validate_plan(plan.id, "alice")
     kept, same = store.get_versioned("migration", ready.id, Migration)
@@ -4593,9 +4601,12 @@ async def test_a_restart_right_after_a_failure_still_rolls_the_stopped_vm_back(t
 async def test_a_failed_event_write_after_a_failure_still_rolls_the_stopped_vm_back(
     tmp_path, store
 ):
-    """SDD §8: an event that fails to be written right after the failure — the first one, its
-    phase event (a database blip) — crashes the driver, but the rollback was saved in the same
-    write as the failure: the tick resumes it."""
+    """SDD §5.1, §8: the failure, the rollback it starts and the failure's phase event are one
+    transaction. Its event refused by the store - a database blip - leaves the stopped migration
+    where it was and crashes the driver; the tick relaunches it, the step fails again, and the
+    failure, its rollback and its event are written together: the stopped VM is rolled back."""
+    import sqlalchemy as sa
+
     settings = make_settings(tmp_path)
     h, plan = await setup(
         tmp_path,
@@ -4605,20 +4616,26 @@ async def test_a_failed_event_write_after_a_failure_still_rolls_the_stopped_vm_b
         executor=_stopping_cutover(settings),
         settings=settings,
     )
-    real_emit = h.orch._emit
     blips = {"left": 1}
 
-    async def flaky_emit(kind, message, **kw):
-        if kind == "migration.phase" and (kw.get("data") or {}).get("to") == "failed":
-            if blips["left"]:
-                blips["left"] -= 1
-                raise OSError("server closed the connection unexpectedly")
-        return await real_emit(kind, message, **kw)
+    def refuse_the_failure(conn, cursor, statement, parameters, context, executemany):
+        if not blips["left"] or not statement.lstrip().upper().startswith("INSERT INTO EVENTS"):
+            return
+        params = context.compiled_parameters[0]
+        if (
+            params.get("kind") == "migration.phase"
+            and (params.get("data") or {}).get("to") == "failed"
+        ):
+            blips["left"] -= 1
+            raise OSError("server closed the connection unexpectedly")
 
-    h.orch._emit = flaky_emit
-    await run_plan(h, plan)
-    done = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
-    await h.orch.stop()
+    sa.event.listen(store.engine, "before_cursor_execute", refuse_the_failure)
+    try:
+        await run_plan(h, plan)
+        done = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    finally:
+        sa.event.remove(store.engine, "before_cursor_execute", refuse_the_failure)
+        await h.orch.stop()
     assert blips["left"] == 0 and done.downtime_ended_at is not None
     assert [str(c.to_phase) for c in done.phase_history][-4:] == [
         "cutover",
@@ -5696,6 +5713,140 @@ async def test_a_persons_decision_names_the_policy_whose_rules_it_follows(tmp_pa
     with pytest.raises(Unprocessable) as refused:
         await h.orch.override_recommendation(rec.id, "cold", "too short", "rina")
     assert str(refused.value).startswith("policy pol-strict requires an override reason")
+
+
+def _rec_events(store, mid: str) -> list[str]:
+    return [
+        e.kind
+        for e in store.events(since_seq=0, limit=1000)
+        if e.migration_id == mid and e.kind.startswith(("recommendation.", "decision."))
+    ]
+
+
+@pytest.mark.parametrize(
+    ("write", "row"),
+    [
+        ("UPDATE documents", "migration"),
+        ("INSERT INTO events", "migration.phase"),
+        ("INSERT INTO documents", "recommendation"),
+        ("INSERT INTO events", "recommendation.created"),
+        ("INSERT INTO events", "decision.auto_applied"),
+    ],
+)
+async def test_a_store_failure_in_validation_leaves_no_decision_without_its_record_and_events(
+    tmp_path, store, refuse_write, write, row
+):
+    """SDD §5.4, §14.4 (audit AD-05): a validation wrote the migration - the advisor's strategy -,
+    then the recommendation and its two events, each on its own: a store failure in between left
+    the migration on the advisor's warm with the newest recommendation saying cold, or a decision
+    without its event. They are one transaction: a write refused leaves the migration as the
+    earlier validation left it and nothing of the new decision, and the next validation records
+    it whole."""
+    state: dict = {"answer": RuntimeError("jev unreachable")}
+    advisor, _ = _answering_advisor(decide=lambda arguments: state["answer"])
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")  # Jev unreachable: the rules keep cold
+    m = await h.by_vm(plan.id, "vm-1")
+    before = (m.strategy, len(_recommendations(store)), _rec_events(store, m.id))
+    assert before == (Strategy.cold, 1, ["recommendation.created", "decision.fallback"])
+    state["answer"] = _decide_answer("warm", 0.9)
+    refused = refuse_write(store, write, row)
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await h.orch.validate_plan(plan.id, "alice")
+    assert refused == [f"{write} {row}"]
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.strategy, len(_recommendations(store)), _rec_events(store, m.id)) == before
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    newest = max(_recommendations(store), key=lambda r: (r.created_at, r.id))
+    assert (m.strategy, newest.decision.status, _rec_events(store, m.id)[2:]) == (
+        Strategy.warm,
+        DecisionStatus.auto_applied,
+        ["recommendation.created", "decision.auto_applied"],
+    )
+
+
+async def test_a_store_failure_in_validation_leaves_no_hold_on_a_missing_recommendation(
+    tmp_path, store, refuse_write
+):
+    """SDD §5.4, §14.6 (audit AD-05, review RV49-06): under an approval-required policy the
+    migration was written held by the new recommendation's id before that recommendation was
+    stored; when its write failed the hold named a recommendation that did not exist - approve a
+    404, the strategy unchangeable, the tick never starting it. A refused write leaves the
+    migration as it was."""
+    state: dict = {"answer": RuntimeError("jev unreachable")}
+    advisor, _ = _answering_advisor(decide=lambda arguments: state["answer"])
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")  # the rules' cold, no hold
+    store.put("advisor_policy", _finance(plan))
+    state["answer"] = _decide_answer("warm", 0.9)
+    refused = refuse_write(store, "INSERT INTO documents", "recommendation")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await h.orch.validate_plan(plan.id, "alice")
+    assert refused == ["INSERT INTO documents recommendation"]
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.advisor_hold, m.strategy) == (None, Strategy.cold)
+
+
+class _CancelDuringSearch:
+    """agentmemory answering slowly (up to its 5 s timeout) while an operator cancels the VM: the
+    cancel takes the migration's lock only (SDD §8)."""
+
+    def __init__(self) -> None:
+        self.h = None
+        self.plan_id = ""
+        self.cancel = False
+
+    async def similar_for(self, option, vm):
+        if self.cancel:
+            m = await self.h.by_vm(self.plan_id, vm.source_id)
+            await self.h.orch.cancel(m.id, "bob", "the VM is retired")
+        return []
+
+
+async def test_a_migration_cancelled_while_validation_searches_takes_no_decision(tmp_path, store):
+    """SDD §5.4, §14.6 (audit AD-11): a validation wrote the migration, then searched agentmemory
+    and recorded the decision without looking at the migration again - a cancel landing in between
+    was followed by recommendation.created and decision.pending_approval for the cancelled
+    migration. The search comes before the migration's assessment is written: the validation
+    finds it cancelled and leaves it alone."""
+    knowledge = _CancelDuringSearch()
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor, knowledge=knowledge
+    )
+    knowledge.h, knowledge.plan_id = h, plan.id
+    await h.orch.validate_plan(plan.id, "alice")  # recorded, auto-applied
+    store.put("advisor_policy", _finance(plan))
+    knowledge.cancel = True
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.phase, m.advisor_hold) == (P.cancelled, None)
+    assert [r.decision.status for r in _recommendations(store)] == [DecisionStatus.auto_applied]
+    assert _rec_events(store, m.id) == ["recommendation.created", "decision.auto_applied"]
+
+
+async def test_a_phase_change_and_its_event_are_one_transaction(tmp_path, store, refuse_write):
+    """SDD §5.1 (audit AD-05): a transition saved the migration, then appended its
+    migration.phase event on its own - a failed event write left the phase changed without its
+    event, in the audit trail and on the live stream. Both are one transaction: a refused event
+    leaves the migration where it was, and the retry writes both."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    await h.orch.validate_plan(plan.id, "alice")
+    m, v = await h.orch._load((await h.by_vm(plan.id, "vm-1")).id)
+    refused = refuse_write(store, "INSERT INTO events", "migration.phase")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await h.orch._transition(m, v, P.validating, "re-assessed")
+    assert refused == ["INSERT INTO events migration.phase"]
+    stored, version = await h.orch._load(m.id)
+    assert (stored.phase, version) == (P.ready, v)
+    moved, _ = await h.orch._transition(stored, version, P.validating, "re-assessed")
+    phases = [
+        e.data["to"]
+        for e in store.events(since_seq=0, limit=1000)
+        if e.kind == "migration.phase" and e.migration_id == m.id
+    ]
+    assert (moved.phase, phases[-1], phases.count("validating")) == (P.validating, "validating", 2)
 
 
 async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_approve(

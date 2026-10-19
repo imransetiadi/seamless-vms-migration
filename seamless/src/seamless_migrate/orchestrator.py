@@ -417,6 +417,11 @@ PLAN_UPDATE_ATTEMPTS = 20
 PLAN_UPDATE_BACKOFF_S = 0.25
 
 
+#: what joins a migration's transitions in their transaction: given the migration as written, its
+#: own documents and events - a validation's recommendation (SDD §5.4, §14.4)
+Joined = Callable[[Migration], tuple[list[tuple[str, Any, int]], list[Event]]]
+
+
 def _update_backoff(attempt: int) -> float:
     """Seconds to wait before retry ``attempt`` (from 1): 5 ms doubling to the cap, jittered so
     that writers which collided do not collide again in step."""
@@ -628,33 +633,48 @@ class Orchestrator:
         actor: str = "system",
         *,
         created: dict[str, Any] | None = None,
+        also: Joined | None = None,
     ) -> tuple[Migration, int]:
-        """Several transitions in one write — a crash or a failed event write never splits them
-        (SDD §8) — then one ``migration.phase`` event each. Version 0 creates the migration, and
-        ``created`` is then the data of the ``migration.created`` event that comes first."""
+        """Several transitions in one write, with the events that announce them - for version 0,
+        a new migration, ``migration.created`` with ``created`` as its data first, then one
+        ``migration.phase`` each - and what ``also`` joins to them, all in one transaction: a
+        crash or a failed event write never splits them (SDD §5.1, §5.4, §8, audit AD-05)."""
         new = m
         for to, reason, _ in steps:
             new = fsm.transition(new, to, reason, actor, now=self._now())
-        version = await self._save(new, version)
+        new.updated_at = self._now()
+        events: list[Event] = []
         if created is not None:
-            await self._emit(
-                "migration.created",
-                f"migration of {new.vm.name} created",
-                migration=new,
-                actor=actor,
-                data=created,
+            events.append(
+                new_event(
+                    "migration.created",
+                    f"migration of {new.vm.name} created",
+                    plan_id=new.plan_id,
+                    migration_id=new.id,
+                    actor=actor,
+                    data=created,
+                )
             )
         before = m.phase
         for to, reason, data in steps:
-            await self._emit(
-                "migration.phase",
-                f"{new.vm.name}: {before} -> {to} ({reason})",
-                migration=new,
-                actor=actor,
-                data={"from": str(before), "to": str(to), "reason": reason, **(data or {})},
+            events.append(
+                new_event(
+                    "migration.phase",
+                    f"{new.vm.name}: {before} -> {to} ({reason})",
+                    plan_id=new.plan_id,
+                    migration_id=new.id,
+                    actor=actor,
+                    data={"from": str(before), "to": str(to), "reason": reason, **(data or {})},
+                )
             )
             before = to
-        return new, version
+        writes: list[tuple[str, Any, int]] = [("migration", new, version)]
+        if also is not None:
+            joined_writes, joined_events = also(new)
+            writes += joined_writes
+            events += joined_events
+        versions = await put_all_and_emit(self.store, self.bus, writes, events)
+        return new, versions[0]
 
     # ------------------------------------------------------------------------------------------
     # providers
@@ -952,6 +972,29 @@ class Orchestrator:
             # (SDD §5.4, §14.6); any other validation clears an earlier hold
             waiting = decision is not None and decision.status == DecisionStatus.pending_approval
             hold = rec_id if waiting else None
+            # the recommendation joins the migration's assessment in its transaction, the
+            # agentmemory search and the input snapshot before it: no store failure leaves the
+            # strategy, the hold or the decision without its record and events, and a cancel
+            # meanwhile finds the migration as it was (SDD §5.4, §14.4, audit AD-05, AD-11)
+            also: Joined | None = None
+            if advice is not None and decision is not None:
+                incidents: list[SimilarIncident] = []
+                if memory_up and self.knowledge is not None and evidence_option is not None:
+                    found = await self.knowledge.similar_for(evidence_option, vm)
+                    memory_up = found is not None
+                    incidents = found or []
+                also = await self._strategy_record(
+                    plan,
+                    vm,
+                    migration_id,
+                    advice,
+                    decision,
+                    rec_id,
+                    actor,
+                    evidence_option=evidence_option,
+                    evidence=evidence,
+                    incidents=incidents,
+                )
             # each migration is written once (SDD §5.4): a new one created already assessed
             if current is None:
                 migration = await self._create_migration(
@@ -965,6 +1008,7 @@ class Orchestrator:
                     findings=findings,
                     resolved=resolved,
                     hold=hold,
+                    also=also,
                 )
             else:
                 migration = await self._apply_validation(
@@ -978,28 +1022,10 @@ class Orchestrator:
                     actor,
                     resolved,
                     hold=hold,
+                    also=also,
                 )
             # recorded only when this validation took the choice (ready or blocked now): one that
-            # went in flight meanwhile was left alone and runs what it ran
-            validated = migration.phase in (P.ready, P.blocked)
-            if advice is not None and decision is not None and validated:
-                incidents: list[SimilarIncident] = []
-                if memory_up and self.knowledge is not None and evidence_option is not None:
-                    found = await self.knowledge.similar_for(evidence_option, vm)
-                    memory_up = found is not None
-                    incidents = found or []
-                await self._record_strategy_recommendation(
-                    plan,
-                    vm,
-                    migration,
-                    advice,
-                    decision,
-                    rec_id,
-                    actor,
-                    evidence_option=evidence_option,
-                    evidence=evidence,
-                    incidents=incidents,
-                )
+            # went in flight or was cancelled meanwhile was left alone, without the record
             items.append(
                 ValidationItem(
                     migration_id=migration.id,
@@ -1067,9 +1093,11 @@ class Orchestrator:
         findings: list[Finding],
         resolved: Mappings | None = None,
         hold: str | None = None,
+        also: Joined | None = None,
     ) -> Migration:
         """A new migration, created already assessed (SDD §5.4): its history from pending through
-        validating to ready or blocked in one write, then migration.created and the phase events."""
+        validating to ready or blocked in one write with migration.created, the phase events and
+        what ``also`` joins - one transaction."""
         now = self._now()
         migration = Migration(
             id=migration_id or new_migration_id(),
@@ -1098,6 +1126,7 @@ class Orchestrator:
             [(P.validating, "pre-flight validation", None), final],
             actor,
             created={"vm": vm.name, "source_id": vm.source_id, "strategy": str(strategy)},
+            also=also,
         )
         return migration
 
@@ -1157,6 +1186,7 @@ class Orchestrator:
         resolved: Mappings | None = None,
         *,
         hold: str | None = None,
+        also: Joined | None = None,
     ) -> Migration:
         async with self._lock(mid):
             m, v = await self._load(mid)
@@ -1174,15 +1204,15 @@ class Orchestrator:
             if m.phase != P.validating:
                 steps.append((P.validating, "pre-flight validation", None))
             final = self._assess(m, plan, vm, strategy, why, estimates, findings, resolved, hold)
-            # both transitions in one write (SDD §5.4)
-            m, v = await self._transitions(m, v, [*steps, final], actor)
+            # both transitions in one write, with what joins them (SDD §5.4)
+            m, v = await self._transitions(m, v, [*steps, final], actor, also=also)
         return m
 
-    async def _record_strategy_recommendation(
+    async def _strategy_record(
         self,
         plan: Plan,
         vm: VMRef,
-        migration: Migration,
+        migration_id: str,
         advice: Advice,
         decision: Decision,
         rec_id: str,
@@ -1191,9 +1221,10 @@ class Orchestrator:
         evidence_option: str | None = None,
         evidence: Sequence[EvidenceItem] = (),
         incidents: Sequence[SimilarIncident] = (),
-    ) -> AdvisorRecommendation:
-        """Store the strategy recommendation, its decision, its evidence and its input; audit both
-        (SDD §14.4, §14.5)."""
+    ) -> Joined:
+        """The strategy recommendation, its decision, its evidence and its input, with their two
+        audit events, to join the migration's assessment in its transaction; the input snapshot,
+        content-addressed, is stored first (SDD §5.4, §14.4, §14.5, audit AD-05)."""
         answered = advice.unavailable is None
         snapshot = await store_snapshot(
             self.db,
@@ -1213,7 +1244,7 @@ class Orchestrator:
             decision_type=DecisionType.migration_strategy,
             subject=AdvisorSubject(kind="vm", id=vm.source_id, name=vm.name),
             plan_id=plan.id,
-            migration_id=migration.id,
+            migration_id=migration_id,
             provider_id=plan.source_provider_id,
             model=AdvisorModelInfo(
                 name="jev" if answered else "rules",
@@ -1236,10 +1267,17 @@ class Orchestrator:
             similar_incidents=list(incidents),
             reasons=keep_reasons(advice.reasons, evidence, recommendation_id=rec_id),
         )
-        await self.db.put("recommendation", rec)
-        for kind, message, actor, data in (created_event(rec), decision_event(rec)):
-            await self._emit(kind, message, migration=migration, actor=actor, data=data)
-        return rec
+        events = [
+            new_event(
+                kind, message, plan_id=plan.id, migration_id=migration_id, actor=by, data=data
+            )
+            for kind, message, by, data in (created_event(rec), decision_event(rec))
+        ]
+
+        def joined(migration: Migration) -> tuple[list[tuple[str, Any, int]], list[Event]]:
+            return [("recommendation", rec, 0)], events
+
+        return joined
 
     async def in_flight(self, plan_id: str) -> list[Migration]:
         """The plan's migrations in flight (SDD §12: no edit, no re-wave meanwhile)."""
