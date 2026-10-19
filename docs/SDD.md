@@ -313,7 +313,8 @@ AdvisorModelInfo { name: "jev"|"rules", version: str, deployment: "on_prem"|"rem
 RecommendedOption { option: str|null, confidence: float|null,   # 0..1, the only number compared with a threshold
                     distribution: dict[str, float] = {},        # raw probabilities, shown only in Details
                     unusable: str|null = null }  # why the answer could not be applied when it was recorded (§14.4
-                                                 # rule 2), null when it could: no approve takes it (§14.6, AD-03)
+                                                 # rule 2), null when it could: no approve takes it (§14.6, AD-03);
+                                                 # one stored without it (v0.1.0-rc.2) reads its fallback's why
 
 Decision { final_option: str|null, status: DecisionStatus, reason_code: ReasonCode, reason_text: str|null,
            actor: AdvisorActor, policy_id: str|null, threshold_used: float|null, decided_at: datetime,
@@ -2671,7 +2672,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/advisor/recommendations/{id}` | viewer | — | `AdvisorRecommendation` (404 unknown; a legacy id resolves too) |
 | GET | `/advisor/notes` | viewer | query `limit` (1–200, default 20) | `{"items": [AdvisorNoteEntry]}`: the advisor notes of every migration except strategy notes (those are listed as legacy recommendations, §14.4), newest first; notes of the same time keep the migrations' creation order and each migration's note order. An `AdvisorNoteEntry` is an `AdvisorNote` (§4) with `migration_id`, `plan_id` and `vm_name` |
 | GET | `/advisor/snapshots/{sha256}` | viewer | `sha256`: 64 lowercase hex characters (422 otherwise) | `AdvisorSnapshot` (404 unknown, §14.5) |
-| POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the migration's newest, the migration not `pending`/`blocked`/`ready`, the plan setting the VM's strategy, the decision already approved, nothing usable or eligible to approve, or the decision's requester when the decision's recorded `require_distinct_approver` — or, for one that recorded none, the policy in force — requires a distinct approver; §14.6) |
+| POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the one the migration's hold names - without a hold, not its newest -, the migration not `pending`/`blocked`/`ready`, the plan setting the VM's strategy, the decision already approved, nothing usable or eligible to approve, or the decision's requester when the decision's recorded `require_distinct_approver` — or, for one that recorded none, the policy in force — requires a distinct approver; §14.6) |
 | POST | `/advisor/recommendations/{id}/override` | admin (`advisor.approve`) | `{"option": Strategy, "reason": str?}` (reason ≤ 2000; at least 10 characters when the decision's recorded `require_override_reason` — or, for a decision that recorded none, the policy in force — requires one (§14.6), 422 otherwise; the option must be eligible, 422) | `AdvisorRecommendation` (409 as approve) |
 | GET | `/advisor/policies` | viewer | — | `{"items": [AdvisorPolicy], "default": AdvisorPolicy}` (`default`: the built-in `global-default`, read-only) |
 | POST | `/advisor/policies` | admin (`advisor.policy.manage`) | `AdvisorPolicy` without `id`, `created_at`, `updated_at`, `updated_by` (422: both scope lists set, an unknown provider or plan id, threshold outside 0..1) | `AdvisorPolicy` (201) |
@@ -3176,14 +3177,18 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   another decision for the migration replaces the hold or clears it, and a cancel clears it — the cancel action
   or a validation's cancel of a VM that left the plan: a cancelled migration takes no decision. The dashboard
   shows a hold as waiting only while the migration is `pending`, `blocked` or `ready`, where it can be decided.
-* **Approve** and **override** (`advisor.approve`) act on the migration's newest stored recommendation while the
-  migration is `pending`, `blocked` or `ready`: approve → `approved`, final = the recommended option, which must
-  be usable and eligible now - one the recommendation recorded as `unusable` (escalated, invalid, escaped, outside
-  the advisor's scope, §14.4 rule 2) never is: 409 "nothing to approve: <why>", while an override to that option
-  stays a person's call, with its reason (audit AD-03); override → `overridden`, final = the chosen eligible option,
-  `reason_text` = the reason (required, at least 10 characters - code points, an emoji one, the dashboard counting
-  as the API does (audit
-  AD-10) - when the policy in force says so — the API refuses with 422, not only
+* **Approve** and **override** (`advisor.approve`) act on the recommendation the migration's `advisor_hold` names
+  while it holds one - the hold is written with it (§5.4), so a clock stepped back between two validations leaves
+  that one decidable, whatever its `created_at` (review RV50-09) -, else on the migration's newest stored
+  recommendation, while the migration is `pending`, `blocked` or `ready`: approve → `approved`, final = the
+  recommended option, which must be usable and eligible now - one the recommendation recorded as `unusable`
+  (escalated, invalid, escaped, outside the advisor's scope, §14.4 rule 2) never is, nor one stored before that
+  field (v0.1.0-rc.2) whose decision fell back (`fallback_rules`, `ADVISOR_UNAVAILABLE_FALLBACK`), which reads as
+  `unusable` the `reason_text` that decision recorded (review RV50-07): 409 "nothing to approve: <why>", while an
+  override to that option stays a person's call, with its reason (audit AD-03); override → `overridden`, final =
+  the chosen eligible option, `reason_text` = the reason (required, at least 10 characters - code points, an emoji
+  one, the dashboard counting as the API does (audit AD-10) - when the policy in force says so — the API refuses
+  with 422, not only
   the dashboard). Eligible is judged at the request, as `PUT …/strategy` judges it (§12): a Retry does not
   re-assess the estimates the last validation stored, so `storage_handover` is not eligible while the migration
   holds the destination volumes an earlier attempt created (§9.2) — an approve of it is refused with 409, an
