@@ -277,8 +277,9 @@ PowerState = Literal["running", "stopped", "paused", "error", "transitioning", "
 
 
 class VMRef(_Model):
-    """A source VM as inventoried (SDD §4.2). Tenant-controlled strings (name, tags, …) are
-    stored in JSON documents: PostgreSQL JSONB rejects NUL characters, so they are stripped."""
+    """A source VM as inventoried (SDD §4.2). Its tenant-controlled strings (name, tags, …) are
+    kept as the source gives them: one holding a NUL, which PostgreSQL cannot store, fails the
+    store's write naming the field, never a name the source does not have (SDD §11)."""
 
     source_id: str
     name: str
@@ -296,21 +297,6 @@ class VMRef(_Model):
     cbt_enabled: bool | None = None
     snapshot_count: int = 0
     tools_ok: bool | None = None
-
-    @field_validator("name", "project", "flavor", "os_type", "host", mode="before")
-    @classmethod
-    def _strip_nul(cls, value: Any) -> Any:
-        return value.replace("\x00", "") if isinstance(value, str) else value
-
-    @field_validator("tags", "flavor_extra_specs", mode="before")
-    @classmethod
-    def _strip_nul_map(cls, value: Any) -> Any:
-        if isinstance(value, dict):
-            return {
-                str(k).replace("\x00", ""): (v.replace("\x00", "") if isinstance(v, str) else v)
-                for k, v in value.items()
-            }
-        return value
 
     change_rate_bps: float | None = None
     #: the task Nova runs on the server whatever its status (OS-EXT-STS:task_state), apart from

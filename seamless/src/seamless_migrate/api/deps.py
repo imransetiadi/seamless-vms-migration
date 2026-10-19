@@ -28,7 +28,7 @@ from ..security.auth import (
     hash_token,
     is_loopback,
 )
-from ..store import AsyncStore, Store, VersionedDocuments
+from ..store import AsyncStore, Store, VersionedDocuments, unstorable
 
 log = logging.getLogger(__name__)
 
@@ -298,10 +298,28 @@ def require_role(role: Role) -> Callable[[Request], Awaitable[Principal]]:
         if not principal.role.at_least(role):
             await _audit_denied(request, f"role {principal.role} is below {role}", role, principal)
             raise ApiError(403, "forbidden", f"this action requires the {role} role")
+        await _refuse_unstorable_body(request)
         return principal
 
     dependency.__name__ = f"require_{role}"
     return dependency
+
+
+async def _refuse_unstorable_body(request: Request) -> None:
+    """A JSON body holding a NUL or a lone surrogate in a string - a key or a value, at any
+    depth - is a 422 naming where, once the token and the role are checked and before the route
+    runs: the store keeps neither, and a route that writes twice would keep part of it (SDD §11,
+    §12, reviews RV48-07, RV48-08)."""
+    if request.method in SAFE_METHODS:
+        return
+    try:
+        body = await request.json()
+    except ValueError:  # no body, or none in JSON: the route's own parsing answers
+        return
+    found = unstorable(body)
+    if found is not None:
+        where, what = found
+        raise ApiError(422, "validation_error", f"{where}: {what}" if where else what)
 
 
 async def metrics_access(request: Request) -> Principal | None:

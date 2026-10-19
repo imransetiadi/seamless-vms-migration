@@ -347,6 +347,19 @@ def test_jev_reasons_keep_only_the_evidence_keys_they_name(caplog):
     assert any("license_cost" in m and "rec-000000000001" in m for m in caplog.messages)
 
 
+def test_jev_reasons_keep_no_nul_or_lone_surrogate():
+    """SDD §13.4 (review RV48-07): Jev's reasons are text from an outside service, kept with the
+    recommendation; a NUL or a lone surrogate in one is written U+FFFD as it arrives, so the
+    store, which refuses both, keeps the recommendation."""
+    vm, plan, estimates = vmware_case()
+    items = build_strategy_evidence(
+        vm, plan, ProviderKind.vmware, estimates, [], "vmware_warm", None, migration_id="mig-1"
+    )
+    raw = [{"key": "cbt", "text": "CBT\x00 is on \ud800."}]
+    kept = keep_reasons(raw, items, recommendation_id="rec-000000000001")
+    assert [(r.key, r.text) for r in kept] == [("cbt", "CBT� is on �.")]
+
+
 async def test_validation_time_incidents_come_from_memory_at_most_three(store):
     seen = []
     hits = [

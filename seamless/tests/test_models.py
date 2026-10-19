@@ -272,12 +272,14 @@ def test_plan_policy_bounds():
         make_plan(downtime_slo_s=0)
 
 
-def test_vmref_strips_nul_from_tenant_strings():
-    """PostgreSQL JSONB rejects NUL characters; tenant-controlled strings are cleaned."""
-    vm = make_vm(name="web\x00-01", os_type="lin\x00ux", tags={"ow\x00ner": "fin\x00ance"})
-    assert vm.name == "web-01" and vm.os_type == "linux"
-    assert vm.tags == {"owner": "finance"}
-    assert "\x00" not in vm.model_dump_json()
+def test_vmref_keeps_tenant_strings_as_the_source_gives_them():
+    """SDD §11 (reviews RV48-05, RV48-08): a VM's tenant-chosen strings were stripped of NUL as
+    the model was built - a name the source does not have, which os-migrate's export filter would
+    match on another VM, and two tags merged into one. The model keeps what the source gives; the
+    store refuses a write holding a NUL, naming the field."""
+    tags = {"ow\x00ner": "fin\x00ance", "owner": "ops"}
+    vm = make_vm(name="web\x00-01", os_type="lin\x00ux", tags=tags)
+    assert (vm.name, vm.os_type, vm.tags) == ("web\x00-01", "lin\x00ux", tags)
 
 
 def test_keep_sync_history_drops_the_oldest_passes_between_the_first_and_the_latest():

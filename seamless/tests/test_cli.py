@@ -64,6 +64,11 @@ def test_token_create_prints_token_and_yaml_hash(env, capsys):
         "system:fallback",
         "policy:pol-finance",
         "user:sari",
+        # not printable: a control or format character, a lone surrogate (review RV48-05)
+        "sys\x00tem",
+        "ops\tlead",
+        "a\u202eb",
+        "a\ud800b",
     ],
 )
 def test_token_create_refuses_names_the_file_or_the_audit_trail_own(env, capsys, name):

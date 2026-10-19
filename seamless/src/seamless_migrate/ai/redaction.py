@@ -129,9 +129,20 @@ def _redact_pem(text: str) -> str:
     return "".join(out) + text[pos:]
 
 
+#: what the store keeps no copy of in a string - a NUL, a lone surrogate (SDD §11)
+_UNSTORABLE = re.compile("[\x00\ud800-\udfff]")
+
+
+def replace_unstorable(text: str) -> str:
+    """``text`` with each NUL and each lone surrogate written U+FFFD, the replacement character:
+    outside text the store then keeps wherever it goes (SDD §11, §13.4, review RV48-07)."""
+    return _UNSTORABLE.sub("\ufffd", text)
+
+
 def redact(text: str, redact_names: Sequence[str] | None = None) -> str:
-    """Remove secrets (and optionally VM names) before text leaves the control plane."""
-    out = _redact_pem(str(text))
+    """Remove secrets (and optionally VM names) before text leaves the control plane; a NUL or a
+    lone surrogate is written U+FFFD (SDD §13.4)."""
+    out = _redact_pem(replace_unstorable(str(text)))
     for pattern, replacement in _PATTERNS:
         out = pattern.sub(replacement, out)
     return replace_names(out, {name: "[vm]" for name in redact_names or []})
@@ -166,12 +177,13 @@ def redact_tail(text: str, limit: int, redact_names: Sequence[str] | None = None
 
 
 def redact_payload(value: Any, redact_names: Sequence[str] | None = None) -> Any:
-    """``redact`` every string of a JSON-like value; a credential key's whole value is removed."""
+    """``redact`` every string of a JSON-like value; a credential key's whole value is removed,
+    and a key's NUL or lone surrogate is written U+FFFD (SDD §13.4)."""
     if isinstance(value, str):
         return redact(value, redact_names)
     if isinstance(value, Mapping):
         return {
-            key: REDACTED
+            (replace_unstorable(key) if isinstance(key, str) else key): REDACTED
             if isinstance(key, str) and _CREDENTIAL_KEY.fullmatch(key)
             else redact_payload(item, redact_names)
             for key, item in value.items()

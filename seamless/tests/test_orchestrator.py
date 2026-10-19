@@ -67,7 +67,7 @@ from seamless_migrate.planning.estimator import (
     params_for_plan,
 )
 from seamless_migrate.providers.base import ProviderError
-from seamless_migrate.store import ConflictError, NotFound, Store
+from seamless_migrate.store import ConflictError, NotFound, Store, UnstorableValue
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_vm
 from tests.jev_fakes import fixture_responder, load_fixture, session_factory
@@ -6563,6 +6563,22 @@ async def test_a_cutover_request_is_not_an_approval_when_a_distinct_approver_is_
     assert (await h.migration(m.id)).approvals == []
     await h.orch.approve(m.id, "rina", "Checked the pre-flight warnings")
     await h.wait_phase(m.id, P.completed)
+    await h.orch.stop()
+
+
+async def test_a_principal_whose_name_holds_a_nul_records_no_request_to_approve_itself(
+    tmp_path, store
+):
+    """SDD §5.4, §11 (review RV48-05): the store stripped a requester's NUL while the approval
+    compared the principal's own name, NUL included, so 'ops\\0lead' approved its own cutover
+    request. The store keeps no NUL: the request is refused, nothing recorded to approve."""
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.awaiting_cutover)
+    with pytest.raises(UnstorableValue, match="holds a NUL character"):
+        await h.orch.request_cutover(m.id, "ops\x00lead")
+    held = await h.migration(m.id)
+    assert (held.cutover_requested, held.cutover_requested_by) == (False, None)
     await h.orch.stop()
 
 

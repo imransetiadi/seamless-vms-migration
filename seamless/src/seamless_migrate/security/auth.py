@@ -24,6 +24,12 @@ TOKEN_PREFIX = "smg_"
 MAX_TOKEN_NAME = 128
 #: actors the control plane records itself (SDD §13.1): no token is created under these names
 RESERVED_TOKEN_NAMES = frozenset({"anonymous", "unauthenticated", "cli", "system"})
+#: why a token name with a control or format character, a lone surrogate or a separator but the
+#: space - what ``str.isprintable`` refuses - is refused (SDD §13.1)
+NOT_PRINTABLE = (
+    "holds a character that is not printable (a control or format character, a lone surrogate, "
+    "a separator but the space)"
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LOOPBACK_NAMES = frozenset({"localhost"})
 
@@ -107,6 +113,10 @@ class TokenStore:
             name = str(item["name"])
             if len(name) > MAX_TOKEN_NAME:
                 raise AuthConfigError(f"token #{index}: name longer than {MAX_TOKEN_NAME}")
+            if not name.isprintable():
+                # SDD §13.1 (review RV48-05): it would read as another name in the dashboard, or
+                # reach the store as a NUL, which it keeps no copy of (§11)
+                raise AuthConfigError(f"token #{index}: {name!r} {NOT_PRINTABLE}")
             # SDD §13.1: what `token create` and POST /users refuse, a hand-edited file cannot add
             if name.strip().casefold() in RESERVED_TOKEN_NAMES:
                 raise AuthConfigError(

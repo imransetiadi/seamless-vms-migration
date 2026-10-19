@@ -276,3 +276,17 @@ def test_only_the_two_clients_talk_to_the_ai_services():
     }
     # the patterns live in one module
     assert _modules_matching(r"re\.compile\(r[\"'][^\n]*BEGIN") == {"ai/redaction.py"}
+
+
+def test_redact_writes_nul_and_lone_surrogates_as_the_replacement_character():
+    """SDD §11, §13.4 (reviews ST-03, RV48-07): outside text - a step's or a provider's error, a
+    migration.log line, an agentmemory hit - may carry a NUL or a lone surrogate, which the store
+    refuses; redact writes each as U+FFFD, the keys of a payload's maps too, so such text is kept
+    wherever it goes. A character outside the BMP is a character like any other."""
+    assert redact("step\x00failed: \ud800 ok \U0001f600") == "step�failed: � ok \U0001f600"
+    assert redact_cut("a\x00" * 10, 4) == "a�a�"
+    assert redact_tail("x\ud800y", 2) == "�y"
+    assert redact_payload({"evidence": ["da\x00ta"], "o\x00k": "v\ud800"}) == {
+        "evidence": ["da�ta"],
+        "o�k": "v�",
+    }

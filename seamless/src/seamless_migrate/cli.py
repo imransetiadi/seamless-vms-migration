@@ -33,6 +33,7 @@ from .domain.models import (
 from .planning.estimator import EstimatorParams, estimate, invalid_estimator_overrides
 from .security.auth import (
     MAX_TOKEN_NAME,
+    NOT_PRINTABLE,
     RESERVED_TOKEN_NAMES,
     TokenStore,
     auth_disabled_allowed,
@@ -240,6 +241,8 @@ def cmd_token_create(args: argparse.Namespace, settings: Settings) -> int:
     # SDD §13.1: never an entry the tokens file refuses, nor a token acting as the control plane
     if not args.name or len(args.name) > MAX_TOKEN_NAME:
         raise CliError(f"a token name has 1 to {MAX_TOKEN_NAME} characters")
+    if not args.name.isprintable():
+        raise CliError(f"{args.name!r} {NOT_PRINTABLE}; pick another")
     if args.name.strip().casefold() in RESERVED_TOKEN_NAMES:
         raise CliError(f"{args.name!r} is an actor the control plane records itself; pick another")
     if ":" in args.name:

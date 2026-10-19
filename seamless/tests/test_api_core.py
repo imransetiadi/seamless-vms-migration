@@ -1,3 +1,4 @@
+import hashlib
 import inspect
 import re
 
@@ -8,7 +9,7 @@ from fastapi.testclient import TestClient
 from seamless_migrate.ai.memory import MemoryClient
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, Role
-from seamless_migrate.domain.models import Provider
+from seamless_migrate.domain.models import Migration, Plan, Provider
 from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, ROLES, SOURCE, Api, api_settings
 from tests.factories import make_migration
@@ -181,7 +182,79 @@ def test_a_128_character_admins_policy_change_is_audited(api):
     res = api.client.post("/api/v1/advisor/policies", headers=headers, json=spec)
     assert res.status_code == 201, res.text
     [audited] = [e for e in api.store.events(since_seq=0) if e.kind == "policy.created"]
-    assert audited.actor == f"user:{name}"[:128]
+    actor = f"user:{name}"  # its start, then 12 hex of its SHA-256 (review RV48-10)
+    assert audited.actor == actor[:115] + "~" + hashlib.sha256(actor.encode()).hexdigest()[:12]
+
+
+@pytest.mark.parametrize(
+    ("fragment", "message"),
+    [
+        ('"name": "fin\\u0000ance"', "name: holds a NUL character"),
+        ('"name": "fin\\ud800ance"', "name: holds a lone surrogate"),
+        (
+            '"name": "Mapped", "mappings": {"networks": {"app\\u0000-net": "prod-net"}}',
+            "mappings.networks: a key holds a NUL character",
+        ),
+    ],
+    ids=["nul", "lone-surrogate", "nul-key"],
+)
+def test_a_request_body_holding_a_nul_or_a_lone_surrogate_is_a_422_before_the_route_runs(
+    api, fragment, message
+):
+    """SDD §11, §12 (reviews RV48-07, RV48-08): a JSON string with a NUL or a lone surrogate
+    passed the request model - the plan was written, then its plan.created message could not be
+    encoded (a 500, a plan without its audit event), PostgreSQL refused the document, and the
+    store's strip merged a mapping's two keys. Such a body is refused 422 naming where, once the
+    token and the role are checked, before the route writes anything."""
+    for provider in (SOURCE, DESTINATION):
+        assert api.post("/api/v1/providers", json=provider).status_code == 201
+    body = (
+        "{" + fragment + ', "source_provider_id": "src-osp",'
+        ' "destination_provider_id": "dst-rhoso", "vm_ids": []}'
+    )
+
+    def post(role):
+        headers = {**api.h(role), "content-type": "application/json"}
+        return api.client.post("/api/v1/plans", headers=headers, content=body)
+
+    assert post(None).status_code == 401  # the token first
+    assert post(Role.viewer).status_code == 403  # then the role
+    res = post(Role.operator)
+    assert (res.status_code, res.json()["error"]) == (
+        422,
+        {"code": "validation_error", "message": message},
+    )
+    assert api.store.list("plan", Plan) == [] and "plan.created" not in api.kinds()
+
+
+def test_a_value_the_store_refuses_is_a_422_naming_its_field(api, monkeypatch):
+    """SDD §11, §12: a source cloud's name holding a NUL - Neutron's names are free strings - is
+    refused by the store, never kept stripped as a name the source does not have; the route
+    answers 422 validation_error with the store's message, naming the field, never a 500."""
+    from seamless_migrate.domain.models import Nic
+    from seamless_migrate.providers.fake import FakeSourceProvider
+
+    for provider in (SOURCE, DESTINATION):
+        assert api.post("/api/v1/providers", json=provider).status_code == 201
+    [first, *_] = [vm["source_id"] for vm in api.get("/api/v1/providers/src-osp/inventory").json()]
+    original = FakeSourceProvider.get_vm
+
+    async def get_vm(self, source_id):
+        vm = await original(self, source_id)
+        return vm.model_copy(update={"nics": [Nic(network="app\x00-net")]})
+
+    monkeypatch.setattr(FakeSourceProvider, "get_vm", get_vm)
+    plan = {"name": "NUL network", "source_provider_id": "src-osp"}
+    plan |= {"destination_provider_id": "dst-rhoso", "vm_ids": [first]}
+    made = api.post("/api/v1/plans", Role.operator, json=plan)
+    assert made.status_code == 201, made.text
+    res = api.post(f"/api/v1/plans/{made.json()['id']}/validate", Role.operator)
+    assert res.status_code == 422 and res.json()["error"]["code"] == "validation_error", res.text
+    assert re.fullmatch(
+        r"[a-z_]+ [\w-]+: [\w.]+: holds a NUL character, which the store cannot keep",
+        res.json()["error"]["message"],
+    ), res.text
+    assert api.store.list("migration", Migration) == []
 
 
 ROUTES = [

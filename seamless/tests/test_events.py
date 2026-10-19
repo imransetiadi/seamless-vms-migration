@@ -122,6 +122,22 @@ async def test_subscribe_replays_since_then_live(store: Store):
     await agen.aclose()
 
 
+async def test_the_stream_publishes_the_event_the_store_holds(store: Store):
+    """SDD §11 (review RV48-14): emit published the event it built, the store kept the row it
+    wrote - an over-long actor cut to its column -, so an open stream (the dashboard's, a SIEM on
+    /events/stream) received another actor for a seq than GET /events, a reconnect's replay and
+    `seamless events export` return. What is published is the row as written."""
+    bus = EventBus(store)
+    agen = bus.subscribe(since=store.max_seq())
+    task = asyncio.ensure_future(_take(agen, 1))  # consuming first: the event arrives live
+    await asyncio.sleep(0.05)
+    await emit(store, bus, "policy.created", "created", actor="user:" + "a" * 128, data={"k": "v"})
+    [live] = await task
+    await agen.aclose()
+    [stored] = store.events(kinds=["policy.created"])
+    assert live == stored and len(live.actor) == events_table.c.actor.type.length
+
+
 async def test_subscribe_has_no_duplicates_when_live_overlaps_replay(store: Store):
     """Events committed while a subscriber replays are delivered exactly once."""
     bus = EventBus(store, replay_page=1)

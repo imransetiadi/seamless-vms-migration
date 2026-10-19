@@ -11,6 +11,7 @@ import contextlib
 import fcntl
 import hashlib
 import logging
+import re
 import threading
 from collections.abc import AsyncIterator, Collection, Iterable
 from datetime import UTC, datetime
@@ -92,6 +93,11 @@ class ConflictError(StoreError):
     """Optimistic-concurrency conflict (stale version, or the document already exists)."""
 
 
+class UnstorableValue(StoreError):
+    """A write holding what PostgreSQL cannot store - a NUL, a lone surrogate -, refused before
+    any statement on every backend rather than rewritten (SDD §11)."""
+
+
 class NotFound(StoreError):
     def __init__(self, kind: str, id_: str) -> None:
         super().__init__(f"{kind} {id_!r} not found")
@@ -148,11 +154,11 @@ def _as_strings(wanted: Any) -> list[str] | None:
 
 def _sql_filter(name: str, wanted: Any) -> Any:
     """A WHERE clause on the JSON field ``name`` for string filters, else ``None``; a value holding
-    a NUL matches no stored string and is never sent (SDD §11)."""
+    a NUL or a lone surrogate matches no stored string and is never sent (SDD §11)."""
     values = _as_strings(wanted)
     if not values or not name.isidentifier():
         return None
-    values = [v for v in values if not _has_nul(v)]
+    values = [v for v in values if not _unsendable(v)]
     if not values:
         return sa.false()
     column = documents.c.data[name].as_string()
@@ -167,36 +173,105 @@ def _matches(value: Any, wanted: Any) -> bool:
     return value == wanted
 
 
-def _no_nul(value: Any) -> Any:
-    """``value`` with NUL stripped from every string, the keys of its maps included: PostgreSQL
-    stores none - psycopg refuses one in a text parameter, JSONB refuses ``\\u0000`` - and SQLite
-    stores what PostgreSQL would (SDD §11, reviews ST-03, ST-04)."""
+#: the end of ``events.seq``'s range, PostgreSQL's integer: no bound beyond it is sent (SDD §11)
+MAX_SEQ = 2**31 - 1
+
+#: what PostgreSQL cannot store in a string: a NUL, a lone surrogate (SDD §11)
+_UNSTORABLE = re.compile("[\x00\ud800-\udfff]")
+
+
+def _unstorable_text(text: str) -> str | None:
+    """What of ``text`` PostgreSQL cannot store, in words, else None (SDD §11)."""
+    found = _UNSTORABLE.search(text)
+    if found is None:
+        return None
+    return "a NUL character" if found.group() == "\x00" else "a lone surrogate"
+
+
+def _unsendable(value: str | None) -> bool:
+    """Whether a lookup value holds what no stored string does (SDD §11)."""
+    return value is not None and _unstorable_text(value) is not None
+
+
+def _find_unstorable(value: Any) -> tuple[list[str], str] | None:
+    """The path, innermost part first, and what - of the first string of ``value`` PostgreSQL
+    cannot store; its parts are only built on the way back from one. A model is read as it holds
+    its fields: its JSON dump writes a lone surrogate of a map's key as U+FFFD, a rewrite the store
+    would never see."""
     if isinstance(value, str):
-        return value.replace("\x00", "")
+        what = _unstorable_text(value)
+        return ([], f"holds {what}") if what else None
+    if isinstance(value, BaseModel):
+        value = value.__dict__
     if isinstance(value, dict):
-        return {_no_nul(k): _no_nul(v) for k, v in value.items()}
-    if isinstance(value, list | tuple):
-        return [_no_nul(v) for v in value]
-    return value
+        for key, item in value.items():
+            if isinstance(key, str) and (what := _unstorable_text(key)):
+                return [], f"a key holds {what}"
+            if (found := _find_unstorable(item)) is not None:
+                found[0].append(str(key))
+                return found
+    elif isinstance(value, list | tuple | set | frozenset):
+        for index, item in enumerate(value):
+            if (found := _find_unstorable(item)) is not None:
+                found[0].append(str(index))
+                return found
+    return None
 
 
-def _has_nul(value: str | None) -> bool:
-    """Whether a lookup value holds a NUL - which no stored string does (SDD §11)."""
-    return value is not None and "\x00" in value
+def unstorable(value: Any) -> tuple[str, str] | None:
+    """Where ``value`` first holds a NUL or a lone surrogate, and what: ``("vm.nics.0.network",
+    "holds a NUL character")``, ``("vm.tags", "a key holds a lone surrogate")``, else None - what
+    the store refuses, and the API before any route runs (SDD §11, §12)."""
+    found = _find_unstorable(value)
+    return None if found is None else (".".join(reversed(found[0])), found[1])
+
+
+def _refuse_unstorable(subject: str, value: Any) -> None:
+    """An ``UnstorableValue`` naming ``subject`` and the field, never the value, when ``value``
+    holds what PostgreSQL cannot store - on every backend, before any statement (SDD §11)."""
+    found = unstorable(value)
+    if found is not None:
+        where, what = found
+        field = f"{where}: " if where else ""
+        raise UnstorableValue(f"{subject}: {field}{what}, which the store cannot keep")
+
+
+def _document_data(kind: str, doc_id: str, model: BaseModel) -> dict[str, Any]:
+    """``model``'s JSON data, refused when it or its id holds what PostgreSQL cannot store - never
+    rewritten, so a stored value is the one a later step compares (SDD §11, reviews RV48-04,
+    RV48-05, RV48-08)."""
+    what = _unstorable_text(doc_id)
+    if what is not None:
+        raise UnstorableValue(f"{kind}: id: holds {what}, which the store cannot keep")
+    _refuse_unstorable(f"{kind} {doc_id}", model)
+    return model.model_dump(mode="json")
+
+
+def _kept_actor(actor: str) -> str:
+    """``actor`` as ``events.actor`` keeps it: whole when it fits, else its first characters,
+    ``~`` and 12 hex digits of its SHA-256 - two actors never read as one (SDD §11, reviews ST-02,
+    RV48-10)."""
+    width = events.c.actor.type.length
+    if len(actor) <= width:
+        return actor
+    digest = hashlib.sha256(actor.encode("utf-8")).hexdigest()[:12]
+    return f"{actor[: width - len(digest) - 1]}~{digest}"
 
 
 def _event_row(event: Event) -> dict[str, Any]:
-    """The ``events`` row of ``event``: no NUL in any string, the actor cut to its column, its start
-    kept - ``user:`` and a name of up to 128 characters (SDD §11, reviews ST-02, ST-03)."""
-    actor = _no_nul(event.actor)[: events.c.actor.type.length]
+    """The ``events`` row of ``event``, refused when it holds what PostgreSQL cannot store, its
+    actor as the column keeps it; the event a write returns, and the bus publishes, is this row
+    (SDD §11, reviews ST-02, RV48-09, RV48-10, RV48-14)."""
+    named = _unstorable_text(event.kind) is None
+    _refuse_unstorable(f"{event.kind} event" if named else "an event", event)
     return {
         "ts": event.ts,
-        "kind": _no_nul(event.kind),
-        "plan_id": _no_nul(event.plan_id),
-        "migration_id": _no_nul(event.migration_id),
-        "actor": actor,
-        "message": _no_nul(event.message),
-        "data": _no_nul(event.model_dump(mode="json")["data"]),
+        "kind": event.kind,
+        "plan_id": event.plan_id,
+        "migration_id": event.migration_id,
+        "actor": _kept_actor(event.actor),
+        "message": event.message,
+        "data": event.model_dump(mode="json")["data"],
     }
 
 
@@ -262,6 +337,8 @@ class Store:
             message=f"User {user.name} created",
             data={"name": user.name, "role": str(user.role)},
         )
+        data = _document_data("user", user.id, user)
+        row = _event_row(event)
         try:
             with self.engine.begin() as conn:
                 conn.execute(
@@ -269,16 +346,16 @@ class Store:
                         kind="user",
                         id=user.id,
                         version=1,
-                        data=_no_nul(user.model_dump(mode="json")),
+                        data=data,
                         created_at=event.ts,
                         updated_at=event.ts,
                     )
                 )
-                result = conn.execute(events.insert().values(**_event_row(event)))
+                result = conn.execute(events.insert().values(**row))
                 seq = int(result.inserted_primary_key[0])
         except IntegrityError:
             raise ConflictError("a user with this name already exists") from None
-        return event.model_copy(update={"seq": seq})
+        return Event(seq=seq, **row)
 
     def put(self, kind: str, model: BaseModel, expected_version: int | None = None) -> int:
         """Insert or update ``model``; return the new version.
@@ -287,7 +364,7 @@ class Store:
         ``n > 0`` requires the stored version to be ``n`` (else :class:`ConflictError`).
         """
         doc_id = str(model.id)  # type: ignore[attr-defined]
-        data = _no_nul(model.model_dump(mode="json"))
+        data = _document_data(kind, doc_id, model)
         attempts = 5 if expected_version is None else 1
         for _ in range(attempts):
             try:
@@ -364,29 +441,23 @@ class Store:
         §11): both are written, or neither - a ``ConflictError`` as ``put``'s, or the store's own
         error. The source watch's flag and its alert (§8.1, review RV21-04)."""
         doc_id = str(model.id)  # type: ignore[attr-defined]
+        data = _document_data(kind, doc_id, model)
+        row = _event_row(event)
         key = (documents.c.kind == kind) & (documents.c.id == doc_id)
         with self.engine.begin() as conn:
             updated = conn.execute(
                 documents.update()
                 .where(key & (documents.c.version == expected_version))
-                .values(
-                    version=expected_version + 1,
-                    data=_no_nul(model.model_dump(mode="json")),
-                    updated_at=_now(),
-                )
+                .values(version=expected_version + 1, data=data, updated_at=_now())
             )
             seq = (
-                int(
-                    conn.execute(events.insert().values(**_event_row(event))).inserted_primary_key[
-                        0
-                    ]
-                )
+                int(conn.execute(events.insert().values(**row)).inserted_primary_key[0])
                 if updated.rowcount == 1
                 else None
             )
         if seq is None:
             raise self._refused(kind, doc_id, expected_version)
-        return expected_version + 1, event.model_copy(update={"seq": seq})
+        return expected_version + 1, Event(seq=seq, **row)
 
     def _refused(self, kind: str, doc_id: str, expected_version: int) -> ConflictError:
         """Why a versioned write found no row to write: the document is missing, or at another
@@ -401,8 +472,8 @@ class Store:
         )
 
     def get_versioned(self, kind: str, id_: str, model_cls: type[M]) -> tuple[M, int]:
-        if _has_nul(id_):
-            raise NotFound(kind, id_)  # no stored id holds a NUL (SDD §11)
+        if _unsendable(id_):
+            raise NotFound(kind, id_)  # no stored id holds one (SDD §11)
         with self.engine.connect() as conn:
             row = conn.execute(
                 sa.select(documents.c.data, documents.c.version).where(
@@ -488,7 +559,7 @@ class Store:
         self, kind: str, ids: Collection[str], model_cls: type[M]
     ) -> dict[str, tuple[int, M]]:
         """``{id: (version, document)}`` for the ``ids`` that exist (SDD §11)."""
-        wanted = [id_ for id_ in dict.fromkeys(ids) if not _has_nul(id_)]
+        wanted = [id_ for id_ in dict.fromkeys(ids) if not _unsendable(id_)]
         out: dict[str, tuple[int, M]] = {}
         with self.engine.connect() as conn:
             for start in range(0, len(wanted), _GET_MANY_CHUNK):
@@ -504,7 +575,7 @@ class Store:
         """Each plan's migration phases with how many of its migrations are in each (SDD §8.1,
         §11): one ``SELECT ... GROUP BY`` over the indexed ``plan_id`` and ``phase`` expressions; no
         document is loaded or validated. A plan without migrations is absent from the result."""
-        wanted = [plan_id for plan_id in plan_ids if not _has_nul(plan_id)]
+        wanted = [plan_id for plan_id in plan_ids if not _unsendable(plan_id)]
         if not wanted:
             return {}
         plan_col = documents.c.data["plan_id"].as_string()
@@ -524,8 +595,8 @@ class Store:
         """Delete the document; with ``expected_version`` only at that version - a write landing
         after the caller read it is a ``ConflictError``, never deleted unseen (SDD §11, review
         ST-05). A document gone is ``NotFound``."""
-        if _has_nul(id_):
-            raise NotFound(kind, id_)  # no stored id holds a NUL (SDD §11)
+        if _unsendable(id_):
+            raise NotFound(kind, id_)  # no stored id holds one (SDD §11)
         key = (documents.c.kind == kind) & (documents.c.id == id_)
         if expected_version is not None:
             key = key & (documents.c.version == expected_version)
@@ -547,10 +618,12 @@ class Store:
 
     # -- events ------------------------------------------------------------------------------
     def append_event(self, event: Event) -> Event:
+        """Append ``event``; return it as written, its seq set (SDD §11)."""
+        row = _event_row(event)
         with self.engine.begin() as conn:
-            result = conn.execute(events.insert().values(**_event_row(event)))
+            result = conn.execute(events.insert().values(**row))
             seq = int(result.inserted_primary_key[0])
-        return event.model_copy(update={"seq": seq})
+        return Event(seq=seq, **row)
 
     def events(
         self,
@@ -564,15 +637,20 @@ class Store:
     ) -> list[Event]:
         """Matching events after ``since_seq`` (and below ``before_seq``) in ascending ``seq``: the
         first ``limit`` of them, or with ``tail`` the newest ``limit`` — with ``before_seq``, the
-        page before an event (SDD §12). A filter value holding a NUL matches no stored event and is
-        never sent (SDD §11)."""
-        if _has_nul(plan_id) or _has_nul(migration_id):
+        page before an event (SDD §12). A filter value holding a NUL or a lone surrogate matches no
+        stored event, and no seq outside ``events.seq``'s range is sent: nothing after its end or
+        before 1 (SDD §11, review RV48-12)."""
+        if _unsendable(plan_id) or _unsendable(migration_id):
             return []
+        if since_seq >= MAX_SEQ or (before_seq is not None and before_seq <= 1):
+            return []
+        if before_seq is not None and before_seq > MAX_SEQ:
+            before_seq = None
         if kinds is not None:
-            kinds = [kind for kind in kinds if not _has_nul(kind)]
+            kinds = [kind for kind in kinds if not _unsendable(kind)]
             if not kinds:
                 return []
-        query = sa.select(events).where(events.c.seq > since_seq)
+        query = sa.select(events).where(events.c.seq > max(since_seq, 0))
         if before_seq is not None:
             query = query.where(events.c.seq < before_seq)
         if plan_id is not None:
@@ -794,6 +872,7 @@ __all__ = [
     "NotFound",
     "Store",
     "StoreError",
+    "UnstorableValue",
     "build_engine",
 ]
 
