@@ -3,6 +3,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -4570,26 +4571,34 @@ def _stopping_cutover(settings):
 
 async def test_a_restart_right_after_a_failure_still_rolls_the_stopped_vm_back(tmp_path, store):
     """SDD §8: the automatic rollback is saved in the same write as the failure, so a restart
-    while the knowledge lookup still waits on agentmemory resumes it — the VM never stays stopped
-    in failed."""
+    before it ends - the knowledge lookup still waiting on agentmemory, which holds the rollback
+    back no more (audit OC-04) - resumes it: the VM never stays stopped in failed."""
     settings = make_settings(tmp_path)
     knowledge = _HangingKnowledge()
+    rolling = asyncio.Event()
+
+    async def held_rollback(ctx):
+        rolling.set()
+        await asyncio.Event().wait()  # until the restart cancels it
+
+    executor = _stopping_cutover(settings)
+    executor.hooks[StepName.ROLLBACK] = held_rollback
     h, plan = await setup(
         tmp_path,
         store,
         [vm(1)],
         {"default_strategy": Strategy.cold},
-        executor=_stopping_cutover(settings),
+        executor=executor,
         knowledge=knowledge,
         settings=settings,
     )
     assert plan.verification.auto_rollback is True
     await run_plan(h, plan)
-    await asyncio.wait_for(knowledge.entered.wait(), 10)
+    await asyncio.wait_for(asyncio.gather(knowledge.entered.wait(), rolling.wait()), 10)
     m = await h.by_vm(plan.id, "vm-1")
     assert (m.phase, m.downtime_ended_at) == (P.rolling_back, None)
     assert [str(c.to_phase) for c in m.phase_history][-3:] == ["cutover", "failed", "rolling_back"]
-    await h.orch.stop()  # a restart while the lookup waits
+    await h.orch.stop()  # a restart while the rollback and the lookup wait
 
     again = build_harness(
         tmp_path, store, [vm(1)], executor=ScriptedExecutor(settings), settings=settings
@@ -4604,6 +4613,184 @@ async def test_a_restart_right_after_a_failure_still_rolls_the_stopped_vm_back(t
         "rolling_back",
         "rolled_back",
     ]
+
+
+async def test_a_slow_agentmemory_never_holds_the_automatic_rollback_back(tmp_path, store):
+    """SDD §8 (audit OC-04): the failure's lookup of similar incidents ran inside the migration's
+    own driver - _launch() was a no-op from there - so the automatic rollback waited for
+    agentmemory (5 s per call with the real client) while the source stayed stopped. The lookup
+    is a task of its own: the rollback runs at once, and a stop cancels the lookup."""
+    settings = make_settings(tmp_path)
+    knowledge = _HangingKnowledge()
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=_stopping_cutover(settings),
+        knowledge=knowledge,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    await asyncio.wait_for(knowledge.entered.wait(), 10)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    done = await h.wait_phase(mid, P.rolled_back, timeout=5.0)  # the lookup still waits
+    assert done.downtime_ended_at is not None and not knowledge.release.is_set()
+    [lookup] = list(h.orch._lookups)
+    await h.orch.stop()
+    assert lookup.cancelled()
+
+
+async def test_a_lookup_that_fails_is_logged_and_the_rollback_runs(tmp_path, store, caplog):
+    """SDD §8, §14.3: agentmemory is best effort - a failure's lookup that raises attaches no
+    note and is logged; the rollback it no longer holds back runs to its end."""
+
+    class _RaisingKnowledge(_HangingKnowledge):
+        async def on_failure(self, migration, step, error):
+            raise RuntimeError("agentmemory answered garbage")
+
+    settings = make_settings(tmp_path)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=_stopping_cutover(settings),
+        knowledge=_RaisingKnowledge(),
+        settings=settings,
+    )
+    caplog.set_level(logging.WARNING, logger="seamless_migrate.orchestrator")
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    done = await h.wait_phase(mid, P.rolled_back, timeout=5.0)
+    deadline = asyncio.get_running_loop().time() + 5
+    while h.orch._lookups:
+        assert asyncio.get_running_loop().time() < deadline, "the lookup never ended"
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert not any(n.kind == "similar_incidents" for n in done.advisor_notes)
+    assert f"the similar incidents of {mid} were not attached" in caplog.text
+    assert mid not in h.orch._driver_crashes
+
+
+async def test_a_driver_that_keeps_crashing_never_stops_the_other_plans(tmp_path, store):
+    """SDD §8 (audit OC-01): the relaunch backoff computed 2**crashes * tick_s before its 300 s
+    cap - at the 1,024th crash of one driver an int too large for a float, so from then on every
+    tick raised in its first statement and no plan of the server moved. The exponent is capped
+    first."""
+    h = build_harness(tmp_path, store, [vm(1), vm(2)])
+    crashing = plan_for([vm(1)], name="A", default_strategy=Strategy.cold)
+    healthy = plan_for([vm(2)], name="B", default_strategy=Strategy.cold)
+    store.put("plan", crashing)
+    store.put("plan", healthy)
+    real_cutover = h.orch._do_cutover
+
+    async def crash_for_vm1(m):
+        if m.vm.source_id == "vm-1":
+            raise RuntimeError("a persistent error outside the step")
+        await real_cutover(m)
+
+    h.orch._do_cutover = crash_for_vm1
+    await run_plan(h, crashing)
+    mid = (await h.by_vm(crashing.id, "vm-1")).id
+    deadline = asyncio.get_running_loop().time() + 10
+    while h.orch._driver_crashes.get(mid, (0, 0.0))[0] < 1:
+        assert asyncio.get_running_loop().time() < deadline, "the driver never crashed"
+        await asyncio.sleep(0.01)
+    # 1,024 crashes in a row, the last one longer ago than the 300 s cap: relaunched once more,
+    # as after any other count
+    h.orch._driver_crashes[mid] = (1024, time.monotonic() - 1000)
+    while h.orch._driver_crashes[mid][0] < 1025:
+        assert asyncio.get_running_loop().time() < deadline, "the driver was not relaunched"
+        await asyncio.sleep(0.01)
+    await h.orch.validate_plan(healthy.id, "alice")
+    await h.orch.start_plan(healthy.id, "alice")
+    other = await h.by_vm(healthy.id, "vm-2")
+    try:
+        done = await h.wait_phase(other.id, P.completed, timeout=5.0)
+    finally:
+        await h.orch.stop()
+    assert done.phase == P.completed
+
+
+async def test_a_relaunch_that_fails_for_one_migration_skips_only_it(tmp_path, store):
+    """SDD §8 (audit OC-01): the relaunch of drivers that died is the first thing a tick does; an
+    error there for one migration skips that migration, logged, and the tick goes on - the
+    gates, passes and completions of every other plan with it."""
+    h = build_harness(tmp_path, store, [vm(1), vm(2)])
+    crashing = plan_for([vm(1)], name="A", default_strategy=Strategy.cold)
+    healthy = plan_for([vm(2)], name="B", default_strategy=Strategy.cold)
+    store.put("plan", crashing)
+    store.put("plan", healthy)
+    real_cutover, real_launch = h.orch._do_cutover, h.orch._launch
+    held: set[str] = set()
+
+    async def crash_for_vm1(m):
+        if m.vm.source_id == "vm-1":
+            held.add(m.id)
+            raise RuntimeError("a persistent error outside the step")
+        await real_cutover(m)
+
+    def launch(mid):
+        if mid in held:
+            raise RuntimeError("the relaunch itself fails")
+        real_launch(mid)
+
+    h.orch._do_cutover, h.orch._launch = crash_for_vm1, launch
+    await run_plan(h, crashing)
+    mid = (await h.by_vm(crashing.id, "vm-1")).id
+    deadline = asyncio.get_running_loop().time() + 10
+    while mid not in held or (h.orch._drivers.get(mid) and not h.orch._drivers[mid].done()):
+        assert asyncio.get_running_loop().time() < deadline, "the driver never crashed"
+        await asyncio.sleep(0.01)
+    h.orch._driver_crashes.pop(mid, None)  # no backoff: the next tick relaunches it, and fails
+    await h.orch.validate_plan(healthy.id, "alice")
+    await h.orch.start_plan(healthy.id, "alice")
+    other = await h.by_vm(healthy.id, "vm-2")
+    try:
+        done = await h.wait_phase(other.id, P.completed, timeout=5.0)
+    finally:
+        await h.orch.stop()
+    assert done.phase == P.completed
+
+
+async def test_the_advisor_review_is_not_counted_as_downtime(tmp_path, store):
+    """SDD §5.2 (audit OC-08): downtime_ended_at was taken after the advisor's review of a passed
+    verification - Jev's screen and verify, up to 20 s each -, so the review's wait counted as
+    outage in actual_downtime_s, the SLO compliance and the plan's figures. The outage ends when
+    the verification step returns."""
+    settings = make_settings(tmp_path)
+
+    async def stopping_cutover(ctx):  # a real cutover: wall-clock downtime, no model seconds
+        await ctx.mark_downtime_start()
+        return StepResult(destination_server_id="dst-web-01")
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: stopping_cutover})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=executor,
+        settings=settings,
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    reviewed: dict[str, datetime] = {}
+
+    async def slow_review(vm_ref, result, review_reason=None):
+        reviewed["at"] = h.clock()
+        h.clock.advance(30)  # jev_screen and jev_verify take their time
+        return None
+
+    h.orch.advisor = SimpleNamespace(review_verification=slow_review)
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    # taken when the step returned: before the review began, not 30 s later
+    for at in (m.downtime_ended_at, m.verification and m.verification.at):
+        assert at is not None and timedelta(0) <= reviewed["at"] - at < timedelta(seconds=1), at
+    assert m.actual_downtime_s is not None and m.actual_downtime_s < 30, m.actual_downtime_s
 
 
 async def test_a_failed_event_write_after_a_failure_still_rolls_the_stopped_vm_back(
@@ -6555,7 +6742,8 @@ async def test_a_failure_with_no_similar_incident_announces_none(tmp_path, store
     mid = (await h.by_vm(plan.id, "vm-1")).id
     await h.wait_phase(mid, P.failed)
     deadline = asyncio.get_running_loop().time() + 10
-    while mid in h.orch._drivers:  # the driver leaves once the failure is handled to its end
+    # the driver leaves once the failure is handled, the lookup once agentmemory answered (§8)
+    while mid in h.orch._drivers or h.orch._lookups:
         assert asyncio.get_running_loop().time() < deadline, (
             "the failure was not handled to its end"
         )

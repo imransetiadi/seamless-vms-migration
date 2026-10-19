@@ -474,6 +474,8 @@ class Orchestrator:
         self._prestage_tasks: dict[str, asyncio.Task[None]] = {}
         #: best-effort rollback of the data path after a cancel in precopy/syncing (SDD §7.2)
         self._cleanups: dict[str, asyncio.Task[None]] = {}
+        #: a failure's lookup of similar incidents, never awaited by the driver (SDD §8)
+        self._lookups: set[asyncio.Task[None]] = set()
         self._wave_events_seen: dict[str, set[tuple[str, str]]] = {}
         self._progress_at: dict[str, float] = {}
         self._tick_task: asyncio.Task[None] | None = None
@@ -2500,6 +2502,7 @@ class Orchestrator:
                 *self._prestage_tasks.values(),
                 *self._steps.values(),
                 *self._cleanups.values(),
+                *self._lookups,
             )
             if t
         ]
@@ -2513,6 +2516,7 @@ class Orchestrator:
         self._steps.clear()
         self._prestage_tasks.clear()
         self._cleanups.clear()
+        self._lookups.clear()
 
     async def _loop(self) -> None:
         assert self._wake is not None
@@ -2843,13 +2847,21 @@ class Orchestrator:
         now = time.monotonic()
         migrations = await self._migrations.get()
         for m in (m for m in migrations if m.phase in fsm.RESUMABLE_PHASES):
-            driver, step = self._drivers.get(m.id), self._steps.get(m.id)
-            if (driver is not None and not driver.done()) or (step is not None and not step.done()):
-                continue
-            crashes, at = self._driver_crashes.get(m.id, (0, 0.0))
-            if crashes and now - at < min(300.0, 2**crashes * self.settings.tick_s):
-                continue
-            self._launch(m.id)
+            try:
+                driver, step = self._drivers.get(m.id), self._steps.get(m.id)
+                if (driver is not None and not driver.done()) or (
+                    step is not None and not step.done()
+                ):
+                    continue
+                crashes, at = self._driver_crashes.get(m.id, (0, 0.0))
+                # the exponent capped first: 2**1024 is past a float (audit OC-01)
+                backoff = min(300.0, 2 ** min(crashes, 64) * self.settings.tick_s)
+                if crashes and now - at < backoff:
+                    continue
+                self._launch(m.id)
+            except Exception:
+                # one migration's relaunch never stops the tick (SDD §8, audit OC-01)
+                log.exception("could not relaunch the driver of %s", m.id)
 
     async def _report_driver_crash(self, mid: str, exc: Exception, crashes: int) -> None:
         """Best effort: the store may be what failed."""
@@ -3331,6 +3343,9 @@ class Orchestrator:
             return
         if result is None:
             return
+        # SDD §5.2 (audit OC-08): the verification ends when its step returns - the advisor's
+        # review below, Jev's screen and verify, is no outage
+        verified_at = self._now()
         note: AdvisorNote | None = None
         # what the rules ask review for (SDD §7.5, ADV-18): an unreachable probe, a database VM
         # that only booted - with or without the advisor
@@ -3350,7 +3365,7 @@ class Orchestrator:
             if cur.phase != P.verifying:
                 return
             # the checks and probe results, passed or failed (SDD §7.5)
-            cur.verification = result.record(self._now())
+            cur.verification = result.record(verified_at)
             if rules_reason:
                 cur.review_required = True
                 cur.review_reason = rules_reason
@@ -3360,12 +3375,11 @@ class Orchestrator:
                     cur.review_required = True
                     cur.review_reason = note.data.get("review_reason")
             if result.passed:
-                now = self._now()
                 # SDD §5.2: a verification run again (a stop or a failed event write came before
                 # completed) keeps the end the first one recorded: the outage ended then
                 if cur.downtime_started_at is not None and cur.downtime_ended_at is None:
-                    cur.downtime_ended_at = now
-                    cur.actual_downtime_s = self._downtime_s(cur, now, plan)
+                    cur.downtime_ended_at = verified_at
+                    cur.actual_downtime_s = self._downtime_s(cur, verified_at, plan)
                 cur.checkpoint = "verified"
                 # the numbers of a completed migration must hold together (SDD §5.5, ADV-16)
                 cur.data_issues = check_invariants(
@@ -3544,16 +3558,36 @@ class Orchestrator:
         if rollback:
             self._launch(mid)
         if self.knowledge is not None:
-            note = await self.knowledge.on_failure(cur, str(step), exc)
-            if note is not None:
-                async with self._lock(mid):
-                    cur, v = await self._load(mid)
-                    cur.advisor_notes.append(note)
-                    await self._save(cur, v)
-                # SDD §14.3: announced once saved - the refresh it asks for (§16) reads the note
-                await self._emit(
-                    "advisor.similar_incidents", note.summary, migration=cur, data=note.data
-                )
+            # SDD §8 (audit OC-04): a task of its own - the driver that runs this goes on to the
+            # rollback at once, never waiting for agentmemory; a stop cancels it
+            lookup = asyncio.create_task(
+                self._attach_similar_incidents(cur, str(step), exc), name=f"similar:{mid}"
+            )
+            self._lookups.add(lookup)
+            lookup.add_done_callback(self._lookups.discard)
+
+    async def _attach_similar_incidents(
+        self, failed: Migration, step: str, exc: BaseException
+    ) -> None:
+        """The incidents agentmemory knows like the failure, attached as a note once it answers
+        (SDD §8, §14.3) - best effort, as every agentmemory call."""
+        assert self.knowledge is not None
+        try:
+            note = await self.knowledge.on_failure(failed, step, exc)
+            if note is None:
+                return
+            async with self._lock(failed.id):
+                cur, v = await self._load(failed.id)
+                cur.advisor_notes.append(note)
+                await self._save(cur, v)
+            # SDD §14.3: announced once saved - the refresh it asks for (§16) reads the note
+            await self._emit(
+                "advisor.similar_incidents", note.summary, migration=cur, data=note.data
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("the similar incidents of %s were not attached", failed.id, exc_info=True)
 
 
 def phases(migrations: Iterable[Migration]) -> Counter[str]:
