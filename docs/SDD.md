@@ -2540,12 +2540,25 @@ callers. `Store.ping() -> bool` backs the health routes (`GET /api/v1/health` re
 `"db": "ok"|"error"` and the orchestrator loop; `GET /api/v1/ready` answers 503 while degraded).
 
 **What PostgreSQL cannot hold.** PostgreSQL stores no NUL character - psycopg refuses one in a text parameter and
-JSONB refuses `\u0000` - so the store strips NUL from every string it writes: the keys and values of a document's
-data, and an event's message, actor, `plan_id`, `migration_id` and the keys and values of its data. SQLite stores
-the same, so a test sees what production keeps (Security.md C1-05; review ST-03, ST-04). No stored id or field then
-holds a NUL, so a lookup, a delete or a filter by a value holding one finds nothing without sending it. An event's
-actor is cut to the column's 128 characters, its start kept - `user:` and a name of 124-128 characters (§13.1,
-§14.5) -, so the event is always written with its change (review ST-02).
+JSONB refuses `\u0000` - and no lone surrogate, half of a UTF-16 pair and no Unicode text (SQLite cannot encode one
+in a text column either). The store rewrites no value to make it fit: it refuses, before any statement, a write
+whose document data - its keys and values at any depth - or whose event - its message, actor, kind, `plan_id`,
+`migration_id` and the keys and values of its data - holds either, the same on SQLite and PostgreSQL, with
+`UnstorableValue` (a `StoreError`) naming the kind, the id and the field but never the value; nothing of the write
+is kept. A name, a map's key, an actor a later comparison reads and a snapshot's digested content are stored as
+given or not at all (reviews ST-03, ST-04, RV48-04, RV48-05, RV48-08). What the control plane is given stops before
+that refusal: a request body holding either is refused before its route runs (§12), the tokens file refuses such a
+name (§13.1), and the text it takes from outside sources passes `redact`, which writes either as U+FFFD (§13.4).
+What reaches it is a source cloud's name holding one - Neutron's names are free strings, Nova's and vSphere's cannot
+hold one -, whose write fails naming the field rather than keep a name the source does not have. No stored id or
+field then holds either, so a lookup, a delete or a filter by a value holding one finds nothing without sending it.
+Nor does `events` send a seq outside `events.seq`'s range, 1 to 2^31 - 1: a `since_seq` at or beyond its end answers
+nothing and one below 0 reads as 0, a `before_seq` beyond its end reads as no bound and one at or below 1 answers
+nothing, whoever asks (review RV48-12; the API bounds both, §12). An event's actor longer than the column's 128
+characters - `user:` and a name of 124-128 characters (§13.1, §14.5) - keeps its first 115 characters, then `~` and
+the first 12 hex digits of the whole actor's SHA-256: the event is always written with its change, and two actors
+never read as one (reviews ST-02, RV48-10). The event the bus publishes is the row as written, so a live stream and
+a later read of one seq agree (review RV48-14).
 
 ---
 
@@ -2566,6 +2579,11 @@ a probe's `expect_stauts`), on `POST /plans` and `POST /providers` as on `PATCH 
 one) and in `seamless plan apply` (§15) — so a misspelt guard (`requrie_approval`, `verify_tsl`) never silently yields a
 plan, provider or policy without it (audit AP-01, AP-02); a stored document keeps loading with fields a later version
 added, at any depth (§11).
+A request body holding a NUL character or a lone surrogate in a string - a key or a value, at any depth - is refused
+with 422 (`validation_error`, naming where: `mappings.networks: a key holds a NUL character`) once the caller's
+token and role are checked, before the route runs, so no route writes part of it (the store keeps neither, §11;
+reviews RV48-07, RV48-08). When the store refuses a value a route writes (`UnstorableValue`, §11: a source cloud's
+name holding one), the route answers 422 `validation_error` with the store's message.
 Authentication: `Authorization: Bearer <token>` (§13).
 A request body holds at most 1 MiB (1,048,576 bytes). A larger `Content-Length`, or a chunked body
 that grows past it, is refused with 413 before the body is parsed: the framework parses a route's
@@ -2694,7 +2712,10 @@ served at `/` with SPA fallback for non-`/api` paths.
 Static bearer tokens: `SEAMLESS_TOKENS_FILE` (YAML `tokens: [{name, role, sha256}]`); only SHA-256
 hashes are stored; comparison uses `hmac.compare_digest`. `seamless token create --name N --role R`
 prints a new token (`smg_` + 32 random URL-safe bytes) once, plus the YAML entry. It refuses a name
-the tokens file refuses (empty, or longer than 128 characters) and the names the control plane records
+the tokens file refuses (empty, longer than 128 characters, or holding a character that is not printable - a control
+character, NUL included, a format character, a lone surrogate, a separator but the space: Python's
+`str.isprintable` -, which would read as another name in the dashboard or reach the store as a NUL, §11; review
+RV48-05) and the names the control plane records
 as actors itself — `anonymous`, `unauthenticated`, `cli`, `system`, in any letter case and with
 blanks around them too, and any name with a colon, the form of the actors the advisor records (`policy:<id>`,
 `user:<name>`, `system:fallback`, `system:advisor`, §14.4) — so no token's audit events pass for theirs. It also refuses
@@ -2847,7 +2868,11 @@ The control plane uses the same `redact` for the text it publishes from outside 
 provider error messages, every `migration.log` line (§4), and agentmemory's search hits - an outside service that
 agents write too - redacted as they arrive, title and content, before anything cuts or publishes them: what
 `POST /advisor/similar-incidents` answers, and the `similar_incidents` a recommendation and a failure's note keep
-(§14.3, §14.4; audit AP-05). Where it cuts such text, it redacts first,
+(§14.3, §14.4; audit AP-05).
+`redact` also writes each NUL and each lone surrogate as U+FFFD, the replacement character, so such text is kept
+wherever it goes (§11); Jev's reasons (§14.4), text from an outside service too, pass that replacement as they
+arrive.
+Where it cuts such text, it redacts first,
 over the cut plus 16384 characters, and cuts after (`redact_cut(text, limit)`): a secret the cut splits
 — a PEM block, a URL with credentials — is still found, at a bounded cost. The cuts: a `migration.log`
 line at 2000 characters (§4), the failing output line in an Ansible step's error at 500, a provider
