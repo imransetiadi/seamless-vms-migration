@@ -2559,17 +2559,21 @@ callers. `Store.ping() -> bool` backs the health routes (`GET /api/v1/health` re
 `"db": "ok"|"error"` and the orchestrator loop; `GET /api/v1/ready` answers 503 while degraded).
 
 **What PostgreSQL cannot hold.** PostgreSQL stores no NUL character - psycopg refuses one in a text parameter and
-JSONB refuses `\u0000` - and no lone surrogate, half of a UTF-16 pair and no Unicode text (SQLite cannot encode one
-in a text column either). The store rewrites no value to make it fit: it refuses, before any statement, a write
-whose document data - its keys and values at any depth - or whose event - its message, actor, kind, `plan_id`,
-`migration_id` and the keys and values of its data - holds either, the same on SQLite and PostgreSQL, with
-`UnstorableValue` (a `StoreError`) naming the kind, the id and the field but never the value; nothing of the write
-is kept. A name, a map's key, an actor a later comparison reads and a snapshot's digested content are stored as
-given or not at all (reviews ST-03, ST-04, RV48-04, RV48-05, RV48-08). What the control plane is given stops before
-that refusal: a request body holding either is refused before its route runs (§12), the tokens file refuses such a
-name (§13.1), and the text it takes from outside sources passes `redact`, which writes either as U+FFFD
-(§13.4) - as every string of Jev's answers does (§14.1), and a source VM's free text that no export filter or
-mapping reads, its tags and flavor extra specs, keys and values, its `os_type` and `host` (§4.2; review RV49-02).
+JSONB refuses `\u0000` -, no lone surrogate, half of a UTF-16 pair and no Unicode text (SQLite cannot encode one
+in a text column either), and no number that is no JSON number: JSONB refuses `NaN` and the infinities, which
+Python's `json` writes as `NaN` and `Infinity` and SQLite keeps. The store rewrites no value to make it fit: it
+refuses, before any statement, a write whose document data - its keys and values at any depth - or whose event - its
+message, actor, kind, `plan_id`, `migration_id` and the keys and values of its data - holds any of them, the same
+on SQLite and PostgreSQL, with `UnstorableValue` (a `StoreError`) naming the kind, the id and the field but never
+the value (`advisor_notes.0.confidence: is an infinity`); nothing of the write is kept. A name, a map's key, an
+actor a later comparison reads and a snapshot's digested content are stored as given or not at all (reviews ST-03,
+ST-04, RV48-04, RV48-05, RV48-08, RV50-04). What the control plane is given stops before that refusal: a request
+body holding a NUL or a lone surrogate is refused before its route runs (§12) - a number is its route's to check,
+as §9.1 checks a plan's -, the tokens file refuses such a name (§13.1), the text it takes from outside sources
+passes `redact`, which writes either as U+FFFD (§13.4) - as every string of Jev's answers does (§14.1), and a
+source VM's free text that no export filter or mapping reads, its tags and flavor extra specs, keys and values,
+its `os_type` and `host` (§4.2; review RV49-02) -, and an outside service's number that is no JSON number is
+refused as it arrives: Jev's answer is an invalid response (§14.1), an agentmemory hit has no score (§14.3).
 What reaches it is a name a cutover reads - a VM's, a project's, a flavor's, a network's, a volume type's - holding
 one, which Nova's server and flavor names and vSphere's cannot, a Neutron network's can: its write fails naming the
 field rather than keep a name the source does not have. No stored id or
@@ -2971,14 +2975,16 @@ fixtures live in `seamless/tests/fixtures/jev_*_response.json`):
 | `jev_verify` | `results[] {id, claim, verdict: "verified"\|"contradicted"\|"unsupported", confidence, action: "auto"\|"review"}`, `summary` |
 | `jev_screen` | `recommendation.action: "pass"\|"review"\|"block"\|"skip"`, `recommendation.reason`, `probabilities.injection` |
 
-An answer is checked as it arrives (audit AD-01, AD-02; reviews RV49-01, RV49-06). `parse_result` refuses text that
-is no JSON object, or JSON holding `NaN` or `Infinity`, which no JSON number is, as an invalid response
+An answer is checked as it arrives (audit AD-01, AD-02; reviews RV49-01, RV49-06, RV50-03, RV50-04). `parse_result`
+refuses text that is no JSON object, or JSON holding `NaN`, `Infinity` or a number past a float's range (`1e999`,
+which Python reads as an infinity) - no JSON number the store keeps (§11) -, as an invalid response
 (`JevUnavailable`), and writes every string of the answer - keys and values, at any depth - with its NUL and lone
 surrogates as U+FFFD, so no answer stalls the write that keeps it (§11, §13.4). A field of another shape than the
-table's - a `recommendation` that is no object; a `selected`, `status` or `model` that is no string; `probabilities`
-that is no object; a `confidence` that is no number from 0 to 1, a JSON `true` none either; `results` that is no
-list, or a result that is no object - makes the answer `invalid_response`: the strategy question falls back to the
-rules (§14.4 rule 2), and a classification's items to the heuristic (§14.2).
+table's - a `recommendation` that is no object; a `selected`, `status` or `model` present as anything but a string
+or null, `false`, `0`, `[]` and `{}` too; `probabilities` that is no object; a `confidence` that is no number from 0
+to 1, a JSON `true` none either, an integer of any length compared as it stands; `results` that is no list, or a
+result that is no object - makes the answer `invalid_response`: the strategy question falls back to the rules
+(§14.4 rule 2), and a classification's items to the heuristic (§14.2).
 
 ### 14.2 Advisor (`ai/advisor.py`)
 
@@ -3025,7 +3031,9 @@ skips approval, never triggers rollback or finalize.
 files=[]) -> bool` → `POST {url}/agentmemory/remember` body `{content, type, concepts, files,
 project}`; `search(query, limit=5) -> list[MemoryHit]` → `POST {url}/agentmemory/smart-search`
 body `{query, limit, project}`; parses hits tolerantly from `results|memories|items` lists, using
-`content|narrative|title` for text. Header `Authorization: Bearer <secret>` when a secret is set.
+`content|narrative|title` for text and a `score` that is a finite number or a number's text (`"0.82"`): `NaN`, an
+infinity - a JSON token, a number past a float's range or text - and a JSON `true` are no score (null), as the store
+keeps no such number (§11; review RV50-04). Header `Authorization: Bearer <secret>` when a secret is set.
 `health() -> bool` → `GET {url}/agentmemory/livez`. Every body is redacted before it is sent
 (`redact_payload`, §13.4; VM names too when `SEAMLESS_MEMORY_REDACT_NAMES`). Disabled when
 `SEAMLESS_MEMORY_URL` is unset.
