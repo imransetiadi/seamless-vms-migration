@@ -671,6 +671,17 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
     expect(Object.fromEntries(found.filter((f) => f.code in c.expected).map((f) => [f.code, f.message]))).toEqual(c.expected);
   });
 
+  it('raises both source-state blockers for a server in error with a Nova task, naming the task, as the API (SDD §9.3, review PV-05)', () => {
+    const plan = { ...base } as Plan;
+    const template = ELIGIBILITY.finding_cases.find((c) => c.vm.task_state)!.vm;
+    const vm: VMRef = { ...template, power_state: 'error', task_state: 'deleting' };
+    const found = preflight(vm, 'openstack', plan, {}, { selected: [vm] });
+    expect(found.map((f) => f.code)).toEqual(expect.arrayContaining(['SRC_VM_ERROR_STATE', 'SRC_VM_TRANSITIONAL_STATE']));
+    expect(found.find((f) => f.code === 'SRC_VM_TRANSITIONAL_STATE')!.message).toBe(
+      'Source VM backup-01 has a Nova task in flight (deleting); a stop or snapshot would fail.',
+    );
+  });
+
   it("judges a VMware source's VMs by the kit's names only, once, and never two unusable names as twins, as the API (SDD §9.3, reviews RV26-04, RV28-04)", () => {
     const plan = { ...base } as Plan;
     const template = ELIGIBILITY.finding_cases.find((c) => c.source_kind === 'vmware')!.vm;

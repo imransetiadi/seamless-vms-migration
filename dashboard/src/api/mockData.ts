@@ -1020,8 +1020,12 @@ export function preflight(
 
   // every message below as the API words it, over the shared finding cases (SDD §9.3, §16)
   if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', `Source VM ${vm.name} is in error state.`);
-  else if (vm.power_state === 'transitioning')
-    add('SRC_VM_TRANSITIONAL_STATE', `Source VM ${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot); a stop or snapshot would fail.`);
+  // a task Nova runs whatever the status is named, and meets its condition beside an error (SDD §9.3, review PV-05)
+  if (vm.power_state === 'transitioning' || vm.task_state)
+    add(
+      'SRC_VM_TRANSITIONAL_STATE',
+      `Source VM ${vm.name} has a Nova task in flight (${vm.task_state || 'resize, migration, rescue, rebuild or reboot'}); a stop or snapshot would fail.`,
+    );
   // the migration kit names a VMware VM's server, ports and volumes after its name as it writes it, and finds a volume
   // again by that name: from a VMware source the kit's names decide, the same name included (SDD §7.2, §9.3, reviews
   // RV26-04, RV28-04)
