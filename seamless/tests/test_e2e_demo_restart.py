@@ -116,8 +116,13 @@ def test_a_restart_that_does_not_happen_fails_demo_06(tmp_path, make_exit):
 
 @pytest.mark.parametrize(
     "by_phase",
-    [{"ready": 1}, {phase: 1 for phase in DEMO_04 if phase != "verifying"}],
-    ids=["none of them", "all but verifying"],
+    [
+        {"ready": 1},
+        {phase: 1 for phase in DEMO_04 if phase != "verifying"},
+        # awaiting_cutover holds cutover in its name: matched as a word, never as a part (RV45A-05)
+        {phase: 1 for phase in DEMO_04 if phase != "cutover"},
+    ],
+    ids=["none of them", "all but verifying", "awaiting_cutover without cutover"],
 )
 def test_a_run_that_never_shows_a_phase_fails_demo_04(tmp_path, by_phase):
     """DEMO-04 (QASuite §6.6, review RV44A-12): every phase - precopy, syncing, awaiting_cutover,
