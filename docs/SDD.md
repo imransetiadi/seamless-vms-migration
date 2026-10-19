@@ -534,10 +534,10 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   timeout, a rollback request, a shutdown) that lands while the clock is being opened takes effect once the clock is
   saved and its event written, so an open clock is never left unannounced; the clock is saved first, so a store error
   on the event never leaves a source that may be stopped without its clock (review RV26-06). `downtime_ended_at` is
-  set when verification passes or, on
-  rollback, when the source VM is running again - marked by the step as soon as its power-on succeeded
-  (`StepContext.mark_downtime_end()`: the VMware rollback, and the storage-handover rollback once the source server
-  it started or recreated reads `ACTIVE`, §7.3), so an attempt that fails after it leaves the clock
+  set when verification passes - when its step returns, before the advisor reviews it (§14.2), whose wait is no
+  outage (audit OC-08) - or, on rollback, when the source VM is running again - marked by the step as soon as its
+  power-on succeeded (`StepContext.mark_downtime_end()`: the VMware rollback, and the storage-handover rollback once
+  the source server it started or recreated reads `ACTIVE`, §7.3), so an attempt that fails after it leaves the clock
   closed: the source runs, and the next cutover counts a new outage (reviews RV30-03, RV36B-03). Both rollbacks run
   the power-on and that close as one, which a cancel - the step timeout, a shutdown - waits out as it does the call
   alone: a power-on vCenter or Nova finishes never leaves the clock open while the source runs (reviews RV37A-01,
@@ -1944,8 +1944,9 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   every tick resumes the same way any of them whose driver task died (an unexpected error outside a
   step, e.g. a database error while persisting after a successful step — the VM may be stopped):
   the crash is emitted as `migration.error` (`step: driver`, redacted message, crash count), and while
-  a driver keeps crashing its relaunch backs off (`2^n × tick_s`, at most 300 s). A migration whose
-  step task is still running is not relaunched.
+  a driver keeps crashing its relaunch backs off (`2^n × tick_s`, at most 300 s - the exponent capped first, so no
+  count of crashes overflows it), and a relaunch that fails for one migration skips that migration, logged, never
+  the rest of the tick (audit OC-01). A migration whose step task is still running is not relaunched.
 * Failure handling: `TransientStepError` → retry with backoff `2^attempt` s (×1/demo_speed) up to
   `max_step_retries`; then `failed`. Each attempt starts under the migration's lock and only while the
   migration is still in the step's phase, so an action under that lock (a cancel) either finds the
@@ -1955,7 +1956,8 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   `failed` (the history keeps both): a restart, or an event that fails to be written, right after the
   failure resumes the rollback (`rolling_back` is resumed) and never leaves the stopped VM in `failed`.
   On every failure the knowledge service looks up similar incidents (§14.3) and attaches them as an
-  `AdvisorNote` — after that write, so a slow agentmemory never holds the rollback back.
+  `AdvisorNote` — after that write and in a task of its own, which a stop cancels, so a slow agentmemory never holds
+  the rollback back: the driver goes on to it at once (audit OC-04).
 * Locks: a lock lives while a coroutine holds it or waits for it (a weak table), so the table does not grow
   with the ids requests name, known or not. One `asyncio.Lock` per migration id serializes API actions with the driver; one lock per
   plan id serializes validations; one shared lock serializes the cross-plan claim of validations and
