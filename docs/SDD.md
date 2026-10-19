@@ -944,9 +944,11 @@ it (upstream intake UP-01, after os-migrate 33aca993e4). Each disk's export port
 port: so two disks of one run on one hypervisor that would share a port are refused before the second's workload
 exports anything - all of a workload's ports are judged before its first export, against this run's exports and an
 earlier run's live export of another disk alike, so a refusal leaves none of its disks exported and unrecorded
-(reviews RV44B-05, RV45B-01) -: the second would stop the first one's export through that PID file, and
-the first VM's recorded URI, which
-names no export, would then serve the second VM's disk, copied into the first VM's volume without an error, across
+(reviews RV44B-05, RV45B-01); a later disk refused or failing on its own - sized at zero bytes or unreadable, its port
+held by a listener no PID file names, an export that does not start - stops the workload's exports no record names
+before the run fails, an export its record names (a rerun's) left serving what the record says (review RV46B-01) -:
+the second would stop the first one's export through that PID file, and the first VM's recorded URI, which names no
+export, would then serve the second VM's disk, copied into the first VM's volume without an error, across
 projects too (upstream intake UP-04a, after os-migrate f1d254cb8b). Give each workload on one hypervisor its own
 base port; how ports could be allocated instead is owner question q49.
 
