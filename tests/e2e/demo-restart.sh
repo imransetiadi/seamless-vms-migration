@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # demo-restart.sh - DEMO-04 and DEMO-06 (QASuite §6.6, run as §14.7 says) against a freshly started demo stack:
-# every phase shows up in GET /stats by_phase, and a restart of the control plane mid-run - `make seamless-stop`
-# then `make seamless-start`, which pick this host's engine and Docker context (SDD §17.1), the container's mode
-# kept - leaves every migration resuming to a terminal phase with contiguous event seqs and FSM-valid
-# migration.phase ordering; a restart that does not happen fails DEMO-06 (docs-drift DD3-03). Run right after
-# `make seamless-reset CONFIRM=yes && make seamless-demo`; SEAMLESS_ENGINE=podman reaches the Make targets.
+# every phase shows up in GET /stats by_phase - one that never does fails DEMO-04 (review RV44A-12) -, and a
+# restart of the control plane mid-run - `make seamless-stop` then `make seamless-start`, which pick this host's
+# engine and Docker context (SDD §17.1), the container's mode kept - leaves every migration resuming to a terminal
+# phase with contiguous event seqs and FSM-valid migration.phase ordering; a restart that does not happen fails
+# DEMO-06 (docs-drift DD3-03). Run right after `make seamless-reset CONFIRM=yes && make seamless-demo`;
+# SEAMLESS_ENGINE=podman reaches the Make targets.
 #
 #   read -rs TOKEN && export TOKEN                    # admin or approver token
 #   read -rs APPROVER_TOKEN && export APPROVER_TOKEN  # an approver of another user: the requester never approves (SDD §5.4)
@@ -85,9 +86,16 @@ print("migrations with phase events:", len(by), "invalid transitions:", bad)
 sys.exit(1 if gaps or bad else 0)
 EOF
 status=$?
+# DEMO-04: every phase of QASuite §6.6 seen in GET /stats by_phase during the run
+missing=""
+for phase in precopy syncing awaiting_cutover cutover verifying completed; do
+  case " $seen " in *" $phase "*) ;; *) missing="$missing $phase" ;; esac
+done
+[ -z "$missing" ] && echo "DEMO-04 OK" || echo "DEMO-04 FAILED: GET /stats by_phase never showed$missing"
 if [ "$restarted" != 1 ]; then
   echo "DEMO-06 FAILED: the control plane was not restarted (see above)"
   exit 1
 fi
 [ "$status" = 0 ] && echo "DEMO-06 OK" || echo "DEMO-06 FAILED (gaps or invalid transitions above)"
+[ -z "$missing" ] || exit 1
 exit $status

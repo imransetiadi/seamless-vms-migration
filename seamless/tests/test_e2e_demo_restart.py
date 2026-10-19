@@ -16,7 +16,8 @@ from seamless_migrate.config import find_repo_root
 ROOT = find_repo_root()
 E2E = ROOT / "tests" / "e2e"
 
-#: answers by URL: the stats, no migration and no running plan, a live health, two events in order
+#: answers by URL: the stats (BY_PHASE), no migration and no running plan, a live health, two events
+#: in order
 FAKE_CURL = """#!{python}
 import json, os, sys
 args = sys.argv[1:]
@@ -24,7 +25,7 @@ url = next((a for a in args if a.startswith("http")), "")
 with open(os.environ["CALLS_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps({{"cmd": "curl", "url": url}}) + "\\n")
 if "/stats" in url:
-    print(json.dumps({{"by_phase": {{"ready": 1}}}}))
+    print(json.dumps({{"by_phase": json.loads(os.environ["BY_PHASE"])}}))
 elif "/events" in url:
     print(json.dumps([{{"seq": 1, "kind": "plan.created", "data": {{}}}},
                       {{"seq": 2, "kind": "plan.started", "data": {{}}}}]))
@@ -43,7 +44,11 @@ sys.exit(int(os.environ.get("MAKE_EXIT", "0")) if sys.argv[0].endswith("make") e
 """
 
 
-def _drill(tmp_path, make_exit: int):
+#: QASuite §6.6 DEMO-04: the phases GET /stats by_phase shows during a run
+DEMO_04 = ("precopy", "syncing", "awaiting_cutover", "cutover", "verifying", "completed")
+
+
+def _drill(tmp_path, make_exit: int, by_phase: dict | None = None):
     tree = tmp_path / "tree"
     (tree / "tests" / "e2e").mkdir(parents=True)
     for name in ("demo-restart.sh", "token-headers.sh"):
@@ -73,6 +78,7 @@ def _drill(tmp_path, make_exit: int):
         "APPROVER_TOKEN": "smg_" + "b" * 32,
         "RESTART_AT": "0",
         "MAKE_EXIT": str(make_exit),
+        "BY_PHASE": json.dumps({phase: 1 for phase in DEMO_04} if by_phase is None else by_phase),
     }
     run = subprocess.run(
         ["bash", str(tree / "tests" / "e2e" / "demo-restart.sh")],
@@ -106,3 +112,21 @@ def test_a_restart_that_does_not_happen_fails_demo_06(tmp_path, make_exit):
     assert run.returncode != 0, out
     assert "DEMO-06 OK" not in run.stdout, out
     assert "DEMO-06 FAILED" in run.stdout and "not restarted" in run.stdout, out
+
+
+@pytest.mark.parametrize(
+    "by_phase",
+    [{"ready": 1}, {phase: 1 for phase in DEMO_04 if phase != "verifying"}],
+    ids=["none of them", "all but verifying"],
+)
+def test_a_run_that_never_shows_a_phase_fails_demo_04(tmp_path, by_phase):
+    """DEMO-04 (QASuite §6.6, review RV44A-12): every phase - precopy, syncing, awaiting_cutover,
+    cutover, verifying, completed - shows in GET /stats by_phase during the run. The drill claimed
+    DEMO-04 and only printed what it saw: a run that never showed them said "DEMO-06 OK" and exited
+    0. It fails DEMO-04, naming the phases never shown, after DEMO-06's own verdict."""
+    run, _, _ = _drill(tmp_path, make_exit=0, by_phase=by_phase)
+    out = run.stdout + run.stderr
+    assert run.returncode != 0, out
+    missing = " ".join(phase for phase in DEMO_04 if phase not in by_phase)
+    assert f"DEMO-04 FAILED: GET /stats by_phase never showed {missing}" in run.stdout, out
+    assert "DEMO-06 OK" in run.stdout, out  # the restart itself held
