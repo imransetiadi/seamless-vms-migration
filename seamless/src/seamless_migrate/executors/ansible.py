@@ -1885,7 +1885,9 @@ class AnsibleExecutor:
         server's disk - another plan's cut-over server of the VM, another VM the kit names alike
         -, never named for deletion (review RV43B-01); one the destination's conversion host alone
         holds is the kit's copy a pass the cancel cut off left there: named as attached to it, left
-        attached - another plan's pass of the VM may sync onto it (review RV44B-01)."""
+        attached - another plan's pass of the VM may sync onto it (review RV44B-01). A conversion
+        host it cannot look up leaves each held volume one of a holder it could not tell
+        (`unsure_volumes`), named with the error (`unsure_why`), never unnamed (review RV45B-02)."""
         server_id = ctx.migration.destination_server_id
         dst = self.providers.get(ctx.destination)
         if server_id:
@@ -1901,7 +1903,9 @@ class AnsibleExecutor:
                 details={**details, "kept_volumes": None, "kept_volumes_unread": str(exc)}
             )
         kept: list[dict[str, Any]] = []
+        unsure: list[dict[str, Any]] = []  # held by a server it could not tell
         conversion_host: list[str | None] = []  # looked up once, for the first kit volume held
+        lookup_error: str | None = None
         for volume in kit_volumes(ctx.migration.vm.name, volumes):
             entry: dict[str, Any] = {"id": str(volume["id"]), "name": str(volume.get("name"))}
             holders = [str(holder) for holder in volume.get("attachments") or []]
@@ -1909,13 +1913,20 @@ class AnsibleExecutor:
                 if not conversion_host:
                     try:
                         conversion_host.append(await self._conversion_host_server(ctx, dst))
-                    except ProviderError:
-                        conversion_host.append(None)  # unknown: no holder is taken for it
+                    except ProviderError as exc:
+                        conversion_host.append(None)
+                        lookup_error = str(exc)
+                if lookup_error is not None:
+                    unsure.append(entry)  # the conversion host's copy, or another server's disk
+                    continue
                 if conversion_host[0] is None or holders != [conversion_host[0]]:
                     continue
                 entry["on_conversion_host"] = True
             kept.append(entry)
         details["kept_volumes"] = kept
+        if unsure:
+            details["unsure_volumes"] = unsure
+            details["unsure_why"] = lookup_error
         return StepResult(details=details)
 
     async def _finalize(self, ctx: StepContext) -> StepResult:

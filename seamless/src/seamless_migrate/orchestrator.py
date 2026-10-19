@@ -1856,6 +1856,17 @@ class Orchestrator:
                     f"{destination.label} ({redact_cut(unread, 300)}): another plan's migration "
                     "of the VM takes them as its own - delete them once no plan migrates the VM"
                 )
+            # held by a server it could not tell - the conversion host's lookup failed: named with
+            # the error, never among the volumes to delete (SDD §5.1, review RV45B-02)
+            unsure = result.details.get("unsure_volumes")
+            if unsure:
+                message += (
+                    "; it could not tell which server holds "
+                    + ", ".join(f"{v['id']} ({v['name']})" for v in unsure)
+                    + f" ({redact_cut(str(result.details.get('unsure_why') or ''), 300)}): each "
+                    "may be the copy a cut-off pass left on the conversion host or another "
+                    "server's disk - check which server holds it before deleting it"
+                )
             await record(
                 "cleaned",
                 self._emit("migration.action", message, migration=m, actor=actor, data=data),

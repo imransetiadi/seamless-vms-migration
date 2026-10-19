@@ -3161,12 +3161,14 @@ async def test_a_rolled_back_migrations_cancel_cleanup_touches_only_its_own_data
     assert cleanup["vars"]["os_migrate_rollback_delete_ports"] is False
 
 
-@pytest.mark.parametrize("read", ["kept", "none", "unread"])
+@pytest.mark.parametrize("read", ["kept", "none", "unread", "unsure"])
 async def test_a_cancels_cleanup_names_the_kit_volumes_it_keeps(tmp_path, store, read):
     """SDD §5.1 (review RV42B, lead NP-2): a VMware cancel's cleanup keeps the kit's copies of
     the VM - another plan's migration of it takes them as its own - and its migration.action names
     each, the ids in data.kept_volumes, for the operator to delete once no plan migrates the VM; a
-    read of them that failed is named, and the cleanup stands."""
+    read of them that failed is named, and the cleanup stands. The volumes held by a server it
+    could not tell - the conversion host's lookup failed - are named with the error, to be checked
+    before any is deleted, beside the ones it keeps (review RV45B-02)."""
     details = {
         "kept": {"kept_volumes": [
             {"id": "vol-a", "name": "web-01-2000"}, {"id": "vol-b", "name": "web-01-2001"},
@@ -3174,6 +3176,11 @@ async def test_a_cancels_cleanup_names_the_kit_volumes_it_keeps(tmp_path, store,
         ]},
         "none": {"kept_volumes": []},
         "unread": {"kept_volumes": None, "kept_volumes_unread": "volumes: HTTP 503 " + "x" * 400},
+        "unsure": {
+            "kept_volumes": [{"id": "vol-a", "name": "web-01-2000"}],
+            "unsure_volumes": [{"id": "vol-c", "name": "web-01-2002"}],
+            "unsure_why": "servers: HTTP 503 " + "y" * 400,
+        },
     }[read]  # fmt: skip
 
     async def rollback(ctx):
@@ -3212,12 +3219,24 @@ async def test_a_cancels_cleanup_names_the_kit_volumes_it_keeps(tmp_path, store,
         ) in event.message  # the kit's copy a cut-off pass left there (RV44B-01)
         assert "delete them once no plan migrates the VM" in event.message
         assert event.data["kept_volumes"] == ["vol-a", "vol-b", "vol-c"]
-    else:
+    elif read == "unread":
         assert event.message.startswith(head + "; ")
         # cut as the cleanup's failure is: 300 characters of the provider's answer
         assert "(volumes: HTTP 503 " + "x" * 282 + ")" in event.message
         assert "delete them once no plan migrates the VM" in event.message
         assert "kept_volumes" not in event.data
+    else:
+        # the ones it keeps as ever, and the ones of a holder it could not tell after them: never
+        # among the volumes to delete - each may be another server's disk (RV45B-02)
+        assert event.message.startswith(head + "; ")
+        assert "vol-a (web-01-2000)" in event.message
+        assert event.data["kept_volumes"] == ["vol-a"]
+        assert (
+            "it could not tell which server holds vol-c (web-01-2002) (servers: HTTP 503 "
+            + "y" * 282
+            + "): each may be the copy a cut-off pass left on the conversion host or another "
+            "server's disk - check which server holds it before deleting it"
+        ) in event.message
 
 
 def _write_record(settings, plan_id, m, **record):
