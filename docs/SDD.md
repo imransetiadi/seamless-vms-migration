@@ -2324,8 +2324,10 @@ class DestinationProvider(Protocol):
         # time, which Cinder refuses; one Cinder failed to delete (`error_deleting`) is a provider error naming
         # it (review RV29-04)
     async def detach_volume(self, server_id: str, volume_id: str) -> None
-        # Nova's attachment of the volume to the server removed, then waits until Cinder reads the volume
-        # available, within the call's bound (§8.1); a volume not attached to that server is no error (§7.2)
+        # Nova's attachment of the volume to the server removed, then waits until Cinder no longer lists the server
+        # among the volume's attachments - `available`, or `in-use` with another holder, a multi-attach volume -
+        # within the call's bound (§8.1); Cinder's `error` is a provider error; a volume not attached to that server
+        # is no error and is neither detached nor waited for (§7.2, review PV-03)
     async def server_of_address(self, address: str) -> str | None
         # the Nova server holding the address: a compute port (`device_owner` `compute:*`) with it as a fixed IP,
         # else the compute port Neutron's floating IP of that address is associated with; None when none (§7.2
