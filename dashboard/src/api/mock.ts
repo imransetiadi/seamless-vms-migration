@@ -2308,7 +2308,8 @@ export class MockServer {
   }
 
   private validatePlan(me: Me, plan: Plan): MockResponse {
-    if (['running', 'completed'].includes(plan.status)) throw new HttpError(409, 'conflict', `A ${plan.status} plan cannot be re-validated.`);
+    // like orchestrator.validate_plan (SDD §8.1, §16): a completed plan is validated again (audit DB-01)
+    if (plan.status === 'running') throw new HttpError(409, 'conflict', 'pause the plan before validating it again');
     if (plan.status === 'cancelled') throw new HttpError(409, 'conflict', 'a cancelled plan cannot be validated');
     const mine = this.migrations.filter((m) => m.plan_id === plan.id);
     const byVm = new Map(mine.map((m) => [m.vm.source_id, m]));

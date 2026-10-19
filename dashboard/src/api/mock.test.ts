@@ -1062,6 +1062,24 @@ describe('mock API', () => {
     });
   });
 
+  it("validates a completed plan, then takes its edit, and refuses a running one in the API's words (SDD §8.1, §16, audit DB-01)", async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    // every VM rolled back over a plan setting: the tick stored the plan completed
+    plan.status = 'completed';
+    for (const m of server.migrations.filter((x) => x.plan_id === plan.id)) {
+      m.phase = 'rolled_back';
+      m.downtime_started_at = '2026-10-08T10:00:00Z';
+      m.downtime_ended_at = '2026-10-08T10:05:00Z';
+    }
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(plan.status).toBe('validated');
+    const edited = await client.patch<Plan>(`/plans/${plan.id}`, { name: 'Fixed after the rollbacks' });
+    expect(edited.name).toBe('Fixed after the rollbacks');
+    plan.status = 'running';
+    await expect(client.post(`/plans/${plan.id}/validate`)).rejects.toMatchObject({ status: 409, message: 'pause the plan before validating it again' });
+  });
+
   it('answers 502 for a VM the source no longer reports, before changing anything, like the API (SDD §12)', async () => {
     const { server, client } = setup('operator');
     const [keep] = freeVms(server, 'rhosp17-dc1', 1);
