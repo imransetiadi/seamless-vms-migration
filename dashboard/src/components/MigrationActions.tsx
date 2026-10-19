@@ -18,7 +18,7 @@ import { waitingDecision } from '../lib/advisor';
 import { buttonClassName } from '../lib/buttonStyles';
 import { cn } from '../lib/cn';
 import { forcedDowntime } from '../lib/forcedEstimate';
-import { formatBytes, formatDateTime, formatDuration } from '../lib/format';
+import { formatBytes, formatDateTime, formatDuration, pyLen, pyStrip } from '../lib/format';
 import { hasDataPath } from '../lib/fsm';
 import { isWarmStrategy } from '../lib/phase';
 import {
@@ -356,7 +356,7 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
           </>
         }
         confirmLabel="Force cutover"
-        canConfirm={reason.trim().length >= FORCE_REASON_MIN}
+        canConfirm={pyLen(pyStrip(reason)) >= FORCE_REASON_MIN}
         confirmReason={`Enter a reason of at least ${FORCE_REASON_MIN} characters.`}
         onConfirm={() => submit({ action: 'force-cutover', body: { reason: reason.trim() } })}
       >

@@ -9,6 +9,7 @@ import {
   formatRate,
   formatRelative,
   pyNames,
+  pyLen,
   pyRepr,
   pyStrip,
 } from './format';
@@ -222,5 +223,12 @@ describe('pyStrip (review RV24-06)', () => {
     // what JavaScript's trim takes that Python keeps, and a space inside
     for (const kept of ['\ufeff', '\u200b', '\u180e']) expect(pyStrip(kept)).toBe(kept);
     expect(pyStrip('  a b  ')).toBe('a b');
+  });
+});
+
+describe('pyLen (audit AD-10)', () => {
+  it("counts code points, as the API's len: an emoji is one", () => {
+    expect([pyLen('\u{1F600}'.repeat(5)), '\u{1F600}'.repeat(5).length]).toEqual([5, 10]);
+    expect(pyLen('ten chars!')).toBe(10);
   });
 });

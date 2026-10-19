@@ -1956,6 +1956,59 @@ describe('mock advisor policies, approval and override, like the API (SDD §14.6
     });
   });
 
+  it('counts the override reason as the API does: code points, after what Python strips (audit AD-10)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const url = `/advisor/recommendations/${recOf(server, 'analytics-db').id}/override`;
+    for (const reason of ['\u{1F600}'.repeat(5), '\x85\x85short\x85\x85\x85']) {
+      await expect(as(server, ADMIN).post(url, { option: 'cold', reason }), JSON.stringify(reason)).rejects.toMatchObject({ status: 422 });
+    }
+    const rec = await as(server, ADMIN).post<AdvisorRecommendation>(url, { option: 'cold', reason: '\u{1F600}'.repeat(10) });
+    expect(rec.decision.status).toBe('overridden');
+  });
+
+  it("refuses to approve an answer that could not be applied, naming why; an override stays a person's call (audit AD-03)", async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const rec = recOf(server, 'analytics-db');
+    expect(rec.recommendation.unusable).toBeNull();
+    rec.recommendation.unusable = "the advisor's answer was escalate";
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${rec.id}/approve`, {})).rejects.toThrow("nothing to approve: the advisor's answer was escalate");
+    const overridden = await as(server, ADMIN).post<AdvisorRecommendation>(`/advisor/recommendations/${rec.id}/override`, { option: 'warm', reason: 'The owner chose warm after review' });
+    expect(overridden.decision.status).toBe('overridden');
+  });
+
+  it('records why a fallback could not take the answer, as the API does (SDD §4.2, audit AD-03)', () => {
+    const server = new MockServer({ now: () => NOW });
+    const fallbacks = server.recommendations.filter((r) => r.decision.status === 'fallback_rules');
+    expect(fallbacks.length).toBeGreaterThan(0);
+    for (const r of fallbacks) expect(r.recommendation.unusable).toBe(r.decision.reason_text);
+    expect(server.recommendations.filter((r) => r.decision.status !== 'fallback_rules').every((r) => r.recommendation.unusable === null)).toBe(true);
+  });
+
+  it("refuses both while the plan's default strategy sets the VM's, as for a pinned one (audit AD-04)", async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const rec = recOf(server, 'analytics-db');
+    server.plans.find((p) => p.id === 'plan-c81d44a0')!.default_strategy = 'cold';
+    const refusal = 'The plan sets the strategy of analytics-db (cold): change it in the plan.';
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${rec.id}/approve`, {})).rejects.toThrow(refusal);
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${rec.id}/override`, { option: 'cold', reason: 'The change window fits a cold cutover' })).rejects.toThrow(refusal);
+  });
+
+  it('names, in a person decision, the policy whose rules it follows (audit AD-06)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const rec = recOf(server, 'analytics-db');
+    expect([rec.decision.policy_id, rec.decision.require_override_reason]).toEqual(['pol-finance', true]);
+    // a policy change applies from the next validation and never rewrites a decision (SDD §14.6)
+    const finance = server.policies[0]!;
+    server.policies.splice(0, 1, { ...finance, id: 'pol-relaxed', mode: 'auto_apply_above_threshold', require_override_reason: false, require_distinct_approver: false });
+    const approved = await as(server, ADMIN).post<AdvisorRecommendation>(`/advisor/recommendations/${rec.id}/approve`, {});
+    expect([approved.decision.policy_id, approved.decision.require_override_reason]).toEqual(['pol-finance', true]);
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${rec.id}/override`, { option: 'cold', reason: 'too short' })).rejects.toThrow('policy pol-finance requires an override reason');
+  });
+
   it('refuses what the API refuses: 403 below admin, 409 for a legacy, an older or a started one, and PUT …/strategy while held', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
     const held = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;
@@ -2364,6 +2417,8 @@ describe('mock convergence, Force cutover and data checks, like the API (SDD §5
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const syncing = 'mig-5d7e2b4a11';
     await expect(as(server, 'approver').post(`/migrations/${syncing}/force-cutover`, { reason: ' too short ' })).rejects.toMatchObject({ status: 422 });
+    // counted as the API's Python counts it: five emoji are five characters (audit AD-10)
+    await expect(as(server, 'approver').post(`/migrations/${syncing}/force-cutover`, { reason: '\u{1F600}'.repeat(5) })).rejects.toMatchObject({ status: 422 });
     await expect(as(server, 'approver').post(`/migrations/${syncing}/force-cutover`, { reason: 'x'.repeat(2001) })).rejects.toMatchObject({ status: 422 });
     await expect(as(server, 'operator').post(`/migrations/${syncing}/force-cutover`, { reason: REASON })).rejects.toMatchObject({ status: 403 });
     for (const id of ['mig-5d7e2b4a12', 'mig-5d7e2b4a13']) {

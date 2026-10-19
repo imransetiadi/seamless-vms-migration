@@ -454,6 +454,8 @@ export interface RecommendedOption {
   confidence: number | null;
   /** Raw probabilities per option, shown only in Details. */
   distribution: Record<string, number>;
+  /** Why the answer could not be applied when it was recorded, else null: no approve takes it (SDD §4.2, §14.6). */
+  unusable: string | null;
 }
 
 export interface Decision {

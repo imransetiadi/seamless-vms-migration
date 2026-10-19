@@ -26,7 +26,7 @@ import { endedPassBytes } from '../lib/transfer';
 import { summaryOf } from '../lib/summary';
 import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
 import { destinationName, isBlank, providerLabel } from '../lib/providerUse';
-import { pyRepr, pyStrip } from '../lib/format';
+import { pyLen, pyRepr, pyStrip } from '../lib/format';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -646,6 +646,7 @@ function legacyRecommendations(m: Migration): AdvisorRecommendation[] {
           option,
           confidence: note.confidence,
           distribution: Object.fromEntries(Object.entries(probabilities).filter((entry): entry is [string, number] => typeof entry[1] === 'number')),
+          unusable: null,
         },
         decision: { final_option, status, reason_code, reason_text: null, actor: { kind: 'system', id: 'legacy' }, policy_id: null, threshold_used: null, decided_at: note.created_at },
         input_snapshot_sha256: null,
@@ -1726,19 +1727,26 @@ export class MockServer {
     // force only for a decision that recorded none
     const distinct = rec.decision.require_distinct_approver ?? policy.require_distinct_approver;
     const reasonRequired = rec.decision.require_override_reason ?? policy.require_override_reason;
+    // the policy whose rules the decision follows names it, as the API's does (SDD §14.6, audit AD-06)
+    const recordedRules = rec.decision.require_distinct_approver !== null || rec.decision.require_override_reason !== null;
+    const ruling = (recordedRules ? rec.decision.policy_id : null) ?? policy.id;
     // maker-checker (SDD §14.6, ADV-17): the validating user does not decide what their validation asked
     if (distinct && rec.requested_by === me.name) throw new HttpError(409, 'conflict', OWN_DECISION);
-    const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;
-    if (reason && reason.length > ACTION_TEXT_MAX) throw new HttpError(422, 'validation_error', `reason: at most ${ACTION_TEXT_MAX} characters.`);
-    if (action === 'override' && reasonRequired && (reason ?? '').length < OVERRIDE_REASON_MIN) {
-      throw new HttpError(422, 'validation_error', `policy ${rec.decision.policy_id ?? policy.id} requires an override reason of at least ${OVERRIDE_REASON_MIN} characters`);
+    // stripped and counted as the API's Python does: code points (SDD §14.6, audit AD-10)
+    const reason = typeof input.reason === 'string' && pyStrip(input.reason) ? pyStrip(input.reason) : null;
+    if (reason && pyLen(reason) > ACTION_TEXT_MAX) throw new HttpError(422, 'validation_error', `reason: at most ${ACTION_TEXT_MAX} characters.`);
+    if (action === 'override' && reasonRequired && pyLen(reason ?? '') < OVERRIDE_REASON_MIN) {
+      throw new HttpError(422, 'validation_error', `policy ${ruling} requires an override reason of at least ${OVERRIDE_REASON_MIN} characters`);
     }
     if (!['pending', 'blocked', 'ready'].includes(m.phase)) throw new HttpError(409, 'conflict', `the strategy cannot change in ${m.phase}`);
     // like the API (SDD §14.6): the plan's own choice stands over the newest recommendation, and an approved
     // decision is not approved again (one event per decision status change)
-    const pinned = plan.strategy_overrides[m.vm.source_id];
+    // the plan's default strategy too: a validation honours it as an override (audit AD-04)
+    const pinned = plan.strategy_overrides[m.vm.source_id] ?? (plan.default_strategy !== 'auto' ? plan.default_strategy : undefined);
     if (pinned) throw new HttpError(409, 'conflict', `The plan sets the strategy of ${m.vm.name} (${pinned}): change it in the plan.`);
     if (action === 'approve' && rec.decision.status === 'approved') throw new HttpError(409, 'conflict', 'The decision is already approved.');
+    // an answer that could not be applied stays unapplied; an override is a person's call (audit AD-03)
+    if (action === 'approve' && rec.recommendation.unusable) throw new HttpError(409, 'conflict', `nothing to approve: ${rec.recommendation.unusable}`);
     const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy as string);
     const chosen = action === 'override' ? input.option : rec.recommendation.option;
     const stored = m.estimates.find((e) => e.strategy === 'storage_handover');
@@ -1763,7 +1771,7 @@ export class MockServer {
       if (!eligible.includes(option)) throw new HttpError(422, 'validation_error', `${option} is not an eligible option`);
       decided = humanDecision(rec, { kind: 'override', user: me.name, option, reason }, at);
     }
-    decided.decision.policy_id = policy.id;
+    decided.decision.policy_id = ruling;
     // the rules go on with a person's decision: a later one follows them too (SDD §14.6)
     decided.decision.require_distinct_approver = distinct;
     decided.decision.require_override_reason = reasonRequired;
@@ -2478,7 +2486,7 @@ export class MockServer {
     for (const field of ['comment', 'reason', 'confirm']) {
       const text = input[field];
       // the API bounds the free text of every action (SDD §12)
-      if (typeof text === 'string' && text.length > ACTION_TEXT_MAX) {
+      if (typeof text === 'string' && pyLen(text) > ACTION_TEXT_MAX) {
         throw new HttpError(422, 'validation_error', `${field}: at most ${ACTION_TEXT_MAX} characters.`);
       }
     }
@@ -2521,8 +2529,9 @@ export class MockServer {
       }
       case 'force-cutover': {
         // the API's ForceCutoverRequest and force_cutover (SDD §5.4, §12, ADV-16)
-        const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
-        if (reason.length < FORCE_REASON_MIN) throw new HttpError(422, 'validation_error', `reason: at least ${FORCE_REASON_MIN} characters.`);
+        // stripped and counted as the API's Python does: code points (audit AD-10)
+        const reason = typeof input.reason === 'string' ? pyStrip(input.reason) : '';
+        if (pyLen(reason) < FORCE_REASON_MIN) throw new HttpError(422, 'validation_error', `reason: at least ${FORCE_REASON_MIN} characters.`);
         if (!FORCEABLE.has(m.phase) || SINGLE_SHOT.has(m.strategy)) {
           throw new HttpError(409, 'conflict', `a Force cutover applies to a warm migration in pre-copy or syncing, not to ${m.strategy} in ${m.phase}`);
         }

@@ -19,7 +19,7 @@ function rec(
     migration_id: 'mig-d4e6f8a090',
     provider_id: 'rhosp17-dc1',
     model: { name: 'jev', version: 'jev-1.13.0', deployment: 'unknown', endpoint_host: null },
-    recommendation: { option: 'warm', confidence: 0.57, distribution: { warm: 0.57, cold: 0.43 }, ...recommendation },
+    recommendation: { option: 'warm', confidence: 0.57, distribution: { warm: 0.57, cold: 0.43 }, unusable: null, ...recommendation },
     decision: {
       final_option: 'cold',
       status: 'below_threshold',

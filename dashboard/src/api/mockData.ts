@@ -141,7 +141,8 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
     model: option === null && confidence === null && input.fallback
       ? { name: 'rules', version: 'rules', deployment: 'unknown', endpoint_host: null }
       : { name: 'jev', version: JEV_MODEL, deployment: 'remote', endpoint_host: null },
-    recommendation: { option, confidence, distribution },
+    // why the answer could not be applied - a fallback's reason -, as the API records it (SDD §4.2, audit AD-03)
+    recommendation: { option, confidence, distribution, unusable: status === 'fallback_rules' ? (input.fallback ?? null) : null },
     input_snapshot_sha256: input.snapshotSha256,
     requested_by: input.requestedBy ?? null,
     decision: {

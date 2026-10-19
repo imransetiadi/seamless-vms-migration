@@ -191,6 +191,12 @@ export function pyStrip(text: string): string {
   return text.replace(PY_STRIP, '');
 }
 
+/** A text's length as the API's Python counts it, in code points: an emoji is one where JavaScript's length counts its
+ * two UTF-16 units - a minimum the dashboard checks is the API's (SDD §14.6, audit AD-10). */
+export function pyLen(text: string): number {
+  return [...text].length;
+}
+
 /**
  * A name quoted as the API's messages quote it, Python's `repr` of a str: in single quotes, in double quotes when it
  * holds a single quote and no double one, with backslashes escaped and what Python does not print written as an escape.

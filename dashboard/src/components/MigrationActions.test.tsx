@@ -211,6 +211,19 @@ describe('MigrationActions', () => {
     expect(dialog).toHaveTextContent('The window and a free cutover slot still apply.');
   });
 
+  it('counts the Force cutover reason as the API does: five emoji are five characters (SDD §5.4, audit AD-10)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { button } = setup('db-mysql-02', 'approver');
+    await user.click(button(/^force cutover$/i));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Force the cutover of db-mysql-02?' });
+    const confirm = within(dialog).getByRole('button', { name: /^force cutover$/i });
+    const reason = within(dialog).getByRole('textbox', { name: /reason/i });
+    await user.type(reason, '\u{1F600}'.repeat(5));
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    await user.type(reason, '\u{1F600}'.repeat(5));
+    expect(confirm).not.toHaveAttribute('aria-disabled');
+  });
+
   it('forces the cutover of a warm migration before it converged, with a reason (SDD §5.4, ADV-16)', async () => {
     const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('db-mysql-02', 'approver');

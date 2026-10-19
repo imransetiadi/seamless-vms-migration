@@ -29,6 +29,14 @@ function setup(eligible: Strategy[]) {
   return { server, migration, rec };
 }
 
+/** The fixtures' plan pins this VM (its seeded override): without it, only what a test sets decides. */
+function unpinned(eligible: Strategy[]) {
+  const made = setup(eligible);
+  const plan = made.server.plans.find((p) => p.id === made.migration.plan_id)!;
+  plan.strategy_overrides = Object.fromEntries(Object.entries(plan.strategy_overrides).filter(([vm]) => vm !== made.migration.vm.source_id));
+  return { ...made, plan };
+}
+
 async function offered(migration: ActionMigration, rec: ReturnType<typeof setup>['rec'], server: ReturnType<typeof setup>['server']) {
   const user = userEvent.setup({ delay: null });
   const { unmount } = renderWithApp(<RecommendationActions rec={rec} migration={migration} />, { token: 'admin', server });
@@ -76,5 +84,58 @@ describe('RecommendationActions (SDD §14.6)', () => {
     const whole = await offered(migration, rec, server);
     expect(whole).toMatchObject({ approve: 'disabled', override: 'disabled' });
     expect(await offered(summaryOf(migration), rec, server)).toEqual(whole);
+  });
+
+  it("refuses to approve an answer that could not be applied, naming why, and still offers an override (SDD §14.6, audit AD-03)", async () => {
+    const { server, migration, rec } = unpinned(['cold', 'warm']);
+    const why = "the advisor's answer was escalate";
+    const unusable = { ...rec, recommendation: { ...rec.recommendation, unusable: why } };
+    renderWithApp(<RecommendationActions rec={unusable} migration={migration} />, { token: 'admin', server });
+    const group = await screen.findByRole('group', { name: /^Decide on the recommendation for/ });
+    const approve = within(group).getByRole('button', { name: 'Approve' });
+    await waitFor(() => expect(approve).toHaveAccessibleDescription(`nothing to approve: ${why}`));
+    expect(approve).toHaveAttribute('aria-disabled', 'true');
+    expect(within(group).getByRole('button', { name: 'Override' })).not.toHaveAttribute('aria-disabled');
+  });
+
+  it("refuses both while the plan's default strategy sets the VM's, as the API does (SDD §14.6, audit AD-04)", async () => {
+    const { server, migration, rec, plan } = unpinned(['cold', 'warm']);
+    plan.default_strategy = 'cold';
+    renderWithApp(<RecommendationActions rec={rec} migration={migration} />, { token: 'admin', server });
+    const group = await screen.findByRole('group', { name: /^Decide on the recommendation for/ });
+    const reason = `The plan sets the strategy of ${rec.subject.name} (Cold migration): change it in the plan.`;
+    for (const name of ['Approve', 'Override']) {
+      const button = within(group).getByRole('button', { name });
+      await waitFor(() => expect(button).toHaveAccessibleDescription(reason));
+      expect(button).toHaveAttribute('aria-disabled', 'true');
+    }
+  });
+
+  it('counts the override reason as the API does: five emoji are five characters, not ten (SDD §14.6, audit AD-10)', async () => {
+    const { server, migration } = unpinned(['cold', 'warm']);
+    const rec = strategyRecommendation({
+      id: 'rec-c0000000beef',
+      at: '2026-10-08T11:00:00Z',
+      migration,
+      providerId: 'rhosp17-dc1',
+      option: 'warm',
+      confidence: 0.9,
+      options: ['cold', 'warm'],
+      status: 'pending_approval',
+      deterministic: 'cold',
+      snapshotSha256: null,
+      policyId: 'pol-finance',
+      rules: { require_distinct_approver: true, require_override_reason: true },
+    });
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<RecommendationActions rec={rec} migration={migration} />, { token: 'admin', server });
+    const group = await screen.findByRole('group', { name: /^Decide on the recommendation for/ });
+    await user.click(within(group).getByRole('button', { name: 'Override' }));
+    const dialog = await screen.findByRole('alertdialog');
+    const field = within(dialog).getByRole('textbox', { name: /Reason/ });
+    await user.type(field, '\u{1F600}'.repeat(5));
+    expect(within(dialog).getByRole('button', { name: 'Override' })).toHaveAttribute('aria-disabled', 'true');
+    await user.type(field, '\u{1F600}'.repeat(5));
+    expect(within(dialog).getByRole('button', { name: 'Override' })).not.toHaveAttribute('aria-disabled');
   });
 });
