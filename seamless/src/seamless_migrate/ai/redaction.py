@@ -24,8 +24,14 @@ _KEYWORDS = (
 _KEY = r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_.-])*(?:" + _KEYWORDS + r")(?![A-Za-z0-9])"
 #: The same key as a text is searched for it: each start looks at a prefix of at most 16 parts -
 #: a longer one is found from a later part, the value redacted all the same - so a run of "a."
-#: costs time linear in its length, not quadratic (SDD §13.4, review RV27-06).
-_SCANNED_KEY = r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_.-]){0,16}(?:" + _KEYWORDS + r")(?![A-Za-z0-9])"
+#: costs time linear in its length, not quadratic (SDD §13.4, review RV27-06). It starts after a
+#: character but a letter or a digit, or after JSON's escape of a line break or a tab - a key that
+#: starts a line of a command's output inside JSON (\npassword: x, review RV51-02).
+_SCANNED_KEY = (
+    r"(?:(?<![A-Za-z0-9])|(?<=\\[ntr]))(?:[A-Za-z0-9]+[_.-]){0,16}(?:"
+    + _KEYWORDS
+    + r")(?![A-Za-z0-9])"
+)
 #: A mapping key whose whole value is a credential: a credential key, or a clouds.yaml ``auth``.
 _CREDENTIAL_KEY = re.compile(r"(?i)" + _KEY + r"|auth")
 #: A PEM block's first and last lines; the block is redacted from one to the first other after it.
@@ -33,9 +39,24 @@ _PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]+-----")
 _PEM_END = re.compile(r"-----END [A-Z0-9 ]+-----")
 
 
-#: What may follow a single-quoted value: a delimiter, a closing bracket, a double quote or a
-#: backslash - the string holding it ends, a JSON escape follows -, or nothing.
-_VALUE_END = r"(?:[\s,;&})\].:\"\\]|\Z)"
+#: What may follow a single-quoted value: a delimiter, a closing bracket or ">", a double quote or
+#: a backslash - the string holding it ends, a JSON escape follows -, or nothing.
+_VALUE_END = r"(?:[\s,;&})\].:\"\\>]|\Z)"
+#: A quoted credential key and its separator ('token': ...): a value read past a close it doubts
+#: stops before one, which is then redacted on its own (SDD §13.4, review RV51-03).
+_QUOTED_KEY_AHEAD = r"'(?:[A-Za-z0-9]+[_.-]){0,16}(?:" + _KEYWORDS + r")'\s*[:=]"
+#: A single-quoted string on one line with no backslash before a quote: every quoting agrees on
+#: its close - a Python repr, YAML ('' a quote), the shell, any of them inside JSON strings.
+_SQ_CLEAN = r"'(?:[^'\\\n]|\\++(?!')|'')*+'"
+#: A quoted part the shell glues to its word, never a quoted credential key's name.
+_SQ_PART = r"(?:(?!" + _QUOTED_KEY_AHEAD + r")'[^'\n]*+')?"
+#: What the shell glues to a closed word: its escaped quote (\') or "'" - JSON's escapes of them
+#: too - and the quoted part that opens after, or characters of no shell or JSON syntax ('a'b!),
+#: each with a quoted part after; a space, a delimiter or ">" ends the word (SDD §13.4, reviews
+#: RV51-05, RV51-20).
+_SQ_WORD = (
+    r"(?:(?:\\++'|\\*+\"'\\*+\")" + _SQ_PART + r"|[^\s'\"\\,;&|<>(){}\[\]:.]++" + _SQ_PART + r")*+"
+)
 #: Where a string inside JSON strings closes: the backslashes that opened it before a quote, after
 #: any number of the 2E + 2 each of its own backslashes became (E the opening's backslashes); a
 #: quote of its own has 2E + 1 before it.
@@ -93,26 +114,34 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer " + REDACTED),
     # key=value / key: value / "key": "value" (the key possibly prefixed, e.g. OS_PASSWORD), which
     # also covers X-Auth-Token / X-Subject-Token headers and Password=...; in connection strings.
-    # A quoted value runs to its own closing quote, read as its quoting reads it, each run once:
-    # JSON's \" and YAML's '' stay inside it, a Python repr's \' too, and a string inside JSON
-    # strings - Ansible's output carries JSON in JSON (\"key\": \"value\") - closes at the
-    # escape that opened it, however deep. A key's quote is looked for where its backslashes
+    # A quoted value runs to its own closing quote, read in every quoting it may be in, each run
+    # once: JSON's \" and YAML's '' stay inside it, a Python repr's \' too, the shell's '\'' and
+    # '"'"', and a string inside JSON strings - Ansible's output carries JSON in JSON (\"key\":
+    # \"value\") - closes at the escape that opened it, however deep; where the readings disagree
+    # on its end, it runs to the longest one's. A key's quote is looked for where its backslashes
     # start, so a run of them costs time linear in its length (SDD §13.4, audit AD-08, reviews
-    # RV50-01, RV50-10)
+    # RV50-01, RV50-10, RV51-02 to RV51-05, RV51-20, RV51-21)
     (
         re.compile(
             r"(?i)((?:(?<!\\)\\*+[\"'])?" + _SCANNED_KEY + r"(?:\\*+[\"'])?\s*[:=]\s*)"
             r"(\"(?:[^\"\\]|\\.)*+\""  # a JSON or a shell string
-            # a Python, YAML or shell string on one line: a backslash escapes, '' is a quote, and
-            # a close glued to more text read an escaped quote as one, so the value runs on to a
-            # close that ends it - YAML's 'C:\' and a repr inside JSON (\\') leave nothing out
-            r"|'(?:[^'\\\n]|\\.|'')*+'"
-            r"(?:(?!" + _VALUE_END + r")(?:[^'\n]|'(?!" + _VALUE_END + r"))*+(?:'|(?=\n)|\Z))?"
+            # a single-quoted string on one line whose close every quoting agrees on, and what the
+            # shell glues to it
+            r"|" + _SQ_CLEAN + _SQ_WORD +
+            # one with a backslash before a quote - an escaped quote in a repr (\', inside JSON
+            # \\'), a close in YAML or the shell ('C:\', YAML's \''): the value runs on, the longer
+            # reading, over the shell's quotes to a close a value end follows, or to its line's end,
+            # stopping before a quoted credential key
+            r"|'(?:[^'\\\n]|\\++(?!')|'')*+\\++''?+"
+            r"(?:\\*+\"'\\*+\"'?+|[^'\\\n]|\\++(?:''?+)?+|''|'(?=\\++')"
+            r"|(?!" + _QUOTED_KEY_AHEAD + r")'(?!" + _VALUE_END + r"))*+"
+            r"(?:(?=" + _QUOTED_KEY_AHEAD + r")|'|(?=\n)|\Z)"
             r"|'(?:[^']|'')*+'"  # a YAML single-quoted string over lines
             # a string inside JSON strings, to its close, a bare quote or its line's end
             r"|(?P<escape>\\++)\"(?:[^\"\\\n]|(?!" + _ESCAPED_CLOSE + r")\\++\"?)*+"
             r"(?:" + _ESCAPED_CLOSE + r"|(?=[\n\"])|\Z)"
-            r"|[^\s,;&}]+)"
+            # a [REDACTED] an earlier pass wrote is left as it is: a second pass changes nothing
+            r"|\[REDACTED\](?![A-Za-z0-9])|[^\s,;&}]+)"
         ),
         r"\1" + REDACTED,
     ),
