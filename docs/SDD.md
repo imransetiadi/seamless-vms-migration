@@ -2524,7 +2524,9 @@ update between two reads could leave count and sum as they were; a route that de
 a value that only grows), `versions(kind) -> [(id, version)]` (in creation order, no document read),
 `get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: {phase: count}}` (one
 `SELECT … GROUP BY` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
-`derived_status` and `migration_counts` from it, §8.1), `delete(kind, id)`,
+`derived_status` and `migration_counts` from it, §8.1), `delete(kind, id, expected_version=None)` (with a version,
+`DELETE … WHERE version = n`: a `ConflictError` when the document moved, `NotFound` when it is gone - the advisor
+policy's delete, review ST-05),
 `get_versioned(kind, id, model_cls) -> (model, version)` (one read that returns the version too: `plan apply`'s
 compare-and-write, §15), `put_with_event(kind, model, event, expected_version) -> (version, Event)` (a versioned
 update and its event in one transaction, a `ConflictError` as `put`'s: the source watch's flag and alert, §8.1),
@@ -2628,7 +2630,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/advisor/policies` | viewer | — | `{"items": [AdvisorPolicy], "default": AdvisorPolicy}` (`default`: the built-in `global-default`, read-only) |
 | POST | `/advisor/policies` | admin (`advisor.policy.manage`) | `AdvisorPolicy` without `id`, `created_at`, `updated_at`, `updated_by` (422: both scope lists set, an unknown provider or plan id, threshold outside 0..1) | `AdvisorPolicy` (201) |
 | PUT | `/advisor/policies/{id}` | admin (`advisor.policy.manage`) | as POST | `AdvisorPolicy` (404 unknown) |
-| DELETE | `/advisor/policies/{id}` | admin (`advisor.policy.manage`) | — | 204 (404 unknown) |
+| DELETE | `/advisor/policies/{id}` | admin (`advisor.policy.manage`) | — | 204 (404 unknown; 409 when it changed since it was read - a replace landed meanwhile, deleted only at the version its `policy.deleted` event names as `before`, review ST-05) |
 | POST | `/advisor/similar-incidents` | operator | `{"query": str (1–2000 characters), "limit": int = 5 (1–20)}`; 422 outside these bounds | `{"hits":[{"title":str,"content":str,"score":float?}]}` |
 | GET | `/metrics` | viewer (public if `SEAMLESS_METRICS_PUBLIC`) | — | Prometheus text format |
 
@@ -2640,8 +2642,10 @@ A plan's `name` holds at most 200 characters and its `description` 2000: `POST /
 `GET /events` pages forward: it returns the first `limit` matching events after `since`, and a client
 continues from the last `seq`. With `tail=true` it returns the newest `limit` matching events after
 `since` instead, still in ascending `seq`, so a history of the latest events is one request however
-many events are persisted (§16); `before` keeps only events below a `seq`, so `tail=true&before=` is the page
-before the oldest one a client shows, and the trail reads back to its start.
+many events are persisted (§16); `before` keeps only events below a `seq`, so `tail=true&before=` is the page before
+the oldest one a client shows, and the trail reads back to its start. `since` and `before` take at most 2147483647,
+the width of `events.seq` - PostgreSQL's `integer` -: a larger value is a 422, never a 500 (Security.md C1-05,
+review ST-01).
 
 Outside `/api/v1`: `GET /api/openapi.json` and `GET /api/docs` (Swagger UI) are public in demo mode
 and need the viewer role otherwise; FastAPI's default `/docs`, `/redoc` and `/openapi.json` are
