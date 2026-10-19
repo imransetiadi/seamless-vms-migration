@@ -55,6 +55,12 @@ FIXTURE = (
     '"region_name": "RegionTwo"}}}\n'
     "seamless token smg_FakeRomeoFakeRomeoFake18 and jwt "  # gitleaks:allow
     "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.ZmFrZVNpZ25hdHVyZQ\n"  # gitleaks:allow
+    # a quote inside a quoted value - JSON's \", YAML's '' - and JSON inside a JSON string, as
+    # Ansible's output carries it (audit AD-08)
+    '{"user": "svc", "password": "Fake\\"Pass Sierra-19"}\n'  # gitleaks:allow
+    "password: 'Fake''Pass Tango-20'\n"  # gitleaks:allow
+    '{\\"password\\": \\"Fake\\nPass Uniform-21\\"}\n'  # gitleaks:allow
+    '{\\"token\\": \\"Fake\\\\\\"Pass Victor-22, x\\", \\"port\\": 5432}\n'  # gitleaks:allow
 )
 #: The reviewed snapshot of ``redact(FIXTURE)``.
 SNAPSHOT = (
@@ -77,11 +83,16 @@ SNAPSHOT = (
     "    interface: public\n"
     '{"clouds": {"dc2": {"auth": [REDACTED], "region_name": "RegionTwo"}}}\n'
     "seamless token [REDACTED] and jwt [REDACTED]\n"
+    '{"user": "svc", "password": [REDACTED]}\n'
+    "password: [REDACTED]\n"
+    '{\\"password\\": [REDACTED]}\n'
+    '{\\"token\\": [REDACTED], \\"port\\": 5432}\n'
 )
 #: Every fake secret of the fixture: none may survive anywhere it is sent.
 SECRETS = re.compile(
     r"Fake(?:Pass|Cloud|Romeo|Juliet|Kilo|Lima|Oscar|@Pass)|fake-(?:api|typesafe)|FAKE\.bearer|"
-    r"fakeKeystone|7f3c0a1b|AKIAFAKE|MIIEFAKE|eyJhbGci|Pass-November|admin\n      password"
+    r"fakeKeystone|7f3c0a1b|AKIAFAKE|MIIEFAKE|eyJhbGci|Pass-November|admin\n      password|"
+    r"Sierra-19|Tango-20|Uniform-21|Victor-22"
 )
 
 

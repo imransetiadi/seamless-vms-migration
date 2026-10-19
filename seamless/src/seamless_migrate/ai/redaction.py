@@ -81,10 +81,18 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     # bare bearer tokens
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer " + REDACTED),
     # key=value / key: value / "key": "value" (the key possibly prefixed, e.g. OS_PASSWORD), which
-    # also covers X-Auth-Token / X-Subject-Token headers and Password=...; in connection strings
+    # also covers X-Auth-Token / X-Subject-Token headers and Password=...; in connection strings.
+    # A quoted value runs to its own closing quote, read as its quoting reads it, each run once:
+    # JSON's \" and YAML's '' stay inside it, and JSON inside a JSON string, as Ansible's output
+    # carries it (\"key\": \"value\"), ends at the first \" that no escape holds (SDD §13.4,
+    # audit AD-08)
     (
         re.compile(
-            r"(?i)([\"']?" + _SCANNED_KEY + r"[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&}]+)"
+            r"(?i)((?:\\*[\"'])?" + _SCANNED_KEY + r"(?:\\*[\"'])?\s*[:=]\s*)"
+            r"(\"(?:[^\"\\]|\\.)*+\""  # a JSON or a shell string
+            r"|'(?:[^']|'')*+'"  # a YAML single-quoted string
+            r"|\\\"(?:[^\"\\]|\\[^\"\\]|\\\\(?:[^\"\\]|\\\\|\\\"))*+\\\""  # inside a JSON string
+            r"|[^\s,;&}]+)"
         ),
         r"\1" + REDACTED,
     ),

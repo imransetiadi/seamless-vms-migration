@@ -209,8 +209,21 @@ def test_memory_hits_are_redacted_where_they_enter():
         "-" * 32768,  # a CLI flag's name: a line of dashes, as logs print them
         "a" * 32768,  # a URL scheme
         "-----BEGIN A-----" * 4000,  # PEM blocks that never end
+        # quoted values that never close: each key's value runs only to its own quote (AD-08)
+        'password: \\"x ' * 2520,
+        "password: '" + "''" * 16384,
+        'password: "' + '\\"' * 16384,
     ],
-    ids=["key prefix", "dotted words", "dash line", "scheme letters", "pem begins"],
+    ids=[
+        "key prefix",
+        "dotted words",
+        "dash line",
+        "scheme letters",
+        "pem begins",
+        "escaped quotes",
+        "doubled quotes",
+        "quotes escaped in a string",
+    ],
 )
 def test_redact_costs_time_linear_in_the_text(text):
     """SDD §13.4 (review RV27-06): redact runs in the event loop - over agentmemory's hits and
