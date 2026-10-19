@@ -2383,7 +2383,10 @@ volume disks carry their Cinder `pool`;
 `os_type` is the most specific of the server metadata `os_type`/`os_distro`, the boot volume's
 `volume_image_metadata` or the boot image's properties (`os_distro` + `os_version`, then `os_type`)),
 `VMwareProvider` (pyVmomi,
-lazy; reports CBT, snapshots, independent disks, tools state; powers a VM on for a rollback (`power_on`) and tells
+lazy; reports CBT, snapshots, independent disks, tools state - its `check()` reports `api_version`, `version`,
+`vm_count`, `cbt_enabled_vms`, `vms_with_snapshots`, `vms_with_independent_disks` and `vms_without_tools`, the keys
+the demo's fake vCenter and the dashboard's mock report too (review PV-06); powers a VM on for a rollback
+(`power_on`) and tells
 whether vCenter recorded a power-on of it since a time (`powered_on_since`, its events, §7.2), and lists the keys of a VM's
 disks in vCenter's device order (`disk_keys`: `config.hardware.device`, as the migration kit reads it, §7.2); `os_type` is the VMware Tools pretty
 name when Tools report one, else the configured guest id), `FakeSourceProvider`/
