@@ -378,6 +378,55 @@ OWN_DECISION = "You requested this decision. Another approver must decide it."
 SOURCE_RUNS_AGAIN = "the source VM runs again: stop it, or roll it back, before finalizing"
 
 
+def reassessed(m: Migration) -> bool:
+    """Whether a validation re-assesses ``m`` (SDD §5.4): pending, blocked or ready, or left in
+    validating - unless its source is stopped, its downtime clock open (§5.2): a re-assessment
+    could block it, where no action restarts the source; it is left as it is, like one in flight
+    (audit OC-02)."""
+    return m.phase in REASSESSED and not fsm.source_stopped(m)
+
+
+def _named_twice(migrations: Iterable[Migration]) -> str | None:
+    """Why a plan cannot go on while two of its migrations - cancelled ones aside - name one VM,
+    else None: both would cut it over (SDD §5.4, audit OC-06)."""
+    by_vm: dict[str, list[Migration]] = {}
+    for m in migrations:
+        if m.phase != P.cancelled:
+            by_vm.setdefault(m.vm.source_id, []).append(m)
+    twice = sorted((ms for ms in by_vm.values() if len(ms) > 1), key=lambda ms: ms[0].vm.name)
+    if not twice:
+        return None
+    named = "; ".join(f"{ms[0].vm.name} ({', '.join(sorted(m.id for m in ms))})" for ms in twice)
+    return f"two migrations of one VM would both cut it over: {named}; cancel all but one first"
+
+
+def _by_vm(migrations: Iterable[Migration]) -> dict[str, Migration]:
+    """Each VM's migration that is not cancelled, else its cancelled one (SDD §5.4)."""
+    existing: dict[str, Migration] = {}
+    for m in migrations:
+        known = existing.get(m.vm.source_id)
+        if known is None or known.phase == P.cancelled:
+            existing[m.vm.source_id] = m
+    return existing
+
+
+def _rewrite_vm_id(plan: Plan, old: str, new: str) -> bool:
+    """The plan follows a recreated source VM (SDD §7.3): every field keyed by its id; whether
+    anything changed - once done nothing names ``old``."""
+    before = plan.model_dump()
+    plan.vm_ids = [new if v == old else v for v in plan.vm_ids]
+    for wave in plan.waves:
+        wave.vm_ids = [new if v == old else v for v in wave.vm_ids]
+    if old in plan.strategy_overrides:
+        plan.strategy_overrides[new] = plan.strategy_overrides.pop(old)
+    if old in plan.probe_overrides:
+        plan.probe_overrides[new] = plan.probe_overrides.pop(old)
+    # its ports keep their MACs (the rollback recreates them with theirs, §7.3)
+    if old in plan.nic_overrides:
+        plan.nic_overrides[new] = plan.nic_overrides.pop(old)
+    return plan.model_dump() != before
+
+
 def _refuse_unchangeable(m: Migration) -> None:
     """A strategy decision applies to pending, ready and blocked migrations only (SDD §8)."""
     if m.phase not in REVALIDATABLE:
@@ -729,7 +778,7 @@ class Orchestrator:
         vms = []
         for vm_id in plan.vm_ids:
             m = existing.get(vm_id)
-            if m is not None and m.phase not in REASSESSED:
+            if m is not None and not reassessed(m):
                 vms.append(m.vm)
                 continue
             try:
@@ -812,9 +861,11 @@ class Orchestrator:
             dst_inv = await dst_impl.inventory()
         except ProviderError as exc:
             raise ProviderError(f"inventory failed: {exc}") from None  # 502, redacted (SDD §12)
-        existing = {
-            m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)
-        }
+        listed = await self.db.list("migration", Migration, plan_id=plan.id)
+        twice = _named_twice(listed)
+        if twice is not None:
+            raise NotAllowed(twice)
+        existing = _by_vm(listed)
         vms = await self._vms(plan, src_impl, existing)
         # what a cutover of each VM will still create - its server alone when an earlier attempt
         # holds its destination volumes (SDD §9.3, reviews PL-02, RV38A-01)
@@ -882,7 +933,7 @@ class Orchestrator:
             detached: list[Finding] = []
             if (
                 current is not None
-                and current.phase in REASSESSED
+                and reassessed(current)
                 and any(change.to_phase == P.cutover for change in current.phase_history)
             ):
                 # a disk the VM had at a cutover attempt never leaves the migration by a
@@ -929,7 +980,7 @@ class Orchestrator:
             )
             # SDD §14.4: validation makes no choice for a migration in flight or finished (it
             # leaves it alone), so the advisor is not asked about it
-            chooses = current is None or current.phase in (*REVALIDATABLE, P.validating)
+            chooses = current is None or reassessed(current)
             advice = None
             if self.advisor is not None and automatic and chooses:
                 # the destination by kind and series: its provider's name never leaves for Jev
@@ -1202,9 +1253,10 @@ class Orchestrator:
             m, v = await self._load(mid)
             # SDD §5.4: one left in validating by an interrupted validation is taken over as it is
             # (validations of a plan run one at a time under its lock: none is at work on it)
-            if m.phase not in REVALIDATABLE and m.phase != P.validating:
-                # already in flight or finished: left alone, but in its VM's wave in the plan, so
-                # waves planned anew reach it before the plan starts (SDD §9.4, review PL-11)
+            if not reassessed(m):
+                # in flight, finished or its source stopped: left alone, but in its VM's wave in
+                # the plan, so waves planned anew reach it before the plan starts (SDD §9.4,
+                # review PL-11)
                 wave = plan.wave_of(m.vm.source_id)
                 if m.wave_id != (wave.id if wave else None):
                     m.wave_id = wave.id if wave else None
@@ -1313,9 +1365,7 @@ class Orchestrator:
         if max_wave_size < 1:
             raise BadRequest("max_wave_size must be >= 1")
         source = await self._provider(plan.source_provider_id, ProviderRole.source)
-        existing = {
-            m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)
-        }
+        existing = _by_vm(await self.db.list("migration", Migration, plan_id=plan.id))
         vms = await self._vms(plan, self.providers.get(source), existing)
         if self.advisor is not None:
             # the destination by kind and series: its provider's name never leaves for Jev
@@ -1402,6 +1452,9 @@ class Orchestrator:
         # AP-07): taken last and innermost, it holds no other (§8)
         async with self.provider_lock():
             plan = await self._update_plan(plan.id, start)
+        # SDD §8 (audit OC-05): pre-staged again - idempotent, it creates what a VM added since
+        # needs, as its validation said (MAP_FLAVOR_PRESTAGED, §9.3)
+        self._prestage_done.discard(plan.id)
         await self._emit("plan.started", f"{plan.name} started", plan_id=plan.id, actor=actor)
         self.wake()
         return plan
@@ -1449,6 +1502,12 @@ class Orchestrator:
                 stopped = [m for m in todo if fsm.source_stopped(m)]
                 if stopped:
                     raise NotAllowed(stopped_refusal(stopped))
+                # SDD §12 (audit OC-07): a pre-staging that still runs - the plan was paused while
+                # it ran - is stopped first, the executor killing its playbook as for a step
+                prestaging = self._prestage_tasks.get(plan_id)
+                if prestaging is not None and not prestaging.done():
+                    prestaging.cancel()
+                    await asyncio.wait({prestaging})
                 why = f"plan cancelled: {reason}" if reason else "plan cancelled"
                 for m in todo:
                     await self.cancel(m.id, actor, why)
@@ -1661,6 +1720,17 @@ class Orchestrator:
                 raise NotAllowed(
                     f"{m.vm.name} cannot be retried: a migration in another plan holds the VM: "
                     f"{self._holders(held)}; finish, roll back or cancel it there first"
+                )
+            siblings = sorted(
+                x.id
+                for x in await self.db.list("migration", Migration, plan_id=m.plan_id)
+                if x.id != m.id and x.vm.source_id == m.vm.source_id and x.phase != P.cancelled
+            )
+            if siblings:
+                # SDD §5.4 (audit OC-06): two migrations of one VM would both cut it over
+                raise NotAllowed(
+                    f"{m.vm.name} cannot be retried: another migration of this plan "
+                    f"({', '.join(siblings)}) holds the VM; cancel one of them first"
                 )
             # only a completed plan's providers can be deleted (SDD §12), and the plan may still
             # complete before the reopen below: the new attempt needs both
@@ -3459,9 +3529,8 @@ class Orchestrator:
         recreated = VMRef.model_validate(vm) if isinstance(vm, dict) else None
         if recreated is not None and recreated.source_id != m.vm.source_id:
             # SDD §7.3: the plan follows a recreated source VM before the migration is rolled
-            # back - rolled_back is never resumed, so a stop after it would lose the rewrite; a
-            # stop before it resumes rolling_back, and the rewrite changes nothing the second time
-            await self._replace_vm_id(m.plan_id, m.vm.source_id, recreated.source_id)
+            # back - rolled_back is never resumed, so a stop after it would lose the rewrite
+            await self._follow_recreated_vm(m.id, recreated)
         async with self._lock(m.id):
             cur, v = await self._load(m.id)
             if cur.phase != P.rolling_back:
@@ -3500,36 +3569,42 @@ class Orchestrator:
             await self.knowledge.on_rolled_back(cur, reason)
         self.wake()
 
-    async def _replace_vm_id(self, plan_id: str, old: str, new: str) -> None:
-        """The plan follows a recreated source VM (SDD §7.3): every field keyed by its id; once
-        done nothing names ``old``, and a repeat writes nothing."""
-        changed = False
-
-        def rewrite(plan: Plan) -> bool:
-            nonlocal changed
-            before = plan.model_dump()
-            plan.vm_ids = [new if v == old else v for v in plan.vm_ids]
-            for wave in plan.waves:
-                wave.vm_ids = [new if v == old else v for v in wave.vm_ids]
-            if old in plan.strategy_overrides:
-                plan.strategy_overrides[new] = plan.strategy_overrides.pop(old)
-            if old in plan.probe_overrides:
-                plan.probe_overrides[new] = plan.probe_overrides.pop(old)
-            # its ports keep their MACs (the rollback recreates them with theirs, §7.3)
-            if old in plan.nic_overrides:
-                plan.nic_overrides[new] = plan.nic_overrides.pop(old)
-            changed = plan.model_dump() != before
-            return changed
-
-        plan = await self._update_plan(plan_id, rewrite)
-        if not changed:
-            return
-        await self._emit(
-            "plan.updated",
-            f"{plan.name}: source VM {old} is now {new}",
-            plan_id=plan.id,
-            data={"vm_id_changed": {"from": old, "to": new}},
-        )
+    async def _follow_recreated_vm(self, mid: str, recreated: VMRef) -> None:
+        """The plan follows a recreated source VM in one transaction with the migration's new
+        ``vm`` (SDD §7.3, §11, audit OC-06): a stop before it leaves both naming the old VM, after
+        it both the new one - never a plan naming a VM no migration does, which a validation would
+        plan a second migration of. A plan that already names it (an earlier version's rewrite,
+        left by a stop) is written no further."""
+        for attempt in range(PLAN_UPDATE_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_update_backoff(attempt))
+            async with self._lock(mid):
+                cur, v = await self._load(mid)
+                if cur.phase != P.rolling_back:
+                    return
+                plan, plan_version = await self.db.get_versioned("plan", cur.plan_id, Plan)
+                old, new = cur.vm.source_id, recreated.source_id
+                cur.vm = recreated
+                cur.updated_at = self._now()
+                writes: list[tuple[str, Any, int]] = [("migration", cur, v)]
+                events: list[Event] = []
+                if _rewrite_vm_id(plan, old, new):
+                    plan.updated_at = self._now()
+                    writes.insert(0, ("plan", plan, plan_version))
+                    events.append(
+                        new_event(
+                            "plan.updated",
+                            f"{plan.name}: source VM {old} is now {new}",
+                            plan_id=plan.id,
+                            data={"vm_id_changed": {"from": old, "to": new}},
+                        )
+                    )
+                try:
+                    await put_all_and_emit(self.store, self.bus, writes, events)
+                    return
+                except ConflictError:
+                    continue  # another writer moved the plan: read both again
+        raise ConflictError(f"plan of {mid} changed too often to follow its recreated source VM")
 
     async def _fail(
         self,

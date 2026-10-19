@@ -7222,27 +7222,27 @@ async def test_a_recreated_source_vm_is_in_the_plan_before_the_migration_is_roll
 ):
     """SDD §7.3: the plan follows the new id before the migration becomes rolled_back - a stop
     in between resumes rolling_back; rolled_back is never resumed, so a later rewrite could be
-    lost for good."""
+    lost for good - and in the same write as the migration's new vm (audit OC-06)."""
     settings = make_settings(tmp_path)
     h, plan = await setup(
         tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
         executor=_recreating_executor(settings), settings=settings,
     )  # fmt: skip
-    put = h.orch.db.put
-    seen: list[Phase] = []
+    put_all = store.put_all_with_events
+    seen: list[tuple[Phase, str]] = []
 
-    async def watching_put(kind, model, expected_version=None):
-        version = await put(kind, model, expected_version)
-        if kind == "plan" and "vm-1-recreated" in model.vm_ids and not seen:
-            # the phase the migration had when its plan first named the recreated VM
-            seen.extend(m.phase for m in await h.migrations(plan.id))
-        return version
+    def watching(writes, events):
+        written = {kind: model for kind, model, _ in writes}
+        if "vm-1-recreated" in getattr(written.get("plan"), "vm_ids", []) and not seen:
+            # the migration the write that first names the recreated VM in the plan holds
+            seen.append((written["migration"].phase, written["migration"].vm.source_id))
+        return put_all(writes, events)
 
-    h.orch.db.put = watching_put
+    store.put_all_with_events = watching
     await run_plan(h, plan)
     m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
     await h.orch.stop()
-    assert seen == [P.rolling_back]
+    assert seen == [(P.rolling_back, "vm-1-recreated")]
     assert m.vm.source_id == "vm-1-recreated"
     assert (await h.plan(plan.id)).vm_ids == ["vm-1-recreated"]
 
@@ -7271,6 +7271,239 @@ async def test_a_rollback_resumed_after_its_rewrite_changes_the_plan_no_further(
     assert not [
         e for e in store.events(since_seq=0, limit=1000) if "vm_id_changed" in (e.data or {})
     ]
+
+
+@pytest.mark.parametrize(
+    ("write", "kind"),
+    [("INSERT INTO events", "plan.updated"), ("UPDATE documents", "migration")],
+    ids=["the-plans-event", "the-migration"],
+)
+async def test_a_recreated_source_and_its_plan_are_written_together(
+    tmp_path, store, refuse_write, write, kind
+):
+    """SDD §7.3, §11 (audit OC-06): the rollback that recreated the source wrote the plan's new id,
+    then the migration's new vm, apart: a stop or a store error between them left the plan naming
+    a VM no migration named, and a validation meanwhile planned a second migration of it - Retry
+    and Start took both, and the tick cut the VM over twice. The plan and the migration are one
+    write: refused, neither changes, and the plan keeps one migration of the VM."""
+    settings = make_settings(tmp_path)
+    executor = _recreating_executor(settings)
+    recreating = executor.hooks[StepName.ROLLBACK]
+    attempts: list[str] = []
+    again, release = asyncio.Event(), asyncio.Event()
+
+    async def rollback(ctx):
+        attempts.append(ctx.migration.id)
+        if len(attempts) == 1:
+            refuse_write(store, write, kind)  # a part of the rewrite's write fails
+        else:
+            again.set()
+            await release.wait()  # the relaunched rollback runs again: minutes for a handover
+        return await recreating(ctx)
+
+    executor.hooks[StepName.ROLLBACK] = rollback
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=executor,
+        settings=settings,
+    )
+    h.source.vms["vm-1-recreated"] = vm(1).model_copy(update={"source_id": "vm-1-recreated"})
+    await run_plan(h, plan)
+    await asyncio.wait_for(again.wait(), 10)
+    await h.orch.pause_plan(plan.id, "alice")
+    await h.orch.validate_plan(plan.id, "alice")  # the paused plan, validated meanwhile
+    [m] = await h.migrations(plan.id)
+    assert (m.vm.source_id, (await h.plan(plan.id)).vm_ids) == ("vm-1", ["vm-1"])
+    release.set()
+    done = await h.wait_phase(m.id, P.rolled_back)
+    await h.orch.stop()
+    assert done.vm.source_id == "vm-1-recreated"
+    assert (await h.plan(plan.id)).vm_ids == ["vm-1-recreated"]
+    assert len(await h.migrations(plan.id)) == 1
+
+
+async def test_a_plan_holding_two_migrations_of_one_vm_is_refused(tmp_path, store):
+    """SDD §5.4 (audit OC-06): two migrations of one VM would both cut it over - an earlier
+    version's rollback could leave a second one beside the first. A validation of such a plan is
+    refused, naming the VM and both migrations, and a retry of one while the other names its VM."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    first = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=P.ready)
+    second = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=P.rolled_back)
+    store.put("migration", first)
+    store.put("migration", second)
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.validate_plan(plan.id, "alice")
+    assert "web-01" in str(refused.value)
+    assert first.id in str(refused.value) and second.id in str(refused.value)
+    with pytest.raises(NotAllowed, match=f"another migration of this plan \\({first.id}\\)"):
+        await h.orch.retry(second.id, "sari")
+    assert (await h.migration(second.id)).phase == P.rolled_back
+    # one cancelled - listed after the other -, the plan goes on with the one left
+    await h.orch.cancel(second.id, "sari", "a second migration of web-01")
+    report = await h.orch.validate_plan(plan.id, "alice")
+    assert [(i.migration_id, i.phase) for i in report.migrations] == [(first.id, P.ready)]
+
+
+async def test_a_validation_leaves_a_stopped_source_as_it_is(tmp_path, store):
+    """SDD §5.4 (audit OC-02): a migration retried after a failed cutover keeps its stopped
+    source (§5.2). A validation re-assessed it: the volume the failed export left detached moved
+    it to blocked, where rollback, cancel, retry and start are all refused - nothing restarted
+    the source. It is left as it is, like one in flight: the plan starts, and the cutover runs
+    again."""
+    settings = make_settings(tmp_path)
+    two_disks = vm(
+        1,
+        disks=[
+            make_disk(id="vol-1", size_gb=20, used_gb=10.0),
+            make_disk(id="vol-1b", size_gb=10, used_gb=2.0, bootable=False, device="/dev/vdb"),
+        ],
+    )
+    # the advisor chooses the strategy: a validation that re-assessed the VM would ask it again
+    advisor, session = _answering_advisor(decide=_decide_answer("cold", 0.99))
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [two_disks],
+        {
+            "default_strategy": "auto",
+            "auto_cutover": False,
+            "verification": VerificationConfig(timeout_s=2, auto_rollback=False),
+        },
+        executor=_stopping_cutover(settings),
+        settings=settings,
+        advisor=advisor,
+    )
+    await run_plan(h, plan)
+    m = await h.by_vm(plan.id, "vm-1")
+    assert m.strategy == Strategy.cold
+    await h.orch.request_cutover(m.id, "sari")
+    m = await h.wait_phase(m.id, P.failed)
+    assert m.downtime_started_at is not None and m.downtime_ended_at is None
+    await h.orch.retry(m.id, "sari")  # keeps the open clock (SDD §5.2)
+    await h.orch.pause_plan(plan.id, "alice")
+    # the failed export left the data volume detached from the stopped source VM (SDD §6.6)
+    src = h.source.vms["vm-1"]
+    h.source.vms["vm-1"] = src.model_copy(update={"disks": [src.disks[0]]})
+    retried = await h.migration(m.id)
+    session.calls.clear()
+    report = await h.orch.validate_plan(plan.id, "alice")
+    left = await h.migration(m.id)
+    assert (left.phase, left.findings, left.vm) == (P.ready, retried.findings, retried.vm)
+    assert left.phase_history == retried.phase_history  # no validating, no blocked
+    # reported as recorded, like one in flight: its VM is not read again, the advisor not asked
+    [item] = report.migrations
+    assert (item.phase, item.estimates) == (P.ready, retried.estimates)
+    assert "SRC_VM_VOLUME_DETACHED" not in {f.code for f in item.findings}
+    assert [name for name, *_ in session.calls if name == "jev_decide"] == []
+    # its VM is not read again: gone from the source, the plan still validates (SDD §5.4)
+    del h.source.vms["vm-1"]
+    await h.orch.validate_plan(plan.id, "alice")
+    assert (await h.migration(m.id)).phase_history == retried.phase_history
+    started = await h.orch.start_plan(plan.id, "alice")
+    await h.orch.stop()
+    assert started.status == PlanStatus.running
+
+
+@dataclasses.dataclass
+class _PrestageRecorder(ScriptedExecutor):
+    """Records the flavors each pre-staging run was asked to create."""
+
+    flavors: list[list[str]] = dataclasses.field(default_factory=list)
+
+    async def prestage(self, plan, source, destination, *, prestage_flavors=None):
+        self.flavors.append(list(prestage_flavors or []))
+
+
+async def test_a_vm_added_after_the_first_start_gets_its_flavor_pre_staged(tmp_path, store):
+    """SDD §8, §9.3 (audit OC-05): a plan was pre-staged once per process: a VM added after its
+    first start was validated ready on MAP_FLAVOR_PRESTAGED's promise - pre-staging creates the
+    flavor - and its flavor was never created, so each pass or cutover of it failed the
+    destination check. A plan is pre-staged again after each start."""
+    settings = make_settings(tmp_path)
+    executor = _PrestageRecorder(settings)
+    big = vm(2, flavor="m1.xlarge")  # no such flavor at the destination, no mapping
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), big],
+        {
+            "vm_ids": ["vm-1"],
+            "default_strategy": Strategy.cold,
+            "auto_cutover": False,
+            "prestage_resources": ["networks", "flavors"],
+        },
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    deadline = asyncio.get_running_loop().time() + 5
+    while not executor.flavors:
+        assert asyncio.get_running_loop().time() < deadline, "the plan was never pre-staged"
+        await asyncio.sleep(0.01)
+    await h.orch.pause_plan(plan.id, "alice")
+    edited = await h.plan(plan.id)  # PATCH /plans/{id}: nothing in flight, back to draft
+    edited.vm_ids = ["vm-1", "vm-2"]
+    edited.status = PlanStatus.draft
+    store.put("plan", edited)
+    await h.orch.validate_plan(plan.id, "alice")
+    added = await h.by_vm(plan.id, "vm-2")
+    assert added.phase == P.ready and "MAP_FLAVOR_PRESTAGED" in {f.code for f in added.findings}
+    await h.orch.start_plan(plan.id, "alice")
+    while len(executor.flavors) < 2:
+        assert asyncio.get_running_loop().time() < deadline + 5, executor.flavors
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.flavors[-1] == ["m1.xlarge"]
+
+
+@dataclasses.dataclass
+class _SlowPrestage(ScriptedExecutor):
+    """Pre-staging that runs until released - the playbooks take minutes on a real cloud."""
+
+    started: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    release: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    finished: list[str] = dataclasses.field(default_factory=list)
+
+    async def prestage(self, plan, source, destination):
+        self.started.set()
+        await self.release.wait()
+        self.finished.append(plan.id)
+
+
+async def test_a_cancelled_plan_pre_stages_nothing(tmp_path, store):
+    """SDD §12 (audit OC-07): a plan paused while its pre-staging ran could be cancelled - none of
+    its migrations started - and the pre-staging went on creating its networks, flavors and
+    conversion hosts, then announced "resources pre-staged" for the cancelled plan. The cancel
+    stops it first."""
+    settings = make_settings(tmp_path)
+    executor = _SlowPrestage(settings)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold, "auto_cutover": False},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    await asyncio.wait_for(executor.started.wait(), 10)
+    await h.orch.pause_plan(plan.id, "alice")
+    cancelled = await h.orch.cancel_plan(plan.id, "alice", "the project was dropped")
+    assert cancelled.status == PlanStatus.cancelled
+    assert plan.id not in h.orch._prestage_tasks
+    executor.release.set()  # were the playbooks still running, they would finish now
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    announced = [
+        e.message
+        for e in store.events(since_seq=0, limit=1000)
+        if e.kind == "plan.updated" and e.data.get("prestaged")
+    ]
+    await h.orch.stop()
+    assert (executor.finished, announced) == ([], [])
 
 
 async def test_tick_ignores_migrations_of_finished_plans_and_records_timing(tmp_path, store):
