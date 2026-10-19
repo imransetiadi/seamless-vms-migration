@@ -2074,11 +2074,15 @@ async def test_openstack_delete_volume_waits_for_a_deletion_cinder_runs(case):
     assert deletes == (["v1"] if case == "began meanwhile" else [])
 
 
-async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_free():
-    """SDD §10 (§7.2 VMware rollback, review RV29-02): detach_volume removes Nova's attachment of
-    the volume to the server, ignoring one already gone, and waits until Cinder reads the volume
-    available, within the call's bound."""
-    calls = []
+def _detaching(monkeypatch, reads, calls, *, step=0.0):
+    """An OpenStackProvider whose Cinder answers ``reads`` (the volume, read after read) and whose
+    clock advances ``step`` seconds a look; ``calls`` records what it asked."""
+    from openstack import exceptions
+
+    from seamless_migrate.providers import openstack as osp
+
+    answered = [0]
+    clock = [0.0]
 
     class Compute:
         def delete_volume_attachment(self, server, volume, ignore_missing=True):
@@ -2086,25 +2090,118 @@ async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_fre
 
     class BlockStorage:
         def get_volume(self, volume_id):
-            return NS(id=volume_id, status="detaching")
+            calls.append(("get_volume", volume_id))
+            answered[0] += 1
+            return reads[min(answered[0], len(reads)) - 1]  # the last answer stays
 
         def wait_for_status(self, volume, status="available", failures=None, interval=2, wait=None):
-            calls.append(("wait_for_status", volume.id, status, failures, wait is not None))
-            return volume
+            # openstacksdk's wait: reads the volume until it reads the status, else times out
+            for _ in range(3):
+                volume = self.get_volume(volume.id)
+                if volume.status == status:
+                    return volume
+            raise exceptions.ResourceTimeout(
+                f"Timeout waiting for Volume:{volume.id} to transition to {status}"
+            )
 
+    def tick():
+        clock[0] += step
+        return clock[0]
+
+    monkeypatch.setattr(osp, "time", NS(monotonic=tick, sleep=lambda s: calls.append(("sleep", s))))
     dst = make_provider(
         id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
     )
-    provider = OpenStackProvider(
+    return OpenStackProvider(
         dst,
         settings(),
         connect_fn=lambda p, s: NS(compute=Compute(), block_storage=BlockStorage()),
     )
+
+
+def _volume(status, *holders):
+    return NS(id="vol-1", status=status, attachments=[{"server_id": s} for s in holders])
+
+
+async def test_openstack_destination_detaches_a_volume_and_waits_until_it_is_free(monkeypatch):
+    """SDD §10 (§7.2 VMware rollback, reviews RV29-02, PV-03): detach_volume removes Nova's
+    attachment of the volume to the server, ignoring one already gone, and waits until Cinder no
+    longer lists the server among the volume's attachments, within the call's bound."""
+    calls = []
+    reads = [
+        _volume("in-use", "srv-conv"),
+        _volume("detaching", "srv-conv"),
+        _volume("available"),
+    ]
+    provider = _detaching(monkeypatch, reads, calls)
     await provider.detach_volume("srv-conv", "vol-1")
     assert calls == [
+        ("get_volume", "vol-1"),
         ("delete_volume_attachment", "srv-conv", "vol-1", True),
-        ("wait_for_status", "vol-1", "available", ["error"], True),
+        ("get_volume", "vol-1"),
+        ("sleep", 2),
+        ("get_volume", "vol-1"),
     ]
+
+
+@pytest.mark.parametrize(
+    "holders", [(), ("srv-dst",)], ids=["attached nowhere", "held by another server"]
+)
+async def test_openstack_detach_volume_of_a_volume_the_server_does_not_hold_is_no_error(
+    monkeypatch, holders
+):
+    """SDD §10 (review PV-03): a volume not attached to that server - attached nowhere, or held by
+    another server only - is no error, and is neither detached nor waited for: Cinder never reads
+    such a volume available from this detach, so the wait ran out its whole bound, then failed."""
+    calls = []
+    provider = _detaching(
+        monkeypatch, [_volume("in-use" if holders else "available", *holders)], calls
+    )
+    await provider.detach_volume("srv-conv", "vol-1")
+    assert calls == [("get_volume", "vol-1")]
+
+
+async def test_openstack_detach_volume_of_a_multiattach_volume_ends_once_that_server_lets_go(
+    monkeypatch,
+):
+    """SDD §10 (review PV-03): a multi-attach volume another server still holds stays in-use after
+    the detach - the wait ends once Cinder no longer lists the server, never waiting for
+    available."""
+    calls = []
+    reads = [_volume("in-use", "srv-conv", "srv-dst"), _volume("in-use", "srv-dst")]
+    provider = _detaching(monkeypatch, reads, calls)
+    await provider.detach_volume("srv-conv", "vol-1")
+    assert calls == [
+        ("get_volume", "vol-1"),
+        ("delete_volume_attachment", "srv-conv", "vol-1", True),
+        ("get_volume", "vol-1"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "case, reads, message",
+    [
+        (
+            "still held",
+            [_volume("in-use", "srv-conv")] * 5,
+            r"^dst: volume vol-1 is still attached to srv-conv$",
+        ),
+        (
+            "cinder failed",
+            [_volume("in-use", "srv-conv"), _volume("error", "srv-conv")],
+            r"^dst: volume vol-1 is in error: Cinder failed to detach it from srv-conv$",
+        ),
+    ],
+)
+async def test_openstack_detach_volume_names_a_volume_the_server_keeps(
+    monkeypatch, case, reads, message
+):
+    """SDD §10 (review PV-03): a volume the server still holds when the call's bound ends, or one
+    Cinder reads in error, is a provider error naming the volume and the server."""
+    calls = []
+    provider = _detaching(monkeypatch, reads, calls, step=100.0)
+    with pytest.raises(ProviderError, match=message):
+        await provider.detach_volume("srv-conv", "vol-1")
 
 
 async def test_openstack_destination_finds_the_server_holding_an_address():

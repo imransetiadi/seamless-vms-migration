@@ -108,6 +108,12 @@ def _attr(obj: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
+def _holders(volume: Any) -> list[str]:
+    """The servers Cinder lists among the volume's attachments (SDD §10)."""
+    attachments = _attr(volume, "attachments", default=None) or []
+    return [str(a.get("server_id")) for a in attachments if a.get("server_id")]
+
+
 def _canonical_ip(address: str) -> str:
     """An address as Neutron writes it; a string that is no address stays as it is."""
     try:
@@ -556,16 +562,13 @@ class OpenStackProvider:
         out: list[dict[str, Any]] = []
         for volume in self._connection().block_storage.volumes(details=True):
             metadata = _attr(volume, "metadata", default=None) or {}
-            attachments = _attr(volume, "attachments", default=None) or []
             out.append(
                 {
                     "id": str(_attr(volume, "id")),
                     "name": str(_attr(volume, "name", default="") or ""),
                     "status": str(_attr(volume, "status", default="") or ""),
                     "metadata": {str(k): str(v) for k, v in metadata.items()},
-                    "attachments": [
-                        str(a.get("server_id")) for a in attachments if a.get("server_id")
-                    ],
+                    "attachments": _holders(volume),
                 }
             )
         return out
@@ -605,14 +608,25 @@ class OpenStackProvider:
         # the wait ends within the call's bound (SDD §8.1, §10)
         deadline = time.monotonic() + PROVIDER_CALL_TIMEOUT_S - 5
         conn = self._connection()
+        if server_id not in _holders(conn.block_storage.get_volume(volume_id)):
+            return  # not attached to that server: no error, nothing to wait for (review PV-03)
         conn.compute.delete_volume_attachment(server_id, volume_id, ignore_missing=True)
-        volume = conn.block_storage.get_volume(volume_id)
-        conn.block_storage.wait_for_status(
-            volume,
-            status="available",
-            failures=["error"],
-            wait=max(1, int(deadline - time.monotonic())),
-        )
+        # until Cinder no longer lists the server: available, or in-use with another holder - a
+        # multi-attach volume another server holds never reads available (SDD §10, review PV-03)
+        while True:
+            volume = conn.block_storage.get_volume(volume_id)
+            if str(_attr(volume, "status", default="") or "").lower() == "error":
+                raise ProviderError(
+                    f"{self.provider.id}: volume {volume_id} is in error: Cinder failed to detach "
+                    f"it from {server_id}"
+                )
+            if server_id not in _holders(volume):
+                return
+            if time.monotonic() > deadline:
+                raise ProviderError(
+                    f"{self.provider.id}: volume {volume_id} is still attached to {server_id}"
+                )
+            time.sleep(2)
 
     def _server_of_address(self, address: str) -> str | None:
         # a compute port's device only: a floating IP's own port names the floating IP, a
