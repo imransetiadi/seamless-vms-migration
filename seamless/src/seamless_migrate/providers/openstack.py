@@ -873,6 +873,9 @@ class _MapContext:
             disks=disks,
             nics=nics,
             power_state=_POWER.get(str(_attr(server, "status", default="")).upper(), "unknown"),  # type: ignore[arg-type]
+            # a task under a steady status - an image snapshot, a stop in flight - is no power
+            # state: the source watch reads a running guest as running (SDD §4.2, review PV-05)
+            task_state=str(_attr(server, "task_state", default="") or "") or None,
             os_type=os_type,
             host=_attr(server, "compute_host", "hypervisor_hostname", "host"),
             tags=metadata,

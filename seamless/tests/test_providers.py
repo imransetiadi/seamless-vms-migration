@@ -559,6 +559,31 @@ async def test_openstack_transitional_nova_states_are_reported(stub_openstack):
     assert vm.power_state == "transitioning"
 
 
+@pytest.mark.parametrize(
+    "status, task",
+    [
+        ("ACTIVE", "image_uploading"),
+        ("ACTIVE", "powering-off"),
+        ("SHUTOFF", "image_snapshot"),
+        ("ACTIVE", None),
+    ],
+)
+async def test_openstack_a_task_in_flight_is_read_apart_from_the_power_state(
+    stub_openstack, status, task
+):
+    """SDD §4.2 (review PV-05): Nova runs a task under a steady status - a backup's image snapshot
+    or its upload, a stop in flight - and reports it as OS-EXT-STS:task_state. The VM carries it
+    as task_state, and its power state stays what the status says: the source watch still reads a
+    running guest a backup snapshots as running (§8.1)."""
+    conn = fake_conn()
+    [server] = conn.compute._servers.values()
+    server.status, server.task_state = status, task
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    power = {"ACTIVE": "running", "SHUTOFF": "stopped"}[status]
+    assert (vm.power_state, vm.task_state) == (power, task)
+
+
 async def test_openstack_get_vm_tells_a_server_the_cloud_lacks_from_a_failing_cloud(stub_openstack):
     """SDD §8.1, §10: the source watch clears a source that ran again once its cloud says the VM is
     gone - a 404 is VMNotFound; any other failure stays a plain ProviderError (not gone)."""

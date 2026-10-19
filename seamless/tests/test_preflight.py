@@ -245,6 +245,23 @@ def test_finding_src_vm_transitional_state():
     assert all(x.code != "SRC_VM_TRANSITIONAL_STATE" for x in check(make_vm(power_state="stopped")))
 
 
+@pytest.mark.parametrize("power_state", ["running", "stopped", "transitioning"])
+def test_a_nova_task_in_flight_is_a_transitional_blocker_naming_the_task(power_state):
+    """SDD §9.3 (review PV-05): a task Nova runs whatever the status - a backup's image upload under
+    ACTIVE, a stop in flight - is a blocker before approval, naming the task: the stop or the
+    snapshot would meet Nova's 409 after it."""
+    vm = make_vm(power_state=power_state, task_state="image_uploading")
+    f = only(check(vm), "SRC_VM_TRANSITIONAL_STATE")
+    assert f.severity == Severity.blocker
+    assert f.message == (
+        "Source VM web-01 has a Nova task in flight (image_uploading); a stop or snapshot "
+        "would fail."
+    )
+    # a server in error with a task - a delete Nova runs on it - meets both conditions (SDD §9.3)
+    codes = {x.code for x in check(make_vm(power_state="error", task_state="deleting"))}
+    assert {"SRC_VM_ERROR_STATE", "SRC_VM_TRANSITIONAL_STATE"} <= codes
+
+
 @pytest.mark.parametrize("quotas", [{}, None], ids=["quotas unreadable", "quotas read"])
 def test_finding_dst_project_missing_against_the_listed_projects(quotas):
     """SDD §9.3 (review PL-06): the destination project is judged against the projects the

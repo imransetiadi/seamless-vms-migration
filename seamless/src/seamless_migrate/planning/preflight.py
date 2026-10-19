@@ -800,12 +800,15 @@ def run_preflight(
 
     if vm.power_state == "error":
         out.append(finding("SRC_VM_ERROR_STATE", f"Source VM {vm.name} is in error state."))
-    elif vm.power_state == "transitioning":
+    if vm.power_state == "transitioning" or vm.task_state:
+        # a task Nova runs whatever the status - an image upload under ACTIVE, a stop in flight, a
+        # delete of a server in error - is named (SDD §9.3, review PV-05)
+        task = vm.task_state or "resize, migration, rescue, rebuild or reboot"
         out.append(
             finding(
                 "SRC_VM_TRANSITIONAL_STATE",
-                f"Source VM {vm.name} has a Nova task in flight (resize, migration, rescue, "
-                "rebuild or reboot); a stop or snapshot would fail.",
+                f"Source VM {vm.name} has a Nova task in flight ({task}); a stop or snapshot "
+                "would fail.",
             )
         )
 

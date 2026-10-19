@@ -313,6 +313,9 @@ class VMRef(_Model):
         return value
 
     change_rate_bps: float | None = None
+    #: the task Nova runs on the server whatever its status (OS-EXT-STS:task_state), apart from
+    #: power_state; None for none and for VMware (SDD §4.2, review PV-05)
+    task_state: str | None = None
     #: the Nova keypair the server boots with (OpenStack); VMware: None (SDD §4.1)
     key_name: str | None = None
 
