@@ -299,17 +299,20 @@ def test_a_disk_qemu_img_sizes_at_zero_bytes_fails_the_export(hypervisor):
     assert hypervisor.started() == []
 
 
-def _add_instance(hypervisor, instance_id, name, migration_params=None):
-    """Another SHUTOFF instance on the same hypervisor, its one qcow2 disk recorded in disk.info."""
+def _add_instance(hypervisor, instance_id, name, migration_params=None, disks=("disk",), first=False):
+    """Another SHUTOFF instance on the same hypervisor, its qcow2 disks recorded in disk.info,
+    listed last in workloads.yml - or first, as export_workloads writes a newer server."""
     disk_dir = os.path.join(hypervisor.instances, instance_id)
     os.makedirs(disk_dir)
-    with open(os.path.join(disk_dir, "disk"), "wb") as f:
-        f.write(QCOW2_HEADER)
+    paths = [os.path.join(disk_dir, disk) for disk in disks]
+    for path in paths:
+        with open(path, "wb") as f:
+            f.write(QCOW2_HEADER)
     with open(os.path.join(disk_dir, "disk.info"), "w") as f:
-        f.write(json.dumps({os.path.join(disk_dir, "disk"): "qcow2"}) + "\n")
+        f.write(json.dumps({path: "qcow2" for path in paths}) + "\n")
     with open(hypervisor.workloads) as f:
         data = yaml.safe_load(f)
-    data["resources"].append({
+    data["resources"].insert(0 if first else len(data["resources"]), {
         "type": "openstack.compute.Server",
         "params": {"name": name},
         "_info": {"id": instance_id, "status": "SHUTOFF", "hypervisor_hostname": "hv-test"},
@@ -317,7 +320,35 @@ def _add_instance(hypervisor, instance_id, name, migration_params=None):
     })
     with open(hypervisor.workloads, "w") as f:
         yaml.safe_dump(data, f)
-    return os.path.join(disk_dir, "disk")
+    return paths[0] if len(paths) == 1 else paths
+
+
+def _set_params(hypervisor, instance_id, **params):
+    with open(hypervisor.workloads) as f:
+        data = yaml.safe_load(f)
+    for resource in data["resources"]:
+        if resource["_info"]["id"] == instance_id:
+            resource["_migration_params"].update(params)
+    with open(hypervisor.workloads, "w") as f:
+        yaml.safe_dump(data, f)
+
+
+def _served(hypervisor):
+    """The live exports: port -> the disk each serves."""
+    return {
+        int(next(a for a in e["argv"] if a.startswith("--port="))[len("--port="):]): e["argv"][-1]
+        for e in hypervisor.started()
+        if alive(e["pid"])
+    }
+
+
+def _recorded(hypervisor, instance_id):
+    with open(hypervisor.workloads) as f:
+        data = yaml.safe_load(f)
+    for resource in data["resources"]:
+        if resource["_info"]["id"] == instance_id:
+            return resource["_migration_params"].get("nbdkit_disks")
+    return None
 
 
 def test_two_disks_of_a_run_sharing_a_port_on_one_hypervisor_are_refused(hypervisor):
@@ -351,6 +382,51 @@ def test_workloads_on_one_hypervisor_with_their_own_base_ports_are_each_exported
         10810: os.path.join(hypervisor.disk_dir, "disk.eph0"),
         10900: second,
     }, out
+
+
+def test_a_rerun_never_stops_an_earlier_runs_export_of_another_disk(hypervisor):
+    """Seamless Migrate SDD 6.6 (review RV44B-04): srv-1 exported and recorded by run 1; run 2
+    enables srv-2 (the default base port), listed first. srv-2's disk took 10809, unknown to the
+    run's table, and its start stopped srv-1's run-1 export through the port's PID file - srv-1's
+    recorded URI then served srv-2's disk. A previous export is stopped only when it serves this
+    same disk: srv-2 is refused, srv-1's export keeps serving what its record names."""
+    rc, out = hypervisor.run()
+    assert rc == 0, out
+    root = os.path.join(hypervisor.disk_dir, "disk")
+    first = [e for e in hypervisor.started() if e["argv"][-1] == root][0]
+
+    second = _add_instance(hypervisor, "srv-2", "vm2", first=True)
+    rc, out = hypervisor.run()
+    assert rc != 0, out
+    assert "serves another disk" in out and "srv-2" in out, out
+    assert alive(first["pid"]), out
+    assert _served(hypervisor).get(10809) == root, out
+    assert second not in [e["argv"][-1] for e in hypervisor.started()], out
+    assert _recorded(hypervisor, "srv-1")[0]["uri"] == "nbd+ssh://stack@hv-test:10809"
+
+
+def test_a_workload_refused_for_a_shared_port_exports_none_of_its_disks(hypervisor):
+    """Seamless Migrate SDD 6.6 (review RV44B-05): the refusal fired per disk, after the
+    workload's earlier disks were exported - running, recorded nowhere, and the refusal's way out
+    (a base port of its own) moved the workload off their ports, so no rerun stopped them. All of
+    a workload's ports are judged before its first export: the refused workload exports nothing,
+    and after its way out every live export is one a record names."""
+    _set_params(hypervisor, "srv-1", nbdkit_port=10810)  # srv-1: 10810, 10811
+    _add_instance(hypervisor, "srv-2", "vm2", disks=("disk", "disk.eph0"))  # 10809, 10810
+    rc, out = hypervisor.run()
+    assert rc != 0 and "port 10810" in out and "another disk of this run" in out, out
+    srv2 = os.path.join(hypervisor.instances, "srv-2")
+    assert not [e for e in hypervisor.started() if e["argv"][-1].startswith(srv2)], out
+
+    _set_params(hypervisor, "srv-2", nbdkit_port=10900)  # the refusal's way out
+    rc, out = hypervisor.run()
+    assert rc == 0, out
+    recorded = {
+        d["port"]: d["disk_path"]
+        for instance in ("srv-1", "srv-2")
+        for d in _recorded(hypervisor, instance)
+    }
+    assert _served(hypervisor) == recorded, out
 
 
 def test_the_format_comes_from_nova_disk_info_never_from_the_disk(hypervisor):

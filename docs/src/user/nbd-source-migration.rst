@@ -74,7 +74,10 @@ For each workload marked with ``use_nbdkit_direct: true``, the role:
    guest's, and a qcow2 header written there would make qemu-nbd read a file of the hypervisor into the
    export. The role stops before any export when ``disk.info`` is missing or unreadable, or records no
    single format for a disk
-5. Spawns one qemu-nbd process per disk on sequential ports starting from 10809
+5. Spawns one qemu-nbd process per disk on sequential ports from the workload's base port
+   (``_migration_params.nbdkit_port``, else ``os_migrate_nbdkit_port``, 10809). Before a workload's first export
+   the role refuses it when any of those ports is taken by another disk of the same run on that hypervisor: give
+   each workload on one hypervisor its own base port, its disks' ports apart. A refused workload exports nothing
 6. Updates the workloads.yml file with the nbdkit_disks list
 
 The nbdkit_disks field
@@ -113,7 +116,8 @@ Each entry in the list represents one disk with:
   in to, whatever qemu-nbd listens on there (``127.0.0.1`` by default)
 * ``port``: The qemu-nbd port number
 * ``size``: Disk size in GiB: the exact byte count ``qemu-img info`` reports, rounded up, so the
-  destination volume is never smaller than the disk; a disk whose size cannot be read stops the export
+  destination volume is never smaller than the disk; a disk whose size cannot be read, or is zero bytes (an empty
+  or unparsable image), stops the export
 * ``bootable``: Whether this is the boot disk
 
 Role configuration
@@ -304,7 +308,11 @@ Check if the port is already in use:
 
     sudo netstat -tlnp | grep 10809
 
-The role automatically stops existing qemu-nbd processes on the same port before starting new ones.
+The role stops a qemu-nbd of the same port before starting a new one only when it serves the same disk - an
+earlier run's export of that disk. One serving another disk, an earlier run's export of another VM whose record
+still names the port, is left running and refuses the disk: give the workload its own
+``_migration_params.nbdkit_port``, or stop that export (its PID file is named in the error) once that VM's
+import is done.
 
 Cannot connect to NBD from destination
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

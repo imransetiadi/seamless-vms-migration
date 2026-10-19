@@ -176,6 +176,25 @@
   ansible.builtin.set_fact:
     import_from_hypervisor_base_port: "{{ workload_item._migration_params.nbdkit_port | default(os_migrate_nbdkit_port) }}"
 
+# Every port this workload's disks would take, judged before its first export: one another disk of this run exports
+# on this hypervisor refuses the workload with nothing of it exported (Seamless Migrate SDD 6.6, upstream intake
+# UP-04a, review RV44B-05).
+- name: Refuse a workload whose ports another disk of this run exports on this hypervisor
+  ansible.builtin.assert:
+    that: import_from_hypervisor_port_clash | length == 0
+    fail_msg: >-
+      the disks of {{ import_from_hypervisor_instance_id }} would take port
+      {{ import_from_hypervisor_port_clash | join(', port ') }} on {{ import_from_hypervisor_host }},
+      which another disk of this run exports: give each workload on one hypervisor its own
+      _migration_params.nbdkit_port, its disks' ports apart
+    quiet: true
+  vars:
+    import_from_hypervisor_port_clash: >-
+      {{ range(import_from_hypervisor_base_port | int,
+               (import_from_hypervisor_base_port | int) + (import_from_hypervisor_disks_found | length))
+         | list
+         | intersect(import_from_hypervisor_ports_taken[import_from_hypervisor_host] | default([])) }}
+
 - name: Process each disk
   ansible.builtin.include_tasks: process_disk.yml
   loop: "{{ import_from_hypervisor_disks_found }}"
