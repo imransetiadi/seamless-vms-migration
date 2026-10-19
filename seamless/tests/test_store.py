@@ -8,7 +8,7 @@ import pytest
 import sqlalchemy as sa
 
 from seamless_migrate.domain.enums import Phase, PlanStatus, Role
-from seamless_migrate.domain.models import Event, Migration, Nic, Plan, Provider
+from seamless_migrate.domain.models import Event, Mappings, Migration, Nic, Plan, Provider
 from seamless_migrate.events import AUDIT_KINDS
 from seamless_migrate.security.auth import DashboardUser
 from seamless_migrate.store import ConflictError, NotFound, Store, UnstorableValue, events
@@ -731,16 +731,17 @@ def test_the_store_refuses_nul_and_lone_surrogates_and_finds_nothing_by_one(
         f"migration {m.id}: vm.nics.0.network: holds {what}, which the store cannot keep"
     )
     # a map's two keys stay two, neither merged into the other (review RV48-08)
-    merged = make_migration(vm=make_vm(tags={"owner": "ops", f"own{bad}er": "finance"}))
-    with pytest.raises(UnstorableValue, match=rf"^migration {merged.id}: vm\.tags: a key holds "):
-        any_store.put("migration", merged)
+    merged = make_plan(mappings=Mappings(networks={"app-net": "prod", f"app{bad}-net": "quiet"}))
+    with pytest.raises(UnstorableValue, match=rf"^plan {merged.id}: mappings\.networks: a key "):
+        any_store.put("plan", merged)
+    with pytest.raises(NotFound):
+        any_store.get("plan", merged.id, Plan)
     # an id holding one: the message names the kind alone, never the id
     named = make_migration(id=f"mig-{bad}1")
     with pytest.raises(UnstorableValue, match=rf"^migration: id: holds {what}, which the store "):
         any_store.put("migration", named)
-    for missing in (m, merged):
-        with pytest.raises(NotFound):
-            any_store.get("migration", missing.id, Migration)
+    with pytest.raises(NotFound):
+        any_store.get("migration", m.id, Migration)
     # a versioned write and its event: either holding one leaves both unwritten
     clean = make_migration()
     any_store.put("migration", clean, expected_version=0)

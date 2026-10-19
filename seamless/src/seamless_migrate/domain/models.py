@@ -41,6 +41,7 @@ from .enums import (
     Strategy,
     SyncPassKind,
 )
+from .text import replace_unstorable
 
 GIB = 2**30
 #: Fraction of the provisioned size assumed used when a disk does not report usage (SDD §4.2).
@@ -277,9 +278,12 @@ PowerState = Literal["running", "stopped", "paused", "error", "transitioning", "
 
 
 class VMRef(_Model):
-    """A source VM as inventoried (SDD §4.2). Its tenant-controlled strings (name, tags, …) are
-    kept as the source gives them: one holding a NUL, which PostgreSQL cannot store, fails the
-    store's write naming the field, never a name the source does not have (SDD §11)."""
+    """A source VM as inventoried (SDD §4.2). The names a cutover reads - its own, its project's,
+    its flavor's, its NICs' networks, its disks' volume types - are kept as the source gives them:
+    one holding a NUL, which PostgreSQL cannot store, fails the store's write naming the field,
+    never a name the source does not have. Its free text no export filter or mapping reads - tags
+    and flavor extra specs, keys and values, os_type, host - is written U+FFFD as the model is
+    built, so one tenant's metadata value never fails a plan's validation (SDD §11, RV49-02)."""
 
     source_id: str
     name: str
@@ -297,6 +301,23 @@ class VMRef(_Model):
     cbt_enabled: bool | None = None
     snapshot_count: int = 0
     tools_ok: bool | None = None
+
+    @field_validator("os_type", "host", mode="before")
+    @classmethod
+    def _storable_text(cls, value: Any) -> Any:
+        return replace_unstorable(value) if isinstance(value, str) else value
+
+    @field_validator("tags", "flavor_extra_specs", mode="before")
+    @classmethod
+    def _storable_map(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        return {
+            (replace_unstorable(k) if isinstance(k, str) else k): (
+                replace_unstorable(v) if isinstance(v, str) else v
+            )
+            for k, v in value.items()
+        }
 
     change_rate_bps: float | None = None
     #: the task Nova runs on the server whatever its status (OS-EXT-STS:task_state), apart from

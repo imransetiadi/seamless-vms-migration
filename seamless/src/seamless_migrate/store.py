@@ -11,7 +11,6 @@ import contextlib
 import fcntl
 import hashlib
 import logging
-import re
 import threading
 from collections.abc import AsyncIterator, Collection, Iterable, Sequence
 from datetime import UTC, datetime
@@ -28,6 +27,7 @@ from sqlalchemy.pool import StaticPool
 
 from .domain.enums import Phase
 from .domain.models import Event
+from .domain.text import UNSTORABLE
 from .security.auth import DashboardUser
 
 log = logging.getLogger(__name__)
@@ -181,13 +181,10 @@ def _matches(value: Any, wanted: Any) -> bool:
 #: the end of ``events.seq``'s range, PostgreSQL's integer: no bound beyond it is sent (SDD §11)
 MAX_SEQ = 2**31 - 1
 
-#: what PostgreSQL cannot store in a string: a NUL, a lone surrogate (SDD §11)
-_UNSTORABLE = re.compile("[\x00\ud800-\udfff]")
-
 
 def _unstorable_text(text: str) -> str | None:
     """What of ``text`` PostgreSQL cannot store, in words, else None (SDD §11)."""
-    found = _UNSTORABLE.search(text)
+    found = UNSTORABLE.search(text)
     if found is None:
         return None
     return "a NUL character" if found.group() == "\x00" else "a lone surrogate"

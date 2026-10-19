@@ -10,6 +10,8 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from ..domain.text import replace_unstorable
+
 REDACTED = "[REDACTED]"
 #: how far past a cut ``redact_cut`` redacts, so it still sees the end of a secret the cut splits
 CUT_MARGIN = 16384
@@ -135,16 +137,6 @@ def _redact_pem(text: str) -> str:
         out += [text[pos : begin.start()], "[REDACTED PEM]"]
         pos = end.end()
     return "".join(out) + text[pos:]
-
-
-#: what the store keeps no copy of in a string - a NUL, a lone surrogate (SDD §11)
-_UNSTORABLE = re.compile("[\x00\ud800-\udfff]")
-
-
-def replace_unstorable(text: str) -> str:
-    """``text`` with each NUL and each lone surrogate written U+FFFD, the replacement character:
-    outside text the store then keeps wherever it goes (SDD §11, §13.4, review RV48-07)."""
-    return _UNSTORABLE.sub("\ufffd", text)
 
 
 def redact(text: str, redact_names: Sequence[str] | None = None) -> str:

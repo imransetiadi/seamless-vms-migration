@@ -272,14 +272,28 @@ def test_plan_policy_bounds():
         make_plan(downtime_slo_s=0)
 
 
-def test_vmref_keeps_tenant_strings_as_the_source_gives_them():
-    """SDD §11 (reviews RV48-05, RV48-08): a VM's tenant-chosen strings were stripped of NUL as
+def test_vmref_keeps_the_names_a_cutover_reads_and_replaces_in_its_free_text():
+    """SDD §4.2, §11 (reviews RV48-05, RV48-08, RV49-02): a VM's strings were stripped of NUL as
     the model was built - a name the source does not have, which os-migrate's export filter would
-    match on another VM, and two tags merged into one. The model keeps what the source gives; the
-    store refuses a write holding a NUL, naming the field."""
-    tags = {"ow\x00ner": "fin\x00ance", "owner": "ops"}
-    vm = make_vm(name="web\x00-01", os_type="lin\x00ux", tags=tags)
-    assert (vm.name, vm.os_type, vm.tags) == ("web\x00-01", "lin\x00ux", tags)
+    match on another VM, and two tags merged into one. The names a cutover reads stay as the source
+    gives them (the store refuses one holding a NUL); the free text no filter or mapping reads - a
+    tenant's metadata, which Nova lets hold any string, an image's os_type, the specs, the host -
+    is written U+FFFD, so one tenant's value never fails a plan's validation, and two tags stay
+    two."""
+    vm = make_vm(
+        name="web\x00-01",
+        tags={"ow\x00ner": "fin\x00ance", "owner": "ops", "note": "\ud83d"},
+        flavor_extra_specs={"hw:cpu\ud800": "a\x00"},
+        os_type="lin\x00ux",
+        host="cmp\ud800-1",
+    )
+    assert vm.name == "web\x00-01"
+    assert (vm.tags, vm.flavor_extra_specs, vm.os_type, vm.host) == (
+        {"ow\ufffdner": "fin\ufffdance", "owner": "ops", "note": "\ufffd"},
+        {"hw:cpu\ufffd": "a\ufffd"},
+        "lin\ufffdux",
+        "cmp\ufffd-1",
+    )
 
 
 def test_keep_sync_history_drops_the_oldest_passes_between_the_first_and_the_latest():

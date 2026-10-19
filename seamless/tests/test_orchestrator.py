@@ -5314,6 +5314,23 @@ async def test_a_jev_verification_answer_never_stalls_a_cut_over_migration(
     assert ((await h.migration(mid)).phase, crashes, errors) == (P.completed, 0, [])
 
 
+@pytest.mark.parametrize(
+    "field",
+    [{"tags": {"note": "backup\x00window"}}, {"os_type": "ubuntu\x00 22.04"}],
+    ids=["nova-metadata-value", "image-property-os-type"],
+)
+async def test_a_tenants_metadata_value_never_fails_the_whole_validation(tmp_path, store, field):
+    """SDD §4.2, §11 (review RV49-02): Nova lets a server metadata value hold any string, and an
+    image's os_type is a free property; with a NUL in one, the VM's migration was refused by the
+    store and the validation of the whole plan failed - web-02, a VM with nothing wrong, got no
+    migration. Free text no filter or mapping reads is written U+FFFD: both VMs validate."""
+    h, plan = await setup(
+        tmp_path, store, [vm(1, **field), vm(2)], {"default_strategy": Strategy.cold}
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    assert sorted(m.vm.name for m in await h.migrations(plan.id)) == ["web-01", "web-02"]
+
+
 async def test_advisor_tie_break_recorded(tmp_path, store):
     """SDD §14.4: the tie is recorded as a recommendation and its decision; the strategy note of
     earlier versions is no longer written."""
