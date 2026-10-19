@@ -303,7 +303,8 @@ scripts/seamless-ctl.sh PLATFORM ACTION [OPTIONS]      # PLATFORM: docker | podm
 |---|---|---|
 | `up` | deploy or update everything and wait until it runs | `scripts/seamless-ctl.sh docker up` (`--demo` for simulated clouds) |
 | `down` | stop everything for maintenance; the data stays (volumes, PVCs, Secrets) | `scripts/seamless-ctl.sh openshift down` |
-| `stop` / `start` | stop or start the control plane alone; PostgreSQL keeps running | `scripts/seamless-ctl.sh podman stop` |
+| `stop` | stop the control plane alone; PostgreSQL keeps running | `scripts/seamless-ctl.sh podman stop` |
+| `start` | start the control plane again - PostgreSQL first when `down` stopped it | `scripts/seamless-ctl.sh podman start` |
 | `restart` | restart the control plane from its current configuration - after a change | `scripts/seamless-ctl.sh kubernetes restart` |
 | `scale 0` / `scale 1` | scale the control plane down to 0 or back up to 1 | `scripts/seamless-ctl.sh openshift scale 0` |
 | `capacity` | scale the one control plane up or down: concurrent migrations and cutovers, and on a cluster its CPU and memory | `scripts/seamless-ctl.sh kubernetes capacity --max-migrations 20 --memory 8Gi` |
@@ -323,7 +324,8 @@ scripts/seamless-ctl.sh PLATFORM ACTION [OPTIONS]      # PLATFORM: docker | podm
   ```
 * **After a change:** a setting in `deploy/compose/.env`, a Secret or the cluster's ConfigMap needs `restart` - but a
   Jev setting (`TYPESAFE_API_KEY`, `JEV_MCP_AUTH_TOKEN`, `COMPOSE_PROFILES`) needs `up`: it is the `jev` sidecar's,
-  which `restart` leaves as it was; a new version (`git pull`) or a changed manifest needs `up`.
+  which `restart` leaves as it was; a new version (`git pull`) or a changed manifest needs `up` - `up --demo` for a
+  demo stack: `up` alone recreates the control plane in real mode over the demo's database.
 * `--dry-run` prints every command and runs none; on a cluster `--namespace` picks the namespace (default
   `seamless-migrate`).
 
@@ -352,9 +354,11 @@ deploy/compose/              Docker Compose stack: a Linux host's Docker Engine,
 deploy/openshift/            kustomize manifests (OpenShift 4.16+)
 deploy/kubernetes/           kustomize overlay of those manifests for vanilla Kubernetes 1.28+
 scripts/compose-init.sh      generates .env and tokens.yaml for the Compose stack
+scripts/seamless-ctl.sh      runs a deployment's lifecycle on every platform (docs/Operations.md)
+scripts/dotenv-value.sh      reads deploy/compose/.env as Compose does, for the Makefile and seamless-ctl.sh
 scripts/check-readonly-runtime.sh  runs the images as the manifests do (make deploy-runtime-check)
 tests/                       collection tests (unit/, sanity/, func/, perf/); demo-stack scripts (e2e/)
-docs/                        PRD, SDD, MEMORY, QASuite, Security, Performance, plans
+docs/                        PRD, SDD, MEMORY, QASuite, Security, Performance, Operations, plans
 .mcp.json  .claude/  CLAUDE.md   agent tooling (Jev + agentmemory MCP servers, plugins, working agreement)
 ```
 

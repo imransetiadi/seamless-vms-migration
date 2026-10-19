@@ -134,23 +134,25 @@ scripts/seamless-ctl.sh docker start        # or: docker scale 1 - the same cont
 | a setting in `deploy/compose/.env` for the control plane (ports, concurrency, log level, memory) | `restart` |
 | a Jev setting in `deploy/compose/.env` (`TYPESAFE_API_KEY`, `JEV_MCP_AUTH_TOKEN`, `COMPOSE_PROFILES=ai`) | `up` - they are the `jev` sidecar's, which `restart` (the control plane alone) leaves as it was |
 | the sources (`git pull` of a new version) or `deploy/compose/compose.yaml` | `up` (rebuilds the image, recreates what changed) |
-| `deploy/compose/tokens.yaml` (tokens added or removed with `seamless token create`) | `restart` |
+| `deploy/compose/tokens.yaml` (an entry added or removed by hand; `seamless token create` prints a new one) | `restart` |
 | only want the control plane to start afresh | `restart` |
 
 ```bash
 git pull --ff-only
 scripts/seamless-ctl.sh docker up           # new version: the image is rebuilt, the control plane recreated
+scripts/seamless-ctl.sh docker up --demo    # ... the same for a demo stack
 ```
 
 `restart` keeps the mode the control plane ran in: a stack started with `up --demo` comes back a demo, a real
-one a real one (`SEAMLESS_DEMO` in your environment or in `.env` wins when you set it).
+one a real one (`SEAMLESS_DEMO` in your environment or in `.env` wins when you set it). `up` does not: without
+`--demo` it recreates the control plane in real mode, over the demo's database - give a demo stack `up --demo`.
 
 ### 3.5 Down for maintenance, and back
 
 ```bash
 scripts/seamless-ctl.sh docker down         # every container removed; the pgdata and data volumes stay
 # ... maintain the host: OS updates, a reboot, Docker updates ...
-scripts/seamless-ctl.sh docker up
+scripts/seamless-ctl.sh docker up           # a demo stack: up --demo
 ```
 
 Take a backup before a change you cannot undo: the `pg_dump` recipe of
@@ -324,6 +326,12 @@ version, then resume the plans.
 | `xtrace (bash -x) is on ...` | Run without `bash -x`: it would print the token. |
 | `a migration is still in cutover after 1800s: nothing was stopped` | A cutover outlasted `--wait-timeout`. Nothing was stopped and the plans stay paused: wait and retry, or raise `--wait-timeout`. |
 | `on kubernetes the API is reached through the Route or Ingress: give its URL with --url` | `--drain`, `resume` and the health check need the external URL on a cluster. |
+| `cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value` | `deploy/compose/.env` sets `SEAMLESS_HOST_PORT` through a variable (a `$`) or an unclosed quote, which Compose would read differently: write the number itself. |
+| `SEAMLESS_HOST_PORT is '...', no port ...` | The value is no port number Compose can publish (an address in front, a stray character): write the number alone. |
+| `the restart's Make target cannot read SEAMLESS_HOST_PORT ...` | The same, found before a `--drain`: nothing was paused or changed. |
+| `deploy/compose/.env is missing` / `tokens.yaml is missing` | `make seamless-init` first; nothing was paused or changed. |
+| `cannot tell who may read the token file ...` | `find` could not judge the file's mode (an unreadable directory, a broken link): fix the path or the permissions. |
+| `the API refused to pause plan ...` | That plan was no longer running (it completed or failed meanwhile): it was not paused and is not named for `resume`. |
 | `Colima profile 'seamless' is not running. Run: make seamless-colima-up` | macOS: start the profile first. |
 | `Docker Engine does not answer ...` | Linux: `sudo systemctl enable --now docker` and join the `docker` group. |
 | `the namespace from the provided object ... does not match` | `--namespace` differs from the kustomization's `namespace:`; change both (section 4.1). |

@@ -51,8 +51,9 @@ or Bahasa Indonesia.
 | `seamless/` | Control plane: `src/seamless_migrate/`, `tests/`, `Containerfile` |
 | `dashboard/` | React 18 + Vite + TypeScript dashboard |
 | `deploy/compose/`, `deploy/openshift/`, `deploy/kubernetes/` | Docker Compose stack and Kustomize manifests |
+| `scripts/` | Tooling: `seamless-ctl.sh` (a deployment's lifecycle, docs/Operations.md), `dotenv-value.sh`, `compose-init.sh`, `collection-sanity.sh` |
 | `tests/` | Collection tests (`unit/`, `sanity/`, `func/`, `perf/`); `e2e/` holds the demo-stack scripts and the upstream end-to-end playbooks |
-| `docs/` | PRD, SDD, MEMORY, QASuite, Security, Performance, implementation plans (`superpowers/`), advisor notes (`advisor/`) and the upstream os-migrate documentation sources (`src/`) |
+| `docs/` | PRD, SDD, MEMORY, QASuite, Security, Performance, Operations, implementation plans (`superpowers/`), advisor notes (`advisor/`) and the upstream os-migrate documentation sources (`src/`) |
 
 ## Development setup
 
