@@ -16,7 +16,11 @@ function mount(start: Migration) {
     return <DemoSourcePower key={m.id} migration={m} role={operator} />;
   }
   renderWithApp(<Page />, { server, token: 'operator' });
-  return { update: (m: Migration) => act(() => update(m)), label: () => screen.getByRole('button', { name: /source VM \(demo\)/ }).textContent };
+  return {
+    update: (m: Migration) => act(() => update(m)),
+    label: () => screen.getByRole('button', { name: /source VM \(demo\)/ }).textContent,
+    status: () => screen.queryByRole('status')?.textContent ?? null,
+  };
 }
 
 describe('DemoSourcePower', () => {
@@ -56,5 +60,31 @@ describe('DemoSourcePower', () => {
     await screen.findByRole('button', { name: 'Power off the source VM (demo)' });
     page.update({ ...done, attempts: done.attempts + 1 });
     expect(page.label()).toBe('Power on the source VM (demo)');
+  });
+
+  it('drops the press\'s announcement with the press: after the rollback, the retry and the new cutover a screen reader hears no stale state (SDD §16, review RV46B-02)', async () => {
+    const done = completedWithStoppedSource();
+    const page = mount(done);
+    fireEvent.click(await screen.findByRole('button', { name: 'Power on the source VM (demo)' }));
+    await screen.findByRole('button', { name: 'Power off the source VM (demo)' });
+    expect(page.status()).toBe('The source VM is running: the source watch flags it on its next check.');
+    page.update({ ...done, phase: 'rolling_back' });
+    page.update({ ...done, phase: 'rolled_back' });
+    page.update({ ...done, phase: 'completed', source_running_at: null, attempts: done.attempts + 1 });
+    expect(page.label()).toBe('Power on the source VM (demo)');
+    expect(page.status()).toBe('');
+  });
+
+  it('drops a failed press\'s error with the press: the new cutover shows no failure of an earlier attempt (SDD §16, review RV46B-02)', async () => {
+    const done = completedWithStoppedSource();
+    const gone = { ...done, vm: { ...done.vm, source_id: 'vm-gone' } }; // unknown to the demo source: 404
+    const page = mount(gone);
+    fireEvent.click(await screen.findByRole('button', { name: 'Power on the source VM (demo)' }));
+    await screen.findByText('The demo power change failed');
+    page.update({ ...gone, phase: 'rolling_back' });
+    page.update({ ...gone, phase: 'rolled_back' });
+    page.update({ ...gone, phase: 'completed', attempts: done.attempts + 1 });
+    expect(page.label()).toBe('Power on the source VM (demo)');
+    expect(screen.queryByText('The demo power change failed')).toBeNull();
   });
 });
