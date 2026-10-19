@@ -554,6 +554,14 @@ class Orchestrator:
         event = new_event(kind, message, plan_id=m.plan_id, migration_id=m.id, data=data)
         return await put_and_emit(self.store, self.bus, "migration", m, version, event)
 
+    async def _save_with_events(self, m: Migration, version: int, events: list[Event]) -> int:
+        """``_save`` and the events of a person's action in one store transaction, published once
+        it commits (SDD §5.4, §11, audit OC-03): a store error leaves none of them, so the
+        person's retry is taken anew."""
+        m.updated_at = self._now()
+        versions = await put_all_and_emit(self.store, self.bus, [("migration", m, version)], events)
+        return versions[0]
+
     async def _plan(self, plan_id: str) -> Plan:
         return await self.db.get("plan", plan_id, Plan)
 
@@ -1472,16 +1480,20 @@ class Orchestrator:
             if plan.require_distinct_approver and forcer == actor:
                 raise NotAllowed(OWN_FORCE)
             m.approvals.append(Approval(actor=actor, at=self._now(), comment=comment))
-            await self._save(m, v)
-        await self._emit(
+            # SDD §5.4 (audit OC-03): an approval that opens the gate never lacks its event
+            await self._save_with_events(m, v, [self._approved_event(m, actor, comment)])
+        self.wake()
+        return m
+
+    def _approved_event(self, m: Migration, actor: str, comment: str | None) -> Event:
+        return new_event(
             "migration.approved",
             f"{m.vm.name} approved by {actor}",
-            migration=m,
+            plan_id=m.plan_id,
+            migration_id=m.id,
             actor=actor,
             data={"comment": comment},
         )
-        self.wake()
-        return m
 
     async def request_cutover(
         self, mid: str, actor: str, force_window: bool = False, comment: str | None = None
@@ -1499,22 +1511,17 @@ class Orchestrator:
                 m.cutover_requested_at = self._now()
             m.cutover_requested = True
             m.force_window = m.force_window or force_window
-            await self._save(m, v)
-        if approves:
-            await self._emit(
-                "migration.approved",
-                f"{m.vm.name} approved by {actor}",
-                migration=m,
+            requested = new_event(
+                "migration.action",
+                f"cutover of {m.vm.name} requested by {actor}",
+                plan_id=m.plan_id,
+                migration_id=m.id,
                 actor=actor,
-                data={"comment": comment},
+                data={"action": "cutover", "force_window": force_window, "comment": comment},
             )
-        await self._emit(
-            "migration.action",
-            f"cutover of {m.vm.name} requested by {actor}",
-            migration=m,
-            actor=actor,
-            data={"action": "cutover", "force_window": force_window, "comment": comment},
-        )
+            # SDD §5.4 (audit OC-03): the request, its approval and their events in one write
+            events = [self._approved_event(m, actor, comment)] if approves else []
+            await self._save_with_events(m, v, [*events, requested])
         self.wake()
         return m
 
@@ -1565,21 +1572,24 @@ class Orchestrator:
                 m.cutover_requested_by = actor
                 m.cutover_requested_at = now
             m.cutover_requested = True
-            await self._save(m, v)
-        await self._emit(
-            "migration.force_cutover",
-            f"cutover of {m.vm.name} forced by {actor}: {reason}",
-            migration=m,
-            actor=actor,
-            data={
-                # in the audit trail (SDD §14.5): its target is the migration
-                "target_id": m.id,
-                "vm": m.vm.name,
-                "reason": reason,
-                "delta_bytes": m.force_cutover.delta_bytes,
-                "estimated_downtime_s": estimated,
-            },
-        )
+            forced = new_event(
+                "migration.force_cutover",
+                f"cutover of {m.vm.name} forced by {actor}: {reason}",
+                plan_id=m.plan_id,
+                migration_id=m.id,
+                actor=actor,
+                data={
+                    # in the audit trail (SDD §14.5): its target is the migration
+                    "target_id": m.id,
+                    "vm": m.vm.name,
+                    "reason": reason,
+                    "delta_bytes": m.force_cutover.delta_bytes,
+                    "estimated_downtime_s": estimated,
+                },
+            )
+            # SDD §5.4 (audit OC-03): the force and its audit event in one write - a force with
+            # no record could never get one, as a second force is refused
+            await self._save_with_events(m, v, [forced])
         self.wake()
         return m
 
@@ -1958,8 +1968,11 @@ class Orchestrator:
                 raise NotAllowed(f"only completed migrations can be finalized ({m.phase})")
             # SDD §8.1 (the owner's choice, 2026-10-13): a source running again diverged - a
             # finalize would keep it, or delete it with what it wrote since; one that began
-            # deleting it finishes, as a rollback is refused then
-            if m.source_running_at is not None and m.checkpoint != "finalizing":
+            # deleting it finishes deleting it, as a rollback is refused then - keeping it is
+            # refused too (audit OC-09)
+            if m.source_running_at is not None and not (
+                m.checkpoint == "finalizing" and delete_source
+            ):
                 raise NotAllowed(SOURCE_RUNS_AGAIN)
             if confirm != m.vm.name:
                 raise BadRequest("confirm must equal the VM name")

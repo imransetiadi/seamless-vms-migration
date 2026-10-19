@@ -7540,6 +7540,50 @@ async def test_a_migration_is_forced_once(tmp_path, store):
     assert h.kinds().count("migration.force_cutover") == 1
 
 
+@pytest.mark.parametrize(
+    ("action", "kind", "distinct"),
+    [
+        ("force", "migration.force_cutover", True),
+        ("approve", "migration.approved", True),
+        ("request", "migration.action", True),
+        ("request", "migration.approved", False),
+    ],
+    ids=["force", "approve", "request", "request-approving"],
+)
+async def test_an_approval_request_or_force_is_never_kept_without_its_event(
+    tmp_path, store, refuse_write, action, kind, distinct
+):
+    """SDD §5.4, §11 (audit OC-03): a Force cutover was saved, then its audit event written apart -
+    refused, the force stood with no record in the trail, and forcing again answered 409, so the
+    record could never be written; an approval that opens the gate, and a cutover request,
+    lacked their events the same way. Each is one transaction with its events: a store error
+    leaves none of them, and the approver's retry is taken anew."""
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {**GATED, "require_distinct_approver": distinct}
+    )
+    syncing = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.warm, phase=P.syncing)
+    store.put("migration", syncing)
+    act = {
+        "force": lambda: h.orch.force_cutover(
+            syncing.id, "sari", "the window closes in ten minutes"
+        ),
+        "approve": lambda: h.orch.approve(syncing.id, "sari", "looked fine"),
+        "request": lambda: h.orch.request_cutover(syncing.id, "sari", comment="ready"),
+    }[action]
+    refused = refuse_write(store, "INSERT INTO events", kind)
+    with pytest.raises(RuntimeError):
+        await act()
+    assert refused, "the event's write was refused"
+    kept = await h.migration(syncing.id)
+    assert (kept.force_cutover, kept.approvals, kept.cutover_requested) == (None, [], False)
+    assert h.kinds() == []
+    await act()  # the retry, as a person makes it
+    assert h.kinds().count(kind) == 1
+    done = await h.migration(syncing.id)
+    assert (done.force_cutover is not None) == (action == "force")
+    assert done.cutover_requested == (action != "approve")
+
+
 async def test_a_force_cutover_in_precopy_expects_the_running_first_pass(tmp_path, store):
     """SDD §5.4 (ADV-16..20 audit, F2): in pre-copy no pass has ended - the recorded estimate is
     the downtime after the running first pass, not after a 0 s one."""
@@ -8526,6 +8570,36 @@ async def test_a_finalize_that_began_deleting_the_source_finishes_while_it_runs(
     assert (seen.checkpoint, seen.source_running_at is not None) == ("finalizing", True)
     out = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm=plan.name)
     assert out == {"finalized": [], "skipped": [{"migration_id": m.id, "reason": RUNS_AGAIN}]}
+    done = await h.orch.finalize(m.id, "rina", delete_source=True, confirm=m.vm.name)
+    assert done.phase == P.finalized
+    await h.orch.stop()
+
+
+async def test_a_running_source_is_never_kept_by_a_finalize(tmp_path, store):
+    """SDD §8.1 (audit OC-09): the exception to the running-source refusal - a finalize that began
+    deleting the source - looked at the checkpoint alone: after a deleting finalize failed and
+    the source ran again, a finalize with delete_source false was accepted, the diverged source
+    kept and the finalized migration watched no more. Only a deleting finalize passes."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    failed: list[str] = []
+
+    async def finalize(ctx):
+        if not failed:
+            failed.append(ctx.migration.id)
+            raise TransientStepError("finalize: src-osp: call timed out after 300 s")
+        return StepResult(details={"source_deleted": True})
+
+    h.executor.hooks[StepName.FINALIZE] = finalize
+    with pytest.raises(NotAllowed, match="finalize failed"):
+        await h.orch.finalize(m.id, "rina", delete_source=True, confirm=m.vm.name)
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    seen = await _watch(h, plan)
+    assert (seen.checkpoint, seen.source_running_at is not None) == ("finalizing", True)
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.finalize(m.id, "rina", delete_source=False, confirm=m.vm.name)
+    assert str(refused.value) == RUNS_AGAIN
+    assert (await h.migration(m.id)).phase == P.completed
     done = await h.orch.finalize(m.id, "rina", delete_source=True, confirm=m.vm.name)
     assert done.phase == P.finalized
     await h.orch.stop()
