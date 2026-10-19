@@ -1954,8 +1954,10 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   holding its plan's lock while it waits would hold up the tick, which starts that plan's steps under it. For the
   same reason a validation refuses a running plan (409) under the plan's lock before it waits for the claim lock.
   A strategy change (`set_strategy`, `PUT …/strategy`) takes the plan's lock, then the migration's, as the advisor's
-  override does (§14.6): it waits for a running validation, and the migration's strategy and the plan's
-  `strategy_overrides` entry are written together under it, so no validation undoes the change. It and an advisor
+  override does (§14.6): it waits for a running validation, and under it the plan's `strategy_overrides` entry is
+  written first and the migration's strategy after it, so no validation undoes the change: a failure between the two
+  writes leaves the plan pinning the strategy asked, which the next validation applies (review ST-08). It and an
+  advisor
   decision refuse a migration whose phase they cannot change (not `pending`, `ready` or `blocked`) before they take
   the plan's lock — the check repeats under it — so neither waits, holding the lock the tick needs, behind a finalize
   that holds the migration's lock across a provider deletion. Plan documents are written by several drivers and the tick loop
@@ -3115,7 +3117,11 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   to the final option, clears `advisor_hold` and — when the strategy changes — the approvals, the cutover
   request and `force_window` (§5.4). An override also records the option in `plan.strategy_overrides`, like
   `PUT …/strategy`, so a later validation keeps it — under the plan's lock, with the decision, so a validation
-  waiting for that lock sees the override and asks no one again. Neither acts while the plan sets the VM's strategy
+  waiting for that lock sees the override and asks no one again. The writes come in the order a failure between them
+  can only complete: an override's plan entry first, then the migration (strategy, `advisor_hold` cleared), then the
+  decision and its event - a decision is never stored `approved` while its migration stays held, and an approver's
+  retry after a failure decides again, its one event following its write (review ST-07). Neither acts while the plan
+  sets the VM's strategy
   (`strategy_overrides` names it: a person chose it in the plan, §9.2, and a validation honours that without
   recording a recommendation, so the newest one no longer stands — 409 "The plan sets the strategy of <vm>
   (<option>): change it in the plan."), and an approve of a decision already `approved` is refused (409 "The
