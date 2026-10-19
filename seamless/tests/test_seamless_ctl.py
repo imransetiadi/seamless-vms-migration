@@ -2282,6 +2282,47 @@ def test_a_cluster_drain_refuses_a_login_that_may_read_but_not_write(
     )
 
 
+@pytest.mark.parametrize(("platform", "tool"), [("kubernetes", "kubectl"), ("openshift", "oc")])
+def test_a_limits_capacity_refused_for_its_login_is_told_the_login_may_be_why(
+    tmp_path, platform, tool
+):
+    """SDD §17.2 (reviews RV46A-02, RV47-07): a capacity of limits alone - --cpu, no ConfigMap
+    patch, so the template's dry run is its first write - by a login that may read but not write
+    is refused with the one message that names every cause, the login among them: "the API server
+    refuses those limits" sent such an operator to change the limits."""
+    state = fake_kube.cluster()
+    proc, _, _ = _run(
+        tmp_path, platform, "capacity", "--cpu", "6", "--drain", "@TOKEN_FILE",
+        "--url", CLUSTER_URL, rules=_drain_rules([{"stdout": "[]"}]), cluster=state,
+        **_wrapped(tmp_path, tool, FORBIDDEN_WRITES),
+    )  # fmt: skip
+    assert proc.returncode == 2 and _cluster_after(tmp_path) == state, proc.stderr
+    assert "a login that may not patch deployment/seamless" in proc.stderr, proc.stderr
+    assert "refuses those limits" not in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_cluster_restart_drains_preview_shows_both_of_its_first_writes(tmp_path, platform):
+    """SDD §17.2 (review RV47-05): --dry-run prints every command and runs none. A cluster restart
+    drain's server-side dry run is its template patch for a running control plane, and its scale to
+    1 for one at 0 replicas: the preview prints the patch, then that case's comment and the scale -
+    it put "at 0 replicas, its scale to 1 instead:" above the patch and printed no scale."""
+    proc, calls, _ = _run(
+        tmp_path, platform, "restart", "--drain", "@TOKEN_FILE", "--url", CLUSTER_URL, "--dry-run"
+    )
+    assert proc.returncode == 0 and calls == [], proc.stderr
+    lines = proc.stdout.splitlines()
+    at = next(
+        i for i, line in enumerate(lines) if "when the control plane is at 0 replicas" in line
+    )
+    assert lines[at] == "# when the control plane is at 0 replicas, instead:", lines[at]
+    assert " patch deployment/seamless -p " in lines[at - 1], lines[at - 1]
+    assert "--dry-run=server -o name" in lines[at - 1], lines[at - 1]
+    assert lines[at + 1].endswith(
+        " scale deployment/seamless --replicas=1 --dry-run=server -o name"
+    ), lines[at + 1]
+
+
 @pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
 @pytest.mark.parametrize("action", CLUSTER_WRITES, ids=[" ".join(a[:2]) for a in CLUSTER_WRITES])
 def test_a_cluster_drains_dry_runs_change_nothing_and_its_action_follows(

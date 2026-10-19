@@ -599,9 +599,11 @@ drain_check() {
     case $ACTION in
       restart)
         if [ "$DRY" = 1 ]; then
-          say "# when the control plane is at 0 replicas, its scale to 1 instead:"
+          # a running control plane's write, then the one of a control plane at 0 replicas (review RV47-05)
           dry_write "restart deployment/seamless" patch deployment/seamless \
             -p '{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"dry-run"}}}}}'
+          say "# when the control plane is at 0 replicas, instead:"
+          dry_write "scale deployment/seamless" scale deployment/seamless --replicas=1
         elif [ "$("$KUBE" -n "$NS" get deployment/seamless -o 'jsonpath={.spec.replicas}')" = 0 ]; then
           dry_write "scale deployment/seamless" scale deployment/seamless --replicas=1
         else
