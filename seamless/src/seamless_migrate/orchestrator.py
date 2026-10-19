@@ -65,6 +65,7 @@ from .domain.models import (
     Approval,
     Decision,
     Estimate,
+    Event,
     EvidenceItem,
     Finding,
     ForceCutover,
@@ -87,7 +88,7 @@ from .domain.models import (
     repeated_vm_ids,
     utcnow,
 )
-from .events import EventBus, emit, new_event, put_and_emit
+from .events import EventBus, emit, new_event, put_all_and_emit, put_and_emit
 from .executors.ansible import recorded_copied_data, recorded_destination_volumes
 from .executors.base import (
     PermanentStepError,
@@ -2157,52 +2158,68 @@ class Orchestrator:
         # SDD §8: the plan's lock first, as the advisor's override (§14.6): a running validation
         # finishes before the change, and no validation undoes it afterwards
         async with self._lock(f"plan:{plan_id}"), self._lock(mid):
-            m, v = await self._load(mid)
-            if m.phase not in REVALIDATABLE:
-                raise NotAllowed(f"the strategy cannot change in {m.phase}")
-            if m.advisor_hold is not None:
-                raise NotAllowed(
-                    f"the advisor's decision ({m.advisor_hold}) waits for approval: approve or "
-                    "override it (advisor.approve)"
-                )
-            est = m.estimate_for(strategy)
-            if est is None:
-                raise BadRequest(f"strategy {strategy} does not apply to this VM (validate first)")
-            if not est.eligible:
-                raise BadRequest(f"strategy {strategy} is not eligible: {'; '.join(est.reasons)}")
-            if strategy == Strategy.storage_handover and await self.holds_destination_volumes(m):
-                # §9.2 judged now: a Retry does not re-assess the estimates the last validation
-                # stored, and a handover would leave the held volumes behind (SDD §12, RV40-01)
-                raise BadRequest(f"strategy {strategy} is not eligible: {HELD_VOLUMES_REASON}")
-            source_id = m.vm.source_id
+            for attempt in range(PLAN_UPDATE_ATTEMPTS):
+                if attempt:
+                    await asyncio.sleep(_update_backoff(attempt))
+                m, writes, events = await self._strategy_writes(mid, strategy, actor)
+                try:
+                    await put_all_and_emit(self.store, self.bus, writes, events)
+                except ConflictError:
+                    continue  # another writer moved the plan or the migration: read them again
+                return m
+        raise ConflictError(f"migration {mid} or its plan changed too often; run the action again")
 
-            def override(plan: Plan) -> None:
-                plan.strategy_overrides[source_id] = strategy
-
-            # the plan's entry first, then the migration: a failure between the two writes leaves
-            # the plan setting the strategy asked, which the next validation applies - never a
-            # change it undoes (SDD §8, review ST-08)
-            plan = await self._update_plan(m.plan_id, override)
-            m.strategy = strategy
-            m.estimate = est
-            m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
-            _clear_request(m)
-            await self._save(m, v)
-        await self._emit(
-            "migration.action",
-            f"{m.vm.name}: strategy set to {strategy}",
-            migration=m,
-            actor=actor,
-            data={"action": "strategy", "strategy": str(strategy)},
-        )
-        await self._emit(
-            "plan.updated",
-            f"{plan.name}: strategy override for {m.vm.name}",
-            plan_id=plan.id,
-            actor=actor,
-            data={"strategy_overrides": {m.vm.source_id: str(strategy)}},
-        )
-        return m
+    async def _strategy_writes(
+        self, mid: str, strategy: Strategy, actor: str
+    ) -> tuple[Migration, list[tuple[str, Any, int]], list[Event]]:
+        """A strategy change's checks on what is stored now, and its writes: the plan's entry, the
+        migration and their events, which ``put_all_and_emit`` makes one transaction - a failure
+        leaves none of them, and the retry makes the whole change (SDD §8, reviews ST-08,
+        RV48-02)."""
+        m, v = await self._load(mid)
+        if m.phase not in REVALIDATABLE:
+            raise NotAllowed(f"the strategy cannot change in {m.phase}")
+        if m.advisor_hold is not None:
+            raise NotAllowed(
+                f"the advisor's decision ({m.advisor_hold}) waits for approval: approve or "
+                "override it (advisor.approve)"
+            )
+        est = m.estimate_for(strategy)
+        if est is None:
+            raise BadRequest(f"strategy {strategy} does not apply to this VM (validate first)")
+        if not est.eligible:
+            raise BadRequest(f"strategy {strategy} is not eligible: {'; '.join(est.reasons)}")
+        if strategy == Strategy.storage_handover and await self.holds_destination_volumes(m):
+            # §9.2 judged now: a Retry does not re-assess the estimates the last validation
+            # stored, and a handover would leave the held volumes behind (SDD §12, RV40-01)
+            raise BadRequest(f"strategy {strategy} is not eligible: {HELD_VOLUMES_REASON}")
+        plan, plan_version = await self.db.get_versioned("plan", m.plan_id, Plan)
+        now = self._now()
+        plan.strategy_overrides[m.vm.source_id] = strategy
+        plan.updated_at = now
+        m.strategy = strategy
+        m.estimate = est
+        m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
+        _clear_request(m)
+        m.updated_at = now
+        events = [
+            new_event(
+                "migration.action",
+                f"{m.vm.name}: strategy set to {strategy}",
+                plan_id=m.plan_id,
+                migration_id=m.id,
+                actor=actor,
+                data={"action": "strategy", "strategy": str(strategy)},
+            ),
+            new_event(
+                "plan.updated",
+                f"{plan.name}: strategy override for {m.vm.name}",
+                plan_id=plan.id,
+                actor=actor,
+                data={"strategy_overrides": {m.vm.source_id: str(strategy)}},
+            ),
+        ]
+        return m, [("plan", plan, plan_version), ("migration", m, v)], events
 
     async def approve_recommendation(self, rec_id: str, actor: str) -> AdvisorRecommendation:
         """Apply the advisor's recommended option (SDD §14.6)."""
@@ -2228,132 +2245,152 @@ class Orchestrator:
         mid, plan_id = rec.migration_id, rec.plan_id
         _refuse_unchangeable((await self._load(mid))[0])  # before the plan's lock (SDD §8)
         async with self._lock(f"plan:{plan_id}"), self._lock(mid):
-            stored = await self.db.list("recommendation", AdvisorRecommendation, migration_id=mid)
-            newest = max(stored, key=lambda r: (r.created_at, r.id))
-            if newest.id != rec_id:
-                raise NotAllowed(f"a newer recommendation ({newest.id}) replaced {rec_id}")
-            rec = newest
-            plan = await self._plan(plan_id)
-            policies = await self.db.list("advisor_policy", AdvisorPolicy)
-            policy = resolve_policy(
-                policies, plan.id, plan.source_provider_id, rec.decision_type, self.settings
-            )
-            # SDD §14.6: the rules of the policy that took the decision, as they were then; the
-            # policy in force only for a decision that recorded none (the fallback, older data)
-            distinct = rec.decision.require_distinct_approver
-            if distinct is None:
-                distinct = policy.require_distinct_approver
-            reason_required = rec.decision.require_override_reason
-            if reason_required is None:
-                reason_required = policy.require_override_reason
-            if distinct and rec.requested_by == actor:
-                raise NotAllowed(OWN_DECISION)  # maker-checker (SDD §14.6, ADV-17)
-            if isinstance(action, Override) and reason_required:
-                if len(action.reason or "") < 10:
-                    raise Unprocessable(
-                        f"policy {rec.decision.policy_id or policy.id} requires an override "
-                        "reason of at least 10 characters"
-                    )
-            m, v = await self._load(mid)
-            if m.phase not in REVALIDATABLE:
-                raise NotAllowed(f"the strategy cannot change in {m.phase}")
-            pinned = plan.strategy_overrides.get(m.vm.source_id)
-            # an override choosing what the plan sets is the retry of one a failure cut off after
-            # its plan entry: it goes on and records the decision (SDD §14.6, review ST-07)
-            if pinned is not None and not (
-                isinstance(action, Override) and pinned == action.option
-            ):
-                # SDD §14.6: a person set the strategy in the plan, which a validation honours
-                # without a recommendation - the newest one no longer stands
-                raise NotAllowed(
-                    f"The plan sets the strategy of {m.vm.name} ({pinned}): change it in the plan."
+            for attempt in range(PLAN_UPDATE_ATTEMPTS):
+                if attempt:
+                    await asyncio.sleep(_update_backoff(attempt))
+                decided, writes, events = await self._decision_writes(
+                    rec_id, mid, plan_id, action, actor
                 )
-            if isinstance(action, Approve) and rec.decision.status == DecisionStatus.approved:
-                raise NotAllowed("The decision is already approved.")  # one event per change
-            eligible = tuple(e.strategy.value for e in m.estimates if e.eligible)
-            handover = Strategy.storage_handover.value
-            chosen = action.option if isinstance(action, Override) else rec.recommendation.option
-            stored = m.estimate_for(Strategy.storage_handover)
-            if (
-                chosen == handover
-                and stored is not None
-                and (
-                    HELD_VOLUMES_REASON in stored.reasons  # a Retry or a validation saw them held
-                    or (stored.eligible and await self.holds_destination_volumes(m))
+                try:
+                    await put_all_and_emit(self.store, self.bus, writes, events)
+                except ConflictError:
+                    continue  # another writer moved a document: read them all again
+                return decided
+        raise ConflictError(f"recommendation {rec_id} changed too often; run the action again")
+
+    async def _decision_writes(
+        self, rec_id: str, mid: str, plan_id: str, action: Approve | Override, actor: str
+    ) -> tuple[AdvisorRecommendation, list[tuple[str, Any, int]], list[Event]]:
+        """A person's decision's checks on what is stored now, and its writes: an override's plan
+        entry, the migration, the recommendation and their events, which ``put_all_and_emit``
+        makes one transaction - a failure leaves none of them, so no migration starts released
+        while its decision is unwritten, and the retry decides again (SDD §14.6, reviews ST-07,
+        RV48-01, RV48-02, RV48-13)."""
+        stored = await self.db.list("recommendation", AdvisorRecommendation, migration_id=mid)
+        newest = max(stored, key=lambda r: (r.created_at, r.id))
+        if newest.id != rec_id:
+            raise NotAllowed(f"a newer recommendation ({newest.id}) replaced {rec_id}")
+        rec, rec_version = await self.db.get_versioned(
+            "recommendation", rec_id, AdvisorRecommendation
+        )
+        plan, plan_version = await self.db.get_versioned("plan", plan_id, Plan)
+        policies = await self.db.list("advisor_policy", AdvisorPolicy)
+        policy = resolve_policy(
+            policies, plan.id, plan.source_provider_id, rec.decision_type, self.settings
+        )
+        # SDD §14.6: the rules of the policy that took the decision, as they were then; the
+        # policy in force only for a decision that recorded none (the fallback, older data)
+        distinct = rec.decision.require_distinct_approver
+        if distinct is None:
+            distinct = policy.require_distinct_approver
+        reason_required = rec.decision.require_override_reason
+        if reason_required is None:
+            reason_required = policy.require_override_reason
+        if distinct and rec.requested_by == actor:
+            raise NotAllowed(OWN_DECISION)  # maker-checker (SDD §14.6, ADV-17)
+        if isinstance(action, Override) and reason_required:
+            if len(action.reason or "") < 10:
+                raise Unprocessable(
+                    f"policy {rec.decision.policy_id or policy.id} requires an override "
+                    "reason of at least 10 characters"
                 )
-            ):
-                # §9.2 judged now, as PUT …/strategy: a Retry does not re-assess the estimates
-                # the last validation stored, and a handover would leave the held volumes behind
-                # (SDD §14.6, review RV41B-01)
-                refusal = f"strategy {handover} is not eligible: {HELD_VOLUMES_REASON}"
-                if isinstance(action, Override):
-                    raise Unprocessable(refusal)
-                raise NotAllowed(f"nothing to approve: {refusal}")
-            advice = Advice(
-                option=rec.recommendation.option,
-                confidence=rec.recommendation.confidence,
-                scope=eligible,
-                options=eligible,
+        m, v = await self._load(mid)
+        if m.phase not in REVALIDATABLE:
+            raise NotAllowed(f"the strategy cannot change in {m.phase}")
+        pinned = plan.strategy_overrides.get(m.vm.source_id)
+        if pinned is not None:
+            # SDD §14.6: a person set the strategy in the plan, which a validation honours
+            # without a recommendation - the newest one no longer stands, whatever option a
+            # decision would choose (reviews A4, RV48-03)
+            raise NotAllowed(
+                f"The plan sets the strategy of {m.vm.name} ({pinned}): change it in the plan."
             )
-            try:
-                decision = decide(
-                    advice, policy, 0, m.strategy.value, action=action, now=self._now()
-                )
-            except ValueError as exc:
-                if isinstance(action, Override):
-                    raise Unprocessable(str(exc)) from None
-                raise NotAllowed(str(exc)) from None
-            before = rec.decision
-            # the rules go on with a person's decision: a later one follows them too
-            decision = decision.model_copy(
-                update={
-                    "require_distinct_approver": distinct,
-                    "require_override_reason": reason_required,
-                }
+        if isinstance(action, Approve) and rec.decision.status == DecisionStatus.approved:
+            raise NotAllowed("The decision is already approved.")  # one event per change
+        eligible = tuple(e.strategy.value for e in m.estimates if e.eligible)
+        handover = Strategy.storage_handover.value
+        chosen = action.option if isinstance(action, Override) else rec.recommendation.option
+        held = m.estimate_for(Strategy.storage_handover)
+        if (
+            chosen == handover
+            and held is not None
+            and (
+                HELD_VOLUMES_REASON in held.reasons  # a Retry or a validation saw them held
+                or (held.eligible and await self.holds_destination_volumes(m))
             )
-            rec = rec.model_copy(update={"decision": decision})
-            final = Strategy(str(decision.final_option))
-            # SDD §14.6: first what a later step honours - an override's plan entry, then the
-            # migration - and the decision last, its event after it: a failure between the writes
-            # leaves a state the retry completes, never a decision approved while its migration
-            # stays held (review ST-07)
+        ):
+            # §9.2 judged now, as PUT …/strategy: a Retry does not re-assess the estimates
+            # the last validation stored, and a handover would leave the held volumes behind
+            # (SDD §14.6, review RV41B-01)
+            refusal = f"strategy {handover} is not eligible: {HELD_VOLUMES_REASON}"
             if isinstance(action, Override):
-                source_id = m.vm.source_id
-
-                def keep(fresh: Plan) -> None:
-                    fresh.strategy_overrides[source_id] = final
-
-                # under the plan's lock, with the decision - a validation waiting for the lock
-                # honours the override instead of asking the advisor again
-                plan = await self._update_plan(plan_id, keep)
-            changed = final != m.strategy
-            m.strategy = final
-            m.estimate = m.estimate_for(final)
-            m.advisor_hold = None
-            if changed:  # the approval was given for the previous strategy (SDD §5.4)
-                m.approvals = []
-                _clear_request(m)
-            await self._save(m, v)
-            await self.db.put("recommendation", rec)
+                raise Unprocessable(refusal)
+            raise NotAllowed(f"nothing to approve: {refusal}")
+        advice = Advice(
+            option=rec.recommendation.option,
+            confidence=rec.recommendation.confidence,
+            scope=eligible,
+            options=eligible,
+        )
+        try:
+            decision = decide(advice, policy, 0, m.strategy.value, action=action, now=self._now())
+        except ValueError as exc:
+            if isinstance(action, Override):
+                raise Unprocessable(str(exc)) from None
+            raise NotAllowed(str(exc)) from None
+        before = rec.decision
+        # the rules go on with a person's decision: a later one follows them too
+        decision = decision.model_copy(
+            update={
+                "require_distinct_approver": distinct,
+                "require_override_reason": reason_required,
+            }
+        )
+        rec = rec.model_copy(update={"decision": decision})
+        final = Strategy(str(decision.final_option))
+        now = self._now()
+        writes: list[tuple[str, Any, int]] = []
+        events: list[Event] = []
         if isinstance(action, Override):
-            await self._emit(
-                "plan.updated",
-                f"{plan.name}: strategy override for {m.vm.name}",
-                plan_id=plan.id,
-                actor=actor,
-                data={"strategy_overrides": {source_id: str(final)}},
+            # under the plan's lock, with the decision - a validation waiting for the lock
+            # honours the override instead of asking the advisor again
+            plan.strategy_overrides[m.vm.source_id] = final
+            plan.updated_at = now
+            writes.append(("plan", plan, plan_version))
+            events.append(
+                new_event(
+                    "plan.updated",
+                    f"{plan.name}: strategy override for {m.vm.name}",
+                    plan_id=plan.id,
+                    actor=actor,
+                    data={"strategy_overrides": {m.vm.source_id: str(final)}},
+                )
             )
+        changed = final != m.strategy
+        m.strategy = final
+        m.estimate = m.estimate_for(final)
+        m.advisor_hold = None
+        if changed:  # the approval was given for the previous strategy (SDD §5.4)
+            m.approvals = []
+            _clear_request(m)
+        m.updated_at = now
+        writes += [("migration", m, v), ("recommendation", rec, rec_version)]
         kind, message, by, data = decision_event(rec, before)
-        await self._emit(kind, message, migration=m, actor=by, data=data)
+        events.append(
+            new_event(kind, message, plan_id=m.plan_id, migration_id=m.id, actor=by, data=data)
+        )
         if changed:
-            await self._emit(
-                "migration.action",
-                f"{m.vm.name}: strategy set to {final} by the advisor decision",
-                migration=m,
-                actor=actor,
-                data={"action": "strategy", "strategy": str(final)},
+            events.append(
+                new_event(
+                    "migration.action",
+                    f"{m.vm.name}: strategy set to {final} by the advisor decision",
+                    plan_id=m.plan_id,
+                    migration_id=m.id,
+                    actor=actor,
+                    data={"action": "strategy", "strategy": str(final)},
+                )
             )
-        return rec
+        return rec, writes, events
 
     # ------------------------------------------------------------------------------------------
     # lifecycle and tick loop

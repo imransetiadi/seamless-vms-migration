@@ -138,6 +138,30 @@ async def test_the_stream_publishes_the_event_the_store_holds(store: Store):
     assert live == stored and len(live.actor) == events_table.c.actor.type.length
 
 
+async def test_put_all_and_emit_publishes_its_events_after_the_commit_or_none(
+    store: Store, refuse_write
+):
+    """SDD §8, §11, §14.6: the events of one transaction are published once it commits, in seq
+    order with every other - a transaction refused publishes none of them."""
+    from tests.factories import make_plan
+
+    bus = EventBus(store)
+    agen = bus.subscribe(since=store.max_seq())
+    task = asyncio.ensure_future(_take(agen, 2))  # consuming first: the events arrive live
+    await asyncio.sleep(0.05)
+    plan = make_plan()
+    store.put("plan", plan, expected_version=0)
+    events_ = [Event(kind="plan.updated", message="a"), Event(kind="plan.updated", message="b")]
+    refuse_write(store, "INSERT INTO events", "plan.updated")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await events_module.put_all_and_emit(store, bus, [("plan", plan, 1)], events_)
+    versions = await events_module.put_all_and_emit(store, bus, [("plan", plan, 1)], events_)
+    live = await task
+    await agen.aclose()
+    assert (versions, live) == ([2], store.events())
+    assert [e.message for e in live] == ["a", "b"]
+
+
 async def test_subscribe_has_no_duplicates_when_live_overlaps_replay(store: Store):
     """Events committed while a subscriber replays are delivered exactly once."""
     bus = EventBus(store, replay_page=1)

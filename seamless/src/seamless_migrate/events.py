@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Sequence
 from typing import Any
 
 from pydantic_core import to_jsonable_python
@@ -263,6 +264,22 @@ async def put_and_emit(
         )
         bus.publish(event, persist=True)
     return version
+
+
+async def put_all_and_emit(
+    store: Store,
+    bus: EventBus,
+    writes: Sequence[tuple[str, Any, int]],
+    events: Sequence[Event],
+) -> list[int]:
+    """Write ``writes`` and ``events`` in one store transaction, then publish the events, in seq
+    order with every other (SDD §8, §11, §14.6): a store error leaves none of them, published or
+    written."""
+    async with bus.emit_lock:
+        versions, written = await asyncio.to_thread(store.put_all_with_events, writes, events)
+        for event in written:
+            bus.publish(event, persist=True)
+    return versions
 
 
 async def emit(

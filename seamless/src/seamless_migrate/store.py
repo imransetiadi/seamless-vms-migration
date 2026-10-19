@@ -13,7 +13,7 @@ import hashlib
 import logging
 import re
 import threading
-from collections.abc import AsyncIterator, Collection, Iterable
+from collections.abc import AsyncIterator, Collection, Iterable, Sequence
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -96,6 +96,11 @@ class ConflictError(StoreError):
 class UnstorableValue(StoreError):
     """A write holding what PostgreSQL cannot store - a NUL, a lone surrogate -, refused before
     any statement on every backend rather than rewritten (SDD §11)."""
+
+
+class _Moved(Exception):
+    """A versioned write of ``put_all_with_events`` found its document at another version: the
+    transaction rolls back."""
 
 
 class NotFound(StoreError):
@@ -440,24 +445,60 @@ class Store:
         """Update ``model`` at ``expected_version`` and append ``event`` in one transaction (SDD
         §11): both are written, or neither - a ``ConflictError`` as ``put``'s, or the store's own
         error. The source watch's flag and its alert (§8.1, review RV21-04)."""
-        doc_id = str(model.id)  # type: ignore[attr-defined]
-        data = _document_data(kind, doc_id, model)
-        row = _event_row(event)
-        key = (documents.c.kind == kind) & (documents.c.id == doc_id)
-        with self.engine.begin() as conn:
-            updated = conn.execute(
-                documents.update()
-                .where(key & (documents.c.version == expected_version))
-                .values(version=expected_version + 1, data=data, updated_at=_now())
-            )
-            seq = (
-                int(conn.execute(events.insert().values(**row)).inserted_primary_key[0])
-                if updated.rowcount == 1
-                else None
-            )
-        if seq is None:
-            raise self._refused(kind, doc_id, expected_version)
-        return expected_version + 1, Event(seq=seq, **row)
+        [version], [written] = self.put_all_with_events([(kind, model, expected_version)], [event])
+        return version, written
+
+    def put_all_with_events(
+        self, writes: Sequence[tuple[str, BaseModel, int]], appended: Sequence[Event]
+    ) -> tuple[list[int], list[Event]]:
+        """Write each ``(kind, model, expected_version)`` - ``0`` a new document, ``n`` the
+        version it must be at - and append ``appended`` in one transaction (SDD §11): all are
+        written or none, a ``ConflictError`` naming the document that moved, else the store's own
+        error. A strategy change and an advisor decision (§8, §14.6, reviews RV48-01, RV48-13);
+        each version and event comes back as written."""
+        documents_ = [
+            (kind, doc_id, _document_data(kind, doc_id, model), expected)
+            for kind, model, expected in writes
+            for doc_id in [str(model.id)]  # type: ignore[attr-defined]
+        ]
+        rows = [_event_row(event) for event in appended]
+        now = _now()
+        moved: tuple[str, str, int] | None = None
+        try:
+            with self.engine.begin() as conn:
+                for kind, doc_id, data, expected in documents_:
+                    moved = (kind, doc_id, expected)
+                    if expected == 0:
+                        conn.execute(
+                            documents.insert().values(
+                                kind=kind,
+                                id=doc_id,
+                                version=1,
+                                data=data,
+                                created_at=now,
+                                updated_at=now,
+                            )
+                        )
+                        continue
+                    key = (documents.c.kind == kind) & (documents.c.id == doc_id)
+                    result = conn.execute(
+                        documents.update()
+                        .where(key & (documents.c.version == expected))
+                        .values(version=expected + 1, data=data, updated_at=now)
+                    )
+                    if result.rowcount != 1:
+                        raise _Moved
+                moved = None
+                seqs = [
+                    int(conn.execute(events.insert().values(**row)).inserted_primary_key[0])
+                    for row in rows
+                ]
+        except (_Moved, IntegrityError):
+            if moved is None:
+                raise
+            raise self._refused(*moved) from None
+        versions = [expected + 1 for *_, expected in documents_]
+        return versions, [Event(seq=seq, **row) for seq, row in zip(seqs, rows, strict=True)]
 
     def _refused(self, kind: str, doc_id: str, expected_version: int) -> ConflictError:
         """Why a versioned write found no row to write: the document is missing, or at another

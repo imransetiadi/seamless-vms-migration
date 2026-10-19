@@ -296,63 +296,164 @@ def _decision_events(api):
     return [e.kind for e in api.store.events() if e.kind.startswith("decision.")]
 
 
-@pytest.mark.parametrize("half", ["migration", "recommendation"])
-def test_an_approval_cut_short_by_a_failed_write_is_completed_by_the_retry(api, refuse_write, half):
-    """SDD §14.6 (review ST-07): an approval writes the migration - the approved strategy, the
-    hold cleared - before the decision and its event. A failure of either write leaves no
-    decision approved while its migration stays held, and the approver's retry approves it with
-    one decision.approved event. The decision written first stayed approved, the migration held
-    and every later Approve was refused as "already approved"."""
+#: what a decision writes besides its documents (SDD §14.5, §14.6)
+DECISION_EVENTS = ("plan.updated", "decision.approved", "decision.overridden", "migration.action")
+
+
+def _events_of(api, *kinds):
+    return [e.kind for e in api.store.events() if e.kind in kinds]
+
+
+@pytest.mark.parametrize(
+    ("write", "row"),
+    [
+        ("UPDATE documents", "migration"),
+        ("UPDATE documents", "recommendation"),
+        ("INSERT INTO events", "decision.approved"),
+        ("INSERT INTO events", "migration.action"),
+    ],
+)
+def test_an_approval_a_failed_write_cuts_short_leaves_nothing_and_the_retry_makes_it(
+    api, refuse_write, write, row
+):
+    """SDD §14.6 (reviews ST-07, RV48-01, RV48-02, RV48-13): an approval's writes came one after
+    another - a failure after the migration's left it released, which a running plan's tick
+    starts on a strategy no decision recorded, and one after the decision's left the approval
+    unaudited for good, every retry refused as "already approved". They are one transaction: a
+    write refused leaves none of them, and the approver's retry makes the whole approval, with
+    one event of each kind."""
     mid, rid = _held_for_a_decision(api)
     url = f"/api/v1/advisor/recommendations/{rid}/approve"
-    refused = refuse_write(api.store, "UPDATE documents", half)
+    refused = refuse_write(api.store, write, row)
     with pytest.raises(RuntimeError, match="briefly unavailable"):
         api.post(url, json={})
-    assert refused == [f"UPDATE documents {half}"]
+    assert refused == [f"{write} {row}"]
     rec = api.store.get("recommendation", rid, AdvisorRecommendation)
     m = api.store.get("migration", mid, Migration)
-    assert rec.decision.status == DecisionStatus.pending_approval
-    # the migration's write refused: it waits as it did; the decision's: it runs the approval
-    assert (m.strategy, m.advisor_hold) == (
-        ("cold", rid) if half == "migration" else ("warm", None)
+    assert (rec.decision.status, m.strategy, m.advisor_hold, _events_of(api, *DECISION_EVENTS)) == (
+        DecisionStatus.pending_approval,
+        "cold",
+        rid,
+        [],
     )
     again = api.post(url, json={})
     assert again.status_code == 200, again.text
     m = api.store.get("migration", mid, Migration)
-    assert (m.strategy, m.advisor_hold, _decision_events(api)) == (
+    assert (m.strategy, m.advisor_hold, _events_of(api, *DECISION_EVENTS)) == (
         "warm",
         None,
-        ["decision.approved"],
+        ["decision.approved", "migration.action"],
     )
 
 
-@pytest.mark.parametrize("half", ["plan", "migration", "recommendation"])
-def test_an_override_cut_short_by_a_failed_write_is_completed_by_the_retry(api, refuse_write, half):
-    """SDD §14.6 (review ST-07): an override writes its plan entry first, then the migration,
-    then the decision and its event. Whichever write fails, the person's retry completes it - an
-    override that chooses the option the plan already sets goes on - with one decision.overridden
-    event."""
+@pytest.mark.parametrize(
+    ("write", "row"),
+    [
+        ("UPDATE documents", "plan"),
+        ("UPDATE documents", "migration"),
+        ("UPDATE documents", "recommendation"),
+        ("INSERT INTO events", "plan.updated"),
+        ("INSERT INTO events", "decision.overridden"),
+    ],
+)
+def test_an_override_a_failed_write_cuts_short_leaves_nothing_and_the_retry_makes_it(
+    api, refuse_write, write, row
+):
+    """SDD §14.6 (reviews ST-07, RV48-03): an override's plan entry, its migration, its decision
+    and their events are one transaction - a write refused leaves none of them, so no plan pins
+    an option no decision records -, and the person's retry makes the whole override, with one
+    event of each kind."""
     mid, rid = _held_for_a_decision(api)
     url = f"/api/v1/advisor/recommendations/{rid}/override"
     body = {"option": "cold", "reason": "Rehearsed the cold path twice"}
-    refused = refuse_write(api.store, "UPDATE documents", half)
+    refused = refuse_write(api.store, write, row)
     with pytest.raises(RuntimeError, match="briefly unavailable"):
         api.post(url, json=body)
-    assert refused == [f"UPDATE documents {half}"]
-    pinned = api.store.get("plan", "plan-1", Plan).strategy_overrides.get(f"src-{mid}")
+    assert refused == [f"{write} {row}"]
+    pinned = api.store.get("plan", "plan-1", Plan).strategy_overrides
     rec = api.store.get("recommendation", rid, AdvisorRecommendation)
-    assert (pinned, rec.decision.status) == (
-        None if half == "plan" else "cold",
+    m = api.store.get("migration", mid, Migration)
+    assert (pinned, rec.decision.status, m.advisor_hold, _events_of(api, *DECISION_EVENTS)) == (
+        {},
         DecisionStatus.pending_approval,
+        rid,
+        [],
     )
     again = api.post(url, json=body)
     assert again.status_code == 200, again.text
+    pinned = api.store.get("plan", "plan-1", Plan).strategy_overrides
     m = api.store.get("migration", mid, Migration)
-    assert (m.strategy, m.advisor_hold, _decision_events(api)) == (
+    assert (pinned, m.strategy, m.advisor_hold, _events_of(api, *DECISION_EVENTS)) == (
+        {f"src-{mid}": "cold"},
         "cold",
         None,
+        ["plan.updated", "decision.overridden"],
+    )
+
+
+def test_an_override_already_made_is_not_made_again(api):
+    """SDD §14.6 (review RV48-03): an override choosing the option the plan sets was let through as
+    the retry of one cut off after its plan entry - and so an override already made was made
+    again, a second decision.overridden rewriting who decided. No failure leaves a plan entry
+    without its decision now: a second override is refused as every decision is while the plan
+    sets the VM's strategy."""
+    mid, rid = _held_for_a_decision(api)
+    url = f"/api/v1/advisor/recommendations/{rid}/override"
+    body = {"option": "cold", "reason": "Rehearsed the cold path twice"}
+    assert api.post(url, json=body).status_code == 200
+    again = api.post(url, json=body)
+    assert (again.status_code, again.json()["error"]["message"]) == (
+        409,
+        "The plan sets the strategy of web-01 (cold): change it in the plan.",
+    )
+    rec = api.store.get("recommendation", rid, AdvisorRecommendation)
+    assert (rec.decision.actor.id, _events_of(api, "decision.overridden")) == (
+        "admin-user",
         ["decision.overridden"],
     )
+
+
+@pytest.mark.parametrize("action", ["approve", "override"])
+def test_no_decision_while_the_plan_sets_the_option_the_advisor_recommends(api, action):
+    """SDD §14.6 (reviews A4, RV48-11): a person set the strategy in the plan, which a validation
+    honours without a recommendation - the newest one no longer stands, whichever option the plan
+    sets: an approve of the option it pins is refused, as an override to it."""
+    mid, rid = _held_for_a_decision(api)
+    plan = api.store.get("plan", "plan-1", Plan)
+    plan.strategy_overrides[f"src-{mid}"] = "warm"  # what the advisor recommends
+    api.store.put("plan", plan)
+    body = {} if action == "approve" else {"option": "warm", "reason": "Rehearsed the warm path"}
+    res = api.post(f"/api/v1/advisor/recommendations/{rid}/{action}", json=body)
+    assert (res.status_code, res.json()["error"]["message"]) == (
+        409,
+        "The plan sets the strategy of web-01 (warm): change it in the plan.",
+    )
+    assert _events_of(api, *DECISION_EVENTS) == []
+
+
+def test_a_decision_another_writer_moved_the_plan_under_is_made_again_keeping_both(api, land_first):
+    """SDD §8, §14.6: plans are written by several drivers and the CLI. A plan moved between a
+    decision's read and its transaction fails the versioned write, which leaves nothing; the
+    decision is read again and made again - the other writer's change kept, one event of each
+    kind."""
+    mid, rid = _held_for_a_decision(api)
+
+    def rename():
+        plan, version = api.store.get_versioned("plan", "plan-1", Plan)
+        renamed = plan.model_copy(update={"name": "renamed meanwhile"})
+        return api.store.put("plan", renamed, expected_version=version)
+
+    landed = land_first(api.store, "UPDATE documents", "plan", rename)
+    body = {"option": "cold", "reason": "Rehearsed the cold path twice"}
+    res = api.post(f"/api/v1/advisor/recommendations/{rid}/override", json=body)
+    assert res.status_code == 200, res.text
+    plan = api.store.get("plan", "plan-1", Plan)
+    assert (landed, plan.name, plan.strategy_overrides) == (
+        [2],
+        "renamed meanwhile",
+        {f"src-{mid}": "cold"},
+    )
+    assert _events_of(api, *DECISION_EVENTS) == ["plan.updated", "decision.overridden"]
 
 
 def test_a_policy_replaced_during_its_delete_is_not_deleted_unseen(api, land_first):

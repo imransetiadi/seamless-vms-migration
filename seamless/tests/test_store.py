@@ -860,6 +860,54 @@ def test_events_never_sends_a_seq_outside_its_column(any_store: Store):
     assert not [v for v in sent if isinstance(v, int) and not -(2**31) <= v <= end]
 
 
+@pytest.mark.parametrize(
+    ("write", "row"),
+    [
+        ("UPDATE documents", "plan"),
+        ("INSERT INTO documents", "migration"),
+        ("INSERT INTO events", "plan.updated"),
+        ("INSERT INTO events", "migration.action"),
+    ],
+)
+def test_put_all_with_events_writes_every_document_and_event_or_none(
+    any_store: Store, refuse_write, write, row
+):
+    """SDD §11 (reviews RV48-01, RV48-13): several versioned writes and their events in one
+    transaction - a strategy change, an advisor decision (§8, §14.6). A statement refused when it
+    runs, after the others ran, leaves none of them; a document at another version is a
+    ConflictError naming it, nothing written; else each version and event comes back as
+    written."""
+    plan = make_plan()
+    any_store.put("plan", plan, expected_version=0)
+    changed = plan.model_copy(update={"name": "changed"})
+    m = make_migration(plan_id=plan.id)
+    events_ = [Event(kind="plan.updated", message="p"), Event(kind="migration.action", message="m")]
+    refused = refuse_write(any_store, write, row)
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        any_store.put_all_with_events([("plan", changed, 1), ("migration", m, 0)], events_)
+    assert refused == [f"{write} {row}"]
+    assert any_store.get_versioned("plan", plan.id, Plan) == (plan, 1)
+    with pytest.raises(NotFound):
+        any_store.get("migration", m.id, Migration)
+    assert any_store.events() == []
+    any_store.put("plan", plan, expected_version=1)  # another writer: now at version 2
+    with pytest.raises(ConflictError, match=f"plan '{plan.id}' is at version 2, expected 1"):
+        any_store.put_all_with_events([("plan", changed, 1), ("migration", m, 0)], events_)
+    with pytest.raises(NotFound):
+        any_store.get("migration", m.id, Migration)
+    assert any_store.events() == []
+    versions, written = any_store.put_all_with_events(
+        [("plan", changed, 2), ("migration", m, 0)], events_
+    )
+    assert (versions, written) == ([3, 1], any_store.events())
+    assert [e.kind for e in written] == ["plan.updated", "migration.action"]
+    assert any_store.get_versioned("plan", plan.id, Plan) == (changed, 3)
+    # a new document that exists meanwhile: a ConflictError naming it, nothing written
+    with pytest.raises(ConflictError, match=f"migration '{m.id}' is at version 1, expected 0"):
+        any_store.put_all_with_events([("plan", changed, 3), ("migration", m, 0)], events_)
+    assert (any_store.get_versioned("plan", plan.id, Plan)[1], len(any_store.events())) == (3, 2)
+
+
 def test_a_delete_at_a_version_refuses_a_document_that_moved(any_store: Store):
     """SDD §11 (review ST-05): a delete may name the version it read - DELETE ... WHERE
     version = n -, so a write landing in between is refused, never deleted unseen; a document

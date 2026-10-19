@@ -4950,13 +4950,13 @@ async def test_a_strategy_change_during_a_validation_waits_for_it_and_is_kept(tm
     # the override is written under the plan's lock: a validation queued behind the change
     # reads the plan only once it holds the change
     under_lock: list[bool] = []
-    update_plan = h.orch._update_plan
+    write_all = h.orch.store.put_all_with_events
 
-    async def spying_update(plan_id, mutate):
-        under_lock.append(h.orch.plan_lock(plan_id).locked())
-        return await update_plan(plan_id, mutate)
+    def spying_write(writes, appended):
+        under_lock.append(h.orch.plan_lock(plan.id).locked())
+        return write_all(writes, appended)
 
-    h.orch._update_plan = spying_update
+    h.orch.store.put_all_with_events = spying_write
     await h.orch.set_strategy(m2.id, m2.strategy, "bayu")
     assert under_lock == [True]
 
@@ -4989,29 +4989,70 @@ async def test_a_change_to_a_migration_being_finalized_is_refused_before_the_pla
                 await task
 
 
-@pytest.mark.parametrize("half", ["plan", "migration"])
-async def test_a_strategy_change_cut_short_by_a_failed_write_is_never_undone_silently(
-    tmp_path, store, refuse_write, half
+@pytest.mark.parametrize(
+    ("write", "row"),
+    [
+        ("UPDATE documents", "plan"),
+        ("UPDATE documents", "migration"),
+        ("INSERT INTO events", "migration.action"),
+        ("INSERT INTO events", "plan.updated"),
+    ],
+)
+async def test_a_strategy_change_a_failed_write_cuts_short_leaves_nothing_and_the_retry_makes_it(
+    tmp_path, store, refuse_write, write, row
 ):
-    """SDD §8 (review ST-08): a strategy change writes the plan's strategy_overrides entry first
-    and the migration's strategy after it. A failure of the first changes nothing; a failure of
-    the second leaves the plan setting the strategy asked, which the next validation applies.
-    The migration written first looked changed while the next validation silently re-selected
-    the old strategy."""
+    """SDD §8 (reviews ST-08, RV48-02): a strategy change wrote the plan's entry, the migration and
+    its two events each on its own - a failure between them left the plan pinning a strategy no
+    event named, which the next validation applied under its own actor. They are one transaction:
+    a write refused leaves none of them - the next validation keeps the strategy -, and the retry
+    makes the whole change, with one event of each kind."""
     h, plan = await setup(tmp_path, store, [vm(1)])
     await h.orch.validate_plan(plan.id, "alice")
     m = await h.by_vm(plan.id, "vm-1")
     chosen = next(e.strategy for e in m.estimates if e.eligible and e.strategy != m.strategy)
-    refused = refuse_write(store, "UPDATE documents", half)
+
+    def changes():
+        events = store.events(since_seq=0, limit=1000)
+        return [e.kind for e in events if e.actor == "rina"]
+
+    refused = refuse_write(store, write, row)
     with pytest.raises(RuntimeError, match="briefly unavailable"):
         await h.orch.set_strategy(m.id, chosen, "rina")
-    assert refused == [f"UPDATE documents {half}"]
-    stored = await h.migration(m.id)
-    pinned = (await h.plan(plan.id)).strategy_overrides.get("vm-1")
-    # the first write refused: nothing changed; the second: the plan sets what was asked
-    assert (stored.strategy, pinned) == (m.strategy, None if half == "plan" else chosen)
+    assert refused == [f"{write} {row}"]
+    pinned = (await h.plan(plan.id)).strategy_overrides
+    assert ((await h.migration(m.id)).strategy, pinned, changes()) == (m.strategy, {}, [])
     await h.orch.validate_plan(plan.id, "alice")
-    assert (await h.migration(m.id)).strategy == (m.strategy if half == "plan" else chosen)
+    assert (await h.migration(m.id)).strategy == m.strategy
+    await h.orch.set_strategy(m.id, chosen, "rina")
+    pinned = (await h.plan(plan.id)).strategy_overrides
+    assert ((await h.migration(m.id)).strategy, pinned, changes()) == (
+        chosen,
+        {"vm-1": chosen},
+        ["migration.action", "plan.updated"],
+    )
+
+
+async def test_a_strategy_change_another_writer_moved_the_plan_under_is_made_again(
+    tmp_path, store, land_first
+):
+    """SDD §8: a plan moved between a strategy change's read and its transaction - the CLI, a
+    driver - fails the versioned write, which leaves nothing; the change is read again and made
+    again, the other writer's change kept."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    chosen = next(e.strategy for e in m.estimates if e.eligible and e.strategy != m.strategy)
+
+    def rename():
+        stored, version = store.get_versioned("plan", plan.id, Plan)
+        renamed = stored.model_copy(update={"name": "renamed meanwhile"})
+        return store.put("plan", renamed, expected_version=version)
+
+    land_first(store, "UPDATE documents", "plan", rename)
+    await h.orch.set_strategy(m.id, chosen, "rina")
+    stored = await h.plan(plan.id)
+    assert (stored.name, stored.strategy_overrides) == ("renamed meanwhile", {"vm-1": chosen})
+    assert (await h.migration(m.id)).strategy == chosen
 
 
 async def test_set_strategy_clears_force_window(tmp_path, store):
@@ -5342,14 +5383,52 @@ async def test_an_override_records_its_reason_in_the_audit_trail(tmp_path, store
     assert overridden.data["before"] == waiting.data["after"]
 
 
+async def test_an_approval_cut_short_on_a_running_plan_leaves_its_migration_held(
+    tmp_path, store, refuse_write
+):
+    """SDD §14.6 (review RV48-01): an approval wrote the migration - its hold cleared - before the
+    decision, so when the decision's write failed a running plan's tick started the released
+    migration at once, and the approver's retry was refused "the strategy cannot change in
+    cutover": the migration ran a strategy its decision never recorded. One transaction keeps
+    the migration held until the decision is written: the tick waits, the retry approves, then
+    the migration runs the approved strategy, with one decision.approved."""
+    advisor, _ = _tie_advisor("warm", 0.99)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await run_plan(h, plan)
+    try:
+        m = await h.by_vm(plan.id, "vm-1")
+        [rec] = _recommendations(store)
+        assert (m.advisor_hold, m.phase) == (rec.id, P.ready)
+        refused = refuse_write(store, "UPDATE documents", "recommendation")
+        with pytest.raises(RuntimeError, match="briefly unavailable"):
+            await h.orch.approve_recommendation(rec.id, "rina")
+        assert refused == ["UPDATE documents recommendation"]
+        await asyncio.sleep(0.2)  # many ticks: a held migration is never started
+        held = await h.migration(m.id)
+        assert (held.phase, held.advisor_hold) == (P.ready, rec.id)
+        approved = await h.orch.approve_recommendation(rec.id, "rina")
+        later = (P.precopy, P.syncing, P.awaiting_cutover, P.cutover, P.verifying, P.completed)
+        started = await h.wait_phase(m.id, *later)
+    finally:
+        await h.orch.stop()
+    decided = [e for e in _audit(store) if e.kind == "decision.approved"]
+    assert (approved.decision.status, started.strategy, len(decided)) == (
+        DecisionStatus.approved,
+        Strategy.warm,
+        1,
+    )
+
+
 async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_approve(
     tmp_path, store
 ):
-    """SDD §14.6 (advisor Phase 1 audit, A4): once the plan sets the VM's strategy, the newest
-    recommendation no longer stands - approving it, or overriding it to another option, would
-    flip the strategy back against the plan (an override to the option the plan sets is the retry
-    of one cut off, review ST-07); and an approved decision is not approved again (one event per
-    decision status change)."""
+    """SDD §14.6 (advisor Phase 1 audit A4, review RV48-03): once the plan sets the VM's strategy,
+    the newest recommendation no longer stands - approving it, or overriding it to any option,
+    would flip the strategy back against the plan or decide what the plan already did; and an
+    approved decision is not approved again (one event per decision status change)."""
     advisor, _ = _tie_advisor("warm", 0.99)
     h, plan = await setup(
         tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
@@ -5363,6 +5442,7 @@ async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_
     for decide in (
         lambda: h.orch.approve_recommendation(rec.id, "rina"),
         lambda: h.orch.override_recommendation(rec.id, "warm", "the owner chose warm", "rina"),
+        lambda: h.orch.override_recommendation(rec.id, "cold", "the owner chose cold", "rina"),
     ):
         with pytest.raises(NotAllowed) as refused:
             await decide()
