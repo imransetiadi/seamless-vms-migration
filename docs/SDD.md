@@ -3433,7 +3433,10 @@ is no origin a browser sends (review RV31-03).
   and its VM table names, as the Inventory's does, the plan that holds each VM with the Plan filter — the plan being
   edited never holding its own VMs — so the free VMs are picked before any warning; Start on a `failed` plan says pre-staging failed and starts
   it again (§8); Start is unavailable, saying why and naming the VMs, while a migration is `blocked` or — in a plan
-  with waves — a migration that has not finished belongs to no wave (§9.4), as `start_plan` refuses both; Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
+  with waves — a migration that has not finished belongs to no wave (§9.4), as `start_plan` refuses both; Validate is
+  unavailable only on a running plan (pause it first) and a cancelled one, as `validate_plan` refuses both — a
+  completed plan, say one whose every VM rolled back over a plan setting, is validated again and then editable (§8.1,
+  audit DB-01); Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (its Findings
   and Estimates panels addressable as `#findings` and `#estimates`, which the page scrolls to and focuses once
   loaded, ADV-02; phase
@@ -3466,7 +3469,8 @@ is no origin a browser sends (review RV31-03).
   roll back (§8.1) — and Finalize unavailable then, saying so, as the API refuses it (a finalize that began deleting
   the source stays available, §8.1), the time in Completed and the finalize reminder past the plan's `finalize_warning_h`, and in
   demo mode "Power on the source VM" / "Power off" for an operator on a completed migration (`POST /demo/vms/…`), so
-  the alert can be shown,
+  the alert can be shown - its label follows the source's power as the migration records it, a press holding only
+  until the migration's phase, attempt or recorded power changes (audit DB-02),
   findings (before pre-flight ran: that it runs at validation, or is running), a Verification panel — the VM's
   a Network panel — each NIC with its source network, MAC and addresses and where it goes in RHOSO (the mapped
   network or its override, with the addresses it keeps or gets). Edit is for an operator on an OpenStack source:
