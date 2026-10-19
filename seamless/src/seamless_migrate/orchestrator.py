@@ -2174,17 +2174,20 @@ class Orchestrator:
                 # §9.2 judged now: a Retry does not re-assess the estimates the last validation
                 # stored, and a handover would leave the held volumes behind (SDD §12, RV40-01)
                 raise BadRequest(f"strategy {strategy} is not eligible: {HELD_VOLUMES_REASON}")
-            m.strategy = strategy
-            m.estimate = est
-            m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
-            _clear_request(m)
-            await self._save(m, v)
             source_id = m.vm.source_id
 
             def override(plan: Plan) -> None:
                 plan.strategy_overrides[source_id] = strategy
 
+            # the plan's entry first, then the migration: a failure between the two writes leaves
+            # the plan setting the strategy asked, which the next validation applies - never a
+            # change it undoes (SDD §8, review ST-08)
             plan = await self._update_plan(m.plan_id, override)
+            m.strategy = strategy
+            m.estimate = est
+            m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
+            _clear_request(m)
+            await self._save(m, v)
         await self._emit(
             "migration.action",
             f"{m.vm.name}: strategy set to {strategy}",
@@ -2255,7 +2258,11 @@ class Orchestrator:
             if m.phase not in REVALIDATABLE:
                 raise NotAllowed(f"the strategy cannot change in {m.phase}")
             pinned = plan.strategy_overrides.get(m.vm.source_id)
-            if pinned is not None:
+            # an override choosing what the plan sets is the retry of one a failure cut off after
+            # its plan entry: it goes on and records the decision (SDD §14.6, review ST-07)
+            if pinned is not None and not (
+                isinstance(action, Override) and pinned == action.option
+            ):
                 # SDD §14.6: a person set the strategy in the plan, which a validation honours
                 # without a recommendation - the newest one no longer stands
                 raise NotAllowed(
@@ -2305,8 +2312,20 @@ class Orchestrator:
                 }
             )
             rec = rec.model_copy(update={"decision": decision})
-            await self.db.put("recommendation", rec)
             final = Strategy(str(decision.final_option))
+            # SDD §14.6: first what a later step honours - an override's plan entry, then the
+            # migration - and the decision last, its event after it: a failure between the writes
+            # leaves a state the retry completes, never a decision approved while its migration
+            # stays held (review ST-07)
+            if isinstance(action, Override):
+                source_id = m.vm.source_id
+
+                def keep(fresh: Plan) -> None:
+                    fresh.strategy_overrides[source_id] = final
+
+                # under the plan's lock, with the decision - a validation waiting for the lock
+                # honours the override instead of asking the advisor again
+                plan = await self._update_plan(plan_id, keep)
             changed = final != m.strategy
             m.strategy = final
             m.estimate = m.estimate_for(final)
@@ -2315,15 +2334,7 @@ class Orchestrator:
                 m.approvals = []
                 _clear_request(m)
             await self._save(m, v)
-            if isinstance(action, Override):
-                source_id = m.vm.source_id
-
-                def keep(fresh: Plan) -> None:
-                    fresh.strategy_overrides[source_id] = final
-
-                # SDD §14.6: under the plan's lock, with the decision - a validation waiting for
-                # the lock honours the override instead of asking the advisor again
-                plan = await self._update_plan(plan_id, keep)
+            await self.db.put("recommendation", rec)
         if isinstance(action, Override):
             await self._emit(
                 "plan.updated",

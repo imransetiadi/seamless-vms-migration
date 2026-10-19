@@ -4989,6 +4989,31 @@ async def test_a_change_to_a_migration_being_finalized_is_refused_before_the_pla
                 await task
 
 
+@pytest.mark.parametrize("half", ["plan", "migration"])
+async def test_a_strategy_change_cut_short_by_a_failed_write_is_never_undone_silently(
+    tmp_path, store, refuse_write, half
+):
+    """SDD §8 (review ST-08): a strategy change writes the plan's strategy_overrides entry first
+    and the migration's strategy after it. A failure of the first changes nothing; a failure of
+    the second leaves the plan setting the strategy asked, which the next validation applies.
+    The migration written first looked changed while the next validation silently re-selected
+    the old strategy."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    chosen = next(e.strategy for e in m.estimates if e.eligible and e.strategy != m.strategy)
+    refused = refuse_write(store, "UPDATE documents", half)
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await h.orch.set_strategy(m.id, chosen, "rina")
+    assert refused == [f"UPDATE documents {half}"]
+    stored = await h.migration(m.id)
+    pinned = (await h.plan(plan.id)).strategy_overrides.get("vm-1")
+    # the first write refused: nothing changed; the second: the plan sets what was asked
+    assert (stored.strategy, pinned) == (m.strategy, None if half == "plan" else chosen)
+    await h.orch.validate_plan(plan.id, "alice")
+    assert (await h.migration(m.id)).strategy == (m.strategy if half == "plan" else chosen)
+
+
 async def test_set_strategy_clears_force_window(tmp_path, store):
     """SDD §5.4: approvals, cutover_requested and a pending force_window belong to the assessment
     they were given for — a strategy change clears all three."""
@@ -5321,8 +5346,10 @@ async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_
     tmp_path, store
 ):
     """SDD §14.6 (advisor Phase 1 audit, A4): once the plan sets the VM's strategy, the newest
-    recommendation no longer stands - approving it would flip the strategy back against the plan;
-    and an approved decision is not approved again (one event per decision status change)."""
+    recommendation no longer stands - approving it, or overriding it to another option, would
+    flip the strategy back against the plan (an override to the option the plan sets is the retry
+    of one cut off, review ST-07); and an approved decision is not approved again (one event per
+    decision status change)."""
     advisor, _ = _tie_advisor("warm", 0.99)
     h, plan = await setup(
         tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
@@ -5335,7 +5362,7 @@ async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_
     store.put("plan", pinned)
     for decide in (
         lambda: h.orch.approve_recommendation(rec.id, "rina"),
-        lambda: h.orch.override_recommendation(rec.id, "cold", "the owner chose cold", "rina"),
+        lambda: h.orch.override_recommendation(rec.id, "warm", "the owner chose warm", "rina"),
     ):
         with pytest.raises(NotAllowed) as refused:
             await decide()
