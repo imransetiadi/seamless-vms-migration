@@ -214,3 +214,37 @@ def test_a_value_compose_would_interpolate_stops_the_targets_that_use_it(
     assert stopped.returncode != 0, stopped.stdout
     assert f"sets {key} through a variable" in stopped.stderr, stopped.stderr
     assert dry("seamless-stop").returncode == 0
+
+
+@pytest.mark.parametrize(
+    "target", ["seamless-up", "seamless-start", "seamless-restart", "deploy-runtime-check"]
+)
+@pytest.mark.parametrize(
+    ("env_file", "key"),
+    [
+        ('SEAMLESS_HOST_PORT="18081\n', "SEAMLESS_HOST_PORT"),
+        ('SEAMLESS_VERSION="0.2.0\nSEAMLESS_HOST_PORT=18081\n', "SEAMLESS_VERSION"),
+    ],
+    ids=["the port's line", "another key's line"],
+)
+def test_an_unclosed_quote_stops_the_targets_as_such(tmp_path, target, env_file, key):
+    """SDD §17.2 (review RV47-03): a quote never closed on any line of .env is no value Compose
+    interpolates - Compose refuses the whole file - and the Make targets that read .env stop
+    before their recipe runs, naming the line's key; they called it "a variable, which Compose
+    interpolates" and sent the operator looking for a '$'."""
+    dotenv = tmp_path / "compose.env"
+    dotenv.write_text(env_file, encoding="utf-8")
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("SEAMLESS_VERSION", "SEAMLESS_HOST_PORT")
+    }
+    stopped = subprocess.run(
+        ["make", "-n", "--no-print-directory", target, f"SEAMLESS_ENV_FILE={dotenv}"]
+        + ["SEAMLESS_HOST_OS=Linux", "SEAMLESS_DOCKER_CONTEXT=default"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert stopped.returncode != 0, stopped.stdout
+    assert f"gives {key} a quote it never closes" in stopped.stderr, stopped.stderr
+    assert "interpolates" not in stopped.stderr, stopped.stderr

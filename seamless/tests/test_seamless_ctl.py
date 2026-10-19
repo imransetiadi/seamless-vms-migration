@@ -989,6 +989,39 @@ def test_the_dotenv_helper_tells_whether_a_key_is_set(tmp_path, dotenv, status):
     assert (done.returncode, done.stdout) == (status, ""), done
 
 
+@pytest.mark.parametrize(
+    ("dotenv", "broken"),
+    [
+        ('KEY=1\nOTHER="open\n', "OTHER"),
+        ('KEY="open\nKEY=1\n', "KEY"),
+        ("export OTHER='open\nKEY=1\n", "OTHER"),
+        ('KEY=1\nOTHER="closed"\n', ""),
+    ],
+    ids=["another key", "an earlier definition", "single quotes", "every quote closed"],
+)
+def test_the_dotenv_helper_refuses_a_file_with_a_quote_it_never_closes(tmp_path, dotenv, broken):
+    """SDD §17.2 (review RV47-01): Compose refuses the whole .env for a quote never closed on any
+    line - another key's, a definition a later line overrides - so the helper refuses any key of
+    such a file, naming the line's key (exit 4); --unclosed prints that key, nothing when every
+    quote closes or there is no file; --defined still only tells whether the key is set."""
+    path = tmp_path / ".env"
+    path.write_text(dotenv)
+
+    def helper(*args):
+        return subprocess.run(["sh", str(DOTENV), *args], capture_output=True, text=True)
+
+    done = helper("KEY", str(path))
+    if broken:
+        assert (done.returncode, done.stdout) == (4, ""), done
+        assert f"{path} gives {broken} a quote it never closes" in done.stderr, done.stderr
+    else:
+        assert (done.returncode, done.stdout) == (0, "1\n"), done
+    unclosed = helper("--unclosed", str(path))
+    assert (unclosed.returncode, unclosed.stdout) == (0, f"{broken}\n" if broken else ""), unclosed
+    assert helper("--defined", "KEY", str(path)).returncode == 0
+    assert (helper("--unclosed", str(tmp_path / "none")).returncode, unclosed.stderr) == (0, "")
+
+
 def test_status_and_drain_ask_the_port_the_stack_publishes(tmp_path):
     """SDD §17.2 (review RV38B-07): with SEAMLESS_HOST_PORT moved in deploy/compose/.env, Compose
     publishes that port - status and a drain ask it, so the operator's token never goes to
@@ -2399,8 +2432,9 @@ TROUBLESHOOTING = {
     "locks this address out after failed attempts (HTTP 429)": (
         "the API at ... locks this address out after failed attempts (HTTP 429)"
     ),
-    "gives SEAMLESS_HOST_PORT a quote it never closes, which": (
-        "deploy/compose/.env gives SEAMLESS_HOST_PORT a quote it never closes ..."
+    "gives $(unclosed_key) a quote it never closes, which": (
+        "deploy/compose/.env gives KEY a quote it never closes, which Compose refuses with the "
+        "whole file"
     ),
     "the API refused to pause plan $id (HTTP $code): it was not paused": (
         "the API refused to pause plan ... (HTTP 4xx): it was not paused"
@@ -2459,6 +2493,93 @@ def test_an_unclosed_quote_is_named_where_the_api_is_asked(tmp_path, argv, or_ur
     assert proc.returncode == 2 and calls == [], proc.stderr
     assert proc.stderr.count("a quote it never closes") == 1, proc.stderr
     assert ("or --url" in proc.stderr) == or_url, proc.stderr
+
+
+#: each single-host drain and the Make target its action ends in
+HOST_DRAINS = {
+    "stop": (["stop"], "seamless-stop"),
+    "down": (["down"], "seamless-down"),
+    "scale 0": (["scale", "0"], "seamless-stop"),
+    "restart": (["restart"], "seamless-restart"),
+    "capacity": (["capacity", "--max-migrations", "20"], "seamless-restart"),
+}
+#: a .env Compose refuses with the whole file, the key it names, and the shell's port
+UNCLOSED_QUOTES = {
+    "the shell sets the port": (
+        'POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT="8081\n',
+        "SEAMLESS_HOST_PORT",
+        "8081",
+    ),
+    "a later line redefines it": (
+        'POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT="8081\nSEAMLESS_HOST_PORT=8081\n',
+        "SEAMLESS_HOST_PORT",
+        None,
+    ),
+    "another key's line": (
+        'POSTGRES_PASSWORD=x\nSEAMLESS_VERSION="0.1\n',
+        "SEAMLESS_VERSION",
+        None,
+    ),
+}
+
+
+@pytest.mark.parametrize("action", list(HOST_DRAINS))
+@pytest.mark.parametrize("where", list(UNCLOSED_QUOTES))
+def test_an_unclosed_quote_anywhere_in_env_is_refused_before_every_single_host_drain(
+    tmp_path, action, where
+):
+    """SDD §17.2 (review RV47-01): Compose refuses the whole .env for a quote never closed on any
+    line, whatever the shell sets - the Make targets load --env-file .env for every command. The
+    check read SEAMLESS_HOST_PORT's last definition only, and none when the shell set the port: the
+    drain paused every plan, then the Make target's Compose refused (the stub make answers the
+    action's target as that refusal ends it). It is refused before the drain, naming its key."""
+    argv, target = HOST_DRAINS[action]
+    env_file, key, shell_port = UNCLOSED_QUOTES[where]
+    rules = [
+        *_drain_rules([{"stdout": "[]"}]),
+        {"cmd": "make", "has": [target], "answers": [{"exit": 2}]},
+    ]
+    proc, calls, _ = _run(
+        tmp_path, "docker", *argv, "--drain", "@TOKEN_FILE", env_file=env_file, rules=rules,
+        environment={"SEAMLESS_HOST_PORT": shell_port} if shell_port else None,
+    )  # fmt: skip
+    assert proc.returncode == 2 and not _paused(calls), (proc.stderr, _paused(calls))
+    assert target not in " ".join(_args(calls, "make")), _args(calls, "make")
+    assert proc.stderr.count(f"gives {key} a quote it never closes") == 1, proc.stderr
+    assert "--url" not in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("engine", ["docker", "podman"])
+def test_status_is_not_advised_url_for_a_quote_its_compose_refuses(tmp_path, engine):
+    """SDD §17.2 (review RV47-02): the single host's status runs make seamless-ps, whose Compose
+    loads the same .env and refuses the whole file for a quote never closed - "--url" gets it past
+    nothing; only resume, which runs no Compose, is advised it."""
+    proc, calls, _ = _run(
+        tmp_path, engine, "status", env_file=UNCLOSED_QUOTES["another key's line"][0]
+    )
+    assert proc.returncode == 2 and calls == [], proc.stderr
+    assert "gives SEAMLESS_VERSION a quote it never closes" in proc.stderr, proc.stderr
+    assert "--url" not in proc.stderr, proc.stderr
+
+
+def test_the_cannot_tell_the_port_row_names_only_a_value_compose_interpolates(tmp_path):
+    """docs/Operations.md §7 (review RV47-04): an unclosed quote has its own refusal wherever the
+    script reads the port - "cannot tell the port the stack publishes" is never said for it - so
+    that row names a value Compose interpolates alone."""
+    env_file = UNCLOSED_QUOTES["the shell sets the port"][0]
+    for argv in (
+        ["stop", "--drain", "@TOKEN_FILE"],
+        ["resume", "--token-file", "@TOKEN_FILE", "plan-aa"],
+        ["status"],
+    ):
+        proc, _, _ = _run(tmp_path / argv[0], "docker", *argv, env_file=env_file)
+        assert proc.returncode == 2 and "cannot tell the port" not in proc.stderr, proc.stderr
+        assert "a quote it never closes" in proc.stderr, proc.stderr
+    ops = (ROOT / "docs" / "Operations.md").read_text(encoding="utf-8")
+    row = next(
+        line for line in ops.splitlines() if line.startswith("| `cannot tell the port the stack")
+    )
+    assert "quote" not in row, row
 
 
 def test_a_port_left_to_compose_is_said_once_as_such_and_the_stop_runs(tmp_path):

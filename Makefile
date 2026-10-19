@@ -407,11 +407,15 @@ SEAMLESS_ENV_FILE       := $(SEAMLESS_COMPOSE_DIR)/.env
 # the value Compose reads for the key $(1) from SEAMLESS_ENV_FILE, by compose-go's dotenv rules - a byte-order mark, an
 # export prefix, a key ended by = or :, spaces, quotes, an inline comment after " #", the last definition wins
 # (scripts/dotenv-value.sh, SDD §17.2, reviews RV38B-09, RV41A-01)
-SEAMLESS_DOTENV = $(shell sh scripts/dotenv-value.sh $(1) $(SEAMLESS_ENV_FILE) 2>/dev/null || echo SEAMLESS_DOTENV_REFUSED)
-# a value the reader refused - Compose would interpolate it - stops a target whose recipe uses it, before the recipe
-# runs, never guessed (SDD §17.2, review RV41A-02)
-SEAMLESS_DOTENV_STOP = $(if $(filter SEAMLESS_DOTENV_REFUSED,$($(1))),$(error $(SEAMLESS_ENV_FILE) sets $(1) through \
-  a variable, which Compose interpolates: the Make targets read plain values - write the value itself (SDD 17.2)))
+SEAMLESS_DOTENV = $(shell sh scripts/dotenv-value.sh $(1) $(SEAMLESS_ENV_FILE) 2>/dev/null || echo SEAMLESS_DOTENV_REFUSED_$$?)
+# a value the reader refused stops a target whose recipe uses it, before the recipe runs, never guessed: a quote never
+# closed on any line of the file - Compose refuses the whole file, the reader exits 4 - named with its line's key, or a
+# value Compose would interpolate (SDD §17.2, reviews RV41A-02, RV47-03)
+SEAMLESS_DOTENV_STOP = $(if $(filter SEAMLESS_DOTENV_REFUSED_4,$($(1))),$(error $(SEAMLESS_ENV_FILE) gives \
+  $(shell sh scripts/dotenv-value.sh --unclosed $(SEAMLESS_ENV_FILE)) a quote it never closes, which Compose refuses \
+  with the whole file: close it (SDD 17.2)),$(if $(filter SEAMLESS_DOTENV_REFUSED_%,$($(1))),$(error \
+  $(SEAMLESS_ENV_FILE) sets $(1) through a variable, which Compose interpolates: the Make targets read plain values - \
+  write the value itself (SDD 17.2))))
 SEAMLESS_TOKENS_FILE    := $(SEAMLESS_COMPOSE_DIR)/tokens.yaml
 # optional: restrict logs to one service, e.g. make seamless-logs SEAMLESS_SERVICE=seamless
 SEAMLESS_SERVICE        ?=

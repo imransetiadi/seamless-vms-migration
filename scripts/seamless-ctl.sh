@@ -197,6 +197,10 @@ elif [ -n "$MAX_MIGRATIONS$MAX_CUTOVERS$CPU$MEMORY" ]; then
   refuse "--max-migrations, --max-cutovers, --cpu and --memory go with capacity"
 fi
 
+# The key of deploy/compose/.env's first line whose quote never closes - which Compose refuses with the whole file -,
+# nothing when every quote closes or there is no .env (scripts/dotenv-value.sh, reviews RV46A-01, RV47-01)
+unclosed_key() { sh "$ROOT/scripts/dotenv-value.sh" --unclosed "$ROOT/deploy/compose/.env"; }
+
 if [ "$KIND" = host ]; then
   # the port Compose publishes: the shell's, else deploy/compose/.env's read by Compose's rules, else 8080; a value
   # Compose would interpolate is refused, never guessed, where the API is asked (SDD §17.2, reviews RV38B-07,
@@ -218,8 +222,10 @@ if [ "$KIND" = host ]; then
     case $ACTION in resume | status) or_url=', or --url' ;; *) or_url='' ;; esac
     case $port in
       '?')
-        [ "$unread" != 4 ] || refuse "deploy/compose/.env gives SEAMLESS_HOST_PORT a quote it never closes, which" \
-          "Compose refuses: close it$or_url"
+        # a quote never closed: Compose refuses the whole file - status's make seamless-ps too -, so --url helps only
+        # resume, which runs no Compose (reviews RV47-01, RV47-02)
+        [ "$unread" != 4 ] || refuse "deploy/compose/.env gives $(unclosed_key) a quote it never closes, which" \
+          "Compose refuses with the whole file: close it$([ "$ACTION" != resume ] || echo ', or --url')"
         case $ACTION in
           restart | capacity) refuse "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value" ;;
           *) refuse "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value, or --url" ;;
@@ -544,22 +550,21 @@ host_restart_check() {
 # (SDD §17.2, reviews RV44A-06, RV45A-01). A value Compose would interpolate only Compose can judge: the restart's Make
 # target refuses it (SEAMLESS_DOTENV_STOP), so the restart's check does; a stop's Compose reads it.
 host_port_check() {
-  local value='' rc=0
+  local value='' rc=0 broken
+  # a quote never closed on any line is no interpolation: Compose refuses the whole file, for every command, whatever
+  # the shell sets (reviews RV46A-01, RV47-01)
+  broken=$(unclosed_key)
+  [ -z "$broken" ] || check_failed "deploy/compose/.env gives $broken a quote it never closes, which Compose" \
+    "refuses with the whole file: close it; nothing was changed"
   if [ -n "${SEAMLESS_HOST_PORT+set}" ]; then
     value=$SEAMLESS_HOST_PORT
   elif [ -f "$ROOT/deploy/compose/.env" ]; then
     value=$(sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env" 2>/dev/null) || rc=$?
-    case $rc in
-      0) ;;
-      # a quote never closed is no interpolation: Compose refuses the whole file, for every command (review RV46A-01)
-      4) check_failed "deploy/compose/.env gives SEAMLESS_HOST_PORT a quote it never closes, which Compose" \
-        "refuses: close it; nothing was changed" ;;
-      *)
-        [ "${1-}" = restart ] || return 0
-        check_failed "the restart's Make target cannot read SEAMLESS_HOST_PORT in deploy/compose/.env: give it a" \
-          "plain value; nothing was changed"
-        ;;
-    esac
+    if [ "$rc" != 0 ]; then
+      [ "${1-}" = restart ] || return 0
+      check_failed "the restart's Make target cannot read SEAMLESS_HOST_PORT in deploy/compose/.env: give it a" \
+        "plain value; nothing was changed"
+    fi
   fi
   is_port "${value:-8080}" ||
     check_failed "SEAMLESS_HOST_PORT is '$value', no port Compose publishes: give a number from 1 to 65535;" \

@@ -330,8 +330,8 @@ version, then resume the plans.
 | `xtrace (bash -x) is on ...` | Run without `bash -x`: it would print the token. |
 | `a migration is still in cutover after 1800s: nothing was stopped` | A cutover outlasted `--wait-timeout`. Nothing was stopped and the plans stay paused: wait and retry, or raise `--wait-timeout`. |
 | `on kubernetes the API is reached through the Route or Ingress: give its URL with --url` | `--drain`, `resume` and the health check need the external URL on a cluster. |
-| `cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value` | `deploy/compose/.env` sets `SEAMLESS_HOST_PORT` through a variable (a `$`) or an unclosed quote, which Compose would read differently: write the number itself. |
-| `deploy/compose/.env gives SEAMLESS_HOST_PORT a quote it never closes ...` | Compose refuses the whole `.env` for it, for every command: close the quote. Nothing was paused or changed. |
+| `cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value` | `deploy/compose/.env` sets `SEAMLESS_HOST_PORT` through a variable (a `$`), which only Compose can resolve: write the number itself. |
+| `deploy/compose/.env gives KEY a quote it never closes, which Compose refuses with the whole file ...` | A line of `.env` - the named key's, whatever the shell sets and whatever a later line defines - opens a quote it never closes, and Compose refuses the whole file for every command, `make` included: close the quote. Nothing was paused or changed; only `resume`, which runs no Compose, can take `--url` past it. |
 | `SEAMLESS_HOST_PORT is '...', no port ...` | The value is no port Compose can publish (an address in front, a stray character, a number outside 1-65535): write the number alone. |
 | `the restart's Make target cannot read SEAMLESS_HOST_PORT ...` | The same, found before a `--drain`: nothing was paused or changed. |
 | `deploy/compose/.env is missing` / `tokens.yaml is missing` | `make seamless-init` first; nothing was paused or changed. |
