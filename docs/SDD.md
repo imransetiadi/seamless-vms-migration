@@ -3121,11 +3121,12 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   can only complete: an override's plan entry first, then the migration (strategy, `advisor_hold` cleared), then the
   decision and its event - a decision is never stored `approved` while its migration stays held, and an approver's
   retry after a failure decides again, its one event following its write (review ST-07). Neither acts while the plan
-  sets the VM's strategy
-  (`strategy_overrides` names it: a person chose it in the plan, §9.2, and a validation honours that without
-  recording a recommendation, so the newest one no longer stands — 409 "The plan sets the strategy of <vm>
-  (<option>): change it in the plan."), and an approve of a decision already `approved` is refused (409 "The
-  decision is already approved."): one event per decision status change (§14.5).
+  sets the VM's strategy (`strategy_overrides` names it: a person chose it in the plan, §9.2, and a validation
+  honours that without recording a recommendation, so the newest one no longer stands — 409 "The plan sets the
+  strategy of <vm> (<option>): change it in the plan.") - save an override that chooses the option the plan sets:
+  the retry of an override a failure cut off after its plan entry was written, which then records the decision
+  (review ST-07) -, and an approve of a decision already `approved` is refused (409 "The decision is already
+  approved."): one event per decision status change (§14.5).
 * **Maker-checker** (ADV-17): a recommendation recorded by a validation names the validating user in `requested_by`
   (the demo's own validations: `demo`). When the policy in force requires a distinct approver (the default, the
   built-in `global-default` too), that user neither approves nor overrides the decision: 409 "You requested this
