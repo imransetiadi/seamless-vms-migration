@@ -209,6 +209,11 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
         flavor_extra_specs: dict[str,str] = {}, cbt_enabled: bool|null = null,
         snapshot_count: int = 0, tools_ok: bool|null = null,
         change_rate_bps: float|null = null,
+        task_state: str|null = null,  # OpenStack: the task Nova runs on the server whatever its status
+                                      # (OS-EXT-STS:task_state: image_uploading, powering-off, ...), which
+                                      # power_state does not read - a running guest a backup snapshots stays
+                                      # running for the source watch (§8.1); null for none, for VMware and on
+                                      # a VM validated before it was recorded (review PV-05)
         key_name: str|null = null }   # the Nova keypair the server boots with (OpenStack); VMware: null
    derived (properties, also serialized): disk_bytes: int, used_bytes: int, guest_os: GuestOS
    (used_bytes = Σ used_gb·2^30 when every disk has used_gb, else ⌊disk_bytes·0.6⌋;
@@ -2166,7 +2171,7 @@ Finding catalog (code — severity — condition):
 | Code | Severity | Condition |
 |---|---|---|
 | `SRC_VM_ERROR_STATE` | blocker | `power_state == "error"` |
-| `SRC_VM_TRANSITIONAL_STATE` | blocker | `power_state == "transitioning"`: a Nova task is in flight (resize, verify-resize, migration, rescue, rebuild, reboot, build) — a stop or snapshot would fail after approval; wait until the VM is ACTIVE or SHUTOFF, then re-validate |
+| `SRC_VM_TRANSITIONAL_STATE` | blocker | `power_state == "transitioning"` or a `task_state`: a Nova task is in flight (resize, verify-resize, migration, rescue, rebuild, reboot, build; under ACTIVE or SHUTOFF an image snapshot or its upload, a stop or a start, named in the message) — a stop or snapshot would fail after approval; wait until the VM is ACTIVE or SHUTOFF with no task, then re-validate (review PV-05) |
 | `SRC_VM_VOLUME_DETACHED` | blocker | a re-assessment of a migration whose history reached `cutover` finds a volume of its validated `vm.disks` no longer attached to the VM (an earlier attempt's cold export may have left it detached, §6.6); the volume stays among the migration's disks (§5.4) — attach it to the source VM again, then re-validate; to migrate the VM without it, cancel the migration and plan the VM anew |
 | `SRC_VM_DUPLICATE_NAME` | blocker | another selected VM has the same name (os-migrate filters by name); from a VMware source instead one whose name the migration kit writes alike, the same name included - §7.2's `<kit name>`, e.g. `web.01` and `web_01`, or two names that differ only past its 64-character cut: the kit names each VM's server, ports and volumes after it and finds a volume again by that name, so one VM's data would go into the other's volume (review RV26-04). The message names the kit's name and every VM written alike, and its remediation says that separate plans into one destination project do not part them (review RV28-04) |
 | `SRC_VM_NAME_UNUSABLE` | blocker | a VMware VM's name of which the migration kit keeps no character (§7.2's `<kit name>` is empty: Japanese, Cyrillic, punctuation): the kit would create its server, ports and volumes without a name, after its migrate task powered the VM off (review RV26-04) |
