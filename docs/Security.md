@@ -399,6 +399,7 @@ malicious, corruption).
 |---|---|---|---|
 | Admin and operator API tokens | `compose-init.sh`, `seamless token create` | holder's password manager; hash in `tokens.yaml` / Secret `seamless-tokens` | §5.1 |
 | Dashboard users' tokens | an admin's **Users > Add user** (`POST /users`) | holder's password manager; digest in the database (`documents`, kind `user`) | §5.1: delete the user's row (no restart), create the user again |
+| The operator token file of `seamless-ctl.sh --drain` and `resume` | the operator, from their password manager (docs/Operations.md §5) | a file only its owner may read - the script refuses any other mode, and hands curl the token through a header file in a private directory, never a command line (SDD §17.2) | with the token it holds (§5.1); remove the file after the planned stop |
 | `POSTGRES_PASSWORD` | `compose-init.sh` (`openssl rand -hex 24`) / `oc create secret` | `.env` (0600) / Secret `seamless-db` | annually or on suspicion: `ALTER USER seamless PASSWORD '…'` **and** update `SEAMLESS_DB_URL`; Compose `--rotate-db-password` only for a *new* DB |
 | `JEV_MCP_AUTH_TOKEN` | `compose-init.sh` | `.env` | any time: `compose-init.sh --force --keep-token` (plain `--force` also replaces the admin token), recreate the stack |
 | `TYPESAFE_API_KEY` | provider console | caller's environment → `.env` / Secret `seamless-ai` | quarterly, on staff change, on suspicion; issue separate keys per environment; revoke the old key at the provider |
@@ -798,6 +799,8 @@ repository at commit `fbf3509` (upstream os-migrate `main` after 1.0.5, the fork
       `seamless events prune --older-than-days N --confirm`); alerting on `auth.denied` bursts.
 - [ ] Dependency and image scans run monthly and before releases (QASuite §10).
 - [ ] Incident contacts and the playbooks in §13 rehearsed once per release.
+- [ ] An operator token file kept for `seamless-ctl.sh --drain`/`resume` is mode 0600, holds a token of the operator
+      role, and is removed after the planned stop (the script refuses a file others may read).
 
 ---
 
@@ -866,7 +869,8 @@ from `GET /migrations`); revoke the link key (SEC-06); rebuild hosts with new ke
 from `checkpoint`).
 
 **E. Suspected data corruption or tampering:** pause the plan; do not finalize; run the checksum comparison
-(QASuite §8) on the affected disks; keep the source VM available (it is untouched until finalize) and use
+(QASuite §8) on the affected disks; keep the source VM available (it is stopped, never deleted, until finalize - a storage handover deletes its
+server at cutover and keeps its volumes, and its rollback recreates it, SDD §7.3) and use
 `rollback` if verification is in doubt; collect `blocksync` logs and manifests; open an S1 defect.
 
 **F. Database exposed or tampered:** rotate the DB password (`ALTER USER … PASSWORD …` and the Secret); compare
