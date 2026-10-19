@@ -18,6 +18,12 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils import (
     server,
     volume_common,
 )
+from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+    import_workload_export_volumes as export_module,
+)
+from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+    import_workload_transfer_volumes as transfer_module,
+)
 from ansible_collections.os_migrate.os_migrate.tests.unit import fake_openstack as fake
 
 CONV = "10.1.0.10"
@@ -135,7 +141,7 @@ def test_update_progress_replaces_state_file_atomically(tmp_path):
     assert os.listdir(str(tmp_path)) == ["vm1.state"]
 
 
-def _exporter(nbdkit_installed):
+def _exporter(nbdkit_installed, val=None):
     src = fake.FakeCloud("src")
     conv = src.add_conversion_host("src-conv", "10.0.0.10")
     # the volume the map names is on the conversion host, at /dev/vdb: the export checks the
@@ -147,7 +153,7 @@ def _exporter(nbdkit_installed):
             return 0 if command[1] == "qemu-nbd" or nbdkit_installed else 1
         return None
 
-    shells = fake.ShellFactory([src], val=which)
+    shells = fake.ShellFactory([src], val=val or which)
     export = volume_common.OpenstackVolumeExport(
         src, "src-conv", "/keys/k", "cloud-user", "uuid-1", shell_factory=shells
     )
@@ -155,6 +161,33 @@ def _exporter(nbdkit_installed):
         "/dev/vda": {"source_id": "vol-1", "source_dev": "/dev/vdb", "port": None}
     }
     return export, shells
+
+
+PROBES = {
+    "which qemu-nbd": ["which", "qemu-nbd"],
+    "which nbdkit": ["which", "nbdkit"],
+    "the file plugin": ["nbdkit", "--dump-plugin", "file"],
+}
+
+
+@pytest.mark.parametrize("status", [255, -9], ids=["ssh failed", "ssh killed"])
+@pytest.mark.parametrize("probe", list(PROBES))
+def test_ssh_failing_at_an_export_tool_probe_is_an_ssh_timeout_never_a_missing_tool(probe, status):
+    """Seamless Migrate SDD 6.6 (review 45b, lead 4): the cold export probes for its NBD server -
+    which qemu-nbd, which nbdkit, nbdkit's file plugin. Ssh's own failure at a probe (255, or a
+    negative status: ssh killed on the migrator) read as the tool missing: the export picked the
+    other tool on a guess, and with ssh failing at all three it failed as "No supported NBD export
+    tool available!", permanent. It gives up as an ssh timeout, retried."""
+    def probes(command):
+        if command == PROBES[probe]:
+            return status
+        return 0 if command in PROBES.values() else None
+
+    export, shells = _exporter(nbdkit_installed=True, val=probes)
+    with pytest.raises(RuntimeError, match=r"SSH timeout: conversion host 10\.0\.0\.10 unreachable over SSH"):
+        export._export_volumes_from_converter()
+    started = [c for c in shells.commands_at("10.0.0.10") if c[:2] in (["sudo", "nbdkit"], ["sudo", "qemu-nbd"])]
+    assert started == []  # no tool picked on a guess
 
 
 def test_nbdkit_export_is_read_only():
@@ -1722,3 +1755,188 @@ def test_an_ssh_failure_at_the_removal_is_not_reported_as_rms_own_exit(tmp_path)
     assert "exited 255" not in message, message
     assert "ssh failed at the removal" in message, message
     assert "/dev/disk/by-id/virtio-" + LEAVING_ID[:20] in message and CONV in message, message
+
+
+# --- ssh killed on the migrator at every site that tells ssh's failure from the command's -----------
+# (Seamless Migrate SDD 6.6, reviews RV44B-03, RV45B-03): each test pins one site, which its 255-only
+# form (before 0577c573) fails.
+KILLED = -9  # subprocess's status for ssh killed by SIGKILL on the migrator
+
+
+def _bare(cls, shell):
+    obj = object.__new__(cls)
+    obj.log, obj.shell = mock.Mock(), shell
+    return obj
+
+
+def test_a_lock_wait_gives_up_as_a_lock_timeout_when_ssh_is_killed_at_every_try():
+    """use_lock's outage counter: a killed ssh at every try is the outage window's, given up as
+    "Lock timeout" (retried), never 1800 tries ending in "Unable to acquire lock" (permanent)."""
+    transfer, clock, guarded = _guarded_attach([KILLED] * 1800)
+    with mock.patch.object(volume_common, "time", clock):
+        with pytest.raises(RuntimeError, match=r"Lock timeout: conversion host 10\.1\.0\.10 unreachable"):
+            guarded(transfer)
+
+
+def test_ssh_killed_at_the_by_id_link_check_gives_up_as_an_ssh_timeout():
+    """_identified_path: the by-id link check with ssh killed gives up as "SSH timeout" - never
+    "has no link: using it by its path", the disk then served by a path another volume can take."""
+
+    class Host:
+        address = CONV
+
+        def cmd_out(self, command, **kwargs):
+            return "dvol-1"  # the disk's serial: the volume's id
+
+        def cmd_val(self, command, **kwargs):
+            return KILLED  # test -b /dev/disk/by-id/virtio-dvol-1
+
+    check = _bare(volume_common.OpenstackVolumeTransfer, Host())
+    with pytest.raises(RuntimeError, match="SSH timeout: conversion host %s unreachable over SSH, checking the by-id link" % CONV):
+        check._identified_path("dvol-1", "/dev/vdc")
+
+
+def test_the_port_probe_counts_a_killed_ssh_as_the_outage():
+    """_test_port_available: a killed ssh is no port in use - the probe's outage window sees it."""
+
+    class Host(PortShell):
+        def cmd_val(self, command, **kwargs):
+            return KILLED
+
+    probe = _bare(volume_common.OpenstackVolumeTransfer, Host(free=1))
+    outage = volume_common.SshOutage(CONV, "a free port")
+    assert probe._test_port_available(49152, outage) is False
+    assert outage.failing
+
+
+class KilledSilentHost(SilentHost):
+    """SilentHost whose ssh is killed (-9) at every `qemu-img info` instead of failing (255)."""
+
+    def cmd_out(self, command, **kwargs):
+        if command[:2] == ["qemu-img", "info"]:
+            self.clock.now += 10
+            raise subprocess.CalledProcessError(KILLED, ["ssh", self.address] + list(command))
+        return PortShell.cmd_out(self, command, **kwargs)
+
+
+@pytest.mark.parametrize("waits_for", ["the forwarded exports", "an nbdkit socket"])
+def test_a_transfers_wait_gives_up_after_the_window_when_ssh_is_killed(waits_for):
+    """The transfer's waits for the forwarded exports and for an nbdkit socket count a killed ssh
+    as the outage and give up as "SSH timeout" after the window, never after 1800 tries as
+    "Timed out ..." (no "timeout" the classifier reads as transient)."""
+    src, dst = fake.FakeCloud("src"), cloud()
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    volume_map = {"/dev/vda": dict(cold_volume_map()["/dev/vda"], port=10809)}
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = transfer_module.OpenStackDestinationVolume(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1", "10.0.0.10", volume_map,
+            workload(), timeout=1800,
+        )  # fmt: skip
+    clock = Clock()
+    transfer.shell = KilledSilentHost(clock)
+    with mock.patch.object(volume_common, "time", clock):
+        with pytest.raises(RuntimeError, match="SSH timeout: conversion host %s unreachable" % CONV):
+            if waits_for == "an nbdkit socket":
+                transfer._setup_nbdkit_direct_urls("nbd+unix:///?socket=/run/nbd.sock", "disk1")
+            else:
+                transfer._create_forwarding_process()
+
+
+def test_the_exports_wait_gives_up_after_the_window_when_ssh_is_killed():
+    """The export's wait for its NBD exports counts a killed ssh as the outage: "SSH timeout"
+    after the window, never "Timed out starting nbdkit exports!" after 1800 tries."""
+    from ansible_collections.os_migrate.os_migrate.tests.unit.test_conversion_host_outage import (
+        COMMON,
+        RebootingHost,
+        _boot_from_volume_vm,
+        _run,
+    )
+
+    class KilledRebootingHost(RebootingHost):
+        """RebootingHost whose ssh is killed (-9) while the host is down, instead of failing (255)."""
+
+        def __call__(self, address, ssh_user, key_path=None):
+            shell = super().__call__(address, ssh_user, key_path)
+            out, val = shell.cmd_out, shell.cmd_val
+
+            def cmd_out(command, **kwargs):
+                try:
+                    return out(command, **kwargs)
+                except subprocess.CalledProcessError as err:
+                    if err.returncode == 255:
+                        raise subprocess.CalledProcessError(KILLED, err.cmd) from None
+                    raise
+
+            def cmd_val(command, **kwargs):
+                status = val(command, **kwargs)
+                return KILLED if status == 255 else status
+
+            shell.cmd_out, shell.cmd_val = cmd_out, cmd_val
+            return shell
+
+    src, data = _boot_from_volume_vm()
+    clock = Clock()
+    host = KilledRebootingHost(src, clock, None, 10 ** 9, starts=lambda command: command[:2] == ["qemu-img", "info"])
+    host.armed = True
+    with mock.patch.object(volume_common, "time", clock):
+        exported = _run(export_module, dict(COMMON, data=data, timeout=1800), src, host)
+    assert exported.get("failed"), exported
+    assert "SSH timeout: conversion host 10.0.0.10 unreachable over SSH" in exported["msg"], exported
+
+
+class CheckHost:
+    """The conversion host as _check_still_a_disk meets it: each command's status in turn."""
+
+    address = CONV
+
+    def __init__(self, **status):
+        self.status = status
+
+    def cmd_val(self, command, **kwargs):
+        return self.status[{"-b": "b", "-f": "f"}.get(command[1], "rm")]
+
+
+def test_ssh_killed_at_the_check_after_a_copy_ssh_killed_gives_up_as_an_ssh_timeout():
+    """nbdcopy's ssh killed (-9) and ssh killed again at `test -b`: ssh broke both - "SSH
+    timeout", retried, never nbdcopy's own failure "Return code: -9", permanent."""
+    check = _bare(volume_common.OpenstackVolumeTransfer, CheckHost(b=KILLED))
+    with pytest.raises(RuntimeError) as caught:
+        check._check_still_a_disk("dvol-1", "/dev/vdc", KILLED)
+    assert str(caught.value).startswith("SSH timeout:"), str(caught.value)
+
+
+def test_ssh_killed_at_the_removal_of_a_file_left_is_said_as_such():
+    """A regular file where the volume was, ssh killed at `sudo rm -f`: "ssh failed at the
+    removal", never "sudo rm -f exited -9"."""
+    check = _bare(volume_common.OpenstackVolumeTransfer, CheckHost(b=1, f=0, rm=KILLED))
+    with pytest.raises(volume_common.DiskIdentityError) as caught:
+        check._check_still_a_disk("dvol-1", "/dev/vdc", 0)
+    assert "ssh failed at the removal" in str(caught.value), str(caught.value)
+
+
+def test_ssh_killed_at_the_file_check_is_said_as_could_not_be_checked():
+    """Not a disk, ssh killed at `test -f`: whether a file was left "could not be checked (ssh
+    failed)", never "left the host after nbdcopy finished"."""
+    check = _bare(volume_common.OpenstackVolumeTransfer, CheckHost(b=1, f=KILLED))
+    with pytest.raises(volume_common.DiskIdentityError) as caught:
+        check._check_still_a_disk("dvol-1", "/dev/vdc", 0)
+    assert "could not be checked (ssh failed)" in str(caught.value), str(caught.value)
+
+
+def test_the_source_cleanup_rides_out_a_killed_ssh():
+    """OpenstackVolumeClean._check_ssh: ssh killed at the check is the outage it rides out, never
+    a failure raised at once."""
+
+    class Host:
+        address = CONV
+        tries = 0
+
+        def test_ssh_connection(self):
+            self.tries += 1
+            if self.tries < 3:
+                raise subprocess.CalledProcessError(KILLED, ["ssh", CONV, "echo connected"])
+
+    clean = _bare(volume_common.OpenstackVolumeClean, Host())
+    with mock.patch.object(volume_common, "time", Clock()):
+        clean._check_ssh()
+    assert clean.shell.tries == 3

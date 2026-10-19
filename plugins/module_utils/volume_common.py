@@ -241,8 +241,9 @@ def _checked_give_up_prefix(prefix):
 
 class SshOutage:
     """
-    How long ssh to a conversion host has failed without a break, its own exit
-    status 255: a wait that meets it gives up once that reaches
+    How long ssh to a conversion host has failed without a break - its own exit
+    status 255, or a negative status: ssh killed by a signal on the migrator
+    (ssh_failed; review RV45B-05) -: a wait that meets it gives up once that reaches
     SSH_UNREACHABLE_S, with "{prefix}: conversion host {address} unreachable
     over SSH for {n} s, waiting for {what}", which the control plane retries
     (Seamless Migrate SDD 6.6, review RV8-01, RV9-02, RV9-04); the prefix is
@@ -1437,6 +1438,20 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             mark="source_attached",
         )
 
+    def _tool_present(self, probe):
+        """Whether a probe for an NBD export tool succeeds on the source conversion host. Ssh
+        failing at the probe tells nothing of the tool: it gives up as an ssh timeout, which the
+        control plane retries - read as the tool missing, it picked the other tool on a guess, or
+        failed the export as "No supported NBD export tool available!" (Seamless Migrate SDD 6.6,
+        review 45b lead 4)."""
+        status = self.shell.cmd_val(probe)
+        if ssh_failed(status):
+            raise RuntimeError(
+                "SSH timeout: conversion host %s unreachable over SSH, probing the NBD export tools"
+                % getattr(self.shell, "address", "?")
+            )
+        return status == 0
+
     def _export_volumes_from_converter(self):
         """
         SSH to source conversion host and start an NBD export. Volume mapping
@@ -1456,11 +1471,11 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             self.log.info("Exporting %s from volume %s", disk, volume_id)
 
             # Fall back to qemu-nbd if nbdkit is not present
-            qemu_nbd_present = self.shell.cmd_val(["which", "qemu-nbd"]) == 0
-            nbdkit_present = self.shell.cmd_val(["which", "nbdkit"]) == 0
+            qemu_nbd_present = self._tool_present(["which", "qemu-nbd"])
+            nbdkit_present = self._tool_present(["which", "nbdkit"])
             if nbdkit_present:
                 dump_plugin = ["nbdkit", "--dump-plugin", "file"]
-                file_plugin_present = self.shell.cmd_val(dump_plugin) == 0
+                file_plugin_present = self._tool_present(dump_plugin)
                 if not file_plugin_present:
                     self.log.info("Found nbdkit, but without file plugin.")
             else:
@@ -1812,10 +1827,11 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         not make the volume's link over one, where udev 239 (RHEL 8) replaces
         it - and the error says whether it was removed, could not be removed or
         could not be checked. Ssh failing at the check gives up as SSH timeout
-        after a whole copy (``nbdcopy_exit`` 0) or one ssh broke (255); after
-        nbdcopy failed on its own every answer would be permanent, so its
-        failure stays (Seamless Migrate SDD 6.6, review RV15-02, RV16-02,
-        RV16-03, RV17-01, RV17-04).
+        after a whole copy (``nbdcopy_exit`` 0) or one ssh broke (255, or a
+        negative status: ssh killed, ssh_failed); after nbdcopy failed on its
+        own (a positive exit) every answer would be permanent, so its failure
+        stays (Seamless Migrate SDD 6.6, review RV15-02, RV16-02, RV16-03,
+        RV17-01, RV17-04, RV45B-05).
         """
         found = self.shell.cmd_val(["test", "-b", path])
         if found == 0:

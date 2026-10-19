@@ -440,8 +440,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
   status), keep their command line, which Seamless Migrate retries - and every
   check that tells ssh's failure from the command's reads both alike: the disk
   identity check, the check after a copy, the port map's read and
-  initialisation (which now gives up as "SSH timeout" as the read does) and
-  the outage windows. After
+  initialisation (which now gives up as "SSH timeout" as the read does), the
+  outage windows, and the cold export's probes for its NBD server (``which
+  qemu-nbd``, ``which nbdkit``, nbdkit's file plugin), which read ssh's failure
+  as a missing tool: the export picked the other tool on a guess, or failed as
+  permanent with "No supported NBD export tool available!". After
   nbdcopy exits, whatever its exit, the
   transfer checks that the path it wrote is still a block device: nbdcopy
   opens its destination again with ``O_CREAT`` when the first open fails, so
