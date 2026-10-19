@@ -1712,7 +1712,8 @@ async def test_openstack_find_server_sends_an_anchored_pattern_and_refuses_two_o
 
     assert await provider.find_server("app (blue)_1-a") == "srv-1"
     assert await provider.find_server("absent") is None
-    assert await provider.find_server("caf\u00e9\u2014(2)") is None  # no metacharacter outside ASCII
+    # no metacharacter outside ASCII
+    assert await provider.find_server("caf\u00e9\u2014(2)") is None
     sent = [
         urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["name"][0]
         for method, url in cloud.seen
