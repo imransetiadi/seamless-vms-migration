@@ -3878,9 +3878,10 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   (`seamless-check-context`, `seamless-check-env`: the Docker context, `deploy/compose/.env` and `tokens.yaml`) and
   a `SEAMLESS_HOST_PORT` Compose can load, a port number from 1 to 65535 - every Compose command loads the whole
   project, its published port included (reviews RV44A-06, RV45A-01): a value Compose would interpolate only Compose
-  can judge, refused for `restart` and `capacity`, whose Make target refuses it; on a cluster `kubectl` or `oc`, a
-  read of the Deployment - and of the StatefulSet for `down` - and a server-side dry run of the writes the action
-  starts with -
+  can judge, refused for `restart` and `capacity`, whose Make target refuses it, while a quote never closed, which
+  Compose refuses with the whole file, is refused before every drain (review RV46A-01); on a cluster `kubectl` or
+  `oc`, a read of the Deployment - and of the StatefulSet for `down` - and a server-side dry run of the writes the
+  action starts with -
   the Deployment's scale, or its rollout restart when it runs, and the StatefulSet's scale for `down` -, so a
   mistyped namespace, an expired login or a login that may read but not write shows before the drain (review
   RV45A-02), and for `capacity` `seamless-config` for the concurrency settings and the server-side dry run of its
@@ -3890,8 +3891,9 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   not named (reviews RV43A-04, RV45A-06), while an error a pause may still have been applied before - a 5xx, a
   gateway's 502 or 504 - is named as a pause with no answer (review RV44A-02). The token is judged before any plan
   is listed: one below the operator role (`GET /api/v1/me`) is refused, as its pauses would be (review RV44A-02),
-  and so is one the API does not take (401, 403), and an API that cannot answer that question or list the running
-  plans stops the drain the same way - nothing changed: 2 (review RV45A-07). It prints the plans it paused - also
+  and so is one the API does not take (401, 403) or an address it locks out (429, §13.1: named as such, review
+  RV46A-07), and an API that cannot answer that question or list the running plans stops the drain the same way -
+  nothing changed: 2 (review RV45A-07). It prints the plans it paused - also
   when it fails or is interrupted after a pause, which stops nothing (reviews RV38B-05, RV41A-05) -, which
   `resume --token-file TOKEN_FILE PLAN_ID...` starts again (`POST /plans/{id}/start`) - every plan it is given: one
   that Start refuses (cancelled meanwhile, or a migration blocked: 409) is named, the others start all the same, and
