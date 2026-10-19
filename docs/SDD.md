@@ -449,7 +449,10 @@ migration's totals.
 | `finalized`, `cancelled` | — (terminal) |
 
 `fsm.transition(migration, to, reason, actor) -> Migration` raises `InvalidTransition` for anything
-else, appends a `PhaseChange`, and updates `updated_at`. `validating → cancelled` is taken only by a validation of the plan, for a
+else, appends a `PhaseChange`, and updates `updated_at`. The orchestrator writes a migration's transitions and the
+events that announce them - `migration.created` for a new one, one `migration.phase` per transition - in one
+transaction (`put_all_with_events`, §11): no store failure leaves a phase change without its event, in the audit
+trail or on the live stream (audit AD-05). `validating → cancelled` is taken only by a validation of the plan, for a
 migration an interrupted validation left in `validating` whose VM has left `vm_ids` (§5.4); the cancel action
 refuses a migration in `validating` — a validation may be moving it — and says to validate the plan again. `failed → cancelled` is only allowed when
 `downtime_started_at is None` (the source VM was never stopped), and no phase moves to `cancelled`
@@ -639,9 +642,14 @@ as the blocker `SRC_VM_VOLUME_DETACHED` (§9.3): neither a validation nor the ex
 VM had at a cutover attempt until it is attached again; a re-assessment that read the VM without it would
 otherwise let the next cutover complete one disk short (review RV7-01). A validation writes each migration once — a new one is
 created already assessed, its history running from `pending` through `validating` to `ready` or `blocked`, and an
-existing one takes both transitions in one write — and then emits the same events: `migration.created` for a new
-one and one `migration.phase` per transition. Only an earlier version wrote the two transitions apart, so that a
-database error or a restart between them could leave a migration in `validating`. A VM whose migration is `cancelled` (terminal) cannot be
+existing one takes both transitions in one write — in one transaction with the events that announce them:
+`migration.created` for a new one and one `migration.phase` per transition (§5.1). When the validation records a
+recommendation for it (§14.4), the recommendation, `recommendation.created` and its first `decision.<status>` join
+that transaction - the agentmemory search and the content-addressed input snapshot come before it -, so no store
+failure leaves the advisor's strategy, its hold or its decision without the record and the events that announce it,
+and a cancel that lands meanwhile finds the migration as it was and takes no decision (audit AD-05, AD-11; review
+RV49-06). Only an earlier version wrote the two transitions apart, so that a database error or a restart between
+them could leave a migration in `validating`. A VM whose migration is `cancelled` (terminal) cannot be
 re-validated inside the plan: `validate_plan` refuses with the VM names (remove them from `vm_ids` or
 plan them anew). It refuses a `vm_ids` list that repeats a VM (a plan written before the API check,
 or by `seamless plan apply`): two migrations of one VM would both cut it over. It cancels the
@@ -3092,7 +3100,8 @@ document (kind `recommendation`, §4.2); the engine reads only the decision.
   notes a migration already has. A migration validation leaves alone (in flight or finished, §5.4) gets no
   choice: the advisor is not asked about it and no recommendation is recorded for it. Recording a
   recommendation stores its input snapshot and emits `recommendation.created` and its first
-  `decision.<status>` (§14.5).
+  `decision.<status>` (§14.5), the recommendation and both events in the transaction that writes the
+  migration's assessment (§5.4).
 * Legacy: strategy notes written before this change (`AdvisorNote kind=strategy` in `Migration.advisor_notes`)
   are listed as recommendations with `legacy: true`, id `rec-legacy-<migration id>-<index>`, `legacy_text` =
   the note's summary, the option, confidence and distribution parsed from `data` where present, and a decision
