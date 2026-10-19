@@ -3875,8 +3875,10 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   RV43A-06, RV44A-01) - on the single host `make`, the Make targets' own read-only prerequisites
   (`seamless-check-context`, `seamless-check-env`: the Docker context, `deploy/compose/.env` and `tokens.yaml`) and
   a `SEAMLESS_HOST_PORT` Compose can load, a port number from 1 to 65535 - every Compose command loads the whole
-  project, its published port included (reviews RV44A-06, RV45A-01); on a cluster `kubectl` or `oc`, a read of the
-  Deployment - and of the StatefulSet for `down` - and a server-side dry run of the writes the action starts with -
+  project, its published port included (reviews RV44A-06, RV45A-01): a value Compose would interpolate only Compose
+  can judge, refused for `restart` and `capacity`, whose Make target refuses it; on a cluster `kubectl` or `oc`, a
+  read of the Deployment - and of the StatefulSet for `down` - and a server-side dry run of the writes the action
+  starts with -
   the Deployment's scale, or its rollout restart when it runs, and the StatefulSet's scale for `down` -, so a
   mistyped namespace, an expired login or a login that may read but not write shows before the drain (review
   RV45A-02), and for `capacity` `seamless-config` for the concurrency settings and the server-side dry run of its
