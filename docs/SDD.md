@@ -3908,8 +3908,11 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   (`seamless-check-context`, `seamless-check-env`: the Docker context, `deploy/compose/.env` and `tokens.yaml`) and
   a `SEAMLESS_HOST_PORT` Compose can load, a port number from 1 to 65535 - every Compose command loads the whole
   project, its published port included (reviews RV44A-06, RV45A-01): a value Compose would interpolate only Compose
-  can judge, refused for `restart` and `capacity`, whose Make target refuses it, while a quote never closed, which
-  Compose refuses with the whole file, is refused before every drain (review RV46A-01); on a cluster `kubectl` or
+  can judge, refused for `restart` and `capacity`, whose Make target refuses it, while a quote never closed on any
+  line of `deploy/compose/.env` - whatever the shell sets, and whatever a later line defines - which Compose refuses
+  with the whole file for every command, is refused before every drain, naming its key (reviews RV46A-01, RV47-01):
+  only `resume`, which runs no Compose, is advised `--url` for it (review RV47-02), and the Make targets refuse it
+  as such, never as a value Compose interpolates (review RV47-03); on a cluster `kubectl` or
   `oc`, a read of the Deployment - and of the StatefulSet for `down` - and a server-side dry run of the writes the
   action starts with -
   the Deployment's scale, or its rollout restart when it runs, and the StatefulSet's scale for `down` -, so a
