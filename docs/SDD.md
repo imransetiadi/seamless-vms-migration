@@ -930,6 +930,16 @@ spawn (it builds the drive after the XML that resolves the other disks), and the
 from Nova when it asks for one — carried over as a plain data disk it would put a second `config-2` filesystem with
 the source's metadata in front of cloud-init.
 
+A disk's size is the exact byte count `qemu-img info` prints, rounded up to whole GiB; a disk whose byte count it
+cannot read, or reads as zero - an empty or unparsable image -, is refused: a zero-sized destination volume would lose
+it (upstream intake UP-01, after os-migrate 33aca993e4). Each disk's export port is the workload's base port
+(`_migration_params.nbdkit_port`, else `os_migrate_nbdkit_port`) plus its index, and its PID file is named by that
+port: so two disks of one run on one hypervisor that would share a port are refused, at the second, before its
+export starts - it would stop the first one's export through that PID file, and the first VM's recorded URI, which
+names no export, would then serve the second VM's disk, copied into the first VM's volume without an error, across
+projects too (upstream intake UP-04a, after os-migrate f1d254cb8b). Give each workload on one hypervisor its own
+base port; how ports could be allocated instead is owner question q49.
+
 Attach locks (`volume_common.use_lock`) serialize attaches and detaches per conversion host with `flock` and a
 `{lock}.lock` file that names its owner as `{migrator hostname}:{pid}`. Before it waits, a module removes such a file
 whose owner ran on its own host and is no longer alive — a module killed by a cancel or a step timeout never
