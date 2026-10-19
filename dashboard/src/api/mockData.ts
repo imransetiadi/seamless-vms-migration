@@ -445,8 +445,9 @@ const CLOUDS: Record<string, { role: ProviderRole; kind: ProviderKind; storage: 
  */
 export function vmwareCheck(vms: readonly VMRef[]): Record<string, unknown> {
   return {
-    admin: true,
     api_version: '8.0.2.0',
+    version: '8.0.2',
+    vm_count: vms.length,
     cbt_enabled_vms: vms.filter((v) => v.cbt_enabled).length,
     vms_with_snapshots: vms.filter((v) => v.snapshot_count).length,
     vms_with_independent_disks: vms.filter((v) => v.disks.some((d) => d.independent)).length,

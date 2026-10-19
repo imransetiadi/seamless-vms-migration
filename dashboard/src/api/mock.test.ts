@@ -43,7 +43,7 @@ import {
 } from './types';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
-const CHECK_KEYS = JSON.parse(checkKeysRaw) as { openstack: string[]; destination: string[] };
+const CHECK_KEYS = JSON.parse(checkKeysRaw) as { openstack: string[]; destination: string[]; vmware: string[] };
 const NAME_CASES = (
   JSON.parse(nameRaw) as { cases: Array<{ route: 'POST' | 'PATCH'; body: { name?: unknown }; status: number; message: string | null; note: string }> }
 ).cases;
@@ -2966,17 +2966,18 @@ describe('providers of community destinations, like the API (SDD §4.2, §10, §
     expect((source.storage_backends as { pool: string }[]).map((b) => b.pool)).toContain('overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1');
   });
 
-  it("a vCenter's check reports the API demo's VMware keys, never an OpenStack service (review RV19-05)", () => {
+  it("a vCenter's check reports the API demo's VMware keys, never an OpenStack service (reviews RV19-05, PV-06)", () => {
     const { server } = setup('admin');
     const vcenter = { ...base, id: 'vc-9', name: 'vCenter 9', kind: 'vmware', role: 'source', distribution: 'vmware' };
     expect(call(server, 'POST', '/providers', vcenter).status).toBe(201);
-    // FakeSourceProvider.check for vmware: its VMs counted; no Nova, OVN or Cinder
-    const VMWARE_KEYS = ['admin', 'api_version', 'cbt_enabled_vms', 'vms_with_independent_disks', 'vms_with_snapshots', 'vms_without_tools'];
+    // FakeSourceProvider.check for vmware - the real check's keys (check_report_keys.json): its version and its VMs
+    // counted; no Nova, OVN or Cinder, and no 'admin', which no vCenter check computes (SDD §10)
+    const VMWARE_KEYS = [...CHECK_KEYS.vmware].sort();
     expect(keysOf((call(server, 'POST', '/providers/vc-9/check').body as Provider).capabilities)).toEqual(VMWARE_KEYS);
     // the seeded vCenter reports what a check of it reads, counted from its VMs
     const hq = server.providers.find((p) => p.id === 'vcenter-hq')!.capabilities;
     expect(keysOf(hq)).toEqual(VMWARE_KEYS);
-    expect(hq).toMatchObject({ admin: true, api_version: '8.0.2.0' });
+    expect(hq).toMatchObject({ api_version: '8.0.2.0', version: '8.0.2', vm_count: (server.inventories['vcenter-hq'] as VMRef[]).length });
     expect(hq.cbt_enabled_vms).toBeGreaterThan(0);
     // an OpenStack declaration on vmware: the API's message, pydantic's "Value error, " included
     expect(call(server, 'POST', '/providers', { ...vcenter, id: 'vc-8', release: '2026.2' })).toMatchObject({
