@@ -17,7 +17,7 @@ import { guestOsOf } from '../lib/guestOs';
 import { capabilityRoles, policyProfileOf } from '../lib/networks';
 import { canonicalIp, isIpAddress } from '../lib/nics';
 import { blocksPlanChange, inFlightRefusal } from '../lib/inFlight';
-import { countedApprovals } from '../lib/migrationActions';
+import { countedApprovals, sourceStopped } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
 import { probesFor } from '../lib/probes';
 import { hasRole, OWN_CUTOVER, OWN_DECISION, OWN_FORCE } from '../lib/roles';
@@ -682,6 +682,16 @@ const SOURCE_RUNS_AGAIN = 'the source VM runs again: stop it, or roll it back, b
 const ACTIVE_STEP_PHASES: ReadonlySet<Phase> = new Set(['precopy', 'syncing', 'cutover', 'verifying', 'rolling_back']);
 /** Phases validation evaluates again; a VM taken out of the plan has its migration cancelled in these. */
 const REVALIDATABLE: ReadonlySet<Phase> = new Set(['pending', 'blocked', 'ready']);
+/** Phases a validation re-assesses, one an interrupted validation left in validating included (the API's REASSESSED). */
+const REASSESSED: ReadonlySet<Phase> = new Set([...REVALIDATABLE, 'validating']);
+/**
+ * Whether a validation re-assesses `m`, the API's reassessed() (SDD §5.4, audit OC-02, reviews RV51-01, RV51-09): unless it
+ * is ready with its source stopped - a re-assessment could block it, where no action restarts the source -; one already
+ * blocked or left in validating is re-assessed whatever its source, a validation being its way back to ready.
+ */
+function reassessed(m: Migration): boolean {
+  return REASSESSED.has(m.phase) && !(m.phase === 'ready' && sourceStopped(m));
+}
 /** Phases whose migration validation cancels when its VM leaves vm_ids, like the API (SDD §5.4). */
 // a migration found in validating is a leftover of an interrupted validation (SDD §5.4)
 const REMOVABLE: ReadonlySet<Phase> = new Set([...REVALIDATABLE, 'failed', 'validating']);
@@ -2208,7 +2218,7 @@ export class MockServer {
     const inventory = (this.inventories[plan.source_provider_id] ?? []) as VMRef[];
     return plan.vm_ids.map((id) => {
       const m = byVm.get(id);
-      if (m && !REVALIDATABLE.has(m.phase) && m.phase !== 'validating') return m.vm;
+      if (m && !reassessed(m)) return m.vm;
       const vm = inventory.find((v) => v.source_id === id);
       if (!vm) throw new HttpError(502, 'provider_error', `VM '${id}': VM '${id}' not found`);
       return vm;
@@ -2329,11 +2339,11 @@ export class MockServer {
     // the source - a migration in any other phase counts as its recorded vm -, and one the source no longer reports is a
     // provider error, before anything changes
     const known = new Set(((this.inventories[plan.source_provider_id] ?? []) as VMRef[]).map((v) => v.source_id));
-    const reassessed = (id: string) => {
+    const readFromSource = (id: string) => {
       const m = byVm.get(id);
-      return !m || REVALIDATABLE.has(m.phase) || m.phase === 'validating';
+      return !m || reassessed(m);
     };
-    const gone = plan.vm_ids.find((id) => reassessed(id) && !known.has(id));
+    const gone = plan.vm_ids.find((id) => readFromSource(id) && !known.has(id));
     if (gone !== undefined) throw new HttpError(502, 'provider_error', `VM '${gone}': VM '${gone}' not found`);
     const cancelled = plan.vm_ids.flatMap((id) => (byVm.get(id)?.phase === 'cancelled' ? [byVm.get(id)!.vm.name] : [])).sort();
     if (cancelled.length) {
@@ -2363,8 +2373,9 @@ export class MockServer {
       const vm = inventory.find((v) => v.source_id === vmId);
       const m = byVm.get(vmId) ?? (vm ? this.createMigration(plan, vm, me.name) : undefined);
       if (!m) continue;
-      // like the API (SDD §5.4): a leftover of an interrupted validation is taken over
-      if (REVALIDATABLE.has(m.phase) || m.phase === 'validating') {
+      // like the API (SDD §5.4): a leftover of an interrupted validation is taken over; a ready one whose source is
+      // stopped is left as it is, like one in flight - its VM not read again, the advisor not asked (audit OC-02)
+      if (reassessed(m)) {
         if (m.phase !== 'validating') this.transition(m, 'validating', 'plan validation started', me.name);
         this.finishValidation(m, plan, me.name);
       } else {

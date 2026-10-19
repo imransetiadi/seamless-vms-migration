@@ -3119,6 +3119,43 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     expect(server.migrations.find((m) => m.id === rolled.id)?.phase).toBe('rolled_back');
   });
 
+  it('a validation leaves a ready migration whose source is stopped as it is, like the API (SDD §5.4, audit OC-02, review RV51-09)', async () => {
+    const { server, client } = setup('operator');
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    expect([m.plan_id, m.phase]).toEqual(['plan-c81d44a0', 'ready']);
+    // retried after a failed cutover: ready again, its downtime clock still open - the source is stopped (SDD §5.2)
+    Object.assign(m, { downtime_started_at: '2026-10-08T11:00:00Z', downtime_ended_at: null });
+    const before = structuredClone({ history: m.phase_history, strategy: m.strategy, hold: m.advisor_hold, findings: m.findings });
+    const recs = server.recommendations.filter((r) => r.migration_id === m.id).length;
+    await client.post('/plans/plan-c81d44a0/validate');
+    // no transition, no recommendation, nothing re-assessed: the API's reassessed(m) is false
+    expect({ history: m.phase_history, strategy: m.strategy, hold: m.advisor_hold, findings: m.findings }).toEqual(before);
+    expect(server.recommendations.filter((r) => r.migration_id === m.id).length).toBe(recs);
+  });
+
+  it('a validation reads no ready migration whose source is stopped from the source, like the API (SDD §5.4, review RV51-09)', async () => {
+    const { server, client } = setup('operator');
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    Object.assign(m, { downtime_started_at: '2026-10-08T11:00:00Z', downtime_ended_at: null });
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    const inventory = inventoryOf(server, plan.source_provider_id);
+    inventory.splice(inventory.findIndex((v) => v.source_id === m.vm.source_id), 1); // the source no longer reports it
+    const report = await client.post<{ migrations: Array<{ migration_id: string; phase: string }> }>(`/plans/${plan.id}/validate`);
+    expect(report.migrations.find((i) => i.migration_id === m.id)?.phase).toBe('ready');
+  });
+
+  it('a validation re-assesses a migration an earlier version left blocked with its source stopped, like the API (SDD §5.4, review RV51-01)', async () => {
+    const { server, client } = setup('operator');
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    Object.assign(m, { phase: 'blocked', downtime_started_at: '2026-10-08T11:00:00Z', downtime_ended_at: null });
+    await client.post('/plans/plan-c81d44a0/validate');
+    expect(m.phase_history.slice(-2).map((c) => [c.from_phase, c.to_phase])).toEqual([
+      ['blocked', 'validating'],
+      ['validating', 'ready'],
+    ]);
+    expect(m.downtime_ended_at).toBeNull(); // the source stays stopped: its next cutover restarts it
+  });
+
   it('a paused plan whose finished VM left the source validates again: only the VMs a validation re-assesses are read', async () => {
     const { server, client } = setup('operator');
     const done = server.migrations.find((m) => m.phase === 'completed' || m.phase === 'finalized')!;
