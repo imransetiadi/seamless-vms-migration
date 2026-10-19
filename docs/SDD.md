@@ -1941,7 +1941,9 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   start `ready` migrations within `wave.max_parallel` and `settings.max_concurrent_migrations`,
   advance gates (§5.4), and mark plans `completed` when all migrations are in terminal-success or
   wave-complete phases with no `failed` — under the plan's lock, on the migrations re-read there, so a
-  retry that returned after the tick's snapshot keeps the plan running (§5.1). The tick decides on a snapshot; starting a step re-checks,
+  retry that returned after the tick's snapshot keeps the plan running (§5.1). Each plan is ticked on its own: an
+  error of one - a write the store refuses, a provider down - is logged and the plans after it are ticked, as each
+  orphan's relaunch is (review RV51-06). The tick decides on a snapshot; starting a step re-checks,
   under the plan's lock and then the migration's, what the decision rested on — that the plan still
   runs (a pause that returned starts nothing more), the phase, the gate of a cutover (§5.4) and the
   strategy: a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
@@ -2137,10 +2139,16 @@ the SLO rule's (§5.3), the estimate it records, a Force cutover's figure (§5.4
 
 **Configuration and calibration (PRD G2).** `EstimatorParams` gains `parallel_disks: int = 4`.
 `Plan.estimator_overrides: dict[str, float] = {}` overrides any `EstimatorParams` field for that plan
-(unknown keys, values that are not finite positive numbers — NaN and infinity included — and the
-plan-owned keys `convergence_threshold_bytes` / `max_passes` are rejected with 400 — set
-`Plan.convergence_threshold_bytes` / `Plan.max_sync_passes` instead); `Plan.link_bps` keeps precedence
-for `link_bps` and must be a finite positive number (422 otherwise). After every
+(unknown keys, values that are not finite positive numbers — NaN and infinity included —, a rate under 1 B/s
+(`scan_bps`, `max_aggregate_scan_bps`, `link_bps`), a duration over 10⁹ s (`shutdown_s`, `boot_s`, `create_s`,
+`snapshot_s`, `handover_per_volume_s`, `v2v_s`, `v2v_inplace_s`) and the plan-owned keys
+`convergence_threshold_bytes` / `max_passes` are rejected with 400 — set `Plan.convergence_threshold_bytes` /
+`Plan.max_sync_passes` instead); `Plan.link_bps` keeps precedence for `link_bps` and must be a finite number of at
+least 1 B/s (422 otherwise), and `Plan.max_sync_passes` is at most 100 (422 otherwise; §5.3 needs a handful). Every
+estimate is then a finite number - a rate a hair above zero made every strategy's figures infinite, and the
+selection failed (review RV51-22) -, and a plan's validation refuses a stored plan beyond these bounds as a create
+does; the model never runs more than 100 passes whatever a plan stored holds, so a validation's or a calibration's
+estimate is bounded work in the event loop (review RV51-07). After every
 completed warm pass the orchestrator calibrates the migration in place and re-estimates it:
 `vm.change_rate_bps = bytes_changed / (pass.started_at − previous_pass.started_at)` (delta passes
 only; the interval is the time between the two snapshots), and the observed per-stream scan rate
@@ -2595,7 +2603,12 @@ message, actor, kind, `plan_id`, `migration_id` and the keys and values of its d
 on SQLite and PostgreSQL, with `UnstorableValue` (a `StoreError`) naming the kind, the id and the field but never
 the value (`advisor_notes.0.confidence: is an infinity`); nothing of the write is kept. A name, a map's key, an
 actor a later comparison reads and a snapshot's digested content are stored as given or not at all (reviews ST-03,
-ST-04, RV48-04, RV48-05, RV48-08, RV50-04). What the control plane is given stops before that refusal: a request
+ST-04, RV48-04, RV48-05, RV48-08, RV50-04). A document an earlier version stored on SQLite with such a number from
+an outside service - an advisor note's confidence or a number of its data (a hit's score, a claim's confidence), a
+recommendation's confidence or a probability of its distribution, a similar incident's score - reads each as
+null, a probability as absent, as this version would have written it: the document is written again as any other,
+where its stopped source could otherwise never be rolled back (review RV51-06). What the control plane is given
+stops before that refusal: a request
 body holding a NUL or a lone surrogate is refused before its route runs (§12) - a number is its route's to check,
 as §9.1 checks a plan's -, the tokens file refuses such a name (§13.1), the text it takes from outside sources
 passes `redact`, which writes either as U+FFFD (§13.4) - as every string of Jev's answers does (§14.1), and a
@@ -3150,7 +3163,9 @@ document (kind `recommendation`, §4.2); the engine reads only the decision.
   migration's assessment (§5.4).
 * Legacy: strategy notes written before this change (`AdvisorNote kind=strategy` in `Migration.advisor_notes`)
   are listed as recommendations with `legacy: true`, id `rec-legacy-<migration id>-<index>`, `legacy_text` =
-  the note's summary, the option, confidence and distribution parsed from `data` where present, and a decision
+  the note's summary, the option, confidence and distribution parsed from `data` where present - each a
+  probability as the advisor reads Jev's (§14.1), a value that is none left out, so an integer of 400 digits
+  never fails the listing (review RV51-23) -, and a decision
   read from it (`applied` → `auto_applied`; `source rules` → `fallback_rules`; otherwise `below_threshold`,
   final = `data.deterministic`), actor `system:legacy`. Nothing is copied or rewritten: the listing adapts the
   notes when it reads them, so the number of legacy entries always equals the number of strategy notes.
