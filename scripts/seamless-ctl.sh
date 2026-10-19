@@ -201,29 +201,32 @@ if [ "$KIND" = host ]; then
   # the port Compose publishes: the shell's, else deploy/compose/.env's read by Compose's rules, else 8080; a value
   # Compose would interpolate is refused, never guessed, where the API is asked (SDD §17.2, reviews RV38B-07,
   # RV41A-01, RV41A-02)
+  unread=0
   if [ -n "${SEAMLESS_HOST_PORT+set}" ]; then
     port=$SEAMLESS_HOST_PORT
   else
-    port=$(sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env") || port='?'
+    # the reader's own message is not shown: a value the script takes after all - one left to Compose - is no refusal,
+    # and a refusal says what the reader would (review RV46A-01)
+    port=$(sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env" 2>/dev/null) ||
+      { unread=$?; port='?'; }
   fi
   port=${port:-8080}
   if [ -z "$URL" ] && { [ -n "$DRAIN" ] || [ "$ACTION" = resume ] || [ "$ACTION" = status ]; }; then
-    # restart and capacity end in the restart's Make target, whose Compose publishes this port: --url gets past
-    # nothing there (SDD §17.2, reviews RV42A-04, RV43A-05)
+    # --url names the API for resume and status; a drain still loads Compose's project, whose port is checked before
+    # every drain, so --url is named for it only where Compose may yet read the value - one it interpolates, before a
+    # stop, down or scale 0 (SDD §17.2, reviews RV42A-04, RV43A-05, RV45A-01, RV46A-03)
+    case $ACTION in resume | status) or_url=', or --url' ;; *) or_url='' ;; esac
     case $port in
       '?')
+        [ "$unread" != 4 ] || refuse "deploy/compose/.env gives SEAMLESS_HOST_PORT a quote it never closes, which" \
+          "Compose refuses: close it$or_url"
         case $ACTION in
           restart | capacity) refuse "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value" ;;
           *) refuse "cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value, or --url" ;;
         esac
         ;;
       *)
-        if ! is_port "$port"; then
-          case $ACTION in
-            restart | capacity) refuse "SEAMLESS_HOST_PORT is '$port', no port: give a number from 1 to 65535" ;;
-            *) refuse "SEAMLESS_HOST_PORT is '$port', no port: give a number from 1 to 65535, or --url" ;;
-          esac
-        fi
+        is_port "$port" || refuse "SEAMLESS_HOST_PORT is '$port', no port: give a number from 1 to 65535$or_url"
         ;;
     esac
   fi
@@ -287,6 +290,9 @@ drain() {
   case $rc:$code in
     0:200) ;;
     0:401 | 0:403) refuse "the API at $API does not take this token (HTTP $code): give an operator's token or higher" ;;
+    # §13.1's lockout after failed attempts from this address, never a control plane down (review RV46A-07)
+    0:429) refuse "the API at $API locks this address out after failed attempts (HTTP 429): retry in a minute;" \
+      "nothing was changed" ;;
     *) refuse "cannot ask the API at $API whose token this is (HTTP ${code:-000}): is the control plane up?" \
       "Nothing was changed" ;;
   esac
@@ -499,6 +505,7 @@ capacity_patch() {
 # needs; on a cluster the Deployment and the ConfigMap read - a mistyped namespace or an expired login shows here -
 # and its limits, which the API server refuses below the requests, by a server-side dry run (review RV38B-02).
 capacity_check() {
+  local refused
   if [ "$KIND" = host ]; then
     host_restart_check
   else
@@ -512,19 +519,12 @@ capacity_check() {
     fi
     # its writes, dry-run on the server: the settings' patch, and the template's - its limits, which the API server
     # refuses below the requests, and a login that may read but not write (SDD §17.2, reviews RV38B-02, RV45A-02)
-    if [ -n "$CAP_DATA" ]; then
-      kube patch configmap/seamless-config --type merge -p "{\"data\":{$CAP_DATA}}" --dry-run=server -o name ||
-        check_failed "$KUBE may not patch configmap/seamless-config in namespace $NS (a server-side dry run" \
-          "refused it): nothing was changed"
-    fi
-    if [ -n "$CAP_LIMITS" ]; then
-      kube patch deployment/seamless -p "$CAP_PATCH" --dry-run=server -o name ||
-        check_failed "the API server refuses those limits (a server-side dry run): nothing was changed"
-    else
-      kube patch deployment/seamless -p "$CAP_PATCH" --dry-run=server -o name ||
-        check_failed "$KUBE may not patch deployment/seamless in namespace $NS (a server-side dry run refused" \
-          "it): nothing was changed"
-    fi
+    [ -z "$CAP_DATA" ] || dry_write "patch configmap/seamless-config" \
+      patch configmap/seamless-config --type merge -p "{\"data\":{$CAP_DATA}}"
+    # one refusal for the template, either cause named - the API server's answer above says which (review RV46A-02)
+    refused="a server-side dry run refused the pod template's patch - ${CAP_LIMITS:+a limit below its request, }an"
+    refused="$refused admission rule, or a login that may not patch deployment/seamless in namespace $NS: nothing"
+    dry_run "$refused was changed" patch deployment/seamless -p "$CAP_PATCH"
   fi
 }
 # What the single host's restart - capacity's last step - needs, which its Make target refuses: make, deploy/compose/.env
@@ -544,15 +544,22 @@ host_restart_check() {
 # (SDD §17.2, reviews RV44A-06, RV45A-01). A value Compose would interpolate only Compose can judge: the restart's Make
 # target refuses it (SEAMLESS_DOTENV_STOP), so the restart's check does; a stop's Compose reads it.
 host_port_check() {
-  local value=''
+  local value='' rc=0
   if [ -n "${SEAMLESS_HOST_PORT+set}" ]; then
     value=$SEAMLESS_HOST_PORT
   elif [ -f "$ROOT/deploy/compose/.env" ]; then
-    if ! value=$(sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env"); then
-      [ "${1-}" = restart ] || return 0
-      check_failed "the restart's Make target cannot read SEAMLESS_HOST_PORT in deploy/compose/.env: give it a" \
-        "plain value; nothing was changed"
-    fi
+    value=$(sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env" 2>/dev/null) || rc=$?
+    case $rc in
+      0) ;;
+      # a quote never closed is no interpolation: Compose refuses the whole file, for every command (review RV46A-01)
+      4) check_failed "deploy/compose/.env gives SEAMLESS_HOST_PORT a quote it never closes, which Compose" \
+        "refuses: close it; nothing was changed" ;;
+      *)
+        [ "${1-}" = restart ] || return 0
+        check_failed "the restart's Make target cannot read SEAMLESS_HOST_PORT in deploy/compose/.env: give it a" \
+          "plain value; nothing was changed"
+        ;;
+    esac
   fi
   is_port "${value:-8080}" ||
     check_failed "SEAMLESS_HOST_PORT is '$value', no port Compose publishes: give a number from 1 to 65535;" \
@@ -576,16 +583,21 @@ drain_check() {
     capacity_check
   else
     need "$KUBE" "install it and log in to the cluster"
-    [ "$DRY" != 1 ] || return 0
-    "$KUBE" -n "$NS" get deployment/seamless -o name >/dev/null ||
-      check_failed "cannot read deployment/seamless in namespace $NS: nothing was changed"
-    [ "$ACTION" != down ] || "$KUBE" -n "$NS" get statefulset/seamless-postgres -o name >/dev/null ||
-      check_failed "cannot read statefulset/seamless-postgres in namespace $NS: nothing was changed"
+    if [ "$DRY" != 1 ]; then
+      "$KUBE" -n "$NS" get deployment/seamless -o name >/dev/null ||
+        check_failed "cannot read deployment/seamless in namespace $NS: nothing was changed"
+      [ "$ACTION" != down ] || "$KUBE" -n "$NS" get statefulset/seamless-postgres -o name >/dev/null ||
+        check_failed "cannot read statefulset/seamless-postgres in namespace $NS: nothing was changed"
+    fi
     # the writes the action starts with, dry-run on the server: a login that may read but not write - the view role -
     # shows here, before a plan is paused (SDD §17.2, review RV45A-02)
     case $ACTION in
       restart)
-        if [ "$("$KUBE" -n "$NS" get deployment/seamless -o 'jsonpath={.spec.replicas}')" = 0 ]; then
+        if [ "$DRY" = 1 ]; then
+          say "# when the control plane is at 0 replicas, its scale to 1 instead:"
+          dry_write "restart deployment/seamless" patch deployment/seamless \
+            -p '{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"dry-run"}}}}}'
+        elif [ "$("$KUBE" -n "$NS" get deployment/seamless -o 'jsonpath={.spec.replicas}')" = 0 ]; then
           dry_write "scale deployment/seamless" scale deployment/seamless --replicas=1
         else
           # what rollout restart patches - it has no --dry-run of its own
@@ -601,12 +613,22 @@ drain_check() {
     esac
   fi
 }
-# A write dry-run on the API server - its authorization and admission, nothing applied -, refused while nothing changed.
+# A write dry-run on the API server - its authorization and admission, nothing applied -, refused while nothing changed;
+# its output, the object's name, is no change made and is not shown, and --dry-run prints the command (SDD §17.2,
+# reviews RV45A-02, RV46A-05, RV46A-08).
+dry_run() {
+  local refused=$1
+  shift
+  if [ "$DRY" = 1 ]; then
+    run "$KUBE" -n "$NS" "$@" --dry-run=server -o name
+    return
+  fi
+  "$KUBE" -n "$NS" "$@" --dry-run=server -o name >/dev/null || check_failed "$refused"
+}
 dry_write() {
   local what=$1
   shift
-  "$KUBE" -n "$NS" "$@" --dry-run=server -o name >/dev/null ||
-    check_failed "$KUBE may not $what in namespace $NS (a server-side dry run refused it): nothing was changed"
+  dry_run "$KUBE may not $what in namespace $NS (a server-side dry run refused it): nothing was changed" "$@"
 }
 cluster_capacity() {
   if [ -n "$MAX_MIGRATIONS" ] && [ "$MAX_MIGRATIONS" -gt 10 ] && [ -z "$MEMORY" ]; then

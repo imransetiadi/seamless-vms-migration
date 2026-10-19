@@ -3,7 +3,8 @@
 # compose-go's dotenv rules: a leading UTF-8 byte-order mark ignored, an `export ` prefix, a key ended by `=` or `:`
 # (its YAML-style form), spaces around the key and the value, single or double quotes (a backslash escapes the
 # quote), an inline comment after ` #` in an unquoted value; the last definition wins. A value Compose would
-# interpolate - a `$` in an unquoted or double-quoted value - is refused, never guessed: a message, exit 3. Prints
+# interpolate - a `$` in an unquoted or double-quoted value - is refused, never guessed: a message, exit 3; a quote
+# that never closes, which Compose refuses with the whole file, is no interpolation: a message, exit 4. Prints
 # nothing when FILE is missing or defines no KEY. With --defined it prints nothing and exits 0 when FILE defines KEY
 # (an empty value too), 1 when it does not. The Makefile and seamless-ctl.sh read SEAMLESS_VERSION, SEAMLESS_HOST_PORT
 # and whether .env sets SEAMLESS_DEMO through it, so they take what Compose does (SDD §17.2, reviews RV38B-07,
@@ -63,7 +64,7 @@ END {
   if (defined) exit 0
   if (found_unterminated) {
     printf "dotenv-value.sh: %s gives %s a quote it never closes, which Compose refuses\n", file, key > "/dev/stderr"
-    exit 3
+    exit 4
   }
   if (found_interpolated && index(found, "$")) {
     printf "dotenv-value.sh: %s sets %s through a variable (%s), which Compose interpolates: these scripts read plain values - write the value itself\n", file, key, found > "/dev/stderr"

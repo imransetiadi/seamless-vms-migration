@@ -331,9 +331,12 @@ version, then resume the plans.
 | `a migration is still in cutover after 1800s: nothing was stopped` | A cutover outlasted `--wait-timeout`. Nothing was stopped and the plans stay paused: wait and retry, or raise `--wait-timeout`. |
 | `on kubernetes the API is reached through the Route or Ingress: give its URL with --url` | `--drain`, `resume` and the health check need the external URL on a cluster. |
 | `cannot tell the port the stack publishes: give SEAMLESS_HOST_PORT a plain value` | `deploy/compose/.env` sets `SEAMLESS_HOST_PORT` through a variable (a `$`) or an unclosed quote, which Compose would read differently: write the number itself. |
+| `deploy/compose/.env gives SEAMLESS_HOST_PORT a quote it never closes ...` | Compose refuses the whole `.env` for it, for every command: close the quote. Nothing was paused or changed. |
 | `SEAMLESS_HOST_PORT is '...', no port ...` | The value is no port Compose can publish (an address in front, a stray character, a number outside 1-65535): write the number alone. |
 | `the restart's Make target cannot read SEAMLESS_HOST_PORT ...` | The same, found before a `--drain`: nothing was paused or changed. |
 | `deploy/compose/.env is missing` / `tokens.yaml is missing` | `make seamless-init` first; nothing was paused or changed. |
+| `the token file '...' is empty` | The token file holds no token on its first line: write the operator's token into it (section 5); nothing was paused. |
+| `... is needed for this action: ...` | A tool the action uses is not installed - `make`, `curl` and `python3` for a drain, `kubectl` or `oc` on a cluster: install it, and log in to the cluster; nothing was paused. |
 | `cannot read the token file ...` | The path names no file this user can read: a typo, a broken link, a directory the user cannot enter. Fix the path or the permissions; nothing was paused. |
 | `cannot tell who may read the token file ...` | `find` itself failed while judging the file's mode (not installed, an I/O error): fix that, then run again; nothing was paused. |
 | `the token's role is 'viewer' ...` | A drain pauses plans: give an operator's token or higher. Nothing was listed or paused. |
@@ -341,11 +344,14 @@ version, then resume the plans.
 | `cannot ask the API at ... whose token this is (HTTP ...)` | The API did not answer `GET /api/v1/me` (HTTP 000: no answer; a 5xx: an error): is the control plane up, is `--url` right? Nothing was listed or paused. |
 | `cannot read the API's answer to GET /api/v1/me` | The API answered something that is not its `/me` JSON - `--url` names another service. Nothing was listed or paused. |
 | `cannot list the running plans at ...` | The API did not list the running plans: is the control plane up? Nothing was paused. |
+| `cannot read the plans the API returned` | The listing answered something that is not the API's JSON - `--url` names another service, or a proxy answered with its own page. Nothing was paused. |
+| `the API at ... locks this address out after failed attempts (HTTP 429)` | Too many failed sign-ins from this address (Security.md, the lockout): wait a minute, check the token, drain again. Nothing was listed or paused. |
 | `make seamless-check-context ... refused ...` | The Make targets' own checks refused before the drain (`down` runs `seamless-check-context` alone, the others `seamless-check-env` too) - the line above says why (the Colima profile or Docker context, `.env` or `tokens.yaml`): nothing was paused or changed. |
 | `cannot read deployment/seamless in namespace ...` | `kubectl` or `oc` cannot read the namespace - an expired login, a mistyped `--namespace`, no access: nothing was paused or changed. |
 | `cannot read statefulset/seamless-postgres in namespace ...` | The same for PostgreSQL's StatefulSet, which `up`, `start` and a `down --drain` read first: nothing was paused or changed. |
 | `kubectl may not ... (a server-side dry run refused it)` / `oc may not ...` | The login may read the namespace but not change it (the `view` role): the drain dry-runs the action's first writes before it pauses a plan. Log in with a role that may scale and patch the Deployment (and PostgreSQL's StatefulSet for `down`); nothing was paused or changed. |
-| `the API server refuses those limits (a server-side dry run) ...` | A limit below the Deployment's request, or one the API server's admission refuses: give another; nothing was changed. |
+| `a server-side dry run refused the pod template's patch ...` | `capacity`'s patch of the Deployment was refused before anything changed - a limit below the request, an admission rule (a LimitRange, a quota), or a login that may not patch the Deployment; the API server's line above says which. Nothing was paused or changed. |
+| `cannot read seamless-config in namespace ...` | `capacity` cannot read the ConfigMap whose settings it changes - a mistyped `--namespace`, no access: nothing was paused or changed. |
 | `no StatefulSet seamless-postgres in namespace ...: run up first` | `start` found no PostgreSQL there: run `up` first, or check `--namespace`. |
 | `the API refused to pause plan ... (HTTP 4xx): it was not paused` | The API answered before it applied anything - the plan no longer running, a token it no longer takes, a plan another writer keeps changing: it was not paused and is not named for `resume`. Nothing was stopped; look at that plan, then drain again. |
 | `the API answered HTTP 5xx to the pause of plan ... - it may be paused all the same` | The API or a gateway (a Route's 502 or 504) answered an error after the request reached it: the plan may be paused, so it is named for `resume`; nothing was stopped. |

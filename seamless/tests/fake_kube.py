@@ -168,6 +168,15 @@ def label_kind():
     return LABELS[selector.split("=", 1)[1]]
 
 
+#: the names kubectl prints for the objects, with their API group
+NAMES = {"deployment/seamless": "deployment.apps/seamless",
+         "statefulset/seamless-postgres": "statefulset.apps/seamless-postgres"}
+
+
+def printed(name, did):  # what kubectl prints for a server-side dry run: -o name, the name alone
+    return f"{name}\n" if flags.get("-o") == "name" else f"{name} {did} (server dry run)\n"
+
+
 def found(kind):  # the object, or kubectl's NotFound
     if st[kind] is None:
         done(f"Error from server (NotFound): {NOT_FOUND[kind]} not found\n", 1)
@@ -183,7 +192,7 @@ if verb in ("get", "scale") and words[1] in KINDS:
 if verb == "rollout" and words[1] == "status":
     found(KINDS[words[2]])
 if verb == "scale" and flags.get("--dry-run") == "server":
-    done(f"{words[1]} scaled (server dry run)\n")
+    done(printed(NAMES[words[1]], "scaled"))
 if verb == "scale":
     kind = KINDS[words[1]]
     st[kind]["replicas"] = int(flags["--replicas"])
@@ -235,7 +244,7 @@ if verb == "rollout" and words[1] == "undo":
     done("deployment.apps/seamless rolled back\n")
 dry_run = flags.get("--dry-run") == "server"
 if verb == "patch" and words[1] == "configmap/seamless-config" and dry_run:
-    done("configmap/seamless-config patched (server dry run)\n")
+    done(printed("configmap/seamless-config", "patched"))
 if verb == "patch" and words[1] == "configmap/seamless-config":  # a merge patch: null removes
     st["configmap_patches"] = st.get("configmap_patches", 0) + 1
     if st.get("fail_configmap_patch") == st["configmap_patches"]:
@@ -261,7 +270,7 @@ if verb == "patch" and words[1] == "deployment/seamless":
                  f'.requests: Invalid value: "{request}": must be less than or equal to {key} limit'
                  f' of {limits[key]}\n', 1)
     if flags.get("--dry-run") == "server":
-        done("deployment.apps/seamless patched (server dry run)\n")
+        done(printed("deployment.apps/seamless", "patched"))
     if st.get("unavailable"):
         done("Error from server (ServiceUnavailable): the server is currently unable to handle the "
              "request\n", 1)

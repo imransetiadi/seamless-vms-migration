@@ -958,7 +958,9 @@ def test_the_dotenv_helper_refuses_a_value_compose_would_interpolate(tmp_path, d
     path = tmp_path / ".env"
     path.write_text(dotenv)
     done = subprocess.run(["sh", str(DOTENV), "KEY", str(path)], capture_output=True, text=True)
-    assert (done.returncode, done.stdout) == (3, ""), done
+    # a quote never closed is no interpolation: Compose refuses the file - status 4 (RV46A-01)
+    status = 4 if "unterminated" in dotenv else 3
+    assert (done.returncode, done.stdout) == (status, ""), done
     assert "KEY" in done.stderr and str(path) in done.stderr
 
 
@@ -1857,14 +1859,27 @@ def test_a_port_compose_cannot_publish_is_refused_before_the_drain(tmp_path, arg
 
 @pytest.mark.parametrize("port", ["80800", "0"])
 def test_a_drain_refuses_a_port_out_of_range_where_it_asks_the_api(tmp_path, port):
-    """SDD §17.2 (review RV44A-06): a drain without --url asks the API at the port the stack
-    publishes: one out of 1-65535 is refused there too, naming --url - curl failed on it, exit 1."""
+    """SDD §17.2 (reviews RV44A-06, RV46A-03): a drain without --url asks the API at the port the
+    stack publishes: one out of 1-65535 is refused there too - and with no word of --url, which
+    gets a drain past nothing since the port is checked before every drain; resume, which loads
+    no Compose project, is still pointed at --url."""
     env = f"POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT={port}\n"
     proc, calls, _ = _run(
         tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", env_file=env, rules=_drain_rules([])
     )
     assert proc.returncode == 2 and calls == [], proc.stderr
-    assert f"SEAMLESS_HOST_PORT is '{port}'" in proc.stderr and "or --url" in proc.stderr
+    assert f"SEAMLESS_HOST_PORT is '{port}'" in proc.stderr and "--url" not in proc.stderr
+    proc, calls, _ = _run(
+        tmp_path / "resume",
+        "docker",
+        "resume",
+        "--token-file",
+        "@TOKEN_FILE",
+        "plan-aa",
+        env_file=env,
+    )
+    assert proc.returncode == 2 and calls == [], proc.stderr
+    assert "or --url" in proc.stderr, proc.stderr
 
 
 @pytest.mark.parametrize("status", ["500", "502", "504"])
@@ -2374,8 +2389,18 @@ TROUBLESHOOTING = {
     "may not $what in namespace $NS (a server-side dry run refused it)": (
         "kubectl may not ... (a server-side dry run refused it)"
     ),
-    "the API server refuses those limits (a server-side dry run)": (
-        "the API server refuses those limits (a server-side dry run) ..."
+    "a server-side dry run refused the pod template's patch": (
+        "a server-side dry run refused the pod template's patch ..."
+    ),
+    "cannot read the plans the API returned": "cannot read the plans the API returned",
+    "cannot read seamless-config in namespace $NS": "cannot read seamless-config in namespace ...",
+    "the token file '$file' is empty": "the token file '...' is empty",
+    "is needed for this action: $2": "... is needed for this action: ...",
+    "locks this address out after failed attempts (HTTP 429)": (
+        "the API at ... locks this address out after failed attempts (HTTP 429)"
+    ),
+    "gives SEAMLESS_HOST_PORT a quote it never closes, which": (
+        "deploy/compose/.env gives SEAMLESS_HOST_PORT a quote it never closes ..."
     ),
     "the API refused to pause plan $id (HTTP $code): it was not paused": (
         "the API refused to pause plan ... (HTTP 4xx): it was not paused"
@@ -2394,3 +2419,166 @@ def test_every_refusal_of_a_drains_checks_has_a_troubleshooting_row(message):
     section = ops.split("\n## 7.", 1)[1].split("\n## 8.", 1)[0]
     row = f"| `{TROUBLESHOOTING[message]}"
     assert any(line.startswith(row) for line in section.splitlines()), row
+
+
+# --- review 46a: an unclosed quote, the template's dry run, the dry runs printed, the lockout ---
+@pytest.mark.parametrize("engine", ["docker", "podman"])
+@pytest.mark.parametrize("action", list(HOST_STOPS))
+def test_an_unclosed_quote_compose_refuses_is_refused_before_a_stop_or_down_drain(
+    tmp_path, engine, action
+):
+    """SDD §17.2 (review RV46A-01): a SEAMLESS_HOST_PORT whose quote never closes is no value
+    Compose interpolates - Compose refuses the whole .env - yet it was left to Compose as one: with
+    --url, stop, down and scale 0 paused every plan, then the Make target's Compose refused. It is
+    refused before every drain, nothing listed or paused, exit 2, said once."""
+    env = 'POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT="8081\n'
+    proc, calls, _ = _run(
+        tmp_path, engine, *HOST_STOPS[action], "--drain", "@TOKEN_FILE",
+        "--url", "http://127.0.0.1:8080", env_file=env, rules=_drain_rules([{"stdout": "[]"}]),
+    )  # fmt: skip
+    assert proc.returncode == 2, proc.stderr
+    assert calls == [], calls
+    assert proc.stderr.count("never closes") == 1, proc.stderr
+
+
+@pytest.mark.parametrize(
+    ("argv", "or_url"),
+    [
+        (["stop", "--drain", "@TOKEN_FILE"], False),
+        (["resume", "--token-file", "@TOKEN_FILE", "plan-aa"], True),
+    ],
+    ids=["a drain", "resume"],
+)
+def test_an_unclosed_quote_is_named_where_the_api_is_asked(tmp_path, argv, or_url):
+    """SDD §17.2 (reviews RV46A-01, RV46A-03): without --url the port Compose publishes names the
+    API; a quote never closed is said as such - "cannot tell the port" asked for --url, which gets
+    a drain past nothing (its port is checked before the drain) and resume, which loads no
+    Compose project, past the port."""
+    env = 'POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT="8081\n'
+    proc, calls, _ = _run(tmp_path, "docker", *argv, env_file=env, rules=_drain_rules([]))
+    assert proc.returncode == 2 and calls == [], proc.stderr
+    assert proc.stderr.count("a quote it never closes") == 1, proc.stderr
+    assert ("or --url" in proc.stderr) == or_url, proc.stderr
+
+
+def test_a_port_left_to_compose_is_said_once_as_such_and_the_stop_runs(tmp_path):
+    """SDD §17.2 (reviews RV45A-01, RV46A-01): a SEAMLESS_HOST_PORT Compose interpolates is
+    Compose's to judge before a stop: the drain and the stop run - the reader's refusal, printed
+    twice before ("these scripts read plain values - write the value itself"), is not printed for
+    a value the script then accepts."""
+    env = "POSTGRES_PASSWORD=x\nPORT=18081\nSEAMLESS_HOST_PORT=${PORT}\n"
+    proc, calls, _ = _run(
+        tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", "--url", "http://127.0.0.1:18081",
+        env_file=env, rules=_drain_rules([{"stdout": "[]"}]),
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    assert "write the value itself" not in proc.stderr, proc.stderr
+    assert _args(calls, "make")[-1].endswith("seamless-stop SEAMLESS_ENGINE=docker")
+
+
+#: kubectl/oc in front of the fake: the login may scale the Deployment but not patch it, or reverse
+REFUSE = r"""#!/bin/sh
+case " $* " in *" REFUSED "*)
+  echo 'Error from server (Forbidden): deployments.apps "seamless" is forbidden' >&2
+  exit 1 ;;
+esac
+exec "$REAL_FAKE" "$@"
+"""
+
+
+@pytest.mark.parametrize(("platform", "tool"), [("kubernetes", "kubectl"), ("openshift", "oc")])
+@pytest.mark.parametrize(
+    ("replicas", "refused"), [(0, "scale"), (1, "patch")], ids=["stopped", "running"]
+)
+def test_a_cluster_restart_drain_dry_runs_the_write_it_starts_with(
+    tmp_path, platform, tool, replicas, refused
+):
+    """SDD §17.2 (reviews RV45A-02, RV46A-04): a restart starts a stopped control plane with a
+    scale, and restarts a running one with rollout restart's template patch: the dry run before
+    the drain is of that write. A login that may not make it - the scale, or the patch - is refused
+    before any plan is paused; no test pinned which write was dry-run."""
+    state = fake_kube.cluster(replicas=replicas)
+    proc, calls, _ = _run(
+        tmp_path, platform, "restart", "--drain", "@TOKEN_FILE", "--url", CLUSTER_URL,
+        rules=_drain_rules([{"stdout": "[]"}]), cluster=state,
+        **_wrapped(tmp_path, tool, REFUSE.replace("REFUSED", refused)),
+    )  # fmt: skip
+    assert proc.returncode == 2, proc.stderr
+    assert not [c for c in calls if c["cmd"] == "curl"], calls
+    assert _cluster_after(tmp_path) == state
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+def test_a_capacitys_dry_runs_print_no_name_a_change_would(tmp_path, platform):
+    """SDD §17.2 (review RV46A-05): kubectl's patch -o name prints the object's name, dry run or
+    not; capacity's server-side dry runs printed it before and after the drain - lines that read
+    as changes made. They print nothing; the fake prints what kubectl prints."""
+    proc, _, _ = _run(
+        tmp_path, platform, "capacity", "--max-migrations", "20", "--memory", "8Gi",
+        "--drain", "@TOKEN_FILE", "--url", CLUSTER_URL,
+        rules=_drain_rules([{"stdout": "[]"}]), cluster=fake_kube.cluster(),
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    names = {"configmap/seamless-config", "deployment.apps/seamless", "deployment/seamless"}
+    assert not [line for line in proc.stdout.splitlines() if line.strip() in names], proc.stdout
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+@pytest.mark.parametrize(
+    "action", [["stop"], ["down"], ["restart"], ["scale", "0"]], ids=lambda a: " ".join(a)
+)
+def test_a_cluster_drains_dry_run_shows_its_server_side_dry_runs(tmp_path, platform, action):
+    """SDD §17.2 (review RV46A-08): --dry-run prints every command - the server-side dry runs a
+    cluster drain makes before it pauses a plan too, as capacity's dry run shows its own."""
+    proc, calls, _ = _run(
+        tmp_path, platform, *action, "--drain", "@TOKEN_FILE", "--url", CLUSTER_URL, "--dry-run"
+    )
+    assert proc.returncode == 0 and calls == [], proc.stderr
+    dry = [line for line in proc.stdout.splitlines() if "--dry-run=server" in line]
+    assert dry, proc.stdout
+    if action == ["down"]:
+        assert any("statefulset/seamless-postgres" in line for line in dry), dry
+
+
+def test_a_drain_from_an_address_the_api_locks_out_says_so(tmp_path):
+    """SDD §17.2, §13.1 (review RV46A-07): GET /api/v1/me answered 429 - the address locked out
+    after failed attempts - was refused as "is the control plane up?". It is named as the lockout:
+    nothing listed or paused, exit 2."""
+    me = {"cmd": "curl", "has": ["/api/v1/me"], "answers": [{"stdout": "\n429"}]}
+    proc, calls, _ = _run(
+        tmp_path,
+        "docker",
+        "stop",
+        "--drain",
+        "@TOKEN_FILE",
+        rules=[me, *_drain_rules([{"stdout": "[]"}])],
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "locks this address out" in proc.stderr and "control plane up" not in proc.stderr
+
+
+@pytest.mark.parametrize(
+    ("rule", "says"),
+    [
+        ({"cmd": "curl", "has": ["/api/v1/me"], "answers": [{"stdout": "<html>proxy</html>\n200"}]},
+         "cannot read the API's answer to GET /api/v1/me"),
+        ({"cmd": "curl", "has": ["/plans?status=running"],
+          "answers": [{"stdout": "<html>proxy</html>"}]},
+         "cannot read the plans the API returned"),
+    ],
+    ids=["me", "listing"],
+)  # fmt: skip
+def test_an_answer_that_is_no_json_is_refused_with_2(tmp_path, rule, says):
+    """SDD §17.2 (reviews RV45A-07, RV46A-09): a 200 that is no JSON - --url naming another
+    service, a proxy's page - for GET /api/v1/me or the listing is refused before any plan is
+    paused: 2, no test pinned it."""
+    proc, calls, _ = _run(
+        tmp_path,
+        "docker",
+        "stop",
+        "--drain",
+        "@TOKEN_FILE",
+        rules=[rule, *_drain_rules([{"stdout": "[]"}])],
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert says in proc.stderr and not _paused(calls), proc.stderr
