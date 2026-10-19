@@ -739,7 +739,7 @@ def main(argv: list[str] | None = None) -> int:
         from .ai.redaction import redact_cut
         from .orchestrator import OrchestratorError
         from .providers.base import ProviderError
-        from .store import ConflictError, NotFound
+        from .store import ConflictError, NotFound, UnstorableValue
 
         # SDD §15: one line, as the API answers each of these with a status (§12)
         if isinstance(exc, ProviderError):
@@ -750,7 +750,7 @@ def main(argv: list[str] | None = None) -> int:
             again = "a running server changed it, run the command again"
             print(f"error: {exc}; {again}", file=sys.stderr)
             return 1
-        if isinstance(exc, OrchestratorError | NotFound | ValueError):
+        if isinstance(exc, OrchestratorError | NotFound | ValueError | UnstorableValue):
             print(f"error: {exc}", file=sys.stderr)
             return 1
         raise

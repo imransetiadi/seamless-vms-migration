@@ -314,7 +314,7 @@ async def _refuse_unstorable_body(request: Request) -> None:
         return
     try:
         body = await request.json()
-    except ValueError:  # no body, or none in JSON: the route's own parsing answers
+    except (ValueError, RecursionError):  # no body, none in JSON or past the parser: the route's
         return
     found = unstorable(body)
     if found is not None:

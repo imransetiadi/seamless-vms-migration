@@ -791,6 +791,21 @@ def test_the_store_refuses_nul_and_lone_surrogates_and_finds_nothing_by_one(
     assert not [v for v in sent if _unstorable_sent(v)], [v for v in sent if _unstorable_sent(v)]
 
 
+def test_the_unstorable_walk_reads_a_value_nested_however_deep():
+    """SDD §11, §12 (review RV49-05): the walk that finds a NUL or a lone surrogate - for the store
+    and for the request-body check - recursed one Python frame per level: 1,500 levels raised
+    RecursionError. It walks without recursion, in document order, and names the path."""
+    from seamless_migrate.store import unstorable
+
+    clean: object = "x"
+    bad: object = "a\x00"
+    for _ in range(3000):
+        clean, bad = [clean], {"k": bad}
+    assert unstorable(clean) is None
+    assert unstorable(bad) == (".".join(["k"] * 3000), "holds a NUL character")
+    assert unstorable([{"a": "ok", "b\x00": "x"}, "\ud800"]) == ("0", "a key holds a NUL character")
+
+
 def test_an_over_long_actor_keeps_its_start_and_a_digest_of_the_whole(any_store: Store):
     """SDD §11 (reviews ST-02, RV48-10): events.actor is VARCHAR(128) while the advisor records
     user:<name> for names of up to 128 characters - PostgreSQL refused the event of a change it

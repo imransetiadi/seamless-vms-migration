@@ -927,3 +927,46 @@ def test_a_cors_origin_python_cannot_split_ends_the_cli_with_an_error_line(
     assert cli.main(["version"]) == 1
     err = capsys.readouterr().err
     assert err.startswith("error: ") and "is not an origin" in err, err
+
+
+def test_a_value_the_store_refuses_is_one_error_line_never_a_traceback(env, capsys):
+    """SDD §15 (review RV49-03): a command fails with one line `error: …` for the errors the API
+    answers with a status - and the API answers the store's refusal 422 (§12). `plan apply` of a
+    YAML whose mapping key holds a NUL (a key copied from a NUL-named Neutron network) let the
+    UnstorableValue out as a traceback; nothing is written."""
+    import yaml
+
+    from seamless_migrate.domain.enums import ProviderKind, ProviderRole
+    from seamless_migrate.domain.models import Plan
+    from tests.factories import make_provider
+
+    store = store_for(env)
+    try:
+        store.put("provider", make_provider(id="src-osp"))
+        store.put(
+            "provider",
+            make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+        )
+    finally:
+        store.dispose()
+    path = env / "plan.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "name": "Finance",
+                "source_provider_id": "src-osp",
+                "destination_provider_id": "dst-rhoso",
+                "vm_ids": ["vm-1"],
+                "mappings": {"networks": {"app\x00-net": "rhoso-app"}},
+            }
+        )
+    )
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and err.count("\n") == 1, err
+    assert "mappings.networks: a key holds a NUL character" in err
+    store = store_for(env)
+    try:
+        assert store.list("plan", Plan) == []
+    finally:
+        store.dispose()

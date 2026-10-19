@@ -227,6 +227,21 @@ def test_a_request_body_holding_a_nul_or_a_lone_surrogate_is_a_422_before_the_ro
     assert api.store.list("plan", Plan) == [] and "plan.created" not in api.kinds()
 
 
+@pytest.mark.parametrize(
+    ("content_type", "depth"),
+    [("application/json", 1500), ("text/plain", 1500), ("text/plain", 10000)],
+)
+def test_a_body_nested_however_deep_is_answered_as_its_route_answers_it(api, content_type, depth):
+    """SDD §12 (review RV49-05): the request-body check walked the parsed JSON in Python frames,
+    one per level - a body nested 1,500 deep (3 KB) was a RecursionError, a 500, for any caller
+    with the route's role, before the route's own validation ran. It walks without recursion,
+    and a body its parser cannot read is left to the route: a 4xx with the envelope."""
+    body = '{"name": "x", "description": ' + "[" * depth + "]" * depth + "}"
+    headers = {**api.h(Role.operator), "content-type": content_type}
+    res = api.client.post("/api/v1/plans", content=body.encode(), headers=headers)
+    assert res.status_code in (400, 422) and "error" in res.json(), res.text
+
+
 def test_a_value_the_store_refuses_is_a_422_naming_its_field(api, monkeypatch):
     """SDD §11, §12: a source cloud's name holding a NUL - Neutron's names are free strings - is
     refused by the store, never kept stripped as a name the source does not have; the route

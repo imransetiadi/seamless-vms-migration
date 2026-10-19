@@ -195,37 +195,54 @@ def _unsendable(value: str | None) -> bool:
     return value is not None and _unstorable_text(value) is not None
 
 
-def _find_unstorable(value: Any) -> tuple[list[str], str] | None:
-    """The path, innermost part first, and what - of the first string of ``value`` PostgreSQL
-    cannot store; its parts are only built on the way back from one. A model is read as it holds
-    its fields: its JSON dump writes a lone surrogate of a map's key as U+FFFD, a rewrite the store
-    would never see."""
-    if isinstance(value, str):
-        what = _unstorable_text(value)
-        return ([], f"holds {what}") if what else None
-    if isinstance(value, BaseModel):
-        value = value.__dict__
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if isinstance(key, str) and (what := _unstorable_text(key)):
-                return [], f"a key holds {what}"
-            if (found := _find_unstorable(item)) is not None:
-                found[0].append(str(key))
-                return found
-    elif isinstance(value, list | tuple | set | frozenset):
-        for index, item in enumerate(value):
-            if (found := _find_unstorable(item)) is not None:
-                found[0].append(str(index))
-                return found
+def _children(item: Any) -> list[tuple[str, Any, Any]] | None:
+    """A container's ``(path part, child, the map key it sits under)``, in document order; a model
+    is read as it holds its fields - its JSON dump writes a lone surrogate of a map's key as
+    U+FFFD, a rewrite the store would never see - else None."""
+    if isinstance(item, BaseModel):
+        item = item.__dict__
+    if isinstance(item, dict):
+        return [(str(key), child, key) for key, child in item.items()]
+    if isinstance(item, list | tuple | set | frozenset):
+        return [(str(index), child, None) for index, child in enumerate(item)]
     return None
+
+
+def _holds_unstorable(value: Any) -> bool:
+    """Whether a string of ``value``, a map's key included, holds what PostgreSQL cannot store -
+    the cheap pass every write takes: no recursion, no path built (review RV49-05)."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if UNSTORABLE.search(item):
+                return True
+        elif (children := _children(item)) is not None:
+            for _, child, key in children:
+                if isinstance(key, str) and UNSTORABLE.search(key):
+                    return True
+                stack.append(child)
+    return False
 
 
 def unstorable(value: Any) -> tuple[str, str] | None:
     """Where ``value`` first holds a NUL or a lone surrogate, and what: ``("vm.nics.0.network",
     "holds a NUL character")``, ``("vm.tags", "a key holds a lone surrogate")``, else None - what
-    the store refuses, and the API before any route runs (SDD §11, §12)."""
-    found = _find_unstorable(value)
-    return None if found is None else (".".join(reversed(found[0])), found[1])
+    the store refuses, and the API before any route runs (SDD §11, §12). Walked without recursion,
+    depth first in document order, so a value nested however deep is read (review RV49-05)."""
+    if not _holds_unstorable(value):
+        return None
+    stack: list[tuple[tuple[str, ...], Any, Any]] = [((), value, None)]
+    while stack:
+        path, item, key = stack.pop()
+        if isinstance(key, str) and (what := _unstorable_text(key)):
+            return ".".join(path[:-1]), f"a key holds {what}"
+        if isinstance(item, str):
+            if what := _unstorable_text(item):
+                return ".".join(path), f"holds {what}"
+        elif (children := _children(item)) is not None:
+            stack.extend(((*path, part), child, key) for part, child, key in reversed(children))
+    return None
 
 
 def _refuse_unstorable(subject: str, value: Any) -> None:
