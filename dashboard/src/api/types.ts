@@ -972,6 +972,9 @@ export interface MigrationListQuery {
 export const SYNC_PASSES_LATEST = 20;
 /** Longest `comment`, `reason` or `confirm` a migration action accepts (SDD §12). */
 export const ACTION_TEXT_MAX = 2000;
+/** Its field's maxLength in the UTF-16 units the browser counts: room for ACTION_TEXT_MAX characters of any kind, an
+ * emoji two units; the dialog refuses more than ACTION_TEXT_MAX as the API counts them (review RV50-06). */
+export const ACTION_TEXT_UNITS = 2 * ACTION_TEXT_MAX;
 /** Longest plan name and description POST/PATCH /plans accept (SDD §12). */
 export const PLAN_NAME_MAX = 200;
 export const PLAN_DESCRIPTION_MAX = 2000;

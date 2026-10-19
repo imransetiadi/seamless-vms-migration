@@ -1719,8 +1719,10 @@ export class MockServer {
     const rec = this.recommendations[index]!;
     const m = this.migrations.find((x) => x.id === rec.migration_id);
     if (!m) throw new HttpError(409, 'conflict', `recommendation ${recId} decides nothing a person can change yet`);
-    const newest = this.recommendations.filter((r) => r.migration_id === m.id).reduce((a, b) => (b.created_at > a.created_at || (b.created_at === a.created_at && b.id > a.id) ? b : a));
-    if (newest.id !== recId) throw new HttpError(409, 'conflict', `a newer recommendation (${newest.id}) replaced ${recId}`);
+    // like the API (SDD §14.6, reviews RV49-04, RV50-09): the hold names the one to decide, whatever its time; without
+    // a hold, the newest
+    const newest = m.advisor_hold ?? this.recommendations.filter((r) => r.migration_id === m.id).reduce((a, b) => (b.created_at > a.created_at || (b.created_at === a.created_at && b.id > a.id) ? b : a)).id;
+    if (newest !== recId) throw new HttpError(409, 'conflict', `a newer recommendation (${newest}) replaced ${recId}`);
     const plan = this.plan(m.plan_id);
     const policy = policyFor(this.policies, plan);
     // like the API (SDD §14.6): the rules of the policy that took the decision, as they were then; the policy in
@@ -2491,7 +2493,8 @@ export class MockServer {
       }
     }
     const plan = this.plan(m.plan_id);
-    const comment = typeof input.comment === 'string' && input.comment.trim() ? input.comment.trim() : null;
+    // stripped as the API's Python strips (str.strip), what the dashboard sends kept as sent (review RV50-06)
+    const comment = typeof input.comment === 'string' && pyStrip(input.comment) ? pyStrip(input.comment) : null;
     const record = (message: string, data: Record<string, unknown> = {}) =>
       this.emit({ kind: 'migration.action', plan_id: m.plan_id, migration_id: m.id, actor: me.name, message: `${m.vm.name}: ${message}`, data: { action, ...data } });
     const approve = () => {
@@ -2567,7 +2570,7 @@ export class MockServer {
         record('delta sync requested');
         break;
       case 'rollback': {
-        const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+        const reason = typeof input.reason === 'string' ? pyStrip(input.reason) : '';
         if (!reason) throw new HttpError(422, 'validation_error', 'reason is required.');
         if (!canTransition(m.phase, 'rolling_back')) throw new HttpError(409, 'conflict', `Cannot move ${m.vm.name} from ${m.phase} to rolling_back.`);
         // like the API (SDD §8.1): a finalize that began deleting the source is finalized again, never rolled back
@@ -2664,7 +2667,7 @@ export class MockServer {
           throw new HttpError(409, 'conflict', `${m.vm.name} cannot be cancelled: the source VM is stopped; ${advice} instead.`);
         }
         if (m.phase === 'failed' && m.downtime_started_at) throw new HttpError(409, 'conflict', 'The source VM was stopped; roll back instead of cancelling.');
-        const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : 'cancelled by operator';
+        const reason = typeof input.reason === 'string' && pyStrip(input.reason) ? pyStrip(input.reason) : 'cancelled by operator';
         // like the API (SDD §5.1): the data copied so far is cleaned up after the cancel - a pass that runs, or the copies
         // the API reads as kept where no record tells (its `copied_data`, §9.3, review RV43B-03), not any recorded pass
         const cleanup = m.phase === 'precopy' || m.phase === 'syncing' || keptAfterRollback(m);

@@ -13,12 +13,12 @@ import {
 import { useId, useLayoutEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useMe, useMigrationAction, useProviders, type MigrationActionRequest } from '../api/hooks';
-import { ACTION_TEXT_MAX, FORCE_REASON_MIN, type Migration, type Plan, type Role } from '../api/types';
+import { ACTION_TEXT_MAX, ACTION_TEXT_UNITS, FORCE_REASON_MIN, type Migration, type Plan, type Role } from '../api/types';
 import { waitingDecision } from '../lib/advisor';
 import { buttonClassName } from '../lib/buttonStyles';
 import { cn } from '../lib/cn';
 import { forcedDowntime } from '../lib/forcedEstimate';
-import { formatBytes, formatDateTime, formatDuration, pyLen, pyStrip } from '../lib/format';
+import { formatBytes, formatDateTime, formatDuration, pyLen, pyStrip, pyTooLong } from '../lib/format';
 import { hasDataPath } from '../lib/fsm';
 import { isWarmStrategy } from '../lib/phase';
 import {
@@ -159,9 +159,14 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       },
     });
 
+  // a comment or reason is sent as counted: stripped as the API's Python strips it, at most ACTION_TEXT_MAX code points,
+  // which the fields' maxLength - UTF-16 units - cannot check (SDD §12, review RV50-06)
   const commentField = (
-    <TextAreaField label="Comment (optional)" rows={2} maxLength={ACTION_TEXT_MAX} value={comment} onChange={(e) => setComment(e.target.value)} hint="Recorded in the audit trail." />
+    <TextAreaField label="Comment (optional)" rows={2} maxLength={ACTION_TEXT_UNITS} value={comment} onChange={(e) => setComment(e.target.value)} hint="Recorded in the audit trail." />
   );
+  const commentTooLong = pyTooLong(comment, ACTION_TEXT_MAX);
+  const commentBody = pyStrip(comment) ? { comment: pyStrip(comment) } : {};
+  const reasonTooLong = pyTooLong(reason, ACTION_TEXT_MAX);
   const estimate = m.estimate ? formatDuration(m.estimate.downtime_s) : 'unknown';
   // what a Force cutover records (SDD §5.4, §16): the downtime after the running pass, not the converged estimate
   const forced = plan && isWarmStrategy(m.strategy) ? forcedDowntime(m, plan) : null;
@@ -258,7 +263,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         // what the approval leads to (SDD §5.4, §16): the one the gate waits for starts the cutover and stops the source
         description={approval.description}
         confirmLabel={approval.confirmLabel}
-        onConfirm={() => submit({ action: 'approve', body: comment.trim() ? { comment: comment.trim() } : {} })}
+        canConfirm={!commentTooLong}
+        confirmReason={commentTooLong ?? undefined}
+        onConfirm={() => submit({ action: 'approve', body: commentBody })}
       >
         {commentField}
       </ConfirmDialog>
@@ -297,10 +304,12 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
           </>
         }
         confirmLabel={forcing ? 'Cut over outside the window' : early || waitsForApprover ? 'Request cutover' : 'Start cutover'}
+        canConfirm={!commentTooLong}
+        confirmReason={commentTooLong ?? undefined}
         onConfirm={() =>
           submit({
             action: 'cutover',
-            body: { force_window: forcing || (closedWindow && forceWindow), ...(comment.trim() ? { comment: comment.trim() } : {}) },
+            body: { force_window: forcing || (closedWindow && forceWindow), ...commentBody },
           })
         }
       >
@@ -356,15 +365,15 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
           </>
         }
         confirmLabel="Force cutover"
-        canConfirm={pyLen(pyStrip(reason)) >= FORCE_REASON_MIN}
-        confirmReason={`Enter a reason of at least ${FORCE_REASON_MIN} characters.`}
-        onConfirm={() => submit({ action: 'force-cutover', body: { reason: reason.trim() } })}
+        canConfirm={pyLen(pyStrip(reason)) >= FORCE_REASON_MIN && !reasonTooLong}
+        confirmReason={reasonTooLong ?? `Enter a reason of at least ${FORCE_REASON_MIN} characters.`}
+        onConfirm={() => submit({ action: 'force-cutover', body: { reason: pyStrip(reason) } })}
       >
         <TextAreaField
           label="Reason"
           required
           rows={2}
-          maxLength={ACTION_TEXT_MAX}
+          maxLength={ACTION_TEXT_UNITS}
           value={reason}
           onChange={(e) => setReason(e.target.value)}
           hint={`At least ${FORCE_REASON_MIN} characters; recorded in the audit trail.`}
@@ -409,11 +418,11 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         title={`Roll back ${m.vm.name}?`}
         description={`${rollbackEffect(m)} Downtime ends when the source is running.`}
         confirmLabel="Roll back"
-        canConfirm={reason.trim().length > 0}
-        confirmReason="Enter a reason first."
-        onConfirm={() => submit({ action: 'rollback', body: { reason: reason.trim() } })}
+        canConfirm={pyStrip(reason).length > 0 && !reasonTooLong}
+        confirmReason={reasonTooLong ?? 'Enter a reason first.'}
+        onConfirm={() => submit({ action: 'rollback', body: { reason: pyStrip(reason) } })}
       >
-        <TextAreaField label="Reason" required rows={2} maxLength={ACTION_TEXT_MAX} value={reason} onChange={(e) => setReason(e.target.value)} hint="Required; recorded in the audit trail." />
+        <TextAreaField label="Reason" required rows={2} maxLength={ACTION_TEXT_UNITS} value={reason} onChange={(e) => setReason(e.target.value)} hint="Required; recorded in the audit trail." />
       </ConfirmDialog>
 
       <ConfirmDialog
@@ -433,9 +442,11 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         }
         confirmLabel="Cancel migration"
         cancelLabel="Keep migration"
-        onConfirm={() => submit({ action: 'cancel', body: reason.trim() ? { reason: reason.trim() } : {} })}
+        canConfirm={!reasonTooLong}
+        confirmReason={reasonTooLong ?? undefined}
+        onConfirm={() => submit({ action: 'cancel', body: pyStrip(reason) ? { reason: pyStrip(reason) } : {} })}
       >
-        <TextAreaField label="Reason (optional)" rows={2} maxLength={ACTION_TEXT_MAX} value={reason} onChange={(e) => setReason(e.target.value)} />
+        <TextAreaField label="Reason (optional)" rows={2} maxLength={ACTION_TEXT_UNITS} value={reason} onChange={(e) => setReason(e.target.value)} />
       </ConfirmDialog>
 
       <ConfirmDialog

@@ -98,6 +98,12 @@ describe('RecommendationActions (SDD §14.6)', () => {
     expect(within(group).getByRole('button', { name: 'Override' })).not.toHaveAttribute('aria-disabled');
   });
 
+  it("offers the option of an answer that could not be applied in the override: Approve cannot run it (SDD §14.6, review RV50-05)", async () => {
+    const { server, migration, rec } = unpinned(['cold', 'warm']);
+    const unusable = { ...rec, recommendation: { ...rec.recommendation, unusable: "the advisor's answer was escalate" } };
+    expect(await offered(migration, unusable, server)).toEqual({ approve: 'disabled', override: 'enabled', alternatives: ['Cold migration', 'Warm migration'] });
+  });
+
   it("refuses both while the plan's default strategy sets the VM's, as the API does (SDD §14.6, audit AD-04)", async () => {
     const { server, migration, rec, plan } = unpinned(['cold', 'warm']);
     plan.default_strategy = 'cold';
@@ -137,5 +143,45 @@ describe('RecommendationActions (SDD §14.6)', () => {
     expect(within(dialog).getByRole('button', { name: 'Override' })).toHaveAttribute('aria-disabled', 'true');
     await user.type(field, '\u{1F600}'.repeat(5));
     expect(within(dialog).getByRole('button', { name: 'Override' })).not.toHaveAttribute('aria-disabled');
+  });
+
+  it('sends the override reason it counted, and holds one of 2000 characters as the API counts them (SDD §14.6, review RV50-06)', async () => {
+    const { server, migration } = unpinned(['cold', 'warm']);
+    const rec = strategyRecommendation({
+      id: 'rec-c0000000beef',
+      at: '2026-10-08T11:00:00Z',
+      migration,
+      providerId: 'rhosp17-dc1',
+      option: 'warm',
+      confidence: 0.9,
+      options: ['cold', 'warm'],
+      status: 'pending_approval',
+      deterministic: 'cold',
+      snapshotSha256: null,
+      policyId: 'pol-finance',
+      rules: { require_distinct_approver: true, require_override_reason: true },
+    });
+    server.recommendations.push(rec);
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<RecommendationActions rec={rec} migration={migration} />, { token: 'admin', server });
+    const group = await screen.findByRole('group', { name: /^Decide on the recommendation for/ });
+    await user.click(within(group).getByRole('button', { name: 'Override' }));
+    const dialog = await screen.findByRole('alertdialog');
+    const field = within(dialog).getByRole('textbox', { name: /Reason/ }) as HTMLTextAreaElement;
+    const confirm = within(dialog).getByRole('button', { name: 'Override' });
+    // 1500 emoji are 1500 characters to the API, 3000 units to the browser
+    await user.click(field);
+    await user.paste('\u{1F600}'.repeat(1500));
+    expect([...field.value].length).toBe(1500);
+    await user.clear(field);
+    await user.paste('a'.repeat(2001));
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).toHaveAccessibleDescription('At most 2000 characters.');
+    // a byte-order mark Python's strip keeps: ten characters counted, ten sent
+    await user.clear(field);
+    await user.type(field, '\uFEFFabcdefghi');
+    expect(confirm).not.toHaveAttribute('aria-disabled');
+    await user.click(confirm);
+    await waitFor(() => expect(server.recommendations.find((r) => r.id === rec.id)!.decision).toMatchObject({ status: 'overridden', reason_text: '\uFEFFabcdefghi' }));
   });
 });

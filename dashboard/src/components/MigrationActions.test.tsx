@@ -365,13 +365,28 @@ describe('MigrationActions', () => {
     await waitFor(() => expect(plan.status).toBe('running'));
   });
 
+  /** The dialog's field holds 2000 characters as the API counts them - 1500 emoji are 3000 units - and its confirm
+   * refuses more, saying why (SDD §12, review RV50-06). */
+  async function capsAsTheApi(user: ReturnType<typeof userEvent.setup>, dialog: HTMLElement, label: RegExp, confirmName: RegExp) {
+    const field = within(dialog).getByLabelText(label) as HTMLTextAreaElement;
+    const confirm = within(dialog).getByRole('button', { name: confirmName });
+    await user.click(field);
+    await user.paste('\u{1F600}'.repeat(1500));
+    expect([...field.value].length).toBe(1500);
+    expect(confirm).not.toHaveAttribute('aria-disabled');
+    await user.clear(field);
+    await user.paste('a'.repeat(2001));
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).toHaveAccessibleDescription('At most 2000 characters.');
+  }
+
   it('caps a rollback reason at the API limit of 2000 characters (SDD §12)', async () => {
     const user = userEvent.setup({ delay: null });
     const { button } = setup('legacy-rhel6-app', 'operator');
 
     await user.click(button(/roll back/i));
     const dialog = await screen.findByRole('alertdialog', { name: /roll back legacy-rhel6-app/i });
-    expect(within(dialog).getByLabelText(/reason/i)).toHaveAttribute('maxlength', '2000');
+    await capsAsTheApi(user, dialog, /reason/i, /^roll back$/i);
   });
 
   it('caps an approval comment and a cancel reason at 2000 characters (SDD §12)', async () => {
@@ -380,11 +395,68 @@ describe('MigrationActions', () => {
 
     await user.click(button(/approve/i));
     const approve = await screen.findByRole('alertdialog', { name: /approve/i });
-    expect(within(approve).getByLabelText(/comment/i)).toHaveAttribute('maxlength', '2000');
+    await capsAsTheApi(user, approve, /comment/i, /^approve/i);
     await user.click(within(approve).getByRole('button', { name: /^cancel$/i }));
     await user.click(button(/^cancel/i));
     const cancel = await screen.findByRole('alertdialog', { name: /cancel/i });
-    expect(within(cancel).getByLabelText(/reason/i)).toHaveAttribute('maxlength', '2000');
+    await capsAsTheApi(user, cancel, /reason/i, /^cancel migration$/i);
+  });
+
+  it('caps a cutover comment at 2000 characters, counted as the API counts them (SDD §12, review RV50-06)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { button } = setup('db-mysql-02', 'approver');
+    await user.click(button(/^cut over/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /db-mysql-02/i });
+    await capsAsTheApi(user, dialog, /comment/i, /cut ?over/i);
+  });
+
+  it("sends an approval comment, a rollback reason and a cancel reason as the API's Python strips them (SDD §12, review RV50-06)", async () => {
+    const user = userEvent.setup({ delay: null });
+    // a byte-order mark Python's strip keeps and JavaScript's trim takes; the spaces around go
+    const approving = setup('app-billing-01', 'approver');
+    await user.click(approving.button(/approve/i));
+    const approve = await screen.findByRole('alertdialog', { name: /approve/i });
+    await user.type(within(approve).getByLabelText(/comment/i), ' looks good\uFEFF ');
+    await user.click(within(approve).getByRole('button', { name: /^approve/i }));
+    await waitFor(() => expect(approving.server.migrations.find((m) => m.id === approving.migration.id)!.approvals.at(-1)?.comment).toBe('looks good\uFEFF'));
+    approving.unmount();
+    const rolling = setup('legacy-rhel6-app', 'operator');
+    await user.click(rolling.button(/roll back/i));
+    const rollback = await screen.findByRole('alertdialog', { name: /roll back legacy-rhel6-app/i });
+    await user.type(within(rollback).getByLabelText(/reason/i), ' undo it\uFEFF ');
+    await user.click(within(rollback).getByRole('button', { name: /^roll back$/i }));
+    await waitFor(() => expect(rolling.server.events.find((e) => e.migration_id === rolling.migration.id && e.data.action === 'rollback')?.data.reason).toBe('undo it\uFEFF'));
+    rolling.unmount();
+    const cancelling = setup('app-billing-01', 'operator');
+    await user.click(cancelling.button(/^cancel/i));
+    const cancel = await screen.findByRole('alertdialog', { name: /cancel/i });
+    await user.type(within(cancel).getByLabelText(/reason/i), ' not now\uFEFF ');
+    await user.click(within(cancel).getByRole('button', { name: /^cancel migration$/i }));
+    await waitFor(() => expect(cancelling.server.events.find((e) => e.migration_id === cancelling.migration.id && e.data.action === 'cancel')?.data.reason).toBe('not now\uFEFF'));
+  });
+
+  it('sends the Force cutover reason it counted, a byte-order mark kept as Python keeps it (SDD §5.4, review RV50-06)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { button, server, migration } = setup('db-mysql-02', 'approver');
+    await user.click(button(/^force cutover$/i));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Force the cutover of db-mysql-02?' });
+    await user.type(within(dialog).getByRole('textbox', { name: /reason/i }), '\uFEFFabcdefghi');
+    const confirm = within(dialog).getByRole('button', { name: /^force cutover$/i });
+    expect(confirm).not.toHaveAttribute('aria-disabled');
+    await user.click(confirm);
+    await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.force_cutover).toMatchObject({ reason: '\uFEFFabcdefghi' }));
+  });
+
+  it("refuses a rollback reason the API's Python strips to nothing (SDD §12, review RV50-06)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const { button } = setup('legacy-rhel6-app', 'operator');
+    await user.click(button(/roll back/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /roll back legacy-rhel6-app/i });
+    // U+0085 is whitespace to Python, not to JavaScript's trim
+    await user.type(within(dialog).getByLabelText(/reason/i), '\u0085');
+    const confirm = within(dialog).getByRole('button', { name: /^roll back$/i });
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).toHaveAccessibleDescription('Enter a reason first.');
   });
 
   it('says a cancel removes the data copied so far when the migration has a data path (SDD §5.1, §16)', async () => {

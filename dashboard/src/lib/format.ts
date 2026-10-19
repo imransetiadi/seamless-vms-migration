@@ -197,6 +197,12 @@ export function pyLen(text: string): number {
   return [...text].length;
 }
 
+/** Why a text the API caps at `max` characters is too long to send - stripped as its Python strips it, counted in code
+ * points -, else null: a dialog refuses it, saying so, as the browser's maxLength counts UTF-16 units (review RV50-06). */
+export function pyTooLong(text: string, max: number): string | null {
+  return pyLen(pyStrip(text)) > max ? `At most ${max} characters.` : null;
+}
+
 /**
  * A name quoted as the API's messages quote it, Python's `repr` of a str: in single quotes, in double quotes when it
  * holds a single quote and no double one, with backslashes escaped and what Python does not print written as an escape.

@@ -10,6 +10,7 @@ import {
   formatRelative,
   pyNames,
   pyLen,
+  pyTooLong,
   pyRepr,
   pyStrip,
 } from './format';
@@ -230,5 +231,14 @@ describe('pyLen (audit AD-10)', () => {
   it("counts code points, as the API's len: an emoji is one", () => {
     expect([pyLen('\u{1F600}'.repeat(5)), '\u{1F600}'.repeat(5).length]).toEqual([5, 10]);
     expect(pyLen('ten chars!')).toBe(10);
+  });
+});
+
+describe('pyTooLong (review RV50-06)', () => {
+  it('refuses a text past the limit as the API counts it: stripped as Python strips, in code points', () => {
+    expect(pyTooLong('\u{1F600}'.repeat(2000), 2000)).toBeNull();
+    expect(pyTooLong(`  ${'a'.repeat(2000)}\n`, 2000)).toBeNull();
+    expect(pyTooLong('a'.repeat(2001), 2000)).toBe('At most 2000 characters.');
+    expect(pyTooLong('\ufeff'.repeat(2001), 2000)).toBe('At most 2000 characters.');
   });
 });

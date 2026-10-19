@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { REASON_CODES, type AdvisorNote, type AdvisorRecommendation, type Decision, type ReasonCode } from '../api/types';
 import { buildFixtures } from '../api/mockData';
-import { decisionText, distributionLabel, distributionRows, nonStrategyNotes, optionLabel, recommendedText, waitingDecision } from './advisor';
+import { decidable, decisionText, distributionLabel, distributionRows, nonStrategyNotes, optionLabel, recommendedText, waitingDecision } from './advisor';
 
 const AT = '2026-10-10T08:00:00Z';
 
@@ -188,5 +188,18 @@ describe('waitingDecision (SDD §14.6)', () => {
       expect(waitingDecision({ ...base, phase, advisor_hold: 'rec-1' }), phase).toBeNull();
     }
     expect(waitingDecision({ ...base, phase: 'ready', advisor_hold: null })).toBeNull();
+  });
+});
+
+describe('decidable (SDD §14.6)', () => {
+  it("is the recommendation the migration's hold names while it holds one, else the newest (review RV50-09)", () => {
+    const base = { ...buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0]!, phase: 'ready' as const };
+    const held = rec({}, {}, { id: 'rec-00000000held' });
+    const newer = rec({}, {}, { id: 'rec-0000000newer' });
+    // the clock stepped back before the validation that held it: the newest by time is another one
+    const holding = { ...base, advisor_hold: held.id };
+    expect([decidable(held, holding, newer.id), decidable(newer, holding, newer.id)]).toEqual([true, false]);
+    const free = { ...base, advisor_hold: null };
+    expect([decidable(held, free, newer.id), decidable(newer, free, newer.id)]).toEqual([false, true]);
   });
 });

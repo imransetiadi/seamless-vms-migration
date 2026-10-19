@@ -1919,6 +1919,23 @@ describe('mock advisor policies, approval and override, like the API (SDD §14.6
     expect(server.events.filter((e) => e.data.target_id === rec.id).map((e) => e.kind)).toEqual(['recommendation.created', 'decision.pending_approval']);
   });
 
+  it("decides the recommendation the migration's hold names, whatever the newest by time, like the API (SDD §14.6, review RV50-09)", async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    const held = recOf(server, 'analytics-db');
+    expect(db.advisor_hold).toBe(held.id);
+    // newer by time, named by no hold: the wall clock stepped back before the validation that held the migration
+    const later = { ...held, id: 'rec-c10c5e0beef0', created_at: new Date(Date.parse(held.created_at) + 60_000).toISOString() };
+    server.recommendations.push(later);
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${later.id}/approve`, {})).rejects.toMatchObject({
+      status: 409,
+      message: `a newer recommendation (${held.id}) replaced ${later.id}`,
+    });
+    const approved = await as(server, ADMIN).post<AdvisorRecommendation>(`/advisor/recommendations/${held.id}/approve`, {});
+    expect([approved.decision.status, db.advisor_hold]).toEqual(['approved', null]);
+  });
+
   it('starts a held migration only once a human decides: approve, then the run goes on', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
     await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
