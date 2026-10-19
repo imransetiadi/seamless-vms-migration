@@ -32,7 +32,16 @@ kubectl and the API server do (review 38b, read from their sources):
 * a namespace the manifests were never applied to (``empty()``, a first ``up``) has no Deployment,
   StatefulSet or ConfigMap: a read answers NotFound (exit 1) - nothing, exit 0, with
   ``--ignore-not-found`` -, a scale or a rollout status fails so, and ``apply -k`` creates them as
-  the manifests define them, PostgreSQL's first; a StatefulSet names a new pod by its ordinal.
+  the manifests define them. Kustomize sends the Deployment before the StatefulSet; the fake
+  creates PostgreSQL first because it records a pod's databases as the pod starts, where a real
+  control plane retries its connection until PostgreSQL answers - it ends connected to
+  seamless-postgres-0 either way (review RV45A-09);
+* a StatefulSet puts each pod at the slot of its ordinal in [0, replicas), deletes the highest
+  first, and creates a slot's pod only once the pod there has gone: a ``rollout status`` of it
+  waits out a pod still terminating in a slot and recreates it (the controller's
+  stateful_set_control.go; review RV45A-09);
+* a ``scale`` or a ``patch`` with ``--dry-run=server`` is judged as the real one, applies nothing
+  and counts no ConfigMap patch (review RV45A-02).
 """
 
 from __future__ import annotations
@@ -84,7 +93,7 @@ def qty(value):
     return float(number) * UNITS.get(unit, 1)
 
 
-def new_pod(kind):
+def new_pod(kind, slot=None):
     obj = st[kind]
     limits = dict(obj.get("limits", {}))
     for key, most in st.get("limitrange", {}).items():  # LimitRanger admits the pod or none
@@ -93,11 +102,7 @@ def new_pod(kind):
                                     f"{limits[key]}")
             return None
     st["serial"] += 1
-    name = f"{obj['name']}-{st['serial']}"
-    if kind == "statefulset":  # a StatefulSet names its pods by ordinal, the lowest free one first
-        taken = {p["name"] for p in obj["pods"]}
-        name = next(f"{obj['name']}-{i}" for i in range(len(taken) + 1)
-                    if f"{obj['name']}-{i}" not in taken)
+    name = f"{obj['name']}-{st['serial'] if slot is None else slot}"
     pod = {"name": name, "phase": "Running", "config": dict(st["configmap"]), "limits": limits}
     if kind == "deployment":
         postgres = (st["statefulset"] or {}).get("pods", [])
@@ -109,8 +114,21 @@ def active(kind):
     return [p for p in st[kind]["pods"] if p["phase"] == "Running" and not p.get("terminating")]
 
 
+def ordinal(pod):
+    return int(pod["name"].rsplit("-", 1)[1])
+
+
 def reconcile(kind):
     obj = st[kind]
+    if kind == "statefulset":  # a slot per ordinal: the highest go first, refilled once empty
+        for pod in active(kind):
+            if ordinal(pod) >= obj["replicas"]:
+                pod["terminating"] = True
+        taken = {ordinal(p) for p in obj["pods"] if p["phase"] == "Running"}  # terminating ones too
+        for slot in range(obj["replicas"]):
+            if slot not in taken:
+                obj["pods"].append(new_pod(kind, slot))
+        return
     for pod in active(kind)[obj["replicas"]:]:  # a scale-down deletes active pods only
         pod["terminating"] = True
     while len(active(kind)) < obj["replicas"]:
@@ -164,6 +182,8 @@ if verb in ("get", "scale") and words[1] in KINDS:
     found(KINDS[words[1]])
 if verb == "rollout" and words[1] == "status":
     found(KINDS[words[2]])
+if verb == "scale" and flags.get("--dry-run") == "server":
+    done(f"{words[1]} scaled (server dry run)\n")
 if verb == "scale":
     kind = KINDS[words[1]]
     st[kind]["replicas"] = int(flags["--replicas"])
@@ -192,6 +212,11 @@ if verb == "wait":
     done()
 if verb == "rollout" and words[1] == "status":
     kind = KINDS[words[2]]
+    if kind == "statefulset":  # the grace period of a slot's terminating pod ends while it waits
+        obj = st[kind]
+        obj["pods"] = [p for p in obj["pods"]
+                       if not (p.get("terminating") and ordinal(p) < obj["replicas"])]
+        reconcile(kind)
     if st[kind].get("deadline_exceeded") or len(active(kind)) < st[kind]["replicas"]:
         st[kind]["deadline_exceeded"] = True
         done(f'error: deployment "seamless" exceeded its progress deadline\n', 1)
@@ -208,6 +233,9 @@ if verb == "rollout" and words[1] == "undo":
     obj["limits"], obj["annotations"] = previous["limits"], previous["annotations"]
     new_template(keep_progress=True)
     done("deployment.apps/seamless rolled back\n")
+dry_run = flags.get("--dry-run") == "server"
+if verb == "patch" and words[1] == "configmap/seamless-config" and dry_run:
+    done("configmap/seamless-config patched (server dry run)\n")
 if verb == "patch" and words[1] == "configmap/seamless-config":  # a merge patch: null removes
     st["configmap_patches"] = st.get("configmap_patches", 0) + 1
     if st.get("fail_configmap_patch") == st["configmap_patches"]:

@@ -270,31 +270,39 @@ count_items() { python3 -c 'import json, sys; print(len(json.load(sys.stdin)))';
 drain() {
   local me role plans ids id phase out busy deadline rc code
   if [ "$DRY" = 1 ]; then
-    api -H "$HEADER" "$API/api/v1/me"
-    say "# refused unless the token is an operator's or higher"
+    run curl -sS --max-time 30 -H "$HEADER" -w '\n%{http_code}' "$API/api/v1/me"
+    say "# refused unless the API takes the token and it is an operator's or higher"
     api -H "$HEADER" "$API/api/v1/plans?status=running"
     say "# then, for each running plan:"
     pause_plan PLAN_ID
     say "# then wait until no migration is in cutover, verifying or rolling_back (at most ${WAIT_TIMEOUT}s)"
     return
   fi
-  # the token's role before any plan is listed: a viewer's lists them, then every pause is refused (SDD §17.2,
-  # review RV44A-02)
-  me=$(curl -fsS --max-time 30 -H "$HEADER" "$API/api/v1/me") ||
-    die "cannot ask the API at $API whose token this is (is the control plane up, and the token valid?)"
-  role=$(printf '%s' "$me" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("role", ""))') ||
-    die "cannot read the API's answer to GET /api/v1/me"
+  # the token's role before any plan is listed: a viewer's lists them, then every pause is refused; a token the API
+  # does not take, or an API that cannot answer, is refused as well - nothing changed yet (SDD §17.2, reviews RV44A-02,
+  # RV45A-07)
+  rc=0
+  me=$(curl -sS --max-time 30 -H "$HEADER" -w '\n%{http_code}' "$API/api/v1/me") || rc=$?
+  code=$(printf '%s\n' "$me" | sed -n '$p')
+  case $rc:$code in
+    0:200) ;;
+    0:401 | 0:403) refuse "the API at $API does not take this token (HTTP $code): give an operator's token or higher" ;;
+    *) refuse "cannot ask the API at $API whose token this is (HTTP ${code:-000}): is the control plane up?" \
+      "Nothing was changed" ;;
+  esac
+  role=$(printf '%s\n' "$me" | sed '$d' | python3 -c 'import json, sys; print(json.load(sys.stdin).get("role", ""))') ||
+    refuse "cannot read the API's answer to GET /api/v1/me: nothing was changed"
   case $role in
     operator | approver | admin) ;;
     *) refuse "the token's role is '$role': a drain pauses plans, which takes an operator's token or higher" ;;
   esac
   plans=$(curl -fsS --max-time 30 -H "$HEADER" "$API/api/v1/plans?status=running") ||
-    die "cannot list the running plans at $API (is the control plane up, and the token an operator's?)"
+    refuse "cannot list the running plans at $API (is the control plane up?): nothing was changed"
   ids=$(printf '%s' "$plans" | python3 -c '
 import json, sys
 for plan in json.load(sys.stdin):
     if plan.get("status") == "running":
-        print(plan["id"])') || die "cannot read the plans the API returned"
+        print(plan["id"])') || refuse "cannot read the plans the API returned: nothing was changed"
   # every way the drain ends before its stop - a failure, an interrupt - stops nothing, and the plans it paused stay
   # paused: named, with the way to resume them (SDD §17.2, reviews RV38B-05, RV41A-05)
   trap 'drain_failed "interrupted"' INT TERM
@@ -304,16 +312,17 @@ for plan in json.load(sys.stdin):
     esac
     # named before its answer: a pause the API applied whose answer never came - a timeout, an interrupt - or came as
     # an error after it - a 5xx, a gateway's 502 or 504 - leaves the plan paused, and resume starts a running plan as
-    # it is (SDD §17.2, reviews RV42A-06, RV44A-02). One the API refused - 404 or 409: a plan no longer running -
-    # paused nothing, and resume would start a plan failed meanwhile again: it is named no more (review RV43A-04).
+    # it is (SDD §17.2, reviews RV42A-06, RV44A-02). One the API refused - any 4xx, answered before anything was
+    # applied: a plan no longer running, a token it no longer takes, a plan another writer keeps changing - paused
+    # nothing, and resume would start a plan failed meanwhile again: it is named no more (reviews RV43A-04, RV45A-06).
     PAUSED+=("$id")
     rc=0
     code=$(pause_plan "$id") || rc=$?
     case $rc:$code in
       0:2[0-9][0-9]) ;;
-      0:404 | 0:409)
+      0:4[0-9][0-9])
         unset "PAUSED[$((${#PAUSED[@]} - 1))]"
-        drain_failed "the API refused to pause plan $id (HTTP $code): it is no longer running" ;;
+        drain_failed "the API refused to pause plan $id (HTTP $code): it was not paused" ;;
       0:*) drain_failed "the API answered HTTP $code to the pause of plan $id - it may be paused all the same" ;;
       *) drain_failed "cannot pause plan $id - it may be paused all the same" ;;
     esac
@@ -501,8 +510,21 @@ capacity_check() {
       [ -z "$CAP_DATA" ] || capacity_settings_now >/dev/null ||
         check_failed "cannot read seamless-config in namespace $NS: nothing was changed"
     fi
-    [ -z "$CAP_LIMITS" ] || kube patch deployment/seamless -p "$CAP_PATCH" --dry-run=server ||
-      check_failed "the API server refuses those limits: nothing was changed"
+    # its writes, dry-run on the server: the settings' patch, and the template's - its limits, which the API server
+    # refuses below the requests, and a login that may read but not write (SDD §17.2, reviews RV38B-02, RV45A-02)
+    if [ -n "$CAP_DATA" ]; then
+      kube patch configmap/seamless-config --type merge -p "{\"data\":{$CAP_DATA}}" --dry-run=server -o name ||
+        check_failed "$KUBE may not patch configmap/seamless-config in namespace $NS (a server-side dry run" \
+          "refused it): nothing was changed"
+    fi
+    if [ -n "$CAP_LIMITS" ]; then
+      kube patch deployment/seamless -p "$CAP_PATCH" --dry-run=server -o name ||
+        check_failed "the API server refuses those limits (a server-side dry run): nothing was changed"
+    else
+      kube patch deployment/seamless -p "$CAP_PATCH" --dry-run=server -o name ||
+        check_failed "$KUBE may not patch deployment/seamless in namespace $NS (a server-side dry run refused" \
+          "it): nothing was changed"
+    fi
   fi
 }
 # What the single host's restart - capacity's last step - needs, which its Make target refuses: make, deploy/compose/.env
@@ -511,17 +533,26 @@ capacity_check() {
 # drain, so no plan is paused for a restart that would stop (SDD §17.2, reviews RV42A-04, RV43A-05, RV43A-06,
 # RV44A-06).
 host_restart_check() {
-  local value
   need make "install GNU make"
   [ -f "$ROOT/deploy/compose/.env" ] || check_failed "deploy/compose/.env is missing: run make seamless-init first"
   [ -f "$ROOT/deploy/compose/tokens.yaml" ] ||
     check_failed "deploy/compose/tokens.yaml is missing: run make seamless-init first"
+  host_port_check restart
+}
+# The port every Compose command of the single host loads with the whole project - stop and down too -: the shell's,
+# else deploy/compose/.env's read as Compose reads it, else 8080 - down needs no .env -, a port number from 1 to 65535
+# (SDD §17.2, reviews RV44A-06, RV45A-01). A value Compose would interpolate only Compose can judge: the restart's Make
+# target refuses it (SEAMLESS_DOTENV_STOP), so the restart's check does; a stop's Compose reads it.
+host_port_check() {
+  local value=''
   if [ -n "${SEAMLESS_HOST_PORT+set}" ]; then
     value=$SEAMLESS_HOST_PORT
-  else
-    value=$(sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env") ||
+  elif [ -f "$ROOT/deploy/compose/.env" ]; then
+    if ! value=$(sh "$ROOT/scripts/dotenv-value.sh" SEAMLESS_HOST_PORT "$ROOT/deploy/compose/.env"); then
+      [ "${1-}" = restart ] || return 0
       check_failed "the restart's Make target cannot read SEAMLESS_HOST_PORT in deploy/compose/.env: give it a" \
         "plain value; nothing was changed"
+    fi
   fi
   is_port "${value:-8080}" ||
     check_failed "SEAMLESS_HOST_PORT is '$value', no port Compose publishes: give a number from 1 to 65535;" \
@@ -537,7 +568,7 @@ drain_check() {
   if [ "$KIND" = host ]; then
     need make "install GNU make"
     [ "$ACTION" = down ] || checks="$checks seamless-check-env"
-    case $ACTION in restart | capacity) host_restart_check ;; esac
+    case $ACTION in restart | capacity) host_restart_check ;; *) host_port_check ;; esac
     # shellcheck disable=SC2086 # the target names, one word each
     run make -C "$ROOT" --no-print-directory $checks "SEAMLESS_ENGINE=$PLATFORM" ||
       check_failed "make $checks refused (exit $?): nothing was changed"
@@ -550,7 +581,32 @@ drain_check() {
       check_failed "cannot read deployment/seamless in namespace $NS: nothing was changed"
     [ "$ACTION" != down ] || "$KUBE" -n "$NS" get statefulset/seamless-postgres -o name >/dev/null ||
       check_failed "cannot read statefulset/seamless-postgres in namespace $NS: nothing was changed"
+    # the writes the action starts with, dry-run on the server: a login that may read but not write - the view role -
+    # shows here, before a plan is paused (SDD §17.2, review RV45A-02)
+    case $ACTION in
+      restart)
+        if [ "$("$KUBE" -n "$NS" get deployment/seamless -o 'jsonpath={.spec.replicas}')" = 0 ]; then
+          dry_write "scale deployment/seamless" scale deployment/seamless --replicas=1
+        else
+          # what rollout restart patches - it has no --dry-run of its own
+          dry_write "restart deployment/seamless" patch deployment/seamless \
+            -p '{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"dry-run"}}}}}'
+        fi
+        ;;
+      *)
+        dry_write "scale deployment/seamless" scale deployment/seamless --replicas=0
+        [ "$ACTION" != down ] ||
+          dry_write "scale statefulset/seamless-postgres" scale statefulset/seamless-postgres --replicas=0
+        ;;
+    esac
   fi
+}
+# A write dry-run on the API server - its authorization and admission, nothing applied -, refused while nothing changed.
+dry_write() {
+  local what=$1
+  shift
+  "$KUBE" -n "$NS" "$@" --dry-run=server -o name >/dev/null ||
+    check_failed "$KUBE may not $what in namespace $NS (a server-side dry run refused it): nothing was changed"
 }
 cluster_capacity() {
   if [ -n "$MAX_MIGRATIONS" ] && [ "$MAX_MIGRATIONS" -gt 10 ] && [ -z "$MEMORY" ]; then

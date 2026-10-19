@@ -24,8 +24,9 @@ SCRIPT = ROOT / "scripts" / "seamless-ctl.sh"
 TOKEN = "smg_" + "t0ken" * 8  # a test token: never an argument of any tool
 
 #: a tool that records its call - with the header files curl was handed - and answers by the rules;
-#: unless a rule says otherwise, curl answers as an API that took the request: `-w %{http_code}` the
-#: status (200, or 000 for an answer that exits non-zero), GET /api/v1/me an operator's token
+#: unless a rule says otherwise, curl answers as an API that took the request: -w's %{http_code} the
+#: status (200, or 000 for an answer that exits non-zero), GET /api/v1/me an operator's token (its
+#: body, then the status on a line of its own when -w asks for it)
 STUB = r"""#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
@@ -39,7 +40,7 @@ if headers:
 with open(os.environ["STUB_LOG"], "a") as log:
     log.write(json.dumps(record) + "\n")
 joined = " ".join(args)
-status = name == "curl" and "%{http_code}" in args
+status = name == "curl" and any("%{http_code}" in a for a in args)
 for n, rule in enumerate(json.loads(Path(os.environ["STUB_RULES"]).read_text())):
     if rule["cmd"] == name and all(part in joined for part in rule.get("has", [])):
         counter = Path(os.environ["STUB_LOG"] + f".{n}")
@@ -50,10 +51,10 @@ for n, rule in enumerate(json.loads(Path(os.environ["STUB_RULES"]).read_text()))
         code = ("000" if answer.get("exit", 0) else "200") if status else ""
         sys.stdout.write(answer.get("stdout", code))
         sys.exit(answer.get("exit", 0))
-if status:
+if name == "curl" and args[-1:] and args[-1].endswith("/api/v1/me"):
+    sys.stdout.write(json.dumps({"name": "ops", "role": "operator"}) + ("\n200" if status else ""))
+elif status:
     sys.stdout.write("200")
-elif name == "curl" and args[-1:] and args[-1].endswith("/api/v1/me"):
-    sys.stdout.write(json.dumps({"name": "ops", "role": "operator"}))
 """
 TOOLS = ("make", "kubectl", "oc", "curl", "docker", "podman")
 #: the Route's or Ingress's URL a cluster's drain and resume take (SDD §17.2)
@@ -427,22 +428,26 @@ def test_cluster_capacity_patches_the_configmap_and_sets_the_limits_in_one_rollo
         args[args.index("-p") + 1] for args in made if args[2:4] == ["patch", "deployment/seamless"]
     ]
     read = [*ns, "get", "configmap/seamless-config", "-o"]
+    # its writes dry-run on the server first - the settings' patch and the template's (RV45A-02)
+    settings = [
+        *ns,
+        "patch",
+        "configmap/seamless-config",
+        "--type",
+        "merge",
+        "-p",
+        _compact({"data": data}),
+    ]
+    dry = ["--dry-run=server", "-o", "name"]
     assert made == [
         [*ns, "get", "deployment/seamless", "-o", "name"],
         [*read, 'go-template={{index .data "SEAMLESS_MAX_CONCURRENT_MIGRATIONS"}}'],
         [*read, 'go-template={{index .data "SEAMLESS_MAX_CONCURRENT_CUTOVERS"}}'],
-        [*ns, "patch", "deployment/seamless", "-p", patches[0], "--dry-run=server"],
+        [*settings, *dry],
+        [*ns, "patch", "deployment/seamless", "-p", patches[0], *dry],
         [*read, 'go-template={{index .data "SEAMLESS_MAX_CONCURRENT_MIGRATIONS"}}'],
         [*read, 'go-template={{index .data "SEAMLESS_MAX_CONCURRENT_CUTOVERS"}}'],
-        [
-            *ns,
-            "patch",
-            "configmap/seamless-config",
-            "--type",
-            "merge",
-            "-p",
-            _compact({"data": data}),
-        ],
+        settings,
         [*ns, "patch", "deployment/seamless", "-p", patches[1]],
         [*ns, "rollout", "status", "deployment/seamless", "--timeout=600s"],
     ]
@@ -455,19 +460,22 @@ def test_cluster_capacity_patches_the_configmap_and_sets_the_limits_in_one_rollo
     [(annotation, at)] = template["metadata"]["annotations"].items()
     assert annotation == "kubectl.kubernetes.io/restartedAt"
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", at)
-    # settings alone: no limit to check, the restart annotation alone - the pod reads the ConfigMap
+    # settings alone: no limit, the restart annotation alone - the pod reads the ConfigMap; both
+    # writes dry-run on the server first (RV45A-02)
     proc, calls, _ = _run(tmp_path / "settings", platform, "capacity", "--max-cutovers", "2")
     assert proc.returncode == 0, proc.stderr
     made = [c["args"] for c in calls if c["cmd"] == tool]
-    assert [args[2:4] for args in made] == [
+    assert [args[2:4] + (["dry"] if "--dry-run=server" in args else []) for args in made] == [
         ["get", "deployment/seamless"],
         ["get", "configmap/seamless-config"],
+        ["patch", "configmap/seamless-config", "dry"],
+        ["patch", "deployment/seamless", "dry"],
         ["get", "configmap/seamless-config"],
         ["patch", "configmap/seamless-config"],
         ["patch", "deployment/seamless"],
         ["rollout", "status"],
     ]
-    assert list(json.loads(made[4][-1])["spec"]["template"]) == ["metadata"]
+    assert list(json.loads(made[6][-1])["spec"]["template"]) == ["metadata"]
 
 
 @pytest.mark.parametrize(("platform", "tool", "overlay"), CLUSTERS)
@@ -722,7 +730,8 @@ def test_a_cluster_capacity_dry_run_changes_nothing(tmp_path, platform):
         next(w for w in ("--dry-run=server", "configmap", "rollout", "patch") if w in line)
         for line in printed
     ] == [
-        "--dry-run=server",
+        "--dry-run=server",  # the settings' patch (RV45A-02)
+        "--dry-run=server",  # the template's
         "configmap",
         "patch",
         "rollout",
@@ -1359,9 +1368,9 @@ def test_a_drain_pauses_the_running_plans_and_waits_until_no_cutover_is_in_fligh
     assert proc.returncode == 0, proc.stderr
     curl = _args(calls, "curl")
     header = [a for c in calls if c["cmd"] == "curl" for a in c["args"] if a.startswith("@")]
-    # the token's role first (review RV44A-02), then the running plans
+    # the token's role first, its status read (reviews RV44A-02, RV45A-07), then the running plans
     assert curl[:2] == [
-        f"-fsS --max-time 30 -H {header[0]} {API}/me",
+        f"-sS --max-time 30 -H {header[0]} -w \\n%{{http_code}} {API}/me",
         f"-fsS --max-time 30 -H {header[0]} {API}/plans?status=running",
     ]
     # each pause's HTTP status read, never curl -f's 22 for any error (review RV44A-02)
@@ -1388,10 +1397,13 @@ def test_a_drain_that_times_out_stops_nothing(tmp_path):
         "--wait-timeout", "0", rules=rules,
     )  # fmt: skip
     assert proc.returncode == 1
-    # read before the drain (review RV44A-01), nothing changed after it
+    # read, and its writes dry-run, before the drain (reviews RV44A-01, RV45A-02); nothing after it
+    dry = "--replicas=0 --dry-run=server -o name"
     assert _args(calls, "kubectl") == [
         "-n seamless-migrate get deployment/seamless -o name",
         "-n seamless-migrate get statefulset/seamless-postgres -o name",
+        f"-n seamless-migrate scale deployment/seamless {dry}",
+        f"-n seamless-migrate scale statefulset/seamless-postgres {dry}",
     ]
     assert "nothing was stopped" in proc.stderr
     assert "plan-aa" in proc.stderr and "resume" in proc.stderr
@@ -1936,7 +1948,11 @@ def test_a_drain_refuses_a_token_below_the_operator_role(tmp_path, role):
     viewer's listed the running plans, then the first pause was refused (403) - and explained as a
     plan no longer running. The token's role (GET /api/v1/me) is asked before any plan is listed:
     below an operator's, nothing is listed or paused, exit 2."""
-    me = {"cmd": "curl", "has": ["/api/v1/me"], "answers": [{"stdout": json.dumps({"role": role})}]}
+    me = {
+        "cmd": "curl",
+        "has": ["/api/v1/me"],
+        "answers": [{"stdout": json.dumps({"role": role}) + "\n200"}],
+    }
     rules = [me, *_drain_rules([{"stdout": "[]"}])]
     proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", rules=rules)
     assert proc.returncode == 2, proc.stderr
@@ -2133,3 +2149,248 @@ def test_operations_md_explains_who_may_read_the_token_file_by_find_failing(tmp_
     )  # fmt: skip
     assert proc.returncode == 2 and calls == [], proc.stderr
     assert "cannot tell who may read the token file" in proc.stderr, proc.stderr
+
+
+# --- review 45a: the port Compose loads, a cluster's first writes, any 4xx, the token's answers --
+HOST_STOPS = {"stop": ["stop"], "down": ["down"], "scale 0": ["scale", "0"]}
+
+
+@pytest.mark.parametrize("engine", ["docker", "podman"])
+@pytest.mark.parametrize("action", list(HOST_STOPS))
+@pytest.mark.parametrize("port", ["80800", "8080x"])
+def test_a_port_compose_cannot_load_is_refused_before_a_stop_or_down_drain(
+    tmp_path, engine, action, port
+):
+    """SDD §17.2 (review RV45A-01): every Compose command of the single host loads the whole
+    project, its published port "127.0.0.1:${SEAMLESS_HOST_PORT:-8080}:8080" included ("Invalid
+    hostPort: 80800") - stop, down and scale 0 too. Their drains checked no port: with --url (the
+    stack still on its old port, .env naming a mistyped new one) every plan was paused, then the
+    Make target's Compose refused the project. The port is checked before every drain: nothing is
+    paused, exit 2."""
+    env = f"POSTGRES_PASSWORD=x\nSEAMLESS_HOST_PORT={port}\n"
+    rules = [
+        *_drain_rules([{"stdout": "[]"}]),
+        {"cmd": "make", "has": ["seamless-"], "answers": [{"exit": 0}]},
+    ]
+    proc, calls, _ = _run(
+        tmp_path, engine, *HOST_STOPS[action], "--drain", "@TOKEN_FILE",
+        "--url", "http://127.0.0.1:8080", env_file=env, rules=rules,
+    )  # fmt: skip
+    assert proc.returncode == 2, proc.stderr
+    assert calls == [], calls  # no make, no plan listed or paused
+    assert f"SEAMLESS_HOST_PORT is '{port}'" in proc.stderr and "1 to 65535" in proc.stderr
+
+
+def test_a_down_drain_without_an_env_file_takes_composes_default_port(tmp_path):
+    """SDD §17.2 (review RV45A-01): down needs no .env (seamless-down loads the project without
+    it), so its port is Compose's default 8080: nothing to refuse."""
+    proc, calls, _ = _run(
+        tmp_path, "docker", "down", "--drain", "@TOKEN_FILE", "--url", "http://127.0.0.1:8080",
+        rules=_drain_rules([{"stdout": "[]"}]),
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    assert _args(calls, "make")[-1].endswith("seamless-down SEAMLESS_ENGINE=docker")
+
+
+#: kubectl/oc in front of the fake: the login may read the namespace (the view role), not change it
+FORBIDDEN_WRITES = r"""#!/bin/sh
+case " $* " in *" scale "*|*" rollout restart "*|*" patch "*)
+  printf '%s %s\n' 'Error from server (Forbidden): deployments.apps "seamless" is forbidden:' \
+    'User "oncall" cannot patch resource "deployments/scale" in API group "apps"' >&2
+  exit 1 ;;
+esac
+exec "$REAL_FAKE" "$@"
+"""
+CLUSTER_WRITES = [
+    ["stop"],
+    ["scale", "0"],
+    ["down"],
+    ["restart"],
+    ["capacity", "--max-migrations", "20"],
+]
+
+
+@pytest.mark.parametrize(("platform", "tool"), [("kubernetes", "kubectl"), ("openshift", "oc")])
+@pytest.mark.parametrize("action", CLUSTER_WRITES, ids=[" ".join(a[:2]) for a in CLUSTER_WRITES])
+def test_a_cluster_drain_refuses_a_login_that_may_read_but_not_write(
+    tmp_path, platform, tool, action
+):
+    """SDD §17.2 (review RV45A-02): the check before a cluster drain was a read of the Deployment,
+    while the action starts with a write - a scale, a rollout restart, capacity's ConfigMap and
+    template patches. A login bound to the view role reads it and is refused the write: every
+    plan was paused, then the write was Forbidden. The writes are dry-run on the server before
+    the drain: nothing is paused or changed, exit 2."""
+    state = fake_kube.cluster()
+    proc, calls, _ = _run(
+        tmp_path, platform, *action, "--drain", "@TOKEN_FILE", "--url", CLUSTER_URL,
+        rules=_drain_rules([{"stdout": "[]"}]), cluster=state,
+        **_wrapped(tmp_path, tool, FORBIDDEN_WRITES),
+    )  # fmt: skip
+    assert proc.returncode == 2, proc.stderr
+    assert _cluster_after(tmp_path) == state
+    assert not [c for c in calls if c["cmd"] == "curl"], calls  # no plan listed or paused
+    assert "server-side dry run" in proc.stderr and "nothing was changed" in proc.stderr, (
+        proc.stderr
+    )
+
+
+@pytest.mark.parametrize("platform", ["kubernetes", "openshift"])
+@pytest.mark.parametrize("action", CLUSTER_WRITES, ids=[" ".join(a[:2]) for a in CLUSTER_WRITES])
+def test_a_cluster_drains_dry_runs_change_nothing_and_its_action_follows(
+    tmp_path, platform, action
+):
+    """SDD §17.2 (review RV45A-02): the server-side dry runs before the drain change nothing - the
+    fake applies none -, and the action runs after the drain as before."""
+    state = fake_kube.cluster(replicas=1, postgres=1)
+    proc, calls, _ = _run(
+        tmp_path, platform, *action, "--drain", "@TOKEN_FILE", "--url", CLUSTER_URL,
+        rules=_drain_rules([{"stdout": "[]"}]), cluster=state,
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    tool = "oc" if platform == "openshift" else "kubectl"
+    first_curl = next(i for i, c in enumerate(calls) if c["cmd"] == "curl")
+    dry = [i for i, c in enumerate(calls) if c["cmd"] == tool and "--dry-run=server" in c["args"]]
+    assert dry and dry[0] < first_curl, _args(calls, tool)
+
+
+@pytest.mark.parametrize("role", ["operator", "approver", "admin"])
+def test_a_drain_takes_an_operators_token_and_any_above_it(tmp_path, role):
+    """SDD §17.2 (review RV45A-03): a drain needs an operator's token or higher - an approver's and
+    an admin's drain, and so does every token when authentication is off, where GET /api/v1/me
+    answers admin. The role test fed only an operator's and below: a check that refused an
+    approver's or an admin's token passed it."""
+    me = {
+        "cmd": "curl",
+        "has": ["/api/v1/me"],
+        "answers": [{"stdout": json.dumps({"role": role}) + "\n200"}],
+    }
+    proc, calls, _ = _run(
+        tmp_path,
+        "docker",
+        "stop",
+        "--drain",
+        "@TOKEN_FILE",
+        rules=[me, *_drain_rules([{"stdout": "[]"}])],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _paused(calls) and _args(calls, "make")[-1].endswith(
+        "seamless-stop SEAMLESS_ENGINE=docker"
+    )
+
+
+@pytest.mark.parametrize(
+    ("answer", "says"),
+    [
+        ({"stdout": "\n401"}, "does not take this token (HTTP 401)"),
+        ({"stdout": "\n403"}, "does not take this token (HTTP 403)"),
+        ({"stdout": "\n502"}, "HTTP 502"),
+        ({"stdout": "\n000", "exit": 7}, "HTTP 000"),
+    ],
+    ids=["401", "403", "502", "no answer"],
+)
+def test_a_drain_the_api_cannot_serve_is_refused_with_2_before_any_plan_is_listed(
+    tmp_path, answer, says
+):
+    """SDD §17.2 (review RV45A-07): a token the API does not take (GET /api/v1/me answers 401 or
+    403), or an API that cannot answer, died with 1 - a failed step's status - though nothing was
+    listed, paused or stopped. Both are refused: 2, saying which."""
+    me = {"cmd": "curl", "has": ["/api/v1/me"], "answers": [answer]}
+    proc, calls, _ = _run(
+        tmp_path,
+        "docker",
+        "stop",
+        "--drain",
+        "@TOKEN_FILE",
+        rules=[me, *_drain_rules([{"stdout": "[]"}])],
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert [c["args"][-1].rsplit("/", 1)[-1] for c in calls if c["cmd"] == "curl"] == ["me"]
+    assert not [a for a in _args(calls, "make") if "seamless-stop" in a]
+    assert says in proc.stderr, proc.stderr
+
+
+def test_a_drain_whose_listing_fails_is_refused_with_2(tmp_path):
+    """SDD §17.2 (review RV45A-07): a listing of the running plans that fails - before any plan is
+    paused - stops the drain as a refusal, 2, as the token's question does."""
+    rules = [{"cmd": "curl", "has": ["/plans?status=running"], "answers": [{"exit": 22}]}]
+    proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", rules=rules)
+    assert proc.returncode == 2, proc.stderr
+    assert "cannot list the running plans" in proc.stderr and not _paused(calls)
+
+
+@pytest.mark.parametrize("status", ["401", "403", "404", "409", "429"])
+def test_a_pause_any_4xx_answers_paused_nothing_and_is_not_named(tmp_path, status):
+    """SDD §17.2 (review RV45A-06): the API answers a 4xx before it applies anything - 401 or 403
+    from the role check ahead of the route, 404 or 409 from the route, 429 from the lockout -, so
+    the plan was not paused and is not named for resume (resume would start it again were it to
+    fail meanwhile, RV43A-04); a 409 may also answer a plan still running that another writer keeps
+    changing, so no cause is claimed."""
+    rules = [
+        {"cmd": "curl", "has": ["plan-bb/pause"], "answers": [{"stdout": status}]},
+        *_drain_rules([{"stdout": "[]"}]),
+    ]
+    proc, calls, _ = _run(tmp_path, "docker", "stop", "--drain", "@TOKEN_FILE", rules=rules)
+    assert proc.returncode == 1, proc.stderr
+    assert (
+        f"the API refused to pause plan plan-bb (HTTP {status}): it was not paused" in proc.stderr
+    )
+    assert "no longer running" not in proc.stderr and "may be paused" not in proc.stderr
+    resume = re.search(r"resume --token-file \S+ (.*)$", proc.stderr, re.M)
+    assert resume and resume.group(1).split() == ["plan-aa"], proc.stderr
+
+
+def test_a_statefulset_recreates_the_ordinal_still_terminating_never_the_next(tmp_path):
+    """fake_kube (review RV45A-09): a StatefulSet puts each pod at the slot of its ordinal in
+    [0, replicas) and waits while the pod of a slot terminates (kubernetes v1.33.0
+    stateful_set_control.go); the fake took the lowest name free among every pod listed and named
+    seamless-postgres-1 beside a terminating -0, so a start after a down whose wait gave up
+    reported a second database and failed. It recreates seamless-postgres-0 once the old one is
+    gone, and the start runs as on a real cluster."""
+    state = fake_kube.cluster()
+    state["deployment"]["replicas"], state["deployment"]["pods"] = 0, []
+    state["statefulset"]["replicas"] = 0
+    state["statefulset"]["pods"][0]["terminating"] = True  # its grace period not over yet
+    proc, _, _ = _run(tmp_path, "kubernetes", "start", cluster=state)
+    after = _cluster_after(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert [p["name"] for p in after["statefulset"]["pods"]] == ["seamless-postgres-0"]
+    [pod] = fake_kube.running(after)
+    assert pod["databases"] == ["seamless-postgres-0"]
+
+
+#: each message of the checks before a drain, as the script writes it, and the start of its row in
+#: Operations.md §7 (reviews RV44A-11, RV45A-08)
+TROUBLESHOOTING = {
+    "cannot read statefulset/seamless-postgres in namespace $NS": (
+        "cannot read statefulset/seamless-postgres in namespace ..."
+    ),
+    "does not take this token (HTTP $code)": "the API at ... does not take this token (HTTP 401)",
+    "whose token this is (HTTP ${code:-000})": "cannot ask the API at ... whose token this is",
+    "cannot read the API's answer to GET /api/v1/me": (
+        "cannot read the API's answer to GET /api/v1/me"
+    ),
+    "cannot list the running plans at $API": "cannot list the running plans at ...",
+    "make $checks refused (exit $?)": "make seamless-check-context ... refused ...",
+    "may not $what in namespace $NS (a server-side dry run refused it)": (
+        "kubectl may not ... (a server-side dry run refused it)"
+    ),
+    "the API server refuses those limits (a server-side dry run)": (
+        "the API server refuses those limits (a server-side dry run) ..."
+    ),
+    "the API refused to pause plan $id (HTTP $code): it was not paused": (
+        "the API refused to pause plan ... (HTTP 4xx): it was not paused"
+    ),
+}
+
+
+@pytest.mark.parametrize("message", list(TROUBLESHOOTING))
+def test_every_refusal_of_a_drains_checks_has_a_troubleshooting_row(message):
+    """docs/Operations.md §7 (reviews RV44A-11, RV45A-08): each message the checks before a drain
+    give - the cluster's reads and dry runs, the Make targets' checks, the token's and the API's
+    answers, a pause the API refused - has a row that explains it; a fix commit said it added rows
+    for the new messages, and four had none."""
+    assert message in SCRIPT.read_text(), message  # the script still says it
+    ops = (ROOT / "docs" / "Operations.md").read_text(encoding="utf-8")
+    section = ops.split("\n## 7.", 1)[1].split("\n## 8.", 1)[0]
+    row = f"| `{TROUBLESHOOTING[message]}"
+    assert any(line.startswith(row) for line in section.splitlines()), row
