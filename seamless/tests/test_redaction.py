@@ -660,6 +660,7 @@ def test_a_double_quoted_shell_value_keeps_no_glued_part_and_a_second_pass_chang
         "{'password': \"x\"}.",
         'password="x"; echo done',
     ],
+    ids=["json-then-item", "json-compact", "repr-then-period", "shell-then-command"],
 )
 def test_what_follows_a_closed_double_quoted_secret_stays(text):
     """SDD §13.4 (review RV52-X6): only what the shell glues to the word goes with it - a JSON or
