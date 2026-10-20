@@ -638,7 +638,8 @@ person's retry - never a cancel without its cleanup nor a finalized VM a bulk fi
 cleanup starts once that write is done (review RV51-12, RV51-13). A retry's reopen of the plan its migration's
 rollback completed follows under the plan's lock, as a completion is written; one a store error kept from it is made
 by the next tick, which reopens a completed plan holding a `ready` migration - never an attempt waiting in `ready`
-for good (review RV51-14). The running pass finishes, then the migration moves to `awaiting_cutover`
+for good (review RV51-14). The tick never waits for that plan's lock: a completed plan whose lock a validation or an
+edit holds is left to a later tick, so a slow source never stalls the other plans' gates (review RV52-O1). The running pass finishes, then the migration moves to `awaiting_cutover`
 with `converged_by: "force"`; the gate still applies — an approval by another approver (maker-checker), the window, the
 cutover slots. A request alone (`POST …/cutover`) never
 forces: it waits for convergence. A migration is forced once: while `force_cutover` is recorded, another Force
