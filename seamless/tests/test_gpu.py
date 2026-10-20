@@ -3,14 +3,17 @@ device's GPU key, NVIDIA profile sizes and pool names - planning/gpu.py, a pure 
 
 import pytest
 
-from seamless_migrate.domain.models import GpuDevice
+from seamless_migrate.domain.enums import ProviderKind
+from seamless_migrate.domain.models import GpuDevice, Mappings
 from seamless_migrate.planning.gpu import (
     ProfileSize,
+    gpu_flavor,
     gpu_key,
     gpu_requests,
     pool_name,
     vgpu_profile_size,
 )
+from tests.factories import make_plan, make_vm
 
 
 def vgpu(**kw):
@@ -239,4 +242,35 @@ def test_pool_name_lists_the_class_then_required_then_forbidden_traits():
     assert pool_name("VGPU", [], []) == "VGPU"
     assert pool_name("CUSTOM_NVIDIA_A100_4C", [], ["CUSTOM_OLD"]) == (
         "CUSTOM_NVIDIA_A100_4C !CUSTOM_OLD"
+    )
+
+
+def test_gpu_flavor_is_the_one_flavor_a_vms_gpu_keys_map_to():
+    """SDD §22.4 (plan task G4): a VMware VM's GPU flavor is the one flavor every GPU key of it maps
+    to - none for a key no mapping names, a device without a key, or keys that map to different
+    flavors -; an OpenStack VM's is its flavor's explicit mapping, never a same-named flavor; a VM
+    without a GPU has none."""
+    vgpu = GpuDevice(kind="vgpu", profile="grid_a100-4c")
+    ids = GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5")
+    vmw = ProviderKind.vmware
+
+    def plan(**gpus):
+        return make_plan(mappings=Mappings(gpus=gpus))
+
+    both = make_vm(flavor=None, gpus=[vgpu, ids])
+    assert gpu_flavor(both, plan(**{"grid_a100-4c": "g1", "10de:20b5": "g1"}), vmw) == "g1"
+    assert gpu_flavor(both, plan(**{"grid_a100-4c": "g1", "10de:20b5": "p1"}), vmw) is None
+    assert gpu_flavor(both, plan(**{"grid_a100-4c": "g1"}), vmw) is None
+    no_key = make_vm(flavor=None, gpus=[vgpu, GpuDevice(kind="passthrough")])
+    assert gpu_flavor(no_key, plan(**{"grid_a100-4c": "g1"}), vmw) is None
+    specs = {"resources:VGPU": "1"}
+    osp = make_vm(flavor="g1.vgpu", flavor_extra_specs=specs, gpus=gpu_requests(specs))
+    openstack = ProviderKind.openstack
+    assert (
+        gpu_flavor(osp, make_plan(mappings=Mappings(flavors={"g1.vgpu": "g1"})), openstack) == "g1"
+    )
+    assert gpu_flavor(osp, make_plan(), openstack) is None
+    assert (
+        gpu_flavor(make_vm(), make_plan(mappings=Mappings(flavors={"m1.small": "g1"})), openstack)
+        is None
     )

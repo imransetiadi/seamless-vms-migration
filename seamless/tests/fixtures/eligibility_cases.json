@@ -1,5 +1,5 @@
 {
-  "_comment": "The API's eligibility reasons per strategy (planning/selector.py) and its finding messages (planning/preflight.py) for each finding case - `others` are the plan's other selected VMs, `source_kind` the source provider's kind (openstack when not given), `holds_volumes` whether the migration holds the destination volumes an earlier attempt created (false when not given): test_selector.py and test_preflight.py run them against the API, mockData.test.ts against the dashboard's mock, which words them as the API does (SDD §9.2, §9.3, §16, review RV20-08). source/destination give a provider's capabilities and whether it has a conversion host, as provider_caps reads them. A network case gives `destination` - its label, kind, networks (id, name, mtu, project_id, own, shared, external), subnets, the token's roles and its policy profile, as the check reports them - and the plan its mappings, prestage_resources and nic_overrides (SDD §6.6, §7.3 step 0, §9.3, §21.5).",
+  "_comment": "The API's eligibility reasons per strategy (planning/selector.py) and its finding messages (planning/preflight.py) for each finding case - `others` are the plan's other selected VMs, `source_kind` the source provider's kind (openstack when not given), `holds_volumes` whether the migration holds the destination volumes an earlier attempt created (false when not given): test_selector.py and test_preflight.py run them against the API, mockData.test.ts against the dashboard's mock, which words them as the API does (SDD §9.2, §9.3, §16, review RV20-08). source/destination give a provider's capabilities and whether it has a conversion host, as provider_caps reads them. A network or GPU case gives `destination` - its label, kind, networks (id, name, mtu, project_id, own, shared, external), subnets, the token's roles and its policy profile, as the check reports them - and the plan its mappings, prestage_resources and nic_overrides (SDD §6.6, §7.3 step 0, §9.3, §21.5).",
   "cases": [
     {
       "why": "an OpenStack VM every strategy takes",
@@ -1664,8 +1664,24 @@
         }
       },
       "expected": {
-        "VM_PCI_PASSTHROUGH": "Flavor requests PCI passthrough (a1:2).",
-        "VM_VGPU": "Flavor requests a vGPU (resources:VGPU)."
+        "VM_PCI_PASSTHROUGH": "Flavor requests PCI passthrough (a1:2). The plan maps no flavor to 'm1.small': map it to a GPU flavor of DC3 Jakarta.",
+        "VM_VGPU": "Flavor requests a vGPU (resources:VGPU). The plan maps no flavor to 'm1.small': map it to a GPU flavor of DC3 Jakarta."
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": []
       }
     },
     {
@@ -1736,7 +1752,23 @@
         }
       },
       "expected": {
-        "VM_VGPU": "Flavor requests a vGPU (resources1:VGPU)."
+        "VM_VGPU": "Flavor requests a vGPU (resources1:VGPU). The plan maps no flavor to 'm1.small': map it to a GPU flavor of DC3 Jakarta."
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": []
       }
     },
     {
@@ -4505,8 +4537,24 @@
         }
       },
       "expected": {
-        "VM_PCI_PASSTHROUGH": "The VM has a PCI passthrough device (10de:20b5, a device without ids).",
-        "VM_VGPU": "The VM has a vGPU (grid_a100-4c ×2)."
+        "VM_PCI_PASSTHROUGH": "The VM has a PCI passthrough device (10de:20b5, a device without ids). No mapping can name its device without ids, so none applies to the VM.",
+        "VM_VGPU": "The VM has a vGPU (grid_a100-4c ×2). No mapping can name its device without ids, so none applies to the VM."
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": []
       }
     }
   ]
