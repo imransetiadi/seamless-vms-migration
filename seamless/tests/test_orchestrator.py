@@ -8034,6 +8034,77 @@ class _SlowPrestage(ScriptedExecutor):
         self.finished.append(plan.id)
 
 
+async def _restart_with_vm_1_at_its_gate_and_vm_2_ready(tmp_path, store, executor_cls):
+    """A warm vm-1 waiting at its cutover gate and a cold vm-2 in ready; the server restarts with
+    ``executor_cls``'s pre-staging, and vm-1's cutover is requested (PR #58 review)."""
+    settings = make_settings(tmp_path)
+    vms = [vm(1), vm(2)]
+    h, plan = await setup(
+        tmp_path,
+        store,
+        vms,
+        {
+            "default_strategy": Strategy.warm,
+            "auto_cutover": False,
+            "strategy_overrides": {"vm-2": Strategy.cold},
+        },
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    first = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.awaiting_cutover)
+    assert (await h.by_vm(plan.id, "vm-2")).phase == P.ready
+    await h.orch.stop()
+    executor = executor_cls(settings)
+    again = build_harness(tmp_path, store, vms, executor=executor, settings=settings)
+    await again.orch.start()
+    await again.orch.request_cutover(first.id, "sari")
+    return again, plan, first, executor
+
+
+async def test_a_migration_waiting_for_its_pre_staging_holds_back_no_other(tmp_path, store):
+    """SDD §8 (PR #58 review): after a restart vm-2, ready, waits for a pre-staging, and the tick
+    returned before every gate while it ran: vm-1's requested cutover waited for the pre-staging,
+    minutes on a real cloud. Only the uncovered migration waits."""
+    again, plan, first, executor = await _restart_with_vm_1_at_its_gate_and_vm_2_ready(
+        tmp_path, store, _SlowPrestage
+    )
+    try:
+        await asyncio.wait_for(executor.started.wait(), 5)
+        done = await again.wait_phase(first.id, P.completed, timeout=10)
+        second = await again.by_vm(plan.id, "vm-2")
+        assert (done.phase, second.phase, executor.finished) == (P.completed, P.ready, [])
+    finally:
+        executor.release.set()
+        await again.orch.stop()
+
+
+async def test_a_failing_pre_staging_never_fails_a_plan_with_work_in_flight(tmp_path, store):
+    """SDD §8 (PR #58 review): the pre-staging vm-2 waits for after a restart failed - a
+    destination API blip - and failed the plan while vm-1 waited at its gate with its cutover
+    requested: vm-1 got no cutover and no keep-warm pass until a person started the plan again.
+    The plan keeps running, the failure is recorded, and the pre-staging is tried again only
+    after 60 s, not at every tick."""
+    again, plan, first, executor = await _restart_with_vm_1_at_its_gate_and_vm_2_ready(
+        tmp_path, store, _FailingPrestage
+    )
+    try:
+        done = await again.wait_phase(first.id, P.completed, timeout=10)
+        for _ in range(20):
+            again.orch.wake()
+            await asyncio.sleep(0.01)
+        status = (await again.plan(plan.id)).status
+        second = await again.by_vm(plan.id, "vm-2")
+        failures = [
+            e.data
+            for e in store.events(since_seq=0, limit=1000)
+            if e.kind == "plan.updated" and "pre-staging failed" in e.message
+        ]
+    finally:
+        await again.orch.stop()
+    assert (done.phase, second.phase, status) == (P.completed, P.ready, PlanStatus.running)
+    assert executor.runs == 1 and len(failures) == 1 and "status" not in failures[0], failures
+
+
 async def test_a_cancelled_plan_pre_stages_nothing(tmp_path, store):
     """SDD §12 (audit OC-07): a plan paused while its pre-staging ran could be cancelled - none of
     its migrations started - and the pre-staging went on creating its networks, flavors and

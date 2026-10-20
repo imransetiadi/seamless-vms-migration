@@ -132,6 +132,8 @@ log = logging.getLogger(__name__)
 P = Phase
 
 PROGRESS_MIN_INTERVAL_S = 1.0
+#: how long a plan with work in flight waits before a failed pre-staging is tried again (SDD §8)
+PRESTAGE_RETRY_S = 60.0
 #: a migration.log line is cut to this many characters, after redaction (SDD §4)
 LOG_LINE_CHARS = 2000
 APPROVABLE = frozenset(
@@ -562,6 +564,8 @@ class Orchestrator:
         self._steps: dict[str, asyncio.Task[Any]] = {}
         #: per plan, the assessments its pre-stagings in this process covered (SDD §8)
         self._prestage_done: dict[str, set[tuple[str, datetime | None, bool]]] = {}
+        #: when a plan whose pre-staging failed with work in flight is pre-staged again (monotonic)
+        self._prestage_retry_at: dict[str, float] = {}
         self._prestage_tasks: dict[str, asyncio.Task[None]] = {}
         #: best-effort rollback of the data path after a cancel in precopy/syncing (SDD §7.2)
         self._cleanups: dict[str, asyncio.Task[None]] = {}
@@ -2796,14 +2800,19 @@ class Orchestrator:
         if not migs:
             return
         covered = self._prestage_done.get(plan.id)
-        if any(
-            covered is None or _assessment(m) not in covered for m in migs if m.phase == P.ready
-        ):
+        uncovered = {
+            m.id
+            for m in migs
+            if m.phase == P.ready and (covered is None or _assessment(m) not in covered)
+        }
+        if uncovered:
             # a ready migration no pre-staging covered - the plan's first, a VM added, validated
             # again or given a strategy that needs a conversion host - waits for one; a plan with
-            # nothing ready is not pre-staged (SDD §8, review RV52-O3)
-            self._ensure_prestage(plan, migs)
-            return
+            # nothing ready is not pre-staged (SDD §8, review RV52-O3). Only the uncovered ones
+            # wait: the plan's gates and passes go on meanwhile (PR #58 review)
+            if time.monotonic() >= self._prestage_retry_at.get(plan.id, 0.0):
+                self._ensure_prestage(plan, migs)
+            migs = [m for m in migs if m.id not in uncovered]
         # two migrations of one VM, as an earlier version left a running plan: neither starts
         # (SDD §5.4, review RV51-18)
         twice = _vms_named_twice(migs)
@@ -2876,8 +2885,8 @@ class Orchestrator:
                 counts["steps"] += 1
                 in_flight[m.wave_id] += 1
 
-        # 4. plan completion
-        if all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
+        # 4. plan completion (an uncovered ready migration is not complete either)
+        if not uncovered and all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
             await self._complete(plan)
 
     async def _complete(self, plan: Plan) -> None:
@@ -3004,6 +3013,7 @@ class Orchestrator:
                 await executor.prestage(plan, source, destination, **kwargs)
             # what it read when it began: a migration assessed meanwhile waits for the next one
             self._prestage_done.setdefault(plan.id, set()).update(_assessment(m) for m in migs)
+            self._prestage_retry_at.pop(plan.id, None)
             await self._emit(
                 "plan.updated",
                 f"{plan.name}: resources pre-staged",
@@ -3016,10 +3026,12 @@ class Orchestrator:
         except Exception as exc:
             log.exception("prestage of %s failed", plan.id)
             failed = False
+            in_flight = False
 
             def fail(fresh: Plan) -> bool:
                 nonlocal failed
-                failed = fresh.status == PlanStatus.running  # re-evaluated on every retry
+                # re-evaluated on every retry; a plan with work in flight keeps running
+                failed = fresh.status == PlanStatus.running and not in_flight
                 if not failed:
                     return False
                 fresh.status = PlanStatus.failed
@@ -3028,8 +3040,16 @@ class Orchestrator:
             # SDD §8: a status writer like the others, under the plan's lock; only a plan that
             # still runs fails. One paused, validated again or edited meanwhile keeps its status
             # (an edited draft must not become a failed plan that start_plan accepts unvalidated)
-            # and pre-stages again at its next start
+            # and pre-stages again at its next start. One with a migration in flight - a step
+            # running, or one waiting at its cutover gate - keeps running too: those go on, and
+            # the tick pre-stages it again after PRESTAGE_RETRY_S (PR #58 review)
             async with self._lock(f"plan:{plan.id}"):
+                in_flight = any(
+                    m.phase in fsm.ACTIVE_STEP_PHASES or m.phase == P.awaiting_cutover
+                    for m in await self.db.list("migration", Migration, plan_id=plan.id)
+                )
+                if in_flight:
+                    self._prestage_retry_at[plan.id] = time.monotonic() + PRESTAGE_RETRY_S
                 await self._update_plan(plan.id, fail)
                 error = redact(str(exc))[:500]
                 await self._emit(
