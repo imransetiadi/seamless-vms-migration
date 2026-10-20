@@ -4529,9 +4529,13 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   * a group that asks for a `CUSTOM_` resource class is a vGPU only when a vGPU profile is declared for its flavor
     (`Provider.gpu_profiles`, §22.3). Nova's `[mdev_<type>] mdev_class` gives a vGPU type such a class, and no API
     tells a custom class that is a GPU from one that is not;
-  * a zero amount asks for none, as Nova reads it (a zero takes a resource out of the request); any other amount
-    that is not a positive integer reads as 1, a request still (Nova refuses such a flavor when a server boots with
-    it);
+  * an amount reads as Nova reads it, with Python's `int()` - spaces around it, a sign, underscores between its digits
+    and any script's decimal digits included (`+2` and `２` are 2). A zero asks for none, as Nova strips a zero amount
+    from the request, and so does a negative or unreadable amount (`-1`, `one`, `1.5`, `²`), which Nova skips with a
+    warning (`RequestGroup.add_resource`): a server boots with no GPU for it. A PCI alias's count reads the same way:
+    a zero or negative count asks for no device (`InstancePCIRequest(count=int(count))`), while an alias with no
+    count, or one `int()` cannot read, reads as 1, a request still - Nova refuses such a flavor when a server boots
+    with it (PR #57 review);
   * no OpenStack flavor names an NVIDIA profile, so `profile` is the declared one (`declared_profile`), else null. On a
     flavor whose GPU requests are PCI aliases alone, the declared profile goes to those entries: a vGPU handed out as a
     PCI device (§22.3).
