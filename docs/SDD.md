@@ -189,6 +189,9 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
                                                        # "2026.2" (§10.1, §21.3); refused on kind vmware (422)
            policy_profile: "secure_rbac"|"legacy"|null, # the policy defaults its operator declares (§21.5):
                                                        # null = by kind and series (§10.1); refused on vmware (422)
+           gpu_profiles: dict[str, str] = {},          # the NVIDIA vGPU profile each of its GPU flavors gives, as its
+                                                       # operator declares it (§22.3): a flavor name (1-255 characters)
+                                                       # to a profile name (1-64); refused on vmware (422)
            credentials_updated_at: datetime|null,      # server-owned: set by PUT …/credentials
            conversion_key_updated_at: datetime|null,   # server-owned: set by PUT …/conversion-key
            capabilities: dict[str, Any] = {}, status: "unknown"|"ok"|"degraded"|"error" = "unknown",
@@ -207,6 +210,17 @@ Nic   { network: str, mac: str|null, fixed_ips: list[str] = [], vnic_type: str =
                                         # (a standard port group's name); null for OpenStack,
                                         # and on a VM validated before it was recorded
 
+GpuDevice { kind: "vgpu"|"passthrough",  # a GPU of a VM or a flavor's GPU request (§22.2)
+            profile: str|null = null,    # its vGPU profile: VMware's as vCenter reports it, an OpenStack
+                                         # request's as its flavor's provider declares it (gpu_profiles)
+            vendor_id: str|null = null,  # VMware passthrough: the PCI vendor id, 4 lower-case hex digits
+            device_id: str|null = null,  # VMware passthrough: the PCI device id, 4 lower-case hex digits
+            count: int = 1,              # at least 1: identical devices of one VM are one entry
+            resource_class: str|null = null,    # OpenStack vGPU: the request group's class ("VGPU")
+            traits: list[str] = [],             # OpenStack: the group's required traits, sorted
+            forbidden_traits: list[str] = [],   # OpenStack: the group's forbidden traits, sorted
+            alias: str|null = null }            # OpenStack passthrough: the PCI alias
+
 VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: int, ram_mb: int,
         disks: list[Disk], nics: list[Nic],
         power_state: "running"|"stopped"|"paused"|"error"|"transitioning"|"unknown",  # transitioning: a Nova task in flight (RESIZE, VERIFY_RESIZE, MIGRATING, RESCUE, REBUILD, REBOOT, BUILD)
@@ -219,20 +233,25 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
                                       # power_state does not read - a running guest a backup snapshots stays
                                       # running for the source watch (§8.1); null for none, for VMware and on
                                       # a VM validated before it was recorded (review PV-05)
-        key_name: str|null = null }   # the Nova keypair the server boots with (OpenStack); VMware: null
+        key_name: str|null = null,    # the Nova keypair the server boots with (OpenStack); VMware: null
+        gpus: list[GpuDevice] = [] }  # its GPUs (§22.2), as its source reports them from plan task G2;
+                                      # [] for a VM recorded before
    derived (properties, also serialized): disk_bytes: int, used_bytes: int, guest_os: GuestOS
    (used_bytes = Σ used_gb·2^30 when every disk has used_gb, else ⌊disk_bytes·0.6⌋;
     guest_os = identify(os_type), §9.5)
-   free text: a NUL or a lone surrogate in tags and flavor_extra_specs (keys and values), os_type or host
-   is written U+FFFD as the model is built - no export filter or mapping reads them -; name, project,
-   flavor, a NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02)
+   free text: a NUL or a lone surrogate in tags and flavor_extra_specs (keys and values), os_type or host,
+   and in a GPU's profile, alias and traits, is written U+FFFD as the model is built - no export filter or
+   mapping reads them -; name, project, flavor, a NIC's network and a disk's volume_type are kept as the
+   source gives them (§11, review RV49-02)
 
 GuestOS { family: "linux"|"windows"|"unknown", distro: str|null, version: str|null, label: str,
           lifecycle: "current"|"legacy"|"unknown",
           v2v: "supported"|"tech_preview"|"unverified"|"unsupported"|"unknown" }
 
 Mappings { networks: dict[str,str] = {}, flavors: dict[str,str] = {},
-           volume_types: dict[str,str] = {}, projects: dict[str,str] = {} }
+           volume_types: dict[str,str] = {}, projects: dict[str,str] = {},
+           gpus: dict[str,str] = {} }   # a VMware GPU key (§22.2) to a destination GPU flavor (§22.4); the
+                                        # pre-flight reads it from plan task G4; resolved_mappings never holds one
 
 NicOverride { network: str|null = null,          # a RHOSO network name; null = where the plan maps the NIC's network
               fixed_ips: list[str]|null = null }  # the NIC's addresses at RHOSO; null = its own; never empty
@@ -2480,6 +2499,14 @@ VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (
 across plans, §5.4) — and the VMware plan 12 of the 13 VMware VMs: `dc2-portal-02` stays unplanned,
 for the operator to plan warm (§7.4). No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
 
+**GPU requests** (`seamless_migrate.planning.gpu`, plan task G1, §22.2–§22.4): a pure module (no I/O) that the
+providers, the pre-flight and the cutover gate share as their GPU tasks land. `gpu_requests(extra_specs,
+declared_profile=None) -> list[GpuDevice]` reads a flavor's GPU requests by §22.2's rules; `gpu_key(device) -> str |
+None` gives a VMware device's GPU key, its profile for a vGPU and `<vendor_id>:<device_id>` for a passthrough device
+with ids; `vgpu_profile_size(name) -> ProfileSize | None` gives an NVIDIA profile's `{gpu, slices, framebuffer_gb,
+series}`; `pool_name(resource_class, traits, forbidden_traits) -> str` names a pool as the cutover gate's wait does
+(§22.7: the class, the required traits sorted, then the forbidden ones sorted, each prefixed with `!`).
+
 **Bounds.** Each provider call runs its blocking SDK calls in a worker thread and is bounded (300 s, §8.1); the
 bound ends the wait, not the thread, so every request a call sends is bounded by the provider API timeout (60 s) as
 well: an endpoint that accepts a connection and never answers frees the thread once its requests give up (a
@@ -2703,7 +2730,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/providers` | viewer | — | `Provider[]` |
 | POST | `/providers` | admin | `Provider` (status fields ignored; a field `Provider` does not have: 422) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown` and the check report (`capabilities`) to `{}`; 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is) (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown` and the check report (`capabilities`) to `{}`; 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
@@ -4397,6 +4424,8 @@ hosts, and nothing in this section claims more.
 
 ### 22.2 GPU devices of a source VM
 
+The model and `planning/gpu.py` are binding in §4.2 and §10 since plan task G1; the sources report `gpus` from G2.
+
 ```text
 GpuDevice { kind: "vgpu"|"passthrough",
             profile: str|null,         # the vGPU profile: VMware's as vCenter reports it ("grid_a100-4c", MIG-backed
@@ -4437,7 +4466,9 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   * a group that asks for a `CUSTOM_` resource class is a vGPU only when a vGPU profile is declared for its flavor
     (`Provider.gpu_profiles`, §22.3). Nova's `[mdev_<type>] mdev_class` gives a vGPU type such a class, and no API
     tells a custom class that is a GPU from one that is not;
-  * an amount that is not a positive integer reads as 1 (Nova refuses such a flavor when a server boots with it);
+  * a zero amount asks for none, as Nova reads it (a zero takes a resource out of the request); any other amount
+    that is not a positive integer reads as 1, a request still (Nova refuses such a flavor when a server boots with
+    it);
   * no OpenStack flavor names an NVIDIA profile, so `profile` is the declared one (`declared_profile`), else null. On a
     flavor whose GPU requests are PCI aliases alone, the declared profile goes to those entries: a vGPU handed out as a
     PCI device (§22.3).
@@ -4445,7 +4476,8 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   `<vendor_id>:<device_id>` (`10de:20b5`) for a passthrough device with ids. A device without ids has no key, so no
   mapping can name it (`VM_PCI_PASSTHROUGH`, §22.5).
 * **Profile sizes** (`planning/gpu.vgpu_profile_size(name) -> {gpu, slices, framebuffer_gb, series} | null`): an
-  NVIDIA profile name is read case-insensitively, with or without vCenter's `grid_` or `nvidia_` prefix. Time-sliced
+  NVIDIA profile name is read case-insensitively, with or without vCenter's `grid_` or `nvidia_` prefix or the
+  `GRID ` that NVIDIA's mediated device types show. Time-sliced
   names read `<gpu>-<framebuffer GB><series>` (`A100-4C`, `T4-16Q`, `grid_a100-4c`), and MIG-backed names read
   `<gpu>-<slices>-<framebuffer GB><series>` (`A100-3-20C`, `grid_a100-3-20c`); the series is A, B, C or Q. Any other
   name has no size, and `MAP_GPU_DOWNSIZED` compares nothing for it (§22.5).
@@ -4728,7 +4760,7 @@ Binding in §13.4 with plan task G3:
 
 | Item | Becomes binding in | Plan task |
 |---|---|---|
-| `GpuDevice`, `VMRef.gpus`, `Mappings.gpus`, `Provider.gpu_profiles`; `planning/gpu.py` (requests, the GPU key, profile sizes) | §4.2, §10, §12 | G1 |
+| `GpuDevice`, `VMRef.gpus`, `Mappings.gpus`, `Provider.gpu_profiles`; `planning/gpu.py` (requests, the GPU key, profile sizes) | §4.2, §10, §12 (binding) | G1 |
 | the sources report `gpus`; the VMware provider writes no GPU extra specs, and §9.3's two GPU rows read `gpus` (still unconditional until G4) | §9.3, §10 | G2 |
 | `DestinationInventory.gpu_flavors` and `gpu_capacity`; the destination check's `gpu_capacity`; `gpu_capacity()`, `server_allocations()` and `get_server`'s flavor; §22.12's rule | §10, §13.4 | G3 |
 | the GPU flavor rule (§22.4) and the catalog change (§22.5) | §9.3, §7.2 (pre-staging) | G4 |
