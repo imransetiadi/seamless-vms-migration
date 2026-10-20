@@ -369,6 +369,29 @@ async def test_verification_redacts_the_console_before_it_keeps_its_last_charact
         assert "KEYLINE" not in json.dumps(args), name
 
 
+async def test_verification_removes_a_key_whose_begin_line_the_line_cut_dropped():
+    """SDD §7.5, §13.4 (PR #58 review): the verifier keeps the console's last CONSOLE_LINES
+    lines before the advisor sees it, so a private key that cut falls inside reaches redact
+    without its BEGIN line, and redact_tail found no block: 28 lines of the key's body went to
+    jev_screen and jev_verify. An END line no BEGIN line comes before ends a block that runs from
+    the text's start."""
+    from seamless_migrate.verification import CONSOLE_LINES
+
+    advisor, session = advisor_for(
+        {"screen": {"recommendation": {"action": "pass"}}}, settings=ON_PREM
+    )
+    pem = "OPENSSH PRIVATE KEY"  # a synthetic key, assembled so no scanner reads a real one here
+    body = [f"KEYLINE{i:02d}{'A' * 56}" for i in range(49)]
+    key = [f"-----BEGIN {pem}-----", *body, f"-----END {pem}-----"]
+    console = [f"boot {i}" for i in range(300)] + key + [f"web-01 line {i}" for i in range(171)]
+    excerpt = "\n".join(console[-CONSOLE_LINES:])  # what Verifier.verify hands on
+    assert "BEGIN OPENSSH" not in excerpt and "KEYLINE48" in excerpt
+    await advisor.review_verification(make_vm(name="web-01"), result(console=excerpt))
+    for name in ("jev_screen", "jev_verify"):
+        [args] = [c[1] for c in session.calls if c[0] == name]
+        assert "KEYLINE" not in json.dumps(args), name
+
+
 async def test_verification_contradiction_sets_review_never_flips_pass():
     contradicted = load_fixture("verify")
     contradicted["results"][1].update(verdict="contradicted", action="auto")

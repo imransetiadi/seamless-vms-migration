@@ -251,10 +251,16 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
 
 def _redact_pem(text: str) -> str:
     """Each PEM block (a key, a certificate) - its BEGIN line to the first END line after it -
-    replaced. No END line after a BEGIN line means none after a later one either, so each END
-    line is looked for once: time linear in the text (SDD §13.4, review RV27-06)."""
+    replaced, and an END line no BEGIN line comes before - a block a cut fell inside, a console's
+    last lines (SDD §7.5) - with the whole text before it. No END line after a BEGIN line means
+    none after a later one either, so each END line is looked for once: time linear in the text
+    (SDD §13.4, reviews RV27-06, RV52-X1, PR #58 review)."""
     out: list[str] = []
     pos = 0
+    first_end = _PEM_END.search(text)
+    if first_end is not None and _PEM_BEGIN.search(text, 0, first_end.start()) is None:
+        out.append("[REDACTED PEM]")
+        pos = first_end.end()
     while (begin := _PEM_BEGIN.search(text, pos)) is not None:
         end = _PEM_END.search(text, begin.end())
         if end is None:

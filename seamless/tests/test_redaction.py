@@ -168,7 +168,8 @@ def test_redact_tail_finds_a_secret_whose_start_the_cut_drops(monkeypatch):
     before them; redact_tail redacts the kept part and CUT_MARGIN characters before it, then keeps
     the last limit characters — at a bounded cost whatever the text's length."""
     text = "head " + PEM_KEY + " the playbook's last words"
-    assert "KKKK" in redact(text[-500:])
+    # a block a cut fell inside goes to its END line too (PR #58 review)
+    assert redact(text[-500:]) == "[REDACTED PEM] the playbook's last words"
     tail = redact_tail(text, 500)
     assert tail == "head [REDACTED PEM] the playbook's last words"
     assert redact_tail("x" * 900 + text, 30) == "PEM] the playbook's last words"
@@ -882,6 +883,19 @@ def test_a_brace_in_a_quoted_password_neither_ends_an_auth_section_nor_keeps_it_
     out = redact(text)
     assert not [s for s in secrets if s in out], out
     assert redact(out) == out, out
+
+
+def test_a_pem_block_a_cut_left_without_its_begin_line_is_removed_to_its_end_line():
+    """SDD §13.4 (PR #58 review): a block a cut fell inside - a console's last lines, a log's
+    tail - has its END line and no BEGIN line before it; it was kept whole. It is removed from
+    the text's start to that END line, and a later block as before."""
+    pem = "RSA PRIVATE KEY"  # synthetic, assembled so no scanner reads a real one here
+    cut = "KEYLINEA" * 8 + "\nKEYLINEB" * 8 + f"\n-----END {pem}-----\nafter the key\n"
+    later = f"-----BEGIN {pem}-----\nKEYLINEC\n-----END {pem}-----\nthe end"
+    out = redact(cut + later)
+    assert "KEYLINE" not in out and out.count("[REDACTED PEM]") == 2, out
+    assert "after the key" in out and out.endswith("the end"), out
+    assert redact(out) == out
 
 
 def _quotings(pairs):
