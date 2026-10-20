@@ -1970,9 +1970,11 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   its strategy needs a conversion host (`cold`, `warm`); a pre-staging covers the assessments of the plan's migrations
   it read when it began, and the tick reads the migrations from the store - a validation during a pre-staging, or in
   another process (§15), is seen -, so a plan paused and resumed with nothing assessed anew is not pre-staged again and
-  its gates and steps go on at once (review RV51-17, RV51-19). After a restart a running plan whose work started counts
-  as pre-staged for its migrations' assessments; any other plan is pre-staged again when it next runs with a `ready`
-  migration. When pre-staging fails a plan that still runs becomes `failed` (event `plan.updated`,
+  its gates and steps go on at once (review RV51-17, RV51-19). What a pre-staging covered lives in the process:
+  after a restart nothing counts as pre-staged, so a running plan is pre-staged again (idempotently) before its next
+  `ready` migration starts - a VM whose pre-staging the restart cut short is never cut over without its flavor or
+  conversion host (review RV52-O2) -, and a plan with no `ready` migration, one resumed with every migration past
+  `ready`, is not pre-staged: its gates and steps go on at once, and a pre-staging error cannot fail it (review RV52-O3). When pre-staging fails a plan that still runs becomes `failed` (event `plan.updated`,
   "pre-staging failed"), and `start_plan` accepts a `failed` plan as it does a `validated` or `paused`
   one, pre-staging it again. A plan paused, validated again or edited while pre-staging ran keeps its status:
   the failure is recorded (the same event, without a status) and pre-staging runs again at its next start —
