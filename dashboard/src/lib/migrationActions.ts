@@ -31,7 +31,7 @@ const CUTOVER_REQUESTABLE: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'sy
 const FORCEABLE: ReadonlySet<Phase> = new Set(['precopy', 'syncing']);
 
 /** The downtime clock is open: the source VM was stopped and has not run since (SDD §5.2). */
-export function sourceStopped(m: Migration): boolean {
+export function sourceStopped(m: Pick<Migration, 'downtime_started_at' | 'downtime_ended_at'>): boolean {
   return Boolean(m.downtime_started_at) && !m.downtime_ended_at;
 }
 
@@ -370,9 +370,18 @@ function count(n: number, noun: string): string {
   return `${n} ${noun}${n === 1 ? '' : 's'}`;
 }
 
+/**
+ * Whether a validation re-assesses the migration, clearing its approvals and cutover request - the API's
+ * `reassessed` (SDD §5.4): pending, blocked or ready, or left in validating, never a ready one whose source is
+ * stopped, which it leaves as it is (audit OC-02, review RV52-D3).
+ */
+export function reassessedByValidation(m: MigrationLike): boolean {
+  return (REVALIDATABLE.has(m.phase) || m.phase === 'validating') && !(m.phase === 'ready' && sourceStopped(m));
+}
+
 /** What validating the plan again would clear, e.g. "2 approvals and 1 cutover request"; null when nothing (SDD §5.4, §16). */
 export function clearedByValidation(migrations: readonly MigrationLike[]): string | null {
-  const touched = migrations.filter((m) => REVALIDATABLE.has(m.phase));
+  const touched = migrations.filter(reassessedByValidation);
   const approvals = touched.reduce((n, m) => n + m.approvals.length, 0);
   const requests = touched.filter((m) => m.cutover_requested).length;
   const parts = [approvals ? count(approvals, 'approval') : '', requests ? count(requests, 'cutover request') : ''].filter(Boolean);
