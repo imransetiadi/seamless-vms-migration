@@ -148,15 +148,16 @@ never a dump of logs, console output or API payloads.**
 Redaction rule classes implemented by `redact(text, redact_names=None)` in `ai/redaction.py`, the one layer every
 agentmemory body and every Jev call passes (SDD §13.4; `test_redact_removes_secrets` and the reviewed snapshot
 `test_a_fixture_of_fake_secrets_redacts_to_the_reviewed_snapshot` cover them): PEM blocks (`-----BEGIN … -----END …`
-→ `[REDACTED PEM]`); the `auth` section of a `clouds.yaml` (YAML or JSON — a flow section to the brace that closes it, nested ones
-counted —, LF or CRLF line breaks, a comment after `auth:`, also JSON-escaped inside a step's output →
-`auth: [REDACTED]`); credentials in URLs and connection strings
-(`scheme://user:password@host`, a password with `@` too, `Password=…;`); `Authorization` headers of any scheme
-(Basic, Digest, Negotiate — in JSON or a repr too) and bare `Bearer` tokens; `key=value`, `key: value` and
+→ `[REDACTED PEM]`); the `auth` section of a `clouds.yaml` (YAML or JSON — a quoted string in a flow section read whole —, LF or CRLF
+line breaks, a comment after `auth:` → `auth: [REDACTED]`); credentials in URLs and connection strings
+(`scheme://user:password@host`, a password with `@` too, `Password=…;`); `Authorization` headers (the credential
+after any scheme, in JSON or a repr too — one token: the parameters of a Digest or AWS4 header after it stay) and bare `Bearer` tokens; `key=value`, `key: value` and
 `"key": "value"` assignments for password, passwd, pwd, secret, client secret, token, auth token, `x-auth-token`,
 API/access/secret/private key, credential(s) and authorization, the key possibly prefixed (`OS_PASSWORD`) — a quoted
-value whole with what the shell glues to it (`"a"b`, `'a'"b"`), a YAML plain value of several words to its line's
-end; CLI flags (`--os-password x`: the whole shell word, or an argv list's next item, as in a `CalledProcessError`);
+value whole with the characters the shell glues to it (`"a"b`), a YAML plain value of several words to its line's
+end, and never past its item: not into the next list item's key, nor across a JSON-escaped line break; CLI flags
+(`--os-password x`: a quoted value with the rest of its word, or an argv list's next item, as in a
+`CalledProcessError`);
 and well-known token shapes — Seamless API tokens (`smg_…`), Keystone
 Fernet tokens (`gAAAAA…`), JWTs (`eyJ….….…`), AWS access key ids, GitHub tokens, `sk-` keys and Slack tokens.
 Matches become `[REDACTED]`, and a `[REDACTED]` already written stays as it is; `redact_payload` also replaces the
