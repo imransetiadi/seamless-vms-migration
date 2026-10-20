@@ -4074,8 +4074,10 @@ dashboard's `node_modules` against its lockfile, the pre-commit hook, and the en
 `seamless-check-context`, and `curl`, which their health wait needs; it installs and pulls nothing, names the fix of
 each failure for the host it runs on, and exits 1 when something `seamless-check`, the stack targets or the pre-commit
 hook need is missing or off its pin. What `seamless-check` works without — `SEAMLESS_TEST_PG_URL`, Playwright's
-Chromium, agentmemory from the host and, on a Linux machine's own engine, from a container (a cached `busybox` image
-looks, or the look is noted as skipped), `TYPESAFE_API_KEY`, and gitleaks, actionlint and shellcheck, which it skips
+Chromium, agentmemory from the host — and whether its API asks for a bearer secret, which `compose-init.sh` takes from
+`AGENTMEMORY_SECRET`: a search, read-only, says so, or whether the secret set is taken (RV52 backlog) — and, on a Linux
+machine's own engine, from a container (a cached `busybox` image looks, or the look is noted as skipped),
+`TYPESAFE_API_KEY`, and gitleaks, actionlint and shellcheck, which it skips
 when absent and runs at the machine's own version — is noted, never failed, each with its fix; no secret's value or
 URL is printed or put on a command line (PR #58 review)).
 
