@@ -27,7 +27,9 @@ describe('attentionItems', () => {
     expect(find()).toMatchObject({
       tone: 'warning',
       reason: 'Waiting for finalize longer than the plan allows (72 h)',
-      nextAction: 'Finalize or roll it back (approver)',
+      // a summary carries no checkpoint: once a finalize began deleting the source the API refuses a rollback, so the
+      // hint says when one still stands (SDD §8.1, review RV52-D2)
+      nextAction: 'Finalize it, or roll it back while no finalize has begun (approver; see its page)',
       rank: 6,
     });
     // the plan sets the reminder; without the plan it is unknown, so nothing is claimed
