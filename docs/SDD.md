@@ -3623,6 +3623,11 @@ is no origin a browser sends (review RV31-03).
   where it lists platforms (the Providers page, its empty state, the sign-in page), and wherever it means the
   destination cloud it says "the destination" - or the destination provider's name where a plan or a migration is
   shown, as the API's messages do; the offline mock mirrors the API's messages word for word.
+* GPU workloads (§22, from 0.3.0, plan task G10): every GPU element the dashboard shows (§22.11) - the Inventory's GPU
+  column, a destination's GPU flavors and GPU capacity among them - carries a "Technology Preview" badge, its label in
+  words beside its icon and never colour alone, whose detail (a focusable term, as a status badge's) reads
+  "Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts." (§22.14), until §22.14's
+  lab cases pass (plan task G15).
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
   when the caller names it, the object it acts on under it (its kind and id); a close button (×, "Close") in the
@@ -3986,6 +3991,14 @@ is no origin a browser sends (review RV31-03).
   (its Provider select switches the inventory in place: focus stays on the select and the address is replaced, so
   arrowing through the providers neither leaves the select nor fills Back — no change of context on input, WCAG 3.2.2;
   a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
+  a GPU column — each of the VM's GPUs as the API reads them (`vm_gpus`, §22.2): its kind, then its profile or PCI ids,
+  "×n" for n identical ones, and for an OpenStack request " · " and what it asks for, its class and traits (a
+  forbidden one prefixed with "!") or its PCI alias — "vGPU grid_a100-4c ×2", "Passthrough 10de:20b5", "Passthrough
+  without device ids", "vGPU · VGPU, CUSTOM_NVIDIA_A100_4C", "Passthrough · alias a100" (a declared profile after the
+  kind); empty for a VM without a GPU — and a GPU filter (all VMs, those with a GPU, those without), both shown while a
+  VM of the table has a GPU, as the Project filter is while it has two projects; the readiness cell's GPU flag reads
+  "Needs a GPU mapping in its plan", guidance, as the plan decides (§22.4), and a block only where no mapping can name a
+  VMware device, a passthrough device without ids (§22.11);
   a VM that a migration of a plan holds (§5.4: one not `cancelled`, `finalized` or `rolled_back`) names that plan
   in its readiness cell, beside its name — the row header stays the VM's name, as a screen reader repeats it for each
   cell — linked to the plan, with the migration's phase, and a Plan filter shows all VMs, those no plan
@@ -3994,8 +4007,17 @@ is no origin a browser sends (review RV31-03).
   them free;
   `?vm={source id}` opens it searching for that VM, ADV-02;
   a destination: networks with MTU, flavors, volume types, free quota per project (an unlimited one reads
-  Unlimited and an unreported one Not reported, never a number) and the project names that plan
-  project mappings point to, `DST_PROJECT_MISSING` §9.3), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
+  Unlimited and an unreported one Not reported, never a number), the project names that plan
+  project mappings point to, `DST_PROJECT_MISSING` §9.3, its GPU flavors (`gpu_flavors`, §22.3: each one's size, its
+  GPU requests as the GPU column words an OpenStack request, the declared profile left to a column of its own, "None
+  declared" without one; "No flavor asks for a GPU." when none does) and, while it has a GPU flavor, its GPU capacity as its inventory read it
+  (`gpu_capacity`, with the read's time): each pool by its class and traits, the GPU flavors that ask of it with their
+  declared profiles - a class alone unites its pools, so every flavor of its class asks of it (§22.5) -, and its free
+  units and providers ("4 free on 1 GPU", "at most 4 on one" past one provider; a pool Placement refused as a bad
+  request names its detail), or "Not read" with the reason in words - the destination credential lacks the role
+  Placement asks for (`forbidden`), the destination has no Placement (`no_placement`), the read failed (`error`), each
+  with its detail -, and for each flavor that asks for a PCI alias "Capacity unknown: PCI aliases are configured in
+  nova.conf" (§22.11)), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
   loads that plan's history, `GET /events?plan_id=`, and keeps only its live events; once every loaded event is shown,
   Load older events reads the 500 before the oldest (`GET /events?tail=true&before=`), so the trail reads back to its start
   in place; the shown audit events download as JSON
@@ -4058,8 +4080,9 @@ is no origin a browser sends (review RV31-03).
   continue without a token only when `GET /health` says authentication is off (`auth_disabled`) — with it on, that
   link would lead straight back to Sign in; it never asks `GET /me` without a token to find out, a refused request
   that would record `auth.denied` and count toward the per-address lockout, §13.1, on every visit).
-* Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
-  typed errors); `src/api/stream.ts` (fetch-based SSE with resume). A stream that delivers nothing — no event and no
+* Data: `src/api/types.ts` mirrors §4/§12 exactly, §22's GPU fields among them, and the keys of §10's check reports
+  that the dashboard reads (a destination's `gpu_capacity`, §22.3; plan task G10); `src/api/client.ts` (fetch with
+  bearer token, typed errors); `src/api/stream.ts` (fetch-based SSE with resume). A stream that delivers nothing — no event and no
   heartbeat — for 45 s, three heartbeats (§12), counts as dropped although no error came, as a half-open connection
   does after a laptop sleeps or a network path dies: the dashboard closes it and connects again with `since`, its
   indicator reading Reconnecting meanwhile, never Live on events that stopped. The indicator's label is a focusable
@@ -4115,8 +4138,17 @@ is no origin a browser sends (review RV31-03).
   cancelled by the next batch, so a slow API still answers while events keep coming, and a query whose refresh
   was under way is refreshed again once it is done, so an event that came after its request still shows.
   `VITE_SEAMLESS_MOCK=1` switches to an in-browser mock adapter (`src/api/mock.ts`) with fixture data
-  that exercises every phase. Its estimates are §9.1's, as a validation computes them: the control plane's `estimate`
-  with the plan's parameters (`params_for_plan`: the plan's overrides, its own link, threshold and pass limit),
+  that exercises every phase. It holds the demo's GPU VMs, GPU flavors and pools (§22.10, plan task G10): an OpenStack
+  `gpu-ml-01` whose flavor `g1.vgpu` asks for `resources:VGPU=1` and `trait:CUSTOM_NVIDIA_A100_4C=required`; the
+  VMware `dc2-ml-01` (8 vCPUs, 32 GiB, a `grid_a100-4c` vGPU, CBT on), `dc2-ml-02` (16 vCPUs, 64 GiB, a MIG-backed
+  `grid_a100-3-20c` vGPU) and `dc2-cuda-01` (16 vCPUs, 128 GiB, a DirectPath I/O GPU `10de:20b5`, powered off); and on
+  its two checked destinations, `rhoso-prod` and `hibiscus-dc3`, which share one inventory as the demo's do (§10) and
+  declare the two vGPU flavors' profiles (`gpu_profiles`), the GPU flavors `g1.a100-4c` (one vGPU with the trait
+  `CUSTOM_NVIDIA_A100_4C`), `g1.a100-3-20c` (one with `CUSTOM_NVIDIA_A100_3_20C`) and `p1.a100`
+  (`pci_passthrough:alias=a100:1`) and their pools as §22.3 reads them - A100-4C's with 4 units free on 1 provider,
+  A100-3-20C's with 2 free on 1, and the class `VGPU` alone, which unites them -, read alike by the inventory and the
+  destination's check; a destination without a GPU flavor reads `ok` with no pools. Its estimates are §9.1's, as a
+  validation computes them: the control plane's `estimate` with the plan's parameters (`params_for_plan`: the plan's overrides, its own link, threshold and pass limit),
   ported to `src/lib/forcedEstimate.ts` and checked against a case table the control plane generates
   (`seamless/tests/fixtures/estimate_cases.json`); the mock shows each part rounded to 0.1 s, the downtime as their
   sum, and the API's `meets_slo`.
@@ -4898,12 +4930,13 @@ Binding in §7.4 and §10 with plan task G9:
   again, as if another tenant had released a vGPU. A plan with `dc2-ml-02` shows the gate's wait (§22.7) and how it
   clears.
 * The dashboard's offline mock (`VITE_SEAMLESS_MOCK=1`) holds the same GPU VMs, flavors, pools, findings and wait
-  (§16).
+  (§16; its GPU VMs, flavors and pools since plan task G10).
 
 ### 22.11 Dashboard
 
-Binding in §16 with plan tasks G10–G12 (track C). §16's design tokens hold. Every GPU element carries a "Technology
-Preview" badge, in words and never by colour alone, until §22.14's lab cases pass.
+Binding in §16 with plan tasks G10–G12 (track C); the badge rule, the Inventory and `types.ts` since plan task G10.
+§16's design tokens hold. Every GPU element carries a "Technology Preview" badge, in words and never by colour alone,
+until §22.14's lab cases pass.
 
 * **Inventory**. For a source: a GPU column ("vGPU grid_a100-4c ×2", "Passthrough 10de:20b5", or for an OpenStack
   request "vGPU · VGPU, CUSTOM_NVIDIA_A100_4C"; empty for a VM without a GPU) and a GPU filter (all VMs, those with a
