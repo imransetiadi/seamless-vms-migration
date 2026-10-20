@@ -13,6 +13,7 @@ from seamless_migrate.events import (
     emit,
     new_event,
     put_all_and_emit,
+    put_and_emit,
 )
 from seamless_migrate.store import Store
 from seamless_migrate.store import events as events_table
@@ -532,6 +533,22 @@ async def test_an_event_joined_to_a_write_is_timed_when_it_is_written(store: Sto
     written = store.events()
     assert [e.message for e in written] == ["written first", "built first"]
     assert written[0].ts <= written[1].ts  # their time order is their seq order
+
+
+async def test_an_event_written_with_its_document_is_timed_when_it_is_written(store: Store):
+    """SDD §4 (review RV52-O5): put_and_emit - the source watch's flag, a downtime's close - kept
+    the time its event was built with; an event another writer wrote while it waited for the emit
+    lock took the lower seq and the later time."""
+    from tests.factories import make_plan
+
+    bus = EventBus(store)
+    built = new_event("plan.updated", "built first")
+    await asyncio.sleep(0.01)
+    await emit(store, bus, "plan.updated", "written first")
+    await put_and_emit(store, bus, "plan", make_plan(), 0, built)
+    written = store.events()
+    assert [e.message for e in written] == ["written first", "built first"]
+    assert written[0].ts <= written[1].ts
 
 
 async def test_an_emitted_event_is_timed_when_it_is_written(store: Store):

@@ -257,8 +257,10 @@ async def put_and_emit(
     store: Store, bus: EventBus, kind: str, model: Any, expected_version: int, event: Event
 ) -> int:
     """Write ``model`` and ``event`` in one store transaction, then publish the event, in seq order
-    with every other (SDD §8.1, §11, review RV21-04): a store error leaves neither."""
+    with every other (SDD §8.1, §11, review RV21-04): a store error leaves neither. The event is
+    timed under the lock, as it is written (SDD §4, review RV52-O5)."""
     async with bus.emit_lock:
+        [event] = _written_now([event])
         version, event = await asyncio.to_thread(
             store.put_with_event, kind, model, event, expected_version
         )
