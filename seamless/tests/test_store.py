@@ -18,6 +18,7 @@ from seamless_migrate.domain.models import (
     Provider,
     RecommendedOption,
     SimilarIncident,
+    VMRef,
 )
 from seamless_migrate.events import AUDIT_KINDS
 from seamless_migrate.security.auth import DashboardUser
@@ -944,6 +945,44 @@ def test_a_document_an_earlier_version_stored_with_a_nul_or_a_lone_surrogate_is_
         "c\ufffd",
     )
     assert (read.recommendation.unusable, read.legacy_text) == ("u\ufffd", "l\ufffd")
+
+
+def test_a_nic_network_an_earlier_version_stored_with_a_nul_reads_with_u_fffd_from_the_store_alone(
+    any_store: Store,
+):
+    """SDD §4.2, §11 (review RV52-S1): a Neutron network's name may hold a NUL, and
+    v0.1.0-rc.2 kept a VM's NIC networks as the source gave them, so on SQLite such a migration
+    could never be written again: no cancel, no rollback of its stopped source. As the store
+    reads a document, a NIC's network reads with U+FFFD and the migration is written again. A VM
+    as its source gives it keeps the name, which the write refuses (§4.2)."""
+    if any_store.engine.dialect.name != "sqlite":
+        pytest.skip("PostgreSQL never kept them")
+    m = make_migration(vm=make_vm(nics=[Nic(network="app-net", mac="fa:16:3e:00:00:01")]))
+    any_store.put("migration", m)
+    data = m.model_dump(mode="json")
+    data["vm"]["nics"] = [
+        {"network": "app\x00-net", "mac": "fa:16:3e:00:00:01"},
+        {"network": "db\ud800-net", "mac": "fa:16:3e:00:00:02"},
+    ]
+    with any_store.engine.begin() as conn:
+        conn.execute(
+            sa.update(documents)
+            .where(documents.c.kind == "migration", documents.c.id == m.id)
+            .values(data=data)
+        )
+    read = ["app�-net", "db�-net"]
+    [listed] = any_store.list("migration", Migration)
+    assert [nic.network for nic in listed.vm.nics] == read
+    [(_, many)] = any_store.get_many("migration", [m.id], Migration).values()
+    assert [nic.network for nic in many.vm.nics] == read
+    loaded, version = any_store.get_versioned("migration", m.id, Migration)
+    assert [nic.network for nic in loaded.vm.nics] == read
+    assert any_store.put("migration", loaded, expected_version=version) == version + 1
+    # the VM as its source gives it: the name the source has, which no write keeps (§4.2)
+    fresh = VMRef.model_validate(data["vm"])
+    assert fresh.nics[0].network == "app\x00-net"
+    with pytest.raises(UnstorableValue, match=r": vm\.nics\.0\.network: holds a NUL character,"):
+        any_store.put("migration", loaded.model_copy(update={"vm": fresh}))
 
 
 def test_every_outside_text_an_earlier_version_kept_with_a_nul_is_written_again(any_store: Store):

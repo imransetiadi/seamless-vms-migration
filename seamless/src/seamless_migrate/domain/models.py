@@ -86,6 +86,9 @@ def new_policy_id() -> str:
 #: the validation context of a request body (SDD §12): its unknown fields are refused at every
 #: depth, where a stored document keeps loading with the fields a later version added (§11)
 REQUEST_BODY: dict[str, bool] = {"request_body": True}
+#: the validation context of a document the store reads (SDD §11): a NIC's network an earlier
+#: version stored with a NUL or a lone surrogate reads with U+FFFD there, and only there (§4.2)
+STORED_DOCUMENT: dict[str, bool] = {"stored_document": True}
 
 
 class _Model(BaseModel):
@@ -278,6 +281,16 @@ class Nic(_Model):
     #: VMware: what the migration kit maps the NIC by - its distributed port group's key, else its
     #: device summary (a standard port group's name); None for OpenStack (SDD §4, §7.2)
     network_key: str | None = None
+
+    @field_validator("network", mode="before")
+    @classmethod
+    def _stored_network(cls, value: Any, info: ValidationInfo) -> Any:
+        """A network v0.1.0-rc.2 stored with a NUL or a lone surrogate, read with U+FFFD as the
+        store reads it, so its migration is written again; from the source the name stays as
+        given, and the store's write refuses it (SDD §4.2, §11, review RV52-S1)."""
+        if isinstance(value, str) and (info.context or {}).get("stored_document"):
+            return _storable(value)
+        return value
 
 
 PowerState = Literal["running", "stopped", "paused", "error", "transitioning", "unknown"]
