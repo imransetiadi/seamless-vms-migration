@@ -268,7 +268,11 @@ On a Linux machine's own Docker Engine (`SEAMLESS_DOCKER_CONTEXT=default`) the M
 `deploy/compose/compose.linux-host.yaml`, which maps `host.docker.internal` to the host gateway (SDD §17.1); pass it
 with `-f` when you run `docker compose` yourself. agentmemory on that host must then listen on an address the
 containers reach — the bridge's (`172.17.0.1` by default), or all addresses behind a firewall — not on `127.0.0.1`
-only. Colima and Docker Desktop resolve the name themselves.
+only. Colima and Docker Desktop resolve the name themselves. The server binds `127.0.0.1` (its `iii-config.yaml`), so
+the least exposed way is a forwarder on the bridge address alone, kept running by the init system, for example a
+systemd unit whose `ExecStart` is `/usr/bin/socat TCP-LISTEN:3111,bind=172.17.0.1,reuseaddr,fork TCP:127.0.0.1:3111`
+(with `After=docker.service`, as the bridge exists only once Docker runs). `make seamless-doctor` checks the
+server from the host and, on a Linux machine's own engine, from a container (SDD §17.1).
 
 ### 4.3 OpenShift
 
