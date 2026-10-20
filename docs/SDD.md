@@ -1457,7 +1457,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   `ssh_allowed_cidr`, `os_migrate_conversion_secgroup_remote_ip_prefix` set to it (SEC-03).
 * Resolved mappings: preflight records, per migration, the flavor it matched automatically when no
   explicit mapping exists (`Migration.resolved_mappings: Mappings`); `apply_mappings` uses the plan
-  mappings overlaid with the migration's resolved mappings, so an auto-matched flavor is really used.
+  mappings overlaid with the migration's resolved mappings, so an auto-matched flavor is really used. A GPU VM's
+  are empty: its plan names its GPU flavor, and nothing is matched for it (§22.4).
 * Planned server only: os-migrate exports workloads by name, so a server of the source project that
   shares the VM's name but is not in the plan lands in `workloads.yml` too and would be imported —
   on a cold cutover stopped and migrated. After `export_workloads.yml` the executor keeps only the
@@ -1474,7 +1475,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   pure function `apply_mappings(doc: dict, mappings: Mappings) -> dict` (flavor_ref.name,
   ports[].params.network_ref.name, fixed_ips_refs[].subnet_ref.network_ref?.name when present,
   volumes[].params.volume_type, `_migration_params.boot_volume_params.volume_type`,
-  project names in refs); the network references are then resolved as above.
+  project names in refs); the network references are then resolved as above. An OpenStack GPU VM's GPU flavor is
+  its flavor's mapping (§22.4), which so reaches `flavor_ref.name`: the cold and warm cutovers create its server with
+  it. `Mappings.gpus` names VMware GPUs only and is not applied (plan task G7).
 * Step → playbook map:
 
 | Strategy | precopy / sync | cutover | rollback |
@@ -1490,7 +1493,20 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   `os_migrate_vmw_data_dir` = run dir, `already_deploy_conversion_host: true`,
   `copy_openstack_credentials_to_conv_host: false`, `os_migrate_tear_down: false`,
   `vmware_insecure`/`openstack_insecure` from the providers' `verify_tls`, `cbt_sync` for `vmware_warm`,
-  `cutover` for the cutover step; inventory group `conversion_host` points at the RHOSO conversion host.
+  `cutover` for the cutover step, `flavor_uuid` for a GPU VM (below); inventory group `conversion_host` points at
+  the RHOSO conversion host.
+* VMware GPU flavor (§22.4, plan task G7). The kit 2.2.7 creates the server with the flavor `flavor_uuid` names (an
+  id or a name) instead of its own best match. Every kit run of a GPU VM (pre-copy, sync, cutover) so gets
+  `flavor_uuid`: the name of its GPU flavor, the one flavor its plan's GPU mappings map each of its GPU keys to
+  (`planning/gpu.gpu_flavor`); while they map them to no single flavor there is none to pass, and the cutover
+  refuses (below). A VM without a GPU gets none, and the kit sizes its server as before. Before the kit
+  runs, so before the power-off, the cutover stops with a permanent failure naming the VM's GPUs when the GPU mapping
+  no longer applies to the destination's flavors read for that run (the inventory the network map below reads): the
+  plan names no one GPU flavor for them (its GPU mappings changed after a failed attempt), the flavor it names no
+  longer exists, or that flavor asks for no GPU (it is none of the inventory's `gpu_flavors`, §22.3) - the server
+  would lose its GPU without a word. A `vmware_warm` pre-copy or sync run, in which the kit creates no server, logs
+  the problem and records it in the migration's `cutover_refusals` instead, as for a NIC below. Destination flavors
+  that cannot be read are a transient failure, as its networks are.
 * VMware networks. The kit (2.2.7, `export_metadata`) looks each NIC up in `network_map` by the NIC's
   distributed port group key, else by its device summary, and drops a NIC the map lacks. Without
   `used_mapped_networks` it would send every NIC to `openstack_private_network`, which nothing sets. With
@@ -1521,10 +1537,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   which the kit makes no port, maps the NIC as usual when its problem is a network the credential may not use or a MAC
   or address another port holds, and logs the problem and records it in the migration's `cutover_refusals` instead
   (ports that cannot be read it only logs); the cutover refuses it before the power-off. Each pre-copy or sync pass
-  replaces `cutover_refusals` with what it met - what the executor defers here and what the destination check
-  returns (§6.6), once each - so the list empties once a pass meets the problems fixed, and a successful cutover
-  empties it. The other problems leave the NIC no correct value in the map, which the kit reads in
-  every run, and stop every run.
+  replaces `cutover_refusals` with what it met - what the executor defers here and for the GPU flavor (above), and
+  what the destination check returns (§6.6), once each - so the list empties once a pass meets the problems fixed,
+  and a successful cutover empties it. The other problems leave the NIC no correct value in the map, which the kit
+  reads in every run, and stop every run.
 
   The rollback deletes the kit's ports of the VM after the destination server and the source's power-on (below):
   Nova only unbinds a port it did not
@@ -1793,7 +1809,9 @@ volumes with their server, so the order is:
    …}}` (journaled per volume). Without it a UEFI or Windows guest would boot with defaults.
 8. Create the destination server from the managed volumes (BDM in journaled device order,
    `delete_on_termination: false`), with the source flavor's mapping — `plan.mappings.flavors` overlaid with the
-   migration's resolved mappings, so the flavor preflight matched is used (§7.2) — else its name. Each network is found
+   migration's resolved mappings, so the flavor preflight matched is used (§7.2) — else its name. A GPU VM's GPU
+   flavor is its flavor's mapping, and its resolved mappings are empty (§22.4): its server is created with the mapped
+   GPU flavor (plan task G7). Each network is found
    with step 0's lookup. Its NICs: with
    `plan.port_creation_mode` `"nova"` each port's mapped network with the port's first fixed IP (Nova creates the port with a new MAC; §9.2 rules out a port with more than one
    address). With `"neutron"` each port is first created through Neutron on the mapped network with the journaled
@@ -4739,12 +4757,13 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   * the pre-flight (§22.5); the quota counts a GPU VM's cores and RAM by its GPU flavor (`DST_QUOTA_INSUFFICIENT`), a
     VMware VM's too, as the migration kit no longer sizes its server;
   * the cold, warm and storage-handover paths create the server with it, as with any flavor mapping (`apply_mappings`,
-    §7.2; §7.3 step 8);
+    §7.2; §7.3 step 8). Binding in §7.2 and §7.3 since plan task G7;
   * the VMware path passes it to the migration kit as `flavor_uuid` in the vars of every kit run. The kit 2.2.7 takes a
     flavor id or name there and uses it for the server instead of its own best match (`TODO(LAB): confirm` that it
     creates no flavor of that name when its best match finds none, §22.14). The cutover refuses before the kit runs,
     and so before the source stops, when a GPU VM's mapping no longer applies (its flavor was deleted since the
-    validation).
+    validation, or no longer asks for a GPU, or the plan's GPU mappings changed after a failed attempt), and a
+    `vmware_warm` pass records it in `cutover_refusals`. Binding in §7.2 since plan task G7.
 
 ### 22.5 Pre-flight findings
 
