@@ -3092,6 +3092,9 @@ class Orchestrator:
                     self._driver_crashes.pop(mid, None)
                     return
                 await handler(m)
+                # the step returned: a later crash starts a new row of crashes, so its relaunch
+                # backs off from the start (SDD §8, review RV51-16)
+                self._driver_crashes.pop(mid, None)
         except asyncio.CancelledError:
             raise
         except NotFound:

@@ -10112,3 +10112,74 @@ async def test_a_retry_whose_plan_reopen_was_refused_is_reopened_by_the_tick(
     await h.orch.stop()
     assert (len(tries), done.attempts) == (2, 1)
     assert any("reopened: a migration waits in ready" in e.message for e in reopened)
+
+
+async def test_a_driver_that_moved_on_starts_a_new_row_of_crashes(tmp_path, store):
+    """SDD §8 (review RV51-16): while a driver keeps crashing its relaunch backs off, 2^n x tick_s.
+    The count was cleared only when the driver found no handler, so four crashes of the cutover's
+    driver (a database blip), the cutover done, then one crash in verifying - the source still
+    stopped - was crash 5: its relaunch waited 32 s at the default tick_s, 300 s after eight. A
+    step that returned starts a new row."""
+    h = build_harness(tmp_path, store, [vm(1)])
+    plan = plan_for([vm(1)], default_strategy=Strategy.cold)
+    store.put("plan", plan)
+    real_cutover, real_verify = h.orch._do_cutover, h.orch._do_verify
+    left = {"cutover": 4, "verify": 1}
+
+    async def cutover(m):
+        if left["cutover"]:
+            left["cutover"] -= 1
+            raise RuntimeError("the store was briefly unavailable")  # outside the step
+        await real_cutover(m)
+
+    async def verify(m):
+        if left["verify"]:
+            left["verify"] -= 1
+            raise RuntimeError("the store was briefly unavailable")
+        await real_verify(m)
+
+    h.orch._do_cutover, h.orch._do_verify = cutover, verify
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    try:
+        done = await h.wait_phase(mid, P.completed, timeout=20)
+    finally:
+        await h.orch.stop()
+    assert [str(c.to_phase) for c in done.phase_history][-3:] == [
+        "cutover",
+        "verifying",
+        "completed",
+    ]
+    crashes = [
+        e.data["crashes"]
+        for e in store.events(since_seq=0)
+        if e.kind == "migration.error" and e.data.get("step") == "driver"
+    ]
+    # the cutover's row, then the verifying crash starts a new one
+    assert crashes == [1, 2, 3, 4, 1], crashes
+
+
+async def test_a_relaunch_failing_for_the_first_migration_still_relaunches_the_next(
+    tmp_path, store
+):
+    """SDD §8 (audit OC-01, review RV51-28): a relaunch that fails for one migration skips only it.
+    The tests saw only another plan go on - started by the tick's gate, not relaunched - so a try
+    around the whole relaunch loop, which skipped every migration after the first failing one,
+    passed them all."""
+    h = build_harness(tmp_path, store, [vm(1), vm(2)])
+    first = make_migration(vm=vm(1), phase=P.cutover)
+    second = make_migration(vm=vm(2), phase=P.cutover)
+    store.put("migration", first)
+    store.put("migration", second)
+    calls: list[str] = []
+
+    def launch(mid):
+        calls.append(mid)
+        if len(calls) == 1:
+            raise RuntimeError("the relaunch itself fails")
+
+    h.orch._launch = launch
+    await h.orch._resume_orphans()
+    assert sorted(calls) == sorted([first.id, second.id]), calls
