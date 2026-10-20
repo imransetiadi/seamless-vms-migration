@@ -398,6 +398,11 @@ Event { seq: int, ts: datetime, kind: str, plan_id: str|null, migration_id: str|
         actor: str, message: str, data: dict = {} }
 ```
 
+An event's `ts` is the time it is written: the control plane takes it under the lock that writes and numbers its
+events, the events of one transaction sharing one, so their order in time is their `seq` order - the Events page
+lists them by time, then by `seq`. One built before its write waited for that lock (a transition's, joined to the
+migration's write) was listed out of `seq` order after a newer one (CI's live-stream journey, PR 56).
+
 `progress_pct` is the running step's percentage. `bytes_total` is the VM's used bytes — what one full
 copy moves; `bytes_transferred` counts every pass (`sync_bytes_dropped` plus the listed passes, §5.4)
 and the running step's bytes, so a warm migration's grows past `bytes_total`. `sync_passes` lists the
