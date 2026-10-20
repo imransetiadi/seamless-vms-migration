@@ -147,6 +147,12 @@ const toLocalInput = (iso: string): string => {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 };
 const plain = (n: number): string => String(Number(n.toFixed(3)));
+/** A rate in MiB/s as the form shows it: three decimals, and three significant digits under 1 MiB/s - three
+ * decimals showed a stored 1-524 B/s as 0, which the form then refused (SDD §9.1, review RV52-D6). */
+const plainRate = (bps: number): string => {
+  const mib = bps / MiB;
+  return String(mib >= 1 || mib <= 0 ? Number(mib.toFixed(3)) : Number(mib.toPrecision(3)));
+};
 
 const DEFAULT_VERIFICATION = {
   probe_address: 'fixed' as const,
@@ -206,16 +212,16 @@ function formFromPlan(plan: Plan): FormState {
     networks: formatMappings(plan.mappings.networks),
     flavors: formatMappings(plan.mappings.flavors),
     volumeTypes: formatMappings(plan.mappings.volume_types),
-    linkMiBps: plain(plan.link_bps / MiB),
+    linkMiBps: plainRate(plan.link_bps),
     thresholdGiB: plain(plan.convergence_threshold_bytes / GiB),
     maxPasses: String(plan.max_sync_passes),
     keepWarmMinutes: plain(plan.keep_warm_interval_s / 60),
     prestage: plan.prestage_resources.filter(isOfferedPrestage),
     keepPorts: plan.port_creation_mode === 'neutron',
-    scanMiBps: plan.estimator_overrides.scan_bps ? plain(plan.estimator_overrides.scan_bps / MiB) : '',
+    scanMiBps: plan.estimator_overrides.scan_bps ? plainRate(plan.estimator_overrides.scan_bps) : '',
     parallelDisks: plan.estimator_overrides.parallel_disks ? String(plan.estimator_overrides.parallel_disks) : '',
-    changeMiBps: plan.estimator_overrides.change_rate_bps ? plain(plan.estimator_overrides.change_rate_bps / MiB) : '',
-    aggregateScanMiBps: plan.estimator_overrides.max_aggregate_scan_bps ? plain(plan.estimator_overrides.max_aggregate_scan_bps / MiB) : '',
+    changeMiBps: plan.estimator_overrides.change_rate_bps ? plainRate(plan.estimator_overrides.change_rate_bps) : '',
+    aggregateScanMiBps: plan.estimator_overrides.max_aggregate_scan_bps ? plainRate(plan.estimator_overrides.max_aggregate_scan_bps) : '',
     stepTimes: Object.fromEntries(
       STEP_TIMES.map(({ key }) => [key, plan.estimator_overrides[key] ? plain(plan.estimator_overrides[key]) : '']),
     ) as Record<StepTimeKey, string>,
@@ -416,7 +422,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     const consolePatterns = f.consolePatterns.split(/\r?\n/).filter((line) => line.trim() !== '');
     const link = Number(f.linkMiBps);
     // like the API (SDD §9.1, review RV51-22): a rate a hair above zero made every estimate infinite
-    if (!(link * MiB >= MIN_RATE_BPS) || !Number.isFinite(link)) e.link = 'Enter the link bandwidth in MiB/s (at least 1 B/s).';
+    if (!(link * MiB >= MIN_RATE_BPS) || !Number.isFinite(link * MiB)) e.link = 'Enter the link bandwidth in MiB/s (at least 1 B/s).';
     // the API's bounds (SDD §16): a stricter form would keep a plan stored with such a value from being edited
     const threshold = f.thresholdGiB.trim() === '' ? Number.NaN : Number(f.thresholdGiB);
     if (!(threshold >= 0)) e.threshold = 'Enter the convergence threshold in GiB (0 or more).';
@@ -432,7 +438,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     const overrides: Record<string, number> = {};
     if (f.scanMiBps.trim()) {
       const scan = Number(f.scanMiBps);
-      if (!(scan * MiB >= MIN_RATE_BPS) || !Number.isFinite(scan)) e.scan = 'Enter the scan rate in MiB/s (at least 1 B/s), or leave it empty.';
+      if (!(scan * MiB >= MIN_RATE_BPS) || !Number.isFinite(scan * MiB)) e.scan = 'Enter the scan rate in MiB/s (at least 1 B/s), or leave it empty.';
       else overrides.scan_bps = scan * MiB;
     }
     if (f.parallelDisks.trim()) {
@@ -443,12 +449,12 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     // like the API (SDD §9.1): every override is a finite number above 0
     if (f.changeMiBps.trim()) {
       const change = Number(f.changeMiBps);
-      if (!(change > 0) || !Number.isFinite(change)) e.changeRate = 'Enter the guest write rate in MiB/s (more than 0), or leave it empty.';
+      if (!(change > 0) || !Number.isFinite(change * MiB)) e.changeRate = 'Enter the guest write rate in MiB/s (more than 0), or leave it empty.';
       else overrides.change_rate_bps = change * MiB;
     }
     if (f.aggregateScanMiBps.trim()) {
       const cap = Number(f.aggregateScanMiBps);
-      if (!(cap * MiB >= MIN_RATE_BPS) || !Number.isFinite(cap)) e.aggregateScan = 'Enter the aggregate scan cap in MiB/s (at least 1 B/s), or leave it empty.';
+      if (!(cap * MiB >= MIN_RATE_BPS) || !Number.isFinite(cap * MiB)) e.aggregateScan = 'Enter the aggregate scan cap in MiB/s (at least 1 B/s), or leave it empty.';
       else overrides.max_aggregate_scan_bps = cap * MiB;
     }
     for (const { key, field, label } of STEP_TIMES) {

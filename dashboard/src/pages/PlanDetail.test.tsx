@@ -1117,6 +1117,30 @@ describe('PlanDetail', () => {
     expect([saved.convergence_threshold_bytes, saved.max_sync_passes, saved.estimator_overrides.parallel_disks]).toEqual([0, 60, 100]);
   });
 
+  it('edits a plan stored with a link under 525 B/s, and refuses a rate that overflows (SDD §9.1, §16, review RV52-D6)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.link_bps = 524; // the API keeps 1 B/s and more; three decimals of MiB/s showed it as 0, which the form refused
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const link = within(dialog).getByLabelText(/link bandwidth/i);
+    expect(Number((link as HTMLInputElement).value) * 1024 * 1024).toBeGreaterThanOrEqual(1);
+    // 1e303 MiB/s is a finite number whose bytes per second are not: JSON would send it as null
+    await user.clear(link);
+    await user.type(link, '1e303');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Enter the link bandwidth in MiB/s (at least 1 B/s).');
+    await user.clear(link);
+    await user.type(link, '0.0005');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const saved = server.plans.find((p) => p.id === plan.id)!;
+    expect(saved.link_bps).toBeGreaterThanOrEqual(1);
+    expect(saved.link_bps).not.toBeNull();
+  }, 30_000);
+
   it('edits a plan whose mapping names contain =, -> or → and keeps them (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
