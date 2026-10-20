@@ -10324,6 +10324,29 @@ async def test_a_relaunch_failing_for_the_first_migration_still_relaunches_the_n
     assert sorted(calls) == sorted([first.id, second.id]), calls
 
 
+async def test_a_plan_cancel_keeps_its_reason_as_python_s_strip_leaves_it(tmp_path, store):
+    """SDD §12 (review RV52-S3): a plan's cancel kept its reason as sent - white space only was a
+    reason, padding stayed - where a migration's cancel keeps it as Python's strip leaves it, and
+    the dashboard's mock said the API did."""
+    reasons = {}
+    for n, sent in enumerate(("  late window\u0085 ", " \u2028\u3000 ")):
+        h, plan = await setup(tmp_path / str(n), store, [vm(n + 1)], {"name": f"p{n}"})
+        await h.orch.validate_plan(plan.id, "alice")
+        await h.orch.cancel_plan(plan.id, "rina", sent)
+        [m] = await h.migrations(plan.id)
+        [event] = [
+            e
+            for e in store.events(since_seq=0, limit=1000)
+            if e.kind == "plan.cancelled" and e.plan_id == plan.id
+        ]
+        reasons[n] = (event.data["reason"], m.phase_history[-1].reason)
+        await h.orch.stop()
+    assert reasons == {
+        0: ("late window", "cancelled: plan cancelled: late window"),
+        1: (None, "cancelled: plan cancelled"),
+    }
+
+
 async def test_the_text_a_person_gives_with_an_action_is_kept_as_pythons_strip_leaves_it(
     tmp_path, store
 ):

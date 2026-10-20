@@ -1538,6 +1538,7 @@ class Orchestrator:
         """Retire a plan none of whose migrations started (SDD §12): each is cancelled as
         :meth:`cancel` does, then the plan becomes ``cancelled``. Nothing is deleted (§11): its
         VMs are free for another plan and its providers for deletion; its history stays."""
+        reason = _text(reason)  # as Python's strip leaves it (SDD §12, review RV52-S3)
         async with self._lock(f"plan:{plan_id}"):  # SDD §8: no validation, start or step meanwhile
             plan = await self._plan(plan_id)
             if plan.status == PlanStatus.cancelled:
