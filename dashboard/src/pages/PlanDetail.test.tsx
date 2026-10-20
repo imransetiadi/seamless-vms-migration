@@ -1117,7 +1117,7 @@ describe('PlanDetail', () => {
     expect([saved.convergence_threshold_bytes, saved.max_sync_passes, saved.estimator_overrides.parallel_disks]).toEqual([0, 60, 100]);
   });
 
-  it('edits a plan stored with a link under 525 B/s, and refuses a rate that overflows (SDD §9.1, §16, review RV52-D6)', async () => {
+  it('edits a plan stored with a link under 525 B/s, and refuses a number that overflows (SDD §9.1, §16, review RV52-D6, PR #58 review)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
@@ -1125,20 +1125,38 @@ describe('PlanDetail', () => {
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
     await user.click(await actionButton(/^edit plan$/i));
     const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
-    const link = within(dialog).getByLabelText(/link bandwidth/i);
-    expect(Number((link as HTMLInputElement).value) * 1024 * 1024).toBeGreaterThanOrEqual(1);
-    // 1e303 MiB/s is a finite number whose bytes per second are not: JSON would send it as null
-    await user.clear(link);
-    await user.type(link, '1e303');
+    // each field looked up once - a label query scans every label of this large dialog - and filled by one paste
+    const fields = new Map<RegExp, HTMLInputElement>();
+    const field = (label: RegExp) => {
+      if (!fields.has(label)) fields.set(label, within(dialog).getByLabelText(label) as HTMLInputElement);
+      return fields.get(label)!;
+    };
+    const enter = async (label: RegExp, value: string) => {
+      await user.clear(field(label));
+      await user.click(field(label));
+      await user.paste(value);
+    };
+    expect(Number(field(/link bandwidth/i).value) * 1024 * 1024).toBeGreaterThanOrEqual(1);
+    // a finite number whose bytes per second, seconds or bytes are not: JSON would send it as null
+    const overflowing: [RegExp, string][] = [
+      [/link bandwidth/i, 'Enter the link bandwidth in MiB/s (at least 1 B/s).'],
+      [/downtime slo/i, 'Enter the downtime SLO in minutes (more than 0).'],
+      [/convergence threshold/i, 'Enter the convergence threshold in GiB (0 or more).'],
+      [/keep-warm interval/i, 'Enter the keep-warm interval in minutes (1 or more).'],
+      [/verification timeout/i, 'Enter the verification timeout in minutes (0 or more).'],
+    ];
+    const prefilled = overflowing.map(([label]) => field(label).value);
+    for (const [label] of overflowing) await enter(label, '1e308'); // times 60, a GiB or a MiB: Infinity
     await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
-    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Enter the link bandwidth in MiB/s (at least 1 B/s).');
-    await user.clear(link);
-    await user.type(link, '0.0005');
+    const summary = await within(dialog).findByRole('alert');
+    for (const [, message] of overflowing) expect(summary).toHaveTextContent(message);
+    for (const [index, [label]] of overflowing.entries()) await enter(label, prefilled[index]!);
+    await enter(/^name/i, 'Analytics, renamed');
     await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
-    const saved = server.plans.find((p) => p.id === plan.id)!;
-    expect(saved.link_bps).toBeGreaterThanOrEqual(1);
-    expect(saved.link_bps).not.toBeNull();
+    // a real PATCH: the name alone - the link as prefilled is no change, and stays 524 B/s
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['name'] });
+    expect(server.plans.find((p) => p.id === plan.id)!.link_bps).toBe(524);
   }, 30_000);
 
   it('edits a plan whose mapping names contain =, -> or → and keeps them (SDD §16)', async () => {

@@ -403,7 +403,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     if (!f.destinationId) e.destination = 'Choose the destination.';
     if (f.vmIds.size === 0) e.vms = 'Select at least one VM.';
     const slo = Number(f.sloMinutes);
-    if (!(slo > 0)) e.slo = 'Enter the downtime SLO in minutes (more than 0).';
+    // a finite number whose seconds are not (1e303 minutes) would go out as null (PR #58 review)
+    if (!(slo > 0) || !Number.isFinite(slo * 60)) e.slo = 'Enter the downtime SLO in minutes (more than 0).';
     if (Boolean(f.windowStart) !== Boolean(f.windowEnd)) e.window = 'Set both the window start and end, or neither.';
     else if (f.windowStart && Date.parse(f.windowEnd) <= Date.parse(f.windowStart)) e.window = 'The window must end after it starts.';
     const networks = parseMappings(f.networks);
@@ -417,7 +418,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     if (!projects) e.projects = formatHint;
     // 0 checks once without polling (SDD §12)
     const timeoutMinutes = f.timeoutMinutes.trim() === '' ? Number.NaN : Number(f.timeoutMinutes);
-    if (!(timeoutMinutes >= 0)) e.timeout = 'Enter the verification timeout in minutes (0 or more).';
+    if (!(timeoutMinutes >= 0) || !Number.isFinite(timeoutMinutes * 60)) e.timeout = 'Enter the verification timeout in minutes (0 or more).';
     // regular expressions: a pattern keeps its spaces; only blank lines are dropped
     const consolePatterns = f.consolePatterns.split(/\r?\n/).filter((line) => line.trim() !== '');
     const link = Number(f.linkMiBps);
@@ -425,13 +426,13 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     if (!(link * MiB >= MIN_RATE_BPS) || !Number.isFinite(link * MiB)) e.link = 'Enter the link bandwidth in MiB/s (at least 1 B/s).';
     // the API's bounds (SDD §16): a stricter form would keep a plan stored with such a value from being edited
     const threshold = f.thresholdGiB.trim() === '' ? Number.NaN : Number(f.thresholdGiB);
-    if (!(threshold >= 0)) e.threshold = 'Enter the convergence threshold in GiB (0 or more).';
+    if (!(threshold >= 0) || !Number.isFinite(threshold * GiB)) e.threshold = 'Enter the convergence threshold in GiB (0 or more).';
     const passes = Number(f.maxPasses);
     // like the API (SDD §9.1, review RV51-07): the model runs a pass per allowed pass
     if (!Number.isInteger(passes) || passes < 1 || passes > MAX_SYNC_PASSES) e.passes = `Enter a whole number of passes from 1 to ${MAX_SYNC_PASSES}.`;
     // at least a minute: a shorter interval would run delta passes back to back (SDD §5.4)
     const keepWarm = f.keepWarmMinutes.trim() === '' ? Number.NaN : Number(f.keepWarmMinutes);
-    if (!(keepWarm >= 1)) e.keepWarm = 'Enter the keep-warm interval in minutes (1 or more).';
+    if (!(keepWarm >= 1) || !Number.isFinite(keepWarm * 60)) e.keepWarm = 'Enter the keep-warm interval in minutes (1 or more).';
     // whole hours, 1 or more, like the API (SDD §4.2)
     const finalizeWarningH = f.finalizeWarningH.trim() === '' ? Number.NaN : Number(f.finalizeWarningH);
     if (!Number.isInteger(finalizeWarningH) || finalizeWarningH < 1) e.finalizeReminder = 'Enter the finalize reminder in whole hours (1 or more).';
