@@ -890,6 +890,25 @@ def _drain_rules(cutover_answers):
         ("\ufeffKEY=1.2.3\n", "1.2.3"),
         ('KEY="1.2\\"3"\n', '1.2"3'),
         ("KEY='${PORT}'\n", "${PORT}"),
+        # a statement after a closing quote is the next assignment, as compose-go reads (RV42A-05)
+        ('OTHER="0.1.0" KEY=18081\n', "18081"),
+        ("OTHER='x' KEY=18081\n", "18081"),
+        ('OTHER="x"KEY=18081\n', "18081"),
+        ('OTHER="x" # KEY=1\n', ""),
+        ('OTHER="x" KEY=1 C=2\n', "1 C=2"),
+        ('OTHER="x" export KEY: 1\n', "1"),
+        ('KEY="x" OTHER=2 KEY=3\n', "x"),
+        ('A="1" KEY="2" KEY=3\n', "3"),
+        # the Latin-1 white space compose-go trims around a key and a value (RV42A-05)
+        ("KEY\u00a0=18081\n", "18081"),
+        ("KEY\x0b=18081\n", "18081"),
+        ("KEY\x0c=1\n", "1"),
+        ("KEY\u0085=1\n", "1"),
+        ("\u00a0export KEY=18081\u00a0\n", "18081"),
+        ("KEY=1\u00a0#c\n", "1\u00a0#c"),
+        ("KEY=a\x0bb\n", "a\x0bb"),
+        ("KEY=\x0b'x y'\n", "x y"),
+        ('KEY=\u00a0"x y"\n', "x y"),
     ],
     ids=[
         "plain",
@@ -912,6 +931,23 @@ def _drain_rules(cutover_answers):
         "a byte-order mark",
         "an escaped quote",
         "single quotes keep a dollar",
+        "a statement after a closing quote",
+        "a statement after single quotes",
+        "a statement glued to a closing quote",
+        "a comment after a closing quote",
+        "an unquoted value after a quote runs to the end",
+        "an export and a colon after a closing quote",
+        "a later key inside an unquoted value",
+        "the last of three statements",
+        "a no-break space after the key",
+        "a vertical tab after the key",
+        "a form feed after the key",
+        "a next line after the key",
+        "no-break spaces before export and after the value",
+        "a no-break space before a hash is no comment",
+        "white space inside a value stays",
+        "a vertical tab before a quoted value",
+        "a no-break space before a quoted value",
     ],
 )
 @pytest.mark.parametrize("locale", ["C", "en_US.UTF-8"])
@@ -920,7 +956,8 @@ def test_the_dotenv_helper_reads_a_key_as_compose_does(tmp_path, dotenv, value, 
     deploy/compose/.env by compose-go's dotenv rules - a byte-order mark ignored, an export
     prefix, a key ended by '=' or ':', spaces around the key and the value, quotes, an inline
     comment after ' #' in an unquoted value (a tab before a '#' is part of the value), the last
-    definition winning - in any locale (each case checked against compose-go v2.16.1's own
+    definition winning, a statement after a closing quote and the Latin-1 white space compose-go
+    trims (review RV42A-05) - in any locale (each case checked against compose-go v2.16.1's own
     parser)."""
     path = tmp_path / ".env"
     path.write_text(dotenv, encoding="utf-8")

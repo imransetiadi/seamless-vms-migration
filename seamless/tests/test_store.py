@@ -1,3 +1,5 @@
+import hashlib
+import re
 import secrets
 import threading
 from datetime import UTC, datetime
@@ -5,12 +7,29 @@ from datetime import UTC, datetime
 import pytest
 import sqlalchemy as sa
 
-from seamless_migrate.domain.enums import Phase, PlanStatus
-from seamless_migrate.domain.models import Event, Migration, Plan, Provider
+from seamless_migrate.domain.enums import Phase, PlanStatus, Role
+from seamless_migrate.domain.models import (
+    Event,
+    Mappings,
+    Migration,
+    Nic,
+    Plan,
+    Provider,
+    RecommendedOption,
+    SimilarIncident,
+)
 from seamless_migrate.events import AUDIT_KINDS
-from seamless_migrate.store import ConflictError, NotFound, Store
+from seamless_migrate.security.auth import DashboardUser
+from seamless_migrate.store import (
+    ConflictError,
+    NotFound,
+    Store,
+    UnstorableValue,
+    documents,
+    events,
+)
 from tests.conftest import PG_URL
-from tests.factories import make_migration, make_plan, make_provider
+from tests.factories import make_migration, make_plan, make_provider, make_vm
 
 
 def test_put_get_roundtrip(any_store: Store):
@@ -671,3 +690,385 @@ def test_a_role_with_a_schema_of_its_own_starts_once_the_owner_created_the_table
             conn.execute(sa.text(f"DROP ROLE {role}"))
         owner.truncate_for_tests()
         owner.dispose()
+
+
+def _sent_values(store: Store) -> list:
+    """Every parameter value the store sends to its database from now on."""
+    sent: list = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        for row in parameters if executemany else [parameters]:
+            if isinstance(row, dict):
+                sent.extend(row.values())
+            elif isinstance(row, list | tuple):
+                sent.extend(row)
+            else:
+                sent.append(row)
+
+    sa.event.listen(store.engine, "before_cursor_execute", record)
+    return sent
+
+
+#: a NUL or a lone surrogate escaped in a parameter's JSON
+_ESCAPED_UNSTORABLE = re.compile(r"\\u(?:0000|[dD][89a-fA-F][0-9a-fA-F]{2})")
+
+
+def _unstorable_sent(value) -> bool:
+    """Whether a parameter carries a NUL or a lone surrogate - raw, or escaped in its JSON."""
+    if isinstance(value, bytes):
+        return b"\x00" in value
+    if not isinstance(value, str):
+        return False
+    return bool(re.search("[\x00\ud800-\udfff]", value) or _ESCAPED_UNSTORABLE.search(value))
+
+
+@pytest.mark.parametrize(
+    ("bad", "what"),
+    [("\x00", "a NUL character"), ("\ud800", "a lone surrogate")],
+    ids=["nul", "lone-surrogate"],
+)
+def test_the_store_refuses_nul_and_lone_surrogates_and_finds_nothing_by_one(
+    any_store: Store, bad: str, what: str
+):
+    """SDD §11 (reviews ST-03, ST-04, RV48-04, RV48-05, RV48-07, RV48-08, RV48-09): PostgreSQL
+    stores no NUL - psycopg refuses one in a text parameter, JSONB refuses \\u0000 - and no lone
+    surrogate, which SQLite cannot encode in a text column either. Stripping one made a stored
+    value differ from the one a later step compares, looks up or digests - two map keys merged,
+    'sys\\0tem' recorded as 'system', a snapshot no longer matching its SHA-256 -, so the store
+    rewrites none: a write whose document or event holds one is refused before any statement,
+    alike on both backends, naming the kind, the id and the field but never the value, and
+    nothing of it is kept. As no stored string holds one, a lookup, a delete or a filter by a
+    value holding one finds nothing, without sending it."""
+    sent = _sent_values(any_store)
+    m = make_migration(vm=make_vm(nics=[Nic(network=f"app{bad}-net", mac="fa:16:3e:00:00:01")]))
+    with pytest.raises(UnstorableValue) as refused:
+        any_store.put("migration", m, expected_version=0)
+    assert str(refused.value) == (
+        f"migration {m.id}: vm.nics.0.network: holds {what}, which the store cannot keep"
+    )
+    # a map's two keys stay two, neither merged into the other (review RV48-08)
+    merged = make_plan(mappings=Mappings(networks={"app-net": "prod", f"app{bad}-net": "quiet"}))
+    with pytest.raises(UnstorableValue, match=rf"^plan {merged.id}: mappings\.networks: a key "):
+        any_store.put("plan", merged)
+    with pytest.raises(NotFound):
+        any_store.get("plan", merged.id, Plan)
+    # an id holding one: the message names the kind alone, never the id
+    named = make_migration(id=f"mig-{bad}1")
+    with pytest.raises(UnstorableValue, match=rf"^migration: id: holds {what}, which the store "):
+        any_store.put("migration", named)
+    with pytest.raises(NotFound):
+        any_store.get("migration", m.id, Migration)
+    # a versioned write and its event: either holding one leaves both unwritten
+    clean = make_migration()
+    any_store.put("migration", clean, expected_version=0)
+    changed = clean.model_copy(update={"error": f"step{bad}failed"})
+    with pytest.raises(UnstorableValue, match=rf"^migration {clean.id}: error: holds {what}"):
+        any_store.put_with_event("migration", changed, Event(kind="migration.updated"), 1)
+    with pytest.raises(UnstorableValue, match=rf"^migration\.updated event: message: holds {what}"):
+        any_store.put_with_event(
+            "migration", clean, Event(kind="migration.updated", message=f"m{bad}"), 1
+        )
+    assert any_store.get_versioned("migration", clean.id, Migration) == (clean, 1)
+    # every field of an event (review RV48-09)
+    for field, event in (
+        ("plan_id", Event(kind="plan.created", plan_id=f"p{bad}")),
+        ("migration_id", Event(kind="plan.created", migration_id=f"m{bad}")),
+        ("actor", Event(kind="plan.created", actor=f"sys{bad}tem")),
+        ("message", Event(kind="plan.created", message=f"GET /x{bad}y")),
+        ("data.path", Event(kind="plan.created", data={"path": [f"/x{bad}y"]})),
+    ):
+        with pytest.raises(UnstorableValue, match=rf"^plan\.created event: {field}(\.0)?: holds "):
+            any_store.append_event(event)
+    with pytest.raises(UnstorableValue, match=rf"^plan\.created event: data: a key holds {what}"):
+        any_store.append_event(Event(kind="plan.created", data={f"pa{bad}th": "/x"}))
+    with pytest.raises(UnstorableValue, match=rf"^an event: kind: holds {what}"):
+        any_store.append_event(Event(kind=f"plan.created{bad}"))
+    user = DashboardUser(id="u-1", name=f"op{bad}erator", role=Role.operator, sha256="0" * 64)
+    with pytest.raises(UnstorableValue, match=rf"^user u-1: name: holds {what}"):
+        any_store.create_user(user, actor="admin")
+    named = DashboardUser(id="u-2", name="operator", role=Role.operator, sha256="0" * 64)
+    with pytest.raises(UnstorableValue, match=rf"^user\.created event: actor: holds {what}"):
+        any_store.create_user(named, actor=f"ad{bad}min")
+    for user_id in ("u-1", "u-2"):
+        with pytest.raises(NotFound):
+            any_store.get("user", user_id, DashboardUser)
+    assert any_store.events() == []
+    # no stored string holds one: a lookup by a value that does finds nothing, sending nothing
+    with pytest.raises(NotFound):
+        any_store.get("migration", clean.id + bad, Migration)
+    with pytest.raises(NotFound):
+        any_store.delete("migration", clean.id + bad)
+    assert any_store.list("migration", Migration, plan_id=clean.plan_id + bad) == []
+    assert any_store.get_many("migration", [clean.id + bad], Migration) == {}
+    assert any_store.plan_phases([clean.plan_id + bad]) == {}
+    assert any_store.events(plan_id=f"p{bad}") == []
+    assert any_store.events(migration_id=f"m{bad}") == []
+    assert any_store.events(kinds=[f"plan.created{bad}"]) == []
+    assert not [v for v in sent if _unstorable_sent(v)], [v for v in sent if _unstorable_sent(v)]
+
+
+@pytest.mark.parametrize(
+    ("bad", "what"),
+    [(float("nan"), "NaN"), (float("inf"), "an infinity"), (float("-inf"), "an infinity")],
+    ids=["nan", "infinity", "-infinity"],
+)
+def test_the_store_refuses_nan_and_the_infinities_naming_the_field(
+    any_store: Store, bad: float, what: str
+):
+    """SDD §11 (review RV50-04): PostgreSQL's JSONB holds no NaN and no infinity, which Python's
+    json writes as NaN and Infinity and SQLite keeps - a verification note's confidence of inf
+    failed the verifying save on PostgreSQL only (a note now reads one as null, as one an earlier
+    version stored, review RV51-06). A write whose document or event holds one is refused on
+    every backend before any statement, naming the field, and nothing of it is kept."""
+    m = make_migration(actual_downtime_s=bad)
+    with pytest.raises(UnstorableValue) as refused:
+        any_store.put("migration", m, expected_version=0)
+    assert str(refused.value) == (
+        f"migration {m.id}: actual_downtime_s: is {what}, which the store cannot keep"
+    )
+    with pytest.raises(NotFound):
+        any_store.get("migration", m.id, Migration)
+    with pytest.raises(UnstorableValue, match=rf"^plan\.created event: data\.hits\.0: is {what},"):
+        any_store.append_event(Event(kind="plan.created", data={"hits": [bad]}))
+    assert any_store.events() == []
+    # an integer of any length is a JSON number, kept as it is
+    any_store.append_event(Event(kind="plan.created", data={"bytes": 10**30}))
+    assert [e.data for e in any_store.events()] == [{"bytes": 10**30}]
+
+
+def test_a_document_an_earlier_version_stored_with_nan_or_an_infinity_is_written_again(
+    any_store: Store,
+):
+    """SDD §11 (review RV51-06): v0.1.0-rc.2 kept agentmemory's NaN score and Jev's 1e999
+    confidence on SQLite, as json wrote them; the store now refuses every write holding one, so
+    such a migration could never be written again - its stopped source never rolled back. They
+    read as null, a probability as absent, and the document is written again."""
+    if any_store.engine.dialect.name != "sqlite":
+        pytest.skip("PostgreSQL's JSONB never kept the tokens")
+    m = make_migration()
+    any_store.put("migration", m)
+    nan, inf = float("nan"), float("inf")
+    data = m.model_dump(mode="json")
+    data["advisor_notes"] = [
+        {
+            "kind": "verification",
+            "source": "jev",
+            "summary": "s",
+            "confidence": inf,
+            "data": {"hits": [{"title": "t", "score": nan}], "results": [{"confidence": -inf}]},
+        }
+    ]
+    with any_store.engine.begin() as conn:
+        conn.execute(
+            sa.update(documents)
+            .where(documents.c.kind == "migration", documents.c.id == m.id)
+            .values(data=data)
+        )
+    loaded, version = any_store.get_versioned("migration", m.id, Migration)
+    [note] = loaded.advisor_notes
+    assert note.confidence is None
+    assert note.data == {"hits": [{"title": "t", "score": None}], "results": [{"confidence": None}]}
+    assert any_store.put("migration", loaded, expected_version=version) == version + 1
+    # a recommendation's confidence and probabilities, and a similar incident's score
+    rec = {
+        "option": "warm",
+        "confidence": nan,
+        "distribution": {"warm": inf, "cold": 0.25},
+    }
+    assert RecommendedOption.model_validate(rec).model_dump() == {
+        "option": "warm",
+        "confidence": None,
+        "distribution": {"cold": 0.25},
+        "unusable": None,
+    }
+    assert (
+        SimilarIncident.model_validate({"title": "t", "content": "c", "score": inf}).score is None
+    )
+
+
+def test_the_unstorable_walk_reads_a_value_nested_however_deep():
+    """SDD §11, §12 (review RV49-05): the walk that finds a NUL or a lone surrogate - for the store
+    and for the request-body check - recursed one Python frame per level: 1,500 levels raised
+    RecursionError. It walks without recursion, in document order, and names the path."""
+    from seamless_migrate.store import unstorable
+
+    clean: object = "x"
+    bad: object = "a\x00"
+    for _ in range(3000):
+        clean, bad = [clean], {"k": bad}
+    assert unstorable(clean) is None
+    assert unstorable(bad) == (".".join(["k"] * 3000), "holds a NUL character")
+    assert unstorable([{"a": "ok", "b\x00": "x"}, "\ud800"]) == ("0", "a key holds a NUL character")
+
+
+def test_an_over_long_actor_keeps_its_start_and_a_digest_of_the_whole(any_store: Store):
+    """SDD §11 (reviews ST-02, RV48-10): events.actor is VARCHAR(128) while the advisor records
+    user:<name> for names of up to 128 characters - PostgreSQL refused the event of a change it
+    stored, and cut to the column two admins whose names share their first 123 characters read
+    as one. An over-long actor keeps its first 115 characters, then ~ and the first 12 hex digits
+    of the whole actor's SHA-256: the event is always written, two actors never read as one, and
+    one that fits is kept whole."""
+    width = events.c.actor.type.length
+    first, second = "user:" + "a" * 123 + "1", "user:" + "a" * 123 + "2"
+    fits = "user:" + "b" * 123
+
+    def kept(actor: str) -> str:
+        return actor[:115] + "~" + hashlib.sha256(actor.encode()).hexdigest()[:12]
+
+    any_store.append_event(Event(kind="policy.created", actor=first, message="appended"))
+    plan = make_plan()
+    any_store.put("plan", plan, expected_version=0)
+    any_store.put_with_event(
+        "plan", plan, Event(kind="plan.updated", actor=second, message="with its change"), 1
+    )
+    any_store.create_user(
+        DashboardUser(id="u-1", name="u", role=Role.viewer, sha256="0" * 64), actor=fits
+    )
+    assert [(e.kind, e.actor) for e in any_store.events()] == [
+        ("policy.created", kept(first)),
+        ("plan.updated", kept(second)),
+        ("user.created", fits),
+    ]
+    assert len(kept(first)) == width == len(fits) and kept(first) != kept(second)
+
+
+def test_the_store_returns_each_event_as_it_wrote_it(any_store: Store):
+    """SDD §11 (review RV48-14): what a write returns is what the bus publishes, and it is the row
+    the store wrote - an over-long actor as its column keeps it -, so an open stream and a later
+    read of one seq agree."""
+    actor = "user:" + "c" * 128
+    appended = any_store.append_event(
+        Event(kind="policy.created", actor=actor, message="appended", data={"k": "v"})
+    )
+    plan = make_plan()
+    any_store.put("plan", plan, expected_version=0)
+    _, changed = any_store.put_with_event(
+        "plan", plan, Event(kind="plan.updated", actor=actor, message="changed"), 1
+    )
+    created = any_store.create_user(
+        DashboardUser(id="u-1", name="u", role=Role.viewer, sha256="0" * 64), actor=actor
+    )
+    stored = {e.seq: e for e in any_store.events()}
+    assert [stored[e.seq] for e in (appended, changed, created)] == [appended, changed, created]
+
+
+def test_events_never_sends_a_seq_outside_its_column(any_store: Store):
+    """SDD §11 (review RV48-12): events.seq is PostgreSQL's integer, 1 to 2^31 - 1, and a bound
+    beyond it was sent as is - 'integer out of range' there, an overflow on SQLite past 2^63 -,
+    so `seamless events export --since-seq 2147483648` failed after creating its file. events
+    answers alike on both backends, whoever asks: nothing after its end or before 1, everything
+    since a bound below 0 or before one beyond its end."""
+    sent = _sent_values(any_store)
+    for n in range(3):
+        any_store.append_event(Event(kind="plan.created", message=str(n)))
+    seqs = [e.seq for e in any_store.events()]
+    end = 2**31 - 1
+    for since in (end, end + 1, 2**63):
+        assert any_store.events(since_seq=since) == []
+    for before in (1, 0, -(2**63)):
+        assert any_store.events(before_seq=before) == []
+    assert [e.seq for e in any_store.events(since_seq=-(2**63), before_seq=2**63)] == seqs
+    assert not [v for v in sent if isinstance(v, int) and not -(2**31) <= v <= end]
+
+
+@pytest.mark.parametrize(
+    ("write", "row"),
+    [
+        ("UPDATE documents", "plan"),
+        ("INSERT INTO documents", "migration"),
+        ("INSERT INTO events", "plan.updated"),
+        ("INSERT INTO events", "migration.action"),
+    ],
+)
+def test_put_all_with_events_writes_every_document_and_event_or_none(
+    any_store: Store, refuse_write, write, row
+):
+    """SDD §11 (reviews RV48-01, RV48-13): several versioned writes and their events in one
+    transaction - a strategy change, an advisor decision (§8, §14.6). A statement refused when it
+    runs, after the others ran, leaves none of them; a document at another version is a
+    ConflictError naming it, nothing written; else each version and event comes back as
+    written."""
+    plan = make_plan()
+    any_store.put("plan", plan, expected_version=0)
+    changed = plan.model_copy(update={"name": "changed"})
+    m = make_migration(plan_id=plan.id)
+    events_ = [Event(kind="plan.updated", message="p"), Event(kind="migration.action", message="m")]
+    refused = refuse_write(any_store, write, row)
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        any_store.put_all_with_events([("plan", changed, 1), ("migration", m, 0)], events_)
+    assert refused == [f"{write} {row}"]
+    assert any_store.get_versioned("plan", plan.id, Plan) == (plan, 1)
+    with pytest.raises(NotFound):
+        any_store.get("migration", m.id, Migration)
+    assert any_store.events() == []
+    any_store.put("plan", plan, expected_version=1)  # another writer: now at version 2
+    with pytest.raises(ConflictError, match=f"plan '{plan.id}' is at version 2, expected 1"):
+        any_store.put_all_with_events([("plan", changed, 1), ("migration", m, 0)], events_)
+    with pytest.raises(NotFound):
+        any_store.get("migration", m.id, Migration)
+    assert any_store.events() == []
+    versions, written = any_store.put_all_with_events(
+        [("plan", changed, 2), ("migration", m, 0)], events_
+    )
+    assert (versions, written) == ([3, 1], any_store.events())
+    assert [e.kind for e in written] == ["plan.updated", "migration.action"]
+    assert any_store.get_versioned("plan", plan.id, Plan) == (changed, 3)
+    # a new document that exists meanwhile: a ConflictError naming it, nothing written
+    with pytest.raises(ConflictError, match=f"migration '{m.id}' is at version 1, expected 0"):
+        any_store.put_all_with_events([("plan", changed, 3), ("migration", m, 0)], events_)
+    assert (any_store.get_versioned("plan", plan.id, Plan)[1], len(any_store.events())) == (3, 2)
+
+
+def test_a_delete_at_a_version_refuses_a_document_that_moved(any_store: Store):
+    """SDD §11 (review ST-05): a delete may name the version it read - DELETE ... WHERE
+    version = n -, so a write landing in between is refused, never deleted unseen; a document
+    gone is NotFound."""
+    plan = make_plan()
+    any_store.put("plan", plan, expected_version=0)
+    any_store.put("plan", plan, expected_version=1)
+    with pytest.raises(ConflictError, match="is at version 2, expected 1"):
+        any_store.delete("plan", plan.id, expected_version=1)
+    any_store.delete("plan", plan.id, expected_version=2)
+    with pytest.raises(NotFound):
+        any_store.delete("plan", plan.id, expected_version=2)
+
+
+def test_a_prune_and_its_record_are_one_write(any_store: Store, refuse_write):
+    """SDD §15 (review RV51-15): events prune deleted the events, then recorded events.pruned
+    apart - a store error on the record left the trail cut with no record, and the retry recorded
+    "0 deleted". Both or neither: nothing is cut, and the retry records what it cut."""
+    from datetime import timedelta
+
+    t0 = datetime(2026, 10, 1, tzinfo=UTC)
+    for i in range(3):
+        any_store.append_event(
+            Event(ts=t0 + timedelta(days=i), kind="plan.updated", actor="t", message=f"e{i}")
+        )
+    cutoff = datetime(2026, 10, 2, tzinfo=UTC)
+    refused = refuse_write(any_store, "INSERT INTO events", "events.pruned")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        any_store.prune_events(cutoff, actor="cli")
+    assert refused and len(any_store.events()) == 3  # nothing was cut
+    deleted, record = any_store.prune_events(cutoff, actor="cli")
+    assert (deleted, record.actor) == (1, "cli")
+    assert record.data == {"before": "2026-10-02T00:00:00+00:00", "deleted": 1}
+    assert [e.kind for e in any_store.events()] == ["plan.updated", "plan.updated", "events.pruned"]
+
+
+def test_a_deletion_and_its_events_are_one_write(any_store: Store, refuse_write):
+    """SDD §11, §14.5 (review RV51-11): a document deleted at its version with its events in one
+    transaction - a refused event leaves the document; a moved one is a ConflictError, a gone one
+    NotFound, neither appending anything."""
+    plan = make_plan(name="To delete")
+    version = any_store.put("plan", plan)
+    event = Event(kind="plan.updated", actor="t", message="deleted")
+    refused = refuse_write(any_store, "INSERT INTO events", "plan.updated")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        any_store.delete_with_events("plan", plan.id, version, [event])
+    assert refused and any_store.get("plan", plan.id, Plan) == plan
+    with pytest.raises(ConflictError):
+        any_store.delete_with_events("plan", plan.id, version + 1, [event])
+    [written] = any_store.delete_with_events("plan", plan.id, version, [event])
+    assert written.seq is not None and [e.message for e in any_store.events()] == ["deleted"]
+    with pytest.raises(NotFound):
+        any_store.delete_with_events("plan", plan.id, version, [event])

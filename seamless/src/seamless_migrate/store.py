@@ -11,8 +11,9 @@ import contextlib
 import fcntl
 import hashlib
 import logging
+import math
 import threading
-from collections.abc import AsyncIterator, Collection, Iterable
+from collections.abc import AsyncIterator, Collection, Iterable, Sequence
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -27,6 +28,7 @@ from sqlalchemy.pool import StaticPool
 
 from .domain.enums import Phase
 from .domain.models import Event
+from .domain.text import UNSTORABLE
 from .security.auth import DashboardUser
 
 log = logging.getLogger(__name__)
@@ -92,6 +94,16 @@ class ConflictError(StoreError):
     """Optimistic-concurrency conflict (stale version, or the document already exists)."""
 
 
+class UnstorableValue(StoreError):
+    """A write holding what PostgreSQL cannot store - a NUL, a lone surrogate -, refused before
+    any statement on every backend rather than rewritten (SDD §11)."""
+
+
+class _Moved(Exception):
+    """A versioned write of ``put_all_with_events`` found its document at another version: the
+    transaction rolls back."""
+
+
 class NotFound(StoreError):
     def __init__(self, kind: str, id_: str) -> None:
         super().__init__(f"{kind} {id_!r} not found")
@@ -147,10 +159,14 @@ def _as_strings(wanted: Any) -> list[str] | None:
 
 
 def _sql_filter(name: str, wanted: Any) -> Any:
-    """A WHERE clause on the JSON field ``name`` for string filters, else ``None``."""
+    """A WHERE clause on the JSON field ``name`` for string filters, else ``None``; a value holding
+    a NUL or a lone surrogate matches no stored string and is never sent (SDD §11)."""
     values = _as_strings(wanted)
     if not values or not name.isidentifier():
         return None
+    values = [v for v in values if not _unsendable(v)]
+    if not values:
+        return sa.false()
     column = documents.c.data[name].as_string()
     return column == values[0] if len(values) == 1 else column.in_(values)
 
@@ -161,6 +177,139 @@ def _matches(value: Any, wanted: Any) -> bool:
     if isinstance(wanted, Collection) and not isinstance(wanted, str | bytes):
         return any(_matches(value, w) for w in wanted)
     return value == wanted
+
+
+#: the end of ``events.seq``'s range, PostgreSQL's integer: no bound beyond it is sent (SDD §11)
+MAX_SEQ = 2**31 - 1
+
+
+def _unstorable_text(text: str) -> str | None:
+    """What of ``text`` PostgreSQL cannot store, in words, else None (SDD §11)."""
+    found = UNSTORABLE.search(text)
+    if found is None:
+        return None
+    return "a NUL character" if found.group() == "\x00" else "a lone surrogate"
+
+
+def _unstorable_number(number: float) -> str | None:
+    """What a float is when JSONB cannot store it - NaN or an infinity, which Python's json writes
+    and SQLite keeps -, else None (SDD §11, review RV50-04)."""
+    if math.isnan(number):
+        return "NaN"
+    return "an infinity" if math.isinf(number) else None
+
+
+def _unsendable(value: str | None) -> bool:
+    """Whether a lookup value holds what no stored string does (SDD §11)."""
+    return value is not None and _unstorable_text(value) is not None
+
+
+def _children(item: Any) -> list[tuple[str, Any, Any]] | None:
+    """A container's ``(path part, child, the map key it sits under)``, in document order; a model
+    is read as it holds its fields - its JSON dump writes a lone surrogate of a map's key as
+    U+FFFD, a rewrite the store would never see - else None."""
+    if isinstance(item, BaseModel):
+        item = item.__dict__
+    if isinstance(item, dict):
+        return [(str(key), child, key) for key, child in item.items()]
+    if isinstance(item, list | tuple | set | frozenset):
+        return [(str(index), child, None) for index, child in enumerate(item)]
+    return None
+
+
+def _holds_unstorable(value: Any, numbers: bool) -> bool:
+    """Whether a string of ``value``, a map's key included, holds what PostgreSQL cannot store, or
+    with ``numbers`` a float of it is NaN or an infinity - the cheap pass every write takes: no
+    recursion, no path built (review RV49-05)."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if UNSTORABLE.search(item):
+                return True
+        elif isinstance(item, float):
+            if numbers and not math.isfinite(item):
+                return True
+        elif (children := _children(item)) is not None:
+            for _, child, key in children:
+                if isinstance(key, str) and UNSTORABLE.search(key):
+                    return True
+                stack.append(child)
+    return False
+
+
+def unstorable(value: Any, *, numbers: bool = True) -> tuple[str, str] | None:
+    """Where ``value`` first holds a NUL or a lone surrogate, and what: ``("vm.nics.0.network",
+    "holds a NUL character")``, ``("vm.tags", "a key holds a lone surrogate")``, else None - what
+    the store refuses, and the API before any route runs (SDD §11, §12) -, or with ``numbers`` a
+    float that is no JSON number: ``("advisor_notes.0.confidence", "is an infinity")`` - what
+    the store refuses too (review RV50-04). Walked without recursion, depth first in document
+    order, so a value nested however deep is read (review RV49-05)."""
+    if not _holds_unstorable(value, numbers):
+        return None
+    stack: list[tuple[tuple[str, ...], Any, Any]] = [((), value, None)]
+    while stack:
+        path, item, key = stack.pop()
+        if isinstance(key, str) and (what := _unstorable_text(key)):
+            return ".".join(path[:-1]), f"a key holds {what}"
+        if isinstance(item, str):
+            if what := _unstorable_text(item):
+                return ".".join(path), f"holds {what}"
+        elif isinstance(item, float):
+            if numbers and (what := _unstorable_number(item)):
+                return ".".join(path), f"is {what}"
+        elif (children := _children(item)) is not None:
+            stack.extend(((*path, part), child, key) for part, child, key in reversed(children))
+    return None
+
+
+def _refuse_unstorable(subject: str, value: Any) -> None:
+    """An ``UnstorableValue`` naming ``subject`` and the field, never the value, when ``value``
+    holds what PostgreSQL cannot store - on every backend, before any statement (SDD §11)."""
+    found = unstorable(value)
+    if found is not None:
+        where, what = found
+        field = f"{where}: " if where else ""
+        raise UnstorableValue(f"{subject}: {field}{what}, which the store cannot keep")
+
+
+def _document_data(kind: str, doc_id: str, model: BaseModel) -> dict[str, Any]:
+    """``model``'s JSON data, refused when it or its id holds what PostgreSQL cannot store - never
+    rewritten, so a stored value is the one a later step compares (SDD §11, reviews RV48-04,
+    RV48-05, RV48-08)."""
+    what = _unstorable_text(doc_id)
+    if what is not None:
+        raise UnstorableValue(f"{kind}: id: holds {what}, which the store cannot keep")
+    _refuse_unstorable(f"{kind} {doc_id}", model)
+    return model.model_dump(mode="json")
+
+
+def _kept_actor(actor: str) -> str:
+    """``actor`` as ``events.actor`` keeps it: whole when it fits, else its first characters,
+    ``~`` and 12 hex digits of its SHA-256 - two actors never read as one (SDD §11, reviews ST-02,
+    RV48-10)."""
+    width = events.c.actor.type.length
+    if len(actor) <= width:
+        return actor
+    digest = hashlib.sha256(actor.encode("utf-8")).hexdigest()[:12]
+    return f"{actor[: width - len(digest) - 1]}~{digest}"
+
+
+def _event_row(event: Event) -> dict[str, Any]:
+    """The ``events`` row of ``event``, refused when it holds what PostgreSQL cannot store, its
+    actor as the column keeps it; the event a write returns, and the bus publishes, is this row
+    (SDD §11, reviews ST-02, RV48-09, RV48-10, RV48-14)."""
+    named = _unstorable_text(event.kind) is None
+    _refuse_unstorable(f"{event.kind} event" if named else "an event", event)
+    return {
+        "ts": event.ts,
+        "kind": event.kind,
+        "plan_id": event.plan_id,
+        "migration_id": event.migration_id,
+        "actor": _kept_actor(event.actor),
+        "message": event.message,
+        "data": event.model_dump(mode="json")["data"],
+    }
 
 
 def _index_names(conn: sa.Connection) -> set[str]:
@@ -225,6 +374,8 @@ class Store:
             message=f"User {user.name} created",
             data={"name": user.name, "role": str(user.role)},
         )
+        data = _document_data("user", user.id, user)
+        row = _event_row(event)
         try:
             with self.engine.begin() as conn:
                 conn.execute(
@@ -232,24 +383,16 @@ class Store:
                         kind="user",
                         id=user.id,
                         version=1,
-                        data=user.model_dump(mode="json"),
+                        data=data,
                         created_at=event.ts,
                         updated_at=event.ts,
                     )
                 )
-                result = conn.execute(
-                    events.insert().values(
-                        ts=event.ts,
-                        kind=event.kind,
-                        actor=event.actor,
-                        message=event.message,
-                        data=event.data,
-                    )
-                )
+                result = conn.execute(events.insert().values(**row))
                 seq = int(result.inserted_primary_key[0])
         except IntegrityError:
             raise ConflictError("a user with this name already exists") from None
-        return event.model_copy(update={"seq": seq})
+        return Event(seq=seq, **row)
 
     def put(self, kind: str, model: BaseModel, expected_version: int | None = None) -> int:
         """Insert or update ``model``; return the new version.
@@ -258,7 +401,7 @@ class Store:
         ``n > 0`` requires the stored version to be ``n`` (else :class:`ConflictError`).
         """
         doc_id = str(model.id)  # type: ignore[attr-defined]
-        data = model.model_dump(mode="json")
+        data = _document_data(kind, doc_id, model)
         attempts = 5 if expected_version is None else 1
         for _ in range(attempts):
             try:
@@ -334,39 +477,60 @@ class Store:
         """Update ``model`` at ``expected_version`` and append ``event`` in one transaction (SDD
         §11): both are written, or neither - a ``ConflictError`` as ``put``'s, or the store's own
         error. The source watch's flag and its alert (§8.1, review RV21-04)."""
-        doc_id = str(model.id)  # type: ignore[attr-defined]
-        key = (documents.c.kind == kind) & (documents.c.id == doc_id)
-        payload = event.model_dump(mode="json")
-        with self.engine.begin() as conn:
-            updated = conn.execute(
-                documents.update()
-                .where(key & (documents.c.version == expected_version))
-                .values(
-                    version=expected_version + 1,
-                    data=model.model_dump(mode="json"),
-                    updated_at=_now(),
-                )
-            )
-            seq = (
-                int(
-                    conn.execute(
-                        events.insert().values(
-                            ts=event.ts,
-                            kind=event.kind,
-                            plan_id=event.plan_id,
-                            migration_id=event.migration_id,
-                            actor=event.actor,
-                            message=event.message,
-                            data=payload["data"],
+        [version], [written] = self.put_all_with_events([(kind, model, expected_version)], [event])
+        return version, written
+
+    def put_all_with_events(
+        self, writes: Sequence[tuple[str, BaseModel, int]], appended: Sequence[Event]
+    ) -> tuple[list[int], list[Event]]:
+        """Write each ``(kind, model, expected_version)`` - ``0`` a new document, ``n`` the
+        version it must be at - and append ``appended`` in one transaction (SDD §11): all are
+        written or none, a ``ConflictError`` naming the document that moved, else the store's own
+        error. A strategy change and an advisor decision (§8, §14.6, reviews RV48-01, RV48-13);
+        each version and event comes back as written."""
+        documents_ = [
+            (kind, doc_id, _document_data(kind, doc_id, model), expected)
+            for kind, model, expected in writes
+            for doc_id in [str(model.id)]  # type: ignore[attr-defined]
+        ]
+        rows = [_event_row(event) for event in appended]
+        now = _now()
+        moved: tuple[str, str, int] | None = None
+        try:
+            with self.engine.begin() as conn:
+                for kind, doc_id, data, expected in documents_:
+                    moved = (kind, doc_id, expected)
+                    if expected == 0:
+                        conn.execute(
+                            documents.insert().values(
+                                kind=kind,
+                                id=doc_id,
+                                version=1,
+                                data=data,
+                                created_at=now,
+                                updated_at=now,
+                            )
                         )
-                    ).inserted_primary_key[0]
-                )
-                if updated.rowcount == 1
-                else None
-            )
-        if seq is None:
-            raise self._refused(kind, doc_id, expected_version)
-        return expected_version + 1, event.model_copy(update={"seq": seq})
+                        continue
+                    key = (documents.c.kind == kind) & (documents.c.id == doc_id)
+                    result = conn.execute(
+                        documents.update()
+                        .where(key & (documents.c.version == expected))
+                        .values(version=expected + 1, data=data, updated_at=now)
+                    )
+                    if result.rowcount != 1:
+                        raise _Moved
+                moved = None
+                seqs = [
+                    int(conn.execute(events.insert().values(**row)).inserted_primary_key[0])
+                    for row in rows
+                ]
+        except (_Moved, IntegrityError):
+            if moved is None:
+                raise
+            raise self._refused(*moved) from None
+        versions = [expected + 1 for *_, expected in documents_]
+        return versions, [Event(seq=seq, **row) for seq, row in zip(seqs, rows, strict=True)]
 
     def _refused(self, kind: str, doc_id: str, expected_version: int) -> ConflictError:
         """Why a versioned write found no row to write: the document is missing, or at another
@@ -381,6 +545,8 @@ class Store:
         )
 
     def get_versioned(self, kind: str, id_: str, model_cls: type[M]) -> tuple[M, int]:
+        if _unsendable(id_):
+            raise NotFound(kind, id_)  # no stored id holds one (SDD §11)
         with self.engine.connect() as conn:
             row = conn.execute(
                 sa.select(documents.c.data, documents.c.version).where(
@@ -466,7 +632,7 @@ class Store:
         self, kind: str, ids: Collection[str], model_cls: type[M]
     ) -> dict[str, tuple[int, M]]:
         """``{id: (version, document)}`` for the ``ids`` that exist (SDD §11)."""
-        wanted = list(dict.fromkeys(ids))
+        wanted = [id_ for id_ in dict.fromkeys(ids) if not _unsendable(id_)]
         out: dict[str, tuple[int, M]] = {}
         with self.engine.connect() as conn:
             for start in range(0, len(wanted), _GET_MANY_CHUNK):
@@ -482,7 +648,7 @@ class Store:
         """Each plan's migration phases with how many of its migrations are in each (SDD §8.1,
         §11): one ``SELECT ... GROUP BY`` over the indexed ``plan_id`` and ``phase`` expressions; no
         document is loaded or validated. A plan without migrations is absent from the result."""
-        wanted = list(plan_ids)
+        wanted = [plan_id for plan_id in plan_ids if not _unsendable(plan_id)]
         if not wanted:
             return {}
         plan_col = documents.c.data["plan_id"].as_string()
@@ -498,31 +664,66 @@ class Store:
                 out.setdefault(plan_id, {})[Phase(phase)] = int(count)
         return out
 
-    def delete(self, kind: str, id_: str) -> None:
+    def delete(self, kind: str, id_: str, expected_version: int | None = None) -> None:
+        """Delete the document; with ``expected_version`` only at that version - a write landing
+        after the caller read it is a ``ConflictError``, never deleted unseen (SDD §11, review
+        ST-05). A document gone is ``NotFound``."""
+        if _unsendable(id_):
+            raise NotFound(kind, id_)  # no stored id holds one (SDD §11)
+        key = (documents.c.kind == kind) & (documents.c.id == id_)
+        if expected_version is not None:
+            key = key & (documents.c.version == expected_version)
         with self.engine.begin() as conn:
-            result = conn.execute(
-                documents.delete().where((documents.c.kind == kind) & (documents.c.id == id_))
-            )
+            result = conn.execute(documents.delete().where(key))
+        if result.rowcount == 0 and expected_version is not None:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    sa.select(documents.c.version).where(
+                        (documents.c.kind == kind) & (documents.c.id == id_)
+                    )
+                ).first()
+            if row is not None:
+                raise ConflictError(
+                    f"{kind} {id_!r} is at version {int(row.version)}, expected {expected_version}"
+                )
         if result.rowcount == 0:
             raise NotFound(kind, id_)
 
-    # -- events ------------------------------------------------------------------------------
-    def append_event(self, event: Event) -> Event:
-        payload = event.model_dump(mode="json")
+    def delete_with_events(
+        self, kind: str, id_: str, expected_version: int, appended: Sequence[Event]
+    ) -> list[Event]:
+        """Delete the document at ``expected_version`` and append ``appended`` in one transaction
+        (SDD §11, §14.5, review RV51-11): both or neither - a ``ConflictError`` when the document
+        moved since it was read, ``NotFound`` when it is gone. The events come back as written."""
+        if _unsendable(id_):
+            raise NotFound(kind, id_)  # no stored id holds one (SDD §11)
+        rows = [_event_row(event) for event in appended]
+        key = (documents.c.kind == kind) & (documents.c.id == id_)
+        written: list[Event] = []
         with self.engine.begin() as conn:
             result = conn.execute(
-                events.insert().values(
-                    ts=event.ts,
-                    kind=event.kind,
-                    plan_id=event.plan_id,
-                    migration_id=event.migration_id,
-                    actor=event.actor,
-                    message=event.message,
-                    data=payload["data"],
-                )
+                documents.delete().where(key & (documents.c.version == expected_version))
             )
+            if result.rowcount == 0:
+                row = conn.execute(sa.select(documents.c.version).where(key)).first()
+                if row is None:
+                    raise NotFound(kind, id_)
+                raise ConflictError(
+                    f"{kind} {id_!r} is at version {int(row.version)}, expected {expected_version}"
+                )
+            for row_ in rows:
+                seq = int(conn.execute(events.insert().values(**row_)).inserted_primary_key[0])
+                written.append(Event(seq=seq, **row_))
+        return written
+
+    # -- events ------------------------------------------------------------------------------
+    def append_event(self, event: Event) -> Event:
+        """Append ``event``; return it as written, its seq set (SDD §11)."""
+        row = _event_row(event)
+        with self.engine.begin() as conn:
+            result = conn.execute(events.insert().values(**row))
             seq = int(result.inserted_primary_key[0])
-        return event.model_copy(update={"seq": seq})
+        return Event(seq=seq, **row)
 
     def events(
         self,
@@ -536,8 +737,20 @@ class Store:
     ) -> list[Event]:
         """Matching events after ``since_seq`` (and below ``before_seq``) in ascending ``seq``: the
         first ``limit`` of them, or with ``tail`` the newest ``limit`` — with ``before_seq``, the
-        page before an event (SDD §12)."""
-        query = sa.select(events).where(events.c.seq > since_seq)
+        page before an event (SDD §12). A filter value holding a NUL or a lone surrogate matches no
+        stored event, and no seq outside ``events.seq``'s range is sent: nothing after its end or
+        before 1 (SDD §11, review RV48-12)."""
+        if _unsendable(plan_id) or _unsendable(migration_id):
+            return []
+        if since_seq >= MAX_SEQ or (before_seq is not None and before_seq <= 1):
+            return []
+        if before_seq is not None and before_seq > MAX_SEQ:
+            before_seq = None
+        if kinds is not None:
+            kinds = [kind for kind in kinds if not _unsendable(kind)]
+            if not kinds:
+                return []
+        query = sa.select(events).where(events.c.seq > max(since_seq, 0))
         if before_seq is not None:
             query = query.where(events.c.seq < before_seq)
         if plan_id is not None:
@@ -565,6 +778,26 @@ class Store:
             )
             for row in rows
         ]
+
+    def prune_events(self, before: datetime, actor: str) -> tuple[int, Event]:
+        """Delete the events with ``ts < before`` and append ``events.pruned`` - its data the
+        cutoff and the count - in one transaction (SDD §15, Security.md §12, review RV51-15): the
+        trail keeps who cut it and where, or nothing was cut."""
+        if before.tzinfo is None:
+            before = before.replace(tzinfo=UTC)
+        before = before.astimezone(UTC)  # SQLite stores UTC wall time without an offset
+        with self.engine.begin() as conn:
+            deleted = int(conn.execute(events.delete().where(events.c.ts < before)).rowcount or 0)
+            row = _event_row(
+                Event(
+                    kind="events.pruned",
+                    actor=actor,
+                    message=f"{deleted} event(s) before {before.isoformat()} deleted from the CLI",
+                    data={"before": before.isoformat(), "deleted": deleted},
+                )
+            )
+            seq = int(conn.execute(events.insert().values(**row)).inserted_primary_key[0])
+        return deleted, Event(seq=seq, **row)
 
     def delete_events_before(self, before: datetime) -> int:
         """Delete events with ``ts < before`` (audit retention, Security.md §12); returns the count.
@@ -717,8 +950,8 @@ class AsyncStore:
     async def plan_phases(self, plan_ids: Collection[str]) -> dict[str, dict[Phase, int]]:
         return await asyncio.to_thread(self.sync.plan_phases, plan_ids)
 
-    async def delete(self, kind: str, id_: str) -> None:
-        await asyncio.to_thread(self.sync.delete, kind, id_)
+    async def delete(self, kind: str, id_: str, expected_version: int | None = None) -> None:
+        await asyncio.to_thread(self.sync.delete, kind, id_, expected_version)
 
     async def append_event(self, event: Event) -> Event:
         return await asyncio.to_thread(self.sync.append_event, event)
@@ -759,6 +992,7 @@ __all__ = [
     "NotFound",
     "Store",
     "StoreError",
+    "UnstorableValue",
     "build_engine",
 ]
 

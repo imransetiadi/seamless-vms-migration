@@ -36,7 +36,7 @@ from ..orchestrator import BadRequest, NotAllowed, Orchestrator, Unprocessable
 from ..providers.base import ProviderError
 from ..providers.registry import ProviderRegistry
 from ..security.auth import TokenStore
-from ..store import ConflictError, NotFound, Store
+from ..store import ConflictError, NotFound, Store, UnstorableValue
 from . import (
     routes_advisor,
     routes_events,
@@ -94,6 +94,12 @@ def _install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ConflictError)
     async def conflict(_: Request, exc: ConflictError) -> JSONResponse:
         return _error(409, "conflict", str(exc))
+
+    @app.exception_handler(UnstorableValue)
+    async def unstorable_value(_: Request, exc: UnstorableValue) -> JSONResponse:
+        # a value the store keeps no copy of - a source cloud's name holding a NUL - names its
+        # field, never the value (SDD §11, §12)
+        return _error(422, "validation_error", str(exc))
 
     @app.exception_handler(InvalidTransition)
     async def invalid_transition(_: Request, exc: InvalidTransition) -> JSONResponse:

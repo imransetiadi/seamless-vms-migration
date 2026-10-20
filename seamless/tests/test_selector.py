@@ -210,6 +210,16 @@ def test_no_eligible_strategy_falls_back_to_simplest():
     assert strategy == Strategy.cold and "no eligible" in reason
 
 
+@pytest.mark.parametrize("downtime", [float("inf"), float("nan")], ids=["infinity", "nan"])
+def test_a_downtime_that_is_no_number_never_fails_the_selection(downtime):
+    """SDD §9.2 (review RV51-22): an infinite downtime ties with none - inf - inf is NaN - so the
+    tie set was empty and select_strategy raised IndexError, a 500 for the validation. The
+    simplest eligible strategy is taken."""
+    estimates = [est(Strategy.warm, downtime), est(Strategy.cold, downtime)]
+    strategy, _ = select_strategy(make_vm(), estimates, make_plan())
+    assert strategy == Strategy.cold
+
+
 def _storage(*entries):
     return [
         {"pool": pool, "vendor": None, "protocol": None, "family": fam} for pool, fam in entries

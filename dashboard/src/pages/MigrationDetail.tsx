@@ -90,8 +90,9 @@ function Alerts({ m, destination }: { m: Migration; destination: string }) {
         <div role="alert" aria-label="Source VM running" className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
           <Power aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
           <p className="text-foreground">
-            <strong className="font-semibold">The source VM runs again</strong> since {formatDateTime(m.source_running_at)}, so its data diverges from {destination}:
-            stop it, or roll back.
+            <strong className="font-semibold">The source VM runs again</strong> since {formatDateTime(m.source_running_at)}, so its data diverges from {destination}:{' '}
+            {/* SDD §8.1 (review RV51-10): a finalize that began deleting the source is finalized again, never rolled back */}
+            {m.checkpoint === 'finalizing' ? 'its finalize began deleting it - finalize it again, deleting the source (approver).' : 'stop it, or roll back.'}
           </p>
         </div>
       )}

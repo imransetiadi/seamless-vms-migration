@@ -41,6 +41,7 @@ from .enums import (
     Strategy,
     SyncPassKind,
 )
+from .text import replace_unstorable
 
 GIB = 2**30
 #: Fraction of the provisioned size assumed used when a disk does not report usage (SDD §4.2).
@@ -54,7 +55,12 @@ def utcnow() -> datetime:
 def _to_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
+    try:
+        return value.astimezone(UTC)
+    except OverflowError:
+        # its offset carries it past datetime's range: a 422 naming the field, never a 500
+        # (SDD §4, audit AA-01)
+        raise ValueError("a time outside 0001-01-01..9999-12-31 UTC") from None
 
 
 UTCDateTime = Annotated[datetime, AfterValidator(_to_utc)]
@@ -277,8 +283,12 @@ PowerState = Literal["running", "stopped", "paused", "error", "transitioning", "
 
 
 class VMRef(_Model):
-    """A source VM as inventoried (SDD §4.2). Tenant-controlled strings (name, tags, …) are
-    stored in JSON documents: PostgreSQL JSONB rejects NUL characters, so they are stripped."""
+    """A source VM as inventoried (SDD §4.2). The names a cutover reads - its own, its project's,
+    its flavor's, its NICs' networks, its disks' volume types - are kept as the source gives them:
+    one holding a NUL, which PostgreSQL cannot store, fails the store's write naming the field,
+    never a name the source does not have. Its free text no export filter or mapping reads - tags
+    and flavor extra specs, keys and values, os_type, host - is written U+FFFD as the model is
+    built, so one tenant's metadata value never fails a plan's validation (SDD §11, RV49-02)."""
 
     source_id: str
     name: str
@@ -297,20 +307,22 @@ class VMRef(_Model):
     snapshot_count: int = 0
     tools_ok: bool | None = None
 
-    @field_validator("name", "project", "flavor", "os_type", "host", mode="before")
+    @field_validator("os_type", "host", mode="before")
     @classmethod
-    def _strip_nul(cls, value: Any) -> Any:
-        return value.replace("\x00", "") if isinstance(value, str) else value
+    def _storable_text(cls, value: Any) -> Any:
+        return replace_unstorable(value) if isinstance(value, str) else value
 
     @field_validator("tags", "flavor_extra_specs", mode="before")
     @classmethod
-    def _strip_nul_map(cls, value: Any) -> Any:
-        if isinstance(value, dict):
-            return {
-                str(k).replace("\x00", ""): (v.replace("\x00", "") if isinstance(v, str) else v)
-                for k, v in value.items()
-            }
-        return value
+    def _storable_map(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        return {
+            (replace_unstorable(k) if isinstance(k, str) else k): (
+                replace_unstorable(v) if isinstance(v, str) else v
+            )
+            for k, v in value.items()
+        }
 
     change_rate_bps: float | None = None
     #: the task Nova runs on the server whatever its status (OS-EXT-STS:task_state), apart from
@@ -608,6 +620,13 @@ def _probe_problems(where: str, probes: Sequence[AppProbe]) -> list[str]:
     return problems
 
 
+#: the estimator's bounds (SDD §9.1, reviews RV51-07, RV51-22): a plan's sync passes at most, a rate
+#: it divides by at least (B/s), a duration it adds at most (s) - so every estimate is finite
+MAX_SYNC_PASSES = 100
+MIN_RATE_BPS = 1.0
+MAX_DURATION_S = 10**9
+
+
 def repeated_vm_ids(vm_ids: Sequence[str]) -> list[str]:
     """VM ids a plan lists more than once: one VM, one migration (SDD §12)."""
     return sorted(vm_id for vm_id, count in Counter(vm_ids).items() if count > 1)
@@ -640,9 +659,17 @@ def invalid_plan_settings(spec: PlanSpec) -> list[str]:
     window = spec.cutover_window
     if window is not None and window.end <= window.start:
         problems.append("cutover_window: end must be after start")
-    # the JSON parser accepts the Infinity literal, which gt=0 lets through (SDD §9.1)
+    # the JSON parser accepts the Infinity literal, which gt=0 lets through, and a rate a hair
+    # above zero makes every estimate infinite (SDD §9.1, review RV51-22)
     if not math.isfinite(spec.link_bps):
         problems.append(f"link_bps must be a finite positive number (got {spec.link_bps})")
+    elif spec.link_bps < MIN_RATE_BPS:
+        problems.append(f"link_bps must be at least 1 B/s (got {spec.link_bps})")
+    # the model runs a pass per allowed pass, in the event loop (SDD §9.1, review RV51-07)
+    if spec.max_sync_passes > MAX_SYNC_PASSES:
+        problems.append(
+            f"max_sync_passes must be at most {MAX_SYNC_PASSES} (got {spec.max_sync_passes})"
+        )
     return problems
 
 
@@ -705,6 +732,18 @@ class Estimate(_Model):
 AdvisorKind = Literal["strategy", "classification", "verification", "similar_incidents", "screen"]
 
 
+def _finite_or_none(value: Any) -> Any:
+    """``value`` with each NaN or infinity in it read as None: what an earlier version stored on
+    SQLite from an outside service, as this version writes it (SDD §11, review RV51-06)."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _finite_or_none(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_finite_or_none(item) for item in value]
+    return value
+
+
 class AdvisorNote(_Model):
     kind: AdvisorKind
     source: Literal["jev", "rules", "memory"]
@@ -712,6 +751,20 @@ class AdvisorNote(_Model):
     confidence: float | None = None
     data: dict[str, Any] = Field(default_factory=dict)
     created_at: UTCDateTime = Field(default_factory=utcnow)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_number_that_is_none(cls, data: Any) -> Any:
+        """A confidence, a hit's score or a claim's confidence v0.1.0-rc.2 stored as NaN or an
+        infinity reads as None, so the migration holding the note is written again (SDD §11,
+        review RV51-06)."""
+        if isinstance(data, dict) and ("confidence" in data or "data" in data):
+            data = {**data}
+            if "confidence" in data:
+                data["confidence"] = _finite_or_none(data["confidence"])
+            if isinstance(data.get("data"), dict):
+                data["data"] = _finite_or_none(data["data"])
+        return data
 
 
 class AdvisorActor(_Model):
@@ -734,6 +787,26 @@ class RecommendedOption(_Model):
     confidence: float | None = None
     #: raw probabilities per option, shown only in Details
     distribution: dict[str, float] = Field(default_factory=dict)
+    #: why the answer could not be applied when it was recorded (§14.4 rule 2), else None: no
+    #: approve takes it (SDD §4.2, §14.6, audit AD-03)
+    unusable: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_number_that_is_none(cls, data: Any) -> Any:
+        """A confidence v0.1.0-rc.2 stored as NaN or an infinity reads as None, such a probability
+        as absent (SDD §11, review RV51-06)."""
+        if isinstance(data, dict):
+            data = {**data}
+            if "confidence" in data:
+                data["confidence"] = _finite_or_none(data["confidence"])
+            if isinstance(data.get("distribution"), dict):
+                data["distribution"] = {
+                    key: value
+                    for key, value in data["distribution"].items()
+                    if not (isinstance(value, float) and not math.isfinite(value))
+                }
+        return data
 
 
 class Decision(_Model):
@@ -789,6 +862,15 @@ class SimilarIncident(_Model):
     content: str = Field(max_length=1000)
     score: float | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _no_number_that_is_none(cls, data: Any) -> Any:
+        """A score v0.1.0-rc.2 stored as NaN or an infinity reads as no score (SDD §11, §14.3,
+        review RV51-06)."""
+        if isinstance(data, dict) and "score" in data:
+            data = {**data, "score": _finite_or_none(data["score"])}
+        return data
+
 
 class AdvisorReason(_Model):
     """A reason Jev gave that names one of the recommendation's evidence items."""
@@ -826,6 +908,27 @@ class AdvisorRecommendation(_Model):
     similar_incidents: list[SimilarIncident] = Field(default_factory=list)
     #: Jev's reasons that name one of the evidence keys
     reasons: list[AdvisorReason] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unusable_stored_before_the_field(cls, data: Any) -> Any:
+        """A recommendation stored before ``unusable`` (v0.1.0-rc.2) whose decision fell back
+        reads as ``unusable`` the why that decision recorded: no approve takes an answer that
+        could not be applied (SDD §4.2, §14.6, review RV50-07)."""
+        if not isinstance(data, dict):
+            return data
+        option, decision = data.get("recommendation"), data.get("decision")
+        if (
+            isinstance(option, dict)
+            and option.get("unusable") is None
+            and isinstance(decision, dict)
+            and decision.get("status") == DecisionStatus.fallback_rules
+        ):
+            why = decision.get("reason_text")
+            if not isinstance(why, str) or not why:
+                why = "the advisor's answer could not be applied"
+            data = {**data, "recommendation": {**option, "unusable": why}}
+        return data
 
 
 class AdvisorSnapshot(_Model):
@@ -939,6 +1042,10 @@ class Migration(_Model):
     advisor_notes: list[AdvisorNote] = Field(default_factory=list)
     #: the recommendation whose decision waits for approval: no start meanwhile (SDD §5.4, §14.6)
     advisor_hold: str | None = None
+    #: the recommendation its last validation stored: what a decision acts on while no hold names
+    #: one - written in that validation's transaction, so a clock step back never makes the one
+    #: it replaced the newest (SDD §14.6, review RV51-08); None: none stored since the field
+    last_recommendation: str | None = None
     #: the convergence rule that ended the passes (SDD §5.3, ADV-16)
     converged_by: Literal["threshold", "slo", "max_passes", "force"] | None = None
     force_cutover: ForceCutover | None = None

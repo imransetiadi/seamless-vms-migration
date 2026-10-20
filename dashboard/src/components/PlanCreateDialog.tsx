@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { useCreatePlan, useInventory, useMigrationSummaries, usePatchPlan, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
+import { MAX_DURATION_S, MAX_SYNC_PASSES, MIN_RATE_BPS } from '../lib/forcedEstimate';
 import { heldElsewhere, holdersOf } from '../lib/holds';
 import { parseDrafts, toDraft, type ProbeDraft } from '../lib/probes';
 import { providerLabel } from '../lib/providerUse';
@@ -414,12 +415,14 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     // regular expressions: a pattern keeps its spaces; only blank lines are dropped
     const consolePatterns = f.consolePatterns.split(/\r?\n/).filter((line) => line.trim() !== '');
     const link = Number(f.linkMiBps);
-    if (!(link > 0)) e.link = 'Enter the link bandwidth in MiB/s (more than 0).';
+    // like the API (SDD §9.1, review RV51-22): a rate a hair above zero made every estimate infinite
+    if (!(link * MiB >= MIN_RATE_BPS) || !Number.isFinite(link)) e.link = 'Enter the link bandwidth in MiB/s (at least 1 B/s).';
     // the API's bounds (SDD §16): a stricter form would keep a plan stored with such a value from being edited
     const threshold = f.thresholdGiB.trim() === '' ? Number.NaN : Number(f.thresholdGiB);
     if (!(threshold >= 0)) e.threshold = 'Enter the convergence threshold in GiB (0 or more).';
     const passes = Number(f.maxPasses);
-    if (!Number.isInteger(passes) || passes < 1) e.passes = 'Enter a whole number of passes (1 or more).';
+    // like the API (SDD §9.1, review RV51-07): the model runs a pass per allowed pass
+    if (!Number.isInteger(passes) || passes < 1 || passes > MAX_SYNC_PASSES) e.passes = `Enter a whole number of passes from 1 to ${MAX_SYNC_PASSES}.`;
     // at least a minute: a shorter interval would run delta passes back to back (SDD §5.4)
     const keepWarm = f.keepWarmMinutes.trim() === '' ? Number.NaN : Number(f.keepWarmMinutes);
     if (!(keepWarm >= 1)) e.keepWarm = 'Enter the keep-warm interval in minutes (1 or more).';
@@ -429,7 +432,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     const overrides: Record<string, number> = {};
     if (f.scanMiBps.trim()) {
       const scan = Number(f.scanMiBps);
-      if (!(scan > 0)) e.scan = 'Enter the scan rate in MiB/s (more than 0), or leave it empty.';
+      if (!(scan * MiB >= MIN_RATE_BPS) || !Number.isFinite(scan)) e.scan = 'Enter the scan rate in MiB/s (at least 1 B/s), or leave it empty.';
       else overrides.scan_bps = scan * MiB;
     }
     if (f.parallelDisks.trim()) {
@@ -445,14 +448,16 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     }
     if (f.aggregateScanMiBps.trim()) {
       const cap = Number(f.aggregateScanMiBps);
-      if (!(cap > 0) || !Number.isFinite(cap)) e.aggregateScan = 'Enter the aggregate scan cap in MiB/s (more than 0), or leave it empty.';
+      if (!(cap * MiB >= MIN_RATE_BPS) || !Number.isFinite(cap)) e.aggregateScan = 'Enter the aggregate scan cap in MiB/s (at least 1 B/s), or leave it empty.';
       else overrides.max_aggregate_scan_bps = cap * MiB;
     }
     for (const { key, field, label } of STEP_TIMES) {
       const text = f.stepTimes[key].trim();
       if (!text) continue;
       const seconds = Number(text);
-      if (!(seconds > 0) || !Number.isFinite(seconds)) e[field] = `Enter the ${label.toLowerCase()} time in seconds (more than 0), or leave it empty.`;
+      if (!(seconds > 0) || !(seconds <= MAX_DURATION_S)) {
+        e[field] = `Enter the ${label.toLowerCase()} time in seconds (more than 0, at most ${MAX_DURATION_S}), or leave it empty.`;
+      }
       else overrides[key] = seconds;
     }
     const ports = f.tcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);

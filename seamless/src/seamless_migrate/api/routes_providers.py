@@ -43,7 +43,7 @@ from .deps import (
     services,
     validation_message,
 )
-from .schemas import ConversionKeyRequest, ProviderCredentialsRequest
+from .schemas import ConversionKeyRequest, EmptyRequest, ProviderCredentialsRequest
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["providers"])
@@ -458,12 +458,15 @@ async def delete_provider(
     forget = getattr(svc.providers, "forget", None)
     if forget is not None:
         forget(provider_id)
-    # the secrets the store manages for this provider go with it (SDD §13.3)
+    # the secrets the store manages for this provider go with it (SDD §13.3); each one is tried,
+    # and the deletion is audited whatever the store answers, naming what it left (audit AA-03)
     store = secret_store(svc.settings)
+    left: list[str] = []
     for name in (credentials_secret_name(provider_id), conversion_key_secret_name(provider_id)):
         try:
             await asyncio.to_thread(store.delete, name)
         except SecretStoreError as exc:
+            left.append(name)
             log.warning("could not delete secret %s of provider %s: %s", name, provider_id, exc)
     await emit(
         svc.store,
@@ -471,14 +474,17 @@ async def delete_provider(
         "provider.deleted",
         f"provider {provider_id} deleted",
         actor=principal.name,
-        data={"provider_id": provider_id},
+        data={"provider_id": provider_id, **({"secrets_left": left} if left else {})},
     )
     return Response(status_code=204)
 
 
 @router.post("/providers/{provider_id}/check", response_model=Provider)
 async def check_provider(
-    provider_id: str, request: Request, principal: Principal = Depends(require_role(Role.operator))
+    provider_id: str,
+    request: Request,
+    body: EmptyRequest | None = None,
+    principal: Principal = Depends(require_role(Role.operator)),
 ) -> Provider:
     return await services(request).orchestrator.check_provider(provider_id, principal.name)
 

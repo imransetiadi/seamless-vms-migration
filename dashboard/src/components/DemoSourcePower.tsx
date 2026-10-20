@@ -1,5 +1,5 @@
 import { Power, PowerOff } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useDemoPower, useHealth } from '../api/hooks';
 import type { Migration, Role } from '../api/types';
 import { hasRole } from '../lib/roles';
@@ -18,13 +18,26 @@ export function DemoSourcePower({ migration: m, role }: { migration: Migration; 
   const power = useDemoPower();
   const [set, setSet] = useState<{ on: boolean; basis: string } | null>(null);
   const [announcement, setAnnouncement] = useState('');
+  // the basis of the last press, whatever it answered: its announcement and its error are the press's too
+  const [pressed, setPressed] = useState<string | null>(null);
   // what a press is measured against: the migration as the page showed it then; once that changes the press is
   // dropped for good - a power back where it was at the press is the record's, not the press's
   const basis = `${m.phase}|${m.attempts}|${m.source_running_at ?? ''}`;
   if (set && set.basis !== basis) setSet(null);
+  const resetPower = power.reset;
+  useEffect(() => {
+    // dropped with the press, so a screen reader hears no stale state and no earlier attempt's failure shows
+    // (review RV46B-02)
+    if (pressed !== null && pressed !== basis) {
+      setPressed(null);
+      setAnnouncement('');
+      resetPower();
+    }
+  }, [basis, pressed, resetPower]);
   if (!health.data?.demo || m.phase !== 'completed') return null;
   const running = set ? set.on : Boolean(m.source_running_at);
-  const press = () =>
+  const press = () => {
+    setPressed(basis);
     power.mutate(
       { sourceId: m.vm.source_id, on: !running },
       {
@@ -35,6 +48,7 @@ export function DemoSourcePower({ migration: m, role }: { migration: Migration; 
         },
       },
     );
+  };
   return (
     <div className="mt-3 flex flex-col gap-2 border-t border-dashed border-border pt-3">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">

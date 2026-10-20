@@ -31,7 +31,7 @@ const CUTOVER_REQUESTABLE: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'sy
 const FORCEABLE: ReadonlySet<Phase> = new Set(['precopy', 'syncing']);
 
 /** The downtime clock is open: the source VM was stopped and has not run since (SDD §5.2). */
-function sourceStopped(m: Migration): boolean {
+export function sourceStopped(m: Migration): boolean {
   return Boolean(m.downtime_started_at) && !m.downtime_ended_at;
 }
 

@@ -1,3 +1,4 @@
+import hashlib
 import inspect
 import re
 
@@ -8,7 +9,7 @@ from fastapi.testclient import TestClient
 from seamless_migrate.ai.memory import MemoryClient
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, Role
-from seamless_migrate.domain.models import Provider
+from seamless_migrate.domain.models import Migration, Plan, Provider
 from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, ROLES, SOURCE, Api, api_settings
 from tests.factories import make_migration
@@ -88,7 +89,15 @@ def test_out_of_range_query_integers_are_422(api):
         res = api.get(path)
         assert res.status_code == 422, path
         assert res.json()["error"]["code"] == "validation_error"
-    assert api.get("/api/v1/events?since=9223372036854775807").status_code == 200
+    # events.seq is PostgreSQL's integer: one past its width is a 422, never a 500 there (SDD §12,
+    # review ST-01)
+    assert api.get("/api/v1/events?since=2147483647").status_code == 200
+    for path in (
+        "/api/v1/events?since=2147483648",
+        "/api/v1/events?tail=true&before=2147483648",
+        "/api/v1/events/stream?since=2147483648",
+    ):
+        assert api.get(path).status_code == 422, path
 
 
 def test_provider_errors_are_redacted_in_the_api(api, monkeypatch):
@@ -142,6 +151,125 @@ def test_me_and_forbidden_audit(api):
     assert res.status_code == 403 and res.json()["error"]["code"] == "forbidden"
     denied = [e for e in api.store.events(since_seq=0) if e.kind == "auth.denied"]
     assert denied[-1].actor == "operator-user" and denied[-1].data["required_role"] == "admin"
+
+
+def test_a_denied_request_records_its_path_as_sent(api):
+    """SDD §13.1 (review ST-03): auth.denied records the path as the client sent it,
+    percent-encoded - the decoded one put a NUL into the event, which PostgreSQL refuses, so the
+    401 became a 500 and the probe left no audit record."""
+    res = api.client.get("/api/v1/providers/x%00y")
+    assert res.status_code == 401
+    [denied] = [e for e in api.store.events(since_seq=0) if e.kind == "auth.denied"]
+    assert denied.data["path"] == "/api/v1/providers/x%00y"
+    assert denied.message == "GET /api/v1/providers/x%00y: missing or invalid bearer token"
+
+
+def test_a_128_character_admins_policy_change_is_audited(api):
+    """SDD §11, §14.5 (review ST-02): names are 1-128 characters and the advisor's audit events
+    name user:<name> - 133 characters for a 128-character admin against events.actor's 128. The
+    change and its audit event are both written, the actor cut to the column."""
+    name = "a" * 128
+    created = api.post("/api/v1/users", Role.admin, json={"name": name, "role": "admin"})
+    assert created.status_code == 201, created.text
+    headers = {"Authorization": f"Bearer {created.json()['token']}"}
+    spec = {
+        "name": "long-named admin",
+        "scope": {"provider_ids": [], "plan_ids": []},
+        "decision_types": ["migration_strategy"],
+        "mode": "always_require_approval",
+        "threshold": 0.6,
+    }
+    res = api.client.post("/api/v1/advisor/policies", headers=headers, json=spec)
+    assert res.status_code == 201, res.text
+    [audited] = [e for e in api.store.events(since_seq=0) if e.kind == "policy.created"]
+    actor = f"user:{name}"  # its start, then 12 hex of its SHA-256 (review RV48-10)
+    assert audited.actor == actor[:115] + "~" + hashlib.sha256(actor.encode()).hexdigest()[:12]
+
+
+@pytest.mark.parametrize(
+    ("fragment", "message"),
+    [
+        ('"name": "fin\\u0000ance"', "name: holds a NUL character"),
+        ('"name": "fin\\ud800ance"', "name: holds a lone surrogate"),
+        (
+            '"name": "Mapped", "mappings": {"networks": {"app\\u0000-net": "prod-net"}}',
+            "mappings.networks: a key holds a NUL character",
+        ),
+    ],
+    ids=["nul", "lone-surrogate", "nul-key"],
+)
+def test_a_request_body_holding_a_nul_or_a_lone_surrogate_is_a_422_before_the_route_runs(
+    api, fragment, message
+):
+    """SDD §11, §12 (reviews RV48-07, RV48-08): a JSON string with a NUL or a lone surrogate
+    passed the request model - the plan was written, then its plan.created message could not be
+    encoded (a 500, a plan without its audit event), PostgreSQL refused the document, and the
+    store's strip merged a mapping's two keys. Such a body is refused 422 naming where, once the
+    token and the role are checked, before the route writes anything."""
+    for provider in (SOURCE, DESTINATION):
+        assert api.post("/api/v1/providers", json=provider).status_code == 201
+    body = (
+        "{" + fragment + ', "source_provider_id": "src-osp",'
+        ' "destination_provider_id": "dst-rhoso", "vm_ids": []}'
+    )
+
+    def post(role):
+        headers = {**api.h(role), "content-type": "application/json"}
+        return api.client.post("/api/v1/plans", headers=headers, content=body)
+
+    assert post(None).status_code == 401  # the token first
+    assert post(Role.viewer).status_code == 403  # then the role
+    res = post(Role.operator)
+    assert (res.status_code, res.json()["error"]) == (
+        422,
+        {"code": "validation_error", "message": message},
+    )
+    assert api.store.list("plan", Plan) == [] and "plan.created" not in api.kinds()
+
+
+@pytest.mark.parametrize(
+    ("content_type", "depth"),
+    [("application/json", 1500), ("text/plain", 1500), ("text/plain", 10000)],
+)
+def test_a_body_nested_however_deep_is_answered_as_its_route_answers_it(api, content_type, depth):
+    """SDD §12 (review RV49-05): the request-body check walked the parsed JSON in Python frames,
+    one per level - a body nested 1,500 deep (3 KB) was a RecursionError, a 500, for any caller
+    with the route's role, before the route's own validation ran. It walks without recursion,
+    and a body its parser cannot read is left to the route: a 4xx with the envelope."""
+    body = '{"name": "x", "description": ' + "[" * depth + "]" * depth + "}"
+    headers = {**api.h(Role.operator), "content-type": content_type}
+    res = api.client.post("/api/v1/plans", content=body.encode(), headers=headers)
+    assert res.status_code in (400, 422) and "error" in res.json(), res.text
+
+
+def test_a_value_the_store_refuses_is_a_422_naming_its_field(api, monkeypatch):
+    """SDD §11, §12: a source cloud's name holding a NUL - Neutron's names are free strings - is
+    refused by the store, never kept stripped as a name the source does not have; the route
+    answers 422 validation_error with the store's message, naming the field, never a 500."""
+    from seamless_migrate.domain.models import Nic
+    from seamless_migrate.providers.fake import FakeSourceProvider
+
+    for provider in (SOURCE, DESTINATION):
+        assert api.post("/api/v1/providers", json=provider).status_code == 201
+    [first, *_] = [vm["source_id"] for vm in api.get("/api/v1/providers/src-osp/inventory").json()]
+    original = FakeSourceProvider.get_vm
+
+    async def get_vm(self, source_id):
+        vm = await original(self, source_id)
+        return vm.model_copy(update={"nics": [Nic(network="app\x00-net")]})
+
+    monkeypatch.setattr(FakeSourceProvider, "get_vm", get_vm)
+    plan = {"name": "NUL network", "source_provider_id": "src-osp"}
+    plan |= {"destination_provider_id": "dst-rhoso", "vm_ids": [first]}
+    made = api.post("/api/v1/plans", Role.operator, json=plan)
+    assert made.status_code == 201, made.text
+    res = api.post(f"/api/v1/plans/{made.json()['id']}/validate", Role.operator)
+    assert res.status_code == 422 and res.json()["error"]["code"] == "validation_error", res.text
+    assert re.fullmatch(
+        r"[a-z_]+ [\w-]+: [\w.]+: holds a NUL character, which the store cannot keep",
+        res.json()["error"]["message"],
+    ), res.text
+    assert api.store.list("migration", Migration) == []
 
 
 ROUTES = [
@@ -1167,3 +1295,68 @@ def test_plans_refuse_a_resource_they_cannot_pre_stage(api):
         json={"prestage_resources": ["workloads"]},
     )
     assert patched.status_code == 422 and "'workloads'" in patched.json()["error"]["message"]
+
+
+#: well-formed ISO-8601 times whose UTC instant lies outside datetime's range (audit AA-01)
+OUT_OF_RANGE = ("0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-14:00")
+
+
+@pytest.mark.parametrize("stamp", OUT_OF_RANGE)
+def test_a_time_outside_datetimes_range_is_refused_naming_its_field(tmp_path, stamp):
+    """SDD §4, §12 (audit AA-01): converting such a time to UTC raised OverflowError, which pydantic
+    does not turn into a validation error - POST /plans, PATCH /plans/{id} and POST /providers
+    answered 500 with a traceback in the log. It is a 422 naming the field."""
+    settings, tokens = api_settings(tmp_path, secrets_dir=tmp_path / "secrets")
+    store = Store(f"sqlite:///{tmp_path / 'api.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store), raise_server_exceptions=False) as client:
+        api = Api(client, store, settings, tokens)
+        assert api.post("/api/v1/providers", json=SOURCE).status_code == 201
+        assert api.post("/api/v1/providers", json=DESTINATION).status_code == 201
+        plan = {
+            "name": "Range plan",
+            "source_provider_id": SOURCE["id"],
+            "destination_provider_id": DESTINATION["id"],
+            "vm_ids": [],
+        }
+        window = {"start": stamp, "end": "2030-01-02T00:00:00Z"}
+        created = api.post("/api/v1/plans", Role.approver, json={**plan, "cutover_window": window})
+        assert created.status_code == 422, created.text
+        assert "cutover_window.start" in created.json()["error"]["message"]
+        draft = api.post("/api/v1/plans", Role.approver, json=plan).json()
+        patched = client.patch(
+            f"/api/v1/plans/{draft['id']}",
+            headers=api.h(Role.approver),
+            json={"cutover_window": window},
+        )
+        assert patched.status_code == 422, patched.text
+        provider = api.post(
+            "/api/v1/providers", json={**SOURCE, "id": "src-two", "last_checked_at": stamp}
+        )
+        assert provider.status_code == 422, provider.text
+        assert "last_checked_at" in provider.json()["error"]["message"]
+    store.dispose()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/advisor/recommendations/rec-none/approve",
+        "/api/v1/plans/plan-none/validate",
+        "/api/v1/plans/plan-none/start",
+        "/api/v1/plans/plan-none/pause",
+        "/api/v1/migrations/mig-none/sync",
+        "/api/v1/migrations/mig-none/retry",
+        "/api/v1/providers/prov-none/check",
+    ],
+)
+def test_a_route_whose_request_is_empty_refuses_a_field(api, path):
+    """SDD §12 (audit AA-04): the routes that take no body dropped every field of one - an approve
+    sent the option meant for an override applied the advisor's, recorded as the person's. An
+    empty object or no body passes; a field is a 422 naming it."""
+    refused = api.client.post(path, headers=api.h(Role.admin), json={"option": "cold"})
+    assert refused.status_code == 422, refused.text
+    assert "option: Extra inputs are not permitted" in refused.json()["error"]["message"]
+    for body in ({}, None):
+        taken = api.client.post(path, headers=api.h(Role.admin), json=body)
+        assert taken.status_code == 404, (body, taken.text)  # its unknown id, as before

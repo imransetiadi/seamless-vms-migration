@@ -17,7 +17,7 @@ import { guestOsOf } from '../lib/guestOs';
 import { capabilityRoles, policyProfileOf } from '../lib/networks';
 import { canonicalIp, isIpAddress } from '../lib/nics';
 import { blocksPlanChange, inFlightRefusal } from '../lib/inFlight';
-import { countedApprovals } from '../lib/migrationActions';
+import { countedApprovals, sourceStopped } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
 import { probesFor } from '../lib/probes';
 import { hasRole, OWN_CUTOVER, OWN_DECISION, OWN_FORCE } from '../lib/roles';
@@ -26,7 +26,7 @@ import { endedPassBytes } from '../lib/transfer';
 import { summaryOf } from '../lib/summary';
 import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
 import { destinationName, isBlank, providerLabel } from '../lib/providerUse';
-import { pyRepr, pyStrip } from '../lib/format';
+import { pyLen, pyRepr, pyStrip } from '../lib/format';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -190,6 +190,12 @@ function refuseOverrideBody(input: Record<string, unknown>): void {
     else if ([...input.reason].length > 2000) problems.push('reason: String should have at most 2000 characters');
   }
   for (const key of Object.keys(input)) if (key !== 'option' && key !== 'reason') problems.push(`${key}: Extra inputs are not permitted`);
+  if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
+}
+
+/** A route whose request is `{}`, like the API's EmptyRequest (SDD §12, audit AA-04): an empty object or none, a field refused. */
+function refuseEmptyBody(input: Record<string, unknown>): void {
+  const problems = Object.keys(input).map((key) => `${key}: Extra inputs are not permitted`);
   if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
 }
 
@@ -646,6 +652,7 @@ function legacyRecommendations(m: Migration): AdvisorRecommendation[] {
           option,
           confidence: note.confidence,
           distribution: Object.fromEntries(Object.entries(probabilities).filter((entry): entry is [string, number] => typeof entry[1] === 'number')),
+          unusable: null,
         },
         decision: { final_option, status, reason_code, reason_text: null, actor: { kind: 'system', id: 'legacy' }, policy_id: null, threshold_used: null, decided_at: note.created_at },
         input_snapshot_sha256: null,
@@ -681,6 +688,16 @@ const SOURCE_RUNS_AGAIN = 'the source VM runs again: stop it, or roll it back, b
 const ACTIVE_STEP_PHASES: ReadonlySet<Phase> = new Set(['precopy', 'syncing', 'cutover', 'verifying', 'rolling_back']);
 /** Phases validation evaluates again; a VM taken out of the plan has its migration cancelled in these. */
 const REVALIDATABLE: ReadonlySet<Phase> = new Set(['pending', 'blocked', 'ready']);
+/** Phases a validation re-assesses, one an interrupted validation left in validating included (the API's REASSESSED). */
+const REASSESSED: ReadonlySet<Phase> = new Set([...REVALIDATABLE, 'validating']);
+/**
+ * Whether a validation re-assesses `m`, the API's reassessed() (SDD §5.4, audit OC-02, reviews RV51-01, RV51-09): unless it
+ * is ready with its source stopped - a re-assessment could block it, where no action restarts the source -; one already
+ * blocked or left in validating is re-assessed whatever its source, a validation being its way back to ready.
+ */
+function reassessed(m: Migration): boolean {
+  return REASSESSED.has(m.phase) && !(m.phase === 'ready' && sourceStopped(m));
+}
 /** Phases whose migration validation cancels when its VM leaves vm_ids, like the API (SDD §5.4). */
 // a migration found in validating is a leftover of an interrupted validation (SDD §5.4)
 const REMOVABLE: ReadonlySet<Phase> = new Set([...REVALIDATABLE, 'failed', 'validating']);
@@ -1262,8 +1279,10 @@ export class MockServer {
     const earlier = m.attempts > 0 ? { id: m.id, attempts: m.attempts, attempt_strategies: [...m.attempt_strategies] } : null;
     this.evaluate(m, plan);
     const rec = this.decideStrategy(m, plan, actor, earlier);
-    // like the API (SDD §5.4, §14.6): a waiting decision holds the migration from this write on
+    // like the API (SDD §5.4, §14.6): a waiting decision holds the migration from this write on, and the one stored is
+    // what a decision acts on while no hold names one (review RV51-08)
     m.advisor_hold = rec?.decision.status === 'pending_approval' ? rec.id : null;
+    if (rec) m.last_recommendation = rec.id;
     this.clearApprovals(m);
     // its VM's wave in the plan, as the API's assessment writes it (SDD §9.4, review RV39-03)
     m.wave_id = plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id))?.id ?? null;
@@ -1484,6 +1503,7 @@ export class MockServer {
         }
         if (sub === 'check' && method === 'POST') {
           const me = this.require(token, 'operator', path);
+          refuseEmptyBody(input);
           provider.last_checked_at = new Date(this.now()).toISOString();
           if (provider.status === 'unknown') {
             // a mock convention: an endpoint whose host starts with "unreachable" fails the test
@@ -1609,7 +1629,9 @@ export class MockServer {
         if (sub && method === 'DELETE') return this.deletePolicy(this.require(token, 'admin', path), sub);
       }
       if (id === 'recommendations' && sub && (subsub === 'approve' || subsub === 'override') && method === 'POST') {
-        return this.decideRecommendation(this.require(token, 'admin', path), sub, subsub, input);
+        const me = this.require(token, 'admin', path);
+        if (subsub === 'approve') refuseEmptyBody(input);
+        return this.decideRecommendation(me, sub, subsub, input);
       }
       if (id === 'snapshots' && sub !== undefined && method === 'GET') {
         this.require(token, 'viewer', path);
@@ -1718,27 +1740,39 @@ export class MockServer {
     const rec = this.recommendations[index]!;
     const m = this.migrations.find((x) => x.id === rec.migration_id);
     if (!m) throw new HttpError(409, 'conflict', `recommendation ${recId} decides nothing a person can change yet`);
-    const newest = this.recommendations.filter((r) => r.migration_id === m.id).reduce((a, b) => (b.created_at > a.created_at || (b.created_at === a.created_at && b.id > a.id) ? b : a));
-    if (newest.id !== recId) throw new HttpError(409, 'conflict', `a newer recommendation (${newest.id}) replaced ${recId}`);
+    // like the API (SDD §14.6, reviews RV49-04, RV50-09, RV51-08): the hold names the one to decide, whatever its time;
+    // without a hold, the one the last validation stored, else the newest
+    const newest =
+      m.advisor_hold ??
+      m.last_recommendation ??
+      this.recommendations.filter((r) => r.migration_id === m.id).reduce((a, b) => (b.created_at > a.created_at || (b.created_at === a.created_at && b.id > a.id) ? b : a)).id;
+    if (newest !== recId) throw new HttpError(409, 'conflict', `a newer recommendation (${newest}) replaced ${recId}`);
     const plan = this.plan(m.plan_id);
     const policy = policyFor(this.policies, plan);
     // like the API (SDD §14.6): the rules of the policy that took the decision, as they were then; the policy in
     // force only for a decision that recorded none
     const distinct = rec.decision.require_distinct_approver ?? policy.require_distinct_approver;
     const reasonRequired = rec.decision.require_override_reason ?? policy.require_override_reason;
+    // the policy whose rules the decision follows names it, as the API's does (SDD §14.6, audit AD-06)
+    const recordedRules = rec.decision.require_distinct_approver !== null || rec.decision.require_override_reason !== null;
+    const ruling = (recordedRules ? rec.decision.policy_id : null) ?? policy.id;
     // maker-checker (SDD §14.6, ADV-17): the validating user does not decide what their validation asked
     if (distinct && rec.requested_by === me.name) throw new HttpError(409, 'conflict', OWN_DECISION);
-    const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;
-    if (reason && reason.length > ACTION_TEXT_MAX) throw new HttpError(422, 'validation_error', `reason: at most ${ACTION_TEXT_MAX} characters.`);
-    if (action === 'override' && reasonRequired && (reason ?? '').length < OVERRIDE_REASON_MIN) {
-      throw new HttpError(422, 'validation_error', `policy ${rec.decision.policy_id ?? policy.id} requires an override reason of at least ${OVERRIDE_REASON_MIN} characters`);
+    // stripped and counted as the API's Python does: code points (SDD §14.6, audit AD-10)
+    const reason = typeof input.reason === 'string' && pyStrip(input.reason) ? pyStrip(input.reason) : null;
+    if (reason && pyLen(reason) > ACTION_TEXT_MAX) throw new HttpError(422, 'validation_error', `reason: at most ${ACTION_TEXT_MAX} characters.`);
+    if (action === 'override' && reasonRequired && pyLen(reason ?? '') < OVERRIDE_REASON_MIN) {
+      throw new HttpError(422, 'validation_error', `policy ${ruling} requires an override reason of at least ${OVERRIDE_REASON_MIN} characters`);
     }
     if (!['pending', 'blocked', 'ready'].includes(m.phase)) throw new HttpError(409, 'conflict', `the strategy cannot change in ${m.phase}`);
     // like the API (SDD §14.6): the plan's own choice stands over the newest recommendation, and an approved
     // decision is not approved again (one event per decision status change)
-    const pinned = plan.strategy_overrides[m.vm.source_id];
+    // the plan's default strategy too: a validation honours it as an override (audit AD-04)
+    const pinned = plan.strategy_overrides[m.vm.source_id] ?? (plan.default_strategy !== 'auto' ? plan.default_strategy : undefined);
     if (pinned) throw new HttpError(409, 'conflict', `The plan sets the strategy of ${m.vm.name} (${pinned}): change it in the plan.`);
     if (action === 'approve' && rec.decision.status === 'approved') throw new HttpError(409, 'conflict', 'The decision is already approved.');
+    // an answer that could not be applied stays unapplied; an override is a person's call (audit AD-03)
+    if (action === 'approve' && rec.recommendation.unusable) throw new HttpError(409, 'conflict', `nothing to approve: ${rec.recommendation.unusable}`);
     const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy as string);
     const chosen = action === 'override' ? input.option : rec.recommendation.option;
     const stored = m.estimates.find((e) => e.strategy === 'storage_handover');
@@ -1763,7 +1797,7 @@ export class MockServer {
       if (!eligible.includes(option)) throw new HttpError(422, 'validation_error', `${option} is not an eligible option`);
       decided = humanDecision(rec, { kind: 'override', user: me.name, option, reason }, at);
     }
-    decided.decision.policy_id = policy.id;
+    decided.decision.policy_id = ruling;
     // the rules go on with a person's decision: a later one follows them too (SDD §14.6)
     decided.decision.require_distinct_approver = distinct;
     decided.decision.require_override_reason = reasonRequired;
@@ -1988,9 +2022,12 @@ export class MockServer {
     }
     if (!sub && method === 'PATCH') return this.patchPlan(this.require(token, 'operator', path), this.plan(id), input);
     if (sub === 'waves' && subsub === 'auto' && method === 'POST') return this.autoWaves(this.require(token, 'operator', path), this.plan(id), input);
-    if (sub === 'validate' && method === 'POST') return this.validatePlan(this.require(token, 'operator', path), this.plan(id));
-    if (sub === 'start' && method === 'POST') return this.startPlan(this.require(token, 'operator', path), this.plan(id));
-    if (sub === 'pause' && method === 'POST') return this.pausePlan(this.require(token, 'operator', path), this.plan(id));
+    if ((sub === 'validate' || sub === 'start' || sub === 'pause') && method === 'POST') {
+      const me = this.require(token, 'operator', path);
+      refuseEmptyBody(input);
+      if (sub === 'validate') return this.validatePlan(me, this.plan(id));
+      return sub === 'start' ? this.startPlan(me, this.plan(id)) : this.pausePlan(me, this.plan(id));
+    }
     if (sub === 'cancel' && method === 'POST') return this.cancelPlan(this.require(token, 'operator', path), this.plan(id), input);
     if (sub === 'finalize' && method === 'POST') return this.finalizePlan(this.require(token, 'approver', path), this.plan(id), input);
     return null;
@@ -2198,7 +2235,7 @@ export class MockServer {
     const inventory = (this.inventories[plan.source_provider_id] ?? []) as VMRef[];
     return plan.vm_ids.map((id) => {
       const m = byVm.get(id);
-      if (m && !REVALIDATABLE.has(m.phase) && m.phase !== 'validating') return m.vm;
+      if (m && !reassessed(m)) return m.vm;
       const vm = inventory.find((v) => v.source_id === id);
       if (!vm) throw new HttpError(502, 'provider_error', `VM '${id}': VM '${id}' not found`);
       return vm;
@@ -2285,6 +2322,7 @@ export class MockServer {
       force_window: false,
       advisor_notes: [],
       advisor_hold: null,
+      last_recommendation: null,
       converged_by: null,
       force_cutover: null,
       data_issues: [],
@@ -2319,11 +2357,11 @@ export class MockServer {
     // the source - a migration in any other phase counts as its recorded vm -, and one the source no longer reports is a
     // provider error, before anything changes
     const known = new Set(((this.inventories[plan.source_provider_id] ?? []) as VMRef[]).map((v) => v.source_id));
-    const reassessed = (id: string) => {
+    const readFromSource = (id: string) => {
       const m = byVm.get(id);
-      return !m || REVALIDATABLE.has(m.phase) || m.phase === 'validating';
+      return !m || reassessed(m);
     };
-    const gone = plan.vm_ids.find((id) => reassessed(id) && !known.has(id));
+    const gone = plan.vm_ids.find((id) => readFromSource(id) && !known.has(id));
     if (gone !== undefined) throw new HttpError(502, 'provider_error', `VM '${gone}': VM '${gone}' not found`);
     const cancelled = plan.vm_ids.flatMap((id) => (byVm.get(id)?.phase === 'cancelled' ? [byVm.get(id)!.vm.name] : [])).sort();
     if (cancelled.length) {
@@ -2353,8 +2391,9 @@ export class MockServer {
       const vm = inventory.find((v) => v.source_id === vmId);
       const m = byVm.get(vmId) ?? (vm ? this.createMigration(plan, vm, me.name) : undefined);
       if (!m) continue;
-      // like the API (SDD §5.4): a leftover of an interrupted validation is taken over
-      if (REVALIDATABLE.has(m.phase) || m.phase === 'validating') {
+      // like the API (SDD §5.4): a leftover of an interrupted validation is taken over; a ready one whose source is
+      // stopped is left as it is, like one in flight - its VM not read again, the advisor not asked (audit OC-02)
+      if (reassessed(m)) {
         if (m.phase !== 'validating') this.transition(m, 'validating', 'plan validation started', me.name);
         this.finishValidation(m, plan, me.name);
       } else {
@@ -2475,15 +2514,17 @@ export class MockServer {
   }
 
   private migrationAction(me: Me, m: Migration, action: string, input: Record<string, unknown>): MockResponse {
+    if (action === 'sync' || action === 'retry') refuseEmptyBody(input);
     for (const field of ['comment', 'reason', 'confirm']) {
       const text = input[field];
       // the API bounds the free text of every action (SDD §12)
-      if (typeof text === 'string' && text.length > ACTION_TEXT_MAX) {
+      if (typeof text === 'string' && pyLen(text) > ACTION_TEXT_MAX) {
         throw new HttpError(422, 'validation_error', `${field}: at most ${ACTION_TEXT_MAX} characters.`);
       }
     }
     const plan = this.plan(m.plan_id);
-    const comment = typeof input.comment === 'string' && input.comment.trim() ? input.comment.trim() : null;
+    // stripped as the API's Python strips (str.strip), what the dashboard sends kept as sent (review RV50-06)
+    const comment = typeof input.comment === 'string' && pyStrip(input.comment) ? pyStrip(input.comment) : null;
     const record = (message: string, data: Record<string, unknown> = {}) =>
       this.emit({ kind: 'migration.action', plan_id: m.plan_id, migration_id: m.id, actor: me.name, message: `${m.vm.name}: ${message}`, data: { action, ...data } });
     const approve = () => {
@@ -2521,8 +2562,9 @@ export class MockServer {
       }
       case 'force-cutover': {
         // the API's ForceCutoverRequest and force_cutover (SDD §5.4, §12, ADV-16)
-        const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
-        if (reason.length < FORCE_REASON_MIN) throw new HttpError(422, 'validation_error', `reason: at least ${FORCE_REASON_MIN} characters.`);
+        // stripped and counted as the API's Python does: code points (audit AD-10)
+        const reason = typeof input.reason === 'string' ? pyStrip(input.reason) : '';
+        if (pyLen(reason) < FORCE_REASON_MIN) throw new HttpError(422, 'validation_error', `reason: at least ${FORCE_REASON_MIN} characters.`);
         if (!FORCEABLE.has(m.phase) || SINGLE_SHOT.has(m.strategy)) {
           throw new HttpError(409, 'conflict', `a Force cutover applies to a warm migration in pre-copy or syncing, not to ${m.strategy} in ${m.phase}`);
         }
@@ -2558,7 +2600,7 @@ export class MockServer {
         record('delta sync requested');
         break;
       case 'rollback': {
-        const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+        const reason = typeof input.reason === 'string' ? pyStrip(input.reason) : '';
         if (!reason) throw new HttpError(422, 'validation_error', 'reason is required.');
         if (!canTransition(m.phase, 'rolling_back')) throw new HttpError(409, 'conflict', `Cannot move ${m.vm.name} from ${m.phase} to rolling_back.`);
         // like the API (SDD §8.1): a finalize that began deleting the source is finalized again, never rolled back
@@ -2655,7 +2697,7 @@ export class MockServer {
           throw new HttpError(409, 'conflict', `${m.vm.name} cannot be cancelled: the source VM is stopped; ${advice} instead.`);
         }
         if (m.phase === 'failed' && m.downtime_started_at) throw new HttpError(409, 'conflict', 'The source VM was stopped; roll back instead of cancelling.');
-        const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : 'cancelled by operator';
+        const reason = typeof input.reason === 'string' && pyStrip(input.reason) ? pyStrip(input.reason) : 'cancelled by operator';
         // like the API (SDD §5.1): the data copied so far is cleaned up after the cancel - a pass that runs, or the copies
         // the API reads as kept where no record tells (its `copied_data`, §9.3, review RV43B-03), not any recorded pass
         const cleanup = m.phase === 'precopy' || m.phase === 'syncing' || keptAfterRollback(m);
@@ -2667,8 +2709,9 @@ export class MockServer {
       case 'finalize': {
         // like the API (SDD §12): the phase first, then the typed name
         if (m.phase !== 'completed') throw new HttpError(409, 'conflict', `only completed migrations can be finalized (${m.phase})`);
-        // like the API (SDD §8.1): not while the source runs again, unless a finalize began deleting it
-        if (m.source_running_at && m.checkpoint !== 'finalizing') {
+        // like the API (SDD §8.1, audit OC-09): not while the source runs again, unless a finalize began
+        // deleting it - and this one deletes it too
+        if (m.source_running_at && !(m.checkpoint === 'finalizing' && input.delete_source)) {
           throw new HttpError(409, 'conflict', SOURCE_RUNS_AGAIN);
         }
         if (input.confirm !== m.vm.name) throw new HttpError(400, 'bad_request', `Type the VM name "${m.vm.name}" exactly to finalize.`);

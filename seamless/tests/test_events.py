@@ -6,7 +6,14 @@ import sqlalchemy as sa
 
 from seamless_migrate import events as events_module
 from seamless_migrate.domain.models import Event, utcnow
-from seamless_migrate.events import EPHEMERAL_KINDS, PERSISTED_KINDS, EventBus, emit
+from seamless_migrate.events import (
+    EPHEMERAL_KINDS,
+    PERSISTED_KINDS,
+    EventBus,
+    emit,
+    new_event,
+    put_all_and_emit,
+)
 from seamless_migrate.store import Store
 from seamless_migrate.store import events as events_table
 
@@ -120,6 +127,46 @@ async def test_subscribe_replays_since_then_live(store: Store):
     assert [e.message for e in got] == ["old-2", "old-3", "old-4", "live", "eph"]
     assert got[3].seq == live.seq and eph.seq == 0
     await agen.aclose()
+
+
+async def test_the_stream_publishes_the_event_the_store_holds(store: Store):
+    """SDD §11 (review RV48-14): emit published the event it built, the store kept the row it
+    wrote - an over-long actor cut to its column -, so an open stream (the dashboard's, a SIEM on
+    /events/stream) received another actor for a seq than GET /events, a reconnect's replay and
+    `seamless events export` return. What is published is the row as written."""
+    bus = EventBus(store)
+    agen = bus.subscribe(since=store.max_seq())
+    task = asyncio.ensure_future(_take(agen, 1))  # consuming first: the event arrives live
+    await asyncio.sleep(0.05)
+    await emit(store, bus, "policy.created", "created", actor="user:" + "a" * 128, data={"k": "v"})
+    [live] = await task
+    await agen.aclose()
+    [stored] = store.events(kinds=["policy.created"])
+    assert live == stored and len(live.actor) == events_table.c.actor.type.length
+
+
+async def test_put_all_and_emit_publishes_its_events_after_the_commit_or_none(
+    store: Store, refuse_write
+):
+    """SDD §8, §11, §14.6: the events of one transaction are published once it commits, in seq
+    order with every other - a transaction refused publishes none of them."""
+    from tests.factories import make_plan
+
+    bus = EventBus(store)
+    agen = bus.subscribe(since=store.max_seq())
+    task = asyncio.ensure_future(_take(agen, 2))  # consuming first: the events arrive live
+    await asyncio.sleep(0.05)
+    plan = make_plan()
+    store.put("plan", plan, expected_version=0)
+    events_ = [Event(kind="plan.updated", message="a"), Event(kind="plan.updated", message="b")]
+    refuse_write(store, "INSERT INTO events", "plan.updated")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await events_module.put_all_and_emit(store, bus, [("plan", plan, 1)], events_)
+    versions = await events_module.put_all_and_emit(store, bus, [("plan", plan, 1)], events_)
+    live = await task
+    await agen.aclose()
+    assert (versions, live) == ([2], store.events())
+    assert [e.message for e in live] == ["a", "b"]
 
 
 async def test_subscribe_has_no_duplicates_when_live_overlaps_replay(store: Store):
@@ -468,3 +515,34 @@ def test_event_kinds_match_sdd_4_3_and_the_dashboard():
     )
     assert persisted_ui == set(PERSISTED_KINDS)
     assert set(EPHEMERAL_KINDS) <= set(re.findall(r"'([a-z_.]+)'", types_ts))
+
+
+async def test_an_event_joined_to_a_write_is_timed_when_it_is_written(store: Store):
+    """SDD §4: an event's ts is the time it is written. A transition's events are built, then
+    joined to the migration's write, which waits for the emit lock; an event another writer
+    wrote meanwhile took the lower seq and the later ts, and the Events page - by time, then
+    seq - listed the two out of seq order (PR 56's live-stream journey)."""
+    from tests.factories import make_plan
+
+    bus = EventBus(store)
+    built = new_event("plan.updated", "built first")
+    await asyncio.sleep(0.01)
+    await emit(store, bus, "plan.updated", "written first")
+    await put_all_and_emit(store, bus, [("plan", make_plan(), 0)], [built])
+    written = store.events()
+    assert [e.message for e in written] == ["written first", "built first"]
+    assert written[0].ts <= written[1].ts  # their time order is their seq order
+
+
+async def test_an_emitted_event_is_timed_when_it_is_written(store: Store):
+    """SDD §4: emit builds its event, then waits for the emit lock; one written meanwhile keeps
+    the time order its seq gives."""
+    bus = EventBus(store)
+    async with bus.emit_lock:
+        waiting = asyncio.create_task(emit(store, bus, "plan.updated", "waited"))
+        await asyncio.sleep(0.02)  # built, waiting for the lock
+        store.append_event(new_event("plan.updated", "meanwhile"))
+    await waiting
+    written = store.events()
+    assert [e.message for e in written] == ["meanwhile", "waited"]
+    assert written[0].ts <= written[1].ts

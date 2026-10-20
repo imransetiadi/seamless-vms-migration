@@ -3,6 +3,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -33,6 +34,7 @@ from seamless_migrate.domain.models import (
     Approval,
     CutoverWindow,
     Event,
+    Finding,
     ForceCutover,
     Migration,
     Nic,
@@ -67,10 +69,10 @@ from seamless_migrate.planning.estimator import (
     params_for_plan,
 )
 from seamless_migrate.providers.base import ProviderError
-from seamless_migrate.store import ConflictError, NotFound, Store
+from seamless_migrate.store import ConflictError, NotFound, Store, UnstorableValue
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_vm
-from tests.jev_fakes import fixture_responder, load_fixture, session_factory
+from tests.jev_fakes import fixture_responder, load_fixture, session_factory, tool_result
 from tests.orch_support import (
     DST_PROVIDER,
     SRC_PROVIDER,
@@ -1284,14 +1286,19 @@ async def test_a_retry_never_writes_a_ready_migration_that_carries_the_old_reque
     m.phase = P.failed
     store.put("migration", m)
     written: list[Migration] = []
-    save = h.orch._save
+    save, write_all = h.orch._save, h.orch.store.put_all_with_events
 
     async def recording_save(doc, version):
         if doc.id == m.id:
             written.append(doc.model_copy(deep=True))
         return await save(doc, version)
 
+    def recording_write(writes, appended):  # a transition: the migration with its events
+        written.extend(d.model_copy(deep=True) for k, d, _ in writes if k == "migration")
+        return write_all(writes, appended)
+
     h.orch._save = recording_save
+    h.orch.store.put_all_with_events = recording_write
     again = await h.orch.retry(m.id, "bayu")
     assert again.phase == P.ready
     assert [w.phase for w in written] == [P.ready]  # one write
@@ -1589,23 +1596,26 @@ async def test_a_failed_validation_write_leaves_no_migration_in_validating(tmp_p
     """SDD §5.4: the one write lands or not - a database error leaves a new VM without a migration
     and an existing migration as it was, never in validating."""
     h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
-    put = h.orch.db.put
+    write_all = h.orch.store.put_all_with_events
 
-    async def failing_put(kind, model, expected_version=None):
+    def failing_write(writes, appended):
         # the write that lands the assessment (an earlier version wrote validating before it)
-        if kind == "migration" and model.vm.source_id == "vm-2" and model.phase != P.validating:
+        if any(
+            kind == "migration" and model.vm.source_id == "vm-2" and model.phase != P.validating
+            for kind, model, _ in writes
+        ):
             raise ConnectionError("database connection lost")
-        return await put(kind, model, expected_version)
+        return write_all(writes, appended)
 
-    h.orch.db.put = failing_put
+    h.orch.store.put_all_with_events = failing_write
     with pytest.raises(ConnectionError):
         await h.orch.validate_plan(plan.id, "alice")
     assert [m.vm.source_id for m in await h.migrations(plan.id)] == ["vm-1"]
-    h.orch.db.put = put
+    h.orch.store.put_all_with_events = write_all
     await h.orch.validate_plan(plan.id, "alice")
     ready = await h.by_vm(plan.id, "vm-2")
     _, version = store.get_versioned("migration", ready.id, Migration)
-    h.orch.db.put = failing_put
+    h.orch.store.put_all_with_events = failing_write
     with pytest.raises(ConnectionError):
         await h.orch.validate_plan(plan.id, "alice")
     kept, same = store.get_versioned("migration", ready.id, Migration)
@@ -1750,14 +1760,22 @@ async def test_validate_refuses_invalid_verification_settings(tmp_path, store):
 
 
 async def test_validate_refuses_an_infinite_link_bps(tmp_path, store):
-    """A stored plan with link_bps = inf (written before the API check) still loads, and
-    validation refuses it instead of estimating every transfer as instant (SDD §9.1)."""
+    """A stored plan with link_bps = inf (written on SQLite before the API check, which the store
+    now refuses too, SDD §11) still loads, and validation refuses it instead of estimating every
+    transfer as instant (SDD §9.1)."""
+    import sqlalchemy as sa
+
     from seamless_migrate.domain.models import Plan
+    from seamless_migrate.store import documents
 
     h, plan = await setup(tmp_path, store, [vm(1)])
-    current = store.get("plan", plan.id, Plan)
-    current.link_bps = float("inf")
-    store.put("plan", current)
+    data = {**store.get("plan", plan.id, Plan).model_dump(mode="json"), "link_bps": float("inf")}
+    with store.engine.begin() as conn:  # as an earlier version wrote it: Infinity in the JSON
+        conn.execute(
+            sa.update(documents)
+            .where(documents.c.kind == "plan", documents.c.id == plan.id)
+            .values(data=data)
+        )
     assert store.get("plan", plan.id, Plan).link_bps == float("inf")
     with pytest.raises(BadRequest, match="link_bps must be a finite positive number"):
         await h.orch.validate_plan(plan.id, "alice")
@@ -4554,26 +4572,34 @@ def _stopping_cutover(settings):
 
 async def test_a_restart_right_after_a_failure_still_rolls_the_stopped_vm_back(tmp_path, store):
     """SDD §8: the automatic rollback is saved in the same write as the failure, so a restart
-    while the knowledge lookup still waits on agentmemory resumes it — the VM never stays stopped
-    in failed."""
+    before it ends - the knowledge lookup still waiting on agentmemory, which holds the rollback
+    back no more (audit OC-04) - resumes it: the VM never stays stopped in failed."""
     settings = make_settings(tmp_path)
     knowledge = _HangingKnowledge()
+    rolling = asyncio.Event()
+
+    async def held_rollback(ctx):
+        rolling.set()
+        await asyncio.Event().wait()  # until the restart cancels it
+
+    executor = _stopping_cutover(settings)
+    executor.hooks[StepName.ROLLBACK] = held_rollback
     h, plan = await setup(
         tmp_path,
         store,
         [vm(1)],
         {"default_strategy": Strategy.cold},
-        executor=_stopping_cutover(settings),
+        executor=executor,
         knowledge=knowledge,
         settings=settings,
     )
     assert plan.verification.auto_rollback is True
     await run_plan(h, plan)
-    await asyncio.wait_for(knowledge.entered.wait(), 10)
+    await asyncio.wait_for(asyncio.gather(knowledge.entered.wait(), rolling.wait()), 10)
     m = await h.by_vm(plan.id, "vm-1")
     assert (m.phase, m.downtime_ended_at) == (P.rolling_back, None)
     assert [str(c.to_phase) for c in m.phase_history][-3:] == ["cutover", "failed", "rolling_back"]
-    await h.orch.stop()  # a restart while the lookup waits
+    await h.orch.stop()  # a restart while the rollback and the lookup wait
 
     again = build_harness(
         tmp_path, store, [vm(1)], executor=ScriptedExecutor(settings), settings=settings
@@ -4590,12 +4616,193 @@ async def test_a_restart_right_after_a_failure_still_rolls_the_stopped_vm_back(t
     ]
 
 
+async def test_a_slow_agentmemory_never_holds_the_automatic_rollback_back(tmp_path, store):
+    """SDD §8 (audit OC-04): the failure's lookup of similar incidents ran inside the migration's
+    own driver - _launch() was a no-op from there - so the automatic rollback waited for
+    agentmemory (5 s per call with the real client) while the source stayed stopped. The lookup
+    is a task of its own: the rollback runs at once, and a stop cancels the lookup."""
+    settings = make_settings(tmp_path)
+    knowledge = _HangingKnowledge()
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=_stopping_cutover(settings),
+        knowledge=knowledge,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    await asyncio.wait_for(knowledge.entered.wait(), 10)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    done = await h.wait_phase(mid, P.rolled_back, timeout=5.0)  # the lookup still waits
+    assert done.downtime_ended_at is not None and not knowledge.release.is_set()
+    [lookup] = list(h.orch._lookups)
+    await h.orch.stop()
+    assert lookup.cancelled()
+
+
+async def test_a_lookup_that_fails_is_logged_and_the_rollback_runs(tmp_path, store, caplog):
+    """SDD §8, §14.3: agentmemory is best effort - a failure's lookup that raises attaches no
+    note and is logged; the rollback it no longer holds back runs to its end."""
+
+    class _RaisingKnowledge(_HangingKnowledge):
+        async def on_failure(self, migration, step, error):
+            raise RuntimeError("agentmemory answered garbage")
+
+    settings = make_settings(tmp_path)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=_stopping_cutover(settings),
+        knowledge=_RaisingKnowledge(),
+        settings=settings,
+    )
+    caplog.set_level(logging.WARNING, logger="seamless_migrate.orchestrator")
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    done = await h.wait_phase(mid, P.rolled_back, timeout=5.0)
+    deadline = asyncio.get_running_loop().time() + 5
+    while h.orch._lookups:
+        assert asyncio.get_running_loop().time() < deadline, "the lookup never ended"
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert not any(n.kind == "similar_incidents" for n in done.advisor_notes)
+    assert f"the similar incidents of {mid} were not attached" in caplog.text
+    assert mid not in h.orch._driver_crashes
+
+
+async def test_a_driver_that_keeps_crashing_never_stops_the_other_plans(tmp_path, store):
+    """SDD §8 (audit OC-01): the relaunch backoff computed 2**crashes * tick_s before its 300 s
+    cap - at the 1,024th crash of one driver an int too large for a float, so from then on every
+    tick raised in its first statement and no plan of the server moved. The exponent is capped
+    first."""
+    h = build_harness(tmp_path, store, [vm(1), vm(2)])
+    crashing = plan_for([vm(1)], name="A", default_strategy=Strategy.cold)
+    healthy = plan_for([vm(2)], name="B", default_strategy=Strategy.cold)
+    store.put("plan", crashing)
+    store.put("plan", healthy)
+    real_cutover = h.orch._do_cutover
+
+    async def crash_for_vm1(m):
+        if m.vm.source_id == "vm-1":
+            raise RuntimeError("a persistent error outside the step")
+        await real_cutover(m)
+
+    h.orch._do_cutover = crash_for_vm1
+    await run_plan(h, crashing)
+    mid = (await h.by_vm(crashing.id, "vm-1")).id
+    deadline = asyncio.get_running_loop().time() + 10
+    while h.orch._driver_crashes.get(mid, (0, 0.0))[0] < 1:
+        assert asyncio.get_running_loop().time() < deadline, "the driver never crashed"
+        await asyncio.sleep(0.01)
+    # 1,024 crashes in a row, the last one longer ago than the 300 s cap: relaunched once more,
+    # as after any other count
+    h.orch._driver_crashes[mid] = (1024, time.monotonic() - 1000)
+    while h.orch._driver_crashes[mid][0] < 1025:
+        assert asyncio.get_running_loop().time() < deadline, "the driver was not relaunched"
+        await asyncio.sleep(0.01)
+    await h.orch.validate_plan(healthy.id, "alice")
+    await h.orch.start_plan(healthy.id, "alice")
+    other = await h.by_vm(healthy.id, "vm-2")
+    try:
+        done = await h.wait_phase(other.id, P.completed, timeout=5.0)
+    finally:
+        await h.orch.stop()
+    assert done.phase == P.completed
+
+
+async def test_a_relaunch_that_fails_for_one_migration_skips_only_it(tmp_path, store):
+    """SDD §8 (audit OC-01): the relaunch of drivers that died is the first thing a tick does; an
+    error there for one migration skips that migration, logged, and the tick goes on - the
+    gates, passes and completions of every other plan with it."""
+    h = build_harness(tmp_path, store, [vm(1), vm(2)])
+    crashing = plan_for([vm(1)], name="A", default_strategy=Strategy.cold)
+    healthy = plan_for([vm(2)], name="B", default_strategy=Strategy.cold)
+    store.put("plan", crashing)
+    store.put("plan", healthy)
+    real_cutover, real_launch = h.orch._do_cutover, h.orch._launch
+    held: set[str] = set()
+
+    async def crash_for_vm1(m):
+        if m.vm.source_id == "vm-1":
+            held.add(m.id)
+            raise RuntimeError("a persistent error outside the step")
+        await real_cutover(m)
+
+    def launch(mid):
+        if mid in held:
+            raise RuntimeError("the relaunch itself fails")
+        real_launch(mid)
+
+    h.orch._do_cutover, h.orch._launch = crash_for_vm1, launch
+    await run_plan(h, crashing)
+    mid = (await h.by_vm(crashing.id, "vm-1")).id
+    deadline = asyncio.get_running_loop().time() + 10
+    while mid not in held or (h.orch._drivers.get(mid) and not h.orch._drivers[mid].done()):
+        assert asyncio.get_running_loop().time() < deadline, "the driver never crashed"
+        await asyncio.sleep(0.01)
+    h.orch._driver_crashes.pop(mid, None)  # no backoff: the next tick relaunches it, and fails
+    await h.orch.validate_plan(healthy.id, "alice")
+    await h.orch.start_plan(healthy.id, "alice")
+    other = await h.by_vm(healthy.id, "vm-2")
+    try:
+        done = await h.wait_phase(other.id, P.completed, timeout=5.0)
+    finally:
+        await h.orch.stop()
+    assert done.phase == P.completed
+
+
+async def test_the_advisor_review_is_not_counted_as_downtime(tmp_path, store):
+    """SDD §5.2 (audit OC-08): downtime_ended_at was taken after the advisor's review of a passed
+    verification - Jev's screen and verify, up to 20 s each -, so the review's wait counted as
+    outage in actual_downtime_s, the SLO compliance and the plan's figures. The outage ends when
+    the verification step returns."""
+    settings = make_settings(tmp_path)
+
+    async def stopping_cutover(ctx):  # a real cutover: wall-clock downtime, no model seconds
+        await ctx.mark_downtime_start()
+        return StepResult(destination_server_id="dst-web-01")
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: stopping_cutover})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=executor,
+        settings=settings,
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    reviewed: dict[str, datetime] = {}
+
+    async def slow_review(vm_ref, result, review_reason=None):
+        reviewed["at"] = h.clock()
+        h.clock.advance(30)  # jev_screen and jev_verify take their time
+        return None
+
+    h.orch.advisor = SimpleNamespace(review_verification=slow_review)
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    # taken when the step returned: before the review began, not 30 s later
+    for at in (m.downtime_ended_at, m.verification and m.verification.at):
+        assert at is not None and timedelta(0) <= reviewed["at"] - at < timedelta(seconds=1), at
+    assert m.actual_downtime_s is not None and m.actual_downtime_s < 30, m.actual_downtime_s
+
+
 async def test_a_failed_event_write_after_a_failure_still_rolls_the_stopped_vm_back(
     tmp_path, store
 ):
-    """SDD §8: an event that fails to be written right after the failure — the first one, its
-    phase event (a database blip) — crashes the driver, but the rollback was saved in the same
-    write as the failure: the tick resumes it."""
+    """SDD §5.1, §8: the failure, the rollback it starts and the failure's phase event are one
+    transaction. Its event refused by the store - a database blip - leaves the stopped migration
+    where it was and crashes the driver; the tick relaunches it, the step fails again, and the
+    failure, its rollback and its event are written together: the stopped VM is rolled back."""
+    import sqlalchemy as sa
+
     settings = make_settings(tmp_path)
     h, plan = await setup(
         tmp_path,
@@ -4605,20 +4812,26 @@ async def test_a_failed_event_write_after_a_failure_still_rolls_the_stopped_vm_b
         executor=_stopping_cutover(settings),
         settings=settings,
     )
-    real_emit = h.orch._emit
     blips = {"left": 1}
 
-    async def flaky_emit(kind, message, **kw):
-        if kind == "migration.phase" and (kw.get("data") or {}).get("to") == "failed":
-            if blips["left"]:
-                blips["left"] -= 1
-                raise OSError("server closed the connection unexpectedly")
-        return await real_emit(kind, message, **kw)
+    def refuse_the_failure(conn, cursor, statement, parameters, context, executemany):
+        if not blips["left"] or not statement.lstrip().upper().startswith("INSERT INTO EVENTS"):
+            return
+        params = context.compiled_parameters[0]
+        if (
+            params.get("kind") == "migration.phase"
+            and (params.get("data") or {}).get("to") == "failed"
+        ):
+            blips["left"] -= 1
+            raise OSError("server closed the connection unexpectedly")
 
-    h.orch._emit = flaky_emit
-    await run_plan(h, plan)
-    done = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
-    await h.orch.stop()
+    sa.event.listen(store.engine, "before_cursor_execute", refuse_the_failure)
+    try:
+        await run_plan(h, plan)
+        done = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    finally:
+        sa.event.remove(store.engine, "before_cursor_execute", refuse_the_failure)
+        await h.orch.stop()
     assert blips["left"] == 0 and done.downtime_ended_at is not None
     assert [str(c.to_phase) for c in done.phase_history][-4:] == [
         "cutover",
@@ -4950,13 +5163,13 @@ async def test_a_strategy_change_during_a_validation_waits_for_it_and_is_kept(tm
     # the override is written under the plan's lock: a validation queued behind the change
     # reads the plan only once it holds the change
     under_lock: list[bool] = []
-    update_plan = h.orch._update_plan
+    write_all = h.orch.store.put_all_with_events
 
-    async def spying_update(plan_id, mutate):
-        under_lock.append(h.orch.plan_lock(plan_id).locked())
-        return await update_plan(plan_id, mutate)
+    def spying_write(writes, appended):
+        under_lock.append(h.orch.plan_lock(plan.id).locked())
+        return write_all(writes, appended)
 
-    h.orch._update_plan = spying_update
+    h.orch.store.put_all_with_events = spying_write
     await h.orch.set_strategy(m2.id, m2.strategy, "bayu")
     assert under_lock == [True]
 
@@ -4987,6 +5200,72 @@ async def test_a_change_to_a_migration_being_finalized_is_refused_before_the_pla
             assert not h.orch.plan_lock(plan.id).locked()
             with pytest.raises(NotAllowed, match="the strategy cannot change in completed"):
                 await task
+
+
+@pytest.mark.parametrize(
+    ("write", "row"),
+    [
+        ("UPDATE documents", "plan"),
+        ("UPDATE documents", "migration"),
+        ("INSERT INTO events", "migration.action"),
+        ("INSERT INTO events", "plan.updated"),
+    ],
+)
+async def test_a_strategy_change_a_failed_write_cuts_short_leaves_nothing_and_the_retry_makes_it(
+    tmp_path, store, refuse_write, write, row
+):
+    """SDD §8 (reviews ST-08, RV48-02): a strategy change wrote the plan's entry, the migration and
+    its two events each on its own - a failure between them left the plan pinning a strategy no
+    event named, which the next validation applied under its own actor. They are one transaction:
+    a write refused leaves none of them - the next validation keeps the strategy -, and the retry
+    makes the whole change, with one event of each kind."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    chosen = next(e.strategy for e in m.estimates if e.eligible and e.strategy != m.strategy)
+
+    def changes():
+        events = store.events(since_seq=0, limit=1000)
+        return [e.kind for e in events if e.actor == "rina"]
+
+    refused = refuse_write(store, write, row)
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await h.orch.set_strategy(m.id, chosen, "rina")
+    assert refused == [f"{write} {row}"]
+    pinned = (await h.plan(plan.id)).strategy_overrides
+    assert ((await h.migration(m.id)).strategy, pinned, changes()) == (m.strategy, {}, [])
+    await h.orch.validate_plan(plan.id, "alice")
+    assert (await h.migration(m.id)).strategy == m.strategy
+    await h.orch.set_strategy(m.id, chosen, "rina")
+    pinned = (await h.plan(plan.id)).strategy_overrides
+    assert ((await h.migration(m.id)).strategy, pinned, changes()) == (
+        chosen,
+        {"vm-1": chosen},
+        ["migration.action", "plan.updated"],
+    )
+
+
+async def test_a_strategy_change_another_writer_moved_the_plan_under_is_made_again(
+    tmp_path, store, land_first
+):
+    """SDD §8: a plan moved between a strategy change's read and its transaction - the CLI, a
+    driver - fails the versioned write, which leaves nothing; the change is read again and made
+    again, the other writer's change kept."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    chosen = next(e.strategy for e in m.estimates if e.eligible and e.strategy != m.strategy)
+
+    def rename():
+        stored, version = store.get_versioned("plan", plan.id, Plan)
+        renamed = stored.model_copy(update={"name": "renamed meanwhile"})
+        return store.put("plan", renamed, expected_version=version)
+
+    land_first(store, "UPDATE documents", "plan", rename)
+    await h.orch.set_strategy(m.id, chosen, "rina")
+    stored = await h.plan(plan.id)
+    assert (stored.name, stored.strategy_overrides) == ("renamed meanwhile", {"vm-1": chosen})
+    assert (await h.migration(m.id)).strategy == chosen
 
 
 async def test_set_strategy_clears_force_window(tmp_path, store):
@@ -5106,6 +5385,216 @@ def _recommendations(store) -> list[AdvisorRecommendation]:
 
 def _audit(store) -> list[Event]:
     return store.events(since_seq=0, limit=1000, kinds=AUDIT_KINDS)
+
+
+def _answering_advisor(**answers):
+    """A Jev that answers each tool with ``answers[tool]``: a payload, or a responder of its
+    arguments; the others with their recorded fixtures."""
+    jev_settings = Settings(jev_mode="stdio")
+    factory, session = session_factory(fixture_responder(answers))
+    return Advisor(JevClient(jev_settings, session_factory=factory), jev_settings), session
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"recommendation": {"selected": "warm", "confidence": 0.9, "status": ["escalate"]}},
+        {"recommendation": {"selected": "warm", "confidence": 0.9, "probabilities": ["warm"]}},
+        {"recommendation": "warm"},
+        {"recommendation": {"selected": ["warm"], "confidence": 0.9}},
+        {"recommendation": {"selected": "warm", "confidence": 0.9}, "model": 1},
+        # a status that is falsy is no absent one (review RV50-03)
+        *(
+            {"recommendation": {"selected": "warm", "confidence": 0.99, "status": status}}
+            for status in ([], {}, 0, False)
+        ),
+    ],
+    ids=[
+        "status-a-list",
+        "probabilities-a-list",
+        "a-string",
+        "selected-a-list",
+        "model-a-number",
+        "status-an-empty-list",
+        "status-an-empty-map",
+        "status-zero",
+        "status-false",
+    ],
+)
+async def test_a_strategy_answer_of_another_shape_falls_back_to_the_rules(tmp_path, store, answer):
+    """SDD §14.1, §14.4 rule 2 (audit AD-01): Jev is an outside service. An answer of another
+    shape - a list where a string goes, a string where an object goes - raised out of the
+    validation, a 500 for every validation while Jev answered so. It is invalid_response: the
+    validation records fallback_rules and keeps the deterministic option."""
+    advisor, _ = _answering_advisor(decide=answer)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (rec.decision.status, m.strategy) == (DecisionStatus.fallback_rules, Strategy.cold)
+    assert "invalid_response" in (rec.decision.reason_text or ""), rec.decision.reason_text
+
+
+@pytest.mark.parametrize(
+    ("answer", "error"),
+    [
+        ({"results": ["item-1"]}, ["invalid response: a result is no object"]),
+        (
+            {"results": {"item-1": {"classification": "stateless_web"}}},
+            ["invalid response: results is no list"],
+        ),
+        ({"results": [{"id": "item-1", "classification": ["db"], "decision": "auto"}]}, []),
+    ],
+    ids=["a-result-a-string", "results-a-mapping", "a-classification-a-list"],
+)
+async def test_a_classification_answer_of_another_shape_falls_back_to_the_heuristic(
+    tmp_path, store, answer, error
+):
+    """SDD §14.1, §14.2 (audit AD-01): a result that is no object, or a classification that is no
+    tier, raised out of auto-waves; such an answer's items take the heuristic's tier, the note
+    names the invalid response, and the waves are planned."""
+    advisor, _ = _answering_advisor(classify=answer)
+    h, plan = await setup(tmp_path, store, [vm(1)], advisor=advisor)
+    await h.orch.auto_waves(plan.id, 10, "alice")
+    assert (await h.plan(plan.id)).waves
+    events = store.events(since_seq=0, limit=1000, kinds=["advisor.classification"])
+    assert [(e.data["fallback"], e.data["errors"]) for e in events] == [(["vm-1"], error)]
+
+
+@pytest.mark.parametrize(
+    "confidence",
+    ["NaN", "Infinity", "true", "1.5", "-0.1", "1" + "0" * 400, "-1" + "0" * 400, "1e999"],
+    ids=["NaN", "Infinity", "true", "1.5", "-0.1", "400-digits", "-400-digits", "1e999"],
+)
+async def test_a_confidence_that_is_no_probability_is_never_applied(tmp_path, store, confidence):
+    """SDD §4.2, §14.1, §14.4 (audit AD-02, review RV50-03): a confidence is a number from 0 to 1,
+    the only number compared with a threshold. NaN, Infinity, a JSON true and 1.5 all passed
+    'confidence < threshold' and the global default applied Jev's option; an integer of 400
+    digits raised OverflowError out of the validation. Such an answer falls back."""
+    decide = load_fixture("decide")
+    decide["recommendation"].update(selected="warm", confidence=0.25)
+    text = json.dumps(decide).replace('"confidence": 0.25', f'"confidence": {confidence}')
+    assert f'"confidence": {confidence}' in text
+    advisor, _ = _answering_advisor(decide=lambda arguments: tool_result(text))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (rec.decision.status, m.strategy) == (DecisionStatus.fallback_rules, Strategy.cold)
+
+
+@pytest.mark.parametrize("bad", ["\x00", "\ud83d"], ids=["nul", "lone-surrogate"])
+async def test_a_jev_model_name_never_holds_a_migration_for_a_missing_recommendation(
+    tmp_path, store, bad
+):
+    """SDD §11, §14.1 (review RV49-06): Jev's model name went into the recommendation as sent; with
+    a NUL or a lone surrogate the recommendation's write was refused after the migration's, which
+    it already held: approve answered 404 and the strategy could not change. The answer's strings
+    arrive replaced, so the recommendation is stored and approvable."""
+    decide = load_fixture("decide")
+    decide["recommendation"].update(selected="warm", confidence=0.99)
+    decide["model"] = "jev-1.13.0" + bad
+    advisor, _ = _answering_advisor(decide=decide)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    [rec] = _recommendations(store)
+    assert (m.advisor_hold, rec.model.version) == (rec.id, "jev-1.13.0�")
+    approved = await h.orch.approve_recommendation(rec.id, "rina")
+    assert approved.decision.status == DecisionStatus.approved
+
+
+@pytest.mark.parametrize(
+    ("where", "bad"),
+    [("screen", "\x00"), ("screen", "\ud83d"), ("verify", "\x00"), ("verify", "\ud83d")],
+    ids=["screen-nul", "screen-lone", "verify-nul", "verify-lone"],
+)
+async def test_a_jev_verification_answer_never_stalls_a_cut_over_migration(
+    tmp_path, store, where, bad
+):
+    """SDD §11, §14.1 (review RV49-01): Jev's screen reason and verify results went into the
+    migration's advisor note as sent; with a NUL or a lone surrogate the verifying save was refused
+    on every attempt - the driver crashed, resumed, verified and crashed again, the cut-over VM
+    (source stopped) never completing. The answer's strings arrive replaced: it completes."""
+    jev_settings = Settings(jev_mode="stdio", jev_deployment="on_prem")
+    answers: dict = {"screen": {"recommendation": {"action": "pass", "reason": "ok"}}}
+    if where == "screen":
+        answers["screen"] = {
+            "recommendation": {"action": "pass", "reason": f"booted to a login prompt {bad}"}
+        }
+    else:
+        verify = load_fixture("verify")
+        verify["results"][0]["claim"] = f"The guest operating system finished booting {bad}"
+        answers["verify"] = verify
+    factory, _ = session_factory(fixture_responder(answers))
+    advisor = Advisor(JevClient(jev_settings, session_factory=factory), jev_settings)
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold}, advisor=advisor
+    )
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    try:
+        await h.wait_phase(mid, P.completed, P.failed, timeout=5.0)
+    except AssertionError:
+        pass
+    finally:
+        crashes = h.orch._driver_crashes.get(mid, (0, 0.0))[0]
+        await h.orch.stop()
+    errors = [e for e in h.store.events(since_seq=0, limit=10000) if e.kind == "migration.error"]
+    assert ((await h.migration(mid)).phase, crashes, errors) == (P.completed, 0, [])
+
+
+@pytest.mark.parametrize(
+    "field",
+    [{"tags": {"note": "backup\x00window"}}, {"os_type": "ubuntu\x00 22.04"}],
+    ids=["nova-metadata-value", "image-property-os-type"],
+)
+async def test_a_tenants_metadata_value_never_fails_the_whole_validation(tmp_path, store, field):
+    """SDD §4.2, §11 (review RV49-02): Nova lets a server metadata value hold any string, and an
+    image's os_type is a free property; with a NUL in one, the VM's migration was refused by the
+    store and the validation of the whole plan failed - web-02, a VM with nothing wrong, got no
+    migration. Free text no filter or mapping reads is written U+FFFD: both VMs validate."""
+    h, plan = await setup(
+        tmp_path, store, [vm(1, **field), vm(2)], {"default_strategy": Strategy.cold}
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    assert sorted(m.vm.name for m in await h.migrations(plan.id)) == ["web-01", "web-02"]
+
+
+@pytest.mark.parametrize("redact_names", [False, True])
+async def test_auto_waves_never_send_the_destination_providers_name_to_jev(
+    tmp_path, store, redact_names
+):
+    """SDD §13.4 (audit AD-09): the destination provider's name never reaches Jev, whatever
+    SEAMLESS_MEMORY_REDACT_NAMES says. The strategy question replaced it even inside a VM's name;
+    jev_classify's items did not - a VM named after the destination site sent it as it is. The
+    classification replaces it by the destination's kind and series, as the strategy question
+    does, the VM's own name too while names are redacted."""
+    jev_settings = Settings(jev_mode="stdio", memory_redact_names=redact_names)
+    factory, session = session_factory(fixture_responder({}))
+    advisor = Advisor(JevClient(jev_settings, session_factory=factory), jev_settings)
+    h, plan = await setup(tmp_path, store, [vm(1, name="jakarta-dc3-prod-db01")], advisor=advisor)
+    store.put("provider", DST_PROVIDER.model_copy(update={"name": "jakarta-dc3-prod"}))
+    await h.orch.auto_waves(plan.id, 10, "alice")
+    [(_, arguments, _)] = [c for c in session.calls if c[0] == "jev_classify"]
+    sent = json.dumps(arguments)
+    assert "jakarta" not in sent, arguments["items"]
+    [item] = arguments["items"]
+    assert item["text"].startswith("name=[vm] " if redact_names else "name=RHOSO 18.0-db01 ")
+
+
+async def test_auto_waves_need_no_destination_to_name(tmp_path, store):
+    """SDD §13.4 (audit AD-09): the classification names the destination by kind and series; a
+    plan whose destination provider is gone meanwhile has no name to leave either - its waves
+    are planned as before."""
+    advisor, _ = _answering_advisor()
+    h, plan = await setup(tmp_path, store, [vm(1)], advisor=advisor)
+    store.delete("provider", DST_PROVIDER.id)
+    await h.orch.auto_waves(plan.id, 10, "alice")
+    assert (await h.plan(plan.id)).waves
 
 
 async def test_advisor_tie_break_recorded(tmp_path, store):
@@ -5317,12 +5806,424 @@ async def test_an_override_records_its_reason_in_the_audit_trail(tmp_path, store
     assert overridden.data["before"] == waiting.data["after"]
 
 
+async def test_an_approval_cut_short_on_a_running_plan_leaves_its_migration_held(
+    tmp_path, store, refuse_write
+):
+    """SDD §14.6 (review RV48-01): an approval wrote the migration - its hold cleared - before the
+    decision, so when the decision's write failed a running plan's tick started the released
+    migration at once, and the approver's retry was refused "the strategy cannot change in
+    cutover": the migration ran a strategy its decision never recorded. One transaction keeps
+    the migration held until the decision is written: the tick waits, the retry approves, then
+    the migration runs the approved strategy, with one decision.approved."""
+    advisor, _ = _tie_advisor("warm", 0.99)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await run_plan(h, plan)
+    try:
+        m = await h.by_vm(plan.id, "vm-1")
+        [rec] = _recommendations(store)
+        assert (m.advisor_hold, m.phase) == (rec.id, P.ready)
+        refused = refuse_write(store, "UPDATE documents", "recommendation")
+        with pytest.raises(RuntimeError, match="briefly unavailable"):
+            await h.orch.approve_recommendation(rec.id, "rina")
+        assert refused == ["UPDATE documents recommendation"]
+        await asyncio.sleep(0.2)  # many ticks: a held migration is never started
+        held = await h.migration(m.id)
+        assert (held.phase, held.advisor_hold) == (P.ready, rec.id)
+        approved = await h.orch.approve_recommendation(rec.id, "rina")
+        later = (P.precopy, P.syncing, P.awaiting_cutover, P.cutover, P.verifying, P.completed)
+        started = await h.wait_phase(m.id, *later)
+    finally:
+        await h.orch.stop()
+    decided = [e for e in _audit(store) if e.kind == "decision.approved"]
+    assert (approved.decision.status, started.strategy, len(decided)) == (
+        DecisionStatus.approved,
+        Strategy.warm,
+        1,
+    )
+
+
+def _decide_answer(selected: str = "warm", confidence: float = 0.99, **extra) -> dict:
+    decide = load_fixture("decide")
+    decide["recommendation"].update(selected=selected, confidence=confidence, **extra)
+    return decide
+
+
+def _policy(pid: str, mode: str, **kw) -> AdvisorPolicy:
+    return AdvisorPolicy(id=pid, name=pid, mode=mode, threshold=0.6, updated_by="rina", **kw)
+
+
+@pytest.mark.parametrize(
+    ("extra", "why"),
+    [
+        ({"status": "escalate"}, "the advisor's answer was escalate"),
+        ({"status": "invalid_response"}, "the advisor's answer was invalid_response"),
+        ({"escaped": True}, "the advisor answered warm, not an option"),
+    ],
+    ids=["escalate", "invalid_response", "escaped"],
+)
+async def test_an_answer_that_could_not_be_applied_is_never_approved_later(
+    tmp_path, store, extra, why
+):
+    """SDD §4.2, §14.6 (audit AD-03): an answer Jev escalated, marked invalid or escaped was
+    recorded as fallback_rules, but nothing stored said it could not be applied: a later approve
+    ran the option Jev itself would not stand behind - and, under a policy that requires an
+    override reason, without one. The recommendation keeps why; no approve takes it, while an
+    override to that option stays a person's call, with its reason."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.9, **extra))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    store.put(
+        "advisor_policy",
+        _policy("pol-reason", "auto_apply_above_threshold", require_override_reason=True),
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert (rec.decision.status, rec.decision.reason_text, rec.recommendation.unusable) == (
+        DecisionStatus.fallback_rules,
+        why,
+        why,
+    )
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.approve_recommendation(rec.id, "rina")
+    assert str(refused.value) == f"nothing to approve: {why}"
+    with pytest.raises(Unprocessable):
+        await h.orch.override_recommendation(rec.id, "warm", None, "rina")
+    reason = "The owner chose warm after the review"
+    overridden = await h.orch.override_recommendation(rec.id, "warm", reason, "rina")
+    assert overridden.decision.status == DecisionStatus.overridden
+
+
+async def test_a_usable_answer_records_nothing_unusable(tmp_path, store):
+    """SDD §4.2: a recommendation whose answer could be applied records `unusable` null."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert (rec.decision.status, rec.recommendation.unusable) == (DecisionStatus.auto_applied, None)
+
+
+@pytest.mark.parametrize("stored", ["absent", "null", "absent-without-a-why"])
+async def test_a_fallback_stored_before_unusable_is_never_approved(tmp_path, store, stored):
+    """SDD §4.2, §14.6 (review RV50-07): v0.1.0-rc.2 stored a recommendation without `unusable`;
+    its fallback decision recorded why the answer could not be applied, which nothing read - the
+    approve ran Jev's escalated option. Such a record reads that why as `unusable`: no approve
+    takes it, an override to that option stays a person's call, and the record keeps the why."""
+    import re
+
+    import sqlalchemy as sa
+
+    from seamless_migrate.store import documents
+
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.9, status="escalate"))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    why = "the advisor's answer was escalate"
+    data = rec.model_dump(mode="json")
+    if stored == "null":
+        data["recommendation"]["unusable"] = None
+    else:
+        del data["recommendation"]["unusable"]  # as rc.2 wrote it: no such field yet
+    if stored == "absent-without-a-why":
+        data["decision"]["reason_text"] = None
+        why = "the advisor's answer could not be applied"
+    with store.engine.begin() as conn:
+        conn.execute(
+            sa.update(documents)
+            .where(documents.c.kind == "recommendation", documents.c.id == rec.id)
+            .values(data=data)
+        )
+    assert store.get("recommendation", rec.id, AdvisorRecommendation).recommendation.unusable == why
+    with pytest.raises(NotAllowed, match=f"^nothing to approve: {re.escape(why)}$"):
+        await h.orch.approve_recommendation(rec.id, "rina")
+    reason = "The owner chose warm after the review"
+    overridden = await h.orch.override_recommendation(rec.id, "warm", reason, "rina")
+    assert (overridden.decision.status, overridden.decision.final_option) == (
+        DecisionStatus.overridden,
+        "warm",
+    )
+    kept = store.get("recommendation", rec.id, AdvisorRecommendation)
+    assert kept.recommendation.unusable == why
+
+
+async def test_a_held_migration_stays_decidable_after_the_clock_steps_back(tmp_path, store):
+    """SDD §14.6 (review RV50-09): a decision acted on the newest recommendation by created_at,
+    the wall clock, and not on one the migration's hold did not name. After the clock stepped
+    back between two validations (an NTP step, a VM resumed from a snapshot) the hold named the
+    second while the first was newer by time: each check refused the other, and the held VM never
+    started. The hold names the one to decide, whatever its time."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    h.clock.advance(-60)
+    await h.orch.validate_plan(plan.id, "alice")
+    stale, held = sorted(_recommendations(store), key=lambda r: r.created_at, reverse=True)
+    assert (await h.by_vm(plan.id, "vm-1")).advisor_hold == held.id
+    assert stale.created_at > held.created_at
+    with pytest.raises(NotAllowed, match=rf"^a newer recommendation \({held.id}\) replaced "):
+        await h.orch.approve_recommendation(stale.id, "rina")
+    approved = await h.orch.approve_recommendation(held.id, "rina")
+    assert approved.decision.status == DecisionStatus.approved
+    assert (await h.by_vm(plan.id, "vm-1")).advisor_hold is None
+
+
+async def test_the_recommendation_the_last_validation_stored_decides_after_the_clock_steps_back(
+    tmp_path, store
+):
+    """SDD §14.6 (review RV51-08): without a hold a decision took the newest recommendation by
+    created_at. Validation 1 held rec-A for approval; the policy went, the clock stepped back and
+    validation 2 stored rec-B auto_applied, clearing the hold - rec-A, which rec-B replaced, was
+    approvable and set the strategy back, and rec-B was refused. The migration names the one its
+    last validation stored."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    [first] = _recommendations(store)
+    assert first.decision.status == DecisionStatus.pending_approval
+    store.delete("advisor_policy", "pol-finance")
+    h.clock.advance(-60)
+    await h.orch.validate_plan(plan.id, "alice")
+    [second] = [r for r in _recommendations(store) if r.id != first.id]
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (second.decision.status, m.advisor_hold) == (DecisionStatus.auto_applied, None)
+    assert first.created_at > second.created_at  # the clock stepped back
+    assert m.last_recommendation == second.id
+    with pytest.raises(NotAllowed, match=rf"^a newer recommendation \({second.id}\) replaced "):
+        await h.orch.approve_recommendation(first.id, "rina")
+    approved = await h.orch.approve_recommendation(second.id, "rina")
+    assert approved.decision.status == DecisionStatus.approved
+
+
+async def test_a_migration_validated_before_the_field_decides_its_newest_by_time(tmp_path, store):
+    """SDD §14.6 (review RV51-08): a migration no validation stored a recommendation for since
+    last_recommendation came (an earlier version's) decides the newest by created_at, as before."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    store.delete("advisor_policy", "pol-finance")
+    await h.orch.validate_plan(plan.id, "alice")
+    older, newer = sorted(_recommendations(store), key=lambda r: r.created_at)
+    m = await h.by_vm(plan.id, "vm-1")
+    m.last_recommendation = None  # as an earlier version stored it
+    store.put("migration", m)
+    with pytest.raises(NotAllowed, match=rf"^a newer recommendation \({newer.id}\) replaced "):
+        await h.orch.approve_recommendation(older.id, "rina")
+    approved = await h.orch.approve_recommendation(newer.id, "rina")
+    assert approved.decision.status == DecisionStatus.approved
+
+
+async def test_no_decision_once_the_plans_default_strategy_decides(tmp_path, store):
+    """SDD §14.6 (audit AD-04): a validation honours the plan's default_strategy as it honours an
+    override, recording no recommendation - the earlier one no longer stands. It stayed the newest
+    and approvable: an approve set the migration to warm against the plan, which the next
+    validation silently set back. Approve and override are refused as for a pinned VM."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert (await h.by_vm(plan.id, "vm-1")).advisor_hold == rec.id
+    fresh = store.get("plan", plan.id, Plan)
+    fresh.default_strategy, fresh.status = Strategy.cold, PlanStatus.draft
+    store.put("plan", fresh)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.strategy, m.advisor_hold, len(_recommendations(store))) == (Strategy.cold, None, 1)
+    for decide in (
+        lambda: h.orch.approve_recommendation(rec.id, "rina"),
+        lambda: h.orch.override_recommendation(rec.id, "warm", "the owner chose warm", "rina"),
+    ):
+        with pytest.raises(NotAllowed) as refused:
+            await decide()
+        assert str(refused.value) == (
+            "The plan sets the strategy of web-01 (cold): change it in the plan."
+        )
+    assert (await h.migration(m.id)).strategy == Strategy.cold
+
+
+async def test_a_persons_decision_names_the_policy_whose_rules_it_follows(tmp_path, store):
+    """SDD §14.5, §14.6 (audit AD-06): a person's decision follows the rules its decision recorded
+    - pol-strict's, which a later policy does not rewrite - but recorded the policy in force,
+    pol-relaxed, as its policy_id, and the reason's 422 named pol-relaxed, which requires none.
+    It names the policy whose rules it follows."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    strict = _policy("pol-strict", "always_require_approval", require_override_reason=True)
+    store.put("advisor_policy", strict)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    store.delete("advisor_policy", "pol-strict")
+    relaxed = _policy(
+        "pol-relaxed",
+        "auto_apply_above_threshold",
+        require_override_reason=False,
+        require_distinct_approver=False,
+    )
+    store.put("advisor_policy", relaxed)
+    approved = await h.orch.approve_recommendation(rec.id, "rina")
+    assert (approved.decision.policy_id, approved.decision.require_override_reason) == (
+        "pol-strict",
+        True,
+    )
+    events = [e for e in _audit(store) if e.kind == "decision.approved"]
+    assert [e.data["after"]["policy_id"] for e in events] == ["pol-strict"]
+    with pytest.raises(Unprocessable) as refused:
+        await h.orch.override_recommendation(rec.id, "cold", "too short", "rina")
+    assert str(refused.value).startswith("policy pol-strict requires an override reason")
+
+
+def _rec_events(store, mid: str) -> list[str]:
+    return [
+        e.kind
+        for e in store.events(since_seq=0, limit=1000)
+        if e.migration_id == mid and e.kind.startswith(("recommendation.", "decision."))
+    ]
+
+
+@pytest.mark.parametrize(
+    ("write", "row"),
+    [
+        ("UPDATE documents", "migration"),
+        ("INSERT INTO events", "migration.phase"),
+        ("INSERT INTO documents", "recommendation"),
+        ("INSERT INTO events", "recommendation.created"),
+        ("INSERT INTO events", "decision.auto_applied"),
+    ],
+)
+async def test_a_store_failure_in_validation_leaves_no_decision_without_its_record_and_events(
+    tmp_path, store, refuse_write, write, row
+):
+    """SDD §5.4, §14.4 (audit AD-05): a validation wrote the migration - the advisor's strategy -,
+    then the recommendation and its two events, each on its own: a store failure in between left
+    the migration on the advisor's warm with the newest recommendation saying cold, or a decision
+    without its event. They are one transaction: a write refused leaves the migration as the
+    earlier validation left it and nothing of the new decision, and the next validation records
+    it whole."""
+    state: dict = {"answer": RuntimeError("jev unreachable")}
+    advisor, _ = _answering_advisor(decide=lambda arguments: state["answer"])
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")  # Jev unreachable: the rules keep cold
+    m = await h.by_vm(plan.id, "vm-1")
+    before = (m.strategy, len(_recommendations(store)), _rec_events(store, m.id))
+    assert before == (Strategy.cold, 1, ["recommendation.created", "decision.fallback"])
+    state["answer"] = _decide_answer("warm", 0.9)
+    refused = refuse_write(store, write, row)
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await h.orch.validate_plan(plan.id, "alice")
+    assert refused == [f"{write} {row}"]
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.strategy, len(_recommendations(store)), _rec_events(store, m.id)) == before
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    newest = max(_recommendations(store), key=lambda r: (r.created_at, r.id))
+    assert (m.strategy, newest.decision.status, _rec_events(store, m.id)[2:]) == (
+        Strategy.warm,
+        DecisionStatus.auto_applied,
+        ["recommendation.created", "decision.auto_applied"],
+    )
+
+
+async def test_a_store_failure_in_validation_leaves_no_hold_on_a_missing_recommendation(
+    tmp_path, store, refuse_write
+):
+    """SDD §5.4, §14.6 (audit AD-05, review RV49-06): under an approval-required policy the
+    migration was written held by the new recommendation's id before that recommendation was
+    stored; when its write failed the hold named a recommendation that did not exist - approve a
+    404, the strategy unchangeable, the tick never starting it. A refused write leaves the
+    migration as it was."""
+    state: dict = {"answer": RuntimeError("jev unreachable")}
+    advisor, _ = _answering_advisor(decide=lambda arguments: state["answer"])
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")  # the rules' cold, no hold
+    store.put("advisor_policy", _finance(plan))
+    state["answer"] = _decide_answer("warm", 0.9)
+    refused = refuse_write(store, "INSERT INTO documents", "recommendation")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await h.orch.validate_plan(plan.id, "alice")
+    assert refused == ["INSERT INTO documents recommendation"]
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.advisor_hold, m.strategy) == (None, Strategy.cold)
+
+
+class _CancelDuringSearch:
+    """agentmemory answering slowly (up to its 5 s timeout) while an operator cancels the VM: the
+    cancel takes the migration's lock only (SDD §8)."""
+
+    def __init__(self) -> None:
+        self.h = None
+        self.plan_id = ""
+        self.cancel = False
+
+    async def similar_for(self, option, vm):
+        if self.cancel:
+            m = await self.h.by_vm(self.plan_id, vm.source_id)
+            await self.h.orch.cancel(m.id, "bob", "the VM is retired")
+        return []
+
+
+async def test_a_migration_cancelled_while_validation_searches_takes_no_decision(tmp_path, store):
+    """SDD §5.4, §14.6 (audit AD-11): a validation wrote the migration, then searched agentmemory
+    and recorded the decision without looking at the migration again - a cancel landing in between
+    was followed by recommendation.created and decision.pending_approval for the cancelled
+    migration. The search comes before the migration's assessment is written: the validation
+    finds it cancelled and leaves it alone."""
+    knowledge = _CancelDuringSearch()
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor, knowledge=knowledge
+    )
+    knowledge.h, knowledge.plan_id = h, plan.id
+    await h.orch.validate_plan(plan.id, "alice")  # recorded, auto-applied
+    store.put("advisor_policy", _finance(plan))
+    knowledge.cancel = True
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.phase, m.advisor_hold) == (P.cancelled, None)
+    assert [r.decision.status for r in _recommendations(store)] == [DecisionStatus.auto_applied]
+    assert _rec_events(store, m.id) == ["recommendation.created", "decision.auto_applied"]
+
+
+async def test_a_phase_change_and_its_event_are_one_transaction(tmp_path, store, refuse_write):
+    """SDD §5.1 (audit AD-05): a transition saved the migration, then appended its
+    migration.phase event on its own - a failed event write left the phase changed without its
+    event, in the audit trail and on the live stream. Both are one transaction: a refused event
+    leaves the migration where it was, and the retry writes both."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    await h.orch.validate_plan(plan.id, "alice")
+    m, v = await h.orch._load((await h.by_vm(plan.id, "vm-1")).id)
+    refused = refuse_write(store, "INSERT INTO events", "migration.phase")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await h.orch._transition(m, v, P.validating, "re-assessed")
+    assert refused == ["INSERT INTO events migration.phase"]
+    stored, version = await h.orch._load(m.id)
+    assert (stored.phase, version) == (P.ready, v)
+    moved, _ = await h.orch._transition(stored, version, P.validating, "re-assessed")
+    phases = [
+        e.data["to"]
+        for e in store.events(since_seq=0, limit=1000)
+        if e.kind == "migration.phase" and e.migration_id == m.id
+    ]
+    assert (moved.phase, phases[-1], phases.count("validating")) == (P.validating, "validating", 2)
+
+
 async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_approve(
     tmp_path, store
 ):
-    """SDD §14.6 (advisor Phase 1 audit, A4): once the plan sets the VM's strategy, the newest
-    recommendation no longer stands - approving it would flip the strategy back against the plan;
-    and an approved decision is not approved again (one event per decision status change)."""
+    """SDD §14.6 (advisor Phase 1 audit A4, review RV48-03): once the plan sets the VM's strategy,
+    the newest recommendation no longer stands - approving it, or overriding it to any option,
+    would flip the strategy back against the plan or decide what the plan already did; and an
+    approved decision is not approved again (one event per decision status change)."""
     advisor, _ = _tie_advisor("warm", 0.99)
     h, plan = await setup(
         tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
@@ -5335,6 +6236,7 @@ async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_
     store.put("plan", pinned)
     for decide in (
         lambda: h.orch.approve_recommendation(rec.id, "rina"),
+        lambda: h.orch.override_recommendation(rec.id, "warm", "the owner chose warm", "rina"),
         lambda: h.orch.override_recommendation(rec.id, "cold", "the owner chose cold", "rina"),
     ):
         with pytest.raises(NotAllowed) as refused:
@@ -5892,7 +6794,8 @@ async def test_a_failure_with_no_similar_incident_announces_none(tmp_path, store
     mid = (await h.by_vm(plan.id, "vm-1")).id
     await h.wait_phase(mid, P.failed)
     deadline = asyncio.get_running_loop().time() + 10
-    while mid in h.orch._drivers:  # the driver leaves once the failure is handled to its end
+    # the driver leaves once the failure is handled, the lookup once agentmemory answered (§8)
+    while mid in h.orch._drivers or h.orch._lookups:
         assert asyncio.get_running_loop().time() < deadline, (
             "the failure was not handled to its end"
         )
@@ -6371,27 +7274,27 @@ async def test_a_recreated_source_vm_is_in_the_plan_before_the_migration_is_roll
 ):
     """SDD §7.3: the plan follows the new id before the migration becomes rolled_back - a stop
     in between resumes rolling_back; rolled_back is never resumed, so a later rewrite could be
-    lost for good."""
+    lost for good - and in the same write as the migration's new vm (audit OC-06)."""
     settings = make_settings(tmp_path)
     h, plan = await setup(
         tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
         executor=_recreating_executor(settings), settings=settings,
     )  # fmt: skip
-    put = h.orch.db.put
-    seen: list[Phase] = []
+    put_all = store.put_all_with_events
+    seen: list[tuple[Phase, str]] = []
 
-    async def watching_put(kind, model, expected_version=None):
-        version = await put(kind, model, expected_version)
-        if kind == "plan" and "vm-1-recreated" in model.vm_ids and not seen:
-            # the phase the migration had when its plan first named the recreated VM
-            seen.extend(m.phase for m in await h.migrations(plan.id))
-        return version
+    def watching(writes, events):
+        written = {kind: model for kind, model, _ in writes}
+        if "vm-1-recreated" in getattr(written.get("plan"), "vm_ids", []) and not seen:
+            # the migration the write that first names the recreated VM in the plan holds
+            seen.append((written["migration"].phase, written["migration"].vm.source_id))
+        return put_all(writes, events)
 
-    h.orch.db.put = watching_put
+    store.put_all_with_events = watching
     await run_plan(h, plan)
     m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
     await h.orch.stop()
-    assert seen == [P.rolling_back]
+    assert seen == [(P.rolling_back, "vm-1-recreated")]
     assert m.vm.source_id == "vm-1-recreated"
     assert (await h.plan(plan.id)).vm_ids == ["vm-1-recreated"]
 
@@ -6420,6 +7323,601 @@ async def test_a_rollback_resumed_after_its_rewrite_changes_the_plan_no_further(
     assert not [
         e for e in store.events(since_seq=0, limit=1000) if "vm_id_changed" in (e.data or {})
     ]
+
+
+@pytest.mark.parametrize(
+    ("write", "kind"),
+    [("INSERT INTO events", "plan.updated"), ("UPDATE documents", "migration")],
+    ids=["the-plans-event", "the-migration"],
+)
+async def test_a_recreated_source_and_its_plan_are_written_together(
+    tmp_path, store, refuse_write, write, kind
+):
+    """SDD §7.3, §11 (audit OC-06): the rollback that recreated the source wrote the plan's new id,
+    then the migration's new vm, apart: a stop or a store error between them left the plan naming
+    a VM no migration named, and a validation meanwhile planned a second migration of it - Retry
+    and Start took both, and the tick cut the VM over twice. The plan and the migration are one
+    write: refused, neither changes, and the plan keeps one migration of the VM."""
+    settings = make_settings(tmp_path)
+    executor = _recreating_executor(settings)
+    recreating = executor.hooks[StepName.ROLLBACK]
+    attempts: list[str] = []
+    again, release = asyncio.Event(), asyncio.Event()
+
+    async def rollback(ctx):
+        attempts.append(ctx.migration.id)
+        if len(attempts) == 1:
+            refuse_write(store, write, kind)  # a part of the rewrite's write fails
+        else:
+            again.set()
+            await release.wait()  # the relaunched rollback runs again: minutes for a handover
+        return await recreating(ctx)
+
+    executor.hooks[StepName.ROLLBACK] = rollback
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=executor,
+        settings=settings,
+    )
+    h.source.vms["vm-1-recreated"] = vm(1).model_copy(update={"source_id": "vm-1-recreated"})
+    await run_plan(h, plan)
+    await asyncio.wait_for(again.wait(), 10)
+    await h.orch.pause_plan(plan.id, "alice")
+    await h.orch.validate_plan(plan.id, "alice")  # the paused plan, validated meanwhile
+    [m] = await h.migrations(plan.id)
+    assert (m.vm.source_id, (await h.plan(plan.id)).vm_ids) == ("vm-1", ["vm-1"])
+    release.set()
+    done = await h.wait_phase(m.id, P.rolled_back)
+    await h.orch.stop()
+    assert done.vm.source_id == "vm-1-recreated"
+    assert (await h.plan(plan.id)).vm_ids == ["vm-1-recreated"]
+    assert len(await h.migrations(plan.id)) == 1
+
+
+async def test_a_plan_holding_two_migrations_of_one_vm_is_refused(tmp_path, store):
+    """SDD §5.4 (audit OC-06): two migrations of one VM would both cut it over - an earlier
+    version's rollback could leave a second one beside the first. A validation of such a plan is
+    refused, naming the VM and both migrations, and a retry of one while the other names its VM."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    first = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=P.ready)
+    second = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=P.rolled_back)
+    store.put("migration", first)
+    store.put("migration", second)
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.validate_plan(plan.id, "alice")
+    assert "web-01" in str(refused.value)
+    assert first.id in str(refused.value) and second.id in str(refused.value)
+    with pytest.raises(NotAllowed, match=f"another migration of this plan \\({first.id}\\)"):
+        await h.orch.retry(second.id, "sari")
+    assert (await h.migration(second.id)).phase == P.rolled_back
+    # one cancelled - listed after the other -, the plan goes on with the one left
+    await h.orch.cancel(second.id, "sari", "a second migration of web-01")
+    report = await h.orch.validate_plan(plan.id, "alice")
+    assert [(i.migration_id, i.phase) for i in report.migrations] == [(first.id, P.ready)]
+
+
+async def test_a_start_refuses_a_plan_holding_two_migrations_of_one_vm(tmp_path, store):
+    """SDD §5.4 (review RV51-18): a plan an earlier version validated with two ready migrations of
+    one VM - its recreating rollback's second migration beside the first one, retried - was
+    started, and the tick cut the VM over twice. The start is refused as the validation is, and
+    the tick starts neither of a plan an earlier version left running so - until one is
+    cancelled."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    first = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=P.ready)
+    second = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=P.ready)
+    store.put("migration", first)
+    store.put("migration", second)
+    validated = await h.plan(plan.id)
+    validated.status = PlanStatus.validated  # as the earlier version's validation left it
+    store.put("plan", validated)
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.start_plan(plan.id, "alice")
+    assert "web-01" in str(refused.value)
+    assert first.id in str(refused.value) and second.id in str(refused.value)
+    assert (await h.plan(plan.id)).status == PlanStatus.validated
+    running = await h.plan(plan.id)
+    running.status = PlanStatus.running  # as the earlier version's start left it
+    store.put("plan", running)
+    await h.orch.start()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while plan.id not in h.orch._prestage_done:
+        assert loop.time() < deadline, "the plan was never pre-staged"
+        await asyncio.sleep(0.01)
+    for _ in range(30):  # ticks enough to cut both over
+        h.orch.wake()
+        await asyncio.sleep(0.01)
+    assert [mid for mid, step in h.executor.calls if step == StepName.CUTOVER] == []
+    await h.orch.cancel(second.id, "sari", "a second migration of web-01")
+    await h.wait_phase(first.id, P.completed)
+    await h.orch.stop()
+    assert [mid for mid, step in h.executor.calls if step == StepName.CUTOVER] == [first.id]
+
+
+async def test_a_validation_leaves_a_stopped_source_as_it_is(tmp_path, store):
+    """SDD §5.4 (audit OC-02): a migration retried after a failed cutover keeps its stopped
+    source (§5.2). A validation re-assessed it: the volume the failed export left detached moved
+    it to blocked, where rollback, cancel, retry and start are all refused - nothing restarted
+    the source. It is left as it is, like one in flight: the plan starts, and the cutover runs
+    again."""
+    settings = make_settings(tmp_path)
+    two_disks = vm(
+        1,
+        disks=[
+            make_disk(id="vol-1", size_gb=20, used_gb=10.0),
+            make_disk(id="vol-1b", size_gb=10, used_gb=2.0, bootable=False, device="/dev/vdb"),
+        ],
+    )
+    # the advisor chooses the strategy: a validation that re-assessed the VM would ask it again
+    advisor, session = _answering_advisor(decide=_decide_answer("cold", 0.99))
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [two_disks],
+        {
+            "default_strategy": "auto",
+            "auto_cutover": False,
+            "verification": VerificationConfig(timeout_s=2, auto_rollback=False),
+        },
+        executor=_stopping_cutover(settings),
+        settings=settings,
+        advisor=advisor,
+    )
+    await run_plan(h, plan)
+    m = await h.by_vm(plan.id, "vm-1")
+    assert m.strategy == Strategy.cold
+    await h.orch.request_cutover(m.id, "sari")
+    m = await h.wait_phase(m.id, P.failed)
+    assert m.downtime_started_at is not None and m.downtime_ended_at is None
+    await h.orch.retry(m.id, "sari")  # keeps the open clock (SDD §5.2)
+    await h.orch.pause_plan(plan.id, "alice")
+    # the failed export left the data volume detached from the stopped source VM (SDD §6.6)
+    src = h.source.vms["vm-1"]
+    h.source.vms["vm-1"] = src.model_copy(update={"disks": [src.disks[0]]})
+    retried = await h.migration(m.id)
+    session.calls.clear()
+    report = await h.orch.validate_plan(plan.id, "alice")
+    left = await h.migration(m.id)
+    assert (left.phase, left.findings, left.vm) == (P.ready, retried.findings, retried.vm)
+    assert left.phase_history == retried.phase_history  # no validating, no blocked
+    # reported as recorded, like one in flight: its VM is not read again, the advisor not asked
+    [item] = report.migrations
+    assert (item.phase, item.estimates) == (P.ready, retried.estimates)
+    assert "SRC_VM_VOLUME_DETACHED" not in {f.code for f in item.findings}
+    assert [name for name, *_ in session.calls if name == "jev_decide"] == []
+    # its VM is not read again: gone from the source, the plan still validates (SDD §5.4)
+    del h.source.vms["vm-1"]
+    await h.orch.validate_plan(plan.id, "alice")
+    assert (await h.migration(m.id)).phase_history == retried.phase_history
+    started = await h.orch.start_plan(plan.id, "alice")
+    await h.orch.stop()
+    assert started.status == PlanStatus.running
+
+
+@pytest.mark.parametrize("left_in", [P.blocked, P.validating], ids=["blocked", "validating"])
+async def test_a_stopped_source_migration_an_earlier_version_left_blocked_is_re_assessed(
+    tmp_path, store, left_in
+):
+    """SDD §5.4 (review RV51-01): an earlier version's validation re-assessed a migration retried
+    after a failed cutover, its source still stopped: the volume the failed export left detached
+    moved it to blocked - or an interrupted validation left it in validating. Cancel, rollback,
+    retry and start are refused there, so leaving it as it is would keep its source stopped for
+    good: once the volume is attached again a validation frees it, and the plan starts."""
+    settings = make_settings(tmp_path)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {
+            "default_strategy": Strategy.cold,
+            "auto_cutover": False,
+            "verification": VerificationConfig(timeout_s=2, auto_rollback=False),
+        },
+        executor=_stopping_cutover(settings),
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m = await h.by_vm(plan.id, "vm-1")
+    await h.orch.request_cutover(m.id, "sari")
+    m = await h.wait_phase(m.id, P.failed)
+    await h.orch.retry(m.id, "sari")  # keeps the open clock (SDD §5.2)
+    await h.orch.pause_plan(plan.id, "alice")
+    m = await h.migration(m.id)
+    assert m.phase == P.ready and m.downtime_started_at and m.downtime_ended_at is None
+    # what the earlier version's validation left: blocked by the detached volume, or validating
+    m.phase_history.append(
+        PhaseChange(from_phase=P.ready, to_phase=P.validating, reason="validation", actor="alice")
+    )
+    if left_in == P.blocked:
+        m.phase_history.append(
+            PhaseChange(
+                from_phase=P.validating, to_phase=P.blocked, reason="1 blocker", actor="alice"
+            )
+        )
+        detached = Finding(
+            code="SRC_VM_VOLUME_DETACHED",
+            severity="blocker",
+            message="vol-1b is detached from the source VM",
+        )
+        m.findings = [*m.findings, detached]
+    m.phase = left_in
+    store.put("migration", m)
+    if left_in == P.blocked:
+        with pytest.raises(NotAllowed, match="blocked: web-01"):
+            await h.orch.start_plan(plan.id, "alice")
+    # the volume is attached again: the source VM is as validated
+    await h.orch.validate_plan(plan.id, "alice")
+    freed = await h.migration(m.id)
+    assert freed.phase == P.ready
+    assert [c.to_phase for c in freed.phase_history][-2:] == [P.validating, P.ready]
+    assert "SRC_VM_VOLUME_DETACHED" not in {f.code for f in freed.findings}
+    assert (freed.downtime_started_at, freed.downtime_ended_at) == (m.downtime_started_at, None)
+    started = await h.orch.start_plan(plan.id, "alice")
+    await h.orch.stop()
+    assert started.status == PlanStatus.running
+
+
+@dataclasses.dataclass
+class _PrestageRecorder(ScriptedExecutor):
+    """Records the flavors each pre-staging run was asked to create."""
+
+    flavors: list[list[str]] = dataclasses.field(default_factory=list)
+
+    async def prestage(self, plan, source, destination, *, prestage_flavors=None):
+        self.flavors.append(list(prestage_flavors or []))
+
+
+async def test_a_vm_added_after_the_first_start_gets_its_flavor_pre_staged(tmp_path, store):
+    """SDD §8, §9.3 (audit OC-05): a plan was pre-staged once per process: a VM added after its
+    first start was validated ready on MAP_FLAVOR_PRESTAGED's promise - pre-staging creates the
+    flavor - and its flavor was never created, so each pass or cutover of it failed the
+    destination check. A plan is pre-staged again for a migration validated since."""
+    settings = make_settings(tmp_path)
+    executor = _PrestageRecorder(settings)
+    big = vm(2, flavor="m1.xlarge")  # no such flavor at the destination, no mapping
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), big],
+        {
+            "vm_ids": ["vm-1"],
+            "default_strategy": Strategy.cold,
+            "auto_cutover": False,
+            "prestage_resources": ["networks", "flavors"],
+        },
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    deadline = asyncio.get_running_loop().time() + 5
+    while not executor.flavors:
+        assert asyncio.get_running_loop().time() < deadline, "the plan was never pre-staged"
+        await asyncio.sleep(0.01)
+    await h.orch.pause_plan(plan.id, "alice")
+    edited = await h.plan(plan.id)  # PATCH /plans/{id}: nothing in flight, back to draft
+    edited.vm_ids = ["vm-1", "vm-2"]
+    edited.status = PlanStatus.draft
+    store.put("plan", edited)
+    await h.orch.validate_plan(plan.id, "alice")
+    added = await h.by_vm(plan.id, "vm-2")
+    assert added.phase == P.ready and "MAP_FLAVOR_PRESTAGED" in {f.code for f in added.findings}
+    await h.orch.start_plan(plan.id, "alice")
+    while len(executor.flavors) < 2:
+        assert asyncio.get_running_loop().time() < deadline + 5, executor.flavors
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.flavors[-1] == ["m1.xlarge"]
+
+
+@dataclasses.dataclass
+class _GatedPrestageRecorder(ScriptedExecutor):
+    """Records the flavors each pre-staging was asked for; the first one runs until released."""
+
+    flavors: list[list[str]] = dataclasses.field(default_factory=list)
+    started: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    release: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+
+    async def prestage(self, plan, source, destination, *, prestage_flavors=None):
+        first = not self.flavors
+        self.flavors.append(list(prestage_flavors or []))
+        if first:
+            self.started.set()
+            await self.release.wait()
+
+
+def _flavor_plan():
+    """web-01 planned cold, its flavor at the destination; web-02 not yet in the plan, its flavor
+    one the destination lacks and no mapping names (MAP_FLAVOR_PRESTAGED when planned)."""
+    return (
+        [vm(1), vm(2, flavor="m1.xlarge")],
+        {
+            "vm_ids": ["vm-1"],
+            "default_strategy": Strategy.cold,
+            "auto_cutover": False,
+            "prestage_resources": ["networks", "flavors"],
+        },
+    )
+
+
+def _add_web_02(store, plan):
+    """What PATCH /plans/{id} (or `seamless plan apply`) does to the paused plan: web-02 added,
+    the plan back to draft."""
+    edited = store.get("plan", plan.id, Plan)
+    edited.vm_ids = ["vm-1", "vm-2"]
+    edited.status = PlanStatus.draft
+    store.put("plan", edited)
+
+
+async def test_a_vm_validated_while_the_plan_pre_stages_is_pre_staged_too(tmp_path, store):
+    """SDD §8 (review RV51-17): a plan paused, edited, validated and started again while its first
+    pre-staging still ran: that pre-staging, which read the VMs before the edit, marked the plan
+    pre-staged when it ended, and the added VM's flavor (MAP_FLAVOR_PRESTAGED) was never
+    created. A pre-staging covers only the assessments it read: the tick pre-stages again."""
+    settings = make_settings(tmp_path)
+    executor = _GatedPrestageRecorder(settings)
+    vms, plan_kw = _flavor_plan()
+    h, plan = await setup(tmp_path, store, vms, plan_kw, executor=executor, settings=settings)
+    await run_plan(h, plan)
+    await asyncio.wait_for(executor.started.wait(), 10)  # the first pre-staging runs
+    await h.orch.pause_plan(plan.id, "alice")
+    _add_web_02(store, plan)
+    await h.orch.validate_plan(plan.id, "alice")
+    added = await h.by_vm(plan.id, "vm-2")
+    assert added.phase == P.ready and "MAP_FLAVOR_PRESTAGED" in {f.code for f in added.findings}
+    await h.orch.start_plan(plan.id, "alice")
+    executor.release.set()  # the first pre-staging ends now
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while ["m1.xlarge"] not in executor.flavors:
+        assert loop.time() < deadline, executor.flavors
+        h.orch.wake()
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.flavors == [[], ["m1.xlarge"]]
+
+
+async def test_a_vm_another_process_validated_is_pre_staged_by_the_servers_tick(tmp_path, store):
+    """SDD §8, §15 (review RV51-17): the pre-staged mark was the process's own: `seamless plan
+    validate` and `seamless plan start` beside the running server (the CLI opens the store
+    directly) added a VM, and the server's tick, which read the plan as pre-staged since its first
+    start, never created its flavor. The tick reads the assessments from the store."""
+    settings = make_settings(tmp_path)
+    executor = _PrestageRecorder(settings)
+    vms, plan_kw = _flavor_plan()
+    h, plan = await setup(tmp_path, store, vms, plan_kw, executor=executor, settings=settings)
+    await run_plan(h, plan)  # the server
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while not executor.flavors:
+        assert loop.time() < deadline, "the plan was never pre-staged"
+        await asyncio.sleep(0.01)
+    await h.orch.pause_plan(plan.id, "alice")  # POST /plans/{id}/pause
+    _add_web_02(store, plan)
+    cli = build_harness(tmp_path, store, vms, settings=settings)  # the CLI's process
+    await cli.orch.validate_plan(plan.id, "cli")
+    await cli.orch.start_plan(plan.id, "cli")
+    while len(executor.flavors) < 2:
+        assert loop.time() < deadline + 5, executor.flavors
+        h.orch.wake()  # the server's next tick
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.flavors == [[], ["m1.xlarge"]]
+
+
+async def test_a_vm_validated_again_with_another_flavor_is_pre_staged_again(tmp_path, store):
+    """SDD §8: a migration's assessment is its last move to validating. web-01, resized at the
+    source while its plan was paused, is validated again with a flavor the destination lacks
+    (MAP_FLAVOR_PRESTAGED): the same migration, assessed anew, is pre-staged again."""
+    settings = make_settings(tmp_path)
+    executor = _PrestageRecorder(settings)
+    vms, plan_kw = _flavor_plan()
+    h, plan = await setup(tmp_path, store, vms, plan_kw, executor=executor, settings=settings)
+    await run_plan(h, plan)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while not executor.flavors:
+        assert loop.time() < deadline, "the plan was never pre-staged"
+        await asyncio.sleep(0.01)
+    await h.orch.pause_plan(plan.id, "alice")
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"flavor": "m1.xlarge"})
+    await h.orch.validate_plan(plan.id, "alice")
+    resized = await h.by_vm(plan.id, "vm-1")
+    assert "MAP_FLAVOR_PRESTAGED" in {f.code for f in resized.findings}
+    await h.orch.start_plan(plan.id, "alice")
+    while len(executor.flavors) < 2:
+        assert loop.time() < deadline + 5, executor.flavors
+        h.orch.wake()
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.flavors == [[], ["m1.xlarge"]]
+
+
+@dataclasses.dataclass
+class _CountingPrestage(ScriptedExecutor):
+    """Counts the pre-stagings; each after the first fails, as a destination API blip would."""
+
+    runs: int = 0
+
+    async def prestage(self, plan, source, destination):
+        self.runs += 1
+        if self.runs > 1:
+            raise RuntimeError("destination API briefly unavailable")
+
+
+async def test_a_plan_paused_and_resumed_is_not_pre_staged_again(tmp_path, store):
+    """SDD §8 (review RV51-19): each start pre-staged the whole plan again, so a plan merely paused
+    and resumed - nothing added or validated, web-01 completed - held every gate and step until
+    the pre-staging (minutes of playbooks) ended, and a pre-staging error failed it. Nothing was
+    assessed anew: web-02's requested cutover starts at once, and the plan keeps running."""
+    settings = make_settings(tmp_path)
+    executor = _CountingPrestage(settings)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), vm(2)],
+        {"default_strategy": Strategy.cold, "auto_cutover": False},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    first = await h.by_vm(plan.id, "vm-1")
+    await h.orch.request_cutover(first.id, "sari")
+    await h.wait_phase(first.id, P.completed)
+    await h.orch.pause_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")  # resumed: nothing was added or changed
+    second = await h.by_vm(plan.id, "vm-2")
+    await h.orch.request_cutover(second.id, "sari")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while (second.id, StepName.CUTOVER) not in h.executor.calls:
+        status = (await h.plan(plan.id)).status
+        assert status == PlanStatus.running, f"{status}: a second pre-staging failed the plan"
+        assert loop.time() < deadline, "web-02's cutover waits for a second pre-staging"
+        h.orch.wake()
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.runs == 1
+
+
+@dataclasses.dataclass
+class _HostsRecorder(ScriptedExecutor):
+    """Records whether each pre-staging was asked to deploy the conversion hosts."""
+
+    hosts: list[bool] = dataclasses.field(default_factory=list)
+
+    async def prestage(self, plan, source, destination, *, deploy_conversion_hosts=None):
+        self.hosts.append(bool(deploy_conversion_hosts))
+
+
+async def test_a_strategy_that_needs_a_conversion_host_pre_stages_the_plan_again(tmp_path, store):
+    """SDD §8 (review RV51-19): an assessment holds whether the migration's strategy needs a
+    conversion host. A storage handover plan was pre-staged without one; a migration given the cold
+    strategy while the plan runs is pre-staged again - the hosts deployed - before it starts."""
+    settings = make_settings(tmp_path)
+    executor = _HostsRecorder(settings)
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {
+            "handover": handover,
+            "auto_cutover": False,
+            "default_strategy": Strategy.storage_handover,
+        },
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while not executor.hosts:
+        assert loop.time() < deadline, "the plan was never pre-staged"
+        await asyncio.sleep(0.01)
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.strategy, executor.hosts) == (Strategy.storage_handover, [False])
+    await h.orch.set_strategy(m.id, Strategy.cold, "alice")
+    while len(executor.hosts) < 2:
+        assert loop.time() < deadline + 5, executor.hosts
+        h.orch.wake()
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.hosts == [False, True]
+
+
+async def test_a_restart_keeps_a_running_plan_pre_staged(tmp_path, store):
+    """SDD §8: after a restart a running plan whose work started counts as pre-staged for its
+    migrations' assessments - web-02's requested cutover starts without a pre-staging -, and a
+    plan paused across a restart is pre-staged again when it next runs with a ready migration."""
+    settings = make_settings(tmp_path)
+    vms = [vm(1), vm(2), vm(3)]
+    h, plan = await setup(
+        tmp_path,
+        store,
+        vms,
+        {"default_strategy": Strategy.cold, "auto_cutover": False},
+        executor=_PrestageRecorder(settings),
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    first = await h.by_vm(plan.id, "vm-1")
+    await h.orch.request_cutover(first.id, "sari")
+    await h.wait_phase(first.id, P.completed)
+    await h.orch.stop()
+    assert len(h.executor.flavors) == 1
+    restarted = build_harness(
+        tmp_path, store, vms, executor=_PrestageRecorder(settings), settings=settings
+    )
+    await restarted.orch.start()
+    second = await restarted.by_vm(plan.id, "vm-2")
+    await restarted.orch.request_cutover(second.id, "sari")
+    await restarted.wait_phase(second.id, P.completed)
+    await restarted.orch.pause_plan(plan.id, "alice")
+    await restarted.orch.stop()
+    assert restarted.executor.flavors == []
+    again = build_harness(
+        tmp_path, store, vms, executor=_PrestageRecorder(settings), settings=settings
+    )
+    await again.orch.start()
+    await again.orch.start_plan(plan.id, "alice")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while not again.executor.flavors:
+        assert loop.time() < deadline, "web-03's plan was never pre-staged again"
+        again.orch.wake()
+        await asyncio.sleep(0.01)
+    await again.orch.stop()
+    assert len(again.executor.flavors) == 1
+
+
+@dataclasses.dataclass
+class _SlowPrestage(ScriptedExecutor):
+    """Pre-staging that runs until released - the playbooks take minutes on a real cloud."""
+
+    started: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    release: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    finished: list[str] = dataclasses.field(default_factory=list)
+
+    async def prestage(self, plan, source, destination):
+        self.started.set()
+        await self.release.wait()
+        self.finished.append(plan.id)
+
+
+async def test_a_cancelled_plan_pre_stages_nothing(tmp_path, store):
+    """SDD §12 (audit OC-07): a plan paused while its pre-staging ran could be cancelled - none of
+    its migrations started - and the pre-staging went on creating its networks, flavors and
+    conversion hosts, then announced "resources pre-staged" for the cancelled plan. The cancel
+    stops it first."""
+    settings = make_settings(tmp_path)
+    executor = _SlowPrestage(settings)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold, "auto_cutover": False},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    await asyncio.wait_for(executor.started.wait(), 10)
+    await h.orch.pause_plan(plan.id, "alice")
+    cancelled = await h.orch.cancel_plan(plan.id, "alice", "the project was dropped")
+    assert cancelled.status == PlanStatus.cancelled
+    assert plan.id not in h.orch._prestage_tasks
+    executor.release.set()  # were the playbooks still running, they would finish now
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    announced = [
+        e.message
+        for e in store.events(since_seq=0, limit=1000)
+        if e.kind == "plan.updated" and e.data.get("prestaged")
+    ]
+    await h.orch.stop()
+    assert (executor.finished, announced) == ([], [])
 
 
 async def test_tick_ignores_migrations_of_finished_plans_and_records_timing(tmp_path, store):
@@ -6536,6 +8034,22 @@ async def test_a_cutover_request_is_not_an_approval_when_a_distinct_approver_is_
     assert (await h.migration(m.id)).approvals == []
     await h.orch.approve(m.id, "rina", "Checked the pre-flight warnings")
     await h.wait_phase(m.id, P.completed)
+    await h.orch.stop()
+
+
+async def test_a_principal_whose_name_holds_a_nul_records_no_request_to_approve_itself(
+    tmp_path, store
+):
+    """SDD §5.4, §11 (review RV48-05): the store stripped a requester's NUL while the approval
+    compared the principal's own name, NUL included, so 'ops\\0lead' approved its own cutover
+    request. The store keeps no NUL: the request is refused, nothing recorded to approve."""
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.awaiting_cutover)
+    with pytest.raises(UnstorableValue, match="holds a NUL character"):
+        await h.orch.request_cutover(m.id, "ops\x00lead")
+    held = await h.migration(m.id)
+    assert (held.cutover_requested, held.cutover_requested_by) == (False, None)
     await h.orch.stop()
 
 
@@ -6671,6 +8185,50 @@ async def test_a_migration_is_forced_once(tmp_path, store):
     )
     assert counted_approvals(m, plan) == [], "the forcer's own approval still does not count"
     assert h.kinds().count("migration.force_cutover") == 1
+
+
+@pytest.mark.parametrize(
+    ("action", "kind", "distinct"),
+    [
+        ("force", "migration.force_cutover", True),
+        ("approve", "migration.approved", True),
+        ("request", "migration.action", True),
+        ("request", "migration.approved", False),
+    ],
+    ids=["force", "approve", "request", "request-approving"],
+)
+async def test_an_approval_request_or_force_is_never_kept_without_its_event(
+    tmp_path, store, refuse_write, action, kind, distinct
+):
+    """SDD §5.4, §11 (audit OC-03): a Force cutover was saved, then its audit event written apart -
+    refused, the force stood with no record in the trail, and forcing again answered 409, so the
+    record could never be written; an approval that opens the gate, and a cutover request,
+    lacked their events the same way. Each is one transaction with its events: a store error
+    leaves none of them, and the approver's retry is taken anew."""
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {**GATED, "require_distinct_approver": distinct}
+    )
+    syncing = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.warm, phase=P.syncing)
+    store.put("migration", syncing)
+    act = {
+        "force": lambda: h.orch.force_cutover(
+            syncing.id, "sari", "the window closes in ten minutes"
+        ),
+        "approve": lambda: h.orch.approve(syncing.id, "sari", "looked fine"),
+        "request": lambda: h.orch.request_cutover(syncing.id, "sari", comment="ready"),
+    }[action]
+    refused = refuse_write(store, "INSERT INTO events", kind)
+    with pytest.raises(RuntimeError):
+        await act()
+    assert refused, "the event's write was refused"
+    kept = await h.migration(syncing.id)
+    assert (kept.force_cutover, kept.approvals, kept.cutover_requested) == (None, [], False)
+    assert h.kinds() == []
+    await act()  # the retry, as a person makes it
+    assert h.kinds().count(kind) == 1
+    done = await h.migration(syncing.id)
+    assert (done.force_cutover is not None) == (action == "force")
+    assert done.cutover_requested == (action != "approve")
 
 
 async def test_a_force_cutover_in_precopy_expects_the_running_first_pass(tmp_path, store):
@@ -7664,6 +9222,36 @@ async def test_a_finalize_that_began_deleting_the_source_finishes_while_it_runs(
     await h.orch.stop()
 
 
+async def test_a_running_source_is_never_kept_by_a_finalize(tmp_path, store):
+    """SDD §8.1 (audit OC-09): the exception to the running-source refusal - a finalize that began
+    deleting the source - looked at the checkpoint alone: after a deleting finalize failed and
+    the source ran again, a finalize with delete_source false was accepted, the diverged source
+    kept and the finalized migration watched no more. Only a deleting finalize passes."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    failed: list[str] = []
+
+    async def finalize(ctx):
+        if not failed:
+            failed.append(ctx.migration.id)
+            raise TransientStepError("finalize: src-osp: call timed out after 300 s")
+        return StepResult(details={"source_deleted": True})
+
+    h.executor.hooks[StepName.FINALIZE] = finalize
+    with pytest.raises(NotAllowed, match="finalize failed"):
+        await h.orch.finalize(m.id, "rina", delete_source=True, confirm=m.vm.name)
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    seen = await _watch(h, plan)
+    assert (seen.checkpoint, seen.source_running_at is not None) == ("finalizing", True)
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.finalize(m.id, "rina", delete_source=False, confirm=m.vm.name)
+    assert str(refused.value) == RUNS_AGAIN
+    assert (await h.migration(m.id)).phase == P.completed
+    done = await h.orch.finalize(m.id, "rina", delete_source=True, confirm=m.vm.name)
+    assert done.phase == P.finalized
+    await h.orch.stop()
+
+
 async def test_the_source_watch_flags_a_completed_vms_source_running_again(tmp_path, store):
     """SDD §8.1: the source VM of a migration awaiting finalize runs again: its data diverges."""
     h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
@@ -8234,3 +9822,407 @@ async def test_jev_reasons_that_name_no_evidence_key_are_dropped_and_logged(
         ("downtime_estimate", "The warm estimate fits the SLO.")
     ]
     assert any("licence" in message for message in caplog.messages)
+
+
+def _stored_json(store: Store, kind: str, doc_id: str) -> object:
+    """A document as the store wrote it, read as JSON that holds no NaN or infinity - what
+    PostgreSQL's JSONB takes (SDD §11)."""
+    import sqlalchemy as sa
+
+    def refuse(name: str) -> object:
+        raise ValueError(f"{name} is no JSON number")
+
+    with store.engine.connect() as conn:
+        raw = conn.execute(
+            sa.text("SELECT CAST(data AS TEXT) FROM documents WHERE kind = :k AND id = :i"),
+            {"k": kind, "i": doc_id},
+        ).scalar_one()
+    return json.loads(raw, parse_constant=refuse)
+
+
+@pytest.mark.parametrize(
+    ("literal", "summary"),
+    [
+        ("1e999", "invalid response"),
+        ("-1e999", "invalid response"),
+        ("1" + "0" * 400, "Boot verified"),
+    ],
+    ids=["1e999", "-1e999", "400-digits"],
+)
+async def test_a_jev_verification_number_past_a_float_never_reaches_the_store(
+    tmp_path, store, literal, summary
+):
+    """SDD §11, §14.1 (reviews RV50-03, RV50-04): json.loads reads the literal 1e999 as an
+    infinity, with no NaN or Infinity token: a verify answer whose claims carried it gave the
+    migration's note the confidence inf, which SQLite kept as Infinity and PostgreSQL's JSONB
+    refuses - the verifying save of the cut-over VM would fail there on every attempt. Such an
+    answer is an invalid response; a claim's confidence of 400 digits, which no float holds, is
+    no probability and counts for none. The cut-over VM completes, and its document is JSON
+    PostgreSQL takes."""
+    verify = load_fixture("verify")
+    for result in verify["results"]:
+        result["confidence"] = 0.25
+    text = json.dumps(verify).replace('"confidence": 0.25', f'"confidence": {literal}')
+    assert text.count(literal) == len(verify["results"])
+    jev_settings = Settings(jev_mode="stdio", jev_deployment="on_prem")
+    answers = {
+        "screen": {"recommendation": {"action": "pass", "reason": "ok"}},
+        "verify": lambda arguments: tool_result(text),
+    }
+    factory, _ = session_factory(fixture_responder(answers))
+    advisor = Advisor(JevClient(jev_settings, session_factory=factory), jev_settings)
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold}, advisor=advisor
+    )
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    try:
+        await h.wait_phase(mid, P.completed, P.failed, timeout=5.0)
+    finally:
+        await h.orch.stop()
+    m = await h.migration(mid)
+    [note] = [n for n in m.advisor_notes if n.kind == "verification"]
+    assert (m.phase, note.confidence) == (P.completed, None)
+    assert summary in note.summary, note.summary
+    _stored_json(store, "migration", mid)
+
+
+@pytest.mark.parametrize(
+    "score",
+    ["NaN", "Infinity", "-Infinity", "1e999", '"nan"', '"inf"', "true", "1" + "0" * 400],
+    ids=["nan", "infinity", "-infinity", "1e999", "nan-text", "inf-text", "true", "400-digits"],
+)
+async def test_an_agentmemory_score_that_is_no_finite_number_never_reaches_the_store(
+    tmp_path, store, score
+):
+    """SDD §11, §14.3 (review RV50-04): agentmemory is an outside service whose answer httpx reads
+    with NaN and Infinity, and a hit's score went through float() - "nan" too. The
+    recommendation's similar incidents kept a NaN score, which SQLite wrote as NaN and
+    PostgreSQL's JSONB refuses: there the validation failed for as long as agentmemory answered
+    so. Such a score is none."""
+    body = (
+        '{"results": [{"title": "warm pre-copy", "content": "a warm pre-copy timed out", '
+        f'"score": {score}}}]}}'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("smart-search"):
+            return httpx.Response(
+                200, content=body.encode(), headers={"content-type": "application/json"}
+            )
+        return httpx.Response(201, json={"success": True})
+
+    memory = MemoryClient("http://m", None, "p", transport=httpx.MockTransport(handler))
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    h.orch.knowledge = KnowledgeService(memory, store, h.bus)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert [i.score for i in rec.similar_incidents] == [None]
+    _stored_json(store, "recommendation", rec.id)
+
+
+def _write_as_rc2(store, migration: Migration, notes: list[dict]) -> None:
+    """The migration as v0.1.0-rc.2 left it on SQLite: advisor notes holding numbers json wrote as
+    NaN and Infinity tokens, which SQLite kept (SDD §11, review RV50-04)."""
+    import sqlalchemy as sa
+
+    from seamless_migrate.store import documents
+
+    data = store.get("migration", migration.id, Migration).model_dump(mode="json")
+    with store.engine.begin() as conn:
+        conn.execute(
+            sa.update(documents)
+            .where(documents.c.kind == "migration", documents.c.id == migration.id)
+            .values(data={**data, "advisor_notes": notes})
+        )
+
+
+#: the note rc.2's knowledge service attached to a failure: a hit's score as rc.2 read
+#: agentmemory's "nan" (review RV50-04)
+_RC2_NOTE = {
+    "kind": "similar_incidents",
+    "source": "memory",
+    "summary": "1 similar past incident(s) found",
+    "data": {
+        "query": "cold cutover",
+        "hits": [{"title": "t", "content": "c", "score": float("nan")}],
+    },
+}
+
+
+async def test_a_stopped_source_an_earlier_version_stored_with_a_nan_score_is_rolled_back(
+    tmp_path, store
+):
+    """SDD §11 (review RV51-06): a cutover failed after the stop under rc.2, whose note kept
+    agentmemory's NaN score on SQLite; every write of the migration was refused since - the
+    rollback, the one action that restarts the source, answered 422. The NaN reads as null."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    m.phase = P.failed
+    m.downtime_started_at = h.orch.now() - timedelta(seconds=900)
+    store.put("migration", m)
+    _write_as_rc2(store, m, [_RC2_NOTE])
+    rolled = await h.orch.rollback(m.id, "bayu", "restart the source")
+    assert rolled.phase == P.rolling_back
+    assert rolled.advisor_notes[0].data["hits"][0]["score"] is None
+
+
+async def test_a_plan_holding_a_migration_an_earlier_version_stored_with_a_nan_score_validates(
+    tmp_path, store
+):
+    """SDD §11 (review RV51-06): a validation writes its migrations in one transaction, so web-01's
+    rc.2 note refused web-02's validation too, and the migration could not be cancelled out of
+    the plan either."""
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    _write_as_rc2(store, m, [_RC2_NOTE])
+    report = await h.orch.validate_plan(plan.id, "alice")
+    assert {i.phase for i in report.migrations} == {P.ready}
+    cancelled = await h.orch.cancel(m.id, "alice", "remove it from the plan")
+    assert cancelled.phase == P.cancelled
+
+
+async def test_one_plans_error_never_stops_the_tick_of_the_others(tmp_path, store, monkeypatch):
+    """SDD §8 (review RV51-06): the tick ticked the running plans one after another, so one plan's
+    error - a write the store refused - failed it before every plan after, each tick, and the
+    health turned unhealthy after three (GET /ready 503). Each plan is ticked on its own: the
+    error is logged, plan B's VM is cut over, and the loop stays healthy."""
+    first, second = vm(1), vm(2)
+    h = build_harness(tmp_path, store, [first, second])
+    plan_a = plan_for([first], name="A", default_strategy=Strategy.cold)
+    plan_b = plan_for([second], name="B", default_strategy=Strategy.cold)
+    store.put("plan", plan_a)  # created first: ticked first
+    store.put("plan", plan_b)
+    for plan in (plan_a, plan_b):
+        await h.orch.validate_plan(plan.id, "alice")
+        await h.orch.start_plan(plan.id, "alice")
+    tick_plan = h.orch._tick_plan
+    failed: list[str] = []
+
+    async def failing(plan, *args):
+        if plan.id == plan_a.id:
+            failed.append(plan.id)
+            raise UnstorableValue("migration mig-x: advisor_notes.0.confidence: is NaN")
+        await tick_plan(plan, *args)
+
+    monkeypatch.setattr(h.orch, "_tick_plan", failing)
+    await h.orch.start()
+    try:
+        other = await h.by_vm(plan_b.id, "vm-2")
+        await h.wait_phase(other.id, P.completed)
+        for _ in range(5):  # ticks enough to count three errors
+            h.orch.wake()
+            await asyncio.sleep(0.02)
+        health = h.orch.health()
+    finally:
+        await h.orch.stop()
+    assert len(failed) >= 3 and health["healthy"], health
+
+
+@pytest.mark.parametrize("action", ["sync", "rollback", "cancel", "retry"])
+async def test_a_persons_action_and_its_record_are_one_write(tmp_path, store, refuse_write, action):
+    """SDD §5.4 (review RV51-12): a delta pass, a rollback, a cancel and a retry wrote the
+    migration, then its migration.action apart - a store error on the record left the action
+    standing without it: a cancel without its cleanup (until a restart) and its retry refused.
+    Both or neither: the migration is as it was, and the person's retry is taken."""
+    phase = {
+        "sync": P.awaiting_cutover,
+        "rollback": P.failed,
+        "cancel": P.precopy,
+        "retry": P.failed,
+    }[action]
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm})
+    m = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.warm, phase=phase)
+    store.put("migration", m)
+
+    def act():
+        return {
+            "sync": lambda: h.orch.request_sync(m.id, "rina"),
+            "rollback": lambda: h.orch.rollback(m.id, "rina", "restart the source"),
+            "cancel": lambda: h.orch.cancel(m.id, "rina", "window closed"),
+            "retry": lambda: h.orch.retry(m.id, "rina"),
+        }[action]()
+
+    refused = refuse_write(store, "INSERT INTO events", "migration.action")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await act()
+    assert refused, "the action's record was refused"
+    assert (await h.migration(m.id)).phase == phase  # nothing of the action stands
+    done = await act()  # the person's retry is taken
+    assert done.phase != phase
+    records = [
+        e.data["action"]
+        for e in store.events(since_seq=0, limit=1000)
+        if e.kind == "migration.action" and e.migration_id == m.id
+    ]
+    assert records == [action]
+    if action == "cancel":  # and its cleanup runs
+        for _ in range(200):
+            if (m.id, StepName.ROLLBACK) in h.executor.calls:
+                break
+            await asyncio.sleep(0.01)
+        assert (m.id, StepName.ROLLBACK) in h.executor.calls
+    await h.orch.stop()
+
+
+async def test_a_bulk_finalize_reports_a_vm_whose_record_was_refused_as_it_stands(
+    tmp_path, store, refuse_write
+):
+    """SDD §8.1 (review RV51-13): finalize wrote finalized, then its migration.action apart: a store
+    error on the record raised after the VM was finalized, and the bulk finalize reported it
+    skipped - "stays completed for a later finalize" - which no finalize could take. Both or
+    neither: it stays completed, as reported, and the next finalize takes it."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    refused = refuse_write(store, "INSERT INTO events", "migration.action")
+    out = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm=plan.name)
+    assert refused, "the finalize's record was refused"
+    assert out["finalized"] == [] and [s["migration_id"] for s in out["skipped"]] == [m.id]
+    assert (await h.migration(m.id)).phase == P.completed
+    again = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm=plan.name)
+    await h.orch.stop()
+    assert again["finalized"] == [m.id]
+
+
+async def test_a_retry_whose_plan_reopen_was_refused_is_reopened_by_the_tick(
+    tmp_path, store, refuse_write
+):
+    """SDD §5.1, §8 (review RV51-14): a retry wrote ready, then reopened the completed plan in a
+    second write; a store error there left the attempt waiting in ready in a plan the tick drives
+    no more, and the person's retry was refused (ready). The tick reopens a completed plan
+    holding a ready migration: the attempt runs."""
+    h, plan, tries = _first_cutover_fails(tmp_path, store)
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.rolled_back)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.orch.stop()  # no tick between the retry's two writes: the store refuses the retry's
+    refused = refuse_write(store, "UPDATE documents", "plan")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await h.orch.retry(mid, "alice")
+    assert refused, "the plan's reopen was refused"
+    stranded = ((await h.migration(mid)).phase, (await h.plan(plan.id)).status)
+    assert stranded == (P.ready, PlanStatus.completed)
+    await h.orch.start()  # the next tick reopens the plan
+    done = await h.wait_phase(mid, P.completed)
+    reopened = [e for e in store.events(since_seq=0, limit=1000) if e.kind == "plan.updated"]
+    await h.orch.stop()
+    assert (len(tries), done.attempts) == (2, 1)
+    assert any("reopened: a migration waits in ready" in e.message for e in reopened)
+
+
+async def test_a_driver_that_moved_on_starts_a_new_row_of_crashes(tmp_path, store):
+    """SDD §8 (review RV51-16): while a driver keeps crashing its relaunch backs off, 2^n x tick_s.
+    The count was cleared only when the driver found no handler, so four crashes of the cutover's
+    driver (a database blip), the cutover done, then one crash in verifying - the source still
+    stopped - was crash 5: its relaunch waited 32 s at the default tick_s, 300 s after eight. A
+    step that returned starts a new row."""
+    h = build_harness(tmp_path, store, [vm(1)])
+    plan = plan_for([vm(1)], default_strategy=Strategy.cold)
+    store.put("plan", plan)
+    real_cutover, real_verify = h.orch._do_cutover, h.orch._do_verify
+    left = {"cutover": 4, "verify": 1}
+
+    async def cutover(m):
+        if left["cutover"]:
+            left["cutover"] -= 1
+            raise RuntimeError("the store was briefly unavailable")  # outside the step
+        await real_cutover(m)
+
+    async def verify(m):
+        if left["verify"]:
+            left["verify"] -= 1
+            raise RuntimeError("the store was briefly unavailable")
+        await real_verify(m)
+
+    h.orch._do_cutover, h.orch._do_verify = cutover, verify
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    try:
+        done = await h.wait_phase(mid, P.completed, timeout=20)
+    finally:
+        await h.orch.stop()
+    assert [str(c.to_phase) for c in done.phase_history][-3:] == [
+        "cutover",
+        "verifying",
+        "completed",
+    ]
+    crashes = [
+        e.data["crashes"]
+        for e in store.events(since_seq=0)
+        if e.kind == "migration.error" and e.data.get("step") == "driver"
+    ]
+    # the cutover's row, then the verifying crash starts a new one
+    assert crashes == [1, 2, 3, 4, 1], crashes
+
+
+async def test_a_relaunch_failing_for_the_first_migration_still_relaunches_the_next(
+    tmp_path, store
+):
+    """SDD §8 (audit OC-01, review RV51-28): a relaunch that fails for one migration skips only it.
+    The tests saw only another plan go on - started by the tick's gate, not relaunched - so a try
+    around the whole relaunch loop, which skipped every migration after the first failing one,
+    passed them all."""
+    h = build_harness(tmp_path, store, [vm(1), vm(2)])
+    first = make_migration(vm=vm(1), phase=P.cutover)
+    second = make_migration(vm=vm(2), phase=P.cutover)
+    store.put("migration", first)
+    store.put("migration", second)
+    calls: list[str] = []
+
+    def launch(mid):
+        calls.append(mid)
+        if len(calls) == 1:
+            raise RuntimeError("the relaunch itself fails")
+
+    h.orch._launch = launch
+    await h.orch._resume_orphans()
+    assert sorted(calls) == sorted([first.id, second.id]), calls
+
+
+async def test_the_text_a_person_gives_with_an_action_is_kept_as_pythons_strip_leaves_it(
+    tmp_path, store
+):
+    """SDD §12 (review RV51-26): an approval's comment and a cutover request's, a rollback's and
+    a cancel's reason were stored as sent while the dashboard's mock stripped them, saying the
+    API did - a rollback reason of white space only reached the trail from any other client.
+    Each is kept as Python's strip leaves it: an empty comment or cancel reason is none, an empty
+    rollback reason a 422."""
+    vms = [vm(i) for i in range(1, 6)]
+    h, plan = await setup(tmp_path, store, vms, {"default_strategy": Strategy.warm})
+    phases = [P.awaiting_cutover, P.awaiting_cutover, P.failed, P.ready, P.ready]
+    ms = [
+        make_migration(plan_id=plan.id, vm=v, strategy=Strategy.warm, phase=phase)
+        for v, phase in zip(vms, phases, strict=True)
+    ]
+    for m in ms:
+        store.put("migration", m)
+    approved = await h.orch.approve(ms[0].id, "rina", "  looks good\u0085 ")
+    blank = await h.orch.approve(ms[1].id, "rina", " \u00a0\u0085 ")
+    assert [approved.approvals[-1].comment, blank.approvals[-1].comment] == ["looks good", None]
+    await h.orch.request_cutover(ms[1].id, "sari", comment="\tgo\u2003")
+    with pytest.raises(Unprocessable, match="reason is required"):
+        await h.orch.rollback(ms[2].id, "rina", " \u0085\u3000")
+    assert (await h.migration(ms[2].id)).phase == P.failed
+    rolled = await h.orch.rollback(ms[2].id, "rina", "  restart it\u0085")
+    assert rolled.phase_history[-1].reason == "rollback requested: restart it"
+    kept = await h.orch.cancel(ms[3].id, "rina", "  window closed ")
+    none = await h.orch.cancel(ms[4].id, "rina", " \u2028 ")
+    assert [kept.phase_history[-1].reason, none.phase_history[-1].reason] == [
+        "cancelled: window closed",
+        "cancelled: no reason given",
+    ]
+    actions = {
+        (e.migration_id, e.data["action"]): e.data
+        for e in store.events(since_seq=0, limit=1000)
+        if e.kind == "migration.action"
+    }
+    await h.orch.stop()
+    assert actions[(ms[1].id, "cutover")]["comment"] == "go"
+    assert actions[(ms[3].id, "cancel")]["reason"] == "window closed"
+    assert actions[(ms[4].id, "cancel")]["reason"] is None

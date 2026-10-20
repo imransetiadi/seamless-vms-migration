@@ -209,8 +209,34 @@ def test_memory_hits_are_redacted_where_they_enter():
         "-" * 32768,  # a CLI flag's name: a line of dashes, as logs print them
         "a" * 32768,  # a URL scheme
         "-----BEGIN A-----" * 4000,  # PEM blocks that never end
+        # quoted values that never close: each key's value runs only to its own quote (AD-08)
+        'password: \\"x ' * 2520,
+        "password: '" + "''" * 16384,
+        'password: "' + '\\"' * 16384,
+        # a run of backslashes: a key's quote may follow one, read once from its start (RV50-01)
+        "\\" * 32768,
+        "\\" * 32767 + '"',
+        # single-quoted values whose close is glued to text, or comes lines later, and strings
+        # inside JSON strings each one level deeper: every value is read once (RV50-10)
+        "password: 'a'x " * 2340,
+        "password: 'a\n" * 2730,
+        "".join("password: " + "\\" * depth + '"a ' for depth in range(1, 220)),
     ],
-    ids=["key prefix", "dotted words", "dash line", "scheme letters", "pem begins"],
+    ids=[
+        "key prefix",
+        "dotted words",
+        "dash line",
+        "scheme letters",
+        "pem begins",
+        "escaped quotes",
+        "doubled quotes",
+        "quotes escaped in a string",
+        "backslash run",
+        "backslash run then a quote",
+        "glued single-quoted closes",
+        "single-quoted values over lines",
+        "deeper and deeper escapes",
+    ],
 )
 def test_redact_costs_time_linear_in_the_text(text):
     """SDD §13.4 (review RV27-06): redact runs in the event loop - over agentmemory's hits and
@@ -235,6 +261,7 @@ def test_redact_costs_time_linear_in_the_text(text):
         "a.",
         "-",
         "ab.",
+        "\\",
     ],
     ids=[
         "jwt starts",
@@ -246,6 +273,7 @@ def test_redact_costs_time_linear_in_the_text(text):
         "key prefix",
         "dash line",
         "dotted words",
+        "backslashes",
     ],
 )
 def test_four_times_the_text_costs_redact_about_four_times_the_time(unit):
@@ -477,3 +505,38 @@ async def test_memory_health_and_from_settings():
         Settings(memory_url="http://localhost:3111", memory_project="x", memory_redact_names=True)
     )
     assert built.project == "x" and built.redact_names is True
+
+
+@pytest.mark.parametrize(
+    ("score", "kept"),
+    [
+        (float("nan"), None),
+        (float("inf"), None),
+        (float("-inf"), None),
+        ("nan", None),
+        ("-inf", None),
+        (True, None),
+        (10**400, None),
+        ("0.82", 0.82),
+        (0.5, 0.5),
+        (1, 1.0),
+    ],
+    ids=[
+        "nan",
+        "inf",
+        "-inf",
+        "nan-text",
+        "-inf-text",
+        "true",
+        "400-digits",
+        "text",
+        "float",
+        "int",
+    ],
+)
+def test_a_hit_score_is_a_finite_number_or_none(score, kept):
+    """SDD §11, §14.3 (review RV50-04): a hit's score is a finite number or a number's text;
+    NaN, an infinity - as the answer's token, a number past a float's range or text -, a JSON
+    true and an integer no float holds are no score: the store keeps no such number."""
+    [hit] = parse_hits({"results": [{"title": "t", "content": "c", "score": score}]}, 5)
+    assert hit.score == kept

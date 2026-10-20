@@ -28,7 +28,7 @@ from ..security.auth import (
     hash_token,
     is_loopback,
 )
-from ..store import AsyncStore, Store, VersionedDocuments
+from ..store import AsyncStore, Store, VersionedDocuments, unstorable
 
 log = logging.getLogger(__name__)
 
@@ -187,14 +187,18 @@ async def _audit_denied(
     if not svc.allow_audit(client):
         log.warning("auth.denied events throttled for %s", client)
         return
+    # the path as the client sent it, percent-encoded: a NUL reads %00, never one the store must
+    # strip - the record shows what was asked (SDD §13.1, review ST-03)
+    raw = request.scope.get("raw_path")
+    path = raw.decode("latin-1") if isinstance(raw, bytes) and raw else request.url.path
     await emit(
         svc.store,
         svc.bus,
         "auth.denied",
-        f"{request.method} {request.url.path}: {reason}",
+        f"{request.method} {path}: {reason}",
         actor=principal.name if principal else "unauthenticated",
         data={
-            "path": request.url.path,
+            "path": path,
             "method": request.method,
             "reason": reason,
             "required_role": str(required),
@@ -294,10 +298,30 @@ def require_role(role: Role) -> Callable[[Request], Awaitable[Principal]]:
         if not principal.role.at_least(role):
             await _audit_denied(request, f"role {principal.role} is below {role}", role, principal)
             raise ApiError(403, "forbidden", f"this action requires the {role} role")
+        await _refuse_unstorable_body(request)
         return principal
 
     dependency.__name__ = f"require_{role}"
     return dependency
+
+
+async def _refuse_unstorable_body(request: Request) -> None:
+    """A JSON body holding a NUL or a lone surrogate in a string - a key or a value, at any
+    depth - is a 422 naming where, once the token and the role are checked and before the route
+    runs: the store keeps neither, and a route that writes twice would keep part of it (SDD §11,
+    §12, reviews RV48-07, RV48-08)."""
+    if request.method in SAFE_METHODS:
+        return
+    try:
+        body = await request.json()
+    except (ValueError, RecursionError):  # no body, none in JSON or past the parser: the route's
+        return
+    # a number is its route's to check - an estimator override's NaN is a 400 (§9.1) -, and the
+    # store refuses one no route checks (§11, review RV50-04)
+    found = unstorable(body, numbers=False)
+    if found is not None:
+        where, what = found
+        raise ApiError(422, "validation_error", f"{where}: {what}" if where else what)
 
 
 async def metrics_access(request: Request) -> Principal | None:

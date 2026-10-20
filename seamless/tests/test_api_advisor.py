@@ -108,6 +108,7 @@ def test_lists_stored_and_legacy_recommendations_newest_first(api):
         "option": "warm",
         "confidence": 0.57,
         "distribution": {"warm": 0.75, "cold": 0.2, "none": 0.05},
+        "unusable": None,  # a legacy entry is history: no decision takes it (SDD §4.2, §14.6)
     }
     assert (legacy["decision"]["status"], legacy["decision"]["final_option"]) == (
         "below_threshold",
@@ -301,3 +302,51 @@ def test_an_override_body_is_judged_by_its_model_before_the_recommendation_is_lo
     assert answer.status_code == case["status"], answer.text
     if case["message"] is not None:
         assert answer.json()["error"]["message"] == case["message"]
+
+
+@pytest.mark.parametrize(
+    "index",
+    ["\u00b2", "\u0663", "00", "+0", " 0", "1" * 4301],
+    ids=["superscript-two", "arabic-indic-three", "leading-zero", "plus", "space", "4301-digits"],
+)
+def test_a_legacy_id_whose_index_is_no_plain_number_is_unknown(api, index):
+    """SDD §12 (audit AD-07, review RV50-02): a legacy entry's id ends in its index, a plain
+    decimal number; the index was read with str.isdigit, True for a superscript two that int()
+    then refused - an unhandled 500 - and an Arabic-Indic three or a leading zero named an entry
+    under a second id; int() refuses more than 4300 digits too. Any other index is an unknown
+    id: 404."""
+    from seamless_migrate.domain.models import AdvisorNote
+
+    api.store.put(
+        "migration",
+        make_migration(
+            id="mig-0000000001",
+            plan_id="plan-1",
+            vm=make_vm(name="web-01", source_id="src-1"),
+            advisor_notes=[
+                AdvisorNote(
+                    kind="strategy",
+                    source="jev",
+                    summary="Jev suggested warm",
+                    data={"selected": "warm", "deterministic": "cold"},
+                )
+            ],
+        ),
+    )
+    url = "/api/v1/advisor/recommendations/rec-legacy-mig-0000000001-"
+    assert api.get(url + "0").json()["legacy"] is True
+    assert api.get(url + index).status_code == 404
+
+
+def test_a_legacy_notes_probability_past_a_floats_range_never_fails_the_listing(api):
+    """SDD §12, §14.4 (review RV51-23): a strategy note of a build before rc.1 kept Jev's
+    probabilities as Jev gave them, an integer of 400 digits too; the legacy reading converted it
+    with float() - OverflowError, and the whole listing answered 500 for every viewer. Each value
+    is read as the advisor reads a probability: one that is none is left out."""
+    m = legacy_migration("mig-d", "plan-4", "app-04")
+    m.advisor_notes[0].data["probabilities"] = {"warm": 10**400, "cold": 0.4, "none": True}
+    api.store.put("migration", m)
+    listing = api.get("/api/v1/advisor/recommendations")
+    entry = api.get("/api/v1/advisor/recommendations/rec-legacy-mig-d-0")
+    assert (listing.status_code, entry.status_code) == (200, 200), (listing.text, entry.text)
+    assert entry.json()["recommendation"]["distribution"] == {"cold": 0.4}

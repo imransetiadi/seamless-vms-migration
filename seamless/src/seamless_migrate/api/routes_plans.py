@@ -34,6 +34,7 @@ from .deps import (
 )
 from .schemas import (
     CancelRequest,
+    EmptyRequest,
     PlanFinalizeRequest,
     PlanFinalizeResult,
     PlanOut,
@@ -255,14 +256,20 @@ async def auto_waves(
 
 @router.post("/plans/{plan_id}/validate", response_model=ValidationReport)
 async def validate_plan(
-    plan_id: str, request: Request, principal: Principal = Depends(require_role(Role.operator))
+    plan_id: str,
+    request: Request,
+    body: EmptyRequest | None = None,
+    principal: Principal = Depends(require_role(Role.operator)),
 ) -> ValidationReport:
     return await services(request).orchestrator.validate_plan(plan_id, principal.name)
 
 
 @router.post("/plans/{plan_id}/start", response_model=PlanOut)
 async def start_plan(
-    plan_id: str, request: Request, principal: Principal = Depends(require_role(Role.operator))
+    plan_id: str,
+    request: Request,
+    body: EmptyRequest | None = None,
+    principal: Principal = Depends(require_role(Role.operator)),
 ) -> PlanOut:
     return await _one(
         request, await services(request).orchestrator.start_plan(plan_id, principal.name)
@@ -271,7 +278,10 @@ async def start_plan(
 
 @router.post("/plans/{plan_id}/pause", response_model=PlanOut)
 async def pause_plan(
-    plan_id: str, request: Request, principal: Principal = Depends(require_role(Role.operator))
+    plan_id: str,
+    request: Request,
+    body: EmptyRequest | None = None,
+    principal: Principal = Depends(require_role(Role.operator)),
 ) -> PlanOut:
     return await _one(
         request, await services(request).orchestrator.pause_plan(plan_id, principal.name)

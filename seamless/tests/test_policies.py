@@ -17,6 +17,8 @@ from seamless_migrate.domain.models import (
     AdvisorSubject,
     Decision,
     Estimate,
+    Migration,
+    Plan,
     PolicyScope,
     RecommendedOption,
 )
@@ -280,6 +282,248 @@ def test_an_override_without_its_required_reason_is_refused_by_the_api(api):
     )
 
 
+def _held_for_a_decision(api):
+    api.store.put("plan", make_plan(id="plan-1", source_provider_id="src-osp"))
+    api.store.put(
+        "advisor_policy", pol("pol-finance", "always_require_approval", providers=["src-osp"])
+    )
+    api.store.put("migration", held_migration("mig-0000000001"))
+    api.store.put("recommendation", rec_for("mig-0000000001"))
+    return "mig-0000000001", "rec-000001aa0001"
+
+
+def _decision_events(api):
+    return [e.kind for e in api.store.events() if e.kind.startswith("decision.")]
+
+
+#: what a decision writes besides its documents (SDD §14.5, §14.6)
+DECISION_EVENTS = ("plan.updated", "decision.approved", "decision.overridden", "migration.action")
+
+
+def _events_of(api, *kinds):
+    return [e.kind for e in api.store.events() if e.kind in kinds]
+
+
+@pytest.mark.parametrize(
+    ("write", "row"),
+    [
+        ("UPDATE documents", "migration"),
+        ("UPDATE documents", "recommendation"),
+        ("INSERT INTO events", "decision.approved"),
+        ("INSERT INTO events", "migration.action"),
+    ],
+)
+def test_an_approval_a_failed_write_cuts_short_leaves_nothing_and_the_retry_makes_it(
+    api, refuse_write, write, row
+):
+    """SDD §14.6 (reviews ST-07, RV48-01, RV48-02, RV48-13): an approval's writes came one after
+    another - a failure after the migration's left it released, which a running plan's tick
+    starts on a strategy no decision recorded, and one after the decision's left the approval
+    unaudited for good, every retry refused as "already approved". They are one transaction: a
+    write refused leaves none of them, and the approver's retry makes the whole approval, with
+    one event of each kind."""
+    mid, rid = _held_for_a_decision(api)
+    url = f"/api/v1/advisor/recommendations/{rid}/approve"
+    refused = refuse_write(api.store, write, row)
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        api.post(url, json={})
+    assert refused == [f"{write} {row}"]
+    rec = api.store.get("recommendation", rid, AdvisorRecommendation)
+    m = api.store.get("migration", mid, Migration)
+    assert (rec.decision.status, m.strategy, m.advisor_hold, _events_of(api, *DECISION_EVENTS)) == (
+        DecisionStatus.pending_approval,
+        "cold",
+        rid,
+        [],
+    )
+    again = api.post(url, json={})
+    assert again.status_code == 200, again.text
+    m = api.store.get("migration", mid, Migration)
+    assert (m.strategy, m.advisor_hold, _events_of(api, *DECISION_EVENTS)) == (
+        "warm",
+        None,
+        ["decision.approved", "migration.action"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("write", "row"),
+    [
+        ("UPDATE documents", "plan"),
+        ("UPDATE documents", "migration"),
+        ("UPDATE documents", "recommendation"),
+        ("INSERT INTO events", "plan.updated"),
+        ("INSERT INTO events", "decision.overridden"),
+    ],
+)
+def test_an_override_a_failed_write_cuts_short_leaves_nothing_and_the_retry_makes_it(
+    api, refuse_write, write, row
+):
+    """SDD §14.6 (reviews ST-07, RV48-03): an override's plan entry, its migration, its decision
+    and their events are one transaction - a write refused leaves none of them, so no plan pins
+    an option no decision records -, and the person's retry makes the whole override, with one
+    event of each kind."""
+    mid, rid = _held_for_a_decision(api)
+    url = f"/api/v1/advisor/recommendations/{rid}/override"
+    body = {"option": "cold", "reason": "Rehearsed the cold path twice"}
+    refused = refuse_write(api.store, write, row)
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        api.post(url, json=body)
+    assert refused == [f"{write} {row}"]
+    pinned = api.store.get("plan", "plan-1", Plan).strategy_overrides
+    rec = api.store.get("recommendation", rid, AdvisorRecommendation)
+    m = api.store.get("migration", mid, Migration)
+    assert (pinned, rec.decision.status, m.advisor_hold, _events_of(api, *DECISION_EVENTS)) == (
+        {},
+        DecisionStatus.pending_approval,
+        rid,
+        [],
+    )
+    again = api.post(url, json=body)
+    assert again.status_code == 200, again.text
+    pinned = api.store.get("plan", "plan-1", Plan).strategy_overrides
+    m = api.store.get("migration", mid, Migration)
+    assert (pinned, m.strategy, m.advisor_hold, _events_of(api, *DECISION_EVENTS)) == (
+        {f"src-{mid}": "cold"},
+        "cold",
+        None,
+        ["plan.updated", "decision.overridden"],
+    )
+
+
+def test_an_override_already_made_is_not_made_again(api):
+    """SDD §14.6 (review RV48-03): an override choosing the option the plan sets was let through as
+    the retry of one cut off after its plan entry - and so an override already made was made
+    again, a second decision.overridden rewriting who decided. No failure leaves a plan entry
+    without its decision now: a second override is refused as every decision is while the plan
+    sets the VM's strategy."""
+    mid, rid = _held_for_a_decision(api)
+    url = f"/api/v1/advisor/recommendations/{rid}/override"
+    body = {"option": "cold", "reason": "Rehearsed the cold path twice"}
+    assert api.post(url, json=body).status_code == 200
+    again = api.post(url, json=body)
+    assert (again.status_code, again.json()["error"]["message"]) == (
+        409,
+        "The plan sets the strategy of web-01 (cold): change it in the plan.",
+    )
+    rec = api.store.get("recommendation", rid, AdvisorRecommendation)
+    assert (rec.decision.actor.id, _events_of(api, "decision.overridden")) == (
+        "admin-user",
+        ["decision.overridden"],
+    )
+
+
+@pytest.mark.parametrize("action", ["approve", "override"])
+def test_no_decision_while_the_plan_sets_the_option_the_advisor_recommends(api, action):
+    """SDD §14.6 (reviews A4, RV48-11): a person set the strategy in the plan, which a validation
+    honours without a recommendation - the newest one no longer stands, whichever option the plan
+    sets: an approve of the option it pins is refused, as an override to it."""
+    mid, rid = _held_for_a_decision(api)
+    plan = api.store.get("plan", "plan-1", Plan)
+    plan.strategy_overrides[f"src-{mid}"] = "warm"  # what the advisor recommends
+    api.store.put("plan", plan)
+    body = {} if action == "approve" else {"option": "warm", "reason": "Rehearsed the warm path"}
+    res = api.post(f"/api/v1/advisor/recommendations/{rid}/{action}", json=body)
+    assert (res.status_code, res.json()["error"]["message"]) == (
+        409,
+        "The plan sets the strategy of web-01 (warm): change it in the plan.",
+    )
+    assert _events_of(api, *DECISION_EVENTS) == []
+
+
+def test_a_decision_another_writer_moved_the_plan_under_is_made_again_keeping_both(api, land_first):
+    """SDD §8, §14.6: plans are written by several drivers and the CLI. A plan moved between a
+    decision's read and its transaction fails the versioned write, which leaves nothing; the
+    decision is read again and made again - the other writer's change kept, one event of each
+    kind."""
+    mid, rid = _held_for_a_decision(api)
+
+    def rename():
+        plan, version = api.store.get_versioned("plan", "plan-1", Plan)
+        renamed = plan.model_copy(update={"name": "renamed meanwhile"})
+        return api.store.put("plan", renamed, expected_version=version)
+
+    landed = land_first(api.store, "UPDATE documents", "plan", rename)
+    body = {"option": "cold", "reason": "Rehearsed the cold path twice"}
+    res = api.post(f"/api/v1/advisor/recommendations/{rid}/override", json=body)
+    assert res.status_code == 200, res.text
+    plan = api.store.get("plan", "plan-1", Plan)
+    assert (landed, plan.name, plan.strategy_overrides) == (
+        [2],
+        "renamed meanwhile",
+        {f"src-{mid}": "cold"},
+    )
+    assert _events_of(api, *DECISION_EVENTS) == ["plan.updated", "decision.overridden"]
+
+
+def test_a_decision_never_releases_a_migration_another_recommendation_holds(api):
+    """SDD §14.6 (review RV49-04): a decision read the recommendations before the migration and
+    cleared whatever hold it found. `seamless plan validate` in another process writing the
+    migration (held for its new recommendation) and that recommendation between those reads was
+    seen by half: the approve released the migration while the newer recommendation still
+    waited. A hold naming another recommendation refuses the decision as a newer one's."""
+    import sqlalchemy as sa
+
+    mid, rid = _held_for_a_decision(api)
+    other = Store(api.store.url)  # the CLI's own engine on the same database
+    newer = "rec-000001bb0002"
+    fired: list[str] = []
+
+    def cli_validates(conn, cursor, statement, parameters, context, executemany):
+        params = context.compiled_parameters[0].values() if context.compiled_parameters else ()
+        if fired or not statement.lstrip().upper().startswith("SELECT"):
+            return
+        if "advisor_policy" not in params:
+            return
+        fired.append("validated")
+        m, version = other.get_versioned("migration", mid, Migration)
+        other.put("migration", m.model_copy(update={"advisor_hold": newer}), version)
+        rec = other.get("recommendation", rid, AdvisorRecommendation)
+        later = rec.created_at.replace(minute=rec.created_at.minute + 1)
+        other.put("recommendation", rec.model_copy(update={"id": newer, "created_at": later}), 0)
+
+    sa.event.listen(api.store.engine, "before_cursor_execute", cli_validates)
+    try:
+        answer = api.post(f"/api/v1/advisor/recommendations/{rid}/approve", json={})
+    finally:
+        sa.event.remove(api.store.engine, "before_cursor_execute", cli_validates)
+        other.dispose()
+    m = api.store.get("migration", mid, Migration)
+    assert fired == ["validated"]
+    assert (answer.status_code, answer.json()["error"]["message"], m.advisor_hold) == (
+        409,
+        f"a newer recommendation ({newer}) replaced {rid}",
+        newer,
+    )
+
+
+def test_a_policy_replaced_during_its_delete_is_not_deleted_unseen(api, land_first):
+    """SDD §12, §14.5 (review ST-05): DELETE /advisor/policies/{id} deletes the version it read: a
+    replace landing between its read and its delete answers 409 and the replaced policy stays.
+    Deleted by key, it was removed unseen and policy.deleted named the older version as before."""
+    created = api.post("/api/v1/advisor/policies", json=SPEC)
+    assert created.status_code == 201, created.text
+    pid = created.json()["id"]
+    stored, version = api.store.get_versioned("advisor_policy", pid, AdvisorPolicy)
+    replaced = stored.model_copy(update={"threshold": 0.95})
+    land_first(
+        api.store,
+        "DELETE FROM documents",
+        "advisor_policy",
+        lambda: api.store.put("advisor_policy", replaced, expected_version=version),
+    )
+    url = f"/api/v1/advisor/policies/{pid}"
+    res = api.client.delete(url, headers=api.h(Role.admin))
+    assert res.status_code == 409, res.text
+    assert res.json()["error"]["message"] == f"policy {pid} changed meanwhile; try again"
+    assert api.store.get("advisor_policy", pid, AdvisorPolicy).threshold == 0.95
+    assert api.store.events(kinds=["policy.deleted"]) == []
+    # the admin deletes what is there now, and the audit event names it
+    assert api.client.delete(url, headers=api.h(Role.admin)).status_code == 204
+    [deleted] = api.store.events(kinds=["policy.deleted"])
+    assert deleted.data["before"]["threshold"] == 0.95
+
+
 def test_a_legacy_entry_cannot_be_approved(api):
     response = api.post(
         "/api/v1/advisor/recommendations/rec-legacy-mig-0000000001-0/approve", json={}
@@ -305,3 +549,47 @@ def test_the_requester_of_a_decision_is_refused_by_the_api(api):
         assert refused.json()["error"]["message"] == (
             "You requested this decision. Another approver must decide it."
         )
+
+
+@pytest.mark.parametrize("change", ["create", "replace", "delete"])
+def test_a_policy_change_and_its_audit_event_are_one_write(tmp_path, refuse_write, change):
+    """SDD §14.5 (review RV51-11): a policy's change and its audit event were written apart - a
+    store error on the event left the change standing with no record: the delete's retry a 404,
+    so policy.deleted was never written; the replace's retry recorded before = after; the
+    create's retry made a second policy. Both or neither."""
+    settings, tokens = api_settings(tmp_path)
+    store = Store(f"sqlite:///{tmp_path / 'tx.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store), raise_server_exceptions=False) as client:
+        api = Api(client, store, settings, tokens)
+        url = "/api/v1/advisor/policies"
+        if change != "create":
+            created = api.post(url, json=SPEC)
+            assert created.status_code == 201, created.text
+            url = f"{url}/{created.json()['id']}"
+        kind = {
+            "create": "policy.created",
+            "replace": "policy.updated",
+            "delete": "policy.deleted",
+        }[change]
+
+        def act():
+            if change == "create":
+                return api.post(url, json=SPEC)
+            if change == "replace":
+                return client.put(url, headers=api.h(Role.admin), json={**SPEC, "threshold": 0.75})
+            return client.delete(url, headers=api.h(Role.admin))
+
+        refused = refuse_write(store, "INSERT INTO events", kind)
+        first = act()
+        assert refused and first.status_code == 500
+        stored = store.list("advisor_policy", AdvisorPolicy)
+        assert [p.threshold for p in stored] == ([] if change == "create" else [0.6])
+        retry = act()  # the admin's retry, as a person makes it
+        assert retry.status_code in (200, 201, 204), retry.text
+        audit = [e for e in store.events(since_seq=0, limit=1000) if e.kind == kind]
+        assert len(audit) == 1
+        if change != "create":
+            assert audit[0].data["before"]["threshold"] == 0.6
+        assert len(store.list("advisor_policy", AdvisorPolicy)) == (0 if change == "delete" else 1)
+    store.dispose()

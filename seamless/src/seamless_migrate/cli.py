@@ -33,6 +33,7 @@ from .domain.models import (
 from .planning.estimator import EstimatorParams, estimate, invalid_estimator_overrides
 from .security.auth import (
     MAX_TOKEN_NAME,
+    NOT_PRINTABLE,
     RESERVED_TOKEN_NAMES,
     TokenStore,
     auth_disabled_allowed,
@@ -240,6 +241,8 @@ def cmd_token_create(args: argparse.Namespace, settings: Settings) -> int:
     # SDD §13.1: never an entry the tokens file refuses, nor a token acting as the control plane
     if not args.name or len(args.name) > MAX_TOKEN_NAME:
         raise CliError(f"a token name has 1 to {MAX_TOKEN_NAME} characters")
+    if not args.name.isprintable():
+        raise CliError(f"{args.name!r} {NOT_PRINTABLE}; pick another")
     if args.name.strip().casefold() in RESERVED_TOKEN_NAMES:
         raise CliError(f"{args.name!r} is an actor the control plane records itself; pick another")
     if ":" in args.name:
@@ -594,8 +597,6 @@ def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
     import math
     from datetime import UTC, datetime, timedelta
 
-    from .events import EventBus, emit
-
     now = utcnow()
     if args.before:
         try:
@@ -631,18 +632,9 @@ def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
         )
         return 2
     store = _store(settings)
-    deleted = store.delete_events_before(before)
-    # written after the delete, so the trail keeps who cut it and where (SDD §15)
-    asyncio.run(
-        emit(
-            store,
-            EventBus(store),
-            "events.pruned",
-            f"{deleted} event(s) before {before.isoformat()} deleted from the CLI",
-            actor="cli",
-            data={"before": before.isoformat(), "deleted": deleted},
-        )
-    )
+    # the deletion and events.pruned in one transaction: the trail keeps who cut it and where,
+    # or nothing was cut (SDD §15, review RV51-15)
+    deleted, _ = store.prune_events(before, actor="cli")
     print(f"deleted {deleted} event(s) before {before.isoformat()}")
     return 0
 
@@ -736,7 +728,7 @@ def main(argv: list[str] | None = None) -> int:
         from .ai.redaction import redact_cut
         from .orchestrator import OrchestratorError
         from .providers.base import ProviderError
-        from .store import ConflictError, NotFound
+        from .store import ConflictError, NotFound, UnstorableValue
 
         # SDD §15: one line, as the API answers each of these with a status (§12)
         if isinstance(exc, ProviderError):
@@ -747,7 +739,7 @@ def main(argv: list[str] | None = None) -> int:
             again = "a running server changed it, run the command again"
             print(f"error: {exc}; {again}", file=sys.stderr)
             return 1
-        if isinstance(exc, OrchestratorError | NotFound | ValueError):
+        if isinstance(exc, OrchestratorError | NotFound | ValueError | UnstorableValue):
             print(f"error: {exc}", file=sys.stderr)
             return 1
         raise

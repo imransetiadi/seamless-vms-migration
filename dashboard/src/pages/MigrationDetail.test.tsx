@@ -1031,6 +1031,20 @@ describe('MigrationDetail', () => {
     expect(edit).toHaveAccessibleDescription('Requires the operator role.');
   });
 
+  it('tells a person to finalize again, never to roll back, a migration whose finalize began deleting its source, which runs again (SDD §8.1, review RV51-10)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'web-cache-01')!;
+    // a finalize that deletes the source failed, and the source watch then saw the source running
+    Object.assign(m, { checkpoint: 'finalizing', source_running_at: '2026-10-08T11:00:00Z' });
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'approver', server });
+    const alert = await screen.findByRole('alert', { name: 'Source VM running' });
+    await waitFor(() =>
+      expect(alert).toHaveTextContent('its data diverges from RHOSO 18.0 — Production: its finalize began deleting it - finalize it again, deleting the source (approver).'),
+    );
+    // the API refuses the rollback (409 "the finalize began deleting the source VM: finalize it again")
+    expect(within(alert).queryByText(/roll back/i)).toBeNull();
+  });
+
   it('alerts while the source VM of a completed migration runs again (SDD §8.1, §16, ADV-19)', async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.vm.name === 'web-cache-01')!;

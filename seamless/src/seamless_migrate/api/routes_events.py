@@ -20,10 +20,11 @@ from ..domain.enums import Role
 from ..domain.models import Event
 from ..events import AUDIT_KINDS, Subscription
 from ..security.auth import Principal
+from ..store import MAX_SEQ
 from .deps import authenticate, require_role, services
 
-#: Largest sequence/offset the database integer columns hold (a bigger value is a 422, not a 500).
-MAX_SEQ = 2**63 - 1
+# MAX_SEQ: the largest sequence events.seq holds - PostgreSQL's ``integer`` - so a bigger
+# ``since`` or ``before`` is a 422, never the 500 of the database's cast (SDD §12, review ST-01)
 
 router = APIRouter(tags=["events"])
 HEARTBEAT = ": heartbeat\n\n"

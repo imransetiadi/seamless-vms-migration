@@ -141,7 +141,8 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
     model: option === null && confidence === null && input.fallback
       ? { name: 'rules', version: 'rules', deployment: 'unknown', endpoint_host: null }
       : { name: 'jev', version: JEV_MODEL, deployment: 'remote', endpoint_host: null },
-    recommendation: { option, confidence, distribution },
+    // why the answer could not be applied - a fallback's reason -, as the API records it (SDD §4.2, audit AD-03)
+    recommendation: { option, confidence, distribution, unusable: status === 'fallback_rules' ? (input.fallback ?? null) : null },
     input_snapshot_sha256: input.snapshotSha256,
     requested_by: input.requestedBy ?? null,
     decision: {
@@ -1803,6 +1804,7 @@ export function buildFixtures(now: number): Fixtures {
         force_window: false,
         advisor_notes: (m.notes ?? []).map(({ ago, ...note }) => ({ ...note, created_at: iso(now - ago * 1000) })),
         advisor_hold: null,
+        last_recommendation: null,
         converged_by: fixtureConvergedBy(m.strategy, m.phase, syncPasses, chosen, plan),
         force_cutover: null,
         data_issues: [],
@@ -1884,6 +1886,7 @@ export function buildFixtures(now: number): Fixtures {
         }
         recommendations.push(decided);
         if (decided.decision.status === 'pending_approval') migration.advisor_hold = decided.id;
+        migration.last_recommendation = decided.id;
       }
       for (const note of migration.advisor_notes) {
         const kind = note.kind === 'screen' ? 'advisor.verification' : `advisor.${note.kind}`;

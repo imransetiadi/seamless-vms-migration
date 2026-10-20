@@ -454,6 +454,8 @@ export interface RecommendedOption {
   confidence: number | null;
   /** Raw probabilities per option, shown only in Details. */
   distribution: Record<string, number>;
+  /** Why the answer could not be applied when it was recorded, else null: no approve takes it (SDD §4.2, §14.6). */
+  unusable: string | null;
 }
 
 export interface Decision {
@@ -657,6 +659,11 @@ export interface Migration {
   advisor_notes: AdvisorNote[];
   /** The recommendation whose decision waits for approval: the migration does not start meanwhile (SDD §5.4, §14.6). */
   advisor_hold: string | null;
+  /**
+   * The recommendation its last validation stored: what a decision acts on while no hold names one, whatever its time
+   * (SDD §14.6, review RV51-08); null when none was stored since the field.
+   */
+  last_recommendation: string | null;
   /** The rule that ended the passes (SDD §5.3); null before convergence and in data written before ADV-16. */
   converged_by: ConvergedBy | null;
   force_cutover: ForceCutover | null;
@@ -970,6 +977,9 @@ export interface MigrationListQuery {
 export const SYNC_PASSES_LATEST = 20;
 /** Longest `comment`, `reason` or `confirm` a migration action accepts (SDD §12). */
 export const ACTION_TEXT_MAX = 2000;
+/** Its field's maxLength in the UTF-16 units the browser counts: room for ACTION_TEXT_MAX characters of any kind, an
+ * emoji two units; the dialog refuses more than ACTION_TEXT_MAX as the API counts them (review RV50-06). */
+export const ACTION_TEXT_UNITS = 2 * ACTION_TEXT_MAX;
 /** Longest plan name and description POST/PATCH /plans accept (SDD §12). */
 export const PLAN_NAME_MAX = 200;
 export const PLAN_DESCRIPTION_MAX = 2000;

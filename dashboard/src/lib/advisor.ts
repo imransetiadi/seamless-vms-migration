@@ -176,7 +176,19 @@ export function waitingDecision(m: Pick<Migration, 'advisor_hold' | 'phase'>): s
   return m.advisor_hold && CHANGEABLE.has(m.phase) ? m.advisor_hold : null;
 }
 
-/** Whether a person may decide on `rec` now: the newest recommendation of a migration that has not started (SDD §14.6). */
+/**
+ * Whether a person may decide on `rec` now, for a migration that has not started (SDD §14.6): the recommendation its hold
+ * names while it holds one - written with it, whatever its time after the clock stepped back (review RV50-09) -, else
+ * its newest.
+ */
 export function decidable(rec: AdvisorRecommendation, migration: Migration | undefined, newestId: string | undefined): migration is Migration {
-  return !rec.legacy && rec.decision_type === 'migration_strategy' && migration !== undefined && CHANGEABLE.has(migration.phase) && newestId === rec.id;
+  return (
+    !rec.legacy &&
+    rec.decision_type === 'migration_strategy' &&
+    migration !== undefined &&
+    CHANGEABLE.has(migration.phase) &&
+    // the hold names the one to decide; without it, the one the last validation stored - both written with it, whatever
+    // their time (reviews RV50-09, RV51-08) -, else the newest
+    (migration.advisor_hold || migration.last_recommendation || newestId) === rec.id
+  );
 }

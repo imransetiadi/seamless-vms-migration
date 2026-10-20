@@ -129,7 +129,9 @@ Strategy enum (wire format, lower-case): `cold | warm | storage_handover | vmwar
 ## 4. Domain model (control plane)
 
 All models are Pydantic v2 (`seamless_migrate.domain.models`). JSON field names are exactly the
-Python attribute names. Timestamps are ISO-8601 UTC strings ending in `Z`. Sizes are integer bytes
+Python attribute names. Timestamps are ISO-8601 UTC strings ending in `Z`; one read with another offset is the same
+instant in UTC, and one whose instant falls outside 0001-01-01 to 9999-12-31 UTC (`0001-01-01T00:00:00+14:00`) is
+refused with 422 naming the field, never a 500 (audit AA-01). Sizes are integer bytes
 unless the name ends in `_gb`. Durations are float seconds (`_s`).
 
 ### 4.1 Enums (`seamless_migrate.domain.enums`, all `StrEnum`)
@@ -218,6 +220,9 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
    derived (properties, also serialized): disk_bytes: int, used_bytes: int, guest_os: GuestOS
    (used_bytes = Σ used_gb·2^30 when every disk has used_gb, else ⌊disk_bytes·0.6⌋;
     guest_os = identify(os_type), §9.5)
+   free text: a NUL or a lone surrogate in tags and flavor_extra_specs (keys and values), os_type or host
+   is written U+FFFD as the model is built - no export filter or mapping reads them -; name, project,
+   flavor, a NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02)
 
 GuestOS { family: "linux"|"windows"|"unknown", distro: str|null, version: str|null, label: str,
           lifecycle: "current"|"legacy"|"unknown",
@@ -308,7 +313,10 @@ AdvisorModelInfo { name: "jev"|"rules", version: str, deployment: "on_prem"|"rem
                    endpoint_host: str|null }   # Jev's answers: SEAMLESS_JEV_DEPLOYMENT / _ENDPOINT_HOST (§13.4)
 
 RecommendedOption { option: str|null, confidence: float|null,   # 0..1, the only number compared with a threshold
-                    distribution: dict[str, float] = {} }       # raw probabilities, shown only in Details
+                    distribution: dict[str, float] = {},        # raw probabilities, shown only in Details
+                    unusable: str|null = null }  # why the answer could not be applied when it was recorded (§14.4
+                                                 # rule 2), null when it could: no approve takes it (§14.6, AD-03);
+                                                 # one stored without it (v0.1.0-rc.2) reads its fallback's why
 
 Decision { final_option: str|null, status: DecisionStatus, reason_code: ReasonCode, reason_text: str|null,
            actor: AdvisorActor, policy_id: str|null, threshold_used: float|null, decided_at: datetime,
@@ -361,6 +369,7 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             cutover_requested_by: str|null, cutover_requested_at: datetime|null,  # who asked for the cutover first, and when (§5.4)
             advisor_notes: list[AdvisorNote] = [],
             advisor_hold: str|null,     # the recommendation whose decision waits for approval: no start meanwhile (§14.6)
+            last_recommendation: str|null,   # the recommendation its last validation stored: a decision acts on it when no hold names one (§14.6)
             converged_by: "threshold"|"slo"|"max_passes"|"force"|null,   # the rule that ended the passes (§5.3)
             force_cutover: ForceCutover|null, data_issues: list[str] = [],   # §5.4, §5.5 (ADV-16)
             cutover_refusals: list[str] = [],   # what the last warm pass met that the cutover refuses before the source stops (§7.2): each pass replaces it, a successful cutover empties it
@@ -388,6 +397,11 @@ MigrationSummary { id, plan_id, wave_id, vm: { source_id, name, project }, strat
 Event { seq: int, ts: datetime, kind: str, plan_id: str|null, migration_id: str|null,
         actor: str, message: str, data: dict = {} }
 ```
+
+An event's `ts` is the time it is written: the control plane takes it under the lock that writes and numbers its
+events, the events of one transaction sharing one, so their order in time is their `seq` order - the Events page
+lists them by time, then by `seq`. One built before its write waited for that lock (a transition's, joined to the
+migration's write) was listed out of `seq` order after a newer one (CI's live-stream journey, PR 56).
 
 `progress_pct` is the running step's percentage. `bytes_total` is the VM's used bytes — what one full
 copy moves; `bytes_transferred` counts every pass (`sync_bytes_dropped` plus the listed passes, §5.4)
@@ -444,7 +458,10 @@ migration's totals.
 | `finalized`, `cancelled` | — (terminal) |
 
 `fsm.transition(migration, to, reason, actor) -> Migration` raises `InvalidTransition` for anything
-else, appends a `PhaseChange`, and updates `updated_at`. `validating → cancelled` is taken only by a validation of the plan, for a
+else, appends a `PhaseChange`, and updates `updated_at`. The orchestrator writes a migration's transitions and the
+events that announce them - `migration.created` for a new one, one `migration.phase` per transition - in one
+transaction (`put_all_with_events`, §11): no store failure leaves a phase change without its event, in the audit
+trail or on the live stream (audit AD-05). `validating → cancelled` is taken only by a validation of the plan, for a
 migration an interrupted validation left in `validating` whose VM has left `vm_ids` (§5.4); the cancel action
 refuses a migration in `validating` — a validation may be moving it — and says to validate the plan again. `failed → cancelled` is only allowed when
 `downtime_started_at is None` (the source VM was never stopped), and no phase moves to `cancelled`
@@ -525,10 +542,10 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   timeout, a rollback request, a shutdown) that lands while the clock is being opened takes effect once the clock is
   saved and its event written, so an open clock is never left unannounced; the clock is saved first, so a store error
   on the event never leaves a source that may be stopped without its clock (review RV26-06). `downtime_ended_at` is
-  set when verification passes or, on
-  rollback, when the source VM is running again - marked by the step as soon as its power-on succeeded
-  (`StepContext.mark_downtime_end()`: the VMware rollback, and the storage-handover rollback once the source server
-  it started or recreated reads `ACTIVE`, §7.3), so an attempt that fails after it leaves the clock
+  set when verification passes - when its step returns, before the advisor reviews it (§14.2), whose wait is no
+  outage (audit OC-08) - or, on rollback, when the source VM is running again - marked by the step as soon as its
+  power-on succeeded (`StepContext.mark_downtime_end()`: the VMware rollback, and the storage-handover rollback once
+  the source server it started or recreated reads `ACTIVE`, §7.3), so an attempt that fails after it leaves the clock
   closed: the source runs, and the next cutover counts a new outage (reviews RV30-03, RV36B-03). Both rollbacks run
   the power-on and that close as one, which a cancel - the step timeout, a shutdown - waits out as it does the call
   alone: a power-on vCenter or Nova finishes never leaves the clock open while the source runs (reviews RV37A-01,
@@ -612,9 +629,18 @@ characters) is the only way to cut over before convergence. In `precopy` or `syn
 downtime if cut over after the running pass, `final_downtime_parts` (§5.3) after a pass as long as the last one that
 ended - its whole time, §9.1 `T_last` - or — in `precopy`, before any pass ended — as long as the first pass's expected duration (§9.1:
 `snapshot_s + max(used/L, scan)`, VMware `used/L`) — and a
-cutover request (its requester the forcer when none), and emits `migration.force_cutover` (audit). The running pass
-finishes, then the migration moves to `awaiting_cutover` with `converged_by: "force"`; the gate still applies — an
-approval by another approver (maker-checker), the window, the cutover slots. A request alone (`POST …/cutover`) never
+cutover request (its requester the forcer when none), and emits `migration.force_cutover` (audit) - the migration and
+its event in one transaction (§11), as an approval and a cutover request are written with their `migration.approved`
+and `migration.action`: a store error leaves neither, so no force and no approval that opens the gate lacks its record,
+and a retry is taken anew (audit OC-03). A person's cancel, rollback, delta pass (`POST …/sync`), retry and finalize
+are written with their `migration.action` the same way, so a store error leaves the migration as it was for the
+person's retry - never a cancel without its cleanup nor a finalized VM a bulk finalize reports skipped; a cancel's
+cleanup starts once that write is done (review RV51-12, RV51-13). A retry's reopen of the plan its migration's
+rollback completed follows under the plan's lock, as a completion is written; one a store error kept from it is made
+by the next tick, which reopens a completed plan holding a `ready` migration - never an attempt waiting in `ready`
+for good (review RV51-14). The running pass finishes, then the migration moves to `awaiting_cutover`
+with `converged_by: "force"`; the gate still applies — an approval by another approver (maker-checker), the window, the
+cutover slots. A request alone (`POST …/cutover`) never
 forces: it waits for convergence. A migration is forced once: while `force_cutover` is recorded, another Force
 cutover answers 409 ("Already forced by {user}: the cutover follows the running pass.") — a second forcer would
 take the first one's place, whose approval would then count again, and the migration would lose the first record;
@@ -623,9 +649,15 @@ Approvals, `cutover_requested` (with its requester) and a pending `force_window`
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
 `blocked` and `ready`, and one left in `validating`: a plan's validations run one at a time under
-its lock, so no other validation is still at work on it. It reads from the source only those VMs and the ones with
-no migration yet; a migration in any other phase counts as its recorded `vm` wherever the whole plan does (duplicate
-names, the addresses a NIC override must not take, the quota, §9.3), and the wave planner (§9.4) reads the plan's VMs
+its lock, so no other validation is still at work on it. One in `ready` whose source is stopped - its downtime clock
+open (§5.2), a migration retried after a failed cutover - it leaves as it is, like one in flight: a re-assessment could
+move it to `blocked`, where no action restarts its source, which its next cutover or a rollback does (audit OC-02). One
+already `blocked`, or left in `validating`, with its source stopped - as an earlier version's validation could leave
+it - it re-assesses: a cancel, a rollback and a retry are refused there, so a validation once its blocker is resolved
+is its one way back to `ready` (review RV51-01).
+It reads from the source only those VMs and the ones with no migration yet; a migration in any other phase counts as
+its recorded `vm` wherever the whole plan does (duplicate names, the addresses a NIC override must not take, the
+quota, §9.3), and the wave planner (§9.4) reads the plan's VMs
 the same way - so a VM that left the source, deleted by a storage handover (§7.3 step 4) or by a finalize with
 `delete_source` (§8.1), never fails its plan's validation or wave planning (review PL-09). A re-assessment of a migration whose history reached
 `cutover` keeps each volume of its validated `vm.disks` that the VM no longer lists - a cold export detaches the data
@@ -634,12 +666,21 @@ as the blocker `SRC_VM_VOLUME_DETACHED` (§9.3): neither a validation nor the ex
 VM had at a cutover attempt until it is attached again; a re-assessment that read the VM without it would
 otherwise let the next cutover complete one disk short (review RV7-01). A validation writes each migration once — a new one is
 created already assessed, its history running from `pending` through `validating` to `ready` or `blocked`, and an
-existing one takes both transitions in one write — and then emits the same events: `migration.created` for a new
-one and one `migration.phase` per transition. Only an earlier version wrote the two transitions apart, so that a
-database error or a restart between them could leave a migration in `validating`. A VM whose migration is `cancelled` (terminal) cannot be
+existing one takes both transitions in one write — in one transaction with the events that announce them:
+`migration.created` for a new one and one `migration.phase` per transition (§5.1). When the validation records a
+recommendation for it (§14.4), the recommendation, `recommendation.created` and its first `decision.<status>` join
+that transaction - the agentmemory search and the content-addressed input snapshot come before it -, so no store
+failure leaves the advisor's strategy, its hold or its decision without the record and the events that announce it,
+and a cancel that lands meanwhile finds the migration as it was and takes no decision (audit AD-05, AD-11; review
+RV49-06). Only an earlier version wrote the two transitions apart, so that a database error or a restart between
+them could leave a migration in `validating`. A VM whose migration is `cancelled` (terminal) cannot be
 re-validated inside the plan: `validate_plan` refuses with the VM names (remove them from `vm_ids` or
 plan them anew). It refuses a `vm_ids` list that repeats a VM (a plan written before the API check,
-or by `seamless plan apply`): two migrations of one VM would both cut it over. It cancels the
+or by `seamless plan apply`): two migrations of one VM would both cut it over - and so, with the VM named, a plan two of
+whose migrations name one VM, as a stop inside an earlier version's rollback that recreated the source could leave
+them, and a retry refuses a migration whose VM another migration of its plan names (audit OC-06); `start_plan` refuses
+such a plan with the same reason, and the tick starts no pre-copy or cutover of a VM two migrations of its running plan
+name, cancelled ones aside - a plan an earlier version left running so (review RV51-18). It cancels the
 migrations of VMs removed from `vm_ids` — `pending`, `blocked`, `ready`, and `failed` ones too, or a
 failed one would hold its VM and keep the plan from completing, and one an interrupted validation left in
 `validating`, which would otherwise hold its VM for good with no action to release it — so it also refuses — before
@@ -1809,9 +1850,10 @@ it resumes by waiting for that server instead of creating a second one on the sa
 knows is created again), and the rollback deletes a sent destination server before it unmanages the volumes it
 holds. A recreated source server has a new id, and the plan follows it — `vm_ids`, the waves'
 `vm_ids`, `strategy_overrides`, `probe_overrides` and `nic_overrides` (event `plan.updated`, data `{"vm_id_changed": {"from",
-"to"}}`) — before the migration becomes `rolled_back` (it then carries the new `vm`): a stop in between resumes
-`rolling_back` and repeats the rewrite, which changes nothing once done, so a rolled-back migration's plan never
-names a VM that no longer exists. QASuite marks handover as **lab-verification required** before production use.
+"to"}}`) — in one transaction with the migration's new `vm` (§11), before the migration becomes `rolled_back`: a stop
+before it leaves both naming the old VM and resumes `rolling_back`, after it both name the new one, so a validation
+meanwhile never plans a second migration of the VM (audit OC-06), and a rolled-back migration's plan never names a VM
+that no longer exists. QASuite marks handover as **lab-verification required** before production use.
 
 #### 7.3.1 Storage references per driver family
 
@@ -1913,12 +1955,23 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   start `ready` migrations within `wave.max_parallel` and `settings.max_concurrent_migrations`,
   advance gates (§5.4), and mark plans `completed` when all migrations are in terminal-success or
   wave-complete phases with no `failed` — under the plan's lock, on the migrations re-read there, so a
-  retry that returned after the tick's snapshot keeps the plan running (§5.1). The tick decides on a snapshot; starting a step re-checks,
+  retry that returned after the tick's snapshot keeps the plan running (§5.1). Each plan is ticked on its own: an
+  error of one - a write the store refuses, a provider down - is logged and the plans after it are ticked, as each
+  orphan's relaunch is (review RV51-06). The tick decides on a snapshot; starting a step re-checks,
   under the plan's lock and then the migration's, what the decision rested on — that the plan still
   runs (a pause that returned starts nothing more), the phase, the gate of a cutover (§5.4) and the
   strategy: a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
-  single-shot one, since `set_strategy` may have changed it meanwhile. A running plan is pre-staged once (`prestage`, §7.2) before
-  its first migration starts; when pre-staging fails a plan that still runs becomes `failed` (event `plan.updated`,
+  single-shot one, since `set_strategy` may have changed it meanwhile. A running plan is pre-staged (`prestage`, §7.2)
+  before its first migration starts, and again before a `ready` migration starts whose assessment no pre-staging
+  covered - pre-staging is idempotent and creates only what the destination lacks, so a VM added since, or one
+  validated again or given a strategy that needs a conversion host since, is pre-staged too, as its validation said
+  (`MAP_FLAVOR_PRESTAGED`, §9.3; audit OC-05). A migration's assessment is its last move to `validating` and whether
+  its strategy needs a conversion host (`cold`, `warm`); a pre-staging covers the assessments of the plan's migrations
+  it read when it began, and the tick reads the migrations from the store - a validation during a pre-staging, or in
+  another process (§15), is seen -, so a plan paused and resumed with nothing assessed anew is not pre-staged again and
+  its gates and steps go on at once (review RV51-17, RV51-19). After a restart a running plan whose work started counts
+  as pre-staged for its migrations' assessments; any other plan is pre-staged again when it next runs with a `ready`
+  migration. When pre-staging fails a plan that still runs becomes `failed` (event `plan.updated`,
   "pre-staging failed"), and `start_plan` accepts a `failed` plan as it does a `validated` or `paused`
   one, pre-staging it again. A plan paused, validated again or edited while pre-staging ran keeps its status:
   the failure is recorded (the same event, without a status) and pre-staging runs again at its next start —
@@ -1930,8 +1983,11 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   every tick resumes the same way any of them whose driver task died (an unexpected error outside a
   step, e.g. a database error while persisting after a successful step — the VM may be stopped):
   the crash is emitted as `migration.error` (`step: driver`, redacted message, crash count), and while
-  a driver keeps crashing its relaunch backs off (`2^n × tick_s`, at most 300 s). A migration whose
-  step task is still running is not relaunched.
+  a driver keeps crashing its relaunch backs off (`2^n × tick_s`, at most 300 s - the exponent capped first, so no
+  count of crashes overflows it; `n` counts the crashes since its last step that returned, so one that moved the
+  migration on starts a new row - review RV51-16), and a relaunch that fails for one migration skips that migration,
+  logged, never the rest of the tick (audit OC-01; a test relaunches a second migration after the first one's
+  relaunch failed, review RV51-28). A migration whose step task is still running is not relaunched.
 * Failure handling: `TransientStepError` → retry with backoff `2^attempt` s (×1/demo_speed) up to
   `max_step_retries`; then `failed`. Each attempt starts under the migration's lock and only while the
   migration is still in the step's phase, so an action under that lock (a cancel) either finds the
@@ -1941,7 +1997,8 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   `failed` (the history keeps both): a restart, or an event that fails to be written, right after the
   failure resumes the rollback (`rolling_back` is resumed) and never leaves the stopped VM in `failed`.
   On every failure the knowledge service looks up similar incidents (§14.3) and attaches them as an
-  `AdvisorNote` — after that write, so a slow agentmemory never holds the rollback back.
+  `AdvisorNote` — after that write and in a task of its own, which a stop cancels, so a slow agentmemory never holds
+  the rollback back: the driver goes on to it at once (audit OC-04).
 * Locks: a lock lives while a coroutine holds it or waits for it (a weak table), so the table does not grow
   with the ids requests name, known or not. One `asyncio.Lock` per migration id serializes API actions with the driver; one lock per
   plan id serializes validations; one shared lock serializes the cross-plan claim of validations and
@@ -1954,9 +2011,13 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   holding its plan's lock while it waits would hold up the tick, which starts that plan's steps under it. For the
   same reason a validation refuses a running plan (409) under the plan's lock before it waits for the claim lock.
   A strategy change (`set_strategy`, `PUT …/strategy`) takes the plan's lock, then the migration's, as the advisor's
-  override does (§14.6): it waits for a running validation, and the migration's strategy and the plan's
-  `strategy_overrides` entry are written together under it, so no validation undoes the change. It and an advisor
-  decision refuse a migration whose phase they cannot change (not `pending`, `ready` or `blocked`) before they take
+  override does (§14.6): it waits for a running validation, and under it the plan's `strategy_overrides` entry, the
+  migration's strategy and their `migration.action` and `plan.updated` events are written in one transaction
+  (`put_all_with_events`, §11), so no validation undoes the change and a failure leaves none of them - the retry
+  makes the whole change, its events with it (reviews ST-08, RV48-02). A document another writer moved meanwhile -
+  the plan, which several drivers write - is read again and the change retried, every check with it, as
+  `_update_plan` retries; after its attempts a 409 asks to run the action again. It and an advisor decision refuse a
+  migration whose phase they cannot change (not `pending`, `ready` or `blocked`) before they take
   the plan's lock — the check repeats under it — so neither waits, holding the lock the tick needs, behind a finalize
   that holds the migration's lock across a provider deletion. Plan documents are written by several drivers and the tick loop
   (ids rewritten after a rollback, status changes, strategy overrides): those read-modify-writes
@@ -2019,8 +2080,10 @@ minutes — and emits `migration.source_running` (data `{"power_state"}`): the V
 writes data RHOSO no longer receives — stop it, or roll back. While `source_running_at` is set, `POST …/finalize`
 answers 409 "the source VM runs again: stop it, or roll it back, before finalizing" (the owner's choice, 2026-10-13):
 a finalize would keep a source that diverged, or delete it with what it wrote since. A migration whose checkpoint is
-`finalizing` is the exception — its finalize began deleting the source, and a rollback is refused then, so finalizing
-it again from its own page is its way out; a bulk finalize skips every migration whose source VM runs again, that one
+`finalizing` is the exception for a finalize that deletes the source (`delete_source: true`) — its finalize began
+deleting it, and a rollback is refused then, so finalizing it again from its own page, deleting the source, is its way
+out; one that would keep the source answers the same 409, and the dashboard's Finalize of such a migration deletes it,
+its box checked and fixed (audit OC-09); a bulk finalize skips every migration whose source VM runs again, that one
 too, so what it finalizes is known from the plan's summaries (§4), which carry no checkpoint. Seen stopped again,
 `source_running_at` clears and the
 migration emits `migration.source_stopped` (data `{"power_state"}`), so every view drops the alert without a reload and
@@ -2092,10 +2155,16 @@ the SLO rule's (§5.3), the estimate it records, a Force cutover's figure (§5.4
 
 **Configuration and calibration (PRD G2).** `EstimatorParams` gains `parallel_disks: int = 4`.
 `Plan.estimator_overrides: dict[str, float] = {}` overrides any `EstimatorParams` field for that plan
-(unknown keys, values that are not finite positive numbers — NaN and infinity included — and the
-plan-owned keys `convergence_threshold_bytes` / `max_passes` are rejected with 400 — set
-`Plan.convergence_threshold_bytes` / `Plan.max_sync_passes` instead); `Plan.link_bps` keeps precedence
-for `link_bps` and must be a finite positive number (422 otherwise). After every
+(unknown keys, values that are not finite positive numbers — NaN and infinity included —, a rate under 1 B/s
+(`scan_bps`, `max_aggregate_scan_bps`, `link_bps`), a duration over 10⁹ s (`shutdown_s`, `boot_s`, `create_s`,
+`snapshot_s`, `handover_per_volume_s`, `v2v_s`, `v2v_inplace_s`) and the plan-owned keys
+`convergence_threshold_bytes` / `max_passes` are rejected with 400 — set `Plan.convergence_threshold_bytes` /
+`Plan.max_sync_passes` instead); `Plan.link_bps` keeps precedence for `link_bps` and must be a finite number of at
+least 1 B/s (422 otherwise), and `Plan.max_sync_passes` is at most 100 (422 otherwise; §5.3 needs a handful). Every
+estimate is then a finite number - a rate a hair above zero made every strategy's figures infinite, and the
+selection failed (review RV51-22) -, and a plan's validation refuses a stored plan beyond these bounds as a create
+does; the model never runs more than 100 passes whatever a plan stored holds, so a validation's or a calibration's
+estimate is bounded work in the event loop (review RV51-07). After every
 completed warm pass the orchestrator calibrates the migration in place and re-estimates it:
 `vm.change_rate_bps = bytes_changed / (pass.started_at − previous_pass.started_at)` (delta passes
 only; the interval is the time between the two snapshots), and the observed per-stream scan rate
@@ -2522,10 +2591,16 @@ update between two reads could leave count and sum as they were; a route that de
 a value that only grows), `versions(kind) -> [(id, version)]` (in creation order, no document read),
 `get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: {phase: count}}` (one
 `SELECT … GROUP BY` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
-`derived_status` and `migration_counts` from it, §8.1), `delete(kind, id)`,
+`derived_status` and `migration_counts` from it, §8.1), `delete(kind, id, expected_version=None)` (with a version,
+`DELETE … WHERE version = n`: a `ConflictError` when the document moved, `NotFound` when it is gone - the advisor
+policy's delete, review ST-05),
 `get_versioned(kind, id, model_cls) -> (model, version)` (one read that returns the version too: `plan apply`'s
 compare-and-write, §15), `put_with_event(kind, model, event, expected_version) -> (version, Event)` (a versioned
 update and its event in one transaction, a `ConflictError` as `put`'s: the source watch's flag and alert, §8.1),
+`put_all_with_events(writes, events) -> (versions, events)` (several versioned writes, `(kind, model,
+expected_version)` each, and their events in one transaction: all are written or none, a `ConflictError` naming
+the document that moved; a strategy change and an advisor decision, §8, §14.6; `put_with_event` is its one
+document's case),
 `create_user(user, actor) -> Event` (§13.1: the `user` document and its `user.created` event in
 one transaction; a `ConflictError` for a name that exists in any case), `delete_events_before(before) -> int` (`events
 prune`, §15),
@@ -2534,6 +2609,39 @@ before_seq=None)` (`kinds` serves `GET /events?audit=true`). SQLite runs with WA
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
 callers. `Store.ping() -> bool` backs the health routes (`GET /api/v1/health` reports
 `"db": "ok"|"error"` and the orchestrator loop; `GET /api/v1/ready` answers 503 while degraded).
+
+**What PostgreSQL cannot hold.** PostgreSQL stores no NUL character - psycopg refuses one in a text parameter and
+JSONB refuses `\u0000` -, no lone surrogate, half of a UTF-16 pair and no Unicode text (SQLite cannot encode one
+in a text column either), and no number that is no JSON number: JSONB refuses `NaN` and the infinities, which
+Python's `json` writes as `NaN` and `Infinity` and SQLite keeps. The store rewrites no value to make it fit: it
+refuses, before any statement, a write whose document data - its keys and values at any depth - or whose event - its
+message, actor, kind, `plan_id`, `migration_id` and the keys and values of its data - holds any of them, the same
+on SQLite and PostgreSQL, with `UnstorableValue` (a `StoreError`) naming the kind, the id and the field but never
+the value (`advisor_notes.0.confidence: is an infinity`); nothing of the write is kept. A name, a map's key, an
+actor a later comparison reads and a snapshot's digested content are stored as given or not at all (reviews ST-03,
+ST-04, RV48-04, RV48-05, RV48-08, RV50-04). A document an earlier version stored on SQLite with such a number from
+an outside service - an advisor note's confidence or a number of its data (a hit's score, a claim's confidence), a
+recommendation's confidence or a probability of its distribution, a similar incident's score - reads each as
+null, a probability as absent, as this version would have written it: the document is written again as any other,
+where its stopped source could otherwise never be rolled back (review RV51-06). What the control plane is given
+stops before that refusal: a request
+body holding a NUL or a lone surrogate is refused before its route runs (§12) - a number is its route's to check,
+as §9.1 checks a plan's -, the tokens file refuses such a name (§13.1), the text it takes from outside sources
+passes `redact`, which writes either as U+FFFD (§13.4) - as every string of Jev's answers does (§14.1), and a
+source VM's free text that no export filter or mapping reads, its tags and flavor extra specs, keys and values,
+its `os_type` and `host` (§4.2; review RV49-02) -, and an outside service's number that is no JSON number is
+refused as it arrives: Jev's answer is an invalid response (§14.1), an agentmemory hit has no score (§14.3).
+What reaches it is a name a cutover reads - a VM's, a project's, a flavor's, a network's, a volume type's - holding
+one, which Nova's server and flavor names and vSphere's cannot, a Neutron network's can: its write fails naming the
+field rather than keep a name the source does not have. No stored id or
+field then holds either, so a lookup, a delete or a filter by a value holding one finds nothing without sending it.
+Nor does `events` send a seq outside `events.seq`'s range, 1 to 2^31 - 1: a `since_seq` at or beyond its end answers
+nothing and one below 0 reads as 0, a `before_seq` beyond its end reads as no bound and one at or below 1 answers
+nothing, whoever asks (review RV48-12; the API bounds both, §12). An event's actor longer than the column's 128
+characters - `user:` and a name of 124-128 characters (§13.1, §14.5) - keeps its first 115 characters, then `~` and
+the first 12 hex digits of the whole actor's SHA-256: the event is always written with its change, and two actors
+never read as one (reviews ST-02, RV48-10). The event the bus publishes is the row as written, so a live stream and
+a later read of one seq agree (review RV48-14).
 
 ---
 
@@ -2553,7 +2661,19 @@ a probe's `expect_stauts`), on `POST /plans` and `POST /providers` as on `PATCH 
 `PATCH /providers/{id}`, on `POST` and `PUT /advisor/policies` (a misspelt `scope` would make a plan's policy a global
 one) and in `seamless plan apply` (§15) — so a misspelt guard (`requrie_approval`, `verify_tsl`) never silently yields a
 plan, provider or policy without it (audit AP-01, AP-02); a stored document keeps loading with fields a later version
-added, at any depth (§11).
+added, at any depth (§11). A route whose request is `{}` - an advisor approve, a plan's validate, start and pause, a
+migration's sync and retry, a provider's check - takes an empty object or no body, and refuses a field in one the
+same way (audit AA-04). The text a person gives with an action is kept as Python's `str.strip()` leaves it: an
+approval's and a cutover request's `comment` and a cancel's `reason` - one that strips to nothing is none - and a
+rollback's `reason`, which must keep a character (422 otherwise), as a Force cutover's and an override's reason are
+(review RV51-26).
+A request body holding a NUL character or a lone surrogate in a string - a key or a value, at any depth - is refused
+with 422 (`validation_error`, naming where: `mappings.networks: a key holds a NUL character`) once the caller's
+token and role are checked, before the route runs, so no route writes part of it (the store keeps neither, §11;
+reviews RV48-07, RV48-08); it walks the body without recursion, so a body nested however deep is answered as its
+route answers it, never with a 500 (review RV49-05). When the store refuses a value a route writes
+(`UnstorableValue`, §11: a source cloud's name holding one), the route answers 422 `validation_error` with the
+store's message.
 Authentication: `Authorization: Bearer <token>` (§13).
 A request body holds at most 1 MiB (1,048,576 bytes). A larger `Content-Length`, or a chunked body
 that grows past it, is refused with 413 before the body is parsed: the framework parses a route's
@@ -2579,7 +2699,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown` and the check report (`capabilities`) to `{}`; 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
-| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
+| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
@@ -2590,7 +2710,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
 | POST | `/plans/{id}/start` | operator | — | `Plan` (from `validated`, `paused` or `failed` — a failed plan pre-stages again; 409 when any migration is `blocked`) |
 | POST | `/plans/{id}/pause` | operator | — | `Plan` |
-| POST | `/plans/{id}/cancel` | operator | `{"reason": str?}` | `Plan` — retires a plan none of whose migrations started: each is `pending`, `blocked`, `ready` or `cancelled`. Under the plan's lock and the VM-claim lock (§5.4, §8) it cancels each one as `POST /migrations/{id}/cancel` does (§5.1: its lock, its event, and the cleanup of a data path an earlier attempt left), then sets the plan `cancelled` and emits `plan.cancelled`. Nothing is deleted (§11): the plan and its history stay, its VMs are free for another plan and its providers for deletion, and pre-staged destination resources stay, as after a finished plan. `cancelled` is terminal: no edit, validation, waves, start or pause; a cancelled plan answers again as it is. 409 while the plan is `running` ("pause the plan before cancelling it": the tick starts its steps) and while a migration has started, naming each VM and its phase (at most 10, then how many more) — a `failed` or `rolled_back` one is cancelled on its own first, which cleans up what it copied - on VMware it names the kit's copies it keeps (§5.1) -, and a plan with a migration that completed or was finalized keeps its status — and while a migration that has not started has its source stopped, naming each VM: an open downtime clock, which a retry after a failed cutover keeps (§5.2), and a cancel cannot restart a stopped source (§5.1), so it is cut over first. Both are checked before any migration is cancelled: a refused plan cancel changes nothing |
+| POST | `/plans/{id}/cancel` | operator | `{"reason": str?}` | `Plan` — retires a plan none of whose migrations started: each is `pending`, `blocked`, `ready` or `cancelled`. Under the plan's lock and the VM-claim lock (§5.4, §8) it cancels each one as `POST /migrations/{id}/cancel` does (§5.1: its lock, its event, and the cleanup of a data path an earlier attempt left), then sets the plan `cancelled` and emits `plan.cancelled`. Nothing is deleted (§11): the plan and its history stay, its VMs are free for another plan and its providers for deletion, and pre-staged destination resources stay, as after a finished plan; a pre-staging that still runs (the plan was paused while it ran) is stopped first - the executor kills its playbook, as for a step - so a cancelled plan pre-stages nothing more (audit OC-07). `cancelled` is terminal: no edit, validation, waves, start or pause; a cancelled plan answers again as it is. 409 while the plan is `running` ("pause the plan before cancelling it": the tick starts its steps) and while a migration has started, naming each VM and its phase (at most 10, then how many more) — a `failed` or `rolled_back` one is cancelled on its own first, which cleans up what it copied - on VMware it names the kit's copies it keeps (§5.1) -, and a plan with a migration that completed or was finalized keeps its status — and while a migration that has not started has its source stopped, naming each VM: an open downtime clock, which a retry after a failed cutover keeps (§5.2), and a cancel cannot restart a stopped source (§5.1), so it is cut over first. Both are checked before any migration is cancelled: a refused plan cancel changes nothing |
 | GET | `/migrations` | viewer | query `plan_id`, `phase`, `wave_id`, `limit` (1…5000, default all), `offset` (default 0), `view` (`full`, the default, or `summary`); creation order | `Migration[]`; with `view=summary` `MigrationSummary[]` (§4) |
 | GET | `/migrations/{id}` | viewer | — | `Migration` |
 | POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` (409 from the cutover's requester, or from the approver who forced it, when the plan requires a distinct approver, §5.4) |
@@ -2600,7 +2720,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1; 409 after a failed finalize began deleting the source, §8.1) |
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; it takes its VM's wave from the plan, §9.4; it assesses nothing anew - the estimates the last validation stored stay -, but marks the stored `storage_handover` estimate ineligible with §9.2's reason while the migration holds the destination volumes an earlier attempt created, judged as `PUT …/strategy` judges it, so the dashboard's strategy choice and the advisor's options show why (review 41b's lead), and takes an earlier Retry's mark off once it holds none - the estimate eligible again when that reason was its only one (review RV43B-02); 409 when a provider of that plan was deleted, and when the plan has waves and the VM is in none of them) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
-| POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` (409 outside `completed`, and while its source VM runs again — `source_running_at` — unless its checkpoint is `finalizing`, §8.1) |
+| POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` (409 outside `completed`, and while its source VM runs again — `source_running_at` — unless its checkpoint is `finalizing` and the finalize deletes the source, `delete_source: true`, §8.1; review RV51-25) |
 | POST | `/plans/{id}/finalize` | approver | `{"wave_id": str\|null, "confirm": str, "delete_source": bool = false}` (`confirm`: the wave's name, or the plan's without `wave_id`; 400 otherwise; 404 for an unknown wave) | `{"finalized": [str], "skipped": [{"migration_id": str, "reason": str}]}` (409 when no migration of the scope is `completed`; §8.1) |
 | POST | `/demo/vms/{source_id}/power` | operator | `{"state": "on"\|"off"}` | `VMRef` (demo mode only, 404 otherwise; the fake source VM's power state, §8.1) |
 | PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible; `storage_handover` is refused (400, §9.2's reason) while the migration holds the destination volumes an earlier attempt created, judged at the request - a Retry does not re-assess the estimates the last validation stored (review RV40-01); 409 while `advisor_hold` is set: approve or override the decision, §14.6) | `Migration` |
@@ -2613,12 +2733,12 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/advisor/recommendations/{id}` | viewer | — | `AdvisorRecommendation` (404 unknown; a legacy id resolves too) |
 | GET | `/advisor/notes` | viewer | query `limit` (1–200, default 20) | `{"items": [AdvisorNoteEntry]}`: the advisor notes of every migration except strategy notes (those are listed as legacy recommendations, §14.4), newest first; notes of the same time keep the migrations' creation order and each migration's note order. An `AdvisorNoteEntry` is an `AdvisorNote` (§4) with `migration_id`, `plan_id` and `vm_name` |
 | GET | `/advisor/snapshots/{sha256}` | viewer | `sha256`: 64 lowercase hex characters (422 otherwise) | `AdvisorSnapshot` (404 unknown, §14.5) |
-| POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the migration's newest, the migration not `pending`/`blocked`/`ready`, the plan setting the VM's strategy, the decision already approved, nothing usable or eligible to approve, or the decision's requester when the decision's recorded `require_distinct_approver` — or, for one that recorded none, the policy in force — requires a distinct approver; §14.6) |
+| POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the one the migration's hold names - without a hold, not its newest -, the migration not `pending`/`blocked`/`ready`, the plan setting the VM's strategy, the decision already approved, nothing usable or eligible to approve, or the decision's requester when the decision's recorded `require_distinct_approver` — or, for one that recorded none, the policy in force — requires a distinct approver; §14.6) |
 | POST | `/advisor/recommendations/{id}/override` | admin (`advisor.approve`) | `{"option": Strategy, "reason": str?}` (reason ≤ 2000; at least 10 characters when the decision's recorded `require_override_reason` — or, for a decision that recorded none, the policy in force — requires one (§14.6), 422 otherwise; the option must be eligible, 422) | `AdvisorRecommendation` (409 as approve) |
 | GET | `/advisor/policies` | viewer | — | `{"items": [AdvisorPolicy], "default": AdvisorPolicy}` (`default`: the built-in `global-default`, read-only) |
 | POST | `/advisor/policies` | admin (`advisor.policy.manage`) | `AdvisorPolicy` without `id`, `created_at`, `updated_at`, `updated_by` (422: both scope lists set, an unknown provider or plan id, threshold outside 0..1) | `AdvisorPolicy` (201) |
 | PUT | `/advisor/policies/{id}` | admin (`advisor.policy.manage`) | as POST | `AdvisorPolicy` (404 unknown) |
-| DELETE | `/advisor/policies/{id}` | admin (`advisor.policy.manage`) | — | 204 (404 unknown) |
+| DELETE | `/advisor/policies/{id}` | admin (`advisor.policy.manage`) | — | 204 (404 unknown; 409 when it changed since it was read - a replace landed meanwhile, deleted only at the version its `policy.deleted` event names as `before`, review ST-05) |
 | POST | `/advisor/similar-incidents` | operator | `{"query": str (1–2000 characters), "limit": int = 5 (1–20)}`; 422 outside these bounds | `{"hits":[{"title":str,"content":str,"score":float?}]}` |
 | GET | `/metrics` | viewer (public if `SEAMLESS_METRICS_PUBLIC`) | — | Prometheus text format |
 
@@ -2630,8 +2750,10 @@ A plan's `name` holds at most 200 characters and its `description` 2000: `POST /
 `GET /events` pages forward: it returns the first `limit` matching events after `since`, and a client
 continues from the last `seq`. With `tail=true` it returns the newest `limit` matching events after
 `since` instead, still in ascending `seq`, so a history of the latest events is one request however
-many events are persisted (§16); `before` keeps only events below a `seq`, so `tail=true&before=` is the page
-before the oldest one a client shows, and the trail reads back to its start.
+many events are persisted (§16); `before` keeps only events below a `seq`, so `tail=true&before=` is the page before
+the oldest one a client shows, and the trail reads back to its start. `since` and `before` take at most 2147483647,
+the width of `events.seq` - PostgreSQL's `integer` -: a larger value is a 422, never a 500 (Security.md C1-05,
+review ST-01).
 
 Outside `/api/v1`: `GET /api/openapi.json` and `GET /api/docs` (Swagger UI) are public in demo mode
 and need the viewer role otherwise; FastAPI's default `/docs`, `/redoc` and `/openapi.json` are
@@ -2680,7 +2802,10 @@ served at `/` with SPA fallback for non-`/api` paths.
 Static bearer tokens: `SEAMLESS_TOKENS_FILE` (YAML `tokens: [{name, role, sha256}]`); only SHA-256
 hashes are stored; comparison uses `hmac.compare_digest`. `seamless token create --name N --role R`
 prints a new token (`smg_` + 32 random URL-safe bytes) once, plus the YAML entry. It refuses a name
-the tokens file refuses (empty, or longer than 128 characters) and the names the control plane records
+the tokens file refuses (empty, longer than 128 characters, or holding a character that is not printable - a control
+character, NUL included, a format character, a lone surrogate, a separator but the space: Python's
+`str.isprintable` -, which would read as another name in the dashboard or reach the store as a NUL, §11; review
+RV48-05) and the names the control plane records
 as actors itself — `anonymous`, `unauthenticated`, `cli`, `system`, in any letter case and with
 blanks around them too, and any name with a colon, the form of the actors the advisor records (`policy:<id>`,
 `user:<name>`, `system:fallback`, `system:advisor`, §14.4) — so no token's audit events pass for theirs. It also refuses
@@ -2702,8 +2827,9 @@ request refused for its role emits
 route's minimum, an approver-only plan field set below the approver role, or, with authentication off, a request
 another site's page may have sent (403, §12) — with `actor`
 the principal's name (`unauthenticated` without one), `message` `METHOD path: reason` and `data`
-`{path, method, reason, required_role, client}`, never the token; at most 30 per client address and
-minute are recorded.
+`{path, method, reason, required_role, client}` - the path as the client sent it, percent-encoded, so a NUL reads
+`%00` and the record is written on PostgreSQL too (§11, review ST-03) -, never the token; at most 30 per client
+address and minute are recorded.
 
 Admins can add people from Dashboard **Users** (`POST /users`). Names are 1-128 ASCII letters,
 digits, dots, underscores, `@` or hyphens, starting with a letter or digit; surrounding whitespace
@@ -2758,14 +2884,17 @@ again once its document (its state fields aside) or the mounted `clouds.yaml` ch
 the storage handover's alike — and the replaced one is closed, so the step after a rotation signs in with the new
 credentials, a running plan's rollback included (audit EX-14). `SEAMLESS_SECRET_STORE` selects it:
 
-* `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory,
-  each key written to a temporary file and renamed; the directory must be writable (Compose mounts the
+* `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory, each key written
+  to a temporary file and renamed. A secret is written and deleted under a lock of its name (`flock` on
+  `{SEAMLESS_SECRETS_DIR}/.{name}.lock`), so two writes at once - two admins saving credentials, a retried save -
+  never leave the keys of both: the last write's secret stands whole (audit AA-02); a directory the store cannot
+  change answers as a write it cannot make (`SecretStoreError`). The directory must be writable (Compose mounts the
   `seamless-secrets` volume there). When it is not — the default on a host run, where a user cannot write
-  `/var/run/secrets/seamless` — the credential routes answer 503 `unavailable` with "secret store: cannot write
-  the secret store at {directory}: {reason}; set SEAMLESS_SECRETS_DIR to a directory this process can write",
-  which the dashboard shows as is. The store creates `SEAMLESS_SECRETS_DIR` itself 0700 too, and sets
-  an existing one it owns to 0700 when it writes, so other local users cannot list the secret names; one
-  it does not own (a mount) keeps its mode.
+  `/var/run/secrets/seamless` — the credential routes answer 503 `unavailable` with "secret store: cannot write the
+  secret store at {directory}: {reason}; set SEAMLESS_SECRETS_DIR to a directory this process can write", which the
+  dashboard shows as is. The store creates `SEAMLESS_SECRETS_DIR` itself 0700 too, and sets an existing one it owns to
+  0700 when it writes, so other local users cannot list the secret names; one it does not own (a mount) keeps its
+  mode.
 * `kubernetes` (OpenShift): a `Secret` named `seamless-{name}` in `SEAMLESS_K8S_NAMESPACE` (default:
   the pod's namespace) created or replaced through the API with the pod's ServiceAccount token
   (labels `app.kubernetes.io/managed-by: seamless-migrate`, `seamless.io/provider: {id}`); reads go
@@ -2800,8 +2929,15 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 `redact(text, names=None)` removes:
 
 * passwords and secrets in key/value pairs — `key=value`, `key: value`, JSON `"key": "value"`, the key
-  possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`) — and in CLI flags
-  (`--os-password x`);
+  possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`), also where it starts a line of a
+  JSON-escaped multi-line string (`\npassword: x`) — and in CLI flags (`--os-password x`). A quoted value is read
+  in every quoting it may be in: JSON's and the shell's double quotes, a Python repr's, YAML's (`''`) and the
+  shell's single quotes - with what the shell glues to a closed word (`'a'b`, `'a'\''b'`, `'a'"'"'b'`) -, any of
+  them inside JSON strings, however deep. Where the readings disagree on where it ends - a backslash before a
+  quote escapes it in a repr (`\'`, inside JSON `\\'`), not in YAML or the shell (`'C:\'`) - the value runs
+  on to the longest reading's end, so no part of a secret stays: at worst the rest of its line goes with it, and
+  it stops before a quoted credential key (`'token':`) so that one is redacted too. A `[REDACTED]` already
+  written stays as it is, so a second pass changes nothing (reviews RV51-02 to RV51-05, RV51-20, RV51-21);
 * `Authorization` headers and bearer tokens;
 * API keys: named ones (`api_key`, `TYPESAFE_API_KEY=`), AWS access key ids, GitHub tokens, `sk-` keys
   and Slack tokens;
@@ -2832,7 +2968,11 @@ The control plane uses the same `redact` for the text it publishes from outside 
 provider error messages, every `migration.log` line (§4), and agentmemory's search hits - an outside service that
 agents write too - redacted as they arrive, title and content, before anything cuts or publishes them: what
 `POST /advisor/similar-incidents` answers, and the `similar_incidents` a recommendation and a failure's note keep
-(§14.3, §14.4; audit AP-05). Where it cuts such text, it redacts first,
+(§14.3, §14.4; audit AP-05).
+`redact` also writes each NUL and each lone surrogate as U+FFFD, the replacement character, so such text is kept
+wherever it goes (§11); every string of Jev's answers - its reasons (§14.4) among them -, text from an outside
+service too, passes that replacement as it arrives (§14.1).
+Where it cuts such text, it redacts first,
 over the cut plus 16384 characters, and cuts after (`redact_cut(text, limit)`): a secret the cut splits
 — a PEM block, a URL with credentials — is still found, at a bounded cost. The cuts: a `migration.log`
 line at 2000 characters (§4), the failing output line in an Ansible step's error at 500, a provider
@@ -2907,6 +3047,17 @@ fixtures live in `seamless/tests/fixtures/jev_*_response.json`):
 | `jev_verify` | `results[] {id, claim, verdict: "verified"\|"contradicted"\|"unsupported", confidence, action: "auto"\|"review"}`, `summary` |
 | `jev_screen` | `recommendation.action: "pass"\|"review"\|"block"\|"skip"`, `recommendation.reason`, `probabilities.injection` |
 
+An answer is checked as it arrives (audit AD-01, AD-02; reviews RV49-01, RV49-06, RV50-03, RV50-04). `parse_result`
+refuses text that is no JSON object, or JSON holding `NaN`, `Infinity` or a number past a float's range (`1e999`,
+which Python reads as an infinity) - no JSON number the store keeps (§11) -, as an invalid response
+(`JevUnavailable`), and writes every string of the answer - keys and values, at any depth - with its NUL and lone
+surrogates as U+FFFD, so no answer stalls the write that keeps it (§11, §13.4). A field of another shape than the
+table's - a `recommendation` that is no object; a `selected`, `status` or `model` present as anything but a string
+or null, `false`, `0`, `[]` and `{}` too; `probabilities` that is no object; a `confidence` that is no number from 0
+to 1, a JSON `true` none either, an integer of any length compared as it stands; `results` that is no list, or a
+result that is no object - makes the answer `invalid_response`: the strategy question falls back to the rules
+(§14.4 rule 2), and a classification's items to the heuristic (§14.2).
+
 ### 14.2 Advisor (`ai/advisor.py`)
 
 The advisor is **advisory and bounded**: it never makes an ineligible strategy eligible, never
@@ -2952,7 +3103,9 @@ skips approval, never triggers rollback or finalize.
 files=[]) -> bool` → `POST {url}/agentmemory/remember` body `{content, type, concepts, files,
 project}`; `search(query, limit=5) -> list[MemoryHit]` → `POST {url}/agentmemory/smart-search`
 body `{query, limit, project}`; parses hits tolerantly from `results|memories|items` lists, using
-`content|narrative|title` for text. Header `Authorization: Bearer <secret>` when a secret is set.
+`content|narrative|title` for text and a `score` that is a finite number or a number's text (`"0.82"`): `NaN`, an
+infinity - a JSON token, a number past a float's range or text - and a JSON `true` are no score (null), as the store
+keeps no such number (§11; review RV50-04). Header `Authorization: Bearer <secret>` when a secret is set.
 `health() -> bool` → `GET {url}/agentmemory/livez`. Every body is redacted before it is sent
 (`redact_payload`, §13.4; VM names too when `SEAMLESS_MEMORY_REDACT_NAMES`). Disabled when
 `SEAMLESS_MEMORY_URL` is unset.
@@ -3027,10 +3180,13 @@ document (kind `recommendation`, §4.2); the engine reads only the decision.
   notes a migration already has. A migration validation leaves alone (in flight or finished, §5.4) gets no
   choice: the advisor is not asked about it and no recommendation is recorded for it. Recording a
   recommendation stores its input snapshot and emits `recommendation.created` and its first
-  `decision.<status>` (§14.5).
+  `decision.<status>` (§14.5), the recommendation and both events in the transaction that writes the
+  migration's assessment (§5.4).
 * Legacy: strategy notes written before this change (`AdvisorNote kind=strategy` in `Migration.advisor_notes`)
   are listed as recommendations with `legacy: true`, id `rec-legacy-<migration id>-<index>`, `legacy_text` =
-  the note's summary, the option, confidence and distribution parsed from `data` where present, and a decision
+  the note's summary, the option, confidence and distribution parsed from `data` where present - each a
+  probability as the advisor reads Jev's (§14.1), a value that is none left out, so an integer of 400 digits
+  never fails the listing (review RV51-23) -, and a decision
   read from it (`applied` → `auto_applied`; `source rules` → `fallback_rules`; otherwise `below_threshold`,
   final = `data.deterministic`), actor `system:legacy`. Nothing is copied or rewritten: the listing adapts the
   notes when it reads them, so the number of legacy entries always equals the number of strategy notes.
@@ -3053,7 +3209,8 @@ them (`seamless events prune` is the only deletion, by hand, §15, Security.md �
   An event recorded before the field existed has none.
 
 * `policy.created`, `policy.updated`, `policy.deleted` — actor `user:<name>`; data `{target_id, before, after}`
-  (the policy, null where there is none). The audit page lists with a `policy.updated` the settings it changed, one
+  (the policy, null where there is none) - each written in the transaction of the change it records: a store error
+  leaves the policy as it was and no event, so a change never stands without its record (review RV51-11). The audit page lists with a `policy.updated` the settings it changed, one
   line each, "{setting}: {before} → {after}", worded as the policies page shows them (§16) and in its order: Name,
   When the advisor decides, Applies to (plans and providers by name, by id when the page does not know it), Decisions,
   Threshold, Minimum evidence, Override reason, Distinct approver. A list of plans, providers or decision types whose
@@ -3094,10 +3251,21 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   another decision for the migration replaces the hold or clears it, and a cancel clears it — the cancel action
   or a validation's cancel of a VM that left the plan: a cancelled migration takes no decision. The dashboard
   shows a hold as waiting only while the migration is `pending`, `blocked` or `ready`, where it can be decided.
-* **Approve** and **override** (`advisor.approve`) act on the migration's newest stored recommendation while the
-  migration is `pending`, `blocked` or `ready`: approve → `approved`, final = the recommended option, which must
-  be usable and eligible now; override → `overridden`, final = the chosen eligible option, `reason_text` = the
-  reason (required, at least 10 characters, when the policy in force says so — the API refuses with 422, not only
+* **Approve** and **override** (`advisor.approve`) act on the recommendation the migration's `advisor_hold` names
+  while it holds one - the hold is written with it (§5.4), so a clock stepped back between two validations leaves
+  that one decidable, whatever its `created_at` (review RV50-09) -, else on the migration's newest stored
+  recommendation: the one its last validation stored (`last_recommendation`, written in that validation's
+  transaction like the hold, so a clock stepped back changes nothing either - review RV51-08; for a migration no
+  validation stored one for since the field, the newest by `created_at`), while the migration is `pending`,
+  `blocked` or `ready`: approve → `approved`, final = the
+  recommended option, which must be usable and eligible now - one the recommendation recorded as `unusable`
+  (escalated, invalid, escaped, outside the advisor's scope, §14.4 rule 2) never is, nor one stored before that
+  field (v0.1.0-rc.2) whose decision fell back (`fallback_rules`, `ADVISOR_UNAVAILABLE_FALLBACK`), which reads as
+  `unusable` the `reason_text` that decision recorded (review RV50-07): 409 "nothing to approve: <why>", while an
+  override to that option stays a person's call, with its reason (audit AD-03); override → `overridden`, final =
+  the chosen eligible option, `reason_text` = the reason (required, at least 10 characters - code points, an emoji
+  one, the dashboard counting as the API does (audit AD-10) - when the policy in force says so — the API refuses
+  with 422, not only
   the dashboard). Eligible is judged at the request, as `PUT …/strategy` judges it (§12): a Retry does not
   re-assess the estimates the last validation stored, so `storage_handover` is not eligible while the migration
   holds the destination volumes an earlier attempt created (§9.2) — an approve of it is refused with 409, an
@@ -3106,11 +3274,22 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   to the final option, clears `advisor_hold` and — when the strategy changes — the approvals, the cutover
   request and `force_window` (§5.4). An override also records the option in `plan.strategy_overrides`, like
   `PUT …/strategy`, so a later validation keeps it — under the plan's lock, with the decision, so a validation
-  waiting for that lock sees the override and asks no one again. Neither acts while the plan sets the VM's strategy
-  (`strategy_overrides` names it: a person chose it in the plan, §9.2, and a validation honours that without
-  recording a recommendation, so the newest one no longer stands — 409 "The plan sets the strategy of <vm>
-  (<option>): change it in the plan."), and an approve of a decision already `approved` is refused (409 "The
-  decision is already approved."): one event per decision status change (§14.5).
+  waiting for that lock sees the override and asks no one again. A decision's writes are one transaction
+  (`put_all_with_events`, §11): an override's plan entry, the migration (strategy, `advisor_hold` cleared), the
+  recommendation with its decision, and their events (`plan.updated`, the decision's, `migration.action`). A failure
+  leaves none of them - no migration starts released while its decision is unwritten, no decision is stored without
+  its event - and an approver's retry decides again (reviews ST-07, RV48-01, RV48-13); a document another writer
+  moved meanwhile is read again and the decision retried, every check with it, as a strategy change retries (§8).
+  Neither acts while the plan sets the VM's strategy (`strategy_overrides` names it, or its `default_strategy` is not
+  `auto`: a person chose it in the plan, §9.2, and a validation honours that without recording a recommendation, so
+  the newest one no longer stands — 409 "The plan sets the strategy of <vm> (<option>): change it in the plan."; no
+  failure leaves an override's plan entry without its decision, so an override choosing that option is refused too;
+  reviews RV48-03, audit AD-04), nor while the migration's `advisor_hold` names another recommendation - a
+  validation of another process that held it after this one was listed (409 "a newer recommendation (<id>) replaced
+  <rec>", review RV49-04) -, and an approve of a decision already `approved` is refused (409 "The decision is already
+  approved."): one event per decision status change (§14.5). A person's decision records, as its `policy_id`, the
+  policy whose rules it follows - the recorded decision's when it carries them, the policy in force otherwise - and
+  the override reason's 422 names that policy (audit AD-06).
 * **Maker-checker** (ADV-17): a recommendation recorded by a validation names the validating user in `requested_by`
   (the demo's own validations: `demo`). When the policy in force requires a distinct approver (the default, the
   built-in `global-default` too), that user neither approves nor overrides the decision: 409 "You requested this
@@ -3168,8 +3347,9 @@ approver-only fields (§12) are not checked.
 cancelled (a VM removed from the plan, §5.1), saying so: the process's end would cut them short, and a
 running server only resumes a cut-short cleanup when it starts. One interrupted anyway (Ctrl-C) keeps its
 mark and runs when the server next starts.
-`events prune` deletes the events older than its cutoff and then records `events.pruned` (actor `cli`, data
-`{before, deleted}`), which the deletion cannot take: the trail keeps who cut it and where. It refuses a
+`events prune` deletes the events older than its cutoff and records `events.pruned` (actor `cli`, data
+`{before, deleted}`) in the same transaction, which the deletion cannot take: the trail keeps who cut it and where,
+and a store error leaves both undone (review RV51-15). It refuses a
 cutoff after now (a negative or non-finite `--older-than-days`, a later `--before`), which would delete the
 whole trail; a `--before` without an offset is UTC.
 `estimate` refuses the knobs a plan refuses: `--slo` and `--max-passes` below 1 (`downtime_slo_s`,
@@ -3935,8 +4115,10 @@ default `seamless-migrate`). It never runs a second orchestrator and never delet
   (§13.1); the API is `http://127.0.0.1:<SEAMLESS_HOST_PORT>` on the single host - the port Compose publishes:
   the shell's, else
   `deploy/compose/.env`'s, else 8080, the file read by Compose's dotenv rules (a leading
-  byte-order mark ignored, an `export ` prefix, a key ended by `=` or `:`, spaces around it, quotes, an inline comment
-  after ` #` in an unquoted value, the last definition wins - reviews RV41A-01, RV41A-03); a value Compose would
+  byte-order mark ignored, an `export ` prefix, a key ended by `=` or `:`, white space around it and the value - the
+  Latin-1 white space compose-go trims: the space, tab, vertical tab, form feed, carriage return, NEL and the no-break
+  space -, quotes, a statement after a closing quote read as the next assignment, an inline comment after ` #` in an
+  unquoted value, the last definition wins - reviews RV41A-01, RV41A-03, RV42A-05); a value Compose would
   interpolate - a `$` in an unquoted or double-quoted value - is refused, never guessed: the script and the Make
   targets that use the value stop and name it (review RV41A-02). So the token never goes to a port the stack does not
   publish (review RV38B-07); the Make targets read `SEAMLESS_HOST_PORT` and `SEAMLESS_VERSION` the same way

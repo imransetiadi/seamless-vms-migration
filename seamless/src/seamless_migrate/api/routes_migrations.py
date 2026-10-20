@@ -15,6 +15,7 @@ from .schemas import (
     ApproveRequest,
     CancelRequest,
     CutoverRequest,
+    EmptyRequest,
     FinalizeRequest,
     ForceCutoverRequest,
     RollbackRequest,
@@ -107,6 +108,7 @@ async def force_cutover(
 async def sync(
     migration_id: str,
     request: Request,
+    body: EmptyRequest | None = None,
     principal: Principal = Depends(require_role(Role.operator)),
 ) -> Migration:
     return await services(request).orchestrator.request_sync(migration_id, principal.name)
@@ -126,6 +128,7 @@ async def rollback(
 async def retry(
     migration_id: str,
     request: Request,
+    body: EmptyRequest | None = None,
     principal: Principal = Depends(require_role(Role.operator)),
 ) -> Migration:
     return await services(request).orchestrator.retry(migration_id, principal.name)

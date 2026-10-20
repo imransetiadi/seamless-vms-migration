@@ -8,7 +8,7 @@ import pytest
 
 from seamless_migrate.config import find_repo_root
 from seamless_migrate.domain.enums import Strategy
-from seamless_migrate.domain.models import SyncPass, VMRef
+from seamless_migrate.domain.models import SyncPass, VMRef, invalid_plan_settings
 from seamless_migrate.planning.estimator import (
     EstimatorParams,
     calibrated_change_rate,
@@ -258,6 +258,47 @@ def test_invalid_estimator_overrides_refuses_non_finite_values():
     assert [p.split(":")[0] for p in problems] == ["boot_s", "scan_bps", "snapshot_s"]
     assert all("finite positive number" in p for p in problems)
     assert invalid_estimator_overrides({"scan_bps": 1e12}) == []
+
+
+def test_invalid_estimator_overrides_bound_a_rate_below_and_a_duration_above():
+    """SDD §9.1 (review RV51-22): each value finite and positive still let the estimate overflow -
+    a rate a hair above zero (1e-310 B/s), or two durations of 1e308 s, made every strategy's
+    figures infinite: the selection raised IndexError, and the store refused a migration's
+    infinite estimate naming a field no person can change. A rate is at least 1 B/s, a duration
+    at most 10**9 s."""
+    problems = invalid_estimator_overrides(
+        {"scan_bps": 1e-310, "max_aggregate_scan_bps": 0.5, "link_bps": 1e-300,
+         "shutdown_s": 1e308, "boot_s": 1e9 + 1}
+    )  # fmt: skip
+    assert [p.split(":")[0] for p in problems] == [
+        "boot_s", "link_bps", "max_aggregate_scan_bps", "scan_bps", "shutdown_s"
+    ]  # fmt: skip
+    assert all("at least 1 B/s" in p for p in problems if p.split(":")[0].endswith("_bps"))
+    assert all("at most 1000000000 s" in p for p in problems if p.split(":")[0].endswith("_s"))
+    bounds = {"scan_bps": 1, "max_aggregate_scan_bps": 1.0, "link_bps": 1, "shutdown_s": 1e9}
+    assert invalid_estimator_overrides(bounds) == []
+    # a rate the model multiplies, never divides by, keeps its own rule
+    assert invalid_estimator_overrides({"change_rate_bps": 0.5}) == []
+
+
+def test_a_plans_link_and_sync_passes_are_bounded():
+    """SDD §9.1, §5.3 (reviews RV51-07, RV51-22): a plan's link is at least 1 B/s and its
+    max_sync_passes at most 100 - a plan check names the field, as a validation's does."""
+    assert any("link_bps" in p for p in invalid_plan_settings(make_plan(link_bps=0.5)))
+    assert any(
+        "max_sync_passes" in p for p in invalid_plan_settings(make_plan(max_sync_passes=101))
+    )
+    assert invalid_plan_settings(make_plan(link_bps=1, max_sync_passes=100)) == []
+
+
+def test_the_model_never_runs_more_than_a_hundred_passes():
+    """SDD §9.1, §5.3 (review RV51-07): the convergence loop appended one pass while the delta
+    stayed above the threshold and fewer than max_sync_passes ran - a stored plan of 2,000,000
+    passes and a threshold of 0 held the event loop for seconds (10**12: hours). The model stops
+    at 100 passes whatever a plan holds."""
+    plan = make_plan(max_sync_passes=2_000_000, convergence_threshold_bytes=0)
+    modelled = estimate(make_vm(), Strategy.warm, params_for_plan(plan), plan.downtime_slo_s)
+    assert modelled.passes == 100
 
 
 def test_estimate_final_downtime_uses_scan_term():

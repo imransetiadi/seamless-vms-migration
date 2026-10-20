@@ -1,8 +1,10 @@
 #!/bin/sh
 # dotenv-value.sh [--defined] KEY FILE | --unclosed FILE - print the value Compose reads for KEY from FILE
 # (deploy/compose/.env), by compose-go's dotenv rules: a leading UTF-8 byte-order mark ignored, an `export ` prefix, a
-# key ended by `=` or `:` (its YAML-style form), spaces around the key and the value, single or double quotes (a
-# backslash escapes the quote), an inline comment after ` #` in an unquoted value; the last definition wins. A quote
+# key ended by `=` or `:` (its YAML-style form), white space around the key and the value - the Latin-1 white space
+# compose-go trims: space, tab, vertical tab, form feed, carriage return, NEL and the no-break space -, single or double
+# quotes (a backslash escapes the quote), a statement after a closing quote read as the next assignment, an inline
+# comment after ` #` in an unquoted value; the last definition wins (review RV42A-05). A quote
 # never closed on any line of FILE - whatever key is read, whatever a later line defines - is no value: Compose
 # refuses the whole file for it, for every command, so the reader refuses any key of it, naming the line's key: a
 # message, exit 4. A value Compose would interpolate - a `$` in an unquoted or double-quoted value - is refused, never
@@ -22,13 +24,18 @@ if [ ! -r "$2" ]; then [ "$mode" = defined ] && exit 1; exit 0; fi
 LC_ALL=C
 export LC_ALL
 exec awk -v key="$1" -v file="$2" -v mode="$mode" '
-function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
-# the value Compose reads from what follows the key: sets unterminated (a quote never closed) and interpolated (a value
-# Compose interpolates: unquoted or double-quoted)
+# the Latin-1 white space compose-go trims (unicode.IsSpace below U+0100) - NEL and the no-break space in UTF-8: bytes,
+# in the C locale
+function lead(s) { while (match(s, "^" space)) s = substr(s, RLENGTH + 1); return s }
+function trail(s) { while (match(s, space "$")) s = substr(s, 1, RSTART - 1); return s }
+function trim(s) { return trail(lead(s)) }
+# the value Compose reads from what follows the key: sets unterminated (a quote never closed), interpolated (a value
+# Compose interpolates: unquoted or double-quoted) and rest (what follows a closing quote: the next statement)
 function scan(value,    quote, out, i, c) {
-  sub(/^[ \t]+/, "", value)
+  value = lead(value)
   quote = substr(value, 1, 1)
   unterminated = 0
+  rest = ""
   if (quote == sq || quote == dq) {
     out = ""
     unterminated = 1
@@ -40,7 +47,7 @@ function scan(value,    quote, out, i, c) {
         out = out (c == quote ? c : bs c)
         continue
       }
-      if (c == quote) { unterminated = 0; break }
+      if (c == quote) { unterminated = 0; rest = substr(value, i + 1); break }
       out = out c
     }
     interpolated = quote == dq
@@ -51,25 +58,35 @@ function scan(value,    quote, out, i, c) {
   interpolated = 1
   return trim(value)
 }
-BEGIN { sq = sprintf("%c", 39); dq = "\""; bs = "\\"; bom = sprintf("%c%c%c", 239, 187, 191) }
+BEGIN {
+  sq = sprintf("%c", 39); dq = "\""; bs = "\\"; bom = sprintf("%c%c%c", 239, 187, 191)
+  space = "([ \t\v\f\r]|" sprintf("%c%c", 194, 133) "|" sprintf("%c%c", 194, 160) ")"
+}
 {
   line = $0
   if (NR == 1 && substr(line, 1, 3) == bom) line = substr(line, 4)
   sub(/\r$/, "", line)
-  if (line ~ /^[ \t]*(#|$)/) next
-  sub(/^[ \t]*export[ \t]+/, "", line)
-  end = index(line, "=")
-  colon = index(line, ":")
-  if (colon && (!end || colon < end)) end = colon
-  if (end == 0) next
-  name = trim(substr(line, 1, end - 1))
-  value = scan(substr(line, end + 1))
-  # Compose refuses the whole file at the first quote it never closes (RV47-01)
-  if (unterminated && broken == "") broken = name
-  if (name != key) next
-  found = value
-  found_interpolated = interpolated
-  seen = 1
+  # one statement, then any after a closing quote: compose-go reads it as the next assignment (RV42A-05)
+  while (1) {
+    line = lead(line)
+    if (line == "" || substr(line, 1, 1) == "#") next
+    sub(/^export[ \t]+/, "", line)
+    end = index(line, "=")
+    colon = index(line, ":")
+    if (colon && (!end || colon < end)) end = colon
+    if (end == 0) next
+    name = trim(substr(line, 1, end - 1))
+    value = scan(substr(line, end + 1))
+    # Compose refuses the whole file at the first quote it never closes (RV47-01)
+    if (unterminated && broken == "") broken = name
+    if (name == key) {
+      found = value
+      found_interpolated = interpolated
+      seen = 1
+    }
+    if (rest == "") next
+    line = rest
+  }
 }
 END {
   if (mode == "unclosed") { if (broken != "") print broken; exit 0 }

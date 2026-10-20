@@ -96,6 +96,15 @@ def _check_state(check: dict[str, Any]) -> str:
     return "ok" if check.get("ok") else "FAILED"
 
 
+def as_probability(value: Any) -> float | None:
+    """``value`` when it is a probability - a real number from 0 to 1, never a bool -, else
+    ``None`` (SDD §4.2, §14.1, audit AD-02). Compared as it stands, so an integer of 400 digits,
+    which no float holds, is none either (review RV50-03)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value) if 0 <= value <= 1 else None
+
+
 class Advisor:
     def __init__(self, jev: JevClient | None, settings: Settings) -> None:
         self.jev = jev
@@ -205,20 +214,38 @@ class Advisor:
             response = await self.jev.decide(**request)
         except JevUnavailable as exc:
             return Advice(option=None, confidence=None, unavailable=str(exc), **base)
-        rec = response.get("recommendation") or {}
+        raw = response.get("recommendation")
+        rec = raw if isinstance(raw, dict) else {}
         selected = rec.get("selected")
         confidence = rec.get("confidence")
-        probabilities = rec.get("probabilities") or {}
+        probabilities = rec.get("probabilities")
+        # the recommendation's status, else the answer's: one of another shape - false, 0, [] or
+        # {} - is no absent one (review RV50-03)
+        status = rec.get("status")
+        if status is None:
+            status = response.get("status")
         model = response.get("model")
+        # SDD §14.1 (audit AD-01, AD-02): a field of another shape than the tool's, or a
+        # confidence that is no probability, makes the answer invalid_response - it falls back
+        # (§14.4 rule 2) instead of raising out of the validation or passing a threshold
+        malformed = (
+            (raw is not None and not isinstance(raw, dict))
+            or (selected is not None and not isinstance(selected, str))
+            or (confidence is not None and as_probability(confidence) is None)
+            or (probabilities is not None and not isinstance(probabilities, dict))
+            or (status is not None and not isinstance(status, str))
+            or (model is not None and not isinstance(model, str))
+        )
+        distribution = probabilities if isinstance(probabilities, dict) else {}
         # jev_decide gives no reasons today; any it gives are checked against the evidence (ADV-02)
         reasons = rec.get("reasons", response.get("reasons"))
         return Advice(
             option=selected if isinstance(selected, str) else None,
-            confidence=float(confidence) if isinstance(confidence, int | float) else None,
+            confidence=as_probability(confidence),
             distribution={
-                k: float(v) for k, v in probabilities.items() if isinstance(v, int | float)
+                k: p for k, v in distribution.items() if (p := as_probability(v)) is not None
             },
-            status=rec.get("status") or response.get("status"),
+            status="invalid_response" if malformed else status,
             escaped=bool(rec.get("escaped")),
             model_version=model if isinstance(model, str) else None,
             reasons=tuple(reasons) if isinstance(reasons, list) else (),
@@ -226,11 +253,20 @@ class Advisor:
         )
 
     # -- classification ----------------------------------------------------------------------
-    def _describe_vm(self, vm: VMRef) -> str:
-        # rendered from the declared field specs (SDD §13.4, ADV-06)
-        return self._redact(payloads.render_workload(vm), [vm.name])
+    def _describe_vm(
+        self, vm: VMRef, destination_name: str | None = None, destination: str = ""
+    ) -> str:
+        # rendered from the declared field specs, then the strategy question's one pass: secrets,
+        # the VM's name while names are redacted, the destination provider's name by its kind and
+        # series whatever the setting (SDD §13.4, ADV-06, audit AD-09)
+        return self._for_strategy(payloads.render_workload(vm), vm, destination_name, destination)
 
-    async def classify_workloads(self, vms: Sequence[VMRef]) -> tuple[dict[str, str], AdvisorNote]:
+    async def classify_workloads(
+        self,
+        vms: Sequence[VMRef],
+        destination_name: str | None = None,
+        destination: str = "",
+    ) -> tuple[dict[str, str], AdvisorNote]:
         tiers = {vm.source_id: heuristic_tier(vm) for vm in vms}
         if not self.jev_enabled or not vms:
             return tiers, AdvisorNote(
@@ -248,7 +284,7 @@ class Advisor:
             # never leaves; the answer maps back through it
             keys = {f"item-{n}": vm.source_id for n, vm in enumerate(batch, 1)}
             items = [
-                {"id": key, "text": self._describe_vm(vm)}
+                {"id": key, "text": self._describe_vm(vm, destination_name, destination)}
                 for key, vm in zip(keys, batch, strict=True)
             ]
             try:
@@ -258,7 +294,18 @@ class Advisor:
             except JevUnavailable as exc:
                 errors.append(str(exc))
                 continue
-            for result in response.get("results") or []:
+            results = response.get("results")
+            if results is None:
+                results = []
+            if not isinstance(results, list):
+                # SDD §14.1 (audit AD-01): an answer of another shape - its items keep the heuristic
+                errors.append("invalid response: results is no list")
+                continue
+            if not all(isinstance(result, dict) for result in results):
+                errors.append("invalid response: a result is no object")
+            for result in results:
+                if not isinstance(result, dict):
+                    continue  # its item keeps the heuristic (§14.1)
                 rid = keys.get(str(result.get("id")))
                 tier = result.get("classification")
                 if (
@@ -358,9 +405,8 @@ class Advisor:
             reasons.append(f"advisor contradicted: {contradicted[0].get('claim')}")
         review_required = bool(reasons)
         review_reason = "; ".join(reasons) or None
-        confidences = [
-            float(i["confidence"]) for i in results if isinstance(i.get("confidence"), int | float)
-        ]
+        # a claim's confidence that is no probability counts for none (SDD §14.1, review RV50-03)
+        confidences = [p for i in results if (p := as_probability(i.get("confidence"))) is not None]
         # each verdict once, in the order seen: never "verified, verified" (ADV-18)
         verdicts = list(dict.fromkeys(str(i.get("verdict")) for i in results))
         if review_required:

@@ -71,6 +71,43 @@ def test_token_store_refuses_reserved_actor_names_and_colons(tmp_path, name):
         TokenStore.from_file(path)
 
 
+@pytest.mark.parametrize(
+    "escaped",
+    [
+        "sys\\0tem",
+        "ops\\tlead",
+        "ops\\nlead",
+        "a\\x85b",
+        "a\\u202eb",
+        "a\\u200bb",
+        "a\\u00a0b",
+        "a\\ud800b",
+    ],
+)
+def test_token_store_refuses_a_name_that_is_not_printable(tmp_path, escaped):
+    """SDD §13.1 (review RV48-05): the file checked a name's length, the reserved actors and the
+    colon, never its characters - a hand-edited "sys\\0tem" is not "system", so its audit events
+    passed for the control plane's once the store stripped the NUL, and a name with a control or
+    format character reads as another in the dashboard. A name that is not printable (Python's
+    str.isprintable: a control or format character, a lone surrogate, a separator but the space)
+    is refused at start-up."""
+    path = tmp_path / "tokens.yaml"
+    path.write_text(f'tokens:\n  - {{name: "{escaped}", role: admin, sha256: {"a" * 64}}}\n')
+    with pytest.raises(AuthConfigError, match=r"^token #0: .* holds a character that is not "):
+        TokenStore.from_file(path)
+
+
+@pytest.mark.parametrize("name", ["Ops Lead", "Ñandú-ops", "运维", "ops 😀"])
+def test_token_store_keeps_a_printable_name_whatever_its_script(tmp_path, name):
+    """SDD §13.1: printable is all the file asks of a name's characters - a space, letters of any
+    script and symbols load as they are."""
+    path = tmp_path / "tokens.yaml"
+    path.write_text(
+        f'tokens:\n  - {{name: "{name}", role: admin, sha256: {"a" * 64}}}\n', encoding="utf-8"
+    )
+    assert [e.name for e in TokenStore.from_file(path).entries] == [name]
+
+
 def test_missing_tokens_file_is_an_error(tmp_path):
     with pytest.raises(AuthConfigError):
         TokenStore.from_file(tmp_path / "absent.yaml")

@@ -21,6 +21,7 @@ from ..domain.models import (
     Migration,
     RecommendedOption,
 )
+from .advisor import as_probability
 
 LEGACY_PREFIX = "rec-legacy-"
 
@@ -33,8 +34,10 @@ def _legacy(migration: Migration, index: int, note: AdvisorNote) -> AdvisorRecom
     data = note.data
     option = _text(data.get("selected"))
     probabilities = data.get("probabilities")
+    # each read as the advisor reads Jev's: compared before it is converted, so an integer of 400
+    # digits a build before rc.1 kept is none (SDD §14.4, review RV51-23)
     distribution = (
-        {k: float(v) for k, v in probabilities.items() if isinstance(v, int | float)}
+        {k: p for k, v in probabilities.items() if (p := as_probability(v)) is not None}
         if isinstance(probabilities, dict)
         else {}
     )
@@ -91,10 +94,11 @@ def legacy_recommendations(migration: Migration) -> list[AdvisorRecommendation]:
 def legacy_by_id(rec_id: str, migration: Migration) -> AdvisorRecommendation | None:
     """The legacy entry ``rec-legacy-<migration id>-<index>`` of ``migration``, if it exists."""
     _, _, index = rec_id.removeprefix(LEGACY_PREFIX).rpartition("-")
-    entries = legacy_recommendations(migration)
-    if not index.isdigit() or int(index) >= len(entries):
-        return None
-    return entries[int(index)]
+    # the index as the id was written, compared as text with the entries' own: int() refuses "²"
+    # and more than 4300 digits, and an Arabic-Indic digit or a leading zero would name an entry
+    # twice (SDD §12, audit AD-07, review RV50-02)
+    entries = {str(n): entry for n, entry in enumerate(legacy_recommendations(migration))}
+    return entries.get(index)
 
 
 def listing(

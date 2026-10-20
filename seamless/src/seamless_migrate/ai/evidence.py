@@ -25,6 +25,7 @@ from ..domain.models import (
     Plan,
     VMRef,
 )
+from .redaction import replace_unstorable
 
 log = logging.getLogger(__name__)
 
@@ -329,5 +330,6 @@ def keep_reasons(
                 recommendation_id,
             )
             continue
-        kept.append(AdvisorReason(key=key, text=text.strip()[:REASON_CHARS]))
+        # outside text: a NUL or a lone surrogate, which the store refuses, written U+FFFD (§13.4)
+        kept.append(AdvisorReason(key=key, text=replace_unstorable(text.strip())[:REASON_CHARS]))
     return kept

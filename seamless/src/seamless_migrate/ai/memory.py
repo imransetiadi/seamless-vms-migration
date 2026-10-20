@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -23,10 +24,16 @@ class MemoryHit:
 
 
 def _score(value: Any) -> float | None:
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
+    """A hit's score: a finite number or a number's text. NaN, an infinity - the answer's token,
+    a number past a float's range or text -, a JSON true and an integer no float holds are none:
+    the store keeps no such number (SDD §11, §14.3, review RV50-04)."""
+    if value is None or isinstance(value, bool):
         return None
+    try:
+        score = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return score if math.isfinite(score) else None
 
 
 #: how much of a hit's content and title the control plane keeps, redacted as redact_cut cuts:

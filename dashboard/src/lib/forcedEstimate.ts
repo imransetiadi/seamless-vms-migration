@@ -34,6 +34,11 @@ export const ESTIMATOR_DEFAULTS: Readonly<EstimatorParams> = Object.freeze({ ...
 export type PlanEstimatorSettings = Pick<Plan, 'link_bps' | 'convergence_threshold_bytes' | 'max_sync_passes' | 'estimator_overrides'>;
 
 const INT_FIELDS = new Set(['convergence_threshold_bytes', 'max_passes', 'parallel_disks']);
+/** The API's MAX_SYNC_PASSES (SDD §9.1, review RV51-07): the model never runs more, whatever a plan stored holds. */
+export const MAX_SYNC_PASSES = 100;
+/** The API's bounds on what the model divides by and adds (SDD §9.1, review RV51-22): a rate in B/s, a duration in s. */
+export const MIN_RATE_BPS = 1;
+export const MAX_DURATION_S = 1_000_000_000;
 
 /** `params_for_plan`, then the migration's calibrated scan rate as the orchestrator applies it. */
 export function paramsFor(plan: PlanEstimatorSettings, observedScanBps?: number | null): EstimatorParams {
@@ -76,7 +81,7 @@ const VMWARE_PASS_OVERHEAD_S = 10;
 /**
  * The convergence loop (`_precopy_passes`): pass k (k ≥ 2) transfers `Δk = min(D, c·T(k−1))` and runs while
  * the pass before it carried more than the threshold (Δ1 = the first pass's data) and k ≤ the pass limit —
- * the runtime rule of SDD §5.3. Returns the passes' durations and the final delta Δf.
+ * the runtime rule of SDD §5.3 —, never past MAX_SYNC_PASSES. Returns the passes' durations and the final delta Δf.
  */
 function precopyPasses(
   firstPassS: number,
@@ -89,7 +94,8 @@ function precopyPasses(
   const durations = [firstPassS];
   let last = firstPassS;
   let previous = firstPassBytes;
-  while (previous > p.convergence_threshold_bytes && durations.length < p.max_passes) {
+  const passes = Math.min(p.max_passes, MAX_SYNC_PASSES);
+  while (previous > p.convergence_threshold_bytes && durations.length < passes) {
     const delta = Math.min(diskBytes, rate * last);
     last = nextPassS(delta);
     durations.push(last);

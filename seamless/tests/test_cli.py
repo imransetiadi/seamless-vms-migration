@@ -64,6 +64,11 @@ def test_token_create_prints_token_and_yaml_hash(env, capsys):
         "system:fallback",
         "policy:pol-finance",
         "user:sari",
+        # not printable: a control or format character, a lone surrogate (review RV48-05)
+        "sys\x00tem",
+        "ops\tlead",
+        "a\u202eb",
+        "a\ud800b",
     ],
 )
 def test_token_create_refuses_names_the_file_or_the_audit_trail_own(env, capsys, name):
@@ -846,6 +851,42 @@ def test_events_export_and_prune(env, capsys, tmp_path):
     assert [(e.kind, e.data["deleted"]) for e in left] == [("events.pruned", 3)]
 
 
+def test_the_cli_prune_cuts_nothing_when_its_record_is_refused(env):
+    """SDD §15 (review RV51-15): `events prune` deleted the events, then recorded events.pruned
+    apart - a store error on the record left the trail cut with no record. Both in one
+    transaction: the refused record leaves every event."""
+    from datetime import UTC, datetime, timedelta
+
+    import sqlalchemy as sa
+    from sqlalchemy.engine import Engine
+
+    from seamless_migrate.domain.models import Event
+
+    store = store_for(env)
+    t0 = datetime(2026, 10, 1, tzinfo=UTC)
+    for i in range(3):
+        store.append_event(
+            Event(ts=t0 + timedelta(days=i), kind="plan.updated", actor="t", message=f"e{i}")
+        )
+    refused: list[str] = []
+
+    def refuse(conn, cursor, statement, parameters, context, executemany):
+        if refused or not statement.lstrip().upper().startswith("INSERT INTO EVENTS"):
+            return
+        if "events.pruned" in context.compiled_parameters[0].values():
+            refused.append(statement)
+            raise RuntimeError("the store was briefly unavailable")
+
+    sa.event.listen(Engine, "before_cursor_execute", refuse)  # the CLI's own engine too
+    try:
+        with pytest.raises(RuntimeError, match="briefly unavailable"):
+            cli.main(["events", "prune", "--before", "2026-10-02T00:00:00Z", "--confirm"])
+    finally:
+        sa.event.remove(Engine, "before_cursor_execute", refuse)
+    assert refused, "the events.pruned insert was refused"
+    assert [e.message for e in store.events(since_seq=0, limit=10)] == ["e0", "e1", "e2"]
+
+
 @pytest.mark.parametrize(
     "bound",
     [
@@ -922,3 +963,46 @@ def test_a_cors_origin_python_cannot_split_ends_the_cli_with_an_error_line(
     assert cli.main(["version"]) == 1
     err = capsys.readouterr().err
     assert err.startswith("error: ") and "is not an origin" in err, err
+
+
+def test_a_value_the_store_refuses_is_one_error_line_never_a_traceback(env, capsys):
+    """SDD §15 (review RV49-03): a command fails with one line `error: …` for the errors the API
+    answers with a status - and the API answers the store's refusal 422 (§12). `plan apply` of a
+    YAML whose mapping key holds a NUL (a key copied from a NUL-named Neutron network) let the
+    UnstorableValue out as a traceback; nothing is written."""
+    import yaml
+
+    from seamless_migrate.domain.enums import ProviderKind, ProviderRole
+    from seamless_migrate.domain.models import Plan
+    from tests.factories import make_provider
+
+    store = store_for(env)
+    try:
+        store.put("provider", make_provider(id="src-osp"))
+        store.put(
+            "provider",
+            make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+        )
+    finally:
+        store.dispose()
+    path = env / "plan.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "name": "Finance",
+                "source_provider_id": "src-osp",
+                "destination_provider_id": "dst-rhoso",
+                "vm_ids": ["vm-1"],
+                "mappings": {"networks": {"app\x00-net": "rhoso-app"}},
+            }
+        )
+    )
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and err.count("\n") == 1, err
+    assert "mappings.networks: a key holds a NUL character" in err
+    store = store_for(env)
+    try:
+        assert store.list("plan", Plan) == []
+    finally:
+        store.dispose()

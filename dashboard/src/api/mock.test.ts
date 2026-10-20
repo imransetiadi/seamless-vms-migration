@@ -1919,6 +1919,41 @@ describe('mock advisor policies, approval and override, like the API (SDD §14.6
     expect(server.events.filter((e) => e.data.target_id === rec.id).map((e) => e.kind)).toEqual(['recommendation.created', 'decision.pending_approval']);
   });
 
+  it("decides the recommendation the migration's hold names, whatever the newest by time, like the API (SDD §14.6, review RV50-09)", async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    const held = recOf(server, 'analytics-db');
+    expect(db.advisor_hold).toBe(held.id);
+    // newer by time, named by no hold: the wall clock stepped back before the validation that held the migration
+    const later = { ...held, id: 'rec-c10c5e0beef0', created_at: new Date(Date.parse(held.created_at) + 60_000).toISOString() };
+    server.recommendations.push(later);
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${later.id}/approve`, {})).rejects.toMatchObject({
+      status: 409,
+      message: `a newer recommendation (${held.id}) replaced ${later.id}`,
+    });
+    const approved = await as(server, ADMIN).post<AdvisorRecommendation>(`/advisor/recommendations/${held.id}/approve`, {});
+    expect([approved.decision.status, db.advisor_hold]).toEqual(['approved', null]);
+  });
+
+  it("decides the recommendation the migration's last validation stored while no hold names one, like the API (SDD §14.6, review RV51-08)", async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    const stored = recOf(server, 'analytics-db');
+    expect(db.last_recommendation).toBe(stored.id);
+    db.advisor_hold = null; // decided by no hold: an auto-applied one or the fallback would leave none
+    // newer by time, stored by no validation since: the wall clock stepped back before the one that stored `stored`
+    const replaced = { ...stored, id: 'rec-c10c5e0beef1', created_at: new Date(Date.parse(stored.created_at) + 60_000).toISOString() };
+    server.recommendations.push(replaced);
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${replaced.id}/approve`, {})).rejects.toMatchObject({
+      status: 409,
+      message: `a newer recommendation (${stored.id}) replaced ${replaced.id}`,
+    });
+    const approved = await as(server, ADMIN).post<AdvisorRecommendation>(`/advisor/recommendations/${stored.id}/approve`, {});
+    expect(approved.decision.status).toBe('approved');
+  });
+
   it('starts a held migration only once a human decides: approve, then the run goes on', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
     await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
@@ -1954,6 +1989,59 @@ describe('mock advisor policies, approval and override, like the API (SDD §14.6
       actor: 'user:rina',
       data: { before: { status: 'pending_approval', reason_text: null }, after: { status: 'overridden', reason_text: 'The change window fits a cold cutover' } },
     });
+  });
+
+  it('counts the override reason as the API does: code points, after what Python strips (audit AD-10)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const url = `/advisor/recommendations/${recOf(server, 'analytics-db').id}/override`;
+    for (const reason of ['\u{1F600}'.repeat(5), '\x85\x85short\x85\x85\x85']) {
+      await expect(as(server, ADMIN).post(url, { option: 'cold', reason }), JSON.stringify(reason)).rejects.toMatchObject({ status: 422 });
+    }
+    const rec = await as(server, ADMIN).post<AdvisorRecommendation>(url, { option: 'cold', reason: '\u{1F600}'.repeat(10) });
+    expect(rec.decision.status).toBe('overridden');
+  });
+
+  it("refuses to approve an answer that could not be applied, naming why; an override stays a person's call (audit AD-03)", async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const rec = recOf(server, 'analytics-db');
+    expect(rec.recommendation.unusable).toBeNull();
+    rec.recommendation.unusable = "the advisor's answer was escalate";
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${rec.id}/approve`, {})).rejects.toThrow("nothing to approve: the advisor's answer was escalate");
+    const overridden = await as(server, ADMIN).post<AdvisorRecommendation>(`/advisor/recommendations/${rec.id}/override`, { option: 'warm', reason: 'The owner chose warm after review' });
+    expect(overridden.decision.status).toBe('overridden');
+  });
+
+  it('records why a fallback could not take the answer, as the API does (SDD §4.2, audit AD-03)', () => {
+    const server = new MockServer({ now: () => NOW });
+    const fallbacks = server.recommendations.filter((r) => r.decision.status === 'fallback_rules');
+    expect(fallbacks.length).toBeGreaterThan(0);
+    for (const r of fallbacks) expect(r.recommendation.unusable).toBe(r.decision.reason_text);
+    expect(server.recommendations.filter((r) => r.decision.status !== 'fallback_rules').every((r) => r.recommendation.unusable === null)).toBe(true);
+  });
+
+  it("refuses both while the plan's default strategy sets the VM's, as for a pinned one (audit AD-04)", async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const rec = recOf(server, 'analytics-db');
+    server.plans.find((p) => p.id === 'plan-c81d44a0')!.default_strategy = 'cold';
+    const refusal = 'The plan sets the strategy of analytics-db (cold): change it in the plan.';
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${rec.id}/approve`, {})).rejects.toThrow(refusal);
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${rec.id}/override`, { option: 'cold', reason: 'The change window fits a cold cutover' })).rejects.toThrow(refusal);
+  });
+
+  it('names, in a person decision, the policy whose rules it follows (audit AD-06)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const rec = recOf(server, 'analytics-db');
+    expect([rec.decision.policy_id, rec.decision.require_override_reason]).toEqual(['pol-finance', true]);
+    // a policy change applies from the next validation and never rewrites a decision (SDD §14.6)
+    const finance = server.policies[0]!;
+    server.policies.splice(0, 1, { ...finance, id: 'pol-relaxed', mode: 'auto_apply_above_threshold', require_override_reason: false, require_distinct_approver: false });
+    const approved = await as(server, ADMIN).post<AdvisorRecommendation>(`/advisor/recommendations/${rec.id}/approve`, {});
+    expect([approved.decision.policy_id, approved.decision.require_override_reason]).toEqual(['pol-finance', true]);
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${rec.id}/override`, { option: 'cold', reason: 'too short' })).rejects.toThrow('policy pol-finance requires an override reason');
   });
 
   it('refuses what the API refuses: 403 below admin, 409 for a legacy, an older or a started one, and PUT …/strategy while held', async () => {
@@ -2364,6 +2452,8 @@ describe('mock convergence, Force cutover and data checks, like the API (SDD §5
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const syncing = 'mig-5d7e2b4a11';
     await expect(as(server, 'approver').post(`/migrations/${syncing}/force-cutover`, { reason: ' too short ' })).rejects.toMatchObject({ status: 422 });
+    // counted as the API's Python counts it: five emoji are five characters (audit AD-10)
+    await expect(as(server, 'approver').post(`/migrations/${syncing}/force-cutover`, { reason: '\u{1F600}'.repeat(5) })).rejects.toMatchObject({ status: 422 });
     await expect(as(server, 'approver').post(`/migrations/${syncing}/force-cutover`, { reason: 'x'.repeat(2001) })).rejects.toMatchObject({ status: 422 });
     await expect(as(server, 'operator').post(`/migrations/${syncing}/force-cutover`, { reason: REASON })).rejects.toMatchObject({ status: 403 });
     for (const id of ['mig-5d7e2b4a12', 'mig-5d7e2b4a13']) {
@@ -2555,6 +2645,21 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
   }
   const byName = (server: MockServer, name: string) => server.migrations.find((m) => m.vm.name === name)!;
+
+  it('finalizes a source that runs again only by deleting it, once a finalize began deleting it, like the API (SDD §8.1, audit OC-09)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = byName(server, 'web-cache-01');
+    expect(m.phase).toBe('completed');
+    Object.assign(m, { checkpoint: 'finalizing', source_running_at: '2026-10-08T11:00:00Z' });
+    const approver = as(server, 'approver');
+    await expect(approver.post(`/migrations/${m.id}/finalize`, { confirm: m.vm.name, delete_source: false })).rejects.toMatchObject({
+      status: 409,
+      message: 'the source VM runs again: stop it, or roll it back, before finalizing',
+    });
+    expect(m.phase).toBe('completed');
+    await approver.post(`/migrations/${m.id}/finalize`, { confirm: m.vm.name, delete_source: true });
+    expect(m.phase).toBe('finalized');
+  });
 
   it('returns every plan with its derived status and the finalize reminder', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
@@ -3032,6 +3137,43 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     expect(server.migrations.find((m) => m.id === rolled.id)?.phase).toBe('rolled_back');
   });
 
+  it('a validation leaves a ready migration whose source is stopped as it is, like the API (SDD §5.4, audit OC-02, review RV51-09)', async () => {
+    const { server, client } = setup('operator');
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    expect([m.plan_id, m.phase]).toEqual(['plan-c81d44a0', 'ready']);
+    // retried after a failed cutover: ready again, its downtime clock still open - the source is stopped (SDD §5.2)
+    Object.assign(m, { downtime_started_at: '2026-10-08T11:00:00Z', downtime_ended_at: null });
+    const before = structuredClone({ history: m.phase_history, strategy: m.strategy, hold: m.advisor_hold, findings: m.findings });
+    const recs = server.recommendations.filter((r) => r.migration_id === m.id).length;
+    await client.post('/plans/plan-c81d44a0/validate');
+    // no transition, no recommendation, nothing re-assessed: the API's reassessed(m) is false
+    expect({ history: m.phase_history, strategy: m.strategy, hold: m.advisor_hold, findings: m.findings }).toEqual(before);
+    expect(server.recommendations.filter((r) => r.migration_id === m.id).length).toBe(recs);
+  });
+
+  it('a validation reads no ready migration whose source is stopped from the source, like the API (SDD §5.4, review RV51-09)', async () => {
+    const { server, client } = setup('operator');
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    Object.assign(m, { downtime_started_at: '2026-10-08T11:00:00Z', downtime_ended_at: null });
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    const inventory = inventoryOf(server, plan.source_provider_id);
+    inventory.splice(inventory.findIndex((v) => v.source_id === m.vm.source_id), 1); // the source no longer reports it
+    const report = await client.post<{ migrations: Array<{ migration_id: string; phase: string }> }>(`/plans/${plan.id}/validate`);
+    expect(report.migrations.find((i) => i.migration_id === m.id)?.phase).toBe('ready');
+  });
+
+  it('a validation re-assesses a migration an earlier version left blocked with its source stopped, like the API (SDD §5.4, review RV51-01)', async () => {
+    const { server, client } = setup('operator');
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    Object.assign(m, { phase: 'blocked', downtime_started_at: '2026-10-08T11:00:00Z', downtime_ended_at: null });
+    await client.post('/plans/plan-c81d44a0/validate');
+    expect(m.phase_history.slice(-2).map((c) => [c.from_phase, c.to_phase])).toEqual([
+      ['blocked', 'validating'],
+      ['validating', 'ready'],
+    ]);
+    expect(m.downtime_ended_at).toBeNull(); // the source stays stopped: its next cutover restarts it
+  });
+
   it('a paused plan whose finished VM left the source validates again: only the VMs a validation re-assesses are read', async () => {
     const { server, client } = setup('operator');
     const done = server.migrations.find((m) => m.phase === 'completed' || m.phase === 'finalized')!;
@@ -3376,5 +3518,34 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     plan.status = 'paused';
     await client.post(`/plans/${plan.id}/validate`);
     expect(server.migrations.find((m) => m.id === rolled.id)!.updated_at).toBe(stamped);
+  });
+});
+
+
+describe('mock routes whose request is empty, like the API (SDD §12, audit AA-04)', () => {
+  it('refuses a field on approve, validate, start, pause, sync, retry and check, and takes an empty body', async () => {
+    const { server, client } = setup('admin');
+    const plan = server.plans[0]!;
+    const migration = server.migrations[0]!;
+    const rec = server.recommendations.find((r) => !r.legacy)!;
+    const provider = server.providers[0]!;
+    const paths = [
+      `/advisor/recommendations/${rec.id}/approve`,
+      `/plans/${plan.id}/validate`,
+      `/plans/${plan.id}/start`,
+      `/plans/${plan.id}/pause`,
+      `/migrations/${migration.id}/sync`,
+      `/migrations/${migration.id}/retry`,
+      `/providers/${provider.id}/check`,
+    ];
+    for (const path of paths) {
+      await expect(client.post(path, { option: 'cold' }), path).rejects.toMatchObject({
+        status: 422,
+        message: 'option: Extra inputs are not permitted',
+      });
+    }
+    // an empty object passes the body check: the provider check runs
+    const checked = await client.post<{ id: string }>(`/providers/${provider.id}/check`, {});
+    expect(checked.id).toBe(provider.id);
   });
 });
