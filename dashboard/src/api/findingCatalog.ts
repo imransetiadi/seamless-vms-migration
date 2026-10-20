@@ -5,6 +5,19 @@ import type { Finding, Strategy } from './types';
  * its default remediation. A finding may give its own remediation or severity, as the API's finding() allows. The offline
  * mock's pre-flight reads it; seamless/tests/fixtures/finding_catalog.json holds it and the API's to one copy.
  */
+/** The GPU rows of §9.3 (SDD §22.5): what the advisor's evidence leaves out, as nothing about GPUs reaches Jev in 0.3.0
+ * (§14.4, §22.12) - the API's GPU_CODES. */
+export const GPU_CODES: ReadonlySet<string> = new Set([
+  'VM_VGPU',
+  'VM_PCI_PASSTHROUGH',
+  'MAP_GPU_FLAVOR',
+  'MAP_GPU_DOWNSIZED',
+  'DST_GPU_CAPACITY_INSUFFICIENT',
+  'DST_GPU_CAPACITY_UNKNOWN',
+  'GUEST_GPU_DRIVER',
+  'GUEST_GPU_LICENSE',
+]);
+
 export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['severity']; strategies: Strategy[]; remediation: string }>> = {
   SRC_VM_ERROR_STATE: {
     severity: 'blocker',

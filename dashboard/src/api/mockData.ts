@@ -536,7 +536,7 @@ function gpuMappingWhy(
     if (keys.includes(null)) return 'No mapping can name its device without ids, so none applies to the VM.';
     const named = keys as string[];
     const mapped = plan.mappings.gpus ?? {};
-    const unnamed = named.filter((key) => !(key in mapped));
+    const unnamed = named.filter((key) => !Object.hasOwn(mapped, key));
     if (unnamed.length)
       return `The plan's GPU mappings name no flavor for ${unnamed.map(pyRepr).join(', ')}: map ${unnamed.length === 1 ? 'it' : 'them'} to a GPU flavor of ${where}.`;
     const targets = named.map((key) => [key, mapped[key]!] as const);
@@ -545,12 +545,31 @@ function gpuMappingWhy(
     target = targets[0]![1];
     mapping = `Its GPU mapping, ${named.map(pyRepr).join(', ')} to ${pyRepr(target)},`;
   } else {
-    target = vm.flavor ? plan.mappings.flavors[vm.flavor] : undefined;
-    if (target === undefined) return `The plan maps no flavor to ${pyRepr(vm.flavor ?? 'None')}: map it to a GPU flavor of ${where}.`;
-    mapping = `Its flavor mapping, ${pyRepr(vm.flavor ?? 'None')} to ${pyRepr(target)},`;
+    const flavor = vm.flavor ? pyRepr(vm.flavor) : 'None';
+    target = vm.flavor && Object.hasOwn(plan.mappings.flavors, vm.flavor) ? plan.mappings.flavors[vm.flavor] : undefined;
+    if (target === undefined) return `The plan maps no flavor to ${flavor}: map it to a GPU flavor of ${where}.`;
+    mapping = `Its flavor mapping, ${flavor} to ${pyRepr(target)},`;
   }
   if (!flavors.includes(target)) return null;
   return gpuFlavors.includes(target) ? null : `${mapping} names a flavor of ${where} that asks for no GPU: the server would lose its GPU.`;
+}
+
+/**
+ * The mappings of a GPU VM whose flavor the destination lacks, in the API's words (_missing_gpu_targets, SDD §9.3
+ * MAP_FLAVOR_MISSING, §22.4): its flavor mapping, or for a VMware VM each GPU key's.
+ */
+function gpuMissingTargets(vm: VMRef, gpus: GpuDevice[], sourceKind: ProviderKind, plan: Plan, flavors: readonly string[], where: string): string[] {
+  if (sourceKind !== 'vmware') {
+    const target = vm.flavor && Object.hasOwn(plan.mappings.flavors, vm.flavor) ? plan.mappings.flavors[vm.flavor] : undefined;
+    return target === undefined || flavors.includes(target)
+      ? []
+      : [`Flavor ${pyRepr(vm.flavor!)} is mapped to ${pyRepr(target)}, which does not exist in ${where}.`];
+  }
+  const mapped = plan.mappings.gpus ?? {};
+  const keys = [...new Set(gpus.map(gpuKey).filter((key): key is string => key !== null))];
+  return keys
+    .filter((key) => Object.hasOwn(mapped, key) && !flavors.includes(mapped[key]!))
+    .map((key) => `The plan maps ${pyRepr(key)} to ${pyRepr(mapped[key]!)}, which does not exist in ${where}.`);
 }
 
 export function makeVm(spec: VmSpec): VMRef {
@@ -1248,6 +1267,9 @@ export function preflight(
   const passthrough = gpus.filter((g) => g.kind === 'passthrough');
   const read = gpus.length ? gpus : gpuRequestsOf(vm.flavor_extra_specs);
   const why = read.length ? gpuMappingWhy(vm, read, sourceKind, plan, context.flavors ?? [], context.gpuFlavors ?? [], where) : null;
+  // a mapped flavor the destination lacks is MAP_FLAVOR_MISSING's alone, as the API's (SDD §22.4)
+  const missing = read.length && context.flavors ? gpuMissingTargets(vm, read, sourceKind, plan, context.flavors, where) : [];
+  if (missing.length) add('MAP_FLAVOR_MISSING', missing.join(' '), { remediation: 'Fix the mapping: the destination flavor must exist.' });
   if (why !== null && (gpus.length ? passthrough.length : alias !== undefined))
     add(
       'VM_PCI_PASSTHROUGH',
