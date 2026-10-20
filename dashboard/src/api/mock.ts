@@ -193,6 +193,12 @@ function refuseOverrideBody(input: Record<string, unknown>): void {
   if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
 }
 
+/** A route whose request is `{}`, like the API's EmptyRequest (SDD §12, audit AA-04): an empty object or none, a field refused. */
+function refuseEmptyBody(input: Record<string, unknown>): void {
+  const problems = Object.keys(input).map((key) => `${key}: Extra inputs are not permitted`);
+  if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
+}
+
 /** The secrets a provider reads, by name, for its audit events - never a value: the API's _secret_names (SDD §13.3). */
 function secretNames(provider: Provider): Record<string, string> {
   return {
@@ -1497,6 +1503,7 @@ export class MockServer {
         }
         if (sub === 'check' && method === 'POST') {
           const me = this.require(token, 'operator', path);
+          refuseEmptyBody(input);
           provider.last_checked_at = new Date(this.now()).toISOString();
           if (provider.status === 'unknown') {
             // a mock convention: an endpoint whose host starts with "unreachable" fails the test
@@ -1622,7 +1629,9 @@ export class MockServer {
         if (sub && method === 'DELETE') return this.deletePolicy(this.require(token, 'admin', path), sub);
       }
       if (id === 'recommendations' && sub && (subsub === 'approve' || subsub === 'override') && method === 'POST') {
-        return this.decideRecommendation(this.require(token, 'admin', path), sub, subsub, input);
+        const me = this.require(token, 'admin', path);
+        if (subsub === 'approve') refuseEmptyBody(input);
+        return this.decideRecommendation(me, sub, subsub, input);
       }
       if (id === 'snapshots' && sub !== undefined && method === 'GET') {
         this.require(token, 'viewer', path);
@@ -2013,9 +2022,12 @@ export class MockServer {
     }
     if (!sub && method === 'PATCH') return this.patchPlan(this.require(token, 'operator', path), this.plan(id), input);
     if (sub === 'waves' && subsub === 'auto' && method === 'POST') return this.autoWaves(this.require(token, 'operator', path), this.plan(id), input);
-    if (sub === 'validate' && method === 'POST') return this.validatePlan(this.require(token, 'operator', path), this.plan(id));
-    if (sub === 'start' && method === 'POST') return this.startPlan(this.require(token, 'operator', path), this.plan(id));
-    if (sub === 'pause' && method === 'POST') return this.pausePlan(this.require(token, 'operator', path), this.plan(id));
+    if ((sub === 'validate' || sub === 'start' || sub === 'pause') && method === 'POST') {
+      const me = this.require(token, 'operator', path);
+      refuseEmptyBody(input);
+      if (sub === 'validate') return this.validatePlan(me, this.plan(id));
+      return sub === 'start' ? this.startPlan(me, this.plan(id)) : this.pausePlan(me, this.plan(id));
+    }
     if (sub === 'cancel' && method === 'POST') return this.cancelPlan(this.require(token, 'operator', path), this.plan(id), input);
     if (sub === 'finalize' && method === 'POST') return this.finalizePlan(this.require(token, 'approver', path), this.plan(id), input);
     return null;
@@ -2502,6 +2514,7 @@ export class MockServer {
   }
 
   private migrationAction(me: Me, m: Migration, action: string, input: Record<string, unknown>): MockResponse {
+    if (action === 'sync' || action === 'retry') refuseEmptyBody(input);
     for (const field of ['comment', 'reason', 'confirm']) {
       const text = input[field];
       // the API bounds the free text of every action (SDD §12)

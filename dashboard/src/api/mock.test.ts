@@ -3520,3 +3520,32 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     expect(server.migrations.find((m) => m.id === rolled.id)!.updated_at).toBe(stamped);
   });
 });
+
+
+describe('mock routes whose request is empty, like the API (SDD §12, audit AA-04)', () => {
+  it('refuses a field on approve, validate, start, pause, sync, retry and check, and takes an empty body', async () => {
+    const { server, client } = setup('admin');
+    const plan = server.plans[0]!;
+    const migration = server.migrations[0]!;
+    const rec = server.recommendations.find((r) => !r.legacy)!;
+    const provider = server.providers[0]!;
+    const paths = [
+      `/advisor/recommendations/${rec.id}/approve`,
+      `/plans/${plan.id}/validate`,
+      `/plans/${plan.id}/start`,
+      `/plans/${plan.id}/pause`,
+      `/migrations/${migration.id}/sync`,
+      `/migrations/${migration.id}/retry`,
+      `/providers/${provider.id}/check`,
+    ];
+    for (const path of paths) {
+      await expect(client.post(path, { option: 'cold' }), path).rejects.toMatchObject({
+        status: 422,
+        message: 'option: Extra inputs are not permitted',
+      });
+    }
+    // an empty object passes the body check: the provider check runs
+    const checked = await client.post<{ id: string }>(`/providers/${provider.id}/check`, {});
+    expect(checked.id).toBe(provider.id);
+  });
+});
