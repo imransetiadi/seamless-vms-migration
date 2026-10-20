@@ -106,6 +106,43 @@ def gpu_requests(
     return entries
 
 
+@dataclass(frozen=True)
+class PoolRequest:
+    """A pool the GPU capacity read asks Placement of (SDD §22.3): a vGPU request's resource class
+    with its required and forbidden traits, or a class alone; `groups`, the units of each request
+    group of more than one unit that asks of it, which the read takes again as <class>:<n>."""
+
+    resource_class: str
+    traits: tuple[str, ...] = ()
+    forbidden_traits: tuple[str, ...] = ()
+    groups: tuple[int, ...] = ()
+
+
+def gpu_pools(requests: Iterable[GpuDevice]) -> list[PoolRequest]:
+    """The pools of the vGPU requests among ``requests`` (SDD §22.3): one per distinct request -
+    its class with its required and forbidden traits -, in the order they come, then one per
+    resource class alone, which unites that class's pools. A PCI alias request has none: the
+    device class its alias asks for lives in nova.conf."""
+    groups: dict[tuple[str, tuple[str, ...], tuple[str, ...]], set[int]] = {}
+    for device in requests:
+        if device.kind != "vgpu" or not device.resource_class:
+            continue
+        key = (
+            device.resource_class,
+            tuple(sorted(device.traits)),
+            tuple(sorted(device.forbidden_traits)),
+        )
+        sizes = groups.setdefault(key, set())
+        if device.count > 1:
+            sizes.add(device.count)
+    for resource_class in dict.fromkeys(cls for cls, _, _ in list(groups)):
+        groups.setdefault((resource_class, (), ()), set())
+    return [
+        PoolRequest(cls, traits, forbidden, tuple(sorted(sizes)))
+        for (cls, traits, forbidden), sizes in groups.items()
+    ]
+
+
 def vgpu_request_keys(
     extra_specs: Mapping[str, str], declared_profile: str | None = None
 ) -> list[str]:

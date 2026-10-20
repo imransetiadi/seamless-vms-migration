@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
-from ..domain.models import Provider, VMRef
-from ..planning.preflight import DestinationInventory, SourceInventory
+from ..domain.models import GpuDevice, Provider, VMRef
+from ..planning.preflight import DestinationInventory, GpuCapacity, SourceInventory
 
 
 class ProviderError(Exception):
@@ -37,10 +37,20 @@ class DestinationProvider(Protocol):
         """The destination's capabilities; ProviderError when it cannot be reached."""
 
     async def inventory(self) -> DestinationInventory:
-        """The destination's networks, flavors, volume types, quotas, projects and keypairs."""
+        """The destination's networks, flavors, volume types, quotas, projects and keypairs, its
+        GPU flavors and their Placement pools (SDD §22.3)."""
 
     async def get_server(self, server_id: str) -> dict[str, Any]:
-        """``{status, ports: [{status, fixed_ips, floating_ips}]}``."""
+        """``{status, ports: [{status, fixed_ips, floating_ips}], flavor: {name, extra_specs}}`` -
+        compute 2.47's embedded flavor, its extra specs empty where Nova's policy hides them."""
+
+    async def gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity:
+        """The Placement pools of the given vGPU requests only, read as the inventory's are: the
+        cutover gate's read (SDD §22.3, §22.7)."""
+
+    async def server_allocations(self, server_id: str) -> dict[str, int] | None:
+        """The units the server holds per resource class, summed over its providers; None when
+        Placement refuses the read or holds no allocation for it (SDD §22.3, §22.8)."""
 
     async def console_log(self, server_id: str, lines: int = 200) -> str | None:
         """The last ``lines`` lines of the server's console; None when it has none."""

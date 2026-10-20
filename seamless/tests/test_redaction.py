@@ -1,6 +1,7 @@
 """The one redaction layer (SDD §13.4, ADV-06): no secret leaves for Jev or agentmemory."""
 
 import json
+import logging
 import random
 import re
 import shlex
@@ -1117,3 +1118,100 @@ def test_a_passphrase_flag_and_a_quoted_camel_case_key_after_a_doubtful_value_ar
     out = redact(text)
     assert secret not in out and kept in out, out
     assert redact(out) == out, out
+
+
+async def test_no_placement_provider_name_or_uuid_leaves_the_capacity_read(caplog):
+    """SDD §13.4, §22.12 (plan task G3): Placement's resource providers are the destination's
+    compute hosts, named after them (`<host>_pci_<address>`) and known by uuids - customer data.
+    Whatever Placement answers - candidates whose summaries even carry a name, an error whose text
+    names the provider, an error code that is no Placement code, an answer that is no JSON, a
+    failure without an answer -, no name or uuid reaches the inventory, the check report, the
+    gate's capacity read, the allocations read or a log line: the read keeps counts."""
+    pytest.importorskip("openstack")
+    from keystoneauth1.exceptions import ConnectFailure
+
+    from tests.test_providers import A100, GROUP, FakePlacement, candidates, gpu_destination
+
+    hosts = ("gpu-host-a", "gpu-host-b")
+    gpus = ("gpu-host-a_pci_0000_3b_00_0", "gpu-host-b_pci_0000_af_00_0")
+    uuids = {
+        gpus[0]: "5b0c9a7e-1f2d-4e3c-9a8b-7c6d5e4f3a21",
+        hosts[0]: "9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b",
+        gpus[1]: "2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d",
+        hosts[1]: "f0e1d2c3-b4a5-4968-8776-a5b4c3d2e1f0",
+    }
+    found = candidates(
+        (uuids[gpus[0]], uuids[hosts[0]], {"VGPU": (4, 1)}, [A100]),
+        (uuids[hosts[0]], uuids[hosts[0]], {"VCPU": (64, 8)}, []),
+        (uuids[gpus[1]], uuids[hosts[1]], {"VGPU": (4, 0)}, [A100]),
+        (uuids[hosts[1]], uuids[hosts[1]], {"VCPU": (64, 0)}, []),
+    )
+    for name, uuid in uuids.items():  # as a later microversion might widen a summary
+        found["provider_summaries"][uuid]["name"] = name
+    held = {
+        "allocations": {
+            uuids[gpus[0]]: {"resources": {"VGPU": 1}},
+            uuids[hosts[0]]: {"resources": {"VCPU": 8, "MEMORY_MB": 32768}},
+        }
+    }
+    told = f"resource provider {gpus[0]} ({uuids[gpus[0]]}) of {hosts[0]}: generation conflict"
+    answers = [
+        (200, found),
+        (409, {"errors": [{"status": 409, "code": "placement.concurrent_update", "detail": told}]}),
+        (500, {"errors": [{"status": 500, "code": gpus[0], "title": told, "detail": told}]}),
+        (400, {"errors": [{"status": 400, "code": f"placement.{hosts[0]}", "detail": told}]}),
+        (503, told),
+    ]
+
+    def answering(status, body):
+        """Placement giving every read the case's answer - the allocations read of the case that
+        finds candidates, the server's units."""
+
+        def answer(url, params):
+            if status == 200 and url.startswith("/allocations/"):
+                return 200, held
+            return status, body
+
+        return FakePlacement(answer)
+
+    caplog.set_level(logging.DEBUG, logger="seamless_migrate")
+    kept = []
+    for placement in [
+        *(answering(*a) for a in answers),
+        FakePlacement(raises=ConnectFailure(told)),
+    ]:
+        _, dst = gpu_destination([("g1.a", 8, 32768, 80, GROUP)], placement)
+        inventory = await dst.inventory()
+        report = await dst.check()
+        gate = await dst.gpu_capacity([gpu for f in inventory.gpu_flavors for gpu in f["gpus"]])
+        kept.append(
+            json.dumps(
+                [
+                    inventory.to_dict(),
+                    report,
+                    gate.to_dict(),
+                    await dst.server_allocations("srv-1"),
+                ]
+            )
+        )
+    # the read went on: the first answer's counts, then each failure named by status and code
+    first = json.loads(kept[0])
+    assert first[0]["gpu_capacity"]["pools"][0] == {
+        "resource_class": "VGPU",
+        "traits": [A100],
+        "forbidden_traits": ["CUSTOM_OLD"],
+        "free": 7,
+        "providers": 2,
+        "largest_free": 4,
+    }
+    assert first[3] == {"VGPU": 1, "VCPU": 8, "MEMORY_MB": 32768}
+    assert [json.loads(k)[1]["gpu_capacity"]["detail"] for k in kept[1:]] == [
+        "HTTP 409 placement.concurrent_update",
+        "HTTP 500",
+        "HTTP 400",
+        "HTTP 503",
+        "ConnectFailure",
+    ]
+    for name in (*hosts, *gpus, *uuids.values()):
+        assert not [k for k in kept if name in k], name
+        assert name not in caplog.text, name

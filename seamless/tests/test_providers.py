@@ -3270,3 +3270,360 @@ async def test_fake_vmware_vms_get_a_network_map_value_for_every_nic():
             assert why is None, (vm.name, why)
             assert kit_network_key(nic) == nic.network
             assert kit_network_value(network, subnet) == f"{network['id']},{subnet['id']}"
+
+
+# -- the destination's GPU flavors and capacity (SDD §22.3, plan task G3) -----------------------
+
+
+class FakePlacement:
+    """Placement as openstacksdk's placement proxy answers it: `get(url, params=...,
+    microversion=..., raise_exc=False)` returns a response, its status and body what `answer(url,
+    params)` gives, or raises `raises`; each call is recorded (SDD §22.3)."""
+
+    def __init__(self, answer=None, raises=None):
+        self.calls = []
+        self.answer = answer or (lambda url, params: (200, candidates()))
+        self.raises = raises
+
+    def get(self, url, params=None, microversion=None, raise_exc=True, **_):
+        self.calls.append({"url": url, "params": dict(params or {}), "microversion": microversion})
+        if self.raises is not None:
+            raise self.raises
+        status, body = self.answer(url, dict(params or {}))
+        return NS(status_code=status, json=lambda: body)
+
+
+def candidates(*providers, cls="VGPU", amount=1, fit=None):
+    """An allocation_candidates answer at 1.29, as Placement writes it (SDD §22.3): providers as
+    (uuid, root uuid, {class: (capacity, used)}, traits), each in provider_summaries - the whole
+    tree of a candidate is; an allocation request takes `amount` of `cls` from each uuid of `fit`,
+    by default every provider with that much of it free."""
+    if fit is None:
+        fit = [
+            u for u, _, res, _ in providers if cls in res and res[cls][0] - res[cls][1] >= amount
+        ]
+    return {
+        "allocation_requests": [
+            {"allocations": {uuid: {"resources": {cls: amount}}}} for uuid in fit
+        ],
+        "provider_summaries": {
+            uuid: {
+                "resources": {c: {"capacity": cap, "used": used} for c, (cap, used) in res.items()},
+                "traits": list(traits),
+                "parent_provider_uuid": None if uuid == root else root,
+                "root_provider_uuid": root,
+            }
+            for uuid, root, res, traits in providers
+        },
+    }
+
+
+def gpu_destination(flavors, placement, **provider):
+    """A destination OpenStackProvider whose compute lists `flavors` - (name, vcpus, ram, disk,
+    extra specs) - and whose catalog's Placement is `placement`."""
+    pytest.importorskip("openstack")
+    conn = fake_conn()
+    conn.compute.flavors = lambda details=True: [
+        NS(name=n, vcpus=v, ram=r, disk=d, extra_specs=specs) for n, v, r, d, specs in flavors
+    ]
+    conn.placement = placement
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, **provider
+    )
+    return conn, OpenStackProvider(dst, settings(), connect_fn=lambda *_: conn)
+
+
+A100 = "CUSTOM_NVIDIA_A100_4C"
+GROUP = {"resources1:VGPU": "1", f"trait1:{A100}": "required", "trait1:CUSTOM_OLD": "forbidden"}
+
+
+async def test_the_destination_inventory_lists_its_gpu_flavors_with_their_declared_profiles():
+    """SDD §22.3 (plan task G3): the GPU flavors are the destination flavors whose extra specs ask
+    for a GPU by §22.2's reading, with the profile declared for them; `flavors` keeps every one."""
+    conn, dst = gpu_destination(
+        [
+            ("m1.small", 2, 4096, 20, {}),
+            (
+                "g1.a100-4c",
+                8,
+                32768,
+                80,
+                {"resources1:CUSTOM_A100_4C": "1", "trait1:CUSTOM_A": "required"},
+            ),
+            ("g1.vgpu", 4, 16384, 40, {"resources:VGPU": "2"}),
+            ("p1.a100", 8, 32768, 80, {"pci_passthrough:alias": "a100:1"}),
+        ],
+        FakePlacement(),
+        gpu_profiles={"g1.a100-4c": "A100-4C"},
+    )
+    inv = await dst.inventory()
+    assert [f["name"] for f in inv.flavors] == ["m1.small", "g1.a100-4c", "g1.vgpu", "p1.a100"]
+    assert inv.gpu_flavors == [
+        {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "gpus": [
+                GpuDevice(
+                    kind="vgpu",
+                    profile="A100-4C",
+                    resource_class="CUSTOM_A100_4C",
+                    traits=["CUSTOM_A"],
+                )
+            ],
+        },
+        {
+            "name": "g1.vgpu",
+            "vcpus": 4,
+            "ram_mb": 16384,
+            "disk_gb": 40,
+            "gpus": [GpuDevice(kind="vgpu", resource_class="VGPU", count=2)],
+        },
+        {
+            "name": "p1.a100",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "gpus": [GpuDevice(kind="passthrough", alias="a100")],
+        },
+    ]
+
+
+async def test_gpu_capacity_reads_one_allocation_candidates_request_per_pool_at_1_29():
+    """SDD §22.3 (plan task G3): one pool per distinct vGPU request - its class with its required
+    and forbidden traits - and one per class alone, each one GET /allocation_candidates at 1.29, a
+    forbidden trait sent as !<trait>; a request two flavors share is read once."""
+    placement = FakePlacement()
+    conn, dst = gpu_destination(
+        [
+            ("g1.a", 8, 32768, 80, GROUP),
+            ("g1.b", 8, 32768, 80, {"resources:VGPU": "1", "trait:CUSTOM_B": "required"}),
+            ("g1.a-again", 4, 16384, 40, GROUP),
+        ],
+        placement,
+    )
+    inv = await dst.inventory()
+    assert placement.calls == [
+        {
+            "url": "/allocation_candidates",
+            "params": {"resources": "VGPU:1", "required": f"{A100},!CUSTOM_OLD"},
+            "microversion": "1.29",
+        },
+        {
+            "url": "/allocation_candidates",
+            "params": {"resources": "VGPU:1", "required": "CUSTOM_B"},
+            "microversion": "1.29",
+        },
+        {
+            "url": "/allocation_candidates",
+            "params": {"resources": "VGPU:1"},
+            "microversion": "1.29",
+        },
+    ]
+    assert [(p.resource_class, p.traits, p.forbidden_traits) for p in inv.gpu_capacity.pools] == [
+        ("VGPU", [A100], ["CUSTOM_OLD"]),
+        ("VGPU", ["CUSTOM_B"], []),
+        ("VGPU", [], []),
+    ]
+    assert (inv.gpu_capacity.status, inv.gpu_capacity.reason) == ("ok", None)
+    assert inv.gpu_capacity.read_at is not None
+
+
+async def test_gpu_capacity_counts_capacity_less_used_on_providers_with_the_pools_traits():
+    """SDD §22.3 (plan task G3): a provider counts when it holds the class and the pool's traits and
+    lacks the forbidden ones; its free is Placement's capacity less used. `providers` counts those
+    with a unit free, `largest_free` the most free on one."""
+    answer = candidates(
+        ("gpu-1", "cn-1", {"VGPU": (8, 2)}, [A100]),
+        ("gpu-2", "cn-1", {"VGPU": (4, 4)}, [A100]),
+        ("gpu-3", "cn-2", {"VGPU": (8, 0)}, ["CUSTOM_OTHER"]),
+        ("gpu-4", "cn-2", {"VGPU": (2, 0)}, [A100, "CUSTOM_OLD"]),
+        ("gpu-5", "cn-2", {"VGPU": (6, 3)}, [A100]),
+        ("cn-1", "cn-1", {"VCPU": (64, 8)}, []),
+        ("cn-2", "cn-2", {}, []),
+    )
+    conn, dst = gpu_destination(
+        [("g1.a", 8, 32768, 80, GROUP)], FakePlacement(lambda u, p: (200, answer))
+    )
+    [pool, alone] = (await dst.inventory()).gpu_capacity.pools
+    assert (pool.free, pool.providers, pool.largest_free) == (9, 2, 6)
+    # the class alone unites the pools: every provider that holds VGPU and is not disabled
+    assert (alone.free, alone.providers, alone.largest_free) == (19, 4, 8)
+
+
+async def test_gpu_capacity_leaves_out_a_provider_whose_compute_service_is_disabled():
+    """SDD §22.3 (plan task G3): a provider whose root provider carries COMPUTE_STATUS_DISABLED - a
+    disabled compute service, which Nova's own requests forbid - is not counted."""
+    answer = candidates(
+        ("gpu-1", "cn-1", {"VGPU": (8, 0)}, [A100]),
+        ("cn-1", "cn-1", {}, ["COMPUTE_STATUS_DISABLED"]),
+        ("gpu-2", "cn-2", {"VGPU": (4, 1)}, [A100]),
+        ("cn-2", "cn-2", {}, []),
+    )
+    conn, dst = gpu_destination(
+        [("g1.a", 8, 32768, 80, GROUP)], FakePlacement(lambda u, p: (200, answer))
+    )
+    pool = (await dst.inventory()).gpu_capacity.pools[0]
+    assert (pool.free, pool.providers, pool.largest_free) == (3, 1, 3)
+
+
+async def test_gpu_capacity_reads_a_pool_again_for_a_group_of_more_than_one_unit():
+    """SDD §22.3 (plan task G3): Nova fills a group from one provider, and an inventory's max_unit
+    may cap what one provider gives below its free: the pool is read again with <class>:<n> for a
+    group of n > 1 units, and when that read finds no provider largest_free stays below n."""
+    one = candidates(("gpu-1", "cn-1", {"VGPU": (8, 2)}, []), ("cn-1", "cn-1", {}, []))
+    for found, largest in ((["gpu-1"], 6), ([], 1)):
+        two = candidates(
+            ("gpu-1", "cn-1", {"VGPU": (8, 2)}, []), ("cn-1", "cn-1", {}, []), amount=2, fit=found
+        )
+        placement = FakePlacement(
+            lambda u, p, two=two: (200, two if p["resources"] == "VGPU:2" else one)
+        )
+        conn, dst = gpu_destination(
+            [("g1.vgpu2", 8, 32768, 80, {"resources:VGPU": "2"})], placement
+        )
+        [pool] = (await dst.inventory()).gpu_capacity.pools
+        assert [c["params"]["resources"] for c in placement.calls] == ["VGPU:1", "VGPU:2"]
+        assert (pool.free, pool.providers, pool.largest_free) == (6, 1, largest)
+
+
+async def test_gpu_capacity_is_unknown_when_placement_refuses_the_credential():
+    """SDD §22.3 (plan task G3): Placement's default policy gives these reads to admin; a credential
+    it refuses (403) reads unknown, reason forbidden, the failure by its status and code - never a
+    guess, and the inventory goes on."""
+    policy = "Policy does not allow placement:allocation_candidates:list to be performed."
+    refused = {"errors": [{"status": 403, "code": "placement.undefined_code", "detail": policy}]}
+    conn, dst = gpu_destination(
+        [("g1.a", 8, 32768, 80, GROUP)], FakePlacement(lambda u, p: (403, refused))
+    )
+    inv = await dst.inventory()
+    capacity = inv.gpu_capacity
+    assert (capacity.status, capacity.reason, capacity.detail, capacity.pools) == (
+        "unknown",
+        "forbidden",
+        "HTTP 403 placement.undefined_code",
+        [],
+    )
+    assert [f["name"] for f in inv.gpu_flavors] == ["g1.a"]
+
+
+async def test_gpu_capacity_is_unknown_without_a_placement_endpoint():
+    """SDD §22.3 (plan task G3): a catalog without Placement reads unknown, reason no_placement."""
+    from keystoneauth1.exceptions import EndpointNotFound
+
+    conn, dst = gpu_destination(
+        [("g1.a", 8, 32768, 80, GROUP)], FakePlacement(raises=EndpointNotFound("no placement"))
+    )
+    capacity = (await dst.inventory()).gpu_capacity
+    assert (capacity.status, capacity.reason, capacity.detail) == ("unknown", "no_placement", None)
+
+
+async def test_gpu_capacity_is_unknown_with_the_status_and_code_of_any_other_failure():
+    """SDD §22.3, §22.12 (plan task G3): any other failure reads unknown, reason error, its detail
+    the HTTP status and Placement error code - or the failure's kind when there is no answer -,
+    never Placement's message text."""
+    from keystoneauth1.exceptions import ConnectTimeout
+
+    broken = {
+        "errors": [
+            {
+                "status": 500,
+                "code": "placement.query.bad_value",
+                "detail": "gpu-host-a_pci_0000_3b_00_0",
+            }
+        ]
+    }
+    for placement, detail in (
+        (FakePlacement(lambda u, p: (500, broken)), "HTTP 500 placement.query.bad_value"),
+        (FakePlacement(lambda u, p: (503, "<html>busy</html>")), "HTTP 503"),
+        (
+            FakePlacement(raises=ConnectTimeout("gpu-host-a timed out")),
+            "ConnectTimeout",
+        ),
+    ):
+        conn, dst = gpu_destination([("g1.a", 8, 32768, 80, GROUP)], placement)
+        capacity = (await dst.inventory()).gpu_capacity
+        assert (capacity.status, capacity.reason, capacity.detail) == ("unknown", "error", detail)
+
+
+async def test_a_destination_without_gpu_flavors_calls_no_placement():
+    """SDD §22.3 (plan task G3): a destination with no vGPU flavor reads ok with no pools and sends
+    Placement nothing."""
+    placement = FakePlacement()
+    conn, dst = gpu_destination([("m1.small", 2, 4096, 20, {})], placement)
+    inv = await dst.inventory()
+    assert (inv.gpu_flavors, inv.gpu_capacity.status, inv.gpu_capacity.pools) == ([], "ok", [])
+    assert placement.calls == []
+
+
+async def test_a_pci_alias_flavor_gets_no_pool():
+    """SDD §22.3 (plan task G3): a PCI alias request has no pool - the device class its alias asks
+    for lives in nova.conf -, so an alias flavor alone sends Placement nothing."""
+    placement = FakePlacement()
+    conn, dst = gpu_destination(
+        [("p1.a100", 8, 32768, 80, {"pci_passthrough:alias": "a100:1"})], placement
+    )
+    inv = await dst.inventory()
+    assert [f["name"] for f in inv.gpu_flavors] == ["p1.a100"]
+    assert (inv.gpu_capacity.status, inv.gpu_capacity.pools, placement.calls) == ("ok", [], [])
+
+
+async def test_the_destination_check_reports_its_gpu_capacity():
+    """SDD §10, §22.3 (plan task G3): a destination's check report holds gpu_capacity, read when the
+    check runs, which the provider card shows with the check's time (§22.11)."""
+    answer = candidates(("gpu-1", "cn-1", {"VGPU": (4, 1)}, [A100]), ("cn-1", "cn-1", {}, []))
+    conn, dst = gpu_destination(
+        [("g1.a", 8, 32768, 80, GROUP)], FakePlacement(lambda u, p: (200, answer))
+    )
+    report = await dst.check()
+    capacity = report["gpu_capacity"]
+    assert (capacity["status"], capacity["reason"], capacity["detail"]) == ("ok", None, None)
+    assert isinstance(capacity["read_at"], str)
+    assert capacity["pools"][0] == {
+        "resource_class": "VGPU",
+        "traits": [A100],
+        "forbidden_traits": ["CUSTOM_OLD"],
+        "free": 3,
+        "providers": 1,
+        "largest_free": 3,
+    }
+
+
+async def test_server_allocations_add_up_the_units_per_resource_class():
+    """SDD §22.3, §22.8 (plan task G3): the units a server holds per resource class, GET
+    /allocations/{server_id} summed over its providers."""
+    held = {
+        "allocations": {
+            "gpu-1": {"resources": {"VGPU": 1}},
+            "gpu-2": {"resources": {"VGPU": 1}},
+            "cn-1": {"resources": {"VCPU": 8, "MEMORY_MB": 32768}},
+        }
+    }
+    placement = FakePlacement(lambda u, p: (200, held))
+    conn, dst = gpu_destination([], placement)
+    assert await dst.server_allocations("srv-1") == {"VGPU": 2, "VCPU": 8, "MEMORY_MB": 32768}
+    assert placement.calls[-1]["url"] == "/allocations/srv-1"
+
+
+async def test_server_allocations_are_none_when_placement_refuses():
+    """SDD §22.3, §22.8 (plan task G3): None when Placement refuses the read or holds no
+    allocation for the server."""
+    refused = {"errors": [{"status": 403, "code": "placement.undefined_code"}]}
+    for answer in ((403, refused), (200, {"allocations": {}})):
+        conn, dst = gpu_destination([], FakePlacement(lambda u, p, answer=answer: answer))
+        assert await dst.server_allocations("srv-1") is None
+
+
+async def test_get_server_reports_its_flavor_name_and_extra_specs():
+    """SDD §10, §22.3 (plan task G3): get_server adds compute 2.47's embedded flavor - its
+    original_name and its extra_specs, which stay empty when Nova's policy hides them."""
+    conn, dst = gpu_destination([], FakePlacement())
+    [server] = conn.compute.servers(details=True)
+    server.flavor = {"original_name": "g1.a100-4c", "extra_specs": {"resources:VGPU": "1"}}
+    assert (await dst.get_server("srv-1"))["flavor"] == {
+        "name": "g1.a100-4c",
+        "extra_specs": {"resources:VGPU": "1"},
+    }
+    server.flavor = {"original_name": "m1.small"}
+    assert (await dst.get_server("srv-1"))["flavor"] == {"name": "m1.small", "extra_specs": {}}

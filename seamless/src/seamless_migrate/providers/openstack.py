@@ -9,17 +9,18 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable, Mapping
+import urllib.parse
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, TypeVar
 
 from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import ProviderRole
-from ..domain.models import Disk, Nic, Provider, VMRef
+from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef, utcnow
 from ..guest_os import identify
-from ..planning.gpu import gpu_requests
+from ..planning.gpu import PoolRequest, gpu_pools, gpu_requests
 from ..planning.platforms import destination_release
-from ..planning.preflight import DestinationInventory, SourceInventory
+from ..planning.preflight import DestinationInventory, GpuCapacity, GpuPool, SourceInventory
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
 from ..storage import storage_family
 from .base import ProviderError, VMNotFound, microversion_text, missing_dependency
@@ -31,6 +32,28 @@ PROVIDER_API_TIMEOUT_S = 60
 PROVIDER_CALL_TIMEOUT_S = 300.0
 #: Cinder statuses of a volume still attached to, or detaching from, a server: no delete yet
 _VOLUME_SETTLING = frozenset({"in-use", "attaching", "detaching", "reserved"})
+#: Placement's microversion of the GPU reads: allocation candidates with each provider's traits and
+#: root, which every series of the window serves (SDD §21.1, §22.3)
+PLACEMENT_MICROVERSION = "1.29"
+#: the trait Nova puts on the root provider of a disabled compute service (SDD §22.3)
+_COMPUTE_DISABLED = "COMPUTE_STATUS_DISABLED"
+#: Placement's error codes (placement/errors.py, read 2026-10-20): what a failure's detail keeps of
+#: its answer, one of these or none - never the message text, which names providers after their
+#: hosts (SDD §22.12)
+_PLACEMENT_CODES = frozenset(
+    {
+        "placement.undefined_code",
+        "placement.inventory.inuse",
+        "placement.concurrent_update",
+        "placement.duplicate_name",
+        "placement.resource_provider.inuse",
+        "placement.resource_provider.cannot_delete_parent",
+        "placement.resource_provider.not_found",
+        "placement.query.duplicate_key",
+        "placement.query.bad_value",
+        "placement.query.missing_value",
+    }
+)
 T = TypeVar("T")
 
 _POWER = {
@@ -177,6 +200,165 @@ def _plain_http(endpoint: str, conn: Any) -> list[str]:
     return found
 
 
+def _flavors(conn: Any) -> list[dict[str, Any]]:
+    """Every flavor the credential sees: [{name, vcpus, ram_mb, disk_gb, extra_specs}] (SDD §10)."""
+    return [
+        {
+            "name": str(_attr(f, "name")),
+            "vcpus": int(_attr(f, "vcpus", default=0)),
+            "ram_mb": int(_attr(f, "ram", default=0)),
+            "disk_gb": int(_attr(f, "disk", default=0)),
+            "extra_specs": dict(_attr(f, "extra_specs", default={}) or {}),
+        }
+        for f in conn.compute.flavors(details=True)
+    ]
+
+
+def _gpu_flavors(
+    flavors: Iterable[Mapping[str, Any]], profiles: Mapping[str, str]
+) -> list[dict[str, Any]]:
+    """The flavors whose extra specs ask for a GPU by §22.2's reading, each with its GPU requests
+    and the profile its provider declares for it: [{name, vcpus, ram_mb, disk_gb, gpus}]
+    (SDD §22.3)."""
+    found = []
+    for flavor in flavors:
+        specs = {str(k): str(v) for k, v in flavor["extra_specs"].items()}
+        gpus = gpu_requests(specs, profiles.get(flavor["name"]))
+        if gpus:
+            size = {key: flavor[key] for key in ("name", "vcpus", "ram_mb", "disk_gb")}
+            found.append({**size, "gpus": gpus})
+    return found
+
+
+class _PlacementAnswer(Exception):
+    """Placement answered a read with an error: `detail` names its HTTP status and error code."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
+def _placement_get(conn: Any, url: str, params: dict[str, str] | None = None) -> Any:
+    """The body of Placement's 200 to a GET at microversion 1.29, else _PlacementAnswer with the
+    status and the error code (SDD §22.3, §22.12)."""
+    response = conn.placement.get(
+        url, params=params, microversion=PLACEMENT_MICROVERSION, raise_exc=False
+    )
+    status = int(response.status_code)
+    if status == 200:
+        return response.json()
+    code = None
+    with contextlib.suppress(Exception):  # an answer that is no Placement error has no code
+        code = response.json()["errors"][0]["code"]
+    if isinstance(code, str) and code in _PLACEMENT_CODES:
+        raise _PlacementAnswer(status, f"HTTP {status} {code}")
+    raise _PlacementAnswer(status, f"HTTP {status}")
+
+
+def _no_placement(exc: Exception) -> bool:
+    """Whether ``exc`` says the catalog has no Placement: keystoneauth finds no endpoint, or
+    openstacksdk's proxy of a service the catalog lacks refuses every call (SDD §22.3)."""
+    try:
+        from keystoneauth1.exceptions import EndpointNotFound
+        from openstack.exceptions import ServiceDisabledException
+    except ImportError:  # a test double, without openstacksdk installed
+        return False
+    return isinstance(exc, (EndpointNotFound, ServiceDisabledException))
+
+
+def _gpu_read_failure(exc: Exception) -> tuple[str, str | None]:
+    """Why a GPU read failed (SDD §22.3): `forbidden` when Placement refused the credential (403),
+    `no_placement` when the catalog has none, else `error` - its detail the HTTP status and the
+    Placement error code, or the failure's kind when nothing answered; never a message's text,
+    which may name a provider (§22.12)."""
+    if isinstance(exc, _PlacementAnswer):
+        return ("forbidden" if exc.status == 403 else "error"), exc.detail
+    if _no_placement(exc):
+        return "no_placement", None
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return "error", f"HTTP {status}"
+    return "error", type(exc).__name__
+
+
+def _gpu_capacity(conn: Any, requests: Iterable[GpuDevice]) -> GpuCapacity:
+    """The Placement pools of the vGPU requests (SDD §22.3), counts only: no provider's name or
+    uuid leaves the read (§22.12). Without a vGPU request it sends Placement nothing. A refused
+    credential, a catalog without Placement and any other failure read unknown - never a guess -
+    and fail neither the inventory nor the check."""
+    pools = gpu_pools(requests)
+    read_at = utcnow()
+    if not pools:
+        return GpuCapacity(status="ok", read_at=read_at)
+    try:
+        counted = [_read_pool(conn, pool) for pool in pools]
+    except Exception as exc:
+        reason, detail = _gpu_read_failure(exc)
+        log.info("GPU capacity not read: %s %s", reason, detail or "")
+        return GpuCapacity(status="unknown", reason=reason, detail=detail, read_at=read_at)
+    return GpuCapacity(status="ok", read_at=read_at, pools=counted)
+
+
+def _candidates(conn: Any, pool: PoolRequest, units: int) -> Any:
+    """GET /allocation_candidates for ``units`` of the pool's class with its traits, a forbidden
+    one as !<trait> (SDD §22.3)."""
+    params = {"resources": f"{pool.resource_class}:{units}"}
+    required = [*pool.traits, *(f"!{trait}" for trait in pool.forbidden_traits)]
+    if required:
+        params["required"] = ",".join(required)
+    return _placement_get(conn, "/allocation_candidates", params)
+
+
+def _free_units(answer: Any, pool: PoolRequest) -> dict[str, int]:
+    """The units free on each provider of an allocation-candidates answer that counts for the pool
+    (SDD §22.3): it holds the class and the pool's traits, lacks the forbidden ones, and its root
+    provider lacks COMPUTE_STATUS_DISABLED - a disabled compute service, which Nova's own requests
+    forbid. Its free is Placement's capacity less its used. Keyed by uuid, kept by nothing."""
+    summaries = answer.get("provider_summaries") or {}
+    free: dict[str, int] = {}
+    for uuid, summary in summaries.items():
+        held = (summary.get("resources") or {}).get(pool.resource_class)
+        traits = set(summary.get("traits") or [])
+        root = summaries.get(summary.get("root_provider_uuid") or uuid) or summary
+        if (
+            held is None
+            or not traits.issuperset(pool.traits)
+            or traits.intersection(pool.forbidden_traits)
+            or _COMPUTE_DISABLED in (root.get("traits") or [])
+        ):
+            continue
+        free[uuid] = max(0, int(held.get("capacity", 0)) - int(held.get("used", 0)))
+    return free
+
+
+def _read_pool(conn: Any, pool: PoolRequest) -> GpuPool:
+    """One pool as Placement shows it (SDD §22.3): the units free on the providers that count, how
+    many have one free, and the most on one. Nova fills a request group from one provider, whose
+    inventory's max_unit may cap it below its free: the pool is read again as <class>:<n> for each
+    group of n > 1 units, and where that read finds no provider its largest free stays below n."""
+    free = _free_units(_candidates(conn, pool, 1), pool)
+    largest = max(free.values(), default=0)
+    for units in pool.groups:
+        answer = _candidates(conn, pool, units)
+        named = {
+            uuid
+            for request in answer.get("allocation_requests") or []
+            for uuid, allocation in (request.get("allocations") or {}).items()
+            if pool.resource_class in (allocation.get("resources") or {})
+        }
+        if not named.intersection(_free_units(answer, pool)):
+            largest = min(largest, units - 1)
+    return GpuPool(
+        resource_class=pool.resource_class,
+        traits=list(pool.traits),
+        forbidden_traits=list(pool.forbidden_traits),
+        free=sum(free.values()),
+        providers=sum(1 for left in free.values() if left > 0),
+        largest_free=largest,
+    )
+
+
 class OpenStackProvider:
     """Source and destination provider for kinds ``openstack`` and ``rhoso``."""
 
@@ -236,6 +418,12 @@ class OpenStackProvider:
 
     async def get_server(self, server_id: str) -> dict[str, Any]:
         return await self._run(self._get_server, server_id)
+
+    async def gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity:
+        return await self._run(self._gpu_capacity, requests)
+
+    async def server_allocations(self, server_id: str) -> dict[str, int] | None:
+        return await self._run(self._server_allocations, server_id)
 
     async def console_log(self, server_id: str, lines: int = 200) -> str | None:
         return await self._run(self._console_log, server_id, lines)
@@ -334,7 +522,18 @@ class OpenStackProvider:
                     block_storage_microversion,
                 )
             )
+            # the Placement pools of its GPU flavors' vGPU requests, read now (SDD §22.3)
+            report["gpu_capacity"] = self._check_gpu_capacity(conn).to_dict()
         return report
+
+    def _check_gpu_capacity(self, conn: Any) -> GpuCapacity:
+        try:
+            flavors = _flavors(conn)
+        except Exception as exc:  # a probe, as the check's others: it fails nothing (SDD §22.3)
+            reason, detail = _gpu_read_failure(exc)
+            return GpuCapacity(status="unknown", reason=reason, detail=detail, read_at=utcnow())
+        gpu_flavors = _gpu_flavors(flavors, self.provider.gpu_profiles)
+        return _gpu_capacity(conn, (gpu for flavor in gpu_flavors for gpu in flavor["gpus"]))
 
     def _list_vms(self) -> list[VMRef]:
         conn = self._connection()
@@ -370,16 +569,11 @@ class OpenStackProvider:
             return SourceInventory(
                 networks=networks, projects=[project] if project else [], keypairs=keypairs
             )
-        flavors = [
-            {
-                "name": str(_attr(f, "name")),
-                "vcpus": int(_attr(f, "vcpus", default=0)),
-                "ram_mb": int(_attr(f, "ram", default=0)),
-                "disk_gb": int(_attr(f, "disk", default=0)),
-                "extra_specs": dict(_attr(f, "extra_specs", default={}) or {}),
-            }
-            for f in conn.compute.flavors(details=True)
-        ]
+        flavors = _flavors(conn)
+        # the flavors that ask for a GPU, with their declared profiles, and the Placement pools of
+        # their vGPU requests (SDD §22.3)
+        gpu_flavors = _gpu_flavors(flavors, self.provider.gpu_profiles)
+        gpu_capacity = _gpu_capacity(conn, (gpu for f in gpu_flavors for gpu in f["gpus"]))
         volume_types = [str(_attr(t, "name")) for t in conn.block_storage.types()]
         quotas = _try(lambda: {project: self._free_quota(conn)}, {})
         # every network it sees with its owner: what a NIC's network name resolves to; shared and
@@ -427,6 +621,8 @@ class OpenStackProvider:
             subnets=subnets,
             network_details=network_details,
             roles=roles,
+            gpu_flavors=gpu_flavors,
+            gpu_capacity=gpu_capacity,
         )
 
     @staticmethod
@@ -473,12 +669,37 @@ class OpenStackProvider:
                     "floating_ips": floating,
                 }
             )
+        # compute 2.47's embedded flavor: its extra specs stay empty where Nova's policy hides them
+        # (SDD §10, §22.3)
+        flavor = _attr(server, "flavor", default={}) or {}
+        extra_specs = _attr(flavor, "extra_specs", default={}) or {}
         return {
             "id": _attr(server, "id"),
             "name": _attr(server, "name"),
             "status": _attr(server, "status"),
             "ports": ports,
+            "flavor": {
+                "name": _attr(flavor, "original_name", "name"),
+                "extra_specs": {str(k): str(v) for k, v in extra_specs.items()},
+            },
         }
+
+    def _gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity:
+        return _gpu_capacity(self._connection(), requests)
+
+    def _server_allocations(self, server_id: str) -> dict[str, int] | None:
+        conn = self._connection()
+        try:
+            answer = _placement_get(conn, f"/allocations/{urllib.parse.quote(server_id, safe='')}")
+            units: dict[str, int] = {}
+            for held in (answer.get("allocations") or {}).values():
+                for resource_class, amount in (held.get("resources") or {}).items():
+                    units[str(resource_class)] = units.get(str(resource_class), 0) + int(amount)
+        except Exception as exc:  # unread, never a guess: the verification skips its check (§22.8)
+            reason, detail = _gpu_read_failure(exc)
+            log.info("allocations of server %s not read: %s %s", server_id, reason, detail or "")
+            return None
+        return units or None
 
     def _console_log(self, server_id: str, lines: int) -> str | None:
         conn = self._connection()

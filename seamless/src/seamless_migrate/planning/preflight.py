@@ -6,6 +6,7 @@ import ipaddress
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from typing import Any, Literal
 
 from ..domain.enums import Phase, ProviderKind, Severity, Strategy
@@ -33,6 +34,41 @@ class SourceInventory:
 
 
 @dataclass
+class GpuPool:
+    """A Placement pool of the destination's GPU requests (SDD §22.3): what a request asks Placement
+    for, and counts only - no provider's name or uuid (§22.12)."""
+
+    resource_class: str
+    traits: list[str] = field(default_factory=list)
+    forbidden_traits: list[str] = field(default_factory=list)
+    #: the units free now on the providers that hold the class and the traits
+    free: int = 0
+    #: the resource providers among them with at least one unit free
+    providers: int = 0
+    #: the most units free on one of them - below n when the read again with <class>:<n> for a
+    #: request group of n > 1 units finds no provider (max_unit caps it)
+    largest_free: int = 0
+
+
+@dataclass
+class GpuCapacity:
+    """The destination's GPU capacity as Placement shows it (SDD §22.3). `unknown` when it cannot
+    be read: Placement refused the credential (`forbidden`), the catalog has no Placement
+    (`no_placement`), or another failure (`error`); `detail` names the failure by its HTTP status
+    and Placement error code, never by its message text (§22.12)."""
+
+    status: Literal["ok", "unknown"] = "ok"
+    reason: Literal["forbidden", "no_placement", "error"] | None = None
+    detail: str | None = None
+    read_at: datetime | None = None
+    pools: list[GpuPool] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """As a destination's check report and the inventory's answer hold it (SDD §10, §22.3)."""
+        return {**asdict(self), "read_at": self.read_at.isoformat() if self.read_at else None}
+
+
+@dataclass
 class DestinationInventory:
     networks: dict[str, int | None] = field(default_factory=dict)
     #: [{name, vcpus, ram_mb, disk_gb, extra_specs}]
@@ -52,9 +88,21 @@ class DestinationInventory:
     #: the role names of the credential's token, read with the inventory - live for every run -;
     #: None when they cannot be read: what the VMware kit's map judges (SDD §10, §7.2, RV19-01)
     roles: list[str] | None = None
+    #: [{name, vcpus, ram_mb, disk_gb, gpus: [GpuDevice]}]: the flavors whose extra specs ask for a
+    #: GPU, with the profile their provider declares (SDD §22.3)
+    gpu_flavors: list[dict[str, Any]] = field(default_factory=list)
+    #: the Placement pools of their vGPU requests, read with the inventory (SDD §22.3)
+    gpu_capacity: GpuCapacity = field(default_factory=GpuCapacity)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            **asdict(self),
+            "gpu_flavors": [
+                {**flavor, "gpus": [gpu.model_dump(mode="json") for gpu in flavor["gpus"]]}
+                for flavor in self.gpu_flavors
+            ],
+            "gpu_capacity": self.gpu_capacity.to_dict(),
+        }
 
 
 @dataclass(frozen=True)
