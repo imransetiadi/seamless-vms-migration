@@ -296,8 +296,8 @@ describe('Plans page', () => {
     await user.type(within(dialog).getByLabelText(/^boot/i), '-5');
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
     const summary = await within(dialog).findByRole('alert');
-    expect(summary).toHaveTextContent('Enter the source shutdown time in seconds (more than 0), or leave it empty.');
-    expect(summary).toHaveTextContent('Enter the boot time in seconds (more than 0), or leave it empty.');
+    expect(summary).toHaveTextContent('Enter the source shutdown time in seconds (more than 0, at most 1000000000), or leave it empty.');
+    expect(summary).toHaveTextContent('Enter the boot time in seconds (more than 0, at most 1000000000), or leave it empty.');
     expect(server.plans).toHaveLength(before);
   }, 30_000);
 
@@ -317,7 +317,7 @@ describe('Plans page', () => {
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
     const summary = await within(dialog).findByRole('alert');
     expect(summary).toHaveTextContent('Enter the guest write rate in MiB/s (more than 0), or leave it empty.');
-    expect(summary).toHaveTextContent('Enter the aggregate scan cap in MiB/s (more than 0), or leave it empty.');
+    expect(summary).toHaveTextContent('Enter the aggregate scan cap in MiB/s (at least 1 B/s), or leave it empty.');
     expect(server.plans).toHaveLength(before);
   });
 
@@ -367,12 +367,43 @@ describe('Plans page', () => {
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
     const summary = await within(dialog).findByRole('alert');
     expect(summary).toHaveTextContent('Enter the convergence threshold in GiB (0 or more).');
-    expect(summary).toHaveTextContent('Enter a whole number of passes (1 or more).');
+    expect(summary).toHaveTextContent('Enter a whole number of passes from 1 to 100.');
     expect(summary).toHaveTextContent('Enter a whole number of disks (1 or more), or leave it empty.');
     // an empty threshold is not 0
     await user.clear(within(dialog).getByLabelText(/convergence threshold/i));
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
     await waitFor(() => expect(within(dialog).getByLabelText(/convergence threshold/i)).toHaveAccessibleDescription(/0 or more/));
+    expect(server.plans).toHaveLength(before);
+  }, 30_000);
+
+  it('refuses 101 passes, a link or scan rate under 1 B/s and a step time over 10^9 s, like the API (SDD §9.1, reviews RV51-07, RV51-22)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const before = server.plans.length;
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Past the bounds');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    for (const [label, value] of [
+      [/max sync passes/i, '101'],
+      [/link bandwidth/i, '0.0000001'],
+      [/^scan rate/i, '0.0000001'],
+      [/aggregate scan cap/i, '0.0000001'],
+      [/^boot/i, '1000000001'],
+    ] as const) {
+      await user.clear(within(dialog).getByLabelText(label));
+      await user.type(within(dialog).getByLabelText(label), value);
+    }
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    const summary = await within(dialog).findByRole('alert');
+    expect(summary).toHaveTextContent('Enter a whole number of passes from 1 to 100.');
+    expect(summary).toHaveTextContent('Enter the link bandwidth in MiB/s (at least 1 B/s).');
+    expect(summary).toHaveTextContent('Enter the scan rate in MiB/s (at least 1 B/s), or leave it empty.');
+    expect(summary).toHaveTextContent('Enter the aggregate scan cap in MiB/s (at least 1 B/s), or leave it empty.');
+    expect(summary).toHaveTextContent('Enter the boot time in seconds (more than 0, at most 1000000000), or leave it empty.');
     expect(server.plans).toHaveLength(before);
   }, 30_000);
 

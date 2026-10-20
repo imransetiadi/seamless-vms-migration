@@ -2075,5 +2075,88 @@
         "boot_s": 120.0
       }
     }
+  },
+  {
+    "name": "warm: a stored plan of 2,000,000 passes is modelled with 100 (review RV51-07)",
+    "vm": {
+      "source_id": "vm-1",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d0",
+          "name": null,
+          "size_gb": 50,
+          "used_gb": 20.0,
+          "bootable": true,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500,
+          "network_key": null
+        }
+      ],
+      "power_state": "running",
+      "os_type": "rhel9",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": null,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": 2097152.0,
+      "key_name": null,
+      "disk_bytes": 53687091200,
+      "used_bytes": 21474836480,
+      "guest_os": {
+        "family": "linux",
+        "distro": "rhel",
+        "version": "9",
+        "label": "RHEL 9",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "strategy": "warm",
+    "plan": {
+      "link_bps": 131072000.0,
+      "convergence_threshold_bytes": 0,
+      "max_sync_passes": 2000000,
+      "estimator_overrides": {},
+      "downtime_slo_s": 600
+    },
+    "expected": {
+      "strategy": "warm",
+      "precopy_s": 13301.44,
+      "passes": 100,
+      "downtime_s": 372.4,
+      "total_s": 13673.84,
+      "final_delta_bytes": 277662924,
+      "meets_slo": true,
+      "downtime_parts": {
+        "shutdown_s": 60.0,
+        "copy_s": 132.4,
+        "conversion_s": 0.0,
+        "create_s": 60.0,
+        "boot_s": 120.0
+      }
+    }
   }
 ]
