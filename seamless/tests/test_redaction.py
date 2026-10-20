@@ -724,6 +724,37 @@ def test_a_cli_flags_quote_that_never_closes_runs_to_its_lines_end(text):
     assert redact(out) == out
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "password: 'Fake\nPass'Word: rest",
+        "Authorization: 'Fake\nPass'Word: x",
+        "token: '\nFake'Pass auth: {a: b}",
+        "password: '\na\"secret}\\\\'auth: {a: b}",
+    ],
+    ids=["glued-key-like", "header-glued", "glued-then-auth", "glued-auth-flow"],
+)
+def test_a_quoted_value_over_lines_keeps_no_glued_part_and_a_second_pass_changes_nothing(text):
+    """SDD §13.4 (review RV52-X6): a single-quoted YAML value over lines took nothing the shell
+    glues to it, so its [REDACTED] stood glued to the word after it, which a second pass then read
+    as part of the value: the text changed (a random fuzz found it through the Authorization key
+    X5 added, and through password and token)."""
+    once = redact(text)
+    assert redact(once) == once, once
+    assert "Pass" not in once and "Word" not in once and "secret" not in once, once
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["password: 'a\nb', user: x", "password: 'a\nb'\nport: 443", "password: 'a\nb' # kept"],
+    ids=["comma", "next-line", "comment"],
+)
+def test_what_follows_a_quoted_value_over_lines_stays(text):
+    """SDD §13.4: a delimiter, a line break or a comment after it stays."""
+    out = redact(text)
+    assert out == text.replace("'a\nb'", REDACTED), out
+
+
 def _quotings(pairs):
     """``pairs`` (key, value) as each quoting a step's output carries them prints them."""
     mapping = dict(pairs)

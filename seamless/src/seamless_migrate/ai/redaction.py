@@ -189,9 +189,15 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
             r"(?:\\*+\"'\\*+\"'?+|[^'\\\n]|\\++(?:''?+)?+|''|'(?=\\++')"
             r"|(?!" + _QUOTED_KEY_AHEAD + r")'(?!" + _VALUE_END + r"))*+"
             r"(?:(?=" + _QUOTED_KEY_AHEAD + r")|'|(?=\n)|\Z)"
-            r"|'(?:[^']|'')*+'"  # a YAML single-quoted string over lines
+            # a YAML single-quoted string over lines, and what the shell glues to it: its [REDACTED]
+            # never stands glued to the word after it (review RV52-X6)
+            r"|'(?:[^']|'')*+'"
+            + _SQ_WORD
+            +
             # a string inside JSON strings, to its close, a bare quote or its line's end
-            r"|(?P<escape>\\++)\"(?:[^\"\\\n]|(?!" + _ESCAPED_CLOSE + r")\\++\"?)*+"
+            r"|(?P<escape>\\++)\"(?:[^\"\\\n]|(?!"
+            + _ESCAPED_CLOSE
+            + r")\\++\"?)*+"
             r"(?:" + _ESCAPED_CLOSE + _ESCAPED_WORD + r"|(?=[\n\"])|\Z)"
             # a [REDACTED] an earlier pass wrote is left as it is: a second pass changes nothing
             r"|\[REDACTED\](?![A-Za-z0-9])"
