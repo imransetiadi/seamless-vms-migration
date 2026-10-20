@@ -946,6 +946,80 @@ def test_a_document_an_earlier_version_stored_with_a_nul_or_a_lone_surrogate_is_
     assert (read.recommendation.unusable, read.legacy_text) == ("u\ufffd", "l\ufffd")
 
 
+def test_every_outside_text_an_earlier_version_kept_with_a_nul_is_written_again(any_store: Store):
+    """SDD §11 (PR #58 review of RV52-S1): the read-side repair covered a chosen list of fields;
+    v0.1.0-rc.2 also kept outside text raw in a migration's error, a phase change's reason, a
+    verification's checks, warnings and probe detail, and a recommendation's option, its
+    distribution's keys and the model's version - such a document could still never be written
+    again: no retry, rollback or cancel, no decision on its hold."""
+    if any_store.engine.dialect.name != "sqlite":
+        pytest.skip("PostgreSQL never kept them")
+    m = make_migration()
+    any_store.put("migration", m)
+    data = m.model_dump(mode="json")
+    data["error"] = "cutover: boom\x00"
+    data["phase_history"] = [
+        {
+            "from_phase": "cutover",
+            "to_phase": "failed",
+            "at": "2026-10-20T00:00:00Z",
+            "reason": "failed: \ud800",
+            "actor": "system",
+        }
+    ]
+    data["verification"] = {
+        "at": "2026-10-20T00:00:00Z",
+        "passed": False,
+        "checks": [{"name": "console", "ok": False, "detail": "matched \x00"}],
+        "warnings": ["console\udfff"],
+        "probes": [
+            {
+                "target": "x",
+                "kind": "tcp",
+                "result": "failed",
+                "at": "2026-10-20T00:00:00Z",
+                "detail": "\x00",
+            }
+        ],
+    }
+    with any_store.engine.begin() as conn:
+        conn.execute(
+            sa.update(documents)
+            .where(documents.c.kind == "migration", documents.c.id == m.id)
+            .values(data=data)
+        )
+    loaded, version = any_store.get_versioned("migration", m.id, Migration)
+    assert (loaded.error, loaded.phase_history[-1].reason) == (
+        "cutover: boom\ufffd",
+        "failed: \ufffd",
+    )
+    assert loaded.verification.checks[0]["detail"] == "matched \ufffd"
+    assert (loaded.verification.warnings, loaded.verification.probes[0].detail) == (
+        ["console\ufffd"],
+        "\ufffd",
+    )
+    assert any_store.put("migration", loaded, expected_version=version) == version + 1
+    rec = AdvisorRecommendation.model_validate(
+        {
+            "decision_type": "migration_strategy",
+            "subject": {"kind": "vm", "id": "vm-1", "name": "web-01"},
+            "model": {"name": "jev", "version": "jev\x00"},
+            "recommendation": {
+                "option": "warm\x00",
+                "confidence": 0.9,
+                "distribution": {"cold\ud800": 0.1},
+            },
+            "decision": {
+                "status": "approved",
+                "reason_code": "APPROVED_BY_USER",
+                "actor": {"kind": "user", "id": "rina"},
+            },
+        }
+    )
+    assert (rec.model.version, rec.recommendation.option) == ("jev\ufffd", "warm\ufffd")
+    assert rec.recommendation.distribution == {"cold\ufffd": 0.1}
+
+
 def test_the_unstorable_walk_reads_a_value_nested_however_deep():
     """SDD §11, §12 (review RV49-05): the walk that finds a NUL or a lone surrogate - for the store
     and for the request-body check - recursed one Python frame per level: 1,500 levels raised

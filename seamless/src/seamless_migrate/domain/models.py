@@ -413,6 +413,41 @@ class NicOverride(_Model):
         return [str(ipaddress.ip_address(a)) if _is_ip(a) else a for a in value]
 
 
+def _storable(text: str) -> str:
+    """``text`` with each NUL and lone surrogate read as U+FFFD; ASCII text with no NUL - nearly
+    every string - is looked at by C code alone (SDD §11, review RV52-S1, PR #58 review)."""
+    if "\x00" not in text and text.isascii():
+        return text
+    return replace_unstorable(text)
+
+
+def _as_written(value: Any) -> Any:
+    """``value`` as this version writes what an earlier version stored on SQLite from an outside
+    service - Jev, agentmemory: each NaN or infinity in it as None, each NUL and lone surrogate of
+    its strings, keys and values, as U+FFFD - in one walk (SDD §11, reviews RV51-06, RV52-S1)."""
+    if isinstance(value, str):  # first and inline: most of what is walked
+        return value if "\x00" not in value and value.isascii() else replace_unstorable(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {_as_written(key): _as_written(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_as_written(item) for item in value]
+    return value
+
+
+def _storable_text_field(value: Any) -> Any:
+    """A field's text, or the strings of its list or mapping, as ``_as_written`` reads them."""
+    return _as_written(value) if isinstance(value, str | dict | list) else value
+
+
+def _storable_keys(value: Any) -> Any:
+    """A mapping's keys read as ``_as_written`` reads them, its values as given."""
+    if not isinstance(value, dict):
+        return value
+    return {(_storable(k) if isinstance(k, str) else k): v for k, v in value.items()}
+
+
 class AppProbe(_Model):
     """An application probe (SDD §7.5, ADV-18): a TCP connect, or an HTTP(S) GET of ``path``."""
 
@@ -435,6 +470,8 @@ class ProbeResult(_Model):
     at: UTCDateTime
     detail: str = ""
 
+    _storable = field_validator("detail", mode="before")(_storable_text_field)
+
 
 class VerificationRecord(_Model):
     """The last verification of a migration: its checks and probe results (SDD §7.5)."""
@@ -444,6 +481,8 @@ class VerificationRecord(_Model):
     checks: list[dict[str, Any]] = Field(default_factory=list)
     probes: list[ProbeResult] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+    _storable = field_validator("checks", "warnings", mode="before")(_storable_text_field)
 
 
 class VerificationConfig(_Model):
@@ -732,35 +771,6 @@ class Estimate(_Model):
 AdvisorKind = Literal["strategy", "classification", "verification", "similar_incidents", "screen"]
 
 
-def _finite_or_none(value: Any) -> Any:
-    """``value`` with each NaN or infinity in it read as None: what an earlier version stored on
-    SQLite from an outside service, as this version writes it (SDD §11, review RV51-06)."""
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, dict):
-        return {key: _finite_or_none(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_finite_or_none(item) for item in value]
-    return value
-
-
-def _storable_strings(value: Any) -> Any:
-    """``value`` with each NUL and lone surrogate of its strings - keys and values, at any depth -
-    read as U+FFFD: what an earlier version kept from Jev or agentmemory, as this version writes
-    it (SDD §11, §14.1, review RV52-S1)."""
-    if isinstance(value, str):
-        return replace_unstorable(value)
-    if isinstance(value, dict):
-        return {_storable_strings(key): _storable_strings(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_storable_strings(item) for item in value]
-    return value
-
-
-def _storable_text_field(value: Any) -> Any:
-    return _storable_strings(value) if isinstance(value, str | dict | list) else value
-
-
 class AdvisorNote(_Model):
     kind: AdvisorKind
     source: Literal["jev", "rules", "memory"]
@@ -769,20 +779,20 @@ class AdvisorNote(_Model):
     data: dict[str, Any] = Field(default_factory=dict)
     created_at: UTCDateTime = Field(default_factory=utcnow)
 
-    _storable = field_validator("summary", "data", mode="before")(_storable_text_field)
+    _storable = field_validator("summary", mode="before")(_storable_text_field)
 
     @model_validator(mode="before")
     @classmethod
     def _no_number_that_is_none(cls, data: Any) -> Any:
         """A confidence, a hit's score or a claim's confidence v0.1.0-rc.2 stored as NaN or an
-        infinity reads as None, so the migration holding the note is written again (SDD §11,
-        review RV51-06)."""
+        infinity reads as None, and a NUL or a lone surrogate in its data as U+FFFD, so the
+        migration holding the note is written again (SDD §11, reviews RV51-06, RV52-S1)."""
         if isinstance(data, dict) and ("confidence" in data or "data" in data):
             data = {**data}
             if "confidence" in data:
-                data["confidence"] = _finite_or_none(data["confidence"])
+                data["confidence"] = _as_written(data["confidence"])
             if isinstance(data.get("data"), dict):
-                data["data"] = _finite_or_none(data["data"])
+                data["data"] = _as_written(data["data"])
         return data
 
 
@@ -799,6 +809,8 @@ class AdvisorModelInfo(_Model):
     deployment: Literal["on_prem", "remote", "unknown"] = "unknown"
     endpoint_host: str | None = None
 
+    _storable = field_validator("version", mode="before")(_storable_text_field)
+
 
 class RecommendedOption(_Model):
     option: str | None = None
@@ -810,7 +822,8 @@ class RecommendedOption(_Model):
     #: approve takes it (SDD §4.2, §14.6, audit AD-03)
     unusable: str | None = None
 
-    _storable = field_validator("unusable", mode="before")(_storable_text_field)
+    _storable = field_validator("option", "unusable", mode="before")(_storable_text_field)
+    _storable_distribution = field_validator("distribution", mode="before")(_storable_keys)
 
     @model_validator(mode="before")
     @classmethod
@@ -820,7 +833,7 @@ class RecommendedOption(_Model):
         if isinstance(data, dict):
             data = {**data}
             if "confidence" in data:
-                data["confidence"] = _finite_or_none(data["confidence"])
+                data["confidence"] = _as_written(data["confidence"])
             if isinstance(data.get("distribution"), dict):
                 data["distribution"] = {
                     key: value
@@ -893,7 +906,7 @@ class SimilarIncident(_Model):
         """A score v0.1.0-rc.2 stored as NaN or an infinity reads as no score (SDD §11, §14.3,
         review RV51-06)."""
         if isinstance(data, dict) and "score" in data:
-            data = {**data, "score": _finite_or_none(data["score"])}
+            data = {**data, "score": _as_written(data["score"])}
         return data
 
 
@@ -1035,6 +1048,8 @@ class PhaseChange(_Model):
     reason: str
     actor: str
 
+    _storable = field_validator("reason", mode="before")(_storable_text_field)
+
 
 class Migration(_Model):
     id: str = Field(default_factory=new_migration_id)
@@ -1094,7 +1109,7 @@ class Migration(_Model):
     review_required: bool = False
     review_reason: str | None = None
 
-    _storable = field_validator("review_reason", mode="before")(_storable_text_field)
+    _storable = field_validator("review_reason", "error", mode="before")(_storable_text_field)
     destination_server_id: str | None = None
     error: str | None = None
     attempts: int = 0
