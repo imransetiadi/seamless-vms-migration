@@ -39,14 +39,14 @@ import { DOWNTIME_PARTS } from './types';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { estimateStrategy, paramsFor } from '../lib/forcedEstimate';
 import { pyNames, pyRepr } from '../lib/format';
-import { vmGpus } from '../lib/gpu';
+import { vgpuRequestKeys, vmGpus } from '../lib/gpu';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { kitVmName } from '../lib/kitName';
 import { addressRefusal, canonicalIp, ipInCidr, mappedNetwork, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
 import { kitSubnet, networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
 import { destinationRelease, parseMicroversion, type PolicyProfile } from '../lib/platforms';
-import { describePorts, portsWithoutOneFixedIp, vgpuRequests } from '../lib/readiness';
+import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { providerLabel } from '../lib/providerUse';
 import { buildStrategyEvidence } from './mockEvidence';
@@ -1131,6 +1131,8 @@ export function preflight(
     /** The destination's flavors by name, and those of them that ask for a GPU: what a GPU VM's mapping names (SDD §22.4). */
     flavors?: string[];
     gpuFlavors?: string[];
+    /** The source provider's declared vGPU profiles by flavor, which make a CUSTOM_ class a vGPU (SDD §22.2, §22.3). */
+    gpuProfiles?: Record<string, string>;
   } = {},
 ): Finding[] {
   const findings: Finding[] = [];
@@ -1264,37 +1266,35 @@ export function preflight(
   for (const [code, message] of nicOverrideFindings(vm, sourceKind, plan, destinationNetworks, context))
     add(code, message);
   // the API's _gpu_blockers (SDD §9.3, §22.4, §22.5, plan task G4): a GPU VM no GPU mapping applies to - an OpenStack
-  // flavor's requests named by their extra specs, a VMware VM's devices by what names them - and why none applies; a VM
-  // recorded without gpus read from its extra specs
-  const gpus = vm.gpus ?? [];
-  const alias = vm.flavor_extra_specs['pci_passthrough:alias'];
-  const passthrough = gpus.filter((g) => g.kind === 'passthrough');
-  const read = vmGpus(vm);
+  // flavor's requests named by their extra specs, a VMware VM's devices by what names them - and why none applies; its
+  // GPUs as the API's _vm_gpus reads them, with the profile its source declares for its flavor (PR #64 review)
+  const profiles = context.gpuProfiles ?? {};
+  const declared = vm.flavor && Object.hasOwn(profiles, vm.flavor) ? profiles[vm.flavor]! : null;
+  const read = vmGpus(vm, declared);
   const why = read.length ? gpuMappingWhy(vm, read, sourceKind, plan, context.flavors ?? [], context.gpuFlavors ?? [], where) : null;
   // a mapped flavor the destination lacks is MAP_FLAVOR_MISSING's alone, as the API's (SDD §22.4)
   const missing = read.length && context.flavors ? gpuMissingTargets(vm, read, sourceKind, plan, context.flavors, where) : [];
   if (missing.length) add('MAP_FLAVOR_MISSING', missing.join(' '), { remediation: 'Fix the mapping: the destination flavor must exist.' });
-  if (why !== null && (gpus.length ? passthrough.length : alias !== undefined))
+  // each blocker by the GPUs read, never by an extra-spec key alone: an alias whose count asks for none is no request
+  const alias = vm.flavor_extra_specs['pci_passthrough:alias'];
+  const passthrough = read.filter((g) => g.kind === 'passthrough');
+  if (why !== null && passthrough.length)
     add(
       'VM_PCI_PASSTHROUGH',
       `${
-        alias !== undefined && (!gpus.length || passthrough.some((g) => g.alias))
+        alias !== undefined && passthrough.some((g) => g.alias)
           ? `Flavor requests PCI passthrough (${alias}).`
           : `The VM has a PCI passthrough device (${gpuNames(passthrough)}).`
       } ${why}`,
     );
-  const vgpus = gpus.filter((g) => g.kind === 'vgpu');
-  // the extra-spec keys of the vGPU requests: the classes gpus names - a declared CUSTOM_ class among them -, else VGPU
-  const classes = new Set(vgpus.map((g) => g.resource_class).filter((c): c is string => Boolean(c)));
-  const vgpu = gpus.length
-    ? Object.keys(vm.flavor_extra_specs).filter((k) => classes.has(k.match(/^resources[A-Za-z0-9_-]*:([A-Z0-9_]+)$/)?.[1] ?? '')).sort()
-    : vgpuRequests(vm.flavor_extra_specs);
-  if (why !== null && (gpus.length ? vgpus.length : vgpu.length))
+  const vgpus = read.filter((g) => g.kind === 'vgpu');
+  const keys = vgpuRequestKeys(vm.flavor_extra_specs, declared);
+  if (why !== null && vgpus.length)
     add(
       'VM_VGPU',
       `${
-        vgpu.length && (!gpus.length || vgpus.some((g) => g.resource_class))
-          ? `Flavor requests a vGPU (${vgpu.join(', ')}).`
+        keys.length && vgpus.some((g) => g.resource_class)
+          ? `Flavor requests a vGPU (${keys.join(', ')}).`
           : `The VM has a vGPU (${gpuNames(vgpus)}).`
       } ${why}`,
     );
@@ -1883,6 +1883,7 @@ export function buildFixtures(now: number): Fixtures {
         selected,
         destination: providerLabel(destination),
         ...flavorContext(dstInventory),
+        gpuProfiles: source.gpu_profiles,
       });
       const elig = eligibility(vm, source.kind, plan, source, destination, findings);
       const estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(vm, s, plan, elig[s] ?? []));

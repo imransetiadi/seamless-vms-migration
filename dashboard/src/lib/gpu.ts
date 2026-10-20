@@ -81,6 +81,18 @@ export function gpuRequests(specs: Record<string, string>, declaredProfile: stri
   return [...vgpus, ...aliases(specs[PCI_ALIAS]).map(([alias, count]) => device({ kind: 'passthrough', alias, count, profile: aliasProfile }))];
 }
 
+/** The extra-spec keys whose requests gpuRequests reads as vGPUs, in code-point order: what §9.3's VM_VGPU names for an
+ * OpenStack flavor - a key whose amount asks for none is not one (the API's vgpu_request_keys, SDD §9.3, §22.2). */
+export function vgpuRequestKeys(specs: Record<string, string>, declaredProfile: string | null = null): string[] {
+  return Object.entries(specs)
+    .filter(([key, value]) => {
+      const resource = RESOURCES.exec(key);
+      return resource !== null && amount(String(value)) > 0 && (resource[2] === VGPU || (Boolean(declaredProfile) && resource[2]!.startsWith('CUSTOM_')));
+    })
+    .map(([key]) => key)
+    .sort(byCodePoint);
+}
+
 /** The VM's GPUs, as the API's vm_gpus reads them (SDD §22.2): as its source reported them, else - a VM recorded before
  * 0.3.0 - what its flavor's extra specs ask for, with the profile its source declares for the flavor. */
 export function vmGpus(vm: VMRef, declaredProfile: string | null = null): GpuDevice[] {

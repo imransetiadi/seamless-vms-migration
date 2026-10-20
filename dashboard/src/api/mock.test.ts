@@ -3608,17 +3608,36 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
 
   it('plans no GPU VM into the automatic pilot, as the API: the next smallest VM takes its room (SDD §9.4, §22.9, PR #64 review)', async () => {
     const { server, client } = setup('operator');
-    const vms = freeVms(server, 'rhosp17-dc1', 4);
-    // the smallest VM has a vGPU at the source, as its flavor asks for one
-    const smallest = [...vms].sort((a, b) => a.disk_bytes - b.disk_bytes)[0]!;
+    const vms = freeVms(server, 'rhosp17-dc1', 5);
+    // the two smallest VMs have GPUs: one as its source reports them, one recorded before 0.3.0 with its flavor's request
+    const [first, second] = [...vms].sort((a, b) => a.disk_bytes - b.disk_bytes);
     const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['rhosp17-dc1']!;
-    const at = inventory.findIndex((v) => v.source_id === smallest.source_id);
-    inventory[at] = { ...inventory[at]!, gpus: [{ kind: 'vgpu', count: 1, resource_class: 'VGPU' }] };
+    const set = (id: string, fields: Partial<VMRef>) => {
+      const at = inventory.findIndex((v) => v.source_id === id);
+      inventory[at] = { ...inventory[at]!, ...fields };
+    };
+    set(first!.source_id, { gpus: [{ kind: 'vgpu', count: 1, resource_class: 'VGPU' }] });
+    set(second!.source_id, { gpus: [], flavor_extra_specs: { 'resources:VGPU': '1' } });
     const plan = await client.post<Plan>('/plans', { name: 'GPU pilot', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: vms.map((v) => v.source_id) });
     const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
     expect(waved.waves[0]!.vm_ids).toHaveLength(3);
-    expect(waved.waves[0]!.vm_ids).not.toContain(smallest.source_id);
-    expect(waved.waves[1]!.vm_ids).toEqual([smallest.source_id]);
+    expect(waved.waves[0]!.vm_ids).not.toContain(first!.source_id);
+    expect(waved.waves[0]!.vm_ids).not.toContain(second!.source_id);
+    expect(waved.waves[1]!.vm_ids).toEqual([first!.source_id, second!.source_id]);
+  });
+
+  it('plans a plan of GPU VMs alone without a pilot: its first wave depends on none, as the API (SDD §9.4, PR #64 review)', async () => {
+    const { server, client } = setup('operator');
+    const vms = freeVms(server, 'rhosp17-dc1', 2);
+    const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['rhosp17-dc1']!;
+    for (const vm of vms) {
+      const at = inventory.findIndex((v) => v.source_id === vm.source_id);
+      inventory[at] = { ...inventory[at]!, gpus: [{ kind: 'vgpu', count: 1, resource_class: 'VGPU' }] };
+    }
+    const plan = await client.post<Plan>('/plans', { name: 'GPU only', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: vms.map((v) => v.source_id) });
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    expect(waved.waves.map((w) => [w.id, w.name, w.order, w.depends_on])).toEqual([['wave-1', 'Wave 1', 1, []]]);
+    expect([...waved.waves[0]!.vm_ids].sort()).toEqual(vms.map((v) => v.source_id).sort());
   });
 
   it("plans the automatic waves from the plan's VMs, a never-validated plan's too (review RV39-03)", async () => {

@@ -1372,6 +1372,8 @@ export class MockServer {
       destination: providerLabel(destination),
       // the flavors a GPU VM's mapping may name, and those of them that ask for a GPU (SDD §22.3, §22.4)
       ...flavorContext(dst),
+      // the profiles the source declares for its flavors, which make a CUSTOM_ class a vGPU (SDD §22.2)
+      gpuProfiles: source.gpu_profiles,
     });
     // what an earlier attempt left at the destination keeps a handover out (SDD §9.2, review 39 lead L1)
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings, keptAfterRollback(m));
@@ -2402,7 +2404,8 @@ export class MockServer {
     if (pilot.length) waves.push({ id: 'wave-1', name: 'Pilot', order: 1, vm_ids: pilot.map((vm) => vm.source_id), depends_on: [], max_parallel: 5 });
     for (let i = 0; i < rest.length; i += size) {
       const n = waves.length + 1;
-      waves.push({ id: `wave-${n}`, name: `Wave ${n}`, order: n, vm_ids: rest.slice(i, i + size).map((vm) => vm.source_id), depends_on: [`wave-${n - 1}`], max_parallel: 5 });
+      // the first wave depends on none: a plan of GPU VMs alone has no pilot (SDD §9.4, PR #64 review)
+      waves.push({ id: `wave-${n}`, name: `Wave ${n}`, order: n, vm_ids: rest.slice(i, i + size).map((vm) => vm.source_id), depends_on: n > 1 ? [`wave-${n - 1}`] : [], max_parallel: 5 });
     }
     // like the API: the migrations take their VM's wave at the next validation, which a plan back in draft needs before it
     // starts (SDD §9.4, review RV40-03)

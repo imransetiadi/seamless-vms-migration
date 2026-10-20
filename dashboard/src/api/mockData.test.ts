@@ -638,7 +638,10 @@ interface FindingCase {
   plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'> & Partial<Pick<Plan, 'mappings' | 'prestage_resources'>>;
   /** a network case's destination: its label, networks, subnets, the token's roles and the policy profile */
   destination?: { label: string; networks: DestinationNetwork[]; subnets?: DestinationSubnet[]; roles?: string[]; policy_profile?: string };
-  expected: Record<string, string>;
+  /** the source provider's declared vGPU profiles, by flavor (SDD §22.3) */
+  gpu_profiles?: Record<string, string>;
+  /** each code's message; null for a code that must not be found (PR #64 review) */
+  expected: Record<string, string | null>;
 }
 
 /** The API's reasons and finding texts, case by case: seamless/tests/fixtures/eligibility_cases.json. */
@@ -688,11 +691,15 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
     const selected = [c.vm, ...(c.others ?? [])];
     const dest = c.destination;
     const networks = Object.fromEntries((dest?.networks ?? []).map((n) => [n.name, n.mtu]));
-    const context = dest
-      ? { selected, networkDetails: dest.networks, subnets: dest.subnets ?? [], roles: dest.roles, profile: dest.policy_profile, destination: dest.label }
-      : { selected };
+    const context = {
+      ...(dest
+        ? { selected, networkDetails: dest.networks, subnets: dest.subnets ?? [], roles: dest.roles, profile: dest.policy_profile, destination: dest.label }
+        : { selected }),
+      gpuProfiles: c.gpu_profiles,
+    };
     const found = preflight(c.vm, c.source_kind ?? 'openstack', plan, networks, context);
-    expect(Object.fromEntries(found.filter((f) => f.code in c.expected).map((f) => [f.code, f.message]))).toEqual(c.expected);
+    const messages = new Map(found.map((f) => [f.code, f.message]));
+    expect(Object.fromEntries(Object.keys(c.expected).map((code) => [code, messages.get(code) ?? null]))).toEqual(c.expected);
   });
 
   it('raises both source-state blockers for a server in error with a Nova task, naming the task, as the API (SDD §9.3, review PV-05)', () => {

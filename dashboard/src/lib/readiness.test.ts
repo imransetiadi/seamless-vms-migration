@@ -96,6 +96,13 @@ describe('readinessFlags', () => {
       ['VM_PCI_PASSTHROUGH', 'warning', needs],
     ]);
     expect(gpuFlags(gpuVm([]), 'vmware')).toEqual([]);
+    // as the API's gpu_requests reads them: a zero amount or count asks for none (PR #64 review)
+    expect(gpuFlags(gpuVm(undefined, { 'resources:VGPU': '0', 'pci_passthrough:alias': 'a100:0' }), 'openstack')).toEqual([]);
+    expect(gpuFlags(gpuVm(undefined, { 'resources:VGPU': '1', 'pci_passthrough:alias': 'a100:0' }), 'openstack')).toEqual([['VM_VGPU', 'warning', needs]]);
+    // a VMware VM recorded before 0.3.0 names its device by its label alone: no mapping can name it, as validation says
+    expect(gpuFlags(gpuVm(undefined, { 'pci_passthrough:alias': 'PCI device 0' }), 'vmware')).toEqual([
+      ['VM_PCI_PASSTHROUGH', 'blocker', 'No mapping can name its device without ids.'],
+    ]);
   });
 
   it('says a GPU VM needs a GPU mapping in its plan', () => {
