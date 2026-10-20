@@ -1977,8 +1977,10 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   step, e.g. a database error while persisting after a successful step — the VM may be stopped):
   the crash is emitted as `migration.error` (`step: driver`, redacted message, crash count), and while
   a driver keeps crashing its relaunch backs off (`2^n × tick_s`, at most 300 s - the exponent capped first, so no
-  count of crashes overflows it), and a relaunch that fails for one migration skips that migration, logged, never
-  the rest of the tick (audit OC-01). A migration whose step task is still running is not relaunched.
+  count of crashes overflows it; `n` counts the crashes since its last step that returned, so one that moved the
+  migration on starts a new row - review RV51-16), and a relaunch that fails for one migration skips that migration,
+  logged, never the rest of the tick (audit OC-01; a test relaunches a second migration after the first one's
+  relaunch failed, review RV51-28). A migration whose step task is still running is not relaunched.
 * Failure handling: `TransientStepError` → retry with backoff `2^attempt` s (×1/demo_speed) up to
   `max_step_retries`; then `failed`. Each attempt starts under the migration's lock and only while the
   migration is still in the step's phase, so an action under that lock (a cancel) either finds the
