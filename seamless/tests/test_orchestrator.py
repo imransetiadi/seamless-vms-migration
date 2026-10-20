@@ -7854,7 +7854,10 @@ async def test_a_strategy_change_racing_the_tick_starts_nothing_no_pre_staging_c
     await h.orch.start_plan(plan.id, "alice")
     m = await h.by_vm(plan.id, "vm-1")
     await h.orch.tick()  # pre-stages: no conversion host needed
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
     while not executor.hosts:
+        assert loop.time() < deadline, "the plan was never pre-staged"
         await asyncio.sleep(0.01)
     await h.orch.tick()  # the window is closed: nothing starts
     assert executor.hosts == [False] and (await h.migration(m.id)).phase == P.ready
@@ -7869,7 +7872,9 @@ async def test_a_strategy_change_racing_the_tick_starts_nothing_no_pre_staging_c
     await tick
     after = await h.migration(m.id)
     await h.orch.tick()  # the next tick pre-stages it, the hosts deployed
+    deadline = loop.time() + 5
     while len(executor.hosts) < 2:
+        assert loop.time() < deadline, f"no second pre-staging: {executor.hosts}"
         await asyncio.sleep(0.01)
     await h.orch.stop()
     assert (after.phase, after.strategy) == (P.ready, Strategy.cold)
