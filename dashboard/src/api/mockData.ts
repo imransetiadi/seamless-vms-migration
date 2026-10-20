@@ -493,6 +493,13 @@ function gpuNames(devices: GpuDevice[]): string {
     .join(', ');
 }
 
+/** The destination's flavors by name, and those of them that ask for a GPU: what the pre-flight's GPU mapping rule reads
+ * (SDD §22.3, §22.4). */
+export function flavorContext(inventory: DestinationInventory | VMRef[] | undefined): { flavors: string[]; gpuFlavors: string[] } {
+  if (!inventory || Array.isArray(inventory)) return { flavors: [], gpuFlavors: [] };
+  return { flavors: inventory.flavors.map((f) => f.name), gpuFlavors: (inventory.gpu_flavors ?? []).map((f) => f.name) };
+}
+
 /** What a plan's GPU mapping names a VMware device by - a vGPU's profile, a passthrough device's PCI ids -, null when it
  * has neither: the API's gpu_key (SDD §22.2). */
 function gpuKey(d: GpuDevice): string | null {
@@ -1846,7 +1853,11 @@ export function buildFixtures(now: number): Fixtures {
     for (const m of spec.migrations) {
       const vm = vms.find((v) => v.source_id === m.vm);
       if (!vm) continue;
-      const findings = preflight(vm, source.kind, plan, dstInventory.networks, { selected, destination: providerLabel(destination) });
+      const findings = preflight(vm, source.kind, plan, dstInventory.networks, {
+        selected,
+        destination: providerLabel(destination),
+        ...flavorContext(dstInventory),
+      });
       const elig = eligibility(vm, source.kind, plan, source, destination, findings);
       const estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(vm, s, plan, elig[s] ?? []));
       const chosen = estimates.find((e) => e.strategy === m.strategy) ?? null;

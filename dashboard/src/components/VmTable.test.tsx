@@ -52,7 +52,10 @@ describe('VmTable', () => {
 
     await user.selectOptions(screen.getByLabelText('Power state'), 'all');
     await user.selectOptions(screen.getByLabelText('Readiness'), 'blocker');
-    expect(rowNames().sort()).toEqual(['build-runner-07', 'gpu-render-01']);
+    expect(rowNames().sort()).toEqual(['build-runner-07']);
+    // a GPU VM needs a GPU mapping in its plan: guidance, which its plan decides (SDD §22.4, §22.11)
+    await user.selectOptions(screen.getByLabelText('Readiness'), 'attention');
+    expect(rowNames()).toContain('gpu-render-01');
 
     await user.selectOptions(screen.getByLabelText('Readiness'), 'all');
     await user.selectOptions(screen.getByLabelText('Project'), 'analytics');
@@ -260,4 +263,3 @@ describe('VmTable', () => {
     });
   });
 });
-
