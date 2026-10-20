@@ -2408,7 +2408,14 @@ class SourceProvider(Protocol):
 class DestinationProvider(Protocol):
     async def check(self) -> dict[str, Any]
     async def inventory(self) -> DestinationInventory
-    async def get_server(self, server_id: str) -> dict[str, Any]   # {status, ports:[{status, fixed_ips, floating_ips}]}
+    async def get_server(self, server_id: str) -> dict[str, Any]   # {status, ports:[{status, fixed_ips, floating_ips}],
+        # flavor: {name, extra_specs}} - compute 2.47's embedded flavor, its extra specs empty where Nova's policy hides
+        # them (§22.3, plan task G3)
+    async def gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity
+        # the Placement pools of the given vGPU requests only, read as §22.3 reads the inventory's (§22.7, plan task G3)
+    async def server_allocations(self, server_id: str) -> dict[str, int] | None
+        # the units the server holds per resource class (GET /allocations/{server_id}, summed over its providers),
+        # None when Placement refuses the read or holds no allocation for it (§22.3, §22.8, plan task G3)
     async def console_log(self, server_id: str, lines: int = 200) -> str | None
     async def delete_server(self, server_id: str) -> None
     async def find_server(self, name: str) -> str | None
@@ -2467,7 +2474,10 @@ subnets: list[{id, name, network, network_id, cidr, ipv6_address_mode, ipv6_ra_m
 credential sees, by network name and by the id of the network they belong to: where a NIC's addresses must lie,
 §9.3; `id` is what a VMware NIC's `network_map` value names, §7.2), roles: list[str]|null (the role names of the
 destination credential's token, read with the inventory - live for every run -, null when they cannot be read: what
-the VMware kit's network map judges, §7.2, review RV19-01)}`. `networks` keeps the name→MTU view; with two networks of
+the VMware kit's network map judges, §7.2, review RV19-01), gpu_flavors: list[{name, vcpus, ram_mb, disk_gb, gpus:
+list[GpuDevice]}] (the flavors whose extra specs ask for a GPU, with their declared profiles) and gpu_capacity:
+GpuCapacity (the Placement pools of their vGPU requests, which a destination's check reports too, read when it runs;
+§22.3, plan task G3)}`. `networks` keeps the name→MTU view; with two networks of
 one name its MTU is one of theirs.
 
 Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking calls wrapped with
@@ -3029,6 +3039,11 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
   `SEAMLESS_MEMORY_REDACT_NAMES` — wherever a name stands between characters that are not letters or digits, so a
   name inside another word stays (`web-010` is another VM than `web-01`) while names built from it are covered:
   `web-01-data`, `web-01_root`, `data-web-01` become `[vm]-data`, `[vm]_root`, `data-[vm]`.
+
+Placement's resource providers - a destination's compute hosts, named after them (`<host>_pci_<address>`), and their
+uuids - never leave the GPU capacity read: `GpuCapacity` keeps counts, and it, a GPU wait and the verification's GPU
+checks name a failure by its HTTP status and Placement error code, never by Placement's message text, so no
+document, event, log line, finding or advisor payload holds one (§22.3, §22.12, plan task G3).
 
 The destination provider's name never reaches Jev, whatever `SEAMLESS_MEMORY_REDACT_NAMES` says (§1 naming). The
 advisor's strategy question names the destination by kind and series (`planning/platforms.destination_descriptor`, by
@@ -4585,7 +4600,8 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   GpuPool { resource_class: str, traits: list[str], forbidden_traits: list[str],   # what a GPU request asks Placement for
             free: int,           # the units free now on the providers below
             providers: int,      # resource providers that have at least one unit free
-            largest_free: int }  # the most units free on one of them
+            largest_free: int }  # the most units free on one of them - below n when the read again with <class>:<n>
+                                 # for a group of n > 1 units finds no provider (max_unit caps it, plan task G3)
   ```
 
   There is one pool for each distinct vGPU request (its resource class with its required and forbidden traits) among the
@@ -4832,7 +4848,7 @@ Binding in §13.4 with plan task G3:
 |---|---|---|
 | `GpuDevice`, `VMRef.gpus`, `Mappings.gpus`, `Provider.gpu_profiles`; `planning/gpu.py` (requests, the GPU key, profile sizes) | §4.2, §10, §12 (binding) | G1 |
 | the sources report `gpus`; the VMware provider writes no GPU extra specs, and §9.3's two GPU rows read `gpus` (still unconditional until G4) | §9.3, §10 (binding) | G2 |
-| `DestinationInventory.gpu_flavors` and `gpu_capacity`; the destination check's `gpu_capacity`; `gpu_capacity()`, `server_allocations()` and `get_server`'s flavor; §22.12's rule | §10, §13.4 | G3 |
+| `DestinationInventory.gpu_flavors` and `gpu_capacity`; the destination check's `gpu_capacity`; `gpu_capacity()`, `server_allocations()` and `get_server`'s flavor; §22.12's rule | §10, §13.4 (binding) | G3 |
 | the GPU flavor rule (§22.4) and the catalog change (§22.5) | §9.3, §7.2 (pre-staging) | G4 |
 | the eligibility of a VMware passthrough VM; a pilot without GPU VMs; the port 9400 suggestion | §9.2, §9.4, §9.6 | G5 |
 | the gate's fifth rule, `Migration.gpu_wait` and `MigrationSummary.gpu_wait`, the event `migration.gpu_wait`, the gauge `seamless_gpu_waits` | §4.2, §4.3, §5.4, §18 | G6 |
