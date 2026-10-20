@@ -575,6 +575,40 @@ def test_an_authorization_header_of_any_scheme_is_redacted_in_json_a_repr_and_a_
     assert payload == {"headers": {"Authorization": REDACTED}}
 
 
+_CLOUDS = (
+    "clouds:\n  dc1:\n    auth:\n      username: FakeUser\n      password: Fake horse Word\n"
+    "    region_name: RegionOne\n"
+)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        json.dumps({"stdout": "Reading clouds.yaml\n" + _CLOUDS, "rc": 0}),
+        _CLOUDS.replace("\n", "\r\n"),
+        _CLOUDS.replace("    auth:\n", "    auth:  # the admin credential\n"),
+        json.dumps({"stdout": _CLOUDS.replace("\n", "\r\n")}),
+    ],
+    ids=["inside-json", "crlf", "comment", "crlf-inside-json"],
+)
+def test_a_clouds_yaml_auth_section_inside_json_or_with_crlf_or_a_comment_is_removed_whole(text):
+    """SDD §13.4 (review RV52-X4): the auth section was found only with LF line breaks and nothing
+    after "auth:", so a clouds.yaml a step printed (its output JSON-escaped), one with CRLF line
+    breaks or a comment kept its user name, and its multi-word password all but the first word."""
+    out = redact(text)
+    assert "Fake" not in out and "horse" not in out and "Word" not in out, out
+    assert "auth: [REDACTED]" in out and "region_name: RegionOne" in out, out
+    assert redact(out) == out, out
+
+
+def test_a_multi_word_yaml_password_is_redacted_whole():
+    """SDD §13.4 (review RV52-X4): a YAML plain value runs to its line's end or a comment - a
+    password of several words kept all but its first."""
+    out = redact("vcenter_password: Fake horse Word  # rotated\nport: 443")
+    assert out == "vcenter_password: [REDACTED]  # rotated\nport: 443", out
+    assert redact("password=Fake horse") == "password=[REDACTED] horse"
+
+
 def _quotings(pairs):
     """``pairs`` (key, value) as each quoting a step's output carries them prints them."""
     mapping = dict(pairs)

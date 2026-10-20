@@ -221,6 +221,11 @@ def test_memory_hits_are_redacted_where_they_enter():
         "password: 'a'x " * 2340,
         "password: 'a\n" * 2730,
         "".join("password: " + "\\" * depth + '"a ' for depth in range(1, 220)),
+        # YAML plain values of several words that never reach their line's end, an argv list's
+        # flags whose value never closes, a JSON-escaped auth section's lines (RV52-X3, RV52-X4)
+        "token: a " * 3640 + ",",
+        "--os-password', '" * 1820,
+        '"auth:\\n' + "   p: q\\n" * 3270,
     ],
     ids=[
         "key prefix",
@@ -236,6 +241,9 @@ def test_memory_hits_are_redacted_where_they_enter():
         "glued single-quoted closes",
         "single-quoted values over lines",
         "deeper and deeper escapes",
+        "plain values to no line end",
+        "argv flags never closed",
+        "json auth section lines",
     ],
 )
 def test_redact_costs_time_linear_in_the_text(text):

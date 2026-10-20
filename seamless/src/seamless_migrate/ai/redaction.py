@@ -66,8 +66,16 @@ _ESCAPED_CLOSE = r"(?:(?P=escape){2}\\\\)*+(?P=escape)\""
 
 
 def _auth_block(match: re.Match[str]) -> str:
-    end = "\n" if match.group(0).endswith("\n") else ""
+    """The auth section's lines as one, ending in the line break its last one ended in, as the
+    text writes it: LF or CRLF, or JSON's escape of either (review RV52-X4)."""
+    block = match.group(0)
+    ends = ("\r\n", "\n", "\\r\\n", "\\n")
+    end = next((e for e in ends if block.endswith(e)), "")
     return f"{match.group(1)}auth: {REDACTED}{end}"
+
+
+#: one character of a JSON string's line: an escape whole, but not a line break's
+_JSON_LINE_CHAR = r"(?:(?!\\[nr])(?:\\.|[^\"\\\n]))"
 
 
 #: a dotted chain of base64url runs, each run read once (possessive): where JWTs are looked for
@@ -104,8 +112,20 @@ def _redact_jwts(match: re.Match[str]) -> str:
 
 
 _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
-    # the auth section of a clouds.yaml: block style (every line indented under "auth:") ...
-    (re.compile(r"(?m)^([ \t]*)auth:[ \t]*\n(?:\1[ \t]+\S[^\n]*(?:\n|$))+"), _auth_block),
+    # the auth section of a clouds.yaml: block style (every line indented under "auth:", a
+    # comment after it, LF or CRLF line breaks) ...
+    (
+        re.compile(r"(?m)^([ \t]*)auth:[ \t]*(?:#[^\n]*)?\r?\n(?:\1[ \t]+\S[^\n]*(?:\n|$))+"),
+        _auth_block,
+    ),
+    # ... the same inside a JSON string - a step's output that printed it (review RV52-X4) ...
+    (
+        re.compile(
+            r"(?:(?<=\\n)|(?<=\"))( *)auth: *(?:#" + _JSON_LINE_CHAR + r"*+)?(?:\\r)?\\n"
+            r"(?:\1 +(?=[^\s\\\"])" + _JSON_LINE_CHAR + r"++(?:(?:\\r)?\\n|(?=\")|\Z))+"
+        ),
+        _auth_block,
+    ),
     # ... and JSON or YAML flow style ("auth": {...})
     (re.compile(r"(?i)(?<![\w.-])([\"']?auth[\"']?\s*:\s*)\{[^{}]*\}"), r"\1" + REDACTED),
     # credentials in URLs and connection strings: scheme://user:pass@host (a pass with "@" too)
@@ -143,7 +163,15 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
             r"|(?P<escape>\\++)\"(?:[^\"\\\n]|(?!" + _ESCAPED_CLOSE + r")\\++\"?)*+"
             r"(?:" + _ESCAPED_CLOSE + r"|(?=[\n\"])|\Z)"
             # a [REDACTED] an earlier pass wrote is left as it is: a second pass changes nothing
-            r"|\[REDACTED\](?![A-Za-z0-9])|[^\s,;&}]+)"
+            r"|\[REDACTED\](?![A-Za-z0-9])"
+            # a YAML plain value of several words runs to its line's end, a comment or its
+            # string's: every word of a password (review RV52-X4); a shell word (key=value) and
+            # a header's value ("X-Auth-Token: x" url) end at a space. No word of it ends in
+            # ": " - the next key's -, so each value is read once: time linear in the text
+            r"|(?<=:[ \t])[^\s,;&}\"'\\]++"
+            r"(?:[ \t]++(?!#)(?:[^\s,;&}\\\"':]|:(?![\s\\]|\Z)|\\(?![nrt\"]))++)++"
+            r"(?=[ \t]*+(?:#|\r?\n|\\[nr]|[\"']|\Z))"
+            r"|[^\s,;&}]+)"
         ),
         r"\1" + REDACTED,
     ),
