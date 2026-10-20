@@ -11,7 +11,7 @@
  * (429); any other token is rejected with 401. Every refusal is audited as `auth.denied` like the API.
  */
 import { DEFAULT_API_BASE } from './client';
-import { forcedDowntime } from '../lib/forcedEstimate';
+import { ESTIMATOR_DEFAULTS, forcedDowntime } from '../lib/forcedEstimate';
 import { canTransition } from '../lib/fsm';
 import { guestOsOf } from '../lib/guestOs';
 import { capabilityRoles, policyProfileOf } from '../lib/networks';
@@ -26,7 +26,7 @@ import { endedPassBytes } from '../lib/transfer';
 import { summaryOf } from '../lib/summary';
 import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
 import { destinationName, isBlank, providerLabel } from '../lib/providerUse';
-import { pyLen, pyRepr, pyStrip } from '../lib/format';
+import { pyFloat, pyLen, pyRepr, pyStrip } from '../lib/format';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -469,7 +469,47 @@ const PRESTAGE_RESOURCES = [
   'flavors', 'keypairs', 'images', 'projects', 'users', 'users_keypairs', 'user_project_role_assignments', 'detached_volumes',
 ];
 
+/** The plan model's bounds, in its field order, as pydantic words them (SDD §4.2, §12, review RV52-D4). */
+const PLAN_BOUNDS: readonly (readonly [string, '>=' | '>', number])[] = [
+  ['downtime_slo_s', '>=', 1],
+  ['keep_warm_interval_s', '>=', 60],
+  ['convergence_threshold_bytes', '>=', 0],
+  ['max_sync_passes', '>=', 1],
+  ['link_bps', '>', 0],
+  ['finalize_warning_h', '>=', 1],
+];
+/** The estimator's bounds (SDD §9.1, reviews RV51-07, RV51-22): passes at most, a rate at least (B/s), a duration at most (s). */
+const MAX_SYNC_PASSES = 100;
+const MIN_RATE_BPS = 1;
+const MAX_DURATION_S = 10 ** 9;
+const OVERRIDE_RATES: ReadonlySet<string> = new Set(['link_bps', 'scan_bps', 'max_aggregate_scan_bps']);
+const OVERRIDE_DURATIONS: ReadonlySet<string> = new Set(['shutdown_s', 'boot_s', 'create_s', 'snapshot_s', 'handover_per_volume_s', 'v2v_s', 'v2v_inplace_s']);
+const OVERRIDE_PLAN_FIELDS: Readonly<Record<string, string>> = { convergence_threshold_bytes: 'convergence_threshold_bytes', max_passes: 'max_sync_passes' };
+
+/** The API's invalid_estimator_overrides (SDD §9.1): one message per key, in sorted order. */
+function overrideProblems(overrides: Record<string, unknown>): string[] {
+  return Object.keys(overrides)
+    .sort()
+    .flatMap((key) => {
+      const value = overrides[key];
+      if (!Object.hasOwn(ESTIMATOR_DEFAULTS, key)) return [`${key}: unknown field`];
+      if (Object.hasOwn(OVERRIDE_PLAN_FIELDS, key)) return [`${key}: set the plan field ${OVERRIDE_PLAN_FIELDS[key]} instead`];
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return [`${key}: must be a finite positive number`];
+      if (key === 'parallel_disks' && Math.trunc(value) < 1) return [`${key}: must be at least 1`];
+      if (OVERRIDE_RATES.has(key) && value < MIN_RATE_BPS) return [`${key}: must be at least 1 B/s`];
+      if (OVERRIDE_DURATIONS.has(key) && value > MAX_DURATION_S) return [`${key}: must be at most ${MAX_DURATION_S} s`];
+      return [];
+    });
+}
+
 function refusePlanSpec(spec: Record<string, unknown>): void {
+  // the model validates the body first (pydantic's words, five at most), then the API's checks run in their order
+  const bounds = PLAN_BOUNDS.flatMap(([field, op, limit]) => {
+    const value = spec[field];
+    if (typeof value !== 'number' || (op === '>=' ? value >= limit : value > limit)) return [];
+    return [`${field}: Input should be greater than ${op === '>=' ? 'or equal to ' : ''}${limit}`];
+  });
+  if (bounds.length) throw new HttpError(422, 'validation_error', bounds.slice(0, 5).join('; '));
   const ids = Array.isArray(spec.vm_ids) ? (spec.vm_ids as string[]) : [];
   const counts = new Map<string, number>();
   for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1);
@@ -514,7 +554,17 @@ function refusePlanSpec(spec: Record<string, unknown>): void {
     problems.push("port_creation_mode: Input should be 'nova' or 'neutron'");
   const window = spec.cutover_window as { start?: string; end?: string } | null | undefined;
   if (window?.start && window.end && Date.parse(window.end) <= Date.parse(window.start)) problems.push('cutover_window: end must be after start');
+  // a rate the estimator divides by, and a pass it runs per allowed pass (SDD §9.1, reviews RV51-07, RV51-22)
+  if (typeof spec.link_bps === 'number') {
+    if (!Number.isFinite(spec.link_bps)) problems.push(`link_bps must be a finite positive number (got ${pyFloat(spec.link_bps)})`);
+    else if (spec.link_bps < MIN_RATE_BPS) problems.push(`link_bps must be at least 1 B/s (got ${pyFloat(spec.link_bps)})`);
+  }
+  if (typeof spec.max_sync_passes === 'number' && spec.max_sync_passes > MAX_SYNC_PASSES) {
+    problems.push(`max_sync_passes must be at most ${MAX_SYNC_PASSES} (got ${spec.max_sync_passes})`);
+  }
   if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
+  const estimator = overrideProblems((spec.estimator_overrides ?? {}) as Record<string, unknown>);
+  if (estimator.length) throw new HttpError(400, 'bad_request', `invalid estimator_overrides: ${estimator.join('; ')}`);
 }
 
 /**

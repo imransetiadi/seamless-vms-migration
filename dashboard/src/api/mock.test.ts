@@ -1190,6 +1190,33 @@ describe('mock API', () => {
     await expect(client.patch(`/plans/${plan.id}`, { vm_ids: ['vm-a', 'vm-a'] })).rejects.toMatchObject({ status: 422, message: 'vm_ids lists a VM more than once: vm-a' });
   });
 
+  it("refuses the estimator's bounds the API refuses, with its words: the model's, §9.1's and the overrides' (SDD §9.1, §12, review RV52-D4)", async () => {
+    const { client } = setup('approver');
+    const base = { name: 'Bounded', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['vm-a'] };
+    const refused = async (body: Record<string, unknown>, status: number, message: string) =>
+      expect(client.post('/plans', { ...base, ...body })).rejects.toMatchObject({ status, message });
+    // the plan model's own bounds, as pydantic words them, in the model's field order
+    await refused({ link_bps: 0, max_sync_passes: 0 }, 422, 'max_sync_passes: Input should be greater than or equal to 1; link_bps: Input should be greater than 0');
+    await refused(
+      { finalize_warning_h: 0, convergence_threshold_bytes: -1, keep_warm_interval_s: 59, downtime_slo_s: 0 },
+      422,
+      'downtime_slo_s: Input should be greater than or equal to 1; keep_warm_interval_s: Input should be greater than or equal to 60; convergence_threshold_bytes: Input should be greater than or equal to 0; finalize_warning_h: Input should be greater than or equal to 1',
+    );
+    // what the estimator divides by and runs a pass for: a rate printed as Python prints a float
+    await refused({ link_bps: 0.5 }, 422, 'link_bps must be at least 1 B/s (got 0.5)');
+    await refused({ link_bps: 0.00001 }, 422, 'link_bps must be at least 1 B/s (got 1e-05)');
+    await refused({ max_sync_passes: 101 }, 422, 'max_sync_passes must be at most 100 (got 101)');
+    await refused(
+      { estimator_overrides: { scan_bps: 0.5, shutdown_s: 2e9, parallel_disks: 0.5, foo: 1, max_passes: 3 } },
+      400,
+      'invalid estimator_overrides: foo: unknown field; max_passes: set the plan field max_sync_passes instead; parallel_disks: must be at least 1; scan_bps: must be at least 1 B/s; shutdown_s: must be at most 1000000000 s',
+    );
+    await refused({ estimator_overrides: { boot_s: 0, link_bps: -1 } }, 400, 'invalid estimator_overrides: boot_s: must be a finite positive number; link_bps: must be a finite positive number');
+    // the bounds themselves pass, and an edit is checked on the plan it would store
+    const plan = await client.post<Plan>('/plans', { ...base, link_bps: 1, max_sync_passes: 100, estimator_overrides: { scan_bps: 1, shutdown_s: 1e9, parallel_disks: 1 } });
+    await expect(client.patch(`/plans/${plan.id}`, { max_sync_passes: 101 })).rejects.toMatchObject({ status: 422, message: 'max_sync_passes must be at most 100 (got 101)' });
+  });
+
   it('refuses a VM another plan holds, at validation and at a retry that would take it back (SDD §5.4)', async () => {
     const { server, client } = setup('operator');
     const first = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
