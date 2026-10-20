@@ -10372,6 +10372,85 @@ async def test_the_tick_never_waits_for_a_validation_of_a_completed_plan(tmp_pat
     assert b_phase != P.ready, "plan B's gate was not ticked"
 
 
+async def test_the_tick_never_queues_behind_a_validation_waiting_for_a_completed_plan(
+    tmp_path, store
+):
+    """SDD §8 (PR #58 review): an edit held completed plan A's lock while a validation of A waited
+    for it; the edit released as the tick resumed from plan_phases, locked() read False, and the
+    reopen queued behind the validation - the tick waited through it, as before RV52-O1. A lock a
+    task waits for is busy too."""
+    h = build_harness(tmp_path, store, [vm(1), vm(2)])
+    a = plan_for([vm(1)], name="A", default_strategy=Strategy.cold, auto_cutover=False)
+    b = plan_for([vm(2)], name="B", default_strategy=Strategy.cold)
+    store.put("plan", a)
+    store.put("plan", b)
+    await h.orch.validate_plan(a.id, "alice")
+    await h.orch.validate_plan(b.id, "alice")
+    done = store.get("plan", a.id, Plan)
+    done.status = PlanStatus.completed  # a retry left vm-1 ready in its completed plan
+    store.put("plan", done)
+    await h.orch.start_plan(b.id, "alice")
+    await h.orch._prestage(store.get("plan", b.id, Plan), await h.migrations(b.id))
+    gate = asyncio.Event()
+    real_get_vm = h.source.get_vm
+
+    async def slow_get_vm(source_id):
+        if source_id == "vm-1":
+            await gate.wait()
+        return await real_get_vm(source_id)
+
+    h.source.get_vm = slow_get_vm
+    lock = h.orch.plan_lock(a.id)
+    await lock.acquire()  # an edit of A ...
+    validating = asyncio.create_task(h.orch.validate_plan(a.id, "rina"))  # ... a validation waits
+    for _ in range(5):
+        await asyncio.sleep(0)
+    real_phases = h.orch.db.plan_phases
+
+    async def plan_phases(plan_ids):
+        phases = await real_phases(plan_ids)
+        lock.release()  # the edit ends as the tick resumes: the validation is next in line
+        return phases
+
+    h.orch.db.plan_phases = plan_phases
+    tick = asyncio.create_task(h.orch.tick())
+    finished, _ = await asyncio.wait({tick}, timeout=2.0)
+    b_phase = (await h.by_vm(b.id, "vm-2")).phase
+    gate.set()
+    await validating
+    await tick
+    await h.orch.stop()
+    assert finished, f"the tick queued behind A's validation; plan B's vm-2 stayed {b_phase}"
+    assert b_phase != P.ready
+
+
+async def test_the_tick_never_waits_for_the_lock_of_a_plan_it_would_start_a_step_of(
+    tmp_path, store
+):
+    """SDD §8 (PR #58 review): plan C ran in the tick's snapshot when a person paused it and
+    validated it against a slow source; _begin waited for C's lock through the validation, and
+    plan B's ready VM was not ticked. The tick leaves a busy plan to a later tick."""
+    h = build_harness(tmp_path, store, [vm(1), vm(2)])
+    c = plan_for([vm(1)], name="C", default_strategy=Strategy.cold)
+    b = plan_for([vm(2)], name="B", default_strategy=Strategy.cold)
+    store.put("plan", c)  # C first: the tick reaches it before B
+    store.put("plan", b)
+    for plan in (c, b):
+        await h.orch.validate_plan(plan.id, "alice")
+        await h.orch.start_plan(plan.id, "alice")
+        await h.orch._prestage(store.get("plan", plan.id, Plan), await h.migrations(plan.id))
+    lock = h.orch.plan_lock(c.id)
+    await lock.acquire()  # the pause and validation of C hold its lock
+    tick = asyncio.create_task(h.orch.tick())
+    finished, _ = await asyncio.wait({tick}, timeout=2.0)
+    phases = ((await h.by_vm(c.id, "vm-1")).phase, (await h.by_vm(b.id, "vm-2")).phase)
+    lock.release()
+    await tick
+    await h.orch.stop()
+    assert finished, f"the tick waited for plan C's lock; phases {phases}"
+    assert phases[0] == P.ready and phases[1] != P.ready, phases
+
+
 async def test_a_driver_that_moved_on_starts_a_new_row_of_crashes(tmp_path, store):
     """SDD §8 (review RV51-16): while a driver keeps crashing its relaunch backs off, 2^n x tick_s.
     The count was cleared only when the driver found no handler, so four crashes of the cutover's

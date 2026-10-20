@@ -404,6 +404,15 @@ def _named_twice(migrations: Iterable[Migration]) -> str | None:
     return f"two migrations of one VM would both cut it over: {named}; cancel all but one first"
 
 
+def _lock_busy(lock: asyncio.Lock) -> bool:
+    """Whether taking ``lock`` would wait: it is held, or a task waits for it - a released lock
+    goes to its first waiter, and acquire() queues behind that one. A free lock no task waits for
+    is taken without yielding, so a check then an acquire is one step of the event loop (SDD §8,
+    review RV52-O1, PR #58 review)."""
+    waiters = getattr(lock, "_waiters", None)  # asyncio.Lock's queue: 3.11 to 3.13 keep it here
+    return lock.locked() or any(not w.cancelled() for w in waiters or ())
+
+
 def _assessment(m: Migration) -> tuple[str, datetime | None, bool]:
     """What a pre-staging covers of ``m`` (SDD §8, reviews RV51-17, RV51-19): its last move to
     validating - the VM that validation read, the flavor and keypair it promised pre-staged - and
@@ -2753,10 +2762,10 @@ class Orchestrator:
             # ready there: reopened, or it would wait for good (SDD §8, review RV51-14)
             phases = await self.db.plan_phases(completed)
             for plan_id in sorted(p for p, counts in phases.items() if counts.get(P.ready)):
-                if self.plan_lock(plan_id).locked():
-                    # a validation or an edit holds it: a later tick reopens it, never this one
-                    # waiting while every plan's gates stall (SDD §8, review RV52-O1); a free
-                    # asyncio.Lock is taken without yielding, so nothing takes it in between
+                if _lock_busy(self.plan_lock(plan_id)):
+                    # a validation or an edit holds or waits for it: a later tick reopens it,
+                    # never this one waiting while every plan's gates stall (SDD §8, review
+                    # RV52-O1, PR #58 review)
                     continue
                 try:
                     await self._reopen_completed(plan_id, "system", "a migration waits in ready")
@@ -2891,8 +2900,12 @@ class Orchestrator:
 
     async def _complete(self, plan: Plan) -> None:
         # SDD §8: under the plan's lock, on the migrations re-read there — a retry that returned
-        # after the tick's snapshot keeps the plan running (SDD §5.1)
-        async with self._lock(f"plan:{plan.id}"):
+        # after the tick's snapshot keeps the plan running (SDD §5.1); one held or waited for is
+        # left to a later tick, which never waits for a lock (PR #58 review)
+        lock = self._lock(f"plan:{plan.id}")
+        if _lock_busy(lock):
+            return
+        async with lock:
             migs = await self.db.list("migration", Migration, plan_id=plan.id)
             if not all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
                 return
@@ -2919,8 +2932,13 @@ class Orchestrator:
     async def _begin(self, mid: str, allowed: set[Phase], to: Phase, reason: str) -> bool:
         plan_id = (await self._load(mid))[0].plan_id
         # SDD §8: under the plan's lock (then the migration's, the documented order), so a pause
-        # that returned starts nothing the tick chose on its snapshot
-        async with self._lock(f"plan:{plan_id}"), self._lock(mid):
+        # that returned starts nothing the tick chose on its snapshot. A lock held or waited for
+        # - a pause, a validation, a person's action - leaves the step to a later tick, which
+        # never waits for one: every other plan would stall (PR #58 review)
+        plan_lock, mig_lock = self._lock(f"plan:{plan_id}"), self._lock(mid)
+        if _lock_busy(plan_lock) or _lock_busy(mig_lock):
+            return False
+        async with plan_lock, mig_lock:
             if (await self._plan(plan_id)).status != PlanStatus.running:
                 return False
             m, v = await self._load(mid)
