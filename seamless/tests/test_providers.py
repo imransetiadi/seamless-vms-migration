@@ -3590,6 +3590,52 @@ async def test_the_destination_check_reports_its_gpu_capacity():
     }
 
 
+async def test_a_destination_check_whose_flavors_cannot_be_listed_reads_gpu_capacity_unknown():
+    """SDD §22.3 (plan task G3): the check reads the GPU flavors to read their pools; when Nova
+    refuses the flavor list, the capacity reads unknown, reason error, by the answer's HTTP status -
+    the check goes on and reports the rest."""
+    import openstack.exceptions
+    import requests
+
+    conn, dst = gpu_destination([], FakePlacement())
+    answer = requests.Response()
+    answer.status_code = 403
+
+    def refused(details=True):
+        # what openstacksdk raises from Nova's 403
+        raise openstack.exceptions.ForbiddenException(
+            "Policy doesn't allow os_compute_api:flavors:list", response=answer
+        )
+
+    conn.compute.flavors = refused
+    report = await dst.check()
+    capacity = report["gpu_capacity"]
+    assert (capacity["status"], capacity["reason"], capacity["detail"]) == (
+        "unknown",
+        "error",
+        "HTTP 403",
+    )
+    assert capacity["pools"] == [] and report["admin"] is True
+
+
+async def test_the_demo_destination_reads_no_gpu_pools_and_holds_no_allocation():
+    """SDD §22.3 (plan task G3): the demo's fake destination lists no GPU flavor, so its check, its
+    inventory and the gate's read find no pool, and a simulated server holds no allocation."""
+    dst = FakeDestinationProvider(
+        provider=make_provider(id="rhoso18", role=ProviderRole.destination)
+    )
+    inventory = await dst.inventory()
+    assert (inventory.gpu_flavors, inventory.gpu_capacity.status, inventory.gpu_capacity.pools) == (
+        [],
+        "ok",
+        [],
+    )
+    assert (await dst.check())["gpu_capacity"]["pools"] == []
+    gate = await dst.gpu_capacity([GpuDevice(kind="vgpu", resource_class="VGPU")])
+    assert (gate.status, gate.pools, gate.read_at is not None) == ("ok", [], True)
+    assert await dst.server_allocations("srv-1") is None
+
+
 async def test_server_allocations_add_up_the_units_per_resource_class():
     """SDD §22.3, §22.8 (plan task G3): the units a server holds per resource class, GET
     /allocations/{server_id} summed over its providers."""
