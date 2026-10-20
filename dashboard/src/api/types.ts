@@ -150,6 +150,8 @@ export interface Provider {
   release: string | null;
   /** The policy defaults its operator declares (SDD §4.2, §21.5); null = by kind and series. Refused on vmware. */
   policy_profile: 'secure_rbac' | 'legacy' | null;
+  /** The NVIDIA vGPU profile each of its GPU flavors gives, as its operator declares it (SDD §4.2, §22.3). Refused on vmware; older fixtures omit it. */
+  gpu_profiles?: Record<string, string>;
   /** Server-owned: when the write-only credentials / conversion key were last stored. */
   credentials_updated_at: Timestamp | null;
   conversion_key_updated_at: Timestamp | null;
@@ -250,6 +252,8 @@ export interface Mappings {
   flavors: Record<string, string>;
   volume_types: Record<string, string>;
   projects: Record<string, string>;
+  /** A VMware GPU key to a destination GPU flavor (SDD §4.2, §22.4); older fixtures omit it. */
+  gpus?: Record<string, string>;
 }
 
 export interface HandoverConfig {

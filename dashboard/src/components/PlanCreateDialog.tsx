@@ -497,7 +497,15 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         require_distinct_approver: f.requireDistinctApprover,
         auto_cutover: f.autoCutover,
         cutover_window: f.windowStart ? { start: new Date(f.windowStart).toISOString(), end: new Date(f.windowEnd).toISOString() } : null,
-        mappings: { networks: networks ?? {}, flavors: flavors ?? {}, volume_types: volumeTypes ?? {}, projects: projects ?? {} },
+        mappings: {
+          networks: networks ?? {},
+          flavors: flavors ?? {},
+          volume_types: volumeTypes ?? {},
+          projects: projects ?? {},
+          // the GPU mappings, which this form shows from plan task G12 on, are kept as the plan has them: a PATCH replaces
+          // `mappings` whole (SDD §22.4)
+          ...(plan?.mappings.gpus ? { gpus: plan.mappings.gpus } : {}),
+        },
         handover: { enabled: f.handoverEnabled && source?.kind !== 'vmware', backend_map: backendMap },
         link_bps: link * MiB,
         convergence_threshold_bytes: Math.round(threshold * GiB),

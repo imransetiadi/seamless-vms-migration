@@ -1545,4 +1545,26 @@ describe('PlanDetail', () => {
     dialog = await edit();
     expect(within(dialog).getByLabelText(/^network mappings/i)).toHaveValue('__proto__ = tenant-web\nanalytics = tenant-app');
   });
+  it("keeps the plan's GPU mappings when the form saves other mappings (SDD §4.2, §22.4)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const planId = 'plan-c81d44a0';
+    const plan = server.plans.find((p) => p.id === planId)!;
+    // set through the API or `seamless plan apply`: the form shows GPU mappings from plan task G12 on, and a PATCH
+    // replaces `mappings` whole
+    plan.mappings = { ...plan.mappings, gpus: { 'grid_a100-4c': 'g1.a100-4c' } };
+    renderWithApp(<PlanDetail />, { route: `/plans/${planId}`, path: '/plans/:planId', token: 'operator', server });
+    const actions = await screen.findByRole('group', { name: /plan actions/i });
+    await user.click(within(actions).getByRole('button', { name: /^edit plan$/i }));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced/i));
+    const networks = within(dialog).getByLabelText(/^network mappings/i);
+    await user.clear(networks);
+    await user.type(networks, 'tenant-gpu = tenant-gpu-ovn');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const saved = server.plans.find((p) => p.id === planId)!;
+    expect(saved.mappings.networks).toEqual({ 'tenant-gpu': 'tenant-gpu-ovn' });
+    expect(saved.mappings.gpus).toEqual({ 'grid_a100-4c': 'g1.a100-4c' });
+  });
 });
