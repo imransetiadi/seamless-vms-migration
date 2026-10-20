@@ -4,8 +4,16 @@ from pathlib import Path
 import pytest
 
 from seamless_migrate.domain.enums import ProviderKind, Severity, Strategy
-from seamless_migrate.domain.models import Estimate, Finding, HandoverConfig, NicOverride, VMRef
+from seamless_migrate.domain.models import (
+    Estimate,
+    Finding,
+    GpuDevice,
+    HandoverConfig,
+    NicOverride,
+    VMRef,
+)
 from seamless_migrate.executors.handover import KEEP_MICROVERSION
+from seamless_migrate.planning.gpu import gpu_requests
 from seamless_migrate.planning.selector import (
     HANDOVER_COMPUTE_FLOOR,
     eligibility,
@@ -143,6 +151,69 @@ def test_vmware_warm_requires_cbt():
     independent = make_vm(cbt_enabled=True, disks=[make_disk(kind="vmdk", independent=True)])
     reasons = eligibility(independent, kind, plan, {}, {}, [])[Strategy.vmware_warm]
     assert any("independent" in r for r in reasons)
+
+
+PASSTHROUGH = GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5")
+VGPU_4C = GpuDevice(kind="vgpu", profile="grid_a100-4c")
+#: the reasons a VMware passthrough VM's strategy is refused for (SDD §9.2, §22.6)
+WARM_REASON = (
+    "PCI passthrough device(s) {}: vSphere takes no snapshot of a VM with one - power it off, "
+    "validate it again and migrate it cold"
+)
+COLD_REASON = (
+    "PCI passthrough device(s) {} on a VM that is not powered off: power it off, validate it again "
+    "and migrate it cold"
+)
+
+
+def test_a_vmware_passthrough_vm_is_ineligible_for_vmware_warm():
+    """SDD §9.2, §22.6 (plan task G5): vSphere supports no snapshot of a VM with a PCI DirectPath
+    I/O device, and the kit reads every copy from one - a passthrough VM is never a vmware_warm
+    candidate, powered off or not; the reason says how to migrate it."""
+    vm = make_vm(flavor=None, cbt_enabled=True, gpus=[PASSTHROUGH, GpuDevice(kind="passthrough")])
+    kind, plan = ProviderKind.vmware, make_plan()
+    for state in ("running", "stopped"):
+        found = eligibility(vm.model_copy(update={"power_state": state}), kind, plan, {}, {}, [])
+        assert found[Strategy.vmware_warm] == [
+            WARM_REASON.format("10de:20b5, a device without ids")
+        ], state
+
+
+def test_a_running_vmware_passthrough_vm_is_ineligible_for_vmware_cold():
+    """SDD §9.2, §22.6 (plan task G5): the kit copies a running guest that is not Windows before it
+    powers it off, and a snapshot of a running VM with a DirectPath I/O device is no copy -
+    vmware_cold takes it only powered off."""
+    kind, plan = ProviderKind.vmware, make_plan()
+    for state in ("running", "paused", "unknown"):
+        vm = make_vm(flavor=None, power_state=state, gpus=[PASSTHROUGH])
+        assert eligibility(vm, kind, plan, {}, {}, [])[Strategy.vmware_cold] == [
+            COLD_REASON.format("10de:20b5")
+        ], state
+
+
+def test_a_powered_off_vmware_passthrough_vm_is_eligible_for_vmware_cold():
+    """SDD §9.2, §22.6 (plan task G5): powered off, a passthrough VM's snapshot holds no device
+    state, and vmware_cold takes it."""
+    vm = make_vm(flavor=None, power_state="stopped", gpus=[PASSTHROUGH])
+    assert eligibility(vm, ProviderKind.vmware, make_plan(), {}, {}, [])[Strategy.vmware_cold] == []
+
+
+def test_a_vgpu_vm_keeps_every_strategys_rules():
+    """SDD §9.2, §22.6 (plan task G5): a vGPU VM's disks move as any VM's do - vmware_cold and
+    vmware_warm keep their rules for it, running or not -, and cold, warm and storage_handover keep
+    theirs for every OpenStack GPU VM, a PCI alias's included."""
+    kind, plan = ProviderKind.vmware, make_plan()
+    for state in ("running", "stopped"):
+        vgpu = make_vm(flavor=None, power_state=state, cbt_enabled=True, gpus=[VGPU_4C])
+        found = eligibility(vgpu, kind, plan, {}, {}, [])
+        assert found == {Strategy.vmware_cold: [], Strategy.vmware_warm: []}, state
+    handover = make_plan(handover=HandoverConfig(enabled=True, backend_map={"ceph-ssd": "x"}))
+    plain = eligibility(make_vm(), ProviderKind.openstack, handover, OK_CAPS, OK_CAPS, [])
+    for specs in ({"resources:VGPU": "1"}, {"pci_passthrough:alias": "a100:1"}):
+        gpu = make_vm(flavor_extra_specs=specs, gpus=gpu_requests(specs))
+        assert eligibility(gpu, ProviderKind.openstack, handover, OK_CAPS, OK_CAPS, []) == plain, (
+            specs
+        )
 
 
 def test_override_ignored_when_ineligible():

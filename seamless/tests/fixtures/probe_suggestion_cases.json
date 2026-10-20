@@ -1,5 +1,5 @@
 {
- "_comment": "Application probe suggestions (SDD §9.6, ADV-18), shared by seamless/tests/test_probes.py and dashboard/src/api/mockProbes.test.ts. Each case: a VM's name, tags and os_type -> the probes the rules suggest. A database that names no engine, an old OS or an unknown role gets none; the service must be of the VM's tier (ldap-db-01 is no LDAP server). An empty tier tag falls back to seamless/tier, as heuristic_tier reads them (review RV25-02). The OS names no service: an Oracle Linux web server is a web server (review PL-03).",
+ "_comment": "Application probe suggestions (SDD §9.6, ADV-18), shared by seamless/tests/test_probes.py and dashboard/src/api/mockProbes.test.ts. Each case: a VM's name, tags and os_type -> the probes the rules suggest. A database that names no engine, an old OS or an unknown role gets none; the service must be of the VM's tier (ldap-db-01 is no LDAP server). An empty tier tag falls back to seamless/tier, as heuristic_tier reads them (review RV25-02). The OS names no service: an Oracle Linux web server is a web server (review PL-03). A case's `gpus` are the VM's GPUs (SDD §22.2): every GPU VM is suggested tcp 9400 too, after its tier's probe (§9.6, plan task G5).",
  "cases": [
   {
    "name": "ledger-db-01",
@@ -362,6 +362,54 @@
    "tags": {},
    "os_type": "Oracle Linux Server 8.9",
    "probes": []
+  },
+  {
+   "name": "ml-db-01",
+   "tags": {
+    "role": "postgresql"
+   },
+   "os_type": "rhel9",
+   "gpus": [
+    {
+     "kind": "vgpu",
+     "profile": "grid_a100-4c",
+     "count": 1
+    }
+   ],
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 5432,
+     "path": "/",
+     "expect_status": null
+    },
+    {
+     "kind": "tcp",
+     "port": 9400,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "render-01",
+   "tags": {},
+   "os_type": "rhel9",
+   "gpus": [
+    {
+     "kind": "vgpu",
+     "profile": "grid_a100-4c",
+     "count": 1
+    }
+   ],
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 9400,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
   }
  ]
 }

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from seamless_migrate.domain.models import AppProbe, VerificationConfig
+from seamless_migrate.domain.models import AppProbe, GpuDevice, VerificationConfig
 from seamless_migrate.planning.probes import describe_probe, is_database, probes_for, suggest_probes
 from tests.factories import make_plan, make_vm
 
@@ -26,7 +26,8 @@ CASES = json.loads(
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c["name"])
 def test_suggestions_follow_the_tier_and_the_service_a_vm_names(case):
     """One case table for the control plane and the dashboard's mock (SDD §9.6)."""
-    vm = make_vm(name=case["name"], tags=case["tags"], os_type=case["os_type"])
+    gpus = [GpuDevice(**gpu) for gpu in case.get("gpus", [])]
+    vm = make_vm(name=case["name"], tags=case["tags"], os_type=case["os_type"], gpus=gpus)
     assert [p.model_dump() for p in suggest_probes(vm)] == case["probes"]
 
 
@@ -65,3 +66,17 @@ def test_probes_are_described_the_way_people_say_them():
         describe_probe(AppProbe(kind="https", port=443, path="/health", expect_status=204))
         == "HTTPS 443 /health (204)"
     )
+
+
+def test_a_gpu_vm_is_suggested_the_dcgm_exporter_port_besides_its_tiers_probe():
+    """SDD §9.6, §22.8 (plan task G5): every GPU VM, whatever its tier, is also suggested tcp 9400 -
+    NVIDIA's DCGM exporter serves its metrics there -, after its tier's probe; an OpenStack VM
+    recorded without gpus is a GPU VM by its flavor's requests."""
+    vgpu = [GpuDevice(kind="vgpu", profile="grid_a100-4c")]
+    db = make_vm(name="ledger-db-01", tags={"role": "postgresql"}, gpus=vgpu)
+    assert suggest_probes(db) == [tcp(5432), tcp(9400)]
+    assert suggest_probes(make_vm(name="web-01", gpus=vgpu)) == [http(80), tcp(9400)]
+    assert suggest_probes(make_vm(name="render-01", gpus=vgpu)) == [tcp(9400)]
+    recorded = make_vm(name="render-02", flavor_extra_specs={"resources:VGPU": "1"})
+    assert suggest_probes(recorded) == [tcp(9400)]
+    assert suggest_probes(make_vm(name="render-03")) == []

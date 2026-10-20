@@ -16,6 +16,7 @@ from .gpu import (
     ProfileSize,
     gpu_flavor,
     gpu_key,
+    gpu_names,
     pool_key,
     pool_name,
     vgpu_profile_size,
@@ -688,23 +689,6 @@ def _vm_gpus(vm: VMRef, source: Provider | None) -> tuple[list[GpuDevice], str |
     return vm_gpus(vm, declared), declared
 
 
-def _gpu_names(devices: Iterable[GpuDevice]) -> str:
-    """Each device by what names it - a profile, an alias, the PCI ids or a vGPU's class -, with
-    its count when more than one."""
-    names = []
-    for device in devices:
-        ids = (
-            f"{device.vendor_id}:{device.device_id}"
-            if device.vendor_id and device.device_id
-            else ""
-        )
-        name = (
-            device.profile or device.alias or ids or device.resource_class or "a device without ids"
-        )
-        names.append(f"{name} ×{device.count}" if device.count > 1 else name)
-    return ", ".join(names)
-
-
 @dataclass(frozen=True)
 class _GpuMapping:
     """Whether a GPU VM's mapping applies (SDD §22.4): its GPU flavor when it does; why not when
@@ -781,7 +765,7 @@ def _gpu_blockers(
         message = (
             f"Flavor requests PCI passthrough ({alias})."
             if alias is not None and any(g.alias for g in passthrough)
-            else f"The VM has a PCI passthrough device ({_gpu_names(passthrough)})."
+            else f"The VM has a PCI passthrough device ({gpu_names(passthrough)})."
         )
         out.append(finding("VM_PCI_PASSTHROUGH", f"{message} {why}"))
     vgpus = [g for g in gpus if g.kind == "vgpu"]
@@ -790,7 +774,7 @@ def _gpu_blockers(
         message = (
             f"Flavor requests a vGPU ({', '.join(keys)})."
             if keys and any(g.resource_class for g in vgpus)
-            else f"The VM has a vGPU ({_gpu_names(vgpus)})."
+            else f"The VM has a vGPU ({gpu_names(vgpus)})."
         )
         out.append(finding("VM_VGPU", f"{message} {why}"))
     return out
@@ -899,7 +883,7 @@ def _gpu_flavor_findings(
     out = [
         finding(
             "MAP_GPU_FLAVOR",
-            f"The VM's GPUs ({_gpu_names(gpus)}) go to flavor {name!r} of {where}: {vcpus} vCPUs, "
+            f"The VM's GPUs ({gpu_names(gpus)}) go to flavor {name!r} of {where}: {vcpus} vCPUs, "
             f"{ram_mb} MB RAM, {disk_gb} GB disk, {_requests_text(flavor['gpus'])}"
             + (f"; it gives the VM {_and(less)}" if less else "")
             + ". GPU migration is a Technology Preview.",
