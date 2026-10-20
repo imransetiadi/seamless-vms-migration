@@ -1038,3 +1038,60 @@ def test_an_auth_section_a_redacted_value_closes_goes_whole_in_the_same_pass(tex
     once = redact(text)
     assert "auth:[REDACTED]" in once.replace(" ", ""), once
     assert redact(once) == once, once
+
+
+def test_a_seeded_fuzz_of_escapes_camel_case_keys_and_auth_sections_redacts_once_for_good():
+    """SDD §13.4 (review RV52-X7): what the escape removal and the camelCase, digit and long-word
+    keys meet - a removal joining what stood around an escape, a key inside a word, a flow-style
+    auth section a value's redaction closes - is redacted once for good: a second pass changes
+    nothing, in a text, inside JSON and inside JSON strings in JSON. The reviewers' fuzz met the
+    auth sections in 7 of 180,000 texts, which the parametrized test above names."""
+    rng = random.Random(57)
+    atoms = [
+        "\x1b[0m",
+        "\x1b[",
+        "\x1b",
+        "\\u001b[1m",
+        "\\u001",
+        "\\x1b",
+        "m",
+        "K",
+        "[0;31m",
+        "adminPass",
+        "Pass",
+        "aB",
+        "DBPassword",
+        "password2",
+        "_3",
+        "passphrase",
+        "adminpassword",
+        "bypass",
+        "auth:",
+        "{",
+        "}",
+        "'token':",
+        '"token":',
+        "secret=",
+        ":",
+        "=",
+        " ",
+        "'",
+        '"',
+        "\\",
+        "\n",
+        "\\n",
+        "x",
+        "[REDACTED]",
+    ]
+    changed = []
+    for _ in range(3000):
+        text = "".join(rng.choice(atoms) for _ in range(rng.randint(2, 12)))
+        for held in (
+            text,
+            json.dumps({"stdout": text}),
+            json.dumps({"o": json.dumps({"o": text})}),
+        ):
+            once = redact(held)
+            if redact(once) != once:
+                changed.append(held)
+    assert changed == [], changed[:5]
