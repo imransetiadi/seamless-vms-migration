@@ -220,9 +220,10 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
             r"(?:(?<=password)|(?<=passwd)|(?<=secret)|(?<=token)|(?<=key))"
             r"(?:\s+|(?P<argesc>\\*+)[\"']\s*,\s*(?P=argesc)(?P<argq>[\"'])))"
             r"((?(argq)(?:(?!(?P=argesc)(?P=argq))(?:\\.|[^\n]))*+"
-            # a shell word: its quoted parts and what is glued to them, a quote that never
-            # closes on its line read as any other character (review RV52-X3)
-            r"|(?:\"(?:[^\"\\\n]|\\.)*+\"|'[^'\n]*+'|\S)++))"
+            # a shell word: its quoted parts and what is glued to them; a quote that never closes
+            # runs to its line's end, the longest reading - each part is read once, so a run of
+            # escaped quotes costs time linear in its length (review RV52-X3)
+            r"|(?:\"(?:[^\"\\\n]|\\.?)*+(?:\"|(?=\n)|\Z)|'[^'\n]*+(?:'|(?=\n)|\Z)|\S)++))"
         ),
         r"\1" + REDACTED,
     ),

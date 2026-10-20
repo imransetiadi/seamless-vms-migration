@@ -710,6 +710,20 @@ def test_a_seeded_fuzz_of_cli_flags_and_authorization_headers_redacts_once_for_g
     assert changed == [], changed[:5]
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["--os-password 'Fake Pass Word", '--os-password "Fake Pass Word', '--os-password "Fake\\'],
+    ids=["single", "double", "backslash-at-end"],
+)
+def test_a_cli_flags_quote_that_never_closes_runs_to_its_lines_end(text):
+    """SDD §13.4 (review RV52-X3): a flag's quote that never closes - a log line cut short - ended
+    at the next space, so the secret's later words stayed. It runs to its line's end, the longest
+    reading."""
+    out = redact(text + "\nnext line")
+    assert out == "--os-password [REDACTED]\nnext line", out
+    assert redact(out) == out
+
+
 def _quotings(pairs):
     """``pairs`` (key, value) as each quoting a step's output carries them prints them."""
     mapping = dict(pairs)

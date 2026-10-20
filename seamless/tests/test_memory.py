@@ -232,6 +232,10 @@ def test_memory_hits_are_redacted_where_they_enter():
         'password="a"" ' * 2340,
         'password="a"' + '"b"' * 8190,
         '{"m": "password=\\"a\\"' + '\\"b\\"' * 5460 + '"}',
+        # a CLI flag's shell word: an unclosed quote before a run of escaped ones, and quoted
+        # parts (RV52-X3)
+        '--os-password "' + '\\"' * 16384,
+        "--os-password " + "'a'\"b\"" * 5460,
     ],
     ids=[
         "key prefix",
@@ -254,6 +258,8 @@ def test_memory_hits_are_redacted_where_they_enter():
         "glued quotes never closed",
         "glued quoted parts",
         "glued escaped parts",
+        "flag quote never closed",
+        "flag quoted parts",
     ],
 )
 def test_redact_costs_time_linear_in_the_text(text):
