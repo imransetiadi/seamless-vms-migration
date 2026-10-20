@@ -9,17 +9,25 @@ import sqlalchemy as sa
 
 from seamless_migrate.domain.enums import Phase, PlanStatus, Role
 from seamless_migrate.domain.models import (
-    AdvisorNote,
     Event,
     Mappings,
     Migration,
     Nic,
     Plan,
     Provider,
+    RecommendedOption,
+    SimilarIncident,
 )
 from seamless_migrate.events import AUDIT_KINDS
 from seamless_migrate.security.auth import DashboardUser
-from seamless_migrate.store import ConflictError, NotFound, Store, UnstorableValue, events
+from seamless_migrate.store import (
+    ConflictError,
+    NotFound,
+    Store,
+    UnstorableValue,
+    documents,
+    events,
+)
 from tests.conftest import PG_URL
 from tests.factories import make_migration, make_plan, make_provider, make_vm
 
@@ -809,14 +817,14 @@ def test_the_store_refuses_nan_and_the_infinities_naming_the_field(
 ):
     """SDD §11 (review RV50-04): PostgreSQL's JSONB holds no NaN and no infinity, which Python's
     json writes as NaN and Infinity and SQLite keeps - a verification note's confidence of inf
-    failed the verifying save on PostgreSQL only. A write whose document or event holds one is
-    refused on every backend before any statement, naming the field, and nothing of it is kept."""
-    note = AdvisorNote(kind="verification", source="jev", summary="s", confidence=bad)
-    m = make_migration(advisor_notes=[note])
+    failed the verifying save on PostgreSQL only (a note now reads one as null, as one an earlier
+    version stored, review RV51-06). A write whose document or event holds one is refused on
+    every backend before any statement, naming the field, and nothing of it is kept."""
+    m = make_migration(actual_downtime_s=bad)
     with pytest.raises(UnstorableValue) as refused:
         any_store.put("migration", m, expected_version=0)
     assert str(refused.value) == (
-        f"migration {m.id}: advisor_notes.0.confidence: is {what}, which the store cannot keep"
+        f"migration {m.id}: actual_downtime_s: is {what}, which the store cannot keep"
     )
     with pytest.raises(NotFound):
         any_store.get("migration", m.id, Migration)
@@ -826,6 +834,56 @@ def test_the_store_refuses_nan_and_the_infinities_naming_the_field(
     # an integer of any length is a JSON number, kept as it is
     any_store.append_event(Event(kind="plan.created", data={"bytes": 10**30}))
     assert [e.data for e in any_store.events()] == [{"bytes": 10**30}]
+
+
+def test_a_document_an_earlier_version_stored_with_nan_or_an_infinity_is_written_again(
+    any_store: Store,
+):
+    """SDD §11 (review RV51-06): v0.1.0-rc.2 kept agentmemory's NaN score and Jev's 1e999
+    confidence on SQLite, as json wrote them; the store now refuses every write holding one, so
+    such a migration could never be written again - its stopped source never rolled back. They
+    read as null, a probability as absent, and the document is written again."""
+    if any_store.engine.dialect.name != "sqlite":
+        pytest.skip("PostgreSQL's JSONB never kept the tokens")
+    m = make_migration()
+    any_store.put("migration", m)
+    nan, inf = float("nan"), float("inf")
+    data = m.model_dump(mode="json")
+    data["advisor_notes"] = [
+        {
+            "kind": "verification",
+            "source": "jev",
+            "summary": "s",
+            "confidence": inf,
+            "data": {"hits": [{"title": "t", "score": nan}], "results": [{"confidence": -inf}]},
+        }
+    ]
+    with any_store.engine.begin() as conn:
+        conn.execute(
+            sa.update(documents)
+            .where(documents.c.kind == "migration", documents.c.id == m.id)
+            .values(data=data)
+        )
+    loaded, version = any_store.get_versioned("migration", m.id, Migration)
+    [note] = loaded.advisor_notes
+    assert note.confidence is None
+    assert note.data == {"hits": [{"title": "t", "score": None}], "results": [{"confidence": None}]}
+    assert any_store.put("migration", loaded, expected_version=version) == version + 1
+    # a recommendation's confidence and probabilities, and a similar incident's score
+    rec = {
+        "option": "warm",
+        "confidence": nan,
+        "distribution": {"warm": inf, "cold": 0.25},
+    }
+    assert RecommendedOption.model_validate(rec).model_dump() == {
+        "option": "warm",
+        "confidence": None,
+        "distribution": {"cold": 0.25},
+        "unusable": None,
+    }
+    assert (
+        SimilarIncident.model_validate({"title": "t", "content": "c", "score": inf}).score is None
+    )
 
 
 def test_the_unstorable_walk_reads_a_value_nested_however_deep():

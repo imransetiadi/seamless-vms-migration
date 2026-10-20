@@ -21,6 +21,7 @@ from ..domain.models import (
     Migration,
     RecommendedOption,
 )
+from .advisor import as_probability
 
 LEGACY_PREFIX = "rec-legacy-"
 
@@ -33,8 +34,10 @@ def _legacy(migration: Migration, index: int, note: AdvisorNote) -> AdvisorRecom
     data = note.data
     option = _text(data.get("selected"))
     probabilities = data.get("probabilities")
+    # each read as the advisor reads Jev's: compared before it is converted, so an integer of 400
+    # digits a build before rc.1 kept is none (SDD §14.4, review RV51-23)
     distribution = (
-        {k: float(v) for k, v in probabilities.items() if isinstance(v, int | float)}
+        {k: p for k, v in probabilities.items() if (p := as_probability(v)) is not None}
         if isinstance(probabilities, dict)
         else {}
     )

@@ -9869,3 +9869,103 @@ async def test_an_agentmemory_score_that_is_no_finite_number_never_reaches_the_s
     [rec] = _recommendations(store)
     assert [i.score for i in rec.similar_incidents] == [None]
     _stored_json(store, "recommendation", rec.id)
+
+
+def _write_as_rc2(store, migration: Migration, notes: list[dict]) -> None:
+    """The migration as v0.1.0-rc.2 left it on SQLite: advisor notes holding numbers json wrote as
+    NaN and Infinity tokens, which SQLite kept (SDD §11, review RV50-04)."""
+    import sqlalchemy as sa
+
+    from seamless_migrate.store import documents
+
+    data = store.get("migration", migration.id, Migration).model_dump(mode="json")
+    with store.engine.begin() as conn:
+        conn.execute(
+            sa.update(documents)
+            .where(documents.c.kind == "migration", documents.c.id == migration.id)
+            .values(data={**data, "advisor_notes": notes})
+        )
+
+
+#: the note rc.2's knowledge service attached to a failure: a hit's score as rc.2 read
+#: agentmemory's "nan" (review RV50-04)
+_RC2_NOTE = {
+    "kind": "similar_incidents",
+    "source": "memory",
+    "summary": "1 similar past incident(s) found",
+    "data": {
+        "query": "cold cutover",
+        "hits": [{"title": "t", "content": "c", "score": float("nan")}],
+    },
+}
+
+
+async def test_a_stopped_source_an_earlier_version_stored_with_a_nan_score_is_rolled_back(
+    tmp_path, store
+):
+    """SDD §11 (review RV51-06): a cutover failed after the stop under rc.2, whose note kept
+    agentmemory's NaN score on SQLite; every write of the migration was refused since - the
+    rollback, the one action that restarts the source, answered 422. The NaN reads as null."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    m.phase = P.failed
+    m.downtime_started_at = h.orch.now() - timedelta(seconds=900)
+    store.put("migration", m)
+    _write_as_rc2(store, m, [_RC2_NOTE])
+    rolled = await h.orch.rollback(m.id, "bayu", "restart the source")
+    assert rolled.phase == P.rolling_back
+    assert rolled.advisor_notes[0].data["hits"][0]["score"] is None
+
+
+async def test_a_plan_holding_a_migration_an_earlier_version_stored_with_a_nan_score_validates(
+    tmp_path, store
+):
+    """SDD §11 (review RV51-06): a validation writes its migrations in one transaction, so web-01's
+    rc.2 note refused web-02's validation too, and the migration could not be cancelled out of
+    the plan either."""
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    _write_as_rc2(store, m, [_RC2_NOTE])
+    report = await h.orch.validate_plan(plan.id, "alice")
+    assert {i.phase for i in report.migrations} == {P.ready}
+    cancelled = await h.orch.cancel(m.id, "alice", "remove it from the plan")
+    assert cancelled.phase == P.cancelled
+
+
+async def test_one_plans_error_never_stops_the_tick_of_the_others(tmp_path, store, monkeypatch):
+    """SDD §8 (review RV51-06): the tick ticked the running plans one after another, so one plan's
+    error - a write the store refused - failed it before every plan after, each tick, and the
+    health turned unhealthy after three (GET /ready 503). Each plan is ticked on its own: the
+    error is logged, plan B's VM is cut over, and the loop stays healthy."""
+    first, second = vm(1), vm(2)
+    h = build_harness(tmp_path, store, [first, second])
+    plan_a = plan_for([first], name="A", default_strategy=Strategy.cold)
+    plan_b = plan_for([second], name="B", default_strategy=Strategy.cold)
+    store.put("plan", plan_a)  # created first: ticked first
+    store.put("plan", plan_b)
+    for plan in (plan_a, plan_b):
+        await h.orch.validate_plan(plan.id, "alice")
+        await h.orch.start_plan(plan.id, "alice")
+    tick_plan = h.orch._tick_plan
+    failed: list[str] = []
+
+    async def failing(plan, *args):
+        if plan.id == plan_a.id:
+            failed.append(plan.id)
+            raise UnstorableValue("migration mig-x: advisor_notes.0.confidence: is NaN")
+        await tick_plan(plan, *args)
+
+    monkeypatch.setattr(h.orch, "_tick_plan", failing)
+    await h.orch.start()
+    try:
+        other = await h.by_vm(plan_b.id, "vm-2")
+        await h.wait_phase(other.id, P.completed)
+        for _ in range(5):  # ticks enough to count three errors
+            h.orch.wake()
+            await asyncio.sleep(0.02)
+        health = h.orch.health()
+    finally:
+        await h.orch.stop()
+    assert len(failed) >= 3 and health["healthy"], health

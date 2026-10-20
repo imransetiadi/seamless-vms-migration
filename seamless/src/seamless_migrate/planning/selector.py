@@ -268,7 +268,9 @@ def select_strategy(vm: VMRef, estimates: Sequence[Estimate], plan: Plan) -> tup
             )
         notes.append(f"no eligible strategy meets the {plan.downtime_slo_s} s SLO")
 
-    ties = tie_set(eligible)
+    # an infinite downtime ties with none (inf - inf is NaN): the simplest eligible is taken
+    # (SDD §9.2, review RV51-22)
+    ties = tie_set(eligible) or sorted((e.strategy for e in eligible), key=simplicity)
     choice = ties[0]
     est = by_strategy[choice]
     if len(ties) > 1:

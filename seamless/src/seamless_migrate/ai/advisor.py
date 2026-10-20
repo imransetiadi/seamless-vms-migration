@@ -96,7 +96,7 @@ def _check_state(check: dict[str, Any]) -> str:
     return "ok" if check.get("ok") else "FAILED"
 
 
-def _probability(value: Any) -> float | None:
+def as_probability(value: Any) -> float | None:
     """``value`` when it is a probability - a real number from 0 to 1, never a bool -, else
     ``None`` (SDD §4.2, §14.1, audit AD-02). Compared as it stands, so an integer of 400 digits,
     which no float holds, is none either (review RV50-03)."""
@@ -231,7 +231,7 @@ class Advisor:
         malformed = (
             (raw is not None and not isinstance(raw, dict))
             or (selected is not None and not isinstance(selected, str))
-            or (confidence is not None and _probability(confidence) is None)
+            or (confidence is not None and as_probability(confidence) is None)
             or (probabilities is not None and not isinstance(probabilities, dict))
             or (status is not None and not isinstance(status, str))
             or (model is not None and not isinstance(model, str))
@@ -241,9 +241,9 @@ class Advisor:
         reasons = rec.get("reasons", response.get("reasons"))
         return Advice(
             option=selected if isinstance(selected, str) else None,
-            confidence=_probability(confidence),
+            confidence=as_probability(confidence),
             distribution={
-                k: p for k, v in distribution.items() if (p := _probability(v)) is not None
+                k: p for k, v in distribution.items() if (p := as_probability(v)) is not None
             },
             status="invalid_response" if malformed else status,
             escaped=bool(rec.get("escaped")),
@@ -406,7 +406,7 @@ class Advisor:
         review_required = bool(reasons)
         review_reason = "; ".join(reasons) or None
         # a claim's confidence that is no probability counts for none (SDD §14.1, review RV50-03)
-        confidences = [p for i in results if (p := _probability(i.get("confidence"))) is not None]
+        confidences = [p for i in results if (p := as_probability(i.get("confidence"))) is not None]
         # each verdict once, in the order seen: never "verified, verified" (ADV-18)
         verdicts = list(dict.fromkeys(str(i.get("verdict")) for i in results))
         if review_required:

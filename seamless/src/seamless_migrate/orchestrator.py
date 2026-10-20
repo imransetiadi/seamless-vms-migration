@@ -2706,7 +2706,12 @@ class Orchestrator:
         }
         now = self._now()
         for plan in plans:
-            await self._tick_plan(plan, by_plan.get(plan.id, []), counts, now)
+            # each plan on its own: one plan's error - a write the store refuses, a provider down -
+            # is logged and the plans after it are ticked (SDD §8, review RV51-06)
+            try:
+                await self._tick_plan(plan, by_plan.get(plan.id, []), counts, now)
+            except Exception:
+                log.exception("the tick of plan %s failed", plan.id)
 
     def _gate(self, m: Migration, plan: Plan, now: datetime) -> bool:
         if plan.require_approval and not counted_approvals(m, plan):

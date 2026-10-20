@@ -336,3 +336,17 @@ def test_a_legacy_id_whose_index_is_no_plain_number_is_unknown(api, index):
     url = "/api/v1/advisor/recommendations/rec-legacy-mig-0000000001-"
     assert api.get(url + "0").json()["legacy"] is True
     assert api.get(url + index).status_code == 404
+
+
+def test_a_legacy_notes_probability_past_a_floats_range_never_fails_the_listing(api):
+    """SDD §12, §14.4 (review RV51-23): a strategy note of a build before rc.1 kept Jev's
+    probabilities as Jev gave them, an integer of 400 digits too; the legacy reading converted it
+    with float() - OverflowError, and the whole listing answered 500 for every viewer. Each value
+    is read as the advisor reads a probability: one that is none is left out."""
+    m = legacy_migration("mig-d", "plan-4", "app-04")
+    m.advisor_notes[0].data["probabilities"] = {"warm": 10**400, "cold": 0.4, "none": True}
+    api.store.put("migration", m)
+    listing = api.get("/api/v1/advisor/recommendations")
+    entry = api.get("/api/v1/advisor/recommendations/rec-legacy-mig-d-0")
+    assert (listing.status_code, entry.status_code) == (200, 200), (listing.text, entry.text)
+    assert entry.json()["recommendation"]["distribution"] == {"cold": 0.4}

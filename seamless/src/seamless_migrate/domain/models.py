@@ -615,6 +615,13 @@ def _probe_problems(where: str, probes: Sequence[AppProbe]) -> list[str]:
     return problems
 
 
+#: the estimator's bounds (SDD §9.1, reviews RV51-07, RV51-22): a plan's sync passes at most, a rate
+#: it divides by at least (B/s), a duration it adds at most (s) - so every estimate is finite
+MAX_SYNC_PASSES = 100
+MIN_RATE_BPS = 1.0
+MAX_DURATION_S = 10**9
+
+
 def repeated_vm_ids(vm_ids: Sequence[str]) -> list[str]:
     """VM ids a plan lists more than once: one VM, one migration (SDD §12)."""
     return sorted(vm_id for vm_id, count in Counter(vm_ids).items() if count > 1)
@@ -647,9 +654,17 @@ def invalid_plan_settings(spec: PlanSpec) -> list[str]:
     window = spec.cutover_window
     if window is not None and window.end <= window.start:
         problems.append("cutover_window: end must be after start")
-    # the JSON parser accepts the Infinity literal, which gt=0 lets through (SDD §9.1)
+    # the JSON parser accepts the Infinity literal, which gt=0 lets through, and a rate a hair
+    # above zero makes every estimate infinite (SDD §9.1, review RV51-22)
     if not math.isfinite(spec.link_bps):
         problems.append(f"link_bps must be a finite positive number (got {spec.link_bps})")
+    elif spec.link_bps < MIN_RATE_BPS:
+        problems.append(f"link_bps must be at least 1 B/s (got {spec.link_bps})")
+    # the model runs a pass per allowed pass, in the event loop (SDD §9.1, review RV51-07)
+    if spec.max_sync_passes > MAX_SYNC_PASSES:
+        problems.append(
+            f"max_sync_passes must be at most {MAX_SYNC_PASSES} (got {spec.max_sync_passes})"
+        )
     return problems
 
 
@@ -712,6 +727,18 @@ class Estimate(_Model):
 AdvisorKind = Literal["strategy", "classification", "verification", "similar_incidents", "screen"]
 
 
+def _finite_or_none(value: Any) -> Any:
+    """``value`` with each NaN or infinity in it read as None: what an earlier version stored on
+    SQLite from an outside service, as this version writes it (SDD §11, review RV51-06)."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _finite_or_none(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_finite_or_none(item) for item in value]
+    return value
+
+
 class AdvisorNote(_Model):
     kind: AdvisorKind
     source: Literal["jev", "rules", "memory"]
@@ -719,6 +746,20 @@ class AdvisorNote(_Model):
     confidence: float | None = None
     data: dict[str, Any] = Field(default_factory=dict)
     created_at: UTCDateTime = Field(default_factory=utcnow)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_number_that_is_none(cls, data: Any) -> Any:
+        """A confidence, a hit's score or a claim's confidence v0.1.0-rc.2 stored as NaN or an
+        infinity reads as None, so the migration holding the note is written again (SDD §11,
+        review RV51-06)."""
+        if isinstance(data, dict) and ("confidence" in data or "data" in data):
+            data = {**data}
+            if "confidence" in data:
+                data["confidence"] = _finite_or_none(data["confidence"])
+            if isinstance(data.get("data"), dict):
+                data["data"] = _finite_or_none(data["data"])
+        return data
 
 
 class AdvisorActor(_Model):
@@ -744,6 +785,23 @@ class RecommendedOption(_Model):
     #: why the answer could not be applied when it was recorded (§14.4 rule 2), else None: no
     #: approve takes it (SDD §4.2, §14.6, audit AD-03)
     unusable: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_number_that_is_none(cls, data: Any) -> Any:
+        """A confidence v0.1.0-rc.2 stored as NaN or an infinity reads as None, such a probability
+        as absent (SDD §11, review RV51-06)."""
+        if isinstance(data, dict):
+            data = {**data}
+            if "confidence" in data:
+                data["confidence"] = _finite_or_none(data["confidence"])
+            if isinstance(data.get("distribution"), dict):
+                data["distribution"] = {
+                    key: value
+                    for key, value in data["distribution"].items()
+                    if not (isinstance(value, float) and not math.isfinite(value))
+                }
+        return data
 
 
 class Decision(_Model):
@@ -798,6 +856,15 @@ class SimilarIncident(_Model):
     title: str
     content: str = Field(max_length=1000)
     score: float | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_number_that_is_none(cls, data: Any) -> Any:
+        """A score v0.1.0-rc.2 stored as NaN or an infinity reads as no score (SDD §11, §14.3,
+        review RV51-06)."""
+        if isinstance(data, dict) and "score" in data:
+            data = {**data, "score": _finite_or_none(data["score"])}
+        return data
 
 
 class AdvisorReason(_Model):

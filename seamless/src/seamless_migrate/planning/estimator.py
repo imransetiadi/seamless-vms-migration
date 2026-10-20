@@ -8,7 +8,16 @@ from dataclasses import dataclass, fields, replace
 from typing import Any
 
 from ..domain.enums import Strategy, SyncPassKind
-from ..domain.models import GIB, Estimate, Plan, SyncPass, VMRef
+from ..domain.models import (
+    GIB,
+    MAX_DURATION_S,
+    MAX_SYNC_PASSES,
+    MIN_RATE_BPS,
+    Estimate,
+    Plan,
+    SyncPass,
+    VMRef,
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,13 @@ def unknown_estimator_overrides(overrides: Mapping[str, Any]) -> list[str]:
     return sorted(k for k in overrides if k not in _FIELD_TYPES)
 
 
+#: The rates the model divides by and the durations it adds (SDD §9.1, review RV51-22).
+_RATE_FIELDS = frozenset({"link_bps", "scan_bps", "max_aggregate_scan_bps"})
+_DURATION_FIELDS = frozenset(
+    {"shutdown_s", "boot_s", "create_s", "snapshot_s", "handover_per_volume_s", "v2v_s",
+     "v2v_inplace_s"}
+)  # fmt: skip
+
 #: Override keys that belong to plan fields (rejected: set the plan field instead).
 _PLAN_FIELD_FOR = {"convergence_threshold_bytes": "convergence_threshold_bytes",
                    "max_passes": "max_sync_passes"}  # fmt: skip
@@ -58,7 +74,8 @@ def invalid_estimator_overrides(overrides: Mapping[str, Any]) -> list[str]:
     Unknown keys, keys owned by plan fields (``link_bps`` is accepted but the plan's value
     keeps precedence, SDD §9.1) and values that are not finite positive numbers are rejected —
     NaN and infinity too, which ``value <= 0`` alone lets through; ``parallel_disks`` must be
-    at least 1.
+    at least 1, a rate the model divides by at least 1 B/s and a duration at most 10**9 s, so
+    every estimate is finite (review RV51-22).
     """
     problems = []
     for key in sorted(overrides):
@@ -76,6 +93,10 @@ def invalid_estimator_overrides(overrides: Mapping[str, Any]) -> list[str]:
             problems.append(f"{key}: must be a finite positive number")
         elif key == "parallel_disks" and int(value) < 1:
             problems.append(f"{key}: must be at least 1")
+        elif key in _RATE_FIELDS and value < MIN_RATE_BPS:
+            problems.append(f"{key}: must be at least 1 B/s")
+        elif key in _DURATION_FIELDS and value > MAX_DURATION_S:
+            problems.append(f"{key}: must be at most {MAX_DURATION_S} s")
     return problems
 
 
@@ -123,11 +144,13 @@ def _precopy_passes(
 
     Pass ``k`` (k ≥ 2) transfers ``Δk = min(D, c·T(k−1))`` and runs while the previous pass
     carried more than the threshold (``Δ(k−1) > threshold``, with ``Δ1`` = the first pass's
-    data) and ``k ≤ max_passes`` — the runtime convergence rule of SDD §5.3.
+    data) and ``k ≤ max_passes`` — the runtime convergence rule of SDD §5.3 —, never more than
+    ``MAX_SYNC_PASSES`` whatever a stored plan holds: bounded work (SDD §9.1, review RV51-07).
     """
     durations = [first_pass_s]
     previous = first_pass_bytes
-    while previous > params.convergence_threshold_bytes and len(durations) < params.max_passes:
+    passes = min(params.max_passes, MAX_SYNC_PASSES)
+    while previous > params.convergence_threshold_bytes and len(durations) < passes:
         delta = min(float(disk_bytes), change_rate * durations[-1])
         durations.append(next_pass_s(delta))
         previous = delta
