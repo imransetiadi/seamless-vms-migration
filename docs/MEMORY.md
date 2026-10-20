@@ -148,8 +148,9 @@ never a dump of logs, console output or API payloads.**
 Redaction rule classes implemented by `redact(text, redact_names=None)` in `ai/redaction.py`, the one layer every
 agentmemory body and every Jev call passes (SDD §13.4; `test_redact_removes_secrets` and the reviewed snapshot
 `test_a_fixture_of_fake_secrets_redacts_to_the_reviewed_snapshot` cover them): PEM blocks (`-----BEGIN … -----END …`
-→ `[REDACTED PEM]`); the `auth` section of a `clouds.yaml` (YAML or JSON, LF or CRLF line breaks, a comment after
-`auth:`, also JSON-escaped inside a step's output → `auth: [REDACTED]`); credentials in URLs and connection strings
+→ `[REDACTED PEM]`); the `auth` section of a `clouds.yaml` (YAML or JSON — a flow section to the brace that closes it, nested ones
+counted —, LF or CRLF line breaks, a comment after `auth:`, also JSON-escaped inside a step's output →
+`auth: [REDACTED]`); credentials in URLs and connection strings
 (`scheme://user:password@host`, a password with `@` too, `Password=…;`); `Authorization` headers of any scheme
 (Basic, Digest, Negotiate — in JSON or a repr too) and bare `Bearer` tokens; `key=value`, `key: value` and
 `"key": "value"` assignments for password, passwd, pwd, secret, client secret, token, auth token, `x-auth-token`,
