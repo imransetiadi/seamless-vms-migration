@@ -11,7 +11,7 @@ import overrideBodyRaw from '../../../seamless/tests/fixtures/override_body_case
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
-import { createMockFetch, MockServer, PLAN_EDITABLE_FIELDS } from './mock';
+import { createMockFetch, MockServer, PLAN_EDITABLE_FIELDS, PROVIDER_EDITABLE } from './mock';
 import { HELD_VOLUMES_REASON } from './mockData';
 import { summaryOf } from '../lib/summary';
 import { streamEvents } from './stream';
@@ -1164,6 +1164,47 @@ describe('mock API', () => {
       'verification',
       'vm_ids',
     ]);
+  });
+
+  it('takes and refuses gpu_profiles as the API does (SDD §4.2, §12, §22.3, PR #57 review)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body: Record<string, unknown>) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const refused = (message: string) => ({ status: 422, body: { error: { code: 'validation_error', message } } });
+    // the API's PROVIDER_EDITABLE_FIELDS, field for field
+    expect([...PROVIDER_EDITABLE].sort()).toEqual([
+      'ca_cert_path',
+      'cloud',
+      'conversion_host',
+      'credentials_secret',
+      'distribution',
+      'endpoint',
+      'gpu_profiles',
+      'name',
+      'policy_profile',
+      'region',
+      'release',
+      'verify_tls',
+    ]);
+    // a new provider answers the API model's default, and an edit takes the profiles
+    const created = call('POST', '/providers', { id: 'gpu-dst', name: 'GPU destination', kind: 'openstack', role: 'destination', endpoint: 'https://keystone.example:5000/v3', cloud: 'gpu' });
+    expect(created).toMatchObject({ status: 201, body: { gpu_profiles: {} } });
+    expect(call('PATCH', '/providers/gpu-dst', { gpu_profiles: { 'g1.a100-4c': 'A100-4C' } })).toMatchObject({ status: 200, body: { gpu_profiles: { 'g1.a100-4c': 'A100-4C' } } });
+    // pydantic's words for a FlavorName (1 to 255 characters) to ProfileName (1 to 64) map
+    expect(call('PATCH', '/providers/gpu-dst', { gpu_profiles: { g: 'x'.repeat(65) } })).toMatchObject(refused('gpu_profiles.g: String should have at most 64 characters'));
+    expect(call('PATCH', '/providers/gpu-dst', { gpu_profiles: { ['f'.repeat(256)]: 'A100-4C' } })).toMatchObject(
+      refused(`gpu_profiles.${'f'.repeat(256)}.[key]: String should have at most 255 characters`),
+    );
+    expect(call('PATCH', '/providers/gpu-dst', { gpu_profiles: { '': 'A100-4C' } })).toMatchObject(refused('gpu_profiles..[key]: String should have at least 1 character'));
+    expect(call('PATCH', '/providers/gpu-dst', { gpu_profiles: { g: '' } })).toMatchObject(refused('gpu_profiles.g: String should have at least 1 character'));
+    expect(call('PATCH', '/providers/gpu-dst', { gpu_profiles: { g: 5 } })).toMatchObject(refused('gpu_profiles.g: Input should be a valid string'));
+    expect(call('PATCH', '/providers/gpu-dst', { gpu_profiles: null })).toMatchObject(refused('gpu_profiles: Input should be a valid dictionary'));
+    // vCenter reports each VM's own profile: none is declared for a vmware provider, created or edited
+    const vmware = "Value error, gpu_profiles: vGPU profiles cannot be declared for vmware: vCenter reports each VM's own";
+    const vcenter = { id: 'vc-gpu', name: 'vCenter GPU', kind: 'vmware', role: 'source', endpoint: 'https://vc.example/sdk' };
+    expect(call('POST', '/providers', { ...vcenter, gpu_profiles: { x: 'A100-4C' } })).toMatchObject(refused(vmware));
+    expect(call('POST', '/providers', vcenter)).toMatchObject({ status: 201, body: { gpu_profiles: {} } });
+    expect(call('PATCH', '/providers/vc-gpu', { gpu_profiles: { x: 'A100-4C' } })).toMatchObject(refused(vmware));
+    expect(call('PATCH', '/providers/vc-gpu', { gpu_profiles: {} }).status).toBe(200);
   });
 
   it('refuses the plans the API refuses on create and on edit, with its words (SDD §12)', async () => {

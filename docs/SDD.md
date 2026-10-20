@@ -4,7 +4,7 @@
 |---|---|
 | Product | Seamless Migrate (`seamless`) |
 | Version | 0.1.0 (design baseline) |
-| Status | Approved for implementation — binding spec for all tracks; amended 2026-10-16: destination platforms (§21) |
+| Status | Approved for implementation — binding spec for all tracks; amended 2026-10-16: destination platforms (§21); 2026-10-20: GPU workloads (§22, planned for 0.3.0) |
 | Date | 2026-10-08 |
 | Related | [PRD.md](PRD.md) · [MEMORY.md](MEMORY.md) · [QASuite.md](QASuite.md) · [Security.md](Security.md) · [Performance.md](Performance.md) · [Implementation plan](superpowers/plans/2026-10-08-seamless-rhoso-migration.md) |
 
@@ -36,7 +36,10 @@ repository's root; upstream `main` after the 1.0.5 release, versioned 1.1.0 here
 * a **control plane** (`seamless/`, Python): plans, waves, strategy selection, downtime estimation,
   pre-flight validation, an orchestrator with an explicit state machine, REST API + SSE, CLI (§8–§13);
 * **AI assistance** via **Jev MCP** (advisory judgments) and **agentmemory** (operational memory) (§14);
-* a **dashboard** (`dashboard/`, React) designed with the ui-ux-pro-max design system (§16).
+* a **dashboard** (`dashboard/`, React) designed with the ui-ux-pro-max design system (§16);
+* from 0.3.0, as a Technology Preview, **GPU workloads**: VMs with an NVIDIA vGPU (MIG-backed profiles included) or a
+  passed-through GPU, mapped explicitly to destination GPU flavors, with the destination's GPU capacity read from
+  Placement before the plan starts and again before the source stops (§22).
 
 Non-goals for 0.1.0: in-place adoption of a 17.1 control plane into RHOSO (Red Hat's *adoption*
 procedure covers that), live migration with zero downtime across clouds, Hyper-V/Nutanix sources,
@@ -186,6 +189,9 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
                                                        # "2026.2" (§10.1, §21.3); refused on kind vmware (422)
            policy_profile: "secure_rbac"|"legacy"|null, # the policy defaults its operator declares (§21.5):
                                                        # null = by kind and series (§10.1); refused on vmware (422)
+           gpu_profiles: dict[str, str] = {},          # the NVIDIA vGPU profile each of its GPU flavors gives, as its
+                                                       # operator declares it (§22.3): a flavor name (1-255 characters)
+                                                       # to a profile name (1-64); refused on vmware (422)
            credentials_updated_at: datetime|null,      # server-owned: set by PUT …/credentials
            conversion_key_updated_at: datetime|null,   # server-owned: set by PUT …/conversion-key
            capabilities: dict[str, Any] = {}, status: "unknown"|"ok"|"degraded"|"error" = "unknown",
@@ -204,6 +210,17 @@ Nic   { network: str, mac: str|null, fixed_ips: list[str] = [], vnic_type: str =
                                         # (a standard port group's name); null for OpenStack,
                                         # and on a VM validated before it was recorded
 
+GpuDevice { kind: "vgpu"|"passthrough",  # a GPU of a VM or a flavor's GPU request (§22.2)
+            profile: str|null = null,    # its vGPU profile: VMware's as vCenter reports it, an OpenStack
+                                         # request's as its flavor's provider declares it (gpu_profiles)
+            vendor_id: str|null = null,  # VMware passthrough: the PCI vendor id, 4 lower-case hex digits
+            device_id: str|null = null,  # VMware passthrough: the PCI device id, 4 lower-case hex digits
+            count: int = 1,              # at least 1: identical devices of one VM are one entry
+            resource_class: str|null = null,    # OpenStack vGPU: the request group's class ("VGPU")
+            traits: list[str] = [],             # OpenStack: the group's required traits, sorted
+            forbidden_traits: list[str] = [],   # OpenStack: the group's forbidden traits, sorted
+            alias: str|null = null }            # OpenStack passthrough: the PCI alias
+
 VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: int, ram_mb: int,
         disks: list[Disk], nics: list[Nic],
         power_state: "running"|"stopped"|"paused"|"error"|"transitioning"|"unknown",  # transitioning: a Nova task in flight (RESIZE, VERIFY_RESIZE, MIGRATING, RESCUE, REBUILD, REBOOT, BUILD)
@@ -216,22 +233,28 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
                                       # power_state does not read - a running guest a backup snapshots stays
                                       # running for the source watch (§8.1); null for none, for VMware and on
                                       # a VM validated before it was recorded (review PV-05)
-        key_name: str|null = null }   # the Nova keypair the server boots with (OpenStack); VMware: null
+        key_name: str|null = null,    # the Nova keypair the server boots with (OpenStack); VMware: null
+        gpus: list[GpuDevice] = [] }  # its GPUs (§22.2), as its source reports them from plan task G2;
+                                      # [] for a VM recorded before
    derived (properties, also serialized): disk_bytes: int, used_bytes: int, guest_os: GuestOS
    (used_bytes = Σ used_gb·2^30 when every disk has used_gb, else ⌊disk_bytes·0.6⌋;
     guest_os = identify(os_type), §9.5)
    free text: a NUL or a lone surrogate in tags and flavor_extra_specs (keys and values), os_type or host
-   is written U+FFFD as the model is built - no export filter or mapping reads them -; name, project,
-   flavor, a NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02);
-   a NIC's network an earlier version stored with one reads with U+FFFD as the store reads it, and only then
-   (§11, review RV52-S1)
+   is written U+FFFD as the model is built - no export filter or mapping reads them -, and so is one in a
+   GPU's profile, alias and traits, though a GPU mapping names a vGPU by its profile: the mapping matches
+   the profile as written, the one form a stored VM holds (§22.2, PR #57 review); name, project, flavor, a
+   NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02); a NIC's
+   network an earlier version stored with one reads with U+FFFD as the store reads it, and only then (§11,
+   review RV52-S1)
 
 GuestOS { family: "linux"|"windows"|"unknown", distro: str|null, version: str|null, label: str,
           lifecycle: "current"|"legacy"|"unknown",
           v2v: "supported"|"tech_preview"|"unverified"|"unsupported"|"unknown" }
 
 Mappings { networks: dict[str,str] = {}, flavors: dict[str,str] = {},
-           volume_types: dict[str,str] = {}, projects: dict[str,str] = {} }
+           volume_types: dict[str,str] = {}, projects: dict[str,str] = {},
+           gpus: dict[str,str] = {} }   # a VMware GPU key (§22.2) to a destination GPU flavor (§22.4); the
+                                        # pre-flight reads it from plan task G4; resolved_mappings never holds one
 
 NicOverride { network: str|null = null,          # a RHOSO network name; null = where the plan maps the NIC's network
               fixed_ips: list[str]|null = null }  # the NIC's addresses at RHOSO; null = its own; never empty
@@ -2292,6 +2315,10 @@ Finding catalog (code — severity — condition):
 | `HANDOVER_BACKEND_UNMAPPED` | info (storage_handover) | handover enabled but a volume type is unmapped |
 | `APP_PROBE_MISSING` | warning | the VM's tier by §9.4's rules is `stateful_database` and it has no application probe (no `plan.verification.app_probes` and no `probe_overrides` entry, or an empty one): verification would check only that it booted (ADV-18); the message names the suggested probe (§9.6) when there is one |
 
+Planned for 0.3.0 (§22.2, §22.5): the two GPU rows above will read the VM's GPUs (plan task G2) and then block only a
+VM that no GPU mapping applies to, as six GPU codes join the catalog (plan task G4); until then the rows hold as
+written.
+
 ### 9.4 Wave planner (`planning/waves.py`)
 
 `plan_waves(vms: list[VMRef], tiers: dict[str, str], max_wave_size: int = 10) -> list[Wave]`.
@@ -2486,6 +2513,14 @@ VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (
 across plans, §5.4) — and the VMware plan 12 of the 13 VMware VMs: `dc2-portal-02` stays unplanned,
 for the operator to plan warm (§7.4). No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
 
+**GPU requests** (`seamless_migrate.planning.gpu`, plan task G1, §22.2–§22.4): a pure module (no I/O) that the
+providers, the pre-flight and the cutover gate share as their GPU tasks land. `gpu_requests(extra_specs,
+declared_profile=None) -> list[GpuDevice]` reads a flavor's GPU requests by §22.2's rules; `gpu_key(device) -> str |
+None` gives a VMware device's GPU key, its profile for a vGPU and `<vendor_id>:<device_id>` for a passthrough device
+with ids; `vgpu_profile_size(name) -> ProfileSize | None` gives an NVIDIA profile's `{gpu, slices, framebuffer_gb,
+series}`; `pool_name(resource_class, traits, forbidden_traits) -> str` names a pool as the cutover gate's wait does
+(§22.7: the class, the required traits sorted, then the forbidden ones sorted, each prefixed with `!`).
+
 **Bounds.** Each provider call runs its blocking SDK calls in a worker thread and is bounded (300 s, §8.1); the
 bound ends the wait, not the thread, so every request a call sends is bounded by the provider API timeout (60 s) as
 well: an endpoint that accepts a connection and never answers frees the thread once its requests give up (a
@@ -2657,7 +2692,8 @@ body holding a NUL or a lone surrogate is refused before its route runs (§12) -
 as §9.1 checks a plan's -, the tokens file refuses such a name (§13.1), the text it takes from outside sources
 passes `redact`, which writes either as U+FFFD (§13.4) - as every string of Jev's answers does (§14.1), and a
 source VM's free text that no export filter or mapping reads, its tags and flavor extra specs, keys and values,
-its `os_type` and `host` (§4.2; review RV49-02) -, and an outside service's number that is no JSON number is
+its `os_type` and `host` (§4.2; review RV49-02), and its GPUs' profiles, aliases and traits, a vGPU's profile the key
+a GPU mapping names as written (§22.2) -, and an outside service's number that is no JSON number is
 refused as it arrives: Jev's answer is an invalid response (§14.1), an agentmemory hit has no score (§14.3).
 What reaches it is a name a cutover reads - a VM's, a project's, a flavor's, a network's, a volume type's - holding
 one, which Nova's server and flavor names and vSphere's cannot, a Neutron network's can: its write fails naming the
@@ -2724,7 +2760,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/providers` | viewer | — | `Provider[]` |
 | POST | `/providers` | admin | `Provider` (status fields ignored; a field `Provider` does not have: 422) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown` and the check report (`capabilities`) to `{}`; 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is) (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown` and the check report (`capabilities`) to `{}`; 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
@@ -4251,6 +4287,8 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D13 | Destination platforms: RHOSO 18.0 and community OpenStack | decided by the owner 2026-10-16: the window 2023.1 Antelope – 2026.2 Hibiscus with the tiers of §21.1 (Jev 0.93), the series detected from the version documents plus an optional declared one (§21.3, Jev 0.77) | each upstream release and end of life (§21.2) |
 | D14 | The policy profile RHOSO 18.0 ships: the legacy rules or the secure-RBAC defaults (§21.5) | judged as today: `admin` or `advsvc` for a port on another project's network; the check reports `legacy` for kind `rhoso` unless its provider declares a profile (§10.1) | the owner confirms it on the lab run on RHOSO 18.0 (owner, 2026-10-16; `TODO(LAB): confirm`) |
 | D15 | Conversion host images on community clouds beyond CentOS Stream 9 and RHEL 9: the RHEL family by `ansible_os_family` (Rocky Linux, AlmaLinux, CentOS Stream 10), then Ubuntu 24.04 LTS (§21.6) | decided: the order the owner approved 2026-10-16 (the RHEL family first, then Ubuntu 24.04), implemented by plan task T7 (§6.5, §21.6) | the lab (plan task T10, §21.9) validates the images |
+| D16 | GPU workloads (§22): how GPU VMs migrate in 0.3.0 | decided by the owner 2026-10-20: a Technology Preview; the plan's GPU mapping is the opt-in (no switch); one GPU flavor per GPU key in a plan; no wave tier of their own, and never in the pilot wave; the network cut-over hooks and the Octavia/Heat helpers move from 0.3.0 to 0.4.0 (PRD, plan task G14) | the lab cases of §22.14 on GPU hosts end the Technology Preview |
+| D17 | A per-VM GPU flavor (a plan field keyed by source id, as `nic_overrides`) for VMs that share a GPU key but need flavors of different sizes | not in 0.3.0: such VMs go into separate plans (D16) | after the Technology Preview, when users ask for it |
 
 ## 21. Destination platforms: RHOSO 18.0 and community OpenStack
 
@@ -4419,3 +4457,410 @@ QASuite §6.7 (AC-6, journey 6 of the PRD), §7.1 (matrices M7–M12), §7.2 (LA
 S-DST: version documents per series (synthetic until the lab records them), the detection and tier table (since T1),
 and each series read through a real keystoneauth session (review 18); the policy-profile cases are QASuite FR-32's
 (since T5).
+
+## 22. GPU workloads (0.3.0, Technology Preview)
+
+Status: the owner's goal of 2026-10-20 (D16). VMs with an NVIDIA vGPU, MIG-backed vGPU profiles included, or with a GPU
+passed through to the guest migrate instead of being blocked. This section is the design. Each item becomes binding in
+the section §22.13 names when its plan task lands (plan `superpowers/plans/2026-10-20-gpu-workloads.md`); until then
+§9.3's two GPU rows block every such VM as they are written. The planned codes, fields, event kind and metric stay
+out of the tables the SDD-reading tests parse (§4.3, §9.3, §12, §15.1, §18) until their tasks land. GPU migration
+ships as a **Technology Preview**: it is validated in simulation only until the lab cases of §22.14 pass on GPU
+hosts, and nothing in this section claims more.
+
+### 22.1 Scope
+
+* A *GPU* here is an NVIDIA virtual GPU (a vGPU, time-sliced or MIG-backed, handed out by the hypervisor's NVIDIA
+  vGPU manager) or a PCI device passed through whole to the guest. Seamless reads which GPU a VM has (§22.2), takes
+  the destination GPU flavor the plan maps it to (§22.4), checks the destination's free GPU capacity before the plan
+  starts (§22.5) and again before the source stops (§22.7), and verifies after boot that the server holds its GPU
+  (§22.8). No GPU state moves: the guest's memory and the GPU's memory stay behind, and the VM boots on the
+  destination as it would after a shutdown.
+* Every strategy keeps its data path (§3): the disks move as for any VM, and the destination server is created with
+  the mapped GPU flavor. §22.6 holds the one eligibility change.
+* A passthrough device counts as a GPU whatever device it is. An OpenStack PCI alias does not say which device it
+  stands for: the alias is defined in nova.conf, which no API shows. The mapping is the operator's explicit choice,
+  and the guest-side findings say "a PCI device" where Seamless cannot tell.
+* Not in 0.3.0: AMD's and Intel's own GPU virtualization (their passthrough devices are passthrough devices as above),
+  live GPU state, a destination whose compute driver is not Nova's libvirt driver, a per-VM GPU flavor (D17), and the
+  NVIDIA License System itself.
+
+### 22.2 GPU devices of a source VM
+
+The model and `planning/gpu.py` are binding in §4.2 and §10 since plan task G1; the sources report `gpus` from G2.
+
+```text
+GpuDevice { kind: "vgpu"|"passthrough",
+            profile: str|null,         # the vGPU profile: VMware's as vCenter reports it ("grid_a100-4c", MIG-backed
+                                       # "grid_a100-3-20c"); an OpenStack request's as its flavor's provider declares it
+                                       # (§22.3); null otherwise
+            vendor_id: str|null,       # VMware passthrough: the PCI vendor id, 4 lower-case hex digits ("10de")
+            device_id: str|null,       # VMware passthrough: the PCI device id, 4 lower-case hex digits ("20b5")
+            count: int = 1,            # identical devices of one VM are one entry
+            resource_class: str|null = null,      # OpenStack vGPU: the request group's class ("VGPU", or a CUSTOM_ class)
+            traits: list[str] = [],               # OpenStack: the group's required traits, sorted
+            forbidden_traits: list[str] = [],     # OpenStack: the group's forbidden traits, sorted
+            alias: str|null = null }              # OpenStack passthrough: the PCI alias ("a100")
+
+VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source reports them
+```
+
+* **VMware** (`VMwareProvider`, from the VM's `config.hardware.device`): each `VirtualPCIPassthrough` device. Its
+  backing decides what it is:
+  * `VirtualPCIPassthroughVmiopBackingInfo` is a vGPU, MIG-backed ones included: `kind: vgpu`, and `profile` is the
+    backing's `vgpu` string;
+  * `VirtualPCIPassthroughDeviceBackingInfo` (DirectPath I/O): `kind: passthrough`, with `vendor_id` from `vendorId`
+    (a signed 16-bit value, read modulo 2^16) and `device_id` from `deviceId` (hex text);
+  * `VirtualPCIPassthroughDynamicBackingInfo` (Dynamic DirectPath I/O): `kind: passthrough`, with the ids of the first
+    of its `allowedDevice` entries;
+  * any other backing (vSphere 8's DVX backing among them): `kind: passthrough` with no ids.
+
+  Devices of one VM that share kind, profile and ids are one entry with their `count`. From 0.3.0 the provider writes
+  no `resources:VGPU` or `pci_passthrough:alias` into a VMware VM's `flavor_extra_specs`: it wrote them before so that
+  §9.3's two GPU rows fired, and a VMware VM has no flavor.
+* **OpenStack** (`OpenStackProvider`): the requests of the server's flavor, whose extra specs `flavor_extra_specs`
+  already holds, read by `planning/gpu.gpu_requests(extra_specs, declared_profile=None) -> list[GpuDevice]`, a pure
+  function that the providers, the pre-flight and the destination inventory share:
+  * each request group that asks for `VGPU` is a vGPU entry: `resources:VGPU=<n>` for the unnumbered group, and
+    `resources<suffix>:VGPU=<n>` for a numbered one (the suffix `[A-Za-z0-9_-]`, as `VM_VGPU` reads it today). Its
+    `count` is n, its `resource_class` `VGPU`, and its `traits` and `forbidden_traits` are the group's
+    `trait<suffix>:<name>` entries set to `required` and `forbidden` (`trait:<name>` for the unnumbered group);
+  * `pci_passthrough:alias=<alias>:<n>[,<alias>:<n>…]` gives one passthrough entry per alias with its `count`;
+  * a group that asks for a `CUSTOM_` resource class is a vGPU only when a vGPU profile is declared for its flavor
+    (`Provider.gpu_profiles`, §22.3). Nova's `[mdev_<type>] mdev_class` gives a vGPU type such a class, and no API
+    tells a custom class that is a GPU from one that is not;
+  * an amount reads as Nova reads it, with Python's `int()` - spaces around it, a sign, underscores between its digits
+    and any script's decimal digits included (`+2` and `２` are 2). A zero asks for none, as Nova strips a zero amount
+    from the request, and so does a negative or unreadable amount (`-1`, `one`, `1.5`, `²`), which Nova skips with a
+    warning (`RequestGroup.add_resource`): a server boots with no GPU for it. A PCI alias's count reads the same way:
+    a zero or negative count asks for no device (`InstancePCIRequest(count=int(count))`), while an alias with no
+    count, or one `int()` cannot read, reads as 1, a request still - Nova refuses such a flavor when a server boots
+    with it (PR #57 review);
+  * no OpenStack flavor names an NVIDIA profile, so `profile` is the declared one (`declared_profile`), else null. On a
+    flavor whose GPU requests are PCI aliases alone, the declared profile goes to those entries: a vGPU handed out as a
+    PCI device (§22.3).
+* **The GPU key** is what a plan's GPU mapping names for a VMware device (§22.4): its `profile` for a vGPU, and
+  `<vendor_id>:<device_id>` (`10de:20b5`) for a passthrough device with ids. A device without ids has no key, so no
+  mapping can name it (`VM_PCI_PASSTHROUGH`, §22.5).
+* **Profile sizes** (`planning/gpu.vgpu_profile_size(name) -> {gpu, slices, framebuffer_gb, series} | null`): an
+  NVIDIA profile name is read case-insensitively, with or without vCenter's `grid_` or `nvidia_` prefix or the
+  `GRID ` that NVIDIA's mediated device types show. Time-sliced
+  names read `<gpu>-<framebuffer GB><series>` (`A100-4C`, `T4-16Q`, `grid_a100-4c`), and MIG-backed names read
+  `<gpu>-<slices>-<framebuffer GB><series>` (`A100-3-20C`, `grid_a100-3-20c`); the series is A, B, C or Q. Any other
+  name has no size, and `MAP_GPU_DOWNSIZED` compares nothing for it (§22.5).
+* A device's `profile`, `alias` and trait names are free text as `flavor_extra_specs` is (§4.2): a NUL or a lone
+  surrogate in them is written U+FFFD as the model is built. A vGPU's `profile` is also its GPU key (§22.4): a mapping
+  names it as written, the form every stored VM holds; a request body holding a NUL or a lone surrogate is refused
+  (§12), so no mapping key holds one either (PR #57 review).
+* A VM recorded before 0.3.0 has no `gpus`. Such a VM could not be migrated (§9.3 blocked it), and a validation reads it
+  again (§5.4).
+
+### 22.3 Destination GPU flavors and capacity
+
+* **GPU flavors** (`DestinationInventory.gpu_flavors`) are the destination flavors whose extra specs ask for a GPU by
+  §22.2's reading, with the profile declared for them: `[{name, vcpus, ram_mb, disk_gb, gpus: list[GpuDevice]}]`.
+  `flavors` keeps listing every flavor.
+* **Declared profiles** (`Provider.gpu_profiles: dict[str, str] = {}`): on an OpenStack or RHOSO provider, source and
+  destination alike, the NVIDIA vGPU profile each of its GPU flavors gives, as its operator declares it
+  (`{"g1.a100-4c": "A100-4C"}`). Nova and Placement name a vGPU type by its mdev type (`nvidia-471`) and by the traits
+  the operator gave its providers, never by its profile, so no API tells a flavor's framebuffer. A key is a flavor
+  name and a value a profile name of at most 64 characters. `POST` and `PATCH /providers` (§12) set it, and refuse it
+  on a `vmware` provider (422), as they refuse `release` (§4.2). A declared profile makes a `CUSTOM_`-class group a
+  vGPU (§22.2), and it is what `MAP_GPU_DOWNSIZED` compares (§22.5): without one, nothing is compared. A destination
+  whose NVIDIA vGPU uses the vendor-specific VFIO framework (newer GPUs and drivers) hands a vGPU out as a PCI device.
+  Such a flavor asks for a PCI alias, which stays a passthrough request; its declared profile, the entry's `profile`,
+  tells the guest findings that the guest needs the vGPU driver and a license (§22.5; `TODO(LAB): confirm` on such a
+  host, §22.14).
+* **Capacity** (`DestinationInventory.gpu_capacity: GpuCapacity`): the same object is a key of a destination's check
+  report (§10), read when the check runs, which the provider card shows with the check's time (§22.11):
+
+  ```text
+  GpuCapacity { status: "ok"|"unknown",
+                reason: "forbidden"|"no_placement"|"error"|null,  # unknown: Placement refused the credential (403),
+                                                                  # the catalog has no placement endpoint, another failure
+                detail: str|null,         # the failure's HTTP status and Placement error code; never its message text
+                read_at: datetime|null,
+                pools: list[GpuPool] }
+  GpuPool { resource_class: str, traits: list[str], forbidden_traits: list[str],   # what a GPU request asks Placement for
+            free: int,           # the units free now on the providers below
+            providers: int,      # resource providers that have at least one unit free
+            largest_free: int }  # the most units free on one of them
+  ```
+
+  There is one pool for each distinct vGPU request (its resource class with its required and forbidden traits) among the
+  destination's GPU flavors, and one for each resource class alone, which unites its pools (§22.5). A destination with
+  no vGPU flavor reads `ok` with no pools and sends Placement nothing. Each pool is one Placement request,
+  `GET /allocation_candidates?resources=<class>:1&required=<traits>` (a forbidden trait as `!<trait>`), at
+  microversion 1.29, which every series of the window serves (§21.1). Its `provider_summaries` give each provider's
+  `capacity` (Placement's `(total - reserved) × allocation_ratio`) and `used` per class, its traits and its root. A
+  provider counts when it holds the class and the pool's traits, lacks the forbidden ones, and its root provider lacks
+  `COMPUTE_STATUS_DISABLED` (a disabled compute service, which Nova's own requests forbid). Its free is its capacity
+  less its used. A request group of n > 1 units needs one provider with n free (Nova fills a group from one provider),
+  and an inventory's `max_unit` may cap that below the provider's free: the pool is read once more with `<class>:<n>`
+  for each such n, and a group fits only where that read finds a provider.
+* Placement's default policy gives these reads to `admin` (`TODO(LAB): confirm` per series, §22.14). A credential
+  Placement refuses (403) reads `unknown`, reason `forbidden`; a catalog without Placement reads `no_placement`; any
+  other failure reads `error`. None of them is a guess, and none fails the inventory or the check. A PCI alias request
+  has no pool: the device class its alias asks for lives in nova.conf, so its capacity is unknown whatever Placement
+  answers (`DST_GPU_CAPACITY_UNKNOWN`, §22.5).
+* The read keeps counts only. Placement names a GPU's provider after its compute host (`<host>_pci_<address>`) and
+  gives it a uuid, and the read keeps neither (§22.12).
+* `DestinationProvider` (§10) gains `gpu_capacity(requests: list[GpuDevice]) -> GpuCapacity`, which reads the pools of
+  the given requests only (the cutover gate's read, §22.7), and `server_allocations(server_id) -> dict[str, int] | None`,
+  the units the server holds per resource class (`GET /allocations/{server_id}`, summed over its providers), None when
+  Placement refuses the read or has no allocation to read (§22.8). `get_server` adds `flavor: {name, extra_specs}`:
+  compute 2.47's embedded flavor, its `original_name` and its `extra_specs`, which stay empty when Nova's policy hides
+  them.
+
+### 22.4 GPU mapping
+
+* A GPU VM's **GPU flavor**, the destination flavor its server is created with, is named by the plan and never matched
+  (`planning/gpu.gpu_flavor(vm, plan, source_kind) -> str | None`):
+  * for a VMware VM: `plan.mappings.gpus[<its GPU key>]`, where `Mappings.gpus: dict[str, str] = {}` maps a GPU key
+    (§22.2) to a destination flavor: `{"grid_a100-4c": "g1.a100-4c", "10de:20b5": "p1.a100"}`. Each of the VM's GPUs
+    needs a key, and when they have several keys, all of them must map to one flavor: the server has one;
+  * for an OpenStack VM: `plan.mappings.flavors[vm.flavor]`, the explicit mapping of its flavor. Its GPU comes with its
+    flavor, and the VMs of one flavor have one size; `Mappings.gpus` names no OpenStack GPU;
+  * a same-named destination flavor is not a mapping for a GPU VM, and no size is matched. §9.3's rule that keeps
+    `resources`, `trait` and `pci_passthrough` flavors out of automatic matching covers the VM too: it gets no
+    `MAP_FLAVOR_AUTO` and no `resolved_mappings` entry. Flavor pre-staging (`"flavors"` in `prestage_resources`, §7.2)
+    never creates a GPU VM's flavor, as the GPU type its traits ask for may not exist at the destination.
+* A mapping **applies** when its flavor is one of the destination's GPU flavors (§22.3). A mapping whose flavor does
+  not exist is `MAP_FLAVOR_MISSING`'s, as for any mapping target (§9.3). A mapping whose flavor asks for no GPU does not
+  apply: the server would lose its GPU without a word, so the VM stays blocked and the finding says why (§22.5). A
+  mapping may change the kind (a passthrough GPU to a vGPU, or back) or the GPU model, which `GUEST_GPU_DRIVER` warns of.
+* **Size**: the GPU flavor decides the server's vCPUs, RAM and root disk. A plan maps each GPU key to one flavor (the
+  owner's choice of 2026-10-20, D16). A flavor with fewer vCPUs, less RAM or a smaller local root disk than a VM makes
+  that VM's `MAP_GPU_FLAVOR` a warning; VMs that need another size go into another plan, which maps their key to
+  another flavor. A per-VM GPU flavor is an open decision (D17).
+* **Opt-in**: the mapping is the opt-in (the owner's choice of 2026-10-20, D16). No switch turns GPU migration on: a
+  GPU VM stays blocked until its plan maps it, and its `MAP_GPU_FLAVOR` says that GPU migration is a Technology
+  Preview.
+* Where the GPU flavor is used:
+  * the pre-flight (§22.5); the quota counts a GPU VM's cores and RAM by its GPU flavor (`DST_QUOTA_INSUFFICIENT`), a
+    VMware VM's too, as the migration kit no longer sizes its server;
+  * the cold, warm and storage-handover paths create the server with it, as with any flavor mapping (`apply_mappings`,
+    §7.2; §7.3 step 8);
+  * the VMware path passes it to the migration kit as `flavor_uuid` in the vars of every kit run. The kit 2.2.7 takes a
+    flavor id or name there and uses it for the server instead of its own best match (`TODO(LAB): confirm` that it
+    creates no flavor of that name when its best match finds none, §22.14). The cutover refuses before the kit runs,
+    and so before the source stops, when a GPU VM's mapping no longer applies (its flavor was deleted since the
+    validation).
+
+### 22.5 Pre-flight findings
+
+The catalog change, binding in §9.3 with plan task G4: the new codes enter §9.3's table together with their catalog
+entries, so `test_catalog_matches_sdd_9_3` stays green. The names follow §9.3's prefixes: `MAP_` judges a mapping,
+`DST_` the destination and `GUEST_` the guest; the two `VM_` rows keep their names. A message names the destination
+provider and a remediation says "the destination" (§1 naming).
+
+| Code | Severity | Condition |
+|---|---|---|
+| `VM_VGPU` | blocker | the VM has a vGPU (an entry of kind `vgpu` in `gpus`; for an OpenStack VM, its flavor asks for `VGPU`, bare or in a request group) and no GPU mapping applies to it (§22.4): no mapping names it (the message names the GPU key or the flavor to map), its mapping's flavor asks for no GPU (the message names the mapping and says the server would lose its GPU), or its GPUs' keys map to different flavors |
+| `VM_PCI_PASSTHROUGH` | blocker | the same for a passthrough device; for a VMware device without ids, the message says that no mapping can name it |
+| `MAP_GPU_FLAVOR` | info; **warning** when the GPU flavor gives fewer vCPUs, less RAM or a smaller local root disk than the VM | a GPU mapping applies: the message names the VM's GPUs, the GPU flavor with its size and GPU requests, and that GPU migration is a Technology Preview (§22.1) |
+| `MAP_GPU_DOWNSIZED` | warning | the GPU flavor gives the VM less GPU than it has: fewer GPUs (`count`), or, when the VM's GPU and the flavor's both have a `profile` with a size (§22.2; VMware's own profile, else the one a provider declares, §22.3), a smaller framebuffer, or fewer MIG slices where both are MIG-backed |
+| `DST_GPU_CAPACITY_INSUFFICIENT` | blocker | the plan's VMs ask a pool for more units than it has free (§22.3), each VM counted by what its cutover will still create, as for `DST_QUOTA_INSUFFICIENT` (`quota_share`: its server's units, or none once its server exists), per pool and per resource class across its pools; or a VM's group of n > 1 units finds no provider that has n free. The message names the pool (its class and traits), the units asked for and free, and the VMs |
+| `DST_GPU_CAPACITY_UNKNOWN` | warning | a GPU VM's capacity cannot be read: the destination's `gpu_capacity` is `unknown` (the message names the reason: the credential's roles, no Placement, or the failure), or its GPU flavor asks for a PCI alias, whose device class Placement does not show. Nothing is guessed, and the cutover gate does not wait on it (§22.7) |
+| `GUEST_GPU_DRIVER` | warning | a GPU VM, whatever its strategy: the guest's NVIDIA driver must suit the destination, which means a vGPU guest driver of a release the destination host's vGPU manager supports (NVIDIA's compatibility table), the data center driver for a passed-through GPU, or a new driver where the mapping changes the kind or the GPU model (the message names the change). virt-v2v neither installs nor updates the driver (VMware) |
+| `GUEST_GPU_LICENSE` | info | the VM's GPU or its GPU flavor's is a vGPU (kind `vgpu`, or a passthrough entry with a vGPU `profile`, §22.3): the guest licenses its vGPU from the NVIDIA License System, so its license server (a CLS instance or an on-premises DLS instance) must be reachable from the VM's destination network, or the guest runs its GPU unlicensed |
+
+* For a GPU VM, `MAP_FLAVOR_AUTO` and `MAP_FLAVOR_PRESTAGED` are not emitted, nor is `MAP_FLAVOR_MISSING` except for a
+  mapped flavor that does not exist: the GPU mapping owns the VM's flavor.
+* `GUEST_GPU_DRIVER` applies to every strategy. The driver must suit the destination host's vGPU manager whatever the
+  source, so an OpenStack-to-OpenStack move needs it as much as a VMware exit does; for a VMware VM the message adds
+  that virt-v2v leaves the driver as it is.
+* The capacity counts every VM of the plan whose server is created with a vGPU flavor, a VM without a GPU that a
+  mapping sends to one included, by the flavor's requests. Other plans' VMs are not counted, as for the quota: the
+  cutover gate's read covers what they take (§22.7). A pool fits when the units of its VMs fit its free units; a
+  resource class fits when the units of all its VMs fit its united pool. The check packs nothing further, and the
+  gate decides the rest (§22.7).
+
+### 22.6 Strategy eligibility
+
+* `cold`, `warm` and `storage_handover` keep their rules (§9.2) for every GPU VM, and `vmware_cold` and `vmware_warm`
+  for a vGPU VM: the disks move as any VM's do.
+* A VMware VM with a passthrough device is ineligible for `vmware_warm`: vSphere supports no snapshot of a VM with a
+  PCI DirectPath I/O device (vSphere 8's Snapshot Limitations, read 2026-10-20), and the kit reads every copy from a
+  snapshot it takes (`osm-snap`, handed to nbdkit's VDDK plugin, kit 2.2.7). It is eligible for `vmware_cold` only while
+  it is powered off (`power_state` `"stopped"`): the kit copies a running guest that is not Windows before it powers the
+  guest off (§7.2), and a powered-off VM's snapshot holds no device state (`TODO(LAB): confirm` that vSphere takes it).
+  The reasons say to power the VM off, validate it again and migrate it cold. A Dynamic DirectPath I/O device is
+  treated alike (`TODO(LAB): confirm`).
+* Whether vSphere takes snapshots of a running vGPU VM, which `vmware_warm` passes and a running guest's cold copy
+  read, is `TODO(LAB): confirm` (§22.14). Until the lab tells, the rules above hold. A pass that cannot take its
+  snapshot fails before the source stops (§7.2), and the operator then powers the VM off and migrates it cold.
+
+### 22.7 Cutover gate: GPU capacity
+
+A fifth rule of §5.4, binding there with plan task G6:
+
+5. a migration whose server is created with a vGPU flavor (its GPU flavor, §22.4) enters `cutover` only on a capacity
+   read that found room. The read is `DestinationProvider.gpu_capacity` for the flavor's requests, made once rules 1–4
+   hold, at most 60 s before the step starts (model time in demo mode, §7.4). It finds room when each pool the flavor
+   asks of has at least the flavor's units free, plus the units of the destination's other migrations in `cutover` that
+   ask of that pool and have recorded no `destination_server_id` yet (their servers may not exist yet; one that already
+   exists is counted twice, which only delays), on a provider with enough free for each group (§22.3).
+
+* The read runs outside the locks, as a task of its own, one per migration at a time, as the source watch does
+  (§8.1): a slow Placement delays that cutover, never the tick, the other gates or the passes. Its outcome is recorded,
+  and the tick starts the cutover on a fresh outcome that found room, re-checking rules 1–4 under the locks as for
+  every step (§8).
+* When a read finds no room, `Migration.gpu_wait` records it: `GpuWait {since: datetime, checked_at: datetime, pool: str
+  (the class, then the required traits, then the forbidden ones prefixed with "!", e.g. "VGPU CUSTOM_NVIDIA_A100_4C"),
+  needed: int, free: int|null, reason: str}`. The persisted event `migration.gpu_wait` (data `{"waiting": true, "pool",
+  "needed", "free"}`) says so once, when the wait begins. The source keeps running: a warm migration goes on with its
+  keep-warm passes (§5.4), and a single-shot one stays in `ready`. The read repeats every 60 s while rules 1–4 hold. A
+  read that finds room clears the wait (`migration.gpu_wait` with `"waiting": false`), and the cutover starts.
+  `MigrationSummary` carries `gpu_wait` (§4.2), and `/metrics` gains the gauge `seamless_gpu_waits`, the number of
+  migrations waiting so (§18).
+* A capacity that is `unknown` because Placement refuses the credential or the destination has no Placement
+  (`forbidden`, `no_placement`), and a PCI alias request, do not hold the cutover: nothing can be read, and the
+  pre-flight warned (`DST_GPU_CAPACITY_UNKNOWN`). A read that fails otherwise (`error`: a timeout, a 5xx answer) holds
+  the cutover, with `gpu_wait` naming the failure as its reason, until a read answers: the source never stops on a
+  capacity the gate could not read.
+* Neither a Force cutover (§5.4), nor `auto_cutover`, nor a bypassed window skips the rule. A migration that leaves the
+  waiting phases (a cancel, a rollback, a validation) drops its `gpu_wait` in the same write, and a retry starts with
+  none.
+* What the rule cannot close: capacity that another server takes between the read and the creation of the
+  migration's server (during a warm cutover's final pass, or a VMware conversion) makes that creation fail after the
+  source stopped, and the automatic rollback (§8) starts the source again. The read narrows that window to the
+  cutover itself; Placement reserves nothing ahead of Nova.
+
+### 22.8 Verification and probe suggestion
+
+* Two checks of §7.5 for a migration whose server is created with a GPU flavor, binding with plan task G8:
+  * `gpu_flavor`: the destination server's flavor (`get_server`'s `flavor`, §22.3) is the GPU flavor by name and, when
+    the server shows its extra specs, still asks for the GPU. A server created another way, by a kit that ignored
+    `flavor_uuid` for one, fails it;
+  * `gpu_allocation`: the server's Placement allocations (`server_allocations`) hold at least the units of each vGPU
+    request of its flavor. It is skipped with a warning when Placement cannot be read (None) and for a PCI alias
+    request, whose resource class the allocations do not name for Seamless.
+
+  Both are deterministic checks: a failed one fails the verification, and the plan's `auto_rollback` rolls the VM back
+  (§7.5). Their details name resource classes and units, never a provider, because the advisor's
+  `review_verification` sends the check results to Jev (§14.2).
+* §9.6 suggests, for every GPU VM whatever its tier, `tcp 9400`, the port NVIDIA's DCGM exporter serves its metrics on,
+  besides its tier's probe. Like every suggestion it never runs until the plan adds it (`probe_overrides`, §9.6).
+  Binding with plan task G5.
+
+### 22.9 Waves
+
+The owner's choice of 2026-10-20 (D16): GPU VMs get no tier of their own, since their service tier (§9.4) keeps
+deciding their probe suggestion (§9.6) and the database review rule (§7.5). The pilot wave never holds a GPU VM: the
+pilot takes the lowest-risk VMs, and a GPU VM's driver, license and capacity are risks of their own. An app group that
+holds a GPU VM stays out of the pilot too, as an app is never split across waves. GPU VMs are ordered with their tier in
+the later waves. Binding in §9.4 with plan task G5.
+
+### 22.10 Demo and simulation
+
+Binding in §7.4 and §10 with plan task G9:
+
+* The fake OpenStack source's `gpu-ml-01` keeps its flavor `g1.vgpu`, which now asks for `resources:VGPU=1` and
+  `trait:CUSTOM_NVIDIA_A100_4C=required`. The finance plan maps that flavor to `g1.a100-4c` (`mappings.flavors`), so the
+  VM migrates instead of being cancelled as blocked (§10).
+* The fake VMware source gains `dc2-ml-01` (8 vCPUs, 32 GiB, a `grid_a100-4c` vGPU, CBT on), which the VMware plan
+  maps (`mappings.gpus`: `grid_a100-4c` to `g1.a100-4c`). It gains two VMs that no seeded plan holds, for the operator to
+  plan from the dashboard: `dc2-ml-02` (16 vCPUs, 64 GiB, a MIG-backed `grid_a100-3-20c` vGPU) and `dc2-cuda-01` (16
+  vCPUs, 128 GiB, a DirectPath I/O GPU `10de:20b5`, powered off, so `vmware_warm` is ineligible for it, §22.6).
+* The fake destinations (`rhoso18`, `hibiscus-dc3`) list three GPU flavors: `g1.a100-4c` (8 vCPUs, 32 GiB, one vGPU
+  with the trait `CUSTOM_NVIDIA_A100_4C`), `g1.a100-3-20c` (16 vCPUs, 64 GiB, one vGPU with the trait
+  `CUSTOM_NVIDIA_A100_3_20C`) and `p1.a100` (16 vCPUs, 128 GiB, `pci_passthrough:alias=a100:1`). Their providers
+  declare the two vGPU flavors' profiles (`gpu_profiles`), and each fake reports two pools: A100-4C with 4 units free on
+  1 provider, A100-3-20C with 2 free on 1. Each fake counts its own servers: a simulated cutover's GPU server takes its
+  units and the rollback gives them back, so the provider card's figures fall as the demo's GPU VMs cut over, and
+  `server_allocations` and `get_server`'s flavor report what the fake server holds.
+* The A100-3-20C pool reads full on the cutover gate's first two reads, while validation sees room, and then has room
+  again, as if another tenant had released a vGPU. A plan with `dc2-ml-02` shows the gate's wait (§22.7) and how it
+  clears.
+* The dashboard's offline mock (`VITE_SEAMLESS_MOCK=1`) holds the same GPU VMs, flavors, pools, findings and wait
+  (§16).
+
+### 22.11 Dashboard
+
+Binding in §16 with plan tasks G10–G12 (track C). §16's design tokens hold. Every GPU element carries a "Technology
+Preview" badge, in words and never by colour alone, until §22.14's lab cases pass.
+
+* **Inventory**. For a source: a GPU column ("vGPU grid_a100-4c ×2", "Passthrough 10de:20b5", or for an OpenStack
+  request "vGPU · VGPU, CUSTOM_NVIDIA_A100_4C"; empty for a VM without a GPU) and a GPU filter (all VMs, those with a
+  GPU, those without). The readiness cell's GPU flag reads "Needs a GPU mapping in its plan", guidance, as the plan
+  decides, where it was a block that nothing lifted. For a destination: its GPU flavors (name, size, GPU requests,
+  declared profile) and its GPU capacity, each pool's free units and providers, or "Not read" with the reason in
+  words (the credential lacks the role Placement asks for, there is no Placement, or the failure), and "Capacity
+  unknown: PCI aliases are configured in nova.conf" for an alias flavor.
+* **Providers**. A destination's card summarizes its check's `gpu_capacity` with the check's time ("A100-4C: 4 free on
+  1 GPU", or "GPU capacity not read: …"), and nothing when the destination has no GPU flavor. The provider form takes
+  `gpu_profiles` for an OpenStack or RHOSO provider, as pairs of a flavor and a profile, offering the provider's GPU
+  flavors once its inventory is read.
+* **Plan form**. For a VMware source, a GPU mappings section with one row per GPU key among the selected VMs
+  ("grid_a100-4c: 2 VMs, 8–16 vCPUs"), each a choice among the destination's GPU flavors (with their size and GPU) or
+  none. Nothing is chosen for the operator. A row marks the VMs its flavor does not fit, as `MAP_GPU_FLAVOR` warns, and a
+  passthrough device without ids is named as one no mapping can take. For an OpenStack source, the flavor mappings say
+  which selected VMs' flavors ask for a GPU and offer the destination's GPU flavors for them.
+* **Migration page**. A GPU panel: the VM's GPUs, its GPU flavor and the mapping that chose it (the GPU mapping or the
+  flavor mapping), the declared profiles, the capacity findings and the last verification's GPU checks. While
+  `gpu_wait` is set, it reads "Waiting for GPU capacity: {free} free of {needed} in {pool}, checked {time}. The source
+  VM keeps running.", announced once when the wait begins and once when it ends.
+* **Findings**. The new codes in the dashboard's catalog mirror (`findingCatalog.ts`) with their remediations. The plan
+  page's migration list marks a migration that waits for GPU capacity.
+* **Overview**. Needs attention lists a migration that waits for GPU capacity ("Waiting for GPU capacity: {pool},
+  {free} free, needs {needed}"), its source still running. It is a wait, not an approval (§16 Approvals).
+* `src/api/types.ts` mirrors the new fields, the event kind and the check report key, and the mock parity tests hold
+  them.
+
+### 22.12 Security and data minimization
+
+Binding in §13.4 with plan task G3:
+
+* GPU profile names (`grid_a100-4c`), PCI vendor and device ids, resource classes and trait names describe products,
+  not a customer. They may appear in findings, events and the dashboard, and in what the advisor sends should a payload
+  spec declare them (§13.4, ADV-06).
+* Placement's resource providers are the destination's compute hosts, named after them (`<host>_pci_<address>`) and
+  identified by uuids: customer data. The capacity read keeps counts only (§22.3), and `GpuCapacity.detail`,
+  `GpuWait.reason` and the verification's GPU checks name a failure by its HTTP status and Placement error code, never
+  by Placement's message text. So no document, event, log line of the control plane, finding, verification detail or
+  advisor payload holds a provider's name or uuid, and none can reach Jev or agentmemory unredacted. A test gives a fake
+  Placement providers named after hosts and asserts that none of those names or uuids reaches the inventory, the check
+  report, `gpu_wait`, the events or the verification record.
+* §14.4's evidence keys, the workload description and the data-sent declaration do not change in 0.3.0: nothing about
+  GPUs is sent to Jev or agentmemory.
+
+### 22.13 Contract changes of 0.3.0 (each binding from its plan task)
+
+| Item | Becomes binding in | Plan task |
+|---|---|---|
+| `GpuDevice`, `VMRef.gpus`, `Mappings.gpus`, `Provider.gpu_profiles`; `planning/gpu.py` (requests, the GPU key, profile sizes) | §4.2, §10, §12 (binding) | G1 |
+| the sources report `gpus`; the VMware provider writes no GPU extra specs, and §9.3's two GPU rows read `gpus` (still unconditional until G4) | §9.3, §10 | G2 |
+| `DestinationInventory.gpu_flavors` and `gpu_capacity`; the destination check's `gpu_capacity`; `gpu_capacity()`, `server_allocations()` and `get_server`'s flavor; §22.12's rule | §10, §13.4 | G3 |
+| the GPU flavor rule (§22.4) and the catalog change (§22.5) | §9.3, §7.2 (pre-staging) | G4 |
+| the eligibility of a VMware passthrough VM; a pilot without GPU VMs; the port 9400 suggestion | §9.2, §9.4, §9.6 | G5 |
+| the gate's fifth rule, `Migration.gpu_wait` and `MigrationSummary.gpu_wait`, the event `migration.gpu_wait`, the gauge `seamless_gpu_waits` | §4.2, §4.3, §5.4, §18 | G6 |
+| the executors create the server with the GPU flavor (`flavor_uuid` for the VMware kit) | §7.2, §7.3 | G7 |
+| the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 | G8 |
+| the demo's GPU VMs, GPU flavors, pools and gate wait | §7.4, §10 | G9 |
+| the dashboard (§22.11) | §16 | G10, G11, G12 |
+| QASuite (requirement rows, AC-7, LAB-G01…LAB-G08), Security.md, README | QASuite, Security.md, README | G13 |
+| PRD goal G8, FR-35…FR-41, journey 7, the release table (0.3.0 GPU workloads; 0.4.0 the network cut-over hooks and the Octavia/Heat helpers) | PRD | G14 |
+| the lab on GPU hosts; the Technology Preview label goes when its cases pass | QASuite §13 | G15 |
+
+### 22.14 Validation
+
+* Today the design is validated in simulation only. The control plane's unit tests (with recorded Placement answers,
+  synthetic until the lab records real ones, and pyVmomi-shaped device backings), the demo's simulated destination
+  (§22.10) and the dashboard's mock exercise every rule of this section. No GPU host has run any of it. The
+  documentation, the dashboard and the website say "Technology Preview, validated in simulation".
+* Before the Technology Preview label goes, QASuite's lab cases LAB-G01…LAB-G08 (plan tasks G13, G15) run on GPU
+  hosts: a vSphere 8 host with an NVIDIA GPU under the vGPU manager (a time-sliced and a MIG-backed profile) and one
+  with a DirectPath I/O GPU; a RHOSO 18.0 destination and a Tier 1 community destination (§21.1) with Nova's vGPU
+  configured (mediated devices, and the vendor-specific VFIO framework where the GPU uses it) and a PCI alias. Each
+  result is recorded in QASuite §13 with the hardware and the driver releases.
+* `TODO(LAB): confirm`, each closed by its lab case:
+  * whether vSphere snapshots a running vGPU VM, whether it snapshots a powered-off VM with a DirectPath I/O device, and
+    whether Dynamic DirectPath I/O blocks snapshots as DirectPath I/O does (§22.6);
+  * that the kit 2.2.7 creates the server with `flavor_uuid` and creates no flavor of that name, and whether its best
+    match can size a VM without a GPU onto a GPU flavor, which no check would count (§22.4);
+  * Placement's default policy for the reads of §22.3 on RHOSO 18.0 and on each Tier 1 series;
+  * the allocations and the embedded flavor a vGPU server shows (§22.8);
+  * that a guest's vGPU driver of the source's release runs under the destination host's vGPU manager release
+    (`GUEST_GPU_DRIVER`);
+  * a vGPU from the vendor-specific VFIO framework, offered as a PCI alias flavor (§22.3).

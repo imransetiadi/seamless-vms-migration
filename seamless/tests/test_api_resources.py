@@ -631,6 +631,44 @@ def test_a_provider_declares_its_policy_profile(api):
     assert api.post("/api/v1/providers", json=vmware).status_code == 422
 
 
+def test_a_provider_is_created_and_patched_with_gpu_profiles(api):
+    """SDD §4.2, §12, §22.3 (plan task G1): POST /providers and PATCH /providers/{id} take the vGPU
+    profiles an operator declares for an OpenStack or RHOSO provider's GPU flavors; a profile out of
+    bounds, or any on a vmware provider, is 422 and stores nothing; {} clears them."""
+    gpu = {**DESTINATION, "id": "dst-gpu", "name": "RHOSO 18.0 (GPU)"}
+    created = api.post("/api/v1/providers", json={**gpu, "gpu_profiles": {"g1.a100-4c": "A100-4C"}})
+    assert created.status_code == 201, created.text
+    assert created.json()["gpu_profiles"] == {"g1.a100-4c": "A100-4C"}
+
+    def patch(body):
+        return api.client.patch("/api/v1/providers/dst-gpu", headers=api.h(Role.admin), json=body)
+
+    both = {"g1.a100-4c": "A100-4C", "g1.a100-3-20c": "A100-3-20C"}
+    patched = patch({"gpu_profiles": both})
+    assert patched.status_code == 200, patched.text
+    assert api.get("/api/v1/providers/dst-gpu").json()["gpu_profiles"] == both
+    too_long = patch({"gpu_profiles": {"g1.a100-4c": "p" * 65}})
+    assert too_long.status_code == 422 and "gpu_profiles" in too_long.text
+    assert api.get("/api/v1/providers/dst-gpu").json()["gpu_profiles"] == both
+    assert patch({"gpu_profiles": {}}).json()["gpu_profiles"] == {}
+    # every provider shows them, the source's none
+    assert {p["id"]: p["gpu_profiles"] for p in api.get("/api/v1/providers").json()}[
+        "src-osp"
+    ] == {}
+
+    vmware = {
+        "id": "vc-01",
+        "name": "vCenter",
+        "kind": "vmware",
+        "role": "source",
+        "endpoint": "https://vcenter.example",
+        "gpu_profiles": {"g1.a100-4c": "A100-4C"},
+    }
+    refused = api.post("/api/v1/providers", json=vmware)
+    assert refused.status_code == 422 and "gpu_profiles" in refused.text
+    assert api.get("/api/v1/providers/vc-01").status_code == 404
+
+
 NAME_CASES = json.loads(
     (Path(__file__).parent / "fixtures" / "provider_name_cases.json").read_text()
 )["cases"]

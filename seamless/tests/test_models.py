@@ -22,10 +22,13 @@ from seamless_migrate.domain.models import (
     Estimate,
     Event,
     Finding,
+    GpuDevice,
+    Mappings,
     Migration,
     Plan,
     Provider,
     SyncPass,
+    VMRef,
     is_blank,
     new_migration_id,
     new_plan_id,
@@ -386,3 +389,91 @@ def test_the_pinned_blank_list_is_what_its_unicode_version_says():
     categories = {"Zs", "Zl", "Zp", "Cc", "Cf"}
     pinned = {cp for first, last in BLANK["ranges"] for cp in range(first, last + 1)}
     assert pinned == {cp for cp in range(0x110000) if unicodedata.category(chr(cp)) in categories}
+
+
+def test_vmref_gpus_default_to_an_empty_list_and_round_trip():
+    """SDD §4.2, §22.2 (plan task G1): a VM has no GPU unless its source reports one; its GPUs
+    survive the store's JSON, and a VM recorded before 0.3.0 loads with none."""
+    assert make_vm().gpus == []
+    vm = make_vm(
+        gpus=[
+            GpuDevice(kind="vgpu", profile="grid_a100-4c", count=2),
+            GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5"),
+        ]
+    )
+    assert VMRef.model_validate(vm.model_dump(mode="json")) == vm
+    recorded = make_vm().model_dump(mode="json")
+    recorded.pop("gpus")
+    assert VMRef.model_validate(recorded).gpus == []
+
+
+def test_mappings_gpus_is_a_map_of_strings():
+    """SDD §4.2, §22.4: a VMware GPU key to a destination GPU flavor, as the other mappings map a
+    name to a name; a plan stored before 0.3.0 loads with none."""
+    assert Mappings().gpus == {}
+    mappings = Mappings(gpus={"grid_a100-4c": "g1.a100-4c", "10de:20b5": "p1.a100"})
+    assert make_plan(mappings=mappings).mappings.gpus["10de:20b5"] == "p1.a100"
+    with pytest.raises(ValidationError, match="gpus"):
+        Mappings(gpus={"grid_a100-4c": ["g1.a100-4c"]})
+    stored = make_plan().model_dump(mode="json")
+    stored["mappings"] = {"networks": {"app-net": "prod"}}
+    assert Plan.model_validate(stored).mappings.gpus == {}
+
+
+def test_provider_gpu_profiles_is_refused_on_a_vmware_provider():
+    """SDD §4.2, §22.3: vCenter reports a VM's own vGPU profile, so a vmware provider declares
+    none; an OpenStack or RHOSO provider, source or destination, may."""
+    vmware = {"id": "vc-01", "kind": ProviderKind.vmware, "endpoint": "https://vcenter.example"}
+    assert make_provider(**vmware).gpu_profiles == {}
+    with pytest.raises(ValidationError, match="gpu_profiles"):
+        make_provider(**vmware, gpu_profiles={"g1.a100-4c": "A100-4C"})
+    profiles = {"g1.a100-4c": "A100-4C"}
+    assert make_provider(gpu_profiles=profiles).gpu_profiles == profiles
+    destination = make_provider(
+        id="dst-rhoso",
+        kind=ProviderKind.rhoso,
+        role=ProviderRole.destination,
+        gpu_profiles=profiles,
+    )
+    assert destination.gpu_profiles == profiles
+
+
+def test_provider_gpu_profiles_bounds_its_profile_names():
+    """SDD §4.2: a flavor name of 1-255 characters to a profile name of 1-64."""
+    longest = {"f" * 255: "p" * 64, "g1.a100-4c": "A100-4C"}
+    assert make_provider(gpu_profiles=longest).gpu_profiles == longest
+    for bad in ({"": "A100-4C"}, {"f" * 256: "A100-4C"}, {"g1": ""}, {"g1": "p" * 65}):
+        with pytest.raises(ValidationError, match="gpu_profiles"):
+            make_provider(gpu_profiles=bad)
+
+
+def test_a_gpu_devices_ids_and_count_are_validated():
+    """SDD §4.2: a kind of the two, PCI ids of four lower-case hex digits, at least one device."""
+    device = GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5")
+    assert (device.count, device.profile, device.traits) == (1, None, [])
+    for bad in (
+        {"kind": "mig"},
+        {"vendor_id": "10DE"},
+        {"vendor_id": "10d"},
+        {"device_id": "20b5x"},
+        {"count": 0},
+    ):
+        with pytest.raises(ValidationError):
+            GpuDevice(**{"kind": "passthrough", **bad})
+
+
+def test_a_gpu_devices_free_text_is_written_u_fffd():
+    """SDD §4.2 (§11, review RV49-02): a GPU's profile, alias and traits are free text, written
+    U+FFFD where they hold a NUL or a lone surrogate, as the model is built."""
+    device = GpuDevice(
+        kind="vgpu",
+        profile="grid\x00a100-4c",
+        traits=["CUSTOM_\ud800X"],
+        forbidden_traits=["CUSTOM_\x00"],
+        alias="a\x00",
+    )
+    assert device.profile == "grid\ufffda100-4c"
+    assert device.traits == ["CUSTOM_\ufffdX"]
+    assert device.forbidden_traits == ["CUSTOM_\ufffd"]
+    assert device.alias == "a\ufffd"
+    assert make_vm(gpus=[device]).gpus[0].profile == "grid\ufffda100-4c"

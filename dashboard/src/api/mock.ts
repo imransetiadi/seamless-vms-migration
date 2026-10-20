@@ -823,7 +823,8 @@ function checkSecretNames(input: Record<string, unknown>, fields: Set<string>, p
   }
 }
 
-const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile']);
+/** The API's PROVIDER_EDITABLE_FIELDS (SDD §12): what PATCH /providers/{id} may set. */
+export const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile', 'gpu_profiles']);
 const DISTRIBUTION_KIND: Record<string, string> = { openstack_community: 'openstack', kolla: 'openstack', rhosp: 'openstack', rhoso: 'rhoso', vmware: 'vmware' };
 
 function checkDistribution(input: Record<string, unknown> | Provider) {
@@ -834,9 +835,32 @@ function checkDistribution(input: Record<string, unknown> | Provider) {
   }
 }
 
-/** A declared series and policy profile, as the API's Provider validates them (SDD §4.2): OpenStack's alone. */
+/**
+ * A provider's declared vGPU profiles as the API's model reads them (SDD §4.2, §22.3): a map of a flavor name of 1 to
+ * 255 characters to a profile name of 1 to 64, worded as pydantic words a refusal - each key, then its value, five at
+ * most. A length counts code points.
+ */
+function checkGpuProfiles(profiles: unknown): void {
+  if (profiles === undefined) return;
+  if (typeof profiles !== 'object' || profiles === null || Array.isArray(profiles)) {
+    throw new HttpError(422, 'validation_error', 'gpu_profiles: Input should be a valid dictionary');
+  }
+  const problems: string[] = [];
+  for (const [flavor, profile] of Object.entries(profiles as Record<string, unknown>)) {
+    const keyLength = [...flavor].length;
+    if (keyLength < 1) problems.push(`gpu_profiles.${flavor}.[key]: String should have at least 1 character`);
+    else if (keyLength > 255) problems.push(`gpu_profiles.${flavor}.[key]: String should have at most 255 characters`);
+    if (typeof profile !== 'string') problems.push(`gpu_profiles.${flavor}: Input should be a valid string`);
+    else if ([...profile].length < 1) problems.push(`gpu_profiles.${flavor}: String should have at least 1 character`);
+    else if ([...profile].length > 64) problems.push(`gpu_profiles.${flavor}: String should have at most 64 characters`);
+  }
+  if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
+}
+
+/** A declared series, policy profile and vGPU profiles, as the API's Provider validates them (SDD §4.2, §22.3): OpenStack's alone. */
 function checkDeclarations(input: Record<string, unknown> | Provider) {
   const fields = input as Record<string, unknown>;
+  checkGpuProfiles(fields.gpu_profiles);
   const release = fields.release;
   if (release !== undefined && release !== null && !(typeof release === 'string' && /^20[0-9]{2}\.[12]$/.test(release))) {
     throw new HttpError(422, 'validation_error', "release: String should match pattern '^20[0-9]{2}\\.[12]$'");
@@ -848,6 +872,9 @@ function checkDeclarations(input: Record<string, unknown> | Provider) {
   if (fields.kind === 'vmware') {
     for (const name of ['release', 'policy_profile']) {
       if (fields[name] !== undefined && fields[name] !== null) throw new HttpError(422, 'validation_error', `Value error, ${name}: an OpenStack ${name} cannot be declared for vmware`);
+    }
+    if (Object.keys((fields.gpu_profiles as Record<string, string> | undefined) ?? {}).length) {
+      throw new HttpError(422, 'validation_error', "Value error, gpu_profiles: vGPU profiles cannot be declared for vmware: vCenter reports each VM's own");
     }
   }
 }
@@ -1974,6 +2001,7 @@ export class MockServer {
       distribution: null,
       release: null,
       policy_profile: null,
+      gpu_profiles: {},
     };
     const provider = {
       ...defaults,

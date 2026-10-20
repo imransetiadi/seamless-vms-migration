@@ -5,7 +5,7 @@
 | Product | Seamless Migrate |
 | Release | 0.1.0 (MVP) |
 | Date | 2026-10-08 |
-| Status | Approved; amended 2026-10-09 (NetApp ONTAP handover, Kubernetes and Podman, guest OS catalog) and 2026-10-16 (destinations: community OpenStack 2023.1 Antelope – 2026.2 Hibiscus beside RHOSO 18.0, goal G7) |
+| Status | Approved; amended 2026-10-09 (NetApp ONTAP handover, Kubernetes and Podman, guest OS catalog), 2026-10-16 (destinations: community OpenStack 2023.1 Antelope – 2026.2 Hibiscus beside RHOSO 18.0, goal G7) and 2026-10-20 (GPU workloads as a Technology Preview in 0.3.0, goal G8; the network cut-over hooks and the Octavia/Heat helpers move to 0.4.0) |
 | Design | [SDD.md](SDD.md) |
 
 ## 1. Problem statement
@@ -49,6 +49,7 @@ Today's tooling forces painful trade-offs:
 | G5 | Operability | Every action audited; live progress in the dashboard; Prometheus metrics |
 | G6 | Assisted decisions | Jev-based advisor for strategy ties, wave classification and post-cutover review; agentmemory recall of similar past incidents |
 | G7 | Destination choice (0.2.0) | Besides RHOSO 18.0, every community OpenStack release series from 2023.1 Antelope to 2026.2 Hibiscus is a destination, by the support tiers of SDD §21: each strategy a destination's capabilities allow runs as on RHOSO 18.0; each Tier 1 series (the upstream-Maintained 2025.1 Epoxy, 2025.2 Flamingo, 2026.1 Gazpacho and 2026.2 Hibiscus) passes the destination lab matrix before a release; every destination's series, tier and missing capabilities are shown before a plan runs |
+| G8 | GPU workloads (0.3.0, Technology Preview) | VMs with an NVIDIA vGPU (MIG-backed profiles included) or a passed-through GPU migrate with an explicit GPU mapping instead of being blocked (SDD §22): the GPU rules of SDD §22 hold in simulation for 0.3.0 (the demo's GPU VMs through mapping, validation, the cutover gate's wait, cutover and verification), and the lab cases LAB-G01–LAB-G08 pass on GPU hosts before the Technology Preview label goes |
 
 ### Non-goals (0.1.0)
 
@@ -60,6 +61,9 @@ Today's tooling forces painful trade-offs:
 * Hyper-V, Nutanix, KVM-without-OpenStack sources.
 * Destinations below 2023.1 Antelope, and clouds without the OpenStack APIs (SDD §21.1). Vendor builds of
   community releases other than RHOSO are not certified; they count as the upstream series they ship.
+* GPU state: a GPU VM's memory and its GPU's memory do not move, and the VM boots on the destination as after a
+  shutdown; AMD's and Intel's own GPU virtualization (their passthrough devices map like any passthrough device);
+  a per-VM GPU flavor in 0.3.0 (SDD §22.1, D17).
 
 ## 4. Personas
 
@@ -71,6 +75,7 @@ Today's tooling forces painful trade-offs:
 | **Application owner** (Dimas) | Know when their VM is down and for how long; confirm it works afterwards | Plan view (read-only), notifications via events |
 | **Security officer** | Credentials never leak; every action attributable; AI use is bounded | Security.md, audit trail, RBAC |
 | **Community cloud operator** (Arif) | Move tenants from an old cloud to a new upstream release side by side, without a Red Hat stack; know before a plan runs whether the destination's release and policies fit | Providers (destination check: series, tier, roles), validation findings, Security.md roles |
+| **ML platform engineer** (Nadia) | Move inference servers, notebook hosts and render nodes with their GPUs; know before a plan runs whether the destination has the GPUs, and that no source stops before its GPU is free at the destination | Inventory (GPU column), the plan's GPU mappings, the provider card's GPU capacity, validation findings |
 
 ## 5. Key user journeys
 
@@ -97,11 +102,16 @@ Today's tooling forces painful trade-offs:
    capabilities each strategy needs. Validation flags the one VM whose port goes to another project's
    network: under the secure-RBAC defaults that needs the `service` or `admin` role, no longer
    `advsvc`. He grants the role, revalidates, and runs the plan as in journey 1.
+7. **GPU exit from VMware** (0.3.0, Technology Preview) — Nadia selects the VMs with vGPUs and maps each vGPU
+   profile to a destination GPU flavor. Validation shows each VM's GPU flavor, the free capacity per vGPU type and
+   the guest driver and license warnings. The pre-copy runs while the VMs serve. One cutover waits because the last
+   vGPU of its type was taken meanwhile; its source keeps running and syncing, and the cutover starts once a vGPU is
+   free. After boot the verification confirms each server holds its GPU.
 
 ## 6. Functional requirements
 
 Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = could (later), **M2** = must
-for 0.2.0 (goal G7).
+for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview until its lab cases pass).
 
 | ID | Requirement | P | Acceptance criteria |
 |---|---|---|---|
@@ -132,13 +142,20 @@ for 0.2.0 (goal G7).
 | FR-25 | Deploy on OpenShift, Kubernetes and Docker Compose (Docker Engine on a Linux host, Colima on macOS, or Podman) with PostgreSQL | M | Manifests in `deploy/openshift` and its overlay `deploy/kubernetes`, compose stack in `deploy/compose` |
 | FR-26 | Changed-extent tracking to remove the scan floor: Ceph-direct `rbd diff` and hypervisor-assisted libvirt checkpoints | C | 0.2.0 |
 | FR-27 | HA control plane (leader election) | C | 0.2.0 |
-| FR-28 | Network cut-over hooks (DNS/FIP/BGP) | C | 0.3.0 |
+| FR-28 | Network cut-over hooks (DNS/FIP/BGP) | C | 0.4.0 |
 | FR-29 | Community OpenStack destinations: a destination provider of kind `openstack` (distribution `openstack_community` or `kolla`) of a series in the support window, beside RHOSO 18.0 | M2 | Every strategy the destination's capabilities allow passes the lab matrix on each Tier 1 series (QASuite §6.7 AC-6, §7.1 M7–M12, §7.2 LAB-D); SDD §21.1 |
 | FR-30 | Release detection and support tier per destination: the series range the API version documents fit, an optional declared series, and the tier | M2 | The provider check shows range, declared series and tier; a declared series the detected range contradicts warns, and where the APIs cannot tell the series the declared one decides; with none declared the tier is the least favourable one the range allows (SDD §21.3) |
 | FR-31 | Destination capability pre-flight: what each chosen strategy needs (compute and block-storage microversions, Cinder manage, Neutron extensions, roles) | M2 | A missing capability blocks the plan and names it; a series outside the tiers or EOL upstream warns (SDD §21.4) |
 | FR-32 | Permission checks follow the destination's policy profile: secure-RBAC defaults (`reader`/`member`/`manager`/`admin`, `service`) or the legacy defaults | M2 | A port on another project's network is judged with `admin`/`service` under the new defaults and `admin`/`advsvc` under the legacy ones (SDD §21.5) |
 | FR-33 | Conversion hosts on community clouds: CentOS Stream 9 and RHEL 9, then Rocky Linux and AlmaLinux 9 and Ubuntu 24.04 LTS images | M2 | The conversion-host roles install and verify the copy tools on each listed image (SDD §21.6) |
 | FR-34 | Destination-neutral wording: a text built for a plan or a migration (a finding, an event, a refusal, in the CLI and the dashboard) names the destination provider; a fixed text says "the destination"; only a text about the Red Hat product says "RHOSO 18.0"; nothing the advisor sends to Jev names a provider | M2 | No user-facing text assumes RHOSO when the destination is community OpenStack (SDD §1 naming, §21.8) |
+| FR-35 | GPU inventory: each source VM's GPUs — a VMware vGPU by its profile (MIG-backed included), a VMware passthrough device by its PCI vendor and device ids, an OpenStack VM's by its flavor's requests | M3 | The Inventory shows each VM's GPUs; the VMware provider keeps the vGPU profile (SDD §22.2) |
+| FR-36 | Destination GPU flavors and capacity: the destination's GPU flavors, their declared vGPU profiles, and the free GPU capacity per pool read from Placement | M3 | A capacity Placement does not let the credential read is "unknown", never guessed; no Placement provider's name or uuid is kept (SDD §22.3, §22.12) |
+| FR-37 | An explicit GPU mapping in the plan: a VMware GPU key to a destination GPU flavor, an OpenStack GPU VM's flavor mapping | M3 | A GPU VM is never matched to a flavor by size or by name and its flavor is never pre-staged; without a mapping that applies it stays blocked (SDD §22.4) |
+| FR-38 | GPU pre-flight: the GPU findings, with the plan's GPU demand counted against the free capacity per pool | M3 | The SDD §22.5 codes implemented and unit-tested; a plan that does not fit is blocked before its first copy |
+| FR-39 | The cutover gate reads the GPU capacity again before the source stops | M3 | With no room the migration waits and keeps syncing, and its source never stops (SDD §22.7) |
+| FR-40 | GPU verification: the server holds its GPU flavor and its allocations, and the DCGM exporter's port is suggested as a probe | M3 | A server created without its GPU fails the verification, and the plan's automatic rollback rolls it back (SDD §22.8) |
+| FR-41 | Technology Preview: every GPU surface says so, and no text claims hardware validation | M3 | The label stays until LAB-G01–LAB-G08 pass on GPU hosts (SDD §22.14) |
 
 ## 7. Non-functional requirements
 
@@ -168,6 +185,8 @@ for 0.2.0 (goal G7).
 * Time to plan a 100-VM migration (inventory → validated plan) ≤ 1 hour.
 * 0.2.0: every Tier 1 community series passes the destination lab matrix (QASuite §6.7, §7.1) with the
   same downtime and success targets as RHOSO 18.0.
+* 0.3.0: no GPU VM's source stops without a capacity read that found room for its GPU (SDD §22.7); LAB-G01–LAB-G08
+  pass on GPU hosts before the Technology Preview label goes.
 
 ## 9. Release plan
 
@@ -175,7 +194,8 @@ for 0.2.0 (goal G7).
 |---|---|
 | **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift, Kubernetes and Compose (Docker on Linux, Colima on macOS, or Podman) deployment, docs |
 | 0.2.0 | Ceph-direct incremental diff, HA (PostgreSQL leader election), per-tenant credentials, notifications (email/Slack webhooks); community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34) |
-| 0.3.0 | Network cut-over hooks (DNS, FIP re-mapping, OVN BGP), Octavia/Heat migration helpers |
+| 0.3.0 | GPU workloads as a Technology Preview (G8, FR-35–FR-41; SDD §22) |
+| 0.4.0 | Network cut-over hooks (DNS, FIP re-mapping, OVN BGP; FR-28), Octavia/Heat migration helpers |
 | 1.0.0 | Certified on RHOSO 18.0.x FRs, validated on every Tier 1 community series of the day, scale test 5,000 VMs, signed releases |
 
 ## 10. Dependencies and assumptions
@@ -193,6 +213,10 @@ for 0.2.0 (goal G7).
   recommended), compute microversion ≥ 2.60 (a storage handover needs ≥ 2.85 on the source cloud), Cinder v3; a
   series of the support window (SDD §21.1).
 * VMware: VDDK available on the destination's conversion host; CBT enabled for warm.
+* GPU workloads (0.3.0): the NVIDIA vGPU manager on the source and destination hosts, Nova's vGPU or a PCI alias
+  configured at the destination, and GPU flavors the operator defines there. Placement's default policy gives the
+  capacity reads to `admin`: without it the capacity reads "unknown" and the pre-flight warns. The guests' NVIDIA
+  drivers and the NVIDIA License System stay the operator's (SDD §22).
 * Jev requires a provider API key (TypeSafe direct by default); everything works with Jev off.
 * agentmemory is optional; when configured, it runs as the team's memory server.
 
@@ -209,6 +233,9 @@ for 0.2.0 (goal G7).
 | Upstream API changes in new series (compute 2.101–2.104 change attach status codes, drop flavor fields and `os-volumes_boot`) | A newer SDK or cloud breaks a call | openstacksdk's per-resource microversion caps (SDD §21.7); recorded version documents in contract tests; the window moves only after the lab matrix passes |
 | Community clouds without TLS, or with private CAs | Credentials or guest data in clear text | `verify_tls` on by default, CA bundle per provider; the check reports plain-HTTP endpoints (`tls`, `plain_http`, SDD §10, Security.md) |
 | Credentials exposure | Security incident | Secrets in mounted files or the platform secret store (written once through the API, never read back), 0600 temp files for playbooks; redaction; Security.md controls |
+| A GPU taken between the cutover gate's read and the server's creation | The cutover fails after the source stopped | The capacity read right before the stop (SDD §22.7), the automatic rollback, LAB-G06 |
+| A guest's NVIDIA driver does not suit the destination host's vGPU manager | The GPU does not work after the cutover | `GUEST_GPU_DRIVER` before the plan runs, a test migration first, the verification's GPU checks, LAB-G08 (SDD §22.5) |
+| vSphere takes no snapshot of a VM with a DirectPath I/O GPU | No warm migration for such VMs | `vmware_warm` ineligible, `vmware_cold` while the VM is powered off (SDD §22.6) |
 
 ## 12. Glossary
 
@@ -227,3 +254,7 @@ for 0.2.0 (goal G7).
 * **CBT** — VMware Changed Block Tracking.
 * **Handover** — moving volume ownership between Cinder services without copying data.
 * **Finalize** — irreversible clean-up of the source after a successful migration.
+* **vGPU** — an NVIDIA virtual GPU, a share of a physical GPU the hypervisor's vGPU manager hands to a VM by its
+  profile (`A100-4C`: 4 GB of framebuffer, compute); **MIG-backed** profiles take a fixed slice of a MIG-capable GPU.
+* **Placement** — the OpenStack service that counts each compute host's resources, a GPU's vGPUs among them.
+* **Technology Preview** — shipped and tested in simulation, not yet validated on real hardware.

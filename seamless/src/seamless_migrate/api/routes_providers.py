@@ -66,6 +66,7 @@ PROVIDER_EDITABLE_FIELDS = frozenset(
         "distribution",
         "release",
         "policy_profile",
+        "gpu_profiles",
     }
 )
 _SERVER_OWNED = {

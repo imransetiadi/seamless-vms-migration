@@ -5183,6 +5183,22 @@ async def test_the_export_record_holds_what_the_rewrite_applied(env):
     assert not record.exists()
 
 
+async def test_the_export_record_leaves_the_gpu_mappings_out(env):
+    """SDD §7.2, §22.4 (plan task G1): the record holds the mappings the rewrite applies, and the
+    rewrite applies no GPU mapping (an OpenStack GPU VM's GPU goes with its flavor mapping): a
+    plan's GPU mappings are not in it, so a change to them exports nothing again, and a record
+    written before 0.3.0 still matches - no in-flight warm migration is exported again for it."""
+    gpus = Mappings(**{**MAPPINGS.model_dump(), "gpus": {"grid_a100-4c": "g1.a100-4c"}})
+    first, _ = ctx_for(env, strategy=Strategy.warm, mappings=gpus)
+    result = await env.executor.run(StepName.PRECOPY, first)
+    record = json.loads((run_dir(env) / "osm" / "rewrite.json").read_text())
+    assert sorted(record["mappings"]) == ["flavors", "networks", "projects", "volume_types"]
+    env.log.write_text("")
+    again, _ = ctx_for(env, strategy=Strategy.warm, sync_passes=[result.sync_pass])
+    await env.executor.run(StepName.SYNC, again)
+    assert [c["playbook"] for c in read_log(env.log)] == ["import_workloads_precopy.yml"]
+
+
 async def test_a_renamed_vm_is_exported_again_before_its_next_run(env, monkeypatch):
     """SDD §7.2 (review lead A): the export record holds the exported server's name - a source VM
     renamed since (and validated again) is exported again before its next run, which selects its

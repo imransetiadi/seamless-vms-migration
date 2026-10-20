@@ -1581,4 +1581,42 @@ describe('PlanDetail', () => {
     dialog = await edit();
     expect(within(dialog).getByLabelText(/^network mappings/i)).toHaveValue('__proto__ = tenant-web\nanalytics = tenant-app');
   });
+  it("keeps the plan's GPU mappings when the form saves other mappings (SDD §4.2, §22.4)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const planId = 'plan-c81d44a0';
+    const plan = server.plans.find((p) => p.id === planId)!;
+    // set through the API or `seamless plan apply`: the form shows GPU mappings from plan task G12 on, and a PATCH
+    // replaces `mappings` whole
+    plan.mappings = { ...plan.mappings, gpus: { 'grid_a100-4c': 'g1.a100-4c' } };
+    renderWithApp(<PlanDetail />, { route: `/plans/${planId}`, path: '/plans/:planId', token: 'operator', server });
+    const actions = await screen.findByRole('group', { name: /plan actions/i });
+    await user.click(within(actions).getByRole('button', { name: /^edit plan$/i }));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced/i));
+    const networks = within(dialog).getByLabelText(/^network mappings/i);
+    await user.clear(networks);
+    await user.type(networks, 'tenant-gpu = tenant-gpu-ovn');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const saved = server.plans.find((p) => p.id === planId)!;
+    expect(saved.mappings.networks).toEqual({ 'tenant-gpu': 'tenant-gpu-ovn' });
+    expect(saved.mappings.gpus).toEqual({ 'grid_a100-4c': 'g1.a100-4c' });
+  });
+
+  it('counts only the mappings it lists: GPU mappings wait for G12 (SDD §16, §22.11, PR #57 review)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    // set through the API or `seamless plan apply`: the page lists GPU mappings from plan task G12 on
+    const gpus = { 'grid_a100-4c': 'g1.a100-4c' };
+    plan.mappings = { networks: { 'app-net': 'tenant-app', 'db-net': 'tenant-db' }, flavors: {}, volume_types: {}, projects: {}, gpus };
+    const first = renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
+    expect(await screen.findByText('2 source → destination mappings')).toBeInTheDocument();
+    first.unmount();
+    // GPU mappings alone: no Mappings entry that opens onto an empty list
+    plan.mappings = { networks: {}, flavors: {}, volume_types: {}, projects: {}, gpus };
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
+    await screen.findByRole('group', { name: /plan actions/i });
+    expect(screen.queryByText(/source → destination mapping/)).not.toBeInTheDocument();
+  });
 });
