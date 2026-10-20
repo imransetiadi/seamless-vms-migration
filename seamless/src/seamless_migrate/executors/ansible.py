@@ -418,9 +418,11 @@ def export_record(
 ) -> dict[str, Any]:
     """The export record (SDD §7.2): the mappings a rewrite applies - the plan's overlaid with the
     migration's resolved ones -, the VM's NIC override entries and the exported server's name, by
-    which each run selects its workload (a renamed VM is exported again, review lead A)."""
+    which each run selects its workload (a renamed VM is exported again, review lead A). The
+    rewrite applies no GPU mapping - an OpenStack GPU VM's GPU goes with its flavor mapping - so
+    `gpus` is left out, and a record written before it existed still matches (SDD §22.4)."""
     return {
-        "mappings": mappings.model_dump(mode="json"),
+        "mappings": mappings.model_dump(mode="json", exclude={"gpus"}),
         "nic_overrides": {
             mac: entry.model_dump(mode="json") for mac, entry in (nic_overrides or {}).items()
         },

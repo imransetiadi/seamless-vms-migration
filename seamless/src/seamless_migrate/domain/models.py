@@ -21,6 +21,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StringConstraints,
     ValidationInfo,
     computed_field,
     field_validator,
@@ -135,6 +136,11 @@ DISTRIBUTION_KIND: dict[str, ProviderKind] = {
 }
 
 
+#: a GPU flavor's name, and the NVIDIA vGPU profile its provider declares it gives (SDD §4.2)
+FlavorName = Annotated[str, StringConstraints(min_length=1, max_length=255)]
+ProfileName = Annotated[str, StringConstraints(min_length=1, max_length=64)]
+
+
 class Provider(_Model):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
     name: str
@@ -156,6 +162,9 @@ class Provider(_Model):
     release: str | None = Field(default=None, pattern=r"^20[0-9]{2}\.[12]$")
     #: the policy defaults its operator declares; None = by kind and series (SDD §4.2, §21.5)
     policy_profile: Literal["secure_rbac", "legacy"] | None = None
+    #: the NVIDIA vGPU profile each of its GPU flavors gives, as its operator declares it: no API
+    #: tells a flavor's framebuffer (SDD §4.2, §22.3)
+    gpu_profiles: dict[FlavorName, ProfileName] = Field(default_factory=dict)
     #: server-owned: when PUT …/credentials / …/conversion-key last wrote the secret store
     credentials_updated_at: UTCDateTime | None = None
     conversion_key_updated_at: UTCDateTime | None = None
@@ -171,11 +180,17 @@ class Provider(_Model):
 
     @model_validator(mode="after")
     def _openstack_declarations(self) -> Provider:
-        """A series and a policy profile are OpenStack's: a vmware provider declares neither."""
+        """A series, a policy profile and vGPU profiles are OpenStack's: a vmware provider declares
+        none - vCenter reports each VM's own vGPU profile (SDD §4.2, §22.3)."""
         if self.kind == ProviderKind.vmware:
             for name in ("release", "policy_profile"):
                 if getattr(self, name) is not None:
                     raise ValueError(f"{name}: an OpenStack {name} cannot be declared for vmware")
+            if self.gpu_profiles:
+                raise ValueError(
+                    "gpu_profiles: vGPU profiles cannot be declared for vmware: vCenter reports "
+                    "each VM's own"
+                )
         return self
 
     @property
@@ -282,6 +297,43 @@ class Nic(_Model):
 PowerState = Literal["running", "stopped", "paused", "error", "transitioning", "unknown"]
 
 
+#: a PCI vendor or device id: four lower-case hex digits (SDD §4.2, §22.2)
+PCI_ID = r"^[0-9a-f]{4}$"
+
+
+class GpuDevice(_Model):
+    """A GPU of a source VM, or a GPU request of a flavor (SDD §4.2, §22.2). Its profile, alias
+    and traits are free text, written U+FFFD where they hold what the store cannot keep (§11)."""
+
+    kind: Literal["vgpu", "passthrough"]
+    #: the vGPU profile: VMware's as vCenter reports it, an OpenStack request's as its flavor's
+    #: provider declares it (Provider.gpu_profiles)
+    profile: str | None = None
+    #: VMware passthrough: the device's PCI vendor and device ids
+    vendor_id: str | None = Field(default=None, pattern=PCI_ID)
+    device_id: str | None = Field(default=None, pattern=PCI_ID)
+    #: identical devices of one VM are one entry
+    count: int = Field(default=1, ge=1)
+    #: OpenStack: the request group's resource class with its required and forbidden traits, and
+    #: a passthrough request's PCI alias
+    resource_class: str | None = None
+    traits: list[str] = Field(default_factory=list)
+    forbidden_traits: list[str] = Field(default_factory=list)
+    alias: str | None = None
+
+    @field_validator("profile", "alias", mode="before")
+    @classmethod
+    def _storable_text(cls, value: Any) -> Any:
+        return replace_unstorable(value) if isinstance(value, str) else value
+
+    @field_validator("traits", "forbidden_traits", mode="before")
+    @classmethod
+    def _storable_names(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        return [replace_unstorable(v) if isinstance(v, str) else v for v in value]
+
+
 class VMRef(_Model):
     """A source VM as inventoried (SDD §4.2). The names a cutover reads - its own, its project's,
     its flavor's, its NICs' networks, its disks' volume types - are kept as the source gives them:
@@ -330,6 +382,8 @@ class VMRef(_Model):
     task_state: str | None = None
     #: the Nova keypair the server boots with (OpenStack); VMware: None (SDD §4.1)
     key_name: str | None = None
+    #: its GPUs, as its source reports them; [] for a VM recorded before (SDD §4.2, §22.2)
+    gpus: list[GpuDevice] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -362,6 +416,8 @@ class Mappings(_Model):
     flavors: dict[str, str] = Field(default_factory=dict)
     volume_types: dict[str, str] = Field(default_factory=dict)
     projects: dict[str, str] = Field(default_factory=dict)
+    #: a VMware GPU key to a destination GPU flavor; never resolved automatically (SDD §4.2, §22.4)
+    gpus: dict[str, str] = Field(default_factory=dict)
 
 
 class HandoverConfig(_Model):

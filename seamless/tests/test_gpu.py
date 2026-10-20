@@ -1,0 +1,204 @@
+"""SDD §22.2-§22.4 (plan task G1): the GPU requests a flavor's extra specs ask for, a VMware
+device's GPU key, NVIDIA profile sizes and pool names - planning/gpu.py, a pure module."""
+
+import pytest
+
+from seamless_migrate.domain.models import GpuDevice
+from seamless_migrate.planning.gpu import (
+    ProfileSize,
+    gpu_key,
+    gpu_requests,
+    pool_name,
+    vgpu_profile_size,
+)
+
+
+def vgpu(**kw):
+    return GpuDevice(kind="vgpu", resource_class="VGPU", **kw)
+
+
+def test_gpu_requests_reads_a_bare_vgpu_request_with_its_traits():
+    """SDD §22.2: the unnumbered group's VGPU with its trait:<name> entries, required and
+    forbidden, sorted; a spec that is no GPU request is no part of it."""
+    specs = {
+        "resources:VGPU": "1",
+        "trait:CUSTOM_NVIDIA_A100_4C": "required",
+        "trait:CUSTOM_NVIDIA_OLD": "forbidden",
+        "trait:CUSTOM_ANY": "preferred",  # neither required nor forbidden: no part of the request
+        "hw:cpu_policy": "dedicated",
+    }
+    assert gpu_requests(specs) == [
+        vgpu(count=1, traits=["CUSTOM_NVIDIA_A100_4C"], forbidden_traits=["CUSTOM_NVIDIA_OLD"])
+    ]
+
+
+def test_gpu_requests_reads_each_numbered_group_with_its_own_traits():
+    """SDD §22.2: Nova's granular groups, resources<suffix>:VGPU, each with the traits of its own
+    suffix - the unnumbered group's traits belong to no numbered group - in suffix order."""
+    specs = {
+        "resources_GPU-b:VGPU": "2",
+        "trait_GPU-b:CUSTOM_B": "required",
+        "trait_GPU-b:CUSTOM_A": "required",
+        "resources1:VGPU": "1",
+        "trait1:CUSTOM_ONE": "required",
+        "trait:CUSTOM_ROOT": "required",
+        "resources:VCPU": "4",
+    }
+    assert gpu_requests(specs) == [
+        vgpu(count=1, traits=["CUSTOM_ONE"]),
+        vgpu(count=2, traits=["CUSTOM_A", "CUSTOM_B"]),
+    ]
+
+
+def test_gpu_requests_reads_each_pci_alias_with_its_count():
+    """SDD §22.2: pci_passthrough:alias=<alias>:<n>[,...] is one passthrough request per alias; a
+    count left out, or one that is not a positive integer, reads as 1."""
+    specs = {"pci_passthrough:alias": "a100:2, t4, l4:x"}
+    assert gpu_requests(specs) == [
+        GpuDevice(kind="passthrough", alias="a100", count=2),
+        GpuDevice(kind="passthrough", alias="t4", count=1),
+        GpuDevice(kind="passthrough", alias="l4", count=1),
+    ]
+
+
+def test_a_custom_resource_class_is_a_vgpu_only_with_a_declared_profile():
+    """SDD §22.2: Nova's mdev_class gives a vGPU type a CUSTOM_ class, which no API tells from any
+    other custom class: it is a vGPU only when its flavor's provider declares a profile."""
+    specs = {"resources1:CUSTOM_NVIDIA_A100_4C": "1", "trait1:CUSTOM_DC3": "required"}
+    assert gpu_requests(specs) == []
+    assert gpu_requests(specs, declared_profile="A100-4C") == [
+        GpuDevice(
+            kind="vgpu",
+            profile="A100-4C",
+            count=1,
+            resource_class="CUSTOM_NVIDIA_A100_4C",
+            traits=["CUSTOM_DC3"],
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "specs",
+    [
+        {"resources1:VCPU": "4"},
+        {"resources:CUSTOM_VGPU_X": "1"},
+        {"resources1:VGPU_DISPLAY_HEAD": "1"},
+        {"trait1:CUSTOM_VGPU": "required"},
+        {"trait:CUSTOM_NVIDIA_A40": "required"},
+        {"aggregate_instance_extra_specs:gpu": "true"},
+        {"pci_passthrough:alias": ""},
+        {},
+    ],
+)
+def test_another_resource_class_or_a_trait_alone_is_no_gpu(specs):
+    """SDD §22.2 (as §9.3's VM_VGPU reads it, review PL-08): another resource class, a trait alone,
+    an aggregate pin or an empty alias list asks for no GPU."""
+    assert gpu_requests(specs) == []
+
+
+def test_a_zero_amount_asks_for_no_gpu():
+    """SDD §22.2: a zero takes a resource out of a request, as Nova reads it - that group asks for
+    no GPU, and the flavor's other groups keep theirs."""
+    assert gpu_requests({"resources:VGPU": "0", "trait:CUSTOM_X": "required"}) == []
+    assert gpu_requests({"resources1:VGPU": "0", "resources2:VGPU": "1"}) == [vgpu(count=1)]
+
+
+@pytest.mark.parametrize("amount", ["", "one", "-1", "1.5", "²", "1e3"])
+def test_an_amount_nova_would_refuse_reads_as_one(amount):
+    """SDD §22.2: any other amount that is not a positive integer is still a request, read as one
+    GPU - Nova refuses such a flavor when a server boots with it, so the VM stays a GPU VM."""
+    assert gpu_requests({"resources:VGPU": amount}) == [vgpu(count=1)]
+
+
+def test_a_declared_profile_goes_to_each_entry_of_its_flavor():
+    """SDD §22.2, §22.3: the declared profile is each vGPU entry's profile; on a flavor whose GPU
+    requests are PCI aliases alone it goes to those entries (a vGPU handed out as a PCI device),
+    and never to an alias beside a vGPU request."""
+    two = gpu_requests({"resources1:VGPU": "1", "resources2:VGPU": "1"}, declared_profile="A100-4C")
+    assert [d.profile for d in two] == ["A100-4C", "A100-4C"]
+    assert gpu_requests({"pci_passthrough:alias": "vgpu-vf:1"}, declared_profile="L4-24Q") == [
+        GpuDevice(kind="passthrough", alias="vgpu-vf", count=1, profile="L4-24Q")
+    ]
+    mixed = gpu_requests(
+        {"resources:VGPU": "1", "pci_passthrough:alias": "nic:1"}, declared_profile="A100-4C"
+    )
+    assert [(d.kind, d.profile) for d in mixed] == [("vgpu", "A100-4C"), ("passthrough", None)]
+    assert gpu_requests({"resources:VGPU": "1"})[0].profile is None
+
+
+def test_the_gpu_key_is_the_profile_or_the_vendor_and_device_ids():
+    """SDD §22.2: what a plan's GPU mapping names for a VMware device (§22.4)."""
+    assert gpu_key(GpuDevice(kind="vgpu", profile="grid_a100-4c")) == "grid_a100-4c"
+    assert gpu_key(GpuDevice(kind="vgpu", profile="grid_a100-3-20c", count=2)) == "grid_a100-3-20c"
+    assert gpu_key(GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5")) == (
+        "10de:20b5"
+    )
+
+
+def test_a_passthrough_device_without_ids_has_no_key():
+    """SDD §22.2: a device vCenter reports without both ids, a vGPU without a profile and an
+    OpenStack alias have no key - no GPU mapping can name them."""
+    for device in (
+        GpuDevice(kind="passthrough"),
+        GpuDevice(kind="passthrough", vendor_id="10de"),
+        GpuDevice(kind="passthrough", device_id="20b5"),
+        GpuDevice(kind="passthrough", alias="a100"),
+        GpuDevice(kind="vgpu"),
+    ):
+        assert gpu_key(device) is None, device
+
+
+@pytest.mark.parametrize(
+    ("name", "size"),
+    [
+        ("grid_a100-4c", ProfileSize("A100", None, 4, "C")),
+        ("A100-4C", ProfileSize("A100", None, 4, "C")),
+        ("GRID A100-4C", ProfileSize("A100", None, 4, "C")),
+        ("nvidia_l4-24q", ProfileSize("L4", None, 24, "Q")),
+        ("T4-16Q", ProfileSize("T4", None, 16, "Q")),
+        ("a16-2b", ProfileSize("A16", None, 2, "B")),
+        ("A40-48A", ProfileSize("A40", None, 48, "A")),
+        ("grid_a100-3-20c", ProfileSize("A100", 3, 20, "C")),
+        ("A100D-7-80C", ProfileSize("A100D", 7, 80, "C")),
+        ("nvidia_h100-1-10c", ProfileSize("H100", 1, 10, "C")),
+    ],
+)
+def test_vgpu_profile_size_reads_time_sliced_and_mig_backed_names(name, size):
+    """SDD §22.2: <gpu>-<framebuffer GB><series>, MIG-backed <gpu>-<slices>-<framebuffer GB>
+    <series>, case-insensitive, with or without vCenter's grid_/nvidia_ prefix or NVIDIA's
+    "GRID "."""
+    assert vgpu_profile_size(name) == size
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "nvidia-471",
+        "A100",
+        "a100-4x",
+        "A100-0C",
+        "A100-0-20C",
+        "A100--4C",
+        "4C",
+        "grid-a100-4c",
+        "grid_a100-4c-extra",
+        "A100-4C ",
+        "",
+    ],
+)
+def test_a_name_outside_nvidias_scheme_has_no_size(name):
+    """SDD §22.2: an mdev type id, a bare GPU model or anything else has no size, and
+    MAP_GPU_DOWNSIZED compares nothing for it (§22.5)."""
+    assert vgpu_profile_size(name) is None
+
+
+def test_pool_name_lists_the_class_then_required_then_forbidden_traits():
+    """SDD §10, §22.7: the class, the required traits sorted, then the forbidden ones sorted,
+    each prefixed with "!"."""
+    assert pool_name("VGPU", ["CUSTOM_B", "CUSTOM_A"], ["CUSTOM_Z", "CUSTOM_Y"]) == (
+        "VGPU CUSTOM_A CUSTOM_B !CUSTOM_Y !CUSTOM_Z"
+    )
+    assert pool_name("VGPU", [], []) == "VGPU"
+    assert pool_name("CUSTOM_NVIDIA_A100_4C", [], ["CUSTOM_OLD"]) == (
+        "CUSTOM_NVIDIA_A100_4C !CUSTOM_OLD"
+    )

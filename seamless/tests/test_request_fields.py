@@ -143,6 +143,43 @@ def test_a_misspelt_field_at_any_depth_of_a_request_body_is_refused(
     assert api.store.get("provider", "src-osp", Provider) == provider
 
 
+def test_a_misspelt_gpu_mapping_or_profile_field_is_refused(api):
+    """SDD §4.2, §12 (plan task G1): Mappings.gpus and Provider.gpu_profiles are taken as spelt,
+    and a misspelling of either - "gpu" for the mapping kind, "gpu_profile" for the profiles - is a
+    422 naming it, never a plan or provider without its GPU settings; nothing is written."""
+    gpus = {"grid_a100-4c": "g1.a100-4c"}
+    for method, path, body, role, misspelt in (
+        ("POST", "/api/v1/plans", {**PLAN, "mappings": {"gpu": gpus}}, Role.operator, "gpu"),
+        (
+            "POST",
+            "/api/v1/providers",
+            {**DESTINATION, "id": "dst-two", "gpu_profile": {"g1": "A100-4C"}},
+            Role.admin,
+            "gpu_profile",
+        ),
+        (
+            "PATCH",
+            "/api/v1/providers/dst-rhoso",
+            {"gpu_profile": {"g1": "A100-4C"}},
+            Role.admin,
+            "gpu_profile",
+        ),
+    ):
+        before = len(api.store.events(since_seq=0, limit=100000))
+        res = send(api, method, path, body, role)
+        assert res.status_code == 422, (path, res.text)
+        error = res.json()["error"]
+        assert error["code"] == "validation_error" and misspelt in error["message"], error
+        assert len(api.store.events(since_seq=0, limit=100000)) == before, "something was written"
+    plan = api.post("/api/v1/plans", Role.operator, json={**PLAN, "mappings": {"gpus": gpus}})
+    assert plan.status_code == 201, plan.text
+    assert plan.json()["mappings"]["gpus"] == gpus
+    provider = send(
+        api, "PATCH", "/api/v1/providers/dst-rhoso", {"gpu_profiles": {"g1": "A100-4C"}}, Role.admin
+    )
+    assert provider.status_code == 200 and provider.json()["gpu_profiles"] == {"g1": "A100-4C"}
+
+
 def test_unknown_fields_are_refused_in_a_request_body_only():
     """SDD §11, §12 (audit AP-01): a stored document keeps loading with a field a later version
     added, at any depth; the same document as a request body is refused, naming the field."""
