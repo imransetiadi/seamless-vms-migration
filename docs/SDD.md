@@ -2961,7 +2961,8 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 * API keys: named ones (`api_key`, `TYPESAFE_API_KEY=`), AWS access key ids, GitHub tokens, `sk-` keys
   and Slack tokens;
 * OpenStack tokens: Keystone fernet tokens and `X-Auth-Token`/`X-Subject-Token` headers;
-* PEM blocks;
+* PEM blocks - and a block a cut fell inside, an END line with no BEGIN line before it (a console's last lines, §7.5),
+  from the text's start to that END line (review RV52-X1, PR #58 review);
 * credentials in connection strings: `scheme://user:password@host` (a password with `@` too) and
   `Password=…;`;
 * the `auth` section of a `clouds.yaml`, in YAML or JSON - a quoted string in a flow-style section read whole, so a
@@ -2999,8 +3000,8 @@ line at 2000 characters (§4), the failing output line in an Ansible step's erro
 SDK's error message at 500, an HTTP error body in the handover executor at 300, an agentmemory hit's content at 4000
 and its title at 200 - only the first `limit` hits of an answer are read (review RV27-06). Every pattern of `redact`
 costs time linear in the text's length - each start looks at a credential key's prefix of at most 16 parts, a URL
-scheme of at most 64 characters and a CLI flag name of at most 64, and a PEM block runs from its BEGIN line to the
-first END line after it, found once -, so a bounded text holds the event loop for a bounded time (review RV27-06).
+scheme of at most 64 characters and a CLI flag name of at most 64, and a PEM block runs from its BEGIN line, or the text's start,
+to the first END line after it, found once -, so a bounded text holds the event loop for a bounded time (review RV27-06).
 The service log too:
 the root handler's formatter (`cli.configure_logging`) passes every record through `redact` — the
 whole line in plain mode; in JSON mode the message and the exception text before they are serialized,
