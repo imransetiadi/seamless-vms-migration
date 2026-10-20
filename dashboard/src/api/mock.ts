@@ -13,6 +13,7 @@
 import { DEFAULT_API_BASE } from './client';
 import { ESTIMATOR_DEFAULTS, forcedDowntime } from '../lib/forcedEstimate';
 import { canTransition } from '../lib/fsm';
+import { vmGpus } from '../lib/gpu';
 import { guestOsOf } from '../lib/guestOs';
 import { capabilityRoles, policyProfileOf } from '../lib/networks';
 import { canonicalIp, isIpAddress } from '../lib/nics';
@@ -2393,8 +2394,10 @@ export class MockServer {
     // the plan's VMs as the API's planner reads them (orchestrator._vms, SDD §9.4, review RV39-03): every VM of vm_ids,
     // a fresh plan's and one added since too - a migration a validation leaves alone as its recorded vm
     const vms = this.planVms(plan).sort((a, b) => a.disk_bytes - b.disk_bytes);
-    const pilot = vms.slice(0, Math.min(3, vms.length));
-    const rest = vms.slice(pilot.length);
+    // the pilot never holds a GPU VM, whose driver, license and capacity are risks of their own: the next smallest VM
+    // takes its room (SDD §9.4, §22.9, PR #64 review)
+    const pilot = vms.filter((vm) => !vmGpus(vm).length).slice(0, 3);
+    const rest = vms.filter((vm) => !pilot.includes(vm));
     const waves: Wave[] = [];
     if (pilot.length) waves.push({ id: 'wave-1', name: 'Pilot', order: 1, vm_ids: pilot.map((vm) => vm.source_id), depends_on: [], max_parallel: 5 });
     for (let i = 0; i < rest.length; i += size) {

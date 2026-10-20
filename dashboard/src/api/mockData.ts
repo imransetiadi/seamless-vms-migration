@@ -39,6 +39,7 @@ import { DOWNTIME_PARTS } from './types';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { estimateStrategy, paramsFor } from '../lib/forcedEstimate';
 import { pyNames, pyRepr } from '../lib/format';
+import { vmGpus } from '../lib/gpu';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { kitVmName } from '../lib/kitName';
@@ -507,14 +508,6 @@ function gpuKey(d: GpuDevice): string | null {
   return d.vendor_id && d.device_id ? `${d.vendor_id}:${d.device_id}` : null;
 }
 
-/** The GPU requests a VM recorded without gpus shows in its flavor's extra specs, for the mapping rule alone: a vGPU per
- * VGPU request, a passthrough device per alias, as the API's gpu_requests reads them (SDD §22.2). */
-function gpuRequestsOf(specs: Record<string, string>): GpuDevice[] {
-  const vgpus: GpuDevice[] = vgpuRequests(specs).map(() => ({ kind: 'vgpu', count: 1, resource_class: 'VGPU' }));
-  const aliases = (specs['pci_passthrough:alias'] ?? '').split(',').filter((a) => a.split(':')[0]!.trim());
-  return [...vgpus, ...aliases.map((a): GpuDevice => ({ kind: 'passthrough', count: 1, alias: a.split(':')[0]!.trim() }))];
-}
-
 /**
  * Why no GPU mapping applies to a GPU VM, in the API's words (_gpu_mapping, SDD §22.4): a VMware device without a key, a
  * key no GPU mapping names, keys mapping to different flavors, an OpenStack flavor no mapping names, a mapping to a flavor
@@ -974,8 +967,7 @@ export function eligibility(
     if (independent.length) warm.push(`independent disk(s): ${diskIds(independent)}`);
     // vSphere takes no snapshot of a VM with a DirectPath I/O device, and the kit reads every copy from one; powered off,
     // its snapshot holds no device state - the API's rule (SDD §9.2, §22.6, plan task G5)
-    const gpus = vm.gpus?.length ? vm.gpus : gpuRequestsOf(vm.flavor_extra_specs);
-    const passthrough = gpus.filter((g) => g.kind === 'passthrough');
+    const passthrough = vmGpus(vm).filter((g) => g.kind === 'passthrough');
     if (passthrough.length) {
       const devices = gpuNames(passthrough);
       warm.push(`PCI passthrough device(s) ${devices}: vSphere takes no snapshot of a VM with one - power it off, validate it again and migrate it cold`);
@@ -1277,7 +1269,7 @@ export function preflight(
   const gpus = vm.gpus ?? [];
   const alias = vm.flavor_extra_specs['pci_passthrough:alias'];
   const passthrough = gpus.filter((g) => g.kind === 'passthrough');
-  const read = gpus.length ? gpus : gpuRequestsOf(vm.flavor_extra_specs);
+  const read = vmGpus(vm);
   const why = read.length ? gpuMappingWhy(vm, read, sourceKind, plan, context.flavors ?? [], context.gpuFlavors ?? [], where) : null;
   // a mapped flavor the destination lacks is MAP_FLAVOR_MISSING's alone, as the API's (SDD §22.4)
   const missing = read.length && context.flavors ? gpuMissingTargets(vm, read, sourceKind, plan, context.flavors, where) : [];

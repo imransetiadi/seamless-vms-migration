@@ -153,7 +153,7 @@ export function secondsBetween(
 }
 
 /** Python's order for str, by code point: JavaScript's default sort compares UTF-16 code units, which differs past U+FFFF. */
-function byCodePoint(a: string, b: string): number {
+export function byCodePoint(a: string, b: string): number {
   const x = Array.from(a, (c) => c.codePointAt(0)!);
   const y = Array.from(b, (c) => c.codePointAt(0)!);
   for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i]! - y[i]!;
@@ -189,6 +189,30 @@ const PY_STRIP = new RegExp(`^[${PY_SPACE}]+|[${PY_SPACE}]+$`, 'g');
 /** A text stripped as the API's Python strips it (str.strip): what the API judges blank is blank here too (review RV24-06). */
 export function pyStrip(text: string): string {
   return text.replace(PY_STRIP, '');
+}
+
+/** The whitespace Python's int() reads around a number: str.isspace's, but U+001C..U+001F - int() keeps an ASCII character as
+ * it is and skips only ASCII's own whitespace, where str.strip removes those four too. */
+const INT_SPACE = '\\t\\n\\v\\f\\r \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000';
+const PY_INT = new RegExp(`^[${INT_SPACE}]*([+-]?)(\\p{Nd}+(?:_\\p{Nd}+)*)[${INT_SPACE}]*$`, 'u');
+const DECIMAL = /^\p{Nd}$/u;
+
+/** A decimal digit's value in any script: Unicode assigns decimal digits in runs of ten, zero first. */
+function decimal(ch: string): number {
+  const code = ch.codePointAt(0)!;
+  let zero = code;
+  while (DECIMAL.test(String.fromCodePoint(zero - 1))) zero -= 1;
+  return (code - zero) % 10;
+}
+
+/** A text as Python's int() reads it - its whitespace around it, a sign, underscores between digits and any script's decimal
+ * digits -, else null: how Nova reads a flavor's amounts and counts (SDD §22.2, PR #64 review). */
+export function pyInt(text: string): number | null {
+  const match = PY_INT.exec(text);
+  if (!match) return null;
+  let n = 0;
+  for (const ch of match[2]!) if (ch !== '_') n = n * 10 + decimal(ch);
+  return match[1] === '-' ? -n : n;
 }
 
 /** A text's length as the API's Python counts it, in code points: an emoji is one where JavaScript's length counts its
