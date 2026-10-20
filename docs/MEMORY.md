@@ -151,7 +151,7 @@ agentmemory body and every Jev call passes (SDD §13.4; `test_redact_removes_sec
 → `[REDACTED PEM]`); the `auth` section of a `clouds.yaml` (YAML or JSON — a quoted string in a flow section read whole —, LF or CRLF
 line breaks, a comment after `auth:` → `auth: [REDACTED]`); credentials in URLs and connection strings
 (`scheme://user:password@host`, a password with `@` too, `Password=…;`); `Authorization` headers (the credential
-after any scheme, in JSON or a repr too — one token: the parameters of a Digest or AWS4 header after it stay) and bare `Bearer` tokens; `key=value`, `key: value` and
+after any scheme, a Digest or AWS4 header's parameter list whole, in JSON or a repr too) and bare `Bearer` tokens; `key=value`, `key: value` and
 `"key": "value"` assignments for password, passwd, pwd, secret, client secret, token, auth token, `x-auth-token`,
 API/access/secret/private key, credential(s) and authorization, the key possibly prefixed (`OS_PASSWORD`) — a quoted
 value whole with the characters the shell glues to it (`"a"b`), a YAML plain value of several words to its line's
