@@ -219,6 +219,8 @@ GpuDevice { kind: "vgpu"|"passthrough",  # a GPU of a VM or a flavor's GPU reque
             resource_class: str|null = null,    # OpenStack vGPU: the request group's class ("VGPU")
             traits: list[str] = [],             # OpenStack: the group's required traits, sorted
             forbidden_traits: list[str] = [],   # OpenStack: the group's forbidden traits, sorted
+            same_provider: bool = false,        # OpenStack vGPU: its group is a numbered one (resources<suffix>:),
+                                                # whose traits Placement checks on the GPU's own provider (§22.3)
             alias: str|null = null }            # OpenStack passthrough: the PCI alias
 
 VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: int, ram_mb: int,
@@ -2494,7 +2496,8 @@ the compute probe; a report without it leaves the role half unjudged there, and 
 version tuple, `(2, 104)`, reported as `"2.104"`), `""` when unreadable; `tls` is true when the provider's `endpoint`,
 the auth URL its credential is posted to (the `auth_url` of its `clouds.yaml` entry or of its credentials secret,
 §13.3) and the endpoint of each service Seamless calls (`identity`, `compute`, `block-storage`, `network`, `image`,
-each as keystoneauth reads it from the catalog) use https, and `plain_http` names those that do not (`endpoint` for
+each as keystoneauth reads it from the catalog, and on a destination `placement` once its check got an answer from it,
+§22.3) use https, and `plain_http` names those that do not (`endpoint` for
 the provider's own, `auth_url` for the credential's; one that cannot be read counts neither way, Security.md); a
 destination's check adds §10.1's `destination_release` keys -
 `release_range`, `release`, `support_tier` and `policy_profile`;
@@ -4515,6 +4518,10 @@ GpuDevice { kind: "vgpu"|"passthrough",
             resource_class: str|null = null,      # OpenStack vGPU: the request group's class ("VGPU", or a CUSTOM_ class)
             traits: list[str] = [],               # OpenStack: the group's required traits, sorted
             forbidden_traits: list[str] = [],     # OpenStack: the group's forbidden traits, sorted
+            same_provider: bool = false,          # OpenStack vGPU: a numbered group's (resources<suffix>:), whose
+                                                  # traits Placement checks on the GPU's own provider; false for the
+                                                  # unnumbered group's (resources:), checked across the GPU's
+                                                  # provider and the compute node's (§22.3; PR #62 review)
             alias: str|null = null }              # OpenStack passthrough: the PCI alias ("a100")
 
 VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source reports them
@@ -4538,8 +4545,9 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   function that the providers, the pre-flight and the destination inventory share:
   * each request group that asks for `VGPU` is a vGPU entry: `resources:VGPU=<n>` for the unnumbered group, and
     `resources<suffix>:VGPU=<n>` for a numbered one (the suffix `[A-Za-z0-9_-]`, as `VM_VGPU` reads it today). Its
-    `count` is n, its `resource_class` `VGPU`, and its `traits` and `forbidden_traits` are the group's
-    `trait<suffix>:<name>` entries set to `required` and `forbidden` (`trait:<name>` for the unnumbered group);
+    `count` is n, its `resource_class` `VGPU`, its `same_provider` true for a numbered group, and its `traits` and
+    `forbidden_traits` are the group's `trait<suffix>:<name>` entries set to `required` and `forbidden`
+    (`trait:<name>` for the unnumbered group);
   * `pci_passthrough:alias=<alias>:<n>[,<alias>:<n>…]` gives one passthrough entry per alias with its `count`;
   * a group that asks for a `CUSTOM_` resource class is a vGPU only when a vGPU profile is declared for its flavor
     (`Provider.gpu_profiles`, §22.3). Nova's `[mdev_<type>] mdev_class` gives a vGPU type such a class, and no API
@@ -4598,30 +4606,47 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
                 read_at: datetime|null,
                 pools: list[GpuPool] }
   GpuPool { resource_class: str, traits: list[str], forbidden_traits: list[str],   # what a GPU request asks Placement for
+            same_provider: bool, # its traits are a numbered request group's, held by the GPU's own provider; false
+                                 # for the unnumbered group's and for a class alone (below)
             free: int,           # the units free now on the providers below
             providers: int,      # resource providers that have at least one unit free
-            largest_free: int }  # the most units free on one of them - below n when the read again with <class>:<n>
+            largest_free: int,   # the most units free on one of them - below n when the read again with <class>:<n>
                                  # for a group of n > 1 units finds no provider (max_unit caps it, plan task G3)
+            detail: str|null }   # Placement refused the pool's request as a bad one (400): its HTTP status and
+                                 # Placement error code; the counts are then 0
   ```
 
-  There is one pool for each distinct vGPU request (its resource class with its required and forbidden traits) among the
-  destination's GPU flavors, and one for each resource class alone, which unites its pools (§22.5). A destination with
-  no vGPU flavor reads `ok` with no pools and sends Placement nothing. Each pool is one Placement request,
-  `GET /allocation_candidates?resources=<class>:1&required=<traits>` (a forbidden trait as `!<trait>`), at
-  microversion 1.29, which every series of the window serves (§21.1). Its `provider_summaries` give each provider's
-  `capacity` (Placement's `(total - reserved) × allocation_ratio`) and `used` per class, its traits and its root. A
-  provider counts when it holds the class and the pool's traits, lacks the forbidden ones, and its root provider lacks
-  `COMPUTE_STATUS_DISABLED` (a disabled compute service, which Nova's own requests forbid). Its free is its capacity
-  less its used. A request group of n > 1 units needs one provider with n free (Nova fills a group from one provider),
-  and an inventory's `max_unit` may cap that below the provider's free: the pool is read once more with `<class>:<n>`
-  for each such n, and a group fits only where that read finds a provider.
+  There is one pool for each distinct vGPU request with traits (its resource class with its required and forbidden
+  traits, and whether its group is numbered) among the destination's GPU flavors, and one for each resource class
+  alone, which unites its pools (§22.5) and is the pool of a request without traits. A destination with no vGPU flavor
+  reads `ok` with no pools and sends Placement nothing. The pools are read with
+  `GET /allocation_candidates?resources=<class>:1` at microversion 1.29, which every series of the window serves
+  (§21.1): a numbered group's pool adds `&required=<traits>` (a forbidden trait as `!<trait>`), and a class alone and
+  its unnumbered groups' pools share one answer. Its `provider_summaries` give each provider's `capacity` (Placement's
+  `(total - reserved) × allocation_ratio`) and `used` per class, its traits and its root. A provider counts when it
+  holds the class, its root provider lacks `COMPUTE_STATUS_DISABLED` (a disabled compute service, which Nova's own
+  requests forbid), and the pool's traits hold as Placement checks them for Nova's request: on the provider itself for
+  a numbered group (Placement's same-provider rule); for the unnumbered group, across the providers its allocation
+  takes from - the GPU's and its root, the compute node Nova's unnumbered group takes VCPU and MEMORY_MB from -, so a
+  required trait of either counts and a forbidden trait of either excludes the provider (Placement's
+  `_check_traits_for_alloc_request`). A request for the class alone would have Placement check them on the GPU's
+  provider alone, which is why an unnumbered group's traits are not sent (PR #62 review). Its free is its capacity
+  less its used, never below 0. A request group of n > 1 units needs one provider with n free (Nova fills a group from
+  one provider), and an inventory's `max_unit` may cap that below the provider's free: the pool is read once more with
+  `<class>:<n>` for each such n, and a group fits only where that read finds a provider that counts.
 * Placement's default policy gives these reads to `admin` (`TODO(LAB): confirm` per series, §22.14). A credential
   Placement refuses (403) reads `unknown`, reason `forbidden`; a catalog without Placement reads `no_placement`; any
-  other failure reads `error`. None of them is a guess, and none fails the inventory or the check. A PCI alias request
+  other failure reads `error`. None of them is a guess, and none fails the inventory or the check. A pool whose request
+  Placement refuses as a bad one (400: a trait or a resource class it does not know) has its `detail` set and counts
+  nothing - Nova's request for it is refused alike, so no server is created with it -, and the other pools are read.
+  A Placement that does not answer (a connection, or its version discovery, fails or times out) is not asked again by
+  the same provider for 5 minutes: each read until then reads `unknown`, reason `error`, with that failure's kind, at
+  once, so an endpoint that accepts connections and never answers costs one wait, not one per read. A PCI alias request
   has no pool: the device class its alias asks for lives in nova.conf, so its capacity is unknown whatever Placement
   answers (`DST_GPU_CAPACITY_UNKNOWN`, §22.5).
 * The read keeps counts only. Placement names a GPU's provider after its compute host (`<host>_pci_<address>`) and
-  gives it a uuid, and the read keeps neither (§22.12).
+  gives it a uuid, and the read keeps neither (§22.12). It asks keystoneauth to log none of its requests and answers
+  (`log=False`): at a DEBUG level keystoneauth writes each answer's body, provider uuids and error texts included.
 * `DestinationProvider` (§10) gains `gpu_capacity(requests: list[GpuDevice]) -> GpuCapacity`, which reads the pools of
   the given requests only (the cutover gate's read, §22.7), and `server_allocations(server_id) -> dict[str, int] | None`,
   the units the server holds per resource class (`GET /allocations/{server_id}`, summed over its providers), None when
@@ -4835,7 +4860,7 @@ Binding in §13.4 with plan task G3:
 * Placement's resource providers are the destination's compute hosts, named after them (`<host>_pci_<address>`) and
   identified by uuids: customer data. The capacity read keeps counts only (§22.3), and `GpuCapacity.detail`,
   `GpuWait.reason` and the verification's GPU checks name a failure by its HTTP status and Placement error code, never
-  by Placement's message text. So no document, event, log line of the control plane, finding, verification detail or
+  by Placement's message text. So no document, event, log line of the control plane (keystoneauth's among them, §22.3), finding, verification detail or
   advisor payload holds a provider's name or uuid, and none can reach Jev or agentmemory unredacted. A test gives a fake
   Placement providers named after hosts and asserts that none of those names or uuids reaches the inventory, the check
   report, `gpu_wait`, the events or the verification record.
