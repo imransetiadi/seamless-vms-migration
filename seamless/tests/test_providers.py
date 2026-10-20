@@ -8,6 +8,7 @@ import pytest
 
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole
+from seamless_migrate.domain.models import GpuDevice
 from seamless_migrate.planning.platforms import destination_release
 from seamless_migrate.planning.preflight import DestinationInventory, SourceInventory, is_legacy_os
 from seamless_migrate.providers import registry
@@ -339,6 +340,41 @@ def stub_openstack(monkeypatch):
         return calls
 
     return install
+
+
+async def test_openstack_source_reports_the_gpus_its_flavor_asks_for(stub_openstack, tmp_path):
+    """SDD §22.2 (plan task G2): an OpenStack VM's gpus are its flavor's requests as gpu_requests
+    reads them, with the profile its provider declares for the flavor - a CUSTOM_ class is a vGPU
+    by that declaration, and the alias beside it keeps no profile."""
+    clouds = tmp_path / "clouds.yaml"
+    clouds.write_text(
+        "clouds:\n  src:\n    auth:\n      auth_url: https://keystone.example/v3\n"
+        "      username: admin\n      password: pw\n      project_name: finance\n"
+    )
+    conn = fake_conn()
+    [server] = conn.compute.servers(details=True)
+    server.flavor["extra_specs"] = {
+        "resources1:CUSTOM_NVIDIA_A100_4C": "1",
+        "trait1:CUSTOM_GPU_A100": "required",
+        "pci_passthrough:alias": "a100:2",
+    }
+    stub_openstack(conn)
+    declared = make_provider(gpu_profiles={"m1.small": "A100-4C"})
+    [vm] = await OpenStackProvider(declared, settings(clouds_yaml=clouds)).list_vms()
+    assert vm.gpus == [
+        GpuDevice(
+            kind="vgpu",
+            profile="A100-4C",
+            resource_class="CUSTOM_NVIDIA_A100_4C",
+            traits=["CUSTOM_GPU_A100"],
+        ),
+        GpuDevice(kind="passthrough", alias="a100", count=2),
+    ]
+    # without the declaration the custom class is no GPU; the flavor's specs stay as they were
+    stub_openstack(conn)
+    [plain] = await OpenStackProvider(make_provider(), settings(clouds_yaml=clouds)).list_vms()
+    assert plain.gpus == [GpuDevice(kind="passthrough", alias="a100", count=2)]
+    assert plain.flavor_extra_specs["pci_passthrough:alias"] == "a100:2"
 
 
 async def test_openstack_provider_maps_server_to_vmref(stub_openstack, tmp_path):
@@ -1611,51 +1647,119 @@ def provider_for_plain(tmp_path, vm):
     )
 
 
-async def test_vmware_pci_and_vgpu_devices_become_blocking_extra_specs(tmp_path):
-    """SDD §9.3 VM_PCI_PASSTHROUGH / VM_VGPU key off extra specs: the provider reports the
-    VMware device classes that way."""
+class VirtualPCIPassthrough:
+    """A vCenter VirtualPCIPassthrough device with the given backing (SDD §22.2)."""
+
+    def __init__(self, backing, label="PCI device 0"):
+        self.key = 13000
+        self.deviceInfo = NS(label=label)
+        self.backing = backing
+
+
+GPU_VIM = NS(
+    VirtualMachine=VirtualMachine,
+    vm=NS(
+        device=NS(
+            VirtualDisk=VirtualDisk,
+            VirtualEthernetCard=VirtualEthernetCard,
+            VirtualPCIPassthrough=VirtualPCIPassthrough,
+        )
+    ),
+)
+
+
+async def _vmware_vm_with(tmp_path, *backings):
+    """The VM the VMware provider lists for a vCenter VM with a VirtualPCIPassthrough device per
+    backing, in that order."""
     secret_dir = tmp_path / "secrets" / "vcenter-dc2"
-    secret_dir.mkdir(parents=True)
+    secret_dir.mkdir(parents=True, exist_ok=True)
     (secret_dir / "username").write_text("u")
     (secret_dir / "password").write_text("p")
-
-    class VirtualPCIPassthrough:
-        def __init__(self, label, vgpu=None):
-            self.key = 13000
-            self.deviceInfo = NS(label=label)
-            self.backing = NS(vgpu=vgpu)
-
-    vim = NS(
-        VirtualMachine=VirtualMachine,
-        vm=NS(
-            device=NS(
-                VirtualDisk=VirtualDisk,
-                VirtualEthernetCard=VirtualEthernetCard,
-                VirtualPCIPassthrough=VirtualPCIPassthrough,
-            )
+    vm = fake_vcenter_vm()
+    for index, backing in enumerate(backings):
+        vm.config.hardware.device.append(VirtualPCIPassthrough(backing, f"PCI device {index}"))
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
         ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda **_: fake_service_instance([vm]),
+        vim=GPU_VIM,
     )
-    pci = fake_vcenter_vm()
-    pci.config.hardware.device.append(VirtualPCIPassthrough("PCI device 0"))
-    vgpu = fake_vcenter_vm()
-    vgpu.config.instanceUuid = "5012-vgpu"
-    vgpu.config.hardware.device.append(VirtualPCIPassthrough("PCI device 1", vgpu="grid_t4-8q"))
+    [listed] = await provider.list_vms()
+    return listed
 
-    def provider_for(vms):
-        return VMwareProvider(
-            make_provider(
-                id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
-            ),
-            settings(secrets_dir=tmp_path / "secrets"),
-            connector=lambda **_: fake_service_instance(vms),
-            vim=vim,
-        )
 
-    listed = {v.source_id: v for v in await provider_for([pci, vgpu]).list_vms()}
-    assert listed["5012-abcd"].flavor_extra_specs == {"pci_passthrough:alias": "PCI device 0"}
-    assert listed["5012-vgpu"].flavor_extra_specs == {"resources:VGPU": "1"}
-    plain = await provider_for([fake_vcenter_vm()]).list_vms()
-    assert plain[0].flavor_extra_specs == {}
+async def test_vmware_reports_a_vgpu_by_its_profile(tmp_path):
+    """SDD §22.2 (plan task G2): a device with a VmiopBackingInfo is a vGPU, its profile the
+    backing's vgpu string as vCenter reports it."""
+    vm = await _vmware_vm_with(tmp_path, NS(vgpu="grid_t4-8q"))
+    assert vm.gpus == [GpuDevice(kind="vgpu", profile="grid_t4-8q")]
+
+
+async def test_vmware_reports_a_mig_backed_vgpu_profile_as_vcenter_names_it(tmp_path):
+    """SDD §22.2 (plan task G2): a MIG-backed vGPU is a vGPU too, its profile kept as vCenter
+    names it - slices and framebuffer in the name."""
+    vm = await _vmware_vm_with(tmp_path, NS(vgpu="grid_a100-3-20c"))
+    assert vm.gpus == [GpuDevice(kind="vgpu", profile="grid_a100-3-20c")]
+
+
+async def test_vmware_reports_a_directpath_device_by_its_vendor_and_device_ids(tmp_path):
+    """SDD §22.2 (plan task G2): a DirectPath I/O device (DeviceBackingInfo) is a passthrough
+    device with its PCI vendor and device ids, four lower-case hex digits each."""
+    vm = await _vmware_vm_with(tmp_path, NS(vendorId=0x10DE, deviceId="20B5", id="0000:3b:00.0"))
+    assert vm.gpus == [GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5")]
+
+
+async def test_vmware_reads_a_negative_short_vendor_id_modulo_2_16(tmp_path):
+    """SDD §22.2 (plan task G2): vSphere sends vendorId as a signed 16-bit value, so Intel's
+    0x8086 arrives as -32634: it is read modulo 2^16."""
+    vm = await _vmware_vm_with(tmp_path, NS(vendorId=0x8086 - 0x10000, deviceId="56c0"))
+    assert vm.gpus == [GpuDevice(kind="passthrough", vendor_id="8086", device_id="56c0")]
+
+
+async def test_vmware_reports_a_dynamic_directpath_device_by_its_first_allowed_device(tmp_path):
+    """SDD §22.2 (plan task G2): a Dynamic DirectPath I/O device (DynamicBackingInfo) is a
+    passthrough device with the ids of the first of its allowed devices."""
+    allowed = [NS(vendorId=0x10DE, deviceId=0x20B5), NS(vendorId=0x10DE, deviceId=0x2236)]
+    vm = await _vmware_vm_with(tmp_path, NS(allowedDevice=allowed))
+    assert vm.gpus == [GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5")]
+
+
+async def test_vmware_counts_identical_gpus_as_one_entry(tmp_path):
+    """SDD §22.2 (plan task G2): devices of one VM that share kind, profile and ids are one entry
+    with their count, in the order vCenter lists them."""
+    vm = await _vmware_vm_with(
+        tmp_path,
+        NS(vgpu="grid_a100-4c"),
+        NS(vendorId=0x10DE, deviceId="20b5"),
+        NS(vgpu="grid_a100-4c"),
+        NS(vgpu="grid_a100-8c"),
+    )
+    assert vm.gpus == [
+        GpuDevice(kind="vgpu", profile="grid_a100-4c", count=2),
+        GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5"),
+        GpuDevice(kind="vgpu", profile="grid_a100-8c"),
+    ]
+
+
+async def test_vmware_reports_an_unknown_passthrough_backing_without_ids(tmp_path):
+    """SDD §22.2 (plan task G2): any other backing - vSphere 8's DVX backing among them - is a
+    passthrough device without ids, which no GPU mapping can name (§22.5)."""
+    vm = await _vmware_vm_with(tmp_path, NS(deviceClass="nvidia-dvx", configParams=[]))
+    assert vm.gpus == [GpuDevice(kind="passthrough")]
+
+
+async def test_vmware_writes_no_gpu_extra_specs(tmp_path):
+    """SDD §22.2 (plan task G2): the provider wrote resources:VGPU and pci_passthrough:alias into
+    flavor_extra_specs so that §9.3's two GPU rows fired; they read gpus now, and a VMware VM has
+    no flavor."""
+    vm = await _vmware_vm_with(
+        tmp_path, NS(vgpu="grid_t4-8q"), NS(vendorId=0x10DE, deviceId="20b5")
+    )
+    assert (vm.flavor_extra_specs, len(vm.gpus)) == ({}, 2)
+    plain = await _vmware_vm_with(tmp_path)
+    assert (plain.flavor_extra_specs, plain.gpus) == ({}, [])
 
 
 async def test_vmware_requires_credentials_secret():
