@@ -77,13 +77,23 @@ class FileSecretStore:
     def read(self, name: str) -> dict[str, str] | None:
         _check(name)
         directory = self.root / name
-        if not directory.is_dir():
+        try:
+            os.stat(directory)  # raises for a root it may not search, on every Python
+            if not directory.is_dir():
+                return None
+            return {
+                entry.name: entry.read_text(encoding="utf-8").strip()
+                for entry in sorted(directory.iterdir())
+                if not entry.name.startswith(".") and _KEY.match(entry.name) and entry.is_file()
+            }
+        except FileNotFoundError:
             return None
-        return {
-            entry.name: entry.read_text(encoding="utf-8").strip()
-            for entry in sorted(directory.iterdir())
-            if not entry.name.startswith(".") and _KEY.match(entry.name) and entry.is_file()
-        }
+        except OSError as exc:
+            # a directory the store cannot search or read is a store it cannot reach, as one it
+            # cannot write (SDD §13.3, PR #58 review)
+            raise SecretStoreError(
+                f"cannot read {name} from the secret store at {self.root}: {exc.strerror}"
+            ) from None
 
     @contextlib.contextmanager
     def _locked(self, name: str) -> Iterator[None]:
@@ -134,7 +144,11 @@ class FileSecretStore:
     def delete(self, name: str) -> None:
         _check(name)
         try:
-            if not (self.root / name).exists():
+            try:
+                # os.lstat, not Path.exists(): on Python 3.14 that reads a root this process may
+                # not search as "already gone" (PR #58 review)
+                os.lstat(self.root / name)
+            except FileNotFoundError:
                 return  # one already gone is no error
             with self._locked(name), contextlib.suppress(FileNotFoundError):
                 shutil.rmtree(self.root / name)

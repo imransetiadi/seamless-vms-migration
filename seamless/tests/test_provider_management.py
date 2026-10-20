@@ -621,6 +621,8 @@ def test_a_provider_deletion_whose_store_cannot_be_searched_or_built_is_audited_
     root = api.settings.secrets_dir
     if failure == "unbuildable_store":
         monkeypatch.setattr(routes_providers, "secret_store", _unbuildable_store)
+    elif os.geteuid() == 0:
+        pytest.skip("root searches a directory of mode 000")
     else:
         os.chmod(root, 0o000)
     try:

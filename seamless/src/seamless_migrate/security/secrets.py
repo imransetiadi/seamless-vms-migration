@@ -9,6 +9,7 @@ Secret material handed to subprocesses is written to 0600 files that are removed
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 from collections.abc import Iterator, Mapping
@@ -34,6 +35,9 @@ def valid_secret_name(name: str) -> bool:
     return bool(_NAME.fullmatch(name)) and name not in (".", "..")
 
 
+log = logging.getLogger(__name__)
+
+
 def _env_prefix(name: str) -> str:
     return "SEAMLESS_SECRET_" + re.sub(r"[^A-Za-z0-9]", "_", name).upper() + "_"
 
@@ -47,12 +51,21 @@ def read_secret(
         raise SecretNotFound(f"invalid secret name {name!r}")
     values: dict[str, str] = {}
     directory = Path(settings.secrets_dir) / name
-    if directory.is_dir():
-        for entry in sorted(directory.iterdir()):
-            # Kubernetes secret volumes add hidden ..data symlinks; skip anything not key-like.
-            if entry.name.startswith(".") or not _KEY.match(entry.name) or not entry.is_file():
-                continue
-            values[entry.name] = entry.read_text(encoding="utf-8").strip()
+    try:
+        os.stat(directory)  # raises for a directory it may not search, on every Python
+        if directory.is_dir():
+            for entry in sorted(directory.iterdir()):
+                # Kubernetes secret volumes add hidden ..data symlinks; skip anything not key-like.
+                if entry.name.startswith(".") or not _KEY.match(entry.name) or not entry.is_file():
+                    continue
+                values[entry.name] = entry.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        # a directory this process may not search or read holds nothing it can use: the
+        # Kubernetes store and the variables come next (SDD §13.3, PR #58 review)
+        log.warning("cannot read secret %s under %s: %s", name, settings.secrets_dir, exc.strerror)
+        values = {}
     if not values and settings.secret_store == "kubernetes":
         from .secret_store import KubernetesSecretStore, SecretStoreError, kubernetes_name
 
@@ -105,9 +118,11 @@ def resolve_private_key(name: str, settings: Settings, env: Mapping[str, str] | 
     if not name or not valid_secret_name(name):
         raise SecretNotFound(f"invalid secret name {name!r}")
     path = Path(settings.secrets_dir) / name / "private_key"
-    if path.is_file():
-        key = path.read_text(encoding="utf-8")
-    else:
+    try:
+        key = path.read_text(encoding="utf-8") if path.is_file() else ""
+    except OSError:
+        key = ""  # one it may not read: read_secret's order says where it is (SDD §13.3)
+    if not key:
         key = read_secret(name, settings, env).get("private_key", "")
     if not key.strip():
         raise SecretNotFound(f"secret {name!r} has no private_key")

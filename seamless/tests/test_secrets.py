@@ -4,13 +4,18 @@ import stat
 import pytest
 
 from seamless_migrate.config import Settings
+from seamless_migrate.security.secret_store import FileSecretStore, SecretStoreError
 from seamless_migrate.security.secrets import (
     SecretNotFound,
     load_cloud_auth,
     resolve,
+    resolve_private_key,
     secret_files,
     write_secret_file,
 )
+
+#: a directory the process may not search: root searches every one
+_UNREADABLE = pytest.mark.skipif(os.geteuid() == 0, reason="root reads a directory of mode 000")
 
 
 def test_secret_resolution_file_then_env(tmp_path):
@@ -89,3 +94,56 @@ def test_secret_name_rejects_path_traversal(tmp_path):
     for bad in ("../../etc/passwd", "..", ".", "a/b", "/etc/shadow", "", "x" * 129, "-leading"):
         with pytest.raises(SecretNotFound):
             resolve(bad, settings, env={})
+
+
+@_UNREADABLE
+@pytest.mark.parametrize("unreadable", ["secret", "root"])
+def test_a_secrets_directory_this_process_may_not_read_falls_back_to_the_variables(
+    tmp_path, unreadable
+):
+    """SDD §13.3 (PR #58 review): the readers raised a bare PermissionError at a secrets
+    directory this process may not search - mode 000, another UID's 0700 directory - so the
+    SEAMLESS_SECRET_* variables were never read, and the providers' and steps' SecretNotFound
+    handling never saw the error. Such a directory holds nothing usable: the variables come next,
+    and a secret found nowhere is SecretNotFound."""
+    settings = Settings(secrets_dir=tmp_path / "secrets")
+    secret = tmp_path / "secrets" / "provider-x"
+    secret.mkdir(parents=True)
+    (secret / "username").write_text("file-user")
+    (secret / "password").write_text("file-pass")
+    blocked = secret if unreadable == "secret" else tmp_path / "secrets"
+    env = {
+        "SEAMLESS_SECRET_PROVIDER_X_USERNAME": "env-user",
+        "SEAMLESS_SECRET_PROVIDER_X_PASSWORD": "env-pass",
+        "SEAMLESS_SECRET_PROVIDER_X_PRIVATE_KEY": "env-key",
+    }
+    os.chmod(blocked, 0)
+    try:
+        assert resolve("provider-x", settings, env=env) == {
+            "username": "env-user",
+            "password": "env-pass",
+            "private_key": "env-key",
+        }
+        assert resolve_private_key("provider-x", settings, env=env) == "env-key\n"
+        with pytest.raises(SecretNotFound):
+            resolve("provider-x", settings, env={})
+    finally:
+        os.chmod(blocked, 0o700)
+
+
+@_UNREADABLE
+def test_a_file_store_this_process_may_not_read_or_search_answers_as_unavailable(tmp_path):
+    """SDD §13.3 (PR #58 review): FileSecretStore.read raised a bare PermissionError, and on
+    Python 3.14 delete read an unsearchable root as "already gone" - Path.exists() no longer
+    raises there - and left the secret on disk unreported. Both are a store it cannot reach."""
+    store = FileSecretStore(tmp_path / "secrets")
+    store.write("provider-x", {"password": "p"}, {})
+    os.chmod(tmp_path / "secrets", 0)
+    try:
+        with pytest.raises(SecretStoreError):
+            store.read("provider-x")
+        with pytest.raises(SecretStoreError):
+            store.delete("provider-x")
+    finally:
+        os.chmod(tmp_path / "secrets", 0o700)
+    assert store.read("provider-x") == {"password": "p"}
