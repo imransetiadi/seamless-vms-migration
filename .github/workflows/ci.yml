@@ -130,7 +130,7 @@ jobs:
             echo "audit material in the artifact"; exit 1
           fi
           echo "COLLECTION_DIST=$work/dist" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: collection-tarball
           path: ${{ env.COLLECTION_DIST }}/os_migrate-os_migrate-*.tar.gz
@@ -157,7 +157,7 @@ jobs:
       - run: npm run build
       - name: Production dependency audit (S-18)
         run: npm audit --omit=dev --audit-level=high
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dashboard-dist
           path: dashboard/dist
@@ -228,7 +228,7 @@ jobs:
         env:
           SHOT_DIR: ${{ runner.temp }}/demo07
         run: mkdir -p "$SHOT_DIR" && SEAMLESS=seamless node ../tests/e2e/demo-overview-browser.mjs
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: playwright-report
@@ -371,7 +371,7 @@ jobs:
           scan-type: image
           format: cyclonedx
           output: sbom.cdx.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom
           path: sbom.cdx.json
