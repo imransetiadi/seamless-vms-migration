@@ -491,7 +491,7 @@ SEAMLESS_COMPOSE_NOENV = env POSTGRES_PASSWORD=unused JEV_MCP_AUTH_TOKEN=unused 
 .PHONY: seamless-help seamless-colima-up seamless-check-context seamless-check-env seamless-init \
         seamless-up seamless-demo seamless-down seamless-stop seamless-start seamless-restart \
         seamless-ps seamless-logs seamless-reset \
-        seamless-test seamless-check dashboard-build lab-handover deploy-runtime-check
+        seamless-test seamless-check seamless-doctor dashboard-build lab-handover deploy-runtime-check
 
 seamless-help:
 	@echo "Seamless Migrate stack (engine '$(SEAMLESS_ENGINE)', host $(SEAMLESS_HOST_OS); Docker context '$(SEAMLESS_DOCKER_CONTEXT)'):"
@@ -512,6 +512,7 @@ seamless-help:
 	@echo "  lab-handover        - storage handover against the lab clouds (SEAMLESS_LAB_*; read-only unless SEAMLESS_LAB_DESTRUCTIVE=1)"
 	@echo "  dashboard-build     - build the dashboard (cd dashboard && npm ci && npm run build)"
 	@echo "  seamless-check      - CI's checks that need only the venv and node_modules: tests with the coverage gate, ruff, DEMO-07, collection tests, ansible-test sanity, playbook syntax, ansible-lint, installed scanners, dashboard; not the Playwright suite, the browser journeys, PostgreSQL, the audits, trivy, the manifest or image jobs (see the README)"
+	@echo "  seamless-doctor     - read-only check of this machine against the repository's pins (Python, Node.js, gitleaks, ruff, actionlint, shellcheck, the venv, node_modules, the pre-commit hook, the engine); names each fix"
 	@echo "  deploy-runtime-check - run PostgreSQL (and the control-plane image, when built) the way the cluster manifests do: read-only, arbitrary UID"
 
 # Start (or create) the dedicated Colima profile; idempotent. Colima activates the context of the profile it
@@ -685,6 +686,10 @@ seamless-check:
 	@if command -v shellcheck >/dev/null; then shellcheck -S warning scripts/*.sh tests/e2e/*.sh; \
 	else echo "shellcheck not installed: skipped"; fi
 	cd dashboard && npm run typecheck && npm run lint && npm test && npm run build
+
+# Read-only: this machine against what the repository pins, each pin read from the file that sets it (SDD 17.1).
+seamless-doctor:
+	@scripts/seamless-doctor.sh
 
 dashboard-build:
 	@command -v npm >/dev/null 2>&1 || { echo "npm (Node 22) is required"; exit 1; }

@@ -28,6 +28,7 @@ from .domain.models import (
     PlanCreate,
     Provider,
     VMRef,
+    to_utc,
     utcnow,
 )
 from .planning.estimator import EstimatorParams, estimate, invalid_estimator_overrides
@@ -595,7 +596,7 @@ def cmd_events_export(args: argparse.Namespace, settings: Settings) -> int:
 def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
     """Delete events older than a date or an age; refuses without ``--confirm`` (SDD §15)."""
     import math
-    from datetime import UTC, datetime, timedelta
+    from datetime import datetime, timedelta
 
     now = utcnow()
     if args.before:
@@ -604,8 +605,16 @@ def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
         except ValueError:
             print(f"error: --before {args.before!r} is no ISO date and time", file=sys.stderr)
             return 2
-        if before.tzinfo is None:
-            before = before.replace(tzinfo=UTC)  # a --before without an offset is UTC
+        try:
+            before = to_utc(before)  # a --before without an offset is UTC
+        except ValueError:
+            # an offset moving it past year 1 or 9999 in UTC: a refused argument, never a
+            # traceback (SDD §15, review RV52-S4)
+            print(
+                f"error: --before {args.before!r} is outside years 1 to 9999 in UTC",
+                file=sys.stderr,
+            )
+            return 2
     elif args.older_than_days is not None:
         days = float(args.older_than_days)
         if not math.isfinite(days) or days < 0:

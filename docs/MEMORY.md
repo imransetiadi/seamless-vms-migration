@@ -148,13 +148,20 @@ never a dump of logs, console output or API payloads.**
 Redaction rule classes implemented by `redact(text, redact_names=None)` in `ai/redaction.py`, the one layer every
 agentmemory body and every Jev call passes (SDD §13.4; `test_redact_removes_secrets` and the reviewed snapshot
 `test_a_fixture_of_fake_secrets_redacts_to_the_reviewed_snapshot` cover them): PEM blocks (`-----BEGIN … -----END …`
-→ `[REDACTED PEM]`); the `auth` section of a `clouds.yaml` (YAML or JSON → `auth: [REDACTED]`); credentials in URLs
-and connection strings (`scheme://user:password@host`, a password with `@` too, `Password=…;`); `Authorization`
-headers and bare `Bearer` tokens; `key=value`, `key: value` and `"key": "value"` assignments for password, passwd,
-pwd, secret, client secret, token, auth token, `x-auth-token`, API/access/secret/private key and credential(s),
-the key possibly prefixed (`OS_PASSWORD`); and well-known token shapes — Seamless API tokens (`smg_…`), Keystone
+→ `[REDACTED PEM]`); the `auth` section of a `clouds.yaml` (YAML or JSON — a quoted string in a flow section read whole —, LF or CRLF
+line breaks, a comment after `auth:` → `auth: [REDACTED]`); credentials in URLs and connection strings
+(`scheme://user:password@host`, a password with `@` too, `Password=…;`); `Authorization` headers (the credential
+after any scheme, a Digest or AWS4 header's parameter list whole, in JSON or a repr too) and bare `Bearer` tokens; `key=value`, `key: value` and
+`"key": "value"` assignments for password, passwd, pwd, secret, client secret, token, auth token, `x-auth-token`,
+API/access/secret/private key, credential(s) and authorization, the key possibly prefixed (`OS_PASSWORD`) — a quoted
+value whole with the characters the shell glues to it (`"a"b`), a YAML plain value of several words to its line's
+end, and never past its item: not into the next list item's key, nor across a JSON-escaped line break; CLI flags
+(`--os-password x`: a quoted value with the rest of its word, or an argv list's next item, as in a
+`CalledProcessError`);
+and well-known token shapes — Seamless API tokens (`smg_…`), Keystone
 Fernet tokens (`gAAAAA…`), JWTs (`eyJ….….…`), AWS access key ids, GitHub tokens, `sk-` keys and Slack tokens.
-Matches become `[REDACTED]`; `redact_payload` also replaces the whole value of a credential key. Redaction is pattern-based: it does **not** remove hostnames, IP addresses or business-sensitive
+Matches become `[REDACTED]`, and a `[REDACTED]` already written stays as it is; `redact_payload` also replaces the
+whole value of a credential key (an `Authorization` key's too). Redaction is pattern-based: it does **not** remove hostnames, IP addresses or business-sensitive
 words that appear in an error message — treat the memory server as an internal system and prefer
 `SEAMLESS_MEMORY_REDACT_NAMES=true` whenever the server is shared (§3.6).
 
@@ -268,7 +275,11 @@ On a Linux machine's own Docker Engine (`SEAMLESS_DOCKER_CONTEXT=default`) the M
 `deploy/compose/compose.linux-host.yaml`, which maps `host.docker.internal` to the host gateway (SDD §17.1); pass it
 with `-f` when you run `docker compose` yourself. agentmemory on that host must then listen on an address the
 containers reach — the bridge's (`172.17.0.1` by default), or all addresses behind a firewall — not on `127.0.0.1`
-only. Colima and Docker Desktop resolve the name themselves.
+only. Colima and Docker Desktop resolve the name themselves. The server binds `127.0.0.1` (its `iii-config.yaml`), so
+the least exposed way is a forwarder on the bridge address alone, kept running by the init system, for example a
+systemd unit whose `ExecStart` is `/usr/bin/socat TCP-LISTEN:3111,bind=172.17.0.1,reuseaddr,fork TCP:127.0.0.1:3111`
+(with `After=docker.service`, as the bridge exists only once Docker runs). `make seamless-doctor` checks the
+server from the host and, on a Linux machine's own engine, from a container (SDD §17.1).
 
 ### 4.3 OpenShift
 

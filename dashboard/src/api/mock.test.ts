@@ -1442,6 +1442,39 @@ describe('mock API', () => {
     expect(server.events.slice(before).filter((e) => e.kind === 'plan.cancelled')).toHaveLength(1);
   });
 
+  it('refuses a plan cancel body the API refuses, and bounds the reason sent, not the one each migration records (SDD §12, PR #58 review)', () => {
+    const cancel = (body: Record<string, unknown>) => {
+      const server = new MockServer({ now: () => NOW, seed: 1 });
+      return server.handle('POST', '/plans/plan-c81d44a0/cancel', new URLSearchParams(), body, 'operator');
+    };
+    expect(cancel({ reason: 42 })).toMatchObject({ status: 422, body: { error: { message: 'reason: Input should be a valid string' } } });
+    expect(cancel({ reason: 'x'.repeat(2001) })).toMatchObject({ status: 422, body: { error: { message: 'reason: String should have at most 2000 characters' } } });
+    expect(cancel({ comment: 'x' })).toMatchObject({ status: 422, body: { error: { message: 'comment: Extra inputs are not permitted' } } });
+    // each migration records "plan cancelled: " and the reason, longer than 2000: the API keeps it
+    expect(cancel({ reason: 'x'.repeat(2000) }).status).toBe(200);
+  });
+
+  it('names the attempts a retry wrote in its event, like the API (SDD §5.1, review RV52-O6, PR #58 review)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const failed = server.migrations.find((m) => m.phase === 'failed')!;
+    const before = server.events.length;
+    expect(server.handle('POST', `/migrations/${failed.id}/retry`, new URLSearchParams(), {}, 'operator').status).toBe(200);
+    const [event] = server.events.slice(before).filter((e) => e.kind === 'migration.action');
+    expect(event?.data).toEqual({ action: 'retry', attempts: failed.attempts });
+  });
+
+  it("keeps a plan cancel's reason as Python's strip leaves it, like the API (SDD §12, review RV52-S3)", () => {
+    const reasonOf = (sent: string) => {
+      const server = new MockServer({ now: () => NOW, seed: 1 });
+      const before = server.events.length;
+      expect(server.handle('POST', '/plans/plan-c81d44a0/cancel', new URLSearchParams(), { reason: sent }, 'operator').status).toBe(200);
+      return server.events.slice(before).find((e) => e.kind === 'plan.cancelled')!.data.reason;
+    };
+    // NEL (U+0085) is white space to Python's strip, not to JavaScript's trim
+    expect(reasonOf('  late window\u0085 ')).toBe('late window');
+    expect(reasonOf(' \u0085\u2028 ')).toBeNull();
+  });
+
   it('cancels a removed VM\u2019s failed migration at validation like the API, unless its cutover stopped the source (SDD §5.4)', () => {
     const { server } = setup('operator');
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;

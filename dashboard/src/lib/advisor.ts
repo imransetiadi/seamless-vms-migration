@@ -177,18 +177,24 @@ export function waitingDecision(m: Pick<Migration, 'advisor_hold' | 'phase'>): s
 }
 
 /**
- * Whether a person may decide on `rec` now, for a migration that has not started (SDD §14.6): the recommendation its hold
- * names while it holds one - written with it, whatever its time after the clock stepped back (review RV50-09) -, else
- * its newest.
+ * The id of the recommendation a person's decision on `migration` acts on, the API's own choice (SDD §14.6): the one its
+ * hold names, else the one its last validation stored - both written with it, whatever their time after the clock stepped
+ * back (reviews RV50-09, RV51-08) -, else `newestId`. Every view that names that decision asks here (PR #58 review).
  */
+export function decidingRecommendationId(
+  migration: Pick<Migration, 'advisor_hold' | 'last_recommendation'>,
+  newestId: string | undefined,
+): string | undefined {
+  return migration.advisor_hold || migration.last_recommendation || newestId || undefined;
+}
+
+/** Whether a person may decide on `rec` now, for a migration that has not started (SDD §14.6). */
 export function decidable(rec: AdvisorRecommendation, migration: Migration | undefined, newestId: string | undefined): migration is Migration {
   return (
     !rec.legacy &&
     rec.decision_type === 'migration_strategy' &&
     migration !== undefined &&
     CHANGEABLE.has(migration.phase) &&
-    // the hold names the one to decide; without it, the one the last validation stored - both written with it, whatever
-    // their time (reviews RV50-09, RV51-08) -, else the newest
-    (migration.advisor_hold || migration.last_recommendation || newestId) === rec.id
+    decidingRecommendationId(migration, newestId) === rec.id
   );
 }

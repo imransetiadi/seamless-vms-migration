@@ -99,7 +99,30 @@ cd dashboard && npx playwright install chromium && npm run test:e2e   # browser 
 ```sh
 pipx install pre-commit   # or: pip install pre-commit (not part of the dev extra)
 pre-commit install        # gitleaks, ruff, shellcheck and actionlint on every commit
+make seamless-doctor      # read-only: this machine against the repository's pins, with the fix for each gap
 make seamless-check       # the tests, linters and scanners CI runs, with the 85 % coverage gate
+```
+
+`make seamless-doctor` reads each pin from the file that sets it (Python from `seamless/pyproject.toml`, Node.js
+from `dashboard/package.json`, gitleaks, ruff, actionlint and shellcheck from `.pre-commit-config.yaml`), installs
+and pulls nothing and exits 1 only for what `make seamless-check`, the stack targets or the pre-commit hook need; the
+PostgreSQL URL, Playwright's Chromium, agentmemory, Jev and the scanners `make seamless-check` skips when absent
+(gitleaks, actionlint, shellcheck) are noted with their fix.
+
+On an Ubuntu 26.04 workstation or server the whole toolchain comes from these sources (checked with
+`make seamless-doctor` on 2026-10-20):
+
+```sh
+sudo apt-get install -y make build-essential python3-venv python3-dev pipx shellcheck postgresql-client \
+  docker.io docker-compose-v2 docker-buildx            # Docker Engine 29, Compose 2.40: the distribution's own
+sudo usermod -aG docker "$USER"                        # then log in again
+# Node.js 22 with npm 10 from NodeSource (the distribution's npm is 9): https://github.com/nodesource/distributions
+# gitleaks and actionlint: the release binaries .pre-commit-config.yaml pins, checked against their checksums file
+pipx install pre-commit uv && pre-commit install
+# a Python CI tests (3.11 and 3.13): the distribution's python3 is 3.14, which CI does not run
+cd seamless && uv venv --seed -p 3.13 .venv && .venv/bin/pip install -e '.[dev,jev,collection]' && cd ..
+cd dashboard && npm ci && npx playwright install --with-deps chromium && cd ..
+make seamless-doctor
 ```
 
 `make seamless-check` leaves out the browser smoke test (`npm run test:e2e`), the manifest

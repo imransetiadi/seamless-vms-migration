@@ -20,7 +20,7 @@ from ..planning.waves import TIERS, heuristic_tier
 from . import payloads
 from .decision import Advice
 from .jev import JevClient, JevUnavailable
-from .redaction import redact, replace_names
+from .redaction import redact, redact_tail, replace_names
 
 log = logging.getLogger(__name__)
 GIB = 2**30
@@ -360,8 +360,10 @@ class Advisor:
         console_sent = bool(console) and payloads.console_allowed(self.settings)
         if console_sent:
             # SDD §13.4/§14.2: the excerpt is redacted before it is screened — it is the one
-            # place raw guest text leaves the control plane
-            excerpt = self._redact(str(console)[-CONSOLE_EXCERPT_CHARS:], [vm.name])
+            # place raw guest text leaves the control plane — and before it is cut, so a private
+            # key the cut falls inside keeps its BEGIN line and goes whole (review RV52-X1)
+            names = [vm.name] if self.settings.memory_redact_names else None
+            excerpt = redact_tail(str(console), CONSOLE_EXCERPT_CHARS, names)
             try:
                 screened = await self.jev.screen(text=excerpt, purpose=SCREEN_PURPOSE)
                 rec = screened.get("recommendation") or {}

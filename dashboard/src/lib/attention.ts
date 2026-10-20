@@ -174,7 +174,9 @@ export function attentionItems(
         migration: m,
         tone: 'warning',
         reason: `Waiting for finalize longer than the plan allows (${plan.finalize_warning_h} h)`,
-        nextAction: 'Finalize or roll it back (approver)',
+        // a summary carries no checkpoint: a rollback stands only while no finalize began deleting the source (SDD
+        // §8.1, review RV52-D2) - its page says which
+        nextAction: 'Finalize it, or roll it back while no finalize has begun (approver; see its page)',
         rank: 6,
       };
     } else if (m.phase === 'rolled_back') {

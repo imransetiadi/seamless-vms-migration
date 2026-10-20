@@ -35,7 +35,9 @@ async def server(tmp_path):
     store.dispose()
 
 
-async def read_frames(response, count, timeout=5.0):
+async def read_frames(response, count, timeout=5.0, *, events_only=False):
+    """The first ``count`` frames; with ``events_only`` a heartbeat comment is passed over - one
+    may arrive before an event the test emits (every 0.2 s here)."""
     frames: list[str] = []
     buffer = ""
 
@@ -45,6 +47,8 @@ async def read_frames(response, count, timeout=5.0):
             buffer += chunk
             while "\n\n" in buffer:
                 frame, buffer = buffer.split("\n\n", 1)
+                if events_only and frame.startswith(":"):
+                    continue
                 frames.append(frame)
                 if len(frames) >= count:
                     return
@@ -117,7 +121,8 @@ async def test_event_stream_is_never_compressed(server):
             assert res.status_code == 200
             assert res.headers["content-type"].startswith("text/event-stream")
             assert "content-encoding" not in res.headers
-            frames_task = asyncio.ensure_future(read_frames(res, 1))
+            # a heartbeat may come first: the emit's store write can outlast the 0.1 s it waits
+            frames_task = asyncio.ensure_future(read_frames(res, 1, events_only=True))
             await asyncio.sleep(0.1)
             live = await emit(store, bus, "plan.updated", "live", plan_id="p")
             frames = await asyncio.wait_for(frames_task, timeout=3)

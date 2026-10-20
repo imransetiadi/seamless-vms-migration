@@ -221,6 +221,31 @@ def test_memory_hits_are_redacted_where_they_enter():
         "password: 'a'x " * 2340,
         "password: 'a\n" * 2730,
         "".join("password: " + "\\" * depth + '"a ' for depth in range(1, 220)),
+        # YAML plain values of several words that never reach their line's end, an argv list's
+        # flags whose value never closes, a JSON-escaped auth section's lines (RV52-X3, RV52-X4)
+        "token: a " * 3640 + ",",
+        "--os-password', '" * 1820,
+        '"auth:\\n' + "   p: q\\n" * 3270,
+        # what the shell glues to a double-quoted value: parts that never close, and a chain of
+        # them, at the top and inside JSON strings (RV52-X6)
+        'password="a""' + "x" * 32768,
+        'password="a"" ' * 2340,
+        'password="a"' + '"b"' * 8190,
+        '{"m": "password=\\"a\\"' + '\\"b\\"' * 5460 + '"}',
+        # a CLI flag's shell word: an unclosed quote before a run of escaped ones, and quoted
+        # parts (RV52-X3)
+        '--os-password "' + '\\"' * 16384,
+        "--os-password " + "'a'\"b\"" * 5460,
+        # an Authorization header after markers, an auth section with a comment and CRLF, what
+        # is glued to a single-quoted value on one line or over several (RV52-X4 to RV52-X6)
+        "Authorization: [REDACTED]x " * 1200,
+        "auth: # c\r\n" + "   p: q\r\n" * 3640,
+        "password='a'" + '"b"' * 10920,
+        "password: '\nx'" + "y" * 32768,
+        ("password: '\n" + "x " * 4) * 1560,
+        # flow-style auth sections nested inside each other, and ones that never close (RV52-X6)
+        "auth: {" * 4096 + "x" + "}" * 4096,
+        "auth:{" * 5460,
     ],
     ids=[
         "key prefix",
@@ -236,6 +261,22 @@ def test_memory_hits_are_redacted_where_they_enter():
         "glued single-quoted closes",
         "single-quoted values over lines",
         "deeper and deeper escapes",
+        "plain values to no line end",
+        "argv flags never closed",
+        "json auth section lines",
+        "glued quote never closed",
+        "glued quotes never closed",
+        "glued quoted parts",
+        "glued escaped parts",
+        "flag quote never closed",
+        "flag quoted parts",
+        "header after markers",
+        "auth section crlf comment",
+        "glued quote after quote",
+        "glued after lines",
+        "values over lines",
+        "auth sections nested",
+        "auth sections never closed",
     ],
 )
 def test_redact_costs_time_linear_in_the_text(text):

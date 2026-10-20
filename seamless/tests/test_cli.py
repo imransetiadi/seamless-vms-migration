@@ -6,7 +6,7 @@ import yaml
 
 from seamless_migrate import __version__, cli
 from seamless_migrate.domain.enums import Phase, PlanStatus, ProviderKind, ProviderRole, Role
-from seamless_migrate.domain.models import Plan
+from seamless_migrate.domain.models import Event, Plan
 from seamless_migrate.security.auth import DashboardUser, hash_token
 from seamless_migrate.store import Store
 from tests.factories import make_migration, make_provider, make_vm
@@ -940,6 +940,19 @@ def test_events_prune_refuses_a_cutoff_it_cannot_use_without_a_traceback(env, ca
     assert cli.main(["events", "prune", *bound, "--confirm"]) == 2
     err = capsys.readouterr().err
     assert err.startswith("error: ") and "Traceback" not in err
+
+
+@pytest.mark.parametrize("before", ["0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-14:00"])
+def test_events_prune_refuses_a_cutoff_outside_datetime_s_range(env, capsys, before):
+    """SDD §15 (review RV52-S4): a cutoff whose offset moves it past year 1 or 9999 in UTC was
+    read, then crashed with an OverflowError traceback where the store turns it into UTC. It is
+    one error line and exit 2, and nothing is cut."""
+    store = store_for(env)
+    store.append_event(Event(kind="plan.created", message="kept"))
+    assert cli.main(["events", "prune", "--before", before, "--confirm"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error: --before ") and "Traceback" not in err, err
+    assert [e.message for e in store.events()] == ["kept"]
 
 
 def test_plan_apply_names_a_non_string_key_it_cannot_change(env, capsys):
