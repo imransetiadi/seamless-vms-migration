@@ -2252,8 +2252,13 @@ strategy ineligible):
   manages the source's volumes and never removes them, so they would be left behind, their quota counted twice - the
   reason says to run it warm again, which uses them, or cold, whose cutover removes them first (§7.2; review
   RV39, lead L1).
-* `vmware_cold`: ineligible if `power_state` is `"error"` or `"transitioning"`.
-* `vmware_warm`: requires `cbt_enabled is True` and no `independent` disk.
+* `vmware_cold`: ineligible if `power_state` is `"error"` or `"transitioning"`, and for a VM with a passthrough device
+  (an entry of kind `passthrough` in its `gpus`, §22.2) unless its `power_state` is `"stopped"`: the kit copies a running
+  guest that is not Windows before it powers it off (§7.2). The reason says to power the VM off, validate it again and
+  migrate it cold (§22.6, plan task G5).
+* `vmware_warm`: requires `cbt_enabled is True`, no `independent` disk and no passthrough device: vSphere supports no
+  snapshot of a VM with a PCI DirectPath I/O device, and the kit reads every copy from one (§22.6). The reason says to
+  power the VM off, validate it again and migrate it cold. A vGPU VM keeps both strategies' rules.
 * Blocker findings (§9.3) make **all** strategies ineligible.
 
 `select_strategy(vm, estimates, plan) -> tuple[Strategy, str]` (deterministic, returns reason):
@@ -2341,7 +2346,9 @@ database, review PL-03):
 `manual_review`. Wave 1 is a **pilot** of up to 3 lowest-risk VMs (`stateless_web` first, smallest
 disks first): app groups are taken whole in that order while they fit, and once one does not fit, only
 groups of the same risk may still fill the pilot — never a riskier one, so a pilot may hold fewer than 3
-VMs. Remaining VMs are ordered by tier (the order above) then disk size ascending and
+VMs. The pilot never holds a GPU VM (one with `gpus`, §22.2), nor an app group that holds one: a GPU VM's driver,
+license and capacity are risks of their own, and GPU VMs keep their service tier, ordered with it in the later waves
+(§22.9, plan task G5). Remaining VMs are ordered by tier (the order above) then disk size ascending and
 chunked by `max_wave_size`; VMs sharing `tags["app"]` stay in the same wave (a wave may exceed
 `max_wave_size` to keep an app together). Each wave depends on the previous one. `manual_review`
 VMs go to a final wave named `Manual review`.
@@ -2397,6 +2404,13 @@ guests boot unchanged when the boot properties travel with the volumes (§6, §7
 | `stateless_web` | any | http 80 `/` |
 | `infrastructure_service` | LDAP, FreeIPA, Active Directory, domain controller (`ldap`, `freeipa`, `active-directory`, `activedirectory`, `domain-controller`, `domaincontroller`; tokens `ad`, `dc`, `ipa`, `idm`) · DNS (`dns`; tokens `bind`, `ns`, `ns1`, `ns2`) · Kerberos | tcp 389 · tcp 53 · tcp 88 |
 | `legacy_os`, `manual_review`, a service the table does not name | — | none |
+
+Every GPU VM (its `gpus`, or for a VM recorded before 0.3.0 its flavor's requests, §22.2) outside the
+`stateful_database` tier is also suggested `tcp 9400`, the port NVIDIA's DCGM exporter serves its metrics on, after its
+tier's probe (§22.8, plan task G5). A database VM's suggestion stays its engine's probe, or none: the exporter's port
+says nothing of the database, so it must neither stand in for the application probe `APP_PROBE_MISSING` and §7.5's
+review ask of a database VM, nor fail - and so roll back - a database whose service answers in a guest that runs no
+exporter (PR #64 review).
 
 Validation records the suggestion in `Migration.suggested_probes`. A suggestion never runs: the verification
 probes only what the plan configures, so a person adds it — the dashboard's "Use suggested probe" saves it as the
@@ -4732,6 +4746,8 @@ provider and a remediation says "the destination" (§1 naming).
 
 ### 22.6 Strategy eligibility
 
+Binding in §9.2 since plan task G5.
+
 * `cold`, `warm` and `storage_handover` keep their rules (§9.2) for every GPU VM, and `vmware_cold` and `vmware_warm`
   for a vGPU VM: the disks move as any VM's do.
 * A VMware VM with a passthrough device is ineligible for `vmware_warm`: vSphere supports no snapshot of a VM with a
@@ -4794,9 +4810,11 @@ A fifth rule of §5.4, binding there with plan task G6:
   Both are deterministic checks: a failed one fails the verification, and the plan's `auto_rollback` rolls the VM back
   (§7.5). Their details name resource classes and units, never a provider, because the advisor's
   `review_verification` sends the check results to Jev (§14.2).
-* §9.6 suggests, for every GPU VM whatever its tier, `tcp 9400`, the port NVIDIA's DCGM exporter serves its metrics on,
-  besides its tier's probe. Like every suggestion it never runs until the plan adds it (`probe_overrides`, §9.6).
-  Binding with plan task G5.
+* §9.6 suggests, for every GPU VM outside the `stateful_database` tier, `tcp 9400`, the port NVIDIA's DCGM exporter
+  serves its metrics on, besides its tier's probe; a database VM keeps its engine's probe alone, as its tier keeps
+  deciding the database review rule (§22.9). Like every suggestion it never runs until the plan adds it
+  (`probe_overrides`, §9.6), and once added it fails the verification of a guest that runs no exporter. Binding in §9.6
+  since plan task G5.
 
 ### 22.9 Waves
 
@@ -4804,7 +4822,7 @@ The owner's choice of 2026-10-20 (D16): GPU VMs get no tier of their own, since 
 deciding their probe suggestion (§9.6) and the database review rule (§7.5). The pilot wave never holds a GPU VM: the
 pilot takes the lowest-risk VMs, and a GPU VM's driver, license and capacity are risks of their own. An app group that
 holds a GPU VM stays out of the pilot too, as an app is never split across waves. GPU VMs are ordered with their tier in
-the later waves. Binding in §9.4 with plan task G5.
+the later waves. Binding in §9.4 since plan task G5.
 
 ### 22.10 Demo and simulation
 
@@ -4887,7 +4905,7 @@ Binding in §13.4 with plan task G3:
 | the sources report `gpus`; the VMware provider writes no GPU extra specs, and §9.3's two GPU rows read `gpus` (still unconditional until G4) | §9.3, §10 (binding) | G2 |
 | `DestinationInventory.gpu_flavors` and `gpu_capacity`; the destination check's `gpu_capacity`; `gpu_capacity()`, `server_allocations()` and `get_server`'s flavor; §22.12's rule | §10, §13.4 (binding) | G3 |
 | the GPU flavor rule (§22.4) and the catalog change (§22.5) | §9.3, §7.2 (pre-staging), §10 (binding) | G4 |
-| the eligibility of a VMware passthrough VM; a pilot without GPU VMs; the port 9400 suggestion | §9.2, §9.4, §9.6 | G5 |
+| the eligibility of a VMware passthrough VM; a pilot without GPU VMs; the port 9400 suggestion | §9.2, §9.4, §9.6 (binding) | G5 |
 | the gate's fifth rule, `Migration.gpu_wait` and `MigrationSummary.gpu_wait`, the event `migration.gpu_wait`, the gauge `seamless_gpu_waits` | §4.2, §4.3, §5.4, §18 | G6 |
 | the executors create the server with the GPU flavor (`flavor_uuid` for the VMware kit) | §7.2, §7.3 | G7 |
 | the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 | G8 |

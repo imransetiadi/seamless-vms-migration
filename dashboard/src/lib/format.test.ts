@@ -13,6 +13,7 @@ import {
   pyTooLong,
   pyFloat,
   pyRepr,
+  pyInt,
   pyStrip,
 } from './format';
 
@@ -235,6 +236,24 @@ describe('pyStrip (review RV24-06)', () => {
     // what JavaScript's trim takes that Python keeps, and a space inside
     for (const kept of ['\ufeff', '\u200b', '\u180e']) expect(pyStrip(kept)).toBe(kept);
     expect(pyStrip('  a b  ')).toBe('a b');
+  });
+});
+
+describe('pyInt (PR #64 review)', () => {
+  // the code points int() reads as whitespace around a number, as Python 3.11 and 3.13 list them:
+  // [c for c in range(0x110000) if (lambda s: s.isspace() and int(s + '5' + s) == 5)(chr(c))] - str.isspace's but U+001C..U+001F
+  const INT_SPACE = [0x9, 0xa, 0xb, 0xc, 0xd, 0x20, 0x85, 0xa0, 0x1680, ...Array.from({ length: 11 }, (_, i) => 0x2000 + i), 0x2028, 0x2029, 0x202f, 0x205f, 0x3000];
+
+  it("reads a number as Python's int(): its whitespace around it, a sign, underscores between digits, any script's digits", () => {
+    expect(INT_SPACE).toHaveLength(25);
+    for (const code of INT_SPACE) expect(pyInt(`${String.fromCodePoint(code)}5${String.fromCodePoint(code)}`), code.toString(16)).toBe(5);
+    const read: Array<[string, number]> = [['4', 4], ['+2', 2], ['-3', -3], ['007', 7], ['1_0', 10], ['\uff12', 2], ['\u0663', 3], ['\u{1D7D9}', 1], ['\u{1D7E1}', 9]];
+    for (const [text, n] of read) expect(pyInt(text), text).toBe(n);
+  });
+
+  it('reads no number where int() raises', () => {
+    for (const text of ['', ' ', '1.5', '0x1', '1e3', 'Infinity', '1__0', '_1', '1_', '+-1', '1 0', '- 1', '\u00b2', '\ufeff1', '\x1c5', '5\x1f'])
+      expect(pyInt(text), JSON.stringify(text)).toBeNull();
   });
 });
 

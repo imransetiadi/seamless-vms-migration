@@ -10,9 +10,13 @@ from __future__ import annotations
 import re
 
 from ..domain.models import AppProbe, Plan, VMRef
+from .gpu import vm_gpus
 from .waves import heuristic_tier
 
 DATABASE_TIER = "stateful_database"
+#: the port NVIDIA's DCGM exporter serves a GPU's metrics on, suggested for every GPU VM outside the
+#: database tier (SDD §9.6, §22.8)
+DCGM_EXPORTER_PORT = 9400
 
 
 def _tcp(port: int) -> AppProbe:
@@ -68,16 +72,20 @@ def _text(vm: VMRef) -> str:
 
 
 def suggest_probes(vm: VMRef) -> list[AppProbe]:
-    """The rules' suggestion for ``vm`` (SDD §9.6); empty when the table names no service."""
+    """The rules' suggestion for ``vm`` (SDD §9.6): its tier's probe, then for a GPU VM tcp 9400,
+    the DCGM exporter's port (§22.8); empty when the table names no service and the VM has no
+    GPU. A database VM keeps its engine's probe alone, or none: the exporter's port says nothing of
+    the database, whose probe APP_PROBE_MISSING and §7.5's review ask for (PR #64 review)."""
     tier = heuristic_tier(vm)
+    gpu = [_tcp(DCGM_EXPORTER_PORT)] if tier != DATABASE_TIER and vm_gpus(vm) else []
     if tier == "stateless_web":
-        return [_http(80)]
+        return [_http(80), *gpu]
     text = _text(vm)
     tokens = set(re.split(r"[^a-z0-9]+", text))
     for service_tier, substrings, words, probe in _SERVICES:
         if service_tier == tier and (any(s in text for s in substrings) or tokens & words):
-            return [probe.model_copy()]
-    return []
+            return [probe.model_copy(), *gpu]
+    return gpu
 
 
 def probes_for(vm: VMRef, plan: Plan) -> list[AppProbe]:

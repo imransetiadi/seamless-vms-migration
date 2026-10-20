@@ -1,23 +1,23 @@
 import { describe, expect, it } from 'vitest';
 // One case table for the control plane and the dashboard's mock (SDD §9.6).
 import raw from '../../../seamless/tests/fixtures/probe_suggestion_cases.json?raw';
-import type { AppProbe, VMRef } from './types';
+import type { AppProbe, GpuDevice, VMRef } from './types';
 import { buildFixtures } from './mockData';
 import { isDatabase, suggestProbes } from './mockProbes';
 
 const fixture = JSON.parse(raw) as {
-  cases: Array<{ name: string; tags: Record<string, string>; os_type: string; probes: AppProbe[] }>;
+  cases: Array<{ name: string; tags: Record<string, string>; os_type: string; gpus?: GpuDevice[]; flavor_extra_specs?: Record<string, string>; probes: AppProbe[] }>;
 };
 
 const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0]!.vm;
 
-function vm(name: string, tags: Record<string, string>, os_type: string): VMRef {
-  return { ...base, name, tags, os_type };
+function vm(name: string, tags: Record<string, string>, os_type: string, gpus: GpuDevice[] = [], flavor_extra_specs: Record<string, string> = {}): VMRef {
+  return { ...base, name, tags, os_type, flavor_extra_specs, gpus };
 }
 
 describe('probe suggestions in the mock, like the control plane (SDD §9.6, ADV-18)', () => {
   it.each(fixture.cases.map((c) => [c.name, c] as const))('suggests for %s what the rules suggest', (_name, c) => {
-    expect(suggestProbes(vm(c.name, c.tags, c.os_type))).toEqual(c.probes);
+    expect(suggestProbes(vm(c.name, c.tags, c.os_type, c.gpus, c.flavor_extra_specs))).toEqual(c.probes);
   });
 
   it('knows a database VM by the tier the rules give it', () => {

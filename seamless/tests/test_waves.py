@@ -1,3 +1,4 @@
+from seamless_migrate.domain.models import GpuDevice
 from seamless_migrate.planning.waves import TIERS, heuristic_tier, plan_waves
 from tests.factories import make_disk, make_vm
 
@@ -149,3 +150,72 @@ def test_manual_review_last_wave():
 
 def test_empty_plan_has_no_waves():
     assert plan_waves([], {}) == []
+
+
+def gpu_vm(source_id: str, name: str, size_gb: int = 20, os_type: str = "rhel9", **tags: str):
+    """A VM with a vGPU (SDD §22.2)."""
+    return vm(source_id, name, size_gb, os_type, **tags).model_copy(
+        update={"gpus": [GpuDevice(kind="vgpu", profile="grid_a100-4c")]}
+    )
+
+
+def test_the_pilot_wave_never_holds_a_gpu_vm():
+    """SDD §9.4, §22.9 (plan task G5): the pilot takes the lowest-risk VMs, and a GPU VM's driver,
+    license and capacity are risks of their own - the smallest web VM waits when it has a GPU."""
+    vms = [
+        gpu_vm("web-gpu", "web-gpu-01", 5),
+        vm("web-a", "web-01", 10),
+        vm("web-b", "web-02", 30),
+        vm("web-c", "web-03", 40),
+    ]
+    waves = plan_waves(vms, {v.source_id: heuristic_tier(v) for v in vms})
+    assert (waves[0].name, waves[0].vm_ids) == ("Pilot", ["web-a", "web-b", "web-c"])
+    assert waves[1].vm_ids == ["web-gpu"]
+    # a GPU VM of any tier, and one recorded before 0.3.0 by its flavor's requests, waits too: the
+    # room they leave goes to the next VM, a riskier one included (PR #64 review)
+    recorded = vm("mq-old", "mq-02", 6).model_copy(
+        update={"flavor_extra_specs": {"resources:VGPU": "1"}}
+    )
+    vms = [
+        vm("web-a", "web-01", 10),
+        vm("web-b", "web-02", 20),
+        gpu_vm("mq-gpu", "mq-01", 5),
+        recorded,
+        vm("dns", "dns-01", 15),
+    ]
+    waves = plan_waves(vms, {v.source_id: heuristic_tier(v) for v in vms})
+    assert (waves[0].name, waves[0].vm_ids) == ("Pilot", ["web-a", "web-b", "dns"])
+    assert waves[1].vm_ids == ["mq-gpu", "mq-old"]
+    # a plan of GPU VMs alone has no pilot: its first wave depends on none (PR #64 review)
+    gpu_only = [gpu_vm("g1", "web-01", 10), gpu_vm("g2", "mq-01", 20)]
+    waves = plan_waves(gpu_only, {v.source_id: heuristic_tier(v) for v in gpu_only})
+    assert [(w.id, w.name, w.depends_on, w.vm_ids) for w in waves] == [
+        ("wave-1", "Wave 1", [], ["g1", "g2"])
+    ]
+
+
+def test_an_app_group_with_a_gpu_vm_stays_out_of_the_pilot():
+    """SDD §9.4, §22.9 (plan task G5): an app is never split across waves, so an app group that
+    holds a GPU VM stays out of the pilot whole; a GPU VM is left out by the rule, not for want of
+    room, so the next lowest-risk VMs still fill the pilot."""
+    vms = [
+        vm("shop-web", "shop-web-01", 10, app="shop"),
+        gpu_vm("shop-gpu", "shop-web-02", 10, app="shop"),
+        vm("blog-web", "blog-web-01", 20),
+        vm("mq", "mq-01", 5),
+    ]
+    waves = plan_waves(vms, {v.source_id: heuristic_tier(v) for v in vms})
+    assert (waves[0].name, waves[0].vm_ids) == ("Pilot", ["blog-web", "mq"])
+    assert waves[1].vm_ids == ["shop-web", "shop-gpu"]
+
+
+def test_a_gpu_vm_keeps_its_service_tier():
+    """SDD §9.4, §22.9 (plan task G5): GPU VMs get no tier of their own - a GPU database VM is a
+    database - and are ordered with their tier in the later waves."""
+    db = gpu_vm("ml-db", "ml-db-01", 100)
+    assert heuristic_tier(db) == heuristic_tier(vm("db", "ml-db-01", 100)) == "stateful_database"
+    web = [vm(f"web-{c}", f"web-0{i}", 10 * i) for i, c in enumerate("abc", start=1)]
+    vms = [db, vm("old", "old-01", os_type="rhel6"), vm("mq", "mq-01", 50), *web]
+    waves = plan_waves(vms, {v.source_id: heuristic_tier(v) for v in vms})
+    assert waves[0].vm_ids == ["web-a", "web-b", "web-c"]
+    assert [vm_id for wave in waves[1:] for vm_id in wave.vm_ids] == ["mq", "ml-db", "old"]

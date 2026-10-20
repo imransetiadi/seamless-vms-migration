@@ -171,6 +171,23 @@ def vgpu_request_keys(
     )
 
 
+def gpu_names(devices: Iterable[GpuDevice]) -> str:
+    """Each device by what names it - a profile, an alias, the PCI ids or a vGPU's class -, with
+    its count when more than one (SDD §9.2, §9.3)."""
+    names = []
+    for device in devices:
+        ids = (
+            f"{device.vendor_id}:{device.device_id}"
+            if device.vendor_id and device.device_id
+            else ""
+        )
+        name = (
+            device.profile or device.alias or ids or device.resource_class or "a device without ids"
+        )
+        names.append(f"{name} ×{device.count}" if device.count > 1 else name)
+    return ", ".join(names)
+
+
 def gpu_key(device: GpuDevice) -> str | None:
     """What a plan's GPU mapping names a VMware device by (SDD §22.2, §22.4): a vGPU's profile, a
     passthrough device's `<vendor_id>:<device_id>`; None when it has neither."""

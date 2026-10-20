@@ -912,6 +912,651 @@
         ],
         "vmware_warm": []
       }
+    },
+    {
+      "why": "a running VMware VM with a passthrough device (plan task G5)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "passthrough",
+            "vendor_id": "10de",
+            "device_id": "20b5",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {}
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {},
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "vmware_cold": [
+          "PCI passthrough device(s) 10de:20b5 on a VM that is not powered off: power it off, validate it again and migrate it cold"
+        ],
+        "vmware_warm": [
+          "PCI passthrough device(s) 10de:20b5: vSphere takes no snapshot of a VM with one - power it off, validate it again and migrate it cold"
+        ]
+      }
+    },
+    {
+      "why": "a powered-off VMware VM with a passthrough device (plan task G5)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "stopped",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "passthrough",
+            "vendor_id": "10de",
+            "device_id": "20b5",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {}
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {},
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "vmware_cold": [],
+        "vmware_warm": [
+          "PCI passthrough device(s) 10de:20b5: vSphere takes no snapshot of a VM with one - power it off, validate it again and migrate it cold"
+        ]
+      }
+    },
+    {
+      "why": "a running VMware VM with a vGPU (plan task G5)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {}
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {},
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "vmware_cold": [],
+        "vmware_warm": []
+      }
+    },
+    {
+      "why": "a running VMware VM with a vGPU beside passthrough devices, two alike and one without ids (PR #64 review)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          },
+          {
+            "kind": "passthrough",
+            "vendor_id": "10de",
+            "device_id": "20b5",
+            "count": 2
+          },
+          {
+            "kind": "passthrough",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {}
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {},
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "vmware_cold": [
+          "PCI passthrough device(s) 10de:20b5 ×2, a device without ids on a VM that is not powered off: power it off, validate it again and migrate it cold"
+        ],
+        "vmware_warm": [
+          "PCI passthrough device(s) 10de:20b5 ×2, a device without ids: vSphere takes no snapshot of a VM with one - power it off, validate it again and migrate it cold"
+        ]
+      }
+    },
+    {
+      "why": "a running VMware VM recorded before 0.3.0 with a passthrough device: its flavor's alias, the device's label (PR #64 review)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {
+          "pci_passthrough:alias": "PCI device 0"
+        },
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {}
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {},
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "vmware_cold": [
+          "PCI passthrough device(s) PCI device 0 on a VM that is not powered off: power it off, validate it again and migrate it cold"
+        ],
+        "vmware_warm": [
+          "PCI passthrough device(s) PCI device 0: vSphere takes no snapshot of a VM with one - power it off, validate it again and migrate it cold"
+        ]
+      }
+    },
+    {
+      "why": "a running VMware VM recorded before 0.3.0 with a vGPU (PR #64 review)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {
+          "resources:VGPU": "1"
+        },
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {}
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {},
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "vmware_cold": [],
+        "vmware_warm": []
+      }
+    },
+    {
+      "why": "a VMware VM in error with a passthrough device: the state's reason, then the device's (PR #64 review)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "d1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "error",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "passthrough",
+            "vendor_id": "10de",
+            "device_id": "20b5",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "source": {
+        "conversion_host": true,
+        "capabilities": {}
+      },
+      "destination": {
+        "conversion_host": true,
+        "capabilities": {},
+        "name": "OpenStack 2026.2 Hibiscus (DC3)"
+      },
+      "findings": [],
+      "expected": {
+        "vmware_cold": [
+          "source VM is in error state",
+          "PCI passthrough device(s) 10de:20b5 on a VM that is not powered off: power it off, validate it again and migrate it cold"
+        ],
+        "vmware_warm": [
+          "PCI passthrough device(s) 10de:20b5: vSphere takes no snapshot of a VM with one - power it off, validate it again and migrate it cold"
+        ]
+      }
     }
   ],
   "finding_cases": [
@@ -1753,6 +2398,445 @@
       },
       "expected": {
         "VM_VGPU": "Flavor requests a vGPU (resources1:VGPU). The plan maps no flavor to 'm1.small': map it to a GPU flavor of DC3 Jakarta."
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": []
+      }
+    },
+    {
+      "why": "a flavor asking a vGPU beside an alias whose count asks for none: the vGPU alone is named (PR #64 review)",
+      "vm": {
+        "source_id": "vm-p",
+        "name": "gpu-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {
+          "resources:VGPU": "1",
+          "pci_passthrough:alias": "a100:0"
+        },
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "VM_VGPU": "Flavor requests a vGPU (resources:VGPU). The plan maps no flavor to 'm1.small': map it to a GPU flavor of DC3 Jakarta.",
+        "VM_PCI_PASSTHROUGH": null
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": []
+      }
+    },
+    {
+      "why": "a flavor asking a zero vGPU beside an alias: the alias alone is named (PR #64 review)",
+      "vm": {
+        "source_id": "vm-p",
+        "name": "gpu-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {
+          "resources:VGPU": "0",
+          "pci_passthrough:alias": "a100:1"
+        },
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "VM_PCI_PASSTHROUGH": "Flavor requests PCI passthrough (a100:1). The plan maps no flavor to 'm1.small': map it to a GPU flavor of DC3 Jakarta.",
+        "VM_VGPU": null
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": []
+      }
+    },
+    {
+      "why": "a flavor whose second request group asks for no vGPU: only the first group's key is named (PR #64 review)",
+      "vm": {
+        "source_id": "vm-p",
+        "name": "gpu-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {
+          "resources1:VGPU": "1",
+          "resources2:VGPU": "0"
+        },
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "VM_VGPU": "Flavor requests a vGPU (resources1:VGPU). The plan maps no flavor to 'm1.small': map it to a GPU flavor of DC3 Jakarta."
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": []
+      }
+    },
+    {
+      "why": "a CUSTOM_ class the source declares a profile for is a vGPU (PR #64 review)",
+      "vm": {
+        "source_id": "vm-p",
+        "name": "gpu-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {
+          "resources:CUSTOM_NVIDIA_A100_4C": "1"
+        },
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "VM_VGPU": "Flavor requests a vGPU (resources:CUSTOM_NVIDIA_A100_4C). The plan maps no flavor to 'm1.small': map it to a GPU flavor of DC3 Jakarta."
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": []
+      },
+      "gpu_profiles": {
+        "m1.small": "A100-4C"
+      }
+    },
+    {
+      "why": "a CUSTOM_ class without a declared profile asks for no GPU (PR #64 review)",
+      "vm": {
+        "source_id": "vm-p",
+        "name": "gpu-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {
+          "resources:CUSTOM_NVIDIA_A100_4C": "1"
+        },
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null
       },
       "destination": {
         "label": "DC3 Jakarta",

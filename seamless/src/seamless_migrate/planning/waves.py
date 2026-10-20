@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from ..domain.models import VMRef, Wave
+from .gpu import vm_gpus
 from .preflight import is_legacy_os
 
 TIERS = (
@@ -146,6 +147,11 @@ class _Unit:
     rank: int = 0
 
     @property
+    def gpu(self) -> bool:
+        """It holds a GPU VM, which never goes to the pilot (SDD §9.4, §22.9)."""
+        return any(vm_gpus(vm) for vm in self.vms)
+
+    @property
     def size(self) -> int:
         return sum(v.disk_bytes for v in self.vms)
 
@@ -197,6 +203,10 @@ def plan_waves(
     # SDD §9.4: the rank of the first group that did not fit; no riskier group takes its room
     ceiling: int | None = None
     for unit in regular:
+        if unit.gpu:
+            # left out by the rule, not for want of room: no ceiling (SDD §22.9)
+            remaining.append(unit)
+            continue
         if len(pilot) + len(unit.vms) <= PILOT_SIZE and (ceiling is None or unit.rank <= ceiling):
             pilot.extend(unit.vms)
         else:

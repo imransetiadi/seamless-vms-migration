@@ -3,8 +3,13 @@
  * probe suggestions (planning/probes.py, §9.6, ADV-18). Both suites test it against one case table,
  * `seamless/tests/fixtures/probe_suggestion_cases.json`.
  */
+import { vmGpus } from '../lib/gpu';
 import { identifyGuestOs } from '../lib/guestOs';
 import type { AppProbe, VMRef } from './types';
+
+/** The port NVIDIA's DCGM exporter serves a GPU's metrics on, suggested for every GPU VM outside the database tier (SDD §9.6,
+ * §22.8). */
+const DCGM_EXPORTER_PORT = 9400;
 
 const TIERS = ['stateless_web', 'middleware_queue', 'infrastructure_service', 'stateful_database', 'legacy_os', 'manual_review'] as const;
 type Tier = (typeof TIERS)[number];
@@ -89,8 +94,11 @@ export function isDatabase(vm: VMRef): boolean {
 /** The rules' suggestion for a VM (SDD §9.6); empty when the table names no service of its tier. */
 export function suggestProbes(vm: VMRef): AppProbe[] {
   const tier = tierOf(vm);
-  if (tier === 'stateless_web') return [http(80)];
+  // a GPU VM is suggested the DCGM exporter's port too, after its tier's probe; a database VM keeps its engine's probe
+  // alone, or none: the exporter's port never stands in for it (SDD §9.6, §22.8, plan task G5, PR #64 review)
+  const gpu = tier !== 'stateful_database' && vmGpus(vm).length ? [tcp(DCGM_EXPORTER_PORT)] : [];
+  if (tier === 'stateless_web') return [http(80), ...gpu];
   const { text, tokens } = describe(vm);
   const match = SERVICES.find(([t, substrings, words]) => t === tier && matches(text, tokens, substrings, words));
-  return match ? [{ ...match[3] }] : [];
+  return match ? [{ ...match[3] }, ...gpu] : gpu;
 }

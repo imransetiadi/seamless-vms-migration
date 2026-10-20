@@ -14,6 +14,7 @@ from ..domain.enums import (
 )
 from ..domain.models import Estimate, Finding, Plan, VMRef
 from ..storage import SUPPORTED, StorageError, resolve_destination, split_host
+from .gpu import gpu_names, vm_gpus
 from .platforms import parse_microversion
 
 #: the compute microversion the handover updates the source server's delete_on_termination with
@@ -74,6 +75,20 @@ def eligibility(
         independent = [d for d in vm.disks if d.independent]
         if independent:
             out[Strategy.vmware_warm].append(f"independent disk(s): {_ids(independent)}")
+        # vSphere takes no snapshot of a VM with a DirectPath I/O device, and the kit reads every
+        # copy from one; powered off, its snapshot holds no device state (SDD §9.2, §22.6)
+        passthrough = [g for g in vm_gpus(vm) if g.kind == "passthrough"]
+        if passthrough:
+            devices = gpu_names(passthrough)
+            out[Strategy.vmware_warm].append(
+                f"PCI passthrough device(s) {devices}: vSphere takes no snapshot of a VM with "
+                "one - power it off, validate it again and migrate it cold"
+            )
+            if vm.power_state != "stopped":
+                out[Strategy.vmware_cold].append(
+                    f"PCI passthrough device(s) {devices} on a VM that is not powered off: power "
+                    "it off, validate it again and migrate it cold"
+                )
     else:
         copy_reasons: list[str] = []
         if in_error:
