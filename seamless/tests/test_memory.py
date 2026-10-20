@@ -226,6 +226,12 @@ def test_memory_hits_are_redacted_where_they_enter():
         "token: a " * 3640 + ",",
         "--os-password', '" * 1820,
         '"auth:\\n' + "   p: q\\n" * 3270,
+        # what the shell glues to a double-quoted value: parts that never close, and a chain of
+        # them, at the top and inside JSON strings (RV52-X6)
+        'password="a""' + "x" * 32768,
+        'password="a"" ' * 2340,
+        'password="a"' + '"b"' * 8190,
+        '{"m": "password=\\"a\\"' + '\\"b\\"' * 5460 + '"}',
     ],
     ids=[
         "key prefix",
@@ -244,6 +250,10 @@ def test_memory_hits_are_redacted_where_they_enter():
         "plain values to no line end",
         "argv flags never closed",
         "json auth section lines",
+        "glued quote never closed",
+        "glued quotes never closed",
+        "glued quoted parts",
+        "glued escaped parts",
     ],
 )
 def test_redact_costs_time_linear_in_the_text(text):

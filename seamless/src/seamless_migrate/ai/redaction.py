@@ -52,13 +52,31 @@ _QUOTED_KEY_AHEAD = r"'(?:[A-Za-z0-9]+[_.-]){0,16}(?:" + _KEYWORDS + r")'\s*[:=]
 _SQ_CLEAN = r"'(?:[^'\\\n]|\\++(?!')|'')*+'"
 #: A quoted part the shell glues to its word, never a quoted credential key's name.
 _SQ_PART = r"(?:(?!" + _QUOTED_KEY_AHEAD + r")'[^'\n]*+')?"
-#: What the shell glues to a closed word: its escaped quote (\') or "'" - JSON's escapes of them
-#: too - and the quoted part that opens after, or characters of no shell or JSON syntax ('a'b!),
-#: each with a quoted part after; a space, a delimiter or ">" ends the word (SDD §13.4, reviews
-#: RV51-05, RV51-20).
-_SQ_WORD = (
-    r"(?:(?:\\++'|\\*+\"'\\*+\")" + _SQ_PART + r"|[^\s'\"\\,;&|<>(){}\[\]:.]++" + _SQ_PART + r")*+"
+#: The same as a double-quoted part on its line, never a quoted credential key's name either.
+_DQ_PART = (
+    r"(?!\"(?:[A-Za-z0-9]+[_.-]){0,16}(?:" + _KEYWORDS + r")\"\s*[:=])\"(?:[^\"\\\n]|\\.)*+\""
 )
+#: What the shell glues to a closed word: its escaped quote (\') or "'" - JSON's escapes of them
+#: too - and the quoted part that opens after, a double-quoted part ('a'"b"), or characters of no
+#: shell or JSON syntax ('a'b!), each with a quoted part after; a space, a delimiter or ">" ends
+#: the word (SDD §13.4, reviews RV51-05, RV51-20, RV52-X6).
+_SQ_WORD = (
+    r"(?:(?:\\++'|\\*+\"'\\*+\")"
+    + _SQ_PART
+    + r"|"
+    + _DQ_PART
+    + _SQ_PART
+    + r"|[^\s'\"\\,;&|<>(){}\[\]:.]++"
+    + _SQ_PART
+    + r")*+"
+)
+#: What the shell glues to a closed double-quoted word, as after a single-quoted one: "a"b,
+#: "a""b" and "a"'b' are one word (SDD §13.4, review RV52-X6).
+_DQ_WORD = (
+    r"(?:[^\s'\"\\,;&|<>(){}\[\]:.]++|" + _DQ_PART + r"|(?!" + _QUOTED_KEY_AHEAD + r")'[^'\n]*+')*+"
+)
+#: The same for a string inside JSON strings, at the escape that opened it: \"a\"b, \"a\"\"b\"
+_ESCAPED_WORD = r"(?:[^\s'\"\\,;&|<>(){}\[\]:.]++|(?P=escape)\"[^\"\\\n]*+(?P=escape)\")*+"
 #: Where a string inside JSON strings closes: the backslashes that opened it before a quote, after
 #: any number of the 2E + 2 each of its own backslashes became (E the opening's backslashes); a
 #: quote of its own has 2E + 1 before it.
@@ -153,10 +171,16 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     (
         re.compile(
             r"(?i)((?:(?<!\\)\\*+[\"'])?" + _SCANNED_KEY + r"(?:\\*+[\"'])?\s*[:=]\s*)"
-            r"(\"(?:[^\"\\]|\\.)*+\""  # a JSON or a shell string
+            # a JSON or a shell string, and what the shell glues to it
+            r"(\"(?:[^\"\\]|\\.)*+\""
+            + _DQ_WORD
+            +
             # a single-quoted string on one line whose close every quoting agrees on, and what the
             # shell glues to it
-            r"|" + _SQ_CLEAN + _SQ_WORD +
+            r"|"
+            + _SQ_CLEAN
+            + _SQ_WORD
+            +
             # one with a backslash before a quote - an escaped quote in a repr (\', inside JSON
             # \\'), a close in YAML or the shell ('C:\', YAML's \''): the value runs on, the longer
             # reading, over the shell's quotes to a close a value end follows, or to its line's end,
@@ -168,7 +192,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
             r"|'(?:[^']|'')*+'"  # a YAML single-quoted string over lines
             # a string inside JSON strings, to its close, a bare quote or its line's end
             r"|(?P<escape>\\++)\"(?:[^\"\\\n]|(?!" + _ESCAPED_CLOSE + r")\\++\"?)*+"
-            r"(?:" + _ESCAPED_CLOSE + r"|(?=[\n\"])|\Z)"
+            r"(?:" + _ESCAPED_CLOSE + _ESCAPED_WORD + r"|(?=[\n\"])|\Z)"
             # a [REDACTED] an earlier pass wrote is left as it is: a second pass changes nothing
             r"|\[REDACTED\](?![A-Za-z0-9])"
             # a YAML plain value of several words runs to its line's end, a comment or its

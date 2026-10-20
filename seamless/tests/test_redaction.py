@@ -630,6 +630,85 @@ def test_a_second_pass_changes_nothing_after_a_cli_flag_or_an_authorization_head
     assert "Pass" not in once and "Word" not in once, once
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        'export OS_PASSWORD="Fake"Pass-Word port=5432',
+        'export OS_PASSWORD="Fake""Pass-Word" port=5432',
+        "export OS_PASSWORD=\"Fake\"'Pass Word' port=5432",
+        'export OS_PASSWORD="Fake"Pass"Word" port=5432',
+        json.dumps({"cmd": 'export OS_PASSWORD="Fake"Pass-Word port=5432'}),
+    ],
+    ids=["glued-word", "glued-dq", "glued-sq", "glued-chain", "inside-json"],
+)
+def test_a_double_quoted_shell_value_keeps_no_glued_part_and_a_second_pass_changes_nothing(text):
+    """SDD §13.4 (review RV52-X6): the shell glues what follows a closed double-quoted word to
+    it ("Fake"Pass-Word is one word), as it does after a single-quoted one; the value ended at its
+    close, so the glued part stayed - and a second pass, reading it as a plain value, changed the
+    output."""
+    out = redact(text)
+    assert "Pass" not in out and "Word" not in out and REDACTED in out, out
+    assert "port=5432" in out, out
+    assert redact(out) == out, out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"password": "x"}, "y"',
+        '{"password":"x","user":"admin"}',
+        "{'password': \"x\"}.",
+        'password="x"; echo done',
+    ],
+)
+def test_what_follows_a_closed_double_quoted_secret_stays(text):
+    """SDD §13.4 (review RV52-X6): only what the shell glues to the word goes with it - a JSON or
+    repr delimiter, a separator or a sentence's end stays."""
+    out = redact(text)
+    assert out.replace(REDACTED, '"x"') == text, out  # the quoted value alone, its quotes too
+
+
+def test_a_seeded_fuzz_of_cli_flags_and_authorization_headers_redacts_once_for_good():
+    """SDD §13.4 (reviews RV52-X3, RV52-X5): a CLI flag's quoted value ended at its close and
+    left what the shell glues to the word, and the Authorization header pattern read a
+    [REDACTED] an earlier pass wrote as a value: a second pass changed 9 % of these texts. A
+    second pass changes nothing, in a text or inside JSON."""
+    rng = random.Random(52)
+    atoms = [
+        "--os-password ",
+        "--token ",
+        "Authorization: ",
+        "Basic ",
+        "Bearer ",
+        "'token':",
+        '"token":',
+        "'",
+        '"',
+        "\\'",
+        '\\"',
+        "x",
+        "a b",
+        " ",
+        ":",
+        "=",
+        ",",
+        ">",
+        "\n",
+        "\\n",
+        "[REDACTED]",
+        "'\"'\"'",
+        "'\\''",
+    ]
+    changed = []
+    for _ in range(3000):
+        text = "".join(rng.choice(atoms) for _ in range(rng.randint(2, 10)))
+        for held in (text, json.dumps({"stdout": text})):
+            once = redact(held)
+            if redact(once) != once:
+                changed.append(held)
+    assert changed == [], changed[:5]
+
+
 def _quotings(pairs):
     """``pairs`` (key, value) as each quoting a step's output carries them prints them."""
     mapping = dict(pairs)
