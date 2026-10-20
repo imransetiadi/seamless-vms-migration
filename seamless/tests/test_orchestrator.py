@@ -10324,6 +10324,30 @@ async def test_a_relaunch_failing_for_the_first_migration_still_relaunches_the_n
     assert sorted(calls) == sorted([first.id, second.id]), calls
 
 
+async def test_a_retrys_action_names_the_attempts_it_wrote(tmp_path, store):
+    """SDD §5.1 (review RV52-O6): a failed migration's retry wrote migration.action with the
+    attempts from before the move to ready counted the new one - one less than it stored; a
+    rolled-back one's, counted by the retry itself, was right. Both name what they wrote."""
+    vms = [vm(1), vm(2)]
+    h = build_harness(tmp_path, store, vms)
+    plan = plan_for(vms, default_strategy=Strategy.cold)
+    store.put("plan", plan)
+    failed = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=P.failed)
+    rolled = make_migration(plan_id=plan.id, vm=vm(2), strategy=Strategy.cold, phase=P.rolled_back)
+    store.put("migration", failed)
+    store.put("migration", rolled)
+    a = await h.orch.retry(failed.id, "alice")
+    b = await h.orch.retry(rolled.id, "alice")
+    said = {
+        e.migration_id: e.data["attempts"]
+        for e in store.events(since_seq=0, limit=100)
+        if e.kind == "migration.action" and e.data.get("action") == "retry"
+    }
+    await h.orch.stop()
+    assert (a.attempts, b.attempts) == (failed.attempts + 1, rolled.attempts + 1)
+    assert said == {a.id: a.attempts, b.id: b.attempts}
+
+
 async def test_a_plan_cancel_keeps_its_reason_as_python_s_strip_leaves_it(tmp_path, store):
     """SDD §12 (review RV52-S3): a plan's cancel kept its reason as sent - white space only was a
     reason, padding stayed - where a migration's cancel keeps it as Python's strip leaves it, and
