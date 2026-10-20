@@ -236,6 +236,13 @@ def test_memory_hits_are_redacted_where_they_enter():
         # parts (RV52-X3)
         '--os-password "' + '\\"' * 16384,
         "--os-password " + "'a'\"b\"" * 5460,
+        # an Authorization header after markers, an auth section with a comment and CRLF, what
+        # is glued to a single-quoted value on one line or over several (RV52-X4 to RV52-X6)
+        "Authorization: [REDACTED]x " * 1200,
+        "auth: # c\r\n" + "   p: q\r\n" * 3640,
+        "password='a'" + '"b"' * 10920,
+        "password: '\nx'" + "y" * 32768,
+        ("password: '\n" + "x " * 4) * 1560,
     ],
     ids=[
         "key prefix",
@@ -260,6 +267,11 @@ def test_memory_hits_are_redacted_where_they_enter():
         "glued escaped parts",
         "flag quote never closed",
         "flag quoted parts",
+        "header after markers",
+        "auth section crlf comment",
+        "glued quote after quote",
+        "glued after lines",
+        "values over lines",
     ],
 )
 def test_redact_costs_time_linear_in_the_text(text):
