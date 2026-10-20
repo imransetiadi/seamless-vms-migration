@@ -1442,6 +1442,18 @@ describe('mock API', () => {
     expect(server.events.slice(before).filter((e) => e.kind === 'plan.cancelled')).toHaveLength(1);
   });
 
+  it("keeps a plan cancel's reason as Python's strip leaves it, like the API (SDD §12, review RV52-S3)", () => {
+    const reasonOf = (sent: string) => {
+      const server = new MockServer({ now: () => NOW, seed: 1 });
+      const before = server.events.length;
+      expect(server.handle('POST', '/plans/plan-c81d44a0/cancel', new URLSearchParams(), { reason: sent }, 'operator').status).toBe(200);
+      return server.events.slice(before).find((e) => e.kind === 'plan.cancelled')!.data.reason;
+    };
+    // NEL (U+0085) is white space to Python's strip, not to JavaScript's trim
+    expect(reasonOf('  late window\u0085 ')).toBe('late window');
+    expect(reasonOf(' \u0085\u2028 ')).toBeNull();
+  });
+
   it('cancels a removed VM\u2019s failed migration at validation like the API, unless its cutover stopped the source (SDD §5.4)', () => {
     const { server } = setup('operator');
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;

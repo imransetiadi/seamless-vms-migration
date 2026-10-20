@@ -2465,7 +2465,8 @@ export class MockServer {
           "cancel a failed or rolled-back migration on its own first, which cleans up what it copied - on VMware it names the kit's copies it keeps",
       );
     }
-    const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;
+    // as Python's strip leaves it, like the API (SDD §12, review RV52-S3)
+    const reason = typeof input.reason === 'string' && pyStrip(input.reason) ? pyStrip(input.reason) : null;
     const todo = mine.filter((m) => m.phase !== 'cancelled').sort((a, b) => (a.id < b.id ? -1 : 1));
     // like the API (SDD §12): refused before any change while a source is stopped - a cancel cannot restart it
     const stopped = todo.filter((m) => m.downtime_started_at && !m.downtime_ended_at).map((m) => m.vm.name).sort();
