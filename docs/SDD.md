@@ -1960,9 +1960,11 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   error of one - a write the store refuses, a provider down - is logged and the plans after it are ticked, as each
   orphan's relaunch is (review RV51-06). The tick decides on a snapshot; starting a step re-checks,
   under the plan's lock and then the migration's, what the decision rested on — that the plan still
-  runs (a pause that returned starts nothing more), the phase, the gate of a cutover (§5.4) and the
-  strategy: a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
-  single-shot one, since `set_strategy` may have changed it meanwhile. A running plan is pre-staged (`prestage`, §7.2)
+  runs (a pause that returned starts nothing more), the phase, the gate of a cutover (§5.4), the
+  strategy - a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
+  single-shot one, since `set_strategy` may have changed it meanwhile - and that a pre-staging covered the
+  assessment of a migration in `ready`: one `set_strategy` changed since starts nothing and wakes the tick, which
+  pre-stages it first (review RV52-O4). A running plan is pre-staged (`prestage`, §7.2)
   before its first migration starts, and again before a `ready` migration starts whose assessment no pre-staging
   covered - pre-staging is idempotent and creates only what the destination lacks, so a VM added since, or one
   validated again or given a strategy that needs a conversion host since, is pre-staged too, as its validation said
