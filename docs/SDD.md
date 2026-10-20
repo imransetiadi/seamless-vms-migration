@@ -129,7 +129,9 @@ Strategy enum (wire format, lower-case): `cold | warm | storage_handover | vmwar
 ## 4. Domain model (control plane)
 
 All models are Pydantic v2 (`seamless_migrate.domain.models`). JSON field names are exactly the
-Python attribute names. Timestamps are ISO-8601 UTC strings ending in `Z`. Sizes are integer bytes
+Python attribute names. Timestamps are ISO-8601 UTC strings ending in `Z`; one read with another offset is the same
+instant in UTC, and one whose instant falls outside 0001-01-01 to 9999-12-31 UTC (`0001-01-01T00:00:00+14:00`) is
+refused with 422 naming the field, never a 500 (audit AA-01). Sizes are integer bytes
 unless the name ends in `_gb`. Durations are float seconds (`_s`).
 
 ### 4.1 Enums (`seamless_migrate.domain.enums`, all `StrEnum`)
@@ -2654,7 +2656,9 @@ a probe's `expect_stauts`), on `POST /plans` and `POST /providers` as on `PATCH 
 `PATCH /providers/{id}`, on `POST` and `PUT /advisor/policies` (a misspelt `scope` would make a plan's policy a global
 one) and in `seamless plan apply` (§15) — so a misspelt guard (`requrie_approval`, `verify_tsl`) never silently yields a
 plan, provider or policy without it (audit AP-01, AP-02); a stored document keeps loading with fields a later version
-added, at any depth (§11). The text a person gives with an action is kept as Python's `str.strip()` leaves it: an
+added, at any depth (§11). A route whose request is `{}` - an advisor approve, a plan's validate, start and pause, a
+migration's sync and retry, a provider's check - takes an empty object or no body, and refuses a field in one the
+same way (audit AA-04). The text a person gives with an action is kept as Python's `str.strip()` leaves it: an
 approval's and a cutover request's `comment` and a cancel's `reason` - one that strips to nothing is none - and a
 rollback's `reason`, which must keep a character (422 otherwise), as a Force cutover's and an override's reason are
 (review RV51-26).
