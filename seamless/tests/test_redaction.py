@@ -1095,3 +1095,25 @@ def test_a_seeded_fuzz_of_escapes_camel_case_keys_and_auth_sections_redacts_once
             if redact(once) != once:
                 changed.append(held)
     assert changed == [], changed[:5]
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "kept"),
+    [
+        ("openstack --key-passphrase FakePhrC1 server list", "FakePhrC1", " server list"),
+        ("ssh-keygen --new-passphrase 'Fake Phr C2' -f k", "Phr C2", " -f k"),
+        (repr({"password": "x'y", "adminPass": "FakeQuotC3"}), "FakeQuotC3", "'adminPass': "),
+        ("password: 'a\\'b', 'adminPass': 'FakeQuotC4', next", "FakeQuotC4", "'adminPass': "),
+        ("{'token': 'it\\'s', 'accessToken': 'FakeQuotC5'}", "FakeQuotC5", "'accessToken': "),
+    ],
+    ids=["flag", "flag-quoted", "repr-after-a-quote", "after-an-escaped-quote", "camel-token"],
+)
+def test_a_passphrase_flag_and_a_quoted_camel_case_key_after_a_doubtful_value_are_redacted(
+    text, secret, kept
+):
+    """SDD §13.4 (review RV52-X7): the CLI form ends in passphrase too, and a value read past a
+    close it doubts stops before a quoted camelCase key as before a quoted credential key - the key
+    is kept and its own value redacted, where it went out in clear."""
+    out = redact(text)
+    assert secret not in out and kept in out, out
+    assert redact(out) == out, out
