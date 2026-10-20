@@ -2,8 +2,10 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Route, Routes, useNavigationType } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
+import type { DestinationInventory, GpuCapacity } from '../api/types';
 import { Layout } from '../components/Layout';
-import { createTestServer, renderWithApp } from '../test/utils';
+import { formatDateTime } from '../lib/format';
+import { createTestServer, renderWithApp, TEST_NOW } from '../test/utils';
 import Inventory from './Inventory';
 
 function NavigationType() {
@@ -186,6 +188,82 @@ describe('Inventory', () => {
         .map((cell) => cell.textContent);
     expect(cells('admin')).toEqual(['Unlimited', 'Unlimited', 'Unlimited', 'Unlimited', 'Unlimited']);
     expect(cells('ops')).toEqual(['10', 'Not reported', '5', '4', 'Not reported']);
+  });
+
+  describe("a destination's GPUs (SDD §16, §22.11)", () => {
+    /** A row of a table in the region, by its row header's text. */
+    const rowOf = (region: HTMLElement, header: string) =>
+      within(region)
+        .getAllByRole('row')
+        .find((row) => within(row).queryByRole('rowheader')?.textContent === header);
+    const cells = (row: HTMLElement | undefined) => (row ? within(row).getAllByRole('cell').map((cell) => cell.textContent) : null);
+    const TECH_PREVIEW = 'Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts.';
+
+    it("shows a destination's GPU flavors and GPU capacity", async () => {
+      renderWithApp(<Inventory />, { route: '/inventory/rhoso-prod', path: '/inventory/:providerId', token: 'viewer' });
+      // its GPU flavors: size, GPU requests and declared profile, labelled Technology Preview in words
+      const flavors = await screen.findByRole('region', { name: 'GPU flavors' });
+      expect(within(flavors).getByRole('button', { name: 'Technology Preview' })).toHaveAccessibleDescription(TECH_PREVIEW);
+      expect(cells(rowOf(flavors, 'g1.a100-4c'))).toEqual(['8', '32.0 GiB', '200 GiB', 'vGPU · VGPU, CUSTOM_NVIDIA_A100_4C', 'A100-4C']);
+      expect(cells(rowOf(flavors, 'g1.a100-3-20c'))).toEqual(['16', '64.0 GiB', '300 GiB', 'vGPU · VGPU, CUSTOM_NVIDIA_A100_3_20C', 'A100-3-20C']);
+      expect(cells(rowOf(flavors, 'p1.a100'))).toEqual(['16', '128 GiB', '400 GiB', 'Passthrough · alias a100', 'None declared']);
+      // a flavor that asks for no GPU is no GPU flavor
+      expect(rowOf(flavors, 'm1.large')).toBeUndefined();
+
+      // its GPU capacity as the inventory read it: each pool with the flavors that ask of it, its free units and GPUs
+      const capacity = screen.getByRole('region', { name: 'GPU capacity' });
+      expect(within(capacity).getByRole('button', { name: 'Technology Preview' })).toHaveAccessibleDescription(TECH_PREVIEW);
+      expect(capacity).toHaveTextContent(`read with the inventory at ${formatDateTime(TEST_NOW)}`);
+      expect(cells(rowOf(capacity, 'VGPU, CUSTOM_NVIDIA_A100_4C'))).toEqual(['g1.a100-4c (A100-4C)', '4 free on 1 GPU']);
+      expect(cells(rowOf(capacity, 'VGPU, CUSTOM_NVIDIA_A100_3_20C'))).toEqual(['g1.a100-3-20c (A100-3-20C)', '2 free on 1 GPU']);
+      // the class alone unites its pools: every flavor of the class asks of it (§22.5)
+      expect(cells(rowOf(capacity, 'VGPU'))).toEqual(['g1.a100-4c (A100-4C), g1.a100-3-20c (A100-3-20C)', '6 free on 2 GPUs, at most 4 on one']);
+      expect(capacity).not.toHaveTextContent(/Not read/);
+    });
+
+    it('says a destination without a GPU flavor has none, and shows no GPU capacity for it', async () => {
+      renderWithApp(<Inventory />, { route: '/inventory/rhoso-staging', path: '/inventory/:providerId', token: 'viewer' });
+      const flavors = await screen.findByRole('region', { name: 'GPU flavors' });
+      expect(flavors).toHaveTextContent('No flavor asks for a GPU.');
+      expect(screen.queryByRole('region', { name: 'GPU capacity' })).not.toBeInTheDocument();
+    });
+
+    it('says why GPU capacity was not read', async () => {
+      const failures: Array<[Pick<GpuCapacity, 'reason' | 'detail'>, string]> = [
+        [{ reason: 'forbidden', detail: 'HTTP 403' }, 'Not read: the destination credential lacks the role Placement asks for, admin by default (HTTP 403).'],
+        [{ reason: 'no_placement', detail: null }, "Not read: the destination's catalog lists no Placement."],
+        [{ reason: 'error', detail: 'HTTP 503' }, 'Not read: the read failed (HTTP 503).'],
+        [{ reason: 'error', detail: 'ConnectTimeout' }, 'Not read: the read failed (ConnectTimeout).'],
+      ];
+      for (const [failure, said] of failures) {
+        const server = createTestServer();
+        (server.inventories['rhoso-prod'] as DestinationInventory).gpu_capacity = { status: 'unknown', ...failure, read_at: '2026-10-08T11:59:00Z', pools: [] };
+        const { unmount } = renderWithApp(<Inventory />, { route: '/inventory/rhoso-prod', path: '/inventory/:providerId', token: 'viewer', server });
+        const capacity = await screen.findByRole('region', { name: 'GPU capacity' });
+        expect(capacity, failure.reason ?? '').toHaveTextContent(said);
+        // nothing read reads as no pool, never as free units
+        expect(within(capacity).queryByRole('table')).not.toBeInTheDocument();
+        expect(capacity).not.toHaveTextContent(/free on/);
+        unmount();
+      }
+    });
+
+    it("marks an alias flavor's capacity unknown", async () => {
+      const { server, unmount } = renderWithApp(<Inventory />, { route: '/inventory/rhoso-prod', path: '/inventory/:providerId', token: 'viewer' });
+      const capacity = await screen.findByRole('region', { name: 'GPU capacity' });
+      expect(within(capacity).getByText(/Capacity unknown/)).toHaveTextContent('p1.a100: Capacity unknown: PCI aliases are configured in nova.conf');
+      // the vGPU flavors' capacity is read: the alias flavor alone is marked
+      expect(within(capacity).getAllByText(/Capacity unknown/)).toHaveLength(1);
+      unmount();
+      // a destination whose GPU flavors ask for aliases alone has no pool to read, and says so
+      const inventory = server.inventories['rhoso-prod'] as DestinationInventory;
+      inventory.gpu_flavors = inventory.gpu_flavors!.filter((f) => f.name === 'p1.a100');
+      inventory.gpu_capacity = { ...inventory.gpu_capacity!, pools: [] };
+      renderWithApp(<Inventory />, { route: '/inventory/rhoso-prod', path: '/inventory/:providerId', token: 'viewer', server });
+      const aliasOnly = await screen.findByRole('region', { name: 'GPU capacity' });
+      expect(aliasOnly).toHaveTextContent('No flavor asks for a vGPU: Placement has no pool to read.');
+      expect(within(aliasOnly).getByText(/Capacity unknown/)).toHaveTextContent('p1.a100: Capacity unknown: PCI aliases are configured in nova.conf');
+    });
   });
 
   it('says when a destination reports no projects', async () => {

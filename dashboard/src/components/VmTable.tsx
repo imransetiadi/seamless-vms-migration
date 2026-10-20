@@ -1,9 +1,10 @@
 import { CircleCheck, CircleHelp, CircleX, Pause, Power, PowerOff, RefreshCw, SearchX, type LucideIcon } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { POWER_STATES, type GuestOS, type PowerState, type ProviderKind, type VMRef } from '../api/types';
+import { POWER_STATES, type GpuDevice, type GuestOS, type PowerState, type ProviderKind, type VMRef } from '../api/types';
 import { cn } from '../lib/cn';
 import { formatBytes, formatNumber } from '../lib/format';
+import { gpuLabel, vmGpus } from '../lib/gpu';
 import { phaseMeta, type Tone } from '../lib/phase';
 import type { Holder } from '../lib/holds';
 import { readinessFlags, readinessLevel, type ReadinessFlag, type ReadinessLevel } from '../lib/readiness';
@@ -14,6 +15,7 @@ import { EmptyState } from './EmptyState';
 import { SelectField } from './Field';
 import { SortableHeader } from './SortableHeader';
 import { StatusBadge } from './StatusBadge';
+import { TechPreviewBadge } from './TechPreviewBadge';
 import { guestOsOf } from '../lib/guestOs';
 
 const POWER_META: Record<PowerState, { label: string; tone: Tone; icon: LucideIcon }> = {
@@ -32,6 +34,7 @@ type ReadinessFilter = 'all' | ReadinessLevel;
 
 type OsFilter = 'all' | 'linux' | 'windows' | 'legacy' | 'unknown';
 type PlanFilter = 'all' | 'free' | 'held';
+type GpuFilter = 'all' | 'with' | 'without';
 
 interface Row {
   vm: VMRef;
@@ -39,6 +42,8 @@ interface Row {
   level: ReadinessLevel;
   haystack: string;
   guest: GuestOS;
+  /** Its GPUs as the API reads them (SDD §22.2): as its source reports them, else its flavor's requests. */
+  gpus: GpuDevice[];
 }
 
 export interface VmTableProps {
@@ -90,6 +95,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   const [project, setProject] = useState('all');
   const [os, setOs] = useState<OsFilter>('all');
   const [plan, setPlan] = useState<PlanFilter>('all');
+  const [gpu, setGpu] = useState<GpuFilter>('all');
   const [sort, setSort] = useState<SortState<SortKey> | null>(null);
   const [limit, setLimit] = useState(pageSize);
   const selectAllRef = useRef<HTMLInputElement>(null);
@@ -106,10 +112,13 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
           .filter(Boolean)
           .join(' ')
           .toLowerCase();
-        return { vm, flags, level: readinessLevel(flags), haystack, guest };
+        return { vm, flags, level: readinessLevel(flags), haystack, guest, gpus: vmGpus(vm) };
       }),
     [vms, providerKind],
   );
+  // the GPU column and filter while a VM of the table has a GPU, as the Project filter while it has two projects (SDD §16)
+  const hasGpus = rows.some((r) => r.gpus.length > 0);
+  const gpuFilter = hasGpus ? gpu : 'all';
 
   const projects = useMemo(
     () => [...new Set(vms.map((vm) => vm.project).filter((p): p is string => Boolean(p)))].sort(),
@@ -118,8 +127,9 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return rows.filter(({ vm, level, haystack, guest }) => {
+    return rows.filter(({ vm, level, haystack, guest, gpus }) => {
       if (power !== 'all' && vm.power_state !== power) return false;
+      if (gpuFilter !== 'all' && (gpus.length > 0) !== (gpuFilter === 'with')) return false;
       if (os === 'legacy' ? guest.lifecycle !== 'legacy' : os !== 'all' && guest.family !== os) return false;
       if (project !== 'all' && vm.project !== project) return false;
       if (readiness === 'ready' && level !== 'ready') return false;
@@ -129,7 +139,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
       if (holders && plan !== 'all' && holders.has(vm.source_id) !== (plan === 'held')) return false;
       return !q || haystack.includes(q);
     });
-  }, [rows, query, power, project, readiness, os, plan, holders]);
+  }, [rows, query, power, project, readiness, os, plan, holders, gpuFilter]);
 
   const sorted = useMemo(
     () =>
@@ -155,7 +165,8 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   );
 
   const visible = sorted.slice(0, limit);
-  const filtersActive = query !== '' || power !== 'all' || readiness !== 'all' || project !== 'all' || os !== 'all' || plan !== 'all';
+  const filtersActive =
+    query !== '' || power !== 'all' || readiness !== 'all' || project !== 'all' || os !== 'all' || plan !== 'all' || gpuFilter !== 'all';
   // the header checkbox acts on every matching VM, also the rows not rendered yet: the labels say so
   const allMatchingShown = visible.length === filtered.length;
   const visibleIds = new Set(visible.map((r) => r.vm.source_id));
@@ -179,6 +190,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
     setProject('all');
     setOs('all');
     setPlan('all');
+    setGpu('all');
     // the button goes away with the filters: the search field keeps the focus (SDD §16)
     searchRef.current?.focus();
   };
@@ -253,6 +265,19 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
             { value: 'unknown', label: 'Not identified' },
           ]}
         />
+        {hasGpus && (
+          <SelectField
+            label="GPU"
+            className="md:w-40"
+            value={gpuFilter}
+            onChange={(e) => setGpu(e.target.value as GpuFilter)}
+            options={[
+              { value: 'all', label: 'All' },
+              { value: 'with', label: 'With a GPU' },
+              { value: 'without', label: 'Without a GPU' },
+            ]}
+          />
+        )}
         {projects.length > 1 && (
           <SelectField
             label="Project"
@@ -330,6 +355,15 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
                 />
                 <SortableHeader label="Power" sortKey="power" sort={sort} onSort={(k) => setSort(nextSort(sort, k))} />
                 <SortableHeader label="vCPU / RAM" sortKey="cpu" sort={sort} onSort={(k) => setSort(nextSort(sort, k))} align="right" />
+                {hasGpus && (
+                  <th scope="col" className="hidden md:table-cell">
+                    {/* a GPU element is labelled Technology Preview, in words (SDD §16, §22.11) */}
+                    <span className="inline-flex items-center gap-1.5">
+                      GPU
+                      <TechPreviewBadge className="normal-case tracking-normal" />
+                    </span>
+                  </th>
+                )}
                 <SortableHeader label="Disks" sortKey="disk" sort={sort} onSort={(k) => setSort(nextSort(sort, k))} align="right" />
                 <SortableHeader
                   label="Used"
@@ -345,7 +379,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
               </tr>
             </thead>
             <tbody>
-              {visible.map(({ vm, flags, level }) => {
+              {visible.map(({ vm, flags, level, gpus }) => {
                 const isSelected = selected?.has(vm.source_id) ?? false;
                 return (
                   <tr key={vm.source_id} className={cn(isSelected && 'bg-accent/5')}>
@@ -383,6 +417,16 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
                     <td className="num whitespace-nowrap text-right">
                       {vm.vcpus} / {formatBytes(vm.ram_mb * 1024 * 1024)}
                     </td>
+                    {hasGpus && (
+                      // each of its GPUs on a line of its own; empty for a VM without one (SDD §16)
+                      <td className="hidden md:table-cell">
+                        {gpus.map((g, i) => (
+                          <span key={i} className="block">
+                            {gpuLabel(g)}
+                          </span>
+                        ))}
+                      </td>
+                    )}
                     <td className="num whitespace-nowrap text-right">
                       <span className="text-muted-foreground">{vm.disks.length}× </span>
                       {formatBytes(vm.disk_bytes)}

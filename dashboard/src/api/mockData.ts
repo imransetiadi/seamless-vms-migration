@@ -10,6 +10,7 @@ import type {
   AdvisorRecommendation,
   AdvisorSnapshot,
   ConvergedBy,
+  DestinationFlavor,
   DestinationInventory,
   DestinationNetwork,
   DestinationSubnet,
@@ -20,6 +21,8 @@ import type {
   Finding,
   GpuCapacity,
   GpuDevice,
+  GpuFlavor,
+  GpuPool,
   Migration,
   Nic,
   Phase,
@@ -39,7 +42,7 @@ import { DOWNTIME_PARTS } from './types';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { estimateStrategy, paramsFor } from '../lib/forcedEstimate';
 import { pyNames, pyRepr } from '../lib/format';
-import { vgpuRequestKeys, vmGpus } from '../lib/gpu';
+import { gpuDevice, gpuRequests, vgpuRequestKeys, vmGpus } from '../lib/gpu';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { kitVmName } from '../lib/kitName';
@@ -403,24 +406,69 @@ const MAXIMA = { source: ['2.88', '3.64'], rhoso: ['2.95', '3.70'], openstack: [
 /** The demo's admin token's role names: its check report and its destinations' inventories name them (SDD §10). */
 export const DEMO_TOKEN_ROLES: readonly string[] = ['admin', 'member', 'reader'];
 
+/** The vGPU profiles the demo's GPU destinations declare for their two vGPU flavors (`gpu_profiles`, SDD §22.3, §22.10). */
+const DEMO_GPU_PROFILES: Readonly<Record<string, string>> = { 'g1.a100-4c': 'A100-4C', 'g1.a100-3-20c': 'A100-3-20C' };
+
+/** The GPU flavors of the demo's GPU destinations (SDD §22.10): two vGPU types by their traits, and an A100 by PCI alias. */
+const DEMO_GPU_FLAVORS: DestinationFlavor[] = [
+  { name: 'g1.a100-4c', vcpus: 8, ram_mb: 32768, disk_gb: 200, extra_specs: { 'resources:VGPU': '1', 'trait:CUSTOM_NVIDIA_A100_4C': 'required' } },
+  { name: 'g1.a100-3-20c', vcpus: 16, ram_mb: 65536, disk_gb: 300, extra_specs: { 'resources:VGPU': '1', 'trait:CUSTOM_NVIDIA_A100_3_20C': 'required' } },
+  { name: 'p1.a100', vcpus: 16, ram_mb: 131072, disk_gb: 400, extra_specs: { 'pci_passthrough:alias': 'a100:1' } },
+];
+
 /**
- * A destination's GPU capacity as its check reads it when the check runs: the demo's destinations list no GPU flavor,
- * so it reads ok with no pools, as the API demo's (SDD §22.3).
+ * The pools the Placement of the demo's GPU destinations holds for those flavors, as §22.3 reads them (SDD §22.10): the
+ * A100-4C type's 4 units free on one GPU, the MIG-backed A100-3-20C type's 2 on another, and the class alone, which
+ * unites them. Each pool its own object: a destination's GPUs are its own.
  */
-export function gpuCapacityOf(readAt: string): GpuCapacity {
-  return { status: 'ok', reason: null, detail: null, read_at: readAt, pools: [] };
+function demoGpuPools(): GpuPool[] {
+  const pool = (traits: string[], free: number, providers: number, largest: number): GpuPool => ({
+    resource_class: 'VGPU',
+    traits,
+    forbidden_traits: [],
+    same_provider: false,
+    free,
+    providers,
+    largest_free: largest,
+    detail: null,
+  });
+  return [pool(['CUSTOM_NVIDIA_A100_4C'], 4, 1, 4), pool(['CUSTOM_NVIDIA_A100_3_20C'], 2, 1, 2), pool([], 6, 2, 4)];
+}
+
+/**
+ * A destination's flavors that ask for a GPU, with the profile its provider declares for each, as the API's inventory
+ * lists them (`gpu_flavors`, SDD §22.3): their requests read by `gpu_requests`.
+ */
+function gpuFlavorsOf(flavors: readonly DestinationFlavor[], profiles: Readonly<Record<string, string>> = {}): GpuFlavor[] {
+  return flavors.flatMap(({ name, vcpus, ram_mb, disk_gb, extra_specs }) => {
+    const gpus = gpuRequests(extra_specs, Object.hasOwn(profiles, name) ? profiles[name]! : null);
+    return gpus.length ? [{ name, vcpus, ram_mb, disk_gb, gpus }] : [];
+  });
+}
+
+/**
+ * A destination's GPU capacity as a read at `readAt` finds it - its inventory's and its check's alike (SDD §10, §22.3):
+ * what the destination's Placement holds for its GPU flavors' pools, or ok with no pools for a destination without a
+ * GPU flavor, which sends Placement nothing.
+ */
+export function gpuCapacityOf(inventory: DestinationInventory | VMRef[] | undefined, readAt: string): GpuCapacity {
+  const held = inventory && !Array.isArray(inventory) ? inventory.gpu_capacity : undefined;
+  if (!held) return { status: 'ok', reason: null, detail: null, read_at: readAt, pools: [] };
+  return { ...held, read_at: readAt, pools: held.pools.map((p) => ({ ...p, traits: [...p.traits], forbidden_traits: [...p.forbidden_traits] })) };
 }
 
 /**
  * An OpenStack or RHOSO provider's check report, with the keys the API's check reports (SDD §10; check_report_keys.json):
  * its token's roles, its services' maxima, its storage pools and TLS; a destination's adds its series, support tier and
- * policy profile, by its maxima and what it declares (§10.1), and its GPU capacity, read at `checkedAt` (§22.3).
+ * policy profile, by its maxima and what it declares (§10.1), and its GPU capacity, read at `checkedAt` for the GPU
+ * flavors of its `inventory` (§22.3).
  */
 function openstackCheck(
   provider: Pick<Provider, 'kind' | 'role' | 'release' | 'policy_profile'>,
   storage: ReturnType<typeof backend>[],
   checkedAt: string,
   extra: Record<string, unknown> = {},
+  inventory?: DestinationInventory | VMRef[],
 ): Record<string, unknown> {
   const [compute, blockStorage] = provider.role === 'source' ? MAXIMA.source : MAXIMA[provider.kind === 'rhoso' ? 'rhoso' : 'openstack'];
   return {
@@ -435,7 +483,7 @@ function openstackCheck(
     tls: true,
     plain_http: [],
     ...(provider.role === 'destination'
-      ? { ...destinationRelease(provider.kind, provider.release, provider.policy_profile, compute, blockStorage), gpu_capacity: gpuCapacityOf(checkedAt) }
+      ? { ...destinationRelease(provider.kind, provider.release, provider.policy_profile, compute, blockStorage), gpu_capacity: gpuCapacityOf(inventory, checkedAt) }
       : {}),
     ...extra,
   };
@@ -473,14 +521,18 @@ export function vmwareCheck(vms: readonly VMRef[]): Record<string, unknown> {
 
 /**
  * An OpenStack or RHOSO provider's check report, as the mock's check reads its cloud at `checkedAt`: the seeded cloud's
- * own pools, else CHECKED_STORAGE.
+ * own pools, else CHECKED_STORAGE, and a destination's GPU capacity for the GPU flavors of its `inventory` (SDD §22.3).
  */
-export function checkOf(provider: Pick<Provider, 'id' | 'kind' | 'role' | 'release' | 'policy_profile'>, checkedAt: string): Record<string, unknown> {
+export function checkOf(
+  provider: Pick<Provider, 'id' | 'kind' | 'role' | 'release' | 'policy_profile'>,
+  checkedAt: string,
+  inventory?: DestinationInventory | VMRef[],
+): Record<string, unknown> {
   // a seeded cloud's own pools only for a provider of its role and kind: one re-created under its id as another
   // provider reads the generic pools, never the deleted cloud's (review RV20-14)
   const seeded = CLOUDS[provider.id];
   const cloud = seeded && seeded.role === provider.role && seeded.kind === provider.kind ? seeded : undefined;
-  return openstackCheck(provider, cloud?.storage ?? CHECKED_STORAGE, checkedAt, cloud?.extra);
+  return openstackCheck(provider, cloud?.storage ?? CHECKED_STORAGE, checkedAt, cloud?.extra, inventory);
 }
 
 /** Each device by what names it - a profile, an alias, the PCI ids or a vGPU's class -, with its count when more than one: the API's _gpu_names (SDD §9.3). */
@@ -620,6 +672,9 @@ export function makeVm(spec: VmSpec): VMRef {
   };
 }
 
+/** What the demo's `g1.vgpu` flavor asks for: one vGPU with the trait of the A100-4C type (SDD §22.10). */
+const GPU_ML_SPECS: Record<string, string> = { 'resources:VGPU': '1', 'trait:CUSTOM_NVIDIA_A100_4C': 'required' };
+
 const OS_VMS: VmSpec[] = [
   { id: 'os-0a11', name: 'web-01', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 40, used_gb: 12 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-01' },
   { id: 'os-0a12', name: 'web-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, os_type: 'ubuntu 22.04', disks: [{ size_gb: 40, used_gb: 14 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-02' },
@@ -646,6 +701,8 @@ const OS_VMS: VmSpec[] = [
   { id: 'os-0f74', name: 'analytics-db', project: 'analytics', flavor: 'db.xlarge', vcpus: 16, ram_mb: 65536, disks: [{ size_gb: 50, used_gb: 17, volume_type: 'ceph-ssd' }, { size_gb: 400, used_gb: 260, volume_type: 'ceph-hdd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark', tier: 'database' }, change_rate_mibps: 6 },
   { id: 'os-1a01', name: 'jump-host-01', project: 'platform', flavor: 'm1.small', os_type: 'ubuntu 18.04', disks: [{ size_gb: 20, used_gb: 5 }], nics: [{ network: 'provider-ext', mtu: 1500, fixed_ips: ['203.0.113.25'] }], tags: { app: 'bastion' } },
   { id: 'os-1a02', name: 'build-runner-07', project: 'platform', flavor: 'm1.large', power_state: 'error', disks: [{ size_gb: 100 }], tags: { app: 'ci' } },
+  // the demo's GPU VM (SDD §22.10): its flavor asks for one vGPU of the type its trait names, as its source reports it (§22.2)
+  { id: 'os-1a03', name: 'gpu-ml-01', project: 'media', flavor: 'g1.vgpu', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 100, used_gb: 58 }], flavor_extra_specs: GPU_ML_SPECS, gpus: gpuRequests(GPU_ML_SPECS), tags: { app: 'ml-training' }, change_rate_mibps: 2 },
 ];
 
 const VMW_VMS: VmSpec[] = [
@@ -655,6 +712,11 @@ const VMW_VMS: VmSpec[] = [
   { id: 'vm-5004', name: 'vm-print-01', project: 'erp', vcpus: 2, ram_mb: 4096, os_type: 'windows2016', cbt_enabled: true, tools_ok: false, disks: [{ size_gb: 60, used_gb: 22, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }, { size_gb: 20, used_gb: 3, kind: 'vmdk', volume_type: null, device: 'scsi0:1', independent: true }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'print' } },
   { id: 'vm-5005', name: 'vm-hr-portal', project: 'erp', vcpus: 4, ram_mb: 8192, os_type: 'Ubuntu 24.04.1 LTS', cbt_enabled: true, tools_ok: true, snapshot_count: 2, disks: [{ size_gb: 80, used_gb: 31, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'hr' } },
   { id: 'vm-5006', name: 'vm-legacy-win2008', project: 'erp', vcpus: 2, ram_mb: 4096, os_type: 'windows2008', cbt_enabled: false, tools_ok: false, disks: [{ size_gb: 60, used_gb: 41, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'legacy-crm' } },
+  // the demo's GPU VMs (SDD §22.10): a vGPU, a MIG-backed vGPU, and a DirectPath I/O GPU on a VM powered off, which only a
+  // cold migration takes (§22.6)
+  { id: 'vm-5007', name: 'dc2-ml-01', project: 'erp', vcpus: 8, ram_mb: 32768, os_type: 'rhel9', cbt_enabled: true, tools_ok: true, disks: [{ size_gb: 120, used_gb: 70, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], gpus: [gpuDevice({ kind: 'vgpu', profile: 'grid_a100-4c' })], tags: { app: 'ml-training' }, change_rate_mibps: 2 },
+  { id: 'vm-5008', name: 'dc2-ml-02', project: 'erp', vcpus: 16, ram_mb: 65536, os_type: 'rhel9', cbt_enabled: true, tools_ok: true, disks: [{ size_gb: 200, used_gb: 120, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], gpus: [gpuDevice({ kind: 'vgpu', profile: 'grid_a100-3-20c' })], tags: { app: 'ml-inference' }, change_rate_mibps: 3 },
+  { id: 'vm-5009', name: 'dc2-cuda-01', project: 'erp', vcpus: 16, ram_mb: 131072, os_type: 'rhel9', power_state: 'stopped', cbt_enabled: true, tools_ok: true, disks: [{ size_gb: 250, used_gb: 160, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], gpus: [gpuDevice({ kind: 'passthrough', vendor_id: '10de', device_id: '20b5' })], tags: { app: 'cuda-batch' } },
 ];
 
 const LAB_VMS: VmSpec[] = [
@@ -671,6 +733,8 @@ function conversionHost(name: string, address: string) {
 }
 
 export function buildProviders(now: number): Provider[] {
+  // what each seeded destination's check read of its cloud: its GPU capacity among it (SDD §10, §22.3)
+  const inventories = buildInventories(now);
   return [
     {
       id: 'rhosp17-dc1',
@@ -774,7 +838,7 @@ export function buildProviders(now: number): Provider[] {
       ca_cert_path: '/etc/pki/seamless/ocp-ingress-ca.pem',
       conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31'),
       // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
-      capabilities: checkOf({ id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null }, iso(now - 3 * 60_000)),
+      capabilities: checkOf({ id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null }, iso(now - 3 * 60_000), inventories['rhoso-prod']),
       status: 'ok',
       // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
       status_message: null,
@@ -782,6 +846,8 @@ export function buildProviders(now: number): Provider[] {
       distribution: 'rhoso',
       release: null,
       policy_profile: null,
+      // the vGPU profiles of its GPU flavors, which no API names (SDD §22.3, §22.10)
+      gpu_profiles: { ...DEMO_GPU_PROFILES },
       credentials_updated_at: null,
       conversion_key_updated_at: null,
     },
@@ -820,7 +886,7 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: null,
       conversion_host: conversionHost('os-migrate-conv-dc3', '192.0.2.60'),
-      capabilities: checkOf({ id: 'hibiscus-dc3', kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null }, iso(now - 6 * 60_000)),
+      capabilities: checkOf({ id: 'hibiscus-dc3', kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null }, iso(now - 6 * 60_000), inventories['hibiscus-dc3']),
       status: 'ok',
       // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
       status_message: null,
@@ -828,21 +894,28 @@ export function buildProviders(now: number): Provider[] {
       distribution: 'kolla',
       release: '2026.2',
       policy_profile: null,
+      gpu_profiles: { ...DEMO_GPU_PROFILES },
       credentials_updated_at: null,
       conversion_key_updated_at: null,
     },
   ];
 }
 
-export function buildInventories(): Record<string, VMRef[] | DestinationInventory> {
+/**
+ * A checked destination's inventory (SDD §10): the community destination shares it, as the API demo's does, each with
+ * its own copy - and with the demo's GPU flavors, their declared profiles and their pools, read at `readAt` (§22.10).
+ */
+function destinationInventory(readAt: string): DestinationInventory {
+  const flavors: DestinationFlavor[] = [
+    { name: 'm1.small', vcpus: 2, ram_mb: 4096, disk_gb: 40, extra_specs: {} },
+    { name: 'm1.medium', vcpus: 4, ram_mb: 8192, disk_gb: 80, extra_specs: {} },
+    { name: 'm1.large', vcpus: 8, ram_mb: 32768, disk_gb: 160, extra_specs: {} },
+    { name: 'db.xlarge', vcpus: 16, ram_mb: 131072, disk_gb: 200, extra_specs: { 'hw:cpu_policy': 'dedicated' } },
+    ...DEMO_GPU_FLAVORS.map((f) => ({ ...f, extra_specs: { ...f.extra_specs } })),
+  ];
   const destination: DestinationInventory = {
     networks: { 'tenant-web': 1442, 'tenant-app': 1442, 'tenant-db': 1442, 'tenant-infra': 1442, analytics: 1442, 'erp-net': 1442, 'provider-ext': 1500 },
-    flavors: [
-      { name: 'm1.small', vcpus: 2, ram_mb: 4096, disk_gb: 40, extra_specs: {} },
-      { name: 'm1.medium', vcpus: 4, ram_mb: 8192, disk_gb: 80, extra_specs: {} },
-      { name: 'm1.large', vcpus: 8, ram_mb: 32768, disk_gb: 160, extra_specs: {} },
-      { name: 'db.xlarge', vcpus: 16, ram_mb: 131072, disk_gb: 200, extra_specs: { 'hw:cpu_policy': 'dedicated' } },
-    ],
+    flavors,
     volume_types: ['ceph-ssd', 'ceph-hdd', 'ceph-nvme', 'netapp-nfs'],
     quotas: {
       shop: { cores: 120, ram_mb: 262144, instances: 40, volumes: 80, gigabytes: 8000 },
@@ -867,6 +940,9 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
       })),
       { id: 'sub-provider-ext-v4', name: 'provider-ext-v4', network: 'provider-ext', network_id: 'net-provider-ext', cidr: '203.0.113.0/24', ipv6_address_mode: null, ipv6_ra_mode: null },
     ],
+    // the flavors that ask for a GPU, with the profiles the provider declares, and the pools of their vGPU requests (SDD §22.3)
+    gpu_flavors: gpuFlavorsOf(flavors, DEMO_GPU_PROFILES),
+    gpu_capacity: { status: 'ok', reason: null, detail: null, read_at: readAt, pools: demoGpuPools() },
   };
   // what a NIC's network name resolves to (SDD §10): the credential's own networks, and a provider network another project shares
   destination.network_details = Object.entries(destination.networks).map(([name, mtu]) => ({
@@ -877,12 +953,27 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
     own: name !== 'provider-ext',
     shared: name === 'provider-ext',
   }));
+  return destination;
+}
+
+/**
+ * A destination's inventory that lists nothing (SDD §10): its token's roles, as the API demo's, and no GPU flavor, so its
+ * GPU capacity reads ok with no pools and Placement is sent nothing (§22.3).
+ */
+export function emptyDestinationInventory(readAt: string): DestinationInventory {
+  return { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [], roles: [...DEMO_TOKEN_ROLES], gpu_flavors: [], gpu_capacity: gpuCapacityOf(undefined, readAt) };
+}
+
+/** The seeded providers' inventories, as a read at `now` finds them (SDD §10). */
+export function buildInventories(now: number = Date.now()): Record<string, VMRef[] | DestinationInventory> {
+  const readAt = iso(now);
   return {
     'rhosp17-dc1': OS_VMS.map(makeVm),
     'vcenter-hq': VMW_VMS.map(makeVm),
     'community-lab': LAB_VMS.map(makeVm),
-    'rhoso-prod': destination,
-    'rhoso-staging': { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [], roles: [...DEMO_TOKEN_ROLES] },
+    'rhoso-prod': destinationInventory(readAt),
+    'rhoso-staging': emptyDestinationInventory(readAt),
+    'hibiscus-dc3': destinationInventory(readAt),
   };
 }
 
@@ -1823,7 +1914,7 @@ export interface Fixtures {
 
 export function buildFixtures(now: number): Fixtures {
   const providers = buildProviders(now);
-  const inventories = buildInventories();
+  const inventories = buildInventories(now);
   const plans: Plan[] = [];
   const migrations: Migration[] = [];
   const recommendations: AdvisorRecommendation[] = [];

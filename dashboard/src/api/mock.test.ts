@@ -30,7 +30,9 @@ import {
   type AdvisorPolicy,
   type AdvisorRecommendation,
   type AdvisorStatus,
+  type DestinationInventory,
   type Event,
+  type GpuCapacity,
   type Migration,
   type Plan,
   type Provider,
@@ -3167,21 +3169,31 @@ describe('providers of community destinations, like the API (SDD §4.2, §10, §
   });
 
   it('the mock destination check reports its GPU capacity', () => {
-    // SDD §10, §22.3 (plan task G3): a destination's check holds gpu_capacity, read each time the check runs - ok with
-    // no pools, as the API demo's destinations, which list no GPU flavor -; a source's check has none
+    // SDD §10, §22.3 (plan task G3): a destination's check holds gpu_capacity, read each time the check runs - the pools
+    // of the demo's GPU flavors (§22.10, plan task G10), as its inventory reads them -; a source's check has none
     let now = NOW;
     const server = new MockServer({ now: () => now, seed: 1 });
     const capacity = (id: string) => server.providers.find((p) => p.id === id)!.capabilities.gpu_capacity;
+    const pools = (id: string) => (server.inventories[id] as DestinationInventory).gpu_capacity!.pools;
     for (const id of ['rhoso-prod', 'hibiscus-dc3']) {
       const seeded = server.providers.find((p) => p.id === id)!;
-      expect(capacity(id)).toEqual({ status: 'ok', reason: null, detail: null, read_at: seeded.last_checked_at, pools: [] });
+      expect(pools(id), id).toHaveLength(3);
+      expect(capacity(id)).toEqual({ status: 'ok', reason: null, detail: null, read_at: seeded.last_checked_at, pools: pools(id) });
     }
     expect(server.providers.find((p) => p.id === 'rhosp17-dc1')!.capabilities).not.toHaveProperty('gpu_capacity');
-    // a check later reads it again, at the check's time
+    // a check later reads it again, at the check's time: what the destination's Placement holds then
     now = NOW + 90_000;
+    (server.inventories['rhoso-prod'] as DestinationInventory).gpu_capacity!.pools[0]!.free = 3;
     const checked = call(server, 'POST', '/providers/rhoso-prod/check').body as Provider;
     expect(checked.last_checked_at).toBe(new Date(now).toISOString());
-    expect(checked.capabilities.gpu_capacity).toEqual({ status: 'ok', reason: null, detail: null, read_at: checked.last_checked_at, pools: [] });
+    expect(checked.capabilities.gpu_capacity).toEqual({ status: 'ok', reason: null, detail: null, read_at: checked.last_checked_at, pools: pools('rhoso-prod') });
+    expect((checked.capabilities.gpu_capacity as GpuCapacity).pools[0]!.free).toBe(3);
+    // the inventory reads it live too, with its own read time (SDD §10)
+    now = NOW + 120_000;
+    const read = call(server, 'GET', '/providers/rhoso-prod/inventory').body as DestinationInventory;
+    expect(read.gpu_capacity).toEqual({ status: 'ok', reason: null, detail: null, read_at: new Date(now).toISOString(), pools: pools('rhoso-prod') });
+    // a destination without a GPU flavor reads ok with no pools
+    expect((call(server, 'GET', '/providers/rhoso-staging/inventory').body as DestinationInventory).gpu_capacity).toMatchObject({ status: 'ok', pools: [] });
     // a new destination's first check reports it; a source's does not
     expect(call(server, 'POST', '/providers', { ...base, id: 'rhoso-x', name: 'RHOSO X', kind: 'rhoso', role: 'destination', distribution: 'rhoso' }).status).toBe(201);
     expect(call(server, 'POST', '/providers', { ...base, id: 'src-x', name: 'Source X', kind: 'openstack', role: 'source', distribution: 'openstack_community' }).status).toBe(201);

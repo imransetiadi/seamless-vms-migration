@@ -1,9 +1,10 @@
 /**
  * A flavor's GPU requests and a VM's GPUs as the control plane reads them (planning/gpu.py `gpu_requests` and `vm_gpus`,
- * SDD §22.2): the mock's one port of them, which its eligibility, probe suggestions, waves and GPU mapping rule read. Both
- * suites test it against one case table, `seamless/tests/fixtures/gpu_request_cases.json` (PR #64 review).
+ * SDD §22.2): the mock's one port of them, which its eligibility, probe suggestions, waves and GPU mapping rule read, and
+ * the dashboard's GPU column too. Both suites test it against one case table,
+ * `seamless/tests/fixtures/gpu_request_cases.json` (PR #64 review). Below them, how the dashboard words GPUs (SDD §16).
  */
-import type { GpuDevice, VMRef } from '../api/types';
+import type { GpuCapacity, GpuDevice, GpuFlavor, GpuPool, VMRef } from '../api/types';
 import { byCodePoint, pyInt, pyStrip } from './format';
 
 /** Nova's resource class of a vGPU. */
@@ -16,7 +17,7 @@ const RESOURCES = /^resources([A-Za-z0-9_-]*):([A-Z0-9_]+)$/;
 const TRAIT = /^trait([A-Za-z0-9_-]*):([^\n]+)$/;
 
 /** A GpuDevice with the fields the API's model fills when a request leaves them out. */
-function device(fields: Partial<GpuDevice> & Pick<GpuDevice, 'kind'>): GpuDevice {
+export function gpuDevice(fields: Partial<GpuDevice> & Pick<GpuDevice, 'kind'>): GpuDevice {
   return { profile: null, vendor_id: null, device_id: null, count: 1, resource_class: null, traits: [], forbidden_traits: [], same_provider: false, alias: null, ...fields };
 }
 
@@ -66,7 +67,7 @@ export function gpuRequests(specs: Record<string, string>, declaredProfile: stri
       .sort(([a], [b]) => byCodePoint(a, b))
       .filter(([cls, n]) => n > 0 && (cls === VGPU || (Boolean(declaredProfile) && cls.startsWith('CUSTOM_'))))
       .map(([cls, n]) =>
-        device({
+        gpuDevice({
           kind: 'vgpu',
           profile: declaredProfile,
           count: n,
@@ -78,7 +79,7 @@ export function gpuRequests(specs: Record<string, string>, declaredProfile: stri
       ),
   );
   const aliasProfile = vgpus.length ? null : declaredProfile;
-  return [...vgpus, ...aliases(specs[PCI_ALIAS]).map(([alias, count]) => device({ kind: 'passthrough', alias, count, profile: aliasProfile }))];
+  return [...vgpus, ...aliases(specs[PCI_ALIAS]).map(([alias, count]) => gpuDevice({ kind: 'passthrough', alias, count, profile: aliasProfile }))];
 }
 
 /** The extra-spec keys whose requests gpuRequests reads as vGPUs, in code-point order: what §9.3's VM_VGPU names for an
@@ -100,4 +101,85 @@ export function vmGpus(vm: VMRef, declaredProfile: string | null = null): GpuDev
   const specs = vm.flavor_extra_specs ?? {};
   if (!Object.keys(specs).some((key) => key.startsWith('resources') || key.startsWith(PCI_ALIAS))) return [];
   return gpuRequests(specs, declaredProfile);
+}
+
+// ---------------------------------------------------------------------------------------------
+// How the dashboard words a VM's GPUs, a flavor's GPU requests and a destination's GPU capacity (SDD §16, §22.11)
+// ---------------------------------------------------------------------------------------------
+
+/** What an OpenStack request asks for: its class and traits, a forbidden one prefixed with "!", or its PCI alias. */
+function askedFor(device: GpuDevice): string | null {
+  if (device.resource_class) return [device.resource_class, ...(device.traits ?? []), ...(device.forbidden_traits ?? []).map((t) => `!${t}`)].join(', ');
+  return device.alias ? `alias ${device.alias}` : null;
+}
+
+/**
+ * A GPU as the Inventory's GPU column words it (SDD §16): its kind, then its profile or PCI ids, "×n" for n identical
+ * ones, and for an OpenStack request " · " and what it asks for - "vGPU grid_a100-4c ×2", "Passthrough 10de:20b5",
+ * "vGPU · VGPU, CUSTOM_NVIDIA_A100_4C", "Passthrough · alias a100". An OpenStack request's declared profile stands after
+ * its kind; `declared: false` leaves it out where the profile is shown beside it.
+ */
+export function gpuLabel(device: GpuDevice, { declared = true }: { declared?: boolean } = {}): string {
+  const request = askedFor(device);
+  const ids = device.vendor_id && device.device_id ? `${device.vendor_id}:${device.device_id}` : null;
+  // a VMware device is named by its own profile or its PCI ids; an OpenStack request by what it asks for
+  const name =
+    request !== null ? (declared ? device.profile : null) : device.kind === 'vgpu' ? device.profile || 'without a profile' : (ids ?? 'without device ids');
+  const head = [device.kind === 'vgpu' ? 'vGPU' : 'Passthrough', name, device.count > 1 ? `×${device.count}` : null].filter(Boolean).join(' ');
+  return request === null ? head : `${head} · ${request}`;
+}
+
+/** The vGPU profiles a destination's GPU flavor gives, as its provider declares them (SDD §22.3): none without a declaration. */
+export function declaredProfiles(flavor: GpuFlavor): string[] {
+  return [...new Set(flavor.gpus.map((g) => g.profile).filter((p): p is string => Boolean(p)))];
+}
+
+/**
+ * What tells a pool from another, as the API's pool_key (SDD §22.3): its class, its required and forbidden traits, and
+ * whether they are a numbered group's - a request without traits is its class's pool.
+ */
+function poolKey(resourceClass: string, traits: readonly string[] = [], forbidden: readonly string[] = [], sameProvider = false): string {
+  const required = [...traits].sort(byCodePoint);
+  const refused = [...forbidden].sort(byCodePoint);
+  return JSON.stringify([resourceClass, required, refused, sameProvider && required.length + refused.length > 0]);
+}
+
+/** A pool as the Inventory names it: its class and traits, a forbidden one prefixed with "!" (SDD §16). */
+export function poolLabel(pool: GpuPool): string {
+  return [pool.resource_class, ...pool.traits, ...pool.forbidden_traits.map((t) => `!${t}`)].join(', ');
+}
+
+/**
+ * The GPU flavors that ask of a pool, as the pre-flight counts them (SDD §22.5): a vGPU request asks of its own pool and
+ * of its class's, which unites the class's pools.
+ */
+export function flavorsOfPool(pool: GpuPool, flavors: readonly GpuFlavor[]): GpuFlavor[] {
+  const key = poolKey(pool.resource_class, pool.traits, pool.forbidden_traits, pool.same_provider);
+  return flavors.filter((f) =>
+    f.gpus.some(
+      (g) => g.kind === 'vgpu' && g.resource_class && (poolKey(g.resource_class, g.traits, g.forbidden_traits, g.same_provider) === key || poolKey(g.resource_class) === key),
+    ),
+  );
+}
+
+/**
+ * A pool's free units and the providers that hold them, as the Inventory words them (SDD §16): "4 free on 1 GPU", the
+ * most free on one past one provider; a pool Placement refused as a bad request names its detail.
+ */
+export function poolFreeText(pool: GpuPool): string {
+  if (pool.detail) return `Refused by Placement (${pool.detail}): no server is created with its flavors`;
+  if (pool.free <= 0) return 'None free';
+  const on = `${pool.free} free on ${pool.providers} GPU${pool.providers === 1 ? '' : 's'}`;
+  return pool.providers > 1 ? `${on}, at most ${pool.largest_free} on one` : on;
+}
+
+/**
+ * Why a destination's GPU capacity was not read, in words (SDD §16, §22.3): the role Placement asks for, no Placement,
+ * or the failure, each with its detail - the HTTP status and Placement's error code, never its text (§22.12).
+ */
+export function gpuCapacityReason(capacity: GpuCapacity): string {
+  const detail = capacity.detail ? ` (${capacity.detail})` : '';
+  if (capacity.reason === 'forbidden') return `the destination credential lacks the role Placement asks for, admin by default${detail}`;
+  if (capacity.reason === 'no_placement') return `the destination's catalog lists no Placement${detail}`;
+  return `the read failed${detail}`;
 }
