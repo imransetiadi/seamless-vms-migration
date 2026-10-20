@@ -7828,10 +7828,12 @@ async def test_a_strategy_that_needs_a_conversion_host_pre_stages_the_plan_again
     assert executor.hosts == [False, True]
 
 
-async def test_a_restart_keeps_a_running_plan_pre_staged(tmp_path, store):
-    """SDD §8: after a restart a running plan whose work started counts as pre-staged for its
-    migrations' assessments - web-02's requested cutover starts without a pre-staging -, and a
-    plan paused across a restart is pre-staged again when it next runs with a ready migration."""
+async def test_a_restart_pre_stages_a_running_plan_again_before_its_next_ready_migration(
+    tmp_path, store
+):
+    """SDD §8 (review RV52-O2): what a pre-staging covered lives in the process. After a restart
+    nothing counts as pre-staged: web-02's requested cutover follows a pre-staging, and a plan
+    paused across a restart is pre-staged again when it next runs with a ready migration."""
     settings = make_settings(tmp_path)
     vms = [vm(1), vm(2), vm(3)]
     h, plan = await setup(
@@ -7857,7 +7859,7 @@ async def test_a_restart_keeps_a_running_plan_pre_staged(tmp_path, store):
     await restarted.wait_phase(second.id, P.completed)
     await restarted.orch.pause_plan(plan.id, "alice")
     await restarted.orch.stop()
-    assert restarted.executor.flavors == []
+    assert len(restarted.executor.flavors) == 1
     again = build_harness(
         tmp_path, store, vms, executor=_PrestageRecorder(settings), settings=settings
     )
@@ -7871,6 +7873,59 @@ async def test_a_restart_keeps_a_running_plan_pre_staged(tmp_path, store):
         await asyncio.sleep(0.01)
     await again.orch.stop()
     assert len(again.executor.flavors) == 1
+
+
+@dataclasses.dataclass
+class _SecondGated(ScriptedExecutor):
+    """Records the flavors each pre-staging was asked for; the second one runs until released."""
+
+    flavors: list[list[str]] = dataclasses.field(default_factory=list)
+    started: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    release: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+
+    async def prestage(self, plan, source, destination, *, prestage_flavors=None):
+        self.flavors.append(list(prestage_flavors or []))
+        if len(self.flavors) == 2:
+            self.started.set()
+            await self.release.wait()
+
+
+async def test_a_restart_during_a_pre_staging_still_pre_stages_what_it_was_to_cover(
+    tmp_path, store
+):
+    """SDD §8 (review RV52-O2): web-02 was added to a plan whose work started and validated
+    (MAP_FLAVOR_PRESTAGED); the server restarted while its pre-staging ran. The restart marked
+    every migration of a plan whose work started as covered, so web-02 cut over without its
+    flavor. After a restart nothing counts as covered: web-02's flavor is pre-staged first."""
+    settings = make_settings(tmp_path)
+    executor = _SecondGated(settings)
+    vms, plan_kw = _flavor_plan()
+    h, plan = await setup(tmp_path, store, vms, plan_kw, executor=executor, settings=settings)
+    await run_plan(h, plan)
+    first = await h.by_vm(plan.id, "vm-1")
+    await h.orch.request_cutover(first.id, "sari")
+    await h.wait_phase(first.id, P.completed)  # work started
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    _add_web_02(store, plan)
+    await h.orch.validate_plan(plan.id, "alice")
+    added = await h.by_vm(plan.id, "vm-2")
+    assert "MAP_FLAVOR_PRESTAGED" in {f.code for f in added.findings}
+    await h.orch.start_plan(plan.id, "alice")
+    await asyncio.wait_for(executor.started.wait(), 5)  # web-02's pre-staging runs ...
+    await h.orch.stop()  # ... when the server restarts
+    again = build_harness(
+        tmp_path, store, vms, executor=_PrestageRecorder(settings), settings=settings
+    )
+    await again.orch.start()
+    await again.orch.request_cutover(added.id, "sari")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while (added.id, StepName.CUTOVER) not in again.executor.calls:
+        assert loop.time() < deadline, "web-02 never started"
+        again.orch.wake()
+        await asyncio.sleep(0.01)
+    await again.orch.stop()
+    assert ["m1.xlarge"] in again.executor.flavors, "web-02 cut over, its flavor never created"
 
 
 @dataclasses.dataclass

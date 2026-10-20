@@ -2630,7 +2630,6 @@ class Orchestrator:
             return
         self._stopping = False
         self._wake = asyncio.Event()
-        running = {p.id for p in await self.db.list("plan", Plan) if p.status == PlanStatus.running}
         migrations = await self.db.list("migration", Migration)
         for m in migrations:
             if m.phase in fsm.RESUMABLE_PHASES:
@@ -2640,17 +2639,8 @@ class Orchestrator:
                 self._cleanups[m.id] = asyncio.create_task(
                     self._cleanup_after_cancel(m, None, "system"), name=f"cleanup:{m.id}"
                 )
-        # work started: a running plan was pre-staged for its migrations' assessments; any other
-        # is pre-staged again when it next runs with a ready migration (SDD §8)
-        started = {
-            m.plan_id
-            for m in migrations
-            if m.plan_id in running
-            and any(c.to_phase in (P.precopy, P.cutover) for c in m.phase_history)
-        }
-        for m in migrations:
-            if m.plan_id in started:
-                self._prestage_done.setdefault(m.plan_id, set()).add(_assessment(m))
+        # nothing counts as pre-staged after a restart: a plan is pre-staged again before its next
+        # ready migration starts (SDD §8, review RV52-O2)
         self._tick_task = asyncio.create_task(self._loop(), name="seamless-orchestrator")
         self._started = True
 
