@@ -554,6 +554,27 @@ def test_a_cli_flag_in_an_argv_list_or_quoted_with_a_space_is_redacted_whole(tex
     assert redact(out) == out, out
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        json.dumps({"Authorization": "Basic RmFrZVBhc3M6V29yZA=="}),
+        repr({"Authorization": "Digest username=FakePass, response=Word"}),
+        json.dumps({"msg": json.dumps({"headers": {"authorization": "Negotiate FakePassWord"}})}),
+        "Authorization: Basic RmFrZVBhc3M6V29yZA==",
+    ],
+    ids=["json", "repr", "json-in-json", "header"],
+)
+def test_an_authorization_header_of_any_scheme_is_redacted_in_json_a_repr_and_a_payload(text):
+    """SDD §13.4 (review RV52-X5): an Authorization header was redacted only as a header line or a
+    bearer token, so a Basic, Digest or Negotiate one in JSON or a repr - a request an HTTP
+    client logged - kept its credentials, and redact_payload kept an Authorization key's value."""
+    out = redact(text)
+    assert "RmFrZ" not in out and "Fake" not in out and "Word" not in out, out
+    assert redact(out) == out, out
+    payload = redact_payload({"headers": {"Authorization": "Basic RmFrZVBhc3M6V29yZA=="}})
+    assert payload == {"headers": {"Authorization": REDACTED}}
+
+
 def _quotings(pairs):
     """``pairs`` (key, value) as each quoting a step's output carries them prints them."""
     mapping = dict(pairs)

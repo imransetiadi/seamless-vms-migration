@@ -17,7 +17,9 @@ REDACTED = "[REDACTED]"
 CUT_MARGIN = 16384
 _KEYWORDS = (
     r"password|passwd|pwd|pass|secret|client[_-]?secret|token|auth[_-]?token|x-auth-token|"
-    r"api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|credentials?"
+    r"api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|credentials?|"
+    # an Authorization header of any scheme, quoted in JSON or a repr (review RV52-X5)
+    r"authorization"
 )
 #: A credential key may carry a prefix joined by ``_``/``-``/``.`` (``OS_PASSWORD``,
 #: ``vcenter_password``, ``ansible_become_pass``, ``AWS_SECRET_ACCESS_KEY``, ``auth.password``).
