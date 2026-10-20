@@ -11,7 +11,7 @@ import pytest
 from seamless_migrate.ai.advisor import TIER_CLASSES, VERIFICATION_CLAIMS, Advisor
 from seamless_migrate.ai.decision import decide, default_policy
 from seamless_migrate.ai.jev import JevClient
-from seamless_migrate.ai.payloads import data_sent
+from seamless_migrate.ai.payloads import CONSOLE_EXCERPT_CHARS, data_sent
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import DecisionStatus, Strategy
 from seamless_migrate.domain.models import Estimate, HandoverConfig
@@ -346,6 +346,27 @@ async def test_verification_redacts_the_console_before_screening():
         for canary in ("hunter2", "eyJhbGciOiJIUzI1NiJ9", "MIIEow"):
             assert canary not in text, (name, canary)
         assert "login:" in text
+
+
+async def test_verification_redacts_the_console_before_it_keeps_its_last_characters():
+    """SDD §13.4 (review RV52-X1): the excerpt is the console's last CONSOLE_EXCERPT_CHARS
+    characters, redacted before it is cut - keeping the end first dropped the BEGIN line of a
+    private key the cut fell inside, and the key's body went to jev_screen and jev_verify."""
+    advisor, session = advisor_for(
+        {"screen": {"recommendation": {"action": "pass"}}}, settings=ON_PREM
+    )
+    body = [f"KEYLINE{i:02d}{'A' * 56}" for i in range(60)]
+    pem = "OPENSSH PRIVATE KEY"  # a synthetic key, assembled so no scanner reads a real one here
+    key = f"-----BEGIN {pem}-----\n" + "\n".join(body) + f"\n-----END {pem}-----\n"
+    tail = "web-01 login: " + "x" * (CONSOLE_EXCERPT_CHARS - 2000)
+    console = "boot\n" * 50 + key + tail
+    # the excerpt's cut falls inside the key: its BEGIN line is before the last characters kept
+    assert console.rindex("BEGIN OPENSSH") < len(console) - CONSOLE_EXCERPT_CHARS
+    assert console.rindex("KEYLINE59") > len(console) - CONSOLE_EXCERPT_CHARS
+    await advisor.review_verification(make_vm(name="web-01"), result(console=console))
+    for name in ("jev_screen", "jev_verify"):
+        [args] = [c[1] for c in session.calls if c[0] == name]
+        assert "KEYLINE" not in json.dumps(args), name
 
 
 async def test_verification_contradiction_sets_review_never_flips_pass():
