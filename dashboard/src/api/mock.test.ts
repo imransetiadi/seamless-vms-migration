@@ -3166,6 +3166,29 @@ describe('providers of community destinations, like the API (SDD §4.2, §10, §
     for (const p of checked) expect(keysOf(p.capabilities)).toEqual([...CHECK_KEYS.openstack, ...(p.role === 'destination' ? CHECK_KEYS.destination : [])].sort());
   });
 
+  it('the mock destination check reports its GPU capacity', () => {
+    // SDD §10, §22.3 (plan task G3): a destination's check holds gpu_capacity, read each time the check runs - ok with
+    // no pools, as the API demo's destinations, which list no GPU flavor -; a source's check has none
+    let now = NOW;
+    const server = new MockServer({ now: () => now, seed: 1 });
+    const capacity = (id: string) => server.providers.find((p) => p.id === id)!.capabilities.gpu_capacity;
+    for (const id of ['rhoso-prod', 'hibiscus-dc3']) {
+      const seeded = server.providers.find((p) => p.id === id)!;
+      expect(capacity(id)).toEqual({ status: 'ok', reason: null, detail: null, read_at: seeded.last_checked_at, pools: [] });
+    }
+    expect(server.providers.find((p) => p.id === 'rhosp17-dc1')!.capabilities).not.toHaveProperty('gpu_capacity');
+    // a check later reads it again, at the check's time
+    now = NOW + 90_000;
+    const checked = call(server, 'POST', '/providers/rhoso-prod/check').body as Provider;
+    expect(checked.last_checked_at).toBe(new Date(now).toISOString());
+    expect(checked.capabilities.gpu_capacity).toEqual({ status: 'ok', reason: null, detail: null, read_at: checked.last_checked_at, pools: [] });
+    // a new destination's first check reports it; a source's does not
+    expect(call(server, 'POST', '/providers', { ...base, id: 'rhoso-x', name: 'RHOSO X', kind: 'rhoso', role: 'destination', distribution: 'rhoso' }).status).toBe(201);
+    expect(call(server, 'POST', '/providers', { ...base, id: 'src-x', name: 'Source X', kind: 'openstack', role: 'source', distribution: 'openstack_community' }).status).toBe(201);
+    expect((call(server, 'POST', '/providers/rhoso-x/check').body as Provider).capabilities.gpu_capacity).toMatchObject({ status: 'ok', read_at: new Date(now).toISOString(), pools: [] });
+    expect((call(server, 'POST', '/providers/src-x/check').body as Provider).capabilities).not.toHaveProperty('gpu_capacity');
+  });
+
   it("a check after new credentials reports the pools the provider's cloud has, as the API demo does (review RV19-02)", () => {
     const { server } = setup('admin');
     const rhoso = () => server.providers.find((p) => p.id === 'rhoso-prod')!;

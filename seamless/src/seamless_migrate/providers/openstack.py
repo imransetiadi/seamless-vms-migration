@@ -9,17 +9,18 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable, Mapping
+import urllib.parse
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, TypeVar
 
 from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import ProviderRole
-from ..domain.models import Disk, Nic, Provider, VMRef
+from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef, utcnow
 from ..guest_os import identify
-from ..planning.gpu import gpu_requests
+from ..planning.gpu import PoolRequest, gpu_pools, gpu_requests
 from ..planning.platforms import destination_release
-from ..planning.preflight import DestinationInventory, SourceInventory
+from ..planning.preflight import DestinationInventory, GpuCapacity, GpuPool, SourceInventory
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
 from ..storage import storage_family
 from .base import ProviderError, VMNotFound, microversion_text, missing_dependency
@@ -31,6 +32,33 @@ PROVIDER_API_TIMEOUT_S = 60
 PROVIDER_CALL_TIMEOUT_S = 300.0
 #: Cinder statuses of a volume still attached to, or detaching from, a server: no delete yet
 _VOLUME_SETTLING = frozenset({"in-use", "attaching", "detaching", "reserved"})
+#: Placement's microversion of the GPU reads: allocation candidates with each provider's traits and
+#: root, which every series of the window serves (SDD §21.1, §22.3)
+PLACEMENT_MICROVERSION = "1.29"
+#: the trait Nova puts on the root provider of a disabled compute service (SDD §22.3)
+_COMPUTE_DISABLED = "COMPUTE_STATUS_DISABLED"
+#: how long a provider does not ask again a Placement that gave a read no answer: an endpoint that
+#: accepts connections and never answers costs one wait, not one per read (SDD §22.3)
+PLACEMENT_SILENCE_S = 300.0
+#: the clock of that silence, apart from time's so that a test moves it alone
+_monotonic = time.monotonic
+#: Placement's error codes (placement/errors.py, read 2026-10-20): what a failure's detail keeps of
+#: its answer, one of these or none - never the message text, which names providers after their
+#: hosts (SDD §22.12)
+_PLACEMENT_CODES = frozenset(
+    {
+        "placement.undefined_code",
+        "placement.inventory.inuse",
+        "placement.concurrent_update",
+        "placement.duplicate_name",
+        "placement.resource_provider.inuse",
+        "placement.resource_provider.cannot_delete_parent",
+        "placement.resource_provider.not_found",
+        "placement.query.duplicate_key",
+        "placement.query.bad_value",
+        "placement.query.missing_value",
+    }
+)
 T = TypeVar("T")
 
 _POWER = {
@@ -169,12 +197,198 @@ def _plain_http(endpoint: str, conn: Any) -> list[str]:
         ("auth_url", lambda: conn.session.auth.auth_url),
     ]
     urls += [(name, lambda p=proxy: _catalog_url(getattr(conn, p))) for name, proxy in _SERVICES]
+    return [name for name, read in urls if _is_plain_http(_try(read, None))]
+
+
+def _is_plain_http(url: Any) -> bool:
+    return isinstance(url, str) and url.strip().lower().startswith("http://")
+
+
+def _flavors(conn: Any) -> list[dict[str, Any]]:
+    """Every flavor the credential sees: [{name, vcpus, ram_mb, disk_gb, extra_specs}] (SDD §10)."""
+    return [
+        {
+            "name": str(_attr(f, "name")),
+            "vcpus": int(_attr(f, "vcpus", default=0)),
+            "ram_mb": int(_attr(f, "ram", default=0)),
+            "disk_gb": int(_attr(f, "disk", default=0)),
+            "extra_specs": dict(_attr(f, "extra_specs", default={}) or {}),
+        }
+        for f in conn.compute.flavors(details=True)
+    ]
+
+
+def _gpu_flavors(
+    flavors: Iterable[Mapping[str, Any]], profiles: Mapping[str, str]
+) -> list[dict[str, Any]]:
+    """The flavors whose extra specs ask for a GPU by §22.2's reading, each with its GPU requests
+    and the profile its provider declares for it: [{name, vcpus, ram_mb, disk_gb, gpus}]
+    (SDD §22.3)."""
     found = []
-    for name, read in urls:
-        url = _try(read, None)
-        if isinstance(url, str) and url.strip().lower().startswith("http://"):
-            found.append(name)
+    for flavor in flavors:
+        specs = {str(k): str(v) for k, v in flavor["extra_specs"].items()}
+        gpus = gpu_requests(specs, profiles.get(flavor["name"]))
+        if gpus:
+            size = {key: flavor[key] for key in ("name", "vcpus", "ram_mb", "disk_gb")}
+            found.append({**size, "gpus": gpus})
     return found
+
+
+class _PlacementAnswer(Exception):
+    """Placement answered a read with an error: `detail` names its HTTP status and error code."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
+def _placement_get(conn: Any, url: str, params: dict[str, str] | None = None) -> Any:
+    """The body of Placement's 200 to a GET at microversion 1.29, else _PlacementAnswer with the
+    status and the error code (SDD §22.3, §22.12). keystoneauth logs nothing of it: at a DEBUG level
+    it writes each answer's body, provider uuids and error texts included (PR #62 review)."""
+    response = conn.placement.get(
+        url, params=params, microversion=PLACEMENT_MICROVERSION, raise_exc=False, log=False
+    )
+    status = int(response.status_code)
+    if status == 200:
+        return response.json()
+    code = None
+    with contextlib.suppress(Exception):  # an answer that is no Placement error has no code
+        code = response.json()["errors"][0]["code"]
+    if isinstance(code, str) and code in _PLACEMENT_CODES:
+        raise _PlacementAnswer(status, f"HTTP {status} {code}")
+    raise _PlacementAnswer(status, f"HTTP {status}")
+
+
+def _no_placement(exc: Exception) -> bool:
+    """Whether ``exc`` says the catalog has no Placement: keystoneauth finds no endpoint, or
+    openstacksdk's proxy of a service the catalog lacks refuses every call (SDD §22.3)."""
+    try:
+        from keystoneauth1.exceptions import EndpointNotFound
+        from openstack.exceptions import ServiceDisabledException
+    except ImportError:  # a test double, without openstacksdk installed
+        return False
+    return isinstance(exc, (EndpointNotFound, ServiceDisabledException))
+
+
+def _gpu_read_failure(exc: Exception) -> tuple[str, str | None]:
+    """Why a GPU read failed (SDD §22.3): `forbidden` when Placement refused the credential (403),
+    `no_placement` when the catalog has none, else `error` - its detail the HTTP status and the
+    Placement error code, or the failure's kind when nothing answered; never a message's text,
+    which may name a provider (§22.12)."""
+    if isinstance(exc, _PlacementAnswer):
+        return ("forbidden" if exc.status == 403 else "error"), exc.detail
+    if _no_placement(exc):
+        return "no_placement", None
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return "error", f"HTTP {status}"
+    return "error", type(exc).__name__
+
+
+def _answered(exc: Exception) -> bool:
+    """Whether Placement, or the SDK reading it, had an HTTP answer before ``exc``."""
+    return isinstance(exc, _PlacementAnswer) or isinstance(getattr(exc, "status_code", None), int)
+
+
+class _Candidates:
+    """The allocation-candidates answers of one capacity read (SDD §22.3), each request sent once:
+    a numbered group's pool asks with its traits, and a class alone and its unnumbered groups'
+    pools share one answer - Placement would check sent traits on the GPU's provider alone, where
+    Nova's unnumbered group has them checked across it and its compute node (PR #62 review)."""
+
+    def __init__(self, conn: Any) -> None:
+        self.conn = conn
+        self.answers: dict[tuple[tuple[str, str], ...], Any] = {}
+        #: Placement answered one of them: its endpoint has the token (SDD §10 tls)
+        self.answered = False
+
+    def __call__(self, pool: PoolRequest, units: int) -> Any:
+        params = {"resources": f"{pool.resource_class}:{units}"}
+        required = [*pool.traits, *(f"!{trait}" for trait in pool.forbidden_traits)]
+        if pool.same_provider and required:
+            params["required"] = ",".join(required)
+        key = tuple(sorted(params.items()))
+        if key not in self.answers:
+            try:
+                self.answers[key] = _placement_get(self.conn, "/allocation_candidates", params)
+            except _PlacementAnswer as refused:
+                self.answers[key] = refused
+            self.answered = True
+        answer = self.answers[key]
+        if isinstance(answer, _PlacementAnswer):
+            raise answer
+        return answer
+
+
+def _free_units(answer: Any, pool: PoolRequest) -> dict[str, int]:
+    """The units free on each provider of an allocation-candidates answer that counts for the pool
+    (SDD §22.3): it holds the class, its root provider lacks COMPUTE_STATUS_DISABLED - a disabled
+    compute service, which Nova's own requests forbid -, and the pool's traits hold as Placement
+    checks them for Nova's request: a numbered group's on the provider itself, the unnumbered
+    group's across it and its root, the compute node Nova's unnumbered group takes VCPU and
+    MEMORY_MB from (_check_traits_for_alloc_request: the required ones on either, no forbidden one
+    on either). Its free is Placement's capacity less its used, never below 0. Keyed by uuid, kept
+    by nothing."""
+    summaries = answer.get("provider_summaries") or {}
+    free: dict[str, int] = {}
+    for uuid, summary in summaries.items():
+        held = (summary.get("resources") or {}).get(pool.resource_class)
+        if held is None:
+            continue
+        root = summaries.get(summary.get("root_provider_uuid") or uuid) or summary
+        root_traits = set(root.get("traits") or [])
+        traits = set(summary.get("traits") or [])
+        if not pool.same_provider:
+            traits |= root_traits
+        if (
+            _COMPUTE_DISABLED in root_traits
+            or not traits.issuperset(pool.traits)
+            or traits.intersection(pool.forbidden_traits)
+        ):
+            continue
+        free[uuid] = max(0, int(held.get("capacity", 0)) - int(held.get("used", 0)))
+    return free
+
+
+def _read_pool(read: _Candidates, pool: PoolRequest) -> GpuPool:
+    """One pool as Placement shows it (SDD §22.3): the units free on the providers that count, how
+    many have one free, and the most on one. Nova fills a request group from one provider, whose
+    inventory's max_unit may cap it below its free: the pool is read again as <class>:<n> for each
+    group of n > 1 units, and where that read finds no provider that counts its largest free stays
+    below n. A request Placement refuses as a bad one (400: a trait or a class it does not know)
+    counts nothing, its detail naming the refusal - Nova's is refused alike -; any other failure is
+    the whole read's."""
+    shape = {
+        "resource_class": pool.resource_class,
+        "traits": list(pool.traits),
+        "forbidden_traits": list(pool.forbidden_traits),
+        "same_provider": pool.same_provider,
+    }
+    try:
+        free = _free_units(read(pool, 1), pool)
+        largest = max(free.values(), default=0)
+        for units in pool.groups:
+            answer = read(pool, units)
+            named = {
+                uuid
+                for request in answer.get("allocation_requests") or []
+                for uuid, allocation in (request.get("allocations") or {}).items()
+                if pool.resource_class in (allocation.get("resources") or {})
+            }
+            if not named.intersection(_free_units(answer, pool)):
+                largest = min(largest, units - 1)
+    except _PlacementAnswer as refused:
+        if refused.status != 400:
+            raise
+        return GpuPool(**shape, detail=refused.detail)
+    return GpuPool(
+        **shape,
+        free=sum(free.values()),
+        providers=sum(1 for left in free.values() if left > 0),
+        largest_free=largest,
+    )
 
 
 class OpenStackProvider:
@@ -192,6 +406,8 @@ class OpenStackProvider:
         self._connect_fn = connect_fn or connect
         self._conn: Any = None
         self._lock = threading.Lock()
+        #: (until, failure): a Placement read got no answer, so none is sent before then (§22.3)
+        self._placement_silent: tuple[float, str | None] | None = None
 
     # -- plumbing ----------------------------------------------------------------------------
     def _connection(self) -> Any:
@@ -236,6 +452,12 @@ class OpenStackProvider:
 
     async def get_server(self, server_id: str) -> dict[str, Any]:
         return await self._run(self._get_server, server_id)
+
+    async def gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity:
+        return await self._run(self._gpu_capacity, requests)
+
+    async def server_allocations(self, server_id: str) -> dict[str, int] | None:
+        return await self._run(self._server_allocations, server_id)
 
     async def console_log(self, server_id: str, lines: int = 200) -> str | None:
         return await self._run(self._console_log, server_id, lines)
@@ -334,7 +556,66 @@ class OpenStackProvider:
                     block_storage_microversion,
                 )
             )
+            # the Placement pools of its GPU flavors' vGPU requests, read now (SDD §22.3); the
+            # token goes to Placement too once it answered the read (§10 tls)
+            capacity, answered = self._check_gpu_capacity(conn)
+            report["gpu_capacity"] = capacity.to_dict()
+            if answered and _is_plain_http(_try(lambda: _catalog_url(conn.placement), None)):
+                report["plain_http"] = [*plain_http, "placement"]
+                report["tls"] = False
         return report
+
+    def _check_gpu_capacity(self, conn: Any) -> tuple[GpuCapacity, bool]:
+        try:
+            flavors = _flavors(conn)
+        except Exception as exc:  # a probe, as the check's others: it fails nothing (SDD §22.3)
+            reason, detail = _gpu_read_failure(exc)
+            failed = GpuCapacity(status="unknown", reason=reason, detail=detail, read_at=utcnow())
+            return failed, False
+        gpu_flavors = _gpu_flavors(flavors, self.provider.gpu_profiles)
+        return self._read_gpu_capacity(conn, (gpu for f in gpu_flavors for gpu in f["gpus"]))
+
+    def _read_gpu_capacity(
+        self, conn: Any, requests: Iterable[GpuDevice]
+    ) -> tuple[GpuCapacity, bool]:
+        """The Placement pools of the vGPU requests (SDD §22.3), counts only: no provider's name
+        or uuid leaves the read (§22.12); and whether Placement answered it. Without a vGPU request
+        it sends Placement nothing. A refused credential, a catalog without Placement and any other
+        failure read unknown - never a guess - and fail neither the inventory nor the check; while
+        a read that got no answer is remembered, none is sent."""
+        pools = gpu_pools(requests)
+        read_at = utcnow()
+        if not pools:
+            return GpuCapacity(status="ok", read_at=read_at), False
+        silent = self._placement_silence()
+        if silent is not None:
+            return (
+                GpuCapacity(status="unknown", reason="error", detail=silent[1], read_at=read_at),
+                False,
+            )
+        read = _Candidates(conn)
+        try:
+            counted = [_read_pool(read, pool) for pool in pools]
+        except Exception as exc:
+            reason, detail = self._placement_failure(exc)
+            log.info("GPU capacity not read: %s %s", reason, detail or "")
+            failed = GpuCapacity(status="unknown", reason=reason, detail=detail, read_at=read_at)
+            return failed, read.answered
+        return GpuCapacity(status="ok", read_at=read_at, pools=counted), True
+
+    def _placement_silence(self) -> tuple[float, str | None] | None:
+        """The read that got no answer from Placement, while the provider does not ask again."""
+        silent = self._placement_silent
+        return silent if silent is not None and _monotonic() < silent[0] else None
+
+    def _placement_failure(self, exc: Exception) -> tuple[str, str | None]:
+        """Why a Placement read failed (``_gpu_read_failure``), remembered when nothing answered
+        it - a connection or a version discovery that failed or timed out - for
+        PLACEMENT_SILENCE_S (SDD §22.3, PR #62 review)."""
+        reason, detail = _gpu_read_failure(exc)
+        if reason == "error" and not _answered(exc):
+            self._placement_silent = (_monotonic() + PLACEMENT_SILENCE_S, detail)
+        return reason, detail
 
     def _list_vms(self) -> list[VMRef]:
         conn = self._connection()
@@ -370,16 +651,11 @@ class OpenStackProvider:
             return SourceInventory(
                 networks=networks, projects=[project] if project else [], keypairs=keypairs
             )
-        flavors = [
-            {
-                "name": str(_attr(f, "name")),
-                "vcpus": int(_attr(f, "vcpus", default=0)),
-                "ram_mb": int(_attr(f, "ram", default=0)),
-                "disk_gb": int(_attr(f, "disk", default=0)),
-                "extra_specs": dict(_attr(f, "extra_specs", default={}) or {}),
-            }
-            for f in conn.compute.flavors(details=True)
-        ]
+        flavors = _flavors(conn)
+        # the flavors that ask for a GPU, with their declared profiles, and the Placement pools of
+        # their vGPU requests (SDD §22.3)
+        gpu_flavors = _gpu_flavors(flavors, self.provider.gpu_profiles)
+        gpu_capacity, _ = self._read_gpu_capacity(conn, (g for f in gpu_flavors for g in f["gpus"]))
         volume_types = [str(_attr(t, "name")) for t in conn.block_storage.types()]
         quotas = _try(lambda: {project: self._free_quota(conn)}, {})
         # every network it sees with its owner: what a NIC's network name resolves to; shared and
@@ -427,6 +703,8 @@ class OpenStackProvider:
             subnets=subnets,
             network_details=network_details,
             roles=roles,
+            gpu_flavors=gpu_flavors,
+            gpu_capacity=gpu_capacity,
         )
 
     @staticmethod
@@ -473,12 +751,41 @@ class OpenStackProvider:
                     "floating_ips": floating,
                 }
             )
+        # compute 2.47's embedded flavor: its extra specs stay empty where Nova's policy hides them
+        # (SDD §10, §22.3)
+        flavor = _attr(server, "flavor", default={}) or {}
+        extra_specs = _attr(flavor, "extra_specs", default={}) or {}
         return {
             "id": _attr(server, "id"),
             "name": _attr(server, "name"),
             "status": _attr(server, "status"),
             "ports": ports,
+            "flavor": {
+                "name": _attr(flavor, "original_name", "name"),
+                "extra_specs": {str(k): str(v) for k, v in extra_specs.items()},
+            },
         }
+
+    def _gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity:
+        return self._read_gpu_capacity(self._connection(), requests)[0]
+
+    def _server_allocations(self, server_id: str) -> dict[str, int] | None:
+        conn = self._connection()
+        silent = self._placement_silence()
+        if silent is not None:
+            log.info("allocations of server %s not read: error %s", server_id, silent[1] or "")
+            return None
+        try:
+            answer = _placement_get(conn, f"/allocations/{urllib.parse.quote(server_id, safe='')}")
+            units: dict[str, int] = {}
+            for held in (answer.get("allocations") or {}).values():
+                for resource_class, amount in (held.get("resources") or {}).items():
+                    units[str(resource_class)] = units.get(str(resource_class), 0) + int(amount)
+        except Exception as exc:  # unread, never a guess: the verification skips its check (§22.8)
+            reason, detail = self._placement_failure(exc)
+            log.info("allocations of server %s not read: %s %s", server_id, reason, detail or "")
+            return None
+        return units or None
 
     def _console_log(self, server_id: str, lines: int) -> str | None:
         conn = self._connection()

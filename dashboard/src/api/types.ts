@@ -267,8 +267,43 @@ export interface GpuDevice {
   resource_class?: string | null;
   traits?: string[];
   forbidden_traits?: string[];
+  /**
+   * OpenStack vGPU: a numbered request group's (`resources1:`), whose traits Placement checks on the GPU's own provider;
+   * the unnumbered group's it checks across the GPU's provider and its compute node (SDD §22.3). Older VMs omit it.
+   */
+  same_provider?: boolean;
   /** OpenStack passthrough: the PCI alias ("a100"). */
   alias?: string | null;
+}
+
+/** A Placement pool of a destination's GPU requests: what a request asks Placement for, and counts only (SDD §22.3). */
+export interface GpuPool {
+  resource_class: string;
+  traits: string[];
+  forbidden_traits: string[];
+  /** Its traits are a numbered request group's, held by the GPU's own provider; false for the unnumbered group's and a class alone. */
+  same_provider: boolean;
+  /** The units free now on the providers that hold the class and the traits. */
+  free: number;
+  /** The resource providers among them with at least one unit free. */
+  providers: number;
+  /** The most units free on one of them: below n when no provider can give a group of n units. */
+  largest_free: number;
+  /** Placement refused the pool's request as a bad one (400): its HTTP status and error code; the counts are then 0. */
+  detail: string | null;
+}
+
+/**
+ * A destination's GPU capacity as Placement shows it, a key of its check report read when the check runs (SDD §10,
+ * §22.3). Unknown when Placement refused the credential, the catalog has no Placement, or another failure; `detail`
+ * names the failure by its HTTP status and Placement error code, never by its message text (§22.12).
+ */
+export interface GpuCapacity {
+  status: 'ok' | 'unknown';
+  reason: 'forbidden' | 'no_placement' | 'error' | null;
+  detail: string | null;
+  read_at: Timestamp | null;
+  pools: GpuPool[];
 }
 
 export interface Mappings {

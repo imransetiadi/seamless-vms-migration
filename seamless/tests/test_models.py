@@ -450,7 +450,12 @@ def test_provider_gpu_profiles_bounds_its_profile_names():
 def test_a_gpu_devices_ids_and_count_are_validated():
     """SDD §4.2: a kind of the two, PCI ids of four lower-case hex digits, at least one device."""
     device = GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5")
-    assert (device.count, device.profile, device.traits) == (1, None, [])
+    assert (device.count, device.profile, device.traits, device.same_provider) == (
+        1,
+        None,
+        [],
+        False,
+    )
     for bad in (
         {"kind": "mig"},
         {"vendor_id": "10DE"},

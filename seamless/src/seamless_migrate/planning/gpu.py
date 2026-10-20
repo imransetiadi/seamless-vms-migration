@@ -75,9 +75,10 @@ def gpu_requests(
     extra_specs: Mapping[str, str], declared_profile: str | None = None
 ) -> list[GpuDevice]:
     """The GPU requests of a flavor's extra specs (SDD §22.2): each request group's `VGPU` with
-    the group's required and forbidden traits, in suffix order (the unnumbered group first), then
-    each PCI alias. A `CUSTOM_` class is a vGPU only with a declared profile, which each vGPU
-    entry takes - or each alias entry, on a flavor whose GPU requests are aliases alone."""
+    the group's required and forbidden traits, in suffix order (the unnumbered group first, a
+    numbered one `same_provider`), then each PCI alias. A `CUSTOM_` class is a vGPU only with a
+    declared profile, which each vGPU entry takes - or each alias entry, on a flavor whose GPU
+    requests are aliases alone."""
     classes: dict[str, list[tuple[str, int]]] = {}
     traits: dict[tuple[str, str], list[str]] = {}
     for key, value in extra_specs.items():
@@ -93,6 +94,7 @@ def gpu_requests(
             resource_class=cls,
             traits=sorted(traits.get((suffix, "required"), [])),
             forbidden_traits=sorted(traits.get((suffix, "forbidden"), [])),
+            same_provider=bool(suffix),
         )
         for suffix in sorted(classes)
         for cls, amount in sorted(classes[suffix])
@@ -104,6 +106,50 @@ def gpu_requests(
         for alias, count in _aliases(extra_specs.get(PCI_ALIAS))
     ]
     return entries
+
+
+@dataclass(frozen=True)
+class PoolRequest:
+    """A pool the GPU capacity read asks Placement of (SDD §22.3): a vGPU request's resource class
+    with its required and forbidden traits - a numbered group's held by the GPU's own provider
+    (`same_provider`), the unnumbered group's by it or its compute node -, or a class alone;
+    `groups`, the units of each request group of more than one unit that asks of it, which the read
+    takes again as <class>:<n>."""
+
+    resource_class: str
+    traits: tuple[str, ...] = ()
+    forbidden_traits: tuple[str, ...] = ()
+    same_provider: bool = False
+    groups: tuple[int, ...] = ()
+
+
+def gpu_pools(requests: Iterable[GpuDevice]) -> list[PoolRequest]:
+    """The pools of the vGPU requests among ``requests`` (SDD §22.3): one per distinct request
+    with traits - its class with its required and forbidden traits, and whether its group is a
+    numbered one -, in the order they come, then one per resource class alone, which unites that
+    class's pools and is the pool of a request without traits. A PCI alias request has none: the
+    device class its alias asks for lives in nova.conf."""
+    groups: dict[tuple[str, tuple[str, ...], tuple[str, ...], bool], set[int]] = {}
+    for device in requests:
+        if device.kind != "vgpu" or not device.resource_class:
+            continue
+        traits = tuple(sorted(device.traits))
+        forbidden = tuple(sorted(device.forbidden_traits))
+        key = (
+            device.resource_class,
+            traits,
+            forbidden,
+            device.same_provider and bool(traits or forbidden),
+        )
+        sizes = groups.setdefault(key, set())
+        if device.count > 1:
+            sizes.add(device.count)
+    for resource_class in dict.fromkeys(cls for cls, *_ in list(groups)):
+        groups.setdefault((resource_class, (), (), False), set())
+    return [
+        PoolRequest(cls, traits, forbidden, same_provider, tuple(sorted(sizes)))
+        for (cls, traits, forbidden, same_provider), sizes in groups.items()
+    ]
 
 
 def vgpu_request_keys(

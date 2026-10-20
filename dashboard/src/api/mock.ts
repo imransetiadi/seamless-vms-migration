@@ -47,6 +47,7 @@ import {
   DEMO_TOKEN_ROLES,
   type StrategyDecision,
   checkOf,
+  gpuCapacityOf,
   vmwareCheck,
   HELD_VOLUMES_REASON,
 } from './mockData';
@@ -1630,8 +1631,11 @@ export class MockServer {
               // the API's keys: a vCenter's VMs counted; an OpenStack cloud's token roles, maxima, pools and TLS, and a
               // destination's series, tier and policy profile by what it declares (SDD §10, §10.1)
               const inventory = this.inventories[provider.id];
-              provider.capabilities = provider.kind === 'vmware' ? vmwareCheck(Array.isArray(inventory) ? inventory : []) : checkOf(provider);
+              provider.capabilities = provider.kind === 'vmware' ? vmwareCheck(Array.isArray(inventory) ? inventory : []) : checkOf(provider, provider.last_checked_at);
             }
+          } else if (provider.status === 'ok' && 'gpu_capacity' in provider.capabilities) {
+            // a destination's GPU capacity is read each time its check runs (SDD §22.3)
+            provider.capabilities = { ...provider.capabilities, gpu_capacity: gpuCapacityOf(provider.last_checked_at) };
           }
           this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id}: ${provider.status}`, data: { provider_id: provider.id, status: provider.status, message: provider.status_message } });
           return ok(provider);

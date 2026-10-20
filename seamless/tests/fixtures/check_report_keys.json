@@ -1,5 +1,5 @@
 {
- "_comment": "The keys an OpenStack or RHOSO provider's check reports (SDD §10): a destination's adds §10.1's destination_release keys; `vmware` lists a vCenter's (review PV-06). Shared by seamless/tests/test_providers.py (the real check through keystoneauth and the demo's fakes report these; the real check leaves roles out when it cannot read the token's roles, and NET_PORT_NOT_PERMITTED then judges no role half, SDD §9.3) and dashboard/src/api/mock.test.ts (the mock's check reports them too, plan T8).",
+ "_comment": "The keys an OpenStack or RHOSO provider's check reports (SDD §10): a destination's adds §10.1's destination_release keys and its GPU capacity (gpu_capacity, SDD §22.3); `vmware` lists a vCenter's (review PV-06). Shared by seamless/tests/test_providers.py (the real check through keystoneauth and the demo's fakes report these; the real check leaves roles out when it cannot read the token's roles, and NET_PORT_NOT_PERMITTED then judges no role half, SDD §9.3) and dashboard/src/api/mock.test.ts (the mock's check reports them too, plan T8).",
  "openstack": [
   "admin",
   "block_storage_microversion",
@@ -12,6 +12,7 @@
   "volume_backends"
  ],
  "destination": [
+  "gpu_capacity",
   "policy_profile",
   "release",
   "release_range",

@@ -11,10 +11,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..domain.enums import ProviderKind
-from ..domain.models import Disk, Nic, Provider, VMRef
+from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef, utcnow
 from ..planning.gpu import gpu_requests
 from ..planning.platforms import destination_release
-from ..planning.preflight import DestinationInventory, SourceInventory
+from ..planning.preflight import DestinationInventory, GpuCapacity, SourceInventory
 from .base import ProviderError, VMNotFound
 
 MIB = 2**20
@@ -430,6 +430,8 @@ class FakeDestinationProvider:
             # RHOSO 18.0 validated by its kind and legacy until D14; a community cloud by its
             # series (SDD §10.1)
             **destination_release(kind, release, profile, compute, block_storage),
+            # it lists no GPU flavor: its capacity reads ok with no pools (SDD §22.3)
+            "gpu_capacity": GpuCapacity(status="ok", read_at=utcnow()).to_dict(),
         }
 
     async def inventory(self) -> DestinationInventory:
@@ -489,7 +491,18 @@ class FakeDestinationProvider:
                 }
                 for name, _, _, cidr in networks
             ],
+            # no GPU flavor, so no pool to read (SDD §22.3)
+            gpu_capacity=GpuCapacity(status="ok", read_at=utcnow()),
         )
+
+    async def gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity:
+        """The pools of the requests: none, as the demo destination lists no GPU flavor
+        (SDD §22.3)."""
+        return GpuCapacity(status="ok", read_at=utcnow())
+
+    async def server_allocations(self, server_id: str) -> dict[str, int] | None:
+        """No allocation to read: a simulated server holds no Placement resources (SDD §22.3)."""
+        return None
 
     async def get_server(self, server_id: str) -> dict[str, Any]:
         if server_id in self.deleted:

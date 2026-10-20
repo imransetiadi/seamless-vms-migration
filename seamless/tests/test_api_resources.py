@@ -88,6 +88,8 @@ def test_provider_crud(api):
         "subnets",  # SDD §11: where a NIC's addresses must lie
         "network_details",  # SDD §11: what a NIC's network name resolves to
         "roles",  # SDD §10: the token's role names, read live (review RV19-01)
+        "gpu_flavors",  # SDD §22.3: the flavors that ask for a GPU, with declared profiles
+        "gpu_capacity",  # SDD §22.3: the Placement pools of their vGPU requests
     }
 
     # a provider used by a non-terminal plan cannot be deleted
