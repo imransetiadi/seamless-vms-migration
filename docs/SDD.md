@@ -3704,7 +3704,9 @@ is no origin a browser sends (review RV31-03).
   unavailable only on a running plan (pause it first) and a cancelled one, as `validate_plan` refuses both — a
   completed plan, say one whose every VM rolled back over a plan setting, is validated again and then editable (§8.1,
   audit DB-01); Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
-  migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (its Findings
+  the migrations a validation re-assesses: in `pending`, `blocked` or `ready`, or one an earlier version left in
+  `validating`, never a `ready` one whose source is stopped, which it leaves as it is (§5.4, review RV52-D3) — and
+  says how many), `/migrations/:id` (its Findings
   and Estimates panels addressable as `#findings` and `#estimates`, which the page scrolls to and focuses once
   loaded, ADV-02; phase
   stepper — one row; on a phone two columns read top-down, half the height of one —, progress (the running step — named from the phase and the passes that ended: in `precopy` the full copy,
