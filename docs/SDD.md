@@ -330,6 +330,21 @@ Estimate { strategy: Strategy, eligible: bool, reasons: list[str] = [], precopy_
 
 ForceCutover { actor: str, at: datetime, reason: str, delta_bytes: int, estimated_downtime_s: float }   # §5.4
 
+GpuWait { since: datetime,        # the cutover waits for GPU capacity, its source running (§5.4 rule 5, §22.7): when
+                                  # the destination answered the read that began the wait
+          checked_at: datetime,   # when the destination answered the last read
+          pool: str,              # what that read found short, by pool_name (§10): a pool - its class, its required
+                                  # traits, then the forbidden ones prefixed with "!" ("VGPU CUSTOM_NVIDIA_A100_4C") -
+                                  # or a class alone across its pools ("VGPU"); "" while no read of the wait could
+                                  # list the GPU flavor's requests
+          needed: int,            # the units the cutover needs there: its GPU flavor's, plus those of the
+                                  # destination's other migrations in cutover with no destination_server_id yet; for a
+                                  # request group of n > 1 units, the n one provider must have free; 0 with pool ""
+          free: int|null,         # the units the read found free there - for such a group, the most on one provider;
+                                  # null when the read failed
+          reason: str }           # why, in words, naming the destination by its label (§1 naming); a failure by its
+                                  # HTTP status, Placement error code or kind, never a message's text (§22.12)
+
 AdvisorNote { kind: "strategy"|"classification"|"verification"|"similar_incidents"|"screen",
               source: "jev"|"rules"|"memory", summary: str, confidence: float|null,
               data: dict = {}, created_at: datetime }
@@ -404,6 +419,8 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             verification: VerificationRecord|null,   # the last verification: checks and probe results (§7.5, ADV-18)
             suggested_probes: list[AppProbe] = [],   # the rules' suggestion at validation; inactive until added to the plan (§9.6)
             source_running_at: datetime|null,   # completed, not finalized: when its source VM was seen running again (§8.1)
+            gpu_wait: GpuWait|null,   # in ready, awaiting_cutover or a keep-warm pass: its cutover waits for GPU capacity
+                                      # (§5.4 rule 5, §22.7); leaving those phases drops it in the same write
             review_required: bool = false, review_reason: str|null,
             destination_server_id: str|null, error: str|null, attempts: int = 0,
             attempt_strategies: list[Strategy] = [],   # each retried attempt's strategy, oldest first (§14.4)
@@ -416,7 +433,7 @@ MigrationSummary { id, plan_id, wave_id, vm: { source_id, name, project }, strat
                    progress_pct, estimate, actual_downtime_s, downtime_started_at, downtime_ended_at, approvals,
                    cutover_requested, cutover_requested_by, force_cutover, force_window, advisor_hold,
                    review_required, review_reason, error, source_running_at, findings, suggested_probes,
-                   cutover_refusals, created_at, updated_at }
+                   cutover_refusals, gpu_wait, created_at, updated_at }
                    # GET /migrations?view=summary (§12): a migration's fields as the Migration has them, those
                    # the Overview's and the plan page's lists read (§16), without the passes, all the estimates,
                    # notes, history or VM details
@@ -441,7 +458,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `plan.completed`, `wave.started`, `wave.completed`, `migration.created`, `migration.phase`,
 `migration.sync_pass`, `migration.downtime_started`, `migration.downtime_ended`, `migration.error`,
 `migration.force_cutover`, `migration.data_inconsistent` (§5.4, §5.5), `migration.source_running`,
-`migration.source_stopped`, `plan.finalized` (§8.1), `plan.cancelled` (§12),
+`migration.source_stopped`, `plan.finalized` (§8.1), `plan.cancelled` (§12), `migration.gpu_wait` (§5.4, §22.7),
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
@@ -449,7 +466,10 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
 never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. `plan.cancelled`
-carries the reason given and how many migrations it cancelled.
+carries the reason given and how many migrations it cancelled. `migration.gpu_wait` carries `{"waiting", "pool",
+"needed", "free"}` - the pool, units needed and units free of a `GpuWait` (§4.2) - written with the migration's change in
+one transaction once when its cutover begins to wait for GPU capacity (`waiting` true) and once when a read finds room
+(`waiting` false: the pool it waited for, as that read found it).
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
 `migration.log`, `heartbeat`. `migration.log` carries one line of a step's output (`StepContext.log`,
@@ -622,7 +642,38 @@ active enters `cutover` when all hold:
    `plan.require_distinct_approver` is set, one by the user who requested the cutover (`cutover_requested_by`);
 2. `cutover_window is None` **or** now ∈ [start, end] — bypassed while `Migration.force_window` is set (`POST …/cutover {"force_window": true}`);
 3. `plan.auto_cutover` **or** `cutover_requested` (set by `POST …/cutover`);
-4. fewer than `max_concurrent_cutovers` migrations are in `cutover`.
+4. fewer than `max_concurrent_cutovers` migrations are in `cutover`;
+5. a GPU VM with a vGPU among its own GPUs (§22.2) has a GPU capacity read that found room for its GPU flavor
+   (§22.4), made once rules 1–4 hold and answered at most 60 s before the step starts (model time in demo mode, §7.4;
+   §22.7); a VM whose GPUs are all passthrough devices is told apart without a read and never waits on one.
+
+**GPU capacity (rule 5, plan task G6).** Once rules 1–4 hold and the tick's limits leave the cutover room to start
+(`max_concurrent_migrations`, the wave's `max_parallel`, §8), the tick starts the migration's read as a task of its
+own, one per migration at a time, and never waits for it, as it starts the source watch (§8.1): a slow destination
+delays that cutover, never the tick, the other gates or the passes. A read lists the destination's GPU flavors
+(`gpu_flavors()`, §10), then reads the capacity of the vGPU requests of the migration's GPU flavor among them
+(`gpu_capacity`, §22.3). It finds room when each pool they ask of has their units free plus those of the
+destination's other migrations in `cutover` that have recorded no `destination_server_id` yet, counted by the flavor
+their server is created with in the same list (a VM without a GPU that a flavor mapping sends to a GPU flavor among
+them, as the pre-flight counts it, §22.5) - per pool, per resource class across its pools and, for a request group of
+n > 1 units, on one provider: `planning/preflight.gpu_shortfalls`, the pre-flight's rule (§22.5). Its outcome lives in
+the process, with the time the destination answered and the cutovers it counted: the tick starts the cutover on an
+outcome that found room, at most 60 s old and made in the migration's present stay at its gate (a validation, a retry
+or a cutover begins another), re-checked under the locks with rules 1–4 (§8) - where a cutover the read did not
+count, started on the destination since and asking of its pools, drops the outcome, and a new read follows. While
+rules 1–4 hold, an outcome 60 s old is read again; after a restart a read comes first. A read without room records
+`Migration.gpu_wait` (§4.2) and emits `migration.gpu_wait` (§4.3) once when the wait begins; a later read without
+room updates it without an event, and a read that finds room clears it, `migration.gpu_wait` saying so once more -
+each with its event in one store transaction. The source keeps running meanwhile: a warm migration goes on with its
+keep-warm passes, a single-shot one stays in `ready`. A VM whose GPUs are all passthrough devices is not read for: the
+PCI alias its GPU flavor asks for has no capacity any API shows (§22.5). Capacity Placement does not show - `unknown`
+with the reason `forbidden` or `no_placement` -, a PCI alias request, and a GPU flavor that asks for no vGPU or that
+the list no longer holds (the cutover then refuses the mapping before the source stops, §22.4) let the cutover start;
+a read that fails otherwise - a flavor list or a capacity read that raises, a capacity `unknown` with the reason
+`error` - holds it, `gpu_wait` naming the failure. Neither a Force cutover, nor `auto_cutover`, nor a bypassed window
+skips rule 5. Leaving `ready`, `awaiting_cutover` and its keep-warm passes (`syncing`) - a cutover, a cancel, a
+failure, a validation - drops `gpu_wait` in the same write, which the transition's `migration.phase` announces; a
+retry starts with none.
 
 A migration whose advisor decision waits for approval (`advisor_hold`, §14.6) starts neither its pre-copy
 nor its cutover until the decision is approved or overridden; the plan runs its other migrations meanwhile,
@@ -2514,6 +2565,10 @@ class DestinationProvider(Protocol):
         # them (§22.3, plan task G3)
     async def gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity
         # the Placement pools of the given vGPU requests only, read as §22.3 reads the inventory's (§22.7, plan task G3)
+    async def gpu_flavors(self) -> list[dict[str, Any]]
+        # the destination's GPU flavors as DestinationInventory.gpu_flavors lists them - [{name, vcpus, ram_mb, disk_gb,
+        # gpus}], the declared profiles applied -, read with one flavor list: where the cutover gate reads a GPU
+        # flavor's requests (§5.4 rule 5, §22.7, plan task G6)
     async def server_allocations(self, server_id: str) -> dict[str, int] | None
         # the units the server holds per resource class (GET /allocations/{server_id}, summed over its providers),
         # None when Placement refuses the read or holds no allocation for it (§22.3, §22.8, plan task G3)
@@ -4420,9 +4475,11 @@ Structured logs (JSON when `SEAMLESS_LOG_JSON=true`), audit events in the DB, `/
 `seamless_downtime_seconds_sum/_count` and `seamless_downtime_seconds_max`,
 `seamless_step_duration_seconds_sum/_count{step}`, `seamless_advisor_calls_total{tool,outcome}`,
 `seamless_tick_seconds_sum/_count`, `seamless_tick_seconds_max` and `seamless_tick_slow_total` (ticks
-over half of `tick_s`; QASuite PERF-CP-02), and `seamless_cutover_refusals` gauge — the migrations in `precopy`,
+over half of `tick_s`; QASuite PERF-CP-02), `seamless_cutover_refusals` gauge — the migrations in `precopy`,
 `syncing` or `awaiting_cutover` whose last pass found what their cutover will refuse (`cutover_refusals`, §7.2), the
-ones the dashboard lists as "Cutover will refuse" (§16): above 0, something is to fix before a cutover.
+ones the dashboard lists as "Cutover will refuse" (§16): above 0, something is to fix before a cutover —, and
+`seamless_gpu_waits` gauge — the migrations whose cutover waits for GPU capacity (`gpu_wait`, §5.4 rule 5, §22.7),
+their source VMs running: above 0 for long, the destination lacks the GPUs its cutovers need (plan task G6).
 
 ---
 
@@ -4821,6 +4878,10 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   them. Below 2.47 - a cloud entry that pins an older `compute_api_version` - the server holds the flavor's id alone,
   and `get_server` looks the flavor up by it, its extra specs read apart, as the source's inventory does (review
   RV28-08); a flavor deleted since gives no name (§7.5, G8 review).
+  Plan task G6 adds `gpu_flavors() -> list[dict[str, Any]]`: the GPU flavors as `DestinationInventory.gpu_flavors`
+  lists them, the declared profiles applied, read with one flavor list (`OpenStackProvider`: Nova's flavor list, the
+  inventory's own reading of it) - the requests the cutover gate reads capacity for (§22.7). The demo's fake destination
+  lists none until plan task G9.
 
 ### 22.4 GPU mapping
 
@@ -4912,14 +4973,41 @@ Binding in §9.2 since plan task G5.
 
 ### 22.7 Cutover gate: GPU capacity
 
-A fifth rule of §5.4, binding there with plan task G6:
+A fifth rule of §5.4, binding there since plan task G6, with `GpuWait`, `Migration.gpu_wait` and
+`MigrationSummary.gpu_wait` in §4.2, the event `migration.gpu_wait` in §4.3, `gpu_flavors()` in §10 and the gauge
+`seamless_gpu_waits` in §18:
 
 5. a migration whose server is created with a vGPU flavor (its GPU flavor, §22.4) enters `cutover` only on a capacity
-   read that found room. The read is `DestinationProvider.gpu_capacity` for the flavor's requests, made once rules 1–4
-   hold, at most 60 s before the step starts (model time in demo mode, §7.4). It finds room when each pool the flavor
-   asks of has at least the flavor's units free, plus the units of the destination's other migrations in `cutover` that
-   ask of that pool and have recorded no `destination_server_id` yet (their servers may not exist yet; one that already
-   exists is counted twice, which only delays), on a provider with enough free for each group (§22.3).
+   read that found room. The read is `DestinationProvider.gpu_flavors()`, then `gpu_capacity` for the vGPU requests of
+   the GPU flavor it lists, made once rules 1–4 hold, at most 60 s before the step starts (model time in demo mode,
+   §7.4). It finds room when each pool the flavor asks of has at least the flavor's units free, plus the units of the
+   destination's other migrations in `cutover` that ask of that pool and have recorded no `destination_server_id` yet
+   (their servers may not exist yet; one that already exists is counted twice, which only delays), on a provider with
+   enough free for each group (§22.3).
+
+* **The read's requests** (the controller's choice of 2026-10-20, `jev_decide` with confidence 0.92): the gate reads a
+  GPU flavor's requests from `gpu_flavors()`, a provider method of its own that lists the GPU flavors as the inventory
+  does with one flavor list, and the requests of the destination's other migrations in cutover from the same list. An
+  `inventory()` per read would cost about ten API calls and a second Placement read of every GPU pool, every 60 s per
+  waiting migration; requests cached at the validation would read a flavor as it was, not as it is when the read is
+  made, and would be lost on a restart.
+* **Which migrations wait** (the G6 implementation's choice, 2026-10-20, and the controller's of 2026-10-21): a GPU VM
+  with a vGPU among its own GPUs (§22.2) is read for, and its GPU flavor - `planning/gpu.gpu_flavor`, §22.4 - holds
+  its cutover only when it asks for a vGPU. A VM whose GPUs are all passthrough devices is told apart without a read:
+  the PCI alias its GPU flavor asks for has no capacity any API shows, so no read could hold its cutover, and none is
+  made - a destination that offers no GPU read never stands in its way. A mapping that gives such a VM a vGPU flavor
+  instead (§22.4), and a flavor mapping that sends a VM without a GPU to one, are not read for either: telling that
+  their flavor asks for a vGPU takes a destination read, which every such cutover would then wait on. Both are counted
+  among the other cutovers, as the pre-flight counts them (§22.5); their pre-flight blocks them while capacity is short
+  at the validation, and the rule's remaining gap (the last bullet) covers them from there.
+* **Freshness** (the same choice): a read's time is when the destination answered, as the source watch's
+  `source_running_at` (§8.1): a slow read's outcome counts from its answer. A read counts the cutovers it found when it
+  began, and a cutover that starts on the destination later, asking of a pool the flavor asks of, makes the outcome
+  stale before its 60 s - the re-check under the locks (§8) drops it, so two GPU migrations that read at once cannot
+  both cut over on one free unit; a cutover of a VM whose flavor asks of none of those pools leaves it as it is.
+  The outcome lives in the process only, for the migration's present stay at its gate - from its last move that was no
+  keep-warm pass's -: after a restart, a retry or a validation, a read comes before its GPU cutover. A read that fails
+  outside the destination's answers (a store error) holds the cutover for its minute too, logged.
 
 * The read runs outside the locks, as a task of its own, one per migration at a time, as the source watch does
   (§8.1): a slow Placement delays that cutover, never the tick, the other gates or the passes. Its outcome is recorded,
@@ -4933,6 +5021,16 @@ A fifth rule of §5.4, binding there with plan task G6:
   read that finds room clears the wait (`migration.gpu_wait` with `"waiting": false`), and the cutover starts.
   `MigrationSummary` carries `gpu_wait` (§4.2), and `/metrics` gains the gauge `seamless_gpu_waits`, the number of
   migrations waiting so (§18).
+* **What a wait names** (the G6 implementation's choice): the first shortfall in the order the pre-flight words them
+  (`planning/preflight.gpu_shortfalls`): a pool Placement refuses (its `detail`, free 0), a pool whose free is below
+  the units asked of it, a class across its pools, then a request group of n > 1 units that no provider holds (`needed`
+  n, `free` the most on one provider). A later read updates `checked_at` and the numbers and keeps `since`. A failed
+  read sets `free` null and names the failure: the HTTP status, Placement error code or kind of the failure, never its
+  text (§22.12). It keeps the pool and units its wait already names; a wait that names none yet takes the GPU flavor's
+  first vGPU pool and its units, or keeps `pool` "" with `needed` 0 while the flavor list itself fails. The end's event
+  carries the pool waited for with the units the ending read found needed and free there (`free` null when that read
+  could not tell). Leaving the waiting phases drops the wait silently: the transition's `migration.phase` announces it,
+  as a rollback clears `source_running_at` (§8.1).
 * A capacity that is `unknown` because Placement refuses the credential or the destination has no Placement
   (`forbidden`, `no_placement`), and a PCI alias request, do not hold the cutover: nothing can be read, and the
   pre-flight warned (`DST_GPU_CAPACITY_UNKNOWN`). A read that fails otherwise (`error`: a timeout, a 5xx answer) holds
