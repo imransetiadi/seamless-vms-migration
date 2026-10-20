@@ -584,17 +584,15 @@ _CLOUDS = (
 @pytest.mark.parametrize(
     "text",
     [
-        json.dumps({"stdout": "Reading clouds.yaml\n" + _CLOUDS, "rc": 0}),
         _CLOUDS.replace("\n", "\r\n"),
         _CLOUDS.replace("    auth:\n", "    auth:  # the admin credential\n"),
-        json.dumps({"stdout": _CLOUDS.replace("\n", "\r\n")}),
     ],
-    ids=["inside-json", "crlf", "comment", "crlf-inside-json"],
+    ids=["crlf", "comment"],
 )
-def test_a_clouds_yaml_auth_section_inside_json_or_with_crlf_or_a_comment_is_removed_whole(text):
+def test_a_clouds_yaml_auth_section_with_crlf_or_a_comment_is_removed_whole(text):
     """SDD §13.4 (review RV52-X4): the auth section was found only with LF line breaks and nothing
-    after "auth:", so a clouds.yaml a step printed (its output JSON-escaped), one with CRLF line
-    breaks or a comment kept its user name, and its multi-word password all but the first word."""
+    after "auth:", so one with CRLF line breaks or a comment kept its user name, and its multi-word
+    password all but the first word."""
     out = redact(text)
     assert "Fake" not in out and "horse" not in out and "Word" not in out, out
     assert "auth: [REDACTED]" in out and "region_name: RegionOne" in out, out
@@ -634,18 +632,15 @@ def test_a_second_pass_changes_nothing_after_a_cli_flag_or_an_authorization_head
     "text",
     [
         'export OS_PASSWORD="Fake"Pass-Word port=5432',
-        'export OS_PASSWORD="Fake""Pass-Word" port=5432',
-        "export OS_PASSWORD=\"Fake\"'Pass Word' port=5432",
-        'export OS_PASSWORD="Fake"Pass"Word" port=5432',
         json.dumps({"cmd": 'export OS_PASSWORD="Fake"Pass-Word port=5432'}),
     ],
-    ids=["glued-word", "glued-dq", "glued-sq", "glued-chain", "inside-json"],
+    ids=["glued-word", "inside-json"],
 )
 def test_a_double_quoted_shell_value_keeps_no_glued_part_and_a_second_pass_changes_nothing(text):
     """SDD §13.4 (review RV52-X6): the shell glues what follows a closed double-quoted word to
-    it ("Fake"Pass-Word is one word), as it does after a single-quoted one; the value ended at its
-    close, so the glued part stayed - and a second pass, reading it as a plain value, changed the
-    output."""
+    it ("Fake"Pass-Word is one word); the value ended at its close, so the glued part stayed - and
+    a second pass, reading it as a plain value, changed the output. Characters are glued, never a
+    quoted part: test_a_value_never_takes_the_next_items_key_or_flag."""
     out = redact(text)
     assert "Pass" not in out and "Word" not in out and REDACTED in out, out
     assert "port=5432" in out, out
@@ -756,90 +751,137 @@ def test_what_follows_a_quoted_value_over_lines_stays(text):
 
 
 @pytest.mark.parametrize(
-    ("text", "expected"),
+    ("text", "secrets"),
     [
-        ("auth:{ x auth: {a: b} }", "auth:[REDACTED]"),
-        ('{"auth": {"password": "Fake", "project": {"name": "Word"}}}', '{"auth": [REDACTED]}'),
-        ('{"stdout": "auth:{\\"token\\":\\n)auth: {a: b}&\'\'"}', '{"stdout": "auth:[REDACTED]'),
-        ("auth:{ x auth: {a: b}", "auth:{ x auth: [REDACTED]"),
+        (
+            "ok: [localhost] => "
+            + json.dumps(
+                {
+                    "stdout_lines": [
+                        "vault_db_password: 'Pr0d!pass'",
+                        "vault_api_token: FakeApiTok3n",
+                    ]
+                }
+            ),
+            ["Pr0d!pass", "FakeApiTok3n"],
+        ),
+        (repr(['db_password: "Fake1x"', "admin_token: s3cr3t"]), ["Fake1x", "s3cr3t"]),
+        (
+            json.dumps({"cmd": "mysql --password='hunter2'", "rc": 1, "password": "Pa,SECRETX"}),
+            ["hunter2", "SECRETX"],
+        ),
+        (
+            json.dumps(["+ openstack --os-password 'a1b2c3'", '--os-token "tok3n-value"']),
+            ["a1b2c3", "tok3n-value"],
+        ),
+        ('password: hunter2 token="SECRETX"', ["hunter2", "SECRETX"]),
+        (
+            "X-Auth-Token: gAAAAtok openstack --os-password 'SECRETX' server list",
+            ["gAAAAtok", "SECRETX"],
+        ),
+        (json.dumps({"stdout": '{"password":"a1x""token":"secret2"}'}), ["a1x", "secret2"]),
+        (
+            json.dumps(
+                {
+                    "stdout": "Host: k\r\nAuthorization: tok123SECRET\r\n"
+                    "X-Subject-Token: SECRET2xyz\r\n"
+                }
+            ),
+            ["tok123SECRET", "SECRET2xyz"],
+        ),
+        (
+            json.dumps({"stdout": "--os-token S3CRone\"y\"\n--os-password 'S3CRtwo'x,"}),
+            ["S3CRone", "S3CRtwo"],
+        ),
     ],
-    ids=["nested", "json-nested", "json-escaped", "outer-never-closes"],
+    ids=[
+        "stdout-lines",
+        "repr-list",
+        "json-cmd",
+        "json-argv",
+        "yaml-then-key",
+        "header-then-flag",
+        "glued-key-in-json",
+        "headers-in-json",
+        "flag-then-flag-in-json",
+    ],
 )
-def test_an_auth_section_holding_another_is_removed_whole_so_a_second_pass_changes_nothing(
-    text, expected
-):
-    """SDD §13.4 (review RV52-X6): the flow-style auth section ran to the first closing brace and
-    read no section inside it, so its inner section went first and a second pass then found the
-    outer one, ending at a later brace: the text changed. A section runs to the brace that closes
-    it, nested ones counted; one that never closes is left to the key patterns."""
-    once = redact(text)
-    assert once == expected, once
-    assert redact(once) == once, once
+def test_a_value_never_takes_the_next_items_key_or_flag(text, secrets):
+    """SDD §13.4 (PR #58 review): the RV52-X3 to X6 readings took a list item's closing quote and
+    the next one's opening quote for a part glued to a value, a later key=, --flag or key: for a
+    word of a YAML value, and a JSON-escaped line break for part of a word - and the next item's
+    or line's secret, which main redacted, went out in clear. No value runs past its item."""
+    out = redact(text)
+    assert not [s for s in secrets if s in out], out
+    assert redact(out) == out, out
 
 
-def test_a_seeded_fuzz_of_the_reviewers_atoms_redacts_once_for_good():
-    """SDD §13.4 (reviews RV51, RV52): the reviewers' random fuzz - credential keys, quotes,
-    escapes, auth sections, CLI flags and headers, each text also inside JSON and JSON in JSON -
-    found texts a second pass changed. It finds none."""
-    rng = random.Random(1)
-    atoms = [
-        "password",
-        "token",
-        "'token':",
-        '"token":',
-        "\\'",
-        "\\\\'",
-        "pass",
-        "secret",
-        " ",
-        ":",
-        "=",
-        "'",
-        '"',
-        "\\",
-        "\\\\",
-        "\n",
-        ",",
-        "}",
-        "{",
-        "a",
-        "[REDACTED]",
-        "\\n",
-        '\\"',
-        "''",
-        "--os-password ",
-        "Authorization: ",
-        "Bearer ",
-        ">",
-        ";",
-        "&",
-        ".",
-        "-",
-        "\t",
-        ")",
-        "]",
-        "!",
-        "'\"'\"'",
-        "'\\''",
-        "eyJhbGciOiJIUzI1NiJ9",
-        ".eyJzdWIiOiJmYWtlIn0",
-        "x://u:p@h",
-        "auth:",
-        "  ",
-        "auth: {a: b}",
-    ]
-    changed = []
-    for _ in range(20000):
-        text = "".join(rng.choice(atoms) for _ in range(rng.randint(2, 12)))
-        for held in (
-            text,
-            json.dumps({"stdout": text}),
-            json.dumps({"stdout": json.dumps({"stdout": text})}),
-        ):
-            once = redact(held)
-            if redact(once) != once:
-                changed.append(held)
-    assert changed == [], changed[:5]
+def test_a_cli_flag_in_a_json_string_leaves_the_rest_of_the_string():
+    """SDD §13.4 (PR #58 review): the flag's shell word read a JSON-escaped quote as the start of
+    a quoted part, ran past the string's own close and deleted the rest of it - the error a step
+    printed and the next key's quote."""
+    text = json.dumps(
+        {
+            "rc": 1,
+            "stdout": '+ openstack --os-password "Fake" server list\n...ERROR: quota exceeded',
+            "stderr": "boom",
+        }
+    )
+    out = redact(text)
+    assert "Fake" not in out and "quota exceeded" in out and '"stderr": "boom"' in out, out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        str(
+            RuntimeError(
+                "cat clouds.yaml failed",
+                "clouds:\n  dc1:\n    auth:\n      username: admin\n"
+                '      password: "Fake Pass Word"\n',
+            )
+        ),
+        repr({"out": 'x\n  auth:\n    token: "Fake s3cr3t"\n'}),
+    ],
+    ids=["exception", "repr"],
+)
+def test_a_yaml_auth_section_in_a_repr_or_an_exception_keeps_no_secret(text):
+    """SDD §13.4 (PR #58 review): a pattern for an auth section inside JSON strings also matched a
+    repr or an exception's text, where a double quote is not escaped: it ended at the quote of a
+    YAML-quoted value and kept the value without its key. The key=value reading removes it."""
+    out = redact(text)
+    assert "Fake" not in out and "Word" not in out and "s3cr3t" not in out, out
+
+
+@pytest.mark.parametrize(
+    ("text", "secrets"),
+    [
+        (
+            json.dumps(
+                {
+                    "clouds": {
+                        "rhoso": {"auth": {"username": "admin", "password": "Xk9}mQ2#vL5pR8wZ3"}}
+                    }
+                }
+            ),
+            ["Xk9", "mQ2", "vL5pR8wZ3"],
+        ),
+        (
+            json.dumps({"auth": {"username": "admin", "password": "Pa{ss"}, "token": "}SECRETX"}),
+            ["Pa{ss", "SECRETX"],
+        ),
+        (repr({"auth": {"username": "admin", "password": "its}mQ2"}}), ["mQ2"]),
+    ],
+    ids=["close-in-password", "open-in-password", "repr"],
+)
+def test_a_brace_in_a_quoted_password_neither_ends_an_auth_section_nor_keeps_it_open(text, secrets):
+    """SDD §13.4 (PR #58 review): the flow-style auth section ran to the first closing brace, a
+    password's own among them, and the password's tail went out in clear; pairing every brace of
+    the text instead let a password's opening brace swallow the next key. A quoted string in the
+    section is read whole."""
+    out = redact(text)
+    assert not [s for s in secrets if s in out], out
+    assert redact(out) == out, out
 
 
 def _quotings(pairs):

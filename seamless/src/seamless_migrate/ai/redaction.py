@@ -52,31 +52,32 @@ _QUOTED_KEY_AHEAD = r"'(?:[A-Za-z0-9]+[_.-]){0,16}(?:" + _KEYWORDS + r")'\s*[:=]
 _SQ_CLEAN = r"'(?:[^'\\\n]|\\++(?!')|'')*+'"
 #: A quoted part the shell glues to its word, never a quoted credential key's name.
 _SQ_PART = r"(?:(?!" + _QUOTED_KEY_AHEAD + r")'[^'\n]*+')?"
-#: The same as a double-quoted part on its line, never a quoted credential key's name either.
-_DQ_PART = (
-    r"(?!\"(?:[A-Za-z0-9]+[_.-]){0,16}(?:" + _KEYWORDS + r")\"\s*[:=])\"(?:[^\"\\\n]|\\.)*+\""
-)
 #: What the shell glues to a closed word: its escaped quote (\') or "'" - JSON's escapes of them
-#: too - and the quoted part that opens after, a double-quoted part ('a'"b"), or characters of no
-#: shell or JSON syntax ('a'b!), each with a quoted part after; a space, a delimiter or ">" ends
-#: the word (SDD §13.4, reviews RV51-05, RV51-20, RV52-X6).
+#: too - and the quoted part that opens after, or characters of no shell or JSON syntax ('a'b!),
+#: each with a quoted part after; a space, a delimiter or ">" ends the word (SDD §13.4, reviews
+#: RV51-05, RV51-20).
 _SQ_WORD = (
-    r"(?:(?:\\++'|\\*+\"'\\*+\")"
-    + _SQ_PART
-    + r"|"
-    + _DQ_PART
-    + _SQ_PART
-    + r"|[^\s'\"\\,;&|<>(){}\[\]:.]++"
-    + _SQ_PART
-    + r")*+"
+    r"(?:(?:\\++'|\\*+\"'\\*+\")" + _SQ_PART + r"|[^\s'\"\\,;&|<>(){}\[\]:.]++" + _SQ_PART + r")*+"
 )
-#: What the shell glues to a closed double-quoted word, as after a single-quoted one: "a"b,
-#: "a""b" and "a"'b' are one word (SDD §13.4, review RV52-X6).
-_DQ_WORD = (
-    r"(?:[^\s'\"\\,;&|<>(){}\[\]:.]++|" + _DQ_PART + r"|(?!" + _QUOTED_KEY_AHEAD + r")'[^'\n]*+')*+"
-)
-#: The same for a string inside JSON strings, at the escape that opened it: \"a\"b, \"a\"\"b\"
-_ESCAPED_WORD = r"(?:[^\s'\"\\,;&|<>(){}\[\]:.]++|(?P=escape)\"[^\"\\\n]*+(?P=escape)\")*+"
+#: What is glued to a closed double-quoted value, at the top or inside JSON strings: characters of
+#: no shell or JSON syntax ("a"b is one word). Never a quoted part: a value that ends a JSON or a
+#: repr list's item would take that item's closing quote and the next one's opening quote for one,
+#: and the next key and its secret with them (SDD §13.4, review RV52-X6, PR #58 review).
+_GLUED = r"[^\s'\"\\,;&|<>(){}\[\]:.]*+"
+
+
+def _word(stops: str) -> str:
+    r"""One character of a word that ends at white space or a character of ``stops`` and runs no
+    further than a JSON-escaped line break (\n, \r in a JSON string): the next line's key, flag
+    or quoted key is then redacted on its own. A word that runs on in letters and digits to its
+    end or to a backslash before one (C:\new\root) keeps it; that look reads up to the next
+    backslash, so a text costs time linear in its length (SDD §13.4, PR #58 review)."""
+    return (
+        rf"(?:[^\s\\{stops}]|\\(?:(?![nr])"
+        rf"|(?=[nr][A-Za-z0-9]*+(?:[\s{stops}]|\Z|\\[A-Za-z0-9]))))"
+    )
+
+
 #: Where a string inside JSON strings closes: the backslashes that opened it before a quote, after
 #: any number of the 2E + 2 each of its own backslashes became (E the opening's backslashes); a
 #: quote of its own has 2E + 1 before it.
@@ -84,50 +85,11 @@ _ESCAPED_CLOSE = r"(?:(?P=escape){2}\\\\)*+(?P=escape)\""
 
 
 def _auth_block(match: re.Match[str]) -> str:
-    """The auth section's lines as one, ending in the line break its last one ended in, as the
-    text writes it: LF or CRLF, or JSON's escape of either (review RV52-X4)."""
+    """The auth section's lines as one, ending in the line break its last one ended in: LF or
+    CRLF (review RV52-X4)."""
     block = match.group(0)
-    ends = ("\r\n", "\n", "\\r\\n", "\\n")
-    end = next((e for e in ends if block.endswith(e)), "")
+    end = next((e for e in ("\r\n", "\n") if block.endswith(e)), "")
     return f"{match.group(1)}auth: {REDACTED}{end}"
-
-
-#: one character of a JSON string's line: an escape whole, but not a line break's
-_JSON_LINE_CHAR = r"(?:(?!\\[nr])(?:\\.|[^\"\\\n]))"
-
-
-#: Where a JSON or YAML flow-style auth section opens ("auth": {, auth: {).
-_AUTH_FLOW_OPEN = re.compile(r"(?i)(?<![\w.-])[\"']?auth[\"']?\s*:\s*\{")
-#: A brace, opening or closing.
-_BRACE = re.compile(r"[{}]")
-
-
-def _redact_auth_flow(text: str) -> str:
-    """Each JSON or YAML flow-style auth section - its opening brace to the brace that closes it,
-    nested ones counted - replaced; one that never closes is left to the key patterns after. A
-    section inside another goes with the outer one, never before it, so a second pass changes
-    nothing; the braces are paired in one pass, a time linear in the text (SDD §13.4, review
-    RV52-X6)."""
-    opens = list(_AUTH_FLOW_OPEN.finditer(text))
-    if not opens:
-        return text
-    closes: dict[int, int] = {}
-    stack: list[int] = []
-    for brace in _BRACE.finditer(text):
-        if brace.group() == "{":
-            stack.append(brace.start())
-        elif stack:
-            closes[stack.pop()] = brace.start()
-    out: list[str] = []
-    pos = 0
-    for opened in opens:
-        start = opened.end() - 1
-        end = closes.get(start)
-        if opened.start() < pos or end is None:
-            continue  # inside a section already removed, or never closed
-        out += [text[pos:start], REDACTED]
-        pos = end + 1
-    return "".join(out) + text[pos:]
 
 
 #: a dotted chain of base64url runs, each run read once (possessive): where JWTs are looked for
@@ -163,26 +125,22 @@ def _redact_jwts(match: re.Match[str]) -> str:
     return ".".join(out)
 
 
-#: The redaction steps in their order: a pattern and its replacement, or a function of the text.
-_PATTERNS: tuple[
-    tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]] | Callable[[str], str], ...
-] = (
+_PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
     # the auth section of a clouds.yaml: block style (every line indented under "auth:", a
     # comment after it, LF or CRLF line breaks) ...
     (
         re.compile(r"(?m)^([ \t]*)auth:[ \t]*(?:#[^\n]*)?\r?\n(?:\1[ \t]+\S[^\n]*(?:\n|$))+"),
         _auth_block,
     ),
-    # ... the same inside a JSON string - a step's output that printed it (review RV52-X4) ...
+    # ... and JSON or YAML flow style ("auth": {...}): a quoted string in it is read whole, so a
+    # brace in a password neither ends the section nor keeps it open (PR #58 review)
     (
         re.compile(
-            r"(?:(?<=\\n)|(?<=\"))( *)auth: *(?:#" + _JSON_LINE_CHAR + r"*+)?(?:\\r)?\\n"
-            r"(?:\1 +(?=[^\s\\\"])" + _JSON_LINE_CHAR + r"++(?:(?:\\r)?\\n|(?=\")|\Z))+"
+            r"(?i)(?<![\w.-])([\"']?auth[\"']?\s*:\s*)"
+            r"\{(?:[^{}\"'\n]|\"(?:[^\"\\\n]|\\.)*+\"|'(?:[^'\n]|'')*+')*+\}"
         ),
-        _auth_block,
+        r"\1" + REDACTED,
     ),
-    # ... and JSON or YAML flow style ("auth": {...}), to the brace that closes it
-    _redact_auth_flow,
     # credentials in URLs and connection strings: scheme://user:pass@host (a pass with "@" too)
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]{0,63}://)[^\s/@:]+:[^\s/]*@"), r"\1[REDACTED]@"),
     # Authorization headers (any scheme); a [REDACTED] an earlier pass wrote is left as it is, so
@@ -190,7 +148,8 @@ _PATTERNS: tuple[
     (
         re.compile(
             r"(?i)\b(authorization)\s*[:=]\s*(?:\w+\s+)?+(?!\[REDACTED\](?![A-Za-z0-9]))"
-            r"[^\s,;'\"]+"
+            + _word(",;'\"")
+            + "+"
         ),
         r"\1: " + REDACTED,
     ),
@@ -210,7 +169,7 @@ _PATTERNS: tuple[
             r"(?i)((?:(?<!\\)\\*+[\"'])?" + _SCANNED_KEY + r"(?:\\*+[\"'])?\s*[:=]\s*)"
             # a JSON or a shell string, and what the shell glues to it
             r"(\"(?:[^\"\\]|\\.)*+\""
-            + _DQ_WORD
+            + _GLUED
             +
             # a single-quoted string on one line whose close every quoting agrees on, and what the
             # shell glues to it
@@ -235,17 +194,19 @@ _PATTERNS: tuple[
             r"|(?P<escape>\\++)\"(?:[^\"\\\n]|(?!"
             + _ESCAPED_CLOSE
             + r")\\++\"?)*+"
-            r"(?:" + _ESCAPED_CLOSE + _ESCAPED_WORD + r"|(?=[\n\"])|\Z)"
+            r"(?:" + _ESCAPED_CLOSE + _GLUED + r"|(?=[\n\"])|\Z)"
             # a [REDACTED] an earlier pass wrote is left as it is: a second pass changes nothing
             r"|\[REDACTED\](?![A-Za-z0-9])"
             # a YAML plain value of several words runs to its line's end, a comment or its
             # string's: every word of a password (review RV52-X4); a shell word (key=value) and
-            # a header's value ("X-Auth-Token: x" url) end at a space. No word of it ends in
-            # ": " - the next key's -, so each value is read once: time linear in the text
-            r"|(?<=:[ \t])[^\s,;&}\"'\\]++"
-            r"(?:[ \t]++(?!#)(?:[^\s,;&}\\\"':]|:(?![\s\\]|\Z)|\\(?![nrt\"]))++)++"
+            # a header's value ("X-Auth-Token: x" url) end at a space. No word of it holds "=" or
+            # a backslash, starts with "-" or ends in ": ": a later key=, --flag or key: ends the
+            # reading, and that key is redacted on its own; each value is read once
+            r"|(?<=:[ \t])[^\s,;&}\"'\\=]++"
+            r"(?:[ \t]++(?![#-])(?:[^\s,;&}\\\"'=:]|:(?![\s\\]|\Z))++)++"
             r"(?=[ \t]*+(?:#|\r?\n|\\[nr]|[\"']|\Z))"
-            r"|[^\s,;&}]+)"
+            # one word, no further than a JSON-escaped line break (PR #58 review)
+            r"|" + _word(",;&}") + r"+)"
         ),
         r"\1" + REDACTED,
     ),
@@ -261,12 +222,17 @@ _PATTERNS: tuple[
         re.compile(
             r"(?i)(?<!-)(--[A-Za-z0-9-]{1,64}+"
             r"(?:(?<=password)|(?<=passwd)|(?<=secret)|(?<=token)|(?<=key))"
-            r"(?:\s+|(?P<argesc>\\*+)[\"']\s*,\s*(?P=argesc)(?P<argq>[\"'])))"
+            r"(?:\s+|(?P<argesc>\\{0,7}+)[\"']\s*,\s*(?P=argesc)(?P<argq>[\"'])))"
             r"((?(argq)(?:(?!(?P=argesc)(?P=argq))(?:\\.|[^\n]))*+"
-            # a shell word: its quoted parts and what is glued to them; a quote that never closes
-            # runs to its line's end, the longest reading - each part is read once, so a run of
-            # escaped quotes costs time linear in its length (review RV52-X3)
-            r"|(?:\"(?:[^\"\\\n]|\\.?)*+(?:\"|(?=\n)|\Z)|'[^'\n]*+(?:'|(?=\n)|\Z)|\S)++))"
+            # a value that opens a quote: the quoted string and the rest of its word, one that
+            # never closes to its line's end; else one word. A quote further in is read as part
+            # of the word: as a quoted part, a list item's closing quote and the next one's
+            # opening quote would join two items (review RV52-X3, PR #58 review)
+            r"|(?:(?:\"(?:[^\"\\\n]|\\.?)*+(?:\"|(?=\n)|\Z)|'[^'\n]*+(?:'|(?=\n)|\Z))"
+            + _word("")
+            + r"*+|"
+            + _word("")
+            + r"+)))"
         ),
         r"\1" + REDACTED,
     ),
@@ -302,8 +268,8 @@ def redact(text: str, redact_names: Sequence[str] | None = None) -> str:
     """Remove secrets (and optionally VM names) before text leaves the control plane; a NUL or a
     lone surrogate is written U+FFFD (SDD §13.4)."""
     out = _redact_pem(replace_unstorable(str(text)))
-    for step in _PATTERNS:
-        out = step(out) if callable(step) else step[0].sub(step[1], out)
+    for pattern, replacement in _PATTERNS:
+        out = pattern.sub(replacement, out)
     return replace_names(out, {name: "[vm]" for name in redact_names or []})
 
 
