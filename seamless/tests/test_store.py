@@ -9,6 +9,7 @@ import sqlalchemy as sa
 
 from seamless_migrate.domain.enums import Phase, PlanStatus, Role
 from seamless_migrate.domain.models import (
+    AdvisorRecommendation,
     Event,
     Mappings,
     Migration,
@@ -884,6 +885,65 @@ def test_a_document_an_earlier_version_stored_with_nan_or_an_infinity_is_written
     assert (
         SimilarIncident.model_validate({"title": "t", "content": "c", "score": inf}).score is None
     )
+
+
+def test_a_document_an_earlier_version_stored_with_a_nul_or_a_lone_surrogate_is_written_again(
+    any_store: Store,
+):
+    """SDD §11 (review RV52-S1): v0.1.0-rc.2 kept Jev's answers as they came, so on SQLite a
+    note, a verification's review reason or a decision's reason could hold a NUL or a lone
+    surrogate; the store refuses every write holding one, so the migration was stuck. They read
+    with U+FFFD, and the document is written again."""
+    if any_store.engine.dialect.name != "sqlite":
+        pytest.skip("PostgreSQL never kept them")
+    m = make_migration()
+    any_store.put("migration", m)
+    data = m.model_dump(mode="json")
+    data["review_reason"] = "advisor contradicted: \ud83d"
+    data["advisor_notes"] = [
+        {
+            "kind": "verification",
+            "source": "jev",
+            "summary": "boot\x00ok",
+            "data": {"claims\ud800": [{"text": "a\x00b"}]},
+        }
+    ]
+    with any_store.engine.begin() as conn:
+        conn.execute(
+            sa.update(documents)
+            .where(documents.c.kind == "migration", documents.c.id == m.id)
+            .values(data=data)
+        )
+    loaded, version = any_store.get_versioned("migration", m.id, Migration)
+    [note] = loaded.advisor_notes
+    assert loaded.review_reason == "advisor contradicted: \ufffd"
+    assert (note.summary, note.data) == ("boot\ufffdok", {"claims\ufffd": [{"text": "a\ufffdb"}]})
+    assert any_store.put("migration", loaded, expected_version=version) == version + 1
+    # a recommendation's decision, reasons, similar incidents and texts
+    rec = {
+        "decision_type": "migration_strategy",
+        "subject": {"kind": "vm", "id": "vm-1", "name": "web-01"},
+        "model": {"name": "jev", "version": "jev-1.13.0"},
+        "recommendation": {"option": "warm", "confidence": 0.9},
+        "decision": {
+            "status": "approved",
+            "reason_code": "APPROVED_BY_USER",
+            "actor": {"kind": "user", "id": "rina"},
+        },
+    }
+    rec["decision"]["reason_text"] = "x\x00"
+    rec["reasons"] = [{"key": "k", "text": "\udfff"}]
+    rec["similar_incidents"] = [{"title": "t\x00", "content": "c\ud800"}]
+    rec["recommendation"]["unusable"] = "u\x00"
+    rec["legacy_text"] = "l\x00"
+    read = AdvisorRecommendation.model_validate(rec)
+    assert read.decision.reason_text == "x\ufffd"
+    assert read.reasons[0].text == "\ufffd"
+    assert (read.similar_incidents[0].title, read.similar_incidents[0].content) == (
+        "t\ufffd",
+        "c\ufffd",
+    )
+    assert (read.recommendation.unusable, read.legacy_text) == ("u\ufffd", "l\ufffd")
 
 
 def test_the_unstorable_walk_reads_a_value_nested_however_deep():

@@ -744,6 +744,23 @@ def _finite_or_none(value: Any) -> Any:
     return value
 
 
+def _storable_strings(value: Any) -> Any:
+    """``value`` with each NUL and lone surrogate of its strings - keys and values, at any depth -
+    read as U+FFFD: what an earlier version kept from Jev or agentmemory, as this version writes
+    it (SDD §11, §14.1, review RV52-S1)."""
+    if isinstance(value, str):
+        return replace_unstorable(value)
+    if isinstance(value, dict):
+        return {_storable_strings(key): _storable_strings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_storable_strings(item) for item in value]
+    return value
+
+
+def _storable_text_field(value: Any) -> Any:
+    return _storable_strings(value) if isinstance(value, str | dict | list) else value
+
+
 class AdvisorNote(_Model):
     kind: AdvisorKind
     source: Literal["jev", "rules", "memory"]
@@ -751,6 +768,8 @@ class AdvisorNote(_Model):
     confidence: float | None = None
     data: dict[str, Any] = Field(default_factory=dict)
     created_at: UTCDateTime = Field(default_factory=utcnow)
+
+    _storable = field_validator("summary", "data", mode="before")(_storable_text_field)
 
     @model_validator(mode="before")
     @classmethod
@@ -791,6 +810,8 @@ class RecommendedOption(_Model):
     #: approve takes it (SDD §4.2, §14.6, audit AD-03)
     unusable: str | None = None
 
+    _storable = field_validator("unusable", mode="before")(_storable_text_field)
+
     @model_validator(mode="before")
     @classmethod
     def _no_number_that_is_none(cls, data: Any) -> Any:
@@ -822,6 +843,8 @@ class Decision(_Model):
     #: §14.6); None: the fallback, or a decision stored before - the policy in force applies
     require_distinct_approver: bool | None = None
     require_override_reason: bool | None = None
+
+    _storable = field_validator("reason_text", mode="before")(_storable_text_field)
 
 
 class AdvisorSubject(_Model):
@@ -862,6 +885,8 @@ class SimilarIncident(_Model):
     content: str = Field(max_length=1000)
     score: float | None = None
 
+    _storable = field_validator("title", "content", mode="before")(_storable_text_field)
+
     @model_validator(mode="before")
     @classmethod
     def _no_number_that_is_none(cls, data: Any) -> Any:
@@ -877,6 +902,8 @@ class AdvisorReason(_Model):
 
     key: str
     text: str
+
+    _storable = field_validator("text", mode="before")(_storable_text_field)
 
 
 class AdvisorRecommendation(_Model):
@@ -908,6 +935,8 @@ class AdvisorRecommendation(_Model):
     similar_incidents: list[SimilarIncident] = Field(default_factory=list)
     #: Jev's reasons that name one of the evidence keys
     reasons: list[AdvisorReason] = Field(default_factory=list)
+
+    _storable = field_validator("legacy_text", mode="before")(_storable_text_field)
 
     @model_validator(mode="before")
     @classmethod
@@ -1064,6 +1093,8 @@ class Migration(_Model):
     source_running_at: UTCDateTime | None = None
     review_required: bool = False
     review_reason: str | None = None
+
+    _storable = field_validator("review_reason", mode="before")(_storable_text_field)
     destination_server_id: str | None = None
     error: str | None = None
     attempts: int = 0
