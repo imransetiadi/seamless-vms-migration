@@ -625,7 +625,13 @@ ended - its whole time, §9.1 `T_last` - or — in `precopy`, before any pass en
 cutover request (its requester the forcer when none), and emits `migration.force_cutover` (audit) - the migration and
 its event in one transaction (§11), as an approval and a cutover request are written with their `migration.approved`
 and `migration.action`: a store error leaves neither, so no force and no approval that opens the gate lacks its record,
-and a retry is taken anew (audit OC-03). The running pass finishes, then the migration moves to `awaiting_cutover`
+and a retry is taken anew (audit OC-03). A person's cancel, rollback, delta pass (`POST …/sync`), retry and finalize
+are written with their `migration.action` the same way, so a store error leaves the migration as it was for the
+person's retry - never a cancel without its cleanup nor a finalized VM a bulk finalize reports skipped; a cancel's
+cleanup starts once that write is done (review RV51-12, RV51-13). A retry's reopen of the plan its migration's
+rollback completed follows under the plan's lock, as a completion is written; one a store error kept from it is made
+by the next tick, which reopens a completed plan holding a `ready` migration - never an attempt waiting in `ready`
+for good (review RV51-14). The running pass finishes, then the migration moves to `awaiting_cutover`
 with `converged_by: "force"`; the gate still applies — an approval by another approver (maker-checker), the window, the
 cutover slots. A request alone (`POST …/cutover`) never
 forces: it waits for convergence. A migration is forced once: while `force_cutover` is recorded, another Force
@@ -3189,7 +3195,8 @@ them (`seamless events prune` is the only deletion, by hand, §15, Security.md �
   An event recorded before the field existed has none.
 
 * `policy.created`, `policy.updated`, `policy.deleted` — actor `user:<name>`; data `{target_id, before, after}`
-  (the policy, null where there is none). The audit page lists with a `policy.updated` the settings it changed, one
+  (the policy, null where there is none) - each written in the transaction of the change it records: a store error
+  leaves the policy as it was and no event, so a change never stands without its record (review RV51-11). The audit page lists with a `policy.updated` the settings it changed, one
   line each, "{setting}: {before} → {after}", worded as the policies page shows them (§16) and in its order: Name,
   When the advisor decides, Applies to (plans and providers by name, by id when the page does not know it), Decisions,
   Threshold, Minimum evidence, Override reason, Distinct approver. A list of plans, providers or decision types whose
@@ -3326,8 +3333,9 @@ approver-only fields (§12) are not checked.
 cancelled (a VM removed from the plan, §5.1), saying so: the process's end would cut them short, and a
 running server only resumes a cut-short cleanup when it starts. One interrupted anyway (Ctrl-C) keeps its
 mark and runs when the server next starts.
-`events prune` deletes the events older than its cutoff and then records `events.pruned` (actor `cli`, data
-`{before, deleted}`), which the deletion cannot take: the trail keeps who cut it and where. It refuses a
+`events prune` deletes the events older than its cutoff and records `events.pruned` (actor `cli`, data
+`{before, deleted}`) in the same transaction, which the deletion cannot take: the trail keeps who cut it and where,
+and a store error leaves both undone (review RV51-15). It refuses a
 cutoff after now (a negative or non-finite `--older-than-days`, a later `--before`), which would delete the
 whole trail; a `--before` without an offset is UTC.
 `estimate` refuses the knobs a plan refuses: `--slo` and `--max-passes` below 1 (`downtime_slo_s`,
