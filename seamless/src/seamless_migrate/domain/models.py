@@ -333,6 +333,10 @@ class GpuDevice(_Model):
     resource_class: str | None = None
     traits: list[str] = Field(default_factory=list)
     forbidden_traits: list[str] = Field(default_factory=list)
+    #: OpenStack vGPU: a numbered request group's (resources<suffix>:), whose traits Placement
+    #: checks on the GPU's own provider; the unnumbered group's it checks across the GPU's provider
+    #: and the compute node's (SDD §22.3, PR #62 review)
+    same_provider: bool = False
     alias: str | None = None
 
     @field_validator("profile", "alias", mode="before")

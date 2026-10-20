@@ -41,6 +41,9 @@ class GpuPool:
     resource_class: str
     traits: list[str] = field(default_factory=list)
     forbidden_traits: list[str] = field(default_factory=list)
+    #: its traits are a numbered request group's, held by the GPU's own provider; false for the
+    #: unnumbered group's, held by it or its compute node, and for a class alone
+    same_provider: bool = False
     #: the units free now on the providers that hold the class and the traits
     free: int = 0
     #: the resource providers among them with at least one unit free
@@ -48,6 +51,9 @@ class GpuPool:
     #: the most units free on one of them - below n when the read again with <class>:<n> for a
     #: request group of n > 1 units finds no provider (max_unit caps it)
     largest_free: int = 0
+    #: Placement refused the pool's request as a bad one (400: a trait or a resource class it does
+    #: not know): its HTTP status and error code; the counts are then 0
+    detail: str | None = None
 
 
 @dataclass

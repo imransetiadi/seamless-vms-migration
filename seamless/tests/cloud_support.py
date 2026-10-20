@@ -4,7 +4,9 @@ request goes to a transport mounted on that session that answers in process - no
 
 What a stub cannot show, this does: keystoneauth's own parsing of the version documents, so a
 service's maximum microversion arrives as keystoneauth hands it (a tuple, ``(2, 96)``), not as
-the text a test double would hand (review RV18-01, RV18-02). Every credential is a placeholder.
+the text a test double would hand (review RV18-01, RV18-02) - and openstacksdk's own Placement
+proxy, its version discovery and keystoneauth's request log (PR #62 review). Every credential is a
+placeholder.
 """
 
 from __future__ import annotations
@@ -28,6 +30,8 @@ CATALOG = {
     "network": "https://network.example.org",
     "image": "https://image.example.org",
 }
+#: where the catalog lists Placement, when a cloud has one
+PLACEMENT_URL = "https://placement.example.org"
 
 
 @dataclass
@@ -38,8 +42,11 @@ class InProcessCloud:
     which ``GET /servers`` and ``GET /servers/detail`` list with a ``name`` filter read as Nova
     reads it: a regular expression searched anywhere in the name - after Nova's escape of ``|``
     when ``nova_db`` is ``mysql`` (MySQL/MariaDB REGEXP), as sent when ``postgresql`` (``~``) - and
-    a 400 for one that is no regular expression (the API schema's ``regex`` format). ``connect``
-    is what OpenStackProvider takes as ``connect_fn``."""
+    a 400 for one that is no regular expression (the API schema's ``regex`` format). ``flavors``
+    are what ``GET /flavors/detail`` lists (``{name, vcpus, ram, disk, extra_specs}``).
+    ``placement`` gives Placement's answers by path (``/allocation_candidates``: ``(status, body)``)
+    and puts Placement in the catalog at ``placement_url``; ``placement_seen`` records each request
+    it answers with its headers. ``connect`` is what OpenStackProvider takes as ``connect_fn``."""
 
     root: Path
     compute: str = "2.96"
@@ -50,6 +57,10 @@ class InProcessCloud:
     seen: list[tuple[str, str]] = field(default_factory=list)
     servers: list[dict[str, Any]] = field(default_factory=list)
     nova_db: str = "postgresql"
+    flavors: list[dict[str, Any]] = field(default_factory=list)
+    placement: dict[str, tuple[int, Any]] | None = None
+    placement_url: str = PLACEMENT_URL
+    placement_seen: list[tuple[str, str, dict[str, str]]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         pytest.importorskip("requests")
@@ -69,6 +80,8 @@ class InProcessCloud:
 
     def _routes(self) -> dict[tuple[str, str], tuple[int, Any, dict[str, str]]]:
         urls = {**CATALOG, **self.catalog}
+        if self.placement is not None:
+            urls["placement"] = self.placement_url
         token = {
             "token": {
                 "methods": ["password"],
@@ -133,6 +146,16 @@ class InProcessCloud:
                 {},
             ),
         }
+        if self.placement is not None:
+            # Placement's root document: its one version and microversion range (handlers/root.py)
+            placement = {
+                "id": "v1.0",
+                "status": "CURRENT",
+                "min_version": "1.0",
+                "max_version": "1.39",
+                "links": [{"rel": "self", "href": ""}],
+            }
+            routes[("GET", self.placement_url.rstrip("/"))] = (200, {"versions": [placement]}, {})
         if self.block_storage is not None:
             block = urls["block-storage"].rstrip("/")
             document = {
@@ -156,12 +179,14 @@ class InProcessCloud:
 
         from seamless_migrate.providers.openstack import connect
 
-        routes, seen, servers = self._routes(), self.seen, self._servers_answer
+        routes, seen = self._routes(), self.seen
+        answers = (self._servers_answer, self._flavors_answer, self._placement_answer)
 
         class Transport(requests.adapters.BaseAdapter):
             def send(self, request, **kwargs):
                 seen.append((request.method, request.url))
-                status, body, headers = servers(request.method, request.url) or routes.get(
+                answer = next((a for a in (f(request) for f in answers) if a), None)
+                status, body, headers = answer or routes.get(
                     (request.method, request.url.rstrip("/")), (404, {"error": "none"}, {})
                 )
                 response = requests.models.Response()
@@ -183,8 +208,34 @@ class InProcessCloud:
             conn.session.session.mount(scheme, Transport())
         return conn
 
-    def _servers_answer(self, method: str, url: str) -> tuple[int, Any, dict[str, str]] | None:
+    def _flavors_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
+        """Nova's answer to a list of the flavors with their details, None for any other request."""
+        compute = {**CATALOG, **self.catalog}["compute"].rstrip("/")
+        parts = urllib.parse.urlsplit(request.url)
+        if request.method != "GET" or f"{parts.scheme}://{parts.netloc}{parts.path}" != (
+            compute + "/flavors/detail"
+        ):
+            return None
+        flavors = [
+            {"id": f"flavor-{i}", "links": [], **flavor} for i, flavor in enumerate(self.flavors)
+        ]
+        return 200, {"flavors": flavors}, {}
+
+    def _placement_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
+        """Placement's answer to a request below its root, by path; None for any other request."""
+        root = self.placement_url.rstrip("/")
+        parts = urllib.parse.urlsplit(request.url)
+        url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+        path = url[len(root) :] if url.startswith(root) else ""
+        if self.placement is None or not path.strip("/"):
+            return None  # not Placement's, or its root document: a route answers it
+        self.placement_seen.append((request.method, request.url, dict(request.headers)))
+        status, body = self.placement.get(path, (404, {"errors": []}))
+        return status, body, {}
+
+    def _servers_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
         """Nova's answer to a list of the project's servers, None for any other request."""
+        method, url = request.method, request.url
         compute = {**CATALOG, **self.catalog}["compute"].rstrip("/")
         parts = urllib.parse.urlsplit(url)
         path = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")

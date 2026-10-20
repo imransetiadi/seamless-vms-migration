@@ -1,6 +1,8 @@
 import builtins
 import json
+import logging
 import sys
+import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -367,6 +369,7 @@ async def test_openstack_source_reports_the_gpus_its_flavor_asks_for(stub_openst
             profile="A100-4C",
             resource_class="CUSTOM_NVIDIA_A100_4C",
             traits=["CUSTOM_GPU_A100"],
+            same_provider=True,
         ),
         GpuDevice(kind="passthrough", alias="a100", count=2),
     ]
@@ -3280,17 +3283,23 @@ class FakePlacement:
     microversion=..., raise_exc=False)` returns a response, its status and body what `answer(url,
     params)` gives, or raises `raises`; each call is recorded (SDD §22.3)."""
 
-    def __init__(self, answer=None, raises=None):
+    def __init__(self, answer=None, raises=None, endpoint="https://placement.example.org"):
         self.calls = []
         self.answer = answer or (lambda url, params: (200, candidates()))
         self.raises = raises
+        self.endpoint = endpoint
 
-    def get(self, url, params=None, microversion=None, raise_exc=True, **_):
-        self.calls.append({"url": url, "params": dict(params or {}), "microversion": microversion})
+    def get(self, url, params=None, microversion=None, raise_exc=True, log=True, **_):
+        params = dict(params or {})
+        self.calls.append({"url": url, "params": params, "microversion": microversion, "log": log})
         if self.raises is not None:
             raise self.raises
-        status, body = self.answer(url, dict(params or {}))
+        status, body = self.answer(url, params)
         return NS(status_code=status, json=lambda: body)
+
+    def get_endpoint(self):
+        """The catalog's Placement URL, as keystoneauth reads it (SDD §10 tls)."""
+        return self.endpoint
 
 
 def candidates(*providers, cls="VGPU", amount=1, fit=None):
@@ -3334,6 +3343,7 @@ def gpu_destination(flavors, placement, **provider):
 
 
 A100 = "CUSTOM_NVIDIA_A100_4C"
+DISABLED = "COMPUTE_STATUS_DISABLED"
 GROUP = {"resources1:VGPU": "1", f"trait1:{A100}": "required", "trait1:CUSTOM_OLD": "forbidden"}
 
 
@@ -3370,6 +3380,7 @@ async def test_the_destination_inventory_lists_its_gpu_flavors_with_their_declar
                     profile="A100-4C",
                     resource_class="CUSTOM_A100_4C",
                     traits=["CUSTOM_A"],
+                    same_provider=True,
                 )
             ],
         },
@@ -3392,14 +3403,18 @@ async def test_the_destination_inventory_lists_its_gpu_flavors_with_their_declar
 
 async def test_gpu_capacity_reads_one_allocation_candidates_request_per_pool_at_1_29():
     """SDD §22.3 (plan task G3): one pool per distinct vGPU request - its class with its required
-    and forbidden traits - and one per class alone, each one GET /allocation_candidates at 1.29, a
-    forbidden trait sent as !<trait>; a request two flavors share is read once."""
+    and forbidden traits - and one per class alone, read with GET /allocation_candidates at 1.29: a
+    numbered group's pool with its traits, a forbidden one sent as !<trait>; an unnumbered group's
+    traits are not sent, so its pool shares its class's read (PR #62 review); a request two
+    flavors share is read once, and keystoneauth logs none of it."""
     placement = FakePlacement()
     conn, dst = gpu_destination(
         [
             ("g1.a", 8, 32768, 80, GROUP),
             ("g1.b", 8, 32768, 80, {"resources:VGPU": "1", "trait:CUSTOM_B": "required"}),
             ("g1.a-again", 4, 16384, 40, GROUP),
+            # a numbered group without traits asks what its class alone does: its pool is that one
+            ("g1.c", 4, 16384, 40, {"resources2:VGPU": "1"}),
         ],
         placement,
     )
@@ -3409,22 +3424,22 @@ async def test_gpu_capacity_reads_one_allocation_candidates_request_per_pool_at_
             "url": "/allocation_candidates",
             "params": {"resources": "VGPU:1", "required": f"{A100},!CUSTOM_OLD"},
             "microversion": "1.29",
-        },
-        {
-            "url": "/allocation_candidates",
-            "params": {"resources": "VGPU:1", "required": "CUSTOM_B"},
-            "microversion": "1.29",
+            "log": False,
         },
         {
             "url": "/allocation_candidates",
             "params": {"resources": "VGPU:1"},
             "microversion": "1.29",
+            "log": False,
         },
     ]
-    assert [(p.resource_class, p.traits, p.forbidden_traits) for p in inv.gpu_capacity.pools] == [
-        ("VGPU", [A100], ["CUSTOM_OLD"]),
-        ("VGPU", ["CUSTOM_B"], []),
-        ("VGPU", [], []),
+    assert [
+        (p.resource_class, p.traits, p.forbidden_traits, p.same_provider)
+        for p in inv.gpu_capacity.pools
+    ] == [
+        ("VGPU", [A100], ["CUSTOM_OLD"], True),
+        ("VGPU", ["CUSTOM_B"], [], False),
+        ("VGPU", [], [], False),
     ]
     assert (inv.gpu_capacity.status, inv.gpu_capacity.reason) == ("ok", None)
     assert inv.gpu_capacity.read_at is not None
@@ -3440,6 +3455,8 @@ async def test_gpu_capacity_counts_capacity_less_used_on_providers_with_the_pool
         ("gpu-3", "cn-2", {"VGPU": (8, 0)}, ["CUSTOM_OTHER"]),
         ("gpu-4", "cn-2", {"VGPU": (2, 0)}, [A100, "CUSTOM_OLD"]),
         ("gpu-5", "cn-2", {"VGPU": (6, 3)}, [A100]),
+        # an inventory whose allocation ratio was lowered under what it holds: none free, not -1
+        ("gpu-6", "cn-2", {"VGPU": (2, 3)}, [A100]),
         ("cn-1", "cn-1", {"VCPU": (64, 8)}, []),
         ("cn-2", "cn-2", {}, []),
     )
@@ -3471,21 +3488,32 @@ async def test_gpu_capacity_leaves_out_a_provider_whose_compute_service_is_disab
 async def test_gpu_capacity_reads_a_pool_again_for_a_group_of_more_than_one_unit():
     """SDD §22.3 (plan task G3): Nova fills a group from one provider, and an inventory's max_unit
     may cap what one provider gives below its free: the pool is read again with <class>:<n> for a
-    group of n > 1 units, and when that read finds no provider largest_free stays below n."""
-    one = candidates(("gpu-1", "cn-1", {"VGPU": (8, 2)}, []), ("cn-1", "cn-1", {}, []))
-    for found, largest in ((["gpu-1"], 6), ([], 1)):
-        two = candidates(
-            ("gpu-1", "cn-1", {"VGPU": (8, 2)}, []), ("cn-1", "cn-1", {}, []), amount=2, fit=found
-        )
+    group of n > 1 units, and when that read finds no provider that counts - none, or only one
+    whose compute service is disabled - largest_free stays below n, never above what is free."""
+    tree = (("gpu-1", "cn-1", {"VGPU": (8, 2)}, []), ("cn-1", "cn-1", {}, []))
+    disabled = (("gpu-2", "cn-2", {"VGPU": (8, 0)}, []), ("cn-2", "cn-2", {}, [DISABLED]))
+    cases = [
+        # (the group's units, the second read's providers and those it names, largest_free)
+        (2, tree, ["gpu-1"], 6),
+        (2, tree, [], 1),
+        (2, (*tree, *disabled), ["gpu-2"], 1),
+        (8, tree, [], 6),
+    ]
+    one = candidates(*tree)
+    for units, providers, found, largest in cases:
+        again = candidates(*providers, amount=units, fit=found)
         placement = FakePlacement(
-            lambda u, p, two=two: (200, two if p["resources"] == "VGPU:2" else one)
+            lambda u, p, units=units, again=again: (
+                200,
+                again if p["resources"] == f"VGPU:{units}" else one,
+            )
         )
         conn, dst = gpu_destination(
-            [("g1.vgpu2", 8, 32768, 80, {"resources:VGPU": "2"})], placement
+            [("g1.vgpu", 8, 32768, 80, {"resources:VGPU": str(units)})], placement
         )
         [pool] = (await dst.inventory()).gpu_capacity.pools
-        assert [c["params"]["resources"] for c in placement.calls] == ["VGPU:1", "VGPU:2"]
-        assert (pool.free, pool.providers, pool.largest_free) == (6, 1, largest)
+        assert [c["params"]["resources"] for c in placement.calls] == ["VGPU:1", f"VGPU:{units}"]
+        assert (pool.free, pool.providers, pool.largest_free) == (6, 1, largest), (units, found)
 
 
 async def test_gpu_capacity_is_unknown_when_placement_refuses_the_credential():
@@ -3508,15 +3536,231 @@ async def test_gpu_capacity_is_unknown_when_placement_refuses_the_credential():
     assert [f["name"] for f in inv.gpu_flavors] == ["g1.a"]
 
 
-async def test_gpu_capacity_is_unknown_without_a_placement_endpoint():
-    """SDD §22.3 (plan task G3): a catalog without Placement reads unknown, reason no_placement."""
+async def test_gpu_capacity_is_unknown_without_a_placement_endpoint(tmp_path):
+    """SDD §22.3 (plan task G3): a catalog without Placement reads unknown, reason no_placement -
+    as openstacksdk tells it: its proxy of a service the catalog lacks refuses every call
+    (ServiceDisabledException), and keystoneauth's EndpointNotFound under strict proxies; through
+    openstacksdk's own Connection too (PR #62 review)."""
     from keystoneauth1.exceptions import EndpointNotFound
+    from openstack.exceptions import ServiceDisabledException
 
+    for missing in (ServiceDisabledException("no placement"), EndpointNotFound("no placement")):
+        conn, dst = gpu_destination([("g1.a", 8, 32768, 80, GROUP)], FakePlacement(raises=missing))
+        capacity = (await dst.inventory()).gpu_capacity
+        assert (capacity.status, capacity.reason, capacity.detail) == (
+            "unknown",
+            "no_placement",
+            None,
+        ), missing
+    vgpu = {"name": "g1.vgpu", "vcpus": 8, "ram": 32768, "disk": 80}
+    cloud = InProcessCloud(tmp_path, flavors=[{**vgpu, "extra_specs": {"resources:VGPU": "1"}}])
+    provider = make_provider(endpoint=AUTH_URL, cloud="dst", role=ProviderRole.destination)
+    real = OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect)
+    capacity = (await real.check())["gpu_capacity"]
+    assert (capacity["status"], capacity["reason"], capacity["detail"]) == (
+        "unknown",
+        "no_placement",
+        None,
+    )
+
+
+async def test_an_unnumbered_groups_traits_hold_across_the_gpus_provider_and_its_root():
+    """SDD §22.3 (PR #62 review): Nova's unnumbered group takes VCPU and MEMORY_MB from the compute
+    node and VGPU from the GPU's provider, and Placement checks its required traits across both and
+    its forbidden ones on each: a CPU trait the compute node holds counts, a forbidden trait on it
+    excludes its GPUs. Placement would check sent traits on the GPU's provider alone, so they are
+    not sent."""
+    answer = candidates(
+        ("gpu-1", "cn-1", {"VGPU": (4, 0)}, []),
+        ("cn-1", "cn-1", {"VCPU": (64, 0)}, ["HW_CPU_X86_AVX512F"]),
+        ("gpu-2", "cn-2", {"VGPU": (4, 0)}, []),
+        ("cn-2", "cn-2", {"VCPU": (64, 0)}, []),
+        ("gpu-3", "cn-3", {"VGPU": (8, 0)}, ["HW_CPU_X86_AVX512F"]),
+        ("cn-3", "cn-3", {"VCPU": (64, 0)}, ["CUSTOM_MAINT"]),
+        ("gpu-4", "cn-4", {"VGPU": (2, 0)}, ["CUSTOM_MAINT"]),
+        ("cn-4", "cn-4", {"VCPU": (64, 0)}, ["HW_CPU_X86_AVX512F"]),
+        ("gpu-5", "cn-5", {"VGPU": (3, 1)}, ["HW_CPU_X86_AVX512F"]),
+        ("cn-5", "cn-5", {"VCPU": (64, 0)}, []),
+    )
+    placement = FakePlacement(lambda u, p: (200, answer))
+    specs = {
+        "resources:VGPU": "1",
+        "trait:HW_CPU_X86_AVX512F": "required",
+        "trait:CUSTOM_MAINT": "forbidden",
+    }
+    conn, dst = gpu_destination([("g1.avx", 8, 32768, 80, specs)], placement)
+    [pool, alone] = (await dst.inventory()).gpu_capacity.pools
+    assert (pool.same_provider, pool.traits, pool.forbidden_traits) == (
+        False,
+        ["HW_CPU_X86_AVX512F"],
+        ["CUSTOM_MAINT"],
+    )
+    # gpu-1 by its compute node's trait and gpu-5 by its own; gpu-2 lacks it, gpu-3's compute node
+    # and gpu-4 itself hold the forbidden one
+    assert (pool.free, pool.providers, pool.largest_free) == (6, 2, 4)
+    assert (alone.free, alone.providers) == (20, 5)
+    assert placement.calls == [
+        {
+            "url": "/allocation_candidates",
+            "params": {"resources": "VGPU:1"},
+            "microversion": "1.29",
+            "log": False,
+        }
+    ]
+
+
+async def test_a_numbered_groups_traits_hold_on_the_gpus_own_provider():
+    """SDD §22.3 (PR #62 review): a numbered group (resources<suffix>:) takes all it asks for from
+    one provider, so Placement checks its traits on the GPU's provider alone: they are sent, and a
+    trait its compute node holds counts for nothing."""
+    answer = candidates(
+        ("gpu-1", "cn-1", {"VGPU": (4, 1)}, ["CUSTOM_A"]),
+        ("cn-1", "cn-1", {"VCPU": (64, 0)}, []),
+        ("gpu-2", "cn-2", {"VGPU": (4, 0)}, []),
+        ("cn-2", "cn-2", {"VCPU": (64, 0)}, ["CUSTOM_A"]),
+    )
+    placement = FakePlacement(lambda u, p: (200, answer))
+    specs = {"resources1:VGPU": "1", "trait1:CUSTOM_A": "required"}
+    conn, dst = gpu_destination([("g1.a", 8, 32768, 80, specs)], placement)
+    [pool, alone] = (await dst.inventory()).gpu_capacity.pools
+    assert (pool.same_provider, pool.free, pool.providers, pool.largest_free) == (True, 3, 1, 3)
+    assert (alone.same_provider, alone.free, alone.providers) == (False, 7, 2)
+    assert [c["params"] for c in placement.calls] == [
+        {"resources": "VGPU:1", "required": "CUSTOM_A"},
+        {"resources": "VGPU:1"},
+    ]
+
+
+async def test_a_pool_placement_refuses_as_a_bad_request_counts_nothing_and_the_others_are_read():
+    """SDD §22.3 (PR #62 review): Placement refuses a request that names a trait or a resource
+    class it does not know (400) - Nova's request for that flavor is refused alike, so no server is
+    created with it. That pool counts nothing, its detail naming the refusal by status and code,
+    and the other pools are read: one flavor ahead of its traits does not blank the others."""
+    text = "No such trait(s): CUSTOM_NOT_YET"
+    unknown = {"errors": [{"status": 400, "code": "placement.undefined_code", "detail": text}]}
+    answer = candidates(("gpu-1", "cn-1", {"VGPU": (4, 1)}, [A100]), ("cn-1", "cn-1", {}, []))
+
+    def placement_answer(url, params):
+        return (400, unknown) if "CUSTOM_NOT_YET" in params.get("required", "") else (200, answer)
+
+    future = {"resources1:VGPU": "1", "trait1:CUSTOM_NOT_YET": "required"}
     conn, dst = gpu_destination(
-        [("g1.a", 8, 32768, 80, GROUP)], FakePlacement(raises=EndpointNotFound("no placement"))
+        [("g1.a", 8, 32768, 80, GROUP), ("g1.future", 8, 32768, 80, future)],
+        FakePlacement(placement_answer),
     )
     capacity = (await dst.inventory()).gpu_capacity
-    assert (capacity.status, capacity.reason, capacity.detail) == ("unknown", "no_placement", None)
+    assert (capacity.status, capacity.reason, capacity.detail) == ("ok", None, None)
+    [a100, refused, alone] = capacity.pools
+    assert (a100.free, a100.providers, a100.detail) == (3, 1, None)
+    assert (refused.traits, refused.free, refused.providers, refused.largest_free) == (
+        ["CUSTOM_NOT_YET"],
+        0,
+        0,
+        0,
+    )
+    assert refused.detail == "HTTP 400 placement.undefined_code"
+    assert (alone.free, alone.detail) == (3, None)
+
+
+async def test_a_placement_that_does_not_answer_is_not_asked_again_for_five_minutes(monkeypatch):
+    """SDD §22.3 (PR #62 review): a Placement endpoint that accepts connections and never answers
+    costs every read its timeouts. A read that got no answer is remembered by the provider for 5
+    minutes: the inventory's, the check's, the gate's and the allocations read until then read
+    unknown/error - or no allocation - at once, then Placement is asked again. An answer, even an
+    error, is no silence: the next read asks again."""
+    from keystoneauth1.exceptions import ConnectTimeout
+
+    from seamless_migrate.providers import openstack as module
+
+    now = [1000.0]
+    monkeypatch.setattr(module, "_monotonic", lambda: now[0])
+    placement = FakePlacement(raises=ConnectTimeout("placement.example.org timed out"))
+    conn, dst = gpu_destination([("g1.a", 8, 32768, 80, GROUP)], placement)
+    first = (await dst.inventory()).gpu_capacity
+    assert (first.status, first.reason, first.detail) == ("unknown", "error", "ConnectTimeout")
+    asked = len(placement.calls)
+    now[0] += 299
+    again = (await dst.inventory()).gpu_capacity
+    report = (await dst.check())["gpu_capacity"]
+    gate = await dst.gpu_capacity([GpuDevice(kind="vgpu", resource_class="VGPU", count=1)])
+    assert (again.status, again.reason, again.detail) == ("unknown", "error", "ConnectTimeout")
+    assert (report["reason"], report["detail"]) == ("error", "ConnectTimeout")
+    assert (gate.reason, gate.detail) == ("error", "ConnectTimeout")
+    assert await dst.server_allocations("srv-1") is None
+    assert len(placement.calls) == asked
+    # five minutes on, Placement is asked again - and it answers
+    now[0] += 2
+    placement.raises = None
+    assert (await dst.inventory()).gpu_capacity.status == "ok"
+    assert len(placement.calls) > asked
+    # an answer that is an error is no silence, nor one the SDK read for it
+    import openstack.exceptions
+    import requests
+
+    gateway = requests.Response()
+    gateway.status_code = 502
+    for failing, detail in (
+        ({"answer": lambda u, p: (503, "<html>busy</html>")}, "HTTP 503"),
+        (
+            {"raises": openstack.exceptions.HttpException("Bad Gateway", response=gateway)},
+            "HTTP 502",
+        ),
+    ):
+        placement = FakePlacement(**failing)
+        conn, dst = gpu_destination([("g1.a", 8, 32768, 80, GROUP)], placement)
+        assert (await dst.inventory()).gpu_capacity.detail == detail
+        asked = len(placement.calls)
+        assert (await dst.inventory()).gpu_capacity.detail == detail
+        assert len(placement.calls) > asked, detail
+
+
+async def test_the_placement_reads_through_keystoneauth_log_no_answer(tmp_path, caplog):
+    """SDD §22.3, §22.12 (PR #62 review): through openstacksdk and keystoneauth themselves - the
+    proxy's version discovery, the microversion header, the query -, the check's read counts the
+    pools, and at a DEBUG level keystoneauth writes none of Placement's answers: no provider uuid
+    reaches a log line."""
+    gpu, root = "5b0c9a7e-1f2d-4e3c-9a8b-7c6d5e4f3a21", "9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b"
+    answer = candidates((gpu, root, {"VGPU": (4, 1)}, [A100]), (root, root, {"VCPU": (64, 0)}, []))
+    held = {"allocations": {gpu: {"resources": {"VGPU": 1}}}}
+    vgpu = {"name": "g1.a", "vcpus": 8, "ram": 32768, "disk": 80, "extra_specs": GROUP}
+    cloud = InProcessCloud(
+        tmp_path,
+        flavors=[vgpu],
+        placement={"/allocation_candidates": (200, answer), "/allocations/srv-1": (200, held)},
+    )
+    provider = make_provider(endpoint=AUTH_URL, cloud="dst", role=ProviderRole.destination)
+    dst = OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect)
+    caplog.set_level(logging.DEBUG)
+    [pool, alone] = (await dst.check())["gpu_capacity"]["pools"]
+    assert (pool["free"], pool["providers"], alone["free"]) == (3, 1, 3)
+    assert await dst.server_allocations("srv-1") == {"VGPU": 1}
+    reads = [(urllib.parse.urlsplit(u), h) for m, u, h in cloud.placement_seen]
+    assert [urllib.parse.parse_qs(url.query) for url, _ in reads[:2]] == [
+        {"resources": ["VGPU:1"], "required": [f"{A100},!CUSTOM_OLD"]},
+        {"resources": ["VGPU:1"]},
+    ]
+    assert {h.get("OpenStack-API-Version") for _, h in reads} == {"placement 1.29"}
+    assert "keystoneauth" in caplog.text  # the session logs at this level: the rest of it
+    assert gpu not in caplog.text and root not in caplog.text
+
+
+async def test_a_destination_check_names_a_plain_http_placement_it_read():
+    """SDD §10 (tls, plain_http), §22.3 (PR #62 review): the check's capacity read sends the token
+    to Placement, so a Placement endpoint on plain HTTP is named once the check got an answer from
+    it - never when it has no vGPU flavor to read, or no Placement answered."""
+    conn, dst = gpu_destination(
+        [("g1.a", 8, 32768, 80, GROUP)], FakePlacement(endpoint="http://placement.example.org")
+    )
+    report = await dst.check()
+    assert ("placement" in report["plain_http"], report["tls"]) == (True, False)
+    conn, dst = gpu_destination(
+        [("m1.small", 2, 4096, 20, {})], FakePlacement(endpoint="http://placement.example.org")
+    )
+    report = await dst.check()
+    assert "placement" not in report["plain_http"]
+    conn, dst = gpu_destination([("g1.a", 8, 32768, 80, GROUP)], FakePlacement())
+    report = await dst.check()
+    assert "placement" not in report["plain_http"]
 
 
 async def test_gpu_capacity_is_unknown_with_the_status_and_code_of_any_other_failure():
@@ -3584,9 +3828,11 @@ async def test_the_destination_check_reports_its_gpu_capacity():
         "resource_class": "VGPU",
         "traits": [A100],
         "forbidden_traits": ["CUSTOM_OLD"],
+        "same_provider": True,
         "free": 3,
         "providers": 1,
         "largest_free": 3,
+        "detail": None,
     }
 
 

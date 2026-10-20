@@ -1200,18 +1200,22 @@ async def test_no_placement_provider_name_or_uuid_leaves_the_capacity_read(caplo
         "resource_class": "VGPU",
         "traits": [A100],
         "forbidden_traits": ["CUSTOM_OLD"],
+        "same_provider": True,
         "free": 7,
         "providers": 2,
         "largest_free": 4,
+        "detail": None,
     }
     assert first[3] == {"VGPU": 1, "VCPU": 8, "MEMORY_MB": 32768}
-    assert [json.loads(k)[1]["gpu_capacity"]["detail"] for k in kept[1:]] == [
+    reports = [json.loads(k)[1]["gpu_capacity"] for k in kept[1:]]
+    assert [r["detail"] for r in reports] == [
         "HTTP 409 placement.concurrent_update",
         "HTTP 500",
-        "HTTP 400",
+        None,  # a bad request is its pools' own, each named so (PR #62 review)
         "HTTP 503",
         "ConnectFailure",
     ]
+    assert {pool["detail"] for pool in reports[2]["pools"]} == {"HTTP 400"}
     for name in (*hosts, *gpus, *uuids.values()):
         assert not [k for k in kept if name in k], name
         assert name not in caplog.text, name

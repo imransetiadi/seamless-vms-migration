@@ -34,7 +34,8 @@ def test_gpu_requests_reads_a_bare_vgpu_request_with_its_traits():
 
 def test_gpu_requests_reads_each_numbered_group_with_its_own_traits():
     """SDD §22.2: Nova's granular groups, resources<suffix>:VGPU, each with the traits of its own
-    suffix - the unnumbered group's traits belong to no numbered group - in suffix order."""
+    suffix - the unnumbered group's traits belong to no numbered group - in suffix order; a numbered
+    group's traits are its GPU provider's own (same_provider, §22.3; PR #62 review)."""
     specs = {
         "resources_GPU-b:VGPU": "2",
         "trait_GPU-b:CUSTOM_B": "required",
@@ -45,9 +46,12 @@ def test_gpu_requests_reads_each_numbered_group_with_its_own_traits():
         "resources:VCPU": "4",
     }
     assert gpu_requests(specs) == [
-        vgpu(count=1, traits=["CUSTOM_ONE"]),
-        vgpu(count=2, traits=["CUSTOM_A", "CUSTOM_B"]),
+        vgpu(count=1, traits=["CUSTOM_ONE"], same_provider=True),
+        vgpu(count=2, traits=["CUSTOM_A", "CUSTOM_B"], same_provider=True),
     ]
+    assert [device.same_provider for device in gpu_requests(specs)] == [True, True]
+    [unnumbered] = gpu_requests({"resources:VGPU": "1", "trait:CUSTOM_X": "required"})
+    assert unnumbered.same_provider is False
 
 
 def test_gpu_requests_reads_each_pci_alias_with_its_count():
@@ -73,6 +77,7 @@ def test_a_custom_resource_class_is_a_vgpu_only_with_a_declared_profile():
             count=1,
             resource_class="CUSTOM_NVIDIA_A100_4C",
             traits=["CUSTOM_DC3"],
+            same_provider=True,
         )
     ]
 
@@ -100,7 +105,9 @@ def test_a_zero_amount_asks_for_no_gpu():
     """SDD §22.2: a zero takes a resource out of a request, as Nova reads it - that group asks for
     no GPU, and the flavor's other groups keep theirs."""
     assert gpu_requests({"resources:VGPU": "0", "trait:CUSTOM_X": "required"}) == []
-    assert gpu_requests({"resources1:VGPU": "0", "resources2:VGPU": "1"}) == [vgpu(count=1)]
+    assert gpu_requests({"resources1:VGPU": "0", "resources2:VGPU": "1"}) == [
+        vgpu(count=1, same_provider=True)
+    ]
 
 
 @pytest.mark.parametrize(
@@ -111,7 +118,9 @@ def test_an_amount_nova_skips_asks_for_no_gpu(amount):
     skips a negative or unreadable one with a warning, and strip_zeros drops a zero in any form - a
     server boots with no vGPU for it, where this read one."""
     assert gpu_requests({"resources:VGPU": amount}) == []
-    assert gpu_requests({"resources1:VGPU": amount, "resources2:VGPU": "1"}) == [vgpu(count=1)]
+    assert gpu_requests({"resources1:VGPU": amount, "resources2:VGPU": "1"}) == [
+        vgpu(count=1, same_provider=True)
+    ]
 
 
 @pytest.mark.parametrize(
