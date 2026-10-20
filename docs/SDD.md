@@ -2639,10 +2639,12 @@ an outside service - an advisor note's confidence or a number of its data (a hit
 recommendation's confidence or a probability of its distribution, a similar incident's score - reads each as
 null, a probability as absent, as this version would have written it: the document is written again as any other,
 where its stopped source could otherwise never be rolled back (review RV51-06). A string such a version kept from
-Jev or agentmemory holding a NUL or a lone surrogate - an advisor note's summary and the keys and values of its data,
-a verification's `review_reason`, a decision's `reason_text`, Jev's reasons, a similar incident's title and content,
-a recommendation's `unusable` and `legacy_text` - reads with U+FFFD for each, as this version writes them (§14.1), so
-that document is written again too (review RV52-S1). What the control plane is given
+outside - Jev, agentmemory, a step's or a provider's error - holding a NUL or a lone surrogate - an advisor note's
+summary and the keys and values of its data, a verification's `review_reason`, its checks, warnings and probe detail,
+a migration's `error` and its phase changes' reasons, a decision's `reason_text`, Jev's reasons, a similar incident's
+title and content, a recommendation's option, its distribution's keys, `unusable` and `legacy_text`, and the model's
+version - reads with U+FFFD for each, as this version writes them (§14.1), so that document is written again too
+(review RV52-S1, PR #58 review); a name a cutover reads is not among them. What the control plane is given
 stops before that refusal: a request
 body holding a NUL or a lone surrogate is refused before its route runs (§12) - a number is its route's to check,
 as §9.1 checks a plan's -, the tokens file refuses such a name (§13.1), the text it takes from outside sources
