@@ -1864,16 +1864,15 @@ class Orchestrator:
                 m.downtime_ended_at = None
                 m.actual_downtime_s = None
                 m.downtime_model_s = None
-            m, v = await self._transitions(
-                m,
-                v,
-                [(P.ready, f"retry requested by {actor}", None)],
-                actor,
+
+            def retried(new: Migration) -> tuple[list[tuple[str, Any, int]], list[Event]]:
                 # the attempts of the migration as transitioned - the FSM counts failed -> ready
                 # itself -, so the action names what is stored (SDD §5.1, review RV52-O6)
-                also=lambda new: _action(
-                    f"retry of {new.vm.name}", actor, {"action": "retry", "attempts": new.attempts}
-                )(new),
+                data = {"action": "retry", "attempts": new.attempts}
+                return _action(f"retry of {new.vm.name}", actor, data)(new)
+
+            m, v = await self._transitions(
+                m, v, [(P.ready, f"retry requested by {actor}", None)], actor, also=retried
             )
         # SDD §5.1/§8: a completed plan is driven no more, so the new attempt reopens it - under
         # the plan's lock, taken only now: held across the claim wait above, it would hold up the

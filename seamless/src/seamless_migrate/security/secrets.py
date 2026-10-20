@@ -60,11 +60,12 @@ def read_secret(
                     continue
                 values[entry.name] = entry.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
-        pass
+        values = {}  # no mounted secret of that name: the Kubernetes store and the variables next
     except OSError as exc:
         # a directory this process may not search or read holds nothing it can use: the
-        # Kubernetes store and the variables come next (SDD §13.3, PR #58 review)
-        log.warning("cannot read secret %s under %s: %s", name, settings.secrets_dir, exc.strerror)
+        # Kubernetes store and the variables come next (SDD §13.3, PR #58 review). Neither the
+        # secret's name nor its path is logged: they name what it guards
+        log.warning("a secrets directory this process may not read was skipped: %s", exc.strerror)
         values = {}
     if not values and settings.secret_store == "kubernetes":
         from .secret_store import KubernetesSecretStore, SecretStoreError, kubernetes_name
