@@ -1353,6 +1353,9 @@ export class MockServer {
     const networks = dst && !Array.isArray(dst) ? dst.networks : {};
     const subnets = dst && !Array.isArray(dst) ? (dst.subnets ?? []) : [];
     const networkDetails = dst && !Array.isArray(dst) ? dst.network_details : undefined;
+    // the flavors a GPU VM's mapping may name, and those of them that ask for a GPU (SDD §22.3, §22.4)
+    const flavors = dst && !Array.isArray(dst) ? dst.flavors.map((f) => f.name) : [];
+    const gpuFlavors = dst && !Array.isArray(dst) ? (dst.gpu_flavors ?? []).map((f) => f.name) : [];
     // the plan's VMs as the API's validation reads them, its vm_ids from the source's inventory: never its migrations,
     // which a first validation has not all created yet and a VM taken out of the plan leaves behind (review RV25-01)
     const inventory = this.inventories[plan.source_provider_id];
@@ -1361,7 +1364,16 @@ export class MockServer {
     // reads the provider's declarations (SDD §9.3, §10, §21.5)
     const roles = capabilityRoles(destination.capabilities);
     const profile = policyProfileOf(destination.capabilities, destination);
-    m.findings = preflight(m.vm, source.kind, plan, networks, { subnets, selected, networkDetails, roles, profile, destination: providerLabel(destination) });
+    m.findings = preflight(m.vm, source.kind, plan, networks, {
+      subnets,
+      selected,
+      networkDetails,
+      roles,
+      profile,
+      destination: providerLabel(destination),
+      flavors,
+      gpuFlavors,
+    });
     // what an earlier attempt left at the destination keeps a handover out (SDD §9.2, review 39 lead L1)
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings, keptAfterRollback(m));
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));

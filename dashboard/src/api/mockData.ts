@@ -493,6 +493,59 @@ function gpuNames(devices: GpuDevice[]): string {
     .join(', ');
 }
 
+/** What a plan's GPU mapping names a VMware device by - a vGPU's profile, a passthrough device's PCI ids -, null when it
+ * has neither: the API's gpu_key (SDD §22.2). */
+function gpuKey(d: GpuDevice): string | null {
+  if (d.kind === 'vgpu') return d.profile || null;
+  return d.vendor_id && d.device_id ? `${d.vendor_id}:${d.device_id}` : null;
+}
+
+/** The GPU requests a VM recorded without gpus shows in its flavor's extra specs, for the mapping rule alone: a vGPU per
+ * VGPU request, a passthrough device per alias, as the API's gpu_requests reads them (SDD §22.2). */
+function gpuRequestsOf(specs: Record<string, string>): GpuDevice[] {
+  const vgpus: GpuDevice[] = vgpuRequests(specs).map(() => ({ kind: 'vgpu', count: 1, resource_class: 'VGPU' }));
+  const aliases = (specs['pci_passthrough:alias'] ?? '').split(',').filter((a) => a.split(':')[0]!.trim());
+  return [...vgpus, ...aliases.map((a): GpuDevice => ({ kind: 'passthrough', count: 1, alias: a.split(':')[0]!.trim() }))];
+}
+
+/**
+ * Why no GPU mapping applies to a GPU VM, in the API's words (_gpu_mapping, SDD §22.4): a VMware device without a key, a
+ * key no GPU mapping names, keys mapping to different flavors, an OpenStack flavor no mapping names, a mapping to a flavor
+ * that asks for no GPU. Null when one applies, or names a flavor the destination lacks - MAP_FLAVOR_MISSING's.
+ */
+function gpuMappingWhy(
+  vm: VMRef,
+  gpus: GpuDevice[],
+  sourceKind: ProviderKind,
+  plan: Plan,
+  flavors: readonly string[],
+  gpuFlavors: readonly string[],
+  where: string,
+): string | null {
+  let target: string | undefined;
+  let mapping: string;
+  if (sourceKind === 'vmware') {
+    const keys = [...new Set(gpus.map(gpuKey))];
+    if (keys.includes(null)) return 'No mapping can name its device without ids, so none applies to the VM.';
+    const named = keys as string[];
+    const mapped = plan.mappings.gpus ?? {};
+    const unnamed = named.filter((key) => !(key in mapped));
+    if (unnamed.length)
+      return `The plan's GPU mappings name no flavor for ${unnamed.map(pyRepr).join(', ')}: map ${unnamed.length === 1 ? 'it' : 'them'} to a GPU flavor of ${where}.`;
+    const targets = named.map((key) => [key, mapped[key]!] as const);
+    if (new Set(targets.map(([, flavor]) => flavor)).size > 1)
+      return `Its GPUs map to different flavors (${targets.map(([key, flavor]) => `${pyRepr(key)} to ${pyRepr(flavor)}`).join(', ')}): its server is created with one.`;
+    target = targets[0]![1];
+    mapping = `Its GPU mapping, ${named.map(pyRepr).join(', ')} to ${pyRepr(target)},`;
+  } else {
+    target = vm.flavor ? plan.mappings.flavors[vm.flavor] : undefined;
+    if (target === undefined) return `The plan maps no flavor to ${pyRepr(vm.flavor ?? 'None')}: map it to a GPU flavor of ${where}.`;
+    mapping = `Its flavor mapping, ${pyRepr(vm.flavor ?? 'None')} to ${pyRepr(target)},`;
+  }
+  if (!flavors.includes(target)) return null;
+  return gpuFlavors.includes(target) ? null : `${mapping} names a flavor of ${where} that asks for no GPU: the server would lose its GPU.`;
+}
+
 export function makeVm(spec: VmSpec): VMRef {
   const disks: Disk[] = spec.disks.map((d, i) => {
     const kind = d.kind ?? 'volume';
@@ -1038,7 +1091,17 @@ export function preflight(
   destinationNetworks: Record<string, number | null>,
   /** The destination's subnets, its networks with their owners, its token's roles, and the plan's selected VMs - `vm` alone
    * when not given, as the API's all_vms (SDD §9.3). */
-  context: { subnets?: DestinationSubnet[]; selected?: VMRef[]; networkDetails?: DestinationNetwork[]; roles?: string[]; profile?: string; destination?: string } = {},
+  context: {
+    subnets?: DestinationSubnet[];
+    selected?: VMRef[];
+    networkDetails?: DestinationNetwork[];
+    roles?: string[];
+    profile?: string;
+    destination?: string;
+    /** The destination's flavors by name, and those of them that ask for a GPU: what a GPU VM's mapping names (SDD §22.4). */
+    flavors?: string[];
+    gpuFlavors?: string[];
+  } = {},
 ): Finding[] {
   const findings: Finding[] = [];
   // the destination provider a message about the destination cloud names, as the API's (SDD §1 naming, §9.3)
@@ -1170,17 +1233,22 @@ export function preflight(
   }
   for (const [code, message] of nicOverrideFindings(vm, sourceKind, plan, destinationNetworks, context))
     add(code, message);
-  // the API's _gpu_findings (SDD §9.3, §22.2, plan task G2): an OpenStack flavor's requests named by their extra specs,
-  // a VMware VM's devices by what names them; a VM recorded without gpus read from its extra specs
+  // the API's _gpu_blockers (SDD §9.3, §22.4, §22.5, plan task G4): a GPU VM no GPU mapping applies to - an OpenStack
+  // flavor's requests named by their extra specs, a VMware VM's devices by what names them - and why none applies; a VM
+  // recorded without gpus read from its extra specs
   const gpus = vm.gpus ?? [];
   const alias = vm.flavor_extra_specs['pci_passthrough:alias'];
   const passthrough = gpus.filter((g) => g.kind === 'passthrough');
-  if (gpus.length ? passthrough.length : alias !== undefined)
+  const read = gpus.length ? gpus : gpuRequestsOf(vm.flavor_extra_specs);
+  const why = read.length ? gpuMappingWhy(vm, read, sourceKind, plan, context.flavors ?? [], context.gpuFlavors ?? [], where) : null;
+  if (why !== null && (gpus.length ? passthrough.length : alias !== undefined))
     add(
       'VM_PCI_PASSTHROUGH',
-      alias !== undefined && (!gpus.length || passthrough.some((g) => g.alias))
-        ? `Flavor requests PCI passthrough (${alias}).`
-        : `The VM has a PCI passthrough device (${gpuNames(passthrough)}).`,
+      `${
+        alias !== undefined && (!gpus.length || passthrough.some((g) => g.alias))
+          ? `Flavor requests PCI passthrough (${alias}).`
+          : `The VM has a PCI passthrough device (${gpuNames(passthrough)}).`
+      } ${why}`,
     );
   const vgpus = gpus.filter((g) => g.kind === 'vgpu');
   // the extra-spec keys of the vGPU requests: the classes gpus names - a declared CUSTOM_ class among them -, else VGPU
@@ -1188,12 +1256,14 @@ export function preflight(
   const vgpu = gpus.length
     ? Object.keys(vm.flavor_extra_specs).filter((k) => classes.has(k.match(/^resources[A-Za-z0-9_-]*:([A-Z0-9_]+)$/)?.[1] ?? '')).sort()
     : vgpuRequests(vm.flavor_extra_specs);
-  if (gpus.length ? vgpus.length : vgpu.length)
+  if (why !== null && (gpus.length ? vgpus.length : vgpu.length))
     add(
       'VM_VGPU',
-      vgpu.length && (!gpus.length || vgpus.some((g) => g.resource_class))
-        ? `Flavor requests a vGPU (${vgpu.join(', ')}).`
-        : `The VM has a vGPU (${gpuNames(vgpus)}).`,
+      `${
+        vgpu.length && (!gpus.length || vgpus.some((g) => g.resource_class))
+          ? `Flavor requests a vGPU (${vgpu.join(', ')}).`
+          : `The VM has a vGPU (${gpuNames(vgpus)}).`
+      } ${why}`,
     );
   const encrypted = vm.disks.filter((d) => d.encrypted).map((d) => d.name || d.id);
   if (encrypted.length)
