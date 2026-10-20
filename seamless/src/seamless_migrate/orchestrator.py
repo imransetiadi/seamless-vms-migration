@@ -2755,6 +2755,11 @@ class Orchestrator:
             # ready there: reopened, or it would wait for good (SDD §8, review RV51-14)
             phases = await self.db.plan_phases(completed)
             for plan_id in sorted(p for p, counts in phases.items() if counts.get(P.ready)):
+                if self.plan_lock(plan_id).locked():
+                    # a validation or an edit holds it: a later tick reopens it, never this one
+                    # waiting while every plan's gates stall (SDD §8, review RV52-O1); a free
+                    # asyncio.Lock is taken without yielding, so nothing takes it in between
+                    continue
                 try:
                     await self._reopen_completed(plan_id, "system", "a migration waits in ready")
                 except Exception:

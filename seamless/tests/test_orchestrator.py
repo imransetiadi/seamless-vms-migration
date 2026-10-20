@@ -10114,6 +10114,46 @@ async def test_a_retry_whose_plan_reopen_was_refused_is_reopened_by_the_tick(
     assert any("reopened: a migration waits in ready" in e.message for e in reopened)
 
 
+async def test_the_tick_never_waits_for_a_validation_of_a_completed_plan(tmp_path, store):
+    """SDD §8 (review RV52-O1): the tick reopens a completed plan holding a ready migration under
+    the plan's lock. A validation of that plan held the lock while its source answered slowly, and
+    the tick waited for it: every running plan's gates stalled, /ready answered 503. The tick
+    leaves a plan whose lock is held to a later tick."""
+    h = build_harness(tmp_path, store, [vm(1), vm(2)])
+    a = plan_for([vm(1)], name="A", default_strategy=Strategy.cold, auto_cutover=False)
+    b = plan_for([vm(2)], name="B", default_strategy=Strategy.cold)
+    store.put("plan", a)
+    store.put("plan", b)
+    await h.orch.validate_plan(a.id, "alice")
+    await h.orch.validate_plan(b.id, "alice")
+    done = store.get("plan", a.id, Plan)
+    done.status = PlanStatus.completed  # a retry left vm-1 ready in its completed plan
+    store.put("plan", done)
+    await h.orch.start_plan(b.id, "alice")
+    await h.orch._prestage(store.get("plan", b.id, Plan), await h.migrations(b.id))
+    entered, gate = asyncio.Event(), asyncio.Event()
+    real_get_vm = h.source.get_vm
+
+    async def slow_get_vm(source_id):
+        if source_id == "vm-1":
+            entered.set()
+            await gate.wait()
+        return await real_get_vm(source_id)
+
+    h.source.get_vm = slow_get_vm
+    validating = asyncio.create_task(h.orch.validate_plan(a.id, "rina"))
+    await asyncio.wait_for(entered.wait(), 5)
+    tick = asyncio.create_task(h.orch.tick())
+    finished, _ = await asyncio.wait({tick}, timeout=2.0)
+    b_phase = (await h.by_vm(b.id, "vm-2")).phase
+    gate.set()
+    await validating
+    await tick
+    await h.orch.stop()
+    assert finished, f"the tick waited for A's validation; plan B's vm-2 stayed {b_phase}"
+    assert b_phase != P.ready, "plan B's gate was not ticked"
+
+
 async def test_a_driver_that_moved_on_starts_a_new_row_of_crashes(tmp_path, store):
     """SDD §8 (review RV51-16): while a driver keeps crashing its relaunch backs off, 2^n x tick_s.
     The count was cleared only when the driver found no handler, so four crashes of the cutover's
