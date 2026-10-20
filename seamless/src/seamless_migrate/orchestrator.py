@@ -416,6 +416,12 @@ def _vms_named_twice(migrations: Iterable[Migration]) -> set[str]:
     return {vm_id for vm_id, count in named.items() if count > 1}
 
 
+def _text(given: str | None) -> str | None:
+    """The text a person gives with an action - a comment, a cancel's reason - as Python's strip
+    leaves it, none when nothing is left (SDD §12, review RV51-26)."""
+    return (given or "").strip() or None
+
+
 def _action(message: str, actor: str, data: dict[str, Any]) -> Joined:
     """A person's action's ``migration.action``, joined to its transition's write: a store error
     leaves neither, the migration as it was for the person's retry (SDD §5.4, reviews RV51-12,
@@ -1576,6 +1582,7 @@ class Orchestrator:
     # ------------------------------------------------------------------------------------------
     # migration actions (each serialized with the driver by the migration lock)
     async def approve(self, mid: str, actor: str, comment: str | None = None) -> Migration:
+        comment = _text(comment)
         async with self._lock(mid):
             m, v = await self._load(mid)
             if m.phase not in APPROVABLE:
@@ -1605,6 +1612,7 @@ class Orchestrator:
     async def request_cutover(
         self, mid: str, actor: str, force_window: bool = False, comment: str | None = None
     ) -> Migration:
+        comment = _text(comment)
         async with self._lock(mid):
             m, v = await self._load(mid)
             if m.phase not in CUTOVER_REQUESTABLE:
@@ -1716,6 +1724,9 @@ class Orchestrator:
         return m
 
     async def rollback(self, mid: str, actor: str, reason: str) -> Migration:
+        reason = reason.strip()
+        if not reason:
+            raise Unprocessable("reason is required.")  # as the dashboard says (SDD §12)
         async with self._lock(mid):
             m, v = await self._load(mid)
             if not fsm.can_transition(m, P.rolling_back):
@@ -1886,6 +1897,7 @@ class Orchestrator:
     async def cancel(
         self, mid: str, actor: str, reason: str | None = None, *, by_validation: bool = False
     ) -> Migration:
+        reason = _text(reason)
         async with self._lock(mid):
             m, v = await self._load(mid)
             if m.phase == P.validating and not by_validation:

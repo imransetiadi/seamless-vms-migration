@@ -10183,3 +10183,46 @@ async def test_a_relaunch_failing_for_the_first_migration_still_relaunches_the_n
     h.orch._launch = launch
     await h.orch._resume_orphans()
     assert sorted(calls) == sorted([first.id, second.id]), calls
+
+
+async def test_the_text_a_person_gives_with_an_action_is_kept_as_pythons_strip_leaves_it(
+    tmp_path, store
+):
+    """SDD §12 (review RV51-26): an approval's comment and a cutover request's, a rollback's and
+    a cancel's reason were stored as sent while the dashboard's mock stripped them, saying the
+    API did - a rollback reason of white space only reached the trail from any other client.
+    Each is kept as Python's strip leaves it: an empty comment or cancel reason is none, an empty
+    rollback reason a 422."""
+    vms = [vm(i) for i in range(1, 6)]
+    h, plan = await setup(tmp_path, store, vms, {"default_strategy": Strategy.warm})
+    phases = [P.awaiting_cutover, P.awaiting_cutover, P.failed, P.ready, P.ready]
+    ms = [
+        make_migration(plan_id=plan.id, vm=v, strategy=Strategy.warm, phase=phase)
+        for v, phase in zip(vms, phases, strict=True)
+    ]
+    for m in ms:
+        store.put("migration", m)
+    approved = await h.orch.approve(ms[0].id, "rina", "  looks good\u0085 ")
+    blank = await h.orch.approve(ms[1].id, "rina", " \u00a0\u0085 ")
+    assert [approved.approvals[-1].comment, blank.approvals[-1].comment] == ["looks good", None]
+    await h.orch.request_cutover(ms[1].id, "sari", comment="\tgo\u2003")
+    with pytest.raises(Unprocessable, match="reason is required"):
+        await h.orch.rollback(ms[2].id, "rina", " \u0085\u3000")
+    assert (await h.migration(ms[2].id)).phase == P.failed
+    rolled = await h.orch.rollback(ms[2].id, "rina", "  restart it\u0085")
+    assert rolled.phase_history[-1].reason == "rollback requested: restart it"
+    kept = await h.orch.cancel(ms[3].id, "rina", "  window closed ")
+    none = await h.orch.cancel(ms[4].id, "rina", " \u2028 ")
+    assert [kept.phase_history[-1].reason, none.phase_history[-1].reason] == [
+        "cancelled: window closed",
+        "cancelled: no reason given",
+    ]
+    actions = {
+        (e.migration_id, e.data["action"]): e.data
+        for e in store.events(since_seq=0, limit=1000)
+        if e.kind == "migration.action"
+    }
+    await h.orch.stop()
+    assert actions[(ms[1].id, "cutover")]["comment"] == "go"
+    assert actions[(ms[3].id, "cancel")]["reason"] == "window closed"
+    assert actions[(ms[4].id, "cancel")]["reason"] is None
