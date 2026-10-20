@@ -2957,7 +2957,11 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 `redact(text, names=None)` removes:
 
 * passwords and secrets in key/value pairs — `key=value`, `key: value`, JSON `"key": "value"`, the key
-  possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`), also where it starts a line of a
+  possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`) or joined to its word in camelCase, read
+  case-sensitively (`adminPass` - the password Nova returns for a server it creates -, `accessToken`, `DBPassword`;
+  `bypass` and `isPassive` are no keys), a long word - password, passwd, passphrase, secret, token - glued in one
+  case too (`adminpassword`; never a word ending in `pass` or `pwd`), with digits after its word (`password2`,
+  `token_3`; review RV52-X7), also where it starts a line of a
   JSON-escaped multi-line string (`\npassword: x`) — and in CLI flags (`--os-password x`; a quoted value whole with the
   rest of its word, a quote it never closes to its line's end, and in an argv list - JSON's, a repr's such as a
   `CalledProcessError`'s - the next item, review RV52-X3). A quoted value is read
@@ -2981,7 +2985,9 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 * credentials in connection strings: `scheme://user:password@host` (a password with `@` too) and
   `Password=…;`;
 * the `auth` section of a `clouds.yaml`, in YAML or JSON - a quoted string in a flow-style section read whole, so a
-  brace in a password neither ends the section nor keeps it open (PR #58 review);
+  brace in a password neither ends the section nor keeps it open (PR #58 review); a flow-style section is looked for
+  again after the other patterns, so one a value's redaction closed, or one that held another, goes whole in the
+  same pass (review RV52-X7);
 * seamless API tokens (`smg_…`) and JWTs;
 * VM names (as `[vm]`) when `names` are given — the advisor and agentmemory give them when
   `SEAMLESS_MEMORY_REDACT_NAMES` — wherever a name stands between characters that are not letters or digits, so a
@@ -3007,7 +3013,11 @@ agents write too - redacted as they arrive, title and content, before anything c
 (§14.3, §14.4; audit AP-05).
 `redact` also writes each NUL and each lone surrogate as U+FFFD, the replacement character, so such text is kept
 wherever it goes (§11); every string of Jev's answers - its reasons (§14.4) among them -, text from an outside
-service too, passes that replacement as it arrives (§14.1).
+service too, passes that replacement as it arrives (§14.1). Before its patterns it removes each terminal escape
+character - raw, as JSON's `\u001b` at any depth or as a repr's `\x1b` - with the colour or erase-line sequence it
+starts (`ESC [ … m`, `ESC [ … K`), so a key or a value a terminal coloured is found; one right after a part of such
+an escape (`\`, `\u0`, …, `\x1`) stays, as removing it would complete another, so a second pass changes nothing
+(review RV52-X7).
 Where it cuts such text, it redacts first,
 over the cut plus 16384 characters, and cuts after (`redact_cut(text, limit)`): a secret the cut splits
 — a PEM block, a URL with credentials — is still found, at a bounded cost. The cuts: a `migration.log`
