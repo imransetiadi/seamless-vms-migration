@@ -2405,8 +2405,12 @@ guests boot unchanged when the boot properties travel with the volumes (§6, §7
 | `infrastructure_service` | LDAP, FreeIPA, Active Directory, domain controller (`ldap`, `freeipa`, `active-directory`, `activedirectory`, `domain-controller`, `domaincontroller`; tokens `ad`, `dc`, `ipa`, `idm`) · DNS (`dns`; tokens `bind`, `ns`, `ns1`, `ns2`) · Kerberos | tcp 389 · tcp 53 · tcp 88 |
 | `legacy_os`, `manual_review`, a service the table does not name | — | none |
 
-Every GPU VM (one with `gpus`, §22.2), whatever its tier, is also suggested `tcp 9400`, the port NVIDIA's DCGM exporter
-serves its metrics on, after its tier's probe (§22.8, plan task G5).
+Every GPU VM (its `gpus`, or for a VM recorded before 0.3.0 its flavor's requests, §22.2) outside the
+`stateful_database` tier is also suggested `tcp 9400`, the port NVIDIA's DCGM exporter serves its metrics on, after its
+tier's probe (§22.8, plan task G5). A database VM's suggestion stays its engine's probe, or none: the exporter's port
+says nothing of the database, so it must neither stand in for the application probe `APP_PROBE_MISSING` and §7.5's
+review ask of a database VM, nor fail - and so roll back - a database whose service answers in a guest that runs no
+exporter (PR #64 review).
 
 Validation records the suggestion in `Migration.suggested_probes`. A suggestion never runs: the verification
 probes only what the plan configures, so a person adds it — the dashboard's "Use suggested probe" saves it as the
@@ -4806,9 +4810,11 @@ A fifth rule of §5.4, binding there with plan task G6:
   Both are deterministic checks: a failed one fails the verification, and the plan's `auto_rollback` rolls the VM back
   (§7.5). Their details name resource classes and units, never a provider, because the advisor's
   `review_verification` sends the check results to Jev (§14.2).
-* §9.6 suggests, for every GPU VM whatever its tier, `tcp 9400`, the port NVIDIA's DCGM exporter serves its metrics on,
-  besides its tier's probe. Like every suggestion it never runs until the plan adds it (`probe_overrides`, §9.6).
-  Binding in §9.6 since plan task G5.
+* §9.6 suggests, for every GPU VM outside the `stateful_database` tier, `tcp 9400`, the port NVIDIA's DCGM exporter
+  serves its metrics on, besides its tier's probe; a database VM keeps its engine's probe alone, as its tier keeps
+  deciding the database review rule (§22.9). Like every suggestion it never runs until the plan adds it
+  (`probe_overrides`, §9.6), and once added it fails the verification of a guest that runs no exporter. Binding in §9.6
+  since plan task G5.
 
 ### 22.9 Waves
 
