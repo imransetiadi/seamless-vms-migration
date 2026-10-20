@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import type { MockServer } from '../api/mock';
 import { makeVm } from '../api/mockData';
 import type { Plan, VMRef } from '../api/types';
-import { createTestClient, createTestServer, renderWithApp } from '../test/utils';
+import { createTestClient, createTestServer, formFields, renderWithApp } from '../test/utils';
 import PlanDetail from './PlanDetail';
 
 function renderPlan(planId: string, token = 'operator') {
@@ -1125,19 +1125,8 @@ describe('PlanDetail', () => {
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
     await user.click(await actionButton(/^edit plan$/i));
     const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
-    // each field looked up once - a label query scans every label of this large dialog - and filled by one paste
-    const fields = new Map<RegExp, HTMLInputElement>();
-    const field = (label: RegExp) => {
-      if (!fields.has(label)) fields.set(label, within(dialog).getByLabelText(label) as HTMLInputElement);
-      return fields.get(label)!;
-    };
-    const enter = async (label: RegExp, value: string) => {
-      await user.clear(field(label));
-      await user.click(field(label));
-      expect(field(label), String(label)).toHaveFocus(); // a paste goes to the focused element
-      await user.paste(value);
-    };
-    expect(Number(field(/link bandwidth/i).value) * 1024 * 1024).toBeGreaterThanOrEqual(1);
+    const { field, enter } = formFields(user, dialog);
+    expect(Number((field(/link bandwidth/i) as HTMLInputElement).value) * 1024 * 1024).toBeGreaterThanOrEqual(1);
     // a finite number whose bytes per second, seconds or bytes are not: JSON would send it as null
     const overflowing: [RegExp, string][] = [
       [/link bandwidth/i, 'Enter the link bandwidth in MiB/s (at least 1 B/s).'],
@@ -1146,7 +1135,7 @@ describe('PlanDetail', () => {
       [/keep-warm interval/i, 'Enter the keep-warm interval in minutes (1 or more).'],
       [/verification timeout/i, 'Enter the verification timeout in minutes (0 or more).'],
     ];
-    const prefilled = overflowing.map(([label]) => field(label).value);
+    const prefilled = overflowing.map(([label]) => (field(label) as HTMLInputElement).value);
     for (const [label] of overflowing) await enter(label, '1e308'); // times 60, a GiB or a MiB: Infinity
     await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
     const summary = await within(dialog).findByRole('alert');
