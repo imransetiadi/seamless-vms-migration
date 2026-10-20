@@ -133,13 +133,14 @@ class FileSecretStore:
 
     def delete(self, name: str) -> None:
         _check(name)
-        if not (self.root / name).exists():
-            return  # one already gone is no error
         try:
+            if not (self.root / name).exists():
+                return  # one already gone is no error
             with self._locked(name), contextlib.suppress(FileNotFoundError):
                 shutil.rmtree(self.root / name)
         except OSError as exc:
-            # a directory the store cannot change answers as a write it cannot make (audit AA-03)
+            # a directory the store cannot search or change answers as a write it cannot make
+            # (audit AA-03; a root this process may not search, review RV52-X2)
             raise SecretStoreError(
                 f"cannot delete {name} from the secret store at {self.root}: {exc.strerror}"
             ) from None
