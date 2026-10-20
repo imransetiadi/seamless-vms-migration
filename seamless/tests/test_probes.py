@@ -27,7 +27,14 @@ CASES = json.loads(
 def test_suggestions_follow_the_tier_and_the_service_a_vm_names(case):
     """One case table for the control plane and the dashboard's mock (SDD §9.6)."""
     gpus = [GpuDevice(**gpu) for gpu in case.get("gpus", [])]
-    vm = make_vm(name=case["name"], tags=case["tags"], os_type=case["os_type"], gpus=gpus)
+    specs = case.get("flavor_extra_specs", {})
+    vm = make_vm(
+        name=case["name"],
+        tags=case["tags"],
+        os_type=case["os_type"],
+        gpus=gpus,
+        flavor_extra_specs=specs,
+    )
     assert [p.model_dump() for p in suggest_probes(vm)] == case["probes"]
 
 
@@ -69,14 +76,23 @@ def test_probes_are_described_the_way_people_say_them():
 
 
 def test_a_gpu_vm_is_suggested_the_dcgm_exporter_port_besides_its_tiers_probe():
-    """SDD §9.6, §22.8 (plan task G5): every GPU VM, whatever its tier, is also suggested tcp 9400 -
-    NVIDIA's DCGM exporter serves its metrics there -, after its tier's probe; an OpenStack VM
-    recorded without gpus is a GPU VM by its flavor's requests."""
+    """SDD §9.6, §22.8 (plan task G5): a GPU VM outside the database tier is also suggested tcp
+    9400 - NVIDIA's DCGM exporter serves its metrics there -, after its tier's probe; a VM recorded
+    before 0.3.0 is a GPU VM by its flavor's requests. A database VM keeps its engine's probe alone,
+    or none: the exporter's port never stands in for the database's, nor rolls a database back
+    whose service answers (PR #64 review)."""
     vgpu = [GpuDevice(kind="vgpu", profile="grid_a100-4c")]
-    db = make_vm(name="ledger-db-01", tags={"role": "postgresql"}, gpus=vgpu)
-    assert suggest_probes(db) == [tcp(5432), tcp(9400)]
     assert suggest_probes(make_vm(name="web-01", gpus=vgpu)) == [http(80), tcp(9400)]
+    mq = make_vm(name="ml-queue-01", tags={"role": "rabbitmq"}, gpus=vgpu)
+    assert suggest_probes(mq) == [tcp(5672), tcp(9400)]
     assert suggest_probes(make_vm(name="render-01", gpus=vgpu)) == [tcp(9400)]
-    recorded = make_vm(name="render-02", flavor_extra_specs={"resources:VGPU": "1"})
-    assert suggest_probes(recorded) == [tcp(9400)]
-    assert suggest_probes(make_vm(name="render-03")) == []
+    for specs in ({"resources:VGPU": "1"}, {"pci_passthrough:alias": "PCI device 0"}):
+        assert suggest_probes(make_vm(name="render-02", flavor_extra_specs=specs)) == [tcp(9400)]
+    assert (
+        suggest_probes(make_vm(name="render-03", flavor_extra_specs={"resources:VGPU": "0"})) == []
+    )
+    assert suggest_probes(make_vm(name="render-04")) == []
+    # a database VM: its engine's probe alone, or none - never the exporter's port
+    db = make_vm(name="ledger-db-01", tags={"role": "postgresql"}, gpus=vgpu)
+    assert suggest_probes(db) == [tcp(5432)]
+    assert suggest_probes(make_vm(name="db-ml-01", gpus=vgpu)) == []

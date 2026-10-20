@@ -1,0 +1,338 @@
+{
+ "_comment": "A flavor's GPU requests as Nova reads its extra specs (SDD §22.2), shared by seamless/tests/test_gpu.py (planning/gpu.gpu_requests) and dashboard/src/lib/gpu.test.ts (the mock's port of it, PR #64 review). Each case: extra_specs and a declared_profile, when the flavor's provider declares one -> the requests, in order, each with the fields that differ from a GpuDevice's defaults.",
+ "cases": [
+  {
+   "why": "a bare VGPU request with its required and forbidden traits; a preferred trait and another spec are no part of it",
+   "extra_specs": {
+    "resources:VGPU": "1",
+    "trait:CUSTOM_NVIDIA_A100_4C": "required",
+    "trait:CUSTOM_NVIDIA_OLD": "forbidden",
+    "trait:CUSTOM_ANY": "preferred",
+    "hw:cpu_policy": "dedicated"
+   },
+   "requests": [
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "traits": [
+      "CUSTOM_NVIDIA_A100_4C"
+     ],
+     "forbidden_traits": [
+      "CUSTOM_NVIDIA_OLD"
+     ]
+    }
+   ]
+  },
+  {
+   "why": "each numbered group with its own traits, in suffix order, the GPU provider's own (same_provider); the unnumbered group's traits belong to none",
+   "extra_specs": {
+    "resources_GPU-b:VGPU": "2",
+    "trait_GPU-b:CUSTOM_B": "required",
+    "trait_GPU-b:CUSTOM_A": "required",
+    "resources1:VGPU": "1",
+    "trait1:CUSTOM_ONE": "required",
+    "trait:CUSTOM_ROOT": "required",
+    "resources:VCPU": "4"
+   },
+   "requests": [
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "traits": [
+      "CUSTOM_ONE"
+     ],
+     "same_provider": true
+    },
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "count": 2,
+     "traits": [
+      "CUSTOM_A",
+      "CUSTOM_B"
+     ],
+     "same_provider": true
+    }
+   ]
+  },
+  {
+   "why": "the unnumbered group first, then the numbered ones",
+   "extra_specs": {
+    "resources2:VGPU": "1",
+    "resources:VGPU": "1",
+    "trait:CUSTOM_X": "forbidden"
+   },
+   "requests": [
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "forbidden_traits": [
+      "CUSTOM_X"
+     ]
+    },
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "same_provider": true
+    }
+   ]
+  },
+  {
+   "why": "each PCI alias with its count; a count left out or one int() cannot read reads as 1",
+   "extra_specs": {
+    "pci_passthrough:alias": "a100:2, t4, l4:x"
+   },
+   "requests": [
+    {
+     "kind": "passthrough",
+     "alias": "a100",
+     "count": 2
+    },
+    {
+     "kind": "passthrough",
+     "alias": "t4"
+    },
+    {
+     "kind": "passthrough",
+     "alias": "l4"
+    }
+   ]
+  },
+  {
+   "why": "an alias count as Nova reads it: a zero or negative count asks for none, an alias without a name is none, spaces and any script's digits are read",
+   "extra_specs": {
+    "pci_passthrough:alias": "a100:0,a40:-1,:2,,l4:x,v100: 3 ,t4:２,PCI device 0"
+   },
+   "requests": [
+    {
+     "kind": "passthrough",
+     "alias": "l4"
+    },
+    {
+     "kind": "passthrough",
+     "alias": "v100",
+     "count": 3
+    },
+    {
+     "kind": "passthrough",
+     "alias": "t4",
+     "count": 2
+    },
+    {
+     "kind": "passthrough",
+     "alias": "PCI device 0"
+    }
+   ]
+  },
+  {
+   "why": "a CUSTOM_ class is no vGPU without a declared profile",
+   "extra_specs": {
+    "resources1:CUSTOM_NVIDIA_A100_4C": "1",
+    "trait1:CUSTOM_DC3": "required"
+   },
+   "requests": []
+  },
+  {
+   "why": "a CUSTOM_ class is a vGPU with a declared profile, which each vGPU entry takes; classes in name order",
+   "extra_specs": {
+    "resources1:CUSTOM_NVIDIA_A100_4C": "1",
+    "resources1:VGPU": "1",
+    "trait1:CUSTOM_DC3": "required"
+   },
+   "declared_profile": "A100-4C",
+   "requests": [
+    {
+     "kind": "vgpu",
+     "profile": "A100-4C",
+     "resource_class": "CUSTOM_NVIDIA_A100_4C",
+     "traits": [
+      "CUSTOM_DC3"
+     ],
+     "same_provider": true
+    },
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "profile": "A100-4C",
+     "traits": [
+      "CUSTOM_DC3"
+     ],
+     "same_provider": true
+    }
+   ]
+  },
+  {
+   "why": "another resource class, a trait alone, an aggregate pin or an empty alias list asks for no GPU",
+   "extra_specs": {
+    "resources1:VCPU": "4",
+    "resources:CUSTOM_VGPU_X": "1",
+    "resources2:VGPU_DISPLAY_HEAD": "1",
+    "resources:vgpu": "1",
+    "resources_VGPU": "1",
+    "trait3:CUSTOM_VGPU": "required",
+    "trait:CUSTOM_NVIDIA_A40": "required",
+    "aggregate_instance_extra_specs:gpu": "true",
+    "pci_passthrough:alias": ""
+   },
+   "requests": []
+  },
+  {
+   "why": "a zero takes its group's request out, and the flavor's other groups keep theirs",
+   "extra_specs": {
+    "resources1:VGPU": "0",
+    "trait1:CUSTOM_X": "required",
+    "resources2:VGPU": "1"
+   },
+   "requests": [
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "same_provider": true
+    }
+   ]
+  },
+  {
+   "why": "an amount Nova skips, negative or unreadable - an ASCII separator int() does not take for a space among them -, or a zero in any form asks for no GPU",
+   "extra_specs": {
+    "resources1:VGPU": "",
+    "resources2:VGPU": " ",
+    "resources3:VGPU": "one",
+    "resources4:VGPU": "-1",
+    "resources5:VGPU": "1.5",
+    "resources6:VGPU": "²",
+    "resources7:VGPU": "1e3",
+    "resources8:VGPU": "+0",
+    "resources9:VGPU": "-0",
+    "resources10:VGPU": "0_0",
+    "resources11:VGPU": "٠",
+    "resources12:VGPU": "0x1",
+    "resources13:VGPU": "Infinity",
+    "resources14:VGPU": "1__0",
+    "resources15:VGPU": "_1",
+    "resources16:VGPU": "1_",
+    "resources17:VGPU": "+-1",
+    "resources18:VGPU": "1 0",
+    "resources19:VGPU": "\u001c1"
+   },
+   "requests": []
+  },
+  {
+   "why": "an amount as Python's int() reads it: a sign, underscores between digits, spaces around it, any script's decimal digits, leading zeros",
+   "extra_specs": {
+    "resources1:VGPU": "+2",
+    "resources2:VGPU": "２",
+    "resources3:VGPU": "1_0",
+    "resources4:VGPU": " 3 ",
+    "resources5:VGPU": "٣",
+    "resources6:VGPU": "007",
+    "resources7:VGPU": "\t4\n",
+    "resources8:VGPU": " 5　"
+   },
+   "requests": [
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "count": 2,
+     "same_provider": true
+    },
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "count": 2,
+     "same_provider": true
+    },
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "count": 10,
+     "same_provider": true
+    },
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "count": 3,
+     "same_provider": true
+    },
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "count": 3,
+     "same_provider": true
+    },
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "count": 7,
+     "same_provider": true
+    },
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "count": 4,
+     "same_provider": true
+    },
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "count": 5,
+     "same_provider": true
+    }
+   ]
+  },
+  {
+   "why": "the declared profile goes to each vGPU entry",
+   "extra_specs": {
+    "resources1:VGPU": "1",
+    "resources2:VGPU": "1"
+   },
+   "declared_profile": "A100-4C",
+   "requests": [
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "profile": "A100-4C",
+     "same_provider": true
+    },
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "profile": "A100-4C",
+     "same_provider": true
+    }
+   ]
+  },
+  {
+   "why": "on a flavor whose GPU requests are PCI aliases alone, the declared profile goes to them",
+   "extra_specs": {
+    "pci_passthrough:alias": "vgpu-vf:1"
+   },
+   "declared_profile": "L4-24Q",
+   "requests": [
+    {
+     "kind": "passthrough",
+     "alias": "vgpu-vf",
+     "profile": "L4-24Q"
+    }
+   ]
+  },
+  {
+   "why": "and never to an alias beside a vGPU request",
+   "extra_specs": {
+    "resources:VGPU": "1",
+    "pci_passthrough:alias": "nic:1"
+   },
+   "declared_profile": "A100-4C",
+   "requests": [
+    {
+     "kind": "vgpu",
+     "resource_class": "VGPU",
+     "profile": "A100-4C"
+    },
+    {
+     "kind": "passthrough",
+     "alias": "nic"
+    }
+   ]
+  }
+ ]
+}

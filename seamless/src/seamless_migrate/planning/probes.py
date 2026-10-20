@@ -14,7 +14,8 @@ from .gpu import vm_gpus
 from .waves import heuristic_tier
 
 DATABASE_TIER = "stateful_database"
-#: the port NVIDIA's DCGM exporter serves a GPU's metrics on, suggested for every GPU VM (SDD §22.8)
+#: the port NVIDIA's DCGM exporter serves a GPU's metrics on, suggested for every GPU VM outside the
+#: database tier (SDD §9.6, §22.8)
 DCGM_EXPORTER_PORT = 9400
 
 
@@ -73,9 +74,10 @@ def _text(vm: VMRef) -> str:
 def suggest_probes(vm: VMRef) -> list[AppProbe]:
     """The rules' suggestion for ``vm`` (SDD §9.6): its tier's probe, then for a GPU VM tcp 9400,
     the DCGM exporter's port (§22.8); empty when the table names no service and the VM has no
-    GPU."""
-    gpu = [_tcp(DCGM_EXPORTER_PORT)] if vm_gpus(vm) else []
+    GPU. A database VM keeps its engine's probe alone, or none: the exporter's port says nothing of
+    the database, whose probe APP_PROBE_MISSING and §7.5's review ask for (PR #64 review)."""
     tier = heuristic_tier(vm)
+    gpu = [_tcp(DCGM_EXPORTER_PORT)] if tier != DATABASE_TIER and vm_gpus(vm) else []
     if tier == "stateless_web":
         return [_http(80), *gpu]
     text = _text(vm)

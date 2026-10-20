@@ -171,6 +171,21 @@ def test_the_pilot_wave_never_holds_a_gpu_vm():
     waves = plan_waves(vms, {v.source_id: heuristic_tier(v) for v in vms})
     assert (waves[0].name, waves[0].vm_ids) == ("Pilot", ["web-a", "web-b", "web-c"])
     assert waves[1].vm_ids == ["web-gpu"]
+    # a GPU VM of any tier, and one recorded before 0.3.0 by its flavor's requests, waits too: the
+    # room they leave goes to the next VM, a riskier one included (PR #64 review)
+    recorded = vm("mq-old", "mq-02", 6).model_copy(
+        update={"flavor_extra_specs": {"resources:VGPU": "1"}}
+    )
+    vms = [
+        vm("web-a", "web-01", 10),
+        vm("web-b", "web-02", 20),
+        gpu_vm("mq-gpu", "mq-01", 5),
+        recorded,
+        vm("dns", "dns-01", 15),
+    ]
+    waves = plan_waves(vms, {v.source_id: heuristic_tier(v) for v in vms})
+    assert (waves[0].name, waves[0].vm_ids) == ("Pilot", ["web-a", "web-b", "dns"])
+    assert waves[1].vm_ids == ["mq-gpu", "mq-old"]
 
 
 def test_an_app_group_with_a_gpu_vm_stays_out_of_the_pilot():

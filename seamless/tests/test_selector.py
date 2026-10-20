@@ -177,6 +177,18 @@ def test_a_vmware_passthrough_vm_is_ineligible_for_vmware_warm():
         assert found[Strategy.vmware_warm] == [
             WARM_REASON.format("10de:20b5, a device without ids")
         ], state
+    # the reason names the passthrough devices alone, never a vGPU beside them; a VM recorded
+    # before 0.3.0 by its flavor's alias, the device's label (PR #64 review)
+    two = PASSTHROUGH.model_copy(update={"count": 2})
+    mixed = make_vm(flavor=None, cbt_enabled=True, gpus=[VGPU_4C, two])
+    assert eligibility(mixed, kind, plan, {}, {}, [])[Strategy.vmware_warm] == [
+        WARM_REASON.format("10de:20b5 ×2")
+    ]
+    specs = {"pci_passthrough:alias": "PCI device 0"}
+    recorded = make_vm(flavor=None, cbt_enabled=True, flavor_extra_specs=specs)
+    assert eligibility(recorded, kind, plan, {}, {}, [])[Strategy.vmware_warm] == [
+        WARM_REASON.format("PCI device 0")
+    ]
 
 
 def test_a_running_vmware_passthrough_vm_is_ineligible_for_vmware_cold():
@@ -188,6 +200,13 @@ def test_a_running_vmware_passthrough_vm_is_ineligible_for_vmware_cold():
         vm = make_vm(flavor=None, power_state=state, gpus=[PASSTHROUGH])
         assert eligibility(vm, kind, plan, {}, {}, [])[Strategy.vmware_cold] == [
             COLD_REASON.format("10de:20b5")
+        ], state
+    # a VM in error or in a task keeps its state's reason, and the device's follows it
+    for state in ("error", "transitioning"):
+        vm = make_vm(flavor=None, power_state=state, gpus=[PASSTHROUGH])
+        assert eligibility(vm, kind, plan, {}, {}, [])[Strategy.vmware_cold] == [
+            f"source VM is in {state} state",
+            COLD_REASON.format("10de:20b5"),
         ], state
 
 
@@ -206,6 +225,13 @@ def test_a_vgpu_vm_keeps_every_strategys_rules():
     for state in ("running", "stopped"):
         vgpu = make_vm(flavor=None, power_state=state, cbt_enabled=True, gpus=[VGPU_4C])
         found = eligibility(vgpu, kind, plan, {}, {}, [])
+        assert found == {Strategy.vmware_cold: [], Strategy.vmware_warm: []}, state
+        # and a VM recorded before 0.3.0, by its flavor's request (PR #64 review)
+        specs = {"resources:VGPU": "1"}
+        recorded = make_vm(
+            flavor=None, power_state=state, cbt_enabled=True, flavor_extra_specs=specs
+        )
+        found = eligibility(recorded, kind, plan, {}, {}, [])
         assert found == {Strategy.vmware_cold: [], Strategy.vmware_warm: []}, state
     handover = make_plan(handover=HandoverConfig(enabled=True, backend_map={"ceph-ssd": "x"}))
     plain = eligibility(make_vm(), ProviderKind.openstack, handover, OK_CAPS, OK_CAPS, [])

@@ -1,6 +1,9 @@
 """SDD §22.2-§22.4 (plan task G1): the GPU requests a flavor's extra specs ask for, a VMware
 device's GPU key, NVIDIA profile sizes and pool names - planning/gpu.py, a pure module."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from seamless_migrate.domain.enums import ProviderKind
@@ -149,6 +152,20 @@ def test_an_alias_count_reads_as_nova_reads_it():
         GpuDevice(kind="passthrough", alias="t4", count=1),
         GpuDevice(kind="passthrough", alias="l4", count=1),
     ]
+
+
+GPU_REQUEST_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "gpu_request_cases.json").read_text(encoding="utf-8")
+)["cases"]
+
+
+@pytest.mark.parametrize("case", GPU_REQUEST_CASES, ids=lambda case: case["why"])
+def test_gpu_requests_follow_the_case_table_the_dashboard_shares(case):
+    """SDD §22.2 (PR #64 review): one case table for gpu_requests and the dashboard mock's port of
+    it, which reads a VM recorded before 0.3.0 as the API does (dashboard/src/lib/gpu.test.ts runs
+    these cases too)."""
+    expected = [GpuDevice(**request) for request in case["requests"]]
+    assert gpu_requests(case["extra_specs"], case.get("declared_profile")) == expected
 
 
 def test_a_declared_profile_goes_to_each_entry_of_its_flavor():
