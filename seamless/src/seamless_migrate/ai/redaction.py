@@ -150,11 +150,16 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     # but a dash, so also after the "n" of a line break Ansible's JSON prints as backslash-n, or
     # glued to a word -, a text costing time linear in its length (SDD §13.4, reviews RV27-06,
     # RV31-02, RV32B-01); --password=hunter2 is the key=value form above, and -p hunter2 too
-    # ambiguous
+    # ambiguous. The value is a quoted string whole, or an argv list's next item - JSON's, a
+    # repr's (CalledProcessError), inside JSON strings - to the quote that opened it, at that
+    # escape (review RV52-X3)
     (
         re.compile(
             r"(?i)(?<!-)(--[A-Za-z0-9-]{1,64}+"
-            r"(?:(?<=password)|(?<=passwd)|(?<=secret)|(?<=token)|(?<=key))\s+)(\S+)"
+            r"(?:(?<=password)|(?<=passwd)|(?<=secret)|(?<=token)|(?<=key))"
+            r"(?:\s+|(?P<argesc>\\*+)[\"']\s*,\s*(?P=argesc)(?P<argq>[\"'])))"
+            r"((?(argq)(?:(?!(?P=argesc)(?P=argq))(?:\\.|[^\n]))*+"
+            r"|(?:\"(?:[^\"\\\n]|\\.)*+\"|'[^'\n]*+'|\S+)))"
         ),
         r"\1" + REDACTED,
     ),

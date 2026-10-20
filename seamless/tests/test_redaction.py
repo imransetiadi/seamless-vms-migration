@@ -4,6 +4,7 @@ import json
 import random
 import re
 import shlex
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -526,6 +527,31 @@ def test_a_shell_quoted_secret_with_a_quote_is_removed_whole(text):
     out = redact(text)
     assert "Pass" not in out and "Word" not in out and "[REDACTED]" in out, out
     assert "port=5432" in out or "-e 'select 1'" in out, out
+
+
+_ARGV = ["openstack", "--os-password", "Fake Pass-Word", "server", "list"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "fatal: [localhost]: FAILED! => " + json.dumps({"cmd": _ARGV, "rc": 1}),
+        str(subprocess.CalledProcessError(1, _ARGV)),
+        json.dumps({"msg": json.dumps({"cmd": _ARGV})}),
+        repr(["openstack", "--os-password", "Fake\\'Pass-Word", "server", "list"]),
+        "+ openstack --os-password 'Fake Pass-Word' server list",
+        'openstack --os-password "Fake \\"Pass\\" Word" server list',
+    ],
+    ids=["ansible-json", "called-process-error", "json-in-json", "repr-quote", "xtrace", "dq"],
+)
+def test_a_cli_flag_in_an_argv_list_or_quoted_with_a_space_is_redacted_whole(text):
+    """SDD §13.4 (review RV52-X3): a CLI flag's value was the word after a space, so an argv list
+    (Ansible's cmd, a CalledProcessError) kept its secret, and a quoted value kept all but its
+    first word. The value is the list's next item, or the quoted string whole."""
+    out = redact(text)
+    assert "Pass" not in out and "Word" not in out and REDACTED in out, out
+    assert "server" in out and "list" in out, out
+    assert redact(out) == out, out
 
 
 def _quotings(pairs):
