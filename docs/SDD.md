@@ -239,11 +239,13 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
    derived (properties, also serialized): disk_bytes: int, used_bytes: int, guest_os: GuestOS
    (used_bytes = Σ used_gb·2^30 when every disk has used_gb, else ⌊disk_bytes·0.6⌋;
     guest_os = identify(os_type), §9.5)
-   free text: a NUL or a lone surrogate in tags and flavor_extra_specs (keys and values), os_type or host,
-   and in a GPU's profile, alias and traits, is written U+FFFD as the model is built - no export filter or
-   mapping reads them -; name, project, flavor, a NIC's network and a disk's volume_type are kept as the
-   source gives them (§11, review RV49-02); a NIC's network an earlier version stored with one reads with
-   U+FFFD as the store reads it, and only then (§11, review RV52-S1)
+   free text: a NUL or a lone surrogate in tags and flavor_extra_specs (keys and values), os_type or host
+   is written U+FFFD as the model is built - no export filter or mapping reads them -, and so is one in a
+   GPU's profile, alias and traits, though a GPU mapping names a vGPU by its profile: the mapping matches
+   the profile as written, the one form a stored VM holds (§22.2, PR #57 review); name, project, flavor, a
+   NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02); a NIC's
+   network an earlier version stored with one reads with U+FFFD as the store reads it, and only then (§11,
+   review RV52-S1)
 
 GuestOS { family: "linux"|"windows"|"unknown", distro: str|null, version: str|null, label: str,
           lifecycle: "current"|"legacy"|"unknown",
@@ -2690,7 +2692,8 @@ body holding a NUL or a lone surrogate is refused before its route runs (§12) -
 as §9.1 checks a plan's -, the tokens file refuses such a name (§13.1), the text it takes from outside sources
 passes `redact`, which writes either as U+FFFD (§13.4) - as every string of Jev's answers does (§14.1), and a
 source VM's free text that no export filter or mapping reads, its tags and flavor extra specs, keys and values,
-its `os_type` and `host` (§4.2; review RV49-02) -, and an outside service's number that is no JSON number is
+its `os_type` and `host` (§4.2; review RV49-02), and its GPUs' profiles, aliases and traits, a vGPU's profile the key
+a GPU mapping names as written (§22.2) -, and an outside service's number that is no JSON number is
 refused as it arrives: Jev's answer is an invalid response (§14.1), an agentmemory hit has no score (§14.3).
 What reaches it is a name a cutover reads - a VM's, a project's, a flavor's, a network's, a volume type's - holding
 one, which Nova's server and flavor names and vSphere's cannot, a Neutron network's can: its write fails naming the
@@ -4542,7 +4545,9 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   `<gpu>-<slices>-<framebuffer GB><series>` (`A100-3-20C`, `grid_a100-3-20c`); the series is A, B, C or Q. Any other
   name has no size, and `MAP_GPU_DOWNSIZED` compares nothing for it (§22.5).
 * A device's `profile`, `alias` and trait names are free text as `flavor_extra_specs` is (§4.2): a NUL or a lone
-  surrogate in them is written U+FFFD as the model is built.
+  surrogate in them is written U+FFFD as the model is built. A vGPU's `profile` is also its GPU key (§22.4): a mapping
+  names it as written, the form every stored VM holds; a request body holding a NUL or a lone surrogate is refused
+  (§12), so no mapping key holds one either (PR #57 review).
 * A VM recorded before 0.3.0 has no `gpus`. Such a VM could not be migrated (§9.3 blocked it), and a validation reads it
   again (§5.4).
 
