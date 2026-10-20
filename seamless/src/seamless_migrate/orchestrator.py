@@ -416,6 +416,25 @@ def _vms_named_twice(migrations: Iterable[Migration]) -> set[str]:
     return {vm_id for vm_id, count in named.items() if count > 1}
 
 
+def _action(message: str, actor: str, data: dict[str, Any]) -> Joined:
+    """A person's action's ``migration.action``, joined to its transition's write: a store error
+    leaves neither, the migration as it was for the person's retry (SDD §5.4, reviews RV51-12,
+    RV51-13)."""
+
+    def joined(new: Migration) -> tuple[list[tuple[str, Any, int]], list[Event]]:
+        event = new_event(
+            "migration.action",
+            message,
+            plan_id=new.plan_id,
+            migration_id=new.id,
+            actor=actor,
+            data=data,
+        )
+        return [], [event]
+
+    return joined
+
+
 def _by_vm(migrations: Iterable[Migration]) -> dict[str, Migration]:
     """Each VM's migration that is not cancelled, else its cancelled one (SDD §5.4)."""
     existing: dict[str, Migration] = {}
@@ -1686,16 +1705,13 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase != P.awaiting_cutover or m.strategy not in WARM_STRATEGIES:
                 raise NotAllowed("a sync pass can only be requested in awaiting_cutover")
-            m, v = await self._transition(
-                m, v, P.syncing, f"delta pass requested by {actor}", actor
+            m, v = await self._transitions(
+                m,
+                v,
+                [(P.syncing, f"delta pass requested by {actor}", None)],
+                actor,
+                also=_action(f"sync of {m.vm.name} requested", actor, {"action": "sync"}),
             )
-        await self._emit(
-            "migration.action",
-            f"sync of {m.vm.name} requested",
-            migration=m,
-            actor=actor,
-            data={"action": "sync"},
-        )
         self._launch(mid)
         return m
 
@@ -1719,19 +1735,20 @@ class Orchestrator:
             # SDD §8.1: the rollback starts the source on purpose; a migration that completes
             # again is watched afresh
             m.source_running_at = None
-            m, v = await self._transition(
-                m, v, P.rolling_back, f"rollback requested: {reason}", actor
+            m, v = await self._transitions(
+                m,
+                v,
+                [(P.rolling_back, f"rollback requested: {reason}", None)],
+                actor,
+                also=_action(
+                    f"rollback of {m.vm.name} requested",
+                    actor,
+                    {"action": "rollback", "reason": reason},
+                ),
             )
             step = self._steps.get(mid)
             if step is not None:
                 step.cancel()
-        await self._emit(
-            "migration.action",
-            f"rollback of {m.vm.name} requested",
-            migration=m,
-            actor=actor,
-            data={"action": "rollback", "reason": reason},
-        )
         self._launch(mid)
         return m
 
@@ -1822,7 +1839,26 @@ class Orchestrator:
                 m.downtime_ended_at = None
                 m.actual_downtime_s = None
                 m.downtime_model_s = None
-            m, v = await self._transition(m, v, P.ready, f"retry requested by {actor}", actor)
+            m, v = await self._transitions(
+                m,
+                v,
+                [(P.ready, f"retry requested by {actor}", None)],
+                actor,
+                also=_action(
+                    f"retry of {m.vm.name}", actor, {"action": "retry", "attempts": m.attempts}
+                ),
+            )
+        # SDD §5.1/§8: a completed plan is driven no more, so the new attempt reopens it - under
+        # the plan's lock, taken only now: held across the claim wait above, it would hold up the
+        # tick; a completion that wrote before the transition is seen here, a later one sees ready.
+        # One a store error keeps from it is made by the next tick (review RV51-14)
+        await self._reopen_completed(m.plan_id, actor, f"retry of {m.vm.name}")
+        self.wake()
+        return m
+
+    async def _reopen_completed(self, plan_id: str, actor: str, why: str) -> None:
+        """Run a completed plan again while it holds a ``ready`` migration (SDD §5.1, §8): under
+        the plan's lock, as a completion is written, on the migrations read there."""
         reopened = False
 
         def reopen(fresh: Plan) -> bool:
@@ -1833,28 +1869,19 @@ class Orchestrator:
             fresh.status = PlanStatus.running
             return True
 
-        # SDD §5.1/§8: a completed plan is driven no more, so the new attempt reopens it - under
-        # the plan's lock, taken only now: held across the claim wait above, it would hold up the
-        # tick; a completion that wrote before the transition is seen here, a later one sees ready
-        async with self._lock(f"plan:{m.plan_id}"):
-            plan = await self._update_plan(m.plan_id, reopen)
+        async with self._lock(f"plan:{plan_id}"):
+            migrations = await self.db.list("migration", Migration, plan_id=plan_id)
+            if not any(m.phase == P.ready for m in migrations):
+                return
+            plan = await self._update_plan(plan_id, reopen)
             if reopened:
                 await self._emit(
                     "plan.updated",
-                    f"{plan.name} reopened: retry of {m.vm.name}",
+                    f"{plan.name} reopened: {why}",
                     plan_id=plan.id,
                     actor=actor,
                     data={"status": "running"},
                 )
-        await self._emit(
-            "migration.action",
-            f"retry of {m.vm.name}",
-            migration=m,
-            actor=actor,
-            data={"action": "retry", "attempts": m.attempts},
-        )
-        self.wake()
-        return m
 
     async def cancel(
         self, mid: str, actor: str, reason: str | None = None, *, by_validation: bool = False
@@ -1885,19 +1912,19 @@ class Orchestrator:
             data_path = m.phase in (P.precopy, P.syncing) or await self.copied_data(m)
             if data_path:
                 m.checkpoint = "cleanup"  # saved with cancelled: a crash cannot lose the cleanup
-            m, v = await self._transition(
-                m, v, P.cancelled, f"cancelled: {reason or 'no reason given'}", actor
+            m, v = await self._transitions(
+                m,
+                v,
+                [(P.cancelled, f"cancelled: {reason or 'no reason given'}", None)],
+                actor,
+                also=_action(
+                    f"{m.vm.name} cancelled", actor, {"action": "cancel", "reason": reason}
+                ),
             )
             step = self._steps.get(mid)
             if step is not None:
                 step.cancel()
-        await self._emit(
-            "migration.action",
-            f"{m.vm.name} cancelled",
-            migration=m,
-            actor=actor,
-            data={"action": "cancel", "reason": reason},
-        )
+        # the cancel and its record are written: nothing can raise before its cleanup starts
         if data_path and not self._stopping:
             # the rollback step removes them (a cancel never leaves the source stopped, §5.1)
             self._cleanups[mid] = asyncio.create_task(
@@ -2093,21 +2120,25 @@ class Orchestrator:
                 # redacted and cut like any reason a skipped VM reports (SDD §8.1)
                 raise NotAllowed(f"finalize failed: {redact_cut(str(exc), 500)}") from exc
             m.checkpoint = "finalized"
-            m, v = await self._transition(
+            # a store error leaves it completed for a later finalize, as a bulk finalize reports
+            # it (SDD §8.1, review RV51-13)
+            m, v = await self._transitions(
                 m,
                 v,
-                P.finalized,
-                f"finalized by {actor}",
+                [
+                    (
+                        P.finalized,
+                        f"finalized by {actor}",
+                        {"delete_source": delete_source, **result.details},
+                    )
+                ],
                 actor,
-                data={"delete_source": delete_source, **result.details},
+                also=_action(
+                    f"{m.vm.name} finalized",
+                    actor,
+                    {"action": "finalize", "delete_source": delete_source},
+                ),
             )
-        await self._emit(
-            "migration.action",
-            f"{m.vm.name} finalized",
-            migration=m,
-            actor=actor,
-            data={"action": "finalize", "delete_source": delete_source},
-        )
         return m
 
     async def finalize_plan(
@@ -2706,6 +2737,16 @@ class Orchestrator:
         await self._resume_orphans()
         self._start_source_watch()
         all_plans = await self.db.list("plan", Plan)
+        completed = [p.id for p in all_plans if p.status == PlanStatus.completed]
+        if completed:
+            # a retry whose reopen a store error kept from its completed plan left the attempt
+            # ready there: reopened, or it would wait for good (SDD §8, review RV51-14)
+            phases = await self.db.plan_phases(completed)
+            for plan_id in sorted(p for p, counts in phases.items() if counts.get(P.ready)):
+                try:
+                    await self._reopen_completed(plan_id, "system", "a migration waits in ready")
+                except Exception:
+                    log.exception("the reopen of plan %s failed", plan_id)
         plans = [p for p in all_plans if p.status == PlanStatus.running]
         if not plans:
             return

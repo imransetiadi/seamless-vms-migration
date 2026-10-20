@@ -851,6 +851,42 @@ def test_events_export_and_prune(env, capsys, tmp_path):
     assert [(e.kind, e.data["deleted"]) for e in left] == [("events.pruned", 3)]
 
 
+def test_the_cli_prune_cuts_nothing_when_its_record_is_refused(env):
+    """SDD §15 (review RV51-15): `events prune` deleted the events, then recorded events.pruned
+    apart - a store error on the record left the trail cut with no record. Both in one
+    transaction: the refused record leaves every event."""
+    from datetime import UTC, datetime, timedelta
+
+    import sqlalchemy as sa
+    from sqlalchemy.engine import Engine
+
+    from seamless_migrate.domain.models import Event
+
+    store = store_for(env)
+    t0 = datetime(2026, 10, 1, tzinfo=UTC)
+    for i in range(3):
+        store.append_event(
+            Event(ts=t0 + timedelta(days=i), kind="plan.updated", actor="t", message=f"e{i}")
+        )
+    refused: list[str] = []
+
+    def refuse(conn, cursor, statement, parameters, context, executemany):
+        if refused or not statement.lstrip().upper().startswith("INSERT INTO EVENTS"):
+            return
+        if "events.pruned" in context.compiled_parameters[0].values():
+            refused.append(statement)
+            raise RuntimeError("the store was briefly unavailable")
+
+    sa.event.listen(Engine, "before_cursor_execute", refuse)  # the CLI's own engine too
+    try:
+        with pytest.raises(RuntimeError, match="briefly unavailable"):
+            cli.main(["events", "prune", "--before", "2026-10-02T00:00:00Z", "--confirm"])
+    finally:
+        sa.event.remove(Engine, "before_cursor_execute", refuse)
+    assert refused, "the events.pruned insert was refused"
+    assert [e.message for e in store.events(since_seq=0, limit=10)] == ["e0", "e1", "e2"]
+
+
 @pytest.mark.parametrize(
     "bound",
     [

@@ -10,8 +10,12 @@ from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1] / "src" / "seamless_migrate"
 CACHED = ("migration", "plan", "recommendation")
-# a store delete naming a kind: db.delete("plan", …), store.delete('migration', …), .delete(kind=…)
-DELETE = re.compile(r"\.delete\(\s*(?:kind\s*=\s*)?[\"'](\w+)[\"']")
+# a store delete naming a kind: db.delete("plan", …), store.delete('migration', …), .delete(kind=…),
+# and one written with its events: delete_and_emit(store, bus, "advisor_policy", …),
+# .delete_with_events("plan", …) (review RV51-11)
+DELETE = re.compile(
+    r"(?:\.delete(?:_with_events)?\(\s*(?:kind\s*=\s*)?|delete_and_emit\([^\"')]*)[\"'](\w+)[\"']"
+)
 
 
 def test_no_code_deletes_a_cached_document_kind():

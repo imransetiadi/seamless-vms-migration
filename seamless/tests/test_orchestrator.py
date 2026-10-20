@@ -10020,3 +10020,95 @@ async def test_one_plans_error_never_stops_the_tick_of_the_others(tmp_path, stor
     finally:
         await h.orch.stop()
     assert len(failed) >= 3 and health["healthy"], health
+
+
+@pytest.mark.parametrize("action", ["sync", "rollback", "cancel", "retry"])
+async def test_a_persons_action_and_its_record_are_one_write(tmp_path, store, refuse_write, action):
+    """SDD §5.4 (review RV51-12): a delta pass, a rollback, a cancel and a retry wrote the
+    migration, then its migration.action apart - a store error on the record left the action
+    standing without it: a cancel without its cleanup (until a restart) and its retry refused.
+    Both or neither: the migration is as it was, and the person's retry is taken."""
+    phase = {
+        "sync": P.awaiting_cutover,
+        "rollback": P.failed,
+        "cancel": P.precopy,
+        "retry": P.failed,
+    }[action]
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm})
+    m = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.warm, phase=phase)
+    store.put("migration", m)
+
+    def act():
+        return {
+            "sync": lambda: h.orch.request_sync(m.id, "rina"),
+            "rollback": lambda: h.orch.rollback(m.id, "rina", "restart the source"),
+            "cancel": lambda: h.orch.cancel(m.id, "rina", "window closed"),
+            "retry": lambda: h.orch.retry(m.id, "rina"),
+        }[action]()
+
+    refused = refuse_write(store, "INSERT INTO events", "migration.action")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await act()
+    assert refused, "the action's record was refused"
+    assert (await h.migration(m.id)).phase == phase  # nothing of the action stands
+    done = await act()  # the person's retry is taken
+    assert done.phase != phase
+    records = [
+        e.data["action"]
+        for e in store.events(since_seq=0, limit=1000)
+        if e.kind == "migration.action" and e.migration_id == m.id
+    ]
+    assert records == [action]
+    if action == "cancel":  # and its cleanup runs
+        for _ in range(200):
+            if (m.id, StepName.ROLLBACK) in h.executor.calls:
+                break
+            await asyncio.sleep(0.01)
+        assert (m.id, StepName.ROLLBACK) in h.executor.calls
+    await h.orch.stop()
+
+
+async def test_a_bulk_finalize_reports_a_vm_whose_record_was_refused_as_it_stands(
+    tmp_path, store, refuse_write
+):
+    """SDD §8.1 (review RV51-13): finalize wrote finalized, then its migration.action apart: a store
+    error on the record raised after the VM was finalized, and the bulk finalize reported it
+    skipped - "stays completed for a later finalize" - which no finalize could take. Both or
+    neither: it stays completed, as reported, and the next finalize takes it."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    refused = refuse_write(store, "INSERT INTO events", "migration.action")
+    out = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm=plan.name)
+    assert refused, "the finalize's record was refused"
+    assert out["finalized"] == [] and [s["migration_id"] for s in out["skipped"]] == [m.id]
+    assert (await h.migration(m.id)).phase == P.completed
+    again = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm=plan.name)
+    await h.orch.stop()
+    assert again["finalized"] == [m.id]
+
+
+async def test_a_retry_whose_plan_reopen_was_refused_is_reopened_by_the_tick(
+    tmp_path, store, refuse_write
+):
+    """SDD §5.1, §8 (review RV51-14): a retry wrote ready, then reopened the completed plan in a
+    second write; a store error there left the attempt waiting in ready in a plan the tick drives
+    no more, and the person's retry was refused (ready). The tick reopens a completed plan
+    holding a ready migration: the attempt runs."""
+    h, plan, tries = _first_cutover_fails(tmp_path, store)
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.rolled_back)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.orch.stop()  # no tick between the retry's two writes: the store refuses the retry's
+    refused = refuse_write(store, "UPDATE documents", "plan")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        await h.orch.retry(mid, "alice")
+    assert refused, "the plan's reopen was refused"
+    stranded = ((await h.migration(mid)).phase, (await h.plan(plan.id)).status)
+    assert stranded == (P.ready, PlanStatus.completed)
+    await h.orch.start()  # the next tick reopens the plan
+    done = await h.wait_phase(mid, P.completed)
+    reopened = [e for e in store.events(since_seq=0, limit=1000) if e.kind == "plan.updated"]
+    await h.orch.stop()
+    assert (len(tries), done.attempts) == (2, 1)
+    assert any("reopened: a migration waits in ready" in e.message for e in reopened)

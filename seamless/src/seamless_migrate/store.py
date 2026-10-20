@@ -689,6 +689,33 @@ class Store:
         if result.rowcount == 0:
             raise NotFound(kind, id_)
 
+    def delete_with_events(
+        self, kind: str, id_: str, expected_version: int, appended: Sequence[Event]
+    ) -> list[Event]:
+        """Delete the document at ``expected_version`` and append ``appended`` in one transaction
+        (SDD §11, §14.5, review RV51-11): both or neither - a ``ConflictError`` when the document
+        moved since it was read, ``NotFound`` when it is gone. The events come back as written."""
+        if _unsendable(id_):
+            raise NotFound(kind, id_)  # no stored id holds one (SDD §11)
+        rows = [_event_row(event) for event in appended]
+        key = (documents.c.kind == kind) & (documents.c.id == id_)
+        written: list[Event] = []
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                documents.delete().where(key & (documents.c.version == expected_version))
+            )
+            if result.rowcount == 0:
+                row = conn.execute(sa.select(documents.c.version).where(key)).first()
+                if row is None:
+                    raise NotFound(kind, id_)
+                raise ConflictError(
+                    f"{kind} {id_!r} is at version {int(row.version)}, expected {expected_version}"
+                )
+            for row_ in rows:
+                seq = int(conn.execute(events.insert().values(**row_)).inserted_primary_key[0])
+                written.append(Event(seq=seq, **row_))
+        return written
+
     # -- events ------------------------------------------------------------------------------
     def append_event(self, event: Event) -> Event:
         """Append ``event``; return it as written, its seq set (SDD §11)."""
@@ -751,6 +778,26 @@ class Store:
             )
             for row in rows
         ]
+
+    def prune_events(self, before: datetime, actor: str) -> tuple[int, Event]:
+        """Delete the events with ``ts < before`` and append ``events.pruned`` - its data the
+        cutoff and the count - in one transaction (SDD §15, Security.md §12, review RV51-15): the
+        trail keeps who cut it and where, or nothing was cut."""
+        if before.tzinfo is None:
+            before = before.replace(tzinfo=UTC)
+        before = before.astimezone(UTC)  # SQLite stores UTC wall time without an offset
+        with self.engine.begin() as conn:
+            deleted = int(conn.execute(events.delete().where(events.c.ts < before)).rowcount or 0)
+            row = _event_row(
+                Event(
+                    kind="events.pruned",
+                    actor=actor,
+                    message=f"{deleted} event(s) before {before.isoformat()} deleted from the CLI",
+                    data={"before": before.isoformat(), "deleted": deleted},
+                )
+            )
+            seq = int(conn.execute(events.insert().values(**row)).inserted_primary_key[0])
+        return deleted, Event(seq=seq, **row)
 
     def delete_events_before(self, before: datetime) -> int:
         """Delete events with ``ts < before`` (audit retention, Security.md §12); returns the count.

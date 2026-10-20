@@ -1031,3 +1031,44 @@ def test_a_delete_at_a_version_refuses_a_document_that_moved(any_store: Store):
     any_store.delete("plan", plan.id, expected_version=2)
     with pytest.raises(NotFound):
         any_store.delete("plan", plan.id, expected_version=2)
+
+
+def test_a_prune_and_its_record_are_one_write(any_store: Store, refuse_write):
+    """SDD §15 (review RV51-15): events prune deleted the events, then recorded events.pruned
+    apart - a store error on the record left the trail cut with no record, and the retry recorded
+    "0 deleted". Both or neither: nothing is cut, and the retry records what it cut."""
+    from datetime import timedelta
+
+    t0 = datetime(2026, 10, 1, tzinfo=UTC)
+    for i in range(3):
+        any_store.append_event(
+            Event(ts=t0 + timedelta(days=i), kind="plan.updated", actor="t", message=f"e{i}")
+        )
+    cutoff = datetime(2026, 10, 2, tzinfo=UTC)
+    refused = refuse_write(any_store, "INSERT INTO events", "events.pruned")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        any_store.prune_events(cutoff, actor="cli")
+    assert refused and len(any_store.events()) == 3  # nothing was cut
+    deleted, record = any_store.prune_events(cutoff, actor="cli")
+    assert (deleted, record.actor) == (1, "cli")
+    assert record.data == {"before": "2026-10-02T00:00:00+00:00", "deleted": 1}
+    assert [e.kind for e in any_store.events()] == ["plan.updated", "plan.updated", "events.pruned"]
+
+
+def test_a_deletion_and_its_events_are_one_write(any_store: Store, refuse_write):
+    """SDD §11, §14.5 (review RV51-11): a document deleted at its version with its events in one
+    transaction - a refused event leaves the document; a moved one is a ConflictError, a gone one
+    NotFound, neither appending anything."""
+    plan = make_plan(name="To delete")
+    version = any_store.put("plan", plan)
+    event = Event(kind="plan.updated", actor="t", message="deleted")
+    refused = refuse_write(any_store, "INSERT INTO events", "plan.updated")
+    with pytest.raises(RuntimeError, match="briefly unavailable"):
+        any_store.delete_with_events("plan", plan.id, version, [event])
+    assert refused and any_store.get("plan", plan.id, Plan) == plan
+    with pytest.raises(ConflictError):
+        any_store.delete_with_events("plan", plan.id, version + 1, [event])
+    [written] = any_store.delete_with_events("plan", plan.id, version, [event])
+    assert written.seq is not None and [e.message for e in any_store.events()] == ["deleted"]
+    with pytest.raises(NotFound):
+        any_store.delete_with_events("plan", plan.id, version, [event])

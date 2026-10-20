@@ -597,8 +597,6 @@ def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
     import math
     from datetime import UTC, datetime, timedelta
 
-    from .events import EventBus, emit
-
     now = utcnow()
     if args.before:
         try:
@@ -634,18 +632,9 @@ def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
         )
         return 2
     store = _store(settings)
-    deleted = store.delete_events_before(before)
-    # written after the delete, so the trail keeps who cut it and where (SDD §15)
-    asyncio.run(
-        emit(
-            store,
-            EventBus(store),
-            "events.pruned",
-            f"{deleted} event(s) before {before.isoformat()} deleted from the CLI",
-            actor="cli",
-            data={"before": before.isoformat(), "deleted": deleted},
-        )
-    )
+    # the deletion and events.pruned in one transaction: the trail keeps who cut it and where,
+    # or nothing was cut (SDD §15, review RV51-15)
+    deleted, _ = store.prune_events(before, actor="cli")
     print(f"deleted {deleted} event(s) before {before.isoformat()}")
     return 0
 

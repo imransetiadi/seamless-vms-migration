@@ -282,6 +282,25 @@ async def put_all_and_emit(
     return versions
 
 
+async def delete_and_emit(
+    store: Store,
+    bus: EventBus,
+    kind: str,
+    id_: str,
+    expected_version: int,
+    events: Sequence[Event],
+) -> None:
+    """Delete the document at ``expected_version`` and append ``events`` in one store
+    transaction, then publish them (SDD §11, §14.5, review RV51-11): a store error leaves the
+    document and no event."""
+    async with bus.emit_lock:
+        written = await asyncio.to_thread(
+            store.delete_with_events, kind, id_, expected_version, events
+        )
+        for event in written:
+            bus.publish(event, persist=True)
+
+
 async def emit(
     store: Store | None,
     bus: EventBus,

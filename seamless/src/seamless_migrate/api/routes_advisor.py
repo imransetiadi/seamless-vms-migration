@@ -8,8 +8,15 @@ from fastapi import APIRouter, Depends, Request, Response
 
 from ..ai.policies import builtin_default
 from ..domain.enums import Role
-from ..domain.models import AdvisorPolicy, AdvisorPolicySpec, AdvisorRecommendation, Plan, Provider
-from ..events import emit
+from ..domain.models import (
+    AdvisorPolicy,
+    AdvisorPolicySpec,
+    AdvisorRecommendation,
+    Event,
+    Plan,
+    Provider,
+)
+from ..events import delete_and_emit, new_event, put_all_and_emit
 from ..security.auth import Principal
 from ..store import ConflictError, NotFound
 from .deps import (
@@ -36,15 +43,14 @@ async def _check_scope(svc: Services, spec: AdvisorPolicySpec) -> None:
         raise ApiError(422, "validation_error", f"unknown provider or plan: {', '.join(unknown)}")
 
 
-async def _audit(
-    svc: Services, kind: str, principal: Principal, policy_id: str, before: Any, after: Any
-) -> None:
+def _audit(kind: str, principal: Principal, policy_id: str, before: Any, after: Any) -> Event:
+    """A policy change's audit event, written in the change's transaction (SDD §14.5, review
+    RV51-11): a store error leaves the policy as it was and no event."""
+
     def dump(policy: AdvisorPolicy | None) -> Any:
         return policy.model_dump(mode="json") if policy is not None else None
 
-    await emit(
-        svc.store,
-        svc.bus,
+    return new_event(
         kind,
         f"advisor policy {policy_id} {kind.removeprefix('policy.')}",
         actor=f"user:{principal.name}",
@@ -71,8 +77,8 @@ async def create_policy(
     await refuse_unknown_fields(request, AdvisorPolicySpec)
     await _check_scope(svc, body)
     policy = AdvisorPolicy(**body.model_dump(), updated_by=principal.name)
-    await svc.db.put("advisor_policy", policy, expected_version=0)
-    await _audit(svc, "policy.created", principal, policy.id, None, policy)
+    created = _audit("policy.created", principal, policy.id, None, policy)
+    await put_all_and_emit(svc.store, svc.bus, [("advisor_policy", policy, 0)], [created])
     return policy
 
 
@@ -93,13 +99,13 @@ async def replace_policy(
         created_at=before.created_at,
         updated_by=principal.name,
     )
+    updated = _audit("policy.updated", principal, policy_id, before, after)
     try:
-        await svc.db.put("advisor_policy", after, expected_version=version)
+        await put_all_and_emit(svc.store, svc.bus, [("advisor_policy", after, version)], [updated])
     except ConflictError:
         raise ApiError(
             409, "conflict", f"policy {policy_id} changed meanwhile; try again"
         ) from None
-    await _audit(svc, "policy.updated", principal, policy_id, before, after)
     return after
 
 
@@ -111,17 +117,17 @@ async def delete_policy(
 ) -> Response:
     svc = services(request)
     before, version = await svc.db.get_versioned("advisor_policy", policy_id, AdvisorPolicy)
+    deleted = _audit("policy.deleted", principal, policy_id, before, None)
     try:
         # the version read: a replace landing in between is refused, never deleted unseen with a
         # stale before in its audit event (SDD §12, §14.5, review ST-05)
-        await svc.db.delete("advisor_policy", policy_id, expected_version=version)
+        await delete_and_emit(svc.store, svc.bus, "advisor_policy", policy_id, version, [deleted])
     except NotFound:
         raise  # deleted meanwhile
     except ConflictError:
         raise ApiError(
             409, "conflict", f"policy {policy_id} changed meanwhile; try again"
         ) from None
-    await _audit(svc, "policy.deleted", principal, policy_id, before, None)
     return Response(status_code=204)
 
 

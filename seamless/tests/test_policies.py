@@ -549,3 +549,47 @@ def test_the_requester_of_a_decision_is_refused_by_the_api(api):
         assert refused.json()["error"]["message"] == (
             "You requested this decision. Another approver must decide it."
         )
+
+
+@pytest.mark.parametrize("change", ["create", "replace", "delete"])
+def test_a_policy_change_and_its_audit_event_are_one_write(tmp_path, refuse_write, change):
+    """SDD §14.5 (review RV51-11): a policy's change and its audit event were written apart - a
+    store error on the event left the change standing with no record: the delete's retry a 404,
+    so policy.deleted was never written; the replace's retry recorded before = after; the
+    create's retry made a second policy. Both or neither."""
+    settings, tokens = api_settings(tmp_path)
+    store = Store(f"sqlite:///{tmp_path / 'tx.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store), raise_server_exceptions=False) as client:
+        api = Api(client, store, settings, tokens)
+        url = "/api/v1/advisor/policies"
+        if change != "create":
+            created = api.post(url, json=SPEC)
+            assert created.status_code == 201, created.text
+            url = f"{url}/{created.json()['id']}"
+        kind = {
+            "create": "policy.created",
+            "replace": "policy.updated",
+            "delete": "policy.deleted",
+        }[change]
+
+        def act():
+            if change == "create":
+                return api.post(url, json=SPEC)
+            if change == "replace":
+                return client.put(url, headers=api.h(Role.admin), json={**SPEC, "threshold": 0.75})
+            return client.delete(url, headers=api.h(Role.admin))
+
+        refused = refuse_write(store, "INSERT INTO events", kind)
+        first = act()
+        assert refused and first.status_code == 500
+        stored = store.list("advisor_policy", AdvisorPolicy)
+        assert [p.threshold for p in stored] == ([] if change == "create" else [0.6])
+        retry = act()  # the admin's retry, as a person makes it
+        assert retry.status_code in (200, 201, 204), retry.text
+        audit = [e for e in store.events(since_seq=0, limit=1000) if e.kind == kind]
+        assert len(audit) == 1
+        if change != "create":
+            assert audit[0].data["before"]["threshold"] == 0.6
+        assert len(store.list("advisor_policy", AdvisorPolicy)) == (0 if change == "delete" else 1)
+    store.dispose()
