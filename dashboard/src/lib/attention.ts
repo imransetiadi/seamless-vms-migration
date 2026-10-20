@@ -102,7 +102,9 @@ export function attentionItems(
         migration: m,
         tone: 'danger',
         reason: 'The source VM runs again: its data diverges from the destination',
-        nextAction: 'Stop the source VM, or roll it back (operator)',
+        // a summary carries no checkpoint: one whose finalize began deleting the source is finalized again, never
+        // rolled back (SDD §8.1, review RV51-10) - its page says which
+        nextAction: 'Stop the source VM, roll it back, or finalize it again (see its page)',
         rank: 1,
       };
     } else if (m.phase === 'failed') {
