@@ -245,6 +245,30 @@ export interface VMRef {
   used_bytes: number;
   /** Derived and serialized from `os_type` (SDD §9.5); absent in responses of older control planes. */
   guest_os?: GuestOS;
+  /** Its GPUs as its source reports them (SDD §4.2, §22.2, plan task G2); [] for a VM recorded before, absent from older control planes. */
+  gpus?: GpuDevice[];
+}
+
+/**
+ * A GPU of a source VM, or a GPU request of a flavor (SDD §4.2, §22.2): a VMware vGPU by its profile or a passthrough
+ * device by its PCI ids; an OpenStack request by its resource class, traits and PCI alias. The API sends every field,
+ * null or [] when unset.
+ */
+export interface GpuDevice {
+  kind: 'vgpu' | 'passthrough';
+  /** The vGPU profile: VMware's as vCenter reports it ("grid_a100-4c"), an OpenStack request's as its provider declares it. */
+  profile?: string | null;
+  /** VMware passthrough: the PCI vendor and device ids, four lower-case hex digits each ("10de", "20b5"). */
+  vendor_id?: string | null;
+  device_id?: string | null;
+  /** Identical devices of one VM are one entry. */
+  count: number;
+  /** OpenStack vGPU: the request group's class ("VGPU", or a CUSTOM_ class) with its required and forbidden traits. */
+  resource_class?: string | null;
+  traits?: string[];
+  forbidden_traits?: string[];
+  /** OpenStack passthrough: the PCI alias ("a100"). */
+  alias?: string | null;
 }
 
 export interface Mappings {

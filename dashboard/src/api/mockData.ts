@@ -18,6 +18,7 @@ import type {
   Event,
   EvidenceItem,
   Finding,
+  GpuDevice,
   Migration,
   Nic,
   Phase,
@@ -352,6 +353,7 @@ interface VmSpec {
   host?: string;
   tags?: Record<string, string>;
   flavor_extra_specs?: Record<string, string>;
+  gpus?: GpuDevice[];
   cbt_enabled?: boolean | null;
   snapshot_count?: number;
   tools_ok?: boolean | null;
@@ -465,6 +467,17 @@ export function checkOf(provider: Pick<Provider, 'id' | 'kind' | 'role' | 'relea
   return openstackCheck(provider, cloud?.storage ?? CHECKED_STORAGE, cloud?.extra);
 }
 
+/** Each device by what names it - a profile, an alias, the PCI ids or a vGPU's class -, with its count when more than one: the API's _gpu_names (SDD §9.3). */
+function gpuNames(devices: GpuDevice[]): string {
+  return devices
+    .map((d) => {
+      const ids = d.vendor_id && d.device_id ? `${d.vendor_id}:${d.device_id}` : '';
+      const name = d.profile || d.alias || ids || d.resource_class || 'a device without ids';
+      return d.count > 1 ? `${name} ×${d.count}` : name;
+    })
+    .join(', ');
+}
+
 export function makeVm(spec: VmSpec): VMRef {
   const disks: Disk[] = spec.disks.map((d, i) => {
     const kind = d.kind ?? 'volume';
@@ -509,6 +522,7 @@ export function makeVm(spec: VmSpec): VMRef {
     host: spec.host ?? null,
     tags: spec.tags ?? {},
     flavor_extra_specs: spec.flavor_extra_specs ?? {},
+    gpus: spec.gpus ?? [],
     cbt_enabled: spec.cbt_enabled === undefined ? null : spec.cbt_enabled,
     snapshot_count: spec.snapshot_count ?? 0,
     tools_ok: spec.tools_ok === undefined ? null : spec.tools_ok,
@@ -1141,11 +1155,31 @@ export function preflight(
   }
   for (const [code, message] of nicOverrideFindings(vm, sourceKind, plan, destinationNetworks, context))
     add(code, message);
-  if ('pci_passthrough:alias' in vm.flavor_extra_specs)
-    add('VM_PCI_PASSTHROUGH', `Flavor requests PCI passthrough (${vm.flavor_extra_specs['pci_passthrough:alias']}).`);
-  const vgpu = vgpuRequests(vm.flavor_extra_specs);
-  if (vgpu.length)
-    add('VM_VGPU', `Flavor requests a vGPU (${vgpu.join(', ')}).`);
+  // the API's _gpu_findings (SDD §9.3, §22.2, plan task G2): an OpenStack flavor's requests named by their extra specs,
+  // a VMware VM's devices by what names them; a VM recorded without gpus read from its extra specs
+  const gpus = vm.gpus ?? [];
+  const alias = vm.flavor_extra_specs['pci_passthrough:alias'];
+  const passthrough = gpus.filter((g) => g.kind === 'passthrough');
+  if (gpus.length ? passthrough.length : alias !== undefined)
+    add(
+      'VM_PCI_PASSTHROUGH',
+      alias !== undefined && (!gpus.length || passthrough.some((g) => g.alias))
+        ? `Flavor requests PCI passthrough (${alias}).`
+        : `The VM has a PCI passthrough device (${gpuNames(passthrough)}).`,
+    );
+  const vgpus = gpus.filter((g) => g.kind === 'vgpu');
+  // the extra-spec keys of the vGPU requests: the classes gpus names - a declared CUSTOM_ class among them -, else VGPU
+  const classes = new Set(vgpus.map((g) => g.resource_class).filter((c): c is string => Boolean(c)));
+  const vgpu = gpus.length
+    ? Object.keys(vm.flavor_extra_specs).filter((k) => classes.has(k.match(/^resources[A-Za-z0-9_-]*:([A-Z0-9_]+)$/)?.[1] ?? '')).sort()
+    : vgpuRequests(vm.flavor_extra_specs);
+  if (gpus.length ? vgpus.length : vgpu.length)
+    add(
+      'VM_VGPU',
+      vgpu.length && (!gpus.length || vgpus.some((g) => g.resource_class))
+        ? `Flavor requests a vGPU (${vgpu.join(', ')}).`
+        : `The VM has a vGPU (${gpuNames(vgpus)}).`,
+    );
   const encrypted = vm.disks.filter((d) => d.encrypted).map((d) => d.name || d.id);
   if (encrypted.length)
     add('VOL_ENCRYPTED', `Encrypted disk(s): ${pyNames(encrypted)}.`);
