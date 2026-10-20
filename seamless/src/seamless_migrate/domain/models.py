@@ -55,7 +55,12 @@ def utcnow() -> datetime:
 def _to_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
+    try:
+        return value.astimezone(UTC)
+    except OverflowError:
+        # its offset carries it past datetime's range: a 422 naming the field, never a 500
+        # (SDD §4, audit AA-01)
+        raise ValueError("a time outside 0001-01-01..9999-12-31 UTC") from None
 
 
 UTCDateTime = Annotated[datetime, AfterValidator(_to_utc)]

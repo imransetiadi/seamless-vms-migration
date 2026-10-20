@@ -43,7 +43,7 @@ from .deps import (
     services,
     validation_message,
 )
-from .schemas import ConversionKeyRequest, ProviderCredentialsRequest
+from .schemas import ConversionKeyRequest, EmptyRequest, ProviderCredentialsRequest
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["providers"])
@@ -481,7 +481,10 @@ async def delete_provider(
 
 @router.post("/providers/{provider_id}/check", response_model=Provider)
 async def check_provider(
-    provider_id: str, request: Request, principal: Principal = Depends(require_role(Role.operator))
+    provider_id: str,
+    request: Request,
+    body: EmptyRequest | None = None,
+    principal: Principal = Depends(require_role(Role.operator)),
 ) -> Provider:
     return await services(request).orchestrator.check_provider(provider_id, principal.name)
 

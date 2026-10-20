@@ -23,6 +23,11 @@ class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class EmptyRequest(_Body):
+    """The body of a route whose request is ``{}``: an empty object or none, a field refused
+    (SDD §12, audit AA-04)."""
+
+
 _SECRET = 4096  # longest accepted credential value
 _TEXT = 2000  # longest free text of a migration action: comment, reason, confirm (SDD §12)
 

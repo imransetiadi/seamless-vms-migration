@@ -27,7 +27,7 @@ from .deps import (
     require_role,
     services,
 )
-from .schemas import OverrideRequest, PolicyList
+from .schemas import EmptyRequest, OverrideRequest, PolicyList
 
 router = APIRouter(tags=["advisor"])
 
@@ -135,6 +135,7 @@ async def delete_policy(
 async def approve_recommendation(
     rec_id: str,
     request: Request,
+    body: EmptyRequest | None = None,
     principal: Principal = Depends(require_permission("advisor.approve")),
 ) -> AdvisorRecommendation:
     return await services(request).orchestrator.approve_recommendation(rec_id, principal.name)

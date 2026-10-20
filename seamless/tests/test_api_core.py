@@ -1295,3 +1295,68 @@ def test_plans_refuse_a_resource_they_cannot_pre_stage(api):
         json={"prestage_resources": ["workloads"]},
     )
     assert patched.status_code == 422 and "'workloads'" in patched.json()["error"]["message"]
+
+
+#: well-formed ISO-8601 times whose UTC instant lies outside datetime's range (audit AA-01)
+OUT_OF_RANGE = ("0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-14:00")
+
+
+@pytest.mark.parametrize("stamp", OUT_OF_RANGE)
+def test_a_time_outside_datetimes_range_is_refused_naming_its_field(tmp_path, stamp):
+    """SDD §4, §12 (audit AA-01): converting such a time to UTC raised OverflowError, which pydantic
+    does not turn into a validation error - POST /plans, PATCH /plans/{id} and POST /providers
+    answered 500 with a traceback in the log. It is a 422 naming the field."""
+    settings, tokens = api_settings(tmp_path, secrets_dir=tmp_path / "secrets")
+    store = Store(f"sqlite:///{tmp_path / 'api.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store), raise_server_exceptions=False) as client:
+        api = Api(client, store, settings, tokens)
+        assert api.post("/api/v1/providers", json=SOURCE).status_code == 201
+        assert api.post("/api/v1/providers", json=DESTINATION).status_code == 201
+        plan = {
+            "name": "Range plan",
+            "source_provider_id": SOURCE["id"],
+            "destination_provider_id": DESTINATION["id"],
+            "vm_ids": [],
+        }
+        window = {"start": stamp, "end": "2030-01-02T00:00:00Z"}
+        created = api.post("/api/v1/plans", Role.approver, json={**plan, "cutover_window": window})
+        assert created.status_code == 422, created.text
+        assert "cutover_window.start" in created.json()["error"]["message"]
+        draft = api.post("/api/v1/plans", Role.approver, json=plan).json()
+        patched = client.patch(
+            f"/api/v1/plans/{draft['id']}",
+            headers=api.h(Role.approver),
+            json={"cutover_window": window},
+        )
+        assert patched.status_code == 422, patched.text
+        provider = api.post(
+            "/api/v1/providers", json={**SOURCE, "id": "src-two", "last_checked_at": stamp}
+        )
+        assert provider.status_code == 422, provider.text
+        assert "last_checked_at" in provider.json()["error"]["message"]
+    store.dispose()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/advisor/recommendations/rec-none/approve",
+        "/api/v1/plans/plan-none/validate",
+        "/api/v1/plans/plan-none/start",
+        "/api/v1/plans/plan-none/pause",
+        "/api/v1/migrations/mig-none/sync",
+        "/api/v1/migrations/mig-none/retry",
+        "/api/v1/providers/prov-none/check",
+    ],
+)
+def test_a_route_whose_request_is_empty_refuses_a_field(api, path):
+    """SDD §12 (audit AA-04): the routes that take no body dropped every field of one - an approve
+    sent the option meant for an override applied the advisor's, recorded as the person's. An
+    empty object or no body passes; a field is a 422 naming it."""
+    refused = api.client.post(path, headers=api.h(Role.admin), json={"option": "cold"})
+    assert refused.status_code == 422, refused.text
+    assert "option: Extra inputs are not permitted" in refused.json()["error"]["message"]
+    for body in ({}, None):
+        taken = api.client.post(path, headers=api.h(Role.admin), json=body)
+        assert taken.status_code == 404, (body, taken.text)  # its unknown id, as before
