@@ -575,6 +575,9 @@ class Orchestrator:
         self._prestage_done: dict[str, set[tuple[str, datetime | None, bool]]] = {}
         #: when a plan whose pre-staging failed with work in flight is pre-staged again (monotonic)
         self._prestage_retry_at: dict[str, float] = {}
+        #: the migrations a retry is writing, from its first lock to its own reopen of the plan:
+        #: the tick's reopen leaves their plans to it (SDD §5.1, §8, PR #58 CI)
+        self._retrying: Counter[str] = Counter()
         self._prestage_tasks: dict[str, asyncio.Task[None]] = {}
         #: best-effort rollback of the data path after a cancel in precopy/syncing (SDD §7.2)
         self._cleanups: dict[str, asyncio.Task[None]] = {}
@@ -1778,6 +1781,17 @@ class Orchestrator:
         return m
 
     async def retry(self, mid: str, actor: str) -> Migration:
+        # marked from its first lock to its own reopen: releasing the claims awaits the
+        # database, so a tick could otherwise reopen the plan in between, as "system"
+        self._retrying[mid] += 1
+        try:
+            return await self._retry(mid, actor)
+        finally:
+            self._retrying[mid] -= 1
+            if not self._retrying[mid]:
+                del self._retrying[mid]
+
+    async def _retry(self, mid: str, actor: str) -> Migration:
         # the provider check and the save of ready share the deletions' lock (SDD §12): a ready
         # migration holds its VM, so a deletion after it refuses and one before it is seen here
         async with self._claims(), self._lock(mid), self._lock(PROVIDERS):
@@ -2766,6 +2780,18 @@ class Orchestrator:
                     # RV52-O1, PR #58 review)
                     continue
                 try:
+                    ready = [
+                        m.id
+                        for m in await self.db.list("migration", Migration, plan_id=plan_id)
+                        if m.phase == P.ready
+                    ]
+                    if _lock_busy(self.plan_lock(plan_id)) or any(
+                        self._retrying[mid] or _lock_busy(self._lock(mid)) for mid in ready
+                    ):
+                        # a retry is still writing its migration: its own reopen names its actor
+                        # (SDD §5.1, §8, PR #58 CI); a later tick reopens it if a store error
+                        # kept that from it
+                        continue
                     await self._reopen_completed(plan_id, "system", "a migration waits in ready")
                 except Exception:
                     log.exception("the reopen of plan %s failed", plan_id)

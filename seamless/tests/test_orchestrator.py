@@ -1950,6 +1950,36 @@ async def test_a_retry_reopens_a_plan_its_rollback_completed(tmp_path, store):
     assert h.kinds().count("plan.completed") == 2
 
 
+async def test_a_tick_during_a_retrys_write_leaves_the_reopen_to_the_retry(tmp_path, store):
+    """SDD §5.1, §8 (PR #58 CI): the tick reopens a completed plan holding a ready migration - the
+    fallback for a retry whose own reopen a store error kept from it. A tick that ran between the
+    retry's write of ready and its reopen, the migration's lock still held, reopened the plan as
+    "system", and the audit named no retry of web-01 and not alice. It leaves the plan to the
+    retry, as any plan or migration whose lock is busy."""
+    h, plan, _ = _first_cutover_fails(tmp_path, store)
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.rolled_back)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    real_transitions = h.orch._transitions
+
+    async def transitions(m, v, steps, *args, **kwargs):
+        out = await real_transitions(m, v, steps, *args, **kwargs)
+        if steps and steps[0][0] == P.ready:
+            await h.orch.tick()  # the retry wrote ready and still holds the migration's lock
+        return out
+
+    h.orch._transitions = transitions
+    await h.orch.retry(mid, "alice")
+    await h.orch.stop()
+    reopened = [
+        e
+        for e in store.events(since_seq=0, limit=1000)
+        if e.kind == "plan.updated" and e.data.get("status") == "running"
+    ]
+    assert [(e.actor, "web-01" in e.message) for e in reopened] == [("alice", True)], reopened
+
+
 async def test_a_retry_in_a_completed_plan_whose_provider_is_gone_is_refused(tmp_path, store):
     """SDD §5.1/§12: a completed plan's providers may be deleted; reopening it without them would
     leave a running plan that cannot run, so the retry is refused and nothing changes."""
