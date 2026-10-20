@@ -234,7 +234,7 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
                                       # running for the source watch (§8.1); null for none, for VMware and on
                                       # a VM validated before it was recorded (review PV-05)
         key_name: str|null = null,    # the Nova keypair the server boots with (OpenStack); VMware: null
-        gpus: list[GpuDevice] = [] }  # its GPUs (§22.2), as its source reports them from plan task G2;
+        gpus: list[GpuDevice] = [] }  # its GPUs (§22.2), as its source reports them (plan task G2);
                                       # [] for a VM recorded before
    derived (properties, also serialized): disk_bytes: int, used_bytes: int, guest_os: GuestOS
    (used_bytes = Σ used_gb·2^30 when every disk has used_gb, else ⌊disk_bytes·0.6⌋;
@@ -2300,8 +2300,8 @@ Finding catalog (code — severity — condition):
 | `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
 | `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one, resolved by the rule of §7.3 step 0; its `DestinationInventory.subnets` by `network_id`) or is no host address there — as Neutron's `check_subnet_ip` rules for a port created with no owner, an IPv4 subnet's network address (at any prefix length) and its broadcast address below a /31 (a /31 or /32 has none), while an IPv6 subnet's first address is taken (§6.6); on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode, and no address in `"nova"` mode (§6.6); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
-| `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
-| `VM_VGPU` | blocker | extra spec `resources:VGPU` present, or its request-group form `resources<suffix>:VGPU` (Nova's granular requests, e.g. `resources1:VGPU`; the suffix is `[A-Za-z0-9_-]`, review PL-08) (VMware: a shared-PCI vGPU device, reported the same way) |
+| `VM_PCI_PASSTHROUGH` | blocker | the VM has a passthrough device: an entry of kind `passthrough` in its `gpus` (§22.2) - an OpenStack flavor's `pci_passthrough:alias`, a VMware `VirtualPCIPassthrough` device that is no vGPU (plan task G2) |
+| `VM_VGPU` | blocker | the VM has a vGPU: an entry of kind `vgpu` in its `gpus` (§22.2) - an OpenStack flavor's `resources:VGPU`, bare or in its request-group form `resources<suffix>:VGPU` (Nova's granular requests, e.g. `resources1:VGPU`; the suffix is `[A-Za-z0-9_-]`, review PL-08), or a custom resource class its source declares a profile for (§22.3); a VMware vGPU device (plan task G2) |
 | `VOL_ENCRYPTED` | warning | encrypted disk (Barbican key must be re-created) |
 | `GUEST_OS_LEGACY` | warning | `guest_os.lifecycle == "legacy"` (§9.5: out of the vendor's standard support; it still migrates — test the application on RHOSO) |
 | `GUEST_OS_UNKNOWN` | info | `guest_os.family == "unknown"`: no OS identified — set the `os_distro`/`os_version` image properties (OpenStack) or run VMware Tools; verification uses the Linux profile |
@@ -2315,9 +2315,9 @@ Finding catalog (code — severity — condition):
 | `HANDOVER_BACKEND_UNMAPPED` | info (storage_handover) | handover enabled but a volume type is unmapped |
 | `APP_PROBE_MISSING` | warning | the VM's tier by §9.4's rules is `stateful_database` and it has no application probe (no `plan.verification.app_probes` and no `probe_overrides` entry, or an empty one): verification would check only that it booted (ADV-18); the message names the suggested probe (§9.6) when there is one |
 
-Planned for 0.3.0 (§22.2, §22.5): the two GPU rows above will read the VM's GPUs (plan task G2) and then block only a
-VM that no GPU mapping applies to, as six GPU codes join the catalog (plan task G4); until then the rows hold as
-written.
+The two GPU rows read the VM's GPUs since plan task G2 - a VM recorded without `gpus`, its flavor's extra specs as
+§22.2 reads them - and block it whatever its plan maps; from plan task G4 they block only a VM that no GPU mapping
+applies to, as six GPU codes join the catalog (§22.2, §22.5).
 
 ### 9.4 Wave planner (`planning/waves.py`)
 
@@ -4487,7 +4487,7 @@ hosts, and nothing in this section claims more.
 
 ### 22.2 GPU devices of a source VM
 
-The model and `planning/gpu.py` are binding in §4.2 and §10 since plan task G1; the sources report `gpus` from G2.
+The model and `planning/gpu.py` are binding in §4.2 and §10 since plan task G1; the sources report `gpus` since plan task G2.
 
 ```text
 GpuDevice { kind: "vgpu"|"passthrough",
@@ -4553,7 +4553,8 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   names it as written, the form every stored VM holds; a request body holding a NUL or a lone surrogate is refused
   (§12), so no mapping key holds one either (PR #57 review).
 * A VM recorded before 0.3.0 has no `gpus`. Such a VM could not be migrated (§9.3 blocked it), and a validation reads it
-  again (§5.4).
+  again (§5.4); until then §9.3's two GPU rows read its flavor's extra specs as `gpu_requests` does, so a VMware VM the
+  provider reported with those specs stays blocked (plan task G2).
 
 ### 22.3 Destination GPU flavors and capacity
 
@@ -4830,7 +4831,7 @@ Binding in §13.4 with plan task G3:
 | Item | Becomes binding in | Plan task |
 |---|---|---|
 | `GpuDevice`, `VMRef.gpus`, `Mappings.gpus`, `Provider.gpu_profiles`; `planning/gpu.py` (requests, the GPU key, profile sizes) | §4.2, §10, §12 (binding) | G1 |
-| the sources report `gpus`; the VMware provider writes no GPU extra specs, and §9.3's two GPU rows read `gpus` (still unconditional until G4) | §9.3, §10 | G2 |
+| the sources report `gpus`; the VMware provider writes no GPU extra specs, and §9.3's two GPU rows read `gpus` (still unconditional until G4) | §9.3, §10 (binding) | G2 |
 | `DestinationInventory.gpu_flavors` and `gpu_capacity`; the destination check's `gpu_capacity`; `gpu_capacity()`, `server_allocations()` and `get_server`'s flavor; §22.12's rule | §10, §13.4 | G3 |
 | the GPU flavor rule (§22.4) and the catalog change (§22.5) | §9.3, §7.2 (pre-staging) | G4 |
 | the eligibility of a VMware passthrough VM; a pilot without GPU VMs; the port 9400 suggestion | §9.2, §9.4, §9.6 | G5 |
