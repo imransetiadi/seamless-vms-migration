@@ -2792,11 +2792,12 @@ class Orchestrator:
         if not migs:
             return
         covered = self._prestage_done.get(plan.id)
-        if covered is None or any(
-            _assessment(m) not in covered for m in migs if m.phase == P.ready
+        if any(
+            covered is None or _assessment(m) not in covered for m in migs if m.phase == P.ready
         ):
-            # a migration assessed since the last pre-staging - a VM added, validated again or
-            # given a strategy that needs a conversion host - waits for one (SDD §8)
+            # a ready migration no pre-staging covered - the plan's first, a VM added, validated
+            # again or given a strategy that needs a conversion host - waits for one; a plan with
+            # nothing ready is not pre-staged (SDD §8, review RV52-O3)
             self._ensure_prestage(plan, migs)
             return
         # two migrations of one VM, as an earlier version left a running plan: neither starts

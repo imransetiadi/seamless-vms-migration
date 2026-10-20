@@ -7929,6 +7929,50 @@ async def test_a_restart_during_a_pre_staging_still_pre_stages_what_it_was_to_co
 
 
 @dataclasses.dataclass
+class _FailingPrestage(ScriptedExecutor):
+    """Pre-staging that always fails, counting its runs."""
+
+    runs: int = 0
+
+    async def prestage(self, plan, source, destination, **_):
+        self.runs += 1
+        raise RuntimeError("destination API briefly unavailable")
+
+
+async def test_a_plan_resumed_after_a_restart_with_no_ready_migration_is_not_pre_staged(
+    tmp_path, store
+):
+    """SDD §8 (review RV52-O3): a warm plan held overnight - both VMs in awaiting_cutover - was
+    paused, the server upgraded, the plan resumed. Nothing was ready, yet the tick pre-staged it,
+    and a failing pre-staging failed the plan. A plan with no ready migration is not pre-staged."""
+    settings = make_settings(tmp_path)
+    vms = [vm(1), vm(2)]
+    h, plan = await setup(
+        tmp_path,
+        store,
+        vms,
+        {"default_strategy": Strategy.warm, "auto_cutover": False},
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    for v in ("vm-1", "vm-2"):
+        await h.wait_phase((await h.by_vm(plan.id, v)).id, P.awaiting_cutover)
+    await h.orch.pause_plan(plan.id, "alice")
+    await h.orch.stop()
+    executor = _FailingPrestage(settings)
+    again = build_harness(tmp_path, store, vms, executor=executor, settings=settings)
+    await again.orch.start()
+    await again.orch.start_plan(plan.id, "alice")
+    for _ in range(20):
+        again.orch.wake()
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.2)
+    status = (await again.plan(plan.id)).status
+    await again.orch.stop()
+    assert (executor.runs, status) == (0, PlanStatus.running)
+
+
+@dataclasses.dataclass
 class _SlowPrestage(ScriptedExecutor):
     """Pre-staging that runs until released - the playbooks take minutes on a real cloud."""
 
