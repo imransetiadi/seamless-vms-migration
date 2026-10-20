@@ -52,7 +52,8 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _to_utc(value: datetime) -> datetime:
+def to_utc(value: datetime) -> datetime:
+    """``value`` in UTC, one without an offset read as UTC; ValueError past datetime's range."""
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     try:
@@ -63,7 +64,7 @@ def _to_utc(value: datetime) -> datetime:
         raise ValueError("a time outside 0001-01-01..9999-12-31 UTC") from None
 
 
-UTCDateTime = Annotated[datetime, AfterValidator(_to_utc)]
+UTCDateTime = Annotated[datetime, AfterValidator(to_utc)]
 
 
 def new_plan_id() -> str:
@@ -375,7 +376,7 @@ class CutoverWindow(_Model):
     end: UTCDateTime
 
     def contains(self, moment: datetime) -> bool:
-        return self.start <= _to_utc(moment) <= self.end
+        return self.start <= to_utc(moment) <= self.end
 
 
 DEFAULT_CONSOLE_PATTERNS = ["login:", "Cloud-init v\\. .* finished", "Reached target .*Multi-User"]
