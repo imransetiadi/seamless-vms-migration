@@ -898,6 +898,28 @@ def test_a_pem_block_a_cut_left_without_its_begin_line_is_removed_to_its_end_lin
     assert redact(out) == out
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        'Authorization: Digest username="admin", realm="vc", nonce="FakeNonce", '
+        'response="FakeResponse6629fae4"',
+        "Authorization: AWS4-HMAC-SHA256 Credential=FakeKeyId/20261020/us-east-1/s3/aws4_request, "
+        "SignedHeaders=host;range;x-amz-date, Signature=FakeSignaturefe5f80",
+        json.dumps(
+            {"headers": 'Authorization: Digest username="admin", response="FakeResponse6629"'}
+        ),
+    ],
+    ids=["digest", "aws4", "digest-in-json"],
+)
+def test_an_authorization_header_with_parameters_is_redacted_whole(text):
+    """SDD §13.4 (PR #58 review): the header pattern took one token after the scheme, so a Digest
+    header kept its response - an offline-crackable hash of the password - and an AWS4 header its
+    replayable Signature. A scheme's parameter list, key=value pairs apart by commas, goes whole."""
+    out = redact(text)
+    assert "Fake" not in out and "admin" not in out, out
+    assert redact(out) == out, out
+
+
 def _quotings(pairs):
     """``pairs`` (key, value) as each quoting a step's output carries them prints them."""
     mapping = dict(pairs)

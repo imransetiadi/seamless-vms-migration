@@ -92,6 +92,9 @@ def _auth_block(match: re.Match[str]) -> str:
     return f"{match.group(1)}auth: {REDACTED}{end}"
 
 
+#: One parameter of an Authorization header's scheme: key=value, the value a quoted string - at the
+#: top, or inside a JSON string at its escape - or a word with no comma, quote or white space.
+_HEADER_PARAM = r"[\w-]+=(?:\"(?:[^\"\\\n]|\\.)*+\"|\\\"(?:[^\"\\\n]|\\[^\"])*+\\\"|[^\s,\"'\\]+)"
 #: a dotted chain of base64url runs, each run read once (possessive): where JWTs are looked for
 _BASE64URL_CHAIN = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]++(?:\.[A-Za-z0-9_-]++)*+")
 
@@ -147,9 +150,11 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     # a second pass changes nothing (review RV52-X5)
     (
         re.compile(
-            r"(?i)\b(authorization)\s*[:=]\s*(?:\w+\s+)?+(?!\[REDACTED\](?![A-Za-z0-9]))"
-            + _word(",;'\"")
-            + "+"
+            r"(?i)\b(authorization)\s*[:=]\s*(?:[\w-]+\s+)?+(?!\[REDACTED\](?![A-Za-z0-9]))"
+            # a scheme's parameters - Digest's response, AWS4's Signature -, key=value pairs apart
+            # by commas, a value quoted (in a JSON string at its escape) or a word (PR #58 review)
+            r"(?:" + _HEADER_PARAM + r"(?:\s*,\s*" + _HEADER_PARAM + r")*+"
+            r"|" + _word(",;'\"") + "+)"
         ),
         r"\1: " + REDACTED,
     ),
