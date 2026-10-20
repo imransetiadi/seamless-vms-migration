@@ -2607,8 +2607,12 @@ expected_version)` each, and their events in one transaction: all are written or
 the document that moved; a strategy change and an advisor decision, §8, §14.6; `put_with_event` is its one
 document's case),
 `create_user(user, actor) -> Event` (§13.1: the `user` document and its `user.created` event in
-one transaction; a `ConflictError` for a name that exists in any case), `delete_events_before(before) -> int` (`events
-prune`, §15),
+one transaction; a `ConflictError` for a name that exists in any case), `delete_with_events(kind, id,
+expected_version, events) -> [Event]` (a versioned delete and its events in one transaction, a `ConflictError` or
+`NotFound` as `delete`'s: an advisor policy's deletion and its `policy.deleted`, §14.5, review RV51-11),
+`prune_events(before, actor) -> (count, Event)` (`events prune`, §15: the events before the cutoff deleted and
+`events.pruned` appended in one transaction, review RV51-15), `delete_events_before(before) -> int` (the deletion
+alone, with no record of it),
 `append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500, kinds=None, tail=False,
 before_seq=None)` (`kinds` serves `GET /events?audit=true`). SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
