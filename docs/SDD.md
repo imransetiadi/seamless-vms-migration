@@ -4936,7 +4936,7 @@ Binding in §13.4 with plan task G3:
 | the eligibility of a VMware passthrough VM; a pilot without GPU VMs; the port 9400 suggestion | §9.2, §9.4, §9.6 (binding) | G5 |
 | the gate's fifth rule, `Migration.gpu_wait` and `MigrationSummary.gpu_wait`, the event `migration.gpu_wait`, the gauge `seamless_gpu_waits` | §4.2, §4.3, §5.4, §18 | G6 |
 | the executors create the server with the GPU flavor (`flavor_uuid` for the VMware kit) | §7.2, §7.3 | G7 |
-| the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 | G8 |
+| the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 (binding) | G8 |
 | the demo's GPU VMs, GPU flavors, pools and gate wait | §7.4, §10 | G9 |
 | the dashboard (§22.11) | §16 | G10, G11, G12 |
 | QASuite (requirement rows, AC-7, LAB-G01…LAB-G08), Security.md, README | QASuite, Security.md, README | G13 |
