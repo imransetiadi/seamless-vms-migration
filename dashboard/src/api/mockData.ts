@@ -18,6 +18,7 @@ import type {
   Event,
   EvidenceItem,
   Finding,
+  GpuCapacity,
   GpuDevice,
   Migration,
   Nic,
@@ -402,13 +403,22 @@ const MAXIMA = { source: ['2.88', '3.64'], rhoso: ['2.95', '3.70'], openstack: [
 export const DEMO_TOKEN_ROLES: readonly string[] = ['admin', 'member', 'reader'];
 
 /**
+ * A destination's GPU capacity as its check reads it when the check runs: the demo's destinations list no GPU flavor,
+ * so it reads ok with no pools, as the API demo's (SDD §22.3).
+ */
+export function gpuCapacityOf(readAt: string): GpuCapacity {
+  return { status: 'ok', reason: null, detail: null, read_at: readAt, pools: [] };
+}
+
+/**
  * An OpenStack or RHOSO provider's check report, with the keys the API's check reports (SDD §10; check_report_keys.json):
  * its token's roles, its services' maxima, its storage pools and TLS; a destination's adds its series, support tier and
- * policy profile, by its maxima and what it declares (§10.1).
+ * policy profile, by its maxima and what it declares (§10.1), and its GPU capacity, read at `checkedAt` (§22.3).
  */
 function openstackCheck(
   provider: Pick<Provider, 'kind' | 'role' | 'release' | 'policy_profile'>,
   storage: ReturnType<typeof backend>[],
+  checkedAt: string,
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
   const [compute, blockStorage] = provider.role === 'source' ? MAXIMA.source : MAXIMA[provider.kind === 'rhoso' ? 'rhoso' : 'openstack'];
@@ -423,7 +433,9 @@ function openstackCheck(
     storage_backends: storage,
     tls: true,
     plain_http: [],
-    ...(provider.role === 'destination' ? destinationRelease(provider.kind, provider.release, provider.policy_profile, compute, blockStorage) : {}),
+    ...(provider.role === 'destination'
+      ? { ...destinationRelease(provider.kind, provider.release, provider.policy_profile, compute, blockStorage), gpu_capacity: gpuCapacityOf(checkedAt) }
+      : {}),
     ...extra,
   };
 }
@@ -458,13 +470,16 @@ export function vmwareCheck(vms: readonly VMRef[]): Record<string, unknown> {
   };
 }
 
-/** An OpenStack or RHOSO provider's check report, as the mock's check reads its cloud: the seeded cloud's own pools, else CHECKED_STORAGE. */
-export function checkOf(provider: Pick<Provider, 'id' | 'kind' | 'role' | 'release' | 'policy_profile'>): Record<string, unknown> {
+/**
+ * An OpenStack or RHOSO provider's check report, as the mock's check reads its cloud at `checkedAt`: the seeded cloud's
+ * own pools, else CHECKED_STORAGE.
+ */
+export function checkOf(provider: Pick<Provider, 'id' | 'kind' | 'role' | 'release' | 'policy_profile'>, checkedAt: string): Record<string, unknown> {
   // a seeded cloud's own pools only for a provider of its role and kind: one re-created under its id as another
   // provider reads the generic pools, never the deleted cloud's (review RV20-14)
   const seeded = CLOUDS[provider.id];
   const cloud = seeded && seeded.role === provider.role && seeded.kind === provider.kind ? seeded : undefined;
-  return openstackCheck(provider, cloud?.storage ?? CHECKED_STORAGE, cloud?.extra);
+  return openstackCheck(provider, cloud?.storage ?? CHECKED_STORAGE, checkedAt, cloud?.extra);
 }
 
 /** Each device by what names it - a profile, an alias, the PCI ids or a vGPU's class -, with its count when more than one: the API's _gpu_names (SDD §9.3). */
@@ -597,7 +612,7 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/dc1-ca.pem',
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
-      capabilities: checkOf({ id: 'rhosp17-dc1', kind: 'openstack', role: 'source', release: null, policy_profile: null }),
+      capabilities: checkOf({ id: 'rhosp17-dc1', kind: 'openstack', role: 'source', release: null, policy_profile: null }, iso(now - 4 * 60_000)),
       status: 'ok',
       // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
       status_message: null,
@@ -687,7 +702,7 @@ export function buildProviders(now: number): Provider[] {
       ca_cert_path: '/etc/pki/seamless/ocp-ingress-ca.pem',
       conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31'),
       // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
-      capabilities: checkOf({ id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null }),
+      capabilities: checkOf({ id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null }, iso(now - 3 * 60_000)),
       status: 'ok',
       // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
       status_message: null,
@@ -733,7 +748,7 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: null,
       conversion_host: conversionHost('os-migrate-conv-dc3', '192.0.2.60'),
-      capabilities: checkOf({ id: 'hibiscus-dc3', kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null }),
+      capabilities: checkOf({ id: 'hibiscus-dc3', kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null }, iso(now - 6 * 60_000)),
       status: 'ok',
       // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
       status_message: null,

@@ -271,6 +271,32 @@ export interface GpuDevice {
   alias?: string | null;
 }
 
+/** A Placement pool of a destination's GPU requests: what a request asks Placement for, and counts only (SDD §22.3). */
+export interface GpuPool {
+  resource_class: string;
+  traits: string[];
+  forbidden_traits: string[];
+  /** The units free now on the providers that hold the class and the traits. */
+  free: number;
+  /** The resource providers among them with at least one unit free. */
+  providers: number;
+  /** The most units free on one of them: below n when no provider can give a group of n units. */
+  largest_free: number;
+}
+
+/**
+ * A destination's GPU capacity as Placement shows it, a key of its check report read when the check runs (SDD §10,
+ * §22.3). Unknown when Placement refused the credential, the catalog has no Placement, or another failure; `detail`
+ * names the failure by its HTTP status and Placement error code, never by its message text (§22.12).
+ */
+export interface GpuCapacity {
+  status: 'ok' | 'unknown';
+  reason: 'forbidden' | 'no_placement' | 'error' | null;
+  detail: string | null;
+  read_at: Timestamp | null;
+  pools: GpuPool[];
+}
+
 export interface Mappings {
   networks: Record<string, string>;
   flavors: Record<string, string>;
