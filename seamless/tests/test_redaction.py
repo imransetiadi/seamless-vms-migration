@@ -960,3 +960,81 @@ def test_a_seeded_fuzz_of_quotings_keeps_no_part_of_a_secret_and_every_other_val
                 out = redact(held)
                 assert not [c for c in canaries if c in out], (held, out)
                 assert all(p in out for p in plain), (held, out)
+
+
+@pytest.mark.parametrize(
+    ("text", "secrets"),
+    [
+        (
+            json.dumps({"server": {"adminPass": "FakeNovaA1", "accessToken": "FakeAccT2"}}),
+            ["A1", "T2"],
+        ),
+        ("openstack.compute.v2.server.Server(adminPass=FakeReprA3, id=1)", ["A3"]),
+        ("vcenter_adminPassword=FakePrefA4 DBPassword: FakeAcroA5", ["A4", "A5"]),
+        ("ssh_key_passphrase=FakePhrA6 password2=FakeDigA7 token_3: FakeDigA8", ["A6", "A7", "A8"]),
+        ("adminpassword=FakeLowA9 rootpasswd: FakeLowB1", ["A9", "B1"]),
+        ("\x1b[1mpassword:\x1b[0m FakeAnsiB2", ["B2"]),
+        ("\x1b[0;31mpassword: FakeAnsiB3\x1b[0m", ["B3"]),
+        (json.dumps({"stdout": "\x1b[0;31mpassword: FakeAnsiB4\x1b[0m"}), ["B4"]),
+        (json.dumps({"stdout": json.dumps({"msg": "\x1b[1mtoken=FakeAnsiB5\x1b[0m"})}), ["B5"]),
+        (repr("\x1b[1;32mtoken: FakeAnsiB6\x1b[K"), ["B6"]),
+    ],
+    ids=[
+        "nova-json",
+        "nova-repr",
+        "camel-prefixed-acronym",
+        "passphrase-digit",
+        "lowercase-long-word",
+        "ansi-around-separator",
+        "ansi-key",
+        "ansi-in-json",
+        "ansi-in-json-in-json",
+        "ansi-in-repr",
+    ],
+)
+def test_credential_keys_in_camel_case_with_a_digit_or_as_a_passphrase_are_found(text, secrets):
+    """SDD §13.4 (review RV52-X7): a key only counted with its prefix joined by `_`, `.` or `-`
+    and its word ending at a character but a letter or a digit, so Nova's `adminPass` - the root
+    password of every server it creates - went out in clear, with `accessToken`, `passphrase`,
+    `password2` and a key a terminal coloured. A key may be joined in camelCase (case-sensitive:
+    `bypass` stays), a long word in lower case (`adminpassword`), end in digits, and a terminal's
+    control sequence is removed first."""
+    out = redact(text)
+    assert not [s for s in secrets if s in out], out
+    assert redact(out) == out, out
+
+
+def test_a_credential_word_inside_another_word_stays_and_a_colour_code_goes():
+    """SDD §13.4 (review RV52-X7): camelCase is read case-sensitive and a lower-case compound
+    only for the long words, so no word that merely holds `pass` or `pwd` loses its value; the
+    terminal's control sequences go, the rest of the text stays as it was."""
+    kept = "bypass: allowed compass=north isPassive: true passage: open oldpwd: /tmp OLDPWD=/srv"
+    assert redact(kept) == kept
+    assert redact("\x1b[0;31mpassword: FakeAnsiB7\x1b[0m\ndone") == "password: [REDACTED]\ndone"
+    assert redact(json.dumps({"out": "\x1b[1mok\x1b[0m"})) == json.dumps({"out": "ok"})
+    assert redact_payload({"adminPass": 1, "passphrase": "x", "token_2": "y", "bypass": "z"}) == {
+        "adminPass": REDACTED,
+        "passphrase": REDACTED,
+        "token_2": REDACTED,
+        "bypass": "z",
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        json.dumps({"stdout": "auth:{secret="}),
+        "'token':\"token\":'auth:{!'token':eyJhbGciOiJIUzI1NiJ9!'\"'\"'password}",
+        json.dumps({"stdout": "\x1bauth:{'token':]eyJhbGciOiJIUzI1NiJ9\\\\'=}"}),
+        "auth: {auth: {username: admin}}",
+    ],
+    ids=["closed-by-a-value", "quoted-keys", "after-an-escape", "nested-once"],
+)
+def test_an_auth_section_a_redacted_value_closes_goes_whole_in_the_same_pass(text):
+    """SDD §13.4 (review RV52-X7): a flow-style auth section that only a value's redaction
+    closes - its inner key's value ran to the section's brace - or that held another one was
+    removed whole by a second pass alone; a terminal's escape, once removed, showed more of them.
+    The section is looked for again after the other patterns, so a second pass changes nothing."""
+    once = redact(text)
+    assert "auth:[REDACTED]" in once.replace(" ", ""), once
+    assert redact(once) == once, once
