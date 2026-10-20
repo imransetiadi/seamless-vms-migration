@@ -4050,11 +4050,13 @@ audits, trivy's configuration scan, the manifest and image jobs — and how to r
 the file that sets it — Python from `seamless/pyproject.toml`, Node.js from `dashboard/package.json`, gitleaks, ruff,
 actionlint and shellcheck from `.pre-commit-config.yaml` —, the venv with its `dev` and `collection` extras, the
 dashboard's `node_modules` against its lockfile, the pre-commit hook, and the engine and Compose by
-`seamless-check-context`; it installs nothing, names the fix of each failure for the host it runs on, and exits 1 when
-something `seamless-check` or the stack targets need is missing or off its pin. What `seamless-check` works without
-— `SEAMLESS_TEST_PG_URL`, Playwright's Chromium, agentmemory from the host and, on a Linux machine's own engine, from
-a container, `TYPESAFE_API_KEY` — is noted, never failed, and no secret's value or URL is printed; shellcheck
-another version than the hook's is noted too, as `seamless-check` runs the machine's own).
+`seamless-check-context`, and `curl`, which their health wait needs; it installs and pulls nothing, names the fix of
+each failure for the host it runs on, and exits 1 when something `seamless-check`, the stack targets or the pre-commit
+hook need is missing or off its pin. What `seamless-check` works without — `SEAMLESS_TEST_PG_URL`, Playwright's
+Chromium, agentmemory from the host and, on a Linux machine's own engine, from a container (a cached `busybox` image
+looks, or the look is noted as skipped), `TYPESAFE_API_KEY`, and gitleaks, actionlint and shellcheck, which it skips
+when absent and runs at the machine's own version — is noted, never failed, each with its fix; no secret's value or
+URL is printed or put on a command line (PR #58 review)).
 
 Engine and context, by the host the targets run on (`SEAMLESS_HOST_OS`, from `uname -s`): on **Linux**
 `SEAMLESS_DOCKER_CONTEXT` defaults to `default`, the machine's own Docker Engine, and `DOCKER_HOST` is honoured (a
