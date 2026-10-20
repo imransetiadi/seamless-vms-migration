@@ -1976,9 +1976,13 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   after a restart nothing counts as pre-staged, so a running plan is pre-staged again (idempotently) before its next
   `ready` migration starts - a VM whose pre-staging the restart cut short is never cut over without its flavor or
   conversion host (review RV52-O2) -, and a plan with no `ready` migration, one resumed with every migration past
-  `ready`, is not pre-staged: its gates and steps go on at once, and a pre-staging error cannot fail it (review RV52-O3). When pre-staging fails a plan that still runs becomes `failed` (event `plan.updated`,
-  "pre-staging failed"), and `start_plan` accepts a `failed` plan as it does a `validated` or `paused`
-  one, pre-staging it again. A plan paused, validated again or edited while pre-staging ran keeps its status:
+  `ready`, is not pre-staged: its gates and steps go on at once, and a pre-staging error cannot fail it (review RV52-O3).
+  While a `ready` migration waits for its pre-staging, the plan's other migrations go on - a cutover gate, a keep-warm
+  pass, a covered migration's start - and only the uncovered ones wait (PR #58 review). When pre-staging fails a plan
+  that still runs becomes `failed` (event `plan.updated`, "pre-staging failed"), and `start_plan` accepts a `failed`
+  plan as it does a `validated` or `paused` one, pre-staging it again - unless a migration of it is in flight (a step
+  running, or one waiting at its cutover gate): that plan keeps running, its in-flight migrations go on, the failure
+  is recorded (the same event, without a status) and the tick pre-stages it again after 60 s (PR #58 review). A plan paused, validated again or edited while pre-staging ran keeps its status:
   the failure is recorded (the same event, without a status) and pre-staging runs again at its next start —
   a late failure must not turn an edited draft into a `failed` plan that `start_plan` accepts unvalidated.
 * Each active migration is driven by one `asyncio.Task` (`_drive(migration_id)`); it persists the
