@@ -222,7 +222,9 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
     guest_os = identify(os_type), §9.5)
    free text: a NUL or a lone surrogate in tags and flavor_extra_specs (keys and values), os_type or host
    is written U+FFFD as the model is built - no export filter or mapping reads them -; name, project,
-   flavor, a NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02)
+   flavor, a NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02);
+   a NIC's network an earlier version stored with one reads with U+FFFD as the store reads it, and only then
+   (§11, review RV52-S1)
 
 GuestOS { family: "linux"|"windows"|"unknown", distro: str|null, version: str|null, label: str,
           lifecycle: "current"|"legacy"|"unknown",
@@ -2644,7 +2646,12 @@ summary and the keys and values of its data, a verification's `review_reason`, i
 a migration's `error` and its phase changes' reasons, a decision's `reason_text`, Jev's reasons, a similar incident's
 title and content, a recommendation's option, its distribution's keys, `unusable` and `legacy_text`, and the model's
 version - reads with U+FFFD for each, as this version writes them (§14.1), so that document is written again too
-(review RV52-S1, PR #58 review); a name a cutover reads is not among them. What the control plane is given
+(review RV52-S1, PR #58 review). Of the names a cutover reads, a NIC's network alone reads so - the one a source
+can give with a NUL, below -, and only as the store reads a document: the migration is written again, so it can be
+cancelled or rolled back (review RV52-S1). No step takes the replaced name for the source's: a validation that
+re-assesses the migration reads the VM from its source again, whose name the write refuses as below; pre-staging
+and the export read the source's networks by their own names (§7.2); and a name that resolves to no destination
+network stops the cutover before the source stops (§7.2, §7.3 step 0). What the control plane is given
 stops before that refusal: a request
 body holding a NUL or a lone surrogate is refused before its route runs (§12) - a number is its route's to check,
 as §9.1 checks a plan's -, the tokens file refuses such a name (§13.1), the text it takes from outside sources
