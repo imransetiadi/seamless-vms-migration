@@ -1134,6 +1134,7 @@ describe('PlanDetail', () => {
     const enter = async (label: RegExp, value: string) => {
       await user.clear(field(label));
       await user.click(field(label));
+      expect(field(label), String(label)).toHaveFocus(); // a paste goes to the focused element
       await user.paste(value);
     };
     expect(Number(field(/link bandwidth/i).value) * 1024 * 1024).toBeGreaterThanOrEqual(1);
@@ -1150,9 +1151,13 @@ describe('PlanDetail', () => {
     await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
     const summary = await within(dialog).findByRole('alert');
     for (const [, message] of overflowing) expect(summary).toHaveTextContent(message);
+    // the summary takes focus a frame later: a paste typed before that frame lands in the summary
+    await waitFor(() => expect(summary).toHaveFocus());
     for (const [index, [label]] of overflowing.entries()) await enter(label, prefilled[index]!);
     await enter(/^name/i, 'Analytics, renamed');
     await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    // a field still refused names itself here, not as a dialog that stays open
+    await waitFor(() => expect(screen.queryByRole('dialog')?.querySelector('[role="alert"]')?.textContent ?? null).toBeNull());
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     // a real PATCH: the name alone - the link as prefilled is no change, and stays 524 B/s
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['name'] });
