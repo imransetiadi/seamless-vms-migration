@@ -45,14 +45,19 @@ test('a definition near the viewport bottom stays fully visible', async ({ page 
   // list has stopped moving before the term is measured and hovered (it moved from under the pointer now and then)
   await expect(page.getByRole('link', { name: 'Details for api-gw-02' })).toBeVisible();
   const term = page.getByRole('button', { name: 'confidence', exact: true }).nth(3);
-  await term.evaluate((el) => {
-    el.scrollIntoView({ block: 'center' });
-    window.scrollBy(0, el.getBoundingClientRect().bottom - innerHeight + 25);
-  });
-  const box = (await term.boundingBox())!;
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   const tooltip = page.getByRole('tooltip').filter({ visible: true });
-  await expect(tooltip).toBeVisible();
+  // a later tick can still move the list from under the pointer (twice in one run of PR #49's CI): place the term at
+  // the bottom, enter it afresh and look again until its definition opens - it opens on entering, at once
+  await expect(async () => {
+    await term.evaluate((el) => {
+      el.scrollIntoView({ block: 'center' });
+      window.scrollBy(0, el.getBoundingClientRect().bottom - innerHeight + 25);
+    });
+    const box = (await term.boundingBox())!;
+    await page.mouse.move(0, 0);
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await expect(tooltip).toBeVisible({ timeout: 1_000 });
+  }).toPass({ timeout: 15_000 });
   await expect.poll(async () => (await tooltip.boundingBox())!.y + (await tooltip.boundingBox())!.height).toBeLessThanOrEqual(792);
   await page.keyboard.press('Escape');
 });
