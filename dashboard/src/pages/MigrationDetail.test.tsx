@@ -1116,6 +1116,17 @@ describe('MigrationDetail', () => {
     view.unmount();
   });
 
+  it('names an advisor decision whose recommendation is not on the loaded page, never leaving it out (SDD §16, PR #58 review)', async () => {
+    const server = createTestServer();
+    const held = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;
+    held.advisor_hold = 'rec-0123456789ab'; // beyond the newest the panel loads, or not found
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${held.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const approvals = await screen.findByRole('region', { name: 'Approvals' });
+    await waitFor(() => expect(approvals).toHaveTextContent('Advisor decision · Migration strategy'));
+    expect(approvals).toHaveTextContent('is not among the recommendations loaded here');
+    expect(within(approvals).getByRole('link', { name: 'see it' })).toHaveAttribute('href', '/advisor/recommendations/rec-0123456789ab');
+  });
+
   it('names the kind of every approval, the advisor decision among them (SDD §16, ADV-20)', async () => {
     const server = createTestServer();
     const held = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;

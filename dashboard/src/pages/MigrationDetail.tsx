@@ -29,7 +29,7 @@ import { Timeline } from '../components/Timeline';
 import { Unavailable } from '../components/Unavailable';
 import { NetworkPanel } from '../components/NetworkPanel';
 import { VerificationPanel } from '../components/VerificationPanel';
-import { decidable, nonStrategyNotes, optionLabel, waitingDecision } from '../lib/advisor';
+import { decidable, decidingRecommendationId, nonStrategyNotes, optionLabel, waitingDecision } from '../lib/advisor';
 import { approvalKindLabel } from '../lib/approvals';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
@@ -538,13 +538,17 @@ function Kind({ label }: { label: string }) {
 
 function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined }) {
   const counted = new Set(countedApprovals(m, plan));
-  // the same query as the Advisor panel; the decision is the one decidable() acts on: the hold's, else the last
-  // validation's, else the newest - whatever their time (SDD §14.6, reviews RV51-08, RV52-D1)
+  // the same query as the Advisor panel, and the decision decidable() acts on (SDD §14.6, reviews RV51-08, RV52-D1)
   const recommendations = useRecommendations({ migration_id: m.id, limit: RECOMMENDATION_LIMIT_MAX });
-  const strategies = recommendations.data?.items.filter((r) => !r.legacy && r.decision_type === 'migration_strategy') ?? [];
-  const named = m.advisor_hold || m.last_recommendation;
-  const current = named ? strategies.find((r) => r.id === named) : strategies[0];
-  const decision = current && PERSON_DECISIONS.has(current.decision.status) ? current : null;
+  const items = recommendations.data?.items ?? [];
+  const id = decidingRecommendationId(m, items.find((r) => !r.legacy)?.id);
+  const current = id ? items.find((r) => r.id === id) : undefined;
+  const decision =
+    current && !current.legacy && current.decision_type === 'migration_strategy' && PERSON_DECISIONS.has(current.decision.status)
+      ? current
+      : null;
+  // one the page does not hold - past its newest, or not found - is named with its link, never left out (PR #58 review)
+  const unloaded = recommendations.data && id && !current ? id : null;
   // a cutover request shows whatever the approval policy, with its window bypass (SDD §16)
   const request = m.cutover_requested ? (
     <div className="flex flex-col gap-0.5 text-sm">
@@ -580,6 +584,26 @@ function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined })
       ),
     })),
     ...(request ? [{ key: 'request', at: m.cutover_requested_at ?? '', node: request }] : []),
+    ...(unloaded
+      ? [
+          {
+            key: `decision-${unloaded}`,
+            at: '',
+            node: (
+              <div className="text-sm">
+                <Kind label={approvalKindLabel({ kind: 'advisor_decision', decisionType: 'migration_strategy' })} />
+                <p className="text-muted-foreground">
+                  Its recommendation is not among the recommendations loaded here:{' '}
+                  <Link to={`/advisor/recommendations/${encodeURIComponent(unloaded)}`} className="underline underline-offset-4">
+                    see it
+                  </Link>
+                  .
+                </p>
+              </div>
+            ),
+          },
+        ]
+      : []),
     ...(decision
       ? [
           {
