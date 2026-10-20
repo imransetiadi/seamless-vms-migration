@@ -538,10 +538,13 @@ function Kind({ label }: { label: string }) {
 
 function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined }) {
   const counted = new Set(countedApprovals(m, plan));
-  // the same query as the Advisor panel: the newest strategy decision is the one the migration runs (ADV-01)
+  // the same query as the Advisor panel; the decision is the one decidable() acts on: the hold's, else the last
+  // validation's, else the newest - whatever their time (SDD §14.6, reviews RV51-08, RV52-D1)
   const recommendations = useRecommendations({ migration_id: m.id, limit: RECOMMENDATION_LIMIT_MAX });
-  const newest = recommendations.data?.items.find((r) => !r.legacy && r.decision_type === 'migration_strategy');
-  const decision = newest && PERSON_DECISIONS.has(newest.decision.status) ? newest : null;
+  const strategies = recommendations.data?.items.filter((r) => !r.legacy && r.decision_type === 'migration_strategy') ?? [];
+  const named = m.advisor_hold || m.last_recommendation;
+  const current = named ? strategies.find((r) => r.id === named) : strategies[0];
+  const decision = current && PERSON_DECISIONS.has(current.decision.status) ? current : null;
   // a cutover request shows whatever the approval policy, with its window bypass (SDD §16)
   const request = m.cutover_requested ? (
     <div className="flex flex-col gap-0.5 text-sm">
