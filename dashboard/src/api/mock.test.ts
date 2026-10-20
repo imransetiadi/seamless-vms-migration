@@ -1190,6 +1190,54 @@ describe('mock API', () => {
     await expect(client.patch(`/plans/${plan.id}`, { vm_ids: ['vm-a', 'vm-a'] })).rejects.toMatchObject({ status: 422, message: 'vm_ids lists a VM more than once: vm-a' });
   });
 
+  it("refuses the estimator's bounds the API refuses, with its words: the model's, §9.1's and the overrides' (SDD §9.1, §12, review RV52-D4)", async () => {
+    const { client } = setup('approver');
+    const base = { name: 'Bounded', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['vm-a'] };
+    const refused = async (body: Record<string, unknown>, status: number, message: string) =>
+      expect(client.post('/plans', { ...base, ...body })).rejects.toMatchObject({ status, message });
+    // the plan model's own bounds, as pydantic words them, in the model's field order
+    await refused({ link_bps: 0, max_sync_passes: 0 }, 422, 'max_sync_passes: Input should be greater than or equal to 1; link_bps: Input should be greater than 0');
+    await refused(
+      { finalize_warning_h: 0, convergence_threshold_bytes: -1, keep_warm_interval_s: 59, downtime_slo_s: 0 },
+      422,
+      'downtime_slo_s: Input should be greater than or equal to 1; keep_warm_interval_s: Input should be greater than or equal to 60; convergence_threshold_bytes: Input should be greater than or equal to 0; finalize_warning_h: Input should be greater than or equal to 1',
+    );
+    // what the estimator divides by and runs a pass for: a rate printed as Python prints a float
+    await refused({ link_bps: 0.5 }, 422, 'link_bps must be at least 1 B/s (got 0.5)');
+    await refused({ link_bps: 0.00001 }, 422, 'link_bps must be at least 1 B/s (got 1e-05)');
+    await refused({ max_sync_passes: 101 }, 422, 'max_sync_passes must be at most 100 (got 101)');
+    await refused(
+      { estimator_overrides: { scan_bps: 0.5, shutdown_s: 2e9, parallel_disks: 0.5, foo: 1, max_passes: 3 } },
+      400,
+      'invalid estimator_overrides: foo: unknown field; max_passes: set the plan field max_sync_passes instead; parallel_disks: must be at least 1; scan_bps: must be at least 1 B/s; shutdown_s: must be at most 1000000000 s',
+    );
+    await refused({ estimator_overrides: { boot_s: 0, link_bps: -1 } }, 400, 'invalid estimator_overrides: boot_s: must be a finite positive number; link_bps: must be a finite positive number');
+    // the bounds themselves pass, and an edit is checked on the plan it would store
+    const plan = await client.post<Plan>('/plans', { ...base, link_bps: 1, max_sync_passes: 100, estimator_overrides: { scan_bps: 1, shutdown_s: 1e9, parallel_disks: 1 } });
+    await expect(client.patch(`/plans/${plan.id}`, { max_sync_passes: 101 })).rejects.toMatchObject({ status: 422, message: 'max_sync_passes must be at most 100 (got 101)' });
+  });
+
+  it('refuses an action body field the API does not take, before it looks the migration up (SDD §12, review RV52-D5)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body: Record<string, unknown>) => server.handle(method, path, new URLSearchParams(), body, 'approver');
+    const extra = (...fields: string[]) => ({
+      status: 422,
+      body: { error: { code: 'validation_error', message: fields.map((f) => `${f}: Extra inputs are not permitted`).join('; ') } },
+    });
+    const m = server.migrations[0]!;
+    for (const action of ['approve', 'cutover', 'force-cutover', 'sync', 'rollback', 'retry', 'cancel', 'finalize']) {
+      expect(call('POST', `/migrations/${m.id}/${action}`, { note: 'x' }), action).toMatchObject(extra('note'));
+      // FastAPI validates the body before the route runs: an unknown migration answers the same
+      expect(call('POST', `/migrations/mig-000000000000/${action}`, { note: 'x', why: 'y' }), action).toMatchObject(extra('note', 'why'));
+    }
+    expect(call('PUT', `/migrations/${m.id}/strategy`, { strategy: 'warm', why: 'x' })).toMatchObject(extra('why'));
+    expect(call('POST', '/plans/plan-c81d44a0/finalize', { confirm: 'x', force: true })).toMatchObject(extra('force'));
+    expect(call('POST', '/plans/plan-c81d44a0/waves/auto', { max_wave_size: 5, size: 5 })).toMatchObject(extra('size'));
+    // the fields an action takes still reach it: a cutover request with its window bypass and comment
+    const ready = server.migrations.find((x) => x.phase === 'ready')!;
+    expect(call('POST', `/migrations/${ready.id}/cutover`, { force_window: false, comment: 'go' }).status).not.toBe(422);
+  });
+
   it('refuses a VM another plan holds, at validation and at a retry that would take it back (SDD §5.4)', async () => {
     const { server, client } = setup('operator');
     const first = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
@@ -1440,6 +1488,39 @@ describe('mock API', () => {
     expect(server.handle('POST', '/plans/plan-c81d44a0/start', new URLSearchParams(), {}, 'operator').status).toBe(409);
     expect(call('plan-c81d44a0')).toMatchObject({ status: 200, body: { status: 'cancelled' } });
     expect(server.events.slice(before).filter((e) => e.kind === 'plan.cancelled')).toHaveLength(1);
+  });
+
+  it('refuses a plan cancel body the API refuses, and bounds the reason sent, not the one each migration records (SDD §12, PR #58 review)', () => {
+    const cancel = (body: Record<string, unknown>) => {
+      const server = new MockServer({ now: () => NOW, seed: 1 });
+      return server.handle('POST', '/plans/plan-c81d44a0/cancel', new URLSearchParams(), body, 'operator');
+    };
+    expect(cancel({ reason: 42 })).toMatchObject({ status: 422, body: { error: { message: 'reason: Input should be a valid string' } } });
+    expect(cancel({ reason: 'x'.repeat(2001) })).toMatchObject({ status: 422, body: { error: { message: 'reason: String should have at most 2000 characters' } } });
+    expect(cancel({ comment: 'x' })).toMatchObject({ status: 422, body: { error: { message: 'comment: Extra inputs are not permitted' } } });
+    // each migration records "plan cancelled: " and the reason, longer than 2000: the API keeps it
+    expect(cancel({ reason: 'x'.repeat(2000) }).status).toBe(200);
+  });
+
+  it('names the attempts a retry wrote in its event, like the API (SDD §5.1, review RV52-O6, PR #58 review)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const failed = server.migrations.find((m) => m.phase === 'failed')!;
+    const before = server.events.length;
+    expect(server.handle('POST', `/migrations/${failed.id}/retry`, new URLSearchParams(), {}, 'operator').status).toBe(200);
+    const [event] = server.events.slice(before).filter((e) => e.kind === 'migration.action');
+    expect(event?.data).toEqual({ action: 'retry', attempts: failed.attempts });
+  });
+
+  it("keeps a plan cancel's reason as Python's strip leaves it, like the API (SDD §12, review RV52-S3)", () => {
+    const reasonOf = (sent: string) => {
+      const server = new MockServer({ now: () => NOW, seed: 1 });
+      const before = server.events.length;
+      expect(server.handle('POST', '/plans/plan-c81d44a0/cancel', new URLSearchParams(), { reason: sent }, 'operator').status).toBe(200);
+      return server.events.slice(before).find((e) => e.kind === 'plan.cancelled')!.data.reason;
+    };
+    // NEL (U+0085) is white space to Python's strip, not to JavaScript's trim
+    expect(reasonOf('  late window\u0085 ')).toBe('late window');
+    expect(reasonOf(' \u0085\u2028 ')).toBeNull();
   });
 
   it('cancels a removed VM\u2019s failed migration at validation like the API, unless its cutover stopped the source (SDD §5.4)', () => {

@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import type { MockServer } from '../api/mock';
 import { makeVm } from '../api/mockData';
 import type { Plan, VMRef } from '../api/types';
-import { createTestClient, createTestServer, renderWithApp } from '../test/utils';
+import { createTestClient, createTestServer, formFields, renderWithApp } from '../test/utils';
 import PlanDetail from './PlanDetail';
 
 function renderPlan(planId: string, token = 'operator') {
@@ -1116,6 +1116,42 @@ describe('PlanDetail', () => {
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['name'] });
     expect([saved.convergence_threshold_bytes, saved.max_sync_passes, saved.estimator_overrides.parallel_disks]).toEqual([0, 60, 100]);
   });
+
+  it('edits a plan stored with a link under 525 B/s, and refuses a number that overflows (SDD §9.1, §16, review RV52-D6, PR #58 review)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.link_bps = 524; // the API keeps 1 B/s and more; three decimals of MiB/s showed it as 0, which the form refused
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const { field, enter } = formFields(user, dialog);
+    expect(Number((field(/link bandwidth/i) as HTMLInputElement).value) * 1024 * 1024).toBeGreaterThanOrEqual(1);
+    // a finite number whose bytes per second, seconds or bytes are not: JSON would send it as null
+    const overflowing: [RegExp, string][] = [
+      [/link bandwidth/i, 'Enter the link bandwidth in MiB/s (at least 1 B/s).'],
+      [/downtime slo/i, 'Enter the downtime SLO in minutes (more than 0).'],
+      [/convergence threshold/i, 'Enter the convergence threshold in GiB (0 or more).'],
+      [/keep-warm interval/i, 'Enter the keep-warm interval in minutes (1 or more).'],
+      [/verification timeout/i, 'Enter the verification timeout in minutes (0 or more).'],
+    ];
+    const prefilled = overflowing.map(([label]) => (field(label) as HTMLInputElement).value);
+    for (const [label] of overflowing) await enter(label, '1e308'); // times 60, a GiB or a MiB: Infinity
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    const summary = await within(dialog).findByRole('alert');
+    for (const [, message] of overflowing) expect(summary).toHaveTextContent(message);
+    // the summary takes focus a frame later: a paste typed before that frame lands in the summary
+    await waitFor(() => expect(summary).toHaveFocus());
+    for (const [index, [label]] of overflowing.entries()) await enter(label, prefilled[index]!);
+    await enter(/^name/i, 'Analytics, renamed');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    // a field still refused names itself here, not as a dialog that stays open
+    await waitFor(() => expect(screen.queryByRole('dialog')?.querySelector('[role="alert"]')?.textContent ?? null).toBeNull());
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    // a real PATCH: the name alone - the link as prefilled is no change, and stays 524 B/s
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['name'] });
+    expect(server.plans.find((p) => p.id === plan.id)!.link_bps).toBe(524);
+  }, 30_000);
 
   it('edits a plan whose mapping names contain =, -> or → and keeps them (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });

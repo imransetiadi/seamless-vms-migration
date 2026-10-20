@@ -242,7 +242,8 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
    free text: a NUL or a lone surrogate in tags and flavor_extra_specs (keys and values), os_type or host,
    and in a GPU's profile, alias and traits, is written U+FFFD as the model is built - no export filter or
    mapping reads them -; name, project, flavor, a NIC's network and a disk's volume_type are kept as the
-   source gives them (§11, review RV49-02)
+   source gives them (§11, review RV49-02); a NIC's network an earlier version stored with one reads with
+   U+FFFD as the store reads it, and only then (§11, review RV52-S1)
 
 GuestOS { family: "linux"|"windows"|"unknown", distro: str|null, version: str|null, label: str,
           lifecycle: "current"|"legacy"|"unknown",
@@ -660,7 +661,10 @@ person's retry - never a cancel without its cleanup nor a finalized VM a bulk fi
 cleanup starts once that write is done (review RV51-12, RV51-13). A retry's reopen of the plan its migration's
 rollback completed follows under the plan's lock, as a completion is written; one a store error kept from it is made
 by the next tick, which reopens a completed plan holding a `ready` migration - never an attempt waiting in `ready`
-for good (review RV51-14). The running pass finishes, then the migration moves to `awaiting_cutover`
+for good (review RV51-14). The tick never waits for a lock: a plan or migration whose lock a validation, an edit, a pause or a
+person's action holds - or waits for, a released lock going to its first waiter - is left to a later tick, for the
+reopen of a completed plan, a step's start and a plan's completion alike, so a slow source never stalls the other
+plans' gates (review RV52-O1, PR #58 review). The running pass finishes, then the migration moves to `awaiting_cutover`
 with `converged_by: "force"`; the gate still applies — an approval by another approver (maker-checker), the window, the
 cutover slots. A request alone (`POST …/cutover`) never
 forces: it waits for convergence. A migration is forced once: while `force_cutover` is recorded, another Force
@@ -1981,9 +1985,11 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   error of one - a write the store refuses, a provider down - is logged and the plans after it are ticked, as each
   orphan's relaunch is (review RV51-06). The tick decides on a snapshot; starting a step re-checks,
   under the plan's lock and then the migration's, what the decision rested on — that the plan still
-  runs (a pause that returned starts nothing more), the phase, the gate of a cutover (§5.4) and the
-  strategy: a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
-  single-shot one, since `set_strategy` may have changed it meanwhile. A running plan is pre-staged (`prestage`, §7.2)
+  runs (a pause that returned starts nothing more), the phase, the gate of a cutover (§5.4), the
+  strategy - a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
+  single-shot one, since `set_strategy` may have changed it meanwhile - and that a pre-staging covered the
+  assessment of a migration in `ready`: one `set_strategy` changed since starts nothing and wakes the tick, which
+  pre-stages it first (review RV52-O4). A running plan is pre-staged (`prestage`, §7.2)
   before its first migration starts, and again before a `ready` migration starts whose assessment no pre-staging
   covered - pre-staging is idempotent and creates only what the destination lacks, so a VM added since, or one
   validated again or given a strategy that needs a conversion host since, is pre-staged too, as its validation said
@@ -1991,11 +1997,17 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   its strategy needs a conversion host (`cold`, `warm`); a pre-staging covers the assessments of the plan's migrations
   it read when it began, and the tick reads the migrations from the store - a validation during a pre-staging, or in
   another process (§15), is seen -, so a plan paused and resumed with nothing assessed anew is not pre-staged again and
-  its gates and steps go on at once (review RV51-17, RV51-19). After a restart a running plan whose work started counts
-  as pre-staged for its migrations' assessments; any other plan is pre-staged again when it next runs with a `ready`
-  migration. When pre-staging fails a plan that still runs becomes `failed` (event `plan.updated`,
-  "pre-staging failed"), and `start_plan` accepts a `failed` plan as it does a `validated` or `paused`
-  one, pre-staging it again. A plan paused, validated again or edited while pre-staging ran keeps its status:
+  its gates and steps go on at once (review RV51-17, RV51-19). What a pre-staging covered lives in the process:
+  after a restart nothing counts as pre-staged, so a running plan is pre-staged again (idempotently) before its next
+  `ready` migration starts - a VM whose pre-staging the restart cut short is never cut over without its flavor or
+  conversion host (review RV52-O2) -, and a plan with no `ready` migration, one resumed with every migration past
+  `ready`, is not pre-staged: its gates and steps go on at once, and a pre-staging error cannot fail it (review RV52-O3).
+  While a `ready` migration waits for its pre-staging, the plan's other migrations go on - a cutover gate, a keep-warm
+  pass, a covered migration's start - and only the uncovered ones wait (PR #58 review). When pre-staging fails a plan
+  that still runs becomes `failed` (event `plan.updated`, "pre-staging failed"), and `start_plan` accepts a `failed`
+  plan as it does a `validated` or `paused` one, pre-staging it again - unless a migration of it is in flight (a step
+  running, or one waiting at its cutover gate): that plan keeps running, its in-flight migrations go on, the failure
+  is recorded (the same event, without a status) and the tick pre-stages it again after 60 s (PR #58 review). A plan paused, validated again or edited while pre-staging ran keeps its status:
   the failure is recorded (the same event, without a status) and pre-staging runs again at its next start —
   a late failure must not turn an edited draft into a `failed` plan that `start_plan` accepts unvalidated.
 * Each active migration is driven by one `asyncio.Task` (`_drive(migration_id)`); it persists the
@@ -2636,8 +2648,12 @@ expected_version)` each, and their events in one transaction: all are written or
 the document that moved; a strategy change and an advisor decision, §8, §14.6; `put_with_event` is its one
 document's case),
 `create_user(user, actor) -> Event` (§13.1: the `user` document and its `user.created` event in
-one transaction; a `ConflictError` for a name that exists in any case), `delete_events_before(before) -> int` (`events
-prune`, §15),
+one transaction; a `ConflictError` for a name that exists in any case), `delete_with_events(kind, id,
+expected_version, events) -> [Event]` (a versioned delete and its events in one transaction, a `ConflictError` or
+`NotFound` as `delete`'s: an advisor policy's deletion and its `policy.deleted`, §14.5, review RV51-11),
+`prune_events(before, actor) -> (count, Event)` (`events prune`, §15: the events before the cutoff deleted and
+`events.pruned` appended in one transaction, review RV51-15), `delete_events_before(before) -> int` (the deletion
+alone, with no record of it),
 `append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500, kinds=None, tail=False,
 before_seq=None)` (`kinds` serves `GET /events?audit=true`). SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
@@ -2657,7 +2673,18 @@ ST-04, RV48-04, RV48-05, RV48-08, RV50-04). A document an earlier version stored
 an outside service - an advisor note's confidence or a number of its data (a hit's score, a claim's confidence), a
 recommendation's confidence or a probability of its distribution, a similar incident's score - reads each as
 null, a probability as absent, as this version would have written it: the document is written again as any other,
-where its stopped source could otherwise never be rolled back (review RV51-06). What the control plane is given
+where its stopped source could otherwise never be rolled back (review RV51-06). A string such a version kept from
+outside - Jev, agentmemory, a step's or a provider's error - holding a NUL or a lone surrogate - an advisor note's
+summary and the keys and values of its data, a verification's `review_reason`, its checks, warnings and probe detail,
+a migration's `error` and its phase changes' reasons, a decision's `reason_text`, Jev's reasons, a similar incident's
+title and content, a recommendation's option, its distribution's keys, `unusable` and `legacy_text`, and the model's
+version - reads with U+FFFD for each, as this version writes them (§14.1), so that document is written again too
+(review RV52-S1, PR #58 review). Of the names a cutover reads, a NIC's network alone reads so - the one a source
+can give with a NUL, below -, and only as the store reads a document: the migration is written again, so it can be
+cancelled or rolled back (review RV52-S1). No step takes the replaced name for the source's: a validation that
+re-assesses the migration reads the VM from its source again, whose name the write refuses as below; pre-staging
+and the export read the source's networks by their own names (§7.2); and a name that resolves to no destination
+network stops the cutover before the source stops (§7.2, §7.3 step 0). What the control plane is given
 stops before that refusal: a request
 body holding a NUL or a lone surrogate is refused before its route runs (§12) - a number is its route's to check,
 as §9.1 checks a plan's -, the tokens file refuses such a name (§13.1), the text it takes from outside sources
@@ -2963,11 +2990,21 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 `redact(text, names=None)` removes:
 
 * passwords and secrets in key/value pairs — `key=value`, `key: value`, JSON `"key": "value"`, the key
-  possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`), also where it starts a line of a
-  JSON-escaped multi-line string (`\npassword: x`) — and in CLI flags (`--os-password x`). A quoted value is read
+  possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`) or joined to its word in camelCase, read
+  case-sensitively (`adminPass` - the password Nova returns for a server it creates -, `accessToken`, `DBPassword`;
+  `bypass` and `isPassive` are no keys), a long word - password, passwd, passphrase, secret, token - glued in one
+  case too (`adminpassword`; never a word ending in `pass` or `pwd`), with digits after its word (`password2`,
+  `token_3`; review RV52-X7), also where it starts a line of a
+  JSON-escaped multi-line string (`\npassword: x`) — and in CLI flags (`--os-password x`; a quoted value whole with the
+  rest of its word, a quote it never closes to its line's end, and in an argv list - JSON's, a repr's such as a
+  `CalledProcessError`'s - the next item, review RV52-X3). A quoted value is read
   in every quoting it may be in: JSON's and the shell's double quotes, a Python repr's, YAML's (`''`) and the
-  shell's single quotes - with what the shell glues to a closed word (`'a'b`, `'a'\''b'`, `'a'"'"'b'`) -, any of
-  them inside JSON strings, however deep. Where the readings disagree on where it ends - a backslash before a
+  shell's single quotes - with what the shell glues to a closed word (`'a'b`, `'a'\''b'`, `'a'"'"'b'`, and the
+  characters after a double-quoted one, `"a"b`, review RV52-X6) -, any of them inside JSON strings, however deep.
+  No value runs past its item: a quoted part is never glued to a value - a JSON or repr list item's closing quote
+  and the next one's opening quote would read as one, and the next key with them -, and a word stops before a
+  JSON-escaped line break (`\n`, `\r` in a JSON string) unless letters and digits carry it on to its end
+  (`C:\new\root`), so the next line's key, flag or quoted key is redacted on its own (PR #58 review). Where the readings disagree on where it ends - a backslash before a
   quote escapes it in a repr (`\'`, inside JSON `\\'`), not in YAML or the shell (`'C:\'`) - the value runs
   on to the longest reading's end, so no part of a secret stays: at worst the rest of its line goes with it, and
   it stops before a quoted credential key (`'token':`) so that one is redacted too. A `[REDACTED]` already
@@ -2976,10 +3013,14 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 * API keys: named ones (`api_key`, `TYPESAFE_API_KEY=`), AWS access key ids, GitHub tokens, `sk-` keys
   and Slack tokens;
 * OpenStack tokens: Keystone fernet tokens and `X-Auth-Token`/`X-Subject-Token` headers;
-* PEM blocks;
+* PEM blocks - and a block a cut fell inside, an END line with no BEGIN line before it (a console's last lines, §7.5),
+  from the text's start to that END line (review RV52-X1, PR #58 review);
 * credentials in connection strings: `scheme://user:password@host` (a password with `@` too) and
   `Password=…;`;
-* the `auth` section of a `clouds.yaml`, in YAML or JSON;
+* the `auth` section of a `clouds.yaml`, in YAML or JSON - a quoted string in a flow-style section read whole, so a
+  brace in a password neither ends the section nor keeps it open (PR #58 review); a flow-style section is looked for
+  again after the other patterns, so one a value's redaction closed, or one that held another, goes whole in the
+  same pass (review RV52-X7);
 * seamless API tokens (`smg_…`) and JWTs;
 * VM names (as `[vm]`) when `names` are given — the advisor and agentmemory give them when
   `SEAMLESS_MEMORY_REDACT_NAMES` — wherever a name stands between characters that are not letters or digits, so a
@@ -3005,7 +3046,11 @@ agents write too - redacted as they arrive, title and content, before anything c
 (§14.3, §14.4; audit AP-05).
 `redact` also writes each NUL and each lone surrogate as U+FFFD, the replacement character, so such text is kept
 wherever it goes (§11); every string of Jev's answers - its reasons (§14.4) among them -, text from an outside
-service too, passes that replacement as it arrives (§14.1).
+service too, passes that replacement as it arrives (§14.1). Before its patterns it removes each terminal escape
+character - raw, as JSON's `\u001b` at any depth or as a repr's `\x1b` - with the colour or erase-line sequence it
+starts (`ESC [ … m`, `ESC [ … K`), so a key or a value a terminal coloured is found; one right after a part of such
+an escape (`\`, `\u0`, …, `\x1`) stays, as removing it would complete another, so a second pass changes nothing
+(review RV52-X7).
 Where it cuts such text, it redacts first,
 over the cut plus 16384 characters, and cuts after (`redact_cut(text, limit)`): a secret the cut splits
 — a PEM block, a URL with credentials — is still found, at a bounded cost. The cuts: a `migration.log`
@@ -3013,8 +3058,8 @@ line at 2000 characters (§4), the failing output line in an Ansible step's erro
 SDK's error message at 500, an HTTP error body in the handover executor at 300, an agentmemory hit's content at 4000
 and its title at 200 - only the first `limit` hits of an answer are read (review RV27-06). Every pattern of `redact`
 costs time linear in the text's length - each start looks at a credential key's prefix of at most 16 parts, a URL
-scheme of at most 64 characters and a CLI flag name of at most 64, and a PEM block runs from its BEGIN line to the
-first END line after it, found once -, so a bounded text holds the event loop for a bounded time (review RV27-06).
+scheme of at most 64 characters and a CLI flag name of at most 64, and a PEM block runs from its BEGIN line, or the text's start,
+to the first END line after it, found once -, so a bounded text holds the event loop for a bounded time (review RV27-06).
 The service log too:
 the root handler's formatter (`cli.configure_logging`) passes every record through `redact` — the
 whole line in plain mode; in JSON mode the message and the exception text before they are serialized,
@@ -3692,7 +3737,9 @@ is no origin a browser sends (review RV31-03).
   unavailable only on a running plan (pause it first) and a cancelled one, as `validate_plan` refuses both — a
   completed plan, say one whose every VM rolled back over a plan setting, is validated again and then editable (§8.1,
   audit DB-01); Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
-  migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (its Findings
+  the migrations a validation re-assesses: in `pending`, `blocked` or `ready`, or one an earlier version left in
+  `validating`, never a `ready` one whose source is stopped, which it leaves as it is (§5.4, review RV52-D3) — and
+  says how many), `/migrations/:id` (its Findings
   and Estimates panels addressable as `#findings` and `#estimates`, which the page scrolls to and focuses once
   loaded, ADV-02; phase
   stepper — one row; on a phone two columns read top-down, half the height of one —, progress (the running step — named from the phase and the passes that ended: in `precopy` the full copy,
@@ -4052,7 +4099,20 @@ against PostgreSQL), `seamless-test` and `seamless-check` (the CI checks that ne
 dashboard's `node_modules`: the control plane with its coverage gate, ruff and DEMO-07, the collection, the
 scanners that are installed, the dashboard's unit tests and build; its comment, `make seamless-help` and the README
 name what it leaves out — the Playwright suite and the browser journeys, the PostgreSQL store tests, the dependency
-audits, trivy's configuration scan, the manifest and image jobs — and how to run each).
+audits, trivy's configuration scan, the manifest and image jobs — and how to run each), and `seamless-doctor`
+(`scripts/seamless-doctor.sh`, read-only: it checks the machine against what the repository pins, each pin read from
+the file that sets it — Python from `seamless/pyproject.toml`, Node.js from `dashboard/package.json`, gitleaks, ruff,
+actionlint and shellcheck from `.pre-commit-config.yaml` —, the venv with its `dev` and `collection` extras, the
+dashboard's `node_modules` against its lockfile, the pre-commit hook, and the engine and Compose by
+`seamless-check-context`, and `curl`, which their health wait needs; it installs and pulls nothing, names the fix of
+each failure for the host it runs on, and exits 1 when something `seamless-check`, the stack targets or the pre-commit
+hook need is missing or off its pin. What `seamless-check` works without — `SEAMLESS_TEST_PG_URL`, Playwright's
+Chromium, agentmemory from the host — and whether its API asks for a bearer secret, which `compose-init.sh` takes from
+`AGENTMEMORY_SECRET`: a search, read-only, says so, or whether the secret set is taken (RV52 backlog) — and, on a Linux
+machine's own engine, from a container (a cached `busybox` image looks, or the look is noted as skipped),
+`TYPESAFE_API_KEY`, and gitleaks, actionlint and shellcheck, which it skips
+when absent and runs at the machine's own version — is noted, never failed, each with its fix; no secret's value or
+URL is printed or put on a command line (PR #58 review)).
 
 Engine and context, by the host the targets run on (`SEAMLESS_HOST_OS`, from `uname -s`): on **Linux**
 `SEAMLESS_DOCKER_CONTEXT` defaults to `default`, the machine's own Docker Engine, and `DOCKER_HOST` is honoured (a

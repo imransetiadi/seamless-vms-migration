@@ -471,6 +471,18 @@ describe('what re-validation or a strategy change clears (SDD §5.4)', () => {
     expect(clearedByValidation([precopy, migration('ready')])).toBeNull();
   });
 
+  it('counts what a validation clears: never a ready migration whose source is stopped, and one left in validating (SDD §5.4, review RV52-D3)', () => {
+    // its downtime clock is open: a re-assessment could block it with no action left to restart the source, so a
+    // validation leaves it as it is, with its approvals and its cutover request
+    const stopped = migration('ready', { approvals: [approval], cutover_requested: true, downtime_started_at: '2026-10-08T11:20:00Z' });
+    expect(clearedByValidation([stopped])).toBeNull();
+    // the source ran again: the clock closed, so a validation re-assesses it
+    const restarted = { ...stopped, downtime_ended_at: '2026-10-08T11:30:00Z' };
+    // one an earlier version left in validating is re-assessed whatever its source
+    const left = migration('validating', { approvals: [approval], downtime_started_at: '2026-10-08T11:20:00Z' });
+    expect(clearedByValidation([stopped, restarted, left])).toBe('2 approvals and 1 cutover request');
+  });
+
   it('names what a strategy change clears for one migration', () => {
     expect(clearedByStrategyChange(migration('ready', { approvals: [approval], cutover_requested: true }))).toBe('1 approval and the cutover request');
     expect(clearedByStrategyChange(migration('ready', { cutover_requested: true }))).toBe('the cutover request');

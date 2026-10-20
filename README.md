@@ -2,6 +2,9 @@
 
 [![ci](https://github.com/imransetiadi/seamless-vms-migration/actions/workflows/ci.yml/badge.svg)](https://github.com/imransetiadi/seamless-vms-migration/actions/workflows/ci.yml)
 
+[Website](https://www.seamlessmigrate.org) · [Downtime calculator](https://www.seamlessmigrate.org/downtime-calculator) ·
+[Migration tools compared](https://www.seamlessmigrate.org/vmware-to-openstack-migration-tools)
+
 **Move virtual machines from Red Hat OpenStack Platform 17.1, community OpenStack or VMware vSphere into
 Red Hat OpenStack Services on OpenShift (RHOSO) 18.0 or community OpenStack 2023.1 Antelope – 2026.2 Hibiscus
 — with minutes of downtime, predictable before it starts, approved by the right people, and reversible until

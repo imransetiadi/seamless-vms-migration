@@ -1084,6 +1084,49 @@ describe('MigrationDetail', () => {
     expect(m.source_running_at).not.toBeNull();
   });
 
+  it('names the advisor decision the hold or the last validation names, whatever its time (SDD §14.6, §16, review RV52-D1)', async () => {
+    const server = createTestServer();
+    const held = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;
+    const rec = server.recommendations.find((r) => r.id === held.advisor_hold)!;
+    // an earlier validation's recommendation, approved, stored at a later time: the clock stepped back since
+    const later = (ms: number) => new Date(Date.parse(rec.created_at) + ms).toISOString();
+    server.recommendations.push({
+      ...rec,
+      id: 'rec-c10c5e0beef0',
+      created_at: later(3_600_000),
+      decision: { ...rec.decision, status: 'approved', reason_code: 'APPROVED_BY_USER', actor: { kind: 'user', id: 'nadia' }, decided_at: later(3_700_000) },
+    });
+    const route = { route: `/migrations/${held.id}`, path: '/migrations/:migrationId', token: 'viewer', server };
+    let view = renderWithApp(<MigrationDetail />, route);
+    let approvals = await screen.findByRole('region', { name: 'Approvals' });
+    await waitFor(() => expect(approvals).toHaveTextContent('Advisor decision · Migration strategy'));
+    expect(approvals).toHaveTextContent('Waits for approval (admin): approve or override it on its recommendation.');
+    expect(within(approvals).getByRole('link', { name: 'its recommendation' })).toHaveAttribute('href', `/advisor/recommendations/${rec.id}`);
+    expect(approvals).not.toHaveTextContent('Approved by nadia');
+    view.unmount();
+
+    // without a hold, the one the last validation stored
+    await createTestClient(server, 'admin').post(`/advisor/recommendations/${rec.id}/approve`, {});
+    const after = server.migrations.find((m) => m.id === held.id)!;
+    expect([after.advisor_hold, after.last_recommendation]).toEqual([null, rec.id]);
+    view = renderWithApp(<MigrationDetail />, route);
+    approvals = await screen.findByRole('region', { name: 'Approvals' });
+    await waitFor(() => expect(approvals).toHaveTextContent('Approved by rina'));
+    expect(approvals).not.toHaveTextContent('Approved by nadia');
+    view.unmount();
+  });
+
+  it('names an advisor decision whose recommendation is not on the loaded page, never leaving it out (SDD §16, PR #58 review)', async () => {
+    const server = createTestServer();
+    const held = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;
+    held.advisor_hold = 'rec-0123456789ab'; // beyond the newest the panel loads, or not found
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${held.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const approvals = await screen.findByRole('region', { name: 'Approvals' });
+    await waitFor(() => expect(approvals).toHaveTextContent('Advisor decision · Migration strategy'));
+    expect(approvals).toHaveTextContent('is not among the recommendations loaded here');
+    expect(within(approvals).getByRole('link', { name: 'see it' })).toHaveAttribute('href', '/advisor/recommendations/rec-0123456789ab');
+  });
+
   it('names the kind of every approval, the advisor decision among them (SDD §16, ADV-20)', async () => {
     const server = createTestServer();
     const held = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;

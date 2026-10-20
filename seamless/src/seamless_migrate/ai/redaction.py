@@ -16,24 +16,64 @@ REDACTED = "[REDACTED]"
 #: how far past a cut ``redact_cut`` redacts, so it still sees the end of a secret the cut splits
 CUT_MARGIN = 16384
 _KEYWORDS = (
-    r"password|passwd|pwd|pass|secret|client[_-]?secret|token|auth[_-]?token|x-auth-token|"
-    r"api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|credentials?"
+    r"password|passwd|passphrase|pwd|pass|secret|client[_-]?secret|token|auth[_-]?token|"
+    r"x-auth-token|api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|credentials?|"
+    # an Authorization header of any scheme, quoted in JSON or a repr (review RV52-X5)
+    r"authorization"
 )
+#: The words a key may end in glued to another word in any case (``adminpassword``,
+#: ``ROOTPASSWD``) - never ``pass`` or ``pwd``, which end other words (``bypass``, ``oldpwd``).
+_LONG_KEYWORDS = r"(?=[pst])(?:pass(?:word|wd|phrase)|secret|token)"
+#: Where a key's word starts inside a word, read case-sensitively: an upper-case letter after a
+#: lower-case one or a digit (``adminPass``, Nova's server password; ``accessToken``), or the last
+#: capital of an acronym (``DBPassword``) - so ``bypass`` and ``isPassive`` stay (review RV52-X7).
+_CAMEL = r"(?-i:(?=[A-Z])(?:(?<=[a-z0-9])|(?<=[A-Z])(?=.[a-z])))"
+#: The digits a key's word may end in: ``password2``, ``token_3`` (review RV52-X7).
+_KEY_DIGITS = r"(?:[_-]?+[0-9]++)?+"
 #: A credential key may carry a prefix joined by ``_``/``-``/``.`` (``OS_PASSWORD``,
-#: ``vcenter_password``, ``ansible_become_pass``, ``AWS_SECRET_ACCESS_KEY``, ``auth.password``).
-_KEY = r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_.-])*(?:" + _KEYWORDS + r")(?![A-Za-z0-9])"
+#: ``vcenter_password``, ``ansible_become_pass``, ``AWS_SECRET_ACCESS_KEY``, ``auth.password``),
+#: or joined to its word in camelCase or, for a long word, in one case (SDD §13.4, RV52-X7).
+_KEY = (
+    r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_.-])*(?:(?:[A-Za-z0-9]*?"
+    + _CAMEL
+    + r")?(?:"
+    + _KEYWORDS
+    + r")|[A-Za-z0-9]+?(?:"
+    + _LONG_KEYWORDS
+    + r"))"
+    + _KEY_DIGITS
+    + r"(?![A-Za-z0-9])"
+)
 #: The same key as a text is searched for it: each start looks at a prefix of at most 16 parts -
 #: a longer one is found from a later part, the value redacted all the same - so a run of "a."
 #: costs time linear in its length, not quadratic (SDD §13.4, review RV27-06). It starts after a
 #: character but a letter or a digit, or after JSON's escape of a line break or a tab - a key that
-#: starts a line of a command's output inside JSON (\npassword: x, review RV51-02).
+#: starts a line of a command's output inside JSON (\npassword: x, review RV51-02) -, and a word
+#: glued to another starts where camelCase starts it, a long word anywhere (review RV52-X7).
 _SCANNED_KEY = (
-    r"(?:(?<![A-Za-z0-9])|(?<=\\[ntr]))(?:[A-Za-z0-9]+[_.-]){0,16}(?:"
+    r"(?:(?:(?<![A-Za-z0-9])|(?<=\\[ntr]))(?:[A-Za-z0-9]+[_.-]){0,16}(?:"
     + _KEYWORDS
-    + r")(?![A-Za-z0-9])"
+    + r")|(?<=[A-Za-z0-9])(?-i:(?=[A-Zpst]))(?:"
+    + _CAMEL
+    + r"(?:"
+    + _KEYWORDS
+    + r")|"
+    + _LONG_KEYWORDS
+    + r"))"
+    + _KEY_DIGITS
+    + r"(?![A-Za-z0-9])"
 )
 #: A mapping key whose whole value is a credential: a credential key, or a clouds.yaml ``auth``.
 _CREDENTIAL_KEY = re.compile(r"(?i)" + _KEY + r"|auth")
+#: A terminal's escape character - raw, as JSON's \u001b at any depth or as a repr's \x1b - with
+#: the colour or erase-line sequence it starts (ESC [ ... m, ESC [ ... K): removed before the
+#: patterns run, so a key or a value a terminal coloured is found. Never right after a part of
+#: such an escape (\, \u0, ..., \x1), which the removal would complete: no escape is left, and a
+#: second pass changes nothing (SDD §13.4, review RV52-X7).
+_ESCAPE = re.compile(
+    r"(?<!\\)(?<!\\u)(?<!\\u0)(?<!\\u00)(?<!\\u001)(?<!\\x)(?<!\\x1)"
+    r"(?:\x1b|\\++(?:u001[bB]|x1[bB]))(?:\[[0-?]*+[mK])?+"
+)
 #: A PEM block's first and last lines; the block is redacted from one to the first other after it.
 _PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]+-----")
 _PEM_END = re.compile(r"-----END [A-Z0-9 ]+-----")
@@ -44,7 +84,17 @@ _PEM_END = re.compile(r"-----END [A-Z0-9 ]+-----")
 _VALUE_END = r"(?:[\s,;&})\].:\"\\>]|\Z)"
 #: A quoted credential key and its separator ('token': ...): a value read past a close it doubts
 #: stops before one, which is then redacted on its own (SDD §13.4, review RV51-03).
-_QUOTED_KEY_AHEAD = r"'(?:[A-Za-z0-9]+[_.-]){0,16}(?:" + _KEYWORDS + r")'\s*[:=]"
+_QUOTED_KEY_AHEAD = (
+    r"'(?:[A-Za-z0-9]+[_.-]){0,16}(?:(?:[A-Za-z0-9]*?"
+    + _CAMEL
+    + r")?(?:"
+    + _KEYWORDS
+    + r")|[A-Za-z0-9]+?(?:"
+    + _LONG_KEYWORDS
+    + r"))"
+    + _KEY_DIGITS
+    + r"'\s*[:=]"
+)
 #: A single-quoted string on one line with no backslash before a quote: every quoting agrees on
 #: its close - a Python repr, YAML ('' a quote), the shell, any of them inside JSON strings.
 _SQ_CLEAN = r"'(?:[^'\\\n]|\\++(?!')|'')*+'"
@@ -57,6 +107,25 @@ _SQ_PART = r"(?:(?!" + _QUOTED_KEY_AHEAD + r")'[^'\n]*+')?"
 _SQ_WORD = (
     r"(?:(?:\\++'|\\*+\"'\\*+\")" + _SQ_PART + r"|[^\s'\"\\,;&|<>(){}\[\]:.]++" + _SQ_PART + r")*+"
 )
+#: What is glued to a closed double-quoted value, at the top or inside JSON strings: characters of
+#: no shell or JSON syntax ("a"b is one word). Never a quoted part: a value that ends a JSON or a
+#: repr list's item would take that item's closing quote and the next one's opening quote for one,
+#: and the next key and its secret with them (SDD §13.4, review RV52-X6, PR #58 review).
+_GLUED = r"[^\s'\"\\,;&|<>(){}\[\]:.]*+"
+
+
+def _word(stops: str) -> str:
+    r"""One character of a word that ends at white space or a character of ``stops`` and runs no
+    further than a JSON-escaped line break (\n, \r in a JSON string): the next line's key, flag
+    or quoted key is then redacted on its own. A word that runs on in letters and digits to its
+    end or to a backslash before one (C:\new\root) keeps it; that look reads up to the next
+    backslash, so a text costs time linear in its length (SDD §13.4, PR #58 review)."""
+    return (
+        rf"(?:[^\s\\{stops}]|\\(?:(?![nr])"
+        rf"|(?=[nr][A-Za-z0-9]*+(?:[\s{stops}]|\Z|\\[A-Za-z0-9]))))"
+    )
+
+
 #: Where a string inside JSON strings closes: the backslashes that opened it before a quote, after
 #: any number of the 2E + 2 each of its own backslashes became (E the opening's backslashes); a
 #: quote of its own has 2E + 1 before it.
@@ -64,10 +133,16 @@ _ESCAPED_CLOSE = r"(?:(?P=escape){2}\\\\)*+(?P=escape)\""
 
 
 def _auth_block(match: re.Match[str]) -> str:
-    end = "\n" if match.group(0).endswith("\n") else ""
+    """The auth section's lines as one, ending in the line break its last one ended in: LF or
+    CRLF (review RV52-X4)."""
+    block = match.group(0)
+    end = next((e for e in ("\r\n", "\n") if block.endswith(e)), "")
     return f"{match.group(1)}auth: {REDACTED}{end}"
 
 
+#: One parameter of an Authorization header's scheme: key=value, the value a quoted string - at the
+#: top, or inside a JSON string at its escape - or a word with no comma, quote or white space.
+_HEADER_PARAM = r"[\w-]+=(?:\"(?:[^\"\\\n]|\\.)*+\"|\\\"(?:[^\"\\\n]|\\[^\"])*+\\\"|[^\s,\"'\\]+)"
 #: a dotted chain of base64url runs, each run read once (possessive): where JWTs are looked for
 _BASE64URL_CHAIN = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]++(?:\.[A-Za-z0-9_-]++)*+")
 
@@ -101,15 +176,39 @@ def _redact_jwts(match: re.Match[str]) -> str:
     return ".".join(out)
 
 
+#: The auth section of a clouds.yaml in JSON or YAML flow style ("auth": {...}): a quoted string
+#: in it is read whole, so a brace in a password neither ends the section nor keeps it open (PR #58
+#: review). Looked for again after the other patterns: a section a value's redaction closed - its
+#: inner key's value ran to the section's brace - or one that held another goes whole in the same
+#: pass, so a second pass changes nothing (SDD §13.4, review RV52-X7).
+_AUTH_FLOW = re.compile(
+    r"(?i)(?<![\w.-])([\"']?auth[\"']?\s*:\s*)"
+    r"\{(?:[^{}\"'\n]|\"(?:[^\"\\\n]|\\.)*+\"|'(?:[^'\n]|'')*+')*+\}"
+)
+
 _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
-    # the auth section of a clouds.yaml: block style (every line indented under "auth:") ...
-    (re.compile(r"(?m)^([ \t]*)auth:[ \t]*\n(?:\1[ \t]+\S[^\n]*(?:\n|$))+"), _auth_block),
+    # the auth section of a clouds.yaml: block style (every line indented under "auth:", a
+    # comment after it, LF or CRLF line breaks) ...
+    (
+        re.compile(r"(?m)^([ \t]*)auth:[ \t]*(?:#[^\n]*)?\r?\n(?:\1[ \t]+\S[^\n]*(?:\n|$))+"),
+        _auth_block,
+    ),
     # ... and JSON or YAML flow style ("auth": {...})
-    (re.compile(r"(?i)(?<![\w.-])([\"']?auth[\"']?\s*:\s*)\{[^{}]*\}"), r"\1" + REDACTED),
+    (_AUTH_FLOW, r"\1" + REDACTED),
     # credentials in URLs and connection strings: scheme://user:pass@host (a pass with "@" too)
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]{0,63}://)[^\s/@:]+:[^\s/]*@"), r"\1[REDACTED]@"),
-    # Authorization headers (any scheme)
-    (re.compile(r"(?i)\b(authorization)\s*[:=]\s*(?:\w+\s+)?[^\s,;'\"]+"), r"\1: " + REDACTED),
+    # Authorization headers (any scheme); a [REDACTED] an earlier pass wrote is left as it is, so
+    # a second pass changes nothing (review RV52-X5)
+    (
+        re.compile(
+            r"(?i)\b(authorization)\s*[:=]\s*(?:[\w-]+\s+)?+(?!\[REDACTED\](?![A-Za-z0-9]))"
+            # a scheme's parameters - Digest's response, AWS4's Signature -, key=value pairs apart
+            # by commas, a value quoted (in a JSON string at its escape) or a word (PR #58 review)
+            r"(?:" + _HEADER_PARAM + r"(?:\s*,\s*" + _HEADER_PARAM + r")*+"
+            r"|" + _word(",;'\"") + "+)"
+        ),
+        r"\1: " + REDACTED,
+    ),
     # bare bearer tokens
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer " + REDACTED),
     # key=value / key: value / "key": "value" (the key possibly prefixed, e.g. OS_PASSWORD), which
@@ -124,10 +223,16 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     (
         re.compile(
             r"(?i)((?:(?<!\\)\\*+[\"'])?" + _SCANNED_KEY + r"(?:\\*+[\"'])?\s*[:=]\s*)"
-            r"(\"(?:[^\"\\]|\\.)*+\""  # a JSON or a shell string
+            # a JSON or a shell string, and what the shell glues to it
+            r"(\"(?:[^\"\\]|\\.)*+\""
+            + _GLUED
+            +
             # a single-quoted string on one line whose close every quoting agrees on, and what the
             # shell glues to it
-            r"|" + _SQ_CLEAN + _SQ_WORD +
+            r"|"
+            + _SQ_CLEAN
+            + _SQ_WORD
+            +
             # one with a backslash before a quote - an escaped quote in a repr (\', inside JSON
             # \\'), a close in YAML or the shell ('C:\', YAML's \''): the value runs on, the longer
             # reading, over the shell's quotes to a close a value end follows, or to its line's end,
@@ -136,12 +241,28 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
             r"(?:\\*+\"'\\*+\"'?+|[^'\\\n]|\\++(?:''?+)?+|''|'(?=\\++')"
             r"|(?!" + _QUOTED_KEY_AHEAD + r")'(?!" + _VALUE_END + r"))*+"
             r"(?:(?=" + _QUOTED_KEY_AHEAD + r")|'|(?=\n)|\Z)"
-            r"|'(?:[^']|'')*+'"  # a YAML single-quoted string over lines
+            # a YAML single-quoted string over lines, and what the shell glues to it: its [REDACTED]
+            # never stands glued to the word after it (review RV52-X6)
+            r"|'(?:[^']|'')*+'"
+            + _SQ_WORD
+            +
             # a string inside JSON strings, to its close, a bare quote or its line's end
-            r"|(?P<escape>\\++)\"(?:[^\"\\\n]|(?!" + _ESCAPED_CLOSE + r")\\++\"?)*+"
-            r"(?:" + _ESCAPED_CLOSE + r"|(?=[\n\"])|\Z)"
+            r"|(?P<escape>\\++)\"(?:[^\"\\\n]|(?!"
+            + _ESCAPED_CLOSE
+            + r")\\++\"?)*+"
+            r"(?:" + _ESCAPED_CLOSE + _GLUED + r"|(?=[\n\"])|\Z)"
             # a [REDACTED] an earlier pass wrote is left as it is: a second pass changes nothing
-            r"|\[REDACTED\](?![A-Za-z0-9])|[^\s,;&}]+)"
+            r"|\[REDACTED\](?![A-Za-z0-9])"
+            # a YAML plain value of several words runs to its line's end, a comment or its
+            # string's: every word of a password (review RV52-X4); a shell word (key=value) and
+            # a header's value ("X-Auth-Token: x" url) end at a space. No word of it holds "=" or
+            # a backslash, starts with "-" or ends in ": ": a later key=, --flag or key: ends the
+            # reading, and that key is redacted on its own; each value is read once
+            r"|(?<=:[ \t])[^\s,;&}\"'\\=]++"
+            r"(?:[ \t]++(?![#-])(?:[^\s,;&}\\\"'=:]|:(?![\s\\]|\Z))++)++"
+            r"(?=[ \t]*+(?:#|\r?\n|\\[nr]|[\"']|\Z))"
+            # one word, no further than a JSON-escaped line break (PR #58 review)
+            r"|" + _word(",;&}") + r"+)"
         ),
         r"\1" + REDACTED,
     ),
@@ -150,11 +271,24 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     # but a dash, so also after the "n" of a line break Ansible's JSON prints as backslash-n, or
     # glued to a word -, a text costing time linear in its length (SDD §13.4, reviews RV27-06,
     # RV31-02, RV32B-01); --password=hunter2 is the key=value form above, and -p hunter2 too
-    # ambiguous
+    # ambiguous. The value is a quoted string whole, or an argv list's next item - JSON's, a
+    # repr's (CalledProcessError), inside JSON strings - to the quote that opened it, at that
+    # escape (review RV52-X3)
     (
         re.compile(
             r"(?i)(?<!-)(--[A-Za-z0-9-]{1,64}+"
-            r"(?:(?<=password)|(?<=passwd)|(?<=secret)|(?<=token)|(?<=key))\s+)(\S+)"
+            r"(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=secret)|(?<=token)|(?<=key))"
+            r"(?:\s+|(?P<argesc>\\{0,7}+)[\"']\s*,\s*(?P=argesc)(?P<argq>[\"'])))"
+            r"((?(argq)(?:(?!(?P=argesc)(?P=argq))(?:\\.|[^\n]))*+"
+            # a value that opens a quote: the quoted string and the rest of its word, one that
+            # never closes to its line's end; else one word. A quote further in is read as part
+            # of the word: as a quoted part, a list item's closing quote and the next one's
+            # opening quote would join two items (review RV52-X3, PR #58 review)
+            r"|(?:(?:\"(?:[^\"\\\n]|\\.?)*+(?:\"|(?=\n)|\Z)|'[^'\n]*+(?:'|(?=\n)|\Z))"
+            + _word("")
+            + r"*+|"
+            + _word("")
+            + r"+)))"
         ),
         r"\1" + REDACTED,
     ),
@@ -173,10 +307,16 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
 
 def _redact_pem(text: str) -> str:
     """Each PEM block (a key, a certificate) - its BEGIN line to the first END line after it -
-    replaced. No END line after a BEGIN line means none after a later one either, so each END
-    line is looked for once: time linear in the text (SDD §13.4, review RV27-06)."""
+    replaced, and an END line no BEGIN line comes before - a block a cut fell inside, a console's
+    last lines (SDD §7.5) - with the whole text before it. No END line after a BEGIN line means
+    none after a later one either, so each END line is looked for once: time linear in the text
+    (SDD §13.4, reviews RV27-06, RV52-X1, PR #58 review)."""
     out: list[str] = []
     pos = 0
+    first_end = _PEM_END.search(text)
+    if first_end is not None and _PEM_BEGIN.search(text, 0, first_end.start()) is None:
+        out.append("[REDACTED PEM]")
+        pos = first_end.end()
     while (begin := _PEM_BEGIN.search(text, pos)) is not None:
         end = _PEM_END.search(text, begin.end())
         if end is None:
@@ -188,10 +328,14 @@ def _redact_pem(text: str) -> str:
 
 def redact(text: str, redact_names: Sequence[str] | None = None) -> str:
     """Remove secrets (and optionally VM names) before text leaves the control plane; a NUL or a
-    lone surrogate is written U+FFFD (SDD §13.4)."""
-    out = _redact_pem(replace_unstorable(str(text)))
+    lone surrogate is written U+FFFD, and a terminal's escape character removed (SDD §13.4)."""
+    out = replace_unstorable(str(text))
+    if "\x1b" in out or "\\u001" in out or "\\x1" in out:
+        out = _ESCAPE.sub("", out)
+    out = _redact_pem(out)
     for pattern, replacement in _PATTERNS:
         out = pattern.sub(replacement, out)
+    out = _AUTH_FLOW.sub(r"\1" + REDACTED, out)
     return replace_names(out, {name: "[vm]" for name in redact_names or []})
 
 

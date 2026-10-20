@@ -282,8 +282,9 @@ async def update_provider(
 async def _store_secret(
     request: Request, name: str, values: dict[str, str], provider_id: str
 ) -> None:
-    store = secret_store(services(request).settings)
     try:
+        # a store that cannot be built (no ServiceAccount) is unavailable too (review RV52-X2)
+        store = secret_store(services(request).settings)
         await asyncio.to_thread(store.write, name, values, {"seamless.io/provider": provider_id})
     except SecretStoreError as exc:
         raise ApiError(503, "unavailable", f"secret store: {exc}") from None
@@ -307,8 +308,8 @@ async def _record_secret(
         try:
             provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
         except NotFound:
-            store = secret_store(svc.settings)
             try:
+                store = secret_store(svc.settings)
                 await asyncio.to_thread(store.delete, name)
             except SecretStoreError:
                 log.warning("secret %s of a deleted provider could not be removed", name)
@@ -460,12 +461,12 @@ async def delete_provider(
     if forget is not None:
         forget(provider_id)
     # the secrets the store manages for this provider go with it (SDD §13.3); each one is tried,
-    # and the deletion is audited whatever the store answers, naming what it left (audit AA-03)
-    store = secret_store(svc.settings)
+    # and the deletion is audited whatever the store answers, naming what it left (audit AA-03) -
+    # a store that cannot be built leaves both (review RV52-X2)
     left: list[str] = []
     for name in (credentials_secret_name(provider_id), conversion_key_secret_name(provider_id)):
         try:
-            await asyncio.to_thread(store.delete, name)
+            await asyncio.to_thread(secret_store(svc.settings).delete, name)
         except SecretStoreError as exc:
             left.append(name)
             log.warning("could not delete secret %s of provider %s: %s", name, provider_id, exc)

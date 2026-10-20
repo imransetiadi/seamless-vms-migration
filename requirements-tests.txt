@@ -1,5 +1,5 @@
 # Modified by the Seamless Migrate project, 2026.
-ansible-lint>=24.0.0
-pytest==8.4.0
+ansible-lint>=26.10.1
+pytest==9.1.1
 pytest-mock==3.14.1
 pytest-xdist==3.7.0

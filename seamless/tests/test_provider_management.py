@@ -16,6 +16,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from seamless_migrate.api import routes_providers
 from seamless_migrate.api.app import create_app
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import PlanStatus, Role
@@ -599,6 +600,56 @@ def test_a_provider_deletion_the_store_cannot_finish_is_audited_naming_what_it_l
         "provider_id": "vc-dc2",
         "secrets_left": ["provider-vc-dc2", "provider-vc-dc2-ssh"],
     }
+
+
+def _unbuildable_store(settings):
+    """A Kubernetes store without its ServiceAccount: it cannot be built (SDD §13.3)."""
+    raise SecretStoreError("no ServiceAccount namespace at /var/run/secrets/kubernetes.io")
+
+
+@pytest.mark.parametrize("failure", ["unsearchable_root", "unbuildable_store"])
+def test_a_provider_deletion_whose_store_cannot_be_searched_or_built_is_audited_naming_what_it_left(
+    api, monkeypatch, failure
+):
+    """SDD §12, §13.3 (review RV52-X2): a root the process may not search (mode 000, a changed
+    UID) raised PermissionError from the store's "already gone?" check, outside its guard, and a
+    store that could not be built raised before the guarded loop - either way 500 after the
+    provider was gone, no provider.deleted, and the secrets left unnamed."""
+    assert api.post("/api/v1/providers", json=VCENTER).status_code == 201
+    put(api, "/api/v1/providers/vc-dc2/credentials", {"username": "u", "password": "p"})
+    put(api, "/api/v1/providers/vc-dc2/conversion-key", {"private_key": KEY})
+    root = api.settings.secrets_dir
+    if failure == "unbuildable_store":
+        monkeypatch.setattr(routes_providers, "secret_store", _unbuildable_store)
+    elif os.geteuid() == 0:
+        pytest.skip("root searches a directory of mode 000")
+    else:
+        os.chmod(root, 0o000)
+    try:
+        res = api.client.delete("/api/v1/providers/vc-dc2", headers=api.h(Role.admin))
+    finally:
+        os.chmod(root, 0o700)
+    assert res.status_code == 204, res.text
+    assert api.get("/api/v1/providers/vc-dc2").status_code == 404
+    [deleted] = [e for e in api.store.events() if e.kind == "provider.deleted"]
+    assert deleted.data == {
+        "provider_id": "vc-dc2",
+        "secrets_left": ["provider-vc-dc2", "provider-vc-dc2-ssh"],
+    }
+
+
+def test_a_secret_store_that_cannot_be_built_answers_503_to_a_credentials_write(api, monkeypatch):
+    """SDD §13.3 (review RV52-X2): a store the control plane cannot build is unavailable, as one
+    it cannot write - 503, never a 500."""
+    assert api.post("/api/v1/providers", json=VCENTER).status_code == 201
+    monkeypatch.setattr(routes_providers, "secret_store", _unbuildable_store)
+    res = api.client.put(
+        "/api/v1/providers/vc-dc2/credentials",
+        json={"username": "u", "password": "p"},
+        headers=api.h(Role.admin),
+    )
+    assert res.status_code == 503, res.text
+    assert "ServiceAccount" in res.json()["error"]["message"]
 
 
 def test_an_unwritable_store_answers_503(tmp_path):

@@ -1,3 +1,4 @@
+import { availableParallelism } from 'node:os';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vitest/config';
 
@@ -60,8 +61,10 @@ export default defineConfig({
     // jsdom integration tests (mock API + SSE) take 1-5 s each; on a developer machine shared with other work
     // (load averages of 16-100 measured) they slowed past 15 s and timed out. Four workers keep the suite from
     // starving itself, and 30 s still catches a test that hangs; CI runs on a dedicated runner: default workers.
+    // On a machine of four cores or fewer one is left to the main process: four workers on a 4 vCPU VM pushed the
+    // Plans dialog tests (12-15 s alone) past 30 s.
     testTimeout: 30_000,
-    maxWorkers: process.env.CI ? undefined : 4,
+    maxWorkers: process.env.CI ? undefined : Math.max(1, Math.min(4, availableParallelism() - 1)),
     // Deterministic wall-clock formatting in tests.
     env: { TZ: 'UTC' },
   },

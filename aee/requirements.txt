@@ -8,4 +8,4 @@
 # version. Revert to an upstream version pin once the fix ships in a release.
 openstacksdk @ git+https://github.com/os-migrate/openstacksdk.git@4.5.1
 PyYAML==6.0.2
-jmespath>=1.0.0
+jmespath>=1.1.0

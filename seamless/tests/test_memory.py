@@ -221,6 +221,44 @@ def test_memory_hits_are_redacted_where_they_enter():
         "password: 'a'x " * 2340,
         "password: 'a\n" * 2730,
         "".join("password: " + "\\" * depth + '"a ' for depth in range(1, 220)),
+        # YAML plain values of several words that never reach their line's end, an argv list's
+        # flags whose value never closes, a JSON-escaped auth section's lines (RV52-X3, RV52-X4)
+        "token: a " * 3640 + ",",
+        "--os-password', '" * 1820,
+        '"auth:\\n' + "   p: q\\n" * 3270,
+        # what the shell glues to a double-quoted value: parts that never close, and a chain of
+        # them, at the top and inside JSON strings (RV52-X6)
+        'password="a""' + "x" * 32768,
+        'password="a"" ' * 2340,
+        'password="a"' + '"b"' * 8190,
+        '{"m": "password=\\"a\\"' + '\\"b\\"' * 5460 + '"}',
+        # a CLI flag's shell word: an unclosed quote before a run of escaped ones, and quoted
+        # parts (RV52-X3)
+        '--os-password "' + '\\"' * 16384,
+        "--os-password " + "'a'\"b\"" * 5460,
+        # an Authorization header after markers, an auth section with a comment and CRLF, what
+        # is glued to a single-quoted value on one line or over several (RV52-X4 to RV52-X6)
+        "Authorization: [REDACTED]x " * 1200,
+        "auth: # c\r\n" + "   p: q\r\n" * 3640,
+        "password='a'" + '"b"' * 10920,
+        "password: '\nx'" + "y" * 32768,
+        ("password: '\n" + "x " * 4) * 1560,
+        # flow-style auth sections nested inside each other, and ones that never close (RV52-X6)
+        "auth: {" * 4096 + "x" + "}" * 4096,
+        "auth:{" * 5460,
+        # a camelCase start every other character, a long word glued anywhere, a key's digits,
+        # and a quoted camelCase key looked for at every quote of a value (RV52-X7)
+        "aB" * 16384,
+        "aBc." * 8192,
+        "xpasswordx" * 3276,
+        "password" + "1" * 32768,
+        "password: 'a\\'" + "'aBcPassx" * 3640,
+        # escape characters: colour sequences that never end, parts of escapes, a run of
+        # backslashes before an escaped one (RV52-X7)
+        "\x1b[" + "0" * 32768,
+        "\x1b[0" * 10922,
+        "\\u001" * 6553,
+        "\\" * 32767 + "u001b[0m",
     ],
     ids=[
         "key prefix",
@@ -236,6 +274,31 @@ def test_memory_hits_are_redacted_where_they_enter():
         "glued single-quoted closes",
         "single-quoted values over lines",
         "deeper and deeper escapes",
+        "plain values to no line end",
+        "argv flags never closed",
+        "json auth section lines",
+        "glued quote never closed",
+        "glued quotes never closed",
+        "glued quoted parts",
+        "glued escaped parts",
+        "flag quote never closed",
+        "flag quoted parts",
+        "header after markers",
+        "auth section crlf comment",
+        "glued quote after quote",
+        "glued after lines",
+        "values over lines",
+        "auth sections nested",
+        "auth sections never closed",
+        "camel starts",
+        "camel parts",
+        "long words glued",
+        "key digits",
+        "quoted camel keys",
+        "colour never ends",
+        "colours never end",
+        "escape parts",
+        "backslashes before an escape",
     ],
 )
 def test_redact_costs_time_linear_in_the_text(text):
@@ -262,6 +325,9 @@ def test_redact_costs_time_linear_in_the_text(text):
         "-",
         "ab.",
         "\\",
+        "aB",
+        "\x1b[0",
+        "\\u001",
     ],
     ids=[
         "jwt starts",
@@ -274,6 +340,9 @@ def test_redact_costs_time_linear_in_the_text(text):
         "dash line",
         "dotted words",
         "backslashes",
+        "camel starts",
+        "colours never end",
+        "escape parts",
     ],
 )
 def test_four_times_the_text_costs_redact_about_four_times_the_time(unit):

@@ -204,6 +204,21 @@ export function pyTooLong(text: string, max: number): string | null {
 }
 
 /**
+ * A float as the API's messages print it, Python's `repr`: the shortest digits that read back, as JavaScript's, written
+ * out from 1e-4 to below 1e16 - a whole number with ".0" - and otherwise with an exponent of at least two digits.
+ */
+export function pyFloat(value: number): string {
+  if (Number.isNaN(value)) return 'nan';
+  if (!Number.isFinite(value)) return value > 0 ? 'inf' : '-inf';
+  if (value === 0) return Object.is(value, -0) ? '-0.0' : '0.0';
+  const [digits, exponent] = value.toExponential().split('e') as [string, string];
+  const power = Number(exponent);
+  if (power < -4 || power >= 16) return `${digits}e${power < 0 ? '-' : '+'}${String(Math.abs(power)).padStart(2, '0')}`;
+  const plain = value.toFixed(Math.max(0, (digits.split('.')[1]?.length ?? 0) - power));
+  return plain.includes('.') ? plain : `${plain}.0`;
+}
+
+/**
  * A name quoted as the API's messages quote it, Python's `repr` of a str: in single quotes, in double quotes when it
  * holds a single quote and no double one, with backslashes escaped and what Python does not print written as an escape.
  */

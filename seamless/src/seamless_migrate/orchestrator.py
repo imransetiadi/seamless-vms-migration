@@ -132,6 +132,8 @@ log = logging.getLogger(__name__)
 P = Phase
 
 PROGRESS_MIN_INTERVAL_S = 1.0
+#: how long a plan with work in flight waits before a failed pre-staging is tried again (SDD §8)
+PRESTAGE_RETRY_S = 60.0
 #: a migration.log line is cut to this many characters, after redaction (SDD §4)
 LOG_LINE_CHARS = 2000
 APPROVABLE = frozenset(
@@ -402,6 +404,15 @@ def _named_twice(migrations: Iterable[Migration]) -> str | None:
     return f"two migrations of one VM would both cut it over: {named}; cancel all but one first"
 
 
+def _lock_busy(lock: asyncio.Lock) -> bool:
+    """Whether taking ``lock`` would wait: it is held, or a task waits for it - a released lock
+    goes to its first waiter, and acquire() queues behind that one. A free lock no task waits for
+    is taken without yielding, so a check then an acquire is one step of the event loop (SDD §8,
+    review RV52-O1, PR #58 review)."""
+    waiters = getattr(lock, "_waiters", None)  # asyncio.Lock's queue: 3.11 to 3.13 keep it here
+    return lock.locked() or any(not w.cancelled() for w in waiters or ())
+
+
 def _assessment(m: Migration) -> tuple[str, datetime | None, bool]:
     """What a pre-staging covers of ``m`` (SDD §8, reviews RV51-17, RV51-19): its last move to
     validating - the VM that validation read, the flavor and keypair it promised pre-staged - and
@@ -562,6 +573,11 @@ class Orchestrator:
         self._steps: dict[str, asyncio.Task[Any]] = {}
         #: per plan, the assessments its pre-stagings in this process covered (SDD §8)
         self._prestage_done: dict[str, set[tuple[str, datetime | None, bool]]] = {}
+        #: when a plan whose pre-staging failed with work in flight is pre-staged again (monotonic)
+        self._prestage_retry_at: dict[str, float] = {}
+        #: the migrations a retry is writing, from its first lock to its own reopen of the plan:
+        #: the tick's reopen leaves their plans to it (SDD §5.1, §8, PR #58 CI)
+        self._retrying: Counter[str] = Counter()
         self._prestage_tasks: dict[str, asyncio.Task[None]] = {}
         #: best-effort rollback of the data path after a cancel in precopy/syncing (SDD §7.2)
         self._cleanups: dict[str, asyncio.Task[None]] = {}
@@ -1538,6 +1554,7 @@ class Orchestrator:
         """Retire a plan none of whose migrations started (SDD §12): each is cancelled as
         :meth:`cancel` does, then the plan becomes ``cancelled``. Nothing is deleted (§11): its
         VMs are free for another plan and its providers for deletion; its history stays."""
+        reason = _text(reason)  # as Python's strip leaves it (SDD §12, review RV52-S3)
         async with self._lock(f"plan:{plan_id}"):  # SDD §8: no validation, start or step meanwhile
             plan = await self._plan(plan_id)
             if plan.status == PlanStatus.cancelled:
@@ -1764,6 +1781,17 @@ class Orchestrator:
         return m
 
     async def retry(self, mid: str, actor: str) -> Migration:
+        # marked from its first lock to its own reopen: releasing the claims awaits the
+        # database, so a tick could otherwise reopen the plan in between, as "system"
+        self._retrying[mid] += 1
+        try:
+            return await self._retry(mid, actor)
+        finally:
+            self._retrying[mid] -= 1
+            if not self._retrying[mid]:
+                del self._retrying[mid]
+
+    async def _retry(self, mid: str, actor: str) -> Migration:
         # the provider check and the save of ready share the deletions' lock (SDD §12): a ready
         # migration holds its VM, so a deletion after it refuses and one before it is seen here
         async with self._claims(), self._lock(mid), self._lock(PROVIDERS):
@@ -1850,14 +1878,15 @@ class Orchestrator:
                 m.downtime_ended_at = None
                 m.actual_downtime_s = None
                 m.downtime_model_s = None
+
+            def retried(new: Migration) -> tuple[list[tuple[str, Any, int]], list[Event]]:
+                # the attempts of the migration as transitioned - the FSM counts failed -> ready
+                # itself -, so the action names what is stored (SDD §5.1, review RV52-O6)
+                data = {"action": "retry", "attempts": new.attempts}
+                return _action(f"retry of {new.vm.name}", actor, data)(new)
+
             m, v = await self._transitions(
-                m,
-                v,
-                [(P.ready, f"retry requested by {actor}", None)],
-                actor,
-                also=_action(
-                    f"retry of {m.vm.name}", actor, {"action": "retry", "attempts": m.attempts}
-                ),
+                m, v, [(P.ready, f"retry requested by {actor}", None)], actor, also=retried
             )
         # SDD §5.1/§8: a completed plan is driven no more, so the new attempt reopens it - under
         # the plan's lock, taken only now: held across the claim wait above, it would hold up the
@@ -2630,7 +2659,6 @@ class Orchestrator:
             return
         self._stopping = False
         self._wake = asyncio.Event()
-        running = {p.id for p in await self.db.list("plan", Plan) if p.status == PlanStatus.running}
         migrations = await self.db.list("migration", Migration)
         for m in migrations:
             if m.phase in fsm.RESUMABLE_PHASES:
@@ -2640,17 +2668,8 @@ class Orchestrator:
                 self._cleanups[m.id] = asyncio.create_task(
                     self._cleanup_after_cancel(m, None, "system"), name=f"cleanup:{m.id}"
                 )
-        # work started: a running plan was pre-staged for its migrations' assessments; any other
-        # is pre-staged again when it next runs with a ready migration (SDD §8)
-        started = {
-            m.plan_id
-            for m in migrations
-            if m.plan_id in running
-            and any(c.to_phase in (P.precopy, P.cutover) for c in m.phase_history)
-        }
-        for m in migrations:
-            if m.plan_id in started:
-                self._prestage_done.setdefault(m.plan_id, set()).add(_assessment(m))
+        # nothing counts as pre-staged after a restart: a plan is pre-staged again before its next
+        # ready migration starts (SDD §8, review RV52-O2)
         self._tick_task = asyncio.create_task(self._loop(), name="seamless-orchestrator")
         self._started = True
 
@@ -2755,7 +2774,24 @@ class Orchestrator:
             # ready there: reopened, or it would wait for good (SDD §8, review RV51-14)
             phases = await self.db.plan_phases(completed)
             for plan_id in sorted(p for p, counts in phases.items() if counts.get(P.ready)):
+                if _lock_busy(self.plan_lock(plan_id)):
+                    # a validation or an edit holds or waits for it: a later tick reopens it,
+                    # never this one waiting while every plan's gates stall (SDD §8, review
+                    # RV52-O1, PR #58 review)
+                    continue
                 try:
+                    ready = [
+                        m.id
+                        for m in await self.db.list("migration", Migration, plan_id=plan_id)
+                        if m.phase == P.ready
+                    ]
+                    if _lock_busy(self.plan_lock(plan_id)) or any(
+                        self._retrying[mid] or _lock_busy(self._lock(mid)) for mid in ready
+                    ):
+                        # a retry is still writing its migration: its own reopen names its actor
+                        # (SDD §5.1, §8, PR #58 CI); a later tick reopens it if a store error
+                        # kept that from it
+                        continue
                     await self._reopen_completed(plan_id, "system", "a migration waits in ready")
                 except Exception:
                     log.exception("the reopen of plan %s failed", plan_id)
@@ -2797,13 +2833,19 @@ class Orchestrator:
         if not migs:
             return
         covered = self._prestage_done.get(plan.id)
-        if covered is None or any(
-            _assessment(m) not in covered for m in migs if m.phase == P.ready
-        ):
-            # a migration assessed since the last pre-staging - a VM added, validated again or
-            # given a strategy that needs a conversion host - waits for one (SDD §8)
-            self._ensure_prestage(plan, migs)
-            return
+        uncovered = {
+            m.id
+            for m in migs
+            if m.phase == P.ready and (covered is None or _assessment(m) not in covered)
+        }
+        if uncovered:
+            # a ready migration no pre-staging covered - the plan's first, a VM added, validated
+            # again or given a strategy that needs a conversion host - waits for one; a plan with
+            # nothing ready is not pre-staged (SDD §8, review RV52-O3). Only the uncovered ones
+            # wait: the plan's gates and passes go on meanwhile (PR #58 review)
+            if time.monotonic() >= self._prestage_retry_at.get(plan.id, 0.0):
+                self._ensure_prestage(plan, migs)
+            migs = [m for m in migs if m.id not in uncovered]
         # two migrations of one VM, as an earlier version left a running plan: neither starts
         # (SDD §5.4, review RV51-18)
         twice = _vms_named_twice(migs)
@@ -2876,14 +2918,18 @@ class Orchestrator:
                 counts["steps"] += 1
                 in_flight[m.wave_id] += 1
 
-        # 4. plan completion
-        if all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
+        # 4. plan completion (an uncovered ready migration is not complete either)
+        if not uncovered and all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
             await self._complete(plan)
 
     async def _complete(self, plan: Plan) -> None:
         # SDD §8: under the plan's lock, on the migrations re-read there — a retry that returned
-        # after the tick's snapshot keeps the plan running (SDD §5.1)
-        async with self._lock(f"plan:{plan.id}"):
+        # after the tick's snapshot keeps the plan running (SDD §5.1); one held or waited for is
+        # left to a later tick, which never waits for a lock (PR #58 review)
+        lock = self._lock(f"plan:{plan.id}")
+        if _lock_busy(lock):
+            return
+        async with lock:
             migs = await self.db.list("migration", Migration, plan_id=plan.id)
             if not all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
                 return
@@ -2910,8 +2956,13 @@ class Orchestrator:
     async def _begin(self, mid: str, allowed: set[Phase], to: Phase, reason: str) -> bool:
         plan_id = (await self._load(mid))[0].plan_id
         # SDD §8: under the plan's lock (then the migration's, the documented order), so a pause
-        # that returned starts nothing the tick chose on its snapshot
-        async with self._lock(f"plan:{plan_id}"), self._lock(mid):
+        # that returned starts nothing the tick chose on its snapshot. A lock held or waited for
+        # - a pause, a validation, a person's action - leaves the step to a later tick, which
+        # never waits for one: every other plan would stall (PR #58 review)
+        plan_lock, mig_lock = self._lock(f"plan:{plan_id}"), self._lock(mid)
+        if _lock_busy(plan_lock) or _lock_busy(mig_lock):
+            return False
+        async with plan_lock, mig_lock:
             if (await self._plan(plan_id)).status != PlanStatus.running:
                 return False
             m, v = await self._load(mid)
@@ -2925,6 +2976,11 @@ class Orchestrator:
             if to == P.precopy and m.strategy not in WARM_STRATEGIES:
                 return False
             if to == P.cutover and m.phase == P.ready and m.strategy not in SINGLE_SHOT_STRATEGIES:
+                return False
+            if m.phase == P.ready and _assessment(m) not in self._prestage_done.get(plan_id, ()):
+                # assessed anew since the tick's snapshot (set_strategy): the tick pre-stages it
+                # first, so no cutover starts without its conversion host (SDD §8, RV52-O4)
+                self.wake()
                 return False
             if to == P.cutover and not self._gate(m, await self._plan(m.plan_id), self._now()):
                 # the tick saw the gate open on its snapshot; an action under this lock (e.g.
@@ -2999,6 +3055,7 @@ class Orchestrator:
                 await executor.prestage(plan, source, destination, **kwargs)
             # what it read when it began: a migration assessed meanwhile waits for the next one
             self._prestage_done.setdefault(plan.id, set()).update(_assessment(m) for m in migs)
+            self._prestage_retry_at.pop(plan.id, None)
             await self._emit(
                 "plan.updated",
                 f"{plan.name}: resources pre-staged",
@@ -3011,10 +3068,12 @@ class Orchestrator:
         except Exception as exc:
             log.exception("prestage of %s failed", plan.id)
             failed = False
+            in_flight = False
 
             def fail(fresh: Plan) -> bool:
                 nonlocal failed
-                failed = fresh.status == PlanStatus.running  # re-evaluated on every retry
+                # re-evaluated on every retry; a plan with work in flight keeps running
+                failed = fresh.status == PlanStatus.running and not in_flight
                 if not failed:
                     return False
                 fresh.status = PlanStatus.failed
@@ -3023,8 +3082,16 @@ class Orchestrator:
             # SDD §8: a status writer like the others, under the plan's lock; only a plan that
             # still runs fails. One paused, validated again or edited meanwhile keeps its status
             # (an edited draft must not become a failed plan that start_plan accepts unvalidated)
-            # and pre-stages again at its next start
+            # and pre-stages again at its next start. One with a migration in flight - a step
+            # running, or one waiting at its cutover gate - keeps running too: those go on, and
+            # the tick pre-stages it again after PRESTAGE_RETRY_S (PR #58 review)
             async with self._lock(f"plan:{plan.id}"):
+                in_flight = any(
+                    m.phase in fsm.ACTIVE_STEP_PHASES or m.phase == P.awaiting_cutover
+                    for m in await self.db.list("migration", Migration, plan_id=plan.id)
+                )
+                if in_flight:
+                    self._prestage_retry_at[plan.id] = time.monotonic() + PRESTAGE_RETRY_S
                 await self._update_plan(plan.id, fail)
                 error = redact(str(exc))[:500]
                 await self._emit(
