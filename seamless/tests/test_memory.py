@@ -246,6 +246,19 @@ def test_memory_hits_are_redacted_where_they_enter():
         # flow-style auth sections nested inside each other, and ones that never close (RV52-X6)
         "auth: {" * 4096 + "x" + "}" * 4096,
         "auth:{" * 5460,
+        # a camelCase start every other character, a long word glued anywhere, a key's digits,
+        # and a quoted camelCase key looked for at every quote of a value (RV52-X7)
+        "aB" * 16384,
+        "aBc." * 8192,
+        "xpasswordx" * 3276,
+        "password" + "1" * 32768,
+        "password: 'a\\'" + "'aBcPassx" * 3640,
+        # escape characters: colour sequences that never end, parts of escapes, a run of
+        # backslashes before an escaped one (RV52-X7)
+        "\x1b[" + "0" * 32768,
+        "\x1b[0" * 10922,
+        "\\u001" * 6553,
+        "\\" * 32767 + "u001b[0m",
     ],
     ids=[
         "key prefix",
@@ -277,6 +290,15 @@ def test_memory_hits_are_redacted_where_they_enter():
         "values over lines",
         "auth sections nested",
         "auth sections never closed",
+        "camel starts",
+        "camel parts",
+        "long words glued",
+        "key digits",
+        "quoted camel keys",
+        "colour never ends",
+        "colours never end",
+        "escape parts",
+        "backslashes before an escape",
     ],
 )
 def test_redact_costs_time_linear_in_the_text(text):
@@ -303,6 +325,9 @@ def test_redact_costs_time_linear_in_the_text(text):
         "-",
         "ab.",
         "\\",
+        "aB",
+        "\x1b[0",
+        "\\u001",
     ],
     ids=[
         "jwt starts",
@@ -315,6 +340,9 @@ def test_redact_costs_time_linear_in_the_text(text):
         "dash line",
         "dotted words",
         "backslashes",
+        "camel starts",
+        "colours never end",
+        "escape parts",
     ],
 )
 def test_four_times_the_text_costs_redact_about_four_times_the_time(unit):

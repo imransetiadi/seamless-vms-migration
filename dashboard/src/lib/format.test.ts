@@ -11,9 +11,20 @@ import {
   pyNames,
   pyLen,
   pyTooLong,
+  pyFloat,
   pyRepr,
   pyStrip,
 } from './format';
+
+describe('pyFloat', () => {
+  it("prints a float as Python's repr does, as the API's messages print one (SDD §12, review RV52-D4)", () => {
+    const values = [0.5, 1e-5, 100, 1e16, 1234567890123456, 0.0001, 1.5e-7, 1.2345678901234568e17, 0.1, 2.5, 1e15, 999999999999999.9, 0.000123, 524, -0.5, 1];
+    // what CPython 3.13 prints for each
+    const python = '0.5 1e-05 100.0 1e+16 1234567890123456.0 0.0001 1.5e-07 1.2345678901234568e+17 0.1 2.5 1000000000000000.0 999999999999999.9 0.000123 524.0 -0.5 1.0';
+    expect(values.map(pyFloat).join(' ')).toBe(python);
+    expect([Infinity, -Infinity, NaN, 0, -0].map(pyFloat)).toEqual(['inf', '-inf', 'nan', '0.0', '-0.0']);
+  });
+});
 
 describe('pyRepr', () => {
   it("quotes a name as the API's messages do (Python's repr of a str)", () => {

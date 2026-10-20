@@ -47,6 +47,24 @@ def _stub(path: Path, stdout: str, code: int = 0) -> None:
     path.chmod(0o755)
 
 
+def _curl(path: Path, search: tuple[str, str]) -> None:
+    """curl as agentmemory answers it: its configuration read from standard input, where the doctor
+    puts the URL and any secret; livez answers ok, a search the status ``search`` gives without and
+    with a bearer secret (docs/MEMORY.md §4.1)."""
+    without, with_secret = search
+    path.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "curl $*" >> "$STUB_LOG"\n'
+        "config=$(cat)\n"
+        'case "$config" in\n'
+        f"  *smart-search*Bearer*) printf %s {with_secret} ;;\n"
+        f"  *smart-search*) printf %s {without} ;;\n"
+        '  *) printf \'%s\\n\' \'{"service":"agentmemory","status":"ok"}\' ;;\n'
+        "esac\n"
+    )
+    path.chmod(0o755)
+
+
 def _venv_python(path: Path, version: str, imports: int) -> None:
     """The venv's python: its version for the version probe, ``imports`` as the exit of the rest."""
     path.write_text(
@@ -71,11 +89,12 @@ def _run(
     node_modules=True,
     edit=None,
     environment=None,
+    search=("200", "200"),
 ):
     """Run a copy of the doctor in a scratch repository tree with stub tools first on PATH and only
     BASE_TOOLS after them; return the run and the stubs' calls. ``tools`` and ``codes`` override
     a stub's output and exit, ``missing`` leaves stubs out, ``edit`` maps a tree file to
-    (old, new)."""
+    (old, new), and ``search`` is what agentmemory's search answers without and with a secret."""
     tree = tmp_path / "tree"
     for rel in (
         "scripts/seamless-doctor.sh",
@@ -110,6 +129,8 @@ def _run(
     for name, out in answers.items():
         if name not in missing:
             _stub(bin_dir / name, out, (codes or {}).get(name, 0))
+    if "curl" not in missing and "curl" not in (tools or {}) and "curl" not in (codes or {}):
+        _curl(bin_dir / "curl", search)
     base = tmp_path / "base"
     base.mkdir()
     for name in BASE_TOOLS:
@@ -240,6 +261,33 @@ def test_the_doctor_puts_no_url_on_a_command_line(tmp_path):
     assert proc.returncode == 0 and "agentmemory answers on this machine" in proc.stdout
     joined = "\n".join(calls)
     assert "curl " in joined and "FAKE-am-secret" not in joined and "127.0.0.1:3111" not in joined
+
+
+def test_an_agentmemory_that_asks_for_a_bearer_secret_names_the_variable_compose_init_reads(
+    tmp_path,
+):
+    """SDD §17.1, docs/MEMORY.md §4.1 (RV52 backlog): livez answers without a secret, so the doctor
+    passed while every search and write of the stack's memory answered 401 - the local copy of the
+    compose-linux job lost "memory available via host" that way. A search tells: a server that asks
+    for a bearer secret is noted, with AGENTMEMORY_SECRET, which compose-init.sh writes for the
+    stack; the doctor never fails for it."""
+    proc, _ = _run(tmp_path, search=("401", "200"))
+    assert proc.returncode == 0, proc.stdout
+    [note] = [line for line in _note_lines(proc.stdout) if "bearer secret" in line]
+    assert "AGENTMEMORY_SECRET" in note and "scripts/compose-init.sh" in note, note
+    assert "agentmemory answers on this machine" in proc.stdout
+
+
+@pytest.mark.parametrize(("status", "said"), [("200", "takes"), ("401", "refuses")])
+def test_an_agentmemory_secret_is_tried_without_reaching_a_command_line(tmp_path, status, said):
+    """SDD §17.1, CLAUDE.md §4 (RV52 backlog): with AGENTMEMORY_SECRET set, the search sends it as
+    a bearer header in curl's configuration on standard input - never on a command line, never
+    printed - and says whether agentmemory takes it."""
+    secret = "FAKE-am-bearer-7c1d"  # gitleaks:allow
+    proc, calls = _run(tmp_path, search=("401", status), environment={"AGENTMEMORY_SECRET": secret})
+    assert proc.returncode == 0, proc.stdout
+    assert f"agentmemory {said} AGENTMEMORY_SECRET" in proc.stdout, proc.stdout
+    assert secret not in proc.stdout + proc.stderr and secret not in "\n".join(calls)
 
 
 def test_a_busybox_image_not_here_is_noted_and_never_pulled(tmp_path):

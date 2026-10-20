@@ -1,7 +1,9 @@
 import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
-import { render, type RenderResult } from '@testing-library/react';
+import { render, within, type RenderResult } from '@testing-library/react';
+import type { UserEvent } from '@testing-library/user-event';
 import type { ReactElement, ReactNode } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { expect } from 'vitest';
 import { ApiProvider } from '../api/ApiProvider';
 import { getStoredToken } from '../api/auth';
 import { ApiClient } from '../api/client';
@@ -100,4 +102,25 @@ export function renderWithApp(ui: ReactElement, options: RenderOptions = {}): Re
     </ThemeProvider>,
   );
   return Object.assign(result, { server, queryClient });
+}
+
+/**
+ * A form's fields, each looked up once - a label query scans every label of a large dialog - and filled by one paste,
+ * where typing re-renders the form once per key (about 300 ms a key in jsdom for the plan dialog). A paste goes to the
+ * focused element, so the field must hold focus: a focus move a frame later would take it (PR #58 CI).
+ */
+export function formFields(user: UserEvent, form: HTMLElement) {
+  const fields = new Map<string, HTMLElement>();
+  const field = (label: RegExp): HTMLElement => {
+    const key = String(label);
+    if (!fields.has(key)) fields.set(key, within(form).getByLabelText(label));
+    return fields.get(key)!;
+  };
+  const enter = async (label: RegExp, value: string): Promise<void> => {
+    await user.clear(field(label));
+    await user.click(field(label));
+    expect(field(label), String(label)).toHaveFocus();
+    if (value) await user.paste(value);
+  };
+  return { field, enter };
 }

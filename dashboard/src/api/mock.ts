@@ -11,7 +11,7 @@
  * (429); any other token is rejected with 401. Every refusal is audited as `auth.denied` like the API.
  */
 import { DEFAULT_API_BASE } from './client';
-import { forcedDowntime } from '../lib/forcedEstimate';
+import { ESTIMATOR_DEFAULTS, forcedDowntime } from '../lib/forcedEstimate';
 import { canTransition } from '../lib/fsm';
 import { guestOsOf } from '../lib/guestOs';
 import { capabilityRoles, policyProfileOf } from '../lib/networks';
@@ -26,7 +26,7 @@ import { endedPassBytes } from '../lib/transfer';
 import { summaryOf } from '../lib/summary';
 import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
 import { destinationName, isBlank, providerLabel } from '../lib/providerUse';
-import { pyLen, pyRepr, pyStrip } from '../lib/format';
+import { pyFloat, pyLen, pyRepr, pyStrip } from '../lib/format';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -207,11 +207,33 @@ function refuseCancelBody(input: Record<string, unknown>): void {
   if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
 }
 
-/** A route whose request is `{}`, like the API's EmptyRequest (SDD §12, audit AA-04): an empty object or none, a field refused. */
-function refuseEmptyBody(input: Record<string, unknown>): void {
-  const problems = Object.keys(input).map((key) => `${key}: Extra inputs are not permitted`);
+/**
+ * A body field its route's request model does not take, refused as pydantic's extra_forbidden in the API's
+ * validation_message: each in the order sent, five at most (SDD §12, audit AA-04, review RV52-D5).
+ */
+function refuseUnknownFields(input: Record<string, unknown>, known: readonly string[]): void {
+  const problems = Object.keys(input)
+    .filter((key) => !known.includes(key))
+    .map((key) => `${key}: Extra inputs are not permitted`);
   if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
 }
+
+/** A route whose request is `{}`, like the API's EmptyRequest (SDD §12, audit AA-04): an empty object or none, a field refused. */
+function refuseEmptyBody(input: Record<string, unknown>): void {
+  refuseUnknownFields(input, []);
+}
+
+/** The fields each migration action's request model takes (SDD §12): FastAPI refuses any other before the route runs. */
+const ACTION_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  approve: ['comment'],
+  cutover: ['force_window', 'comment'],
+  'force-cutover': ['reason'],
+  sync: [],
+  rollback: ['reason'],
+  retry: [],
+  cancel: ['reason'],
+  finalize: ['delete_source', 'confirm'],
+};
 
 /** The secrets a provider reads, by name, for its audit events - never a value: the API's _secret_names (SDD §13.3). */
 function secretNames(provider: Provider): Record<string, string> {
@@ -469,7 +491,47 @@ const PRESTAGE_RESOURCES = [
   'flavors', 'keypairs', 'images', 'projects', 'users', 'users_keypairs', 'user_project_role_assignments', 'detached_volumes',
 ];
 
+/** The plan model's bounds, in its field order, as pydantic words them (SDD §4.2, §12, review RV52-D4). */
+const PLAN_BOUNDS: readonly (readonly [string, '>=' | '>', number])[] = [
+  ['downtime_slo_s', '>=', 1],
+  ['keep_warm_interval_s', '>=', 60],
+  ['convergence_threshold_bytes', '>=', 0],
+  ['max_sync_passes', '>=', 1],
+  ['link_bps', '>', 0],
+  ['finalize_warning_h', '>=', 1],
+];
+/** The estimator's bounds (SDD §9.1, reviews RV51-07, RV51-22): passes at most, a rate at least (B/s), a duration at most (s). */
+const MAX_SYNC_PASSES = 100;
+const MIN_RATE_BPS = 1;
+const MAX_DURATION_S = 10 ** 9;
+const OVERRIDE_RATES: ReadonlySet<string> = new Set(['link_bps', 'scan_bps', 'max_aggregate_scan_bps']);
+const OVERRIDE_DURATIONS: ReadonlySet<string> = new Set(['shutdown_s', 'boot_s', 'create_s', 'snapshot_s', 'handover_per_volume_s', 'v2v_s', 'v2v_inplace_s']);
+const OVERRIDE_PLAN_FIELDS: Readonly<Record<string, string>> = { convergence_threshold_bytes: 'convergence_threshold_bytes', max_passes: 'max_sync_passes' };
+
+/** The API's invalid_estimator_overrides (SDD §9.1): one message per key, in sorted order. */
+function overrideProblems(overrides: Record<string, unknown>): string[] {
+  return Object.keys(overrides)
+    .sort()
+    .flatMap((key) => {
+      const value = overrides[key];
+      if (!Object.hasOwn(ESTIMATOR_DEFAULTS, key)) return [`${key}: unknown field`];
+      if (Object.hasOwn(OVERRIDE_PLAN_FIELDS, key)) return [`${key}: set the plan field ${OVERRIDE_PLAN_FIELDS[key]} instead`];
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return [`${key}: must be a finite positive number`];
+      if (key === 'parallel_disks' && Math.trunc(value) < 1) return [`${key}: must be at least 1`];
+      if (OVERRIDE_RATES.has(key) && value < MIN_RATE_BPS) return [`${key}: must be at least 1 B/s`];
+      if (OVERRIDE_DURATIONS.has(key) && value > MAX_DURATION_S) return [`${key}: must be at most ${MAX_DURATION_S} s`];
+      return [];
+    });
+}
+
 function refusePlanSpec(spec: Record<string, unknown>): void {
+  // the model validates the body first (pydantic's words, five at most), then the API's checks run in their order
+  const bounds = PLAN_BOUNDS.flatMap(([field, op, limit]) => {
+    const value = spec[field];
+    if (typeof value !== 'number' || (op === '>=' ? value >= limit : value > limit)) return [];
+    return [`${field}: Input should be greater than ${op === '>=' ? 'or equal to ' : ''}${limit}`];
+  });
+  if (bounds.length) throw new HttpError(422, 'validation_error', bounds.slice(0, 5).join('; '));
   const ids = Array.isArray(spec.vm_ids) ? (spec.vm_ids as string[]) : [];
   const counts = new Map<string, number>();
   for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1);
@@ -514,7 +576,17 @@ function refusePlanSpec(spec: Record<string, unknown>): void {
     problems.push("port_creation_mode: Input should be 'nova' or 'neutron'");
   const window = spec.cutover_window as { start?: string; end?: string } | null | undefined;
   if (window?.start && window.end && Date.parse(window.end) <= Date.parse(window.start)) problems.push('cutover_window: end must be after start');
+  // a rate the estimator divides by, and a pass it runs per allowed pass (SDD §9.1, reviews RV51-07, RV51-22)
+  if (typeof spec.link_bps === 'number') {
+    if (!Number.isFinite(spec.link_bps)) problems.push(`link_bps must be a finite positive number (got ${pyFloat(spec.link_bps)})`);
+    else if (spec.link_bps < MIN_RATE_BPS) problems.push(`link_bps must be at least 1 B/s (got ${pyFloat(spec.link_bps)})`);
+  }
+  if (typeof spec.max_sync_passes === 'number' && spec.max_sync_passes > MAX_SYNC_PASSES) {
+    problems.push(`max_sync_passes must be at most ${MAX_SYNC_PASSES} (got ${spec.max_sync_passes})`);
+  }
   if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
+  const estimator = overrideProblems((spec.estimator_overrides ?? {}) as Record<string, unknown>);
+  if (estimator.length) throw new HttpError(400, 'bad_request', `invalid estimator_overrides: ${estimator.join('; ')}`);
 }
 
 /**
@@ -1580,11 +1652,14 @@ export class MockServer {
       }
       if (id && sub === 'strategy' && method === 'PUT') {
         const me = this.require(token, 'operator', path);
+        refuseUnknownFields(input, ['strategy']);
         return this.setStrategy(me, this.migration(id), input);
       }
       if (id && sub && method === 'POST') {
         const min: Role = sub === 'approve' || sub === 'cutover' || sub === 'force-cutover' || sub === 'finalize' ? 'approver' : 'operator';
         const me = this.require(token, min, path);
+        // the body is the request model's before the route looks the migration up, as FastAPI validates it
+        if (Object.hasOwn(ACTION_FIELDS, sub)) refuseUnknownFields(input, ACTION_FIELDS[sub]!);
         return this.migrationAction(me, this.migration(id), sub, input);
       }
     }
@@ -2035,7 +2110,11 @@ export class MockServer {
       return ok(this.plan(id));
     }
     if (!sub && method === 'PATCH') return this.patchPlan(this.require(token, 'operator', path), this.plan(id), input);
-    if (sub === 'waves' && subsub === 'auto' && method === 'POST') return this.autoWaves(this.require(token, 'operator', path), this.plan(id), input);
+    if (sub === 'waves' && subsub === 'auto' && method === 'POST') {
+      const me = this.require(token, 'operator', path);
+      refuseUnknownFields(input, ['max_wave_size']);
+      return this.autoWaves(me, this.plan(id), input);
+    }
     if ((sub === 'validate' || sub === 'start' || sub === 'pause') && method === 'POST') {
       const me = this.require(token, 'operator', path);
       refuseEmptyBody(input);
@@ -2043,7 +2122,11 @@ export class MockServer {
       return sub === 'start' ? this.startPlan(me, this.plan(id)) : this.pausePlan(me, this.plan(id));
     }
     if (sub === 'cancel' && method === 'POST') return this.cancelPlan(this.require(token, 'operator', path), this.plan(id), input);
-    if (sub === 'finalize' && method === 'POST') return this.finalizePlan(this.require(token, 'approver', path), this.plan(id), input);
+    if (sub === 'finalize' && method === 'POST') {
+      const me = this.require(token, 'approver', path);
+      refuseUnknownFields(input, ['wave_id', 'confirm', 'delete_source']);
+      return this.finalizePlan(me, this.plan(id), input);
+    }
     return null;
   }
 
@@ -2531,7 +2614,6 @@ export class MockServer {
   }
 
   private migrationAction(me: Me, m: Migration, action: string, input: Record<string, unknown>, sent = true): MockResponse {
-    if (action === 'sync' || action === 'retry') refuseEmptyBody(input);
     for (const field of ['comment', 'reason', 'confirm']) {
       const text = input[field];
       // the API bounds the free text of every action a client sends (SDD §12)

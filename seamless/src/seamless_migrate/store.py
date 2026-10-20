@@ -27,7 +27,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
 from .domain.enums import Phase
-from .domain.models import Event
+from .domain.models import STORED_DOCUMENT, Event
 from .domain.text import UNSTORABLE
 from .security.auth import DashboardUser
 
@@ -555,7 +555,7 @@ class Store:
             ).first()
         if row is None:
             raise NotFound(kind, id_)
-        return model_cls.model_validate(row.data), int(row.version)
+        return model_cls.model_validate(row.data, context=STORED_DOCUMENT), int(row.version)
 
     def get(self, kind: str, id_: str, model_cls: type[M]) -> M:
         return self.get_versioned(kind, id_, model_cls)[0]
@@ -611,7 +611,7 @@ class Store:
             data = row.data
             # the Python check stays authoritative (non-string values, dialect quirks)
             if all(_matches(data.get(name), wanted) for name, wanted in filters.items()):
-                out.append(model_cls.model_validate(data))
+                out.append(model_cls.model_validate(data, context=STORED_DOCUMENT))
         if not page_in_sql and (limit is not None or offset):
             start = max(0, int(offset))
             out = out[start:] if limit is None else out[start : start + max(0, int(limit))]
@@ -641,7 +641,10 @@ class Store:
                     documents.c.kind == kind, documents.c.id.in_(chunk)
                 )
                 for row in conn.execute(query):
-                    out[row.id] = (int(row.version), model_cls.model_validate(row.data))
+                    out[row.id] = (
+                        int(row.version),
+                        model_cls.model_validate(row.data, context=STORED_DOCUMENT),
+                    )
         return out
 
     def plan_phases(self, plan_ids: Collection[str]) -> dict[str, dict[Phase, int]]:

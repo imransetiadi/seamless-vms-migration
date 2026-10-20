@@ -5,7 +5,7 @@ import type { MockServer } from '../api/mock';
 import { makeVm } from '../api/mockData';
 import type { VMRef } from '../api/types';
 import { phaseMeta } from '../lib/phase';
-import { createTestServer, recordScrolls, renderWithApp } from '../test/utils';
+import { createTestServer, formFields, recordScrolls, renderWithApp } from '../test/utils';
 import Plans from './Plans';
 
 
@@ -264,18 +264,19 @@ describe('Plans page', () => {
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
-    await user.type(within(dialog).getByLabelText(/^name/i), 'Step times');
-    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+    const { field, enter } = formFields(user, dialog);
+    await enter(/^name/i, 'Step times');
+    await user.selectOptions(field(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(field(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     // empty fields keep the planning defaults, which the placeholders show
-    expect(within(dialog).getByLabelText(/source shutdown/i)).toHaveAttribute('placeholder', '60 (planning default)');
-    expect(within(dialog).getByLabelText(/^boot/i)).toHaveAttribute('placeholder', '120 (planning default)');
-    await user.type(within(dialog).getByLabelText(/source shutdown/i), '30');
-    await user.type(within(dialog).getByLabelText(/snapshot/i), '20');
-    await user.type(within(dialog).getByLabelText(/volume create/i), '45');
-    await user.type(within(dialog).getByLabelText(/^boot/i), '90');
+    expect(field(/source shutdown/i)).toHaveAttribute('placeholder', '60 (planning default)');
+    expect(field(/^boot/i)).toHaveAttribute('placeholder', '120 (planning default)');
+    await enter(/source shutdown/i, '30');
+    await enter(/snapshot/i, '20');
+    await enter(/volume create/i, '45');
+    await enter(/^boot/i, '90');
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
     await waitFor(() => expect(server.plans.some((p) => p.name === 'Step times')).toBe(true));
     expect(server.plans.find((p) => p.name === 'Step times')?.estimator_overrides).toEqual({ shutdown_s: 30, snapshot_s: 20, create_s: 45, boot_s: 90 });
@@ -287,13 +288,14 @@ describe('Plans page', () => {
     const before = server.plans.length;
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
-    await user.type(within(dialog).getByLabelText(/^name/i), 'Bad step times');
-    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+    const { field, enter } = formFields(user, dialog);
+    await enter(/^name/i, 'Bad step times');
+    await user.selectOptions(field(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(field(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
-    await user.type(within(dialog).getByLabelText(/source shutdown/i), '0');
-    await user.type(within(dialog).getByLabelText(/^boot/i), '-5');
+    await enter(/source shutdown/i, '0');
+    await enter(/^boot/i, '-5');
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
     const summary = await within(dialog).findByRole('alert');
     expect(summary).toHaveTextContent('Enter the source shutdown time in seconds (more than 0, at most 1000000000), or leave it empty.');
@@ -307,13 +309,14 @@ describe('Plans page', () => {
     const before = server.plans.length;
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
-    await user.type(within(dialog).getByLabelText(/^name/i), 'Bad rates');
-    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+    const { field, enter } = formFields(user, dialog);
+    await enter(/^name/i, 'Bad rates');
+    await user.selectOptions(field(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(field(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
-    await user.type(within(dialog).getByLabelText(/guest write rate/i), '0');
-    await user.type(within(dialog).getByLabelText(/aggregate scan cap/i), '-5');
+    await enter(/guest write rate/i, '0');
+    await enter(/aggregate scan cap/i, '-5');
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
     const summary = await within(dialog).findByRole('alert');
     expect(summary).toHaveTextContent('Enter the guest write rate in MiB/s (more than 0), or leave it empty.');
@@ -326,19 +329,18 @@ describe('Plans page', () => {
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
-    await user.type(within(dialog).getByLabelText(/^name/i), 'API bounds');
-    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+    const { field, enter } = formFields(user, dialog);
+    await enter(/^name/i, 'API bounds');
+    await user.selectOptions(field(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(field(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     for (const [label, value] of [
       [/convergence threshold/i, '0'],
       [/max sync passes/i, '60'],
       [/disks scanned in parallel/i, '100'],
-    ] as const) {
-      await user.clear(within(dialog).getByLabelText(label));
-      await user.type(within(dialog).getByLabelText(label), value);
-    }
+    ] as const)
+      await enter(label, value);
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
     await waitFor(() => expect(server.plans.some((p) => p.name === 'API bounds')).toBe(true));
     const created = server.plans.find((p) => p.name === 'API bounds')!;
@@ -351,28 +353,27 @@ describe('Plans page', () => {
     const before = server.plans.length;
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
-    await user.type(within(dialog).getByLabelText(/^name/i), 'Below the bounds');
-    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+    const { field, enter } = formFields(user, dialog);
+    await enter(/^name/i, 'Below the bounds');
+    await user.selectOptions(field(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(field(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     for (const [label, value] of [
       [/convergence threshold/i, '-1'],
       [/max sync passes/i, '0'],
       [/disks scanned in parallel/i, '0'],
-    ] as const) {
-      await user.clear(within(dialog).getByLabelText(label));
-      await user.type(within(dialog).getByLabelText(label), value);
-    }
+    ] as const)
+      await enter(label, value);
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
     const summary = await within(dialog).findByRole('alert');
     expect(summary).toHaveTextContent('Enter the convergence threshold in GiB (0 or more).');
     expect(summary).toHaveTextContent('Enter a whole number of passes from 1 to 100.');
     expect(summary).toHaveTextContent('Enter a whole number of disks (1 or more), or leave it empty.');
     // an empty threshold is not 0
-    await user.clear(within(dialog).getByLabelText(/convergence threshold/i));
+    await user.clear(field(/convergence threshold/i));
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
-    await waitFor(() => expect(within(dialog).getByLabelText(/convergence threshold/i)).toHaveAccessibleDescription(/0 or more/));
+    await waitFor(() => expect(field(/convergence threshold/i)).toHaveAccessibleDescription(/0 or more/));
     expect(server.plans).toHaveLength(before);
   }, 30_000);
 
@@ -382,9 +383,10 @@ describe('Plans page', () => {
     const before = server.plans.length;
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
-    await user.type(within(dialog).getByLabelText(/^name/i), 'Past the bounds');
-    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+    const { field, enter } = formFields(user, dialog);
+    await enter(/^name/i, 'Past the bounds');
+    await user.selectOptions(field(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(field(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
     for (const [label, value] of [
@@ -393,10 +395,8 @@ describe('Plans page', () => {
       [/^scan rate/i, '0.0000001'],
       [/aggregate scan cap/i, '0.0000001'],
       [/^boot/i, '1000000001'],
-    ] as const) {
-      await user.clear(within(dialog).getByLabelText(label));
-      await user.type(within(dialog).getByLabelText(label), value);
-    }
+    ] as const)
+      await enter(label, value);
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
     const summary = await within(dialog).findByRole('alert');
     expect(summary).toHaveTextContent('Enter a whole number of passes from 1 to 100.');
@@ -594,19 +594,16 @@ describe('Plans page', () => {
 
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
-    await user.type(within(dialog).getByLabelText(/^name/i), 'Verified wave');
-    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
-    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+    const { field, enter } = formFields(user, dialog);
+    await enter(/^name/i, 'Verified wave');
+    await user.selectOptions(field(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(field(/destination provider/i), 'rhoso-prod');
     await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
     await user.click(within(dialog).getByText(/^advanced:/i));
-    await user.type(within(dialog).getByLabelText(/^project mappings/i), 'shop = shop-prod');
-    await user.selectOptions(within(dialog).getByLabelText(/^probe address/i), 'floating');
-    const timeout = within(dialog).getByLabelText(/^verification timeout/i);
-    await user.clear(timeout);
-    await user.type(timeout, '15');
-    const patterns = within(dialog).getByLabelText(/^console success patterns/i);
-    await user.clear(patterns);
-    await user.type(patterns, 'login:{enter}Reached target .*Multi-User');
+    await enter(/^project mappings/i, 'shop = shop-prod');
+    await user.selectOptions(field(/^probe address/i), 'floating');
+    await enter(/^verification timeout/i, '15');
+    await enter(/^console success patterns/i, 'login:\nReached target .*Multi-User');
     await user.click(within(dialog).getByRole('checkbox', { name: /advisor reviews the verification/i }));
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
 

@@ -222,7 +222,9 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
     guest_os = identify(os_type), §9.5)
    free text: a NUL or a lone surrogate in tags and flavor_extra_specs (keys and values), os_type or host
    is written U+FFFD as the model is built - no export filter or mapping reads them -; name, project,
-   flavor, a NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02)
+   flavor, a NIC's network and a disk's volume_type are kept as the source gives them (§11, review RV49-02);
+   a NIC's network an earlier version stored with one reads with U+FFFD as the store reads it, and only then
+   (§11, review RV52-S1)
 
 GuestOS { family: "linux"|"windows"|"unknown", distro: str|null, version: str|null, label: str,
           lifecycle: "current"|"legacy"|"unknown",
@@ -2644,7 +2646,12 @@ summary and the keys and values of its data, a verification's `review_reason`, i
 a migration's `error` and its phase changes' reasons, a decision's `reason_text`, Jev's reasons, a similar incident's
 title and content, a recommendation's option, its distribution's keys, `unusable` and `legacy_text`, and the model's
 version - reads with U+FFFD for each, as this version writes them (§14.1), so that document is written again too
-(review RV52-S1, PR #58 review); a name a cutover reads is not among them. What the control plane is given
+(review RV52-S1, PR #58 review). Of the names a cutover reads, a NIC's network alone reads so - the one a source
+can give with a NUL, below -, and only as the store reads a document: the migration is written again, so it can be
+cancelled or rolled back (review RV52-S1). No step takes the replaced name for the source's: a validation that
+re-assesses the migration reads the VM from its source again, whose name the write refuses as below; pre-staging
+and the export read the source's networks by their own names (§7.2); and a name that resolves to no destination
+network stops the cutover before the source stops (§7.2, §7.3 step 0). What the control plane is given
 stops before that refusal: a request
 body holding a NUL or a lone surrogate is refused before its route runs (§12) - a number is its route's to check,
 as §9.1 checks a plan's -, the tokens file refuses such a name (§13.1), the text it takes from outside sources
@@ -2950,7 +2957,11 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 `redact(text, names=None)` removes:
 
 * passwords and secrets in key/value pairs — `key=value`, `key: value`, JSON `"key": "value"`, the key
-  possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`), also where it starts a line of a
+  possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`) or joined to its word in camelCase, read
+  case-sensitively (`adminPass` - the password Nova returns for a server it creates -, `accessToken`, `DBPassword`;
+  `bypass` and `isPassive` are no keys), a long word - password, passwd, passphrase, secret, token - glued in one
+  case too (`adminpassword`; never a word ending in `pass` or `pwd`), with digits after its word (`password2`,
+  `token_3`; review RV52-X7), also where it starts a line of a
   JSON-escaped multi-line string (`\npassword: x`) — and in CLI flags (`--os-password x`; a quoted value whole with the
   rest of its word, a quote it never closes to its line's end, and in an argv list - JSON's, a repr's such as a
   `CalledProcessError`'s - the next item, review RV52-X3). A quoted value is read
@@ -2974,7 +2985,9 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 * credentials in connection strings: `scheme://user:password@host` (a password with `@` too) and
   `Password=…;`;
 * the `auth` section of a `clouds.yaml`, in YAML or JSON - a quoted string in a flow-style section read whole, so a
-  brace in a password neither ends the section nor keeps it open (PR #58 review);
+  brace in a password neither ends the section nor keeps it open (PR #58 review); a flow-style section is looked for
+  again after the other patterns, so one a value's redaction closed, or one that held another, goes whole in the
+  same pass (review RV52-X7);
 * seamless API tokens (`smg_…`) and JWTs;
 * VM names (as `[vm]`) when `names` are given — the advisor and agentmemory give them when
   `SEAMLESS_MEMORY_REDACT_NAMES` — wherever a name stands between characters that are not letters or digits, so a
@@ -3000,7 +3013,11 @@ agents write too - redacted as they arrive, title and content, before anything c
 (§14.3, §14.4; audit AP-05).
 `redact` also writes each NUL and each lone surrogate as U+FFFD, the replacement character, so such text is kept
 wherever it goes (§11); every string of Jev's answers - its reasons (§14.4) among them -, text from an outside
-service too, passes that replacement as it arrives (§14.1).
+service too, passes that replacement as it arrives (§14.1). Before its patterns it removes each terminal escape
+character - raw, as JSON's `\u001b` at any depth or as a repr's `\x1b` - with the colour or erase-line sequence it
+starts (`ESC [ … m`, `ESC [ … K`), so a key or a value a terminal coloured is found; one right after a part of such
+an escape (`\`, `\u0`, …, `\x1`) stays, as removing it would complete another, so a second pass changes nothing
+(review RV52-X7).
 Where it cuts such text, it redacts first,
 over the cut plus 16384 characters, and cuts after (`redact_cut(text, limit)`): a secret the cut splits
 — a PEM block, a URL with credentials — is still found, at a bounded cost. The cuts: a `migration.log`
@@ -3687,7 +3704,9 @@ is no origin a browser sends (review RV31-03).
   unavailable only on a running plan (pause it first) and a cancelled one, as `validate_plan` refuses both — a
   completed plan, say one whose every VM rolled back over a plan setting, is validated again and then editable (§8.1,
   audit DB-01); Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
-  migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (its Findings
+  the migrations a validation re-assesses: in `pending`, `blocked` or `ready`, or one an earlier version left in
+  `validating`, never a `ready` one whose source is stopped, which it leaves as it is (§5.4, review RV52-D3) — and
+  says how many), `/migrations/:id` (its Findings
   and Estimates panels addressable as `#findings` and `#estimates`, which the page scrolls to and focuses once
   loaded, ADV-02; phase
   stepper — one row; on a phone two columns read top-down, half the height of one —, progress (the running step — named from the phase and the passes that ended: in `precopy` the full copy,
@@ -4055,8 +4074,10 @@ dashboard's `node_modules` against its lockfile, the pre-commit hook, and the en
 `seamless-check-context`, and `curl`, which their health wait needs; it installs and pulls nothing, names the fix of
 each failure for the host it runs on, and exits 1 when something `seamless-check`, the stack targets or the pre-commit
 hook need is missing or off its pin. What `seamless-check` works without — `SEAMLESS_TEST_PG_URL`, Playwright's
-Chromium, agentmemory from the host and, on a Linux machine's own engine, from a container (a cached `busybox` image
-looks, or the look is noted as skipped), `TYPESAFE_API_KEY`, and gitleaks, actionlint and shellcheck, which it skips
+Chromium, agentmemory from the host — and whether its API asks for a bearer secret, which `compose-init.sh` takes from
+`AGENTMEMORY_SECRET`: a search, read-only, says so, or whether the secret set is taken (RV52 backlog) — and, on a Linux
+machine's own engine, from a container (a cached `busybox` image looks, or the look is noted as skipped),
+`TYPESAFE_API_KEY`, and gitleaks, actionlint and shellcheck, which it skips
 when absent and runs at the machine's own version — is noted, never failed, each with its fix; no secret's value or
 URL is printed or put on a command line (PR #58 review)).
 

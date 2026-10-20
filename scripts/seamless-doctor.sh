@@ -185,6 +185,21 @@ fi
 if printf 'url = "%s"\n' "${AGENTMEMORY_URL:-http://localhost:3111}/agentmemory/livez" |
   curl -fsS -m 3 -K - -o /dev/null >/dev/null 2>&1; then
   ok "agentmemory answers on this machine"
+  # livez answers without a secret, the API may not: a search, read-only, tells whether it asks for the bearer
+  # secret compose-init.sh writes for the stack; the secret goes in curl's configuration on standard input too
+  memory_status=$({
+    printf 'url = "%s"\n' "${AGENTMEMORY_URL:-http://localhost:3111}/agentmemory/smart-search"
+    printf 'header = "Content-Type: application/json"\n'
+    printf 'data = "%s"\n' '{\"query\":\"seamless-doctor\",\"limit\":1,\"project\":\"seamless-migrate\"}'
+    if [ -n "${AGENTMEMORY_SECRET:-}" ]; then printf 'header = "Authorization: Bearer %s"\n' "$AGENTMEMORY_SECRET"; fi
+  } | curl -sS -m 3 -K - -o /dev/null -w '%{http_code}' 2>/dev/null) || memory_status=000
+  case "$memory_status:${AGENTMEMORY_SECRET:+set}" in
+    2??:set) ok "agentmemory takes AGENTMEMORY_SECRET" ;;
+    2??:) ;;
+    401:set | 403:set) note "agentmemory refuses AGENTMEMORY_SECRET (HTTP $memory_status): give the secret its server was started with (docs/MEMORY.md §4.1)" ;;
+    401: | 403:) note "agentmemory asks for a bearer secret (HTTP $memory_status without one): export AGENTMEMORY_SECRET before scripts/compose-init.sh, which writes it for the stack (docs/MEMORY.md §4.1)" ;;
+    *) note "agentmemory's search did not answer (HTTP $memory_status): the stack's memory may fail where livez answers (docs/MEMORY.md §4.1)" ;;
+  esac
   # a Linux machine's own engine reaches the host through the bridge, never its 127.0.0.1
   if [ "$os" = Linux ] && [ "$engine_ok" = 1 ] && [ "${SEAMLESS_ENGINE:-docker}" = docker ] &&
     [ "${SEAMLESS_DOCKER_CONTEXT:-default}" = default ]; then
