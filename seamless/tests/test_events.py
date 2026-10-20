@@ -6,7 +6,14 @@ import sqlalchemy as sa
 
 from seamless_migrate import events as events_module
 from seamless_migrate.domain.models import Event, utcnow
-from seamless_migrate.events import EPHEMERAL_KINDS, PERSISTED_KINDS, EventBus, emit
+from seamless_migrate.events import (
+    EPHEMERAL_KINDS,
+    PERSISTED_KINDS,
+    EventBus,
+    emit,
+    new_event,
+    put_all_and_emit,
+)
 from seamless_migrate.store import Store
 from seamless_migrate.store import events as events_table
 
@@ -508,3 +515,34 @@ def test_event_kinds_match_sdd_4_3_and_the_dashboard():
     )
     assert persisted_ui == set(PERSISTED_KINDS)
     assert set(EPHEMERAL_KINDS) <= set(re.findall(r"'([a-z_.]+)'", types_ts))
+
+
+async def test_an_event_joined_to_a_write_is_timed_when_it_is_written(store: Store):
+    """SDD §4: an event's ts is the time it is written. A transition's events are built, then
+    joined to the migration's write, which waits for the emit lock; an event another writer
+    wrote meanwhile took the lower seq and the later ts, and the Events page - by time, then
+    seq - listed the two out of seq order (PR 56's live-stream journey)."""
+    from tests.factories import make_plan
+
+    bus = EventBus(store)
+    built = new_event("plan.updated", "built first")
+    await asyncio.sleep(0.01)
+    await emit(store, bus, "plan.updated", "written first")
+    await put_all_and_emit(store, bus, [("plan", make_plan(), 0)], [built])
+    written = store.events()
+    assert [e.message for e in written] == ["written first", "built first"]
+    assert written[0].ts <= written[1].ts  # their time order is their seq order
+
+
+async def test_an_emitted_event_is_timed_when_it_is_written(store: Store):
+    """SDD §4: emit builds its event, then waits for the emit lock; one written meanwhile keeps
+    the time order its seq gives."""
+    bus = EventBus(store)
+    async with bus.emit_lock:
+        waiting = asyncio.create_task(emit(store, bus, "plan.updated", "waited"))
+        await asyncio.sleep(0.02)  # built, waiting for the lock
+        store.append_event(new_event("plan.updated", "meanwhile"))
+    await waiting
+    written = store.events()
+    assert [e.message for e in written] == ["meanwhile", "waited"]
+    assert written[0].ts <= written[1].ts

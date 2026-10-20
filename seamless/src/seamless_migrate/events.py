@@ -266,6 +266,14 @@ async def put_and_emit(
     return version
 
 
+def _written_now(events: Sequence[Event]) -> list[Event]:
+    """``events`` timed now, under the emit lock that writes and numbers them - one transaction's
+    sharing one time -, so their order in time is their seq order (SDD §4): one built before it
+    waited for the lock was listed after a newer one by the Events page, which sorts by time."""
+    now = utcnow()
+    return [event.model_copy(update={"ts": now}) for event in events]
+
+
 async def put_all_and_emit(
     store: Store,
     bus: EventBus,
@@ -276,7 +284,9 @@ async def put_all_and_emit(
     order with every other (SDD §8, §11, §14.6): a store error leaves none of them, published or
     written."""
     async with bus.emit_lock:
-        versions, written = await asyncio.to_thread(store.put_all_with_events, writes, events)
+        versions, written = await asyncio.to_thread(
+            store.put_all_with_events, writes, _written_now(events)
+        )
         for event in written:
             bus.publish(event, persist=True)
     return versions
@@ -295,7 +305,7 @@ async def delete_and_emit(
     document and no event."""
     async with bus.emit_lock:
         written = await asyncio.to_thread(
-            store.delete_with_events, kind, id_, expected_version, events
+            store.delete_with_events, kind, id_, expected_version, _written_now(events)
         )
         for event in written:
             bus.publish(event, persist=True)
@@ -320,6 +330,7 @@ async def emit(
     if persist and kind in PERSISTED_KINDS and store is not None:
         # Serialize persist+publish so live delivery order equals seq order.
         async with bus.emit_lock:
+            [event] = _written_now([event])
             event = await asyncio.to_thread(store.append_event, event)
             bus.publish(event, persist=True)
     else:
