@@ -367,6 +367,7 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             cutover_requested_by: str|null, cutover_requested_at: datetime|null,  # who asked for the cutover first, and when (§5.4)
             advisor_notes: list[AdvisorNote] = [],
             advisor_hold: str|null,     # the recommendation whose decision waits for approval: no start meanwhile (§14.6)
+            last_recommendation: str|null,   # the recommendation its last validation stored: a decision acts on it when no hold names one (§14.6)
             converged_by: "threshold"|"slo"|"max_passes"|"force"|null,   # the rule that ended the passes (§5.3)
             force_cutover: ForceCutover|null, data_issues: list[str] = [],   # §5.4, §5.5 (ADV-16)
             cutover_refusals: list[str] = [],   # what the last warm pass met that the cutover refuses before the source stops (§7.2): each pass replaces it, a successful cutover empties it
@@ -3232,7 +3233,10 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
 * **Approve** and **override** (`advisor.approve`) act on the recommendation the migration's `advisor_hold` names
   while it holds one - the hold is written with it (§5.4), so a clock stepped back between two validations leaves
   that one decidable, whatever its `created_at` (review RV50-09) -, else on the migration's newest stored
-  recommendation, while the migration is `pending`, `blocked` or `ready`: approve → `approved`, final = the
+  recommendation: the one its last validation stored (`last_recommendation`, written in that validation's
+  transaction like the hold, so a clock stepped back changes nothing either - review RV51-08; for a migration no
+  validation stored one for since the field, the newest by `created_at`), while the migration is `pending`,
+  `blocked` or `ready`: approve → `approved`, final = the
   recommended option, which must be usable and eligible now - one the recommendation recorded as `unusable`
   (escalated, invalid, escaped, outside the advisor's scope, §14.4 rule 2) never is, nor one stored before that
   field (v0.1.0-rc.2) whose decision fell back (`fallback_rules`, `ADVISOR_UNAVAILABLE_FALLBACK`), which reads as
