@@ -2654,7 +2654,10 @@ a probe's `expect_stauts`), on `POST /plans` and `POST /providers` as on `PATCH 
 `PATCH /providers/{id}`, on `POST` and `PUT /advisor/policies` (a misspelt `scope` would make a plan's policy a global
 one) and in `seamless plan apply` (§15) — so a misspelt guard (`requrie_approval`, `verify_tsl`) never silently yields a
 plan, provider or policy without it (audit AP-01, AP-02); a stored document keeps loading with fields a later version
-added, at any depth (§11).
+added, at any depth (§11). The text a person gives with an action is kept as Python's `str.strip()` leaves it: an
+approval's and a cutover request's `comment` and a cancel's `reason` - one that strips to nothing is none - and a
+rollback's `reason`, which must keep a character (422 otherwise), as a Force cutover's and an override's reason are
+(review RV51-26).
 A request body holding a NUL character or a lone surrogate in a string - a key or a value, at any depth - is refused
 with 422 (`validation_error`, naming where: `mappings.networks: a key holds a NUL character`) once the caller's
 token and role are checked, before the route runs, so no route writes part of it (the store keeps neither, §11;
@@ -2708,7 +2711,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1; 409 after a failed finalize began deleting the source, §8.1) |
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; it takes its VM's wave from the plan, §9.4; it assesses nothing anew - the estimates the last validation stored stay -, but marks the stored `storage_handover` estimate ineligible with §9.2's reason while the migration holds the destination volumes an earlier attempt created, judged as `PUT …/strategy` judges it, so the dashboard's strategy choice and the advisor's options show why (review 41b's lead), and takes an earlier Retry's mark off once it holds none - the estimate eligible again when that reason was its only one (review RV43B-02); 409 when a provider of that plan was deleted, and when the plan has waves and the VM is in none of them) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
-| POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` (409 outside `completed`, and while its source VM runs again — `source_running_at` — unless its checkpoint is `finalizing`, §8.1) |
+| POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` (409 outside `completed`, and while its source VM runs again — `source_running_at` — unless its checkpoint is `finalizing` and the finalize deletes the source, `delete_source: true`, §8.1; review RV51-25) |
 | POST | `/plans/{id}/finalize` | approver | `{"wave_id": str\|null, "confirm": str, "delete_source": bool = false}` (`confirm`: the wave's name, or the plan's without `wave_id`; 400 otherwise; 404 for an unknown wave) | `{"finalized": [str], "skipped": [{"migration_id": str, "reason": str}]}` (409 when no migration of the scope is `completed`; §8.1) |
 | POST | `/demo/vms/{source_id}/power` | operator | `{"state": "on"\|"off"}` | `VMRef` (demo mode only, 404 otherwise; the fake source VM's power state, §8.1) |
 | PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible; `storage_handover` is refused (400, §9.2's reason) while the migration holds the destination volumes an earlier attempt created, judged at the request - a Retry does not re-assess the estimates the last validation stored (review RV40-01); 409 while `advisor_hold` is set: approve or override the decision, §14.6) | `Migration` |
