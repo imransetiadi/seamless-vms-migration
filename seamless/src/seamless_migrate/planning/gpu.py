@@ -19,8 +19,6 @@ PCI_ALIAS = "pci_passthrough:alias"
 _RESOURCES = re.compile(r"^resources(?P<suffix>[A-Za-z0-9_-]*):(?P<cls>[A-Z0-9_]+)$")
 #: a request group's trait: trait<suffix>:<name>, set to required or forbidden
 _TRAIT = re.compile(r"^trait(?P<suffix>[A-Za-z0-9_-]*):(?P<name>.+)$")
-#: an amount Nova takes: ASCII digits, spaces around them allowed
-_AMOUNT = re.compile(r"\s*([0-9]+)\s*")
 #: NVIDIA's profile names, with or without vCenter's grid_/nvidia_ prefix or the "GRID " of the
 #: mediated device types: <gpu>-<framebuffer GB><series>, MIG-backed
 #: <gpu>-<slices>-<framebuffer GB><series> (SDD §22.2)
@@ -42,23 +40,34 @@ class ProfileSize:
     series: str
 
 
+def _int(value: str) -> int | None:
+    """``value`` as Nova reads an amount or a count, with Python's ``int()`` - spaces around it, a
+    sign, underscores between digits and any script's decimal digits included -, else None."""
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
 def _amount(value: str) -> int:
-    """A resource amount: its integer, a zero included (Nova takes the resource out of the
-    request); any other value is still a request, read as 1 (SDD §22.2)."""
-    match = _AMOUNT.fullmatch(value)
-    return int(match.group(1)) if match else 1
+    """A resource amount as Nova's ``RequestGroup.add_resource`` reads it, 0 for none: it skips a
+    negative or unreadable amount with a warning, and strips a zero from the request (SDD §22.2)."""
+    amount = _int(value)
+    return amount if amount is not None and amount > 0 else 0
 
 
 def _aliases(value: str | None) -> list[tuple[str, int]]:
-    """The aliases of `pci_passthrough:alias` with their counts; a count left out, or one that is
-    not a positive integer, reads as 1 (SDD §22.2)."""
+    """The aliases of `pci_passthrough:alias` with their counts, as Nova asks for int(count)
+    devices: a zero or negative count asks for none; a count left out, or one int() cannot read,
+    reads as 1 - Nova refuses to boot such a flavor (SDD §22.2)."""
     out = []
     for item in (value or "").split(","):
         name, _, count = item.partition(":")
         if not name.strip():
             continue
-        match = _AMOUNT.fullmatch(count)
-        out.append((name.strip(), int(match.group(1)) if match and int(match.group(1)) else 1))
+        number = _int(count)
+        if number is None or number > 0:
+            out.append((name.strip(), 1 if number is None else number))
     return out
 
 

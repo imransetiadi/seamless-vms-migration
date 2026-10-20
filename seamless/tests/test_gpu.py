@@ -52,7 +52,7 @@ def test_gpu_requests_reads_each_numbered_group_with_its_own_traits():
 
 def test_gpu_requests_reads_each_pci_alias_with_its_count():
     """SDD §22.2: pci_passthrough:alias=<alias>:<n>[,...] is one passthrough request per alias; a
-    count left out, or one that is not a positive integer, reads as 1."""
+    count left out, or one Python's int() cannot read, reads as 1 (Nova refuses to boot it)."""
     specs = {"pci_passthrough:alias": "a100:2, t4, l4:x"}
     assert gpu_requests(specs) == [
         GpuDevice(kind="passthrough", alias="a100", count=2),
@@ -103,11 +103,40 @@ def test_a_zero_amount_asks_for_no_gpu():
     assert gpu_requests({"resources1:VGPU": "0", "resources2:VGPU": "1"}) == [vgpu(count=1)]
 
 
-@pytest.mark.parametrize("amount", ["", "one", "-1", "1.5", "²", "1e3"])
-def test_an_amount_nova_would_refuse_reads_as_one(amount):
-    """SDD §22.2: any other amount that is not a positive integer is still a request, read as one
-    GPU - Nova refuses such a flavor when a server boots with it, so the VM stays a GPU VM."""
-    assert gpu_requests({"resources:VGPU": amount}) == [vgpu(count=1)]
+@pytest.mark.parametrize(
+    "amount", ["", " ", "one", "-1", "1.5", "²", "1e3", "+0", "-0", "0_0", "٠"]
+)
+def test_an_amount_nova_skips_asks_for_no_gpu(amount):
+    """SDD §22.2 (PR #57 review): Nova's RequestGroup.add_resource reads an amount with int() and
+    skips a negative or unreadable one with a warning, and strip_zeros drops a zero in any form - a
+    server boots with no vGPU for it, where this read one."""
+    assert gpu_requests({"resources:VGPU": amount}) == []
+    assert gpu_requests({"resources1:VGPU": amount, "resources2:VGPU": "1"}) == [vgpu(count=1)]
+
+
+@pytest.mark.parametrize(
+    ("amount", "count"), [("+2", 2), ("２", 2), ("1_0", 10), (" 3 ", 3), ("٣", 3), ("4", 4)]
+)
+def test_an_amount_reads_as_pythons_int_reads_it(amount, count):
+    """SDD §22.2 (PR #57 review): a sign, underscores between digits, spaces around them and any
+    script's decimal digits are an amount Nova's int() reads - "+2" asks for two vGPUs, not one."""
+    assert gpu_requests({"resources:VGPU": amount}) == [vgpu(count=count)]
+
+
+def test_an_alias_count_reads_as_nova_reads_it():
+    """SDD §22.2 (PR #57 review): Nova asks for int(count) devices of an alias - a zero or negative
+    count for none, "２" for two -, and a count it cannot read fails the boot: it reads as 1."""
+    alias = "pci_passthrough:alias"
+    assert gpu_requests({alias: "a100:0"}) == []
+    assert gpu_requests({alias: "a100:-1, t4:1"}) == [GpuDevice(kind="passthrough", alias="t4")]
+    assert gpu_requests({alias: "a100:２"}) == [
+        GpuDevice(kind="passthrough", alias="a100", count=2)
+    ]
+    assert gpu_requests({alias: "a100: 3 , t4:x, l4"}) == [
+        GpuDevice(kind="passthrough", alias="a100", count=3),
+        GpuDevice(kind="passthrough", alias="t4", count=1),
+        GpuDevice(kind="passthrough", alias="l4", count=1),
+    ]
 
 
 def test_a_declared_profile_goes_to_each_entry_of_its_flavor():
