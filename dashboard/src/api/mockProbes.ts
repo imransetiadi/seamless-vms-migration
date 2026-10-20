@@ -4,7 +4,17 @@
  * `seamless/tests/fixtures/probe_suggestion_cases.json`.
  */
 import { identifyGuestOs } from '../lib/guestOs';
+import { vgpuRequests } from '../lib/readiness';
 import type { AppProbe, VMRef } from './types';
+
+/** The port NVIDIA's DCGM exporter serves a GPU's metrics on, suggested for every GPU VM (SDD §9.6, §22.8). */
+const DCGM_EXPORTER_PORT = 9400;
+
+/** A VM with a GPU, as the API's vm_gpus reads it: its gpus, else - a VM recorded before 0.3.0 - its flavor's requests. */
+function hasGpu(vm: VMRef): boolean {
+  if (vm.gpus?.length) return true;
+  return vgpuRequests(vm.flavor_extra_specs).some((key) => Number(vm.flavor_extra_specs[key]) > 0) || 'pci_passthrough:alias' in vm.flavor_extra_specs;
+}
 
 const TIERS = ['stateless_web', 'middleware_queue', 'infrastructure_service', 'stateful_database', 'legacy_os', 'manual_review'] as const;
 type Tier = (typeof TIERS)[number];
@@ -88,9 +98,11 @@ export function isDatabase(vm: VMRef): boolean {
 
 /** The rules' suggestion for a VM (SDD §9.6); empty when the table names no service of its tier. */
 export function suggestProbes(vm: VMRef): AppProbe[] {
+  // a GPU VM is suggested the DCGM exporter's port too, after its tier's probe (SDD §9.6, §22.8, plan task G5)
+  const gpu = hasGpu(vm) ? [tcp(DCGM_EXPORTER_PORT)] : [];
   const tier = tierOf(vm);
-  if (tier === 'stateless_web') return [http(80)];
+  if (tier === 'stateless_web') return [http(80), ...gpu];
   const { text, tokens } = describe(vm);
   const match = SERVICES.find(([t, substrings, words]) => t === tier && matches(text, tokens, substrings, words));
-  return match ? [{ ...match[3] }] : [];
+  return match ? [{ ...match[3] }, ...gpu] : gpu;
 }

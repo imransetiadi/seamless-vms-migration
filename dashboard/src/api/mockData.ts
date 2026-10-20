@@ -972,6 +972,18 @@ export function eligibility(
     if (vm.cbt_enabled !== true) warm.push('Changed Block Tracking (CBT) is not enabled');
     const independent = vm.disks.filter((d) => d.independent);
     if (independent.length) warm.push(`independent disk(s): ${diskIds(independent)}`);
+    // vSphere takes no snapshot of a VM with a DirectPath I/O device, and the kit reads every copy from one; powered off,
+    // its snapshot holds no device state - the API's rule (SDD §9.2, §22.6, plan task G5)
+    const gpus = vm.gpus?.length ? vm.gpus : gpuRequestsOf(vm.flavor_extra_specs);
+    const passthrough = gpus.filter((g) => g.kind === 'passthrough');
+    if (passthrough.length) {
+      const devices = gpuNames(passthrough);
+      warm.push(`PCI passthrough device(s) ${devices}: vSphere takes no snapshot of a VM with one - power it off, validate it again and migrate it cold`);
+      if (vm.power_state !== 'stopped')
+        result.vmware_cold.push(
+          `PCI passthrough device(s) ${devices} on a VM that is not powered off: power it off, validate it again and migrate it cold`,
+        );
+    }
     result.vmware_warm = warm;
   } else {
     const copy: string[] = [];
