@@ -1217,6 +1217,27 @@ describe('mock API', () => {
     await expect(client.patch(`/plans/${plan.id}`, { max_sync_passes: 101 })).rejects.toMatchObject({ status: 422, message: 'max_sync_passes must be at most 100 (got 101)' });
   });
 
+  it('refuses an action body field the API does not take, before it looks the migration up (SDD §12, review RV52-D5)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body: Record<string, unknown>) => server.handle(method, path, new URLSearchParams(), body, 'approver');
+    const extra = (...fields: string[]) => ({
+      status: 422,
+      body: { error: { code: 'validation_error', message: fields.map((f) => `${f}: Extra inputs are not permitted`).join('; ') } },
+    });
+    const m = server.migrations[0]!;
+    for (const action of ['approve', 'cutover', 'force-cutover', 'sync', 'rollback', 'retry', 'cancel', 'finalize']) {
+      expect(call('POST', `/migrations/${m.id}/${action}`, { note: 'x' }), action).toMatchObject(extra('note'));
+      // FastAPI validates the body before the route runs: an unknown migration answers the same
+      expect(call('POST', `/migrations/mig-000000000000/${action}`, { note: 'x', why: 'y' }), action).toMatchObject(extra('note', 'why'));
+    }
+    expect(call('PUT', `/migrations/${m.id}/strategy`, { strategy: 'warm', why: 'x' })).toMatchObject(extra('why'));
+    expect(call('POST', '/plans/plan-c81d44a0/finalize', { confirm: 'x', force: true })).toMatchObject(extra('force'));
+    expect(call('POST', '/plans/plan-c81d44a0/waves/auto', { max_wave_size: 5, size: 5 })).toMatchObject(extra('size'));
+    // the fields an action takes still reach it: a cutover request with its window bypass and comment
+    const ready = server.migrations.find((x) => x.phase === 'ready')!;
+    expect(call('POST', `/migrations/${ready.id}/cutover`, { force_window: false, comment: 'go' }).status).not.toBe(422);
+  });
+
   it('refuses a VM another plan holds, at validation and at a retry that would take it back (SDD §5.4)', async () => {
     const { server, client } = setup('operator');
     const first = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;

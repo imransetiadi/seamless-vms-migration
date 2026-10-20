@@ -207,11 +207,33 @@ function refuseCancelBody(input: Record<string, unknown>): void {
   if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
 }
 
-/** A route whose request is `{}`, like the API's EmptyRequest (SDD §12, audit AA-04): an empty object or none, a field refused. */
-function refuseEmptyBody(input: Record<string, unknown>): void {
-  const problems = Object.keys(input).map((key) => `${key}: Extra inputs are not permitted`);
+/**
+ * A body field its route's request model does not take, refused as pydantic's extra_forbidden in the API's
+ * validation_message: each in the order sent, five at most (SDD §12, audit AA-04, review RV52-D5).
+ */
+function refuseUnknownFields(input: Record<string, unknown>, known: readonly string[]): void {
+  const problems = Object.keys(input)
+    .filter((key) => !known.includes(key))
+    .map((key) => `${key}: Extra inputs are not permitted`);
   if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
 }
+
+/** A route whose request is `{}`, like the API's EmptyRequest (SDD §12, audit AA-04): an empty object or none, a field refused. */
+function refuseEmptyBody(input: Record<string, unknown>): void {
+  refuseUnknownFields(input, []);
+}
+
+/** The fields each migration action's request model takes (SDD §12): FastAPI refuses any other before the route runs. */
+const ACTION_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  approve: ['comment'],
+  cutover: ['force_window', 'comment'],
+  'force-cutover': ['reason'],
+  sync: [],
+  rollback: ['reason'],
+  retry: [],
+  cancel: ['reason'],
+  finalize: ['delete_source', 'confirm'],
+};
 
 /** The secrets a provider reads, by name, for its audit events - never a value: the API's _secret_names (SDD §13.3). */
 function secretNames(provider: Provider): Record<string, string> {
@@ -1630,11 +1652,14 @@ export class MockServer {
       }
       if (id && sub === 'strategy' && method === 'PUT') {
         const me = this.require(token, 'operator', path);
+        refuseUnknownFields(input, ['strategy']);
         return this.setStrategy(me, this.migration(id), input);
       }
       if (id && sub && method === 'POST') {
         const min: Role = sub === 'approve' || sub === 'cutover' || sub === 'force-cutover' || sub === 'finalize' ? 'approver' : 'operator';
         const me = this.require(token, min, path);
+        // the body is the request model's before the route looks the migration up, as FastAPI validates it
+        if (Object.hasOwn(ACTION_FIELDS, sub)) refuseUnknownFields(input, ACTION_FIELDS[sub]!);
         return this.migrationAction(me, this.migration(id), sub, input);
       }
     }
@@ -2085,7 +2110,11 @@ export class MockServer {
       return ok(this.plan(id));
     }
     if (!sub && method === 'PATCH') return this.patchPlan(this.require(token, 'operator', path), this.plan(id), input);
-    if (sub === 'waves' && subsub === 'auto' && method === 'POST') return this.autoWaves(this.require(token, 'operator', path), this.plan(id), input);
+    if (sub === 'waves' && subsub === 'auto' && method === 'POST') {
+      const me = this.require(token, 'operator', path);
+      refuseUnknownFields(input, ['max_wave_size']);
+      return this.autoWaves(me, this.plan(id), input);
+    }
     if ((sub === 'validate' || sub === 'start' || sub === 'pause') && method === 'POST') {
       const me = this.require(token, 'operator', path);
       refuseEmptyBody(input);
@@ -2093,7 +2122,11 @@ export class MockServer {
       return sub === 'start' ? this.startPlan(me, this.plan(id)) : this.pausePlan(me, this.plan(id));
     }
     if (sub === 'cancel' && method === 'POST') return this.cancelPlan(this.require(token, 'operator', path), this.plan(id), input);
-    if (sub === 'finalize' && method === 'POST') return this.finalizePlan(this.require(token, 'approver', path), this.plan(id), input);
+    if (sub === 'finalize' && method === 'POST') {
+      const me = this.require(token, 'approver', path);
+      refuseUnknownFields(input, ['wave_id', 'confirm', 'delete_source']);
+      return this.finalizePlan(me, this.plan(id), input);
+    }
     return null;
   }
 
@@ -2581,7 +2614,6 @@ export class MockServer {
   }
 
   private migrationAction(me: Me, m: Migration, action: string, input: Record<string, unknown>, sent = true): MockResponse {
-    if (action === 'sync' || action === 'retry') refuseEmptyBody(input);
     for (const field of ['comment', 'reason', 'confirm']) {
       const text = input[field];
       // the API bounds the free text of every action a client sends (SDD §12)
