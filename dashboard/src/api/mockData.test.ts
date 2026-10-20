@@ -644,6 +644,30 @@ interface FindingCase {
 /** The API's reasons and finding texts, case by case: seamless/tests/fixtures/eligibility_cases.json. */
 const ELIGIBILITY = JSON.parse(eligibilityRaw) as { cases: EligibilityCase[]; finding_cases: FindingCase[] };
 
+describe("the mock's GPU mapping rule, as the API's (SDD §9.3, §22.4, plan task G4)", () => {
+  const plan = buildFixtures(now).plans[0]!;
+  const gpuVm = makeVm({ id: 'os-gpu1', name: 'ml-01', flavor: 'g1.vgpu', disks: [{ size_gb: 20 }], flavor_extra_specs: { 'resources:VGPU': '1' } });
+  const flavors = ['m1.small', 'g1.a100-4c'];
+
+  it("names a GPU VM's mapped flavor the destination lacks as MAP_FLAVOR_MISSING alone, as the API words it", () => {
+    const mapped = { ...plan, mappings: { ...plan.mappings, flavors: { 'g1.vgpu': 'g1.nope' } } } as Plan;
+    const found = preflight(gpuVm, 'openstack', mapped, {}, { selected: [gpuVm], destination: 'RHOSO 18.0', flavors, gpuFlavors: ['g1.a100-4c'] });
+    const codes = found.filter((f) => f.code === 'MAP_FLAVOR_MISSING' || f.code === 'VM_VGPU').map((f) => [f.code, f.message]);
+    expect(codes).toEqual([['MAP_FLAVOR_MISSING', "Flavor 'g1.vgpu' is mapped to 'g1.nope', which does not exist in RHOSO 18.0."]]);
+  });
+
+  it('lifts the block once the mapping names a GPU flavor, and reads no mapping from the prototype', () => {
+    const mapped = { ...plan, mappings: { ...plan.mappings, flavors: { 'g1.vgpu': 'g1.a100-4c' } } } as Plan;
+    const context = { selected: [gpuVm], destination: 'RHOSO 18.0', flavors, gpuFlavors: ['g1.a100-4c'] };
+    expect(preflight(gpuVm, 'openstack', mapped, {}, context).map((f) => f.code)).not.toContain('VM_VGPU');
+    const prototype = makeVm({ id: 'os-gpu2', name: 'ml-02', flavor: 'constructor', disks: [{ size_gb: 20 }], flavor_extra_specs: { 'resources:VGPU': '1' } });
+    const found = preflight(prototype, 'openstack', plan, {}, { ...context, selected: [prototype] });
+    expect(found.find((f) => f.code === 'VM_VGPU')!.message).toBe(
+      "Flavor requests a vGPU (resources:VGPU). The plan maps no flavor to 'constructor': map it to a GPU flavor of RHOSO 18.0.",
+    );
+  });
+});
+
 describe('the mock words eligibility and the handover findings as the API (SDD §9.2, §9.3, §16, review RV20-08)', () => {
   const base = buildFixtures(now).plans[0]!;
   const provider = (id: string, kind: ProviderKind, side: ProviderSide) =>

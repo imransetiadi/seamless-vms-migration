@@ -930,6 +930,19 @@ export interface DestinationInventory {
   network_details?: DestinationNetwork[];
   /** The role names of the destination credential's token, read live with the inventory; null when unreadable (SDD §10, RV19-01). */
   roles?: string[] | null;
+  /** The flavors whose extra specs ask for a GPU, with the profile their provider declares (SDD §22.3); older answers omit it. */
+  gpu_flavors?: GpuFlavor[];
+  /** The Placement pools of their vGPU requests, read with the inventory (SDD §22.3). */
+  gpu_capacity?: GpuCapacity;
+}
+
+/** A destination flavor that asks for a GPU, with its GPU requests (SDD §22.3). */
+export interface GpuFlavor {
+  name: string;
+  vcpus: number;
+  ram_mb: number;
+  disk_gb: number;
+  gpus: GpuDevice[];
 }
 
 export interface DestinationSubnet {

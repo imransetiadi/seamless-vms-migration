@@ -7,7 +7,8 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
-from ..domain.models import GpuDevice
+from ..domain.enums import ProviderKind
+from ..domain.models import GpuDevice, Plan, VMRef
 
 #: Nova's resource class of a vGPU (SDD §22.2)
 VGPU = "VGPU"
@@ -123,6 +124,15 @@ class PoolRequest:
     groups: tuple[int, ...] = ()
 
 
+def pool_key(
+    resource_class: str, traits: Iterable[str], forbidden: Iterable[str], same_provider: bool
+) -> tuple[str, tuple[str, ...], tuple[str, ...], bool]:
+    """What tells a pool from another (SDD §22.3): its class, its required and forbidden traits,
+    and whether they are a numbered group's - a request without traits is its class's pool."""
+    required, refused = tuple(sorted(traits)), tuple(sorted(forbidden))
+    return resource_class, required, refused, same_provider and bool(required or refused)
+
+
 def gpu_pools(requests: Iterable[GpuDevice]) -> list[PoolRequest]:
     """The pools of the vGPU requests among ``requests`` (SDD §22.3): one per distinct request
     with traits - its class with its required and forbidden traits, and whether its group is a
@@ -133,13 +143,8 @@ def gpu_pools(requests: Iterable[GpuDevice]) -> list[PoolRequest]:
     for device in requests:
         if device.kind != "vgpu" or not device.resource_class:
             continue
-        traits = tuple(sorted(device.traits))
-        forbidden = tuple(sorted(device.forbidden_traits))
-        key = (
-            device.resource_class,
-            traits,
-            forbidden,
-            device.same_provider and bool(traits or forbidden),
+        key = pool_key(
+            device.resource_class, device.traits, device.forbidden_traits, device.same_provider
         )
         sizes = groups.setdefault(key, set())
         if device.count > 1:
@@ -174,6 +179,35 @@ def gpu_key(device: GpuDevice) -> str | None:
     if device.vendor_id and device.device_id:
         return f"{device.vendor_id}:{device.device_id}"
     return None
+
+
+def vm_gpus(vm: VMRef, declared_profile: str | None = None) -> list[GpuDevice]:
+    """The VM's GPUs (SDD §22.2): as its source reported them, else - a VM recorded before 0.3.0 -
+    what its flavor's extra specs ask for, with the profile its source declares for the flavor."""
+    if vm.gpus:
+        return list(vm.gpus)
+    specs = vm.flavor_extra_specs
+    # most flavors make no resource request and name no alias: no GPU, and nothing to read - the
+    # quota asks this of every VM pair of a plan (G4 review)
+    if not any(str(key).startswith(("resources", PCI_ALIAS)) for key in specs):
+        return []
+    return gpu_requests(specs, declared_profile)
+
+
+def gpu_flavor(vm: VMRef, plan: Plan, source_kind: ProviderKind | str) -> str | None:
+    """A GPU VM's GPU flavor, the destination flavor its server is created with, as its plan names
+    it (SDD §22.4): for a VMware VM the one flavor ``mappings.gpus`` maps each of its GPU keys to -
+    None when a device has no key, a key no mapping names, or its keys map to different flavors -;
+    for an OpenStack VM the explicit mapping of its flavor. Never a same-named or a matched flavor;
+    None for a VM without a GPU."""
+    gpus = vm_gpus(vm)
+    if not gpus:
+        return None
+    if ProviderKind(source_kind) != ProviderKind.vmware:
+        return plan.mappings.flavors.get(vm.flavor) if vm.flavor else None
+    named = {plan.mappings.gpus.get(key) if key else None for key in map(gpu_key, gpus)}
+    flavor = named.pop()
+    return flavor if not named else None
 
 
 def vgpu_profile_size(name: str) -> ProfileSize | None:

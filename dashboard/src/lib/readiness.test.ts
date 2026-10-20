@@ -76,32 +76,60 @@ describe('readinessFlags', () => {
       readinessFlags(vm, kind)
         .filter((f) => f.code === 'VM_VGPU' || f.code === 'VM_PCI_PASSTHROUGH')
         .map((f) => [f.code, f.severity, f.detail]);
-    // a VMware VM's devices arrive in gpus, no longer as flavor extra specs; the wording stays until plan task G4
+    // a VMware VM's devices arrive in gpus, no longer as flavor extra specs; its plan's GPU mapping decides (G4)
+    const needs = 'Needs a GPU mapping in its plan.';
     const vmware = gpuVm([
       { kind: 'vgpu', profile: 'grid_a100-4c', count: 2 },
       { kind: 'passthrough', vendor_id: '10de', device_id: '20b5', count: 1 },
     ]);
     expect(gpuFlags(vmware, 'vmware')).toEqual([
-      ['VM_VGPU', 'blocker', 'The flavor requests a vGPU.'],
-      ['VM_PCI_PASSTHROUGH', 'blocker', 'The flavor requests PCI passthrough.'],
+      ['VM_VGPU', 'warning', needs],
+      ['VM_PCI_PASSTHROUGH', 'warning', needs],
     ]);
     // an OpenStack flavor's custom class its provider declares a profile for is a vGPU only in gpus
     const declared = gpuVm([{ kind: 'vgpu', profile: 'A100-4C', resource_class: 'CUSTOM_NVIDIA_A100_4C', count: 1 }], {
       'resources1:CUSTOM_NVIDIA_A100_4C': '1',
     });
-    expect(gpuFlags(declared, 'openstack')).toEqual([['VM_VGPU', 'blocker', 'The flavor requests a vGPU.']]);
+    expect(gpuFlags(declared, 'openstack')).toEqual([['VM_VGPU', 'warning', needs]]);
     // a VM recorded without gpus is read from its flavor's extra specs, as validation reads it
     expect(gpuFlags(gpuVm(undefined, { 'pci_passthrough:alias': 'a100:1' }), 'openstack')).toEqual([
-      ['VM_PCI_PASSTHROUGH', 'blocker', 'The flavor requests PCI passthrough.'],
+      ['VM_PCI_PASSTHROUGH', 'warning', needs],
     ]);
     expect(gpuFlags(gpuVm([]), 'vmware')).toEqual([]);
+  });
+
+  it('says a GPU VM needs a GPU mapping in its plan', () => {
+    // SDD §22.4, §22.11 (plan task G4): guidance, as the plan decides - the VM migrates once its plan maps its GPU to a GPU
+    // flavor -, where it was a block nothing lifted; a block still where no mapping can name a VMware device
+    const gpuVm = (gpus: VMRef['gpus'], specs: Record<string, string> = {}) =>
+      makeVm({ id: 'vm-g4', name: 'gpu-04', disks: [{ size_gb: 20 }], nics: [{ network: 'VM Network', fixed_ips: ['10.0.0.9'] }], gpus, flavor_extra_specs: specs });
+    const vgpu = gpuVm([{ kind: 'vgpu', profile: 'grid_a100-4c', count: 1 }]);
+    expect(readinessFlags(vgpu, 'vmware').find((f) => f.code === 'VM_VGPU')).toMatchObject({
+      label: 'vGPU',
+      severity: 'warning',
+      detail: 'Needs a GPU mapping in its plan.',
+    });
+    expect(readinessLevel(readinessFlags(vgpu, 'vmware'))).toBe('attention');
+    const openstack = gpuVm([{ kind: 'vgpu', resource_class: 'VGPU', count: 1 }], { 'resources:VGPU': '1' });
+    expect(readinessFlags(openstack, 'openstack').find((f) => f.code === 'VM_VGPU')).toMatchObject({
+      severity: 'warning',
+      detail: 'Needs a GPU mapping in its plan.',
+    });
+    // a VMware passthrough device without ids has no GPU key: no mapping can name it
+    const unnamed = gpuVm([{ kind: 'passthrough', count: 1 }]);
+    expect(readinessFlags(unnamed, 'vmware').find((f) => f.code === 'VM_PCI_PASSTHROUGH')).toMatchObject({
+      severity: 'blocker',
+      detail: 'No mapping can name its device without ids.',
+    });
+    expect(readinessLevel(readinessFlags(unnamed, 'vmware'))).toBe('blocker');
   });
 
   it('blocks a vGPU requested bare or in a request group, as validation does (SDD §9.3 VM_VGPU, review PL-08)', () => {
     const vm = (specs: Record<string, string>) =>
       makeVm({ id: 'os-r6', name: 'gpu-02', disks: [{ size_gb: 20 }], nics: [{ network: 'app-net', fixed_ips: ['10.0.0.8'] }], flavor_extra_specs: specs });
     for (const key of ['resources:VGPU', 'resources1:VGPU', 'resources_GPU-a:VGPU'])
-      expect(readinessFlags(vm({ [key]: '1' }), 'openstack').find((f) => f.code === 'VM_VGPU')).toMatchObject({ label: 'vGPU', severity: 'blocker' });
+      // validation blocks it until its plan maps it; the inventory says so as guidance (SDD §22.4, §22.11)
+      expect(readinessFlags(vm({ [key]: '1' }), 'openstack').find((f) => f.code === 'VM_VGPU')).toMatchObject({ label: 'vGPU', severity: 'warning' });
     // another resource class, or a trait, in a request group is no vGPU
     for (const key of ['resources1:VCPU', 'resources:CUSTOM_VGPU_X', 'resources1:VGPU_DISPLAY_HEAD', 'trait1:CUSTOM_VGPU'])
       expect(readinessFlags(vm({ [key]: '1' }), 'openstack').map((f) => f.code)).not.toContain('VM_VGPU');

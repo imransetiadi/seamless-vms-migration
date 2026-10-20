@@ -5,6 +5,19 @@ import type { Finding, Strategy } from './types';
  * its default remediation. A finding may give its own remediation or severity, as the API's finding() allows. The offline
  * mock's pre-flight reads it; seamless/tests/fixtures/finding_catalog.json holds it and the API's to one copy.
  */
+/** The GPU rows of §9.3 (SDD §22.5): what the advisor's evidence leaves out, as nothing about GPUs reaches Jev in 0.3.0
+ * (§14.4, §22.12) - the API's GPU_CODES. */
+export const GPU_CODES: ReadonlySet<string> = new Set([
+  'VM_VGPU',
+  'VM_PCI_PASSTHROUGH',
+  'MAP_GPU_FLAVOR',
+  'MAP_GPU_DOWNSIZED',
+  'DST_GPU_CAPACITY_INSUFFICIENT',
+  'DST_GPU_CAPACITY_UNKNOWN',
+  'GUEST_GPU_DRIVER',
+  'GUEST_GPU_LICENSE',
+]);
+
 export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['severity']; strategies: Strategy[]; remediation: string }>> = {
   SRC_VM_ERROR_STATE: {
     severity: 'blocker',
@@ -134,12 +147,42 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
   VM_PCI_PASSTHROUGH: {
     severity: 'blocker',
     strategies: [],
-    remediation: 'PCI passthrough devices cannot be migrated; rebuild the VM with an equivalent flavor.',
+    remediation: 'Map the VM\'s passthrough device in its plan to a GPU flavor of the destination: a GPU mapping of its PCI ids (VMware) or a flavor mapping (OpenStack). A device without ids cannot be mapped.',
   },
   VM_VGPU: {
     severity: 'blocker',
     strategies: [],
-    remediation: 'vGPU instances cannot be migrated; rebuild the VM with a vGPU flavor of the destination.',
+    remediation: 'Map the VM\'s vGPU in its plan to a GPU flavor of the destination: a GPU mapping of its profile (VMware) or a flavor mapping (OpenStack).',
+  },
+  MAP_GPU_FLAVOR: {
+    severity: 'info',
+    strategies: [],
+    remediation: 'Check the GPU flavor\'s size and GPU before the cutover: GPU migration is a Technology Preview.',
+  },
+  MAP_GPU_DOWNSIZED: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Map the VM to a GPU flavor of the destination that gives at least the GPU it has, or confirm that its workload fits the smaller one.',
+  },
+  DST_GPU_CAPACITY_INSUFFICIENT: {
+    severity: 'blocker',
+    strategies: [],
+    remediation: 'Free GPU capacity in the destination, or move some of the plan\'s GPU VMs to a later plan or to another GPU flavor\'s pool, then re-validate.',
+  },
+  DST_GPU_CAPACITY_UNKNOWN: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Give the destination credential a role Placement lets read its allocation candidates (admin by default), or check the destination\'s GPU capacity yourself; a PCI alias\'s devices are configured in nova.conf.',
+  },
+  GUEST_GPU_DRIVER: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Install the NVIDIA driver the destination needs in the guest - a vGPU guest driver its vGPU manager supports, or the data center driver for a passed-through GPU - and test it after the cutover.',
+  },
+  GUEST_GPU_LICENSE: {
+    severity: 'info',
+    strategies: [],
+    remediation: 'Make the NVIDIA License System (a CLS instance or an on-premises DLS instance) reachable from the VM\'s destination network, and check the guest\'s license after the cutover.',
   },
   VOL_ENCRYPTED: {
     severity: 'warning',

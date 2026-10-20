@@ -6,7 +6,7 @@ import { buildFixtures } from './mockData';
 
 const SHARED = JSON.parse(catalogRaw) as { catalog: Record<string, { severity: string; strategies: string[]; remediation: string }> };
 /** The findings the API words with a remediation or severity of their own (planning/preflight.py finding(..., remediation=, severity=)). */
-const OWN = new Set(['MAP_NETWORK_MISSING', 'NET_PORT_NOT_PERMITTED', 'MAP_FLAVOR_MISSING', 'MAP_FLAVOR_AUTO', 'MAP_VOLUME_TYPE_MISSING']);
+const OWN = new Set(['MAP_NETWORK_MISSING', 'NET_PORT_NOT_PERMITTED', 'MAP_FLAVOR_MISSING', 'MAP_FLAVOR_AUTO', 'MAP_VOLUME_TYPE_MISSING', 'MAP_GPU_FLAVOR']);
 
 describe("the offline mock's finding catalog is the API's (SDD §9.3, §16)", () => {
   it("holds each code's severity, strategies and default remediation as the API's CATALOG", () => {

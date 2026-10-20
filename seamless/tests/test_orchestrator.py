@@ -1088,7 +1088,12 @@ async def test_validate_creates_migrations_with_findings_and_estimates(tmp_path,
     assert len(report.migrations) == 3
     by_name = {item.vm_name: item for item in report.migrations}
     assert by_name["gpu-01"].phase == P.blocked
-    assert [f.code for f in by_name["gpu-01"].findings] == ["VM_VGPU"]
+    # blocked until its plan maps its vGPU, and told of its guest's driver and license (SDD §22.5)
+    assert [f.code for f in by_name["gpu-01"].findings] == [
+        "VM_VGPU",
+        "GUEST_GPU_DRIVER",
+        "GUEST_GPU_LICENSE",
+    ]
     assert all(not e.eligible for e in by_name["gpu-01"].estimates)
     web = await h.by_vm(plan.id, "vm-1")
     assert web.phase == P.ready and web.wave_id is None

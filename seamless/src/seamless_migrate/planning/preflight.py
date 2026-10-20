@@ -12,7 +12,16 @@ from typing import Any, Literal
 from ..domain.enums import Phase, ProviderKind, Severity, Strategy
 from ..domain.models import Finding, GpuDevice, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
-from .gpu import gpu_requests, vgpu_request_keys
+from .gpu import (
+    ProfileSize,
+    gpu_flavor,
+    gpu_key,
+    pool_key,
+    pool_name,
+    vgpu_profile_size,
+    vgpu_request_keys,
+    vm_gpus,
+)
 from .ipam import address_refusal
 from .kit import kit_vm_name
 from .networks import kit_subnet, policy_profile_of, port_refusal, resolve_network
@@ -271,12 +280,53 @@ CATALOG: dict[str, CatalogEntry] = {
     "VM_PCI_PASSTHROUGH": CatalogEntry(
         Severity.blocker,
         (),
-        "PCI passthrough devices cannot be migrated; rebuild the VM with an equivalent flavor.",
+        "Map the VM's passthrough device in its plan to a GPU flavor of the destination: a GPU "
+        "mapping of its PCI ids (VMware) or a flavor mapping (OpenStack). A device without ids "
+        "cannot be mapped.",
     ),
     "VM_VGPU": CatalogEntry(
         Severity.blocker,
         (),
-        "vGPU instances cannot be migrated; rebuild the VM with a vGPU flavor of the destination.",
+        "Map the VM's vGPU in its plan to a GPU flavor of the destination: a GPU mapping of its "
+        "profile (VMware) or a flavor mapping (OpenStack).",
+    ),
+    "MAP_GPU_FLAVOR": CatalogEntry(
+        Severity.info,
+        (),
+        "Check the GPU flavor's size and GPU before the cutover: GPU migration is a Technology "
+        "Preview.",
+    ),
+    "MAP_GPU_DOWNSIZED": CatalogEntry(
+        Severity.warning,
+        (),
+        "Map the VM to a GPU flavor of the destination that gives at least the GPU it has, or "
+        "confirm that its workload fits the smaller one.",
+    ),
+    "DST_GPU_CAPACITY_INSUFFICIENT": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Free GPU capacity in the destination, or move some of the plan's GPU VMs to a later plan "
+        "or to another GPU flavor's pool, then re-validate.",
+    ),
+    "DST_GPU_CAPACITY_UNKNOWN": CatalogEntry(
+        Severity.warning,
+        (),
+        "Give the destination credential a role Placement lets read its allocation candidates "
+        "(admin by default), or check the destination's GPU capacity yourself; a PCI alias's "
+        "devices are configured in nova.conf.",
+    ),
+    "GUEST_GPU_DRIVER": CatalogEntry(
+        Severity.warning,
+        (),
+        "Install the NVIDIA driver the destination needs in the guest - a vGPU guest driver its "
+        "vGPU manager supports, or the data center driver for a passed-through GPU - and test it "
+        "after the cutover.",
+    ),
+    "GUEST_GPU_LICENSE": CatalogEntry(
+        Severity.info,
+        (),
+        "Make the NVIDIA License System (a CLS instance or an on-premises DLS instance) reachable "
+        "from the VM's destination network, and check the guest's license after the cutover.",
     ),
     "VOL_ENCRYPTED": CatalogEntry(
         Severity.warning,
@@ -444,34 +494,72 @@ def destination_project(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) ->
     return vm.project
 
 
+#: the GPU rows of §9.3 (SDD §22.5): what the advisor's evidence leaves out, as nothing about GPUs
+#: reaches Jev in 0.3.0 (§14.4, §22.12)
+GPU_CODES = frozenset(
+    {
+        "VM_VGPU",
+        "VM_PCI_PASSTHROUGH",
+        "MAP_GPU_FLAVOR",
+        "MAP_GPU_DOWNSIZED",
+        "DST_GPU_CAPACITY_INSUFFICIENT",
+        "DST_GPU_CAPACITY_UNKNOWN",
+        "GUEST_GPU_DRIVER",
+        "GUEST_GPU_LICENSE",
+    }
+)
+
+
+def _kind_of(vm: VMRef, source_kind: ProviderKind | str | None) -> ProviderKind:
+    """The VM's source kind, as given, else as the VM shows it: a VMware VM has no flavor."""
+    if source_kind is not None:
+        return ProviderKind(source_kind)
+    return ProviderKind.vmware if vm.flavor is None else ProviderKind.openstack
+
+
+def _flavor_named(dst_inv: DestinationInventory, name: str | None) -> dict[str, Any] | None:
+    return next((f for f in dst_inv.flavors if f.get("name") == name), None) if name else None
+
+
 def destination_flavor(
-    vm: VMRef, plan: Plan, dst_inv: DestinationInventory
+    vm: VMRef,
+    plan: Plan,
+    dst_inv: DestinationInventory,
+    source_kind: ProviderKind | str | None = None,
 ) -> dict[str, Any] | None:
-    """The destination flavor ``vm``'s server is created with (SDD §9.3, review PL-01): the mapped
-    one, else the same-named or automatically matched one. ``None`` for a VM without a flavor (a
-    VMware VM: the migration kit chooses), for a flavor pre-staging creates with the source's
-    size, and when none resolves."""
+    """The destination flavor ``vm``'s server is created with (SDD §9.3, review PL-01): a GPU VM's
+    GPU flavor, which its plan names and nothing matches (§22.4); else the mapped one, else the
+    same-named or automatically matched one. ``None`` for a VMware VM without a GPU flavor (the
+    migration kit chooses), for a flavor pre-staging creates with the source's size, and when none
+    resolves."""
+    if vm_gpus(vm):
+        return _flavor_named(dst_inv, gpu_flavor(vm, plan, _kind_of(vm, source_kind)))
     if not vm.flavor or flavor_prestaged(vm, plan, dst_inv):
         return None
     target = plan.mappings.flavors.get(vm.flavor)
     if target is not None:
-        return next((f for f in dst_inv.flavors if f.get("name") == target), None)
+        return _flavor_named(dst_inv, target)
     return fitting_flavor(vm, dst_inv)
 
 
 def resource_demand(
-    vm: VMRef, plan: Plan | None = None, dst_inv: DestinationInventory | None = None
+    vm: VMRef,
+    plan: Plan | None = None,
+    dst_inv: DestinationInventory | None = None,
+    source_kind: ProviderKind | str | None = None,
 ) -> dict[str, int]:
     """Quota the VM needs at the destination. An ``image_root`` disk becomes a destination volume
     on the warm path (``boot_disk_copy``), so it counts unless the plan is cold-only. Its cores and
-    RAM are those of the destination flavor its server is created with, when one resolves (SDD
-    §9.3, review PL-01)."""
+    RAM are those of the destination flavor its server is created with, when one resolves - a GPU
+    VM's GPU flavor, a VMware VM's included (SDD §9.3, §22.4, review PL-01)."""
     kinds = {"volume", "vmdk"}
     if plan is None or plan.default_strategy != Strategy.cold:
         kinds.add("image_root")
     volumes = [d for d in vm.disks if d.kind in kinds]
     flavor = (
-        destination_flavor(vm, plan, dst_inv) if plan is not None and dst_inv is not None else None
+        destination_flavor(vm, plan, dst_inv, source_kind)
+        if plan is not None and dst_inv is not None
+        else None
     )
     return {
         "cores": int(flavor.get("vcpus") or 0) if flavor else vm.vcpus,
@@ -517,9 +605,10 @@ def remaining_demand(
     plan: Plan | None,
     share: QuotaShare,
     dst_inv: DestinationInventory | None = None,
+    source_kind: ProviderKind | str | None = None,
 ) -> dict[str, int]:
     """The part of ``vm``'s demand its ``share`` counts (SDD §9.3, reviews PL-02, RV38A-01)."""
-    demand = resource_demand(vm, plan, dst_inv)
+    demand = resource_demand(vm, plan, dst_inv, source_kind)
     if share == "nothing":
         return dict.fromkeys(demand, 0)
     if share == "server":
@@ -533,6 +622,7 @@ def _quota_shortfall(
     dst_inv: DestinationInventory,
     all_vms: Sequence[VMRef],
     shares: Mapping[str, QuotaShare],
+    source_kind: ProviderKind | str | None = None,
 ) -> tuple[str, list[str]] | None:
     project = destination_project(vm, plan, dst_inv)
     if project is None or project not in dst_inv.quotas:
@@ -540,7 +630,9 @@ def _quota_shortfall(
     totals = dict.fromkeys(_QUOTA_KEYS, 0)
     for other in all_vms:
         if destination_project(other, plan, dst_inv) == project:
-            share = remaining_demand(other, plan, shares.get(other.source_id, "all"), dst_inv)
+            share = remaining_demand(
+                other, plan, shares.get(other.source_id, "all"), dst_inv, source_kind
+            )
             for key, value in share.items():
                 totals[key] += value
     free = dst_inv.quotas[project]
@@ -593,7 +685,7 @@ def _vm_gpus(vm: VMRef, source: Provider | None) -> tuple[list[GpuDevice], str |
     its source declares for its flavor: as the source reported them, else - a VM recorded before
     G2 - what its flavor's extra specs ask for, so a VMware VM reported with them stays blocked."""
     declared = source.gpu_profiles.get(vm.flavor) if source is not None and vm.flavor else None
-    return (list(vm.gpus) or gpu_requests(vm.flavor_extra_specs, declared)), declared
+    return vm_gpus(vm, declared), declared
 
 
 def _gpu_names(devices: Iterable[GpuDevice]) -> str:
@@ -613,11 +705,75 @@ def _gpu_names(devices: Iterable[GpuDevice]) -> str:
     return ", ".join(names)
 
 
-def _gpu_findings(vm: VMRef, source: Provider | None) -> list[Finding]:
-    """`VM_PCI_PASSTHROUGH` and `VM_VGPU`, unconditional blockers until plan task G4 (SDD §9.3,
-    §22.2): an OpenStack flavor's requests named by their extra specs, as before; a VMware VM's
-    devices by what names them."""
-    gpus, declared = _vm_gpus(vm, source)
+@dataclass(frozen=True)
+class _GpuMapping:
+    """Whether a GPU VM's mapping applies (SDD §22.4): its GPU flavor when it does; why not when
+    no mapping names one, a VMware key is missing, its keys split or the flavor asks for no GPU;
+    neither for a mapped flavor that does not exist, which is MAP_FLAVOR_MISSING's."""
+
+    flavor: dict[str, Any] | None = None
+    why: str | None = None
+
+
+def _quoted(names: Iterable[str]) -> str:
+    return ", ".join(repr(name) for name in names)
+
+
+def _gpu_mapping(
+    vm: VMRef,
+    plan: Plan,
+    gpus: Sequence[GpuDevice],
+    kind: ProviderKind,
+    dst_inv: DestinationInventory,
+    where: str,
+) -> _GpuMapping:
+    """The mapping of a GPU VM, as §22.4 decides whether it applies: a VMware VM's GPU keys all to
+    one GPU flavor, an OpenStack VM's flavor to one - never a same-named flavor."""
+    if kind == ProviderKind.vmware:
+        keys = list(dict.fromkeys(gpu_key(device) for device in gpus))
+        if None in keys:
+            return _GpuMapping(
+                why="No mapping can name its device without ids, so none applies to the VM."
+            )
+        named = [key for key in keys if key is not None]
+        unnamed = [key for key in named if key not in plan.mappings.gpus]
+        if unnamed:
+            return _GpuMapping(
+                why=f"The plan's GPU mappings name no flavor for {_quoted(unnamed)}: map "
+                f"{'it' if len(unnamed) == 1 else 'them'} to a GPU flavor of {where}."
+            )
+        targets = {key: plan.mappings.gpus[key] for key in named}
+        if len(set(targets.values())) > 1:
+            pairs = ", ".join(f"{key!r} to {flavor!r}" for key, flavor in targets.items())
+            return _GpuMapping(
+                why=f"Its GPUs map to different flavors ({pairs}): its server is created with one."
+            )
+        target = next(iter(targets.values()))
+        mapping = f"Its GPU mapping, {_quoted(named)} to {target!r},"
+    else:
+        target = plan.mappings.flavors.get(vm.flavor) if vm.flavor else None
+        if target is None:
+            return _GpuMapping(
+                why=f"The plan maps no flavor to {vm.flavor!r}: map it to a GPU flavor of {where}."
+            )
+        mapping = f"Its flavor mapping, {vm.flavor!r} to {target!r},"
+    if _flavor_named(dst_inv, target) is None:
+        return _GpuMapping()
+    gpu_flavor_of = next((f for f in dst_inv.gpu_flavors if f.get("name") == target), None)
+    if gpu_flavor_of is None:
+        return _GpuMapping(
+            why=f"{mapping} names a flavor of {where} that asks for no GPU: the server would lose "
+            "its GPU."
+        )
+    return _GpuMapping(flavor=gpu_flavor_of)
+
+
+def _gpu_blockers(
+    vm: VMRef, gpus: Sequence[GpuDevice], declared: str | None, why: str
+) -> list[Finding]:
+    """`VM_PCI_PASSTHROUGH` and `VM_VGPU` for a GPU VM no mapping applies to (SDD §9.3, §22.5): an
+    OpenStack flavor's requests named by their extra specs, a VMware VM's devices by what names
+    them, then why no mapping applies."""
     out = []
     passthrough = [g for g in gpus if g.kind == "passthrough"]
     if passthrough:
@@ -627,7 +783,7 @@ def _gpu_findings(vm: VMRef, source: Provider | None) -> list[Finding]:
             if alias is not None and any(g.alias for g in passthrough)
             else f"The VM has a PCI passthrough device ({_gpu_names(passthrough)})."
         )
-        out.append(finding("VM_PCI_PASSTHROUGH", message))
+        out.append(finding("VM_PCI_PASSTHROUGH", f"{message} {why}"))
     vgpus = [g for g in gpus if g.kind == "vgpu"]
     if vgpus:
         keys = vgpu_request_keys(vm.flavor_extra_specs, declared)
@@ -636,7 +792,388 @@ def _gpu_findings(vm: VMRef, source: Provider | None) -> list[Finding]:
             if keys and any(g.resource_class for g in vgpus)
             else f"The VM has a vGPU ({_gpu_names(vgpus)})."
         )
-        out.append(finding("VM_VGPU", message))
+        out.append(finding("VM_VGPU", f"{message} {why}"))
+    return out
+
+
+def _missing_gpu_targets(
+    vm: VMRef, plan: Plan, kind: ProviderKind, flavors: set[str], where: str
+) -> list[str]:
+    """The mappings of a GPU VM whose flavor does not exist at the destination, in words: its
+    flavor mapping, or for a VMware VM each GPU key's (SDD §9.3 MAP_FLAVOR_MISSING, §22.4)."""
+    if kind != ProviderKind.vmware:
+        target = plan.mappings.flavors.get(vm.flavor) if vm.flavor else None
+        if target is None or target in flavors:
+            return []
+        return [f"Flavor {vm.flavor!r} is mapped to {target!r}, which does not exist in {where}."]
+    keys = dict.fromkeys(key for key in map(gpu_key, vm_gpus(vm)) if key is not None)
+    return [
+        f"The plan maps {key!r} to {plan.mappings.gpus[key]!r}, which does not exist in {where}."
+        for key in keys
+        if key in plan.mappings.gpus and plan.mappings.gpus[key] not in flavors
+    ]
+
+
+def _requests_text(requests: Iterable[GpuDevice]) -> str:
+    """A GPU flavor's requests in words: "vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C)" (SDD §22.5)."""
+    words = []
+    for device in requests:
+        what = (
+            f"vGPU {pool_name(device.resource_class or '', device.traits, device.forbidden_traits)}"
+            if device.kind == "vgpu"
+            else f"PCI alias {device.alias}"
+        )
+        words.append(
+            what
+            + (f" ×{device.count}" if device.count > 1 else "")
+            + (f" ({device.profile})" if device.profile else "")
+        )
+    return ", ".join(words)
+
+
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _first_names(names: Iterable[str], limit: int = 10) -> str:
+    """The names sorted, the first ``limit`` of them, then how many more: a message of a plan of
+    hundreds of VMs stays short (SDD §22.5)."""
+    ordered = sorted(set(names))
+    if len(ordered) <= limit:
+        return ", ".join(ordered)
+    return f"{', '.join(ordered[:limit])} and {len(ordered) - limit} more"
+
+
+def _and(items: Sequence[str]) -> str:
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _sized(devices: Iterable[GpuDevice]) -> list[tuple[ProfileSize, str]]:
+    """Each GPU unit whose profile has a size (SDD §22.2), with the profile, the largest first."""
+    units = []
+    for device in devices:
+        size = vgpu_profile_size(device.profile) if device.profile else None
+        if size is not None:
+            units += [(size, str(device.profile))] * device.count
+    return sorted(
+        units, key=lambda unit: (unit[0].framebuffer_gb, unit[0].slices or 0), reverse=True
+    )
+
+
+def _nvidia_passthrough(devices: Iterable[GpuDevice]) -> bool:
+    """Whether every passed-through device is known to be an NVIDIA GPU: a VMware device of vendor
+    id 10de. An OpenStack PCI alias names no device, so it is "a PCI device" (SDD §22.1)."""
+    passthrough = [d for d in devices if d.kind == "passthrough"]
+    return bool(passthrough) and all(d.vendor_id == "10de" for d in passthrough)
+
+
+def _gpu_words(devices: Sequence[GpuDevice]) -> str:
+    """What the guest gets, in words: a vGPU, a passed-through NVIDIA GPU or a PCI device."""
+    if _is_vgpu(devices):
+        return "a vGPU"
+    if _nvidia_passthrough(devices):
+        return "a passed-through NVIDIA GPU"
+    return "a passed-through PCI device"
+
+
+def _is_vgpu(devices: Iterable[GpuDevice]) -> bool:
+    """A vGPU among them: one of kind vgpu, or a PCI device with a vGPU profile (SDD §22.3)."""
+    return any(d.kind == "vgpu" or (d.kind == "passthrough" and d.profile) for d in devices)
+
+
+def _gpu_flavor_findings(
+    vm: VMRef, gpus: Sequence[GpuDevice], flavor: dict[str, Any], where: str
+) -> list[Finding]:
+    """`MAP_GPU_FLAVOR` and `MAP_GPU_DOWNSIZED` for a GPU mapping that applies (SDD §22.5)."""
+    vcpus, ram_mb, disk_gb, name = _flavor_size(flavor)
+    root = _local_root_gb(vm)
+    less = [
+        text
+        for short, text in (
+            (vcpus < vm.vcpus, f"{vcpus} vCPUs for its {vm.vcpus}"),
+            (ram_mb < vm.ram_mb, f"{ram_mb} MB RAM for its {vm.ram_mb}"),
+            (disk_gb < root, f"{disk_gb} GB of root disk for its {root}"),
+        )
+        if short
+    ]
+    out = [
+        finding(
+            "MAP_GPU_FLAVOR",
+            f"The VM's GPUs ({_gpu_names(gpus)}) go to flavor {name!r} of {where}: {vcpus} vCPUs, "
+            f"{ram_mb} MB RAM, {disk_gb} GB disk, {_requests_text(flavor['gpus'])}"
+            + (f"; it gives the VM {_and(less)}" if less else "")
+            + ". GPU migration is a Technology Preview.",
+            severity=Severity.warning if less else None,
+            # the GPU flavor decides the server's size, one per GPU key of a plan (SDD §22.4)
+            remediation=(
+                "Map the VM's GPU to a GPU flavor of the destination of at least its size, or put "
+                "the VMs that need another size in another plan, which maps their GPU to another "
+                "flavor."
+            )
+            if less
+            else None,
+        )
+    ]
+    has = sum(device.count for device in gpus)
+    gives = sum(device.count for device in flavor["gpus"])
+    reasons = [f"{gives} GPU{'' if gives == 1 else 's'} for its {has}"] if gives < has else []
+    # compared one by one, the largest first: as many pairs as both sides have sizes for
+    pairs = list(zip(_sized(gpus), _sized(flavor["gpus"]), strict=False))
+    smaller = next(((v, f) for v, f in pairs if f[0].framebuffer_gb < v[0].framebuffer_gb), None)
+    if smaller is not None:
+        (own, own_name), (other, other_name) = smaller
+        reasons.append(
+            f"a {other.framebuffer_gb} GB framebuffer for its {own.framebuffer_gb} GB "
+            f"({other_name} for {own_name})"
+        )
+    fewer = next(
+        (
+            (v, f)
+            for v, f in pairs
+            if v[0].slices is not None and f[0].slices is not None and f[0].slices < v[0].slices
+        ),
+        None,
+    )
+    if fewer is not None:
+        (own, own_name), (other, other_name) = fewer
+        reasons.append(
+            f"{_count(other.slices, 'MIG slice')} for its {own.slices} ({other_name} for "
+            f"{own_name})"
+        )
+    if reasons:
+        out.append(
+            finding(
+                "MAP_GPU_DOWNSIZED",
+                f"Flavor {name!r} of {where} gives the VM less GPU than it has: "
+                f"{'; '.join(reasons)}.",
+            )
+        )
+    return out
+
+
+def _guest_gpu_findings(
+    gpus: Sequence[GpuDevice], flavor: dict[str, Any] | None, kind: ProviderKind, where: str
+) -> list[Finding]:
+    """`GUEST_GPU_DRIVER` for every GPU VM, and `GUEST_GPU_LICENSE` for a vGPU's (SDD §22.5): the
+    driver the GPU it gets needs - the flavor's when a mapping applies, else its own -, and the
+    change of kind or model the mapping makes."""
+    target = flavor["gpus"] if flavor is not None else gpus
+    to_vgpu = _is_vgpu(target)
+    if to_vgpu:
+        message = (
+            f"The guest's NVIDIA driver must suit {where}: a vGPU guest driver of a release its "
+            "hosts' vGPU manager supports (NVIDIA's compatibility table)."
+        )
+    elif _nvidia_passthrough(target):
+        message = (
+            f"The guest's NVIDIA driver must suit {where}: the data center driver for its "
+            "passed-through NVIDIA GPU."
+        )
+    else:
+        message = (
+            f"The guest's driver must suit {where}: the driver of its passed-through PCI device."
+        )
+    if flavor is not None:
+        models = sorted({size.gpu for size, _ in _sized(gpus)})
+        new_models = sorted({size.gpu for size, _ in _sized(target)})
+        if _is_vgpu(gpus) != to_vgpu:
+            message += (
+                f" The mapping changes the GPU from {_gpu_words(gpus)} to {_gpu_words(target)}, so "
+                "the guest needs a new driver."
+            )
+        elif models and new_models and models != new_models:
+            message += (
+                f" The mapping changes the GPU model from {', '.join(models)} to "
+                f"{', '.join(new_models)}, so the guest needs a new driver."
+            )
+    if kind == ProviderKind.vmware:
+        message += " virt-v2v neither installs nor updates the driver."
+    out = [finding("GUEST_GPU_DRIVER", message)]
+    if _is_vgpu(gpus) or to_vgpu:
+        out.append(
+            finding(
+                "GUEST_GPU_LICENSE",
+                "The guest licenses its vGPU from the NVIDIA License System: its license server, "
+                "a CLS instance or an on-premises DLS instance, must be reachable from its network "
+                f"in {where}, or the guest runs its GPU unlicensed.",
+            )
+        )
+    return out
+
+
+def _server_gpu_flavor(
+    vm: VMRef, plan: Plan, dst_inv: DestinationInventory, kind: ProviderKind
+) -> dict[str, Any] | None:
+    """The GPU flavor ``vm``'s server is created with, if any (SDD §22.5): a GPU VM's GPU flavor,
+    or the GPU flavor a mapping sends a VM without a GPU to."""
+    if vm_gpus(vm):
+        name = gpu_flavor(vm, plan, kind)
+    else:
+        name = plan.mappings.flavors.get(vm.flavor) if vm.flavor else None
+    return next((f for f in dst_inv.gpu_flavors if f.get("name") == name), None) if name else None
+
+
+def _unknown_capacity(capacity: GpuCapacity) -> str:
+    """Why the destination's GPU capacity cannot be read, in words (SDD §22.3, §22.5)."""
+    if capacity.reason == "forbidden":
+        return (
+            f"Placement refuses its credential ({capacity.detail}): its default policy lets only "
+            "the admin role read it"
+        )
+    if capacity.reason == "no_placement":
+        return "its catalog has no Placement"
+    return f"the read failed ({capacity.detail})"
+
+
+def _capacity_findings(
+    vm: VMRef,
+    flavor: dict[str, Any],
+    plan: Plan,
+    dst_inv: DestinationInventory,
+    kind: ProviderKind,
+    where: str,
+    selected: Sequence[VMRef],
+    shares: Mapping[str, QuotaShare],
+) -> list[Finding]:
+    """`DST_GPU_CAPACITY_UNKNOWN` and `DST_GPU_CAPACITY_INSUFFICIENT` for a VM whose server is
+    created with a GPU flavor (SDD §22.5): the plan's VMs each count what their cutover will still
+    create, per pool and per resource class across its pools; a group of n > 1 units needs a
+    provider with n free; a pool Placement refused counts nothing. Nothing is guessed."""
+    capacity = dst_inv.gpu_capacity
+    vgpus = [g for g in flavor["gpus"] if g.kind == "vgpu" and g.resource_class]
+    pools = {
+        pool_key(p.resource_class, p.traits, p.forbidden_traits, p.same_provider): p
+        for p in capacity.pools
+    }
+    unknown = []
+    if vgpus and capacity.status == "unknown":
+        unknown.append(
+            f"The GPU capacity of {where} cannot be read: {_unknown_capacity(capacity)}."
+        )
+    elif vgpus:
+        # a read that holds no pool for a request: nothing is guessed for it (SDD §22.5)
+        unknown += [
+            f"The GPU capacity read of {where} holds no pool "
+            f"{pool_name(g.resource_class or '', g.traits, g.forbidden_traits)}: nothing is "
+            "guessed for it."
+            for g in vgpus
+            if pool_key(g.resource_class or "", g.traits, g.forbidden_traits, g.same_provider)
+            not in pools
+        ]
+    unknown += [
+        f"Flavor {flavor['name']!r} of {where} asks for PCI alias {g.alias}, whose devices "
+        "nova.conf configures: Placement does not show their capacity."
+        for g in flavor["gpus"]
+        if g.kind == "passthrough"
+    ]
+    out = [finding("DST_GPU_CAPACITY_UNKNOWN", " ".join(unknown))] if unknown else []
+    if not vgpus or capacity.status != "ok" or shares.get(vm.source_id) == "nothing":
+        return out
+    # the units each pool, and each class across its pools, is asked for by the plan's VMs
+    asked: dict[tuple[str, tuple[str, ...], tuple[str, ...], bool], int] = {}
+    askers: dict[tuple[str, tuple[str, ...], tuple[str, ...], bool], set[str]] = {}
+    for other in selected:
+        other_flavor = _server_gpu_flavor(other, plan, dst_inv, kind)
+        if other_flavor is None or shares.get(other.source_id) == "nothing":
+            continue
+        for device in other_flavor["gpus"]:
+            if device.kind != "vgpu" or not device.resource_class:
+                continue
+            own = pool_key(
+                device.resource_class, device.traits, device.forbidden_traits, device.same_provider
+            )
+            for key in dict.fromkeys((own, (device.resource_class, (), (), False))):
+                asked[key] = asked.get(key, 0) + device.count
+                askers.setdefault(key, set()).add(other.name)
+    reasons = []
+    for key in dict.fromkeys(
+        pool_key(g.resource_class or "", g.traits, g.forbidden_traits, g.same_provider)
+        for g in vgpus
+    ):
+        pool = pools.get(key)
+        if pool is None:
+            continue
+        name = pool_name(pool.resource_class, pool.traits, pool.forbidden_traits)
+        if pool.detail is not None:
+            reasons.append(
+                f"Placement refuses the request for {name} of {where} ({pool.detail}): no server "
+                f"is created with flavor {flavor['name']!r}."
+            )
+            continue
+        if asked.get(key, 0) > pool.free:
+            reasons.append(
+                f"The plan's VMs ask {name} of {where} for {_count(asked[key], 'unit')}, more "
+                f"than its {pool.free} free ({_first_names(askers[key])})."
+            )
+    for cls in dict.fromkeys(g.resource_class or "" for g in vgpus):
+        key = (cls, (), (), False)
+        alone = pools.get(key)
+        own = {
+            pool_key(cls, g.traits, g.forbidden_traits, g.same_provider)
+            for g in vgpus
+            if g.resource_class == cls
+        }
+        if alone is None or alone.detail is not None or key in own:
+            continue  # a request without traits asks its class's pool: that check was its own
+        if asked.get(key, 0) > alone.free:
+            reasons.append(
+                f"The plan's VMs ask {cls} of {where} for {_count(asked[key], 'unit')} across "
+                f"its pools, more than its {alone.free} free ({_first_names(askers[key])})."
+            )
+    for device in vgpus:
+        key = pool_key(
+            device.resource_class or "",
+            device.traits,
+            device.forbidden_traits,
+            device.same_provider,
+        )
+        pool = pools.get(key)
+        # a group of n > 1 units needs one provider with n free (SDD §22.3, §22.5)
+        if (
+            pool is not None
+            and pool.detail is None
+            and device.count > 1
+            and device.count > pool.largest_free
+        ):
+            name = pool_name(pool.resource_class, pool.traits, pool.forbidden_traits)
+            reasons.append(
+                f"Its flavor asks {name} of {where} for {device.count} units on one provider, and "
+                f"none has {device.count} free (the most on one is {pool.largest_free})."
+            )
+    if reasons:
+        out.append(finding("DST_GPU_CAPACITY_INSUFFICIENT", " ".join(dict.fromkeys(reasons))))
+    return out
+
+
+def _gpu_findings(
+    vm: VMRef,
+    plan: Plan,
+    dst_inv: DestinationInventory,
+    source: Provider | None,
+    where: str,
+    selected: Sequence[VMRef],
+    shares: Mapping[str, QuotaShare],
+) -> list[Finding]:
+    """§9.3's GPU rows for ``vm`` (SDD §22.4, §22.5): a GPU VM is blocked until a GPU mapping
+    applies to it, then told of its GPU flavor and any downsizing; every GPU VM of its guest's
+    driver and a vGPU's license; and a VM whose server is created with a GPU flavor of the
+    destination's capacity for it."""
+    gpus, declared = _vm_gpus(vm, source)
+    kind = _kind_of(vm, source.kind if source is not None else None)
+    out: list[Finding] = []
+    flavor = None
+    if gpus:
+        mapping = _gpu_mapping(vm, plan, gpus, kind, dst_inv, where)
+        flavor = mapping.flavor
+        if mapping.why is not None:
+            out += _gpu_blockers(vm, gpus, declared, mapping.why)
+        if flavor is not None:
+            out += _gpu_flavor_findings(vm, gpus, flavor, where)
+        out += _guest_gpu_findings(gpus, flavor, kind, where)
+    else:
+        flavor = _server_gpu_flavor(vm, plan, dst_inv, kind)
+    if flavor is not None:
+        out += _capacity_findings(vm, flavor, plan, dst_inv, kind, where, selected, shares)
     return out
 
 
@@ -672,9 +1209,11 @@ def fitting_flavor(vm: VMRef, dst_inv: DestinationInventory) -> dict[str, Any] |
 def flavor_prestaged(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> bool:
     """Whether pre-staging creates ``vm``'s flavor (SDD §7.2, §9.3 ``MAP_FLAVOR_PRESTAGED``):
     "flavors" is pre-staged and the flavor has no mapping and no same-named destination flavor
-    (an existing destination flavor is never pre-staged over)."""
+    (an existing destination flavor is never pre-staged over) - and never a GPU VM's, whose GPU
+    type may not exist at the destination (§22.4)."""
     return bool(
         vm.flavor
+        and not vm_gpus(vm)
         and "flavors" in plan.prestage_resources
         and vm.flavor not in plan.mappings.flavors
         and vm.flavor not in {str(f.get("name")) for f in dst_inv.flavors if f.get("name")}
@@ -702,9 +1241,12 @@ def resolve_mappings(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> Ma
     """Mappings preflight matched automatically for ``vm`` (``Migration.resolved_mappings``).
 
     0.1.0 resolves flavors only: when the plan has no mapping for the VM's flavor and no
-    same-named destination flavor fits, the smallest fitting flavor is recorded.
+    same-named destination flavor fits, the smallest fitting flavor is recorded - never for a GPU
+    VM, whose GPU mapping owns its flavor (SDD §22.4).
     """
     out = Mappings()
+    if vm_gpus(vm):
+        return out
     if (
         vm.flavor
         and vm.flavor not in plan.mappings.flavors
@@ -1098,7 +1640,20 @@ def run_preflight(
         )
 
     dst_flavor_names = {str(f.get("name")) for f in dst_inv.flavors if f.get("name")}
-    if flavor_prestaged(vm, plan, dst_inv) and (
+    kind = _kind_of(vm, source.kind if source is not None else None)
+    if vm_gpus(vm):
+        # the GPU mapping owns a GPU VM's flavor: nothing is matched or pre-staged, and only a
+        # mapped flavor that does not exist is missing (SDD §22.4)
+        missing = _missing_gpu_targets(vm, plan, kind, dst_flavor_names, where)
+        if missing:
+            out.append(
+                finding(
+                    "MAP_FLAVOR_MISSING",
+                    " ".join(missing),
+                    remediation="Fix the mapping: the destination flavor must exist.",
+                )
+            )
+    elif flavor_prestaged(vm, plan, dst_inv) and (
         source is None or source.kind != ProviderKind.vmware
     ):
         out.append(
@@ -1226,7 +1781,7 @@ def run_preflight(
                     f"project, and {where} has {len(dst_inv.projects)} projects.",
                 )
             )
-    shortfall = _quota_shortfall(vm, plan, dst_inv, selected, shares or {})
+    shortfall = _quota_shortfall(vm, plan, dst_inv, selected, shares or {}, kind)
     if shortfall is not None:
         project, short = shortfall
         out.append(
@@ -1329,7 +1884,7 @@ def run_preflight(
 
     out.extend(_nic_override_findings(vm, plan, dst_inv, selected, source, where))
 
-    out.extend(_gpu_findings(vm, source))
+    out.extend(_gpu_findings(vm, plan, dst_inv, source, where, selected, shares or {}))
 
     encrypted = [d.name or d.id for d in vm.disks if d.encrypted]
     if encrypted:

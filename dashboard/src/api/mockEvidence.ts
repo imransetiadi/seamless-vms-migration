@@ -4,6 +4,7 @@ import { optionLabel } from '../lib/advisor';
 import { formatBytes, formatDuration } from '../lib/format';
 import { guestOsOf } from '../lib/guestOs';
 import { PROVIDER_KIND_LABELS } from '../lib/status';
+import { GPU_CODES } from './findingCatalog';
 import type { Estimate, EvidenceEffect, EvidenceItem, EvidenceSourceKind, Finding, GuestOS, Migration, Plan, ProviderKind, Strategy, VMRef } from './types';
 
 const V2V_TEXT: Record<GuestOS['v2v'], string> = {
@@ -89,7 +90,10 @@ export function buildStrategyEvidence(
       earlier.id,
     );
   }
-  const applying = findings.filter((f) => (f.severity === 'blocker' || f.severity === 'warning') && applies(f, option));
+  // nothing about GPUs reaches Jev in 0.3.0: the GPU codes stay out, as the API's (SDD §14.4, §22.12)
+  const applying = findings.filter(
+    (f) => (f.severity === 'blocker' || f.severity === 'warning') && applies(f, option) && !GPU_CODES.has(f.code),
+  );
   const unmapped = applying.filter((f) => f.code.startsWith('MAP_'));
   add(
     'mappings',
