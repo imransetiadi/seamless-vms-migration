@@ -2626,7 +2626,11 @@ ST-04, RV48-04, RV48-05, RV48-08, RV50-04). A document an earlier version stored
 an outside service - an advisor note's confidence or a number of its data (a hit's score, a claim's confidence), a
 recommendation's confidence or a probability of its distribution, a similar incident's score - reads each as
 null, a probability as absent, as this version would have written it: the document is written again as any other,
-where its stopped source could otherwise never be rolled back (review RV51-06). What the control plane is given
+where its stopped source could otherwise never be rolled back (review RV51-06). A string such a version kept from
+Jev or agentmemory holding a NUL or a lone surrogate - an advisor note's summary and the keys and values of its data,
+a verification's `review_reason`, a decision's `reason_text`, Jev's reasons, a similar incident's title and content,
+a recommendation's `unusable` and `legacy_text` - reads with U+FFFD for each, as this version writes them (§14.1), so
+that document is written again too (review RV52-S1). What the control plane is given
 stops before that refusal: a request
 body holding a NUL or a lone surrogate is refused before its route runs (§12) - a number is its route's to check,
 as §9.1 checks a plan's -, the tokens file refuses such a name (§13.1), the text it takes from outside sources
