@@ -187,6 +187,8 @@ export function decidable(rec: AdvisorRecommendation, migration: Migration | und
     rec.decision_type === 'migration_strategy' &&
     migration !== undefined &&
     CHANGEABLE.has(migration.phase) &&
-    (migration.advisor_hold ? migration.advisor_hold : newestId) === rec.id
+    // the hold names the one to decide; without it, the one the last validation stored - both written with it, whatever
+    // their time (reviews RV50-09, RV51-08) -, else the newest
+    (migration.advisor_hold || migration.last_recommendation || newestId) === rec.id
   );
 }

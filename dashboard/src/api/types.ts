@@ -659,6 +659,11 @@ export interface Migration {
   advisor_notes: AdvisorNote[];
   /** The recommendation whose decision waits for approval: the migration does not start meanwhile (SDD §5.4, §14.6). */
   advisor_hold: string | null;
+  /**
+   * The recommendation its last validation stored: what a decision acts on while no hold names one, whatever its time
+   * (SDD §14.6, review RV51-08); null when none was stored since the field.
+   */
+  last_recommendation: string | null;
   /** The rule that ended the passes (SDD §5.3); null before convergence and in data written before ADV-16. */
   converged_by: ConvergedBy | null;
   force_cutover: ForceCutover | null;

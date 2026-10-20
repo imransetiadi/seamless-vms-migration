@@ -162,6 +162,8 @@ describe('RecommendationActions (SDD §14.6)', () => {
       rules: { require_distinct_approver: true, require_override_reason: true },
     });
     server.recommendations.push(rec);
+    // the migration names it, as the validation that stored it writes it (SDD §14.6, review RV51-08)
+    server.migrations.find((m) => m.id === migration.id)!.last_recommendation = rec.id;
     const user = userEvent.setup({ delay: null });
     renderWithApp(<RecommendationActions rec={rec} migration={migration} />, { token: 'admin', server });
     const group = await screen.findByRole('group', { name: /^Decide on the recommendation for/ });

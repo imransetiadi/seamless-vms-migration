@@ -86,6 +86,12 @@ describe('mock data holds together like the API (SDD §5.5, ADV-16)', () => {
     for (const m of fx.migrations.filter((x) => x.attempts === 0)) expect(m.attempt_strategies, m.id).toEqual([]);
   });
 
+  it('names, on each migration, the recommendation its validation stored, as the API writes it (SDD §14.6, review RV51-08)', () => {
+    const stored = new Map(fx.recommendations.filter((r) => !r.legacy).map((r) => [r.migration_id, r.id]));
+    expect(stored.size).toBeGreaterThan(0);
+    for (const m of fx.migrations) expect(m.last_recommendation, m.id).toBe(stored.get(m.id) ?? null);
+  });
+
   it("every estimate's parts add up to its downtime, in the API's keys", () => {
     for (const m of fx.migrations) {
       for (const e of m.estimates) {

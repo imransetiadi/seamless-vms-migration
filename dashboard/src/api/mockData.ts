@@ -1804,6 +1804,7 @@ export function buildFixtures(now: number): Fixtures {
         force_window: false,
         advisor_notes: (m.notes ?? []).map(({ ago, ...note }) => ({ ...note, created_at: iso(now - ago * 1000) })),
         advisor_hold: null,
+        last_recommendation: null,
         converged_by: fixtureConvergedBy(m.strategy, m.phase, syncPasses, chosen, plan),
         force_cutover: null,
         data_issues: [],
@@ -1885,6 +1886,7 @@ export function buildFixtures(now: number): Fixtures {
         }
         recommendations.push(decided);
         if (decided.decision.status === 'pending_approval') migration.advisor_hold = decided.id;
+        migration.last_recommendation = decided.id;
       }
       for (const note of migration.advisor_notes) {
         const kind = note.kind === 'screen' ? 'advisor.verification' : `advisor.${note.kind}`;

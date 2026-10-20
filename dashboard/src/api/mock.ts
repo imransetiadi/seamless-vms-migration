@@ -1273,8 +1273,10 @@ export class MockServer {
     const earlier = m.attempts > 0 ? { id: m.id, attempts: m.attempts, attempt_strategies: [...m.attempt_strategies] } : null;
     this.evaluate(m, plan);
     const rec = this.decideStrategy(m, plan, actor, earlier);
-    // like the API (SDD §5.4, §14.6): a waiting decision holds the migration from this write on
+    // like the API (SDD §5.4, §14.6): a waiting decision holds the migration from this write on, and the one stored is
+    // what a decision acts on while no hold names one (review RV51-08)
     m.advisor_hold = rec?.decision.status === 'pending_approval' ? rec.id : null;
+    if (rec) m.last_recommendation = rec.id;
     this.clearApprovals(m);
     // its VM's wave in the plan, as the API's assessment writes it (SDD §9.4, review RV39-03)
     m.wave_id = plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id))?.id ?? null;
@@ -1729,9 +1731,12 @@ export class MockServer {
     const rec = this.recommendations[index]!;
     const m = this.migrations.find((x) => x.id === rec.migration_id);
     if (!m) throw new HttpError(409, 'conflict', `recommendation ${recId} decides nothing a person can change yet`);
-    // like the API (SDD §14.6, reviews RV49-04, RV50-09): the hold names the one to decide, whatever its time; without
-    // a hold, the newest
-    const newest = m.advisor_hold ?? this.recommendations.filter((r) => r.migration_id === m.id).reduce((a, b) => (b.created_at > a.created_at || (b.created_at === a.created_at && b.id > a.id) ? b : a)).id;
+    // like the API (SDD §14.6, reviews RV49-04, RV50-09, RV51-08): the hold names the one to decide, whatever its time;
+    // without a hold, the one the last validation stored, else the newest
+    const newest =
+      m.advisor_hold ??
+      m.last_recommendation ??
+      this.recommendations.filter((r) => r.migration_id === m.id).reduce((a, b) => (b.created_at > a.created_at || (b.created_at === a.created_at && b.id > a.id) ? b : a)).id;
     if (newest !== recId) throw new HttpError(409, 'conflict', `a newer recommendation (${newest}) replaced ${recId}`);
     const plan = this.plan(m.plan_id);
     const policy = policyFor(this.policies, plan);
@@ -2305,6 +2310,7 @@ export class MockServer {
       force_window: false,
       advisor_notes: [],
       advisor_hold: null,
+      last_recommendation: null,
       converged_by: null,
       force_cutover: null,
       data_issues: [],

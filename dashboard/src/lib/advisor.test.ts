@@ -199,7 +199,17 @@ describe('decidable (SDD §14.6)', () => {
     // the clock stepped back before the validation that held it: the newest by time is another one
     const holding = { ...base, advisor_hold: held.id };
     expect([decidable(held, holding, newer.id), decidable(newer, holding, newer.id)]).toEqual([true, false]);
-    const free = { ...base, advisor_hold: null };
+    // a migration no validation stored a recommendation for since last_recommendation came: the newest by time
+    const free = { ...base, advisor_hold: null, last_recommendation: null };
     expect([decidable(held, free, newer.id), decidable(newer, free, newer.id)]).toEqual([false, true]);
+  });
+
+  it("is the one the migration's last validation stored while no hold names one, whatever its time (review RV51-08)", () => {
+    const base = { ...buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0]!, phase: 'ready' as const };
+    const stored = rec({}, {}, { id: 'rec-000000stored' });
+    const replaced = rec({}, {}, { id: 'rec-0000replaced' });
+    // the clock stepped back before the validation that stored it: the newest by time is the one it replaced
+    const m = { ...base, advisor_hold: null, last_recommendation: stored.id };
+    expect([decidable(stored, m, replaced.id), decidable(replaced, m, replaced.id)]).toEqual([true, false]);
   });
 });
