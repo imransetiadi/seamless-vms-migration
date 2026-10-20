@@ -609,6 +609,27 @@ def test_a_multi_word_yaml_password_is_redacted_whole():
     assert redact("password=Fake horse") == "password=[REDACTED] horse"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        'Authorization: "token":\n!;',
+        "Authorization: 'token':Bearer '\\''.",
+        "--os-password ':,>\\'\"'\"'\"token\":-auth: {a: b} next",
+        "--os-password 'Fake'Pass-Word server list",
+        json.dumps({"cmd": "--os-password 'Fake'Pass-Word server list"}),
+    ],
+    ids=["header-dq", "header-sq", "flag-glued-quotes", "flag-glued-word", "flag-in-json"],
+)
+def test_a_second_pass_changes_nothing_after_a_cli_flag_or_an_authorization_header(text):
+    """SDD §13.4 (reviews RV52-X3, RV52-X5): a CLI flag's quoted value ended at its close and left
+    what the shell glues to the word, and the Authorization header pattern read a [REDACTED] an
+    earlier pass wrote as a value, so a second pass changed the text. A flag's value is a shell
+    word whole, and the header pattern leaves a [REDACTED] as it is."""
+    once = redact(text)
+    assert redact(once) == once, once
+    assert "Pass" not in once and "Word" not in once, once
+
+
 def _quotings(pairs):
     """``pairs`` (key, value) as each quoting a step's output carries them prints them."""
     mapping = dict(pairs)

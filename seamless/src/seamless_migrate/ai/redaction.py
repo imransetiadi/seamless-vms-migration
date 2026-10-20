@@ -130,8 +130,15 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
     (re.compile(r"(?i)(?<![\w.-])([\"']?auth[\"']?\s*:\s*)\{[^{}]*\}"), r"\1" + REDACTED),
     # credentials in URLs and connection strings: scheme://user:pass@host (a pass with "@" too)
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]{0,63}://)[^\s/@:]+:[^\s/]*@"), r"\1[REDACTED]@"),
-    # Authorization headers (any scheme)
-    (re.compile(r"(?i)\b(authorization)\s*[:=]\s*(?:\w+\s+)?[^\s,;'\"]+"), r"\1: " + REDACTED),
+    # Authorization headers (any scheme); a [REDACTED] an earlier pass wrote is left as it is, so
+    # a second pass changes nothing (review RV52-X5)
+    (
+        re.compile(
+            r"(?i)\b(authorization)\s*[:=]\s*(?:\w+\s+)?+(?!\[REDACTED\](?![A-Za-z0-9]))"
+            r"[^\s,;'\"]+"
+        ),
+        r"\1: " + REDACTED,
+    ),
     # bare bearer tokens
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer " + REDACTED),
     # key=value / key: value / "key": "value" (the key possibly prefixed, e.g. OS_PASSWORD), which
@@ -189,7 +196,9 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
             r"(?:(?<=password)|(?<=passwd)|(?<=secret)|(?<=token)|(?<=key))"
             r"(?:\s+|(?P<argesc>\\*+)[\"']\s*,\s*(?P=argesc)(?P<argq>[\"'])))"
             r"((?(argq)(?:(?!(?P=argesc)(?P=argq))(?:\\.|[^\n]))*+"
-            r"|(?:\"(?:[^\"\\\n]|\\.)*+\"|'[^'\n]*+'|\S+)))"
+            # a shell word: its quoted parts and what is glued to them, a quote that never
+            # closes on its line read as any other character (review RV52-X3)
+            r"|(?:\"(?:[^\"\\\n]|\\.)*+\"|'[^'\n]*+'|\S)++))"
         ),
         r"\1" + REDACTED,
     ),
