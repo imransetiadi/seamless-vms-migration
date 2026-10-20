@@ -494,6 +494,22 @@ def destination_project(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) ->
     return vm.project
 
 
+#: the GPU rows of §9.3 (SDD §22.5): what the advisor's evidence leaves out, as nothing about GPUs
+#: reaches Jev in 0.3.0 (§14.4, §22.12)
+GPU_CODES = frozenset(
+    {
+        "VM_VGPU",
+        "VM_PCI_PASSTHROUGH",
+        "MAP_GPU_FLAVOR",
+        "MAP_GPU_DOWNSIZED",
+        "DST_GPU_CAPACITY_INSUFFICIENT",
+        "DST_GPU_CAPACITY_UNKNOWN",
+        "GUEST_GPU_DRIVER",
+        "GUEST_GPU_LICENSE",
+    }
+)
+
+
 def _kind_of(vm: VMRef, source_kind: ProviderKind | str | None) -> ProviderKind:
     """The VM's source kind, as given, else as the VM shows it: a VMware VM has no flavor."""
     if source_kind is not None:
@@ -815,6 +831,19 @@ def _requests_text(requests: Iterable[GpuDevice]) -> str:
     return ", ".join(words)
 
 
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _first_names(names: Iterable[str], limit: int = 10) -> str:
+    """The names sorted, the first ``limit`` of them, then how many more: a message of a plan of
+    hundreds of VMs stays short (SDD §22.5)."""
+    ordered = sorted(set(names))
+    if len(ordered) <= limit:
+        return ", ".join(ordered)
+    return f"{', '.join(ordered[:limit])} and {len(ordered) - limit} more"
+
+
 def _and(items: Sequence[str]) -> str:
     return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
 
@@ -829,6 +858,22 @@ def _sized(devices: Iterable[GpuDevice]) -> list[tuple[ProfileSize, str]]:
     return sorted(
         units, key=lambda unit: (unit[0].framebuffer_gb, unit[0].slices or 0), reverse=True
     )
+
+
+def _nvidia_passthrough(devices: Iterable[GpuDevice]) -> bool:
+    """Whether every passed-through device is known to be an NVIDIA GPU: a VMware device of vendor
+    id 10de. An OpenStack PCI alias names no device, so it is "a PCI device" (SDD §22.1)."""
+    passthrough = [d for d in devices if d.kind == "passthrough"]
+    return bool(passthrough) and all(d.vendor_id == "10de" for d in passthrough)
+
+
+def _gpu_words(devices: Sequence[GpuDevice]) -> str:
+    """What the guest gets, in words: a vGPU, a passed-through NVIDIA GPU or a PCI device."""
+    if _is_vgpu(devices):
+        return "a vGPU"
+    if _nvidia_passthrough(devices):
+        return "a passed-through NVIDIA GPU"
+    return "a passed-through PCI device"
 
 
 def _is_vgpu(devices: Iterable[GpuDevice]) -> bool:
@@ -892,7 +937,8 @@ def _gpu_flavor_findings(
     if fewer is not None:
         (own, own_name), (other, other_name) = fewer
         reasons.append(
-            f"{other.slices} MIG slices for its {own.slices} ({other_name} for {own_name})"
+            f"{_count(other.slices, 'MIG slice')} for its {own.slices} ({other_name} for "
+            f"{own_name})"
         )
     if reasons:
         out.append(
@@ -913,23 +959,27 @@ def _guest_gpu_findings(
     change of kind or model the mapping makes."""
     target = flavor["gpus"] if flavor is not None else gpus
     to_vgpu = _is_vgpu(target)
-    message = f"The guest's NVIDIA driver must suit {where}: " + (
-        "a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's "
-        "compatibility table)."
-        if to_vgpu
-        else "the data center driver for a passed-through GPU."
-    )
+    if to_vgpu:
+        message = (
+            f"The guest's NVIDIA driver must suit {where}: a vGPU guest driver of a release its "
+            "hosts' vGPU manager supports (NVIDIA's compatibility table)."
+        )
+    elif _nvidia_passthrough(target):
+        message = (
+            f"The guest's NVIDIA driver must suit {where}: the data center driver for its "
+            "passed-through NVIDIA GPU."
+        )
+    else:
+        message = (
+            f"The guest's driver must suit {where}: the driver of its passed-through PCI device."
+        )
     if flavor is not None:
-        from_vgpu = _is_vgpu(gpus)
         models = sorted({size.gpu for size, _ in _sized(gpus)})
         new_models = sorted({size.gpu for size, _ in _sized(target)})
-        if from_vgpu != to_vgpu:
-            kinds = [
-                ("a vGPU" if vgpu else "a passed-through GPU") for vgpu in (from_vgpu, to_vgpu)
-            ]
+        if _is_vgpu(gpus) != to_vgpu:
             message += (
-                f" The mapping changes the GPU from {kinds[0]} to {kinds[1]}, so the guest needs a "
-                "new driver."
+                f" The mapping changes the GPU from {_gpu_words(gpus)} to {_gpu_words(target)}, so "
+                "the guest needs a new driver."
             )
         elif models and new_models and models != new_models:
             message += (
@@ -991,11 +1041,25 @@ def _capacity_findings(
     provider with n free; a pool Placement refused counts nothing. Nothing is guessed."""
     capacity = dst_inv.gpu_capacity
     vgpus = [g for g in flavor["gpus"] if g.kind == "vgpu" and g.resource_class]
+    pools = {
+        pool_key(p.resource_class, p.traits, p.forbidden_traits, p.same_provider): p
+        for p in capacity.pools
+    }
     unknown = []
     if vgpus and capacity.status == "unknown":
         unknown.append(
             f"The GPU capacity of {where} cannot be read: {_unknown_capacity(capacity)}."
         )
+    elif vgpus:
+        # a read that holds no pool for a request: nothing is guessed for it (SDD §22.5)
+        unknown += [
+            f"The GPU capacity read of {where} holds no pool "
+            f"{pool_name(g.resource_class or '', g.traits, g.forbidden_traits)}: nothing is "
+            "guessed for it."
+            for g in vgpus
+            if pool_key(g.resource_class or "", g.traits, g.forbidden_traits, g.same_provider)
+            not in pools
+        ]
     unknown += [
         f"Flavor {flavor['name']!r} of {where} asks for PCI alias {g.alias}, whose devices "
         "nova.conf configures: Placement does not show their capacity."
@@ -1005,10 +1069,6 @@ def _capacity_findings(
     out = [finding("DST_GPU_CAPACITY_UNKNOWN", " ".join(unknown))] if unknown else []
     if not vgpus or capacity.status != "ok" or shares.get(vm.source_id) == "nothing":
         return out
-    pools = {
-        pool_key(p.resource_class, p.traits, p.forbidden_traits, p.same_provider): p
-        for p in capacity.pools
-    }
     # the units each pool, and each class across its pools, is asked for by the plan's VMs
     asked: dict[tuple[str, tuple[str, ...], tuple[str, ...], bool], int] = {}
     askers: dict[tuple[str, tuple[str, ...], tuple[str, ...], bool], set[str]] = {}
@@ -1042,19 +1102,23 @@ def _capacity_findings(
             continue
         if asked.get(key, 0) > pool.free:
             reasons.append(
-                f"The plan's VMs ask {name} of {where} for {asked[key]} units, more than its "
-                f"{pool.free} free ({_names(askers[key])})."
+                f"The plan's VMs ask {name} of {where} for {_count(asked[key], 'unit')}, more "
+                f"than its {pool.free} free ({_first_names(askers[key])})."
             )
     for cls in dict.fromkeys(g.resource_class or "" for g in vgpus):
         key = (cls, (), (), False)
         alone = pools.get(key)
-        own = {pool_key(cls, g.traits, g.forbidden_traits, g.same_provider) for g in vgpus}
+        own = {
+            pool_key(cls, g.traits, g.forbidden_traits, g.same_provider)
+            for g in vgpus
+            if g.resource_class == cls
+        }
         if alone is None or alone.detail is not None or key in own:
             continue  # a request without traits asks its class's pool: that check was its own
         if asked.get(key, 0) > alone.free:
             reasons.append(
-                f"The plan's VMs ask {cls} of {where} for {asked[key]} units across its pools, "
-                f"more than its {alone.free} free ({_names(askers[key])})."
+                f"The plan's VMs ask {cls} of {where} for {_count(asked[key], 'unit')} across "
+                f"its pools, more than its {alone.free} free ({_first_names(askers[key])})."
             )
     for device in vgpus:
         key = pool_key(
@@ -1064,7 +1128,13 @@ def _capacity_findings(
             device.same_provider,
         )
         pool = pools.get(key)
-        if pool is not None and pool.detail is None and device.count > pool.largest_free:
+        # a group of n > 1 units needs one provider with n free (SDD §22.3, §22.5)
+        if (
+            pool is not None
+            and pool.detail is None
+            and device.count > 1
+            and device.count > pool.largest_free
+        ):
             name = pool_name(pool.resource_class, pool.traits, pool.forbidden_traits)
             reasons.append(
                 f"Its flavor asks {name} of {where} for {device.count} units on one provider, and "

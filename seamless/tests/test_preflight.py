@@ -1369,6 +1369,17 @@ def test_finding_map_gpu_downsized_smaller_framebuffer_or_fewer_mig_slices():
         "Flavor 'g1.a100-3-20c' of RHOSO 18.0 gives the VM less GPU than it has: 3 MIG slices for "
         "its 4 (A100-3-20C for grid_a100-4-20c)."
     )
+    # the GPUs are paired the largest first: the VM's 8 GB vGPU meets the flavor's one 4 GB vGPU
+    listed = check(
+        vmware_gpu_vm(VGPU_4C, GpuDevice(kind="vgpu", profile="grid_a100-8c")),
+        plan=gpus_mapped(**{"grid_a100-4c": "g1.a100-4c", "grid_a100-8c": "g1.a100-4c"}),
+        source=VMWARE,
+        dst=gpu_dst(A4C),
+    )
+    assert only(listed, "MAP_GPU_DOWNSIZED").message == (
+        "Flavor 'g1.a100-4c' of RHOSO 18.0 gives the VM less GPU than it has: 1 GPU for its 2; a 4 "
+        "GB framebuffer for its 8 GB (A100-4C for grid_a100-8c)."
+    )
     # a MIG slice count is compared only where both are MIG-backed: a time-sliced 20 GB vGPU for a
     # MIG-backed 20 GB one is no downsizing
     sliced = ("g1.a100-20c", 16, 65536, 80, ON_A100, "A100-20C")
@@ -1453,6 +1464,26 @@ def test_finding_dst_gpu_capacity_insufficient_per_resource_class_across_pools()
         "The plan's VMs ask VGPU of RHOSO 18.0 for 2 units across its pools, more than its 1 free "
         "(ml-01, ml-02)."
     )
+    # a traitless request of another class is that class's pool, never this one's (G4 review)
+    specs = {"resources1:VGPU": "1", f"trait1:{A100}": "required", "resources2:CUSTOM_MDEV_X": "1"}
+    two = ("g1.two-classes", 8, 32768, 80, specs, "A100-4C")
+    first, second = _two_vmware_gpu_vms()
+    pools = [
+        GpuPool("VGPU", [A100], [], same_provider=True, free=2, providers=1, largest_free=2),
+        GpuPool("VGPU", [], [], free=1, providers=1, largest_free=1),
+        GpuPool("CUSTOM_MDEV_X", [], [], free=4, providers=1, largest_free=4),
+    ]
+    found = check(
+        first,
+        plan=gpus_mapped(**{"grid_a100-4c": "g1.two-classes"}),
+        all_vms=[first, second],
+        source=VMWARE,
+        dst=gpu_dst(two, pools=pools),
+    )
+    assert only(found, "DST_GPU_CAPACITY_INSUFFICIENT").message == (
+        "The plan's VMs ask VGPU of RHOSO 18.0 for 2 units across its pools, more than its 1 free "
+        "(ml-01, ml-02)."
+    )
 
 
 def test_finding_dst_gpu_capacity_insufficient_counts_what_each_cutover_still_creates():
@@ -1479,6 +1510,45 @@ def test_finding_dst_gpu_capacity_insufficient_counts_what_each_cutover_still_cr
     assert "DST_GPU_CAPACITY_INSUFFICIENT" in codes({})
     assert "DST_GPU_CAPACITY_INSUFFICIENT" in codes({"vm-2": quota_share(Phase.syncing)})
     assert "DST_GPU_CAPACITY_INSUFFICIENT" not in codes({"vm-2": quota_share(Phase.verifying)})
+    # a VM whose server exists asks for nothing more, whatever the others ask: vm-2 alone is more
+    # than an empty pool holds, and only vm-2 is told
+    tight[0] = GpuPool("VGPU", [A100], [], free=0, providers=0, largest_free=0)
+    assert "DST_GPU_CAPACITY_INSUFFICIENT" not in codes({"vm-1": quota_share(Phase.verifying)})
+
+
+def test_finding_dst_gpu_capacity_insufficient_counts_a_vm_a_mapping_gives_a_gpu():
+    """SDD §9.3, §22.5 (plan task G4 review): the capacity counts every VM of the plan whose
+    server is created with a vGPU flavor - a VM without a GPU that a flavor mapping sends to one
+    included."""
+    gpu = openstack_gpu_vm(source_id="vm-1", name="ml-01")
+    plain = make_vm(source_id="vm-2", name="app-01", flavor="m1.small")
+    plan = make_plan(mappings=Mappings(flavors={"g1.vgpu": "g1.a100-4c", "m1.small": "g1.a100-4c"}))
+    tight = [GpuPool("VGPU", [A100], [], free=1, providers=1, largest_free=1), OPEN[2]]
+    for vm in (gpu, plain):
+        found = check(vm, plan=plan, all_vms=[gpu, plain], dst=gpu_dst(A4C, pools=tight))
+        assert only(found, "DST_GPU_CAPACITY_INSUFFICIENT").message == (
+            "The plan's VMs ask VGPU CUSTOM_NVIDIA_A100_4C of RHOSO 18.0 for 2 units, more than "
+            "its 1 free (app-01, ml-01)."
+        ), vm.name
+
+
+def test_finding_dst_gpu_capacity_insufficient_names_the_first_ten_vms():
+    """SDD §22.5 (plan task G4 review): a finding names the VMs that ask the pool - the first ten,
+    then how many more -, so a plan of hundreds of GPU VMs stores no message of kilobytes."""
+    vms = [vmware_gpu_vm(VGPU_4C, source_id=f"vm-{i:02d}", name=f"ml-{i:02d}") for i in range(12)]
+    tight = [GpuPool("VGPU", [A100], [], free=1, providers=1, largest_free=1), OPEN[2]]
+    found = check(
+        vms[0],
+        plan=gpus_mapped(**{"grid_a100-4c": "g1.a100-4c"}),
+        all_vms=vms,
+        source=VMWARE,
+        dst=gpu_dst(A4C, pools=tight),
+    )
+    names = ", ".join(f"ml-{i:02d}" for i in range(10))
+    assert only(found, "DST_GPU_CAPACITY_INSUFFICIENT").message == (
+        "The plan's VMs ask VGPU CUSTOM_NVIDIA_A100_4C of RHOSO 18.0 for 12 units, more than its "
+        f"1 free ({names} and 2 more)."
+    )
 
 
 def test_finding_dst_gpu_capacity_insufficient_for_a_group_no_provider_can_hold():
@@ -1495,6 +1565,18 @@ def test_finding_dst_gpu_capacity_insufficient_for_a_group_no_provider_can_hold(
     assert only(found, "DST_GPU_CAPACITY_INSUFFICIENT").message == (
         "Its flavor asks VGPU CUSTOM_NVIDIA_A100_4C of RHOSO 18.0 for 2 units on one provider, and "
         "none has 2 free (the most on one is 1)."
+    )
+    # a group of one unit is the pool's own sentence alone, its unit in the singular (§22.5: n > 1)
+    full = [GpuPool("VGPU", [A100], [], free=0, providers=0, largest_free=0), OPEN[2]]
+    found = check(
+        vmware_gpu_vm(VGPU_4C),
+        plan=gpus_mapped(**{"grid_a100-4c": "g1.a100-4c"}),
+        source=VMWARE,
+        dst=gpu_dst(A4C, pools=full),
+    )
+    assert only(found, "DST_GPU_CAPACITY_INSUFFICIENT").message == (
+        "The plan's VMs ask VGPU CUSTOM_NVIDIA_A100_4C of RHOSO 18.0 for 1 unit, more than its 0 "
+        "free (web-01)."
     )
 
 
@@ -1541,6 +1623,13 @@ def test_finding_dst_gpu_capacity_unknown_when_placement_cannot_be_read():
             f"The GPU capacity of RHOSO 18.0 cannot be read: {why}.",
         )
         assert "DST_GPU_CAPACITY_INSUFFICIENT" not in gpu_codes(found)
+    # a read that holds no pool for a request guesses nothing for it (G4 review)
+    found = check(vm, plan=plan, source=VMWARE, dst=gpu_dst(A4C, pools=[OPEN[2]]))
+    assert only(found, "DST_GPU_CAPACITY_UNKNOWN").message == (
+        "The GPU capacity read of RHOSO 18.0 holds no pool VGPU CUSTOM_NVIDIA_A100_4C: nothing is "
+        "guessed for it."
+    )
+    assert "DST_GPU_CAPACITY_INSUFFICIENT" not in gpu_codes(found)
 
 
 def test_finding_dst_gpu_capacity_unknown_for_a_pci_alias():
@@ -1582,9 +1671,23 @@ def test_finding_guest_gpu_driver():
         check(vmware_gpu_vm(PASS_ID), source=VMWARE, dst=gpu_dst(P1)), "GUEST_GPU_DRIVER"
     )
     assert passthrough.message.startswith(
-        "The guest's NVIDIA driver must suit RHOSO 18.0: the data center driver for a "
-        "passed-through GPU."
+        "The guest's NVIDIA driver must suit RHOSO 18.0: the data center driver for its "
+        "passed-through NVIDIA GPU."
     )
+    # a device of another vendor, and an OpenStack PCI alias, are a PCI device: Seamless cannot
+    # tell an NVIDIA GPU (§22.1, G4 review)
+    amd = GpuDevice(kind="passthrough", vendor_id="1002", device_id="740f")
+    for found in (
+        check(vmware_gpu_vm(amd), source=VMWARE, dst=gpu_dst(P1)),
+        check(
+            openstack_gpu_vm(flavor="p1.src", specs={"pci_passthrough:alias": "fpga:1"}),
+            plan=make_plan(mappings=Mappings(flavors={"p1.src": "p1.a100"})),
+            dst=gpu_dst(P1),
+        ),
+    ):
+        assert only(found, "GUEST_GPU_DRIVER").message.startswith(
+            "The guest's driver must suit RHOSO 18.0: the driver of its passed-through PCI device."
+        )
 
 
 def test_finding_guest_gpu_driver_names_a_change_of_kind():
@@ -1602,8 +1705,8 @@ def test_finding_guest_gpu_driver_names_a_change_of_kind():
     assert kind.message == (
         "The guest's NVIDIA driver must suit RHOSO 18.0: a vGPU guest driver of a release its "
         "hosts' vGPU manager supports (NVIDIA's compatibility table). The mapping changes the GPU "
-        "from a passed-through GPU to a vGPU, so the guest needs a new driver. virt-v2v neither "
-        "installs nor updates the driver."
+        "from a passed-through NVIDIA GPU to a vGPU, so the guest needs a new driver. virt-v2v "
+        "neither installs nor updates the driver."
     )
     model = only(
         check(
@@ -1645,6 +1748,14 @@ def test_finding_guest_gpu_license():
         dst=gpu_dst(P1),
     )
     assert "GUEST_GPU_LICENSE" not in gpu_codes(passthrough)
+    # the VM's GPU is a vGPU: its guest holds a license, whatever the flavor gives it
+    vgpu_to_pci = check(
+        vmware_gpu_vm(VGPU_4C),
+        plan=gpus_mapped(**{"grid_a100-4c": "p1.a100"}),
+        source=VMWARE,
+        dst=gpu_dst(P1),
+    )
+    assert "GUEST_GPU_LICENSE" in gpu_codes(vgpu_to_pci)
 
 
 def test_finding_guest_gpu_license_for_a_vgpu_handed_out_as_a_pci_device():
@@ -1704,6 +1815,10 @@ def test_the_quota_counts_a_gpu_vm_by_its_gpu_flavor():
     assert (demand["cores"], demand["ram_mb"]) == (8, 32768)
     small = {"cores": 4, "ram_mb": 1_000_000, "instances": 50, "volumes": 50, "gigabytes": 10_000}
     found = check(vm, plan=plan, source=VMWARE, dst=gpu_dst(A4C, quotas={"finance": small}))
+    assert "cores 8 > 4 free" in only(found, "DST_QUOTA_INSUFFICIENT").message
+    # the source's kind decides, not the VM's record: a VMware VM recorded with a flavor name
+    named = vmware_gpu_vm(VGPU_4C, vcpus=2, ram_mb=4096, flavor="m1.small")
+    found = check(named, plan=plan, source=VMWARE, dst=gpu_dst(A4C, quotas={"finance": small}))
     assert "cores 8 > 4 free" in only(found, "DST_QUOTA_INSUFFICIENT").message
 
 

@@ -15,7 +15,7 @@ from seamless_migrate.ai.policies import builtin_default
 from seamless_migrate.api.app import create_app
 from seamless_migrate.config import Settings
 from seamless_migrate.demo import DEMO_PROVIDERS
-from seamless_migrate.domain.enums import Phase, ProviderKind, Role, Strategy
+from seamless_migrate.domain.enums import Phase, ProviderKind, Role, Severity, Strategy
 from seamless_migrate.domain.models import (
     AdvisorPolicySpec,
     CutoverWindow,
@@ -199,6 +199,43 @@ def test_an_unknown_fact_is_left_out():
         None,
         "Cutover window: any time",
     )
+
+
+def test_the_evidence_leaves_the_gpu_findings_out():
+    """SDD §14.4, §22.12 (plan task G4 review): nothing about GPUs reaches Jev in 0.3.0, so the
+    mappings and findings evidence leave the GPU codes out - a GPU VM's mapping, size, capacity
+    and guest findings, its VM_VGPU block among them - and name the others as before."""
+    findings = [
+        finding("MAP_NETWORK_MISSING", "network app-net has no mapping"),
+        finding("VM_VGPU", "The VM has a vGPU (grid_a100-4c)."),
+        finding("MAP_GPU_FLAVOR", "goes to g1.a100-4c", severity=Severity.warning),
+        finding("MAP_GPU_DOWNSIZED", "less GPU"),
+        finding("DST_GPU_CAPACITY_INSUFFICIENT", "no room"),
+        finding("DST_GPU_CAPACITY_UNKNOWN", "cannot be read"),
+        finding("GUEST_GPU_DRIVER", "the guest's NVIDIA driver"),
+        finding("VMW_CBT_DISABLED", "CBT is off"),
+    ]
+    warm = by_key(
+        build_strategy_evidence(
+            make_vm(),
+            make_plan(),
+            ProviderKind.vmware,
+            [],
+            findings,
+            "vmware_warm",
+            None,
+            migration_id="mig-1",
+        )
+    )
+    assert (warm["mappings"].value, warm["mappings"].display) == (
+        1,
+        "Not mapped: MAP_NETWORK_MISSING",
+    )
+    assert (warm["findings"].value, warm["findings"].display) == (
+        1,
+        "1 finding applies to VMware warm migration (CBT): VMW_CBT_DISABLED",
+    )
+    assert not [item for item in warm.values() if "GPU" in item.display]
 
 
 def test_preflight_findings_that_apply_to_the_option_oppose_it():

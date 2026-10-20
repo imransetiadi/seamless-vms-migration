@@ -184,7 +184,14 @@ def gpu_key(device: GpuDevice) -> str | None:
 def vm_gpus(vm: VMRef, declared_profile: str | None = None) -> list[GpuDevice]:
     """The VM's GPUs (SDD §22.2): as its source reported them, else - a VM recorded before 0.3.0 -
     what its flavor's extra specs ask for, with the profile its source declares for the flavor."""
-    return list(vm.gpus) or gpu_requests(vm.flavor_extra_specs, declared_profile)
+    if vm.gpus:
+        return list(vm.gpus)
+    specs = vm.flavor_extra_specs
+    # most flavors make no resource request and name no alias: no GPU, and nothing to read - the
+    # quota asks this of every VM pair of a plan (G4 review)
+    if not any(str(key).startswith(("resources", PCI_ALIAS)) for key in specs):
+        return []
+    return gpu_requests(specs, declared_profile)
 
 
 def gpu_flavor(vm: VMRef, plan: Plan, source_kind: ProviderKind | str) -> str | None:

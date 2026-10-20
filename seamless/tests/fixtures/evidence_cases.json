@@ -1482,5 +1482,286 @@
         }
       }
     ]
+  },
+  {
+    "name": "vmware warm, a mapped GPU VM: its GPU findings stay out of the evidence (SDD §14.4, §22.12)",
+    "vm": {
+      "source_id": "vmw-17",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d1",
+          "name": null,
+          "size_gb": 100,
+          "used_gb": 40.0,
+          "bootable": true,
+          "volume_type": null,
+          "device": "sda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        },
+        {
+          "id": "d2",
+          "name": null,
+          "size_gb": 50,
+          "used_gb": 10.0,
+          "bootable": false,
+          "volume_type": null,
+          "device": "sdb",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500
+        }
+      ],
+      "power_state": "running",
+      "os_type": "rhel9",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": true,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": 4194304.0,
+      "disk_bytes": 161061273600,
+      "used_bytes": 53687091200,
+      "guest_os": {
+        "family": "linux",
+        "distro": "rhel",
+        "version": "9",
+        "label": "RHEL 9",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "plan": {
+      "name": "Finance",
+      "source_provider_id": "vcenter-1",
+      "destination_provider_id": "dst-rhoso",
+      "vm_ids": [
+        "vm-1"
+      ],
+      "downtime_slo_s": 900,
+      "cutover_window": {
+        "start": "2026-10-11T22:00:00Z",
+        "end": "2026-10-12T02:30:00Z"
+      },
+      "id": "plan-0000abcd"
+    },
+    "provider_kind": "vmware",
+    "estimates": [
+      {
+        "strategy": "vmware_warm",
+        "eligible": true,
+        "reasons": [],
+        "precopy_s": 600.0,
+        "passes": 3,
+        "downtime_s": 240.0,
+        "total_s": 840.0,
+        "final_delta_bytes": 1073741824,
+        "meets_slo": true,
+        "downtime_parts": {}
+      },
+      {
+        "strategy": "vmware_cold",
+        "eligible": true,
+        "reasons": [],
+        "precopy_s": 600.0,
+        "passes": 3,
+        "downtime_s": 3000.0,
+        "total_s": 3600.0,
+        "final_delta_bytes": 1073741824,
+        "meets_slo": false,
+        "downtime_parts": {}
+      }
+    ],
+    "findings": [
+      {
+        "code": "MAP_NETWORK_MISSING",
+        "severity": "blocker",
+        "message": "app-net has no mapping",
+        "remediation": "Add a network mapping or create a same-named network on the destination.",
+        "strategies": []
+      },
+      {
+        "code": "MAP_GPU_FLAVOR",
+        "severity": "warning",
+        "message": "The VM's GPUs go to flavor 'g1.a100-4c'",
+        "remediation": "Check the GPU flavor's size and GPU before the cutover: GPU migration is a Technology Preview.",
+        "strategies": []
+      },
+      {
+        "code": "MAP_GPU_DOWNSIZED",
+        "severity": "warning",
+        "message": "gives the VM less GPU than it has",
+        "remediation": "Map the VM to a GPU flavor of the destination that gives at least the GPU it has, or confirm that its workload fits the smaller one.",
+        "strategies": []
+      },
+      {
+        "code": "DST_GPU_CAPACITY_UNKNOWN",
+        "severity": "warning",
+        "message": "The GPU capacity cannot be read",
+        "remediation": "Give the destination credential a role Placement lets read its allocation candidates (admin by default), or check the destination's GPU capacity yourself; a PCI alias's devices are configured in nova.conf.",
+        "strategies": []
+      },
+      {
+        "code": "GUEST_GPU_DRIVER",
+        "severity": "warning",
+        "message": "The guest's NVIDIA driver must suit the destination",
+        "remediation": "Install the NVIDIA driver the destination needs in the guest - a vGPU guest driver its vGPU manager supports, or the data center driver for a passed-through GPU - and test it after the cutover.",
+        "strategies": []
+      },
+      {
+        "code": "GUEST_GPU_LICENSE",
+        "severity": "info",
+        "message": "The guest licenses its vGPU",
+        "remediation": "Make the NVIDIA License System (a CLS instance or an on-premises DLS instance) reachable from the VM's destination network, and check the guest's license after the cutover.",
+        "strategies": []
+      }
+    ],
+    "option": "vmware_warm",
+    "earlier": null,
+    "migration_id": "mig-0123456789",
+    "expected": [
+      {
+        "key": "downtime_estimate",
+        "label": "Estimated downtime",
+        "value": 240.0,
+        "display": "Estimated downtime 4m 00s, SLO 15m 00s",
+        "effect": "supports",
+        "weight": 100,
+        "source": {
+          "kind": "estimate",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "cbt",
+        "label": "Changed Block Tracking",
+        "value": true,
+        "display": "Changed Block Tracking is on",
+        "effect": "supports",
+        "weight": 90,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-17"
+        }
+      },
+      {
+        "key": "mappings",
+        "label": "Mappings",
+        "value": 1,
+        "display": "Not mapped: MAP_NETWORK_MISSING",
+        "effect": "opposes",
+        "weight": 80,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "findings",
+        "label": "Pre-flight findings",
+        "value": 0,
+        "display": "No blocker or warning applies to VMware warm migration (CBT)",
+        "effect": "supports",
+        "weight": 75,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "guest_os",
+        "label": "Guest OS",
+        "value": "RHEL 9",
+        "display": "RHEL 9; virt-v2v supported",
+        "effect": "supports",
+        "weight": 70,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-17"
+        }
+      },
+      {
+        "key": "disk_total",
+        "label": "Disk size",
+        "value": 161061273600,
+        "display": "150 GiB provisioned, 50.0 GiB used",
+        "effect": "context",
+        "weight": 60,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-17"
+        }
+      },
+      {
+        "key": "disk_count",
+        "label": "Disks",
+        "value": 2,
+        "display": "2 disks",
+        "effect": "context",
+        "weight": 50,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-17"
+        }
+      },
+      {
+        "key": "write_rate",
+        "label": "Guest write rate",
+        "value": 4194304.0,
+        "display": "Guest write rate 4.0 MiB/s, measured",
+        "effect": "context",
+        "weight": 40,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-17"
+        }
+      },
+      {
+        "key": "cutover_window",
+        "label": "Cutover window",
+        "value": "2026-10-11T22:00:00+00:00/2026-10-12T02:30:00+00:00",
+        "display": "Cutover window: 2026-10-11 22:00 – 2026-10-12 02:30 UTC",
+        "effect": "context",
+        "weight": 30,
+        "source": {
+          "kind": "plan",
+          "ref_id": "plan-0000abcd"
+        }
+      },
+      {
+        "key": "source_kind",
+        "label": "Source platform",
+        "value": "vmware",
+        "display": "Source platform: VMware vSphere",
+        "effect": "context",
+        "weight": 20,
+        "source": {
+          "kind": "provider",
+          "ref_id": "vcenter-1"
+        }
+      }
+    ]
   }
 ]

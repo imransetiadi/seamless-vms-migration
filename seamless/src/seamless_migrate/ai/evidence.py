@@ -25,6 +25,7 @@ from ..domain.models import (
     Plan,
     VMRef,
 )
+from ..planning.preflight import GPU_CODES
 from .redaction import replace_unstorable
 
 log = logging.getLogger(__name__)
@@ -195,7 +196,12 @@ def build_strategy_evidence(
             earlier.id,
         )
     strategy = Strategy(option)
-    applying = [f for f in findings if f.severity in BEARING and f.applies_to(strategy)]
+    # nothing about GPUs reaches Jev in 0.3.0: the GPU codes stay out (SDD §14.4, §22.12)
+    applying = [
+        f
+        for f in findings
+        if f.severity in BEARING and f.applies_to(strategy) and f.code not in GPU_CODES
+    ]
     unmapped = [f for f in applying if f.code.startswith("MAP_")]
     add(
         "mappings",
