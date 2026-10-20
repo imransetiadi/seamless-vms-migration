@@ -755,6 +755,93 @@ def test_what_follows_a_quoted_value_over_lines_stays(text):
     assert out == text.replace("'a\nb'", REDACTED), out
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("auth:{ x auth: {a: b} }", "auth:[REDACTED]"),
+        ('{"auth": {"password": "Fake", "project": {"name": "Word"}}}', '{"auth": [REDACTED]}'),
+        ('{"stdout": "auth:{\\"token\\":\\n)auth: {a: b}&\'\'"}', '{"stdout": "auth:[REDACTED]'),
+        ("auth:{ x auth: {a: b}", "auth:{ x auth: [REDACTED]"),
+    ],
+    ids=["nested", "json-nested", "json-escaped", "outer-never-closes"],
+)
+def test_an_auth_section_holding_another_is_removed_whole_so_a_second_pass_changes_nothing(
+    text, expected
+):
+    """SDD §13.4 (review RV52-X6): the flow-style auth section ran to the first closing brace and
+    read no section inside it, so its inner section went first and a second pass then found the
+    outer one, ending at a later brace: the text changed. A section runs to the brace that closes
+    it, nested ones counted; one that never closes is left to the key patterns."""
+    once = redact(text)
+    assert once == expected, once
+    assert redact(once) == once, once
+
+
+def test_a_seeded_fuzz_of_the_reviewers_atoms_redacts_once_for_good():
+    """SDD §13.4 (reviews RV51, RV52): the reviewers' random fuzz - credential keys, quotes,
+    escapes, auth sections, CLI flags and headers, each text also inside JSON and JSON in JSON -
+    found texts a second pass changed. It finds none."""
+    rng = random.Random(1)
+    atoms = [
+        "password",
+        "token",
+        "'token':",
+        '"token":',
+        "\\'",
+        "\\\\'",
+        "pass",
+        "secret",
+        " ",
+        ":",
+        "=",
+        "'",
+        '"',
+        "\\",
+        "\\\\",
+        "\n",
+        ",",
+        "}",
+        "{",
+        "a",
+        "[REDACTED]",
+        "\\n",
+        '\\"',
+        "''",
+        "--os-password ",
+        "Authorization: ",
+        "Bearer ",
+        ">",
+        ";",
+        "&",
+        ".",
+        "-",
+        "\t",
+        ")",
+        "]",
+        "!",
+        "'\"'\"'",
+        "'\\''",
+        "eyJhbGciOiJIUzI1NiJ9",
+        ".eyJzdWIiOiJmYWtlIn0",
+        "x://u:p@h",
+        "auth:",
+        "  ",
+        "auth: {a: b}",
+    ]
+    changed = []
+    for _ in range(20000):
+        text = "".join(rng.choice(atoms) for _ in range(rng.randint(2, 12)))
+        for held in (
+            text,
+            json.dumps({"stdout": text}),
+            json.dumps({"stdout": json.dumps({"stdout": text})}),
+        ):
+            once = redact(held)
+            if redact(once) != once:
+                changed.append(held)
+    assert changed == [], changed[:5]
+
+
 def _quotings(pairs):
     """``pairs`` (key, value) as each quoting a step's output carries them prints them."""
     mapping = dict(pairs)

@@ -96,6 +96,40 @@ def _auth_block(match: re.Match[str]) -> str:
 _JSON_LINE_CHAR = r"(?:(?!\\[nr])(?:\\.|[^\"\\\n]))"
 
 
+#: Where a JSON or YAML flow-style auth section opens ("auth": {, auth: {).
+_AUTH_FLOW_OPEN = re.compile(r"(?i)(?<![\w.-])[\"']?auth[\"']?\s*:\s*\{")
+#: A brace, opening or closing.
+_BRACE = re.compile(r"[{}]")
+
+
+def _redact_auth_flow(text: str) -> str:
+    """Each JSON or YAML flow-style auth section - its opening brace to the brace that closes it,
+    nested ones counted - replaced; one that never closes is left to the key patterns after. A
+    section inside another goes with the outer one, never before it, so a second pass changes
+    nothing; the braces are paired in one pass, a time linear in the text (SDD §13.4, review
+    RV52-X6)."""
+    opens = list(_AUTH_FLOW_OPEN.finditer(text))
+    if not opens:
+        return text
+    closes: dict[int, int] = {}
+    stack: list[int] = []
+    for brace in _BRACE.finditer(text):
+        if brace.group() == "{":
+            stack.append(brace.start())
+        elif stack:
+            closes[stack.pop()] = brace.start()
+    out: list[str] = []
+    pos = 0
+    for opened in opens:
+        start = opened.end() - 1
+        end = closes.get(start)
+        if opened.start() < pos or end is None:
+            continue  # inside a section already removed, or never closed
+        out += [text[pos:start], REDACTED]
+        pos = end + 1
+    return "".join(out) + text[pos:]
+
+
 #: a dotted chain of base64url runs, each run read once (possessive): where JWTs are looked for
 _BASE64URL_CHAIN = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]++(?:\.[A-Za-z0-9_-]++)*+")
 
@@ -129,7 +163,10 @@ def _redact_jwts(match: re.Match[str]) -> str:
     return ".".join(out)
 
 
-_PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
+#: The redaction steps in their order: a pattern and its replacement, or a function of the text.
+_PATTERNS: tuple[
+    tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]] | Callable[[str], str], ...
+] = (
     # the auth section of a clouds.yaml: block style (every line indented under "auth:", a
     # comment after it, LF or CRLF line breaks) ...
     (
@@ -144,8 +181,8 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], .
         ),
         _auth_block,
     ),
-    # ... and JSON or YAML flow style ("auth": {...})
-    (re.compile(r"(?i)(?<![\w.-])([\"']?auth[\"']?\s*:\s*)\{[^{}]*\}"), r"\1" + REDACTED),
+    # ... and JSON or YAML flow style ("auth": {...}), to the brace that closes it
+    _redact_auth_flow,
     # credentials in URLs and connection strings: scheme://user:pass@host (a pass with "@" too)
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]{0,63}://)[^\s/@:]+:[^\s/]*@"), r"\1[REDACTED]@"),
     # Authorization headers (any scheme); a [REDACTED] an earlier pass wrote is left as it is, so
@@ -265,8 +302,8 @@ def redact(text: str, redact_names: Sequence[str] | None = None) -> str:
     """Remove secrets (and optionally VM names) before text leaves the control plane; a NUL or a
     lone surrogate is written U+FFFD (SDD §13.4)."""
     out = _redact_pem(replace_unstorable(str(text)))
-    for pattern, replacement in _PATTERNS:
-        out = pattern.sub(replacement, out)
+    for step in _PATTERNS:
+        out = step(out) if callable(step) else step[0].sub(step[1], out)
     return replace_names(out, {name: "[vm]" for name in redact_names or []})
 
 

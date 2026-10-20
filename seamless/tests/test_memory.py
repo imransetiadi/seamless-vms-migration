@@ -243,6 +243,9 @@ def test_memory_hits_are_redacted_where_they_enter():
         "password='a'" + '"b"' * 10920,
         "password: '\nx'" + "y" * 32768,
         ("password: '\n" + "x " * 4) * 1560,
+        # flow-style auth sections nested inside each other, and ones that never close (RV52-X6)
+        "auth: {" * 4096 + "x" + "}" * 4096,
+        "auth:{" * 5460,
     ],
     ids=[
         "key prefix",
@@ -272,6 +275,8 @@ def test_memory_hits_are_redacted_where_they_enter():
         "glued quote after quote",
         "glued after lines",
         "values over lines",
+        "auth sections nested",
+        "auth sections never closed",
     ],
 )
 def test_redact_costs_time_linear_in_the_text(text):
