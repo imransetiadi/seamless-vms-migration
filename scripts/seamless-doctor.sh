@@ -5,10 +5,12 @@
 # Each pin is read from the file that sets it: Python from seamless/pyproject.toml, Node.js from
 # dashboard/package.json, gitleaks, ruff, actionlint and shellcheck from .pre-commit-config.yaml (the version the
 # hooks, CI and the venv share). The engine and Compose are checked by the stack targets' own check
-# (`make seamless-check-context`). What `make seamless-check` works without - SEAMLESS_TEST_PG_URL, Playwright's
-# Chromium, agentmemory (from the host and, on a Linux machine's own engine, from a container) and Jev's key - is
-# noted, never failed. No secret's value is printed. Exit 1 when something `make seamless-check` or the stack
-# targets need is missing or off its pin, else 0. Bash 3.2 compatible.
+# (`make seamless-check-context`), and curl, which their health wait needs. What `make seamless-check` works without
+# - SEAMLESS_TEST_PG_URL, Playwright's Chromium, agentmemory (from the host and, on a Linux machine's own engine, from
+# a container), Jev's key, and gitleaks, actionlint and shellcheck, which it skips when absent and runs at the
+# machine's own version - is noted, never failed, with its fix. No secret's value or URL is printed or put on a
+# command line, and nothing is installed or pulled. Exit 1 when something `make seamless-check`, the stack targets or
+# the pre-commit hook need is missing or off its pin, else 0 (SDD §17.1). Bash 3.2 compatible.
 set -uo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -40,19 +42,20 @@ hook_rev() {
     inside && /^[[:space:]]*rev:/ { sub(/^[[:space:]]*rev:[[:space:]]*v?/, ""); sub(/[[:space:]]*#.*$/, ""); print; exit }
   ' "$repo/.pre-commit-config.yaml"
 }
-# a tool the hooks pin exactly: name, hook repository, version option, Linux fix, macOS fix
+# a scanner the hooks pin exactly: name, hook repository, version option, Linux fix, macOS fix. make seamless-check
+# skips it when absent and runs the machine's own version, so either is noted, never failed (SDD §17.1)
 pinned() {
   local pin version
   pin=$(hook_rev "$2")
   if ! command -v "$1" >/dev/null 2>&1; then
-    fail "$1: not found (.pre-commit-config.yaml pins $pin)" "$(on_host "$4" "$5")"
+    note "$1: not found (.pre-commit-config.yaml pins $pin; make seamless-check skips it) - fix: $(on_host "$4" "$5")"
     return
   fi
   version=$("$1" "$3" 2>/dev/null | first_version)
   if [ "$version" = "$pin" ]; then
     ok "$1 $version"
   else
-    fail "$1 ${version:-of unknown version}: .pre-commit-config.yaml pins $pin" "$(on_host "$4" "$5")"
+    note "$1 ${version:-of unknown version}: .pre-commit-config.yaml pins $pin (make seamless-check runs this one) - fix: $(on_host "$4" "$5")"
   fi
 }
 
@@ -124,7 +127,7 @@ pinned actionlint rhysd/actionlint --version \
 # the hook's rev is shellcheck's version and a fourth number of shellcheck-py's packaging (v0.10.0.1: 0.10.0)
 shellcheck_pin=$(hook_rev shellcheck-py/shellcheck-py | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
 if ! command -v shellcheck >/dev/null 2>&1; then
-  fail "shellcheck: not found" "$(on_host 'sudo apt-get install -y shellcheck' 'brew install shellcheck')"
+  note "shellcheck: not found (make seamless-check skips it) - fix: $(on_host 'sudo apt-get install -y shellcheck' 'brew install shellcheck')"
 else
   shellcheck=$(shellcheck --version 2>/dev/null | first_version)
   if [ "$shellcheck" = "$shellcheck_pin" ]; then
@@ -154,6 +157,12 @@ else
   engine=$(printf '%s\n' "$engine" | grep -v '^make\(\[[0-9]*\]\)\{0,1\}: \*\*\*')
   fail "${engine:-make seamless-check-context failed}"
 fi
+if command -v curl >/dev/null 2>&1; then
+  ok "curl (the stack targets wait for /api/v1/health with it)"
+else
+  fail "curl: not found (the stack targets wait for /api/v1/health with it)" \
+    "$(on_host 'sudo apt-get install -y curl' 'brew install curl')"
+fi
 
 echo "Optional (make seamless-check works without them):"
 if [ -n "${SEAMLESS_TEST_PG_URL:-}" ]; then
@@ -171,18 +180,22 @@ else
   note "Playwright's Chromium is not installed: cd dashboard && npx playwright install chromium$(on_host ' --with-deps' '')"
 fi
 
-# the URL is never printed: it may carry a user and password
-if curl -fsS -m 3 "${AGENTMEMORY_URL:-http://localhost:3111}/agentmemory/livez" >/dev/null 2>&1; then
+# the URL is never printed nor put on curl's command line, which ps shows every local user: it may carry a user and
+# password, so curl reads it from its configuration on standard input (CLAUDE.md §4)
+if printf 'url = "%s"\n' "${AGENTMEMORY_URL:-http://localhost:3111}/agentmemory/livez" |
+  curl -fsS -m 3 -K - -o /dev/null >/dev/null 2>&1; then
   ok "agentmemory answers on this machine"
   # a Linux machine's own engine reaches the host through the bridge, never its 127.0.0.1
   if [ "$os" = Linux ] && [ "$engine_ok" = 1 ] && [ "${SEAMLESS_ENGINE:-docker}" = docker ] &&
     [ "${SEAMLESS_DOCKER_CONTEXT:-default}" = default ]; then
-    if docker run --rm --add-host host.docker.internal:host-gateway busybox \
-      wget -qO- -T 3 http://host.docker.internal:3111/agentmemory/livez >/dev/null 2>&1; then
-      ok "agentmemory answers from a container (host.docker.internal:3111)"
-    else
-      note "agentmemory does not answer from a container: the control plane runs without memory until it listens on the bridge address (docs/MEMORY.md §4.2)"
-    fi
+    # a cached busybox only: the doctor pulls nothing, and docker exits 125 when there is none
+    docker run --pull=never --rm --add-host host.docker.internal:host-gateway busybox \
+      wget -qO- -T 3 http://host.docker.internal:3111/agentmemory/livez >/dev/null 2>&1
+    case $? in
+      0) ok "agentmemory answers from a container (host.docker.internal:3111)" ;;
+      125) note "agentmemory from a container: skipped - no busybox image here to look with, and the doctor pulls nothing (docker pull busybox to look)" ;;
+      *) note "agentmemory does not answer from a container: the control plane runs without memory until it listens on the bridge address (docs/MEMORY.md §4.2)" ;;
+    esac
   fi
 else
   note "agentmemory does not answer: memory is off for agents and the stack (docs/MEMORY.md §4.1)"
