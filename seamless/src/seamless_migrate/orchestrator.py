@@ -1086,6 +1086,7 @@ class Orchestrator:
                     findings=findings,
                     resolved=resolved,
                     hold=hold,
+                    recommended=rec_id if also is not None else None,
                     also=also,
                 )
             else:
@@ -1100,6 +1101,7 @@ class Orchestrator:
                     actor,
                     resolved,
                     hold=hold,
+                    recommended=rec_id if also is not None else None,
                     also=also,
                 )
             # recorded only when this validation took the choice (ready or blocked now): one that
@@ -1171,6 +1173,7 @@ class Orchestrator:
         findings: list[Finding],
         resolved: Mappings | None = None,
         hold: str | None = None,
+        recommended: str | None = None,
         also: Joined | None = None,
     ) -> Migration:
         """A new migration, created already assessed (SDD §5.4): its history from pending through
@@ -1196,7 +1199,7 @@ class Orchestrator:
             updated_at=now,
         )
         final = self._assess(
-            migration, plan, vm, strategy, why, estimates, findings, resolved, hold
+            migration, plan, vm, strategy, why, estimates, findings, resolved, hold, recommended
         )
         migration, _ = await self._transitions(
             migration,
@@ -1219,6 +1222,7 @@ class Orchestrator:
         findings: list[Finding],
         resolved: Mappings | None,
         hold: str | None,
+        recommended: str | None = None,
     ) -> tuple[Phase, str, dict[str, Any] | None]:
         """Write a validation's assessment into ``m``; return its last transition: to ready, or
         to blocked by a blocker or when no strategy is eligible (SDD §5.4, §9)."""
@@ -1235,6 +1239,9 @@ class Orchestrator:
         m.wave_id = wave.id if wave else None
         m.bytes_total = vm.used_bytes
         m.advisor_hold = hold
+        if recommended is not None:
+            # the one a decision acts on while no hold names one (SDD §14.6, review RV51-08)
+            m.last_recommendation = recommended
         # SDD §14.4: strategy decisions are recommendations now; the notes a migration has
         # stay - strategy notes of earlier versions are listed as legacy recommendations
         m.error = None
@@ -1264,6 +1271,7 @@ class Orchestrator:
         resolved: Mappings | None = None,
         *,
         hold: str | None = None,
+        recommended: str | None = None,
         also: Joined | None = None,
     ) -> Migration:
         async with self._lock(mid):
@@ -1282,7 +1290,9 @@ class Orchestrator:
             steps: list[tuple[Phase, str, dict[str, Any] | None]] = []
             if m.phase != P.validating:
                 steps.append((P.validating, "pre-flight validation", None))
-            final = self._assess(m, plan, vm, strategy, why, estimates, findings, resolved, hold)
+            final = self._assess(
+                m, plan, vm, strategy, why, estimates, findings, resolved, hold, recommended
+            )
             # both transitions in one write, with what joins them (SDD §5.4)
             m, v = await self._transitions(m, v, [*steps, final], actor, also=also)
         return m
@@ -2426,10 +2436,17 @@ class Orchestrator:
             if m.advisor_hold != rec_id:
                 raise NotAllowed(f"a newer recommendation ({m.advisor_hold}) replaced {rec_id}")
         else:
-            stored = await self.db.list("recommendation", AdvisorRecommendation, migration_id=mid)
-            newest = max(stored, key=lambda r: (r.created_at, r.id))
-            if newest.id != rec_id:
-                raise NotAllowed(f"a newer recommendation ({newest.id}) replaced {rec_id}")
+            # the one the last validation stored - written with it, so whatever its time after a
+            # clock step back (review RV51-08); one no validation stored since the field: the
+            # newest by its time
+            newest = m.last_recommendation
+            if newest is None:
+                stored = await self.db.list(
+                    "recommendation", AdvisorRecommendation, migration_id=mid
+                )
+                newest = max(stored, key=lambda r: (r.created_at, r.id)).id
+            if newest != rec_id:
+                raise NotAllowed(f"a newer recommendation ({newest}) replaced {rec_id}")
         rec, rec_version = await self.db.get_versioned(
             "recommendation", rec_id, AdvisorRecommendation
         )

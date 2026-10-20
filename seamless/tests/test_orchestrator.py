@@ -5972,6 +5972,57 @@ async def test_a_held_migration_stays_decidable_after_the_clock_steps_back(tmp_p
     assert (await h.by_vm(plan.id, "vm-1")).advisor_hold is None
 
 
+async def test_the_recommendation_the_last_validation_stored_decides_after_the_clock_steps_back(
+    tmp_path, store
+):
+    """SDD §14.6 (review RV51-08): without a hold a decision took the newest recommendation by
+    created_at. Validation 1 held rec-A for approval; the policy went, the clock stepped back and
+    validation 2 stored rec-B auto_applied, clearing the hold - rec-A, which rec-B replaced, was
+    approvable and set the strategy back, and rec-B was refused. The migration names the one its
+    last validation stored."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    [first] = _recommendations(store)
+    assert first.decision.status == DecisionStatus.pending_approval
+    store.delete("advisor_policy", "pol-finance")
+    h.clock.advance(-60)
+    await h.orch.validate_plan(plan.id, "alice")
+    [second] = [r for r in _recommendations(store) if r.id != first.id]
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (second.decision.status, m.advisor_hold) == (DecisionStatus.auto_applied, None)
+    assert first.created_at > second.created_at  # the clock stepped back
+    assert m.last_recommendation == second.id
+    with pytest.raises(NotAllowed, match=rf"^a newer recommendation \({second.id}\) replaced "):
+        await h.orch.approve_recommendation(first.id, "rina")
+    approved = await h.orch.approve_recommendation(second.id, "rina")
+    assert approved.decision.status == DecisionStatus.approved
+
+
+async def test_a_migration_validated_before_the_field_decides_its_newest_by_time(tmp_path, store):
+    """SDD §14.6 (review RV51-08): a migration no validation stored a recommendation for since
+    last_recommendation came (an earlier version's) decides the newest by created_at, as before."""
+    advisor, _ = _answering_advisor(decide=_decide_answer("warm", 0.99))
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    store.delete("advisor_policy", "pol-finance")
+    await h.orch.validate_plan(plan.id, "alice")
+    older, newer = sorted(_recommendations(store), key=lambda r: r.created_at)
+    m = await h.by_vm(plan.id, "vm-1")
+    m.last_recommendation = None  # as an earlier version stored it
+    store.put("migration", m)
+    with pytest.raises(NotAllowed, match=rf"^a newer recommendation \({newer.id}\) replaced "):
+        await h.orch.approve_recommendation(older.id, "rina")
+    approved = await h.orch.approve_recommendation(newer.id, "rina")
+    assert approved.decision.status == DecisionStatus.approved
+
+
 async def test_no_decision_once_the_plans_default_strategy_decides(tmp_path, store):
     """SDD §14.6 (audit AD-04): a validation honours the plan's default_strategy as it honours an
     override, recording no recommendation - the earlier one no longer stands. It stayed the newest

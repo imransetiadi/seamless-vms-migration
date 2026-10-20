@@ -1037,6 +1037,10 @@ class Migration(_Model):
     advisor_notes: list[AdvisorNote] = Field(default_factory=list)
     #: the recommendation whose decision waits for approval: no start meanwhile (SDD §5.4, §14.6)
     advisor_hold: str | None = None
+    #: the recommendation its last validation stored: what a decision acts on while no hold names
+    #: one - written in that validation's transaction, so a clock step back never makes the one
+    #: it replaced the newest (SDD §14.6, review RV51-08); None: none stored since the field
+    last_recommendation: str | None = None
     #: the convergence rule that ended the passes (SDD §5.3, ADV-16)
     converged_by: Literal["threshold", "slo", "max_passes", "force"] | None = None
     force_cutover: ForceCutover | None = None
