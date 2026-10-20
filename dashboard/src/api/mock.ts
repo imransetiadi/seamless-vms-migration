@@ -193,6 +193,20 @@ function refuseOverrideBody(input: Record<string, unknown>): void {
   if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
 }
 
+/**
+ * A plan cancel's body as the API's CancelRequest reads it (SDD §12, PR #58 review): `reason` a string of at most
+ * ACTION_TEXT_MAX characters or null, nothing else - worded as its validation_message over pydantic's errors.
+ */
+function refuseCancelBody(input: Record<string, unknown>): void {
+  const problems: string[] = [];
+  if (Object.hasOwn(input, 'reason') && input.reason !== null) {
+    if (typeof input.reason !== 'string') problems.push('reason: Input should be a valid string');
+    else if ([...input.reason].length > ACTION_TEXT_MAX) problems.push(`reason: String should have at most ${ACTION_TEXT_MAX} characters`);
+  }
+  for (const key of Object.keys(input)) if (key !== 'reason') problems.push(`${key}: Extra inputs are not permitted`);
+  if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
+}
+
 /** A route whose request is `{}`, like the API's EmptyRequest (SDD §12, audit AA-04): an empty object or none, a field refused. */
 function refuseEmptyBody(input: Record<string, unknown>): void {
   const problems = Object.keys(input).map((key) => `${key}: Extra inputs are not permitted`);
@@ -2451,6 +2465,7 @@ export class MockServer {
 
   /** POST /plans/{id}/cancel, like the API (SDD §12): retires a plan none of whose migrations started; nothing is deleted. */
   private cancelPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+    refuseCancelBody(input); // the API refuses the body before its route runs
     if (plan.status === 'cancelled') return ok(plan);
     if (plan.status === 'running') throw new HttpError(409, 'conflict', 'pause the plan before cancelling it');
     const mine = this.migrations.filter((m) => m.plan_id === plan.id);
@@ -2480,7 +2495,8 @@ export class MockServer {
       );
     }
     // each one as POST /migrations/{id}/cancel does, with its own event
-    for (const m of todo) this.migrationAction(me, m, 'cancel', { reason: reason ? `plan cancelled: ${reason}` : 'plan cancelled' });
+    // the reason sent is bounded; the one each migration records, prefixed, is not (the API's cancel_plan)
+    for (const m of todo) this.migrationAction(me, m, 'cancel', { reason: reason ? `plan cancelled: ${reason}` : 'plan cancelled' }, false);
     plan.status = 'cancelled';
     plan.updated_at = new Date(this.now()).toISOString();
     this.emit({ kind: 'plan.cancelled', plan_id: plan.id, migration_id: null, actor: me.name, message: `${plan.name} cancelled`, data: { reason, migrations: todo.length } });
@@ -2514,12 +2530,12 @@ export class MockServer {
     return ok(m);
   }
 
-  private migrationAction(me: Me, m: Migration, action: string, input: Record<string, unknown>): MockResponse {
+  private migrationAction(me: Me, m: Migration, action: string, input: Record<string, unknown>, sent = true): MockResponse {
     if (action === 'sync' || action === 'retry') refuseEmptyBody(input);
     for (const field of ['comment', 'reason', 'confirm']) {
       const text = input[field];
-      // the API bounds the free text of every action (SDD §12)
-      if (typeof text === 'string' && pyLen(text) > ACTION_TEXT_MAX) {
+      // the API bounds the free text of every action a client sends (SDD §12)
+      if (sent && typeof text === 'string' && pyLen(text) > ACTION_TEXT_MAX) {
         throw new HttpError(422, 'validation_error', `${field}: at most ${ACTION_TEXT_MAX} characters.`);
       }
     }
@@ -2684,7 +2700,8 @@ export class MockServer {
           plan.updated_at = new Date(this.now()).toISOString();
           this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `${plan.name} reopened: retry of ${m.vm.name}`, data: { status: 'running' } });
         }
-        record('retry requested');
+        // the attempts the retry wrote, like the API's migration.action (SDD §5.1, review RV52-O6)
+        record('retry requested', { attempts: m.attempts });
         break;
       }
       case 'cancel': {
