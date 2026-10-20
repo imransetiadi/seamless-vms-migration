@@ -133,10 +133,10 @@
    "requests": []
   },
   {
-   "why": "a CUSTOM_ class is a vGPU with a declared profile, which each vGPU entry takes; classes in name order",
+   "why": "a CUSTOM_ class is a vGPU with a declared profile, which each vGPU entry takes; classes in name order, whatever their order in the extra specs",
    "extra_specs": {
-    "resources1:CUSTOM_NVIDIA_A100_4C": "1",
     "resources1:VGPU": "1",
+    "resources1:CUSTOM_NVIDIA_A100_4C": "1",
     "trait1:CUSTOM_DC3": "required"
    },
    "declared_profile": "A100-4C",

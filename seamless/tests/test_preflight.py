@@ -3379,14 +3379,18 @@ ELIGIBILITY_CASES = json.loads(
 def test_the_shared_handover_finding_cases(case):
     """SDD §9.3, §16 (review RV20-08): the findings as the API words them, which the dashboard's
     mock words the same way (mockData.test.ts); `others` are the plan's other selected VMs,
-    `source_kind` the source provider's kind; a network case's `destination` gives the
-    destination's label, networks, subnets, the token's roles and the policy profile."""
+    `source_kind` the source provider's kind and `gpu_profiles` its declared profiles; a network
+    case's `destination` gives the destination's label, networks, subnets, the token's roles and
+    the policy profile. A code a case expects as null is not found (PR #64 review)."""
     plan = make_plan(**case["plan"])
     vm = VMRef.model_validate(case["vm"])
     others = [VMRef.model_validate(other) for other in case.get("others", [])]
     source = VMWARE if case.get("source_kind") == "vmware" else SRC
+    if "gpu_profiles" in case:
+        source = source.model_copy(update={"gpu_profiles": case["gpu_profiles"]})
     found = check(vm, plan=plan, all_vms=[vm, *others], source=source, **_destination(case))
-    assert {f.code: f.message for f in found if f.code in case["expected"]} == case["expected"]
+    messages = {f.code: f.message for f in found}
+    assert {code: messages.get(code) for code in case["expected"]} == case["expected"]
 
 
 def test_the_kits_names_judge_a_vmware_sources_vms_only_and_once():

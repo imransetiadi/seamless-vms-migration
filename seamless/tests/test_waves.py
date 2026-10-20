@@ -186,6 +186,12 @@ def test_the_pilot_wave_never_holds_a_gpu_vm():
     waves = plan_waves(vms, {v.source_id: heuristic_tier(v) for v in vms})
     assert (waves[0].name, waves[0].vm_ids) == ("Pilot", ["web-a", "web-b", "dns"])
     assert waves[1].vm_ids == ["mq-gpu", "mq-old"]
+    # a plan of GPU VMs alone has no pilot: its first wave depends on none (PR #64 review)
+    gpu_only = [gpu_vm("g1", "web-01", 10), gpu_vm("g2", "mq-01", 20)]
+    waves = plan_waves(gpu_only, {v.source_id: heuristic_tier(v) for v in gpu_only})
+    assert [(w.id, w.name, w.depends_on, w.vm_ids) for w in waves] == [
+        ("wave-1", "Wave 1", [], ["g1", "g2"])
+    ]
 
 
 def test_an_app_group_with_a_gpu_vm_stays_out_of_the_pilot():
