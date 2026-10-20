@@ -86,8 +86,8 @@ SCRIPT = textwrap.dedent(
             "type": "openstack.compute.Server",
             "params": {{
                 "name": name,
-                "flavor_ref": {{"name": "m1.small", "project_name": "finance",
-                               "domain_name": "Default"}},
+                "flavor_ref": {{"name": os.environ.get("ANSIBLE_FAKE_FLAVOR", "m1.small"),
+                               "project_name": "finance", "domain_name": "Default"}},
                 "ports": [{{"params": {{
                     "mac_address": "fa:16:3e:00:00:01",
                     "network_ref": {{"name": "app-net", "project_name": "finance",

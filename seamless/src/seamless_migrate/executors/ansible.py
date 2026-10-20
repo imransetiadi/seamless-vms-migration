@@ -39,9 +39,11 @@ from ..domain.models import (
     Plan,
     Provider,
     SyncPass,
+    VMRef,
     next_pass_number,
     utcnow,
 )
+from ..planning.gpu import gpu_flavor, gpu_names, vm_gpus
 from ..planning.kit import kit_vm_name
 from ..planning.networks import (
     kit_ipv4,
@@ -495,6 +497,38 @@ def effective_mappings(plan_mappings: Mappings, resolved: Mappings | None) -> Ma
     )
 
 
+def gpu_mapping_refusal(
+    vm: VMRef,
+    plan: Plan,
+    source_kind: ProviderKind | str,
+    inventory: Any,
+    where: str = "the destination",
+) -> str | None:
+    """Why a GPU VM's mapping does not apply to the destination's flavors ``inventory`` read for
+    the run (SDD §7.2, §22.4): the plan's GPU mappings map its GPUs to no single flavor, the
+    flavor they name does not exist, or it asks for no GPU - none of the inventory's gpu_flavors
+    (§22.3) -, and the server would lose its GPU. None for a VM without a GPU and for a mapping
+    that applies; ``where`` names the destination provider (SDD §1 naming)."""
+    gpus = vm_gpus(vm)
+    if not gpus:
+        return None
+    what = f"the GPUs of {vm.name} ({gpu_names(gpus)})"
+    flavor = gpu_flavor(vm, plan, source_kind)
+    if flavor is None:
+        return f"the plan's GPU mappings map {what} to no single flavor of {where}"
+
+    def listed(key: str) -> set[str]:
+        return {str(f.get("name")) for f in getattr(inventory, key, None) or []}
+
+    if flavor not in listed("flavors"):
+        why = f"there is no flavor named {flavor!r}"
+    elif flavor not in listed("gpu_flavors"):
+        why = "it asks for no GPU, and the server would lose its GPU"
+    else:
+        return None
+    return f"{what} cannot go to flavor {flavor!r} of {where}: {why}"
+
+
 def classify_failure(output: str) -> type[Exception]:
     """Transient (retried) when the failure output matches a transient pattern."""
     return TransientStepError if TRANSIENT.search(output[-8000:]) else PermanentStepError
@@ -558,7 +592,8 @@ def build_vars(
     step: StepName, ctx: StepContext, network_map: dict[str, str] | None = None
 ) -> dict[str, Any]:
     """Non-secret extra-vars for running ``step`` (credentials go to ``secrets.yml``); a VMware
-    run's ``network_map`` is what ``_vmware_network_map`` resolved (SDD §7.2)."""
+    run's ``network_map`` is what ``_vmware_network_map`` resolved, and a GPU VM's ``flavor_uuid``
+    the GPU flavor its plan names (SDD §7.2, §22.4)."""
     step = StepName(step)
     m = ctx.migration
     rdir = run_dir(ctx.settings, ctx.plan.id, m.id)
@@ -585,6 +620,11 @@ def build_vars(
         targets = set(mappings.volume_types.values())
         if len(targets) == 1:
             out["cinder_volume_type"] = targets.pop()
+        flavor = gpu_flavor(m.vm, ctx.plan, ctx.source.kind)
+        if flavor is not None:
+            # the kit creates a GPU VM's server with its GPU flavor, never its own best match:
+            # every run gets it (SDD §7.2, §22.4)
+            out["flavor_uuid"] = flavor
         return out
     out = _common_openstack_vars(
         ctx.source, ctx.destination, rdir / "osm", plan_dir(ctx.settings, ctx.plan.id) / "osm"
@@ -1190,10 +1230,20 @@ class AnsibleExecutor:
             await asyncio.to_thread(
                 _ensure_record, osm, ctx.migration.vm.source_id, ctx.migration.vm.name
             )
-        # the kit powers the VM off at the cutover: its networks are settled before it runs
+        # the kit powers the VM off at the cutover: its networks are settled before it runs, and so
+        # is the GPU flavor it creates a GPU VM's server with (SDD §7.2, §22.4)
         network_map = None
         if strategy in VMWARE:
-            network_map = await self._vmware_network_map(ctx, deferred)
+            inventory = await self._kit_inventory(ctx)
+            refusal = gpu_mapping_refusal(
+                ctx.migration.vm, ctx.plan, ctx.source.kind, inventory, ctx.destination.label
+            )
+            if refusal:
+                if deferred is None:
+                    raise PermanentStepError(refusal)
+                # the kit creates no server in a pass: its cutover refuses it (SDD §7.2)
+                deferred.append(refusal)
+            network_map = await self._vmware_network_map(ctx, inventory, deferred)
             await self._log_deferred(ctx, deferred)
         passes_before = 0
         if strategy == Strategy.warm:
@@ -1563,27 +1613,32 @@ class AnsibleExecutor:
         # none listed (an older provider): nothing to resolve against
         return list(getattr(inventory, "network_details", None) or [])
 
-    async def _vmware_network_map(
-        self, ctx: StepContext, deferred: list[str] | None = None
-    ) -> dict[str, str]:
-        """The migration kit's network_map (SDD §7.2): each NIC of the VM by the kit's key to
-        "{network id},{subnet id}" of the RHOSO network its port group resolves to - the plan's
-        mapping of it, else the same name, by the rule of §7.3 step 0 - and of the subnet that
-        holds its IPv4 guest addresses. Refused before the kit runs: a network that does not
-        resolve, one the credential may not put a port on (§6.6), addresses the kit's port cannot
-        take, two NICs one key would send to different values - a NIC with no IPv4 address takes
-        any of its network's -, a MAC or address another port of the network holds; networks or
-        ports that cannot be read are a transient failure. Given ``deferred`` (a pre-copy or sync
-        run, in which the kit makes no port), the network the credential may not use and the
-        held MAC or address are added there instead and the NIC is mapped, and ports that cannot
-        be read are logged."""
-        dst = self.providers.get(ctx.destination)
+    async def _kit_inventory(self, ctx: StepContext) -> Any:
+        """The destination's inventory for a kit run, read once for it: the networks, subnets and
+        token roles of the network map, and the flavors a GPU VM's mapping must still apply to (SDD
+        §7.2, §22.4). One that cannot be read is a transient failure, before the kit runs."""
         try:
-            inventory = await dst.inventory()
+            return await self.providers.get(ctx.destination).inventory()
         except ProviderError as exc:
             raise TransientStepError(
                 f"could not read the networks of {ctx.destination.label}: {exc}"
             ) from exc
+
+    async def _vmware_network_map(
+        self, ctx: StepContext, inventory: Any, deferred: list[str] | None = None
+    ) -> dict[str, str]:
+        """The migration kit's network_map (SDD §7.2): each NIC of the VM by the kit's key to
+        "{network id},{subnet id}" of the RHOSO network its port group resolves to - the plan's
+        mapping of it, else the same name, by the rule of §7.3 step 0 against the networks of the
+        run's ``inventory`` - and of the subnet that holds its IPv4 guest addresses. Refused before
+        the kit runs: a network that does not resolve, one the credential may not put a port on
+        (§6.6), addresses the kit's port cannot take, two NICs one key would send to different
+        values - a NIC with no IPv4 address takes any of its network's -, a MAC or address another
+        port of the network holds; ports that cannot be read are a transient failure. Given
+        ``deferred`` (a pre-copy or sync run, in which the kit makes no port), the network the
+        credential may not use and the held MAC or address are added there instead and the NIC is
+        mapped, and ports that cannot be read are logged."""
+        dst = self.providers.get(ctx.destination)
         networks = list(getattr(inventory, "network_details", None) or [])
         subnets = list(getattr(inventory, "subnets", None) or [])
         # the token's roles read now with the inventory, as the handover's step 0 and the
