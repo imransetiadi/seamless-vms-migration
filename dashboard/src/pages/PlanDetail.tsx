@@ -135,7 +135,9 @@ function SettingsSummary({
   const destination = providers.find((p) => p.id === plan.destination_provider_id);
   const overrides = Object.keys(plan.strategy_overrides).length;
   const v = plan.verification;
-  const mappingCount = Object.values(plan.mappings).reduce((n, m) => n + Object.keys(m).length, 0);
+  // the kinds the Mappings entry lists: the page lists GPU mappings from plan task G12 on (SDD §22.11)
+  const { networks, flavors, volume_types, projects } = plan.mappings;
+  const mappingCount = [networks, flavors, volume_types, projects].reduce((n, m) => n + Object.keys(m ?? {}).length, 0);
   return (
     <dl className="grid gap-x-6 gap-y-3 sm:grid-cols-2 xl:grid-cols-4">
       <Setting label="Source">
