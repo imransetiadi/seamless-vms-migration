@@ -2943,12 +2943,16 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 
 * passwords and secrets in key/value pairs — `key=value`, `key: value`, JSON `"key": "value"`, the key
   possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`), also where it starts a line of a
-  JSON-escaped multi-line string (`\npassword: x`) — and in CLI flags (`--os-password x`; a shell word whole - its quoted
-  parts and what is glued to them, a quote it never closes to its line's end -, and in an argv list - JSON's, a repr's such as a `CalledProcessError`'s - the next item, review RV52-X3). A quoted value is read
+  JSON-escaped multi-line string (`\npassword: x`) — and in CLI flags (`--os-password x`; a quoted value whole with the
+  rest of its word, a quote it never closes to its line's end, and in an argv list - JSON's, a repr's such as a
+  `CalledProcessError`'s - the next item, review RV52-X3). A quoted value is read
   in every quoting it may be in: JSON's and the shell's double quotes, a Python repr's, YAML's (`''`) and the
-  shell's single quotes - with what the shell glues to a closed word, single- or double-quoted (`'a'b`, `'a'\''b'`,
-  `'a'"'"'b'`, `"a"b`, `"a""b"`, `'a'"b"`, review RV52-X6) -, any of
-  them inside JSON strings, however deep. Where the readings disagree on where it ends - a backslash before a
+  shell's single quotes - with what the shell glues to a closed word (`'a'b`, `'a'\''b'`, `'a'"'"'b'`, and the
+  characters after a double-quoted one, `"a"b`, review RV52-X6) -, any of them inside JSON strings, however deep.
+  No value runs past its item: a quoted part is never glued to a value - a JSON or repr list item's closing quote
+  and the next one's opening quote would read as one, and the next key with them -, and a word stops before a
+  JSON-escaped line break (`\n`, `\r` in a JSON string) unless letters and digits carry it on to its end
+  (`C:\new\root`), so the next line's key, flag or quoted key is redacted on its own (PR #58 review). Where the readings disagree on where it ends - a backslash before a
   quote escapes it in a repr (`\'`, inside JSON `\\'`), not in YAML or the shell (`'C:\'`) - the value runs
   on to the longest reading's end, so no part of a secret stays: at worst the rest of its line goes with it, and
   it stops before a quoted credential key (`'token':`) so that one is redacted too. A `[REDACTED]` already
@@ -2960,7 +2964,8 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 * PEM blocks;
 * credentials in connection strings: `scheme://user:password@host` (a password with `@` too) and
   `Password=…;`;
-* the `auth` section of a `clouds.yaml`, in YAML or JSON;
+* the `auth` section of a `clouds.yaml`, in YAML or JSON - a quoted string in a flow-style section read whole, so a
+  brace in a password neither ends the section nor keeps it open (PR #58 review);
 * seamless API tokens (`smg_…`) and JWTs;
 * VM names (as `[vm]`) when `names` are given — the advisor and agentmemory give them when
   `SEAMLESS_MEMORY_REDACT_NAMES` — wherever a name stands between characters that are not letters or digits, so a
