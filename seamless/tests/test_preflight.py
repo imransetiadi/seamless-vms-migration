@@ -10,6 +10,7 @@ from seamless_migrate.domain.enums import Phase, ProviderKind, ProviderRole, Sev
 from seamless_migrate.domain.models import (
     DEFAULT_PRESTAGE,
     AppProbe,
+    GpuDevice,
     HandoverConfig,
     Mappings,
     Nic,
@@ -1034,6 +1035,33 @@ def test_finding_vm_vgpu_names_the_vgpu_class_only(key):
     """SDD §9.3 (review PL-08): another resource class, or a trait, in a request group is no
     vGPU."""
     assert "VM_VGPU" not in [f.code for f in check(make_vm(flavor_extra_specs={key: "1"}))]
+
+
+def test_finding_vm_vgpu_from_a_vmware_vgpu_device():
+    """SDD §9.3, §22.2 (plan task G2): a VMware VM's vGPU, which its provider reports in gpus and no
+    longer as a flavor extra spec, blocks the VM as before - whatever its plan maps, until G4."""
+    vm = make_vm(gpus=[GpuDevice(kind="vgpu", profile="grid_a100-4c", count=2)])
+    found = only(check(vm, source=VMWARE), "VM_VGPU")
+    assert (found.severity, found.message) == (
+        Severity.blocker,
+        "The VM has a vGPU (grid_a100-4c ×2).",
+    )
+
+
+def test_finding_vm_pci_passthrough_from_a_vmware_passthrough_device():
+    """SDD §9.3, §22.2 (plan task G2): a VMware VM's DirectPath I/O devices, reported in gpus, block
+    the VM as before; a device without ids is named as one."""
+    vm = make_vm(
+        gpus=[
+            GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5"),
+            GpuDevice(kind="passthrough"),
+        ]
+    )
+    found = only(check(vm, source=VMWARE), "VM_PCI_PASSTHROUGH")
+    assert (found.severity, found.message) == (
+        Severity.blocker,
+        "The VM has a PCI passthrough device (10de:20b5, a device without ids).",
+    )
 
 
 @pytest.mark.parametrize(

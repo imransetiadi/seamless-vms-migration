@@ -69,6 +69,34 @@ describe('readinessFlags', () => {
     );
   });
 
+  it('flags a GPU VM from vm.gpus, from either source (SDD §9.3, §22.2, plan task G2)', () => {
+    const gpuVm = (gpus: VMRef['gpus'], specs: Record<string, string> = {}) =>
+      makeVm({ id: 'vm-g2', name: 'gpu-03', disks: [{ size_gb: 20 }], nics: [{ network: 'VM Network', fixed_ips: ['10.0.0.9'] }], gpus, flavor_extra_specs: specs });
+    const gpuFlags = (vm: VMRef, kind: 'vmware' | 'openstack') =>
+      readinessFlags(vm, kind)
+        .filter((f) => f.code === 'VM_VGPU' || f.code === 'VM_PCI_PASSTHROUGH')
+        .map((f) => [f.code, f.severity, f.detail]);
+    // a VMware VM's devices arrive in gpus, no longer as flavor extra specs; the wording stays until plan task G4
+    const vmware = gpuVm([
+      { kind: 'vgpu', profile: 'grid_a100-4c', count: 2 },
+      { kind: 'passthrough', vendor_id: '10de', device_id: '20b5', count: 1 },
+    ]);
+    expect(gpuFlags(vmware, 'vmware')).toEqual([
+      ['VM_VGPU', 'blocker', 'The flavor requests a vGPU.'],
+      ['VM_PCI_PASSTHROUGH', 'blocker', 'The flavor requests PCI passthrough.'],
+    ]);
+    // an OpenStack flavor's custom class its provider declares a profile for is a vGPU only in gpus
+    const declared = gpuVm([{ kind: 'vgpu', profile: 'A100-4C', resource_class: 'CUSTOM_NVIDIA_A100_4C', count: 1 }], {
+      'resources1:CUSTOM_NVIDIA_A100_4C': '1',
+    });
+    expect(gpuFlags(declared, 'openstack')).toEqual([['VM_VGPU', 'blocker', 'The flavor requests a vGPU.']]);
+    // a VM recorded without gpus is read from its flavor's extra specs, as validation reads it
+    expect(gpuFlags(gpuVm(undefined, { 'pci_passthrough:alias': 'a100:1' }), 'openstack')).toEqual([
+      ['VM_PCI_PASSTHROUGH', 'blocker', 'The flavor requests PCI passthrough.'],
+    ]);
+    expect(gpuFlags(gpuVm([]), 'vmware')).toEqual([]);
+  });
+
   it('blocks a vGPU requested bare or in a request group, as validation does (SDD §9.3 VM_VGPU, review PL-08)', () => {
     const vm = (specs: Record<string, string>) =>
       makeVm({ id: 'os-r6', name: 'gpu-02', disks: [{ size_gb: 20 }], nics: [{ network: 'app-net', fixed_ips: ['10.0.0.8'] }], flavor_extra_specs: specs });

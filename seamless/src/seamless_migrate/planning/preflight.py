@@ -9,8 +9,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from ..domain.enums import Phase, ProviderKind, Severity, Strategy
-from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
+from ..domain.models import Finding, GpuDevice, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
+from .gpu import gpu_requests, vgpu_request_keys
 from .ipam import address_refusal
 from .kit import kit_vm_name
 from .networks import kit_subnet, policy_profile_of, port_refusal, resolve_network
@@ -531,8 +532,58 @@ def _flavor_size(flavor: dict[str, Any]) -> tuple[int, int, int, str]:
 _CONSTRAINED_SPEC = re.compile(
     r"^(?:(?:resources|trait)[A-Za-z0-9_-]*:|pci_passthrough:|aggregate_instance_extra_specs:)"
 )
-#: A vGPU request, bare or in a request group (SDD §9.3 ``VM_VGPU``, review PL-08).
-_VGPU_SPEC = re.compile(r"^resources[A-Za-z0-9_-]*:VGPU$")
+
+
+def _vm_gpus(vm: VMRef, source: Provider | None) -> tuple[list[GpuDevice], str | None]:
+    """The VM's GPUs as §9.3's two GPU rows read them (SDD §22.2, plan task G2), with the profile
+    its source declares for its flavor: as the source reported them, else - a VM recorded before
+    G2 - what its flavor's extra specs ask for, so a VMware VM reported with them stays blocked."""
+    declared = source.gpu_profiles.get(vm.flavor) if source is not None and vm.flavor else None
+    return (list(vm.gpus) or gpu_requests(vm.flavor_extra_specs, declared)), declared
+
+
+def _gpu_names(devices: Iterable[GpuDevice]) -> str:
+    """Each device by what names it - a profile, an alias, the PCI ids or a vGPU's class -, with
+    its count when more than one."""
+    names = []
+    for device in devices:
+        ids = (
+            f"{device.vendor_id}:{device.device_id}"
+            if device.vendor_id and device.device_id
+            else ""
+        )
+        name = (
+            device.profile or device.alias or ids or device.resource_class or "a device without ids"
+        )
+        names.append(f"{name} ×{device.count}" if device.count > 1 else name)
+    return ", ".join(names)
+
+
+def _gpu_findings(vm: VMRef, source: Provider | None) -> list[Finding]:
+    """`VM_PCI_PASSTHROUGH` and `VM_VGPU`, unconditional blockers until plan task G4 (SDD §9.3,
+    §22.2): an OpenStack flavor's requests named by their extra specs, as before; a VMware VM's
+    devices by what names them."""
+    gpus, declared = _vm_gpus(vm, source)
+    out = []
+    passthrough = [g for g in gpus if g.kind == "passthrough"]
+    if passthrough:
+        alias = vm.flavor_extra_specs.get("pci_passthrough:alias")
+        message = (
+            f"Flavor requests PCI passthrough ({alias})."
+            if alias is not None and any(g.alias for g in passthrough)
+            else f"The VM has a PCI passthrough device ({_gpu_names(passthrough)})."
+        )
+        out.append(finding("VM_PCI_PASSTHROUGH", message))
+    vgpus = [g for g in gpus if g.kind == "vgpu"]
+    if vgpus:
+        keys = vgpu_request_keys(vm.flavor_extra_specs, declared)
+        message = (
+            f"Flavor requests a vGPU ({', '.join(keys)})."
+            if keys and any(g.resource_class for g in vgpus)
+            else f"The VM has a vGPU ({_gpu_names(vgpus)})."
+        )
+        out.append(finding("VM_VGPU", message))
+    return out
 
 
 def _constrained(flavor: dict[str, Any]) -> bool:
@@ -1224,17 +1275,7 @@ def run_preflight(
 
     out.extend(_nic_override_findings(vm, plan, dst_inv, selected, source, where))
 
-    if "pci_passthrough:alias" in vm.flavor_extra_specs:
-        out.append(
-            finding(
-                "VM_PCI_PASSTHROUGH",
-                "Flavor requests PCI passthrough "
-                f"({vm.flavor_extra_specs['pci_passthrough:alias']}).",
-            )
-        )
-    vgpu = sorted(k for k in vm.flavor_extra_specs if _VGPU_SPEC.match(str(k)))
-    if vgpu:
-        out.append(finding("VM_VGPU", f"Flavor requests a vGPU ({', '.join(vgpu)})."))
+    out.extend(_gpu_findings(vm, source))
 
     encrypted = [d.name or d.id for d in vm.disks if d.encrypted]
     if encrypted:

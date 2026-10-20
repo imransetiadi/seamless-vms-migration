@@ -4421,6 +4421,93 @@
       "expected": {
         "SRC_VM_NAME_UNUSABLE": "The migration kit keeps no character of the name 'サーバー' - only Latin letters, digits, '_' and '-' after its transliteration - so it would create the VM's server, ports and volumes without a name."
       }
+    },
+    {
+      "why": "a VMware VM's vGPUs and passthrough devices, reported in gpus (plan task G2)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-gpu",
+        "name": "vmw-gpu-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "disk-1",
+            "name": "vmw-01-root",
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "/dev/vda",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 42949672960,
+        "used_bytes": 21474836480,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 2
+          },
+          {
+            "kind": "passthrough",
+            "vendor_id": "10de",
+            "device_id": "20b5",
+            "count": 1
+          },
+          {
+            "kind": "passthrough",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        }
+      },
+      "expected": {
+        "VM_PCI_PASSTHROUGH": "The VM has a PCI passthrough device (10de:20b5, a device without ids).",
+        "VM_VGPU": "The VM has a vGPU (grid_a100-4c ×2)."
+      }
     }
   ]
 }

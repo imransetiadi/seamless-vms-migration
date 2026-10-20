@@ -106,6 +106,20 @@ def gpu_requests(
     return entries
 
 
+def vgpu_request_keys(
+    extra_specs: Mapping[str, str], declared_profile: str | None = None
+) -> list[str]:
+    """The extra-spec keys whose requests `gpu_requests` reads as vGPUs, sorted: what §9.3's
+    `VM_VGPU` names for an OpenStack flavor (SDD §9.3, §22.2)."""
+    return sorted(
+        str(key)
+        for key, value in extra_specs.items()
+        if (match := _RESOURCES.match(str(key)))
+        and _amount(str(value))
+        and (match["cls"] == VGPU or (declared_profile and match["cls"].startswith("CUSTOM_")))
+    )
+
+
 def gpu_key(device: GpuDevice) -> str | None:
     """What a plan's GPU mapping names a VMware device by (SDD §22.2, §22.4): a vGPU's profile, a
     passthrough device's `<vendor_id>:<device_id>`; None when it has neither."""

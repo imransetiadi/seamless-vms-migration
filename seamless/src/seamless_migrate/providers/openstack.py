@@ -17,6 +17,7 @@ from ..config import Settings
 from ..domain.enums import ProviderRole
 from ..domain.models import Disk, Nic, Provider, VMRef
 from ..guest_os import identify
+from ..planning.gpu import gpu_requests
 from ..planning.platforms import destination_release
 from ..planning.preflight import DestinationInventory, SourceInventory
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
@@ -337,7 +338,7 @@ class OpenStackProvider:
 
     def _list_vms(self) -> list[VMRef]:
         conn = self._connection()
-        ctx = _MapContext(conn)
+        ctx = _MapContext(conn, self.provider.gpu_profiles)
         servers = list(conn.compute.servers(details=True))
         if len(servers) > 1:
             ctx.prefetch()
@@ -352,7 +353,7 @@ class OpenStackProvider:
         except openstack.exceptions.NotFoundException:
             # Nova answered 404: it has no such server (SDD §10), not an unreachable cloud
             raise VMNotFound(f"{self.provider.id}: VM {source_id!r} not found") from None
-        return _MapContext(conn).server_to_vmref(server)
+        return _MapContext(conn, self.provider.gpu_profiles).server_to_vmref(server)
 
     def _project_name(self, conn: Any) -> str:
         pid = _attr(conn, "current_project_id", default="")
@@ -714,8 +715,10 @@ def _best_os_type(*candidates: str | None) -> str | None:
 class _MapContext:
     """Per-call caches used while mapping servers to :class:`VMRef`."""
 
-    def __init__(self, conn: Any) -> None:
+    def __init__(self, conn: Any, gpu_profiles: Mapping[str, str] | None = None) -> None:
         self.conn = conn
+        #: the source's declared vGPU profiles by flavor name, which its VMs' GPUs take (SDD §22.3)
+        self.gpu_profiles = dict(gpu_profiles or {})
         self._projects: dict[str, str | None] = {}
         self._networks: dict[str, Any] = {}
         self._images: dict[str, dict[str, Any]] = {}
@@ -798,6 +801,7 @@ class _MapContext:
         )
         flavor_name = _attr(flavor, "original_name", "name")
         extra_specs = _attr(flavor, "extra_specs", default={}) or {}
+        specs = {str(k): str(v) for k, v in extra_specs.items()}
 
         image = _attr(server, "image", default={}) or {}
         image_booted = bool(_attr(image, "id"))
@@ -912,6 +916,8 @@ class _MapContext:
             os_type=os_type,
             host=_attr(server, "compute_host", "hypervisor_hostname", "host"),
             tags=metadata,
-            flavor_extra_specs={str(k): str(v) for k, v in extra_specs.items()},
+            flavor_extra_specs=specs,
             key_name=_attr(server, "key_name", default=None) or None,
+            # the GPUs its flavor asks for, with the profile its source declares (SDD §22.2)
+            gpus=gpu_requests(specs, self.gpu_profiles.get(flavor_name) if flavor_name else None),
         )

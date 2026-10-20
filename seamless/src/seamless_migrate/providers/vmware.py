@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 
 from ..ai.redaction import redact_cut
 from ..config import Settings
-from ..domain.models import Disk, Nic, Provider, VMRef
+from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef
 from ..planning.preflight import SourceInventory
 from ..security.secrets import SecretNotFound, resolve
 from .base import ProviderError, VMNotFound, missing_dependency
@@ -141,6 +141,34 @@ def _disk_usage(vm: Any) -> dict[int, int]:
     return out
 
 
+def _pci_id(value: Any) -> str | None:
+    """A PCI vendor or device id as four lower-case hex digits: a number - vSphere's signed
+    16-bit vendorId among them - read modulo 2^16, or hex text (SDD §22.2)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return f"{value % 0x10000:04x}"
+    text = str(value).strip().lower().removeprefix("0x")
+    return text.zfill(4) if re.fullmatch(r"[0-9a-f]{1,4}", text) else None
+
+
+def _gpu_device(backing: Any) -> GpuDevice:
+    """What a VirtualPCIPassthrough device is, by its backing (SDD §22.2): a VmiopBackingInfo is a
+    vGPU with its profile; a DynamicBackingInfo a passthrough device with the ids of its first
+    allowed device, a DeviceBackingInfo one with its own; any other a passthrough device without
+    ids."""
+    profile = getattr(backing, "vgpu", None)
+    if profile:
+        return GpuDevice(kind="vgpu", profile=str(profile))
+    allowed = getattr(backing, "allowedDevice", None) or []
+    ids = allowed[0] if allowed else backing
+    vendor = _pci_id(getattr(ids, "vendorId", None))
+    device = _pci_id(getattr(ids, "deviceId", None))
+    if vendor and device:
+        return GpuDevice(kind="passthrough", vendor_id=vendor, device_id=device)
+    return GpuDevice(kind="passthrough")
+
+
 def map_vm(
     vm: Any,
     vim: Any,
@@ -205,20 +233,18 @@ def map_vm(
             )
         )
 
-    # PCI passthrough and vGPU (shared PCI) devices: expressed as the flavor extra specs the
-    # pre-flight catalog keys off (SDD §9.3 VM_PCI_PASSTHROUGH / VM_VGPU)
-    extra_specs: dict[str, str] = {}
+    # each PCI passthrough device by its backing, identical ones one entry with their count; none
+    # is written as a flavor extra spec, as a VMware VM has no flavor (SDD §22.2, plan task G2)
+    gpus: dict[tuple[str, str | None, str | None, str | None], GpuDevice] = {}
     pci_cls = getattr(getattr(vim, "vm", None), "device", None)
     pci_cls = getattr(pci_cls, "VirtualPCIPassthrough", None)
     for dev in devices if pci_cls is not None else []:
         if not isinstance(dev, pci_cls):
             continue
-        backing = getattr(dev, "backing", None)
-        label = str(getattr(getattr(dev, "deviceInfo", None), "label", "") or "PCI device")
-        if getattr(backing, "vgpu", None):
-            extra_specs["resources:VGPU"] = "1"
-        else:
-            extra_specs["pci_passthrough:alias"] = label
+        gpu = _gpu_device(getattr(dev, "backing", None))
+        key = (gpu.kind, gpu.profile, gpu.vendor_id, gpu.device_id)
+        seen = gpus.get(key)
+        gpus[key] = seen.model_copy(update={"count": seen.count + 1}) if seen else gpu
 
     runtime = getattr(vm, "runtime", None)
     host = getattr(getattr(runtime, "host", None), "name", None)
@@ -241,7 +267,7 @@ def map_vm(
         os_type=_tools_os_name(guest) or getattr(config, "guestId", None),
         host=str(host) if host else None,
         tags=tags,
-        flavor_extra_specs=extra_specs,
+        gpus=list(gpus.values()),
         cbt_enabled=bool(getattr(config, "changeTrackingEnabled", False)),
         snapshot_count=_count_snapshots(getattr(snapshot, "rootSnapshotList", None)),
         tools_ok=str(getattr(guest, "toolsRunningStatus", "")) == "guestToolsRunning",

@@ -12,6 +12,7 @@ from typing import Any
 
 from ..domain.enums import ProviderKind
 from ..domain.models import Disk, Nic, Provider, VMRef
+from ..planning.gpu import gpu_requests
 from ..planning.platforms import destination_release
 from ..planning.preflight import DestinationInventory, SourceInventory
 from .base import ProviderError, VMNotFound
@@ -264,6 +265,7 @@ def _openstack_vm(spec: _Spec, rng: random.Random, index: int) -> VMRef:
         host=f"compute-{index % 4}",
         tags=dict(spec.tags),
         flavor_extra_specs=dict(spec.extra_specs),
+        gpus=gpu_requests(dict(spec.extra_specs)),  # what its flavor asks for (SDD §22.2)
         change_rate_bps=round(spec.rate_mib * rng.uniform(0.8, 1.2) * MIB, 1),
     )
 
