@@ -48,7 +48,7 @@ from seamless_migrate.domain.models import (
     next_pass_number,
     utcnow,
 )
-from seamless_migrate.events import AUDIT_KINDS, EventBus, emit
+from seamless_migrate.events import AUDIT_KINDS, EventBus, emit, put_all_and_emit
 from seamless_migrate.executors.base import (
     PermanentStepError,
     StepName,
@@ -7825,6 +7825,54 @@ async def test_a_strategy_that_needs_a_conversion_host_pre_stages_the_plan_again
         h.orch.wake()
         await asyncio.sleep(0.01)
     await h.orch.stop()
+    assert executor.hosts == [False, True]
+
+
+async def test_a_strategy_change_racing_the_tick_starts_nothing_no_pre_staging_covered(
+    tmp_path, store
+):
+    """SDD §8 (review RV52-O4): the tick chose a storage handover's cutover on its snapshot - its
+    window just opened - while PUT .../strategy, holding the plan's lock, made it cold. The step's
+    start re-checked the strategy and the gate, not the pre-staging: a cold cutover began that no
+    pre-staging had deployed conversion hosts for. It starts nothing, and the tick pre-stages."""
+    settings = make_settings(tmp_path)
+    executor = _HostsRecorder(settings)
+    handover = {"enabled": True, "backend_map": {"ceph-ssd": "rhoso@ceph#rbd"}}
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"handover": handover, "default_strategy": Strategy.storage_handover},
+        executor=executor,
+        settings=settings,
+    )
+    now = h.orch.now()
+    p = store.get("plan", plan.id, Plan)
+    p.cutover_window = CutoverWindow(start=now + timedelta(hours=1), end=now + timedelta(hours=2))
+    store.put("plan", p)  # auto_cutover: the gate opens with the window
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    await h.orch.tick()  # pre-stages: no conversion host needed
+    while not executor.hosts:
+        await asyncio.sleep(0.01)
+    await h.orch.tick()  # the window is closed: nothing starts
+    assert executor.hosts == [False] and (await h.migration(m.id)).phase == P.ready
+    h.clock.advance(3600 + 60)  # the window opens
+    lock = h.orch.plan_lock(plan.id)
+    await lock.acquire()  # PUT .../strategy holds the plan's lock ...
+    tick = asyncio.create_task(h.orch.tick())  # ... while the tick, on its snapshot, begins
+    await asyncio.sleep(0.2)
+    _, writes, events = await h.orch._strategy_writes(m.id, Strategy.cold, "alice")
+    await put_all_and_emit(store, h.bus, writes, events)  # what set_strategy writes
+    lock.release()
+    await tick
+    after = await h.migration(m.id)
+    await h.orch.tick()  # the next tick pre-stages it, the hosts deployed
+    while len(executor.hosts) < 2:
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert (after.phase, after.strategy) == (P.ready, Strategy.cold)
     assert executor.hosts == [False, True]
 
 

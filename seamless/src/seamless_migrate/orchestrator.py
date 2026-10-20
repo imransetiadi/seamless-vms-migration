@@ -2926,6 +2926,11 @@ class Orchestrator:
                 return False
             if to == P.cutover and m.phase == P.ready and m.strategy not in SINGLE_SHOT_STRATEGIES:
                 return False
+            if m.phase == P.ready and _assessment(m) not in self._prestage_done.get(plan_id, ()):
+                # assessed anew since the tick's snapshot (set_strategy): the tick pre-stages it
+                # first, so no cutover starts without its conversion host (SDD §8, RV52-O4)
+                self.wake()
+                return False
             if to == P.cutover and not self._gate(m, await self._plan(m.plan_id), self._now()):
                 # the tick saw the gate open on its snapshot; an action under this lock (e.g.
                 # set_strategy clearing the approvals) may have closed it since (SDD §5.4)
