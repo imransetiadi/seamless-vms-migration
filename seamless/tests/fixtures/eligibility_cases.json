@@ -1,5 +1,5 @@
 {
-  "_comment": "The API's eligibility reasons per strategy (planning/selector.py) and its finding messages (planning/preflight.py) for each finding case - `others` are the plan's other selected VMs, `source_kind` the source provider's kind (openstack when not given), `holds_volumes` whether the migration holds the destination volumes an earlier attempt created (false when not given): test_selector.py and test_preflight.py run them against the API, mockData.test.ts against the dashboard's mock, which words them as the API does (SDD §9.2, §9.3, §16, review RV20-08). source/destination give a provider's capabilities and whether it has a conversion host, as provider_caps reads them. A network or GPU case gives `destination` - its label, kind, networks (id, name, mtu, project_id, own, shared, external), subnets, the token's roles and its policy profile, as the check reports them - and the plan its mappings, prestage_resources and nic_overrides (SDD §6.6, §7.3 step 0, §9.3, §21.5).",
+  "_comment": "The API's eligibility reasons per strategy (planning/selector.py) and its finding messages (planning/preflight.py) for each finding case - `others` are the plan's other selected VMs, `source_kind` the source provider's kind (openstack when not given), `holds_volumes` whether the migration holds the destination volumes an earlier attempt created (false when not given): test_selector.py and test_preflight.py run them against the API, mockData.test.ts against the dashboard's mock, which words them as the API does (SDD §9.2, §9.3, §16, review RV20-08). source/destination give a provider's capabilities and whether it has a conversion host, as provider_caps reads them. A network or GPU case gives `destination` - its label, kind, networks (id, name, mtu, project_id, own, shared, external), subnets, the token's roles and its policy profile, as the check reports them - and the plan its mappings, prestage_resources and nic_overrides (SDD §6.6, §7.3 step 0, §9.3, §21.5). A GPU case's `destination` also gives its flavors, the vGPU profiles it declares (`gpu_profiles`) and its GPU capacity, as its inventory reads them, and the plan its GPU mappings; `phases` gives the phase of the migration of a selected VM that has one, which its share is counted by (quota_share), `severities` and `remediations` a finding's own where they are not its catalog's, and an entry of `others` may give only the fields its count reads (SDD §9.3, §22.3, §22.5, plan task G12).",
   "cases": [
     {
       "why": "an OpenStack VM every strategy takes",
@@ -5639,6 +5639,4044 @@
           }
         ],
         "subnets": []
+      }
+    },
+    {
+      "why": "a VMware vGPU its GPU mapping sends to a GPU flavor of its size: the flavor with its size and GPU, the guest's driver and license, and room for it (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g01",
+        "name": "dc2-ml-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g01-disk-0",
+            "name": "dc2-ml-01-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          },
+          {
+            "name": "g1.a100-3-20c",
+            "vcpus": 16,
+            "ram_mb": 65536,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_3_20C": "required"
+            }
+          },
+          {
+            "name": "p1.a100",
+            "vcpus": 16,
+            "ram_mb": 131072,
+            "disk_gb": 80,
+            "extra_specs": {
+              "pci_passthrough:alias": "a100:1"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C",
+          "g1.a100-3-20c": "A100-3-20C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      },
+      "severities": {
+        "MAP_GPU_FLAVOR": "info",
+        "GUEST_GPU_DRIVER": "warning",
+        "GUEST_GPU_LICENSE": "info"
+      }
+    },
+    {
+      "why": "a GPU flavor smaller than its VM that gives it less GPU: a MIG-backed vGPU of a 16-vCPU VM mapped to a 4 GB time-sliced flavor (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g02",
+        "name": "dc2-ml-02",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 16,
+        "ram_mb": 65536,
+        "disks": [
+          {
+            "id": "vm-g02-disk-0",
+            "name": "dc2-ml-02-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-3-20c",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-3-20c": "g1.a100-4c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          },
+          {
+            "name": "g1.a100-3-20c",
+            "vcpus": 16,
+            "ram_mb": 65536,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_3_20C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C",
+          "g1.a100-3-20c": "A100-3-20C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-3-20c) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C); it gives the VM 8 vCPUs for its 16 and 32768 MB RAM for its 65536. GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": "Flavor 'g1.a100-4c' of DC3 Jakarta gives the VM less GPU than it has: a 4 GB framebuffer for its 20 GB (A100-4C for grid_a100-3-20c).",
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      },
+      "severities": {
+        "MAP_GPU_FLAVOR": "warning",
+        "MAP_GPU_DOWNSIZED": "warning"
+      },
+      "remediations": {
+        "MAP_GPU_FLAVOR": "Map the VM's GPU to a GPU flavor of the destination of at least its size, or put the VMs that need another size in another plan, which maps their GPU to another flavor."
+      }
+    },
+    {
+      "why": "fewer GPUs and fewer MIG slices: two 4-slice MIG vGPUs mapped to a flavor of one 3-slice vGPU (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g03",
+        "name": "ml-mig-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 16,
+        "ram_mb": 65536,
+        "disks": [
+          {
+            "id": "vm-g03-disk-0",
+            "name": "ml-mig-01-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4-20c",
+            "count": 2
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4-20c": "g1.a100-3-20c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-3-20c",
+            "vcpus": 16,
+            "ram_mb": 65536,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_3_20C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-3-20c": "A100-3-20C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4-20c ×2) go to flavor 'g1.a100-3-20c' of DC3 Jakarta: 16 vCPUs, 65536 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_3_20C (A100-3-20C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": "Flavor 'g1.a100-3-20c' of DC3 Jakarta gives the VM less GPU than it has: 1 GPU for its 2; 3 MIG slices for its 4 (A100-3-20C for grid_a100-4-20c).",
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a passed-through NVIDIA GPU mapped to a vGPU flavor: the guest needs a new driver and a license (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g04",
+        "name": "cuda-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g04-disk-0",
+            "name": "cuda-01-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "stopped",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "passthrough",
+            "vendor_id": "10de",
+            "device_id": "20b5",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "10de:20b5": "g1.a100-4c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (10de:20b5) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). The mapping changes the GPU from a passed-through NVIDIA GPU to a vGPU, so the guest needs a new driver. virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a T4 vGPU mapped to an A100 flavor: a new GPU model, and a smaller framebuffer (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g05",
+        "name": "render-t4-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g05-disk-0",
+            "name": "render-t4-01-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_t4-16q",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_t4-16q": "g1.a100-4c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_t4-16q) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": "Flavor 'g1.a100-4c' of DC3 Jakarta gives the VM less GPU than it has: a 4 GB framebuffer for its 16 GB (A100-4C for grid_t4-16q).",
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). The mapping changes the GPU model from T4 to A100, so the guest needs a new driver. virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "an OpenStack vGPU VM's flavor mapping is its GPU mapping; virt-v2v plays no part in its driver (plan task G12)",
+      "vm": {
+        "source_id": "os-g06",
+        "name": "gpu-ml-01",
+        "project": "media",
+        "flavor": "g1.vgpu",
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {
+          "resources:VGPU": "1",
+          "trait:CUSTOM_NVIDIA_A100_4C": "required"
+        },
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "resource_class": "VGPU",
+            "traits": [
+              "CUSTOM_NVIDIA_A100_4C"
+            ],
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {
+            "g1.vgpu": "g1.a100-4c"
+          },
+          "volume_types": {},
+          "projects": {},
+          "gpus": {}
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          },
+          {
+            "name": "g1.a100-3-20c",
+            "vcpus": 16,
+            "ram_mb": 65536,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_3_20C": "required"
+            }
+          },
+          {
+            "name": "p1.a100",
+            "vcpus": 16,
+            "ram_mb": 131072,
+            "disk_gb": 80,
+            "extra_specs": {
+              "pci_passthrough:alias": "a100:1"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C",
+          "g1.a100-3-20c": "A100-3-20C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (VGPU) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table).",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a VM recorded before 0.3.0 reads its GPU from its flavor with the profile its source declares, which MAP_GPU_DOWNSIZED compares; a local root disk larger than the flavor's (plan task G12)",
+      "vm": {
+        "source_id": "os-g07",
+        "name": "train-01",
+        "project": "media",
+        "flavor": "g1.src-8c",
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "os-g07-root",
+            "name": null,
+            "size_gb": 100,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "/dev/vda",
+            "kind": "image_root",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {
+          "resources:VGPU": "1",
+          "trait:CUSTOM_NVIDIA_A100_8C": "required"
+        },
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 107374182400,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {
+            "g1.src-8c": "g1.a100-4c"
+          },
+          "volume_types": {},
+          "projects": {},
+          "gpus": {}
+        }
+      },
+      "gpu_profiles": {
+        "g1.src-8c": "A100-8C"
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (A100-8C) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C); it gives the VM 80 GB of root disk for its 100. GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": "Flavor 'g1.a100-4c' of DC3 Jakarta gives the VM less GPU than it has: a 4 GB framebuffer for its 8 GB (A100-4C for A100-8C).",
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table).",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      },
+      "severities": {
+        "MAP_GPU_FLAVOR": "warning"
+      }
+    },
+    {
+      "why": "a PCI alias flavor: its capacity is unknown, and the guest needs the driver of its passed-through PCI device (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g08",
+        "name": "dc2-cuda-01",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 16,
+        "ram_mb": 131072,
+        "disks": [
+          {
+            "id": "vm-g08-disk-0",
+            "name": "dc2-cuda-01-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "stopped",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "passthrough",
+            "vendor_id": "10de",
+            "device_id": "20b5",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "10de:20b5": "p1.a100"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "p1.a100",
+            "vcpus": 16,
+            "ram_mb": 131072,
+            "disk_gb": 80,
+            "extra_specs": {
+              "pci_passthrough:alias": "a100:1"
+            }
+          }
+        ],
+        "gpu_profiles": {},
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (10de:20b5) go to flavor 'p1.a100' of DC3 Jakarta: 16 vCPUs, 131072 MB RAM, 80 GB disk, PCI alias a100. GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": "Flavor 'p1.a100' of DC3 Jakarta asks for PCI alias a100, whose devices nova.conf configures: Placement does not show their capacity.",
+        "GUEST_GPU_DRIVER": "The guest's driver must suit DC3 Jakarta: the driver of its passed-through PCI device. virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": null
+      },
+      "severities": {
+        "DST_GPU_CAPACITY_UNKNOWN": "warning"
+      }
+    },
+    {
+      "why": "a vGPU handed out as a PCI device: the alias flavor's declared profile makes it a vGPU, licensed (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g09",
+        "name": "cuda-02",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g09-disk-0",
+            "name": "cuda-02-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "passthrough",
+            "vendor_id": "10de",
+            "device_id": "20b5",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "10de:20b5": "p1.l4-vgpu"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "p1.l4-vgpu",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "pci_passthrough:alias": "l4-vf:1"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "p1.l4-vgpu": "L4-24Q"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (10de:20b5) go to flavor 'p1.l4-vgpu' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, PCI alias l4-vf (L4-24Q). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": "Flavor 'p1.l4-vgpu' of DC3 Jakarta asks for PCI alias l4-vf, whose devices nova.conf configures: Placement does not show their capacity.",
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). The mapping changes the GPU from a passed-through NVIDIA GPU to a vGPU, so the guest needs a new driver. virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "the plan's VMs ask a pool for more units than it has free: each VM's finding names the pool, the units and the VMs (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g10",
+        "name": "ml-10",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g10-disk-0",
+            "name": "ml-10-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "others": [
+        {
+          "source_id": "vm-g11",
+          "name": "ml-11",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        }
+      ],
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 1,
+              "providers": 1,
+              "largest_free": 1,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": "The plan's VMs ask VGPU CUSTOM_NVIDIA_A100_4C of DC3 Jakarta for 2 units, more than its 1 free (ml-10, ml-11).",
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      },
+      "severities": {
+        "DST_GPU_CAPACITY_INSUFFICIENT": "blocker"
+      }
+    },
+    {
+      "why": "pools of one class share providers: the class alone holds the plan's VMs of all its pools (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g12",
+        "name": "ml-12",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g12-disk-0",
+            "name": "ml-12-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "others": [
+        {
+          "source_id": "vm-g13",
+          "name": "ml-13",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-3-20c",
+              "count": 1
+            }
+          ]
+        }
+      ],
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c",
+            "grid_a100-3-20c": "g1.a100-3-20c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          },
+          {
+            "name": "g1.a100-3-20c",
+            "vcpus": 16,
+            "ram_mb": 65536,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_3_20C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C",
+          "g1.a100-3-20c": "A100-3-20C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 1,
+              "providers": 1,
+              "largest_free": 1,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 1,
+              "providers": 1,
+              "largest_free": 1,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 1,
+              "providers": 1,
+              "largest_free": 1,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": "The plan's VMs ask VGPU of DC3 Jakarta for 2 units across its pools, more than its 1 free (ml-12, ml-13).",
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a request group of two units needs one provider with two free, whatever the pool holds in all (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g14",
+        "name": "ml-14",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 16,
+        "ram_mb": 65536,
+        "disks": [
+          {
+            "id": "vm-g14-disk-0",
+            "name": "ml-14-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 2
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c-x2"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c-x2",
+            "vcpus": 16,
+            "ram_mb": 65536,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources1:VGPU": "2",
+              "trait1:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c-x2": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": true,
+              "free": 4,
+              "providers": 4,
+              "largest_free": 1,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 8,
+              "providers": 4,
+              "largest_free": 2,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c ×2) go to flavor 'g1.a100-4c-x2' of DC3 Jakarta: 16 vCPUs, 65536 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C ×2 (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": "Its flavor asks VGPU CUSTOM_NVIDIA_A100_4C of DC3 Jakarta for 2 units on one provider, and none has 2 free (the most on one is 1).",
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "Placement refuses the pool's request as a bad one: no server is created with the flavor (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g15",
+        "name": "ml-15",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g15-disk-0",
+            "name": "ml-15-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 0,
+              "providers": 0,
+              "largest_free": 0,
+              "detail": "HTTP 400 placement.undefined_code"
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": "Placement refuses the request for VGPU CUSTOM_NVIDIA_A100_4C of DC3 Jakarta (HTTP 400 placement.undefined_code): no server is created with flavor 'g1.a100-4c'.",
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a GPU capacity Placement refuses to show: the warning names the role it asks for, and nothing is guessed (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g16",
+        "name": "ml-16",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g16-disk-0",
+            "name": "ml-16-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "unknown",
+          "reason": "forbidden",
+          "detail": "HTTP 403 placement.undefined_code",
+          "pools": []
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": "The GPU capacity of DC3 Jakarta cannot be read: Placement refuses its credential (HTTP 403 placement.undefined_code): its default policy lets only the admin role read it.",
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      },
+      "severities": {
+        "DST_GPU_CAPACITY_UNKNOWN": "warning"
+      }
+    },
+    {
+      "why": "a GPU capacity read that failed (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g17",
+        "name": "ml-17",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g17-disk-0",
+            "name": "ml-17-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "unknown",
+          "reason": "error",
+          "detail": "HTTP 503",
+          "pools": []
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": "The GPU capacity of DC3 Jakarta cannot be read: the read failed (HTTP 503).",
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a destination whose catalog has no Placement (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g18",
+        "name": "ml-18",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g18-disk-0",
+            "name": "ml-18-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "unknown",
+          "reason": "no_placement",
+          "detail": null,
+          "pools": []
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": "The GPU capacity of DC3 Jakarta cannot be read: its catalog has no Placement.",
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a capacity read that holds no pool for a request guesses nothing for it (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g19",
+        "name": "ml-19",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g19-disk-0",
+            "name": "ml-19-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": "The GPU capacity read of DC3 Jakarta holds no pool VGPU CUSTOM_NVIDIA_A100_4C: nothing is guessed for it.",
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a VM without a GPU that a flavor mapping sends to a vGPU flavor counts against its pool (plan task G12)",
+      "vm": {
+        "source_id": "os-g20",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {
+            "m1.small": "g1.a100-4c"
+          },
+          "volume_types": {},
+          "projects": {},
+          "gpus": {}
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 0,
+              "providers": 0,
+              "largest_free": 0,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": null,
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": "The plan's VMs ask VGPU CUSTOM_NVIDIA_A100_4C of DC3 Jakarta for 1 unit, more than its 0 free (web-01).",
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": null,
+        "GUEST_GPU_LICENSE": null
+      }
+    },
+    {
+      "why": "a VM of the plan whose server exists asks for nothing more: a migration in verification counts no unit (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g21",
+        "name": "ml-21",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g21-disk-0",
+            "name": "ml-21-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "others": [
+        {
+          "source_id": "vm-g22",
+          "name": "ml-22",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        }
+      ],
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c"
+          }
+        }
+      },
+      "phases": {
+        "vm-g22": "verifying"
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 1,
+              "providers": 1,
+              "largest_free": 1,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a capacity finding names the first ten VMs, then how many more (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g30",
+        "name": "ml-30",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g30-disk-0",
+            "name": "ml-30-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "others": [
+        {
+          "source_id": "vm-g31",
+          "name": "ml-31",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "source_id": "vm-g32",
+          "name": "ml-32",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "source_id": "vm-g33",
+          "name": "ml-33",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "source_id": "vm-g34",
+          "name": "ml-34",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "source_id": "vm-g35",
+          "name": "ml-35",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "source_id": "vm-g36",
+          "name": "ml-36",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "source_id": "vm-g37",
+          "name": "ml-37",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "source_id": "vm-g38",
+          "name": "ml-38",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "source_id": "vm-g39",
+          "name": "ml-39",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "source_id": "vm-g40",
+          "name": "ml-40",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        },
+        {
+          "source_id": "vm-g41",
+          "name": "ml-41",
+          "vcpus": 8,
+          "ram_mb": 32768,
+          "gpus": [
+            {
+              "kind": "vgpu",
+              "profile": "grid_a100-4c",
+              "count": 1
+            }
+          ]
+        }
+      ],
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 1,
+              "providers": 1,
+              "largest_free": 1,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c) go to flavor 'g1.a100-4c' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU CUSTOM_NVIDIA_A100_4C (A100-4C). GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": "The plan's VMs ask VGPU CUSTOM_NVIDIA_A100_4C of DC3 Jakarta for 12 units, more than its 1 free (ml-30, ml-31, ml-32, ml-33, ml-34, ml-35, ml-36, ml-37, ml-38, ml-39 and 2 more). The plan's VMs ask VGPU of DC3 Jakarta for 12 units across its pools, more than its 6 free (ml-30, ml-31, ml-32, ml-33, ml-34, ml-35, ml-36, ml-37, ml-38, ml-39 and 2 more).",
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a VM's GPUs whose keys map to different flavors stay blocked, and its guest is told of its own GPU's driver and license (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g43",
+        "name": "ml-43",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g43-disk-0",
+            "name": "ml-43-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          },
+          {
+            "kind": "passthrough",
+            "vendor_id": "10de",
+            "device_id": "20b5",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.a100-4c",
+            "10de:20b5": "p1.a100"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          },
+          {
+            "name": "p1.a100",
+            "vcpus": 16,
+            "ram_mb": 131072,
+            "disk_gb": 80,
+            "extra_specs": {
+              "pci_passthrough:alias": "a100:1"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": "The VM has a vGPU (grid_a100-4c). Its GPUs map to different flavors ('grid_a100-4c' to 'g1.a100-4c', '10de:20b5' to 'p1.a100'): its server is created with one.",
+        "VM_PCI_PASSTHROUGH": "The VM has a PCI passthrough device (10de:20b5). Its GPUs map to different flavors ('grid_a100-4c' to 'g1.a100-4c', '10de:20b5' to 'p1.a100'): its server is created with one.",
+        "MAP_GPU_FLAVOR": null,
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a GPU mapping to a flavor that asks for no GPU keeps the VM blocked: its server would lose its GPU (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g44",
+        "name": "ml-44",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g44-disk-0",
+            "name": "ml-44-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "m1.large"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": "The VM has a vGPU (grid_a100-4c). Its GPU mapping, 'grid_a100-4c' to 'm1.large', names a flavor of DC3 Jakarta that asks for no GPU: the server would lose its GPU.",
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": null,
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      }
+    },
+    {
+      "why": "a GPU VM's mapped flavor the destination lacks is MAP_FLAVOR_MISSING's alone (plan task G12)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g45",
+        "name": "ml-45",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g45-disk-0",
+            "name": "ml-45-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.nope"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1",
+              "trait:CUSTOM_NVIDIA_A100_4C": "required"
+            }
+          }
+        ],
+        "gpu_profiles": {
+          "g1.a100-4c": "A100-4C"
+        },
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_4C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 4,
+              "providers": 1,
+              "largest_free": 4,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [
+                "CUSTOM_NVIDIA_A100_3_20C"
+              ],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 2,
+              "providers": 1,
+              "largest_free": 2,
+              "detail": null
+            },
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 6,
+              "providers": 2,
+              "largest_free": 4,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "MAP_FLAVOR_MISSING": "The plan maps 'grid_a100-4c' to 'g1.nope', which does not exist in DC3 Jakarta.",
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": null,
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": null,
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      },
+      "remediations": {
+        "MAP_FLAVOR_MISSING": "Fix the mapping: the destination flavor must exist."
       }
     }
   ]
