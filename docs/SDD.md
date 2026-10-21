@@ -651,8 +651,15 @@ active enters `cutover` when all hold:
 (`max_concurrent_migrations`, the wave's `max_parallel`, §8), the tick starts the migration's read as a task of its
 own, one per migration at a time, and never waits for it, as it starts the source watch (§8.1): a slow destination
 delays that cutover, never the tick, the other gates or the passes. A read starts only while a cutover slot is left
-for it - `max_concurrent_cutovers` less the migrations in `cutover` and the reads already out -, and none for a
-migration whose advisor decision waits (`advisor_hold`, §14.6). A read lists the destination's GPU flavors
+for it - `max_concurrent_cutovers` less the migrations in `cutover` and the places its destination's GPU VMs ahead of
+it hold (below) - and while its destination has fewer than `max_concurrent_cutovers` reads out, the worker threads its
+reads take: a destination whose reads hang never holds another destination's reads or slots. None starts for a
+migration whose advisor decision waits (`advisor_hold`, §14.6). A GPU VM whose read is out, or whose read found room
+and still counts, holds its place: the tick gives that cutover slot to no migration of its destination behind it in
+the tick's order - its plan's wave order, then the plans ticked after it - until the read finds no room or fails, or
+its cutover starts. A held place costs the migrations behind it the read's time - about a second, or as long as a slow
+destination takes, within the provider's bounds (§10) - and the GPU VM's own cutover; a migration of another
+destination never waits on it, and may take a free slot first. A read lists the destination's GPU flavors
 (`gpu_flavors()`, §10), then reads the capacity of the vGPU requests of the migration's GPU flavor among them
 (`gpu_capacity`, §22.3); a GPU flavor that asks for a PCI alias alone, or for no vGPU, or that the list no longer
 holds (the cutover then refuses the mapping before the source stops, §22.4), passes with that list, Placement not
@@ -5012,15 +5019,19 @@ A fifth rule of §5.4, binding there since plan task G6, with `GpuWait`, `Migrat
   list the read took, whatever phase that migration is in now: its server may already hold the unit the read found
   free - drops the outcome. So two GPU migrations whose reads overlap never both cut over on one free unit, whether
   the second waits for a cutover slot or runs a keep-warm pass meanwhile; a cutover of a VM whose flavor asks of none
-  of those pools - a VM without a GPU among them - leaves the read as it is, and no GPU VM starves behind other
-  cutovers. Reads start only while a cutover slot is left for them: GPU VMs queued at one slot read one at a time. The
-  outcome lives in the process only, for the migration's present stay at its gate - from its last move that was no
-  keep-warm pass's -: after a restart, a retry or a validation, a read comes before its GPU cutover, and a read still
-  out across one of them is recorded on no stay. A read that fails outside the destination's answers (a store error)
-  holds the cutover for its minute too, logged. A read has no bound of its own beyond the provider's (each request 60
-  s, a call 300 s, and a Placement that does not answer is not asked again for 5 minutes, §10, §22.3): a shorter one
-  would end the wait but not the worker thread, so each later read would add a thread to the pool the store shares,
-  while the cutover waits on the safe side, its source running.
+  of those pools - a VM without a GPU among them - leaves the read as it is. Reads count per destination (the second
+  review of G6, 2026-10-21): a destination has at most `max_concurrent_cutovers` reads out, and a GPU VM whose read is
+  out, or found room and still counts, holds its cutover slot against its destination's migrations behind it. GPU VMs
+  queued at one slot read one at a time and cut over in their order, never losing the slot to a VM behind them, while
+  a destination whose reads hang never holds another destination's reads or slots, and that destination's cutovers may
+  take a free slot first. The outcome lives in the process only, for the migration's present stay at its gate - from
+  its last move that was no keep-warm pass's -: after a restart, a retry or a validation, a read comes before its GPU
+  cutover, and a read still out across one of them is recorded on no stay. A read that fails outside the destination's
+  answers (a store error) holds the cutover for its minute too, logged. A read has no bound of its own beyond the
+  provider's (each request 60 s, a call 300 s, and a Placement that does not answer is not asked again for 5 minutes,
+  §10, §22.3): a shorter one would end the wait but not the worker thread, so each later read would add a thread to
+  the pool the store shares, while the cutover waits on the safe side, its source running. A destination's reads take
+  at most `max_concurrent_cutovers` of those threads.
 
 * The read runs outside the locks, as a task of its own, one per migration at a time, as the source watch does
   (§8.1): a slow Placement delays that cutover, never the tick, the other gates or the passes. Its outcome is recorded,
