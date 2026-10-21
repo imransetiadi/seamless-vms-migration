@@ -474,7 +474,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
             onChange={(e) => setDeleteSource(e.target.checked)}
           />
           <span>
-            Also delete the source VM
+            {/* a space of its own before the hint: only CSS puts the hint on its own line, and the name must not rely on it */}
+            Also delete the source VM{' '}
             <span className="block text-xs text-muted-foreground">
               {mustDeleteSource
                 ? 'The finalize began deleting the source VM, which runs again: only deleting it finalizes it.'

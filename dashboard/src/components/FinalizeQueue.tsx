@@ -222,7 +222,8 @@ export function FinalizePlanDialog({ plan, migrations, scope, onClose, onDone, r
       <label htmlFor={deleteId} className="flex min-h-11 cursor-pointer items-start gap-2.5 text-sm">
         <input id={deleteId} type="checkbox" className="mt-1 size-4 accent-accent" checked={deleteSource} onChange={(e) => setDeleteSource(e.target.checked)} />
         <span>
-          {one ? 'Also delete the source VM' : 'Also delete the source VMs'}
+          {/* a space of its own before the hint: only CSS puts the hint on its own line, and the name must not rely on it */}
+          {one ? 'Also delete the source VM' : 'Also delete the source VMs'}{' '}
           <span className="block text-xs text-muted-foreground">
             {one ? 'Leave unchecked to keep the stopped source VM for a while.' : 'Leave unchecked to keep the stopped source VMs for a while.'}
           </span>

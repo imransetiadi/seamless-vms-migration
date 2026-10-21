@@ -67,7 +67,12 @@ export function ProbeListEditor({
           {drafts.map((draft, i) => {
             const n = i + 1;
             const http = draft.kind !== 'tcp';
-            const prefix = <span className="sr-only">Probe {n} </span>;
+            // the space after the hidden number is text of its own: the field's name never relies on CSS to keep its words apart
+            const prefix = (
+              <>
+                <span className="sr-only">Probe {n}</span>{' '}
+              </>
+            );
             return (
               <li key={i} className="grid grid-cols-6 items-end gap-2 rounded-md border border-border p-2 @2xl:grid-cols-[7rem_6rem_minmax(0,1fr)_8rem_auto]">
                 <SelectField

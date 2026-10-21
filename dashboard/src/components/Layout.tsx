@@ -127,7 +127,8 @@ function Brand({ compact = false }: { compact?: boolean }) {
     <Link to="/" className={cn('flex min-h-11 items-center gap-2 rounded-md', compact && 'justify-center')}>
       <BrandMark className="size-7 shrink-0" />
       <span className={cn('flex flex-col leading-tight', compact && 'sr-only')}>
-        <span className="font-mono text-sm font-semibold text-foreground">Seamless Migrate</span>
+        {/* a space of its own between the lines: only CSS sets them apart, and the link's name must not rely on it */}
+        <span className="font-mono text-sm font-semibold text-foreground">Seamless Migrate</span>{' '}
         <span className="text-xs text-muted-foreground">to {BRAND_DESTINATIONS}</span>
       </span>
     </Link>

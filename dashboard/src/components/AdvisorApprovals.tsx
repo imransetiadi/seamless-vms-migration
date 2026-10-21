@@ -55,7 +55,7 @@ export function AdvisorApprovals({ planId, migrations, onDecided }: { planId: st
                   </Link>
                   {rec && (
                     <Link to={`/advisor/recommendations/${encodeURIComponent(rec.id)}`} className="ml-auto underline underline-offset-4">
-                      Details<span className="sr-only"> for {m.vm.name}</span>
+                      Details <span className="sr-only">for {m.vm.name}</span>
                     </Link>
                   )}
                 </p>

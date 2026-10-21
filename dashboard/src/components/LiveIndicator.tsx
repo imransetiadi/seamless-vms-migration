@@ -50,8 +50,9 @@ export function LiveIndicator({
       )}
     >
       <meta.icon aria-hidden className={cn('size-3.5 shrink-0', meta.icon === LoaderCircle && 'animate-spin')} />
-      {/* the name says what the label is a status of; the visible label stays the short one (WCAG 2.5.3) */}
-      <span className="sr-only">Event stream: </span>
+      {/* the name says what the label is a status of; the visible label stays the short one (WCAG 2.5.3). The space
+          between them is text of its own, so the name never relies on CSS to keep the words apart */}
+      <span className="sr-only">Event stream:</span>{' '}
       <span className={compact ? 'sr-only' : stacked ? 'max-w-full hyphens-auto [overflow-wrap:anywhere]' : undefined}>{meta.label}</span>
     </Term>
   );
