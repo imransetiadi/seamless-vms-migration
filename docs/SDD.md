@@ -654,8 +654,11 @@ delays that cutover, never the tick, the other gates or the passes. A read start
 for it - `max_concurrent_cutovers` less the migrations in `cutover` and the places its destination's GPU VMs ahead of
 it hold (below) - while its destination has fewer than `max_concurrent_cutovers` reads out and fewer than 3, and while
 fewer than 4 are out in all: each read out holds a worker thread of asyncio's default pool - never under 5 threads,
-and shared with the store's calls -, so reads that hang never take every thread the store needs, and a destination
-whose reads hang always leaves another destination a read and holds none of its slots. None starts for a migration
+and shared with the store's calls -, so reads that hang never take every thread the store needs. A destination whose
+reads hang holds none of another destination's slots, and while it is the only one it leaves the others a read; when
+two or more hang at once, their reads can hold all four until the provider ends them (each call within 300 s, §10),
+and the other destinations' GPU reads wait so long - a delayed cutover, its source running, never one on a guess
+(G6 final review). None starts for a migration
 whose advisor decision waits (`advisor_hold`, §14.6). A GPU VM whose read is out, or whose read found room and still
 counts, holds its place: the tick gives that cutover slot, a step of `max_concurrent_migrations` and its wave's room
 (`max_parallel`) to no migration of its destination behind it in the tick's order - its plan's wave order, then the
@@ -5039,7 +5042,9 @@ A fifth rule of §5.4, binding there since plan task G6, with `GpuWait`, `Migrat
   side, its source running. The cap on the reads out keeps them below that pool however many destinations hang.
 
 * The read runs outside the locks, as a task of its own, one per migration at a time, as the source watch does
-  (§8.1): a slow Placement delays that cutover, never the tick, the other gates or the passes. Its outcome is recorded,
+  (§8.1): a slow Placement delays that cutover - and, while two or more destinations' reads hang at once, the GPU reads
+  of the others, up to the provider's bound (§5.4) -, never the tick, the gates of migrations without a GPU or the
+  passes. Its outcome is recorded,
   and the tick starts the cutover on a fresh outcome that found room, re-checking rules 1–4 under the locks as for
   every step (§8).
 * When a read finds no room, `Migration.gpu_wait` records it: `GpuWait {since: datetime, checked_at: datetime, pool: str
