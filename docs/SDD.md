@@ -3774,8 +3774,9 @@ is no origin a browser sends (review RV31-03).
   shown, as the API's messages do; the offline mock mirrors the API's messages word for word.
 * GPU workloads (§22, from 0.3.0, plan tasks G10, G11 and G12): every GPU element the dashboard shows (§22.11) - the
   Inventory's GPU column and GPU filter, a destination's GPU flavors and GPU capacity, a destination card's GPU capacity,
-  the provider form's vGPU profiles, the plan form's GPU mappings and its flavor mappings' GPU hint, and the migration
-  page's GPU panel among them - carries a "Technology Preview"
+  the provider form's vGPU profiles, the plan form's GPU mappings and its flavor mappings' GPU hint, the plan page's
+  GPU mappings and its mark of a migration that waits for GPU capacity, the Overview's Needs attention entry for one,
+  and the migration page's GPU panel among them - carries a "Technology Preview"
   badge, its label in words beside its icon and never colour alone, whose detail (a focusable term, as a status
   badge's) reads "Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts." (§22.14),
   until §22.14's lab cases pass (plan task G15).
@@ -3891,11 +3892,14 @@ is no origin a browser sends (review RV31-03).
   for "The cutover will refuse {n} problem(s): fix it first.", so the approver sees it where the approval is given.
   A migration whose cutover waits for GPU capacity (`gpu_wait` set, in `ready`, `awaiting_cutover` or a keep-warm
   pass, §5.4 rule 5, §22.7; plan task G12) is listed there as a wait, ranked with the window's, its source still
-  running: "Waiting for GPU capacity: {pool}, {free} free, needs {needed}" — after a read that failed, whose `free` is
-  null, "Waiting for GPU capacity: {reason}" with the wait's reason, which names the failure (§22.12) — and "Wait, or
-  free GPU capacity on the destination: the cutover starts once a read finds room"; a read is made once the gate's
-  other rules hold, so its approvals are in and Pending approvals never lists it, and what its cutover will refuse
-  is listed ahead of it, as ahead of any wait.
+  running, with a "Technology Preview" badge: "Waiting for GPU capacity: {pool}, {free} free, needs {needed}" — after
+  a read that failed, whose `free` is null, "Waiting for GPU capacity: {reason}" with the wait's reason, which names
+  the failure (§22.12) — and "Wait, or free GPU capacity on the destination: the cutover starts once a read finds
+  room". A read is made once the gate's other rules hold, and its wait stays until the migration leaves its gate
+  (§5.4): while they no longer hold, what they wait for is listed in its place, as the gate checks them first — an
+  approval that does not count is Pending approvals', a missing cutover request or a closed window Needs attention's
+  as for any migration at the gate (review of G12) —, and what its cutover will refuse is listed ahead of it, as ahead
+  of any wait.
   A rolled-back migration waits for a person too — to fix the cause and retry it, or to cancel it — so Needs
   attention lists it last, after the overdue finalizes: "Rolled back — the source VM runs again", with "Fix the
   cause, then retry or cancel (operator)". A failed migration is offered only what it can take, alike in Needs
@@ -3990,7 +3994,9 @@ is no origin a browser sends (review RV31-03).
   cancelled plan shows Cancelled and offers no action but its history; a finalize queue lists the `completed` migrations oldest first, each with its time
   in Completed — flagged past the plan's `finalize_warning_h` — and a "Source VM running" badge while
   `source_running_at` is set; settings summary — with "Ports: MAC and fixed IPs kept" when `port_creation_mode` is
-  `"neutron"`, "Network overrides: {n} VMs" when `nic_overrides` has entries, and "Advisor policy: {name}", its mode
+  `"neutron"`, "Network overrides: {n} VMs" when `nic_overrides` has entries, its mappings by kind — its GPU mappings
+  among them (`mappings.gpus`, §22.4), with a "Technology Preview" badge, counted with the others (plan task G12) —,
+  and "Advisor policy: {name}", its mode
   and threshold, the policy
   in force for `migration_strategy` (`resolve_policy`, the built-in default when none applies) linking to it on
   `/advisor/policies` (ADV-20) —, waves board, migrations table with
@@ -4083,7 +4089,8 @@ is no origin a browser sends (review RV31-03).
   profiles its source declares for its flavor and its destination for its GPU flavor (`gpu_profiles`, §22.3), each
   with its provider, or "None declared"; the capacity findings (`DST_GPU_CAPACITY_INSUFFICIENT`,
   `DST_GPU_CAPACITY_UNKNOWN`) with their severity — else that the validation found room, once its GPU mapping applied
-  there (`MAP_GPU_FLAVOR`), or that the validation checks it —; and the last verification's GPU checks (`gpu_flavor`,
+  there (`MAP_GPU_FLAVOR`) or, for a VM without a GPU of its own, which gets no `MAP_GPU_FLAVOR`, once it ran, or that
+  the validation checks it —; and the last verification's GPU checks (`gpu_flavor`,
   `gpu_allocation`, §7.5) with their results and details, or that none ran yet. While `gpu_wait` is set it reads
   "Waiting for GPU capacity: {free} free of {needed} in {pool}, checked {time}. The source VM keeps running." with the
   wait's reason under it — after a failed read, whose `free` is null, "Waiting for GPU capacity: {reason}, checked
@@ -4118,7 +4125,7 @@ is no origin a browser sends (review RV31-03).
   them and that the retry's pass looks again —; the
   plan page's migration list marks such a migration with a warning naming how many problems the cutover will
   refuse, and one whose cutover waits for GPU capacity (`gpu_wait`, §22.7; plan task G12) "Waiting for GPU capacity"
-  under its phase, as a wait, in the info tone with its icon; while a requested cutover waits for a closed window, an approver can let it cut over
+  under its phase, as a wait, in the info tone with its icon and a "Technology Preview" badge; while a requested cutover waits for a closed window, an approver can let it cut over
   outside the window — the plan, its wave and the cutover slots still gate it (§5.4); a cutover request is shown
   whether or not the plan needs approval, and while it waits the page says when it may start outside the window
   (`force_window`, §4.2); a request that waits for another approver — maker-checker, and no approval counts but
