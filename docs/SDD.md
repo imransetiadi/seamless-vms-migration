@@ -5197,7 +5197,7 @@ Binding in §13.4 with plan task G3:
 | `DestinationInventory.gpu_flavors` and `gpu_capacity`; the destination check's `gpu_capacity`; `gpu_capacity()`, `server_allocations()` and `get_server`'s flavor; §22.12's rule | §10, §13.4 (binding) | G3 |
 | the GPU flavor rule (§22.4) and the catalog change (§22.5) | §9.3, §7.2 (pre-staging), §10 (binding) | G4 |
 | the eligibility of a VMware passthrough VM; a pilot without GPU VMs; the port 9400 suggestion | §9.2, §9.4, §9.6 (binding) | G5 |
-| the gate's fifth rule, `Migration.gpu_wait` and `MigrationSummary.gpu_wait`, the event `migration.gpu_wait`, the gauge `seamless_gpu_waits` | §4.2, §4.3, §5.4, §18 | G6 |
+| the gate's fifth rule, `Migration.gpu_wait` and `MigrationSummary.gpu_wait`, the event `migration.gpu_wait`, the gauge `seamless_gpu_waits` | §4.2, §4.3, §5.4, §18 (binding); `gpu_flavors()` in §10, §22.3 | G6 |
 | the executors create the server with the GPU flavor (`flavor_uuid` for the VMware kit) | §7.2, §7.3 (binding) | G7 |
 | the OpenStack cold, warm and storage-handover cutovers refuse a GPU mapping that no longer applies before the source stops, as the VMware one does | §7.2, §7.3 step 0 (binding) | G7b |
 | the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 (binding) | G8 |
