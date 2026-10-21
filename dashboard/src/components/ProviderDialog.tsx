@@ -265,7 +265,7 @@ function VgpuProfiles({
                   id={fieldId(`gpuFlavor-${row.key}`)}
                   label={
                     <>
-                      Flavor<span className="sr-only"> {n}</span>
+                      Flavor <span className="sr-only">{n}</span>
                     </>
                   }
                   value={row.flavor}
@@ -282,7 +282,7 @@ function VgpuProfiles({
                   id={fieldId(`gpuProfile-${row.key}`)}
                   label={
                     <>
-                      Profile<span className="sr-only"> {n}</span>
+                      Profile <span className="sr-only">{n}</span>
                     </>
                   }
                   value={row.profile}

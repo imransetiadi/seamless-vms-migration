@@ -106,10 +106,10 @@ function PolicyCard({
           ) : (
             <>
               <Button icon={Pencil} onClick={onEdit} disabledReason={canManage ? null : MANAGE_REASON}>
-                Edit<span className="sr-only"> {policy.name}</span>
+                Edit <span className="sr-only">{policy.name}</span>
               </Button>
               <Button variant="ghost" icon={Trash2} className="ml-auto" onClick={onDelete} disabledReason={canManage ? null : MANAGE_REASON}>
-                Delete<span className="sr-only"> {policy.name}</span>
+                Delete <span className="sr-only">{policy.name}</span>
               </Button>
             </>
           )}

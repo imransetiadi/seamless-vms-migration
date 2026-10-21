@@ -89,7 +89,7 @@ function RecommendationItem({ rec, showSubject, actionsFor }: { rec: AdvisorReco
           {formatRelative(rec.created_at)}
         </time>
         <Link ref={detailsRef} to={`/advisor/recommendations/${encodeURIComponent(rec.id)}`} className="ml-auto underline underline-offset-4">
-          Details<span className="sr-only"> for {rec.subject.name}</span>
+          Details <span className="sr-only">for {rec.subject.name}</span>
         </Link>
       </div>
       <RecommendedLine rec={rec} className="mt-1 wrap-break-word text-sm text-muted-foreground" />

@@ -370,15 +370,16 @@ function ProviderCard({
             })
           }
         >
-          {/* the card's heading shows the provider: it is named for assistive technology only (SDD §16) */}
-          Check<span className="sr-only"> {providerLabel(provider)}</span>
+          {/* the card's heading shows the provider: it is named for assistive technology only (SDD §16). The space
+              before it stays outside the hidden span, so the name never relies on CSS to keep its words apart */}
+          Check <span className="sr-only">{providerLabel(provider)}</span>
         </Button>
         <Link to={`/inventory/${provider.id}`} className={buttonClassName('ghost', 'md')}>
           <HardDrive aria-hidden className="size-4" />
-          Inventory<span className="sr-only"> of {providerLabel(provider)}</span>
+          Inventory <span className="sr-only">of {providerLabel(provider)}</span>
         </Link>
         <Button variant="ghost" icon={Pencil} onClick={onEdit} disabledReason={canEdit ? null : 'Editing a provider requires the admin role.'}>
-          Edit<span className="sr-only"> {providerLabel(provider)}</span>
+          Edit <span className="sr-only">{providerLabel(provider)}</span>
         </Button>
         <Button
           variant="ghost"
@@ -387,7 +388,7 @@ function ProviderCard({
           className="ml-auto"
           disabledReason={canEdit ? refusal : 'Deleting a provider requires the admin role.'}
         >
-          Delete<span className="sr-only"> {providerLabel(provider)}</span>
+          Delete <span className="sr-only">{providerLabel(provider)}</span>
         </Button>
       </footer>
 
