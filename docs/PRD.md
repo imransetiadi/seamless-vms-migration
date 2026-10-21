@@ -5,7 +5,7 @@
 | Product | Seamless Migrate |
 | Release | 0.1.0 (MVP) |
 | Date | 2026-10-08 |
-| Status | Approved; amended 2026-10-09 (NetApp ONTAP handover, Kubernetes and Podman, guest OS catalog), 2026-10-16 (destinations: community OpenStack 2023.1 Antelope – 2026.2 Hibiscus beside RHOSO 18.0, goal G7) and 2026-10-20 (GPU workloads as a Technology Preview in 0.3.0, goal G8; the network cut-over hooks and the Octavia/Heat helpers move to 0.4.0) |
+| Status | Approved; amended 2026-10-09 (NetApp ONTAP handover, Kubernetes and Podman, guest OS catalog), 2026-10-16 (destinations: community OpenStack 2023.1 Antelope – 2026.2 Hibiscus beside RHOSO 18.0, goal G7) 2026-10-20 (GPU workloads as a Technology Preview in 0.3.0, goal G8; the network cut-over hooks and the Octavia/Heat helpers move to 0.4.0) and 2026-10-21 (network cut-over as a Technology Preview in 0.4.0, goal G9; SDD §23, D18) |
 | Design | [SDD.md](SDD.md) |
 
 ## 1. Problem statement
@@ -50,14 +50,17 @@ Today's tooling forces painful trade-offs:
 | G6 | Assisted decisions | Jev-based advisor for strategy ties, wave classification and post-cutover review; agentmemory recall of similar past incidents |
 | G7 | Destination choice (0.2.0) | Besides RHOSO 18.0, every community OpenStack release series from 2023.1 Antelope to 2026.2 Hibiscus is a destination, by the support tiers of SDD §21: each strategy a destination's capabilities allow runs as on RHOSO 18.0; each Tier 1 series (the upstream-Maintained 2025.1 Epoxy, 2025.2 Flamingo, 2026.1 Gazpacho and 2026.2 Hibiscus) passes the destination lab matrix before a release; every destination's series, tier and missing capabilities are shown before a plan runs |
 | G8 | GPU workloads (0.3.0, Technology Preview) | VMs with an NVIDIA vGPU (MIG-backed profiles included) or a passed-through GPU migrate with an explicit GPU mapping instead of being blocked (SDD §22): the GPU rules of SDD §22 hold in simulation for 0.3.0 (the demo's GPU VMs through mapping, validation, the cutover gate's wait, cutover and verification), and the lab cases LAB-GPU01–LAB-GPU08 pass on GPU hosts before the Technology Preview label goes |
+| G9 | Network cut-over (0.4.0, Technology Preview) | A migrated VM keeps its network identity where Seamless can move it: on an opt-in plan a floating IP keeps its address, a DNS record follows a changed address, and BGP announcements follow the floating IP. An admin's hooks run at fixed points of each migration for the rest, and the pre-flight reports the Heat stacks, autoscaling groups and Octavia memberships it does not move (SDD §23). The rules hold in simulation for 0.4.0, and the LAB-NET cases pass before the label goes |
 
 ### Non-goals (0.1.0)
 
 * In-place adoption of a 17.1 control plane (Red Hat adoption procedure).
 * Zero-downtime live migration across clouds.
-* Migrating Heat stacks, Octavia load balancers, Manila shares, Designate zones (reported as
-  findings; manual runbooks).
-* Network cut-over automation (DNS/FIP/BGP) — documented hooks only.
+* Migrating Heat stacks, Octavia load balancers, Manila shares, Designate zones: they move by runbook. From 0.4.0
+  the pre-flight reports a VM's Heat stack, its autoscaling group and its Octavia memberships, and a helper moves an
+  Octavia membership (SDD §23). Up to 0.3.0 no finding reported them, though this list said so.
+* Network cut-over beyond SDD §23: Seamless as a BGP speaker, recreating load balancers, copying their TLS secrets,
+  and Heat's stack abandon and adopt.
 * Hyper-V, Nutanix, KVM-without-OpenStack sources.
 * Destinations below 2023.1 Antelope, and clouds without the OpenStack APIs (SDD §21.1). Vendor builds of
   community releases other than RHOSO are not certified; they count as the upstream series they ship.
@@ -76,6 +79,7 @@ Today's tooling forces painful trade-offs:
 | **Security officer** | Credentials never leak; every action attributable; AI use is bounded | Security.md, audit trail, RBAC |
 | **Community cloud operator** (Arif) | Move tenants from an old cloud to a new upstream release side by side, without a Red Hat stack; know before a plan runs whether the destination's release and policies fit | Providers (destination check: series, tier, roles), validation findings, Security.md roles |
 | **ML platform engineer** (Nadia) | Move inference servers, notebook hosts and render nodes with their GPUs; know before a plan runs whether the destination has the GPUs, and that no source stops before its GPU is free at the destination | Inventory (GPU column), the plan's GPU mappings, the provider card's GPU capacity, validation findings |
+| **Network engineer** (Wulan) | Keep a VM's public address and DNS name through its cutover; know which load balancers and stacks a plan touches; run the site's own network steps at the right moment | Plan network cut-over settings, the hook catalog, findings, events |
 
 ## 5. Key user journeys
 
@@ -107,11 +111,18 @@ Today's tooling forces painful trade-offs:
    the guest driver and license warnings. The pre-copy runs while the VMs serve. One cutover waits because the last
    vGPU of its type was taken meanwhile; its source keeps running and syncing, and the cutover starts once a vGPU is
    free. After boot the verification confirms each server holds its GPU.
+8. **Keep the address** (0.4.0, Technology Preview) — Wulan plans a web tier whose floating IPs both clouds' external
+   network reaches. The plan keeps their addresses, swaps the API's DNS record in Designate, and runs the site's
+   firewall playbook after each server is created. Validation blocks a VM of an autoscaling group until Wulan
+   acknowledges it, and names the Octavia pools the VMs belong to; the helper drains each member before its source
+   stops and joins the migrated VM to the destination's pool after its verification. A hook that fails after a stop
+   rolls that VM back, its floating IP associated at the source again.
 
 ## 6. Functional requirements
 
 Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = could (later), **M2** = must
-for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview until its lab cases pass).
+for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview until its lab cases pass), **M4** = must for
+0.4.0 (goal G9, a Technology Preview until its lab cases pass).
 
 | ID | Requirement | P | Acceptance criteria |
 |---|---|---|---|
@@ -142,7 +153,7 @@ for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview unti
 | FR-25 | Deploy on OpenShift, Kubernetes and Docker Compose (Docker Engine on a Linux host, Colima on macOS, or Podman) with PostgreSQL | M | Manifests in `deploy/openshift` and its overlay `deploy/kubernetes`, compose stack in `deploy/compose` |
 | FR-26 | Changed-extent tracking to remove the scan floor: Ceph-direct `rbd diff` and hypervisor-assisted libvirt checkpoints | C | 0.2.0 |
 | FR-27 | HA control plane (leader election) | C | 0.2.0 |
-| FR-28 | Network cut-over hooks (DNS/FIP/BGP) | C | 0.4.0 |
+| FR-28 | Network cut-over hooks: an admin's playbook and webhook hooks that a plan runs at `pre_stop`, `post_create`, `post_verify`, `on_rollback` and `on_finalize`, each with a timeout, an idempotency key and a revert | M4 | A hook's failure before the stop keeps the source running, one after it follows `auto_rollback`, and no credential reaches a hook's context (SDD §23.3) |
 | FR-29 | Community OpenStack destinations: a destination provider of kind `openstack` (distribution `openstack_community` or `kolla`) of a series in the support window, beside RHOSO 18.0 | M2 | Every strategy the destination's capabilities allow passes the lab matrix on each Tier 1 series (QASuite §6.7 AC-6, §7.1 M7–M12, §7.2 LAB-D); SDD §21.1 |
 | FR-30 | Release detection and support tier per destination: the series range the API version documents fit, an optional declared series, and the tier | M2 | The provider check shows range, declared series and tier; a declared series the detected range contradicts warns, and where the APIs cannot tell the series the declared one decides; with none declared the tier is the least favourable one the range allows (SDD §21.3) |
 | FR-31 | Destination capability pre-flight: what each chosen strategy needs (compute and block-storage microversions, Cinder manage, Neutron extensions, roles) | M2 | A missing capability blocks the plan and names it; a series outside the tiers or EOL upstream warns (SDD §21.4) |
@@ -156,6 +167,12 @@ for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview unti
 | FR-39 | The cutover gate reads the GPU capacity again before the source stops | M3 | With no room the migration waits and keeps syncing, and its source never stops (SDD §22.7) |
 | FR-40 | GPU verification: the server holds its GPU flavor and its allocations, and the DCGM exporter's port is suggested as a probe | M3 | A server created without its GPU fails the verification, and the plan's automatic rollback rolls it back (SDD §22.8) |
 | FR-41 | Technology Preview: every GPU surface says so, and no text claims hardware validation | M3 | The label stays until LAB-GPU01–LAB-GPU08 pass on GPU hosts (SDD §22.14) |
+| FR-42 | Network findings: a VM's Heat stack and autoscaling group, its Octavia memberships, a floating IP whose address would change, `allowed_address_pairs`, an announced prefix a plan's waves split, and DNS names the destination cannot publish | M4 | The SDD §23.8 codes implemented and unit-tested; an autoscaled VM is blocked until acknowledged |
+| FR-43 | A floating IP that keeps its address, opt-in per plan, on every OpenStack strategy | M4 | The address is reserved at the destination before the window and moves after the source stopped; a rollback gives it back to the source before the source starts (SDD §23.4) |
+| FR-44 | A DNS swap through Designate or an RFC 2136 server when an address changes | M4 | A compare-and-swap that changes nothing when the record holds another address, and swaps back on rollback; a TTL longer than the downtime SLO warns (SDD §23.5) |
+| FR-45 | A moved floating IP is reachable before the verification passes | M4 | The wait counts in the downtime; Seamless speaks no BGP (SDD §23.6) |
+| FR-46 | An Octavia member helper | M4 | The source member is drained before the stop and the migrated VM joins the mapped destination pool after its verification; TLS keys are never read (SDD §23.7) |
+| FR-47 | Technology Preview: every network cut-over surface says so, and no text claims a lab validation | M4 | The label stays until the LAB-NET cases pass on two clouds (SDD §23.10) |
 
 ## 7. Non-functional requirements
 
@@ -187,6 +204,8 @@ for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview unti
   same downtime and success targets as RHOSO 18.0.
 * 0.3.0: no GPU VM's source stops without a capacity read that found room for its GPU (SDD §22.7); LAB-GPU01–LAB-GPU08
   pass on GPU hosts before the Technology Preview label goes.
+* 0.4.0: no floating IP changes its address without a finding that says so, and a keep-address move's gap stays
+  inside the downtime (SDD §23.4); the LAB-NET cases pass on two clouds before the Technology Preview label goes.
 
 ## 9. Release plan
 
@@ -195,7 +214,7 @@ for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview unti
 | **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift, Kubernetes and Compose (Docker on Linux, Colima on macOS, or Podman) deployment, docs |
 | 0.2.0 | Ceph-direct incremental diff, HA (PostgreSQL leader election), per-tenant credentials, notifications (email/Slack webhooks); community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34) |
 | 0.3.0 | GPU workloads as a Technology Preview (G8, FR-35–FR-41; SDD §22) |
-| 0.4.0 | Network cut-over hooks (DNS, FIP re-mapping, OVN BGP; FR-28), Octavia/Heat migration helpers |
+| 0.4.0 | Network cut-over as a Technology Preview (G9, FR-28, FR-42–FR-47; SDD §23): hooks, the keep-address floating IP move, the DNS swap, the BGP reachability wait, the Heat and Octavia findings and the Octavia member helper |
 | 1.0.0 | Certified on RHOSO 18.0.x FRs, validated on every Tier 1 community series of the day, scale test 5,000 VMs, signed releases |
 
 ## 10. Dependencies and assumptions
@@ -217,6 +236,9 @@ for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview unti
   configured at the destination, and GPU flavors the operator defines there. Placement's default policy gives the
   capacity reads to `admin`: without it the capacity reads "unknown" and the pre-flight warns. The guests' NVIDIA
   drivers and the NVIDIA License System stay the operator's (SDD §22).
+* Network cut-over (0.4.0): for the keep-address move, an external segment or a BGP fabric both clouds reach, and a
+  destination credential that may choose a floating IP's address; for the DNS swap, Designate or an RFC 2136 server
+  with a TSIG key; Octavia at the destination for the member helper (SDD §23).
 * Jev requires a provider API key (TypeSafe direct by default); everything works with Jev off.
 * agentmemory is optional; when configured, it runs as the team's memory server.
 
@@ -236,6 +258,9 @@ for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview unti
 | A GPU taken between the cutover gate's read and the server's creation | The cutover fails after the source stopped | The capacity read right before the stop (SDD §22.7), the automatic rollback, LAB-GPU06 |
 | A guest's NVIDIA driver does not suit the destination host's vGPU manager | The GPU does not work after the cutover | `GUEST_GPU_DRIVER` before the plan runs, a test migration first, the verification's GPU checks, LAB-GPU08 (SDD §22.5) |
 | vSphere takes no snapshot of a VM with a DirectPath I/O GPU | No warm migration for such VMs | `vmware_warm` ineligible, `vmware_cold` while the VM is powered off (SDD §22.6) |
+| A floating IP's address answered from both clouds during a move | Traffic split between a stopped source and its copy | The source's floating IP is disassociated after the stop and before the destination's is associated, journaled; LAB-NET (SDD §23.4) |
+| A hook does harm or hangs | A failed or slow cutover, a leaked secret | Hooks registered by an admin alone, a timeout per hook, a revert, output through redaction, no credential in the context (SDD §23.3) |
+| An autoscaling group replaces a server Seamless stopped | Two live copies of a VM | `SRC_VM_AUTOSCALED` blocks the VM until acknowledged (SDD §23.8) |
 
 ## 12. Glossary
 
