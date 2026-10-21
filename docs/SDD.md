@@ -2012,7 +2012,8 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
 (÷ `demo_speed`), like the steps (§7.4).
 
 **GPU checks** (§22.8, plan task G8). A migration whose VM has a GPU flavor - the destination flavor its plan maps the
-VM's GPUs to (`planning/gpu.gpu_flavor(vm, plan, source_kind)`, §22.4) - gets two checks after `ports_up`. Any other
+VM's GPUs to (`planning/gpu.gpu_flavor(vm, plan, source_kind, declared_profile)`, §22.4), its GPUs read with the profile its
+source declares for its flavor, as §9.3's GPU rows and the executors read them (§7.2, §22.2) - gets two checks after `ports_up`. Any other
 VM gets neither - a VM without a GPU too, whatever flavor a mapping sends it to -, and its verification reads no
 Placement allocation:
 

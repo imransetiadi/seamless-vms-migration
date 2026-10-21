@@ -210,12 +210,15 @@ def review_reason(vm: Any, plan: Any, result: VerificationResult) -> str | None:
 def _gpu_flavor_of(ctx: Any) -> tuple[str, str | None] | None:
     """The GPU flavor the migration's server is created with, as its plan names it, and the profile
     the destination declares for it (SDD §7.5, §22.4); None for a VM without one, a VM without a
-    GPU among them - and for a context without its source, which names none."""
+    GPU among them - its GPUs read with the profile its source declares for its flavor, as §9.3's
+    rows and the executors read them (§22.2, G8b) - and for a context without its source, which
+    names none."""
     vm = getattr(ctx.migration, "vm", None)
     source = getattr(ctx, "source", None)
     if vm is None or source is None:
         return None
-    name = gpu_flavor(vm, ctx.plan, source.kind)
+    declared = (getattr(source, "gpu_profiles", None) or {}).get(vm.flavor) if vm.flavor else None
+    name = gpu_flavor(vm, ctx.plan, source.kind, declared)
     if name is None:
         return None
     profiles = getattr(getattr(ctx, "destination", None), "gpu_profiles", None) or {}

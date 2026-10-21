@@ -982,3 +982,27 @@ async def test_gpu_check_details_name_no_provider(caplog):
     for name in (*hosts, *gpus, *uuids.values()):
         assert not [k for k in kept if name in k], name
         assert name not in caplog.text, name
+
+
+async def test_a_vm_whose_gpu_its_source_declares_a_profile_for_gets_the_gpu_checks():
+    """SDD §7.5, §22.2 (G8b): a VM recorded before 0.3.0 whose flavor asks only for a CUSTOM_ class
+    is a GPU VM once its source declares a profile for that flavor, as §9.3's rows and the
+    executors read it - it gets the GPU checks; without the declared profile it has no GPU and
+    gets none."""
+    custom = {"resources:CUSTOM_NVIDIA_A100_4C": "1"}
+    vm = make_vm(flavor="g1.vgpu", flavor_extra_specs=dict(custom), gpus=[])
+    flavor = {"name": "g1.a100-4c", "extra_specs": dict(custom)}
+    declared = gpu_ctx(vm, profiles={"g1.a100-4c": "A100-4C"})
+    declared.source = make_provider(gpu_profiles={"g1.vgpu": "A100-4C"})
+    dest = GpuDest(flavor=flavor, allocations={"CUSTOM_NVIDIA_A100_4C": 1})
+    result = await Verifier(dest, Settings(), poll_s=0).verify(declared)
+    assert result.passed is True, result.checks
+    assert [c["name"] for c in result.checks if c["name"].startswith("gpu_")] == [
+        "gpu_flavor",
+        "gpu_allocation",
+    ]
+    assert by_name(result)["gpu_allocation"]["ok"] is True and dest.allocation_reads == 1
+    # the same VM from a source that declares nothing: no GPU, no GPU check
+    undeclared = gpu_ctx(vm, profiles={"g1.a100-4c": "A100-4C"})
+    result = await Verifier(GpuDest(flavor=flavor), Settings(), poll_s=0).verify(undeclared)
+    assert not [c for c in result.checks if c["name"].startswith("gpu_")]
