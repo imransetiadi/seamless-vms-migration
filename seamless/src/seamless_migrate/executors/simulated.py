@@ -3,7 +3,9 @@
 Durations follow the estimator model (§9.1) in *model seconds* (recorded in
 ``SyncPass.duration_s``); wall-clock time is compressed by ``settings.demo_speed``. Byte counts
 carry seeded jitter; each pass changes ``min(disk_bytes, change_rate · previous_pass_duration)``.
-Cutover fails with probability ``settings.demo_failure_rate`` after the source was stopped.
+Cutover fails with probability ``settings.demo_failure_rate`` after the source was stopped. A
+cutover creates its server on the fake destination with the flavor the plan names, where it takes
+that flavor's vGPU units; the rollback deletes it (§7.4, §10, §22.10).
 """
 
 from __future__ import annotations
@@ -15,13 +17,14 @@ from typing import Any
 
 from ..config import Settings
 from ..domain.enums import WARM_STRATEGIES, Strategy, SyncPassKind
-from ..domain.models import Migration, Plan, Provider, SyncPass, next_pass_number, utcnow
+from ..domain.models import Migration, Plan, Provider, SyncPass, VMRef, next_pass_number, utcnow
 from ..planning.estimator import (
     VMWARE_PASS_OVERHEAD_S,
     params_for_plan,
     scan_seconds,
     whole_pass_seconds,
 )
+from ..planning.gpu import gpu_flavor, vm_gpus
 from ..providers.base import ProviderError
 from .base import PermanentStepError, StepContext, StepName, StepResult
 
@@ -55,6 +58,23 @@ def _demo_refusal(m: Migration, plan: Plan) -> str | None:
     )
 
 
+def server_id(m: Migration) -> str:
+    """The id of the server a simulated cutover of ``m`` creates (SDD §7.4)."""
+    return f"sim-{m.id}"
+
+
+def server_flavor(vm: VMRef, plan: Plan, source: Provider) -> str | None:
+    """The flavor a simulated server is created with, as the plan names it (SDD §7.4): a GPU VM's
+    GPU flavor - its GPUs read with the profile its source declares for its flavor, as the
+    executors read them (§7.2, §22.4) -, else the flavor ``mappings.flavors`` maps the VM's flavor
+    to, which the pre-flight and the gate count when it asks for a vGPU (§22.5, §22.7); None for
+    any other VM."""
+    declared = source.gpu_profiles.get(vm.flavor) if vm.flavor else None
+    if vm_gpus(vm, declared):
+        return gpu_flavor(vm, plan, source.kind, declared)
+    return plan.mappings.flavors.get(vm.flavor) if vm.flavor else None
+
+
 class SimulatedExecutor:
     name = "simulated"
 
@@ -81,6 +101,13 @@ class SimulatedExecutor:
             await action(ctx.migration.vm.source_id)
         except ProviderError:
             pass  # a VM the fake does not hold: nothing to stop or start, never a failed step
+
+    def _destination_call(self, ctx: StepContext, name: str) -> Any:
+        """The fake destination's ``name`` method, which holds the simulated servers and their
+        GPU units (SDD §7.4, §10); None without one."""
+        if self.providers is None:
+            return None
+        return getattr(self.providers.get(ctx.destination), name, None)
 
     def supports(self, strategy: Strategy) -> bool:
         return True
@@ -120,6 +147,11 @@ class SimulatedExecutor:
             # a cutover this rollback cancelled reported nothing: its stopped seconds come here
             interrupted = self._stopped.pop(ctx.migration.id, 0.0)
             await self._elapse(ctx, ROLLBACK_MODEL_S, 0)
+            # the server goes first, its GPU units free again, then the source starts, as §7.2's
+            # rollback does (SDD §7.4)
+            delete = self._destination_call(ctx, "delete_server")
+            if delete is not None:
+                await delete(server_id(ctx.migration))
             await self._source_power(ctx, on=True)
             # the model seconds the rollback kept the source stopped: the downtime counts them
             # (SDD §5.2)
@@ -261,8 +293,15 @@ class SimulatedExecutor:
         await self._elapse(ctx, p.create_s, 0, stopped=True)
         self._stopped.pop(m.id, None)
         # the model seconds the source stayed down here: the downtime counts them (SDD §5.2)
-        return StepResult(
-            sync_pass=sync_pass,
-            destination_server_id=f"sim-{m.id}",
-            details={"downtime_model_s": p.shutdown_s + copy_s + p.create_s},
-        )
+        stopped = {"downtime_model_s": p.shutdown_s + copy_s + p.create_s}
+        create = self._destination_call(ctx, "create_server")
+        if create is not None:
+            try:
+                # its flavor's vGPU units taken at the fake destination (SDD §7.4, §10)
+                await create(server_id(m), server_flavor(vm, ctx.plan, ctx.source))
+            except ProviderError as exc:
+                # as Nova finds no valid host: after the source stopped (§22.7)
+                raise PermanentStepError(
+                    f"simulated cutover failure: {exc}", details=stopped
+                ) from None
+        return StepResult(sync_pass=sync_pass, destination_server_id=server_id(m), details=stopped)

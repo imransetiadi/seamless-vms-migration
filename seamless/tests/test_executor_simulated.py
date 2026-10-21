@@ -317,6 +317,98 @@ async def test_a_simulated_warm_cutover_takes_the_downtime_the_gate_estimates(
     )
 
 
+#: what the demo's A100-4C vGPU flavor asks for: one vGPU of the type its trait names (SDD §22.10)
+A100_4C = {"resources:VGPU": "1", "trait:CUSTOM_NVIDIA_A100_4C": "required"}
+#: the free units of the demo destination's three pools, by pool name, before any server (§22.10)
+ROOM = {"VGPU CUSTOM_NVIDIA_A100_4C": 4, "VGPU CUSTOM_NVIDIA_A100_3_20C": 2, "VGPU": 6}
+
+
+def demo_destination():
+    """The demo's rhoso18 as the demo registry builds it, the registry with it (SDD §10)."""
+    from seamless_migrate.demo import DEMO_PROVIDERS
+    from seamless_migrate.providers.registry import ProviderRegistry
+
+    rhoso = next(p for p in DEMO_PROVIDERS if p.id == "rhoso18")
+    registry = ProviderRegistry(FAST)
+    return rhoso, registry, registry.get(rhoso)
+
+
+async def gpu_free(fake) -> dict[str, int]:
+    """The free units of each pool the fake destination's inventory reads, by pool name (§22.3)."""
+    from seamless_migrate.planning.gpu import pool_name
+
+    capacity = (await fake.inventory()).gpu_capacity
+    return {
+        pool_name(p.resource_class, p.traits, p.forbidden_traits): p.free for p in capacity.pools
+    }
+
+
+async def test_a_simulated_gpu_cutover_takes_its_units_and_its_rollback_gives_them_back():
+    """SDD §7.4, §10, §22.10 (plan task G9): a simulated cutover creates its server on the demo's
+    fake destination with the VM's GPU flavor, which takes one unit of the A100-4C pool and of its
+    class - the check reads them taken, as the provider card does -, and the server reports that
+    flavor and holds that unit. The rollback deletes the server before it starts the source
+    again, and the units are free once more."""
+    from seamless_migrate.planning.gpu import gpu_requests
+    from seamless_migrate.providers.base import ProviderError
+
+    rhoso, registry, fake = demo_destination()
+    vm = make_vm(flavor="g1.vgpu", flavor_extra_specs=A100_4C, gpus=gpu_requests(A100_4C))
+    plan = make_plan(mappings={"flavors": {"g1.vgpu": "g1.a100-4c"}})
+    m = make_migration(id="mig-000000000a", strategy=Strategy.cold, vm=vm)
+    ex = SimulatedExecutor(FAST, providers=registry)
+    assert await gpu_free(fake) == ROOM
+    ctx, _ = make_ctx(plan, m, SRC, rhoso, FAST)
+    server = (await ex.run(StepName.CUTOVER, ctx)).destination_server_id
+    assert await gpu_free(fake) == {**ROOM, "VGPU CUSTOM_NVIDIA_A100_4C": 3, "VGPU": 5}
+    assert [p["free"] for p in (await fake.check())["gpu_capacity"]["pools"]] == [3, 2, 5]
+    flavor = (await fake.get_server(server))["flavor"]
+    assert flavor == {"name": "g1.a100-4c", "extra_specs": A100_4C}
+    assert await fake.server_allocations(server) == {"VGPU": 1}
+
+    started: list = []
+
+    async def power_on(source_id: str) -> None:
+        # the server is gone before the source starts again, as §7.2's rollback does
+        started.append(await fake.server_allocations(server))
+
+    registry.get(SRC).power_on = power_on
+    m.destination_server_id = server
+    ctx, _ = make_ctx(plan, m, SRC, rhoso, FAST)
+    await ex.run(StepName.ROLLBACK, ctx)
+    assert started == [None]
+    assert await gpu_free(fake) == ROOM
+    with pytest.raises(ProviderError):
+        await fake.get_server(server)
+
+
+async def test_a_simulated_cutover_that_finds_no_gpu_free_fails_after_the_source_stopped():
+    """SDD §7.4, §10, §22.7 (plan task G9): a VM without a GPU that the plan's flavor mapping sends
+    to a vGPU flavor takes its units as a GPU VM does - the pre-flight and the gate count it so -;
+    once its pool has none free, the create fails as Nova finds no valid host: after the source
+    stopped, with its model seconds, naming the flavor and the pool, and no server is recorded."""
+    rhoso, registry, fake = demo_destination()
+    ex = SimulatedExecutor(FAST, providers=registry)
+    plan = make_plan(mappings={"flavors": {"m1.small": "g1.a100-3-20c"}})
+    for mid in ("mig-00000000b1", "mig-00000000b2"):
+        ctx, _ = make_ctx(plan, mig(Strategy.cold, mid=mid), SRC, rhoso, FAST)
+        await ex.run(StepName.CUTOVER, ctx)
+    assert await gpu_free(fake) == {**ROOM, "VGPU CUSTOM_NVIDIA_A100_3_20C": 0, "VGPU": 4}
+    ctx, rec = make_ctx(plan, mig(Strategy.cold, mid="mig-00000000b3"), SRC, rhoso, FAST)
+    with pytest.raises(PermanentStepError) as failed:
+        await ex.run(StepName.CUTOVER, ctx)
+    assert "'g1.a100-3-20c'" in str(failed.value)
+    assert "VGPU CUSTOM_NVIDIA_A100_3_20C" in str(failed.value)
+    assert rec.downtime_marks == 1 and failed.value.details["downtime_model_s"] > 0
+    assert await fake.server_allocations("sim-mig-00000000b3") is None
+    assert await gpu_free(fake) == {**ROOM, "VGPU CUSTOM_NVIDIA_A100_3_20C": 0, "VGPU": 4}
+    # a VM whose flavor no mapping names takes nothing
+    ctx, _ = make_ctx(make_plan(), mig(Strategy.cold, mid="mig-00000000b4"), SRC, rhoso, FAST)
+    server = (await ex.run(StepName.CUTOVER, ctx)).destination_server_id
+    assert await fake.server_allocations(server) is None
+    assert (await fake.get_server(server))["flavor"] == {"name": None, "extra_specs": {}}
+
+
 async def test_simulated_time_is_compressed_by_demo_speed():
     slept: list[float] = []
 

@@ -1,4 +1,5 @@
-"""Deterministic demo providers (SDD §10): 24 OpenStack VMs, 12 VMware VMs and a RHOSO cloud.
+"""Deterministic demo providers (SDD §10): 24 OpenStack VMs, 16 VMware VMs and two destinations,
+RHOSO 18.0 and a community cloud, with GPU flavors and the Placement pools of their vGPUs (§22.10).
 
 The traits (names, special cases) are fixed; sizes, usage and change rates vary with the seed.
 """
@@ -7,14 +8,15 @@ from __future__ import annotations
 
 import hashlib
 import random
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
 from ..domain.enums import ProviderKind
 from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef, utcnow
-from ..planning.gpu import gpu_requests
+from ..planning.gpu import gpu_pools, gpu_requests, pool_name
 from ..planning.platforms import destination_release
-from ..planning.preflight import DestinationInventory, GpuCapacity, SourceInventory
+from ..planning.preflight import DestinationInventory, GpuCapacity, GpuPool, SourceInventory
 from .base import ProviderError, VMNotFound
 
 MIB = 2**20
@@ -151,7 +153,9 @@ _OPENSTACK: tuple[_Spec, ...] = (
         (100,),
         "rhel9",
         rate_mib=2.0,
-        extra_specs=(("resources:VGPU", "1"),),
+        # one vGPU of the A100-4C type, which its trait names; the finance plan maps the flavor
+        # to the destination's g1.a100-4c (SDD §22.10)
+        extra_specs=(("resources:VGPU", "1"), ("trait:CUSTOM_NVIDIA_A100_4C", "required")),
     ),
     _Spec("report-01", "m1.medium", (80,), "rhel9", rate_mib=1.5),
     _Spec("batch-01", "m1.medium", (60,), "rhel9", rate_mib=0.5, power_state="stopped"),
@@ -181,9 +185,11 @@ class _VSpec:
     tools_ok: bool = True
     rate_mib: float = 1.0
     tags: tuple[tuple[str, str], ...] = ()
+    power_state: str = "running"
+    gpus: tuple[GpuDevice, ...] = ()
 
 
-# 13 VMware VMs of the "DC2" datacenter with mixed CBT/snapshot/independent-disk states.
+# 16 VMware VMs of the "DC2" datacenter with mixed CBT/snapshot/independent-disk states.
 _VMWARE: tuple[_VSpec, ...] = (
     _VSpec("dc2-web-01", 2, 4096, (40,), "rhel9_64Guest", network="DC2-DMZ", rate_mib=0.5),
     _VSpec("dc2-web-02", 2, 4096, (40,), "rhel9_64Guest", network="DC2-DMZ", cbt=False),
@@ -206,6 +212,39 @@ _VMWARE: tuple[_VSpec, ...] = (
         (40,),
         "rhel9_64Guest",
         tags=(("app", "portal"), ("demo-fault", "cutover-refusal")),
+    ),
+    # the GPU VMs (SDD §22.10), last so that the VMs above keep their addresses and sizes: the
+    # VMware plan maps dc2-ml-01's vGPU; no seeded plan holds the MIG-backed vGPU of dc2-ml-02 or
+    # the DirectPath I/O GPU of dc2-cuda-01, powered off, which only vmware_cold takes (§22.6)
+    _VSpec(
+        "dc2-ml-01",
+        8,
+        32768,
+        (120,),
+        "rhel9_64Guest",
+        rate_mib=2.0,
+        tags=(("app", "ml-training"),),
+        gpus=(GpuDevice(kind="vgpu", profile="grid_a100-4c"),),
+    ),
+    _VSpec(
+        "dc2-ml-02",
+        16,
+        65536,
+        (200,),
+        "rhel9_64Guest",
+        rate_mib=3.0,
+        tags=(("app", "ml-inference"),),
+        gpus=(GpuDevice(kind="vgpu", profile="grid_a100-3-20c"),),
+    ),
+    _VSpec(
+        "dc2-cuda-01",
+        16,
+        131072,
+        (250,),
+        "rhel9_64Guest",
+        tags=(("app", "cuda-batch"),),
+        power_state="stopped",
+        gpus=(GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5"),),
     ),
 )
 
@@ -301,7 +340,7 @@ def _vmware_vm(spec: _VSpec, rng: random.Random, index: int) -> VMRef:
                 network_key=spec.network,
             )
         ],
-        power_state="running",
+        power_state=spec.power_state,  # type: ignore[arg-type]
         os_type=spec.guest_id,
         host=f"esx-{index % 3 + 1:02d}.dc2",
         cbt_enabled=spec.cbt,
@@ -309,6 +348,8 @@ def _vmware_vm(spec: _VSpec, rng: random.Random, index: int) -> VMRef:
         tools_ok=spec.tools_ok,
         change_rate_bps=round(spec.rate_mib * rng.uniform(0.8, 1.2) * MIB, 1),
         tags=dict(spec.tags),
+        # its VirtualPCIPassthrough devices, as vCenter reports them (SDD §22.2)
+        gpus=[gpu.model_copy() for gpu in spec.gpus],
     )
 
 
@@ -402,6 +443,49 @@ _DESTINATION_MAXIMA = {
     ProviderKind.openstack: ("2.104", "3.71"),
 }
 
+#: the demo destinations' GPU flavors, with the sizes of the dashboard's mock (SDD §10, §22.10):
+#: two vGPU types by their traits, and an A100 passed through by PCI alias
+_GPU_FLAVORS: dict[str, tuple[int, int, int, dict[str, str]]] = {
+    "g1.a100-4c": (
+        8,
+        32768,
+        200,
+        {"resources:VGPU": "1", "trait:CUSTOM_NVIDIA_A100_4C": "required"},
+    ),
+    "g1.a100-3-20c": (
+        16,
+        65536,
+        300,
+        {"resources:VGPU": "1", "trait:CUSTOM_NVIDIA_A100_3_20C": "required"},
+    ),
+    "p1.a100": (16, 131072, 400, {"pci_passthrough:alias": "a100:1"}),
+}
+#: the GPUs the demo destinations' Placement holds (SDD §10, §22.10), each one resource provider
+#: on a compute node whose service is enabled: its class, its trait and its units
+_GPUS: tuple[tuple[str, str, int], ...] = (
+    ("VGPU", "CUSTOM_NVIDIA_A100_4C", 4),
+    ("VGPU", "CUSTOM_NVIDIA_A100_3_20C", 2),
+)
+#: the GPU §22.10's other tenant holds on the cutover gate's first reads that ask for its trait,
+#: and how many of those reads find it held
+_TENANT_GPU = 1
+_TENANT_READS = 2
+
+
+def _counts(
+    gpu: tuple[str, str, int], resource_class: str, traits: Iterable[str], forbidden: Iterable[str]
+) -> bool:
+    """Whether a GPU counts for a request or a pool (SDD §22.3): it holds the class and the required
+    traits, and none of the forbidden ones."""
+    cls, trait, _ = gpu
+    return cls == resource_class and set(traits) <= {trait} and trait not in set(forbidden)
+
+
+def _vgpus(flavor: str | None) -> list[GpuDevice]:
+    """The vGPU requests of a demo destination flavor (SDD §22.2); none for any other."""
+    specs = _GPU_FLAVORS[flavor][3] if flavor in _GPU_FLAVORS else {}
+    return [d for d in gpu_requests(specs) if d.kind == "vgpu" and d.resource_class]
+
 
 class FakeDestinationProvider:
     def __init__(self, seed: int = 42, provider: Provider | None = None) -> None:
@@ -409,6 +493,58 @@ class FakeDestinationProvider:
         self.deleted: set[str] = set()
         #: the demo provider it stands for: its kind, declared series and profile (SDD §10)
         self.provider = provider
+        #: the servers the simulated cutovers created, by id: the flavor each was created with
+        #: (SDD §7.4, §10)
+        self._servers: dict[str, str | None] = {}
+        #: the GPU units each of them holds, by GPU: its Placement allocations (§22.3)
+        self._held: dict[str, dict[int, int]] = {}
+        #: the cutover gate's reads that found the other tenant's GPU held (SDD §22.10)
+        self._tenant_reads = 0
+
+    def _gpu_flavor_list(self) -> list[dict[str, Any]]:
+        """The GPU flavors with the profiles its provider declares (SDD §22.3, §22.10)."""
+        profiles = self.provider.gpu_profiles if self.provider is not None else {}
+        return [
+            {
+                "name": name,
+                "vcpus": vcpus,
+                "ram_mb": ram_mb,
+                "disk_gb": disk_gb,
+                "gpus": gpu_requests(specs, profiles.get(name)),
+            }
+            for name, (vcpus, ram_mb, disk_gb, specs) in _GPU_FLAVORS.items()
+        ]
+
+    def _free(self, gpu: int) -> int:
+        """The units of a GPU its servers leave free."""
+        return _GPUS[gpu][2] - sum(held.get(gpu, 0) for held in self._held.values())
+
+    def _capacity(self, requests: Iterable[GpuDevice], tenant: bool = False) -> GpuCapacity:
+        """The pools of the vGPU requests, read as §22.3 counts them on the fake's GPUs less the
+        units its servers hold - with ``tenant``, the other tenant's GPU full (§22.10)."""
+        pools = []
+        for pool in gpu_pools(requests):
+            free = [
+                0 if tenant and i == _TENANT_GPU else self._free(i)
+                for i, gpu in enumerate(_GPUS)
+                if _counts(gpu, pool.resource_class, pool.traits, pool.forbidden_traits)
+            ]
+            pools.append(
+                GpuPool(
+                    resource_class=pool.resource_class,
+                    traits=list(pool.traits),
+                    forbidden_traits=list(pool.forbidden_traits),
+                    same_provider=pool.same_provider,
+                    free=sum(free),
+                    providers=sum(1 for units in free if units > 0),
+                    largest_free=max(free, default=0),
+                )
+            )
+        return GpuCapacity(status="ok", read_at=utcnow(), pools=pools)
+
+    def _flavor_capacity(self) -> GpuCapacity:
+        """The pools of every GPU flavor's requests: the inventory's and the check's (§22.3)."""
+        return self._capacity(g for flavor in self._gpu_flavor_list() for g in flavor["gpus"])
 
     async def check(self) -> dict[str, Any]:
         kind = self.provider.kind if self.provider is not None else ProviderKind.rhoso
@@ -430,8 +566,8 @@ class FakeDestinationProvider:
             # RHOSO 18.0 validated by its kind and legacy until D14; a community cloud by its
             # series (SDD §10.1)
             **destination_release(kind, release, profile, compute, block_storage),
-            # it lists no GPU flavor: its capacity reads ok with no pools (SDD §22.3)
-            "gpu_capacity": GpuCapacity(status="ok", read_at=utcnow()).to_dict(),
+            # its GPU flavors' pools, which the provider card shows (SDD §22.3, §22.11)
+            "gpu_capacity": self._flavor_capacity().to_dict(),
         }
 
     async def inventory(self) -> DestinationInventory:
@@ -443,6 +579,10 @@ class FakeDestinationProvider:
         flavors.append(
             {"name": "m1.2xlarge", "vcpus": 32, "ram_mb": 65536, "disk_gb": 160, "extra_specs": {}}
         )
+        flavors += [
+            {"name": name, "vcpus": v, "ram_mb": r, "disk_gb": d, "extra_specs": dict(specs)}
+            for name, (v, r, d, specs) in _GPU_FLAVORS.items()
+        ]
         free = {
             "cores": 2000,
             "ram_mb": 4_194_304,
@@ -491,31 +631,85 @@ class FakeDestinationProvider:
                 }
                 for name, _, _, cidr in networks
             ],
-            # no GPU flavor, so no pool to read (SDD §22.3)
-            gpu_capacity=GpuCapacity(status="ok", read_at=utcnow()),
+            # the GPU flavors with their declared profiles, and their pools (SDD §22.3, §22.10)
+            gpu_flavors=self._gpu_flavor_list(),
+            gpu_capacity=self._flavor_capacity(),
         )
 
     async def gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity:
-        """The pools of the requests: none, as the demo destination lists no GPU flavor
-        (SDD §22.3)."""
-        return GpuCapacity(status="ok", read_at=utcnow())
+        """The pools of the requests (SDD §22.3): the cutover gate's read (§22.7), whose first two
+        reads that ask for the other tenant's GPU's trait find it full, as if that tenant then
+        released its vGPUs (§22.10) - the inventory, the validation's read, never."""
+        trait = _GPUS[_TENANT_GPU][1]
+        tenant = self._tenant_reads < _TENANT_READS and any(
+            device.kind == "vgpu" and trait in device.traits for device in requests
+        )
+        if tenant:
+            self._tenant_reads += 1
+        return self._capacity(requests, tenant)
 
     async def gpu_flavors(self) -> list[dict[str, Any]]:
-        """None: the demo destination lists no GPU flavor until plan task G9 (SDD §10, §22.3)."""
-        return []
+        """The GPU flavors as the inventory lists them, the declared profiles applied (SDD §10,
+        §22.3): the cutover gate's read of a GPU flavor's requests (§22.7)."""
+        return self._gpu_flavor_list()
+
+    async def create_server(self, server_id: str, flavor: str | None) -> None:
+        """The server a simulated cutover creates with ``flavor`` (SDD §7.4, §10): each vGPU
+        request of the flavor takes its units from the first GPU of its pool that has them free.
+        When one finds none, nothing is recorded and the create fails as Nova finds no valid host,
+        naming the flavor and the pool, never a GPU (§22.12). Created again, it holds anew."""
+        self._held.pop(server_id, None)
+        held: dict[int, int] = {}
+        for device in _vgpus(flavor):
+            gpu = next(
+                (
+                    i
+                    for i, candidate in enumerate(_GPUS)
+                    if _counts(
+                        candidate,
+                        device.resource_class or "",
+                        device.traits,
+                        device.forbidden_traits,
+                    )
+                    and self._free(i) - held.get(i, 0) >= device.count
+                ),
+                None,
+            )
+            if gpu is None:
+                self._servers.pop(server_id, None)
+                pool = pool_name(
+                    device.resource_class or "", device.traits, device.forbidden_traits
+                )
+                units = "1 unit" if device.count == 1 else f"{device.count} units"
+                raise ProviderError(
+                    f"no valid host was found for flavor {flavor!r}: no GPU of {pool} has "
+                    f"{units} free"
+                )
+            held[gpu] = held.get(gpu, 0) + device.count
+        self.deleted.discard(server_id)
+        self._servers[server_id] = flavor
+        self._held[server_id] = held
 
     async def server_allocations(self, server_id: str) -> dict[str, int] | None:
-        """No allocation to read: a simulated server holds no Placement resources (SDD §22.3)."""
-        return None
+        """The GPU units the server holds, per resource class (SDD §10, §22.3): the fake's
+        Placement holds GPUs alone, so None for a server that holds none."""
+        units: dict[str, int] = {}
+        for gpu, count in self._held.get(server_id, {}).items():
+            units[_GPUS[gpu][0]] = units.get(_GPUS[gpu][0], 0) + count
+        return units or None
 
     async def get_server(self, server_id: str) -> dict[str, Any]:
         if server_id in self.deleted:
             raise ProviderError(f"server {server_id!r} not found")
         octet = int(hashlib.sha1(server_id.encode()).hexdigest()[:2], 16) % 200 + 20
+        # the flavor it was created with, as compute 2.47 embeds it (SDD §10, §22.3)
+        flavor = self._servers.get(server_id)
+        specs = _GPU_FLAVORS[flavor][3] if flavor in _GPU_FLAVORS else {}
         return {
             "id": server_id,
             "status": "ACTIVE",
             "ports": [{"status": "ACTIVE", "fixed_ips": [f"10.30.0.{octet}"], "floating_ips": []}],
+            "flavor": {"name": flavor, "extra_specs": dict(specs)},
         }
 
     async def console_log(self, server_id: str, lines: int = 200) -> str | None:
@@ -547,6 +741,9 @@ class FakeDestinationProvider:
 
     async def delete_server(self, server_id: str) -> None:
         self.deleted.add(server_id)
+        # its units are free again (SDD §7.4, §10)
+        self._servers.pop(server_id, None)
+        self._held.pop(server_id, None)
 
     async def find_server(self, name: str) -> str | None:
         return _stable_id("dst", name)
