@@ -3075,8 +3075,8 @@ async def test_the_gate_counts_the_gpus_of_cutovers_without_a_server_yet(tmp_pat
 async def test_unknown_gpu_capacity_does_not_hold_the_cutover(tmp_path, store, unknown):
     """SDD §22.7: capacity Placement does not show - its credential refused, no Placement in the
     catalog - and a PCI alias request, whose devices nova.conf configures, let the cutover start:
-    nothing is read that could hold it, as the pre-flight warned (DST_GPU_CAPACITY_UNKNOWN); a VM
-    whose GPUs are all passthrough devices is told apart without any read."""
+    nothing is read that could hold it, as the pre-flight warned (DST_GPU_CAPACITY_UNKNOWN); an
+    alias flavor needs its flavor list alone, and no Placement read."""
     from seamless_migrate.planning.preflight import GpuCapacity
 
     alias = {"pci_passthrough:alias": "a100:1"}
@@ -3092,52 +3092,50 @@ async def test_unknown_gpu_capacity_does_not_hold_the_cutover(tmp_path, store, u
     m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
     await h.orch.stop()
     assert m.gpu_wait is None and _gpu_events(h, m.id) == []
-    assert (dst.flavor_reads, len(dst.reads)) == ((0, 0) if unknown == "alias" else (1, 1))
+    assert (dst.flavor_reads, len(dst.reads)) == ((1, 0) if unknown == "alias" else (1, 1))
 
 
-class ReadlessDestination(StaticDestination):
-    """A destination double that offers no GPU read - no gpu_flavors(), no gpu_capacity() -, as
-    other tests' doubles: its inventory lists a vGPU flavor and a PCI alias flavor, with room, for
-    the validation (SDD §22.3)."""
+class AliasDestination(StaticDestination):
+    """A destination double that lists a PCI alias GPU flavor in its inventory and leaves its GPU
+    reads to StaticDestination, which reads them from that inventory - as G8's test of a
+    PCI-alias VM does (SDD §22.3); its capacity reads are counted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.capacity_reads = 0
 
     async def inventory(self):
         from seamless_migrate.planning.gpu import gpu_requests
 
-        inv = await GateDestination().inventory()
+        inv = await super().inventory()
         alias = {"pci_passthrough:alias": "a100:1"}
         size = {"name": "p1.a100", "vcpus": 8, "ram_mb": 32768, "disk_gb": 80}
         inv.flavors.append({**size, "extra_specs": alias})
-        inv.gpu_flavors.append({**size, "gpus": gpu_requests(alias)})
+        inv.gpu_flavors = [{**size, "gpus": gpu_requests(alias)}]
         return inv
 
+    async def gpu_capacity(self, requests):
+        self.capacity_reads += 1
+        return await super().gpu_capacity(requests)
 
-async def test_a_destination_without_gpu_reads_never_holds_a_cutover(tmp_path, store):
-    """SDD §22.7 (the controller's note on G8's test): a PCI-alias VM's cutover starts with no read
-    - its GPUs are passthrough devices, told apart without one -, and a destination double that
-    offers no GPU read holds no cutover, a vGPU VM's either: nothing can be read, as without
-    Placement. Both VMs cut over; no wait is recorded."""
+
+async def test_a_pci_alias_vm_cuts_over_on_one_flavor_list_and_no_capacity_read(tmp_path, store):
+    """SDD §22.7 (G6 review, G8's test): a PCI-alias VM is read for as any GPU VM - the flavor list
+    tells that its GPU flavor asks for no vGPU, so Placement is not asked and nothing holds it -
+    on a destination double whose GPU reads are StaticDestination's own."""
     from seamless_migrate.domain.models import Mappings
 
     alias = gate_vm(1, flavor="p1.src", flavor_extra_specs={"pci_passthrough:alias": "a100:1"})
-    mappings = Mappings(flavors={"p1.src": "p1.a100", "g1.vgpu": GATE_FLAVOR})
-    plan_kw = {"default_strategy": Strategy.cold, "mappings": mappings}
-    h, plan = await setup(
-        tmp_path, store, [alias, gate_vm(2)], plan_kw, destination=ReadlessDestination()
-    )
-    read_for: list[str] = []
-    start_read = h.orch._start_gpu_read
-
-    def recording(mid: str) -> None:
-        read_for.append(mid)
-        start_read(mid)
-
-    h.orch._start_gpu_read = recording
+    plan_kw = {
+        "default_strategy": Strategy.cold,
+        "mappings": Mappings(flavors={"p1.src": "p1.a100"}),
+    }
+    dst = AliasDestination()
+    h, plan = await setup(tmp_path, store, [alias], plan_kw, destination=dst)
     await run_plan(h, plan)
-    await h.wait_plan(plan.id, PlanStatus.completed)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
     await h.orch.stop()
-    migrations = {m.vm.source_id: m for m in await h.migrations(plan.id)}
-    assert [(m.phase, m.gpu_wait) for m in migrations.values()] == [(P.completed, None)] * 2
-    assert set(read_for) == {migrations["vm-2"].id}, "the alias VM is read for never"
+    assert (m.gpu_wait, dst.capacity_reads) == (None, 0)
     assert "migration.gpu_wait" not in h.kinds()
 
 
@@ -3386,6 +3384,420 @@ async def test_a_validation_drops_the_gpu_wait_and_the_read_made_before_it(tmp_p
     await h.orch.stop()
     assert again.since > old.since and len(dst.reads) == 2
     assert [e.data["waiting"] for e in _gpu_events(h, mid)] == [True, True]
+
+
+async def _gpu_outcome_with_room(h, mid: str):
+    """The migration's GPU read once one is recorded with room."""
+
+    async def recorded():
+        outcome = h.orch._gpu_outcomes.get(mid)
+        return outcome if outcome is not None and outcome.read.room else None
+
+    return await _eventually(recorded)
+
+
+async def test_a_read_made_before_another_gpu_cutover_began_never_lets_a_second_cut_over(
+    tmp_path, store
+):
+    """SDD §5.4 rule 5, §22.7 (G6 review): one cutover slot, one unit free. B's read finds room but
+    its cutover cannot start - its plan is busy -; A reads, finds room, cuts over and ends its step,
+    its server holding the unit. B's read, made before A's cutover began, no longer counts whatever
+    phase A is in now: B reads again and waits."""
+    from seamless_migrate.domain.models import Mappings
+
+    settings = make_settings(tmp_path, max_concurrent_cutovers=1)
+    gates: dict[str, asyncio.Event] = {}
+    started: list[str] = []
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.CUTOVER: blocking_cutover(gates, started)}
+    )
+    dst = GateDestination()
+    h = build_harness(
+        tmp_path,
+        store,
+        [gate_vm(1), gate_vm(2)],
+        executor=executor,
+        settings=settings,
+        destination=dst,
+    )
+    kw = {"default_strategy": Strategy.cold, "mappings": Mappings(flavors={"g1.vgpu": GATE_FLAVOR})}
+    plan_b = plan_for([gate_vm(2)], name="B", **kw)
+    plan_a = plan_for([gate_vm(1)], name="A", **kw)
+    for plan in (plan_b, plan_a):  # B's plan is ticked first
+        store.put("plan", plan)
+        await h.orch.validate_plan(plan.id, "alice")
+        await h.orch.start_plan(plan.id, "alice")
+    a, b = await h.by_vm(plan_a.id, "vm-1"), await h.by_vm(plan_b.id, "vm-2")
+    busy = h.orch.plan_lock(plan_b.id)
+    await busy.acquire()  # a pause or an edit of B's plan holds it: B's step waits
+    try:
+        await h.orch.start()
+        await _gpu_outcome_with_room(h, b.id)
+
+        async def a_started():
+            return started == ["vm-1"]
+
+        await _eventually(a_started)
+        dst.free = dict(GATE_FULL)  # A's server holds the unit
+        gates.setdefault("vm-1", asyncio.Event()).set()
+        await h.wait_phase(a.id, P.completed)
+    finally:
+        busy.release()
+    m = await _gpu_wait(h, b.id)
+    await asyncio.sleep(0.1)  # many ticks
+    await h.orch.stop()
+    assert started == ["vm-1"] and (await h.migration(b.id)).phase == P.ready
+    assert (m.gpu_wait.pool, m.gpu_wait.needed, m.gpu_wait.free) == (GATE_POOL, 1, 0)
+
+
+async def test_a_keep_warm_pass_never_hides_a_gpu_cutover_begun_after_the_read(tmp_path, store):
+    """SDD §22.7 (G6 review): B's read finds room while B runs a keep-warm pass; A cuts over and
+    ends its step meanwhile, its server holding the unit. Back at its gate, B does not cut over on
+    that read - A's cutover began after it -: it reads again and waits."""
+    settings = make_settings(tmp_path)
+    gates: dict[str, asyncio.Event] = {}
+    started: list[str] = []
+    passing = asyncio.Event()
+    keep_b_in_its_pass: list[str] = []
+
+    async def keep_warm(ctx):
+        if keep_b_in_its_pass and ctx.migration.vm.source_id == "vm-2":
+            await passing.wait()
+        return await executor.sim.run(StepName.SYNC, ctx)
+
+    executor = ScriptedExecutor(
+        settings,
+        hooks={StepName.CUTOVER: blocking_cutover(gates, started), StepName.SYNC: keep_warm},
+    )
+    h, plan, dst = await _gate_plan(
+        tmp_path,
+        store,
+        [gate_vm(1), gate_vm(2)],
+        {"default_strategy": Strategy.warm, "auto_cutover": False},
+        dst=GateDestination(free={GATE_POOL: 2, "VGPU": 2}),
+        executor=executor,
+        settings=settings,
+    )
+    dst.free = dict(GATE_ROOM)
+    await h.orch.start()
+    a, b = await h.by_vm(plan.id, "vm-1"), await h.by_vm(plan.id, "vm-2")
+    await h.wait_phase(a.id, P.awaiting_cutover)
+    await h.wait_phase(b.id, P.awaiting_cutover)
+    dst.hold = asyncio.Event()
+    await h.orch.request_cutover(b.id, "sari", force_window=True)
+
+    async def b_reading():
+        return len(dst.reads) == 1
+
+    await _eventually(b_reading)
+    keep_b_in_its_pass.append("on")
+    await h.orch.request_sync(b.id, "sari")  # a keep-warm pass while its read is out
+    dst.hold.set()
+    await _gpu_outcome_with_room(h, b.id)
+    assert (await h.migration(b.id)).phase == P.syncing
+    dst.hold = None
+    await h.orch.request_cutover(a.id, "sari", force_window=True)
+
+    async def a_started():
+        return "vm-1" in started
+
+    await _eventually(a_started)
+    dst.free = dict(GATE_FULL)  # A's server holds the unit
+    gates.setdefault("vm-1", asyncio.Event()).set()
+    await h.wait_phase(a.id, P.completed)
+    passing.set()  # B's pass ends: B is back at its gate
+    m = await _gpu_wait(h, b.id)
+    await asyncio.sleep(0.1)  # many ticks
+    await h.orch.stop()
+    assert "vm-2" not in started and (m.gpu_wait.needed, m.gpu_wait.free) == (1, 0)
+
+
+async def test_a_cutover_of_a_vm_without_a_gpu_leaves_a_gpu_read_as_it_is(tmp_path, store):
+    """SDD §22.7 (G6 review): a cutover begun after a GPU read began drops the read only when it
+    asks of the pools the read counted: a VM without a GPU that cuts over meanwhile leaves it as it
+    is, and the GPU VM cuts over on that one read - no GPU VM starves behind other cutovers."""
+    h, plan, dst = await _gate_plan(
+        tmp_path, store, [gate_vm(1), vm(2)], {"default_strategy": Strategy.cold}
+    )
+    dst.free = dict(GATE_ROOM)
+    dst.hold = asyncio.Event()  # the GPU VM's read is out while the other VM cuts over
+    await h.orch.start()
+    gpu, other = await h.by_vm(plan.id, "vm-1"), await h.by_vm(plan.id, "vm-2")
+    await h.wait_phase(other.id, P.cutover, P.verifying, P.completed)
+    dst.hold.set()
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.orch.stop()
+    assert len(dst.reads) == 1
+    assert (await h.migration(gpu.id)).gpu_wait is None
+
+
+class TwoClassDestination(GateDestination):
+    """GateDestination with a second vGPU flavor, g1.mdev-x, of another resource class: a
+    CUSTOM_MDEV_X request, a vGPU by its declared profile (SDD §22.2)."""
+
+    MDEV = {"resources:CUSTOM_MDEV_X": "1"}
+    SIZE = {"name": "g1.mdev-x", "vcpus": 8, "ram_mb": 32768, "disk_gb": 80}
+
+    def gpu_flavor_list(self) -> list[dict]:
+        from seamless_migrate.planning.gpu import gpu_requests
+
+        return [
+            *super().gpu_flavor_list(),
+            {**self.SIZE, "gpus": gpu_requests(self.MDEV, "A100-4C")},
+        ]
+
+    async def inventory(self):
+        inv = await super().inventory()
+        inv.flavors.append({**self.SIZE, "extra_specs": dict(self.MDEV)})
+        return inv
+
+
+async def test_a_gpu_cutover_in_other_pools_leaves_a_gpu_read_as_it_is(tmp_path, store):
+    """SDD §22.7 (G6 review): a read is dropped for a cutover begun after it only when that cutover
+    asks of the pools it counted: two GPU VMs of two resource classes read at once, and the second
+    cuts over on its read though the first's cutover began after it."""
+    from seamless_migrate.domain.models import Mappings
+
+    room = {GATE_POOL: 1, "VGPU": 1, "CUSTOM_MDEV_X": 1}
+    mappings = Mappings(flavors={"g1.vgpu": GATE_FLAVOR, "g1.src2": "g1.mdev-x"})
+    h, plan, dst = await _gate_plan(
+        tmp_path,
+        store,
+        [gate_vm(1), gate_vm(2, flavor="g1.src2")],
+        {"default_strategy": Strategy.cold, "mappings": mappings},
+        dst=TwoClassDestination(free=room),
+    )
+    dst.free = dict(room)
+    dst.hold = asyncio.Event()
+    await h.orch.start()
+
+    async def both_read():
+        return len(dst.reads) == 2
+
+    await _eventually(both_read)
+    dst.hold.set()
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.orch.stop()
+    assert len(dst.reads) == 2, "neither read was made again"
+
+
+async def test_gpu_reads_start_only_while_a_cutover_slot_is_left(tmp_path, store):
+    """SDD §5.4 rule 5, §22.7 (G6 review): six GPU VMs at their gates and one cutover slot - one
+    read is out at a time, never one per VM -, and all six cut over in turn."""
+    settings = make_settings(tmp_path, max_concurrent_cutovers=1)
+    room = {GATE_POOL: 6, "VGPU": 6}
+    h, plan, dst = await _gate_plan(
+        tmp_path,
+        store,
+        [gate_vm(i) for i in range(1, 7)],
+        {"default_strategy": Strategy.cold},
+        dst=GateDestination(free=room),
+        settings=settings,
+    )
+    dst.free = dict(room)
+    dst.hold = asyncio.Event()
+    await h.orch.start()
+
+    async def reading():
+        return dst.reads
+
+    await _eventually(reading)
+    await asyncio.sleep(0.2)  # many ticks
+    assert (len(dst.reads), dst.flavor_reads) == (1, 1)
+    dst.hold.set()
+    await h.wait_plan(plan.id, PlanStatus.completed, timeout=20)
+    await h.orch.stop()
+    assert len(dst.reads) >= 6
+
+
+async def test_a_gpu_read_wakes_the_tick_and_counts_some_ticks_in_demo_mode(tmp_path, store):
+    """SDD §22.7 (G6 review): a read's answer wakes the tick, which takes it at once; in demo mode a
+    read counts its model minute but never under a few ticks, so at demo_speed 6000 the cutover
+    starts on its first reads instead of reading for ever."""
+    settings = make_settings(tmp_path, tick_s=2.0)  # no tick of its own soon after the read
+    h, plan, dst = await _gate_plan(
+        tmp_path, store, [gate_vm(1)], {"default_strategy": Strategy.cold}, settings=settings
+    )
+    dst.free = dict(GATE_ROOM)
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.cutover, P.verifying, P.completed, timeout=1.5)
+    await h.orch.stop()
+
+    settings = make_settings(tmp_path / "demo", demo=True, demo_speed=6000.0, tick_s=0.1)
+    h, plan, dst = await _gate_plan(
+        tmp_path / "demo",
+        store,
+        [gate_vm(2)],
+        {"default_strategy": Strategy.cold},
+        settings=settings,
+    )
+    dst.free = dict(GATE_ROOM)
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-2")).id
+    await h.wait_phase(mid, P.cutover, P.verifying, P.completed, timeout=6)
+    await h.orch.stop()
+    assert len(dst.reads) <= 3
+
+
+async def test_a_passthrough_vm_mapped_to_a_vgpu_flavor_waits_for_gpu_capacity(tmp_path, store):
+    """SDD §22.4, §22.7 (G6 review): a 17.1 VM with a PCI passthrough GPU that its plan maps to an
+    18.0 vGPU flavor - a change of kind the pre-flight accepts - is read for like any GPU VM: the
+    pool empties after the validation, and it waits; once the unit is free, it cuts over."""
+    from seamless_migrate.domain.models import Mappings
+
+    passthrough = gate_vm(
+        1, flavor="p1.src", flavor_extra_specs={"pci_passthrough:alias": "a100:1"}
+    )
+    plan_kw = {
+        "default_strategy": Strategy.cold,
+        "mappings": Mappings(flavors={"p1.src": GATE_FLAVOR}),
+    }
+    h, plan, dst = await _gate_plan(tmp_path, store, [passthrough], plan_kw)
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    m = await _gpu_wait(h, mid)
+    assert (m.phase, m.gpu_wait.pool, m.gpu_wait.needed, m.gpu_wait.free) == (
+        P.ready,
+        GATE_POOL,
+        1,
+        0,
+    )
+    dst.free = dict(GATE_ROOM)
+    h.clock.advance(61)
+    m = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert m.gpu_wait is None
+
+
+async def test_a_crashed_gpu_read_holds_the_cutover_and_says_so(tmp_path, store, caplog):
+    """SDD §22.7 (G6 review): a read that fails outside the destination's answers - here the store
+    it counts the other cutovers from - holds the cutover, as a read without room does, and the
+    log says so; the next read, a minute later, lets it cut over."""
+    h, plan, dst = await _gate_plan(
+        tmp_path, store, [gate_vm(1)], {"default_strategy": Strategy.cold}
+    )
+    dst.free = dict(GATE_ROOM)  # room: only the crash could hold it
+    crashed: list[bool] = []
+    count = h.orch._cutovers_without_server
+
+    async def crashing(*args):
+        if not crashed:
+            crashed.append(True)
+            raise RuntimeError("the store went away")
+        return await count(*args)
+
+    h.orch._cutovers_without_server = crashing
+    caplog.set_level(logging.WARNING, logger="seamless_migrate.orchestrator")
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+
+    async def crash_seen():
+        return crashed
+
+    await _eventually(crash_seen)
+    await asyncio.sleep(0.2)  # many ticks
+    assert (await h.migration(mid)).phase == P.ready
+    assert "its cutover waits for the next read" in caplog.text
+    h.clock.advance(61)
+    await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+
+
+async def test_a_restarted_orchestrator_goes_on_with_a_stored_gpu_wait(tmp_path, store):
+    """SDD §4.3, §22.7 (G6 review): after a restart the stored wait goes on - the new process's
+    first read finds no room and updates it, emitting no second migration.gpu_wait (waiting true)
+    -, and a read with room ends it once."""
+    h, plan, dst = await _gate_plan(
+        tmp_path, store, [gate_vm(1)], {"default_strategy": Strategy.cold}
+    )
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    first = (await _gpu_wait(h, mid)).gpu_wait
+    await h.orch.stop()
+    restarted = build_harness(tmp_path, store, [gate_vm(1)], destination=dst, clock=h.clock)
+    await restarted.orch.start()
+    again = (await _gpu_wait(restarted, mid, after=first.checked_at)).gpu_wait
+    assert again.since == first.since
+    dst.free = dict(GATE_ROOM)
+    restarted.clock.advance(61)
+    await restarted.wait_phase(mid, P.completed)
+    await restarted.orch.stop()
+    assert [e.data["waiting"] for e in _gpu_events(restarted, mid)] == [True, False]
+
+
+async def test_two_gpu_cutovers_with_room_for_both_both_cut_over(tmp_path, store):
+    """SDD §22.7 (G6 review): two GPU VMs whose reads find room for both cut over, though each read
+    was made before the other's cutover began - the second one reads again and counts the first."""
+    room = {GATE_POOL: 2, "VGPU": 2}
+    h, plan, dst = await _gate_plan(
+        tmp_path,
+        store,
+        [gate_vm(1), gate_vm(2)],
+        {"default_strategy": Strategy.cold},
+        dst=GateDestination(free=room),
+    )
+    dst.free = dict(room)
+    await h.orch.start()
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.orch.stop()
+    assert all(m.phase == P.completed for m in await h.migrations(plan.id))
+    assert "migration.gpu_wait" not in h.kinds()
+
+
+async def test_a_read_in_flight_across_a_validation_is_not_recorded_on_the_new_stay(
+    tmp_path, store
+):
+    """SDD §22.7 (G6 review): a read still out when a validation takes the migration through
+    validating answers after it - no room -, and is recorded on no stay: the migration it was made
+    for left its gate. Started again, the new stay reads for itself."""
+    h, plan, dst = await _gate_plan(
+        tmp_path, store, [gate_vm(1)], {"default_strategy": Strategy.cold}
+    )
+    dst.hold = asyncio.Event()
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+
+    async def reading():
+        return dst.reads
+
+    await _eventually(reading)
+    await h.orch.pause_plan(plan.id, "alice")
+    dst.free = dict(GATE_ROOM)  # the validation sees room
+    await h.orch.validate_plan(plan.id, "alice")
+    dst.free = dict(GATE_FULL)
+    dst.hold.set()  # the read made before the validation answers: no room
+    await asyncio.sleep(0.2)
+    m = await h.migration(mid)
+    assert (m.phase, m.gpu_wait, _gpu_events(h, mid)) == (P.ready, None, [])
+    assert mid not in h.orch._gpu_outcomes
+    dst.hold = None
+    await h.orch.start_plan(plan.id, "alice")
+    await _gpu_wait(h, mid)
+    await h.orch.stop()
+    assert len(dst.reads) == 2
+
+
+async def test_a_migration_held_by_its_advisor_decision_is_not_read_for(tmp_path, store):
+    """SDD §5.4, §14.6 (G6 review): a migration whose advisor decision waits for approval starts
+    no cutover, so no GPU capacity is read for it; once the hold is gone, it is."""
+    h, plan, dst = await _gate_plan(
+        tmp_path, store, [gate_vm(1)], {"default_strategy": Strategy.cold}
+    )
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    cur, v = await h.orch._load(mid)
+    cur.advisor_hold = "rec-000000000001"
+    await h.orch._save(cur, v)
+    await h.orch.start()
+    await asyncio.sleep(0.2)  # many ticks
+    assert (dst.flavor_reads, len(dst.reads)) == (0, 0)
+    async with h.orch._lock(mid):
+        cur, v = await h.orch._load(mid)
+        cur.advisor_hold = None
+        await h.orch._save(cur, v)
+    await _gpu_wait(h, mid)
+    await h.orch.stop()
+    assert len(dst.reads) == 1
 
 
 async def test_step_timeout_fails_the_attempt_and_rolls_back_after_a_stop(tmp_path, store):

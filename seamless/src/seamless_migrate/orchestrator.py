@@ -22,7 +22,7 @@ import logging
 import random
 import time
 import weakref
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -387,6 +387,12 @@ SOURCE_RUNS_AGAIN = "the source VM runs again: stop it, or roll it back, before 
 #: a GPU capacity read counts this long from its answer - model time in demo mode (SDD §5.4 rule
 #: 5, §22.7); while rules 1-4 hold, an older one is read again
 GPU_READ_S = 60.0
+#: in demo mode a read counts at least this many ticks, wall time: the model runs faster, the
+#: tick's own work and its locks do not (SDD §22.7)
+GPU_READ_FLOOR_TICKS = 3
+#: per destination, the cutovers begun that a read's re-check looks back on (SDD §22.7); a read
+#: older than all of them no longer counts
+CUTOVERS_BEGUN_KEPT = 512
 
 
 @dataclass(frozen=True)
@@ -394,7 +400,7 @@ class _GpuRead:
     """What one GPU capacity read found (SDD §5.4 rule 5, §22.7): whether the cutover may start,
     else what holds it - the pool, the units needed and free, why, and whether the read failed -;
     the units needed and free it found by pool name; and what the check under the locks needs -
-    the cutovers it counted, the pools the flavor asks of and the GPU flavors it listed."""
+    the pools the flavor asks of, the GPU flavors it listed and the cutovers begun before it."""
 
     room: bool
     pool: str = ""
@@ -403,9 +409,21 @@ class _GpuRead:
     reason: str = ""
     failed: bool = False
     found: dict[str, tuple[int, int]] = field(default_factory=dict)
-    counted: frozenset[str] = frozenset()
     keys: frozenset[PoolKey] = frozenset()
     flavors: tuple[dict[str, Any], ...] = ()
+    #: how many cutovers the process had begun on the destination when the read began
+    begun: int = 0
+
+
+@dataclass
+class _CutoversBegun:
+    """The cutovers this process began on one destination (SDD §22.7): how many, and the latest of
+    them, numbered by that count - the ones a read made earlier may not have counted."""
+
+    count: int = 0
+    latest: deque[tuple[int, str]] = field(
+        default_factory=lambda: deque(maxlen=CUTOVERS_BEGUN_KEPT)
+    )
 
 
 @dataclass(frozen=True)
@@ -416,14 +434,6 @@ class _GpuOutcome:
     at: datetime
     mark: datetime | None
     read: _GpuRead
-
-
-def _reads_gpu_capacity(vm: VMRef) -> bool:
-    """Whether rule 5 reads for ``vm``'s cutover (SDD §5.4 rule 5, §22.7): one of its own GPUs is
-    a vGPU (§22.2). A VM whose GPUs are all passthrough devices is told apart without a read - the
-    PCI alias its GPU flavor asks for has no capacity any API shows (§22.5) -, so its cutover never
-    waits on one."""
-    return any(device.kind == "vgpu" for device in vm_gpus(vm))
 
 
 def _wait_mark(m: Migration) -> datetime | None:
@@ -662,6 +672,9 @@ class Orchestrator:
         self._gpu_reads: dict[str, asyncio.Task[None]] = {}
         #: per migration at its cutover gate, its last GPU capacity read's outcome (SDD §22.7)
         self._gpu_outcomes: dict[str, _GpuOutcome] = {}
+        #: per destination provider, the cutovers this process began: a read notes their count
+        #: when it begins, and one begun since makes it stale whatever phase it is in now (§22.7)
+        self._cutovers_begun: defaultdict[str, _CutoversBegun] = defaultdict(_CutoversBegun)
         self._drivers: dict[str, asyncio.Task[None]] = {}
         #: migration id -> (crashes in a row, monotonic time of the last one): relaunch backoff
         self._driver_crashes: dict[str, tuple[int, float]] = {}
@@ -2482,10 +2495,13 @@ class Orchestrator:
     # ------------------------------------------------------------------------------------------
     # the cutover gate's fifth rule: GPU capacity (SDD §5.4 rule 5, §22.7)
     def _gpu_read_s(self) -> float:
-        """How long a GPU capacity read counts from its answer: GPU_READ_S, ÷ demo_speed in demo
-        mode, as the source watch scales its interval (SDD §5.4 rule 5, §8.1)."""
-        scale = max(self.settings.demo_speed, 1.0) if self.settings.demo else 1.0
-        return GPU_READ_S / scale
+        """How long a GPU capacity read counts from its answer (SDD §5.4 rule 5, §22.7): GPU_READ_S;
+        in demo mode ÷ demo_speed, as the source watch scales its interval (§8.1), but never under
+        GPU_READ_FLOOR_TICKS ticks - the model runs faster, the tick's own work does not."""
+        if not self.settings.demo:
+            return GPU_READ_S
+        scaled = GPU_READ_S / max(self.settings.demo_speed, 1.0)
+        return max(scaled, GPU_READ_FLOOR_TICKS * self.settings.tick_s)
 
     def _gpu_outcome(self, m: Migration, now: datetime) -> _GpuOutcome | None:
         """``m``'s last GPU capacity read while it counts: answered at most ``_gpu_read_s`` ago, in
@@ -2497,24 +2513,28 @@ class Orchestrator:
             return None
         return outcome
 
-    def _gpu_gate(self, m: Migration, now: datetime) -> bool:
+    def _gpu_gate(self, m: Migration, now: datetime, cutovers: int) -> bool:
         """Rule 5 on the tick's snapshot, once rules 1-4 hold (SDD §5.4, §22.7): a GPU VM's cutover
         starts on a read that counts and found room; without one, a read starts - a task of its
-        own, which the tick never waits for - and the cutover waits."""
-        if not _reads_gpu_capacity(m.vm):
+        own, which the tick never waits for - while a cutover slot is left for it, the
+        ``cutovers`` in cutover and the reads already out taking theirs; the cutover waits."""
+        if not vm_gpus(m.vm):
             return True
         outcome = self._gpu_outcome(m, now)
         if outcome is None:
-            self._start_gpu_read(m.id)
+            reading = {mid for mid, task in self._gpu_reads.items() if not task.done()}
+            if m.id in reading or cutovers + len(reading) < self.settings.max_concurrent_cutovers:
+                self._start_gpu_read(m.id)
             return False
         return outcome.read.room
 
     async def _gpu_room_now(self, m: Migration) -> bool:
         """Rule 5 under the locks (SDD §5.4, §22.7): ``m``'s read still counts and found room, and
-        no cutover it did not count has started since on the destination asking of the pools it
-        read - else the read is dropped, and the next tick reads again. Two GPU migrations that
-        read at once never both cut over on one free unit."""
-        if not _reads_gpu_capacity(m.vm):
+        no cutover has begun on the destination since the read began, asking of the pools it read
+        - whatever phase that migration is in now: its server may hold the unit the read found
+        free (one the read counted only delays). Else the read is dropped, and the next tick reads
+        again."""
+        if not vm_gpus(m.vm):
             return True
         outcome = self._gpu_outcome(m, self._now())
         if outcome is None or not outcome.read.room:
@@ -2523,19 +2543,38 @@ class Orchestrator:
         if not read.keys:
             return True  # nothing was counted against free units: an alias, unknown capacity
         plan = await self._plan(m.plan_id)
+        begun = self._cutovers_begun[plan.destination_provider_id]
+        if begun.count == read.begun:
+            return True
+        latest = list(begun.latest)
+        if latest[0][0] > read.begun + 1:
+            return self._drop_gpu_outcome(m.id)  # some begun since are no longer kept: read again
         kinds: dict[str, ProviderKind] = {}
-        for other, other_plan in await self._cutovers_without_server(
-            plan.destination_provider_id, m.id
-        ):
-            if other.id in read.counted:
+        for number, other_id in latest:
+            if number <= read.begun or other_id == m.id:
                 continue
-            kind = await self._source_kind(other_plan, kinds)
+            try:
+                other, _ = await self._load(other_id)
+                other_plan = await self._plan(other.plan_id)
+                kind = await self._source_kind(other_plan, kinds)
+            except NotFound:
+                return self._drop_gpu_outcome(m.id)  # nothing tells what it asks: read again
             flavor = server_gpu_flavor(other.vm, other_plan, read.flavors, kind)
             if flavor is not None and not read.keys.isdisjoint(gpu_units(flavor["gpus"])):
-                self._gpu_outcomes.pop(m.id, None)
-                self.wake()
-                return False
+                return self._drop_gpu_outcome(m.id)
         return True
+
+    def _drop_gpu_outcome(self, mid: str) -> bool:
+        """Drop ``mid``'s read and wake the tick to read again: False, the cutover waits."""
+        self._gpu_outcomes.pop(mid, None)
+        self.wake()
+        return False
+
+    def _cutover_begun(self, destination_id: str, mid: str) -> None:
+        """Count a cutover begun on the destination, for the reads made before it (SDD §22.7)."""
+        begun = self._cutovers_begun[destination_id]
+        begun.count += 1
+        begun.latest.append((begun.count, mid))
 
     def _start_gpu_read(self, mid: str) -> None:
         """Start ``mid``'s GPU capacity read as a task of its own, one per migration at a time;
@@ -2560,6 +2599,9 @@ class Orchestrator:
                 return
             mark, gated = _wait_mark(m), True
             plan = await self._plan(m.plan_id)
+            # the cutovers begun on its destination so far: one begun after this, which the read
+            # may not count, makes it stale (SDD §22.7)
+            begun = self._cutovers_begun[plan.destination_provider_id].count
             source = await self.db.get("provider", plan.source_provider_id, Provider)
             destination = await self.db.get("provider", plan.destination_provider_id, Provider)
             flavor = gpu_flavor(m.vm, plan, source.kind)
@@ -2568,12 +2610,18 @@ class Orchestrator:
                 others = await self._cutovers_without_server(destination.id, mid)
                 client = self.providers.get(destination)
                 read = await self._gpu_capacity_read(client, flavor, others, destination.label)
+                read = replace(read, begun=begun)
             # when the destination answered: one read may take minutes (§8.1)
             await self._record_gpu_read(mid, mark, read, self._now(), destination.label)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.warning("the GPU capacity read of %s failed", mid, exc_info=True)
+            # held, as a read without room: the source keeps running (SDD §22.7)
+            log.warning(
+                "the GPU capacity read of %s failed: its cutover waits for the next read",
+                mid,
+                exc_info=True,
+            )
             if gated:
                 self._gpu_outcomes[mid] = _GpuOutcome(self._now(), mark, _GpuRead(room=False))
         finally:
@@ -2588,22 +2636,17 @@ class Orchestrator:
         yet - ask of its pools, by the pre-flight's rule (SDD §22.5, §22.7). Capacity Placement
         does not show, a PCI alias and a flavor without a vGPU request leave room; a failed read
         holds the cutover, named by its status or kind (§22.12)."""
-        counted = frozenset(other.id for other, _ in others)
-        if not (hasattr(client, "gpu_flavors") and hasattr(client, "gpu_capacity")):
-            # a destination that offers no GPU read - a test double -: nothing can be read, as
-            # without Placement, and nothing holds the cutover
-            return _GpuRead(room=True, counted=counted)
         try:
             flavors = tuple(await client.gpu_flavors())
         except Exception as exc:
             reason = f"the GPU flavors of {where} could not be read ({_failure_kind(exc)})"
-            return _GpuRead(room=False, failed=True, reason=reason, counted=counted)
+            return _GpuRead(room=False, failed=True, reason=reason)
         listed = next((f for f in flavors if f.get("name") == flavor), None)
         vgpus = [g for g in (listed or {}).get("gpus", []) if g.kind == "vgpu" and g.resource_class]
         if not vgpus:
             # a PCI alias, whose devices nova.conf configures, or a flavor that asks for no vGPU
             # or is gone - the cutover refuses such a mapping before the source stops (§22.4)
-            return _GpuRead(room=True, counted=counted, flavors=flavors)
+            return _GpuRead(room=True, flavors=flavors)
         own = gpu_units(vgpus)
         asked = dict(own)
         kinds: dict[str, ProviderKind] = {}
@@ -2621,7 +2664,7 @@ class Orchestrator:
             "pool": pool_name(first.resource_class or "", first.traits, first.forbidden_traits),
             "needed": asked[first_key],
         }
-        common = {"counted": counted, "keys": frozenset(own), "flavors": flavors}
+        common = {"keys": frozenset(own), "flavors": flavors}
         try:
             capacity = await client.gpu_capacity(vgpus)
         except Exception as exc:
@@ -2630,7 +2673,7 @@ class Orchestrator:
         if capacity.status != "ok":
             if capacity.reason in ("forbidden", "no_placement"):
                 # nothing can be read, and the pre-flight warned (DST_GPU_CAPACITY_UNKNOWN)
-                return _GpuRead(room=True, counted=counted, flavors=flavors)
+                return _GpuRead(room=True, flavors=flavors)
             why = capacity.detail or capacity.reason or "error"
             reason = f"the GPU capacity of {where} could not be read ({why})"
             return _GpuRead(room=False, failed=True, reason=reason, **held, **common)
@@ -2702,6 +2745,7 @@ class Orchestrator:
                 else:
                     await self._save(cur, v)
             self._gpu_outcomes[mid] = _GpuOutcome(answered, mark, read)
+        self.wake()  # a read counts for a while only: the tick takes it at once (SDD §22.7)
 
     async def _cutovers_without_server(
         self, destination_id: str, exclude: str
@@ -3237,7 +3281,9 @@ class Orchestrator:
                 continue  # waits for a cutover slot: keep-warm passes go on meanwhile
             if counts["steps"] >= limit_steps or (m.phase == P.ready and not wave_room(m)):
                 continue
-            if not self._gpu_gate(m, now):
+            if m.advisor_hold is not None:
+                continue  # its advisor decision waits for approval: no read, no step (§14.6)
+            if not self._gpu_gate(m, now, counts["cutover"]):
                 continue  # it waits for GPU capacity, or for a read of it (SDD §5.4 rule 5)
             if await self._begin(
                 m.id, {P.ready, P.awaiting_cutover}, P.cutover, "cutover gate open"
@@ -3317,7 +3363,8 @@ class Orchestrator:
         if _lock_busy(plan_lock) or _lock_busy(mig_lock):
             return False
         async with plan_lock, mig_lock:
-            if (await self._plan(plan_id)).status != PlanStatus.running:
+            plan = await self._plan(plan_id)
+            if plan.status != PlanStatus.running:
                 return False
             m, v = await self._load(mid)
             if m.phase not in allowed:
@@ -3347,6 +3394,7 @@ class Orchestrator:
             await self._transition(m, v, to, reason)
             if to == P.cutover:
                 self._gpu_outcomes.pop(mid, None)  # one read, one cutover: a retry reads anew
+                self._cutover_begun(plan.destination_provider_id, mid)
         self._launch(mid)
         return True
 
