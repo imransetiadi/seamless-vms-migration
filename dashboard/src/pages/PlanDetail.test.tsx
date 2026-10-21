@@ -58,6 +58,50 @@ describe('PlanDetail', () => {
     expect(within(table).getAllByRole('row')).toHaveLength(11);
   });
 
+  it("edits a plan's GPU mappings: a row shows the plan's own, None removes it, and a key no selected VM has keeps its mapping (SDD §16, §22.4)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const created = await createTestClient(server, 'operator').post<Plan>('/plans', {
+      name: 'ML edit',
+      source_provider_id: 'vcenter-hq',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: ['vm-5007'],
+      mappings: { networks: { 'VM Network ERP': 'erp-net' }, flavors: {}, volume_types: {}, projects: {}, gpus: { 'grid_a100-4c': 'g1.a100-4c', '10de:20b5': 'p1.a100' } },
+    });
+    renderWithApp(<PlanDetail />, { route: `/plans/${created.id}`, path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const row = await within(dialog).findByRole('combobox', { name: 'grid_a100-4c: 1 VM, 8 vCPUs, 32 GiB' });
+    // the plan's choice, never one the form makes
+    expect(row).toHaveValue('g1.a100-4c');
+    await user.selectOptions(row, '');
+    await user.click(within(dialog).getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(server.plans.find((p) => p.id === created.id)!.mappings.gpus).toEqual({ '10de:20b5': 'p1.a100' }));
+  });
+
+  it('marks a migration waiting for GPU capacity', async () => {
+    const server = createTestServer();
+    const billing = server.migrations.find((m) => m.vm.name === 'app-billing-01')!;
+    billing.gpu_wait = {
+      since: '2026-10-08T11:58:00Z',
+      checked_at: '2026-10-08T11:59:30Z',
+      pool: 'VGPU CUSTOM_NVIDIA_A100_3_20C',
+      needed: 1,
+      free: 0,
+      reason: "VGPU CUSTOM_NVIDIA_A100_3_20C of RHOSO 18.0 — Production has 0 units free, and flavor 'g1.a100-3-20c' needs 1",
+    };
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-4f2a9c1e', path: '/plans/:planId', token: 'viewer', server });
+    const table = await screen.findByRole('table', { name: /migrations/i });
+    const row = within(table).getByRole('link', { name: 'app-billing-01' }).closest('tr')!;
+    // under its phase, as a wait: its words, never colour alone
+    const phase = within(row).getAllByRole('cell')[0]!;
+    expect(phase).toHaveTextContent('Waiting for GPU capacity');
+    expect(within(table).getAllByText('Waiting for GPU capacity')).toHaveLength(1);
+    // a GPU element: its Technology Preview badge in words, a focusable term (SDD §16, §22.11)
+    expect(within(phase).getByRole('button', { name: 'Technology Preview' })).toBeInTheDocument();
+    expect(within(table).getAllByRole('button', { name: 'Technology Preview' })).toHaveLength(1);
+  });
+
   it("names a destination stored with a blank name by its id in the plan's settings (SDD §1 naming, §4.2, review RV21-06)", async () => {
     const server = createTestServer();
     server.providers.find((p) => p.id === 'rhoso-prod')!.name = '   ';
@@ -1604,19 +1648,21 @@ describe('PlanDetail', () => {
     expect(saved.mappings.gpus).toEqual({ 'grid_a100-4c': 'g1.a100-4c' });
   });
 
-  it('counts only the mappings it lists: GPU mappings wait for G12 (SDD §16, §22.11, PR #57 review)', async () => {
+  it('lists and counts a plan\'s GPU mappings with its other mappings, with their Technology Preview badge (SDD §16, §22.11, PR #57 review, G12 review)', async () => {
+    const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
-    // set through the API or `seamless plan apply`: the page lists GPU mappings from plan task G12 on
     const gpus = { 'grid_a100-4c': 'g1.a100-4c' };
     plan.mappings = { networks: { 'app-net': 'tenant-app', 'db-net': 'tenant-db' }, flavors: {}, volume_types: {}, projects: {}, gpus };
     const first = renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
-    expect(await screen.findByText('2 source → destination mappings')).toBeInTheDocument();
+    expect(await screen.findByText('3 source → destination mappings')).toBeInTheDocument();
     first.unmount();
-    // GPU mappings alone: no Mappings entry that opens onto an empty list
+    // GPU mappings alone are a Mappings entry too, listed by kind with their badge
     plan.mappings = { networks: {}, flavors: {}, volume_types: {}, projects: {}, gpus };
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
-    await screen.findByRole('group', { name: /plan actions/i });
-    expect(screen.queryByText(/source → destination mapping/)).not.toBeInTheDocument();
+    await user.click(await screen.findByText('1 source → destination mapping'));
+    const list = screen.getByText('GPUs', { selector: 'p' }).parentElement!;
+    expect(list).toHaveTextContent('grid_a100-4c → g1.a100-4c');
+    expect(within(list).getByRole('button', { name: 'Technology Preview' })).toBeInTheDocument();
   });
 });

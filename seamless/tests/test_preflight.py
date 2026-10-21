@@ -76,7 +76,15 @@ def dst_inv(**kw) -> DestinationInventory:
 
 
 def check(
-    vm=None, plan=None, src=None, dst=None, all_vms=None, source=SRC, destination=DST, dst_caps=None
+    vm=None,
+    plan=None,
+    src=None,
+    dst=None,
+    all_vms=None,
+    source=SRC,
+    destination=DST,
+    dst_caps=None,
+    shares=None,
 ):
     vm = vm or make_vm()
     return run_preflight(
@@ -88,6 +96,7 @@ def check(
         source=source,
         destination=destination,
         dst_caps=dst_caps,
+        shares=shares,
     )
 
 
@@ -3421,16 +3430,28 @@ def test_the_shared_handover_finding_cases(case):
     mock words the same way (mockData.test.ts); `others` are the plan's other selected VMs,
     `source_kind` the source provider's kind and `gpu_profiles` its declared profiles; a network
     case's `destination` gives the destination's label, networks, subnets, the token's roles and
-    the policy profile. A code a case expects as null is not found (PR #64 review)."""
+    the policy profile, a GPU case's its flavors, the profiles it declares and its GPU capacity,
+    and `phases` the phase of the plan's migration of a VM that has one, by which its share is
+    counted (quota_share, §9.3, §22.5). A code a case expects as null is not found (PR #64 review);
+    `severities` and `remediations` give a finding's own where they are not its catalog's (a
+    MAP_GPU_FLAVOR warning, plan task G12)."""
     plan = make_plan(**case["plan"])
     vm = VMRef.model_validate(case["vm"])
     others = [VMRef.model_validate(other) for other in case.get("others", [])]
     source = VMWARE if case.get("source_kind") == "vmware" else SRC
     if "gpu_profiles" in case:
         source = source.model_copy(update={"gpu_profiles": case["gpu_profiles"]})
-    found = check(vm, plan=plan, all_vms=[vm, *others], source=source, **_destination(case))
+    shares = {vm_id: quota_share(Phase(phase)) for vm_id, phase in case.get("phases", {}).items()}
+    found = check(
+        vm, plan=plan, all_vms=[vm, *others], source=source, shares=shares, **_destination(case)
+    )
     messages = {f.code: f.message for f in found}
     assert {code: messages.get(code) for code in case["expected"]} == case["expected"]
+    by_code = {f.code: f for f in found}
+    severities = case.get("severities", {})
+    assert {code: by_code[code].severity.value for code in severities} == severities
+    remediations = case.get("remediations", {})
+    assert {code: by_code[code].remediation for code in remediations} == remediations
 
 
 def test_the_kits_names_judge_a_vmware_sources_vms_only_and_once():
@@ -3476,16 +3497,36 @@ def test_the_kits_names_judge_a_vmware_sources_vms_only_and_once():
 
 
 def _destination(case):
-    """check()'s destination for a finding case: its own when the case gives one (SDD §9.3)."""
+    """check()'s destination for a finding case: its own when the case gives one (SDD §9.3) - with
+    its flavors, its GPU flavors among them as its inventory lists them with the profiles it
+    declares, and its GPU capacity, when the case gives them (§22.3, plan task G12)."""
     dest = case.get("destination")
     if dest is None:
         return {}
     details = dest["networks"]
+    gpu = {}
+    if "flavors" in dest:
+        declared = dest.get("gpu_profiles", {})
+        gpu["flavors"] = dest["flavors"]
+        gpu["gpu_flavors"] = [
+            {**{key: f[key] for key in ("name", "vcpus", "ram_mb", "disk_gb")}, "gpus": gpus}
+            for f in dest["flavors"]
+            if (gpus := gpu_requests(f["extra_specs"], declared.get(f["name"])))
+        ]
+    if "gpu_capacity" in dest:
+        capacity = dest["gpu_capacity"]
+        gpu["gpu_capacity"] = GpuCapacity(
+            status=capacity["status"],
+            reason=capacity.get("reason"),
+            detail=capacity.get("detail"),
+            pools=[GpuPool(**pool) for pool in capacity["pools"]],
+        )
     return {
         "dst": dst_inv(
             networks={n["name"]: n.get("mtu") for n in details},
             network_details=details,
             subnets=dest.get("subnets", []),
+            **gpu,
         ),
         "destination": make_provider(
             id="dst-case",

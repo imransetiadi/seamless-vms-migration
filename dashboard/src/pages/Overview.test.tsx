@@ -331,6 +331,38 @@ describe('Overview page (mock data)', () => {
     expect(within(attention).getByRole('link', { name: 'gpu-render-01' })).toBeInTheDocument();
   });
 
+  it('lists a migration waiting for GPU capacity in Needs attention', async () => {
+    const server = createTestServer();
+    const billing = server.migrations.find((m) => m.vm.name === 'app-billing-01')!;
+    // the gate's other rules hold - an approval that counts, a cutover request, no window - and a read found no room
+    server.plans.find((p) => p.id === billing.plan_id)!.cutover_window = null;
+    Object.assign(billing, {
+      approvals: [{ actor: 'sari', at: new Date().toISOString(), comment: null }],
+      cutover_requested: true,
+      gpu_wait: {
+        since: new Date(Date.now() - 120_000).toISOString(),
+        checked_at: new Date(Date.now() - 20_000).toISOString(),
+        pool: 'VGPU CUSTOM_NVIDIA_A100_3_20C',
+        needed: 1,
+        free: 0,
+        reason: "VGPU CUSTOM_NVIDIA_A100_3_20C of RHOSO 18.0 — Production has 0 units free, and flavor 'g1.a100-3-20c' needs 1",
+      },
+    });
+    renderWithApp(<Overview />, { server });
+    const attention = await screen.findByRole('region', { name: 'Needs attention' });
+    const link = await within(attention).findByRole('link', { name: 'app-billing-01' });
+    const item = link.closest('li')!;
+    expect(item).toHaveTextContent('Waiting for GPU capacity: VGPU CUSTOM_NVIDIA_A100_3_20C, 0 free, needs 1');
+    expect(item).toHaveTextContent('Next: Wait, or free GPU capacity on the destination: the cutover starts once a read finds room');
+    // a GPU element: its Technology Preview badge in words, a focusable term (SDD §16, §22.11); none for the others
+    expect(within(item).getByRole('button', { name: 'Technology Preview' })).toBeInTheDocument();
+    expect(within(attention).getAllByRole('button', { name: 'Technology Preview' })).toHaveLength(1);
+    // a wait, not an approval: the inbox does not list it
+    const inbox = screen.getByRole('region', { name: 'Pending approvals' });
+    await within(inbox).findByRole('listitem', { name: 'analytics-node-2' });
+    expect(within(inbox).queryByRole('listitem', { name: 'app-billing-01' })).not.toBeInTheDocument();
+  });
+
   it('lists the pending approvals of both kinds once, each with its kind, filtered by kind (SDD §16, ADV-20)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Overview />);

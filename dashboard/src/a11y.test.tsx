@@ -6,7 +6,9 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import App from './App';
 import { ApiClient } from './api/client';
 import { createMockFetch, type MockServer } from './api/mock';
-import type { DestinationInventory } from './api/types';
+import { makeVm } from './api/mockData';
+import type { DestinationInventory, VMRef } from './api/types';
+import { gpuDevice } from './lib/gpu';
 import { createTestServer } from './test/utils';
 
 /*
@@ -170,6 +172,76 @@ describe('axe-core: no WCAG violations', () => {
     await user.click(within(section).getByRole('button', { name: 'Add vGPU profile' }));
     await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
     await within(dialog).findByRole('alert');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it("the plan form's GPU mappings, with a flavor that does not fit and a device no mapping can take (SDD §16, §22.11)", async () => {
+    const user = userEvent.setup({ delay: null });
+    // mounted in #root as main.tsx mounts the app: the open dialog makes #root inert
+    const root = document.body.appendChild(Object.assign(document.createElement('div'), { id: 'root' }));
+    renderAt(
+      '/plans',
+      'operator',
+      (server) => {
+        const inventory = server.inventories['vcenter-hq'] as VMRef[];
+        inventory.push(makeVm({ id: 'vm-5011', name: 'dc2-fpga-01', disks: [{ size_gb: 40, kind: 'vmdk', volume_type: null }], gpus: [gpuDevice({ kind: 'passthrough' })] }));
+      },
+      root,
+    );
+    await screen.findByRole('heading', { level: 1, name: 'Plans' }, { timeout: 8_000 });
+    await settled();
+    await user.click(screen.getByRole('button', { name: 'New plan' }));
+    const dialog = await screen.findByRole('dialog', { name: 'New migration plan' });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'vcenter-hq');
+    await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select dc2-ml-02' }));
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Select dc2-fpga-01' }));
+    const row = within(dialog).getByRole('combobox', { name: 'grid_a100-3-20c: 1 VM, 16 vCPUs, 64 GiB' });
+    await within(row).findByRole('option', { name: /^g1\.a100-4c:/ });
+    await user.selectOptions(row, 'g1.a100-4c');
+    expect(row).toHaveAccessibleDescription(/Does not fit dc2-ml-02/);
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it("a migration's GPU panel while its cutover waits for GPU capacity (SDD §16, §22.11)", async () => {
+    renderAt('/migrations/mig-9e4f6a8b51', 'viewer', (server) => {
+      // a VMware migration of the MIG-backed vGPU VM, its key mapped, waiting at its gate (SDD §22.7)
+      const m = server.migrations.find((x) => x.id === 'mig-9e4f6a8b51')!;
+      m.vm = (server.inventories['vcenter-hq'] as VMRef[]).find((v) => v.source_id === 'vm-5008')!;
+      const plan = server.plans.find((p) => p.id === m.plan_id)!;
+      plan.mappings = { ...plan.mappings, gpus: { 'grid_a100-3-20c': 'g1.a100-3-20c' } };
+      m.gpu_wait = {
+        since: '2026-10-08T11:58:00Z',
+        checked_at: '2026-10-08T11:59:30Z',
+        pool: 'VGPU CUSTOM_NVIDIA_A100_3_20C',
+        needed: 1,
+        free: 0,
+        reason: "VGPU CUSTOM_NVIDIA_A100_3_20C of RHOSO 18.0 — Production has 0 units free, and flavor 'g1.a100-3-20c' needs 1",
+      };
+    });
+    expect(await screen.findByRole('heading', { level: 1, name: 'dc2-ml-02' }, { timeout: 8_000 })).toBeInTheDocument();
+    await settled();
+    await within(screen.getByRole('region', { name: 'GPU' })).findByText(/^Waiting for GPU capacity: 0 free of 1/);
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it.each([
+    ['/', 'Overview'],
+    ['/plans/plan-4f2a9c1e', 'DC1 → RHOSO production rollout'],
+  ])("%s with a migration waiting for GPU capacity, its Technology Preview badge (SDD §16, §22.11)", async (path, heading) => {
+    renderAt(path, 'viewer', (server) => {
+      const billing = server.migrations.find((m) => m.vm.name === 'app-billing-01')!;
+      server.plans.find((p) => p.id === billing.plan_id)!.cutover_window = null;
+      Object.assign(billing, {
+        approvals: [{ actor: 'sari', at: new Date().toISOString(), comment: null }],
+        cutover_requested: true,
+        gpu_wait: { since: new Date().toISOString(), checked_at: new Date().toISOString(), pool: 'VGPU CUSTOM_NVIDIA_A100_4C', needed: 1, free: 0, reason: 'VGPU CUSTOM_NVIDIA_A100_4C of RHOSO 18.0 — Production has 0 units free' },
+      });
+    });
+    expect(await screen.findByRole('heading', { level: 1, name: heading }, { timeout: 8_000 })).toBeInTheDocument();
+    await settled();
+    await screen.findByText(/^Waiting for GPU capacity/);
+    expect(screen.getAllByRole('button', { name: 'Technology Preview' }).length).toBeGreaterThan(0);
     expect(await violations()).toEqual([]);
   }, 30_000);
 

@@ -1,4 +1,4 @@
-import { SearchX, TriangleAlert } from 'lucide-react';
+import { Hourglass, SearchX, TriangleAlert } from 'lucide-react';
 import { memo, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { SEVERITIES, type Phase, type Plan, type Strategy, type MigrationLike } from '../api/types';
@@ -14,6 +14,7 @@ import { FindingsSummary } from './FindingsList';
 import { ProgressBar } from './ProgressBar';
 import { SortableHeader } from './SortableHeader';
 import { PhaseBadge } from './StatusBadge';
+import { TechPreviewBadge } from './TechPreviewBadge';
 
 type SortKey = 'vm' | 'phase' | 'strategy' | 'wave' | 'progress' | 'estimate' | 'findings' | 'downtime';
 
@@ -54,6 +55,14 @@ const MigrationRow = memo(function MigrationRow({ migration: m, override, wave }
       </th>
       <td>
         <PhaseBadge phase={m.phase} />
+        {m.gpu_wait && (
+          // its cutover waits for GPU capacity, its source running: a wait, not a problem (SDD §16, §22.7)
+          <span className="mt-1 flex flex-wrap items-center gap-1 text-xs leading-tight text-status-info">
+            <Hourglass aria-hidden className="size-3.5 shrink-0" />
+            Waiting for GPU capacity
+            <TechPreviewBadge />
+          </span>
+        )}
       </td>
       <td className="whitespace-nowrap">
         {strategyLabel(m.strategy)}

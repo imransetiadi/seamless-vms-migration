@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import eligibilityRaw from '../../../seamless/tests/fixtures/eligibility_cases.json?raw';
-import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, iso, makeVm, preflight, readDestinationGpus, replaceNames } from './mockData';
+import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, gpuFlavorsOf, iso, makeVm, preflight, quotaShare, readDestinationGpus, replaceNames } from './mockData';
 import { gpuRequests } from '../lib/gpu';
 import { capabilityRoles } from '../lib/networks';
-import type { DestinationInventory, DestinationNetwork, DestinationSubnet, Finding, GpuCheckReport, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
+import type { DestinationFlavor, DestinationInventory, DestinationNetwork, DestinationSubnet, Finding, GpuCapacity, GpuCheckReport, Phase, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
 
 const now = Date.parse('2026-10-09T12:00:00Z');
 
@@ -637,12 +637,29 @@ interface FindingCase {
   /** the source provider's kind, openstack when not given */
   source_kind?: ProviderKind;
   plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'> & Partial<Pick<Plan, 'mappings' | 'prestage_resources'>>;
-  /** a network case's destination: its label, networks, subnets, the token's roles and the policy profile */
-  destination?: { label: string; networks: DestinationNetwork[]; subnets?: DestinationSubnet[]; roles?: string[]; policy_profile?: string };
+  /**
+   * a network case's destination: its label, networks, subnets, the token's roles and the policy profile; a GPU case's
+   * its flavors too, the vGPU profiles it declares and its GPU capacity, as its inventory reads them (SDD §22.3)
+   */
+  destination?: {
+    label: string;
+    networks: DestinationNetwork[];
+    subnets?: DestinationSubnet[];
+    roles?: string[];
+    policy_profile?: string;
+    flavors?: DestinationFlavor[];
+    gpu_profiles?: Record<string, string>;
+    gpu_capacity?: GpuCapacity;
+  };
   /** the source provider's declared vGPU profiles, by flavor (SDD §22.3) */
   gpu_profiles?: Record<string, string>;
+  /** the phase of the plan's migration of a VM that has one, by its source id: its share counts by it (SDD §9.3, §22.5) */
+  phases?: Record<string, Phase>;
   /** each code's message; null for a code that must not be found (PR #64 review) */
   expected: Record<string, string | null>;
+  /** a finding's own severity and remediation, where they are not its catalog's (plan task G12) */
+  severities?: Record<string, Severity>;
+  remediations?: Record<string, string>;
 }
 
 /** The API's reasons and finding texts, case by case: seamless/tests/fixtures/eligibility_cases.json. */
@@ -652,17 +669,19 @@ describe("the mock's GPU mapping rule, as the API's (SDD §9.3, §22.4, plan tas
   const plan = buildFixtures(now).plans[0]!;
   const gpuVm = makeVm({ id: 'os-gpu1', name: 'ml-01', flavor: 'g1.vgpu', disks: [{ size_gb: 20 }], flavor_extra_specs: { 'resources:VGPU': '1' } });
   const flavors = ['m1.small', 'g1.a100-4c'];
+  // the destination's one GPU flavor, as its inventory lists it (SDD §22.3)
+  const gpuFlavors = gpuFlavorsOf([{ name: 'g1.a100-4c', vcpus: 8, ram_mb: 32768, disk_gb: 80, extra_specs: { 'resources:VGPU': '1' } }]);
 
   it("names a GPU VM's mapped flavor the destination lacks as MAP_FLAVOR_MISSING alone, as the API words it", () => {
     const mapped = { ...plan, mappings: { ...plan.mappings, flavors: { 'g1.vgpu': 'g1.nope' } } } as Plan;
-    const found = preflight(gpuVm, 'openstack', mapped, {}, { selected: [gpuVm], destination: 'RHOSO 18.0', flavors, gpuFlavors: ['g1.a100-4c'] });
+    const found = preflight(gpuVm, 'openstack', mapped, {}, { selected: [gpuVm], destination: 'RHOSO 18.0', flavors, gpuFlavors });
     const codes = found.filter((f) => f.code === 'MAP_FLAVOR_MISSING' || f.code === 'VM_VGPU').map((f) => [f.code, f.message]);
     expect(codes).toEqual([['MAP_FLAVOR_MISSING', "Flavor 'g1.vgpu' is mapped to 'g1.nope', which does not exist in RHOSO 18.0."]]);
   });
 
   it('lifts the block once the mapping names a GPU flavor, and reads no mapping from the prototype', () => {
     const mapped = { ...plan, mappings: { ...plan.mappings, flavors: { 'g1.vgpu': 'g1.a100-4c' } } } as Plan;
-    const context = { selected: [gpuVm], destination: 'RHOSO 18.0', flavors, gpuFlavors: ['g1.a100-4c'] };
+    const context = { selected: [gpuVm], destination: 'RHOSO 18.0', flavors, gpuFlavors };
     expect(preflight(gpuVm, 'openstack', mapped, {}, context).map((f) => f.code)).not.toContain('VM_VGPU');
     const prototype = makeVm({ id: 'os-gpu2', name: 'ml-02', flavor: 'constructor', disks: [{ size_gb: 20 }], flavor_extra_specs: { 'resources:VGPU': '1' } });
     const found = preflight(prototype, 'openstack', plan, {}, { ...context, selected: [prototype] });
@@ -782,11 +801,18 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
       ...(dest
         ? { selected, networkDetails: dest.networks, subnets: dest.subnets ?? [], roles: dest.roles, profile: dest.policy_profile, destination: dest.label }
         : { selected }),
+      // a GPU case's destination flavors, its GPU flavors among them as its inventory lists them, and its capacity (SDD §22.3)
+      ...(dest?.flavors ? { flavors: dest.flavors.map((f) => f.name), gpuFlavors: gpuFlavorsOf(dest.flavors, dest.gpu_profiles) } : {}),
+      ...(dest?.gpu_capacity ? { gpuCapacity: dest.gpu_capacity } : {}),
+      shares: Object.fromEntries(Object.entries(c.phases ?? {}).map(([vmId, phase]) => [vmId, quotaShare(phase)])),
       gpuProfiles: c.gpu_profiles,
     };
     const found = preflight(c.vm, c.source_kind ?? 'openstack', plan, networks, context);
     const messages = new Map(found.map((f) => [f.code, f.message]));
     expect(Object.fromEntries(Object.keys(c.expected).map((code) => [code, messages.get(code) ?? null]))).toEqual(c.expected);
+    const byCode = new Map(found.map((f) => [f.code, f]));
+    expect(Object.fromEntries(Object.keys(c.severities ?? {}).map((code) => [code, byCode.get(code)?.severity ?? null]))).toEqual(c.severities ?? {});
+    expect(Object.fromEntries(Object.keys(c.remediations ?? {}).map((code) => [code, byCode.get(code)?.remediation ?? null]))).toEqual(c.remediations ?? {});
   });
 
   it('raises both source-state blockers for a server in error with a Nova task, naming the task, as the API (SDD §9.3, review PV-05)', () => {

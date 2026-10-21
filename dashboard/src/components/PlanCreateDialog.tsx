@@ -5,6 +5,7 @@ import { useCreatePlan, useInventory, useMigrationSummaries, usePatchPlan, usePl
 import { useRole } from '../api/session';
 import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
 import { MAX_DURATION_S, MAX_SYNC_PASSES, MIN_RATE_BPS } from '../lib/forcedEstimate';
+import { declaredProfileOf, destinationGpuFlavors, gpuFlavorRows, gpuKeyRows, vmGpus, type GpuVm } from '../lib/gpu';
 import { heldElsewhere, holdersOf } from '../lib/holds';
 import { parseDrafts, toDraft, type ProbeDraft } from '../lib/probes';
 import { providerLabel } from '../lib/providerUse';
@@ -18,9 +19,11 @@ import { Checkbox } from './Checkbox';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ErrorBanner } from './ErrorBanner';
 import { SelectField, TextAreaField, TextField } from './Field';
+import { GpuMappings, type OfferedGpuFlavors } from './GpuMappings';
 import { Modal } from './Modal';
 import { ProbeListEditor } from './ProbeListEditor';
 import { LoadingBlock } from './Skeleton';
+import { TechPreviewBadge } from './TechPreviewBadge';
 import { VmTable } from './VmTable';
 
 const GiB = 1024 ** 3;
@@ -80,6 +83,8 @@ interface FormState {
   /** Storage handover (SDD §7.3): volume type -> RHOSO backend chosen by the operator. */
   handoverEnabled: boolean;
   handoverMap: Record<string, string>;
+  /** A VMware GPU key -> the destination GPU flavor its row names (SDD §4.2 `mappings.gpus`, §22.4): never prefilled. */
+  gpuMappings: Record<string, string>;
 }
 
 /** The step times an operator measures on the first migrations (SDD §16, Performance.md §6.4). */
@@ -138,6 +143,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     appProbes: [],
     handoverEnabled: false,
     handoverMap: {},
+    gpuMappings: {},
   };
 }
 
@@ -237,12 +243,26 @@ function formFromPlan(plan: Plan): FormState {
     appProbes: v.app_probes.map(toDraft),
     handoverEnabled: plan.handover.enabled,
     handoverMap: { ...plan.handover.backend_map },
+    gpuMappings: { ...(plan.mappings.gpus ?? {}) },
   };
 }
 
 function strategiesFor(kind: ProviderKind | undefined): Strategy[] {
   if (kind === 'vmware') return ['vmware_cold', 'vmware_warm'];
   return ['cold', 'warm', 'storage_handover'];
+}
+
+/**
+ * The flavor mappings' GPU hint for an OpenStack source (SDD §16, §22.4): each flavor of the selected VMs that asks for a GPU,
+ * with its VMs, and the destination's GPU flavors to map it to - a same-named flavor is no mapping.
+ */
+function flavorMappingsGpuHint(rows: ReadonlyArray<{ flavor: string; vms: ReadonlyArray<{ name: string }> }>, offered: OfferedGpuFlavors): string {
+  const named = rows.map((row) => `${row.flavor} (${row.vms.map((vm) => vm.name).join(', ')})`);
+  const asks = named.length === 1 ? `${named[0]} asks` : `${named.slice(0, -1).join(', ')} and ${named.at(-1)} ask`;
+  const where = offered.destination ? providerLabel(offered.destination) : 'the destination';
+  const names = offered.flavors.map((f) => f.name);
+  const list = names.length === 0 ? '' : ` - ${names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} or ${names.at(-1)}`}`;
+  return `${asks} for a GPU: map ${named.length === 1 ? 'it' : 'each'} to a GPU flavor of ${where}${list}. A same-named flavor is no mapping.`;
 }
 
 /** `aria-describedby` for a field shown read-only; nothing otherwise, so the field keeps its own hint and error. */
@@ -360,6 +380,30 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   // storage handover (SDD §7.3, §7.3.1): one RHOSO backend per volume type of the selected VMs
   const destination = destinations.find((p) => p.id === form.destinationId);
   const selectedVms = vms.filter((vm) => form.vmIds.has(vm.source_id));
+  // the selected VMs with a GPU, read with the profile the source declares for their flavor (SDD §22.2): the GPU mappings
+  // show while there is one, and read the destination's GPU flavors from its inventory meanwhile (SDD §16, §22.3)
+  const gpuVmsOf = (f: FormState): GpuVm[] =>
+    vms.flatMap((vm) => {
+      const gpus = f.vmIds.has(vm.source_id) ? vmGpus(vm, declaredProfileOf(vm, source?.gpu_profiles)) : [];
+      return gpus.length ? [{ vm, gpus }] : [];
+    });
+  const gpuVms = gpuVmsOf(form);
+  const destinationInventory = useInventory(open && gpuVms.length > 0 && form.destinationId ? form.destinationId : undefined);
+  const destinationHeld = destinationInventory.data && isDestinationInventory(destinationInventory.data) ? destinationInventory.data : undefined;
+  const offered: OfferedGpuFlavors = {
+    destination,
+    inventory: destinationHeld,
+    flavors: destinationHeld ? destinationGpuFlavors(destinationHeld, destination?.gpu_profiles) : [],
+    pending: destinationInventory.isPending,
+    error: destinationInventory.error,
+    retry: () => void destinationInventory.refetch(),
+  };
+  // an OpenStack VM's GPU mapping is its flavor's (SDD §22.4): the flavor mappings say which flavors ask for a GPU
+  const gpuFlavorHint = source && source.kind !== 'vmware' && gpuVms.length ? flavorMappingsGpuHint(gpuFlavorRows(gpuVms), offered) : undefined;
+  const editFlavorMappings = () => {
+    (document.getElementById(id('advanced')) as HTMLDetailsElement | null)?.setAttribute('open', '');
+    document.getElementById(id('flavors'))?.focus();
+  };
   const held = heldElsewhere(form.vmIds, form.sourceId, plan?.id, plans.data ?? [], migrations.data ?? []);
   // the check needs every plan and migration: without them it is unknown, not "none held" (SDD §16)
   const plansUnknown = Boolean(plans.error) && !plans.data;
@@ -485,6 +529,13 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
       backendMap = Object.fromEntries(handoverTypes.filter((t) => chosenTarget(t, f)).map((t) => [t, chosenTarget(t, f)]));
     }
     if (Object.keys(e).length) return { errors: e, body: null };
+    // each GPU key a row shows takes its row's choice, None removing it; a key no selected VM has keeps the plan's
+    // mapping, as `mappings` is sent whole (SDD §16, §22.4)
+    const gpuRowKeys = new Set(source?.kind === 'vmware' ? gpuKeyRows(gpuVmsOf(f)).rows.map((row) => row.key) : []);
+    const gpus = Object.fromEntries([
+      ...Object.entries(plan?.mappings.gpus ?? {}).filter(([key]) => !gpuRowKeys.has(key)),
+      ...[...gpuRowKeys].flatMap((key) => (Object.hasOwn(f.gpuMappings, key) ? [[key, f.gpuMappings[key]!] as const] : [])),
+    ]);
     return {
       errors: e,
       body: {
@@ -504,14 +555,15 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         require_distinct_approver: f.requireDistinctApprover,
         auto_cutover: f.autoCutover,
         cutover_window: f.windowStart ? { start: new Date(f.windowStart).toISOString(), end: new Date(f.windowEnd).toISOString() } : null,
-        // every kind of mapping this form does not show - the GPU mappings until plan task G12 - is kept as the plan has
-        // it: a PATCH replaces `mappings` whole (SDD §22.4)
+        // every kind of mapping this form does not show is kept as the plan has it: a PATCH replaces `mappings` whole
+        // (SDD §22.4)
         mappings: {
           ...plan?.mappings,
           networks: networks ?? {},
           flavors: flavors ?? {},
           volume_types: volumeTypes ?? {},
           projects: projects ?? {},
+          gpus,
         },
         handover: { enabled: f.handoverEnabled && source?.kind !== 'vmware', backend_map: backendMap },
         link_bps: link * MiB,
@@ -681,7 +733,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 label="Source provider"
                 required
                 value={form.sourceId}
-                onChange={(e) => setForm((f) => ({ ...f, sourceId: e.target.value, vmIds: new Set(), defaultStrategy: 'auto', overrides: {} }))}
+                onChange={(e) => setForm((f) => ({ ...f, sourceId: e.target.value, vmIds: new Set(), defaultStrategy: 'auto', overrides: {}, gpuMappings: {} }))}
                 disabled={editing}
                 hint={editing ? 'The source of an existing plan stays the same; create a new plan for another source.' : undefined}
                 error={errors.source}
@@ -782,6 +834,25 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
               )}
             </div>
           </fieldset>
+
+          {source && gpuVms.length > 0 && (
+            <GpuMappings
+              idFor={id}
+              sourceKind={source.kind}
+              vms={gpuVms}
+              offered={offered}
+              mappings={form.gpuMappings}
+              onChange={(key, flavor) =>
+                // own keys, never an assignment: a key named "__proto__" is a mapping like any other (review RV23-01)
+                setForm((f) => ({
+                  ...f,
+                  gpuMappings: Object.fromEntries([...Object.entries(f.gpuMappings).filter(([k]) => k !== key), ...(flavor ? [[key, flavor] as const] : [])]),
+                }))
+              }
+              flavorMappings={parseMappings(form.flavors)}
+              onEditFlavorMappings={editFlavorMappings}
+            />
+          )}
 
           <Fieldset legend="Strategy and downtime">
             <div className="grid gap-3 sm:grid-cols-3">
@@ -938,7 +1009,17 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
               )}
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextAreaField id={id('networks')} label="Network mappings" rows={3} placeholder="tenant-net = tenant-net-ovn" value={form.networks} onChange={(e) => set('networks', e.target.value)} error={errors.networks} />
-                <TextAreaField id={id('flavors')} label="Flavor mappings" rows={3} placeholder="m1.xlarge = m2.xlarge" value={form.flavors} onChange={(e) => set('flavors', e.target.value)} error={errors.flavors} />
+                <TextAreaField
+                  id={id('flavors')}
+                  label="Flavor mappings"
+                  aside={gpuFlavorHint ? <TechPreviewBadge /> : undefined}
+                  rows={3}
+                  placeholder="m1.xlarge = m2.xlarge"
+                  value={form.flavors}
+                  onChange={(e) => set('flavors', e.target.value)}
+                  error={errors.flavors}
+                  hint={gpuFlavorHint}
+                />
                 <TextAreaField id={id('volume-types')} label="Volume type mappings" rows={3} placeholder="tripleo-ceph = ceph-ssd" value={form.volumeTypes} onChange={(e) => set('volumeTypes', e.target.value)} error={errors.volumeTypes} />
                 <TextAreaField
                   id={id('projects')}

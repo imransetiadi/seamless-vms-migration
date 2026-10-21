@@ -144,15 +144,15 @@ it afresh.
    maps `dc2-ml-01`'s `grid_a100-4c` to it. Both validate with `MAP_GPU_FLAVOR`, `GUEST_GPU_DRIVER` and
    `GUEST_GPU_LICENSE`, and nothing blocks. Each migrates in its plan's last wave, and its verification passes
    `gpu_flavor` and `gpu_allocation`.
-3. **A wait for GPU capacity.** Plan `dc2-ml-02` (source id `vmw-054a64a2b9ff`) to RHOSO 18.0 with
-   `"gpus": {"grid_a100-3-20c": "g1.a100-3-20c"}` in its mappings - through `POST /api/v1/plans` until the
-   dashboard's plan form maps GPUs - then validate and start it. The validation finds room. The gate's first two
-   reads find the pool full, as if another tenant held its vGPUs, and the event log shows "dc2-ml-02: its cutover
-   waits for GPU capacity - VGPU CUSTOM_NVIDIA_A100_3_20C of RHOSO 18.0 has 0 units free, and flavor 'g1.a100-3-20c'
-   needs 1; the source VM keeps running".
+3. **A wait for GPU capacity.** Plan `dc2-ml-02` from vCenter DC2 to RHOSO 18.0. The plan form's *GPU mappings* lists
+   its key `grid_a100-3-20c`, with nothing prefilled: choose `g1.a100-3-20c`. Validate and start the plan - if it asks
+   for approval, one person requests the cutover and an approver approves it. The validation finds room. The gate's
+   first two reads find the pool full, as if another tenant held its vGPUs. The migration's GPU panel says "Waiting for
+   GPU capacity", and the event log shows "dc2-ml-02: its cutover waits for GPU capacity - VGPU CUSTOM_NVIDIA_A100_3_20C
+   of RHOSO 18.0 has 0 units free, and flavor 'g1.a100-3-20c' needs 1; the source VM keeps running".
 4. **The wait ends.** The third read, a few seconds later at the demo's speed, finds 2 units free: "RHOSO 18.0 has the
    GPU capacity its cutover needs". The VM cuts over and passes its GPU checks, and A100-3-20C reads 1 free.
-5. **Passthrough.** Plan `dc2-cuda-01` (`vmw-e22680548bd1`) with `"gpus": {"10de:20b5": "p1.a100"}`. Only
+5. **Passthrough.** Plan `dc2-cuda-01` and map its key `10de:20b5` to `p1.a100`. Only
    `vmware_cold` takes it, while it is powered off: vSphere snapshots no running VM with a DirectPath I/O device
    ([SDD §22.6](docs/SDD.md)). `DST_GPU_CAPACITY_UNKNOWN` warns that Placement does not show the alias's capacity,
    so the gate does not wait, and the verification skips `gpu_allocation`: "PCI alias a100 not checked: nova.conf
