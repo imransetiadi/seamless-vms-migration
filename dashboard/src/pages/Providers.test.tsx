@@ -1,8 +1,11 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
+import type { DestinationInventory, GpuCapacity } from '../api/types';
+import { TECH_PREVIEW_DETAIL } from '../components/TechPreviewBadge';
+import { formatDateTime } from '../lib/format';
 import { destinationRelease } from '../lib/platforms';
-import { createTestServer, recordScrolls, renderWithApp } from '../test/utils';
+import { createTestServer, recordScrolls, renderWithApp, TEST_NOW } from '../test/utils';
 import Providers from './Providers';
 
 // a key-shaped string without key material (write-only upload fixture)
@@ -688,5 +691,97 @@ describe('Providers page', () => {
     await user.click(within(dialog).getByRole('button', { name: /^delete provider$/i }));
     await waitFor(() => expect(within(from).queryByRole('article', { name: 'Kolla Edge (Bobcat)' })).not.toBeInTheDocument());
     await waitFor(() => expect(within(from).getByRole('heading', { name: 'Migrate from' })).toHaveFocus());
+  });
+});
+
+describe("Providers: a destination's GPU capacity (SDD §16, §22.11; plan task G11)", () => {
+  /** A card's GPU capacity, named by its heading. */
+  const gpuOf = (card: HTMLElement) => within(card).getByRole('group', { name: 'GPU capacity' });
+  const lines = (group: HTMLElement) => within(group).getAllByRole('listitem').map((item) => item.textContent);
+  const SEEDED = ['VGPU, CUSTOM_NVIDIA_A100_4C: 4 free on 1 GPU', 'VGPU, CUSTOM_NVIDIA_A100_3_20C: 2 free on 1 GPU', 'VGPU: 6 free on 2 GPUs, at most 4 on one'];
+
+  it("summarizes a destination's GPU capacity with the check's time", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    renderPage('operator', server);
+    // as each check read it: every pool by its class and traits, then its free units and GPUs, as the Inventory words them
+    for (const id of ['rhoso-prod', 'hibiscus-dc3']) {
+      const provider = server.providers.find((p) => p.id === id)!;
+      const gpu = gpuOf(await screen.findByRole('article', { name: provider.name }));
+      expect(within(gpu).getByRole('button', { name: 'Technology Preview' })).toHaveAccessibleDescription(TECH_PREVIEW_DETAIL);
+      expect(lines(gpu)).toEqual(SEEDED);
+      // with the check's time: the read's own
+      const time = within(gpu).getByText(/^Checked$/).querySelector('time');
+      expect(time).toHaveAttribute('datetime', provider.last_checked_at);
+      expect(time).toHaveAttribute('title', formatDateTime(provider.last_checked_at));
+    }
+    // a vGPU taken since then: the card keeps the check's figures until a check reads them again
+    const inventory = server.inventories['rhoso-prod'] as DestinationInventory;
+    inventory.gpu_capacity!.pools = inventory.gpu_capacity!.pools.map((pool) =>
+      pool.traits.includes('CUSTOM_NVIDIA_A100_4C') ? { ...pool, free: 3, largest_free: 3 } : pool.traits.length ? pool : { ...pool, free: 5, largest_free: 3 },
+    );
+    const card = screen.getByRole('article', { name: 'RHOSO 18.0 — Production' });
+    expect(lines(gpuOf(card))).toEqual(SEEDED);
+    await user.click(within(card).getByRole('button', { name: /^check /i }));
+    await waitFor(() => expect(within(gpuOf(card)).getByText(/^Checked$/).querySelector('time')).toHaveAttribute('datetime', new Date(TEST_NOW).toISOString()));
+    expect(lines(gpuOf(card))).toEqual(['VGPU, CUSTOM_NVIDIA_A100_4C: 3 free on 1 GPU', 'VGPU, CUSTOM_NVIDIA_A100_3_20C: 2 free on 1 GPU', 'VGPU: 5 free on 2 GPUs, at most 3 on one']);
+  });
+
+  it("says why a destination's GPU capacity was not read", async () => {
+    const failures: Array<[Pick<GpuCapacity, 'reason' | 'detail'>, string]> = [
+      [{ reason: 'forbidden', detail: 'HTTP 403' }, 'Not read: the destination credential lacks the role Placement asks for, admin by default (HTTP 403).'],
+      [{ reason: 'no_placement', detail: null }, "Not read: the destination's catalog lists no Placement."],
+      [{ reason: 'error', detail: 'HTTP 503' }, 'Not read: the read failed (HTTP 503).'],
+    ];
+    for (const [failure, said] of failures) {
+      const server = createTestServer();
+      const hibiscus = server.providers.find((p) => p.id === 'hibiscus-dc3')!;
+      // the read's own time: the API's check reads Placement before it stamps last_checked_at
+      const readAt = new Date(Date.parse(hibiscus.last_checked_at!) - 1500).toISOString();
+      hibiscus.capabilities = { ...hibiscus.capabilities, gpu_capacity: { status: 'unknown', ...failure, read_at: readAt, pools: [] } };
+      const view = renderPage('viewer', server);
+      const gpu = gpuOf(await screen.findByRole('article', { name: hibiscus.name }));
+      expect(gpu, failure.reason ?? '').toHaveTextContent(said);
+      // nothing read is never shown as free units; the badge and the check's time stay
+      expect(within(gpu).queryByRole('list')).not.toBeInTheDocument();
+      expect(gpu).not.toHaveTextContent(/free on|None free/);
+      expect(within(gpu).getByRole('button', { name: 'Technology Preview' })).toBeInTheDocument();
+      expect(within(gpu).getByText(/^Checked$/).querySelector('time')).toHaveAttribute('datetime', readAt);
+      view.unmount();
+    }
+    // a check whose read Placement refuses says so on the card
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    (server.inventories['rhoso-prod'] as DestinationInventory).gpu_capacity = { status: 'unknown', reason: 'forbidden', detail: 'HTTP 403', read_at: null, pools: [] };
+    renderPage('operator', server);
+    const card = await screen.findByRole('article', { name: 'RHOSO 18.0 — Production' });
+    expect(lines(gpuOf(card))).toEqual(SEEDED);
+    await user.click(within(card).getByRole('button', { name: /^check /i }));
+    await waitFor(() => expect(gpuOf(card)).toHaveTextContent('Not read: the destination credential lacks the role Placement asks for, admin by default (HTTP 403).'));
+    expect(within(gpuOf(card)).getByText(/^Checked$/).querySelector('time')).toHaveAttribute('datetime', new Date(TEST_NOW).toISOString());
+  });
+
+  it('shows no GPU line for a destination without GPU flavors', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    // a check report from before 0.3.0 holds no gpu_capacity
+    const hibiscus = server.providers.find((p) => p.id === 'hibiscus-dc3')!;
+    delete hibiscus.capabilities.gpu_capacity;
+    renderPage('operator', server);
+    const staging = await screen.findByRole('article', { name: 'RHOSO 18.0 — Staging' });
+    // never checked: no report to summarize
+    expect(within(staging).queryByRole('group', { name: 'GPU capacity' })).not.toBeInTheDocument();
+    // checked, it lists no GPU flavor: its check reads ok with no pool and sends Placement nothing (§22.3)
+    await user.click(within(staging).getByRole('button', { name: /^check /i }));
+    expect(await screen.findByText(/^RHOSO 18\.0 — Staging checked: /)).toBeInTheDocument();
+    expect(within(staging).getByText('Last checked', { selector: 'dt' }).nextElementSibling).not.toHaveTextContent('Never');
+    expect(server.providers.find((p) => p.id === 'rhoso-staging')?.capabilities.gpu_capacity).toMatchObject({ status: 'ok', pools: [] });
+    expect(within(staging).queryByRole('group', { name: 'GPU capacity' })).not.toBeInTheDocument();
+    expect(staging).not.toHaveTextContent(/GPU|Technology Preview/);
+    // a source has none, and only the GPU destination checked since 0.3.0 shows one
+    for (const name of ['RHOSP 17.1 — DC1', 'vCenter HQ', 'OpenStack Lab (2023.1)', 'Kolla Edge (Bobcat)', hibiscus.name]) {
+      expect(within(screen.getByRole('article', { name })).queryByRole('group', { name: 'GPU capacity' }), name).not.toBeInTheDocument();
+    }
+    expect(screen.getAllByRole('group', { name: 'GPU capacity' }).map((group) => group.closest('article'))).toEqual([screen.getByRole('article', { name: 'RHOSO 18.0 — Production' })]);
   });
 });

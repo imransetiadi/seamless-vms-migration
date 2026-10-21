@@ -1,8 +1,25 @@
 import { describe, expect, it } from 'vitest';
 // One case table for the control plane and the dashboard's mock (SDD §22.2, PR #64 review).
 import raw from '../../../seamless/tests/fixtures/gpu_request_cases.json?raw';
-import type { GpuCapacity, GpuDevice, GpuFlavor, GpuPool, VMRef } from '../api/types';
-import { declaredProfiles, flavorsOfPool, gpuCapacityReason, gpuDevice, gpuLabel, gpuPools, gpuRequests, poolFreeText, poolLabel, samePool, vmGpus } from './gpu';
+import type { DestinationFlavor, DestinationInventory, GpuCapacity, GpuDevice, GpuFlavor, GpuPool, VMRef } from '../api/types';
+import {
+  checkedGpuCapacity,
+  declaredProfiles,
+  flavorsOfPool,
+  gpuCapacityReason,
+  gpuDevice,
+  gpuLabel,
+  gpuPools,
+  gpuRequests,
+  inventoryGpuFlavors,
+  poolFreeText,
+  poolLabel,
+  samePool,
+  sameVgpuProfiles,
+  vgpuProfileErrors,
+  vgpuProfileMap,
+  vmGpus,
+} from './gpu';
 
 const fixture = JSON.parse(raw) as {
   cases: Array<{ why: string; extra_specs: Record<string, string>; declared_profile?: string; requests: Array<Partial<GpuDevice> & Pick<GpuDevice, 'kind'>> }>;
@@ -112,5 +129,89 @@ describe('how the dashboard words GPUs and GPU capacity (SDD §16, §22.11)', ()
     expect(gpuCapacityReason(unknown('no_placement', null))).toBe("the destination's catalog lists no Placement");
     expect(gpuCapacityReason(unknown('error', null))).toBe('the read failed');
     expect(gpuCapacityReason(unknown('error', 'ReadTimeout'))).toBe('the read failed (ReadTimeout)');
+  });
+});
+
+describe("a destination card's GPU capacity and the provider form's vGPU profiles (SDD §16, §22.3; plan task G11)", () => {
+  const row = (key: number, flavor: string, profile: string) => ({ key, flavor, profile });
+
+  it("reads a destination's GPU capacity from its check report, and none from a report without it", () => {
+    const capacity: GpuCapacity = { status: 'ok', reason: null, detail: null, read_at: '2026-10-08T11:57:00Z', pools: [] };
+    expect(checkedGpuCapacity({ admin: true, gpu_capacity: capacity })).toBe(capacity);
+    const unread = { ...capacity, status: 'unknown', reason: 'forbidden', detail: 'HTTP 403' };
+    expect(checkedGpuCapacity({ gpu_capacity: unread })).toBe(unread);
+    // a source's report, one from before 0.3.0 and one a PATCH reset hold none; a value it cannot read is none
+    expect(checkedGpuCapacity({ admin: true, roles: ['admin'] })).toBeNull();
+    expect(checkedGpuCapacity({})).toBeNull();
+    expect(checkedGpuCapacity({ gpu_capacity: null })).toBeNull();
+    expect(checkedGpuCapacity({ gpu_capacity: 'ok' })).toBeNull();
+    expect(checkedGpuCapacity({ gpu_capacity: { status: 'ok', pools: 'none' } })).toBeNull();
+    expect(checkedGpuCapacity({ gpu_capacity: { status: 'read', pools: [] } })).toBeNull();
+  });
+
+  it("lists a provider's GPU flavors as its inventory reads them: a destination's, and a source's VMs'", () => {
+    const flavor = (name: string, extra_specs: Record<string, string>): DestinationFlavor => ({ name, vcpus: 8, ram_mb: 32768, disk_gb: 80, extra_specs });
+    const flavors = [
+      flavor('m1.large', {}),
+      flavor('p1.a100', { 'pci_passthrough:alias': 'a100:1' }),
+      flavor('g1.custom', { 'resources:CUSTOM_A100_4C': '1' }),
+      flavor('g1.a100-4c', { 'resources:VGPU': '1', 'trait:CUSTOM_NVIDIA_A100_4C': 'required' }),
+    ];
+    const destination: DestinationInventory = { networks: {}, flavors, volume_types: [], quotas: {}, projects: [] };
+    // a destination's gpu_flavors, by name in code-point order
+    const gpuFlavors = (names: string[]): GpuFlavor[] => names.map((name) => ({ name, vcpus: 8, ram_mb: 32768, disk_gb: 80, gpus: [] }));
+    expect(inventoryGpuFlavors({ ...destination, gpu_flavors: gpuFlavors(['p1.a100', 'g1.a100-4c']) })).toEqual(['g1.a100-4c', 'p1.a100']);
+    expect(inventoryGpuFlavors({ ...destination, gpu_flavors: [] })).toEqual([]);
+    // an answer without them: its flavors that ask for a GPU as §22.2 reads them, a CUSTOM_ class with a declared profile
+    expect(inventoryGpuFlavors(destination)).toEqual(['g1.a100-4c', 'p1.a100']);
+    expect(inventoryGpuFlavors(destination, { 'g1.custom': 'A100-4C' })).toEqual(['g1.a100-4c', 'g1.custom', 'p1.a100']);
+    // a source's: the flavors of its VMs with a GPU, each once - a VM recorded before 0.3.0 by its flavor's requests
+    const vgpu = gpuDevice({ kind: 'vgpu', resource_class: 'VGPU' });
+    const vms = [
+      vm({ flavor: 'g1.vgpu', gpus: [vgpu] }),
+      vm({ flavor: 'm1.small' }),
+      vm({ flavor: 'g1.vgpu', gpus: [vgpu] }),
+      vm({ flavor: 'g1.old', flavor_extra_specs: { 'resources:VGPU': '1' } }),
+      vm({ flavor: 'g1.custom', flavor_extra_specs: { 'resources:CUSTOM_A100_4C': '1' } }),
+      vm({ flavor: null, gpus: [vgpu] }),
+    ];
+    expect(inventoryGpuFlavors(vms)).toEqual(['g1.old', 'g1.vgpu']);
+    expect(inventoryGpuFlavors(vms, { 'g1.custom': 'A100-4C' })).toEqual(['g1.custom', 'g1.old', 'g1.vgpu']);
+    expect(inventoryGpuFlavors([])).toEqual([]);
+  });
+
+  it('refuses what the API refuses of a declared vGPU profile, and a flavor declared twice, each name trimmed (SDD §4.2)', () => {
+    expect(vgpuProfileErrors([row(0, 'g1.a100-4c', 'A100-4C'), row(1, ' p1.a100 ', ' A100D-80C ')])).toEqual([]);
+    expect(vgpuProfileErrors([])).toEqual([]);
+    // at most 255 and 64 characters, counted in code points as Python counts them: one astral character is two UTF-16 units
+    const astral = '\u{1D7D8}';
+    expect(vgpuProfileErrors([row(0, astral.repeat(255), astral.repeat(64))])).toEqual([]);
+    expect(vgpuProfileErrors([row(0, 'g1.a100-4c', 'A100-4C'), row(7, 'f'.repeat(256), astral.repeat(65))])).toEqual([
+      { key: 7, field: 'flavor', message: 'Shorten the flavor of vGPU profile 2: at most 255 characters.' },
+      { key: 7, field: 'profile', message: 'Shorten the profile of vGPU profile 2: at most 64 characters.' },
+    ]);
+    // an empty name - one of spaces too - and a flavor declared again, which one map cannot hold
+    expect(vgpuProfileErrors([row(0, ' ', ''), row(1, 'g1.a100-4c', 'A100-4C'), row(2, 'g1.a100-4c ', ' '), row(3, '', 'A100-3-20C'), row(4, 'g1.a100-4c', 'A100-4C')])).toEqual([
+      { key: 0, field: 'flavor', message: 'Enter the flavor of vGPU profile 1, or remove it.' },
+      { key: 0, field: 'profile', message: 'Enter the profile of vGPU profile 1, such as A100-4C.' },
+      { key: 2, field: 'flavor', message: 'g1.a100-4c is declared twice: change or remove vGPU profile 3.' },
+      { key: 2, field: 'profile', message: 'Enter the profile of vGPU profile 3, such as A100-4C.' },
+      { key: 3, field: 'flavor', message: 'Enter the flavor of vGPU profile 4, or remove it.' },
+      { key: 4, field: 'flavor', message: 'g1.a100-4c is declared twice: change or remove vGPU profile 5.' },
+    ]);
+  });
+
+  it('sends the rows as one map of trimmed names, and tells the same map in any order of its pairs', () => {
+    expect(vgpuProfileMap([row(0, ' g1.a100-4c ', ' A100-4C '), row(1, 'p1.a100', 'A100D-80C')])).toEqual({ 'g1.a100-4c': 'A100-4C', 'p1.a100': 'A100D-80C' });
+    // own keys, never an assignment: a flavor named "__proto__" is a pair like any other (review RV23-01)
+    const odd = vgpuProfileMap([row(0, '__proto__', 'A100-4C')]);
+    expect(Object.getPrototypeOf(odd)).toBe(Object.prototype);
+    expect(JSON.stringify(odd)).toBe('{"__proto__":"A100-4C"}');
+    expect(vgpuProfileMap([])).toEqual({});
+    expect(sameVgpuProfiles({ 'g1.a100-4c': 'A100-4C', 'p1.a100': 'A100D-80C' }, { 'p1.a100': 'A100D-80C', 'g1.a100-4c': 'A100-4C' })).toBe(true);
+    expect(sameVgpuProfiles({}, {})).toBe(true);
+    expect(sameVgpuProfiles({ 'g1.a100-4c': 'A100-4C' }, { 'g1.a100-4c': 'A100-3-20C' })).toBe(false);
+    expect(sameVgpuProfiles({ 'g1.a100-4c': 'A100-4C' }, { 'g1.a100-4c': 'A100-4C', 'p1.a100': 'A100D-80C' })).toBe(false);
+    expect(sameVgpuProfiles({ 'g1.a100-4c': 'A100-4C' }, {})).toBe(false);
   });
 });

@@ -4,7 +4,7 @@
  * the dashboard's GPU column too. Both suites test it against one case table,
  * `seamless/tests/fixtures/gpu_request_cases.json` (PR #64 review). Below them, how the dashboard words GPUs (SDD §16).
  */
-import type { GpuCapacity, GpuDevice, GpuFlavor, GpuPool, VMRef } from '../api/types';
+import type { GpuCapacity, GpuCheckReport, GpuDevice, GpuFlavor, GpuPool, ProviderInventory, VMRef } from '../api/types';
 import { byCodePoint, pyInt, pyStrip } from './format';
 
 /** Nova's resource class of a vGPU. */
@@ -214,4 +214,77 @@ export function gpuCapacityReason(capacity: GpuCapacity): string {
   if (capacity.reason === 'forbidden') return `the destination credential lacks the role Placement asks for, admin by default${detail}`;
   if (capacity.reason === 'no_placement') return `the destination's catalog lists no Placement${detail}`;
   return `the read failed${detail}`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// A destination card's GPU capacity and the provider form's vGPU profiles (SDD §16, §22.3, §22.11; plan task G11)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A destination's GPU capacity as its check report holds it (`gpu_capacity`, SDD §10, §22.3), or null: a source's report,
+ * one from before 0.3.0 and one a PATCH reset (§12) hold none.
+ */
+export function checkedGpuCapacity(report: Record<string, unknown>): GpuCapacity | null {
+  const capacity: unknown = (report as GpuCheckReport).gpu_capacity;
+  if (!capacity || typeof capacity !== 'object') return null;
+  const { status, pools } = capacity as Partial<GpuCapacity>;
+  return (status === 'ok' || status === 'unknown') && Array.isArray(pools) ? (capacity as GpuCapacity) : null;
+}
+
+/**
+ * A provider's GPU flavors as its inventory lists them, by name in code-point order (SDD §16, §22.3): a destination's
+ * `gpu_flavors` - from an answer without them, its flavors that ask for a GPU as §22.2 reads them -, a source's the
+ * flavors of its VMs with a GPU (`vm_gpus`), each read with the profile the provider declares for it.
+ */
+export function inventoryGpuFlavors(inventory: ProviderInventory, declared: Readonly<Record<string, string>> = {}): string[] {
+  const profile = (flavor: string) => (Object.hasOwn(declared, flavor) ? declared[flavor]! : null);
+  const names = Array.isArray(inventory)
+    ? inventory.flatMap((vm) => (vm.flavor && vmGpus(vm, profile(vm.flavor)).length ? [vm.flavor] : []))
+    : (inventory.gpu_flavors ?? inventory.flavors.filter((f) => gpuRequests(f.extra_specs, profile(f.name)).length)).map((f) => f.name);
+  return [...new Set(names)].sort(byCodePoint);
+}
+
+/** A row of the provider form's declared vGPU profiles: a flavor and the profile it gives, as typed (SDD §16). */
+export interface VgpuProfileRow {
+  /** Stable while the row lives: what its fields and their errors are keyed by. */
+  key: number;
+  flavor: string;
+  profile: string;
+}
+
+/** What the API's model takes of a declared vGPU profile (SDD §4.2, §22.3): a flavor name of 1 to 255 characters and a profile of 1 to 64. */
+const FLAVOR_MAX = 255;
+const PROFILE_MAX = 64;
+
+/**
+ * What the API refuses of a form's declared vGPU profiles, and what one map cannot hold - a flavor declared twice -, in
+ * the form's words (SDD §16): each row's flavor and profile, trimmed, counted in code points as Python counts them.
+ */
+export function vgpuProfileErrors(rows: readonly VgpuProfileRow[]): Array<{ key: number; field: 'flavor' | 'profile'; message: string }> {
+  const errors: Array<{ key: number; field: 'flavor' | 'profile'; message: string }> = [];
+  const seen = new Set<string>();
+  rows.forEach(({ key, flavor: typedFlavor, profile: typedProfile }, i) => {
+    const n = i + 1;
+    const flavor = typedFlavor.trim();
+    const profile = typedProfile.trim();
+    if (!flavor) errors.push({ key, field: 'flavor', message: `Enter the flavor of vGPU profile ${n}, or remove it.` });
+    else if ([...flavor].length > FLAVOR_MAX) errors.push({ key, field: 'flavor', message: `Shorten the flavor of vGPU profile ${n}: at most ${FLAVOR_MAX} characters.` });
+    else if (seen.has(flavor)) errors.push({ key, field: 'flavor', message: `${flavor} is declared twice: change or remove vGPU profile ${n}.` });
+    if (flavor) seen.add(flavor);
+    if (!profile) errors.push({ key, field: 'profile', message: `Enter the profile of vGPU profile ${n}, such as A100-4C.` });
+    else if ([...profile].length > PROFILE_MAX) errors.push({ key, field: 'profile', message: `Shorten the profile of vGPU profile ${n}: at most ${PROFILE_MAX} characters.` });
+  });
+  return errors;
+}
+
+/** The map a form's rows declare, each name trimmed: `gpu_profiles` as POST and PATCH /providers send it (SDD §12, §22.3). */
+export function vgpuProfileMap(rows: readonly VgpuProfileRow[]): Record<string, string> {
+  // own keys, never an assignment: a flavor named "__proto__" is a pair like any other (review RV23-01)
+  return Object.fromEntries(rows.map((row) => [row.flavor.trim(), row.profile.trim()]));
+}
+
+/** Whether two declarations are one map, their pairs in any order: a PATCH that changes nothing resets the check report (SDD §12, §16). */
+export function sameVgpuProfiles(a: Readonly<Record<string, string>>, b: Readonly<Record<string, string>>): boolean {
+  const pairs = (map: Readonly<Record<string, string>>) => JSON.stringify(Object.entries(map).sort(([x], [y]) => byCodePoint(x, y)));
+  return pairs(a) === pairs(b);
 }

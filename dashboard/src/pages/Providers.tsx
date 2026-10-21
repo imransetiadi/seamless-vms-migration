@@ -12,9 +12,11 @@ import { ErrorBanner } from '../components/ErrorBanner';
 import { PageHeader } from '../components/PageHeader';
 import { LoadingBlock } from '../components/Skeleton';
 import { ProviderStatusBadge } from '../components/StatusBadge';
+import { TechPreviewBadge } from '../components/TechPreviewBadge';
 import { buttonClassName } from '../lib/buttonStyles';
 import { cn } from '../lib/cn';
-import { formatDateTime, formatRelative } from '../lib/format';
+import { formatDateTime, formatRelative, namesText } from '../lib/format';
+import { checkedGpuCapacity, gpuCapacityReason, poolFreeText, poolLabel } from '../lib/gpu';
 import { deleteRefusal, plansThatNeed, providerLabel } from '../lib/providerUse';
 import { hasRole } from '../lib/roles';
 import { presetFor } from '../lib/distributions';
@@ -42,8 +44,8 @@ const CAPABILITY_LABELS: Record<string, string> = {
   vms_without_tools: 'VMs without VMware Tools',
 };
 
-/** The check-report keys the card shows in its own rows: a destination's series, tier and profile, and TLS (SDD §10, §16). */
-const SHOWN_IN_ROWS = new Set(['release_range', 'release', 'support_tier', 'policy_profile', 'tls', 'plain_http']);
+/** The check-report keys the card shows in its own rows: a destination's series, tier, profile and GPU capacity, and TLS (SDD §10, §16). */
+const SHOWN_IN_ROWS = new Set(['release_range', 'release', 'support_tier', 'policy_profile', 'gpu_capacity', 'tls', 'plain_http']);
 
 function Capabilities({ capabilities }: { capabilities: Record<string, unknown> }) {
   // storage_backends (SDD §10) supersedes the plain pool-name list and is shown by driver family; a value the card
@@ -182,6 +184,50 @@ function DestinationRows({ provider }: { provider: Provider }) {
   );
 }
 
+/**
+ * A destination's GPU capacity as its check read it, with the check's time (SDD §16, §22.3): each pool as the Inventory
+ * words it, by what it asks Placement for - a check report holds no flavor to name it by a declared profile -, or why it
+ * was not read; nothing while the check read no pool or the report holds none.
+ */
+function GpuCapacitySummary({ provider }: { provider: Provider }) {
+  const headingId = useId();
+  const capacity = checkedGpuCapacity(provider.capabilities);
+  if (!capacity || (capacity.status === 'ok' && capacity.pools.length === 0)) return null;
+  return (
+    <div role="group" aria-labelledby={headingId} className="flex min-w-0 flex-col gap-1.5 rounded-md border border-border px-3 py-2">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <h4 id={headingId} className="text-sm font-medium text-foreground">
+          GPU capacity
+        </h4>
+        <TechPreviewBadge />
+      </div>
+      {capacity.status === 'ok' ? (
+        <ul className="flex flex-col gap-0.5 text-sm text-foreground">
+          {capacity.pools.map((pool) => (
+            <li key={JSON.stringify([pool.resource_class, pool.traits, pool.forbidden_traits, pool.same_provider])} className="min-w-0 wrap-break-word">
+              <span className="font-mono text-xs">{poolLabel(pool)}</span>: {poolFreeText(pool)}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        // nothing read is never shown as free units (SDD §16): the reason, in the Inventory's words
+        <p className="flex items-start gap-1.5 text-sm text-status-warning">
+          <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0" />
+          <span className="min-w-0 wrap-break-word">Not read: {gpuCapacityReason(capacity)}.</span>
+        </p>
+      )}
+      {capacity.read_at && (
+        <p className="text-xs text-muted-foreground">
+          Checked{' '}
+          <time dateTime={capacity.read_at} title={formatDateTime(capacity.read_at)}>
+            {formatRelative(capacity.read_at)}
+          </time>
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** Where the provider signs in from, without ever showing a credential. */
 function CredentialState({ provider }: { provider: Provider }) {
   if (provider.credentials_secret && provider.credentials_updated_at) {
@@ -307,6 +353,8 @@ function ProviderCard({
         </dd>
       </dl>
 
+      {provider.role === 'destination' && provider.kind !== 'vmware' && <GpuCapacitySummary provider={provider} />}
+
       <Capabilities capabilities={provider.capabilities} />
 
       {check.error && <ErrorBanner error={check.error} title="Check failed" />}
@@ -377,12 +425,6 @@ function ProviderCard({
 }
 
 const SUMMARY_ORDER: Array<Provider['status']> = ['ok', 'degraded', 'error', 'unknown'];
-
-/** "A, B and C", or "A, B, C and 2 more" past `limit` names. */
-function namesText(names: string[], limit = 3): string {
-  if (names.length > limit) return `${names.slice(0, limit).join(', ')} and ${names.length - limit} more`;
-  return names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : (names[0] ?? '');
-}
 
 /** One line an operator reads first: how many clouds are healthy, and a way to re-check all. */
 function FleetSummary({ providers, canCheck, onAnnounce }: { providers: Provider[]; canCheck: boolean; onAnnounce: (message: string) => void }) {

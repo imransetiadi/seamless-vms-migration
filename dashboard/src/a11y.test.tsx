@@ -152,6 +152,27 @@ describe('axe-core: no WCAG violations', () => {
     expect(await violations()).toEqual([]);
   }, 30_000);
 
+  it("a destination card's GPU capacity that was not read, and the provider form's vGPU profiles with their errors (SDD §16, §22.11)", async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/providers', 'admin', (server) => {
+      const hibiscus = server.providers.find((p) => p.id === 'hibiscus-dc3')!;
+      hibiscus.capabilities = { ...hibiscus.capabilities, gpu_capacity: { status: 'unknown', reason: 'forbidden', detail: 'HTTP 403', read_at: hibiscus.last_checked_at, pools: [] } };
+    });
+    await screen.findByRole('heading', { level: 1, name: 'Providers' }, { timeout: 8_000 });
+    await settled();
+    const card = screen.getByRole('article', { name: 'OpenStack 2026.2 Hibiscus (DC3)' });
+    await within(within(card).getByRole('group', { name: 'GPU capacity' })).findByText(/^Not read:/);
+    expect(await violations()).toEqual([]);
+    await user.click(within(card).getByRole('button', { name: /^edit /i }));
+    const dialog = await screen.findByRole('dialog');
+    const section = within(dialog).getByRole('region', { name: 'vGPU profiles' });
+    await within(section).findByText(/^Its GPU flavors/);
+    await user.click(within(section).getByRole('button', { name: 'Add vGPU profile' }));
+    await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
+    await within(dialog).findByRole('alert');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
   it("a recommendation's input tab", async () => {
     const user = userEvent.setup({ delay: null });
     renderAt('/advisor/recommendations/rec-d4e6f8a09001');

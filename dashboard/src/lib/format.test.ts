@@ -8,6 +8,7 @@ import {
   formatPct,
   formatRate,
   formatRelative,
+  namesText,
   pyNames,
   pyLen,
   pyTooLong,
@@ -270,5 +271,16 @@ describe('pyTooLong (review RV50-06)', () => {
     expect(pyTooLong(`  ${'a'.repeat(2000)}\n`, 2000)).toBeNull();
     expect(pyTooLong('a'.repeat(2001), 2000)).toBe('At most 2000 characters.');
     expect(pyTooLong('\ufeff'.repeat(2001), 2000)).toBe('At most 2000 characters.');
+  });
+});
+
+describe('namesText', () => {
+  it('lists names in a sentence, and counts those past its limit', () => {
+    expect(namesText([])).toBe('');
+    expect(namesText(['a'])).toBe('a');
+    expect(namesText(['a', 'b'])).toBe('a and b');
+    expect(namesText(['a', 'b', 'c'])).toBe('a, b and c');
+    expect(namesText(['a', 'b', 'c', 'd', 'e'])).toBe('a, b, c and 2 more');
+    expect(namesText(['a', 'b', 'c', 'd'], 4)).toBe('a, b, c and d');
   });
 });
