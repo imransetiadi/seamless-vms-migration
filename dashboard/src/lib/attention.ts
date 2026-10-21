@@ -3,19 +3,30 @@ import type { ApprovalMigration } from './approvals';
 import { isOverdue, type Completable } from './finalize';
 import { countedApprovals } from './migrationActions';
 import { formatRelative } from './format';
+import { gpuWaitSummary } from './gpu';
 import type { Tone } from './phase';
 import { isWaveActive } from './waves';
 
 const SINGLE_SHOT = new Set(['cold', 'storage_handover', 'vmware_cold']);
 /** Where what the warm passes found still stands before the cutover (SDD §7.2, §16). */
 const REFUSABLE = new Set(['precopy', 'syncing', 'awaiting_cutover']);
+/** Where a cutover waits at its gate, a keep-warm pass included: where a wait for GPU capacity stands (SDD §5.4, §22.7). */
+const GPU_WAIT_PHASES = new Set(['ready', 'awaiting_cutover', 'syncing']);
 
 /** What Needs attention reads of a migration, or of its summary (SDD §4, §16). */
 export type AttentionMigration = ApprovalMigration &
   Completable &
   Pick<
     Migration,
-    'downtime_started_at' | 'downtime_ended_at' | 'source_running_at' | 'error' | 'review_required' | 'review_reason' | 'findings' | 'cutover_refusals'
+    | 'downtime_started_at'
+    | 'downtime_ended_at'
+    | 'source_running_at'
+    | 'error'
+    | 'review_required'
+    | 'review_reason'
+    | 'findings'
+    | 'cutover_refusals'
+    | 'gpu_wait'
   >;
 
 export interface AttentionItem {
@@ -136,6 +147,16 @@ export function attentionItems(
         nextAction:
           m.phase === 'awaiting_cutover' ? `${fix}, then Sync now (operator)` : `${fix} before it converges: the next pass looks again (operator)`,
         rank: 3,
+      };
+    } else if (m.gpu_wait && GPU_WAIT_PHASES.has(m.phase)) {
+      // a capacity read is made once the gate's other rules hold (SDD §5.4 rule 5): its approvals are in, and it is a
+      // wait, ranked with the window's, its source still running (§16, §22.7)
+      item = {
+        migration: m,
+        tone: 'info',
+        reason: gpuWaitSummary(m.gpu_wait),
+        nextAction: 'Wait, or free GPU capacity on the destination: the cutover starts once a read finds room',
+        rank: 6,
       };
     } else if (m.phase === 'awaiting_cutover') {
       item =

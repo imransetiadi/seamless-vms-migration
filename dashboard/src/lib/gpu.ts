@@ -2,10 +2,14 @@
  * A flavor's GPU requests and a VM's GPUs as the control plane reads them (planning/gpu.py `gpu_requests` and `vm_gpus`,
  * SDD §22.2): the mock's one port of them, which its eligibility, probe suggestions, waves and GPU mapping rule read, and
  * the dashboard's GPU column too. Both suites test it against one case table,
- * `seamless/tests/fixtures/gpu_request_cases.json` (PR #64 review). Below them, how the dashboard words GPUs (SDD §16).
+ * `seamless/tests/fixtures/gpu_request_cases.json` (PR #64 review). Then the rest of planning/gpu.py the mock's pre-flight
+ * and cutover gate read - the GPU key, the GPU flavor rule, profile sizes, pool names and units - and the room rule they
+ * share (planning/preflight.gpu_shortfalls), which the shared finding cases hold to the API's (eligibility_cases.json,
+ * plan task G12). Below them, how the dashboard words GPUs, their mappings and a cutover's wait for them (SDD §16).
  */
-import type { GpuCapacity, GpuCheckReport, GpuDevice, GpuFlavor, GpuPool, ProviderInventory, VMRef } from '../api/types';
-import { byCodePoint, pyInt, pyStrip } from './format';
+import { GPU_CODES } from '../api/findingCatalog';
+import type { DestinationInventory, GpuCapacity, GpuCheckReport, GpuDevice, GpuFlavor, GpuPool, GpuWait, Migration, Plan, Provider, ProviderInventory, ProviderKind, VMRef } from '../api/types';
+import { byCodePoint, formatNumber, pyInt, pyStrip } from './format';
 
 /** Nova's resource class of a vGPU. */
 const VGPU = 'VGPU';
@@ -96,11 +100,171 @@ export function vgpuRequestKeys(specs: Record<string, string>, declaredProfile: 
 
 /** The VM's GPUs, as the API's vm_gpus reads them (SDD §22.2): as its source reported them, else - a VM recorded before
  * 0.3.0 - what its flavor's extra specs ask for, with the profile its source declares for the flavor. */
-export function vmGpus(vm: VMRef, declaredProfile: string | null = null): GpuDevice[] {
+export function vmGpus(vm: Pick<VMRef, 'gpus' | 'flavor_extra_specs'>, declaredProfile: string | null = null): GpuDevice[] {
   if (vm.gpus?.length) return [...vm.gpus];
   const specs = vm.flavor_extra_specs ?? {};
   if (!Object.keys(specs).some((key) => key.startsWith('resources') || key.startsWith(PCI_ALIAS))) return [];
   return gpuRequests(specs, declaredProfile);
+}
+
+/** The profile its source declares for a VM's flavor (`gpu_profiles`, SDD §22.3), by own key: null without one. */
+export function declaredProfileOf(vm: Pick<VMRef, 'flavor'>, profiles: Readonly<Record<string, string>> | undefined): string | null {
+  return vm.flavor && profiles && Object.hasOwn(profiles, vm.flavor) ? profiles[vm.flavor]! : null;
+}
+
+/** What a plan's GPU mapping names a VMware device by: a vGPU's profile, a passthrough device's `<vendor_id>:<device_id>`;
+ * null when it has neither (the API's gpu_key, SDD §22.2, §22.4). */
+export function gpuKey(device: GpuDevice): string | null {
+  if (device.kind === 'vgpu') return device.profile || null;
+  return device.vendor_id && device.device_id ? `${device.vendor_id}:${device.device_id}` : null;
+}
+
+/**
+ * A GPU VM's GPU flavor as its plan names it, the API's gpu_flavor (SDD §22.4): for a VMware VM the one flavor
+ * `mappings.gpus` maps each of its GPU keys to - null when a device has no key, a key no mapping names, or its keys map
+ * to different flavors -; for an OpenStack VM the explicit mapping of its flavor. Never a same-named or matched flavor;
+ * null for a VM without a GPU, its GPUs read with the profile its source declares for its flavor.
+ */
+export function gpuFlavorOf(
+  vm: Pick<VMRef, 'gpus' | 'flavor_extra_specs' | 'flavor'>,
+  plan: Pick<Plan, 'mappings'>,
+  sourceKind: ProviderKind,
+  declaredProfile: string | null = null,
+): string | null {
+  const gpus = vmGpus(vm, declaredProfile);
+  if (!gpus.length) return null;
+  if (sourceKind !== 'vmware') return vm.flavor && Object.hasOwn(plan.mappings.flavors, vm.flavor) ? plan.mappings.flavors[vm.flavor]! : null;
+  const mapped = plan.mappings.gpus ?? {};
+  const named = new Set(gpus.map((g) => {
+    const key = gpuKey(g);
+    return key !== null && Object.hasOwn(mapped, key) ? mapped[key]! : null;
+  }));
+  return named.size === 1 ? ([...named][0] ?? null) : null;
+}
+
+/** What an NVIDIA vGPU profile's name says of its size (SDD §22.2): `grid_a100-3-20c` is an A100's 3 MIG slices with 20 GB
+ * of framebuffer, series C. */
+export interface ProfileSize {
+  gpu: string;
+  slices: number | null;
+  framebuffer_gb: number;
+  series: string;
+}
+
+/** NVIDIA's profile names, with or without vCenter's grid_/nvidia_ prefix or the "GRID " of the mediated device types, read
+ * case-insensitively as Python's re.IGNORECASE reads them (simple case folding: the `u` flag) - the API's _PROFILE. */
+const PROFILE = /^(?:grid_|nvidia_|grid )?([a-z0-9]+)-(?:([1-9][0-9]?)-)?([1-9][0-9]*)([abcq])$/iu;
+
+/** The size an NVIDIA vGPU profile's name gives, the API's vgpu_profile_size (SDD §22.2); null for any other name - an
+ * mdev type id such as `nvidia-471` among them. */
+export function vgpuProfileSize(name: string): ProfileSize | null {
+  const match = PROFILE.exec(name);
+  if (!match) return null;
+  return { gpu: match[1]!.toUpperCase(), slices: match[2] ? Number(match[2]) : null, framebuffer_gb: Number(match[3]), series: match[4]!.toUpperCase() };
+}
+
+/** A pool's name as the cutover gate's wait gives it, the API's pool_name (SDD §10, §22.7): the class, the required traits
+ * sorted, then the forbidden ones sorted, each prefixed with "!" - "VGPU CUSTOM_NVIDIA_A100_4C". */
+export function poolName(resourceClass: string, traits: readonly string[] = [], forbidden: readonly string[] = []): string {
+  return [resourceClass, ...[...traits].sort(byCodePoint), ...[...forbidden].sort(byCodePoint).map((t) => `!${t}`)].join(' ');
+}
+
+/** A request's pool, as poolKey tells it from another: what the room rule counts units by (SDD §22.3). */
+export function requestPoolKey(device: Pick<GpuDevice, 'resource_class' | 'traits' | 'forbidden_traits' | 'same_provider'>): string {
+  return poolKey(device.resource_class ?? '', device.traits, device.forbidden_traits, Boolean(device.same_provider));
+}
+
+/** A class alone's pool, which unites the class's pools (SDD §22.3). */
+export function classPoolKey(resourceClass: string): string {
+  return poolKey(resourceClass);
+}
+
+/**
+ * The units `requests` ask of each pool, the API's gpu_units (SDD §22.3, §22.5, §22.7): a vGPU request's count in its own
+ * pool and in its class's, which unites the class's pools - once, for a request without traits, whose pool its class's
+ * is. A PCI alias request asks of no pool.
+ */
+export function gpuUnits(requests: Iterable<GpuDevice>): Map<string, number> {
+  const units = new Map<string, number>();
+  for (const device of requests) {
+    if (device.kind !== 'vgpu' || !device.resource_class) continue;
+    for (const key of new Set([requestPoolKey(device), classPoolKey(device.resource_class)])) units.set(key, (units.get(key) ?? 0) + device.count);
+  }
+  return units;
+}
+
+/**
+ * Where vGPU requests find no room in a capacity read (SDD §22.3, §22.5, §22.7): `kind` "refused" - Placement refused the
+ * pool's request, its `detail` -, "pool" - the units asked of it pass its free -, "class" - across its class's pools - or
+ * "group" - no provider has the `needed` units a request group takes from one, `free` the most on one.
+ */
+export interface Shortfall {
+  key: string;
+  /** the pool by poolName, or a class alone */
+  pool: string;
+  kind: 'refused' | 'pool' | 'class' | 'group';
+  needed: number;
+  free: number;
+  detail: string | null;
+}
+
+/**
+ * Where the vGPU requests among `requests` find no room in the read's `pools` when `asked` gives the units asked of each
+ * pool (gpuUnits): the pre-flight's rule and the cutover gate's, the API's gpu_shortfalls (SDD §22.5, §22.7), in the
+ * order the pre-flight words it - each pool they ask of that Placement refuses or whose free is below what is asked of it;
+ * each class across its pools, unless a request without traits asks of the class's pool, whose check is its own; then each
+ * request group of n > 1 units no provider holds. A pool the read does not hold is skipped: nothing is guessed.
+ */
+export function gpuShortfalls(requests: Iterable<GpuDevice>, asked: ReadonlyMap<string, number>, pools: Iterable<GpuPool>): Shortfall[] {
+  const vgpus = [...requests].filter((g) => g.kind === 'vgpu' && g.resource_class);
+  const read = new Map([...pools].map((p) => [poolKey(p.resource_class, p.traits, p.forbidden_traits, p.same_provider), p]));
+  const keys = [...new Set(vgpus.map(requestPoolKey))];
+  const out: Shortfall[] = [];
+  for (const key of keys) {
+    const pool = read.get(key);
+    if (!pool) continue;
+    const name = poolName(pool.resource_class, pool.traits, pool.forbidden_traits);
+    if (pool.detail !== null && pool.detail !== undefined) out.push({ key, pool: name, kind: 'refused', needed: asked.get(key) ?? 0, free: pool.free, detail: pool.detail });
+    else if ((asked.get(key) ?? 0) > pool.free) out.push({ key, pool: name, kind: 'pool', needed: asked.get(key)!, free: pool.free, detail: null });
+  }
+  for (const cls of new Set(vgpus.map((g) => g.resource_class!))) {
+    const key = classPoolKey(cls);
+    const alone = read.get(key);
+    // a request without traits asks its class's pool: that check was its own
+    if (!alone || (alone.detail !== null && alone.detail !== undefined) || keys.includes(key)) continue;
+    if ((asked.get(key) ?? 0) > alone.free) out.push({ key, pool: cls, kind: 'class', needed: asked.get(key)!, free: alone.free, detail: null });
+  }
+  for (const device of vgpus) {
+    const key = requestPoolKey(device);
+    const pool = read.get(key);
+    // a group of n > 1 units needs one provider with n free (SDD §22.3, §22.5)
+    if (pool && (pool.detail === null || pool.detail === undefined) && device.count > 1 && device.count > pool.largest_free) {
+      out.push({ key, pool: poolName(pool.resource_class, pool.traits, pool.forbidden_traits), kind: 'group', needed: device.count, free: pool.largest_free, detail: null });
+    }
+  }
+  return out;
+}
+
+/** The root disk size a flavor must give a VM: an image-booted or ephemeral root's, else 0 - the API's _local_root_gb, its
+ * root the first bootable disk, else the first (SDD §9.3). */
+export function localRootGb(vm: Pick<VMRef, 'disks'>): number {
+  const root = (vm.disks ?? []).find((d) => d.bootable) ?? vm.disks?.[0];
+  return root && (root.kind === 'image_root' || root.kind === 'ephemeral') ? root.size_gb : 0;
+}
+
+/** What a GPU flavor gives a VM less of than the VM has, as `MAP_GPU_FLAVOR` warns (SDD §22.4, §22.5): vCPUs, RAM in MiB
+ * and local root disk in GiB, each what the flavor gives and what the VM has; empty when it fits. */
+export function flavorShortfalls(
+  flavor: Pick<GpuFlavor, 'vcpus' | 'ram_mb' | 'disk_gb'>,
+  vm: Pick<VMRef, 'vcpus' | 'ram_mb' | 'disks'>,
+): Array<{ what: 'vcpus' | 'ram_mb' | 'root_gb'; gives: number; has: number }> {
+  const root = localRootGb(vm);
+  const pairs: Array<{ what: 'vcpus' | 'ram_mb' | 'root_gb'; gives: number; has: number }> = [
+    { what: 'vcpus', gives: flavor.vcpus || 0, has: vm.vcpus },
+    { what: 'ram_mb', gives: flavor.ram_mb || 0, has: vm.ram_mb },
+    { what: 'root_gb', gives: flavor.disk_gb || 0, has: root },
+  ];
+  return pairs.filter((p) => p.gives < p.has);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -242,6 +406,130 @@ export function inventoryGpuFlavors(inventory: ProviderInventory, declared: Read
     ? inventory.flatMap((vm) => (vm.flavor && vmGpus(vm, profile(vm.flavor)).length ? [vm.flavor] : []))
     : (inventory.gpu_flavors ?? inventory.flavors.filter((f) => gpuRequests(f.extra_specs, profile(f.name)).length)).map((f) => f.name);
   return [...new Set(names)].sort(byCodePoint);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The plan form's GPU mappings (SDD §16, §22.4, §22.11; plan task G12)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A destination's GPU flavors as its inventory lists them (`gpu_flavors`, SDD §22.3) - from an answer without them, its
+ * flavors that ask for a GPU, read with the profiles it declares.
+ */
+export function destinationGpuFlavors(inventory: DestinationInventory, declared: Readonly<Record<string, string>> = {}): GpuFlavor[] {
+  if (inventory.gpu_flavors) return inventory.gpu_flavors;
+  return inventory.flavors.flatMap(({ name, vcpus, ram_mb, disk_gb, extra_specs }) => {
+    const gpus = gpuRequests(extra_specs, Object.hasOwn(declared, name) ? declared[name]! : null);
+    return gpus.length ? [{ name, vcpus, ram_mb, disk_gb, gpus }] : [];
+  });
+}
+
+/** A selected VM with its GPUs, read with the profile its source declares for its flavor (SDD §22.2). */
+export interface GpuVm {
+  vm: VMRef;
+  gpus: GpuDevice[];
+}
+
+/** One row per GPU key among the selected VMs, by key, and the devices no GPU key names (SDD §22.2, §22.4). */
+export function gpuKeyRows(vms: readonly GpuVm[]): { rows: Array<{ key: string; vms: VMRef[] }>; keyless: Array<{ vm: VMRef; device: GpuDevice }> } {
+  const byKey = new Map<string, VMRef[]>();
+  const keyless: Array<{ vm: VMRef; device: GpuDevice }> = [];
+  for (const { vm, gpus } of vms) {
+    for (const device of gpus) {
+      const key = gpuKey(device);
+      if (key === null) keyless.push({ vm, device });
+      else if (!byKey.get(key)?.includes(vm)) byKey.set(key, [...(byKey.get(key) ?? []), vm]);
+    }
+  }
+  const rows = [...byKey.entries()].sort(([a], [b]) => byCodePoint(a, b)).map(([key, list]) => ({ key, vms: list }));
+  return { rows, keyless };
+}
+
+/** The OpenStack flavors among the selected VMs that ask for a GPU, by flavor, with their VMs and what they ask for (SDD §22.4). */
+export function gpuFlavorRows(vms: readonly GpuVm[]): Array<{ flavor: string; vms: VMRef[]; gpus: GpuDevice[] }> {
+  const byFlavor = new Map<string, { vms: VMRef[]; gpus: GpuDevice[] }>();
+  for (const { vm, gpus } of vms) {
+    const flavor = vm.flavor ?? '';
+    const row = byFlavor.get(flavor) ?? { vms: [], gpus };
+    row.vms.push(vm);
+    byFlavor.set(flavor, row);
+  }
+  return [...byFlavor.entries()].sort(([a], [b]) => byCodePoint(a, b)).map(([flavor, row]) => ({ flavor, ...row }));
+}
+
+/** MiB of RAM in GiB, as the form words a size: "32 GiB", "1.5 GiB" (SDD §16 sizes). */
+export function ramGib(ramMb: number): string {
+  return `${formatNumber(ramMb / 1024, 1)} GiB`;
+}
+
+/** A GPU flavor with its size and its GPU requests as the Inventory words them (SDD §16): "g1.a100-4c: 8 vCPUs, 32 GiB RAM,
+ * 200 GiB disk, vGPU A100-4C · VGPU, CUSTOM_NVIDIA_A100_4C". */
+export function gpuFlavorText(flavor: GpuFlavor): string {
+  return `${flavor.name}: ${flavor.vcpus} vCPUs, ${ramGib(flavor.ram_mb)} RAM, ${flavor.disk_gb} GiB disk, ${flavor.gpus.map((g) => gpuLabel(g)).join('; ')}`;
+}
+
+/** What a GPU flavor gives a VM less of than it has, in words, as `MAP_GPU_FLAVOR` warns: "8 vCPUs for its 16 and 32 GiB RAM
+ * for its 64 GiB"; null when it fits (SDD §22.4). */
+export function misfitText(flavor: Pick<GpuFlavor, 'vcpus' | 'ram_mb' | 'disk_gb'>, vm: Pick<VMRef, 'vcpus' | 'ram_mb' | 'disks'>): string | null {
+  const parts = flavorShortfalls(flavor, vm).map(({ what, gives, has }) =>
+    what === 'vcpus' ? `${gives} vCPUs for its ${has}` : what === 'ram_mb' ? `${ramGib(gives)} RAM for its ${ramGib(has)}` : `${gives} GiB of root disk for its ${has} GiB`,
+  );
+  if (!parts.length) return null;
+  return parts.length === 1 ? parts[0]! : `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)}`;
+}
+
+/** The VMs' sizes as a GPU mapping row names them (SDD §16): "2 VMs, 8–16 vCPUs, 32–64 GiB". */
+export function vmsSizeText(vms: ReadonlyArray<Pick<VMRef, 'vcpus' | 'ram_mb'>>): string {
+  const range = (values: number[], word: (n: number) => string) => {
+    const low = Math.min(...values);
+    const high = Math.max(...values);
+    return low === high ? word(low) : `${word(low).replace(/ .*$/, '')}–${word(high)}`;
+  };
+  return `${vms.length} VM${vms.length === 1 ? '' : 's'}, ${range(vms.map((v) => v.vcpus), (n) => `${n} vCPUs`)}, ${range(vms.map((v) => v.ram_mb), ramGib)}`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The migration page's GPU panel (SDD §16, §22.11; plan task G12)
+// ---------------------------------------------------------------------------------------------
+
+/** The verification's GPU checks (SDD §7.5, §22.8). */
+export const GPU_CHECKS: ReadonlySet<string> = new Set(['gpu_flavor', 'gpu_allocation']);
+/** Whether the migration page shows its GPU panel (SDD §16): a VM with a GPU, a GPU finding, a wait or a GPU check. */
+export function hasGpuPanel(m: Pick<Migration, 'vm' | 'gpu_wait' | 'findings' | 'verification'>, source: Pick<Provider, 'gpu_profiles'> | undefined): boolean {
+  return (
+    vmGpus(m.vm, declaredProfileOf(m.vm, source?.gpu_profiles)).length > 0 ||
+    m.gpu_wait !== null ||
+    m.findings.some((f) => GPU_CODES.has(f.code)) ||
+    Boolean(m.verification?.checks.some((c) => GPU_CHECKS.has(c.name)))
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A cutover's wait for GPU capacity, as the dashboard words it (SDD §16, §22.7, §22.11; plan task G12)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * What Needs attention says of a wait (SDD §16): "Waiting for GPU capacity: {pool}, {free} free, needs {needed}" - after a
+ * read that failed, whose `free` is null, its reason, which names the failure, in place of the numbers it could not read.
+ */
+export function gpuWaitSummary(wait: GpuWait): string {
+  return wait.free === null ? `Waiting for GPU capacity: ${wait.reason}` : `Waiting for GPU capacity: ${wait.pool}, ${wait.free} free, needs ${wait.needed}`;
+}
+
+/** What it waits for, as the migration page words it (SDD §16): "{free} free of {needed} in {pool}", or after a failed read
+ * its reason. */
+export function gpuWaitWhat(wait: GpuWait): string {
+  return wait.free === null ? wait.reason : `${wait.free} free of ${wait.needed} in ${wait.pool}`;
+}
+
+/** The migration page's announcement when a wait begins (SDD §16): "{vm} waits for GPU capacity: ... The source VM keeps running." */
+export function gpuWaitBegins(vm: string, wait: GpuWait): string {
+  return `${vm} waits for GPU capacity: ${gpuWaitWhat(wait)}. The source VM keeps running.`;
+}
+
+/** The migration page's announcement when a wait ends (SDD §16). */
+export function gpuWaitEnds(vm: string): string {
+  return `${vm} no longer waits for GPU capacity.`;
 }
 
 /** A row of the provider form's declared vGPU profiles: a flavor and the profile it gives, as typed (SDD §16). */

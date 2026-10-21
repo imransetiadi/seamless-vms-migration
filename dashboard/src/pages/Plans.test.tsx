@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import type { MockServer } from '../api/mock';
 import { makeVm } from '../api/mockData';
 import type { VMRef } from '../api/types';
+import { gpuDevice } from '../lib/gpu';
 import { phaseMeta } from '../lib/phase';
 import { createTestServer, formFields, recordScrolls, renderWithApp } from '../test/utils';
 import Plans from './Plans';
@@ -15,7 +16,124 @@ function withVolumeType(server: MockServer, id: string, type: string, pool: stri
   inventory.unshift(makeVm({ id, name: 'odd-01', project: 'shop', disks: [{ size_gb: 20, used_gb: 2, volume_type: type, pool }] }));
 }
 
+/** A VMware VM of the source's inventory, on its ERP port group, with these GPUs (SDD §22.2). */
+function withVmwareGpuVm(server: MockServer, id: string, name: string, gpus: VMRef['gpus'], size: { vcpus?: number; ram_mb?: number } = {}): void {
+  const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['vcenter-hq']!;
+  inventory.push(
+    makeVm({ id, name, project: 'erp', ...size, cbt_enabled: true, tools_ok: true, disks: [{ size_gb: 100, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], gpus }),
+  );
+}
+
+/** The new-plan dialog with its name, source and destination chosen. */
+async function newPlan(user: ReturnType<typeof userEvent.setup>, name: string, source: string) {
+  await user.click(await screen.findByRole('button', { name: /new plan/i }));
+  const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+  await user.type(within(dialog).getByLabelText(/^name/i), name);
+  await user.selectOptions(within(dialog).getByLabelText(/source provider/i), source);
+  await user.selectOptions(within(dialog).getByLabelText(/destination provider/i), 'rhoso-prod');
+  return dialog;
+}
+
 describe('Plans page', () => {
+  it('maps each GPU key of the selected VMware VMs to a destination GPU flavor, never prefilled', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const dialog = await newPlan(user, 'ML exit', 'vcenter-hq');
+    // no selected VM has a GPU: no GPU mappings
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select vm-erp-app-01' }));
+    expect(within(dialog).queryByRole('group', { name: 'GPU mappings' })).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Select dc2-ml-01' }));
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Select dc2-ml-02' }));
+    const section = within(dialog).getByRole('group', { name: 'GPU mappings' });
+    // outside the advanced settings, with its Technology Preview badge
+    expect(within(dialog).getByText(/^advanced:/i).closest('details')).not.toContainElement(section);
+    expect(within(section).getByRole('button', { name: 'Technology Preview' })).toBeInTheDocument();
+    // one row per GPU key, by key, naming how many VMs have it and their size; nothing chosen for the operator
+    const mig = within(section).getByRole('combobox', { name: 'grid_a100-3-20c: 1 VM, 16 vCPUs, 64 GiB' });
+    const fourC = within(section).getByRole('combobox', { name: 'grid_a100-4c: 1 VM, 8 vCPUs, 32 GiB' });
+    expect(within(section).getAllByRole('combobox')).toEqual([mig, fourC]);
+    expect([mig, fourC].map((select) => (select as HTMLSelectElement).value)).toEqual(['', '']);
+    // a choice among the destination's GPU flavors, each with its size and GPU requests, or None
+    await waitFor(() =>
+      expect(within(fourC).getAllByRole('option').map((o) => o.textContent)).toEqual([
+        'None',
+        'g1.a100-4c: 8 vCPUs, 32 GiB RAM, 200 GiB disk, vGPU A100-4C · VGPU, CUSTOM_NVIDIA_A100_4C',
+        'g1.a100-3-20c: 16 vCPUs, 64 GiB RAM, 300 GiB disk, vGPU A100-3-20C · VGPU, CUSTOM_NVIDIA_A100_3_20C',
+        'p1.a100: 16 vCPUs, 128 GiB RAM, 400 GiB disk, Passthrough · alias a100',
+      ]),
+    );
+    await user.selectOptions(fourC, 'g1.a100-4c');
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 3 vms/i }));
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'ML exit')).toBe(true));
+    // the key left at None is no mapping: validation keeps its VM blocked
+    expect(server.plans.find((p) => p.name === 'ML exit')!.mappings.gpus).toEqual({ 'grid_a100-4c': 'g1.a100-4c' });
+  });
+
+  it('marks the VMs a GPU flavor does not fit', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    withVmwareGpuVm(server, 'vm-5010', 'dc2-ml-03', [gpuDevice({ kind: 'vgpu', profile: 'grid_a100-4c' })], { vcpus: 16, ram_mb: 65536 });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+    const dialog = await newPlan(user, 'ML sizes', 'vcenter-hq');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select dc2-ml-01' }));
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Select dc2-ml-03' }));
+    const row = within(dialog).getByRole('combobox', { name: 'grid_a100-4c: 2 VMs, 8–16 vCPUs, 32–64 GiB' });
+    await within(row).findByRole('option', { name: /^g1\.a100-4c:/ });
+    // the GPU flavor decides the server's size, as MAP_GPU_FLAVOR warns: each VM it does not fit, with what it gives
+    await user.selectOptions(row, 'g1.a100-4c');
+    expect(row).toHaveAccessibleDescription(/Does not fit dc2-ml-03: 8 vCPUs for its 16 and 32 GiB RAM for its 64 GiB\./);
+    expect(row).not.toHaveAccessibleDescription(/dc2-ml-01:/);
+    // a flavor of both VMs' size marks none
+    await user.selectOptions(row, 'g1.a100-3-20c');
+    expect(row).not.toHaveAccessibleDescription(/Does not fit/);
+  });
+
+  it('names a passthrough device no mapping can take', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    withVmwareGpuVm(server, 'vm-5011', 'dc2-fpga-01', [gpuDevice({ kind: 'passthrough' })]);
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+    const dialog = await newPlan(user, 'FPGA', 'vcenter-hq');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select dc2-fpga-01' }));
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Select dc2-cuda-01' }));
+    const section = within(dialog).getByRole('group', { name: 'GPU mappings' });
+    // a device without ids has no GPU key: named with its VM, and no choice offered for it (SDD §22.2, §22.4)
+    expect(section).toHaveTextContent('dc2-fpga-01: Passthrough without device ids. No mapping can take a device without ids: validation blocks the VM.');
+    // the device with ids is mapped by them
+    expect(within(section).getAllByRole('combobox')).toHaveLength(1);
+    expect(within(section).getByRole('combobox', { name: '10de:20b5: 1 VM, 16 vCPUs, 128 GiB' })).toHaveValue('');
+  });
+
+  it("says which selected VMs' flavors ask for a GPU and offers the destination's GPU flavors for them (SDD §16, §22.4)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const dialog = await newPlan(user, 'ML training', 'rhosp17-dc1');
+    // past the table's first page of 25: found by its name
+    await user.type(await within(dialog).findByLabelText('Search VMs'), 'gpu-ml');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select gpu-ml-01' }));
+    const section = within(dialog).getByRole('group', { name: 'GPU mappings' });
+    // an OpenStack VM's GPU comes with its flavor: its flavor mapping is its GPU mapping, offered here and in the field
+    const row = within(section).getByRole('listitem', { name: 'g1.vgpu: 1 VM, 8 vCPUs, 32 GiB' });
+    expect(row).toHaveTextContent('Asks for vGPU · VGPU, CUSTOM_NVIDIA_A100_4C');
+    expect(row).toHaveTextContent('Not mapped: validation blocks its VMs until Flavor mappings map it to a GPU flavor.');
+    await user.click(within(section).getByRole('link', { name: 'Edit flavor mappings' }));
+    const field = within(dialog).getByLabelText(/^flavor mappings/i);
+    expect(field).toHaveFocus();
+    await waitFor(() =>
+      expect(field).toHaveAccessibleDescription(
+        'g1.vgpu (gpu-ml-01) asks for a GPU: map it to a GPU flavor of RHOSO 18.0 — Production - g1.a100-4c, g1.a100-3-20c or p1.a100. A same-named flavor is no mapping.',
+      ),
+    );
+    await user.type(field, 'g1.vgpu = m1.large');
+    expect(row).toHaveTextContent('Flavor mappings map it to m1.large, which asks for no GPU: its server would lose its GPU, so validation blocks it.');
+    await user.clear(field);
+    await user.type(field, 'g1.vgpu = g1.a100-4c');
+    expect(row).toHaveTextContent('Flavor mappings map it to g1.a100-4c: 8 vCPUs, 32 GiB RAM, 200 GiB disk, vGPU A100-4C · VGPU, CUSTOM_NVIDIA_A100_4C.');
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'ML training')).toBe(true));
+    expect(server.plans.find((p) => p.name === 'ML training')!.mappings).toMatchObject({ flavors: { 'g1.vgpu': 'g1.a100-4c' }, gpus: {} });
+  });
+
   it('lists plans with status in text', async () => {
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer' });
     const table = await screen.findByRole('table', { name: /migration plans/i });

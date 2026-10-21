@@ -3815,3 +3815,81 @@ describe('mock routes whose request is empty, like the API (SDD §12, audit AA-0
     expect(checked.id).toBe(provider.id);
   });
 });
+
+describe("the mock's cutover gate for GPU capacity, as the API demo's (SDD §5.4 rule 5, §22.7, §22.10, plan task G12)", () => {
+  /** A running plan of the VMware source's MIG-backed vGPU VM, mapped to the destination's MIG flavor and cut over on its own. */
+  async function migPlan() {
+    let t = NOW;
+    const server = new MockServer({ now: () => t, seed: 1 });
+    const client = new ApiClient({ getToken: () => 'admin', fetchImpl: createMockFetch(server) });
+    const plan = await client.post<Plan>('/plans', {
+      name: 'MIG inference',
+      source_provider_id: 'vcenter-hq',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: ['vm-5008'],
+      default_strategy: 'vmware_cold',
+      require_approval: false,
+      auto_cutover: true,
+      mappings: { networks: { 'VM Network ERP': 'erp-net' }, flavors: {}, volume_types: {}, projects: {}, gpus: { 'grid_a100-3-20c': 'g1.a100-3-20c' } },
+    });
+    await client.post(`/plans/${plan.id}/validate`);
+    const m = server.migrations.find((x) => x.plan_id === plan.id)!;
+    const tick = () => {
+      t += 1000;
+      server.tick();
+    };
+    return { server, client, plan, m, tick };
+  }
+
+  it("holds a GPU VM's cutover while the A100-3-20C pool reads full on the gate's first two reads, then cuts it over, saying so once each", async () => {
+    const { server, client, plan, m, tick } = await migPlan();
+    // the validation sees room: its mapping applies, and no capacity finding holds it
+    expect(m.phase).toBe('ready');
+    expect(m.findings.map((f) => f.code)).toEqual(expect.arrayContaining(['MAP_GPU_FLAVOR', 'GUEST_GPU_DRIVER', 'GUEST_GPU_LICENSE']));
+    expect(m.findings.map((f) => f.code)).not.toContain('DST_GPU_CAPACITY_INSUFFICIENT');
+    await client.post(`/plans/${plan.id}/start`);
+    const waits = () => server.events.filter((e) => e.migration_id === m.id && e.kind === 'migration.gpu_wait');
+    const pool = 'VGPU CUSTOM_NVIDIA_A100_3_20C';
+    const reason = "VGPU CUSTOM_NVIDIA_A100_3_20C of RHOSO 18.0 — Production has 0 units free, and flavor 'g1.a100-3-20c' needs 1";
+    tick();
+    // the first read finds the pool full: the source keeps running, and the wait is said once
+    expect(m.phase).toBe('ready');
+    expect(m.gpu_wait).toEqual({ since: new Date(NOW + 1000).toISOString(), checked_at: new Date(NOW + 1000).toISOString(), pool, needed: 1, free: 0, reason });
+    expect(waits().map((e) => [e.message, e.data])).toEqual([
+      [`dc2-ml-02: its cutover waits for GPU capacity - ${reason}; the source VM keeps running`, { waiting: true, pool, needed: 1, free: 0 }],
+    ]);
+    // a read counts for three ticks; the second finds the pool full again and updates the wait without an event
+    tick();
+    tick();
+    tick();
+    expect(m.phase).toBe('ready');
+    expect(m.gpu_wait).toMatchObject({ since: new Date(NOW + 1000).toISOString(), checked_at: new Date(NOW + 4000).toISOString(), free: 0 });
+    expect(waits()).toHaveLength(1);
+    // the third finds room: the wait ends, said once more with the units found, and the cutover starts
+    for (let i = 0; i < 3; i += 1) tick();
+    expect(m.phase).toBe('cutover');
+    expect(m.gpu_wait).toBeNull();
+    expect(waits().map((e) => [e.message, e.data])).toEqual([
+      [`dc2-ml-02: its cutover waits for GPU capacity - ${reason}; the source VM keeps running`, { waiting: true, pool, needed: 1, free: 0 }],
+      ['dc2-ml-02: RHOSO 18.0 — Production has the GPU capacity its cutover needs', { waiting: false, pool, needed: 1, free: 2 }],
+    ]);
+  });
+
+  it('drops the wait silently when its migration leaves the gate, and a VM without a GPU never waits on a read', async () => {
+    const { server, client, plan, m, tick } = await migPlan();
+    await client.post(`/plans/${plan.id}/start`);
+    tick();
+    expect(m.gpu_wait).not.toBeNull();
+    await client.post(`/migrations/${m.id}/cancel`, {});
+    expect(m.phase).toBe('cancelled');
+    expect(m.gpu_wait).toBeNull();
+    expect(server.events.filter((e) => e.migration_id === m.id && e.kind === 'migration.gpu_wait')).toHaveLength(1);
+    // the gate reads for a GPU VM alone: a VM without a GPU cuts over on its tick
+    const plain = server.migrations.find((x) => x.vm.name === 'ad-dc-01')!;
+    Object.assign(server.plans.find((p) => p.id === plain.plan_id)!, { require_approval: false, auto_cutover: true, cutover_window: null, waves: [] });
+    plain.wave_id = null;
+    tick();
+    expect(plain.phase).toBe('cutover');
+    expect(plain.gpu_wait).toBeNull();
+  });
+});

@@ -13,7 +13,7 @@
 import { DEFAULT_API_BASE } from './client';
 import { ESTIMATOR_DEFAULTS, forcedDowntime } from '../lib/forcedEstimate';
 import { canTransition } from '../lib/fsm';
-import { vmGpus } from '../lib/gpu';
+import { classPoolKey, declaredProfileOf, gpuFlavorOf, gpuShortfalls, gpuUnits, poolName, requestPoolKey, vmGpus, type Shortfall } from '../lib/gpu';
 import { guestOsOf } from '../lib/guestOs';
 import { capabilityRoles, policyProfileOf } from '../lib/networks';
 import { canonicalIp, isIpAddress } from '../lib/nics';
@@ -50,6 +50,8 @@ import {
   flavorContext,
   emptyDestinationInventory,
   readDestinationGpus,
+  quotaShare,
+  serverGpuFlavor,
   vmwareCheck,
   HELD_VOLUMES_REASON,
 } from './mockData';
@@ -267,6 +269,38 @@ const STOPPED_SOURCE: ReadonlySet<Phase> = new Set(['cutover', 'verifying', 'com
 const FORCEABLE: ReadonlySet<Phase> = new Set(['precopy', 'syncing']);
 const SIMPLICITY: Record<Strategy, number> = { cold: 0, storage_handover: 1, warm: 2, vmware_cold: 0, vmware_warm: 1 };
 const MAX_EVENTS = 5000;
+
+/** Where a cutover waits at its gate, for its approval, its window, a slot or GPU capacity (SDD §5.4): leaving them drops
+ * its wait for GPU capacity (§22.7). */
+const CUTOVER_WAIT_PHASES: ReadonlySet<Phase> = new Set(['ready', 'awaiting_cutover', 'syncing']);
+/** How many ticks a GPU capacity read counts for: the API demo's at its default speed, a model minute but never under
+ * three ticks (SDD §7.4, §22.7). */
+const GPU_READ_TICKS = 3;
+/** The demo's MIG-backed pool, which reads full on each destination's first two gate reads that ask of it (SDD §22.10). */
+const DEMO_MIG_POOL = requestPoolKey({ resource_class: 'VGPU', traits: ['CUSTOM_NVIDIA_A100_3_20C'], forbidden_traits: [], same_provider: false });
+
+/** What a capacity read of the cutover gate found (SDD §22.7): room, or the first shortfall - or the failure - its wait names,
+ * and the units asked and free in each pool of the flavor's own. */
+interface GpuRead {
+  room: boolean;
+  failed?: boolean;
+  pool?: string;
+  needed?: number;
+  free?: number | null;
+  reason?: string;
+  found?: Map<string, [number, number]>;
+}
+
+/** Why a capacity read found no room, in the API's words (orchestrator._shortfall_reason, SDD §22.7): the pool, the units it
+ * has free and the units the cutover needs there - `own` of them its flavor's -, the destination by its label. */
+function shortfallReason(short: Shortfall, where: string, flavor: string, own: number): string {
+  if (short.kind === 'refused') return `Placement of ${where} refuses the request for ${short.pool} (${short.detail}): no server is created with flavor ${pyRepr(flavor)}`;
+  if (short.kind === 'group')
+    return `no provider of ${short.pool} in ${where} has the ${short.needed} units free that a request group of flavor ${pyRepr(flavor)} takes from one; the most on one is ${short.free}`;
+  const across = short.kind === 'class' ? ' across its pools' : '';
+  const who = short.needed <= own ? `flavor ${pyRepr(flavor)} needs` : `flavor ${pyRepr(flavor)} and the cutovers to ${where} without a server yet need`;
+  return `${short.pool} of ${where} has ${short.free} units free${across}, and ${who} ${short.needed}`;
+}
 
 function ok(body: unknown, status = 200): MockResponse {
   return { status, body };
@@ -921,6 +955,12 @@ export class MockServer {
   private readonly passSizes = new Map<string, number>();
   /** The request being handled, for the `auth.denied` audit (SDD §13.1). */
   private request = { method: 'GET', path: '/' };
+  /** The ticks run so far: a GPU capacity read counts for GPU_READ_TICKS of them (SDD §22.7). */
+  private ticks = 0;
+  /** The last GPU capacity read of each migration at its gate, for its present stay there (SDD §5.4 rule 5, §22.7). */
+  private readonly gpuReads = new Map<string, { tick: number; room: boolean }>();
+  /** Each destination's gate reads that asked of the demo's MIG-backed pool (SDD §22.10). */
+  private readonly migPoolReads = new Map<string, number>();
 
   constructor(options: MockServerOptions = {}) {
     this.now = options.now ?? (() => Date.now());
@@ -977,6 +1017,7 @@ export class MockServer {
 
   /** One simulation step (1 s of demo time). */
   tick(): void {
+    this.ticks += 1;
     this.watchSources();
     const now = this.now();
     for (const m of this.migrations) {
@@ -996,13 +1037,13 @@ export class MockServer {
           // like the API's tick and _begin (SDD §5.4, §8): no held migration, only an active wave with room
           if (plan.status !== 'running' || !this.mayBegin(m, plan)) break;
           if (SINGLE_SHOT.has(m.strategy)) {
-            if (this.gateOpen(m, plan)) this.beginCutover(m, plan);
+            if (this.gateOpen(m, plan) && this.gpuRoom(m, plan)) this.beginCutover(m, plan);
           } else {
             this.transition(m, 'precopy', 'pre-copy started', 'orchestrator');
           }
           break;
         case 'awaiting_cutover':
-          if (plan.status === 'running' && this.mayBegin(m, plan) && this.gateOpen(m, plan)) this.beginCutover(m, plan);
+          if (plan.status === 'running' && this.mayBegin(m, plan) && this.gateOpen(m, plan) && this.gpuRoom(m, plan)) this.beginCutover(m, plan);
           break;
         case 'cutover':
           this.advanceCutover(m, plan);
@@ -1163,6 +1204,106 @@ export class MockServer {
     const inWindow = !window || (now >= Date.parse(window.start) && now <= Date.parse(window.end)) || m.force_window;
     const cutovers = this.migrations.filter((x) => x.phase === 'cutover').length;
     return approved && requested && inWindow && cutovers < 3;
+  }
+
+  /**
+   * Rule 5 of the cutover gate (SDD §5.4, §22.7): a GPU VM enters cutover only on a capacity read that found room for its
+   * GPU flavor, made once rules 1-4 hold. A read counts for three ticks, as the API demo's at its default speed; a VM
+   * without a GPU is never read for.
+   */
+  private gpuRoom(m: Migration, plan: Plan): boolean {
+    const source = this.sourceFor(plan);
+    if (!vmGpus(m.vm, declaredProfileOf(m.vm, source.gpu_profiles)).length) return true;
+    const last = this.gpuReads.get(m.id);
+    if (last && this.ticks - last.tick < GPU_READ_TICKS) return last.room;
+    const destination = this.destinationFor(plan);
+    const read = this.readGpuCapacity(m, plan, source, destination);
+    this.recordGpuRead(m, read, providerLabel(destination));
+    this.gpuReads.set(m.id, { tick: this.ticks, room: read.room });
+    return read.room;
+  }
+
+  /**
+   * A capacity read of the gate, as the API's _gpu_capacity_read (SDD §22.7): the destination's GPU flavors, then the pools
+   * of the migration's GPU flavor as the destination holds them - the demo's MIG-backed pool full on each destination's
+   * first two reads that ask of it, the class's pool short by its units then (§22.10) -, room for the flavor's units plus
+   * those of the destination's other cutovers without a server yet, by the pre-flight's rule. A PCI alias, a flavor
+   * without a vGPU request and a capacity Placement does not show (forbidden, no_placement) leave room; a failed read holds.
+   */
+  private readGpuCapacity(m: Migration, plan: Plan, source: Provider, destination: Provider): GpuRead {
+    const where = providerLabel(destination);
+    const flavor = gpuFlavorOf(m.vm, plan, source.kind, declaredProfileOf(m.vm, source.gpu_profiles)) ?? '';
+    const { gpu_flavors: flavors, gpu_capacity: capacity } = readDestinationGpus(this.inventories[destination.id], destination.gpu_profiles, new Date(this.now()).toISOString());
+    const vgpus = (flavors.find((f) => f.name === flavor)?.gpus ?? []).filter((g) => g.kind === 'vgpu' && g.resource_class);
+    if (!vgpus.length) return { room: true };
+    const own = gpuUnits(vgpus);
+    const asked = new Map(own);
+    for (const other of this.migrations) {
+      if (other.id === m.id || other.phase !== 'cutover' || other.destination_server_id) continue;
+      const otherPlan = this.plans.find((p) => p.id === other.plan_id);
+      const otherSource = otherPlan && this.providers.find((p) => p.id === otherPlan.source_provider_id);
+      if (!otherPlan || !otherSource || otherPlan.destination_provider_id !== destination.id) continue;
+      for (const [key, units] of gpuUnits(serverGpuFlavor(other.vm, otherPlan, flavors, otherSource.kind)?.gpus ?? [])) asked.set(key, (asked.get(key) ?? 0) + units);
+    }
+    const first = vgpus[0]!;
+    const held = { pool: poolName(first.resource_class!, first.traits, first.forbidden_traits), needed: asked.get(requestPoolKey(first)) ?? 0 };
+    if (capacity.status !== 'ok') {
+      // nothing can be read, and the pre-flight warned (DST_GPU_CAPACITY_UNKNOWN)
+      if (capacity.reason === 'forbidden' || capacity.reason === 'no_placement') return { room: true };
+      return { room: false, failed: true, ...held, free: null, reason: `the GPU capacity of ${where} could not be read (${capacity.detail || capacity.reason || 'error'})` };
+    }
+    let pools = capacity.pools;
+    if (own.has(DEMO_MIG_POOL)) {
+      const reads = (this.migPoolReads.get(destination.id) ?? 0) + 1;
+      this.migPoolReads.set(destination.id, reads);
+      const mig = pools.find((p) => requestPoolKey(p) === DEMO_MIG_POOL);
+      if (reads <= 2 && mig) {
+        // as if another tenant held its vGPUs: the pool full, and the class that unites it short by its units
+        pools = pools.map((p) => {
+          if (p === mig) return { ...p, free: 0, providers: 0, largest_free: 0 };
+          if (requestPoolKey(p) !== classPoolKey(mig.resource_class)) return p;
+          const free = Math.max(0, p.free - mig.free);
+          return { ...p, free, providers: Math.max(0, p.providers - mig.providers), largest_free: Math.min(p.largest_free, free) };
+        });
+      }
+    }
+    const found = new Map<string, [number, number]>();
+    for (const p of pools) if (own.has(requestPoolKey(p))) found.set(poolName(p.resource_class, p.traits, p.forbidden_traits), [asked.get(requestPoolKey(p)) ?? 0, p.free]);
+    const [short] = gpuShortfalls(vgpus, asked, pools);
+    if (!short) return { room: true, found };
+    return { room: false, pool: short.pool, needed: short.needed, free: short.free, reason: shortfallReason(short, where, flavor, own.get(short.key) ?? 0), found };
+  }
+
+  /**
+   * A read's outcome, as the API's _record_gpu_read (SDD §22.7): a read without room begins the migration's wait -
+   * `migration.gpu_wait` saying so once - or updates it; one with room ends it, the event saying so once more with the
+   * units the read found. A failed read keeps the pool and units its wait names.
+   */
+  private recordGpuRead(m: Migration, read: GpuRead, where: string): void {
+    const at = new Date(this.now()).toISOString();
+    const wait = m.gpu_wait;
+    if (read.room && wait) {
+      const [needed, free] = read.found?.get(wait.pool) ?? [wait.needed, null];
+      m.gpu_wait = null;
+      m.updated_at = at;
+      this.emit({ kind: 'migration.gpu_wait', plan_id: m.plan_id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: ${where} has the GPU capacity its cutover needs`, data: { waiting: false, pool: wait.pool, needed, free } });
+    } else if (!read.room) {
+      const keep = read.failed && wait && wait.pool;
+      const pool = keep ? wait.pool : (read.pool ?? '');
+      const needed = keep ? wait.needed : (read.needed ?? 0);
+      m.gpu_wait = { since: wait?.since ?? at, checked_at: at, pool, needed, free: read.free ?? null, reason: read.reason ?? '' };
+      m.updated_at = at;
+      if (!wait) {
+        this.emit({
+          kind: 'migration.gpu_wait',
+          plan_id: m.plan_id,
+          migration_id: m.id,
+          actor: 'orchestrator',
+          message: `${m.vm.name}: its cutover waits for GPU capacity - ${m.gpu_wait.reason}; the source VM keeps running`,
+          data: { waiting: true, pool, needed, free: read.free ?? null },
+        });
+      }
+    }
   }
 
   private beginCutover(m: Migration, plan: Plan): void {
@@ -1330,6 +1471,12 @@ export class MockServer {
     const from = m.phase;
     m.phase = to;
     m.updated_at = at;
+    // leaving its gate drops its wait for GPU capacity in the same write, which this transition announces, and its read
+    // was for a stay that ended (SDD §5.4 rule 5, §22.7)
+    if (!CUTOVER_WAIT_PHASES.has(to)) {
+      m.gpu_wait = null;
+      this.gpuReads.delete(m.id);
+    }
     // like the API (SDD §14.6): a cancelled migration takes no advisor decision
     if (to === 'cancelled') m.advisor_hold = null;
     if (to !== 'precopy' && to !== 'syncing' && to !== 'cutover') this.dropRunningPass(m);
@@ -1370,9 +1517,11 @@ export class MockServer {
       roles,
       profile,
       destination: providerLabel(destination),
-      // the flavors a GPU VM's mapping may name, and those of them that ask for a GPU with the profiles the destination
-      // declares now (SDD §22.3, §22.4)
-      ...flavorContext(dst, destination.gpu_profiles),
+      // the flavors a GPU VM's mapping may name, those of them that ask for a GPU with the profiles the destination
+      // declares now, and its GPU capacity as this read finds it (SDD §22.3, §22.4, §22.5)
+      ...flavorContext(dst, destination.gpu_profiles, new Date(this.now()).toISOString()),
+      // what a cutover of each of the plan's VMs will still create, by its migration's phase (SDD §9.3, §22.5)
+      shares: Object.fromEntries(this.migrations.filter((x) => x.plan_id === plan.id).map((x) => [x.vm.source_id, quotaShare(x.phase, keptAfterRollback(x))])),
       // the profiles the source declares for its flavors, which make a CUSTOM_ class a vGPU (SDD §22.2)
       gpuProfiles: source.gpu_profiles,
     });
@@ -2712,7 +2861,7 @@ export class MockServer {
         // only a converged warm migration or a ready single-shot one enters the cutover (SDD §5.4); an
         // early request waits for convergence
         const waiting = m.phase === 'awaiting_cutover' || (m.phase === 'ready' && SINGLE_SHOT.has(m.strategy));
-        if (plan.status === 'running' && waiting && this.mayBegin(m, plan) && this.gateOpen(m, plan)) this.beginCutover(m, plan);
+        if (plan.status === 'running' && waiting && this.mayBegin(m, plan) && this.gateOpen(m, plan) && this.gpuRoom(m, plan)) this.beginCutover(m, plan);
         break;
       }
       case 'force-cutover': {

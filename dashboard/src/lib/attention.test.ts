@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import type { Migration } from '../api/types';
+import { pendingApprovals } from './approvals';
 import { attentionItems } from './attention';
 import { completedSince } from './finalize';
+import { summaryOf } from './summary';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
 
@@ -165,5 +167,56 @@ describe('attentionItems', () => {
     billing.phase = 'awaiting_cutover';
     billing.cutover_refusals = [];
     expect(find()).toBeUndefined();
+  });
+
+  it('ranks a wait for GPU capacity as a wait, not an approval', () => {
+    const { fx, plans, byName } = scenario();
+    const billing = byName('app-billing-01');
+    expect(billing.phase).toBe('awaiting_cutover');
+    const plan = plans.get(billing.plan_id)!;
+    // the gate's other rules hold - an approval that counts, a cutover request, no window: nothing waits for a person
+    plan.cutover_window = null;
+    billing.approvals = [{ actor: 'sari', at: '2026-10-08T11:59:00Z', comment: null }];
+    billing.cutover_requested = true;
+    const find = () => attentionItems(fx.migrations, plans, NOW).find((i) => i.migration === billing);
+    expect(find()).toBeUndefined();
+    // a capacity read found no room (SDD §5.4 rule 5, §22.7): listed as a wait, its source still running
+    billing.gpu_wait = {
+      since: '2026-10-08T11:58:00Z',
+      checked_at: '2026-10-08T11:59:30Z',
+      pool: 'VGPU CUSTOM_NVIDIA_A100_3_20C',
+      needed: 1,
+      free: 0,
+      reason: "VGPU CUSTOM_NVIDIA_A100_3_20C of RHOSO 18.0 — Production has 0 units free, and flavor 'g1.a100-3-20c' needs 1",
+    };
+    const waiting = {
+      tone: 'info',
+      reason: 'Waiting for GPU capacity: VGPU CUSTOM_NVIDIA_A100_3_20C, 0 free, needs 1',
+      nextAction: 'Wait, or free GPU capacity on the destination: the cutover starts once a read finds room',
+      rank: 6,
+    };
+    expect(find()).toMatchObject(waiting);
+    // ranked with the window's wait, never with the human actions ahead of it, and never in Pending approvals
+    const dc = byName('ad-dc-01'); // cold, ready, in the same running plan: approved and requested, its window closed
+    Object.assign(dc, { approvals: [{ actor: 'sari', at: '2026-10-08T11:59:00Z', comment: null }], cutover_requested: true });
+    plan.cutover_window = { start: '2026-10-08T20:00:00Z', end: '2026-10-08T23:00:00Z' };
+    const window = attentionItems(fx.migrations, plans, NOW).find((i) => i.migration === dc);
+    expect(window?.reason).toMatch(/^Waiting for the cutover window/);
+    expect(window?.rank).toBe(find()?.rank);
+    plan.cutover_window = null;
+    expect(pendingApprovals(fx.migrations, plans).items.map((i) => i.migration.vm.name)).not.toContain('app-billing-01');
+    // the same wait in a single-shot migration's ready and in a keep-warm pass
+    billing.phase = 'syncing';
+    expect(find()).toMatchObject(waiting);
+    billing.phase = 'awaiting_cutover';
+    // a read that failed names the failure in place of the numbers it could not read (SDD §22.12)
+    billing.gpu_wait = { ...billing.gpu_wait, free: null, reason: 'the GPU capacity of RHOSO 18.0 — Production could not be read (HTTP 503)' };
+    expect(find()?.reason).toBe('Waiting for GPU capacity: the GPU capacity of RHOSO 18.0 — Production could not be read (HTTP 503)');
+    // what its cutover will refuse is listed ahead of it, as ahead of any wait
+    billing.cutover_refusals = ["the NIC fa:16:3e:00:00:01 of app-billing-01 on 'finance-app': port p-1 holds 10.0.0.5"];
+    expect(find()?.reason).toBe('Cutover will refuse 1 problem');
+    billing.cutover_refusals = [];
+    // a summary carries it as the migration does (SDD §4.2)
+    expect(attentionItems([summaryOf(billing)], plans, NOW)[0]?.reason).toBe(find()?.reason);
   });
 });

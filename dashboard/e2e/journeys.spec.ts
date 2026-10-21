@@ -350,3 +350,48 @@ test('the navigation is on the left at every width: sidebar, rail, then a drawer
   await expect(drawer).toBeHidden();
   await expect(page.getByRole('button', { name: 'Open navigation' })).toBeFocused();
 });
+
+test("a GPU VM through its mapping, the gate's wait and its cutover", async ({ page }) => {
+  // the plan form, a validation, then the gate's three reads a few seconds apart (SDD §22.10): more than a page's time
+  test.slow();
+  await signIn(page, 'admin');
+  await page.goto('/plans');
+  await page.getByRole('button', { name: /new plan/i }).first().click();
+  const dialog = page.getByRole('dialog', { name: /new migration plan/i });
+  await dialog.getByLabel(/^name/i).fill('MIG inference');
+  await dialog.getByLabel(/source provider/i).selectOption('vcenter-hq');
+  await dialog.getByLabel(/destination provider/i).selectOption('rhoso-prod');
+  await dialog.getByRole('checkbox', { name: 'Select dc2-ml-02' }).click();
+  // the mapping is the GPU VM's opt-in: nothing is chosen for the operator (SDD §22.4)
+  const row = dialog.getByRole('group', { name: 'GPU mappings' }).getByRole('combobox', { name: 'grid_a100-3-20c: 1 VM, 16 vCPUs, 64 GiB' });
+  await expect(row).toHaveValue('');
+  await row.selectOption('g1.a100-3-20c');
+  // a cold copy cuts over from ready, on its own once the gate opens
+  await dialog.getByLabel('Default strategy').selectOption('vmware_cold');
+  await dialog.getByRole('checkbox', { name: /^Require approval/ }).uncheck();
+  await dialog.getByRole('checkbox', { name: /^Automatic cutover/ }).check();
+  await dialog.getByText(/^advanced/i).click();
+  await dialog.getByLabel(/^network mappings/i).fill('VM Network ERP = erp-net');
+  await dialog.getByRole('button', { name: /create plan with 1 vm/i }).click();
+  await expect(page).toHaveURL(/\/plans\/plan-/);
+
+  const actions = page.getByRole('group', { name: /plan actions/i });
+  await actions.getByRole('button', { name: /^validate$/i }).click();
+  await expect(page.getByRole('status').filter({ hasText: /validation finished/i })).toBeVisible();
+  await page.getByRole('table', { name: /migrations/i }).getByRole('link', { name: 'dc2-ml-02' }).click();
+  // the validation applied the mapping and found room
+  const panel = page.getByRole('region', { name: 'GPU' });
+  await expect(panel.getByText('g1.a100-3-20c, by the GPU mapping grid_a100-3-20c → g1.a100-3-20c')).toBeVisible();
+  await expect(panel.getByText('The validation found room for its GPU flavor.')).toBeVisible();
+
+  // the plan starts: the A100-3-20C pool reads full on the gate's first two reads, the source VM still running
+  await page.getByRole('link', { name: 'MIG inference' }).click();
+  await actions.getByRole('button', { name: /^start$/i }).click();
+  await page.getByRole('alertdialog', { name: 'Start this plan?' }).getByRole('button', { name: 'Start plan' }).click();
+  await page.getByRole('table', { name: /migrations/i }).getByRole('link', { name: 'dc2-ml-02' }).click();
+  await expect(panel.getByText(/^Waiting for GPU capacity: 0 free of 1 in VGPU CUSTOM_NVIDIA_A100_3_20C, checked .+\. The source VM keeps running\.$/)).toBeVisible();
+  // the third read finds room: the wait ends, and the cutover starts
+  await expect(panel.getByText(/^Waiting for GPU capacity/)).toBeHidden({ timeout: 20_000 });
+  await expect(page.getByRole('list', { name: 'Migration lifecycle' })).toBeVisible();
+  await expect(page.locator('header').getByText(/^(Cutover|Verifying|Completed)$/)).toBeVisible();
+});

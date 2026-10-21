@@ -2,7 +2,8 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import { queryKeys } from '../api/hooks';
-import type { DestinationInventory, Migration } from '../api/types';
+import type { MockServer } from '../api/mock';
+import type { DestinationInventory, Migration, Plan, PlanCreate } from '../api/types';
 import { STRATEGY_LABELS } from '../lib/status';
 import { createTestClient, createTestServer, renderWithApp } from '../test/utils';
 import MigrationDetail from './MigrationDetail';
@@ -11,7 +12,157 @@ function renderMigration(id: string) {
   return renderWithApp(<MigrationDetail />, { route: `/migrations/${id}`, path: '/migrations/:migrationId', token: 'viewer' });
 }
 
+/** The migration of a new plan of `vmId`, validated: its findings are the mock's pre-flight's, as the API's (SDD §22.5). */
+async function validatedMigration(server: MockServer, plan: Partial<PlanCreate> & Pick<PlanCreate, 'source_provider_id' | 'vm_ids'>): Promise<Migration> {
+  const client = createTestClient(server, 'admin');
+  const created = await client.post<Plan>('/plans', { name: 'GPU plan', destination_provider_id: 'rhoso-prod', ...plan });
+  await client.post(`/plans/${created.id}/validate`);
+  return server.migrations.find((m) => m.plan_id === created.id)!;
+}
+
+/** The VMware source's MIG-backed vGPU VM, its key mapped to the destination's MIG flavor (SDD §22.4, §22.10). */
+function migVm(server: MockServer): Promise<Migration> {
+  return validatedMigration(server, {
+    source_provider_id: 'vcenter-hq',
+    vm_ids: ['vm-5008'],
+    default_strategy: 'vmware_cold',
+    mappings: { networks: { 'VM Network ERP': 'erp-net' }, flavors: {}, volume_types: {}, projects: {}, gpus: { 'grid_a100-3-20c': 'g1.a100-3-20c' } },
+  });
+}
+
 describe('MigrationDetail', () => {
+  it("shows the GPU panel with the VM's GPUs, its GPU flavor and the mapping that chose it", async () => {
+    const server = createTestServer();
+    const m = await migVm(server);
+    const { unmount } = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const panel = await screen.findByRole('region', { name: /^GPU/ });
+    const row = (term: string) => within(panel).getByText(term, { selector: 'dt' }).nextElementSibling as HTMLElement;
+    expect(row('GPUs')).toHaveTextContent('vGPU grid_a100-3-20c');
+    // the plan names it, never a match (SDD §22.4): a VMware VM by its GPU key's mapping
+    await waitFor(() => expect(row('GPU flavor')).toHaveTextContent('g1.a100-3-20c, by the GPU mapping grid_a100-3-20c → g1.a100-3-20c'));
+    // the profile its destination declares for it (SDD §22.3)
+    expect(row('Declared profiles')).toHaveTextContent('g1.a100-3-20c gives A100-3-20C, declared by RHOSO 18.0 — Production');
+    // the validation applied the mapping and found room; no verification yet
+    expect(row('Capacity')).toHaveTextContent('The validation found room for its GPU flavor.');
+    expect(row('GPU checks')).toHaveTextContent('Not verified yet: the verification checks its GPU flavor and allocation after the cutover.');
+    unmount();
+
+    // an OpenStack VM's GPU comes with its flavor: its flavor mapping chose it
+    const ml = await validatedMigration(server, {
+      source_provider_id: 'rhosp17-dc1',
+      vm_ids: ['os-1a03'],
+      mappings: { networks: {}, flavors: { 'g1.vgpu': 'g1.a100-4c' }, volume_types: {}, projects: {} },
+    });
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${ml.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const osPanel = await screen.findByRole('region', { name: /^GPU/ });
+    const osRow = (term: string) => within(osPanel).getByText(term, { selector: 'dt' }).nextElementSibling as HTMLElement;
+    expect(osRow('GPUs')).toHaveTextContent('vGPU · VGPU, CUSTOM_NVIDIA_A100_4C');
+    await waitFor(() => expect(osRow('GPU flavor')).toHaveTextContent('g1.a100-4c, by the flavor mapping g1.vgpu → g1.a100-4c'));
+  });
+
+  it("shows the capacity findings and the last verification's GPU checks in the GPU panel, and why no mapping applies (SDD §16, §22.8)", async () => {
+    const server = createTestServer();
+    const m = await migVm(server);
+    m.findings.push({
+      code: 'DST_GPU_CAPACITY_UNKNOWN',
+      severity: 'warning',
+      message: 'The GPU capacity of RHOSO 18.0 — Production cannot be read: the read failed (HTTP 503).',
+      remediation: null,
+      strategies: [],
+    });
+    m.verification = {
+      at: '2026-10-08T12:00:00Z',
+      passed: true,
+      checks: [
+        { name: 'server_active', ok: true, detail: 'status ACTIVE' },
+        { name: 'gpu_flavor', ok: true, detail: "flavor 'g1.a100-3-20c' asks for VGPU 1" },
+        { name: 'gpu_allocation', ok: true, detail: 'Placement allocation read skipped (HTTP 403)', skipped: true },
+      ],
+      probes: [],
+      warnings: [],
+    };
+    const { unmount } = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const panel = await screen.findByRole('region', { name: /^GPU/ });
+    const row = (term: string) => within(panel).getByText(term, { selector: 'dt' }).nextElementSibling as HTMLElement;
+    expect(row('Capacity')).toHaveTextContent('Warning');
+    expect(row('Capacity')).toHaveTextContent('The GPU capacity of RHOSO 18.0 — Production cannot be read: the read failed (HTTP 503).');
+    const checks = within(row('GPU checks')).getAllByRole('listitem');
+    expect(checks.map((li) => li.textContent)).toEqual([
+      "gpu_flavor: passed flavor 'g1.a100-3-20c' asks for VGPU 1",
+      'gpu_allocation: skipped Placement allocation read skipped (HTTP 403)',
+    ]);
+    unmount();
+    // a plan that maps no flavor for its key: why none applies, and nothing to check yet
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    plan.mappings = { ...plan.mappings, gpus: {} };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const unmapped = await screen.findByRole('region', { name: /^GPU/ });
+    await waitFor(() =>
+      expect(within(unmapped).getByText('GPU flavor', { selector: 'dt' }).nextElementSibling).toHaveTextContent('None: no GPU mapping names grid_a100-3-20c.'),
+    );
+  });
+
+  it('announces a wait for GPU capacity once when it begins and once when it ends', async () => {
+    const server = createTestServer();
+    const m = await migVm(server);
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server, live: true });
+    const panel = await screen.findByRole('region', { name: /^GPU/ });
+    await waitFor(() => expect(server.subscriberCount).toBeGreaterThan(0));
+    const region = screen.getByTestId('gpu-wait-announcement');
+    // what the region said, each change of its text once
+    const said: string[] = [];
+    const observer = new MutationObserver(() => {
+      const text = region.textContent ?? '';
+      if (text && text !== said.at(-1)) said.push(text);
+    });
+    observer.observe(region, { childList: true, characterData: true, subtree: true });
+    const event = (data: Record<string, unknown>) =>
+      server.emit({ kind: 'migration.gpu_wait', plan_id: m.plan_id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: GPU wait`, data });
+    const pool = 'VGPU CUSTOM_NVIDIA_A100_3_20C';
+    const wait = {
+      since: new Date(Date.now() - 5_000).toISOString(),
+      checked_at: new Date(Date.now() - 5_000).toISOString(),
+      pool,
+      needed: 1,
+      free: 0,
+      reason: "VGPU CUSTOM_NVIDIA_A100_3_20C of RHOSO 18.0 — Production has 0 units free, and flavor 'g1.a100-3-20c' needs 1",
+    };
+    m.gpu_wait = wait;
+    event({ waiting: true, pool, needed: 1, free: 0 });
+    expect(await within(panel).findByText(/^Waiting for GPU capacity: 0 free of 1 in VGPU CUSTOM_NVIDIA_A100_3_20C, checked/)).toHaveTextContent(
+      /checked .+\. The source VM keeps running\.$/,
+    );
+    expect(within(panel).getByText(wait.reason)).toBeInTheDocument();
+    await waitFor(() => expect(said).toEqual(['dc2-ml-02 waits for GPU capacity: 0 free of 1 in VGPU CUSTOM_NVIDIA_A100_3_20C. The source VM keeps running.']));
+    // a later read only updates it: nothing is said again
+    m.gpu_wait = { ...wait, checked_at: new Date().toISOString(), free: 1, needed: 2 };
+    server.emit({ kind: 'migration.action', plan_id: m.plan_id, migration_id: m.id, actor: 'rina', message: `${m.vm.name}: noted`, data: {} });
+    expect(await within(panel).findByText(/^Waiting for GPU capacity: 1 free of 2 in/)).toBeInTheDocument();
+    expect(said).toHaveLength(1);
+    // the read that finds room ends it, said once more
+    m.gpu_wait = null;
+    event({ waiting: false, pool, needed: 1, free: 2 });
+    await waitFor(() => expect(said).toEqual([said[0], 'dc2-ml-02 no longer waits for GPU capacity.']));
+    expect(within(panel).queryByText(/^Waiting for GPU capacity/)).not.toBeInTheDocument();
+    observer.disconnect();
+  });
+
+  it('labels the GPU panel Technology Preview', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = await migVm(server);
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const panel = await screen.findByRole('region', { name: /^GPU/ });
+    // in words beside its icon, a focusable term whose detail a tap shows (SDD §16, §22.11)
+    await user.click(within(panel).getByRole('button', { name: 'Technology Preview' }));
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts.');
+    // a VM without a GPU, a GPU finding, a wait or a GPU check shows no GPU panel
+    const { unmount } = renderMigration('mig-3c1a0f9e21');
+    await screen.findByRole('heading', { level: 1, name: 'web-01' });
+    expect(screen.getAllByRole('region', { name: /^GPU/ })).toHaveLength(1);
+    unmount();
+  });
+
   it("shows a retried migration's storage handover ineligible, with the reason, while an earlier attempt holds its volumes (SDD §12, §9.2, §16)", async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e872')!;

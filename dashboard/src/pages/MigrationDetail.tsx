@@ -15,6 +15,7 @@ import { DowntimeClock } from '../components/DowntimeClock';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { FindingsList } from '../components/FindingsList';
+import { GpuPanel } from '../components/GpuPanel';
 import { MigrationActions } from '../components/MigrationActions';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
@@ -33,6 +34,7 @@ import { decidable, decidingRecommendationId, nonStrategyNotes, optionLabel, wai
 import { approvalKindLabel } from '../lib/approvals';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
+import { gpuWaitBegins, gpuWaitEnds, hasGpuPanel } from '../lib/gpu';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
 import { clearedByStrategyChange, countedApprovals, uncountedReason } from '../lib/migrationActions';
 import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan, runningStep } from '../lib/phase';
@@ -65,6 +67,30 @@ function useProgressAnnouncement(m: Migration | undefined): string {
       last.current.bucket = bucket;
     }
   }, [id, phase, pct, name]);
+  return text;
+}
+
+/**
+ * Announces a wait for GPU capacity once when it begins and once when it ends (SDD §16, §22.7): never a read that only
+ * updates it, nor a wait already set when the page opened.
+ */
+function useGpuWaitAnnouncement(m: Migration | undefined): string {
+  const [text, setText] = useState('');
+  const last = useRef<{ id?: string; waiting?: boolean }>({});
+  const id = m?.id;
+  const wait = m?.gpu_wait ?? null;
+  const waiting = wait !== null;
+  const name = m?.vm.name ?? '';
+  useEffect(() => {
+    if (!id) return;
+    if (last.current.id !== id) {
+      last.current = { id, waiting };
+      return;
+    }
+    if (last.current.waiting === waiting) return;
+    last.current.waiting = waiting;
+    setText(wait ? gpuWaitBegins(name, wait) : gpuWaitEnds(name));
+  }, [id, waiting, wait, name]);
   return text;
 }
 
@@ -671,6 +697,7 @@ export default function MigrationDetail() {
   // a link to its findings or estimates (#findings, #estimates) lands there once loaded (SDD §16, ADV-02)
   useHashLanding(Boolean(m));
   const announcement = useProgressAnnouncement(m);
+  const gpuAnnouncement = useGpuWaitAnnouncement(m);
 
   useEffect(() => setLiveEvents([]), [migrationId]);
   useLiveEvents((event) => {
@@ -705,6 +732,8 @@ export default function MigrationDetail() {
   const planLoading = !p && !plan.error;
   const warm = isWarmStrategy(m.strategy);
   const wave = p?.waves.find((w) => w.id === m.wave_id);
+  const source = p ? providers.data?.find((x) => x.id === p.source_provider_id) : undefined;
+  const destinationProvider = p ? providers.data?.find((x) => x.id === p.destination_provider_id) : undefined;
 
   return (
     <>
@@ -731,6 +760,10 @@ export default function MigrationDetail() {
       />
       <p aria-live="polite" className="sr-only">
         {announcement}
+      </p>
+      {/* a region already on the page: one inserted together with its text is not reliably read (SDD §16) */}
+      <p role="status" data-testid="gpu-wait-announcement" className="sr-only">
+        {gpuAnnouncement}
       </p>
 
       <div className="flex flex-col gap-4">
@@ -769,6 +802,8 @@ export default function MigrationDetail() {
             <Approvals m={m} plan={p} />
           </Panel>
         </div>
+
+        {hasGpuPanel(m, source) && <GpuPanel migration={m} plan={p} source={source} destination={destinationProvider} />}
 
         {warm && (
           <Panel title="Sync-pass convergence" description="Bytes changed per pass, the final sync after the source stopped, and the rules that allow the cutover">
