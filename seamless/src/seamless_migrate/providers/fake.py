@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import random
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..domain.enums import ProviderKind
@@ -367,6 +367,12 @@ class FakeSourceProvider:
         #: rollback starts it, the demo power control either; the registry keeps one fake each
         self._power: dict[str, str] = {}
 
+    def adopt(self, old: FakeSourceProvider) -> None:
+        """Rebuilt for a changed provider document (SDD §10): its VMs keep the power states the
+        replaced fake gave them - the same states, which a call on either changes."""
+        if old.kind == self.kind:
+            self._power = old._power
+
     def _as_now(self, vm: VMRef) -> VMRef:
         copy = vm.model_copy(deep=True)
         if vm.source_id in self._power:
@@ -487,19 +493,39 @@ def _vgpus(flavor: str | None) -> list[GpuDevice]:
     return [d for d in gpu_requests(specs) if d.kind == "vgpu" and d.resource_class]
 
 
+@dataclass
+class _DestinationCloud:
+    """What a fake destination's simulated cloud holds (SDD §10): a fake rebuilt for a changed
+    provider document shares it with the one it replaces, as a real cloud keeps its servers."""
+
+    #: the servers the rollbacks deleted
+    deleted: set[str] = field(default_factory=set)
+    #: the servers the simulated cutovers created, by id: the flavor each was created with
+    #: (SDD §7.4, §10)
+    servers: dict[str, str | None] = field(default_factory=dict)
+    #: the GPU units each of them holds, by GPU: its Placement allocations (§22.3)
+    held: dict[str, dict[int, int]] = field(default_factory=dict)
+    #: the cutover gate's reads that found the other tenant's GPU held (SDD §22.10)
+    tenant_reads: int = 0
+
+
 class FakeDestinationProvider:
     def __init__(self, seed: int = 42, provider: Provider | None = None) -> None:
         self.seed = seed
-        self.deleted: set[str] = set()
         #: the demo provider it stands for: its kind, declared series and profile (SDD §10)
         self.provider = provider
-        #: the servers the simulated cutovers created, by id: the flavor each was created with
-        #: (SDD §7.4, §10)
-        self._servers: dict[str, str | None] = {}
-        #: the GPU units each of them holds, by GPU: its Placement allocations (§22.3)
-        self._held: dict[str, dict[int, int]] = {}
-        #: the cutover gate's reads that found the other tenant's GPU held (SDD §22.10)
-        self._tenant_reads = 0
+        self._cloud = _DestinationCloud()
+
+    def adopt(self, old: FakeDestinationProvider) -> None:
+        """Rebuilt for a changed provider document - a rename, its declared profiles, a written
+        credential (SDD §10): it takes over the replaced fake's cloud, its servers, their GPU
+        units and the gate's reads, which a call on either fake changes from then on."""
+        self._cloud = old._cloud
+
+    @property
+    def deleted(self) -> set[str]:
+        """The servers its rollbacks deleted (SDD §10)."""
+        return self._cloud.deleted
 
     def _gpu_flavor_list(self) -> list[dict[str, Any]]:
         """The GPU flavors with the profiles its provider declares (SDD §22.3, §22.10)."""
@@ -517,7 +543,7 @@ class FakeDestinationProvider:
 
     def _free(self, gpu: int) -> int:
         """The units of a GPU its servers leave free."""
-        return _GPUS[gpu][2] - sum(held.get(gpu, 0) for held in self._held.values())
+        return _GPUS[gpu][2] - sum(held.get(gpu, 0) for held in self._cloud.held.values())
 
     def _capacity(self, requests: Iterable[GpuDevice], tenant: bool = False) -> GpuCapacity:
         """The pools of the vGPU requests, read as §22.3 counts them on the fake's GPUs less the
@@ -641,11 +667,11 @@ class FakeDestinationProvider:
         reads that ask for the other tenant's GPU's trait find it full, as if that tenant then
         released its vGPUs (§22.10) - the inventory, the validation's read, never."""
         trait = _GPUS[_TENANT_GPU][1]
-        tenant = self._tenant_reads < _TENANT_READS and any(
+        tenant = self._cloud.tenant_reads < _TENANT_READS and any(
             device.kind == "vgpu" and trait in device.traits for device in requests
         )
         if tenant:
-            self._tenant_reads += 1
+            self._cloud.tenant_reads += 1
         return self._capacity(requests, tenant)
 
     async def gpu_flavors(self) -> list[dict[str, Any]]:
@@ -658,7 +684,7 @@ class FakeDestinationProvider:
         request of the flavor takes its units from the first GPU of its pool that has them free.
         When one finds none, nothing is recorded and the create fails as Nova finds no valid host,
         naming the flavor and the pool, never a GPU (§22.12). Created again, it holds anew."""
-        self._held.pop(server_id, None)
+        self._cloud.held.pop(server_id, None)
         held: dict[int, int] = {}
         for device in _vgpus(flavor):
             gpu = next(
@@ -676,7 +702,7 @@ class FakeDestinationProvider:
                 None,
             )
             if gpu is None:
-                self._servers.pop(server_id, None)
+                self._cloud.servers.pop(server_id, None)
                 pool = pool_name(
                     device.resource_class or "", device.traits, device.forbidden_traits
                 )
@@ -686,24 +712,24 @@ class FakeDestinationProvider:
                     f"{units} free"
                 )
             held[gpu] = held.get(gpu, 0) + device.count
-        self.deleted.discard(server_id)
-        self._servers[server_id] = flavor
-        self._held[server_id] = held
+        self._cloud.deleted.discard(server_id)
+        self._cloud.servers[server_id] = flavor
+        self._cloud.held[server_id] = held
 
     async def server_allocations(self, server_id: str) -> dict[str, int] | None:
         """The GPU units the server holds, per resource class (SDD §10, §22.3): the fake's
         Placement holds GPUs alone, so None for a server that holds none."""
         units: dict[str, int] = {}
-        for gpu, count in self._held.get(server_id, {}).items():
+        for gpu, count in self._cloud.held.get(server_id, {}).items():
             units[_GPUS[gpu][0]] = units.get(_GPUS[gpu][0], 0) + count
         return units or None
 
     async def get_server(self, server_id: str) -> dict[str, Any]:
-        if server_id in self.deleted:
+        if server_id in self._cloud.deleted:
             raise ProviderError(f"server {server_id!r} not found")
         octet = int(hashlib.sha1(server_id.encode()).hexdigest()[:2], 16) % 200 + 20
         # the flavor it was created with, as compute 2.47 embeds it (SDD §10, §22.3)
-        flavor = self._servers.get(server_id)
+        flavor = self._cloud.servers.get(server_id)
         specs = _GPU_FLAVORS[flavor][3] if flavor in _GPU_FLAVORS else {}
         return {
             "id": server_id,
@@ -740,10 +766,10 @@ class FakeDestinationProvider:
         return ProbeAnswer("passed", "HTTP 200", True)
 
     async def delete_server(self, server_id: str) -> None:
-        self.deleted.add(server_id)
+        self._cloud.deleted.add(server_id)
         # its units are free again (SDD §7.4, §10)
-        self._servers.pop(server_id, None)
-        self._held.pop(server_id, None)
+        self._cloud.servers.pop(server_id, None)
+        self._cloud.held.pop(server_id, None)
 
     async def find_server(self, name: str) -> str | None:
         return _stable_id("dst", name)

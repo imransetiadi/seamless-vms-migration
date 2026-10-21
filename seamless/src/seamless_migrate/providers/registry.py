@@ -64,6 +64,8 @@ class ProviderRegistry:
             if cached is not None and cached[0] == fingerprint:
                 return cached[1]
             impl = build(provider, self.settings)
+            if cached is not None:
+                _carry_state(cached[1], impl)
             self._cache[provider.id] = (fingerprint, impl)
         if cached is not None:
             _close(cached[1])  # the replaced implementation must not keep its session
@@ -74,6 +76,15 @@ class ProviderRegistry:
             cached = self._cache.pop(provider_id, None)
         if cached is not None:
             _close(cached[1])
+
+
+def _carry_state(old: Any, new: Any) -> None:
+    """A demo fake rebuilt for a changed document takes over what its simulated cloud holds
+    (SDD §10): a real cloud keeps its servers and its VMs' power whatever the provider's document
+    says. A real provider holds no such state, and a new connection has nothing to carry."""
+    adopt = getattr(new, "adopt", None)
+    if callable(adopt) and type(old) is type(new):
+        adopt(old)
 
 
 def _close(impl: Any) -> None:

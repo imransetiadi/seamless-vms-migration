@@ -382,6 +382,33 @@ async def test_a_simulated_gpu_cutover_takes_its_units_and_its_rollback_gives_th
         await fake.get_server(server)
 
 
+async def test_a_gpu_cutover_retried_after_its_rollback_creates_its_server_again():
+    """SDD §7.4, §10 (plan task G9 review): a retried cutover creates the server its rollback
+    deleted again - one id per migration -, so the verification finds it with its GPU flavor and
+    its unit taken; a second rollback gives the unit back."""
+    from seamless_migrate.planning.gpu import gpu_requests
+    from seamless_migrate.providers.base import ProviderError
+
+    rhoso, registry, fake = demo_destination()
+    vm = make_vm(flavor="g1.vgpu", flavor_extra_specs=A100_4C, gpus=gpu_requests(A100_4C))
+    plan = make_plan(mappings={"flavors": {"g1.vgpu": "g1.a100-4c"}})
+    m = make_migration(id="mig-000000000d", strategy=Strategy.cold, vm=vm)
+    ex = SimulatedExecutor(FAST, providers=registry)
+    taken = {**ROOM, "VGPU CUSTOM_NVIDIA_A100_4C": 3, "VGPU": 5}
+    for attempt in (1, 2):
+        ctx, _ = make_ctx(plan, m, SRC, rhoso, FAST)
+        server = (await ex.run(StepName.CUTOVER, ctx)).destination_server_id
+        assert (await fake.get_server(server))["flavor"]["name"] == "g1.a100-4c", attempt
+        assert await fake.server_allocations(server) == {"VGPU": 1}, attempt
+        assert await gpu_free(fake) == taken, attempt
+        m.destination_server_id = server
+        ctx, _ = make_ctx(plan, m, SRC, rhoso, FAST)
+        await ex.run(StepName.ROLLBACK, ctx)
+        assert await gpu_free(fake) == ROOM, attempt
+        with pytest.raises(ProviderError):
+            await fake.get_server(server)
+
+
 async def test_a_simulated_cutover_that_finds_no_gpu_free_fails_after_the_source_stopped():
     """SDD §7.4, §10, §22.7 (plan task G9): a VM without a GPU that the plan's flavor mapping sends
     to a vGPU flavor takes its units as a GPU VM does - the pre-flight and the gate count it so -;
