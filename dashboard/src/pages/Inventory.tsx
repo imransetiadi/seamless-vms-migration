@@ -1,9 +1,9 @@
-import { ClipboardPlus, HardDrive, Server } from 'lucide-react';
+import { ClipboardPlus, HardDrive, Info, Server, TriangleAlert } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useInventory, useMigrationSummaries, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
-import { isDestinationInventory, type DestinationInventory, type Provider } from '../api/types';
+import { isDestinationInventory, type DestinationInventory, type GpuCapacity, type GpuFlavor, type Provider } from '../api/types';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
 import { ScrollRegion } from '../components/ScrollRegion';
@@ -13,8 +13,10 @@ import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
 import { ProviderStatusBadge } from '../components/StatusBadge';
+import { TechPreviewBadge } from '../components/TechPreviewBadge';
 import { VmTable } from '../components/VmTable';
-import { formatBytes, formatNumber } from '../lib/format';
+import { formatBytes, formatDateTime, formatNumber } from '../lib/format';
+import { declaredProfiles, flavorsOfPool, gpuCapacityReason, gpuLabel, poolFreeText, poolLabel } from '../lib/gpu';
 import { holdersOf } from '../lib/holds';
 import { providerLabel } from '../lib/providerUse';
 import { KEEP_FOCUS } from '../lib/navigation';
@@ -30,6 +32,141 @@ const GIB = 1024 ** 3;
 function quotaText(value: number | null, format: (value: number) => string): string {
   if (value === null) return 'Not reported';
   return value < 0 ? 'Unlimited' : format(value);
+}
+
+/** A GPU flavor by its name and the profiles it gives: "g1.a100-4c (A100-4C)". */
+function flavorName(flavor: GpuFlavor): string {
+  const profiles = declaredProfiles(flavor);
+  return profiles.length ? `${flavor.name} (${profiles.join(', ')})` : flavor.name;
+}
+
+/** A destination's GPU flavors: each one's size, its GPU requests and its declared profile (SDD §16, §22.3). */
+function GpuFlavorsPanel({ flavors }: { flavors: GpuFlavor[] | undefined }) {
+  return (
+    <Panel
+      title="GPU flavors"
+      description="The flavors whose extra specs ask for a GPU, which a plan's GPU mapping names; a vGPU profile is the one the provider declares"
+      actions={<TechPreviewBadge />}
+    >
+      {flavors === undefined ? (
+        <p className="text-sm text-muted-foreground">Not reported.</p>
+      ) : flavors.length === 0 ? (
+        <p className="text-sm text-muted-foreground">No flavor asks for a GPU.</p>
+      ) : (
+        <ScrollRegion label="Destination GPU flavors">
+          <table className="data-table">
+            <caption className="sr-only">Destination GPU flavors</caption>
+            <thead>
+              <tr>
+                <th scope="col">Flavor</th>
+                <th scope="col" className="text-right">
+                  vCPU
+                </th>
+                <th scope="col" className="text-right">
+                  RAM
+                </th>
+                <th scope="col" className="text-right">
+                  Disk
+                </th>
+                <th scope="col">GPU requests</th>
+                <th scope="col">Declared profile</th>
+              </tr>
+            </thead>
+            <tbody>
+              {flavors.map((f) => {
+                const profiles = declaredProfiles(f);
+                return (
+                  <tr key={f.name}>
+                    <th scope="row" className="font-mono">
+                      {f.name}
+                    </th>
+                    <td className="num text-right">{f.vcpus}</td>
+                    <td className="num text-right">{formatBytes(f.ram_mb * 1024 * 1024)}</td>
+                    <td className="num text-right">{formatBytes(f.disk_gb * GIB)}</td>
+                    <td>
+                      {f.gpus.map((g, i) => (
+                        <span key={i} className="block">
+                          {gpuLabel(g, { declared: false })}
+                        </span>
+                      ))}
+                    </td>
+                    <td className={profiles.length ? undefined : 'text-muted-foreground'}>{profiles.length ? profiles.join(', ') : 'None declared'}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </ScrollRegion>
+      )}
+    </Panel>
+  );
+}
+
+/**
+ * A destination's GPU capacity as its inventory read it (SDD §16, §22.3): each pool with the flavors that ask of it and
+ * its free units, or why it was not read; an alias flavor's capacity is unknown whatever Placement answers.
+ */
+function GpuCapacityPanel({ capacity, flavors }: { capacity: GpuCapacity | undefined; flavors: GpuFlavor[] }) {
+  const aliases = flavors.filter((f) => f.gpus.some((g) => g.kind === 'passthrough' && g.alias));
+  const readAt = capacity?.read_at ? ` at ${formatDateTime(capacity.read_at)}` : '';
+  return (
+    <Panel title="GPU capacity" description={`Placement's free vGPU units, read with the inventory${readAt}`} actions={<TechPreviewBadge />}>
+      <div className="flex flex-col gap-3">
+        {capacity === undefined ? (
+          <p className="text-sm text-muted-foreground">Not reported.</p>
+        ) : capacity.status !== 'ok' ? (
+          // nothing read is never shown as free units (SDD §16): the reason, in words
+          <p className="flex items-start gap-1.5 text-sm text-status-warning">
+            <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0" />
+            <span>Not read: {gpuCapacityReason(capacity)}.</span>
+          </p>
+        ) : capacity.pools.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No flavor asks for a vGPU: Placement has no pool to read.</p>
+        ) : (
+          <>
+            <ScrollRegion label="Destination GPU capacity">
+              <table className="data-table">
+                <caption className="sr-only">Destination GPU capacity</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Pool</th>
+                    <th scope="col">GPU flavors</th>
+                    <th scope="col">Free</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {capacity.pools.map((pool) => (
+                    <tr key={JSON.stringify([pool.resource_class, pool.traits, pool.forbidden_traits, pool.same_provider])}>
+                      <th scope="row" className="font-mono">
+                        {poolLabel(pool)}
+                      </th>
+                      <td>{flavorsOfPool(pool, flavors).map(flavorName).join(', ') || '—'}</td>
+                      <td>{poolFreeText(pool)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </ScrollRegion>
+            {capacity.pools.some((p) => p.traits.length + p.forbidden_traits.length === 0) && (
+              <p className="text-xs text-muted-foreground">A resource class alone unites its pools: a plan's GPU VMs count against it across them.</p>
+            )}
+          </>
+        )}
+        {aliases.length > 0 && (
+          <ul className="flex flex-col gap-1">
+            {aliases.map((f) => (
+              <li key={f.name} className="flex items-start gap-1.5 text-sm">
+                <Info aria-hidden className="mt-0.5 size-4 shrink-0 text-status-info" />
+                <span>
+                  <span className="font-mono">{f.name}</span>: Capacity unknown: PCI aliases are configured in nova.conf
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </Panel>
+  );
 }
 
 function DestinationInventoryView({ inventory }: { inventory: DestinationInventory }) {
@@ -110,6 +247,9 @@ function DestinationInventoryView({ inventory }: { inventory: DestinationInvento
           </ScrollRegion>
         )}
       </Panel>
+      <GpuFlavorsPanel flavors={inventory.gpu_flavors} />
+      {/* its GPU capacity while it has a GPU flavor: without one, Placement is sent nothing (SDD §16, §22.3) */}
+      {inventory.gpu_flavors && inventory.gpu_flavors.length > 0 && <GpuCapacityPanel capacity={inventory.gpu_capacity} flavors={inventory.gpu_flavors} />}
       <Panel title="Volume types">
         {inventory.volume_types.length === 0 ? (
           <p className="text-sm text-muted-foreground">No volume types reported.</p>

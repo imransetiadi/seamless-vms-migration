@@ -11,6 +11,7 @@ import overrideBodyRaw from '../../../seamless/tests/fixtures/override_body_case
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
+import { poolLabel } from '../lib/gpu';
 import { createMockFetch, MockServer, PLAN_EDITABLE_FIELDS, PROVIDER_EDITABLE } from './mock';
 import { HELD_VOLUMES_REASON } from './mockData';
 import { summaryOf } from '../lib/summary';
@@ -30,7 +31,10 @@ import {
   type AdvisorPolicy,
   type AdvisorRecommendation,
   type AdvisorStatus,
+  type DestinationInventory,
   type Event,
+  type GpuCapacity,
+  type GpuCheckReport,
   type Migration,
   type Plan,
   type Provider,
@@ -3167,26 +3171,109 @@ describe('providers of community destinations, like the API (SDD §4.2, §10, §
   });
 
   it('the mock destination check reports its GPU capacity', () => {
-    // SDD §10, §22.3 (plan task G3): a destination's check holds gpu_capacity, read each time the check runs - ok with
-    // no pools, as the API demo's destinations, which list no GPU flavor -; a source's check has none
+    // SDD §10, §22.3 (plan task G3): a destination's check holds gpu_capacity, read each time the check runs - the pools
+    // of the demo's GPU flavors (§22.10, plan task G10), as its inventory reads them -; a source's check has none
     let now = NOW;
     const server = new MockServer({ now: () => now, seed: 1 });
     const capacity = (id: string) => server.providers.find((p) => p.id === id)!.capabilities.gpu_capacity;
+    const pools = (id: string) => (server.inventories[id] as DestinationInventory).gpu_capacity!.pools;
     for (const id of ['rhoso-prod', 'hibiscus-dc3']) {
       const seeded = server.providers.find((p) => p.id === id)!;
-      expect(capacity(id)).toEqual({ status: 'ok', reason: null, detail: null, read_at: seeded.last_checked_at, pools: [] });
+      expect(pools(id), id).toHaveLength(3);
+      expect(capacity(id)).toEqual({ status: 'ok', reason: null, detail: null, read_at: seeded.last_checked_at, pools: pools(id) });
     }
     expect(server.providers.find((p) => p.id === 'rhosp17-dc1')!.capabilities).not.toHaveProperty('gpu_capacity');
-    // a check later reads it again, at the check's time
+    // a check later reads it again, at the check's time: what the destination's Placement holds then
     now = NOW + 90_000;
+    (server.inventories['rhoso-prod'] as DestinationInventory).gpu_capacity!.pools[0]!.free = 3;
     const checked = call(server, 'POST', '/providers/rhoso-prod/check').body as Provider;
     expect(checked.last_checked_at).toBe(new Date(now).toISOString());
-    expect(checked.capabilities.gpu_capacity).toEqual({ status: 'ok', reason: null, detail: null, read_at: checked.last_checked_at, pools: [] });
+    expect(checked.capabilities.gpu_capacity).toEqual({ status: 'ok', reason: null, detail: null, read_at: checked.last_checked_at, pools: pools('rhoso-prod') });
+    expect((checked.capabilities.gpu_capacity as GpuCapacity).pools[0]!.free).toBe(3);
+    // the inventory reads it live too, with its own read time (SDD §10)
+    now = NOW + 120_000;
+    const read = call(server, 'GET', '/providers/rhoso-prod/inventory').body as DestinationInventory;
+    expect(read.gpu_capacity).toEqual({ status: 'ok', reason: null, detail: null, read_at: new Date(now).toISOString(), pools: pools('rhoso-prod') });
+    // a destination without a GPU flavor reads ok with no pools
+    expect((call(server, 'GET', '/providers/rhoso-staging/inventory').body as DestinationInventory).gpu_capacity).toMatchObject({ status: 'ok', pools: [] });
     // a new destination's first check reports it; a source's does not
     expect(call(server, 'POST', '/providers', { ...base, id: 'rhoso-x', name: 'RHOSO X', kind: 'rhoso', role: 'destination', distribution: 'rhoso' }).status).toBe(201);
     expect(call(server, 'POST', '/providers', { ...base, id: 'src-x', name: 'Source X', kind: 'openstack', role: 'source', distribution: 'openstack_community' }).status).toBe(201);
     expect((call(server, 'POST', '/providers/rhoso-x/check').body as Provider).capabilities.gpu_capacity).toMatchObject({ status: 'ok', read_at: new Date(now).toISOString(), pools: [] });
     expect((call(server, 'POST', '/providers/src-x/check').body as Provider).capabilities).not.toHaveProperty('gpu_capacity');
+  });
+
+  it("reads the declared profiles from the provider on every read: a PATCH of gpu_profiles changes the next inventory's and check's (SDD §22.3, G10 review)", () => {
+    // the API reads provider.gpu_profiles for its inventory and its check alike (openstack.py), never a profile it kept
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const read = () => call(server, 'GET', '/providers/hibiscus-dc3/inventory').body as DestinationInventory;
+    const profiles = () => Object.fromEntries(read().gpu_flavors!.map((f) => [f.name, f.gpus.map((g) => g.profile)]));
+    const check = () => ((call(server, 'POST', '/providers/hibiscus-dc3/check').body as Provider).capabilities as GpuCheckReport).gpu_capacity!;
+    expect(profiles()).toEqual({ 'g1.a100-4c': ['A100-4C'], 'g1.a100-3-20c': ['A100-3-20C'], 'p1.a100': [null] });
+    expect(call(server, 'PATCH', '/providers/hibiscus-dc3', { gpu_profiles: {} }).status).toBe(200);
+    expect(profiles()).toEqual({ 'g1.a100-4c': [null], 'g1.a100-3-20c': [null], 'p1.a100': [null] });
+    expect(call(server, 'PATCH', '/providers/hibiscus-dc3', { gpu_profiles: { 'g1.a100-3-20c': 'A100-3-20C' } }).status).toBe(200);
+    expect(profiles()).toEqual({ 'g1.a100-4c': [null], 'g1.a100-3-20c': ['A100-3-20C'], 'p1.a100': [null] });
+
+    // a CUSTOM_ class asks for a vGPU only with a declared profile (§22.2): its flavor and its pool come with the declaration
+    const inventory = server.inventories['hibiscus-dc3'] as DestinationInventory;
+    inventory.flavors.push({ name: 'g2.a16', vcpus: 4, ram_mb: 16384, disk_gb: 80, extra_specs: { 'resources:CUSTOM_VGPU_A16': '1' } });
+    expect(read().gpu_flavors!.map((f) => f.name)).not.toContain('g2.a16');
+    expect(check().pools.map(poolLabel)).toEqual(['VGPU, CUSTOM_NVIDIA_A100_4C', 'VGPU, CUSTOM_NVIDIA_A100_3_20C', 'VGPU']);
+    expect(call(server, 'PATCH', '/providers/hibiscus-dc3', { gpu_profiles: { 'g2.a16': 'A16-4Q' } }).status).toBe(200);
+    expect(read().gpu_flavors!.find((f) => f.name === 'g2.a16')?.gpus).toMatchObject([{ kind: 'vgpu', resource_class: 'CUSTOM_VGPU_A16', profile: 'A16-4Q' }]);
+    // the check reads its pool in the API's order (gpu_pools), the first check after the PATCH and the next one alike -
+    // empty, as no GPU of the destination's Placement holds the class
+    for (const capacity of [check(), check()]) {
+      expect(capacity.pools.map(poolLabel)).toEqual(['VGPU, CUSTOM_NVIDIA_A100_4C', 'VGPU, CUSTOM_NVIDIA_A100_3_20C', 'CUSTOM_VGPU_A16', 'VGPU']);
+      expect(capacity.pools.find((p) => p.resource_class === 'CUSTOM_VGPU_A16')).toMatchObject({ free: 0, providers: 0, largest_free: 0, detail: null });
+    }
+    expect(read().gpu_capacity!.pools.map(poolLabel)).toContain('CUSTOM_VGPU_A16');
+  });
+
+  it("validates a GPU VM against the GPU flavors its destination's provider declares now (SDD §22.2, §22.4, G10 review)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    // a CUSTOM_ class asks for a vGPU only where the destination declares the flavor's profile (§22.2)
+    (server.inventories['hibiscus-dc3'] as DestinationInventory).flavors.push({
+      name: 'g2.a16',
+      vcpus: 8,
+      ram_mb: 32768,
+      disk_gb: 200,
+      extra_specs: { 'resources:CUSTOM_VGPU_A16': '1' },
+    });
+    const mappings = { networks: {}, flavors: { 'g1.vgpu': 'g2.a16' }, volume_types: {}, projects: {} };
+    const created = call(server, 'POST', '/plans', { name: 'GPU to DC3', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'hibiscus-dc3', vm_ids: ['os-1a03'], mappings });
+    expect(created.status).toBe(201);
+    const id = (created.body as Plan).id;
+    const vgpu = () => {
+      expect(call(server, 'POST', `/plans/${id}/validate`).status).toBe(200);
+      return server.migrations.find((m) => m.plan_id === id)!.findings.find((f) => f.code === 'VM_VGPU')?.message ?? null;
+    };
+    expect(vgpu()).toBe(
+      "Flavor requests a vGPU (resources:VGPU). Its flavor mapping, 'g1.vgpu' to 'g2.a16', names a flavor of OpenStack 2026.2 Hibiscus (DC3) that asks for no GPU: the server would lose its GPU.",
+    );
+    expect(call(server, 'PATCH', '/providers/hibiscus-dc3', { gpu_profiles: { 'g2.a16': 'A16-4Q' } }).status).toBe(200);
+    expect(vgpu()).toBeNull();
+  });
+
+  it("never hands a read the pool objects its destination's Placement holds (SDD §22.3, G10 review)", () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const held = (server.inventories['hibiscus-dc3'] as DestinationInventory).gpu_capacity!;
+    const checked = ((call(server, 'POST', '/providers/hibiscus-dc3/check').body as Provider).capabilities as GpuCheckReport).gpu_capacity!;
+    const read = (call(server, 'GET', '/providers/hibiscus-dc3/inventory').body as DestinationInventory).gpu_capacity!;
+    // a change to what a read handed out reaches neither the destination nor another read, and the other way round
+    checked.pools[0]!.free = 99;
+    checked.pools[0]!.traits.push('CUSTOM_X');
+    read.pools[1]!.forbidden_traits.push('CUSTOM_Y');
+    expect(held.pools[0]).toMatchObject({ free: 4, traits: ['CUSTOM_NVIDIA_A100_4C'] });
+    expect(held.pools[1]!.forbidden_traits).toEqual([]);
+    expect(read.pools[0]).toMatchObject({ free: 4, traits: ['CUSTOM_NVIDIA_A100_4C'] });
+    held.pools[2]!.free = 5;
+    expect([checked.pools[2]!.free, read.pools[2]!.free]).toEqual([6, 6]);
+    // the seeded check report holds its own pools too
+    const seeded = (server.providers.find((p) => p.id === 'rhoso-prod')!.capabilities as GpuCheckReport).gpu_capacity!;
+    seeded.pools[0]!.free = 0;
+    expect((server.inventories['rhoso-prod'] as DestinationInventory).gpu_capacity!.pools[0]!.free).toBe(4);
   });
 
   it("a check after new credentials reports the pools the provider's cloud has, as the API demo does (review RV19-02)", () => {

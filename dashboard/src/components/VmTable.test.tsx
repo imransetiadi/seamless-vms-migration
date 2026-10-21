@@ -2,8 +2,9 @@ import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
-import { buildInventories } from '../api/mockData';
+import { buildInventories, makeVm } from '../api/mockData';
 import type { VMRef } from '../api/types';
+import { gpuDevice, gpuRequests } from '../lib/gpu';
 import { VmTable } from './VmTable';
 
 const inventories = buildInventories();
@@ -212,6 +213,87 @@ describe('VmTable', () => {
     expect(screen.getByText('No VMs match these filters')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Clear filters' }));
     expect(bodyRows()).toHaveLength(openstackVms.length);
+  });
+
+  describe("a VM's GPUs (SDD §16, §22.11)", () => {
+    /** The GPU column's text for a VM: the cell under the GPU header. */
+    const gpuOf = (name: string): string | null => {
+      const column = screen.getAllByRole('columnheader').indexOf(screen.getByRole('columnheader', { name: /^GPU/ }));
+      const row = bodyRows().find((r) => within(r).getByRole('rowheader').textContent === name)!;
+      return [within(row).getByRole('rowheader'), ...within(row).getAllByRole('cell')][column]!.textContent;
+    };
+
+    it("shows each VM's GPUs in a GPU column and filters by GPU", async () => {
+      const user = userEvent.setup({ delay: null });
+      // two identical vGPUs are one entry with its count (§22.2), and a passthrough device may have no ids
+      const twice = makeVm({ id: 'vm-6001', name: 'dc2-ml-03', vcpus: 16, ram_mb: 65536, disks: [{ size_gb: 80, kind: 'vmdk', volume_type: null }], gpus: [gpuDevice({ kind: 'vgpu', profile: 'grid_a100-4c', count: 2 })] });
+      const noIds = makeVm({ id: 'vm-6002', name: 'dc2-dvx-01', disks: [{ size_gb: 40, kind: 'vmdk', volume_type: null }], gpus: [gpuDevice({ kind: 'passthrough' })] });
+      const vms = [...vmwareVms, twice, noIds];
+      render(<VmTable vms={vms} providerKind="vmware" />);
+      // the column says Technology Preview in words, its detail on hover, focus and tap
+      const header = screen.getByRole('columnheader', { name: /^GPU/ });
+      expect(within(header).getByRole('button', { name: 'Technology Preview' })).toHaveAccessibleDescription(
+        'Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts.',
+      );
+      expect(gpuOf('dc2-ml-01')).toBe('vGPU grid_a100-4c');
+      expect(gpuOf('dc2-ml-02')).toBe('vGPU grid_a100-3-20c');
+      expect(gpuOf('dc2-cuda-01')).toBe('Passthrough 10de:20b5');
+      expect(gpuOf('dc2-ml-03')).toBe('vGPU grid_a100-4c ×2');
+      expect(gpuOf('dc2-dvx-01')).toBe('Passthrough without device ids');
+      // empty for a VM without a GPU
+      expect(gpuOf('vm-erp-app-01')).toBe('');
+
+      // the GPU filter: those with a GPU, those without, and back to all with Clear filters
+      const gpuVms = ['dc2-cuda-01', 'dc2-dvx-01', 'dc2-ml-01', 'dc2-ml-02', 'dc2-ml-03'];
+      await user.selectOptions(screen.getByLabelText('GPU'), 'With a GPU');
+      expect(rowNames().sort()).toEqual(gpuVms);
+      expect(screen.getByRole('status')).toHaveTextContent(`Showing 5 of ${vms.length} VMs`);
+      await user.selectOptions(screen.getByLabelText('GPU'), 'Without a GPU');
+      expect(rowNames().sort()).toEqual(vms.map((vm) => vm.name).filter((name) => !gpuVms.includes(name)).sort());
+      await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+      expect(screen.getByLabelText('GPU')).toHaveValue('all');
+      expect(rowNames()).toHaveLength(vms.length);
+    });
+
+    it("words an OpenStack VM's GPU by what its flavor asks for, a VM recorded before 0.3.0 by its flavor's requests", () => {
+      // a source that declares its flavor's profile reports it on the request: it stands after the kind (SDD §16, §22.2)
+      const declared = makeVm({
+        id: 'os-6003',
+        name: 'gpu-ml-02',
+        flavor: 'g1.vgpu',
+        disks: [{ size_gb: 40 }],
+        gpus: gpuRequests({ 'resources:VGPU': '2', 'trait:CUSTOM_NVIDIA_A100_4C': 'required' }, 'A100-4C'),
+      });
+      render(<VmTable vms={[...openstackVms, declared]} providerKind="openstack" />);
+      expect(gpuOf('gpu-ml-01')).toBe('vGPU · VGPU, CUSTOM_NVIDIA_A100_4C');
+      expect(gpuOf('gpu-ml-02')).toBe('vGPU A100-4C ×2 · VGPU, CUSTOM_NVIDIA_A100_4C');
+      // no gpus reported: its flavor's extra specs, read as the API's vm_gpus reads them (§22.2)
+      expect(gpuOf('gpu-render-01')).toBe('vGPU · VGPU');
+      expect(gpuOf('web-01')).toBe('');
+    });
+
+    it('gives the GPU filter a Technology Preview badge of its own, shown at every width as the GPU column is not (SDD §16)', () => {
+      render(<VmTable vms={vmwareVms} providerKind="vmware" />);
+      const filter = screen.getByLabelText('GPU');
+      const badges = screen.getAllByRole('button', { name: 'Technology Preview' });
+      const own = badges.find((badge) => !badge.closest('table'));
+      // beside the filter, a focusable term with its definition, never inside an element a narrow screen hides
+      expect(own).toBeDefined();
+      expect(filter.parentElement).toContainElement(own!);
+      expect(own).toHaveAccessibleDescription('Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts.');
+      expect(own!.closest('.hidden')).toBeNull();
+      // the filter keeps its name: the badge stands outside its label
+      expect(filter).toHaveAccessibleName('GPU');
+      // the column's badge goes with the column, which a narrow screen hides
+      expect(badges.filter((badge) => badge !== own).map((badge) => badge.closest('th')?.className)).toEqual(['hidden md:table-cell']);
+    });
+
+    it('offers no GPU column or filter while no VM of the table has a GPU, as the Project filter needs two projects', () => {
+      render(<VmTable vms={vmwareVms.filter((vm) => !vm.gpus?.length)} providerKind="vmware" />);
+      expect(screen.queryByRole('columnheader', { name: /^GPU/ })).not.toBeInTheDocument();
+      expect(screen.queryByLabelText('GPU')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Technology Preview' })).not.toBeInTheDocument();
+    });
   });
 
   it('warns about guests virt-v2v does not support on VMware sources', () => {

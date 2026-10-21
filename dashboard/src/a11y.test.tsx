@@ -6,6 +6,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import App from './App';
 import { ApiClient } from './api/client';
 import { createMockFetch, type MockServer } from './api/mock';
+import type { DestinationInventory } from './api/types';
 import { createTestServer } from './test/utils';
 
 /*
@@ -122,6 +123,32 @@ describe('axe-core: no WCAG violations', () => {
     await user.type(addresses!, 'nonsense');
     await user.click(within(dialog).getByRole('button', { name: 'Save network' }));
     await waitFor(() => expect(addresses).toHaveAttribute('aria-invalid', 'true'));
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it("the Inventory's GPU column and GPU filter, with its Technology Preview badge (SDD §16, §22.11)", async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/inventory/vcenter-hq', 'operator');
+    expect(await screen.findByRole('heading', { level: 1, name: 'Inventory' }, { timeout: 8_000 })).toBeInTheDocument();
+    await settled();
+    const table = await screen.findByRole('table', { name: /^VMs on/ });
+    await user.selectOptions(screen.getByLabelText('GPU'), 'With a GPU');
+    expect(within(table).getAllByRole('row').length).toBeGreaterThan(1);
+    expect(await violations()).toEqual([]);
+    // the badge is a focusable term: a tap shows its definition, as hover and focus do
+    await user.click(within(screen.getByRole('columnheader', { name: /^GPU/ })).getByRole('button', { name: 'Technology Preview' }));
+    expect(screen.getByRole('tooltip')).toHaveTextContent(/validated in simulation/);
+  }, 30_000);
+
+  it("a destination's GPU flavors, and its GPU capacity that was not read (SDD §16, §22.11)", async () => {
+    renderAt('/inventory/rhoso-prod', 'viewer', (server) => {
+      const inventory = server.inventories['rhoso-prod'] as DestinationInventory;
+      inventory.gpu_capacity = { status: 'unknown', reason: 'forbidden', detail: 'HTTP 403', read_at: '2026-10-08T11:59:00Z', pools: [] };
+    });
+    expect(await screen.findByRole('heading', { level: 1, name: 'Inventory' }, { timeout: 8_000 })).toBeInTheDocument();
+    await settled();
+    await within(await screen.findByRole('region', { name: 'GPU flavors' })).findByRole('table');
+    await within(screen.getByRole('region', { name: 'GPU capacity' })).findByText(/^Not read:/);
     expect(await violations()).toEqual([]);
   }, 30_000);
 

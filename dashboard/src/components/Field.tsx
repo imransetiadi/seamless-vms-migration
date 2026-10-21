@@ -4,6 +4,8 @@ import { cn } from '../lib/cn';
 
 interface FieldChrome {
   label: ReactNode;
+  /** Beside the label and outside it, so the control keeps its name: a status badge such as Technology Preview (SDD §16). */
+  aside?: ReactNode;
   hint?: ReactNode;
   error?: string | null;
   required?: boolean;
@@ -18,6 +20,7 @@ interface FieldChrome {
 function Chrome({
   id,
   label,
+  aside,
   hint,
   error,
   required,
@@ -31,16 +34,26 @@ function Chrome({
       {error}
     </p>
   );
+  const labelled = (
+    <label htmlFor={id} className="field-label">
+      {label}
+      {required && (
+        <span aria-hidden className="ml-0.5 text-status-danger">
+          *
+        </span>
+      )}
+    </label>
+  );
   return (
     <div className={cn('min-w-0', className)}>
-      <label htmlFor={id} className="field-label">
-        {label}
-        {required && (
-          <span aria-hidden className="ml-0.5 text-status-danger">
-            *
-          </span>
-        )}
-      </label>
+      {aside ? (
+        <div className="flex flex-wrap items-center gap-x-2">
+          {labelled}
+          <span className="mb-1">{aside}</span>
+        </div>
+      ) : (
+        labelled
+      )}
       {children}
       {hint && !error && (
         <p id={`${id}-hint`} className="field-hint">
@@ -66,6 +79,7 @@ export interface SelectOption {
 
 export function SelectField({
   label,
+  aside,
   hint,
   error,
   required,
@@ -78,7 +92,7 @@ export function SelectField({
   const generated = useId();
   const id = idProp ?? generated;
   return (
-    <Chrome id={id} label={label} hint={hint} error={error} required={required} className={className} liveError={liveError}>
+    <Chrome id={id} label={label} aside={aside} hint={hint} error={error} required={required} className={className} liveError={liveError}>
       <select
         id={id}
         className="input cursor-pointer pr-8"

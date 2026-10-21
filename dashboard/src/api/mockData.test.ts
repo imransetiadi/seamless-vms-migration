@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import eligibilityRaw from '../../../seamless/tests/fixtures/eligibility_cases.json?raw';
-import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, makeVm, preflight, replaceNames } from './mockData';
+import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, iso, makeVm, preflight, readDestinationGpus, replaceNames } from './mockData';
+import { gpuRequests } from '../lib/gpu';
 import { capabilityRoles } from '../lib/networks';
-import type { DestinationInventory, DestinationNetwork, DestinationSubnet, Finding, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
+import type { DestinationInventory, DestinationNetwork, DestinationSubnet, Finding, GpuCheckReport, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
 
 const now = Date.parse('2026-10-09T12:00:00Z');
 
@@ -668,6 +669,92 @@ describe("the mock's GPU mapping rule, as the API's (SDD §9.3, §22.4, plan tas
     expect(found.find((f) => f.code === 'VM_VGPU')!.message).toBe(
       "Flavor requests a vGPU (resources:VGPU). The plan maps no flavor to 'constructor': map it to a GPU flavor of RHOSO 18.0.",
     );
+  });
+});
+
+describe("the mock's GPU VMs, flavors and pools, as the demo's (SDD §16, §22.10, plan task G10)", () => {
+  /** A GpuDevice's fields as the API's model fills them. */
+  const DEVICE = { profile: null, vendor_id: null, device_id: null, count: 1, resource_class: null, traits: [], forbidden_traits: [], same_provider: false, alias: null };
+  /** The vGPU profiles the GPU destinations declare for their two vGPU flavors (SDD §22.3, §22.10). */
+  const DECLARED: Record<string, string> = { 'g1.a100-4c': 'A100-4C', 'g1.a100-3-20c': 'A100-3-20C' };
+  const pool = (traits: string[], free: number, providers: number, largest: number) => ({
+    resource_class: 'VGPU',
+    traits,
+    forbidden_traits: [],
+    same_provider: false,
+    free,
+    providers,
+    largest_free: largest,
+    detail: null,
+  });
+
+  it("the mock holds the demo's GPU VMs, flavors and pools", () => {
+    const inventories = buildInventories();
+    const providers = buildProviders(now);
+    const vmsOf = (id: string) => new Map((inventories[id] as VMRef[]).map((vm) => [vm.name, vm]));
+    const shape = (vm: VMRef | undefined) => vm && { vcpus: vm.vcpus, ram_mb: vm.ram_mb, power_state: vm.power_state, cbt_enabled: vm.cbt_enabled, gpus: vm.gpus };
+
+    // an OpenStack VM whose flavor asks for a vGPU with its type's trait, its GPUs as its source reports them (SDD §22.2)
+    const ml = vmsOf('rhosp17-dc1').get('gpu-ml-01')!;
+    expect(ml.flavor).toBe('g1.vgpu');
+    expect(ml.flavor_extra_specs).toEqual({ 'resources:VGPU': '1', 'trait:CUSTOM_NVIDIA_A100_4C': 'required' });
+    expect(ml.gpus).toEqual([{ ...DEVICE, kind: 'vgpu', resource_class: 'VGPU', traits: ['CUSTOM_NVIDIA_A100_4C'] }]);
+    expect(ml.gpus).toEqual(gpuRequests(ml.flavor_extra_specs));
+
+    // a VMware vGPU, a MIG-backed one and a DirectPath I/O GPU of a powered-off VM (SDD §22.6)
+    const vmware = vmsOf('vcenter-hq');
+    expect(shape(vmware.get('dc2-ml-01'))).toEqual({ vcpus: 8, ram_mb: 32768, power_state: 'running', cbt_enabled: true, gpus: [{ ...DEVICE, kind: 'vgpu', profile: 'grid_a100-4c' }] });
+    expect(shape(vmware.get('dc2-ml-02'))).toEqual({ vcpus: 16, ram_mb: 65536, power_state: 'running', cbt_enabled: true, gpus: [{ ...DEVICE, kind: 'vgpu', profile: 'grid_a100-3-20c' }] });
+    expect(shape(vmware.get('dc2-cuda-01'))).toEqual({
+      vcpus: 16,
+      ram_mb: 131072,
+      power_state: 'stopped',
+      cbt_enabled: true,
+      gpus: [{ ...DEVICE, kind: 'passthrough', vendor_id: '10de', device_id: '20b5' }],
+    });
+
+    // the GPU destinations: three GPU flavors, the profiles their providers declare, and the pools of their vGPU flavors
+    for (const id of ['rhoso-prod', 'hibiscus-dc3']) {
+      const provider = providers.find((p) => p.id === id)!;
+      expect(provider.gpu_profiles, id).toEqual(DECLARED);
+      const inventory = inventories[id] as DestinationInventory;
+      const flavor = (name: string) => inventory.flavors.find((f) => f.name === name);
+      expect(flavor('g1.a100-4c'), id).toMatchObject({ vcpus: 8, ram_mb: 32768, extra_specs: { 'resources:VGPU': '1', 'trait:CUSTOM_NVIDIA_A100_4C': 'required' } });
+      expect(flavor('g1.a100-3-20c'), id).toMatchObject({ vcpus: 16, ram_mb: 65536, extra_specs: { 'resources:VGPU': '1', 'trait:CUSTOM_NVIDIA_A100_3_20C': 'required' } });
+      expect(flavor('p1.a100'), id).toMatchObject({ vcpus: 16, ram_mb: 131072, extra_specs: { 'pci_passthrough:alias': 'a100:1' } });
+      // the flavors whose extra specs ask for a GPU, read as the API's gpu_requests reads them with the profiles the
+      // provider declares at the time of the read - never kept with the inventory (§22.3)
+      expect(inventory, id).not.toHaveProperty('gpu_flavors');
+      const read = readDestinationGpus(inventory, provider.gpu_profiles, iso(now));
+      expect(read.gpu_flavors, id).toEqual(
+        ['g1.a100-4c', 'g1.a100-3-20c', 'p1.a100'].map((name) => {
+          const { vcpus, ram_mb, disk_gb, extra_specs } = flavor(name)!;
+          return { name, vcpus, ram_mb, disk_gb, gpus: gpuRequests(extra_specs, DECLARED[name] ?? null) };
+        }),
+      );
+      // A100-4C's pool 4 free on 1 provider, A100-3-20C's 2 free on 1, and the class alone, which unites them (§22.3)
+      const pools = [pool(['CUSTOM_NVIDIA_A100_4C'], 4, 1, 4), pool(['CUSTOM_NVIDIA_A100_3_20C'], 2, 1, 2), pool([], 6, 2, 4)];
+      expect(inventory.gpu_capacity!.pools, id).toEqual(pools);
+      expect(read.gpu_capacity, id).toEqual({ status: 'ok', reason: null, detail: null, read_at: iso(now), pools });
+      // the destination's check reads the same pools, when it runs (SDD §10, §22.3)
+      const report: GpuCheckReport = provider.capabilities;
+      expect(report.gpu_capacity, id).toEqual({ status: 'ok', reason: null, detail: null, read_at: provider.last_checked_at, pools });
+    }
+
+    // a destination without a GPU flavor reads ok with no pools, and sends Placement nothing (§22.3)
+    const staging = readDestinationGpus(inventories['rhoso-staging'], undefined, iso(now));
+    expect(staging).toEqual({ gpu_flavors: [], gpu_capacity: { status: 'ok', reason: null, detail: null, read_at: iso(now), pools: [] } });
+  });
+
+  it("keeps the seeded plans' GPU findings as they were: the GPU flavors map nothing on their own (SDD §22.4)", () => {
+    const fixtures = buildFixtures(now);
+    // the render VM's plan still maps its flavor to one that asks for no GPU: it stays blocked, saying why
+    const render = fixtures.migrations.find((m) => m.vm.name === 'gpu-render-01')!;
+    expect(render.phase).toBe('blocked');
+    expect(render.findings.find((f) => f.code === 'VM_VGPU')?.message).toBe(
+      "Flavor requests a vGPU (resources:VGPU). Its flavor mapping, 'g1.a10' to 'm1.large', names a flavor of RHOSO 18.0 — Production that asks for no GPU: the server would lose its GPU.",
+    );
+    expect(render.findings.map((f) => f.code)).not.toContain('MAP_FLAVOR_MISSING');
   });
 });
 

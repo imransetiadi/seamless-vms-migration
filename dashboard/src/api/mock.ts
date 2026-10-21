@@ -45,11 +45,11 @@ import {
   strategyRecommendation,
   strategySnapshot,
   destinationDescriptor,
-  DEMO_TOKEN_ROLES,
   type StrategyDecision,
   checkOf,
   flavorContext,
-  gpuCapacityOf,
+  emptyDestinationInventory,
+  readDestinationGpus,
   vmwareCheck,
   HELD_VOLUMES_REASON,
 } from './mockData';
@@ -1370,8 +1370,9 @@ export class MockServer {
       roles,
       profile,
       destination: providerLabel(destination),
-      // the flavors a GPU VM's mapping may name, and those of them that ask for a GPU (SDD §22.3, §22.4)
-      ...flavorContext(dst),
+      // the flavors a GPU VM's mapping may name, and those of them that ask for a GPU with the profiles the destination
+      // declares now (SDD §22.3, §22.4)
+      ...flavorContext(dst, destination.gpu_profiles),
       // the profiles the source declares for its flavors, which make a CUSTOM_ class a vGPU (SDD §22.2)
       gpuProfiles: source.gpu_profiles,
     });
@@ -1644,11 +1645,14 @@ export class MockServer {
               // the API's keys: a vCenter's VMs counted; an OpenStack cloud's token roles, maxima, pools and TLS, and a
               // destination's series, tier and policy profile by what it declares (SDD §10, §10.1)
               const inventory = this.inventories[provider.id];
-              provider.capabilities = provider.kind === 'vmware' ? vmwareCheck(Array.isArray(inventory) ? inventory : []) : checkOf(provider, provider.last_checked_at);
+              provider.capabilities =
+                provider.kind === 'vmware' ? vmwareCheck(Array.isArray(inventory) ? inventory : []) : checkOf(provider, provider.last_checked_at, inventory);
             }
           } else if (provider.status === 'ok' && 'gpu_capacity' in provider.capabilities) {
-            // a destination's GPU capacity is read each time its check runs (SDD §22.3)
-            provider.capabilities = { ...provider.capabilities, gpu_capacity: gpuCapacityOf(provider.last_checked_at) };
+            // a destination's GPU capacity is read each time its check runs, for its GPU flavors with the profiles it declares
+            // now (SDD §22.3)
+            const { gpu_capacity } = readDestinationGpus(this.inventories[provider.id], provider.gpu_profiles, provider.last_checked_at);
+            provider.capabilities = { ...provider.capabilities, gpu_capacity };
           }
           this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id}: ${provider.status}`, data: { provider_id: provider.id, status: provider.status, message: provider.status_message } });
           return ok(provider);
@@ -1656,8 +1660,11 @@ export class MockServer {
         if (sub === 'inventory' && method === 'GET') {
           this.require(token, 'viewer', path);
           if (provider.status === 'error') throw new HttpError(502, 'provider_error', `${provider.id}: ${provider.status_message ?? 'unreachable'}`);
-          // a destination's answer names its token's roles, as the API demo's (SDD §10, review RV20-10)
-          return ok(this.inventories[provider.id] ?? (provider.role === 'source' ? [] : { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [], roles: [...DEMO_TOKEN_ROLES] }));
+          // a destination's answer names its token's roles, as the API demo's (SDD §10, review RV20-10), and reads its GPU
+          // flavors with the profiles its provider declares now, and their capacity, live (§22.3)
+          const inventory = this.inventories[provider.id] ?? (provider.role === 'source' ? [] : emptyDestinationInventory());
+          if (Array.isArray(inventory)) return ok(inventory);
+          return ok({ ...inventory, ...readDestinationGpus(inventory, provider.gpu_profiles, new Date(this.now()).toISOString()) });
         }
       }
     }

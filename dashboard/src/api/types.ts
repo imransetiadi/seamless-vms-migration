@@ -159,11 +159,11 @@ export interface Provider {
 
 /** `POST /providers` body (status and server-owned fields are ignored by the API). */
 export type ProviderCreate = Pick<Provider, 'id' | 'name' | 'kind' | 'role' | 'endpoint' | 'cloud' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'credentials_secret'> &
-  Partial<Pick<Provider, 'release' | 'policy_profile'>>;
+  Partial<Pick<Provider, 'release' | 'policy_profile' | 'gpu_profiles'>>;
 
 /** `PATCH /providers/{id}`: the editable fields (SDD §12). */
 export type ProviderPatch = Partial<
-  Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'release' | 'policy_profile'>
+  Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'release' | 'policy_profile' | 'gpu_profiles'>
 >;
 
 /** `PUT /providers/{id}/credentials`: write-only; never returned (SDD §13.3). */
@@ -304,6 +304,14 @@ export interface GpuCapacity {
   detail: string | null;
   read_at: Timestamp | null;
   pools: GpuPool[];
+}
+
+/**
+ * What §22 adds to a destination's check report (`Provider.capabilities`, SDD §10, §22.3): its GPU capacity, read when
+ * the check runs. A source's report holds none, nor does a report from before 0.3.0.
+ */
+export interface GpuCheckReport {
+  gpu_capacity?: GpuCapacity;
 }
 
 export interface Mappings {
