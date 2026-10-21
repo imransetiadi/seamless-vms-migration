@@ -29,10 +29,11 @@ from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import Strategy
 from ..domain.models import Mappings, Plan, Provider, VMRef, utcnow
+from ..planning.gpu import vm_gpus
 from ..planning.ipam import address_refusal, requested_ips
 from ..planning.networks import policy_profile_of, port_refusal_at_run
-from ..providers.base import microversion_text
-from ..providers.registry import connection_fingerprint
+from ..providers.base import ProviderError, microversion_text
+from ..providers.registry import ProviderRegistry, connection_fingerprint
 from ..storage import (
     StorageError,
     manage_reference,
@@ -40,7 +41,13 @@ from ..storage import (
     split_host,
     storage_family,
 )
-from .ansible import classify_failure, effective_mappings, run_dir
+from .ansible import (
+    classify_failure,
+    declared_gpu_profile,
+    effective_mappings,
+    gpu_mapping_refusal,
+    run_dir,
+)
 from .base import (
     PermanentStepError,
     StepContext,
@@ -449,6 +456,7 @@ class HandoverExecutor:
         *,
         poll_s: float = 2.0,
         wait_s: int = 900,
+        providers: Any = None,
     ) -> None:
         self.settings = settings
         self._conn_factory = conn_factory or self._default_conn
@@ -457,6 +465,15 @@ class HandoverExecutor:
         self._conns_lock = asyncio.Lock()
         self.poll_s = poll_s
         self.wait_s = wait_s
+        self._providers = providers
+
+    @property
+    def providers(self) -> Any:
+        """The provider registry step 0 reads a GPU VM's destination inventory through (SDD §7.3
+        step 0): the control plane's, which the router passes, else one of its own."""
+        if self._providers is None:
+            self._providers = ProviderRegistry(self.settings)
+        return self._providers
 
     def _default_conn(self, provider: Provider) -> Any:
         from ..providers.openstack import connect
@@ -796,6 +813,27 @@ class HandoverExecutor:
                 destination.label,
                 destination.capabilities.get("roles"),
             ),
+        )
+
+    async def _gpu_mapping_refusal(self, ctx: StepContext) -> str | None:
+        """Why step 0 refuses a GPU VM's mapping (SDD §7.3 step 0, §22.4): it no longer applies to
+        the destination's flavors, read once for the step before the stop - for a GPU VM only,
+        its GPUs read with the profile its source declares for its flavor -, and step 8 would
+        create its server with a same-named flavor or without its GPU. None for a VM without a
+        GPU and for a mapping that applies; flavors that cannot be read are a transient failure."""
+        vm = ctx.migration.vm
+        declared = declared_gpu_profile(vm, ctx.source)
+        if not vm_gpus(vm, declared):
+            return None
+        where = ctx.destination.label
+        try:
+            inventory = await self.providers.get(ctx.destination).inventory()
+        except ProviderError as exc:
+            raise TransientStepError(
+                f"could not read the flavors of {where} for the GPU flavor of {vm.name}: {exc}"
+            ) from exc
+        return gpu_mapping_refusal(
+            vm, ctx.plan, ctx.source.kind, inventory, where, declared_profile=declared
         )
 
     @staticmethod
@@ -1367,10 +1405,17 @@ class HandoverExecutor:
             report = await self.readiness(
                 ctx.source, ctx.destination, server_id, backend_map, ctx.plan, mappings
             )
-            if report["problems"]:
-                raise PermanentStepError(
-                    "storage handover refused: " + "; ".join(report["problems"])
-                )
+            problems = list(report["problems"])
+            try:
+                gpu = await self._gpu_mapping_refusal(ctx)
+            except TransientStepError:
+                if not problems:
+                    raise
+                gpu = None  # refused anyway: the next attempt judges the GPU flavor
+            if gpu:
+                problems.append(gpu)
+            if problems:
+                raise PermanentStepError("storage handover refused: " + "; ".join(problems))
 
         def settle(server: Any) -> Any:
             """The server once a start Nova runs ended: a rollback's, its wait cut off, reads

@@ -497,25 +497,43 @@ def effective_mappings(plan_mappings: Mappings, resolved: Mappings | None) -> Ma
     )
 
 
+def declared_gpu_profile(vm: VMRef, source: Provider) -> str | None:
+    """The vGPU profile the VM's source provider declares for its flavor (`Provider.gpu_profiles`,
+    SDD §22.3), with which a cutover reads its GPUs as §9.3's GPU rows do (§7.2, §22.2); None for a
+    VMware VM, whose provider declares none."""
+    return source.gpu_profiles.get(vm.flavor) if vm.flavor else None
+
+
 def gpu_mapping_refusal(
     vm: VMRef,
     plan: Plan,
     source_kind: ProviderKind | str,
     inventory: Any,
     where: str = "the destination",
+    *,
+    declared_profile: str | None = None,
 ) -> str | None:
     """Why a GPU VM's mapping does not apply to the destination's flavors ``inventory`` read for
-    the run (SDD §7.2, §22.4): the plan's GPU mappings map its GPUs to no single flavor, the
-    flavor they name does not exist, or it asks for no GPU - none of the inventory's gpu_flavors
-    (§22.3) -, and the server would lose its GPU. None for a VM without a GPU and for a mapping
-    that applies; ``where`` names the destination provider (SDD §1 naming)."""
-    gpus = vm_gpus(vm)
+    the run (SDD §7.2, §22.4): the plan maps its GPUs to no single flavor - a VMware VM's GPU
+    mappings, an OpenStack VM's mapping of its flavor, never a same-named flavor -, the flavor it
+    names does not exist, or it asks for no GPU - none of the inventory's gpu_flavors (§22.3) -,
+    and the server would lose its GPU. The VM's GPUs are read with ``declared_profile``, the
+    profile its source declares for its flavor (`declared_gpu_profile`). None for a VM without a
+    GPU and for a mapping that applies; ``where`` names the destination provider (SDD §1
+    naming)."""
+    gpus = vm_gpus(vm, declared_profile)
     if not gpus:
         return None
     what = f"the GPUs of {vm.name} ({gpu_names(gpus)})"
-    flavor = gpu_flavor(vm, plan, source_kind)
+    flavor = gpu_flavor(vm, plan, source_kind, declared_profile)
     if flavor is None:
-        return f"the plan's GPU mappings map {what} to no single flavor of {where}"
+        if ProviderKind(source_kind) == ProviderKind.vmware:
+            return f"the plan's GPU mappings map {what} to no single flavor of {where}"
+        # the import, or the handover's step 8, would take the same-named flavor (§22.4)
+        return (
+            f"the plan maps no flavor to {vm.flavor!r}, which gives {what}: map it to a GPU flavor "
+            f"of {where}"
+        )
 
     def listed(key: str) -> set[str]:
         return {str(f.get("name")) for f in getattr(inventory, key, None) or []}
@@ -1194,7 +1212,16 @@ class AnsibleExecutor:
             )
             judged = step != StepName.ROLLBACK and not finishing
             if judged:
-                networks = await self._destination_networks(ctx)
+                inventory = await self._destination_inventory(ctx, deferred)
+                # the import creates the server with the flavor the export names: a GPU VM's
+                # mapping must still apply to the destination's flavors (SDD §7.2, §22.4)
+                self._refuse_gpu_mapping(ctx, inventory, deferred)
+                # none listed (an older provider): nothing to resolve against
+                networks = (
+                    None
+                    if inventory is None
+                    else list(getattr(inventory, "network_details", None) or [])
+                )
             mappings = effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings)
             reexport = await asyncio.to_thread(
                 _apply_port_mode,
@@ -1236,14 +1263,7 @@ class AnsibleExecutor:
         network_map = None
         if strategy in VMWARE:
             inventory = await self._kit_inventory(ctx)
-            refusal = gpu_mapping_refusal(
-                ctx.migration.vm, ctx.plan, ctx.source.kind, inventory, ctx.destination.label
-            )
-            if refusal:
-                if deferred is None:
-                    raise PermanentStepError(refusal)
-                # the kit creates no server in a pass: its cutover refuses it (SDD §7.2)
-                deferred.append(refusal)
+            self._refuse_gpu_mapping(ctx, inventory, deferred)
             network_map = await self._vmware_network_map(ctx, inventory, deferred)
             await self._log_deferred(ctx, deferred)
         passes_before = 0
@@ -1599,20 +1619,57 @@ class AnsibleExecutor:
             )
         )
 
-    async def _destination_networks(self, ctx: StepContext) -> list[dict[str, Any]] | None:
-        """The destination's networks for this run's network references (SDD §7.2); None when
-        they cannot be read - the references stay as exported, and the destination check (§6.6)
-        still looks them up before the source stops."""
+    async def _destination_inventory(self, ctx: StepContext, deferred: Deferred | None) -> Any:
+        """The destination's inventory for an OpenStack run, read once for it (SDD §7.2): the
+        networks of its network references, and the flavors a GPU VM's mapping must still apply to
+        (§22.4). None when it cannot be read - logged: the references stay as exported, and the
+        destination check (§6.6) still looks them up before the source stops -, except at a GPU
+        VM's cutover, which then fails as transient before any playbook: it never creates the
+        server on a mapping it could not judge. A pre-copy or sync run (``deferred``) creates no
+        server and goes on."""
+        vm, where = ctx.migration.vm, ctx.destination.label
         try:
-            inventory = await self.providers.get(ctx.destination).inventory()
+            return await self.providers.get(ctx.destination).inventory()
         except ProviderError as exc:
+            gpu = bool(vm_gpus(vm, declared_gpu_profile(vm, ctx.source)))
+            if gpu and deferred is None:
+                raise TransientStepError(
+                    f"could not read the flavors of {where} for the GPU flavor of {vm.name}: {exc}"
+                ) from exc
             await ctx.log(
-                f"could not read the networks of {ctx.destination.label} ({exc}): the network "
-                "references stay as exported"
+                f"could not read the networks of {where} ({exc}): the network references stay as "
+                "exported"
             )
+            if gpu:
+                await ctx.log(
+                    f"the GPU flavor of {vm.name} is not judged in this pass: the cutover reads "
+                    f"the flavors of {where} again before the source stops"
+                )
             return None
-        # none listed (an older provider): nothing to resolve against
-        return list(getattr(inventory, "network_details", None) or [])
+
+    @staticmethod
+    def _refuse_gpu_mapping(ctx: StepContext, inventory: Any, deferred: list[str] | None) -> None:
+        """Before the source stops, refuse a GPU VM whose mapping no longer applies to the
+        destination's flavors ``inventory`` read for the run (SDD §7.2, §22.4): a permanent
+        failure - or, in a pre-copy or sync run (``deferred``), which creates no server, a problem
+        the pass records for its cutover. Without an inventory nothing is judged: a pass that
+        could not read it leaves that to its cutover."""
+        if inventory is None:
+            return
+        vm = ctx.migration.vm
+        refusal = gpu_mapping_refusal(
+            vm,
+            ctx.plan,
+            ctx.source.kind,
+            inventory,
+            ctx.destination.label,
+            declared_profile=declared_gpu_profile(vm, ctx.source),
+        )
+        if refusal is None:
+            return
+        if deferred is None:
+            raise PermanentStepError(refusal)
+        deferred.append(refusal)
 
     async def _kit_inventory(self, ctx: StepContext) -> Any:
         """The destination's inventory for a kit run, read once for it: the networks, subnets and
