@@ -4001,12 +4001,15 @@ is no origin a browser sends (review RV31-03).
   and the profile it gives (Add vGPU profile; Remove vGPU profile {n}; "No vGPU profile declared." without one): it
   trims each name and refuses before anything is sent what the API refuses - an empty flavor or profile, a flavor of
   more than 255 characters or a profile of more than 64, counted in code points as Python counts them - and a flavor
-  declared twice, which one map cannot hold, each in the error summary with a link to its field; it sends the map
-  whole, with `POST`, and with `PATCH` only when it changed, its pairs in any order (a PATCH resets the check report,
-  §12); while it edits a provider, it offers the provider's GPU flavors once its inventory is read
-  (`GET /providers/{id}/inventory`, which the Inventory shares): a destination's `gpu_flavors`, a source's the flavors
-  of its VMs with a GPU (`vm_gpus`, §22.2), named in the section's hint and suggested by each Flavor field, less those
-  declared (a suggestion, never a restriction: a flavor its inventory does not list is typed); the hint says so while
+  declared twice, which one map cannot hold, each in the error summary with a link to its field - judged again for the
+  rows left when one is removed, and dropped when the platform becomes vCenter -; it sends the map whole, with `POST`,
+  and with `PATCH` only when it changed, its pairs in any order (a PATCH resets the check report, §12); while it edits
+  a provider, it offers the provider's GPU flavors once its inventory is read (`GET /providers/{id}/inventory`, which
+  the Inventory shares, read while the form shows and nothing is saved: a save's steps and the test's result read
+  none): a destination's `gpu_flavors`, a source's the flavors of its VMs with a GPU (`vm_gpus`, §22.2), named in the
+  section's hint, which describes each Flavor field (three by name, then "and {n} more"), and suggested by each Flavor
+  field, less those declared (a suggestion, never a restriction: a flavor its inventory does not list is typed); the
+  hint says so while
   the inventory is read, when it cannot be read or lists no GPU flavor, and for a provider not added yet; a vCenter's
   form shows no vGPU profiles and sends none (vCenter reports each VM's own, §22.3); admins add and edit providers
   with a distribution preset —
