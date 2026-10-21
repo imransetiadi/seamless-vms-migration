@@ -482,3 +482,37 @@ def test_a_gpu_devices_free_text_is_written_u_fffd():
     assert device.forbidden_traits == ["CUSTOM_\ufffd"]
     assert device.alias == "a\ufffd"
     assert make_vm(gpus=[device]).gpus[0].profile == "grid\ufffda100-4c"
+
+
+def test_the_migration_summary_carries_the_gpu_wait():
+    """SDD §4.2 (§5.4 rule 5, §22.7): a migration whose cutover waits for GPU capacity holds its
+    GpuWait - through the store's JSON, its free text as the store keeps it - and its summary
+    carries it as the migration has it; one stored before 0.3.0 loads waiting for nothing."""
+    from seamless_migrate.domain.models import GpuWait, MigrationSummary
+
+    at = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
+    wait = GpuWait(
+        since=at,
+        checked_at=at,
+        pool="VGPU CUSTOM_NVIDIA_A100_4C",
+        needed=2,
+        free=1,
+        reason="VGPU CUSTOM_NVIDIA_A100_4C of RHOSO 18.0 has 1 unit free; it needs 2",
+    )
+    m = make_migration(phase=Phase.ready, gpu_wait=wait)
+    assert m.gpu_wait == wait
+    assert Migration.model_validate(m.model_dump(mode="json")).gpu_wait == wait
+    assert MigrationSummary.of(m).gpu_wait == wait
+    assert MigrationSummary.of(m).model_dump(mode="json")["gpu_wait"] == wait.model_dump(
+        mode="json"
+    )
+    stored = make_migration().model_dump(mode="json")
+    stored.pop("gpu_wait")
+    assert Migration.model_validate(stored).gpu_wait is None
+    assert MigrationSummary.of(Migration.model_validate(stored)).gpu_wait is None
+    failed = GpuWait(
+        since=at, checked_at=at, pool="\x00", needed=0, free=None, reason="read\ud800 failed"
+    )
+    assert (failed.pool, failed.free, failed.reason) == ("�", None, "read� failed")
+    with pytest.raises(ValidationError):
+        GpuWait(since=at, checked_at=at, pool="VGPU", needed=1, free=0)  # a wait says why

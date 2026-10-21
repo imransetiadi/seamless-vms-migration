@@ -28,7 +28,21 @@ describe('summaryOf (SDD §4 MigrationSummary, perf audit PF-02)', () => {
     expect(summaryOf(m).phase_since).toBe(m.created_at);
   });
 
-  it("holds the API's 29 fields, no more (SDD §4)", () => {
+  it("carries the migration's wait for GPU capacity as the migration has it (SDD §4.2, §22.7)", () => {
+    const gpu_wait = {
+      since: '2026-10-20T12:00:00Z',
+      checked_at: '2026-10-20T12:01:00Z',
+      pool: 'VGPU CUSTOM_NVIDIA_A100_3_20C',
+      needed: 1,
+      free: 0,
+      reason: 'VGPU CUSTOM_NVIDIA_A100_3_20C of RHOSO 18.0 has 0 units free',
+    };
+    const m: Migration = { ...fx.migrations[0]!, phase: 'ready', gpu_wait };
+    expect(summaryOf(m).gpu_wait).toEqual(gpu_wait);
+    expect(summaryOf({ ...m, gpu_wait: null }).gpu_wait).toBeNull();
+  });
+
+  it("holds the API's 30 fields, no more (SDD §4)", () => {
     expect([...MIGRATION_SUMMARY_FIELDS].sort()).toEqual(
       [
         'id',
@@ -58,6 +72,7 @@ describe('summaryOf (SDD §4 MigrationSummary, perf audit PF-02)', () => {
         'findings',
         'suggested_probes',
         'cutover_refusals',
+        'gpu_wait',
         'created_at',
         'updated_at',
       ].sort(),

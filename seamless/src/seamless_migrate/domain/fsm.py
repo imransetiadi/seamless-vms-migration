@@ -37,6 +37,12 @@ WAVE_COMPLETE_PHASES = frozenset({P.completed, P.finalized, P.cancelled, P.rolle
 ACTIVE_STEP_PHASES = frozenset({P.precopy, P.syncing, P.cutover, P.verifying, P.rolling_back})
 #: Phases resumed by the orchestrator after a restart (SDD §8).
 RESUMABLE_PHASES = ACTIVE_STEP_PHASES
+#: Where a migration's cutover waits at its gate (SDD §5.4): a single-shot one in ready, a warm one
+#: in awaiting_cutover and its keep-warm passes. Its GPU wait lives only while it moves between
+#: them (§22.7).
+CUTOVER_WAIT_PHASES = frozenset({P.ready, P.awaiting_cutover, P.syncing})
+#: the moves of a keep-warm pass: a wait for GPU capacity goes on through them (SDD §5.4, §22.7)
+KEEP_WARM_MOVES = frozenset({(P.awaiting_cutover, P.syncing), (P.syncing, P.awaiting_cutover)})
 
 
 class InvalidTransition(Exception):
@@ -102,6 +108,10 @@ def transition(
     )
     if migration.phase == P.failed and target == P.ready:
         out.attempts += 1
+    if (Phase(migration.phase), target) not in KEEP_WARM_MOVES:
+        # leaving the phases its cutover waits in drops a wait for GPU capacity in the same write,
+        # and a retry starts with none (SDD §5.4, §22.7)
+        out.gpu_wait = None
     out.phase = target
     out.updated_at = at
     return out

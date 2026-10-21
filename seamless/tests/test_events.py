@@ -52,6 +52,7 @@ def test_kind_catalog_matches_sdd():
         "migration.data_inconsistent",
         "migration.source_running",
         "migration.source_stopped",
+        "migration.gpu_wait",
         "plan.finalized",
         "plan.cancelled",
         "migration.approved",

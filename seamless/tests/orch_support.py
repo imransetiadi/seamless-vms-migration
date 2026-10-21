@@ -102,6 +102,16 @@ class StaticDestination:
     async def find_server(self, name: str) -> str | None:
         return f"dst-{name}"
 
+    async def gpu_flavors(self) -> list[dict[str, Any]]:
+        """The GPU flavors its inventory lists (SDD §10, §22.3): none, unless a test's double lists
+        some - the cutover gate reads them for a GPU VM (§22.7)."""
+        return list((await self.inventory()).gpu_flavors)
+
+    async def gpu_capacity(self, requests: list[Any]) -> Any:
+        """Its inventory's GPU capacity (SDD §22.3): ok with no pool, unless a test's double has
+        some."""
+        return (await self.inventory()).gpu_capacity
+
 
 class StaticRegistry:
     def __init__(self, source: StaticSource, destination: StaticDestination) -> None:

@@ -686,6 +686,7 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 | `seamless_advisor_calls_total{tool,outcome}` | counter | Jev usage and failures (label values are defined by the implementation) |
 | `seamless_tick_seconds_sum`, `_count`, `_max`, `seamless_tick_slow_total` | summary / counter | orchestrator tick duration and ticks above half of `tick_s` (SDD §18; `/health` turns `degraded` when the loop stalls) |
 | `seamless_cutover_refusals` | gauge | migrations in `precopy`, `syncing` or `awaiting_cutover` whose last pass found what their cutover will refuse (`cutover_refusals`, SDD §7.2, §18) — the dashboard's "Cutover will refuse"; above 0, something is to fix before a cutover |
+| `seamless_gpu_waits` | gauge | migrations waiting at the cutover gate for GPU capacity (`gpu_wait` set, SDD §5.4 rule 5, §18, §22.7) - their sources keep running; above 0, a vGPU pool of a destination is full |
 
 The endpoint needs a viewer token unless `SEAMLESS_METRICS_PUBLIC=true`; configure the scrape with a bearer
 token Secret. Queries:

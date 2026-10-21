@@ -1013,6 +1013,7 @@ SUMMARY_FIELDS = {
     "findings",
     "suggested_probes",
     "cutover_refusals",
+    "gpu_wait",
     "created_at",
     "updated_at",
 }
@@ -1023,6 +1024,8 @@ def test_a_summary_list_holds_the_fields_the_overview_reads(api, monkeypatch):
     MigrationSummary - its list fields as the full list has them, phase_since the last
     PhaseChange's time (created_at without one) - in the same order, filtered and paged alike."""
     from datetime import timedelta
+
+    from seamless_migrate.domain.models import GpuWait
 
     async def no_watch() -> None:
         return None
@@ -1073,6 +1076,10 @@ def test_a_summary_list_holds_the_fields_the_overview_reads(api, monkeypatch):
     )
     awaiting.findings = [Finding(code="SRC_VM_MULTIATTACH", severity="warning", message="x")]
     awaiting.cutover_refusals = ["the NIC of db-awaiting on 'app': port p holds its MAC"]
+    # its cutover waits for GPU capacity (SDD §5.4 rule 5, §22.7)
+    awaiting.gpu_wait = GpuWait(
+        since=at, checked_at=at, pool="VGPU", needed=2, free=1, reason="VGPU has 1 unit free"
+    )
     awaiting.updated_at = at + timedelta(minutes=5)
     api.store.put("migration", awaiting)
     completed = migs["completed"]

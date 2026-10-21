@@ -895,6 +895,38 @@ def test_the_cutover_refusals_gauge_counts_the_migrations_dashboard_lists_so():
     assert "\nseamless_cutover_refusals 3\n" in text
 
 
+def test_metrics_counts_the_migrations_waiting_for_gpu_capacity(api):
+    """SDD §18 (§5.4 rule 5, §22.7): /metrics' seamless_gpu_waits gauge counts the migrations whose
+    cutover waits for GPU capacity - one in ready and one at its warm gate - and none of the
+    others, whatever their phase."""
+    from seamless_migrate.domain.models import GpuWait, utcnow
+
+    assert "\nseamless_gpu_waits 0\n" in api.get("/api/v1/metrics").text
+    wait = GpuWait(
+        since=utcnow(),
+        checked_at=utcnow(),
+        pool="VGPU CUSTOM_NVIDIA_A100_4C",
+        needed=2,
+        free=1,
+        reason="VGPU CUSTOM_NVIDIA_A100_4C of RHOSO 18.0 has 1 unit free; it needs 2",
+    )
+    for i, (phase, gpu_wait) in enumerate(
+        [
+            (Phase.ready, wait),
+            (Phase.awaiting_cutover, wait),
+            (Phase.ready, None),
+            (Phase.awaiting_cutover, None),
+            (Phase.completed, None),
+        ]
+    ):
+        api.store.put(
+            "migration", make_migration(id=f"mig-{i:010x}", phase=phase, gpu_wait=gpu_wait)
+        )
+    text = api.get("/api/v1/metrics").text
+    assert "# TYPE seamless_gpu_waits gauge" in text
+    assert "\nseamless_gpu_waits 2\n" in text
+
+
 # routes test_role_matrix cannot drive, and the test that checks their role instead
 MATRIX_EXCEPTIONS = {
     ("GET", "/events/stream"): "test_sse_route_requires_viewer (a stream never ends)",

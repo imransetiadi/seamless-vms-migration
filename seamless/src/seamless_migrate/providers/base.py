@@ -48,6 +48,11 @@ class DestinationProvider(Protocol):
         """The Placement pools of the given vGPU requests only, read as the inventory's are: the
         cutover gate's read (SDD §22.3, §22.7)."""
 
+    async def gpu_flavors(self) -> list[dict[str, Any]]:
+        """The GPU flavors as ``DestinationInventory.gpu_flavors`` lists them - ``[{name, vcpus,
+        ram_mb, disk_gb, gpus}]``, the declared profiles applied -, read with one flavor list:
+        where the cutover gate reads a GPU flavor's requests (SDD §10, §22.3, §22.7)."""
+
     async def server_allocations(self, server_id: str) -> dict[str, int] | None:
         """The units the server holds per resource class, summed over its providers; None when
         Placement refuses the read or holds no allocation for it (SDD §22.3, §22.8)."""

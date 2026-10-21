@@ -52,6 +52,11 @@ def render_metrics(
     refusing = sum(1 for m in migrations if m.phase in REFUSABLE and m.cutover_refusals)
     lines.append(f"seamless_cutover_refusals {refusing}")
 
+    # SDD §18: the migrations whose cutover waits for GPU capacity, their sources running (§5.4
+    # rule 5, §22.7) - a wait leaves with the phases it lives in (domain.fsm)
+    family("seamless_gpu_waits", "gauge", "Migrations whose cutover waits for GPU capacity.")
+    lines.append(f"seamless_gpu_waits {sum(1 for m in migrations if m.gpu_wait is not None)}")
+
     family("seamless_bytes_transferred_total", "counter", "Bytes transferred by migrations.")
     lines.append(f"seamless_bytes_transferred_total {sum(m.bytes_transferred for m in migrations)}")
 

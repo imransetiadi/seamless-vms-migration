@@ -35,6 +35,7 @@ export function summaryOf(m: Migration): MigrationSummary {
     findings: m.findings,
     suggested_probes: m.suggested_probes,
     cutover_refusals: m.cutover_refusals,
+    gpu_wait: m.gpu_wait,
     created_at: m.created_at,
     updated_at: m.updated_at,
   };

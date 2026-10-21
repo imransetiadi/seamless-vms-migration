@@ -500,6 +500,10 @@ class FakeDestinationProvider:
         (SDD §22.3)."""
         return GpuCapacity(status="ok", read_at=utcnow())
 
+    async def gpu_flavors(self) -> list[dict[str, Any]]:
+        """None: the demo destination lists no GPU flavor until plan task G9 (SDD §10, §22.3)."""
+        return []
+
     async def server_allocations(self, server_id: str) -> dict[str, int] | None:
         """No allocation to read: a simulated server holds no Placement resources (SDD §22.3)."""
         return None
