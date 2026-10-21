@@ -3624,10 +3624,10 @@ is no origin a browser sends (review RV31-03).
   destination cloud it says "the destination" - or the destination provider's name where a plan or a migration is
   shown, as the API's messages do; the offline mock mirrors the API's messages word for word.
 * GPU workloads (§22, from 0.3.0, plan task G10): every GPU element the dashboard shows (§22.11) - the Inventory's GPU
-  column, a destination's GPU flavors and GPU capacity among them - carries a "Technology Preview" badge, its label in
-  words beside its icon and never colour alone, whose detail (a focusable term, as a status badge's) reads
-  "Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts." (§22.14), until §22.14's
-  lab cases pass (plan task G15).
+  column and GPU filter, a destination's GPU flavors and GPU capacity among them - carries a "Technology Preview"
+  badge, its label in words beside its icon and never colour alone, whose detail (a focusable term, as a status
+  badge's) reads "Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts." (§22.14),
+  until §22.14's lab cases pass (plan task G15).
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
   when the caller names it, the object it acts on under it (its kind and id); a close button (×, "Close") in the
@@ -3991,12 +3991,15 @@ is no origin a browser sends (review RV31-03).
   (its Provider select switches the inventory in place: focus stays on the select and the address is replaced, so
   arrowing through the providers neither leaves the select nor fills Back — no change of context on input, WCAG 3.2.2;
   a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
-  a GPU column — each of the VM's GPUs as the API reads them (`vm_gpus`, §22.2): its kind, then its profile or PCI ids,
-  "×n" for n identical ones, and for an OpenStack request " · " and what it asks for, its class and traits (a
-  forbidden one prefixed with "!") or its PCI alias — "vGPU grid_a100-4c ×2", "Passthrough 10de:20b5", "Passthrough
-  without device ids", "vGPU · VGPU, CUSTOM_NVIDIA_A100_4C", "Passthrough · alias a100" (a declared profile after the
-  kind); empty for a VM without a GPU — and a GPU filter (all VMs, those with a GPU, those without), both shown while a
-  VM of the table has a GPU, as the Project filter is while it has two projects; the readiness cell's GPU flag reads
+  a GPU column — each of the VM's GPUs as the API reads them (`vm_gpus`, §22.2), on a line of its own: its kind, then
+  what names it, "×n" for n identical ones, and for an OpenStack request " · " and what it asks for, its class and
+  traits (a forbidden one prefixed with "!") or its PCI alias. A VMware vGPU reads "vGPU grid_a100-4c ×2", or "vGPU
+  without a profile"; a VMware passthrough device "Passthrough 10de:20b5", or "Passthrough without device ids"; an
+  OpenStack request "vGPU · VGPU, CUSTOM_NVIDIA_A100_4C", "vGPU ×2 · VGPU" or "Passthrough · alias a100", and with the
+  profile its source declares after the kind, "vGPU A100-4C · VGPU, CUSTOM_NVIDIA_A100_4C"; empty for a VM without a
+  GPU — and a GPU filter (all VMs, those with a GPU, those without) with a "Technology Preview" badge of its own,
+  shown at every width as the column is not on a phone, both shown while a VM of the table has a GPU, as the Project
+  filter is while it has two projects; the readiness cell's GPU flag reads
   "Needs a GPU mapping in its plan", guidance, as the plan decides (§22.4), and a block only where no mapping can name a
   VMware device, a passthrough device without ids (§22.11);
   a VM that a migration of a plan holds (§5.4: one not `cancelled`, `finalized` or `rolled_back`) names that plan
@@ -4014,10 +4017,12 @@ is no origin a browser sends (review RV31-03).
   (`gpu_capacity`, with the read's time): each pool by its class and traits, the GPU flavors that ask of it with their
   declared profiles - a class alone unites its pools, so every flavor of its class asks of it (§22.5) -, and its free
   units and providers ("4 free on 1 GPU", "at most 4 on one" past one provider; a pool Placement refused as a bad
-  request names its detail), or "Not read" with the reason in words - the destination credential lacks the role
-  Placement asks for (`forbidden`), the destination has no Placement (`no_placement`), the read failed (`error`), each
-  with its detail -, and for each flavor that asks for a PCI alias "Capacity unknown: PCI aliases are configured in
-  nova.conf" (§22.11)), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
+  request names its detail; `TODO(LAB): confirm` the word: Placement counts resource providers, and on an SR-IOV GPU,
+  A100 and later, Nova makes each virtual function one, so the count may read in virtual functions, not GPUs, §22.14),
+  or "Not read: {reason}." with the reason in words - "the destination credential lacks the role Placement asks for,
+  admin by default" (`forbidden`), "the destination's catalog lists no Placement" (`no_placement`), "the read failed"
+  (`error`), each with its detail in parentheses -, and for each flavor that asks for a PCI alias "Capacity unknown:
+  PCI aliases are configured in nova.conf" (§22.11)), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
   loads that plan's history, `GET /events?plan_id=`, and keeps only its live events; once every loaded event is shown,
   Load older events reads the 500 before the oldest (`GET /events?tail=true&before=`), so the trail reads back to its start
   in place; the shown audit events download as JSON
@@ -4922,10 +4927,12 @@ Binding in §7.4 and §10 with plan task G9:
 * The fake destinations (`rhoso18`, `hibiscus-dc3`) list three GPU flavors: `g1.a100-4c` (8 vCPUs, 32 GiB, one vGPU
   with the trait `CUSTOM_NVIDIA_A100_4C`), `g1.a100-3-20c` (16 vCPUs, 64 GiB, one vGPU with the trait
   `CUSTOM_NVIDIA_A100_3_20C`) and `p1.a100` (16 vCPUs, 128 GiB, `pci_passthrough:alias=a100:1`). Their providers
-  declare the two vGPU flavors' profiles (`gpu_profiles`), and each fake reports two pools: A100-4C with 4 units free on
-  1 provider, A100-3-20C with 2 free on 1. Each fake counts its own servers: a simulated cutover's GPU server takes its
-  units and the rollback gives them back, so the provider card's figures fall as the demo's GPU VMs cut over, and
-  `server_allocations` and `get_server`'s flavor report what the fake server holds.
+  declare the two vGPU flavors' profiles (`gpu_profiles`), and each fake reports the three pools §22.3 reads for them:
+  A100-4C's (`VGPU` with `CUSTOM_NVIDIA_A100_4C`) with 4 units free on 1 provider, A100-3-20C's with 2 free on 1, and
+  the class `VGPU` alone, which unites them (6 free on 2 providers, at most 4 on one). Each fake counts its own
+  servers: a simulated cutover's GPU server takes its units and the rollback gives them back, so the provider card's
+  figures fall as the demo's GPU VMs cut over, and `server_allocations` and `get_server`'s flavor report what the fake
+  server holds.
 * The A100-3-20C pool reads full on the cutover gate's first two reads, while validation sees room, and then has room
   again, as if another tenant had released a vGPU. A plan with `dc2-ml-02` shows the gate's wait (§22.7) and how it
   clears.
@@ -4943,10 +4950,12 @@ until §22.14's lab cases pass.
   GPU, those without). The readiness cell's GPU flag reads "Needs a GPU mapping in its plan", guidance, as the plan
   decides, where it was a block that nothing lifted. For a destination: its GPU flavors (name, size, GPU requests,
   declared profile) and its GPU capacity, each pool's free units and providers, or "Not read" with the reason in
-  words (the credential lacks the role Placement asks for, there is no Placement, or the failure), and "Capacity
+  words (the credential lacks the role Placement asks for, the catalog lists no Placement, or the failure), and "Capacity
   unknown: PCI aliases are configured in nova.conf" for an alias flavor.
 * **Providers**. A destination's card summarizes its check's `gpu_capacity` with the check's time ("A100-4C: 4 free on
-  1 GPU", or "GPU capacity not read: …"), and nothing when the destination has no GPU flavor. The provider form takes
+  1 GPU", or "GPU capacity not read: …"; `TODO(LAB): confirm` the word: Placement counts resource providers, and on an
+  SR-IOV GPU, A100 and later, Nova makes each virtual function one, so the count may read in virtual functions, not
+  GPUs, §22.14), and nothing when the destination has no GPU flavor. The provider form takes
   `gpu_profiles` for an OpenStack or RHOSO provider, as pairs of a flavor and a profile, offering the provider's GPU
   flavors once its inventory is read.
 * **Plan form**. For a VMware source, a GPU mappings section with one row per GPU key among the selected VMs
@@ -5024,4 +5033,6 @@ Binding in §13.4 with plan task G3:
   * the allocations and the embedded flavor a vGPU server shows (§22.8);
   * that a guest's vGPU driver of the source's release runs under the destination host's vGPU manager release
     (`GUEST_GPU_DRIVER`);
-  * a vGPU from the vendor-specific VFIO framework, offered as a PCI alias flavor (§22.3).
+  * a vGPU from the vendor-specific VFIO framework, offered as a PCI alias flavor (§22.3);
+  * whether a pool's resource providers are its GPUs or, on an SR-IOV GPU (A100 and later), their virtual functions,
+    which the dashboard words "on 1 GPU" (§16, §22.11).
