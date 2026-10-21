@@ -4934,6 +4934,55 @@ async def test_failed_verification_rolls_back(tmp_path, store):
     assert reviews == []
 
 
+async def test_a_failed_gpu_check_rolls_the_vm_back(tmp_path, store):
+    """SDD §7.5, §22.8 (plan task G8): the GPU checks are deterministic - a GPU VM's server created
+    with another flavor than its GPU flavor fails the verification, and the plan's auto_rollback
+    rolls the VM back, its source running again; the record keeps the failed check."""
+    from seamless_migrate.domain.models import GpuDevice, Mappings
+    from seamless_migrate.planning.gpu import gpu_requests
+
+    alias = {"pci_passthrough:alias": "a100:1"}
+
+    class GpuDestination(StaticDestination):
+        """Lists the GPU flavor p1.a100 (SDD §22.3), but created the server with m1.small."""
+
+        async def inventory(self):
+            inventory = await super().inventory()
+            size = {"name": "p1.a100", "vcpus": 16, "ram_mb": 131072, "disk_gb": 160}
+            inventory.flavors.append({**size, "extra_specs": dict(alias)})
+            inventory.gpu_flavors.append({**size, "gpus": gpu_requests(alias)})
+            return inventory
+
+        async def get_server(self, server_id):
+            server = await super().get_server(server_id)
+            return {**server, "flavor": {"name": "m1.small", "extra_specs": {}}}
+
+    gpu_vm = vm(
+        1,
+        flavor="p1.src",
+        flavor_extra_specs=dict(alias),
+        gpus=[GpuDevice(kind="passthrough", alias="a100")],
+    )
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [gpu_vm],
+        {
+            "default_strategy": Strategy.cold,
+            "mappings": Mappings(flavors={"p1.src": "p1.a100"}),
+            "verification": VerificationConfig(timeout_s=0, tcp_ports=[]),
+        },
+        destination=GpuDestination(),
+    )
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    await h.orch.stop()
+    assert h.history(m)[-5:] == [P.cutover, P.verifying, P.failed, P.rolling_back, P.rolled_back]
+    assert "gpu_flavor (the server's flavor is m1.small, not the GPU flavor p1.a100)" in m.error
+    assert [c["name"] for c in m.verification.checks if not c["ok"]] == ["gpu_flavor"]
+    assert m.downtime_ended_at is not None
+
+
 async def test_a_failed_verification_keeps_provider_secrets_out_of_every_event(tmp_path, store):
     """SDD §12, §13.3: a provider error during verification is redacted wherever it goes - the
     check details of the verification summary in the migration.phase event included, which any

@@ -204,6 +204,22 @@ def _is_plain_http(url: Any) -> bool:
     return isinstance(url, str) and url.strip().lower().startswith("http://")
 
 
+def _server_flavor(conn: Any, server: Any) -> Any:
+    """A server's flavor (SDD §10, §22.3): Nova embeds it from compute 2.47 on; below it - or with a
+    cloud entry that pins an older compute microversion - the server holds only the flavor's id,
+    which openstacksdk's Flavor reads as 0 everywhere (review RV28-08), so it is looked up by that
+    id - its extra specs only when asked, below 2.61 (review RV31-04): read apart, so a policy that
+    forbids them keeps the flavor without them, as Nova 2.47+ does (RV32B-03). A flavor deleted
+    since stays the bare reference, which names none."""
+    flavor = _attr(server, "flavor", default={}) or {}
+    flavor_id = _attr(flavor, "id")
+    if not _attr(flavor, "original_name") and flavor_id:
+        looked = _try(lambda: conn.compute.get_flavor(flavor_id), None)
+        if looked is not None:
+            flavor = _try(lambda: looked.fetch_extra_specs(conn.compute), None) or looked
+    return flavor
+
+
 def _flavors(conn: Any) -> list[dict[str, Any]]:
     """Every flavor the credential sees: [{name, vcpus, ram_mb, disk_gb, extra_specs}] (SDD §10)."""
     return [
@@ -751,9 +767,9 @@ class OpenStackProvider:
                     "floating_ips": floating,
                 }
             )
-        # compute 2.47's embedded flavor: its extra specs stay empty where Nova's policy hides them
-        # (SDD §10, §22.3)
-        flavor = _attr(server, "flavor", default={}) or {}
+        # compute 2.47's embedded flavor, else the one looked up by its id: its extra specs stay
+        # empty where Nova's policy hides them (SDD §10, §22.3, G8 review)
+        flavor = _server_flavor(conn, server)
         extra_specs = _attr(flavor, "extra_specs", default={}) or {}
         return {
             "id": _attr(server, "id"),
@@ -1091,16 +1107,7 @@ class _MapContext:
 
     def server_to_vmref(self, server: Any) -> VMRef:
         conn = self.conn
-        flavor = _attr(server, "flavor", default={}) or {}
-        flavor_id = _attr(flavor, "id")
-        if not _attr(flavor, "original_name") and flavor_id:
-            # Nova embeds the flavor from compute 2.47 on; below it the server holds only the
-            # flavor's id, which openstacksdk's Flavor reads as 0 everywhere (review RV28-08) -
-            # and its extra specs only when asked, below 2.61 (review RV31-04): read apart, so a
-            # policy that forbids them keeps the flavor without them, as Nova 2.47+ does (RV32B-03)
-            looked = _try(lambda: conn.compute.get_flavor(flavor_id), None)
-            if looked is not None:
-                flavor = _try(lambda: looked.fetch_extra_specs(conn.compute), None) or looked
+        flavor = _server_flavor(conn, server)
         vcpus, ram, disk_gb = (
             _attr(flavor, "vcpus"),
             _attr(flavor, "ram"),

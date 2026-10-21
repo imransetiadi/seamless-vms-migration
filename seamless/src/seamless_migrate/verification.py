@@ -1,6 +1,9 @@
 """Post-cutover verification (SDD §7.5).
 
 Checks: ``server_active`` (destination server ``ACTIVE``), ``ports_up`` (all ports ``ACTIVE``),
+for a VM with a GPU flavor ``gpu_flavor`` (the server's flavor is it, still asking for a GPU) and
+``gpu_allocation`` (its Placement allocations hold the flavor's vGPU units; skipped with a warning
+when they cannot be read, when the server hides its extra specs and for a PCI alias),
 ``tcp:<port>`` for every configured port (5 s connect timeout from the control plane),
 ``app:<kind>:<port>`` for each application probe (ADV-18: passed, failed - refused or a wrong
 status - or unreachable, which does not fail it) and ``console`` (a success pattern in the last 200
@@ -16,7 +19,7 @@ import logging
 import re
 import ssl
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
@@ -25,7 +28,8 @@ import httpx
 
 from .ai.redaction import redact
 from .config import Settings
-from .domain.models import AppProbe, ProbeResult, VerificationRecord, utcnow
+from .domain.models import AppProbe, GpuDevice, ProbeResult, VerificationRecord, utcnow
+from .planning.gpu import gpu_flavor, gpu_requests, pool_name
 from .planning.probes import is_database, probes_for
 from .providers.base import ProviderError
 
@@ -40,6 +44,15 @@ WINDOWS_NO_PORTS = "no TCP port probed for this Windows guest: set windows_tcp_p
 #: the reasons the rules ask review for a passed verification (SDD §7.5, ADV-18)
 DATABASE_REVIEW = "database VM without an application probe: only its boot was verified"
 UNREACHABLE_REVIEW = "application probe unreachable from the control plane: "
+#: the GPU checks' fixed texts (SDD §7.5, §22.8): they name no Placement provider (§22.12)
+GPU_UNREAD = "the server's Placement allocations are unavailable; gpu_allocation check skipped"
+GPU_HIDDEN = "the server's flavor extra specs are hidden; gpu_allocation check skipped"
+GPU_NOT_CHECKED = "the server's flavor is not the GPU flavor; gpu_allocation check skipped"
+GPU_FLAVOR_UNREAD = (
+    "the server's flavor cannot be read; gpu_flavor and gpu_allocation checks skipped"
+)
+GPU_CHECKS = ("gpu_flavor", "gpu_allocation")
+GPU_ALIAS = "PCI alias {} not checked: nova.conf sets its resource class, which no API shows"
 
 
 @dataclass
@@ -194,6 +207,29 @@ def review_reason(vm: Any, plan: Any, result: VerificationResult) -> str | None:
     return None
 
 
+def _gpu_flavor_of(ctx: Any) -> tuple[str, str | None] | None:
+    """The GPU flavor the migration's server is created with, as its plan names it, and the profile
+    the destination declares for it (SDD §7.5, §22.4); None for a VM without one, a VM without a
+    GPU among them - and for a context without its source, which names none."""
+    vm = getattr(ctx.migration, "vm", None)
+    source = getattr(ctx, "source", None)
+    if vm is None or source is None:
+        return None
+    name = gpu_flavor(vm, ctx.plan, source.kind)
+    if name is None:
+        return None
+    profiles = getattr(getattr(ctx, "destination", None), "gpu_profiles", None) or {}
+    return name, profiles.get(name)
+
+
+def _gpu_request(device: GpuDevice) -> str:
+    """A GPU request by what Placement or nova.conf knows it as, with its units (SDD §7.5)."""
+    if device.kind == "vgpu" and device.resource_class:
+        name = pool_name(device.resource_class, device.traits, device.forbidden_traits)
+        return f"{name} ×{device.count}"
+    return f"PCI alias {device.alias} ×{device.count}"
+
+
 def _pattern_match(patterns: list[str], text: str) -> str | None:
     for pattern in patterns:
         try:
@@ -251,6 +287,78 @@ class Verifier:
             return answer
         return await self._app_probe(address, probe)
 
+    async def _gpu_checks(
+        self,
+        server_id: str,
+        server: dict[str, Any],
+        expected: str,
+        declared: str | None,
+        warnings: list[str],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """``gpu_flavor`` and ``gpu_allocation`` (SDD §7.5, §22.8), and whether the result is
+        final: no polling changes the flavor a server was created with. Their details name
+        flavors, aliases, resource classes and units, never a Placement provider (§22.12)."""
+        flavor = server.get("flavor")
+        flavor = flavor if isinstance(flavor, Mapping) else {}
+        name = flavor.get("name")
+        if not name:
+            # the flavor could not be read - one Nova no longer has, below compute 2.47 -: not
+            # judged, and nothing is guessed (SDD §7.5, §22.3, G8 review)
+            warnings.append(GPU_FLAVOR_UNREAD)
+            unread = [_check(n, True, GPU_FLAVOR_UNREAD, skipped=True) for n in GPU_CHECKS]
+            return unread, False
+        specs = {str(k): str(v) for k, v in (flavor.get("extra_specs") or {}).items()}
+        # extra specs the server shows are the requests it was created with (SDD §22.3)
+        requests = gpu_requests(specs, declared) if specs else None
+        if name != expected or requests == []:
+            if name == expected:
+                detail = f"the server's flavor {name} asks for no GPU"
+            else:
+                detail = f"the server's flavor is {name}, not the GPU flavor {expected}"
+            skipped = _check("gpu_allocation", True, GPU_NOT_CHECKED, skipped=True)
+            return [_check("gpu_flavor", False, detail), skipped], True
+        if requests is None:
+            # Nova hides them from every flavor read of this credential alike: nothing tells
+            # the requests, and none is guessed (SDD §7.5)
+            warnings.append(GPU_HIDDEN)
+            by_name = f"flavor {name}, the GPU flavor by its name: the server hides its extra specs"
+            skipped = _check("gpu_allocation", True, GPU_HIDDEN, skipped=True)
+            return [_check("gpu_flavor", True, by_name), skipped], False
+        asked = ", ".join(map(_gpu_request, requests))
+        flavor_check = _check("gpu_flavor", True, f"flavor {name}, the GPU flavor: {asked}")
+        return [flavor_check, await self._gpu_allocation(server_id, requests, warnings)], False
+
+    async def _gpu_allocation(
+        self, server_id: str, requests: list[GpuDevice], warnings: list[str]
+    ) -> dict[str, Any]:
+        """``gpu_allocation`` (SDD §7.5): the server's allocations, summed per resource class,
+        hold the units of the flavor's vGPU requests of that class. A PCI alias request is not
+        checked, and allocations that cannot be read skip the check - each with a warning."""
+        asked: dict[str, int] = {}
+        aliases: list[str] = []
+        for request in requests:
+            if request.kind == "vgpu" and request.resource_class:
+                asked[request.resource_class] = asked.get(request.resource_class, 0) + request.count
+            else:
+                aliases.append(request.alias or "")
+        if aliases:
+            warnings.append(GPU_ALIAS.format(", ".join(aliases)))
+            if not asked:
+                return _check("gpu_allocation", True, warnings[-1], skipped=True)
+        try:
+            held = await self.dst.server_allocations(server_id)
+        except ProviderError:
+            # unread, never a guess - and its text, which may name a Placement provider, stays
+            # out (SDD §22.12)
+            held = None
+        if not held:
+            # None, or an empty answer: no allocation to read (SDD §7.5, §22.3)
+            warnings.append(GPU_UNREAD)
+            return _check("gpu_allocation", True, GPU_UNREAD, skipped=True)
+        units = {cls: int(held.get(cls) or 0) for cls in asked}
+        detail = "; ".join(f"{cls}: {units[cls]} held, {n} asked for" for cls, n in asked.items())
+        return _check("gpu_allocation", all(units[c] >= n for c, n in asked.items()), detail)
+
     async def _attempt(self, ctx: Any) -> VerificationResult:
         cfg = ctx.plan.verification
         server_id = ctx.migration.destination_server_id
@@ -279,12 +387,19 @@ class Verifier:
                 f"{len(up)}/{len(ports)} ports ACTIVE" if ports else "no ports on the server",
             )
         )
+        warnings: list[str] = []
+        # a VM with a GPU flavor: the server holds it and its GPU (SDD §7.5, §22.8)
+        gpu = _gpu_flavor_of(ctx)
+        if gpu is not None:
+            gpu_checks, final = await self._gpu_checks(server_id, server, *gpu, warnings)
+            checks += gpu_checks
+            if final:
+                evidence["terminal"] = True
 
         # the guest family picks the profile (SDD §7.5)
         vm = getattr(ctx.migration, "vm", None)
         windows = vm is not None and vm.guest_os.family == "windows"
         probe_ports = list(cfg.windows_tcp_ports if windows else cfg.tcp_ports)
-        warnings: list[str] = []
         if windows and not probe_ports:
             warnings.append(WINDOWS_NO_PORTS)
 

@@ -1966,6 +1966,35 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
 `data.verification` carries it too. In demo mode the timeout and the polling interval run in model time
 (÷ `demo_speed`), like the steps (§7.4).
 
+**GPU checks** (§22.8, plan task G8). A migration whose VM has a GPU flavor - the destination flavor its plan maps the
+VM's GPUs to (`planning/gpu.gpu_flavor(vm, plan, source_kind)`, §22.4) - gets two checks after `ports_up`. Any other
+VM gets neither - a VM without a GPU too, whatever flavor a mapping sends it to -, and its verification reads no
+Placement allocation:
+
+* `gpu_flavor`: the server's flavor (`get_server`'s `flavor`, §22.3) is the GPU flavor by name and, when the server
+  shows its extra specs, they still ask for a GPU, read by `gpu_requests` with the profile the destination provider
+  declares for the flavor (§22.2, §22.3). A server created another way - by a kit that ignored `flavor_uuid`, for one
+  (§22.4) - fails it, as one whose shown extra specs ask for no GPU does. Such a failure ends the verification at once,
+  as a server in `ERROR` does: no polling changes the flavor a server was created with, and polling to `timeout_s`
+  would keep the source stopped that long before the rollback starts it again. Only a wrong flavor ends it so: a
+  passed `gpu_flavor`, or a failed `gpu_allocation`, leaves the polling to go on as for any check. A server that
+  reports no flavor name - one whose flavor Nova no longer has, below compute 2.47 (§22.3) - is not judged: both GPU
+  checks are skipped with a warning, as nothing tells the flavor it was created with (G8 review).
+* `gpu_allocation`: the server's Placement allocations (`server_allocations`, §22.3: the units it holds per resource
+  class, summed over its providers) hold, for each resource class the flavor's vGPU requests ask of, at least the
+  units those requests ask for together. The requests are read from the server's extra specs. It is skipped with a
+  warning when Placement cannot be read (`None` or an empty answer, or a read that raises `ProviderError`); when the server hides its
+  flavor's extra specs, whose requests then cannot be read - Nova shows a server's embedded extra specs and a flavor's
+  under one policy (`os_compute_api:os-flavor-extra-specs:index`), so no flavor read of the same credential, the
+  inventory's included, tells them, and nothing is guessed -; and for a PCI alias request, whose resource class the
+  allocations do not name for Seamless (a flavor that also asks for a vGPU has its vGPU requests checked, with that
+  warning). After a failed `gpu_flavor` it is skipped without a warning: the server's flavor is not the one whose
+  requests it checks.
+* Both are deterministic: a failed one fails the verification, and the plan's `auto_rollback` rolls the VM back (§8).
+  Their details and warnings name flavors, PCI aliases, resource classes and units, never a Placement provider's name
+  or uuid nor Placement's message text (§13.4, §22.12): the advisor's `review_verification` sends the check results
+  to Jev (§14.2).
+
 ---
 
 ## 8. Orchestrator (`seamless_migrate.orchestrator`)
@@ -4678,7 +4707,9 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   the units the server holds per resource class (`GET /allocations/{server_id}`, summed over its providers), None when
   Placement refuses the read or has no allocation to read (§22.8). `get_server` adds `flavor: {name, extra_specs}`:
   compute 2.47's embedded flavor, its `original_name` and its `extra_specs`, which stay empty when Nova's policy hides
-  them.
+  them. Below 2.47 - a cloud entry that pins an older `compute_api_version` - the server holds the flavor's id alone,
+  and `get_server` looks the flavor up by it, its extra specs read apart, as the source's inventory does (review
+  RV28-08); a flavor deleted since gives no name (§7.5, G8 review).
 
 ### 22.4 GPU mapping
 
@@ -4799,13 +4830,15 @@ A fifth rule of §5.4, binding there with plan task G6:
 
 ### 22.8 Verification and probe suggestion
 
-* Two checks of §7.5 for a migration whose server is created with a GPU flavor, binding with plan task G8:
+* Two checks of §7.5 for a migration whose server is created with a GPU flavor, binding there since plan task G8:
   * `gpu_flavor`: the destination server's flavor (`get_server`'s `flavor`, §22.3) is the GPU flavor by name and, when
     the server shows its extra specs, still asks for the GPU. A server created another way, by a kit that ignored
-    `flavor_uuid` for one, fails it;
+    `flavor_uuid` for one, fails it, and at once: no polling changes the flavor a server was created with;
   * `gpu_allocation`: the server's Placement allocations (`server_allocations`) hold at least the units of each vGPU
-    request of its flavor. It is skipped with a warning when Placement cannot be read (None) and for a PCI alias
-    request, whose resource class the allocations do not name for Seamless.
+    request of its flavor, per resource class. It is skipped with a warning when Placement cannot be read (None), when
+    the server hides its flavor's extra specs (one Nova policy hides them from every flavor read of the credential, so
+    nothing tells its requests), and for a PCI alias request, whose resource class the allocations do not name for
+    Seamless.
 
   Both are deterministic checks: a failed one fails the verification, and the plan's `auto_rollback` rolls the VM back
   (§7.5). Their details name resource classes and units, never a provider, because the advisor's
@@ -4895,7 +4928,11 @@ Binding in §13.4 with plan task G3:
   Placement providers named after hosts and asserts that none of those names or uuids reaches the inventory, the check
   report, `gpu_wait`, the events or the verification record.
 * §14.4's evidence keys, the workload description and the data-sent declaration do not change in 0.3.0 - the GPU findings stay out of the `mappings` and `findings` evidence (plan task G4) -: nothing about
-  GPUs is sent to Jev or agentmemory.
+  GPUs is sent to Jev or agentmemory but the verification's results, which carry the GPU checks (§7.5, plan task G8)
+  as they carry every check: `review_verification` sends their details and warnings - flavors, PCI aliases, resource
+  classes, traits and units - to Jev (§14.2), and a failed verification's error, which names its failed checks,
+  reaches agentmemory's lookup and lesson (§14.3). None of them names a Placement provider or holds Placement's
+  message text (above; G8 review).
 
 ### 22.13 Contract changes of 0.3.0 (each binding from its plan task)
 
@@ -4908,7 +4945,7 @@ Binding in §13.4 with plan task G3:
 | the eligibility of a VMware passthrough VM; a pilot without GPU VMs; the port 9400 suggestion | §9.2, §9.4, §9.6 (binding) | G5 |
 | the gate's fifth rule, `Migration.gpu_wait` and `MigrationSummary.gpu_wait`, the event `migration.gpu_wait`, the gauge `seamless_gpu_waits` | §4.2, §4.3, §5.4, §18 | G6 |
 | the executors create the server with the GPU flavor (`flavor_uuid` for the VMware kit) | §7.2, §7.3 | G7 |
-| the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 | G8 |
+| the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 (binding) | G8 |
 | the demo's GPU VMs, GPU flavors, pools and gate wait | §7.4, §10 | G9 |
 | the dashboard (§22.11) | §16 | G10, G11, G12 |
 | QASuite (requirement rows, AC-7, LAB-G01…LAB-G08), Security.md, README | QASuite, Security.md, README | G13 |
