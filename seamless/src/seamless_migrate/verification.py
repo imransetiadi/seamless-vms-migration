@@ -48,6 +48,10 @@ UNREACHABLE_REVIEW = "application probe unreachable from the control plane: "
 GPU_UNREAD = "the server's Placement allocations are unavailable; gpu_allocation check skipped"
 GPU_HIDDEN = "the server's flavor extra specs are hidden; gpu_allocation check skipped"
 GPU_NOT_CHECKED = "the server's flavor is not the GPU flavor; gpu_allocation check skipped"
+GPU_FLAVOR_UNREAD = (
+    "the server's flavor cannot be read; gpu_flavor and gpu_allocation checks skipped"
+)
+GPU_CHECKS = ("gpu_flavor", "gpu_allocation")
 GPU_ALIAS = "PCI alias {} not checked: nova.conf sets its resource class, which no API shows"
 
 
@@ -297,16 +301,20 @@ class Verifier:
         flavor = server.get("flavor")
         flavor = flavor if isinstance(flavor, Mapping) else {}
         name = flavor.get("name")
+        if not name:
+            # the flavor could not be read - one Nova no longer has, below compute 2.47 -: not
+            # judged, and nothing is guessed (SDD §7.5, §22.3, G8 review)
+            warnings.append(GPU_FLAVOR_UNREAD)
+            unread = [_check(n, True, GPU_FLAVOR_UNREAD, skipped=True) for n in GPU_CHECKS]
+            return unread, False
         specs = {str(k): str(v) for k, v in (flavor.get("extra_specs") or {}).items()}
         # extra specs the server shows are the requests it was created with (SDD §22.3)
         requests = gpu_requests(specs, declared) if specs else None
         if name != expected or requests == []:
             if name == expected:
                 detail = f"the server's flavor {name} asks for no GPU"
-            elif name:
-                detail = f"the server's flavor is {name}, not the GPU flavor {expected}"
             else:
-                detail = f"the server reports no flavor, not the GPU flavor {expected}"
+                detail = f"the server's flavor is {name}, not the GPU flavor {expected}"
             skipped = _check("gpu_allocation", True, GPU_NOT_CHECKED, skipped=True)
             return [_check("gpu_flavor", False, detail), skipped], True
         if requests is None:
@@ -343,7 +351,8 @@ class Verifier:
             # unread, never a guess - and its text, which may name a Placement provider, stays
             # out (SDD §22.12)
             held = None
-        if held is None:
+        if not held:
+            # None, or an empty answer: no allocation to read (SDD §7.5, §22.3)
             warnings.append(GPU_UNREAD)
             return _check("gpu_allocation", True, GPU_UNREAD, skipped=True)
         units = {cls: int(held.get(cls) or 0) for cls in asked}

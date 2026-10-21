@@ -557,6 +557,7 @@ from seamless_migrate.domain.enums import ProviderKind, ProviderRole  # noqa: E4
 from seamless_migrate.domain.models import GpuDevice, Mappings  # noqa: E402
 from seamless_migrate.providers.base import ProviderError  # noqa: E402
 from seamless_migrate.verification import (  # noqa: E402
+    GPU_FLAVOR_UNREAD,
     GPU_HIDDEN,
     GPU_NOT_CHECKED,
     GPU_UNREAD,
@@ -685,10 +686,11 @@ async def test_gpu_flavor_check_passes_on_the_mapped_gpu_flavor():
 
 
 async def test_gpu_flavor_check_fails_a_server_created_with_another_flavor():
-    """SDD §7.5, §22.8 (plan task G8): a server created another way - with a kit's own flavor, with
-    a flavor of the GPU flavor's name whose extra specs ask for no GPU, with no flavor it reports -
-    fails gpu_flavor, and at once: no polling changes a server's flavor, while the source stays
-    stopped until the rollback. Its allocations are not checked then."""
+    """SDD §7.5, §22.8 (plan task G8): a server created another way - with a kit's own flavor, or
+    with a flavor of the GPU flavor's name whose extra specs ask for no GPU - fails gpu_flavor, and
+    at once: no polling changes a server's flavor, while the source stays stopped until the
+    rollback. Its allocations are not checked then. A server that reports no flavor is not judged
+    (test_a_gpu_server_whose_flavor_cannot_be_read_is_not_judged, G8 review)."""
     cases = [
         (
             {"name": "m1.xlarge", "extra_specs": {"hw:cpu_policy": "dedicated"}},
@@ -702,7 +704,6 @@ async def test_gpu_flavor_check_fails_a_server_created_with_another_flavor():
             {"name": "g1.a100-4c", "extra_specs": {"hw:cpu_policy": "dedicated"}},
             "the server's flavor g1.a100-4c asks for no GPU",
         ),
-        (NO_FLAVOR, "the server reports no flavor, not the GPU flavor g1.a100-4c"),
     ]
     for flavor, detail in cases:
         clock = {"t": 0.0}
@@ -774,11 +775,78 @@ async def test_gpu_allocation_check_needs_the_units_of_each_vgpu_request():
     )
 
 
+async def test_a_gpu_server_whose_flavor_cannot_be_read_is_not_judged():
+    """SDD §7.5, §22.3 (G8 review): a server that reports no flavor name - below compute 2.47, one
+    whose flavor Nova no longer has - is not judged: both GPU checks are skipped with a warning, no
+    allocation is read, and the verification goes on as any VM's does; nothing is guessed."""
+    for flavor in (NO_FLAVOR, {"name": None, "extra_specs": {}}):
+        dest = GpuDest(flavor=flavor, allocations={"VGPU": 1})
+        result = await Verifier(dest, Settings(), poll_s=0).verify(gpu_ctx())
+        assert result.passed is True, (flavor, result.checks)
+        checks = by_name(result)
+        for name in ("gpu_flavor", "gpu_allocation"):
+            assert checks[name] == {
+                "name": name,
+                "ok": True,
+                "detail": GPU_FLAVOR_UNREAD,
+                "skipped": True,
+            }, flavor
+        assert result.evidence["warnings"] == [GPU_FLAVOR_UNREAD]
+        assert not result.evidence.get("terminal") and dest.allocation_reads == 0
+
+
+class SlowBoot(GpuDest):
+    """A GPU server whose guest prints its login prompt on the third poll."""
+
+    async def console_log(self, server_id, lines=200):
+        return "web-01 login: " if self.polls >= 3 else "booting"
+
+
+class LateAllocations(GpuDest):
+    """A GPU server still building, with no allocation yet, then ACTIVE with its vGPU."""
+
+    async def get_server(self, server_id):
+        self.status = "BUILD" if self.polls < 1 else "ACTIVE"
+        return await super().get_server(server_id)
+
+    async def server_allocations(self, server_id):
+        self.allocation_reads += 1
+        return None if self.status == "BUILD" else {"VGPU": 1}
+
+
+def clocked(dest):
+    """A verifier of ``dest`` whose sleeps advance a clock of its own: polls without waiting."""
+    clock = {"t": 0.0}
+
+    async def sleep(seconds):
+        clock["t"] += max(seconds, 1.0)
+
+    return Verifier(dest, Settings(), poll_s=10, sleep=sleep, clock=lambda: clock["t"])
+
+
+async def test_only_a_wrong_gpu_flavor_ends_the_verification_at_once():
+    """SDD §7.5 (G8 review): a GPU VM's guest is polled as any guest is - a passed gpu_flavor, its
+    extra specs shown or hidden, never ends the verification, so a guest that boots slowly passes
+    on a later poll, and a failed gpu_allocation leaves it polling to its deadline; a server that
+    builds before its vGPU is allocated passes once it is, with no warning left of the build."""
+    for flavor in (GPU_FLAVOR, {"name": "g1.a100-4c", "extra_specs": {}}):
+        dest = SlowBoot(flavor=flavor, allocations={"VGPU": 1})
+        result = await clocked(dest).verify(gpu_ctx(timeout_s=600))
+        assert result.passed is True, (flavor, result.checks)
+        assert result.evidence["attempts"] == 3 and not result.evidence.get("terminal")
+    short = await clocked(GpuDest(allocations={"VGPU": 0})).verify(gpu_ctx(timeout_s=600))
+    assert short.failed_checks() == ["gpu_allocation"], short.checks
+    assert short.evidence["attempts"] > 1 and not short.evidence.get("terminal")
+    late = await clocked(LateAllocations()).verify(gpu_ctx(timeout_s=600))
+    assert late.passed is True and late.evidence["attempts"] == 2, late.checks
+    assert "warnings" not in late.evidence and late.record().warnings == []
+
+
 async def test_gpu_allocation_check_is_skipped_with_a_warning_when_placement_cannot_be_read():
     """SDD §7.5, §22.8 (plan task G8): allocations Placement does not give (None) - or a read that
     fails - skip gpu_allocation with a warning, never a guess; the verification passes on its
     other checks, and the record keeps the warning."""
-    for unread in (None, ProviderError("dst-rhoso: call timed out after 60 s")):
+    for unread in (None, {}, ProviderError("dst-rhoso: call timed out after 60 s")):
         dest = GpuDest(allocations=unread)
         result = await Verifier(dest, Settings(), poll_s=0).verify(gpu_ctx())
         assert result.passed is True, result.checks

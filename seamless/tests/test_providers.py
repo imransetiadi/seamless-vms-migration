@@ -3919,3 +3919,27 @@ async def test_get_server_reports_its_flavor_name_and_extra_specs():
     }
     server.flavor = {"original_name": "m1.small"}
     assert (await dst.get_server("srv-1"))["flavor"] == {"name": "m1.small", "extra_specs": {}}
+
+
+async def test_get_server_looks_up_a_flavor_nova_did_not_embed():
+    """SDD §22.3 (G8 review): below compute 2.47 - a cloud entry that pins an older
+    compute_api_version - the server holds its flavor's id alone: get_server looks the flavor up by
+    it, its extra specs read apart, as the inventory does (review RV28-08); a policy that forbids
+    them keeps the flavor without them, and a flavor deleted since gives no name, which the
+    verification does not judge (§7.5)."""
+    conn, dst = gpu_destination([], FakePlacement())
+    [server] = conn.compute.servers(details=True)
+    server.flavor = {"id": "flv-gpu", "links": []}
+    conn.compute.get_flavor = _looked_up_flavors()
+    assert (await dst.get_server("srv-1"))["flavor"] == {
+        "name": "g1.large",
+        "extra_specs": {"resources:VGPU": "1"},
+    }
+    conn.compute.get_flavor = _looked_up_flavors(forbidden=True)
+    assert (await dst.get_server("srv-1"))["flavor"] == {"name": "g1.large", "extra_specs": {}}
+
+    def gone(flavor_id, get_extra_specs=False):
+        raise RuntimeError(f"HTTP 404: flavor {flavor_id} could not be found")
+
+    conn.compute.get_flavor = gone
+    assert (await dst.get_server("srv-1"))["flavor"] == {"name": None, "extra_specs": {}}
