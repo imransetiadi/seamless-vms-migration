@@ -3801,6 +3801,58 @@ async def test_a_destination_without_gpu_flavors_calls_no_placement():
     assert placement.calls == []
 
 
+async def test_gpu_flavors_lists_the_inventorys_gpu_flavors_with_one_flavor_list(tmp_path):
+    """SDD §10, §22.3 (plan task G6): the cutover gate's read of a GPU flavor's requests - the
+    GPU flavors as the inventory lists them, their declared profiles applied, read with one Nova
+    flavor list and nothing else: no Placement, no network or volume call. The demo's fake
+    destination lists none until plan task G9."""
+    vgpu = {"name": "g1.a100-4c", "vcpus": 8, "ram": 32768, "disk": 80, "extra_specs": GROUP}
+    small = {"name": "m1.small", "vcpus": 2, "ram": 4096, "disk": 20, "extra_specs": {}}
+    alias = {**small, "name": "p1.a100", "extra_specs": {"pci_passthrough:alias": "a100:1"}}
+    cloud = InProcessCloud(
+        tmp_path, flavors=[small, vgpu, alias], placement={"/allocation_candidates": (500, {})}
+    )
+    provider = make_provider(
+        endpoint=AUTH_URL,
+        cloud="dst",
+        role=ProviderRole.destination,
+        gpu_profiles={"g1.a100-4c": "A100-4C"},
+    )
+    dst = OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect)
+    flavors = await dst.gpu_flavors()
+    assert flavors == [
+        {
+            "name": "g1.a100-4c",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "gpus": [
+                GpuDevice(
+                    kind="vgpu",
+                    profile="A100-4C",
+                    resource_class="VGPU",
+                    traits=[A100],
+                    forbidden_traits=["CUSTOM_OLD"],
+                    same_provider=True,
+                )
+            ],
+        },
+        {
+            "name": "p1.a100",
+            "vcpus": 2,
+            "ram_mb": 4096,
+            "disk_gb": 20,
+            "gpus": [GpuDevice(kind="passthrough", alias="a100")],
+        },
+    ]
+    paths = [urllib.parse.urlsplit(url).path for _, url in cloud.seen]
+    assert paths.count("/v2.1/flavors/detail") == 1
+    services = ("https://network.", "https://block-storage.", "https://image.")
+    assert [url for _, url in cloud.seen if url.startswith(services)] == []
+    assert cloud.placement_seen == []
+    assert await FakeDestinationProvider().gpu_flavors() == []
+
+
 async def test_a_pci_alias_flavor_gets_no_pool():
     """SDD §22.3 (plan task G3): a PCI alias request has no pool - the device class its alias asks
     for lives in nova.conf -, so an alias flavor alone sends Placement nothing."""

@@ -157,6 +157,26 @@ def gpu_pools(requests: Iterable[GpuDevice]) -> list[PoolRequest]:
     ]
 
 
+#: a pool as pool_key tells it from another (SDD §22.3)
+PoolKey = tuple[str, tuple[str, ...], tuple[str, ...], bool]
+
+
+def gpu_units(requests: Iterable[GpuDevice]) -> dict[PoolKey, int]:
+    """The units ``requests`` ask of each pool (SDD §22.3, §22.5, §22.7): a vGPU request's count in
+    its own pool and in its class's, which unites the class's pools - once, for a request without
+    traits, whose pool its class's is. A PCI alias request asks of no pool."""
+    units: dict[PoolKey, int] = {}
+    for device in requests:
+        if device.kind != "vgpu" or not device.resource_class:
+            continue
+        own = pool_key(
+            device.resource_class, device.traits, device.forbidden_traits, device.same_provider
+        )
+        for key in dict.fromkeys((own, (device.resource_class, (), (), False))):
+            units[key] = units.get(key, 0) + device.count
+    return units
+
+
 def vgpu_request_keys(
     extra_specs: Mapping[str, str], declared_profile: str | None = None
 ) -> list[str]:

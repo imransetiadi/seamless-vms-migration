@@ -58,6 +58,9 @@ PERSISTED_KINDS = frozenset(
         "migration.data_inconsistent",
         "migration.source_running",
         "migration.source_stopped",
+        # a cutover that waits for GPU capacity, once when the wait begins and once when it ends
+        # (SDD §4.3, §5.4 rule 5, §22.7)
+        "migration.gpu_wait",
         "plan.finalized",
         "plan.cancelled",
         "migration.approved",

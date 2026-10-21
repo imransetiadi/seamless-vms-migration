@@ -1647,6 +1647,46 @@ def test_finding_dst_gpu_capacity_unknown_for_a_pci_alias():
     )
 
 
+def test_gpu_shortfalls_name_the_pool_and_the_units_needed_and_free_in_the_preflights_order():
+    """SDD §22.5, §22.7 (plan task G6): the room rule the pre-flight and the cutover gate share,
+    each shortfall with the pool and the units needed and free that the gate's wait names - a
+    pool Placement refuses, a pool asked for more than its free, its class across its pools, then
+    a request group no provider holds; a pool the read does not hold guesses nothing."""
+    from seamless_migrate.planning.gpu import gpu_units
+    from seamless_migrate.planning.preflight import gpu_shortfalls
+
+    a100 = GpuDevice(kind="vgpu", resource_class="VGPU", traits=[A100], same_provider=True, count=2)
+    l40 = GpuDevice(kind="vgpu", resource_class="VGPU", traits=[L40], same_provider=True)
+    alias = GpuDevice(kind="passthrough", alias="a100")
+    asked = gpu_units([a100, l40, alias])
+    assert asked == {
+        ("VGPU", (A100,), (), True): 2,
+        ("VGPU", (), (), False): 3,
+        ("VGPU", (L40,), (), True): 1,
+    }
+    refused = "HTTP 400 placement.undefined_code"
+    pools = [
+        GpuPool("VGPU", [A100], [], same_provider=True, free=2, providers=2, largest_free=1),
+        GpuPool("VGPU", [L40], [], same_provider=True, detail=refused),
+        GpuPool("VGPU", [], [], free=2, providers=2, largest_free=1),
+    ]
+    assert [
+        (s.kind, s.pool, s.needed, s.free, s.detail)
+        for s in gpu_shortfalls([a100, l40, alias], asked, pools)
+    ] == [
+        ("refused", f"VGPU {L40}", 1, 0, refused),
+        ("class", "VGPU", 3, 2, None),
+        ("group", f"VGPU {A100}", 2, 1, None),
+    ]
+    # a request without traits asks its class's pool, once: that check is its own, never "class"
+    bare = GpuDevice(kind="vgpu", resource_class="VGPU")
+    assert gpu_units([bare]) == {("VGPU", (), (), False): 1}
+    assert gpu_shortfalls([bare], {("VGPU", (), (), False): 2}, pools[2:]) == []
+    short = gpu_shortfalls([bare], {("VGPU", (), (), False): 3}, pools[2:])
+    assert [(s.kind, s.pool, s.needed, s.free) for s in short] == [("pool", "VGPU", 3, 2)]
+    assert gpu_shortfalls([a100], gpu_units([a100]), []) == []
+
+
 def test_finding_guest_gpu_driver():
     """SDD §22.5 (plan task G4): every GPU VM, whatever its strategy and whether or not a mapping
     applies yet: the guest's NVIDIA driver must suit the destination; virt-v2v leaves a VMware

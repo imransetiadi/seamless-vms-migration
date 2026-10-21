@@ -1109,6 +1109,31 @@ class ForceCutover(_Model):
     estimated_downtime_s: float
 
 
+class GpuWait(_Model):
+    """A cutover that waits for GPU capacity, its source running (SDD §4.2, §5.4 rule 5, §22.7):
+    what the last capacity read found short - or that it failed -, since when."""
+
+    #: when the destination answered the read that began the wait
+    since: UTCDateTime
+    #: when the destination answered the last read
+    checked_at: UTCDateTime
+    #: what that read found short, by pool_name: a pool, or a class alone across its pools; ""
+    #: while no read of the wait could list the GPU flavor's requests
+    pool: str
+    #: the units the cutover needs there: its GPU flavor's, plus those of the destination's other
+    #: migrations in cutover with no server yet; for a request group of n > 1 units, the n one
+    #: provider must have free
+    needed: int
+    #: the units the read found free there (the most on one provider, for such a group); None
+    #: when the read failed
+    free: int | None = None
+    #: why, in words, naming the destination by its label; a failure by its HTTP status,
+    #: Placement error code or kind, never a message's text (§22.12)
+    reason: str
+
+    _storable = field_validator("pool", "reason", mode="before")(_storable_text_field)
+
+
 class Approval(_Model):
     actor: str
     at: UTCDateTime = Field(default_factory=utcnow)
@@ -1180,6 +1205,9 @@ class Migration(_Model):
     suggested_probes: list[AppProbe] = Field(default_factory=list)
     #: completed, not finalized: when its source VM was seen running again (SDD §8.1, ADV-19)
     source_running_at: UTCDateTime | None = None
+    #: in ready, awaiting_cutover or a keep-warm pass: its cutover waits for GPU capacity (SDD §5.4
+    #: rule 5, §22.7); leaving those phases drops it in the same write (domain.fsm)
+    gpu_wait: GpuWait | None = None
     review_required: bool = False
     review_reason: str | None = None
 
@@ -1241,6 +1269,7 @@ class MigrationSummary(_Model):
     findings: list[Finding]
     suggested_probes: list[AppProbe]
     cutover_refusals: list[str]
+    gpu_wait: GpuWait | None
     created_at: UTCDateTime
     updated_at: UTCDateTime
 
@@ -1274,6 +1303,7 @@ class MigrationSummary(_Model):
             findings=m.findings,
             suggested_probes=m.suggested_probes,
             cutover_refusals=m.cutover_refusals,
+            gpu_wait=m.gpu_wait,
             created_at=m.created_at,
             updated_at=m.updated_at,
         )

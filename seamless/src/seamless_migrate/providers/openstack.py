@@ -472,6 +472,9 @@ class OpenStackProvider:
     async def gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity:
         return await self._run(self._gpu_capacity, requests)
 
+    async def gpu_flavors(self) -> list[dict[str, Any]]:
+        return await self._run(self._list_gpu_flavors)
+
     async def server_allocations(self, server_id: str) -> dict[str, int] | None:
         return await self._run(self._server_allocations, server_id)
 
@@ -784,6 +787,12 @@ class OpenStackProvider:
 
     def _gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity:
         return self._read_gpu_capacity(self._connection(), requests)[0]
+
+    def _list_gpu_flavors(self) -> list[dict[str, Any]]:
+        """The GPU flavors with their declared profiles, read with one flavor list, as the
+        inventory reads them (SDD §10, §22.3): the cutover gate's read of a GPU flavor's requests
+        (§22.7)."""
+        return _gpu_flavors(_flavors(self._connection()), self.provider.gpu_profiles)
 
     def _server_allocations(self, server_id: str) -> dict[str, int] | None:
         conn = self._connection()

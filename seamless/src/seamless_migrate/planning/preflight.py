@@ -13,10 +13,12 @@ from ..domain.enums import Phase, ProviderKind, Severity, Strategy
 from ..domain.models import Finding, GpuDevice, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
 from .gpu import (
+    PoolKey,
     ProfileSize,
     gpu_flavor,
     gpu_key,
     gpu_names,
+    gpu_units,
     pool_key,
     pool_name,
     vgpu_profile_size,
@@ -985,16 +987,90 @@ def _guest_gpu_findings(
     return out
 
 
-def _server_gpu_flavor(
-    vm: VMRef, plan: Plan, dst_inv: DestinationInventory, kind: ProviderKind
+def server_gpu_flavor(
+    vm: VMRef, plan: Plan, gpu_flavors: Iterable[dict[str, Any]], kind: ProviderKind | str
 ) -> dict[str, Any] | None:
-    """The GPU flavor ``vm``'s server is created with, if any (SDD §22.5): a GPU VM's GPU flavor,
-    or the GPU flavor a mapping sends a VM without a GPU to."""
+    """The GPU flavor among ``gpu_flavors`` that ``vm``'s server is created with, if any (SDD
+    §22.5, §22.7): a GPU VM's GPU flavor, or the GPU flavor a mapping sends a VM without a GPU
+    to."""
     if vm_gpus(vm):
         name = gpu_flavor(vm, plan, kind)
     else:
         name = plan.mappings.flavors.get(vm.flavor) if vm.flavor else None
-    return next((f for f in dst_inv.gpu_flavors if f.get("name") == name), None) if name else None
+    return next((f for f in gpu_flavors if f.get("name") == name), None) if name else None
+
+
+@dataclass(frozen=True)
+class Shortfall:
+    """Where vGPU requests find no room in a capacity read (SDD §22.3, §22.5, §22.7): ``kind``
+    "refused" - Placement refused the pool's request, its ``detail`` -, "pool" - the units asked of
+    it pass its free -, "class" - across its class's pools - or "group" - no provider has the
+    ``needed`` units a request group takes from one, ``free`` the most free on one."""
+
+    key: PoolKey
+    #: the pool by pool_name, or a class alone
+    pool: str
+    kind: Literal["refused", "pool", "class", "group"]
+    needed: int
+    free: int
+    detail: str | None = None
+
+
+def gpu_shortfalls(
+    requests: Iterable[GpuDevice], asked: Mapping[PoolKey, int], pools: Iterable[GpuPool]
+) -> list[Shortfall]:
+    """Where the vGPU requests among ``requests`` find no room in the read's ``pools`` when
+    ``asked`` gives the units asked of each pool (``gpu_units``, SDD §22.3, §22.5, §22.7) - the
+    pre-flight's rule and the cutover gate's, in the order the pre-flight words it: each pool they
+    ask of that Placement refuses or whose free is below what is asked of it; each class across
+    its pools, unless a request without traits asks of the class's pool, whose check is its own;
+    then each request group of n > 1 units that no provider holds. A pool the read does not hold
+    is skipped: nothing is guessed."""
+    vgpus = [g for g in requests if g.kind == "vgpu" and g.resource_class]
+    read = {
+        pool_key(p.resource_class, p.traits, p.forbidden_traits, p.same_provider): p for p in pools
+    }
+    keys = list(
+        dict.fromkeys(
+            pool_key(g.resource_class or "", g.traits, g.forbidden_traits, g.same_provider)
+            for g in vgpus
+        )
+    )
+    out: list[Shortfall] = []
+    for key in keys:
+        pool = read.get(key)
+        if pool is None:
+            continue
+        name = pool_name(pool.resource_class, pool.traits, pool.forbidden_traits)
+        if pool.detail is not None:
+            out.append(Shortfall(key, name, "refused", asked.get(key, 0), pool.free, pool.detail))
+        elif asked.get(key, 0) > pool.free:
+            out.append(Shortfall(key, name, "pool", asked[key], pool.free))
+    for cls in dict.fromkeys(g.resource_class or "" for g in vgpus):
+        key = (cls, (), (), False)
+        alone = read.get(key)
+        if alone is None or alone.detail is not None or key in keys:
+            continue  # a request without traits asks its class's pool: that check was its own
+        if asked.get(key, 0) > alone.free:
+            out.append(Shortfall(key, cls, "class", asked[key], alone.free))
+    for device in vgpus:
+        key = pool_key(
+            device.resource_class or "",
+            device.traits,
+            device.forbidden_traits,
+            device.same_provider,
+        )
+        pool = read.get(key)
+        # a group of n > 1 units needs one provider with n free (SDD §22.3, §22.5)
+        if (
+            pool is not None
+            and pool.detail is None
+            and device.count > 1
+            and device.count > pool.largest_free
+        ):
+            name = pool_name(pool.resource_class, pool.traits, pool.forbidden_traits)
+            out.append(Shortfall(key, name, "group", device.count, pool.largest_free))
+    return out
 
 
 def _unknown_capacity(capacity: GpuCapacity) -> str:
@@ -1054,75 +1130,32 @@ def _capacity_findings(
     if not vgpus or capacity.status != "ok" or shares.get(vm.source_id) == "nothing":
         return out
     # the units each pool, and each class across its pools, is asked for by the plan's VMs
-    asked: dict[tuple[str, tuple[str, ...], tuple[str, ...], bool], int] = {}
-    askers: dict[tuple[str, tuple[str, ...], tuple[str, ...], bool], set[str]] = {}
+    asked: dict[PoolKey, int] = {}
+    askers: dict[PoolKey, set[str]] = {}
     for other in selected:
-        other_flavor = _server_gpu_flavor(other, plan, dst_inv, kind)
+        other_flavor = server_gpu_flavor(other, plan, dst_inv.gpu_flavors, kind)
         if other_flavor is None or shares.get(other.source_id) == "nothing":
             continue
-        for device in other_flavor["gpus"]:
-            if device.kind != "vgpu" or not device.resource_class:
-                continue
-            own = pool_key(
-                device.resource_class, device.traits, device.forbidden_traits, device.same_provider
-            )
-            for key in dict.fromkeys((own, (device.resource_class, (), (), False))):
-                asked[key] = asked.get(key, 0) + device.count
-                askers.setdefault(key, set()).add(other.name)
+        for key, units in gpu_units(other_flavor["gpus"]).items():
+            asked[key] = asked.get(key, 0) + units
+            askers.setdefault(key, set()).add(other.name)
     reasons = []
-    for key in dict.fromkeys(
-        pool_key(g.resource_class or "", g.traits, g.forbidden_traits, g.same_provider)
-        for g in vgpus
-    ):
-        pool = pools.get(key)
-        if pool is None:
-            continue
-        name = pool_name(pool.resource_class, pool.traits, pool.forbidden_traits)
-        if pool.detail is not None:
+    for short in gpu_shortfalls(vgpus, asked, capacity.pools):
+        if short.kind == "refused":
             reasons.append(
-                f"Placement refuses the request for {name} of {where} ({pool.detail}): no server "
-                f"is created with flavor {flavor['name']!r}."
+                f"Placement refuses the request for {short.pool} of {where} ({short.detail}): no "
+                f"server is created with flavor {flavor['name']!r}."
             )
-            continue
-        if asked.get(key, 0) > pool.free:
+        elif short.kind == "group":
             reasons.append(
-                f"The plan's VMs ask {name} of {where} for {_count(asked[key], 'unit')}, more "
-                f"than its {pool.free} free ({_first_names(askers[key])})."
+                f"Its flavor asks {short.pool} of {where} for {short.needed} units on one "
+                f"provider, and none has {short.needed} free (the most on one is {short.free})."
             )
-    for cls in dict.fromkeys(g.resource_class or "" for g in vgpus):
-        key = (cls, (), (), False)
-        alone = pools.get(key)
-        own = {
-            pool_key(cls, g.traits, g.forbidden_traits, g.same_provider)
-            for g in vgpus
-            if g.resource_class == cls
-        }
-        if alone is None or alone.detail is not None or key in own:
-            continue  # a request without traits asks its class's pool: that check was its own
-        if asked.get(key, 0) > alone.free:
+        else:
+            across = " across its pools" if short.kind == "class" else ""
             reasons.append(
-                f"The plan's VMs ask {cls} of {where} for {_count(asked[key], 'unit')} across "
-                f"its pools, more than its {alone.free} free ({_first_names(askers[key])})."
-            )
-    for device in vgpus:
-        key = pool_key(
-            device.resource_class or "",
-            device.traits,
-            device.forbidden_traits,
-            device.same_provider,
-        )
-        pool = pools.get(key)
-        # a group of n > 1 units needs one provider with n free (SDD §22.3, §22.5)
-        if (
-            pool is not None
-            and pool.detail is None
-            and device.count > 1
-            and device.count > pool.largest_free
-        ):
-            name = pool_name(pool.resource_class, pool.traits, pool.forbidden_traits)
-            reasons.append(
-                f"Its flavor asks {name} of {where} for {device.count} units on one provider, and "
-                f"none has {device.count} free (the most on one is {pool.largest_free})."
+                f"The plan's VMs ask {short.pool} of {where} for {_count(short.needed, 'unit')}"
+                f"{across}, more than its {short.free} free ({_first_names(askers[short.key])})."
             )
     if reasons:
         out.append(finding("DST_GPU_CAPACITY_INSUFFICIENT", " ".join(dict.fromkeys(reasons))))
@@ -1155,7 +1188,7 @@ def _gpu_findings(
             out += _gpu_flavor_findings(vm, gpus, flavor, where)
         out += _guest_gpu_findings(gpus, flavor, kind, where)
     else:
-        flavor = _server_gpu_flavor(vm, plan, dst_inv, kind)
+        flavor = server_gpu_flavor(vm, plan, dst_inv.gpu_flavors, kind)
     if flavor is not None:
         out += _capacity_findings(vm, flavor, plan, dst_inv, kind, where, selected, shares)
     return out
