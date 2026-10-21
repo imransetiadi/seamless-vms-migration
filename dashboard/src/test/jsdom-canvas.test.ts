@@ -11,8 +11,10 @@ type VirtualConsole = { on(event: string, listener: (error: Error) => void): voi
 describe('a canvas in the test environment (audit F-10)', () => {
   const reports: string[] = [];
   const listener = (error: Error) => reports.push(error.message);
-  // jsdom's own console for the window: what Vitest prints its reports from
-  const virtualConsole = (window as unknown as { _virtualConsole?: VirtualConsole })._virtualConsole;
+  // jsdom's own console for the window: what Vitest prints its reports from. Read through the public
+  // JSDOM#virtualConsole of the instance Vitest exposes as `jsdom`: the window field it used to be read from
+  // (`window._virtualConsole`) is private, and jsdom 30 moved it.
+  const virtualConsole = (globalThis as unknown as { jsdom?: { virtualConsole?: VirtualConsole } }).jsdom?.virtualConsole;
 
   beforeEach(() => {
     reports.length = 0;
