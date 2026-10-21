@@ -5074,7 +5074,7 @@ Binding in §13.4 with plan task G3:
 | the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 (binding) | G8 |
 | the demo's GPU VMs, GPU flavors, pools and gate wait | §7.4, §10 | G9 |
 | the dashboard (§22.11) | §16 (binding for G10's and G11's parts: the badge rule, the Inventory, `types.ts`, the Providers page) | G10, G11, G12 |
-| QASuite (requirement rows, AC-7, LAB-G01…LAB-G08), Security.md, README | QASuite, Security.md, README | G13 |
+| QASuite (requirement rows, AC-7, LAB-GPU01…LAB-GPU08), Security.md, README | QASuite, Security.md, README | G13 |
 | PRD goal G8, FR-35…FR-41, journey 7, the release table (0.3.0 GPU workloads; 0.4.0 the network cut-over hooks and the Octavia/Heat helpers) | PRD | G14 |
 | the lab on GPU hosts; the Technology Preview label goes when its cases pass | QASuite §13 | G15 |
 
@@ -5084,7 +5084,7 @@ Binding in §13.4 with plan task G3:
   synthetic until the lab records real ones, and pyVmomi-shaped device backings), the demo's simulated destination
   (§22.10) and the dashboard's mock exercise every rule of this section. No GPU host has run any of it. The
   documentation, the dashboard and the website say "Technology Preview, validated in simulation".
-* Before the Technology Preview label goes, QASuite's lab cases LAB-G01…LAB-G08 (plan tasks G13, G15) run on GPU
+* Before the Technology Preview label goes, QASuite's lab cases LAB-GPU01…LAB-GPU08 (plan tasks G13, G15) run on GPU
   hosts: a vSphere 8 host with an NVIDIA GPU under the vGPU manager (a time-sliced and a MIG-backed profile) and one
   with a DirectPath I/O GPU; a RHOSO 18.0 destination and a Tier 1 community destination (§21.1) with Nova's vGPU
   configured (mediated devices, and the vendor-specific VFIO framework where the GPU uses it) and a PCI alias. Each
