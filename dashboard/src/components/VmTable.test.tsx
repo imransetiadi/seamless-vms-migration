@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { buildInventories, makeVm } from '../api/mockData';
 import type { VMRef } from '../api/types';
-import { gpuDevice } from '../lib/gpu';
+import { gpuDevice, gpuRequests } from '../lib/gpu';
 import { VmTable } from './VmTable';
 
 const inventories = buildInventories();
@@ -256,11 +256,36 @@ describe('VmTable', () => {
     });
 
     it("words an OpenStack VM's GPU by what its flavor asks for, a VM recorded before 0.3.0 by its flavor's requests", () => {
-      render(<VmTable vms={openstackVms} providerKind="openstack" />);
+      // a source that declares its flavor's profile reports it on the request: it stands after the kind (SDD §16, §22.2)
+      const declared = makeVm({
+        id: 'os-6003',
+        name: 'gpu-ml-02',
+        flavor: 'g1.vgpu',
+        disks: [{ size_gb: 40 }],
+        gpus: gpuRequests({ 'resources:VGPU': '2', 'trait:CUSTOM_NVIDIA_A100_4C': 'required' }, 'A100-4C'),
+      });
+      render(<VmTable vms={[...openstackVms, declared]} providerKind="openstack" />);
       expect(gpuOf('gpu-ml-01')).toBe('vGPU · VGPU, CUSTOM_NVIDIA_A100_4C');
+      expect(gpuOf('gpu-ml-02')).toBe('vGPU A100-4C ×2 · VGPU, CUSTOM_NVIDIA_A100_4C');
       // no gpus reported: its flavor's extra specs, read as the API's vm_gpus reads them (§22.2)
       expect(gpuOf('gpu-render-01')).toBe('vGPU · VGPU');
       expect(gpuOf('web-01')).toBe('');
+    });
+
+    it('gives the GPU filter a Technology Preview badge of its own, shown at every width as the GPU column is not (SDD §16)', () => {
+      render(<VmTable vms={vmwareVms} providerKind="vmware" />);
+      const filter = screen.getByLabelText('GPU');
+      const badges = screen.getAllByRole('button', { name: 'Technology Preview' });
+      const own = badges.find((badge) => !badge.closest('table'));
+      // beside the filter, a focusable term with its definition, never inside an element a narrow screen hides
+      expect(own).toBeDefined();
+      expect(filter.parentElement).toContainElement(own!);
+      expect(own).toHaveAccessibleDescription('Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts.');
+      expect(own!.closest('.hidden')).toBeNull();
+      // the filter keeps its name: the badge stands outside its label
+      expect(filter).toHaveAccessibleName('GPU');
+      // the column's badge goes with the column, which a narrow screen hides
+      expect(badges.filter((badge) => badge !== own).map((badge) => badge.closest('th')?.className)).toEqual(['hidden md:table-cell']);
     });
 
     it('offers no GPU column or filter while no VM of the table has a GPU, as the Project filter needs two projects', () => {

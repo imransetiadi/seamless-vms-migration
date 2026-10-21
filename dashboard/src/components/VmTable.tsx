@@ -268,7 +268,9 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
         {hasGpus && (
           <SelectField
             label="GPU"
-            className="md:w-40"
+            // its own badge, shown at every width: a narrow screen hides the GPU column and its badge (SDD §16, §22.11)
+            aside={<TechPreviewBadge />}
+            className="md:w-48"
             value={gpuFilter}
             onChange={(e) => setGpu(e.target.value as GpuFilter)}
             options={[

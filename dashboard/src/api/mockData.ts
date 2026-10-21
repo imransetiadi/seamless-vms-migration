@@ -42,7 +42,7 @@ import { DOWNTIME_PARTS } from './types';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { estimateStrategy, paramsFor } from '../lib/forcedEstimate';
 import { pyNames, pyRepr } from '../lib/format';
-import { gpuDevice, gpuRequests, vgpuRequestKeys, vmGpus } from '../lib/gpu';
+import { gpuDevice, gpuPools, gpuRequests, samePool, vgpuRequestKeys, vmGpus } from '../lib/gpu';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { kitVmName } from '../lib/kitName';
@@ -447,24 +447,40 @@ function gpuFlavorsOf(flavors: readonly DestinationFlavor[], profiles: Readonly<
 }
 
 /**
- * A destination's GPU capacity as a read at `readAt` finds it - its inventory's and its check's alike (SDD §10, §22.3):
- * what the destination's Placement holds for its GPU flavors' pools, or ok with no pools for a destination without a
- * GPU flavor, which sends Placement nothing.
+ * A destination's GPU flavors and GPU capacity as a read at `readAt` finds them, its inventory's, its check's and its
+ * validation's alike, as the API reads them (SDD §10, §22.3): the flavors whose extra specs ask for a GPU, with the
+ * profiles its provider declares at the time of the read (`gpu_profiles`), and the pools of their vGPU requests as the
+ * destination's Placement holds them (`gpu_capacity`), each a pool of its own - a pool no GPU holds has none free.
+ * Without a vGPU request Placement is sent nothing; a read Placement refused or failed has no pool.
  */
-export function gpuCapacityOf(inventory: DestinationInventory | VMRef[] | undefined, readAt: string): GpuCapacity {
-  const held = inventory && !Array.isArray(inventory) ? inventory.gpu_capacity : undefined;
-  if (!held) return { status: 'ok', reason: null, detail: null, read_at: readAt, pools: [] };
-  return { ...held, read_at: readAt, pools: held.pools.map((p) => ({ ...p, traits: [...p.traits], forbidden_traits: [...p.forbidden_traits] })) };
+export function readDestinationGpus(
+  inventory: DestinationInventory | VMRef[] | undefined,
+  profiles: Readonly<Record<string, string>> | undefined,
+  readAt: string,
+): { gpu_flavors: GpuFlavor[]; gpu_capacity: GpuCapacity } {
+  const held = inventory && !Array.isArray(inventory) ? inventory : undefined;
+  const gpuFlavors = gpuFlavorsOf(held?.flavors ?? [], profiles ?? {});
+  const asked = gpuPools(gpuFlavors.flatMap((f) => f.gpus));
+  const placement = held?.gpu_capacity;
+  const ok = (pools: GpuPool[]): GpuCapacity => ({ status: 'ok', reason: null, detail: null, read_at: readAt, pools });
+  if (!asked.length) return { gpu_flavors: gpuFlavors, gpu_capacity: ok([]) };
+  if (placement && placement.status !== 'ok') return { gpu_flavors: gpuFlavors, gpu_capacity: { ...placement, read_at: readAt, pools: [] } };
+  const pools = asked.map((pool) => {
+    const found = placement?.pools.find((p) => samePool(p, pool));
+    const counts = found ? { free: found.free, providers: found.providers, largest_free: found.largest_free, detail: found.detail } : { free: 0, providers: 0, largest_free: 0, detail: null };
+    return { ...pool, traits: [...pool.traits], forbidden_traits: [...pool.forbidden_traits], ...counts };
+  });
+  return { gpu_flavors: gpuFlavors, gpu_capacity: ok(pools) };
 }
 
 /**
  * An OpenStack or RHOSO provider's check report, with the keys the API's check reports (SDD §10; check_report_keys.json):
  * its token's roles, its services' maxima, its storage pools and TLS; a destination's adds its series, support tier and
  * policy profile, by its maxima and what it declares (§10.1), and its GPU capacity, read at `checkedAt` for the GPU
- * flavors of its `inventory` (§22.3).
+ * flavors of its `inventory` with the profiles it declares (§22.3).
  */
 function openstackCheck(
-  provider: Pick<Provider, 'kind' | 'role' | 'release' | 'policy_profile'>,
+  provider: Pick<Provider, 'kind' | 'role' | 'release' | 'policy_profile' | 'gpu_profiles'>,
   storage: ReturnType<typeof backend>[],
   checkedAt: string,
   extra: Record<string, unknown> = {},
@@ -483,7 +499,10 @@ function openstackCheck(
     tls: true,
     plain_http: [],
     ...(provider.role === 'destination'
-      ? { ...destinationRelease(provider.kind, provider.release, provider.policy_profile, compute, blockStorage), gpu_capacity: gpuCapacityOf(inventory, checkedAt) }
+      ? {
+          ...destinationRelease(provider.kind, provider.release, provider.policy_profile, compute, blockStorage),
+          gpu_capacity: readDestinationGpus(inventory, provider.gpu_profiles, checkedAt).gpu_capacity,
+        }
       : {}),
     ...extra,
   };
@@ -524,7 +543,7 @@ export function vmwareCheck(vms: readonly VMRef[]): Record<string, unknown> {
  * own pools, else CHECKED_STORAGE, and a destination's GPU capacity for the GPU flavors of its `inventory` (SDD §22.3).
  */
 export function checkOf(
-  provider: Pick<Provider, 'id' | 'kind' | 'role' | 'release' | 'policy_profile'>,
+  provider: Pick<Provider, 'id' | 'kind' | 'role' | 'release' | 'policy_profile' | 'gpu_profiles'>,
   checkedAt: string,
   inventory?: DestinationInventory | VMRef[],
 ): Record<string, unknown> {
@@ -546,11 +565,14 @@ function gpuNames(devices: GpuDevice[]): string {
     .join(', ');
 }
 
-/** The destination's flavors by name, and those of them that ask for a GPU: what the pre-flight's GPU mapping rule reads
- * (SDD §22.3, §22.4). */
-export function flavorContext(inventory: DestinationInventory | VMRef[] | undefined): { flavors: string[]; gpuFlavors: string[] } {
+/** The destination's flavors by name, and those of them that ask for a GPU with the profiles its provider declares: what
+ * the pre-flight's GPU mapping rule reads (SDD §22.3, §22.4). */
+export function flavorContext(
+  inventory: DestinationInventory | VMRef[] | undefined,
+  profiles: Readonly<Record<string, string>> | undefined,
+): { flavors: string[]; gpuFlavors: string[] } {
   if (!inventory || Array.isArray(inventory)) return { flavors: [], gpuFlavors: [] };
-  return { flavors: inventory.flavors.map((f) => f.name), gpuFlavors: (inventory.gpu_flavors ?? []).map((f) => f.name) };
+  return { flavors: inventory.flavors.map((f) => f.name), gpuFlavors: gpuFlavorsOf(inventory.flavors, profiles ?? {}).map((f) => f.name) };
 }
 
 /** What a plan's GPU mapping names a VMware device by - a vGPU's profile, a passthrough device's PCI ids -, null when it
@@ -838,7 +860,11 @@ export function buildProviders(now: number): Provider[] {
       ca_cert_path: '/etc/pki/seamless/ocp-ingress-ca.pem',
       conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31'),
       // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
-      capabilities: checkOf({ id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null }, iso(now - 3 * 60_000), inventories['rhoso-prod']),
+      capabilities: checkOf(
+        { id: 'rhoso-prod', kind: 'rhoso', role: 'destination', release: null, policy_profile: null, gpu_profiles: DEMO_GPU_PROFILES },
+        iso(now - 3 * 60_000),
+        inventories['rhoso-prod'],
+      ),
       status: 'ok',
       // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
       status_message: null,
@@ -886,7 +912,11 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: null,
       conversion_host: conversionHost('os-migrate-conv-dc3', '192.0.2.60'),
-      capabilities: checkOf({ id: 'hibiscus-dc3', kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null }, iso(now - 6 * 60_000), inventories['hibiscus-dc3']),
+      capabilities: checkOf(
+        { id: 'hibiscus-dc3', kind: 'openstack', role: 'destination', release: '2026.2', policy_profile: null, gpu_profiles: DEMO_GPU_PROFILES },
+        iso(now - 6 * 60_000),
+        inventories['hibiscus-dc3'],
+      ),
       status: 'ok',
       // an ok check leaves no message, as the API's (SDD §10, review RV23-04)
       status_message: null,
@@ -903,7 +933,8 @@ export function buildProviders(now: number): Provider[] {
 
 /**
  * A checked destination's inventory (SDD §10): the community destination shares it, as the API demo's does, each with
- * its own copy - and with the demo's GPU flavors, their declared profiles and their pools, read at `readAt` (§22.10).
+ * its own copy - the demo's GPU flavors among its flavors, and what its Placement holds for their pools (§22.10). Its GPU
+ * flavors are not kept: each read finds them with the profiles its provider declares then (`readDestinationGpus`).
  */
 function destinationInventory(readAt: string): DestinationInventory {
   const flavors: DestinationFlavor[] = [
@@ -940,8 +971,7 @@ function destinationInventory(readAt: string): DestinationInventory {
       })),
       { id: 'sub-provider-ext-v4', name: 'provider-ext-v4', network: 'provider-ext', network_id: 'net-provider-ext', cidr: '203.0.113.0/24', ipv6_address_mode: null, ipv6_ra_mode: null },
     ],
-    // the flavors that ask for a GPU, with the profiles the provider declares, and the pools of their vGPU requests (SDD §22.3)
-    gpu_flavors: gpuFlavorsOf(flavors, DEMO_GPU_PROFILES),
+    // what the destination's Placement holds for its GPU flavors' pools, which each read takes its pools from (SDD §22.3)
     gpu_capacity: { status: 'ok', reason: null, detail: null, read_at: readAt, pools: demoGpuPools() },
   };
   // what a NIC's network name resolves to (SDD §10): the credential's own networks, and a provider network another project shares
@@ -957,14 +987,14 @@ function destinationInventory(readAt: string): DestinationInventory {
 }
 
 /**
- * A destination's inventory that lists nothing (SDD §10): its token's roles, as the API demo's, and no GPU flavor, so its
- * GPU capacity reads ok with no pools and Placement is sent nothing (§22.3).
+ * A destination's inventory that lists nothing (SDD §10): its token's roles, as the API demo's, and no GPU flavor, so a
+ * read finds its GPU capacity ok with no pools and sends Placement nothing (§22.3).
  */
-export function emptyDestinationInventory(readAt: string): DestinationInventory {
-  return { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [], roles: [...DEMO_TOKEN_ROLES], gpu_flavors: [], gpu_capacity: gpuCapacityOf(undefined, readAt) };
+export function emptyDestinationInventory(): DestinationInventory {
+  return { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [], roles: [...DEMO_TOKEN_ROLES] };
 }
 
-/** The seeded providers' inventories, as a read at `now` finds them (SDD §10). */
+/** The seeded providers' inventories at `now`: what a read finds there, a destination's GPUs by `readDestinationGpus` (SDD §10). */
 export function buildInventories(now: number = Date.now()): Record<string, VMRef[] | DestinationInventory> {
   const readAt = iso(now);
   return {
@@ -972,7 +1002,7 @@ export function buildInventories(now: number = Date.now()): Record<string, VMRef
     'vcenter-hq': VMW_VMS.map(makeVm),
     'community-lab': LAB_VMS.map(makeVm),
     'rhoso-prod': destinationInventory(readAt),
-    'rhoso-staging': emptyDestinationInventory(readAt),
+    'rhoso-staging': emptyDestinationInventory(),
     'hibiscus-dc3': destinationInventory(readAt),
   };
 }
@@ -1973,7 +2003,7 @@ export function buildFixtures(now: number): Fixtures {
       const findings = preflight(vm, source.kind, plan, dstInventory.networks, {
         selected,
         destination: providerLabel(destination),
-        ...flavorContext(dstInventory),
+        ...flavorContext(dstInventory, destination.gpu_profiles),
         gpuProfiles: source.gpu_profiles,
       });
       const elig = eligibility(vm, source.kind, plan, source, destination, findings);

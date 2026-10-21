@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 // One case table for the control plane and the dashboard's mock (SDD §22.2, PR #64 review).
 import raw from '../../../seamless/tests/fixtures/gpu_request_cases.json?raw';
 import type { GpuCapacity, GpuDevice, GpuFlavor, GpuPool, VMRef } from '../api/types';
-import { declaredProfiles, flavorsOfPool, gpuCapacityReason, gpuDevice, gpuLabel, gpuRequests, poolFreeText, poolLabel, vmGpus } from './gpu';
+import { declaredProfiles, flavorsOfPool, gpuCapacityReason, gpuDevice, gpuLabel, gpuPools, gpuRequests, poolFreeText, poolLabel, samePool, vmGpus } from './gpu';
 
 const fixture = JSON.parse(raw) as {
   cases: Array<{ why: string; extra_specs: Record<string, string>; declared_profile?: string; requests: Array<Partial<GpuDevice> & Pick<GpuDevice, 'kind'>> }>;
@@ -74,6 +74,27 @@ describe('how the dashboard words GPUs and GPU capacity (SDD §16, §22.11)', ()
     expect(flavorsOfPool(pool({ resource_class: 'CUSTOM_OTHER' }), flavors)).toEqual([]);
     expect(declaredProfiles(a)).toEqual(['A100-4C']);
     expect(declaredProfiles(b)).toEqual([]);
+  });
+
+  it("reads a capacity's pools in the API's order: each request with traits, then each class alone (SDD §22.3)", () => {
+    const requests = [
+      ...gpuRequests({ 'resources:VGPU': '1', 'trait:CUSTOM_B': 'required', 'trait:CUSTOM_A': 'required' }),
+      ...gpuRequests({ 'resources1:VGPU': '1', 'trait1:CUSTOM_A': 'required', 'trait1:CUSTOM_B': 'required' }),
+      ...gpuRequests({ 'resources:CUSTOM_X': '1' }, 'A16-4Q'),
+      ...gpuRequests({ 'resources:VGPU': '2', 'trait:CUSTOM_A': 'required', 'trait:CUSTOM_B': 'required' }),
+      ...gpuRequests({ 'pci_passthrough:alias': 'a100:1' }),
+      ...gpuRequests({ 'resources:VGPU': '1', 'trait:CUSTOM_C': 'forbidden' }),
+    ];
+    // a numbered group's pool is its own; a request without traits is its class's pool, where it comes; an alias has none
+    expect(gpuPools(requests).map((p) => [poolLabel({ ...p, free: 0, providers: 0, largest_free: 0, detail: null }), p.same_provider])).toEqual([
+      ['VGPU, CUSTOM_A, CUSTOM_B', false],
+      ['VGPU, CUSTOM_A, CUSTOM_B', true],
+      ['CUSTOM_X', false],
+      ['VGPU, !CUSTOM_C', false],
+      ['VGPU', false],
+    ]);
+    expect(samePool(gpuPools(requests)[0]!, { resource_class: 'VGPU', traits: ['CUSTOM_B', 'CUSTOM_A'], forbidden_traits: [], same_provider: false })).toBe(true);
+    expect(gpuPools(gpuRequests({ 'pci_passthrough:alias': 'a100:1' }))).toEqual([]);
   });
 
   it('says what a pool has free, on how many GPUs, and why a refused pool counts nothing', () => {

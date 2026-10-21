@@ -244,6 +244,8 @@ describe('Inventory', () => {
         // nothing read reads as no pool, never as free units
         expect(within(capacity).queryByRole('table')).not.toBeInTheDocument();
         expect(capacity).not.toHaveTextContent(/free on/);
+        // the alias flavor's capacity is unknown whatever Placement answers: said beside the read that failed
+        expect(within(capacity).getByText(/Capacity unknown/)).toHaveTextContent('p1.a100: Capacity unknown: PCI aliases are configured in nova.conf');
         unmount();
       }
     });
@@ -257,8 +259,7 @@ describe('Inventory', () => {
       unmount();
       // a destination whose GPU flavors ask for aliases alone has no pool to read, and says so
       const inventory = server.inventories['rhoso-prod'] as DestinationInventory;
-      inventory.gpu_flavors = inventory.gpu_flavors!.filter((f) => f.name === 'p1.a100');
-      inventory.gpu_capacity = { ...inventory.gpu_capacity!, pools: [] };
+      inventory.flavors = inventory.flavors.filter((f) => !f.extra_specs['resources:VGPU']);
       renderWithApp(<Inventory />, { route: '/inventory/rhoso-prod', path: '/inventory/:providerId', token: 'viewer', server });
       const aliasOnly = await screen.findByRole('region', { name: 'GPU capacity' });
       expect(aliasOnly).toHaveTextContent('No flavor asks for a vGPU: Placement has no pool to read.');

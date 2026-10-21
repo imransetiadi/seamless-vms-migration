@@ -144,6 +144,38 @@ function poolKey(resourceClass: string, traits: readonly string[] = [], forbidde
   return JSON.stringify([resourceClass, required, refused, sameProvider && required.length + refused.length > 0]);
 }
 
+/** What a capacity read asks Placement of: a pool without its counts, as the API's PoolRequest (SDD §22.3). */
+export type PoolRequest = Pick<GpuPool, 'resource_class' | 'traits' | 'forbidden_traits' | 'same_provider'>;
+
+/** Whether two pools are one, as the API's pool_key tells them apart (SDD §22.3). */
+export function samePool(a: PoolRequest, b: PoolRequest): boolean {
+  return poolKey(a.resource_class, a.traits, a.forbidden_traits, a.same_provider) === poolKey(b.resource_class, b.traits, b.forbidden_traits, b.same_provider);
+}
+
+/**
+ * The pools of the vGPU requests among `requests`, as the API's gpu_pools (SDD §22.3): one per distinct request with traits
+ * - its class with its required and forbidden traits, sorted, and whether its group is a numbered one -, in the order they
+ * come, then one per resource class alone, which unites that class's pools and is the pool of a request without traits.
+ * A PCI alias request has none: the device class its alias asks for lives in nova.conf.
+ */
+export function gpuPools(requests: Iterable<GpuDevice>): PoolRequest[] {
+  const pools = new Map<string, PoolRequest>();
+  const add = (pool: PoolRequest) => {
+    const key = poolKey(pool.resource_class, pool.traits, pool.forbidden_traits, pool.same_provider);
+    if (!pools.has(key)) pools.set(key, pool);
+  };
+  for (const g of requests) {
+    if (g.kind !== 'vgpu' || !g.resource_class) continue;
+    const traits = [...(g.traits ?? [])].sort(byCodePoint);
+    const forbidden = [...(g.forbidden_traits ?? [])].sort(byCodePoint);
+    add({ resource_class: g.resource_class, traits, forbidden_traits: forbidden, same_provider: Boolean(g.same_provider) && traits.length + forbidden.length > 0 });
+  }
+  for (const resourceClass of new Set([...pools.values()].map((p) => p.resource_class))) {
+    add({ resource_class: resourceClass, traits: [], forbidden_traits: [], same_provider: false });
+  }
+  return [...pools.values()];
+}
+
 /** A pool as the Inventory names it: its class and traits, a forbidden one prefixed with "!" (SDD §16). */
 export function poolLabel(pool: GpuPool): string {
   return [pool.resource_class, ...pool.traits, ...pool.forbidden_traits.map((t) => `!${t}`)].join(', ');
