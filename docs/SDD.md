@@ -643,37 +643,41 @@ active enters `cutover` when all hold:
 2. `cutover_window is None` **or** now ∈ [start, end] — bypassed while `Migration.force_window` is set (`POST …/cutover {"force_window": true}`);
 3. `plan.auto_cutover` **or** `cutover_requested` (set by `POST …/cutover`);
 4. fewer than `max_concurrent_cutovers` migrations are in `cutover`;
-5. a GPU VM with a vGPU among its own GPUs (§22.2) has a GPU capacity read that found room for its GPU flavor
-   (§22.4), made once rules 1–4 hold and answered at most 60 s before the step starts (model time in demo mode, §7.4;
-   §22.7); a VM whose GPUs are all passthrough devices is told apart without a read and never waits on one.
+5. a GPU VM (§22.2) has a GPU capacity read that found room for its GPU flavor (§22.4), made once rules 1–4 hold and a
+   cutover slot is left for it, and answered at most 60 s before the step starts (model time in demo mode, though
+   never under three ticks; §7.4, §22.7).
 
 **GPU capacity (rule 5, plan task G6).** Once rules 1–4 hold and the tick's limits leave the cutover room to start
 (`max_concurrent_migrations`, the wave's `max_parallel`, §8), the tick starts the migration's read as a task of its
 own, one per migration at a time, and never waits for it, as it starts the source watch (§8.1): a slow destination
-delays that cutover, never the tick, the other gates or the passes. A read lists the destination's GPU flavors
+delays that cutover, never the tick, the other gates or the passes. A read starts only while a cutover slot is left
+for it - `max_concurrent_cutovers` less the migrations in `cutover` and the reads already out -, and none for a
+migration whose advisor decision waits (`advisor_hold`, §14.6). A read lists the destination's GPU flavors
 (`gpu_flavors()`, §10), then reads the capacity of the vGPU requests of the migration's GPU flavor among them
-(`gpu_capacity`, §22.3). It finds room when each pool they ask of has their units free plus those of the
-destination's other migrations in `cutover` that have recorded no `destination_server_id` yet, counted by the flavor
-their server is created with in the same list (a VM without a GPU that a flavor mapping sends to a GPU flavor among
-them, as the pre-flight counts it, §22.5) - per pool, per resource class across its pools and, for a request group of
-n > 1 units, on one provider: `planning/preflight.gpu_shortfalls`, the pre-flight's rule (§22.5). Its outcome lives in
-the process, with the time the destination answered and the cutovers it counted: the tick starts the cutover on an
-outcome that found room, at most 60 s old and made in the migration's present stay at its gate (a validation, a retry
-or a cutover begins another), re-checked under the locks with rules 1–4 (§8) - where a cutover the read did not
-count, started on the destination since and asking of its pools, drops the outcome, and a new read follows. While
-rules 1–4 hold, an outcome 60 s old is read again; after a restart a read comes first. A read without room records
-`Migration.gpu_wait` (§4.2) and emits `migration.gpu_wait` (§4.3) once when the wait begins; a later read without
-room updates it without an event, and a read that finds room clears it, `migration.gpu_wait` saying so once more -
-each with its event in one store transaction. The source keeps running meanwhile: a warm migration goes on with its
-keep-warm passes, a single-shot one stays in `ready`. A VM whose GPUs are all passthrough devices is not read for: the
-PCI alias its GPU flavor asks for has no capacity any API shows (§22.5). Capacity Placement does not show - `unknown`
-with the reason `forbidden` or `no_placement` -, a PCI alias request, and a GPU flavor that asks for no vGPU or that
-the list no longer holds (the cutover then refuses the mapping before the source stops, §22.4) let the cutover start;
-a read that fails otherwise - a flavor list or a capacity read that raises, a capacity `unknown` with the reason
-`error` - holds it, `gpu_wait` naming the failure. Neither a Force cutover, nor `auto_cutover`, nor a bypassed window
-skips rule 5. Leaving `ready`, `awaiting_cutover` and its keep-warm passes (`syncing`) - a cutover, a cancel, a
-failure, a validation - drops `gpu_wait` in the same write, which the transition's `migration.phase` announces; a
-retry starts with none.
+(`gpu_capacity`, §22.3); a GPU flavor that asks for a PCI alias alone, or for no vGPU, or that the list no longer
+holds (the cutover then refuses the mapping before the source stops, §22.4), passes with that list, Placement not
+asked. It finds room when each pool the requests ask of has their units free plus those of the destination's other
+migrations in `cutover` that have recorded no `destination_server_id` yet, counted by the flavor their server is
+created with in the same list (a VM without a GPU that a flavor mapping sends to a GPU flavor among them, as the
+pre-flight counts it, §22.5) - per pool, per resource class across its pools and, for a request group of n > 1 units,
+on one provider: `planning/preflight.gpu_shortfalls`, the pre-flight's rule (§22.5). Its outcome lives in the process,
+with the time the destination answered and how many cutovers this process had begun on the destination when the read
+began; the answer wakes the tick. The tick starts the cutover on an outcome that found room, at most 60 s old and made
+in the migration's present stay at its gate (a validation, a retry or a cutover begins another), re-checked under the
+locks with rules 1–4 (§8) - where a cutover begun on the destination since the read began, asking of the pools it
+read, drops the outcome whatever phase that migration is in now (its server may hold the unit the read found free),
+and a new read follows. While rules 1–4 hold, an outcome 60 s old is read again; after a restart a read comes first. A
+read without room records `Migration.gpu_wait` (§4.2) and emits `migration.gpu_wait` (§4.3) once when the wait begins;
+a later read without room updates it without an event - after a restart too -, and a read that finds room clears it,
+`migration.gpu_wait` saying so once more - each with its event in one store transaction. The source keeps running
+meanwhile: a warm migration goes on with its keep-warm passes, a single-shot one stays in `ready`. Capacity Placement
+does not show - `unknown` with the reason `forbidden` or `no_placement` - lets the cutover start; a read that fails
+otherwise - a flavor list or a capacity read that raises, a capacity `unknown` with the reason `error` - holds it,
+`gpu_wait` naming the failure; a read that fails outside the destination's answers (a store error) holds it too,
+logged, until the next read a minute later. Neither a Force cutover, nor `auto_cutover`, nor a bypassed window skips
+rule 5. Leaving `ready`, `awaiting_cutover` and its keep-warm passes (`syncing`) - a cutover, a cancel, a failure, a
+validation - drops `gpu_wait` in the same write, which the transition's `migration.phase` announces; a read still out
+then is recorded on no stay, and a retry starts with none.
 
 A migration whose advisor decision waits for approval (`advisor_hold`, §14.6) starts neither its pre-copy
 nor its cutover until the decision is approved or overridden; the plan runs its other migrations meanwhile,
@@ -4977,13 +4981,13 @@ A fifth rule of §5.4, binding there since plan task G6, with `GpuWait`, `Migrat
 `MigrationSummary.gpu_wait` in §4.2, the event `migration.gpu_wait` in §4.3, `gpu_flavors()` in §10 and the gauge
 `seamless_gpu_waits` in §18:
 
-5. a migration whose server is created with a vGPU flavor (its GPU flavor, §22.4) enters `cutover` only on a capacity
-   read that found room. The read is `DestinationProvider.gpu_flavors()`, then `gpu_capacity` for the vGPU requests of
-   the GPU flavor it lists, made once rules 1–4 hold, at most 60 s before the step starts (model time in demo mode,
-   §7.4). It finds room when each pool the flavor asks of has at least the flavor's units free, plus the units of the
-   destination's other migrations in `cutover` that ask of that pool and have recorded no `destination_server_id` yet
-   (their servers may not exist yet; one that already exists is counted twice, which only delays), on a provider with
-   enough free for each group (§22.3).
+5. a GPU VM (§22.2) enters `cutover` only on a capacity read that found room for its GPU flavor (§22.4). The read is
+   `DestinationProvider.gpu_flavors()`, then `gpu_capacity` for the vGPU requests of the GPU flavor it lists, made
+   once rules 1–4 hold and a cutover slot is left for it, at most 60 s before the step starts (model time in demo
+   mode, though never under three ticks, §7.4). It finds room when each pool the flavor asks of has at least the
+   flavor's units free, plus the units of the destination's other migrations in `cutover` that ask of that pool and
+   have recorded no `destination_server_id` yet (their servers may not exist yet; one that already exists is counted
+   twice, which only delays), on a provider with enough free for each group (§22.3).
 
 * **The read's requests** (the controller's choice of 2026-10-20, `jev_decide` with confidence 0.92): the gate reads a
   GPU flavor's requests from `gpu_flavors()`, a provider method of its own that lists the GPU flavors as the inventory
@@ -4991,23 +4995,32 @@ A fifth rule of §5.4, binding there since plan task G6, with `GpuWait`, `Migrat
   `inventory()` per read would cost about ten API calls and a second Placement read of every GPU pool, every 60 s per
   waiting migration; requests cached at the validation would read a flavor as it was, not as it is when the read is
   made, and would be lost on a restart.
-* **Which migrations wait** (the G6 implementation's choice, 2026-10-20, and the controller's of 2026-10-21): a GPU VM
-  with a vGPU among its own GPUs (§22.2) is read for, and its GPU flavor - `planning/gpu.gpu_flavor`, §22.4 - holds
-  its cutover only when it asks for a vGPU. A VM whose GPUs are all passthrough devices is told apart without a read:
-  the PCI alias its GPU flavor asks for has no capacity any API shows, so no read could hold its cutover, and none is
-  made - a destination that offers no GPU read never stands in its way. A mapping that gives such a VM a vGPU flavor
-  instead (§22.4), and a flavor mapping that sends a VM without a GPU to one, are not read for either: telling that
-  their flavor asks for a vGPU takes a destination read, which every such cutover would then wait on. Both are counted
-  among the other cutovers, as the pre-flight counts them (§22.5); their pre-flight blocks them while capacity is short
-  at the validation, and the rule's remaining gap (the last bullet) covers them from there.
-* **Freshness** (the same choice): a read's time is when the destination answered, as the source watch's
-  `source_running_at` (§8.1): a slow read's outcome counts from its answer. A read counts the cutovers it found when it
-  began, and a cutover that starts on the destination later, asking of a pool the flavor asks of, makes the outcome
-  stale before its 60 s - the re-check under the locks (§8) drops it, so two GPU migrations that read at once cannot
-  both cut over on one free unit; a cutover of a VM whose flavor asks of none of those pools leaves it as it is.
-  The outcome lives in the process only, for the migration's present stay at its gate - from its last move that was no
-  keep-warm pass's -: after a restart, a retry or a validation, a read comes before its GPU cutover. A read that fails
-  outside the destination's answers (a store error) holds the cutover for its minute too, logged.
+* **Which migrations wait** (the G6 implementation's choice of 2026-10-20, as the review of G6 corrected it on
+  2026-10-21): every GPU VM (§22.2) is read for - a 17.1 VM with a PCI passthrough GPU that its plan maps to an 18.0
+  vGPU flavor (§22.4), which the pre-flight accepts, among them -, and its GPU flavor (`planning/gpu.gpu_flavor`,
+  §22.4) holds its cutover only when it asks for a vGPU: a flavor that asks for a PCI alias alone passes with the
+  flavor list, Placement not asked. A VM without a GPU that a flavor mapping sends to a vGPU flavor is not read for
+  (the last bullet): telling that its mapped flavor asks for a vGPU takes a destination read, which the cutover of
+  every VM with a flavor mapping would then wait on. It is counted among the other cutovers, as the pre-flight counts
+  it (§22.5).
+* **Freshness and the cutovers begun since** (the same choices): a read's time is when the destination answered, as
+  the source watch's `source_running_at` (§8.1): a slow read's outcome counts from its answer, and the answer wakes
+  the tick, which takes it at once. In demo mode a read counts its model minute but never under three ticks: the model
+  runs faster, a tick's own work and its locks do not, and a read that counted less than a tick would never be taken.
+  A read counts the cutovers it found when it began and notes how many cutovers this process had begun on the
+  destination then; under the locks (§8), a cutover begun since that asks of a pool the read counted - by the flavor
+  list the read took, whatever phase that migration is in now: its server may already hold the unit the read found
+  free - drops the outcome. So two GPU migrations whose reads overlap never both cut over on one free unit, whether
+  the second waits for a cutover slot or runs a keep-warm pass meanwhile; a cutover of a VM whose flavor asks of none
+  of those pools - a VM without a GPU among them - leaves the read as it is, and no GPU VM starves behind other
+  cutovers. Reads start only while a cutover slot is left for them: GPU VMs queued at one slot read one at a time. The
+  outcome lives in the process only, for the migration's present stay at its gate - from its last move that was no
+  keep-warm pass's -: after a restart, a retry or a validation, a read comes before its GPU cutover, and a read still
+  out across one of them is recorded on no stay. A read that fails outside the destination's answers (a store error)
+  holds the cutover for its minute too, logged. A read has no bound of its own beyond the provider's (each request 60
+  s, a call 300 s, and a Placement that does not answer is not asked again for 5 minutes, §10, §22.3): a shorter one
+  would end the wait but not the worker thread, so each later read would add a thread to the pool the store shares,
+  while the cutover waits on the safe side, its source running.
 
 * The read runs outside the locks, as a task of its own, one per migration at a time, as the source watch does
   (§8.1): a slow Placement delays that cutover, never the tick, the other gates or the passes. Its outcome is recorded,
@@ -5039,10 +5052,12 @@ A fifth rule of §5.4, binding there since plan task G6, with `GpuWait`, `Migrat
 * Neither a Force cutover (§5.4), nor `auto_cutover`, nor a bypassed window skips the rule. A migration that leaves the
   waiting phases (a cancel, a rollback, a validation) drops its `gpu_wait` in the same write, and a retry starts with
   none.
-* What the rule cannot close: capacity that another server takes between the read and the creation of the
-  migration's server (during a warm cutover's final pass, or a VMware conversion) makes that creation fail after the
-  source stopped, and the automatic rollback (§8) starts the source again. The read narrows that window to the
-  cutover itself; Placement reserves nothing ahead of Nova.
+* What the rule cannot close: capacity that another server takes between the read and the creation of the migration's
+  server (during a warm cutover's final pass, or a VMware conversion) makes that creation fail after the source
+  stopped, and the automatic rollback (§8) starts the source again. The read narrows that window to the cutover
+  itself; Placement reserves nothing ahead of Nova. And a VM without a GPU of its own that a flavor mapping sends to a
+  vGPU flavor is not read for (above): its pre-flight checks the capacity at the validation
+  (`DST_GPU_CAPACITY_INSUFFICIENT`, §22.5), and nothing checks it after that.
 
 ### 22.8 Verification and probe suggestion
 
