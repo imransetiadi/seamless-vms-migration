@@ -49,7 +49,7 @@ Today's tooling forces painful trade-offs:
 | G5 | Operability | Every action audited; live progress in the dashboard; Prometheus metrics |
 | G6 | Assisted decisions | Jev-based advisor for strategy ties, wave classification and post-cutover review; agentmemory recall of similar past incidents |
 | G7 | Destination choice (0.2.0) | Besides RHOSO 18.0, every community OpenStack release series from 2023.1 Antelope to 2026.2 Hibiscus is a destination, by the support tiers of SDD §21: each strategy a destination's capabilities allow runs as on RHOSO 18.0; each Tier 1 series (the upstream-Maintained 2025.1 Epoxy, 2025.2 Flamingo, 2026.1 Gazpacho and 2026.2 Hibiscus) passes the destination lab matrix before a release; every destination's series, tier and missing capabilities are shown before a plan runs |
-| G8 | GPU workloads (0.3.0, Technology Preview) | VMs with an NVIDIA vGPU (MIG-backed profiles included) or a passed-through GPU migrate with an explicit GPU mapping instead of being blocked (SDD §22): the GPU rules of SDD §22 hold in simulation for 0.3.0 (the demo's GPU VMs through mapping, validation, the cutover gate's wait, cutover and verification), and the lab cases LAB-G01–LAB-G08 pass on GPU hosts before the Technology Preview label goes |
+| G8 | GPU workloads (0.3.0, Technology Preview) | VMs with an NVIDIA vGPU (MIG-backed profiles included) or a passed-through GPU migrate with an explicit GPU mapping instead of being blocked (SDD §22): the GPU rules of SDD §22 hold in simulation for 0.3.0 (the demo's GPU VMs through mapping, validation, the cutover gate's wait, cutover and verification), and the lab cases LAB-GPU01–LAB-GPU08 pass on GPU hosts before the Technology Preview label goes |
 
 ### Non-goals (0.1.0)
 
@@ -155,7 +155,7 @@ for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview unti
 | FR-38 | GPU pre-flight: the GPU findings, with the plan's GPU demand counted against the free capacity per pool | M3 | The SDD §22.5 codes implemented and unit-tested; a plan that does not fit is blocked before its first copy |
 | FR-39 | The cutover gate reads the GPU capacity again before the source stops | M3 | With no room the migration waits and keeps syncing, and its source never stops (SDD §22.7) |
 | FR-40 | GPU verification: the server holds its GPU flavor and its allocations, and the DCGM exporter's port is suggested as a probe | M3 | A server created without its GPU fails the verification, and the plan's automatic rollback rolls it back (SDD §22.8) |
-| FR-41 | Technology Preview: every GPU surface says so, and no text claims hardware validation | M3 | The label stays until LAB-G01–LAB-G08 pass on GPU hosts (SDD §22.14) |
+| FR-41 | Technology Preview: every GPU surface says so, and no text claims hardware validation | M3 | The label stays until LAB-GPU01–LAB-GPU08 pass on GPU hosts (SDD §22.14) |
 
 ## 7. Non-functional requirements
 
@@ -185,7 +185,7 @@ for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview unti
 * Time to plan a 100-VM migration (inventory → validated plan) ≤ 1 hour.
 * 0.2.0: every Tier 1 community series passes the destination lab matrix (QASuite §6.7, §7.1) with the
   same downtime and success targets as RHOSO 18.0.
-* 0.3.0: no GPU VM's source stops without a capacity read that found room for its GPU (SDD §22.7); LAB-G01–LAB-G08
+* 0.3.0: no GPU VM's source stops without a capacity read that found room for its GPU (SDD §22.7); LAB-GPU01–LAB-GPU08
   pass on GPU hosts before the Technology Preview label goes.
 
 ## 9. Release plan
@@ -233,8 +233,8 @@ for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview unti
 | Upstream API changes in new series (compute 2.101–2.104 change attach status codes, drop flavor fields and `os-volumes_boot`) | A newer SDK or cloud breaks a call | openstacksdk's per-resource microversion caps (SDD §21.7); recorded version documents in contract tests; the window moves only after the lab matrix passes |
 | Community clouds without TLS, or with private CAs | Credentials or guest data in clear text | `verify_tls` on by default, CA bundle per provider; the check reports plain-HTTP endpoints (`tls`, `plain_http`, SDD §10, Security.md) |
 | Credentials exposure | Security incident | Secrets in mounted files or the platform secret store (written once through the API, never read back), 0600 temp files for playbooks; redaction; Security.md controls |
-| A GPU taken between the cutover gate's read and the server's creation | The cutover fails after the source stopped | The capacity read right before the stop (SDD §22.7), the automatic rollback, LAB-G06 |
-| A guest's NVIDIA driver does not suit the destination host's vGPU manager | The GPU does not work after the cutover | `GUEST_GPU_DRIVER` before the plan runs, a test migration first, the verification's GPU checks, LAB-G08 (SDD §22.5) |
+| A GPU taken between the cutover gate's read and the server's creation | The cutover fails after the source stopped | The capacity read right before the stop (SDD §22.7), the automatic rollback, LAB-GPU06 |
+| A guest's NVIDIA driver does not suit the destination host's vGPU manager | The GPU does not work after the cutover | `GUEST_GPU_DRIVER` before the plan runs, a test migration first, the verification's GPU checks, LAB-GPU08 (SDD §22.5) |
 | vSphere takes no snapshot of a VM with a DirectPath I/O GPU | No warm migration for such VMs | `vmware_warm` ineligible, `vmware_cold` while the VM is powered off (SDD §22.6) |
 
 ## 12. Glossary
