@@ -5,7 +5,7 @@ import { useCheckProvider, useCreateProvider, useInventory, useSetConversionKey,
 import type { ConversionHostConfig, Distribution, Provider, ProviderCredentials, ProviderPatch, ProviderRole } from '../api/types';
 import { cn } from '../lib/cn';
 import { DISTRIBUTION_PRESETS, presetFor, slugify, type CredentialMode, type DistributionPreset } from '../lib/distributions';
-import { formatRelative } from '../lib/format';
+import { formatRelative, namesText } from '../lib/format';
 import { inventoryGpuFlavors, sameVgpuProfiles, vgpuProfileErrors, vgpuProfileMap, type VgpuProfileRow } from '../lib/gpu';
 import { RELEASE_CHOICES, seriesText } from '../lib/platforms';
 import { isBlank, providerLabel } from '../lib/providerUse';
@@ -204,11 +204,6 @@ function Section({
   );
 }
 
-/** "A, B and C". */
-function namesText(names: readonly string[]): string {
-  return names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : (names[0] ?? '');
-}
-
 /**
  * The vGPU profiles an OpenStack or RHOSO provider declares for its GPU flavors, as rows of a flavor and the profile it
  * gives (SDD §16, §22.3): each Flavor field suggests the provider's GPU flavors not declared yet, once its inventory is
@@ -237,6 +232,7 @@ function VgpuProfiles({
 }) {
   const declared = new Set(rows.map((row) => row.flavor.trim()));
   const listId = fieldId('gpuFlavors');
+  const hintId = fieldId('gpuFlavorsHint');
   const set = (key: number, patch: Partial<VgpuProfileRow>) => onChange(rows.map((row) => (row.key === key ? { ...row, ...patch } : row)));
   return (
     <Section
@@ -245,7 +241,9 @@ function VgpuProfiles({
       headingRef={headingRef}
       description="The NVIDIA vGPU profile each GPU flavor gives, such as A100-4C: no OpenStack API names it. A flavor that asks for a CUSTOM_ resource class counts as a vGPU only once its profile is declared."
     >
-      <p className="text-xs text-muted-foreground">{hint}</p>
+      <p id={hintId} className="text-xs text-muted-foreground">
+        {hint}
+      </p>
       {offered.length > 0 && (
         <datalist id={listId}>
           {offered
@@ -274,6 +272,7 @@ function VgpuProfiles({
                   onChange={(e) => set(row.key, { flavor: e.target.value })}
                   // no autoComplete="off": a browser may then hide the list's suggestions
                   list={offered.length > 0 ? listId : undefined}
+                  aria-describedby={hintId}
                   placeholder="e.g. g1.a100-4c"
                   error={errors[`gpuFlavor-${row.key}`]}
                   inputClassName="font-mono"
@@ -320,6 +319,27 @@ function VgpuProfiles({
       </div>
     </Section>
   );
+}
+
+/** The problems of the form's vGPU profile rows, each on its field (SDD §16). */
+function rowProblems(rows: readonly VgpuProfileRow[]): Errors {
+  const problems: Errors = {};
+  for (const { key, field, message } of vgpuProfileErrors(rows)) {
+    const at: FieldKey = field === 'flavor' ? `gpuFlavor-${key}` : `gpuProfile-${key}`;
+    problems[at] = message;
+  }
+  return problems;
+}
+
+/**
+ * The form's problems with its vGPU profile rows judged again (SDD §16): unchanged while the summary holds none of
+ * theirs; else theirs as `rows` give them now, or none when the rows are gone with a switch to vCenter (null).
+ */
+function judgedAgain(errors: Errors, rows: readonly VgpuProfileRow[] | null): Errors {
+  const isRow = (field: string) => field.startsWith('gpuFlavor-') || field.startsWith('gpuProfile-');
+  if (!Object.keys(errors).some(isRow)) return errors;
+  const kept = Object.fromEntries(Object.entries(errors).filter(([field]) => !isRow(field))) as Errors;
+  return { ...kept, ...rowProblems(rows ?? []) };
 }
 
 /** The platform mark: two letters in a square, the one memorable element of the provider UI. */
@@ -460,8 +480,9 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
   const setCredentials = useSetProviderCredentials();
   const setKey = useSetConversionKey();
   const check = useCheckProvider();
-  // the provider's GPU flavors, which its vGPU profiles name: read with its inventory while it is edited (SDD §16)
-  const inventory = useInventory(open && current && current.kind !== 'vmware' ? current.id : undefined);
+  // the provider's GPU flavors, which its vGPU profiles name: read with its inventory while the form shows and nothing
+  // saves - each step of a save would read it again, for a source every VM, for a destination Placement too (SDD §16)
+  const inventory = useInventory(open && !busy && !outcome && current && current.kind !== 'vmware' ? current.id : undefined);
   const gpuHeadingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
@@ -500,13 +521,17 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         ? "Its inventory could not be read, so no GPU flavor is offered: type each flavor's name."
         : 'Reading its inventory for its GPU flavors.';
   const removeGpuProfile = (key: number) => {
-    setForm((f) => ({ ...f, gpuProfiles: f.gpuProfiles.filter((row) => row.key !== key) }));
-    // its problems go with it, and the focus moves to the section's heading, never to the page (SDD §16)
-    setErrors((e) => Object.fromEntries(Object.entries(e).filter(([field]) => field !== `gpuFlavor-${key}` && field !== `gpuProfile-${key}`)) as Errors);
+    const rows = form.gpuProfiles.filter((row) => row.key !== key);
+    setForm((f) => ({ ...f, gpuProfiles: rows }));
+    // its problems go with it and the rows left are judged again, as they renumber; the focus moves to the section's
+    // heading, never to the page (SDD §16)
+    setErrors((e) => judgedAgain(e, rows));
     gpuHeadingRef.current?.focus();
   };
 
-  const choosePreset = (next: DistributionPreset) =>
+  const choosePreset = (next: DistributionPreset) => {
+    // a vCenter's form has no vGPU profiles: their problems go with them, as their fields do (SDD §16)
+    if (next.kind === 'vmware') setErrors((e) => judgedAgain(e, null));
     setForm((f) => ({
       ...f,
       distribution: next.id,
@@ -514,6 +539,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       mode: next.credentialModes.includes(f.mode) ? f.mode : (next.credentialModes[0] ?? 'password'),
       hostManaged: editing ? f.hostManaged : next.managedConversionHost,
     }));
+  };
 
   const setName = (value: string) =>
     setForm((f) => ({ ...f, name: value, id: f.idTouched || editing ? f.id : slugify(value) }));
@@ -557,13 +583,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       e.privateKey = 'This is not an OpenSSH or PEM private key (it must start with -----BEGIN … PRIVATE KEY-----).';
     }
     // what the API refuses of a declared vGPU profile, and a flavor declared twice (SDD §4.2, §16, §22.3)
-    if (declaresGpuProfiles) {
-      for (const { key, field, message } of vgpuProfileErrors(form.gpuProfiles)) {
-        const at: FieldKey = field === 'flavor' ? `gpuFlavor-${key}` : `gpuProfile-${key}`;
-        e[at] = message;
-      }
-    }
-    return e;
+    return declaresGpuProfiles ? { ...e, ...rowProblems(form.gpuProfiles) } : e;
   };
 
   const conversionHost = (): ConversionHostConfig | null => {

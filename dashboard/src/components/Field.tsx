@@ -114,11 +114,13 @@ export function SelectField({
 type TextFieldProps = FieldChrome & Omit<InputHTMLAttributes<HTMLInputElement>, 'className'> & { inputClassName?: string };
 
 export const TextField = forwardRef<HTMLInputElement, TextFieldProps>(function TextField(
-  { label, hint, error, required, className, liveError, inputClassName, id: idProp, ...rest },
+  { label, hint, error, required, className, liveError, inputClassName, id: idProp, 'aria-describedby': alsoDescribedBy, ...rest },
   ref,
 ) {
   const generated = useId();
   const id = idProp ?? generated;
+  // a text that describes several fields (a section's hint) joins the field's own hint or error, never replaces it
+  const described = [describedBy(id, hint, error), alsoDescribedBy].filter(Boolean).join(' ') || undefined;
   return (
     <Chrome id={id} label={label} hint={hint} error={error} required={required} className={className} liveError={liveError}>
       <input
@@ -126,7 +128,7 @@ export const TextField = forwardRef<HTMLInputElement, TextFieldProps>(function T
         id={id}
         className={cn('input', inputClassName)}
         aria-invalid={error ? true : undefined}
-        aria-describedby={describedBy(id, hint, error)}
+        aria-describedby={described}
         aria-required={required || undefined}
         {...rest}
       />

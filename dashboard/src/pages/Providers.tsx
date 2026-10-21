@@ -15,7 +15,7 @@ import { ProviderStatusBadge } from '../components/StatusBadge';
 import { TechPreviewBadge } from '../components/TechPreviewBadge';
 import { buttonClassName } from '../lib/buttonStyles';
 import { cn } from '../lib/cn';
-import { formatDateTime, formatRelative } from '../lib/format';
+import { formatDateTime, formatRelative, namesText } from '../lib/format';
 import { checkedGpuCapacity, gpuCapacityReason, poolFreeText, poolLabel } from '../lib/gpu';
 import { deleteRefusal, plansThatNeed, providerLabel } from '../lib/providerUse';
 import { hasRole } from '../lib/roles';
@@ -425,12 +425,6 @@ function ProviderCard({
 }
 
 const SUMMARY_ORDER: Array<Provider['status']> = ['ok', 'degraded', 'error', 'unknown'];
-
-/** "A, B and C", or "A, B, C and 2 more" past `limit` names. */
-function namesText(names: string[], limit = 3): string {
-  if (names.length > limit) return `${names.slice(0, limit).join(', ')} and ${names.length - limit} more`;
-  return names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : (names[0] ?? '');
-}
 
 /** One line an operator reads first: how many clouds are healthy, and a way to re-check all. */
 function FleetSummary({ providers, canCheck, onAnnounce }: { providers: Provider[]; canCheck: boolean; onAnnounce: (message: string) => void }) {

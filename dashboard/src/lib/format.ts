@@ -160,6 +160,12 @@ export function byCodePoint(a: string, b: string): number {
   return x.length - y.length;
 }
 
+/** "A, B and C", or "A, B, C and 2 more" past `limit` names, as the dashboard lists names in a sentence. */
+export function namesText(names: readonly string[], limit = 3): string {
+  if (names.length > limit) return `${names.slice(0, limit).join(', ')} and ${names.length - limit} more`;
+  return names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : (names[0] ?? '');
+}
+
 /** Names listed as the API's messages list them: Python's `", ".join(sorted(set(items)))`. */
 export function pyNames(items: Iterable<string>): string {
   return [...new Set(items)].sort(byCodePoint).join(', ');

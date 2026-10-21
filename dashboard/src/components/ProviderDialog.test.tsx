@@ -67,6 +67,18 @@ describe('ProviderDialog: what a destination declares (SDD §4.2, §16; plan T8)
 });
 
 describe('ProviderDialog: declared vGPU profiles (SDD §16, §22.3; plan task G11)', () => {
+  /** Every request the page sends, and the bodies of its writes. */
+  const record = (server: ReturnType<typeof createTestServer>) => {
+    const calls: string[] = [];
+    const bodies: Array<{ method: string; path: string; body: unknown }> = [];
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) => {
+      calls.push(`${method} ${path}`);
+      if (method !== 'GET') bodies.push({ method, path, body });
+      return handle(method, path, query, body, token);
+    };
+    return { calls, bodies };
+  };
   /** The flavors a Flavor field suggests: the options of its datalist. */
   const offered = (field: HTMLElement): string[] => {
     const list = field.getAttribute('list');
@@ -140,29 +152,28 @@ describe('ProviderDialog: declared vGPU profiles (SDD §16, §22.3; plan task G1
   it('offers no vGPU profiles for a vCenter', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
-    const created: unknown[] = [];
-    const handle = server.handle.bind(server);
-    server.handle = (method, path, query, body, token) => {
-      if (method === 'POST' && path === '/providers') created.push(body);
-      return handle(method, path, query, body, token);
-    };
+    const { calls, bodies } = record(server);
     renderPage(server);
-    // vCenter reports each VM's own vGPU profile (§22.3): its form has none
+    // vCenter reports each VM's own vGPU profile (§22.3): its form has none, and reads no inventory for them
     const hq = await screen.findByRole('article', { name: 'vCenter HQ' });
     await user.click(within(hq).getByRole('button', { name: /^edit /i }));
     let dialog = await screen.findByRole('dialog', { name: /edit vcenter hq/i });
     expect(within(dialog).queryByRole('region', { name: 'vGPU profiles' })).not.toBeInTheDocument();
     expect(within(dialog).queryByRole('button', { name: 'Add vGPU profile' })).not.toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(calls).not.toContain('GET /providers/vcenter-hq/inventory');
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
-    // pairs typed for an OpenStack platform go once vCenter is chosen, and the new vCenter is sent none
+    // pairs typed for an OpenStack platform go once vCenter is chosen - their problems too -, and none is sent
     await user.click(screen.getByRole('button', { name: /^add provider$/i }));
     dialog = await screen.findByRole('dialog', { name: /^add provider$/i });
     const section = within(dialog).getByRole('region', { name: 'vGPU profiles' });
     await user.click(within(section).getByRole('button', { name: 'Add vGPU profile' }));
     await user.type(within(section).getByLabelText('Flavor 1'), 'g1.a100-4c');
-    await user.type(within(section).getByLabelText('Profile 1'), 'A100-4C');
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Enter the profile of vGPU profile 1, such as A100-4C.');
     await user.click(within(dialog).getByRole('radio', { name: /vmware vcenter/i }));
     expect(within(dialog).queryByRole('region', { name: 'vGPU profiles' })).not.toBeInTheDocument();
+    expect(within(dialog).getByRole('alert')).not.toHaveTextContent(/vGPU profile/);
     await user.type(within(dialog).getByLabelText(/^name/i), 'vCenter DC7');
     await user.type(within(dialog).getByLabelText(/vcenter url/i), 'https://vcenter.dc7.example.com/sdk');
     await user.click(within(dialog).getByRole('radio', { name: 'Secret managed outside Seamless' }));
@@ -171,8 +182,10 @@ describe('ProviderDialog: declared vGPU profiles (SDD §16, §22.3; plan task G1
     await user.type(within(dialog).getByLabelText(/^address/i), '198.51.100.79');
     await user.click(within(dialog).getByRole('radio', { name: 'Key in a secret managed outside Seamless' }));
     await user.type(within(dialog).getByLabelText(/^key secret name/i), 'conv-dc7-key');
+    // the hidden row, its profile still empty, is judged no more
     await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const created = bodies.filter((b) => b.method === 'POST' && b.path === '/providers').map((b) => b.body);
     expect(created).toHaveLength(1);
     expect(created[0]).toMatchObject({ id: 'vcenter-dc7', kind: 'vmware' });
     expect(created[0]).not.toHaveProperty('gpu_profiles');
@@ -181,13 +194,14 @@ describe('ProviderDialog: declared vGPU profiles (SDD §16, §22.3; plan task G1
   it('refuses what the API would refuse before anything is sent, and sends the profiles only when they changed (SDD §12)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
+    const { bodies } = record(server);
     const lab = server.providers.find((p) => p.id === 'community-lab')!;
     lab.gpu_profiles = { 'g1.a100-4c': 'A100-4C', 'g1.a100-3-20c': 'A100-3-20C' };
     renderPage(server);
     const card = await screen.findByRole('article', { name: 'OpenStack Lab (2023.1)' });
     await user.click(within(card).getByRole('button', { name: /^edit /i }));
-    const dialog = await screen.findByRole('dialog', { name: /edit openstack lab/i });
-    const section = within(dialog).getByRole('region', { name: 'vGPU profiles' });
+    let dialog = await screen.findByRole('dialog', { name: /edit openstack lab/i });
+    let section = within(dialog).getByRole('region', { name: 'vGPU profiles' });
     // its cloud answers HTTP 503: nothing is offered, and nothing reads as all clear
     expect(await within(section).findByText("Its inventory could not be read, so no GPU flavor is offered: type each flavor's name.")).toBeInTheDocument();
     // a flavor declared twice, an empty flavor and profile, and a profile over 64 characters are named, nothing sent
@@ -198,7 +212,8 @@ describe('ProviderDialog: declared vGPU profiles (SDD §16, §22.3; plan task G1
     await user.paste('A'.repeat(65));
     await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
     const summary = await within(dialog).findByRole('alert');
-    expect(within(summary).getAllByRole('link').map((link) => link.textContent)).toEqual([
+    const problems = () => within(within(dialog).getByRole('alert')).getAllByRole('link').map((link) => link.textContent);
+    expect(problems()).toEqual([
       'g1.a100-4c is declared twice: change or remove vGPU profile 3.',
       'Enter the profile of vGPU profile 3, such as A100-4C.',
       'Enter the flavor of vGPU profile 4, or remove it.',
@@ -212,14 +227,17 @@ describe('ProviderDialog: declared vGPU profiles (SDD §16, §22.3; plan task G1
     expect(long).toHaveFocus();
     expect(long).toHaveAttribute('aria-invalid', 'true');
     expect(long).toHaveAccessibleDescription('Shorten the profile of vGPU profile 4: at most 64 characters.');
-    // a removed row takes its problems with it
+    // a Flavor field's own problem comes first, then the section's hint
+    expect(within(section).getByLabelText('Flavor 3')).toHaveAccessibleDescription(
+      "g1.a100-4c is declared twice: change or remove vGPU profile 3. Its inventory could not be read, so no GPU flavor is offered: type each flavor's name.",
+    );
+    // a removed row takes its problems with it, and the rows left are judged again: no twin is left, the rows renumber
     await user.click(within(section).getByRole('button', { name: 'Remove vGPU profile 4' }));
-    await user.click(within(section).getByRole('button', { name: 'Remove vGPU profile 3' }));
-    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
-    // a pair removed and declared again is the same map in another order: a PATCH would reset the check for nothing
+    expect(problems()).toEqual(['g1.a100-4c is declared twice: change or remove vGPU profile 3.', 'Enter the profile of vGPU profile 3, such as A100-4C.']);
     await user.click(within(section).getByRole('button', { name: 'Remove vGPU profile 1' }));
-    await user.click(within(section).getByRole('button', { name: 'Add vGPU profile' }));
-    await user.type(within(section).getByLabelText('Flavor 2'), 'g1.a100-4c');
+    expect(problems()).toEqual(['Enter the profile of vGPU profile 2, such as A100-4C.']);
+    expect(within(section).getByLabelText('Flavor 2')).not.toHaveAttribute('aria-invalid');
+    // the pair removed and declared again is the same map in another order: a PATCH would reset the check for nothing
     await user.type(within(section).getByLabelText('Profile 2'), 'A100-4C');
     const region = within(dialog).getByLabelText(/^region/i);
     await user.clear(region);
@@ -228,5 +246,65 @@ describe('ProviderDialog: declared vGPU profiles (SDD §16, §22.3; plan task G1
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(server.events.filter((e) => e.kind === 'provider.updated').at(-1)?.data).toEqual({ provider_id: 'community-lab', fields: ['region'] });
     expect(server.providers.find((p) => p.id === 'community-lab')?.gpu_profiles).toEqual({ 'g1.a100-4c': 'A100-4C', 'g1.a100-3-20c': 'A100-3-20C' });
+    // every pair removed: the map is sent empty, which clears the declaration
+    await user.click(within(card).getByRole('button', { name: /^edit /i }));
+    dialog = await screen.findByRole('dialog', { name: /edit openstack lab/i });
+    section = within(dialog).getByRole('region', { name: 'vGPU profiles' });
+    await user.click(within(section).getByRole('button', { name: 'Remove vGPU profile 2' }));
+    await user.click(within(section).getByRole('button', { name: 'Remove vGPU profile 1' }));
+    expect(section).toHaveTextContent('No vGPU profile declared.');
+    await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(bodies.filter((b) => b.method === 'PATCH').at(-1)?.body).toEqual({ gpu_profiles: {} });
+    expect(server.providers.find((p) => p.id === 'community-lab')?.gpu_profiles).toEqual({});
+  });
+
+  it('reads the inventory while the form shows and nothing saves, says so while it reads, and describes each Flavor field with it', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const { calls } = record(server);
+    const reads = (id: string) => calls.filter((call) => call === `GET /providers/${id}/inventory`).length;
+    // the read waits until the test lets it through
+    let release: () => void = () => {};
+    let hold: Promise<void> | null = new Promise<void>((resolve) => (release = resolve));
+    const wrapFetch = (fetchImpl: typeof fetch): typeof fetch => async (input, init) => {
+      if (hold && String(input).endsWith('/inventory')) await hold;
+      return fetchImpl(input, init);
+    };
+    renderWithApp(<Providers />, { route: '/providers', path: '/providers', token: 'admin', server, wrapFetch });
+    const hibiscus = await screen.findByRole('article', { name: 'OpenStack 2026.2 Hibiscus (DC3)' });
+    await user.click(within(hibiscus).getByRole('button', { name: /^edit /i }));
+    let dialog = await screen.findByRole('dialog');
+    const section = within(dialog).getByRole('region', { name: 'vGPU profiles' });
+    expect(within(section).getByText('Reading its inventory for its GPU flavors.')).toBeInTheDocument();
+    expect(within(section).getByLabelText('Flavor 1')).toHaveAccessibleDescription('Reading its inventory for its GPU flavors.');
+    release();
+    hold = null;
+    const offered = 'Its GPU flavors: g1.a100-3-20c, g1.a100-4c and p1.a100. Each Flavor field offers those not declared yet.';
+    expect(await within(section).findByText(offered)).toBeInTheDocument();
+    expect(within(section).getByLabelText('Flavor 2')).toHaveAccessibleDescription(offered);
+    expect(reads('hibiscus-dc3')).toBe(1);
+    // a save's steps and the test's result read nothing: for a source the read lists every VM, for a destination it asks Placement
+    const region = within(dialog).getByLabelText(/^region/i);
+    await user.clear(region);
+    await user.type(region, 'RegionTwo');
+    await user.click(within(dialog).getByRole('button', { name: /^save and test connection$/i }));
+    const result = await screen.findByRole('dialog', { name: /is connected|did not pass/i });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(reads('hibiscus-dc3')).toBe(1);
+    await user.click(within(result).getByRole('button', { name: /^done$/i }));
+    // nor does a new provider's: added, its credentials stored and tested, it has not been read
+    await user.click(screen.getByRole('button', { name: /^add provider$/i }));
+    dialog = await screen.findByRole('dialog', { name: /^add provider$/i });
+    await user.click(within(dialog).getByRole('radio', { name: /kolla-ansible/i }));
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Kolla GPU');
+    await user.type(within(dialog).getByLabelText(/keystone url/i), 'https://kolla-gpu.example.com:5000/v3');
+    await user.type(within(dialog).getByLabelText(/^user name/i), 'svc-migrate');
+    await user.type(within(dialog).getByLabelText(/^password/i), 'Hunter2-secret');
+    await user.type(within(dialog).getByLabelText(/^project$/i), 'admin');
+    await user.click(within(dialog).getByRole('button', { name: /^add and test connection$/i }));
+    await screen.findByRole('dialog', { name: /kolla gpu is connected/i });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(reads('kolla-gpu')).toBe(0);
   });
 });
