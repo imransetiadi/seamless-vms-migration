@@ -69,6 +69,22 @@ describe('Plans page', () => {
     expect(server.plans.find((p) => p.name === 'ML exit')!.mappings.gpus).toEqual({ 'grid_a100-4c': 'g1.a100-4c' });
   });
 
+  it.each(['__proto__', 'constructor'])('maps a GPU key named %s as any other, by own key (SDD §22.4, G12 review)', async (key) => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    withVmwareGpuVm(server, 'vm-5012', 'odd-gpu-01', [gpuDevice({ kind: 'vgpu', profile: key })]);
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+    const dialog = await newPlan(user, 'Odd key', 'vcenter-hq');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select odd-gpu-01' }));
+    const row = within(dialog).getByRole('combobox', { name: `${key}: 1 VM, 2 vCPUs, 4 GiB` });
+    await within(row).findByRole('option', { name: /^g1\.a100-4c:/ });
+    await user.selectOptions(row, 'g1.a100-4c');
+    expect(row).toHaveValue('g1.a100-4c');
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Odd key')).toBe(true));
+    expect(Object.entries(server.plans.find((p) => p.name === 'Odd key')!.mappings.gpus ?? {})).toEqual([[key, 'g1.a100-4c']]);
+  });
+
   it('marks the VMs a GPU flavor does not fit', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

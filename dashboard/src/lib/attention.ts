@@ -36,6 +36,8 @@ export interface AttentionItem {
   nextAction: string;
   /** Lower is more urgent. */
   rank: number;
+  /** A GPU element, which carries the Technology Preview badge (SDD §16, §22.11). */
+  techPreview?: true;
 }
 
 function windowState(plan: Plan | undefined, now: number): 'none' | 'open' | 'closed' {
@@ -72,6 +74,18 @@ function gateItem(m: AttentionMigration, plan: Plan | undefined, now: number, ra
     };
   }
   return null;
+}
+
+/** A cutover that waits for GPU capacity, its source running (SDD §16, §22.7): a wait, a GPU element. */
+function gpuWaitItem(m: AttentionMigration, wait: NonNullable<AttentionMigration['gpu_wait']>): AttentionItem {
+  return {
+    migration: m,
+    tone: 'info',
+    reason: gpuWaitSummary(wait),
+    nextAction: 'Wait, or free GPU capacity on the destination: the cutover starts once a read finds room',
+    rank: 6,
+    techPreview: true,
+  };
 }
 
 /**
@@ -149,15 +163,12 @@ export function attentionItems(
         rank: 3,
       };
     } else if (m.gpu_wait && GPU_WAIT_PHASES.has(m.phase)) {
-      // a capacity read is made once the gate's other rules hold (SDD §5.4 rule 5): its approvals are in, and it is a
-      // wait, ranked with the window's, its source still running (§16, §22.7)
-      item = {
-        migration: m,
-        tone: 'info',
-        reason: gpuWaitSummary(m.gpu_wait),
-        nextAction: 'Wait, or free GPU capacity on the destination: the cutover starts once a read finds room',
-        rank: 6,
-      };
+      // a capacity read is made once the gate's other rules hold (SDD §5.4 rule 5), and its wait stays until the migration
+      // leaves its gate: while one no longer holds, that is what it waits for, in the gate's order - an approval that does
+      // not count is Pending approvals' -; else it is a wait, ranked with the window's, its source still running (§16, §22.7)
+      const approvalMissing = Boolean(plan?.require_approval) && plan !== undefined && countedApprovals(m, plan).length === 0;
+      const wait = m.gpu_wait;
+      item = plan ? (gateItem(m, plan, now, 3) ?? (approvalMissing ? null : gpuWaitItem(m, wait))) : gpuWaitItem(m, wait);
     } else if (m.phase === 'awaiting_cutover') {
       item =
         plan || !plansUnknown

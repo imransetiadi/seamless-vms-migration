@@ -97,6 +97,9 @@ describe('PlanDetail', () => {
     const phase = within(row).getAllByRole('cell')[0]!;
     expect(phase).toHaveTextContent('Waiting for GPU capacity');
     expect(within(table).getAllByText('Waiting for GPU capacity')).toHaveLength(1);
+    // a GPU element: its Technology Preview badge in words, a focusable term (SDD §16, §22.11)
+    expect(within(phase).getByRole('button', { name: 'Technology Preview' })).toBeInTheDocument();
+    expect(within(table).getAllByRole('button', { name: 'Technology Preview' })).toHaveLength(1);
   });
 
   it("names a destination stored with a blank name by its id in the plan's settings (SDD §1 naming, §4.2, review RV21-06)", async () => {
@@ -1645,19 +1648,21 @@ describe('PlanDetail', () => {
     expect(saved.mappings.gpus).toEqual({ 'grid_a100-4c': 'g1.a100-4c' });
   });
 
-  it('counts only the mappings it lists: GPU mappings wait for G12 (SDD §16, §22.11, PR #57 review)', async () => {
+  it('lists and counts a plan\'s GPU mappings with its other mappings, with their Technology Preview badge (SDD §16, §22.11, PR #57 review, G12 review)', async () => {
+    const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
-    // set through the API or `seamless plan apply`: the page lists GPU mappings from plan task G12 on
     const gpus = { 'grid_a100-4c': 'g1.a100-4c' };
     plan.mappings = { networks: { 'app-net': 'tenant-app', 'db-net': 'tenant-db' }, flavors: {}, volume_types: {}, projects: {}, gpus };
     const first = renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
-    expect(await screen.findByText('2 source → destination mappings')).toBeInTheDocument();
+    expect(await screen.findByText('3 source → destination mappings')).toBeInTheDocument();
     first.unmount();
-    // GPU mappings alone: no Mappings entry that opens onto an empty list
+    // GPU mappings alone are a Mappings entry too, listed by kind with their badge
     plan.mappings = { networks: {}, flavors: {}, volume_types: {}, projects: {}, gpus };
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
-    await screen.findByRole('group', { name: /plan actions/i });
-    expect(screen.queryByText(/source → destination mapping/)).not.toBeInTheDocument();
+    await user.click(await screen.findByText('1 source → destination mapping'));
+    const list = screen.getByText('GPUs', { selector: 'p' }).parentElement!;
+    expect(list).toHaveTextContent('grid_a100-4c → g1.a100-4c');
+    expect(within(list).getByRole('button', { name: 'Technology Preview' })).toBeInTheDocument();
   });
 });

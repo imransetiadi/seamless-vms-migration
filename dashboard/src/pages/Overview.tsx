@@ -25,6 +25,7 @@ import { PhaseDistribution } from '../components/PhaseDistribution';
 import { ProgressBar } from '../components/ProgressBar';
 import { LoadingBlock, Skeleton } from '../components/Skeleton';
 import { PhaseBadge, PlanStatusBadge } from '../components/StatusBadge';
+import { TechPreviewBadge } from '../components/TechPreviewBadge';
 import { ThroughputChart } from '../components/ThroughputChart';
 import { Unavailable } from '../components/Unavailable';
 import { attentionItems } from '../lib/attention';
@@ -202,6 +203,7 @@ function NeedsAttention({ migrations, plans, plansUnknown }: { migrations: Migra
                         {item.migration.vm.name}
                       </Link>
                       <PhaseBadge phase={item.migration.phase} />
+                      {item.techPreview && <TechPreviewBadge />}
                     </div>
                     <p className="mt-0.5 wrap-break-word text-sm text-foreground">{item.reason}</p>
                     <p className="text-xs text-muted-foreground">Next: {item.nextAction}</p>

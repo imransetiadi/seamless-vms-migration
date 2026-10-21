@@ -218,5 +218,35 @@ describe('attentionItems', () => {
     billing.cutover_refusals = [];
     // a summary carries it as the migration does (SDD §4.2)
     expect(attentionItems([summaryOf(billing)], plans, NOW)[0]?.reason).toBe(find()?.reason);
+    // the entry is a GPU element: it carries the Technology Preview badge (SDD §16)
+    expect(find()?.techPreview).toBe(true);
+    expect(attentionItems(fx.migrations, plans, NOW).filter((i) => i.techPreview).map((i) => i.migration)).toEqual([billing]);
+  });
+
+  it('lists what the gate waits for first while its other rules no longer hold beside a wait for GPU capacity (SDD §5.4, §16, G12 review)', () => {
+    const { fx, plans, byName } = scenario();
+    const billing = byName('app-billing-01');
+    const plan = plans.get(billing.plan_id)!;
+    plan.cutover_window = null;
+    billing.approvals = [{ actor: 'sari', at: '2026-10-08T11:59:00Z', comment: null }];
+    billing.cutover_requested = true;
+    billing.gpu_wait = { since: '2026-10-08T11:58:00Z', checked_at: '2026-10-08T11:59:30Z', pool: 'VGPU', needed: 1, free: 0, reason: 'VGPU of RHOSO 18.0 — Production has 0 units free' };
+    const find = () => attentionItems(fx.migrations, plans, NOW).find((i) => i.migration === billing);
+    expect(find()?.reason).toMatch(/^Waiting for GPU capacity/);
+    // the window closed again: the gate reads no capacity until it opens, its wait stays as it was
+    plan.cutover_window = { start: '2026-10-08T20:00:00Z', end: '2026-10-08T23:00:00Z' };
+    expect(find()?.reason).toMatch(/^Waiting for the cutover window/);
+    expect(find()?.techPreview).toBeUndefined();
+    plan.cutover_window = null;
+    // no cutover request any more: the request is what it waits for
+    billing.cutover_requested = false;
+    expect(find()?.reason).toBe('Approved — waiting for a cutover request');
+    billing.cutover_requested = true;
+    // an approval that does not count is Pending approvals', listed once there
+    billing.approvals = [];
+    expect(find()).toBeUndefined();
+    expect(pendingApprovals(fx.migrations, plans).items.map((i) => i.migration)).toContain(billing);
+    // without its plan nothing tells: the wait is what it records
+    expect(attentionItems(fx.migrations, new Map(), NOW, { plansUnknown: true }).find((i) => i.migration === billing)?.reason).toMatch(/^Waiting for GPU capacity/);
   });
 });

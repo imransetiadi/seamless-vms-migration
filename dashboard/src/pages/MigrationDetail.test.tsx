@@ -147,6 +147,50 @@ describe('MigrationDetail', () => {
     observer.disconnect();
   });
 
+  it('says a VM without a GPU of its own found room once its validation ran without a capacity finding (SDD §16, G12 review)', async () => {
+    const server = createTestServer();
+    // a flavor mapping sends a VM without a GPU to the vGPU flavor: no MAP_GPU_FLAVOR, and room at its validation
+    const m = await validatedMigration(server, {
+      source_provider_id: 'rhosp17-dc1',
+      vm_ids: ['os-0b21'],
+      mappings: { networks: {}, flavors: { 'm1.medium': 'g1.a100-4c' }, volume_types: {}, projects: {} },
+    });
+    expect(m.findings.map((f) => f.code)).not.toContain('MAP_GPU_FLAVOR');
+    // its verification checked the flavor's GPU, which shows the panel
+    m.verification = { at: '2026-10-08T12:00:00Z', passed: true, checks: [{ name: 'gpu_flavor', ok: true, detail: "flavor 'g1.a100-4c' asks for VGPU 1" }], probes: [], warnings: [] };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const panel = await screen.findByRole('region', { name: /^GPU/ });
+    const row = (term: string) => within(panel).getByText(term, { selector: 'dt' }).nextElementSibling as HTMLElement;
+    expect(row('GPUs')).toHaveTextContent('None of its own');
+    await waitFor(() => expect(row('GPU flavor')).toHaveTextContent('g1.a100-4c, by the flavor mapping m1.medium → g1.a100-4c'));
+    expect(row('Capacity')).toHaveTextContent('The validation found room for its GPU flavor.');
+  });
+
+  it('announces nothing for a wait already set when its page opened, nor for a later read of it (SDD §16)', async () => {
+    const server = createTestServer();
+    const m = await migVm(server);
+    m.gpu_wait = {
+      since: new Date(Date.now() - 60_000).toISOString(),
+      checked_at: new Date(Date.now() - 10_000).toISOString(),
+      pool: 'VGPU CUSTOM_NVIDIA_A100_3_20C',
+      needed: 1,
+      free: 0,
+      reason: "VGPU CUSTOM_NVIDIA_A100_3_20C of RHOSO 18.0 — Production has 0 units free, and flavor 'g1.a100-3-20c' needs 1",
+    };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server, live: true });
+    const panel = await screen.findByRole('region', { name: /^GPU/ });
+    // the wait shows, and the region already on the page says nothing of it
+    expect(await within(panel).findByText(/^Waiting for GPU capacity: 0 free of 1 in/)).toBeInTheDocument();
+    const region = screen.getByTestId('gpu-wait-announcement');
+    expect(region).toBeEmptyDOMElement();
+    // a later read updates it: still nothing to say
+    await waitFor(() => expect(server.subscriberCount).toBeGreaterThan(0));
+    m.gpu_wait = { ...m.gpu_wait, checked_at: new Date().toISOString(), free: 1, needed: 2 };
+    server.emit({ kind: 'migration.action', plan_id: m.plan_id, migration_id: m.id, actor: 'rina', message: `${m.vm.name}: noted`, data: {} });
+    expect(await within(panel).findByText(/^Waiting for GPU capacity: 1 free of 2 in/)).toBeInTheDocument();
+    expect(region).toBeEmptyDOMElement();
+  });
+
   it('labels the GPU panel Technology Preview', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

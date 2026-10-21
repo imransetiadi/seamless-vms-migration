@@ -843,12 +843,11 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
               offered={offered}
               mappings={form.gpuMappings}
               onChange={(key, flavor) =>
-                setForm((f) => {
-                  const next = { ...f.gpuMappings };
-                  if (flavor) next[key] = flavor;
-                  else delete next[key];
-                  return { ...f, gpuMappings: next };
-                })
+                // own keys, never an assignment: a key named "__proto__" is a mapping like any other (review RV23-01)
+                setForm((f) => ({
+                  ...f,
+                  gpuMappings: Object.fromEntries([...Object.entries(f.gpuMappings).filter(([k]) => k !== key), ...(flavor ? [[key, flavor] as const] : [])]),
+                }))
               }
               flavorMappings={parseMappings(form.flavors)}
               onEditFlavorMappings={editFlavorMappings}

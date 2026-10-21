@@ -225,6 +225,26 @@ describe('axe-core: no WCAG violations', () => {
     expect(await violations()).toEqual([]);
   }, 30_000);
 
+  it.each([
+    ['/', 'Overview'],
+    ['/plans/plan-4f2a9c1e', 'DC1 → RHOSO production rollout'],
+  ])("%s with a migration waiting for GPU capacity, its Technology Preview badge (SDD §16, §22.11)", async (path, heading) => {
+    renderAt(path, 'viewer', (server) => {
+      const billing = server.migrations.find((m) => m.vm.name === 'app-billing-01')!;
+      server.plans.find((p) => p.id === billing.plan_id)!.cutover_window = null;
+      Object.assign(billing, {
+        approvals: [{ actor: 'sari', at: new Date().toISOString(), comment: null }],
+        cutover_requested: true,
+        gpu_wait: { since: new Date().toISOString(), checked_at: new Date().toISOString(), pool: 'VGPU CUSTOM_NVIDIA_A100_4C', needed: 1, free: 0, reason: 'VGPU CUSTOM_NVIDIA_A100_4C of RHOSO 18.0 — Production has 0 units free' },
+      });
+    });
+    expect(await screen.findByRole('heading', { level: 1, name: heading }, { timeout: 8_000 })).toBeInTheDocument();
+    await settled();
+    await screen.findByText(/^Waiting for GPU capacity/);
+    expect(screen.getAllByRole('button', { name: 'Technology Preview' }).length).toBeGreaterThan(0);
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
   it("a recommendation's input tab", async () => {
     const user = userEvent.setup({ delay: null });
     renderAt('/advisor/recommendations/rec-d4e6f8a09001');

@@ -14,6 +14,7 @@ import { FindingsSummary } from './FindingsList';
 import { ProgressBar } from './ProgressBar';
 import { SortableHeader } from './SortableHeader';
 import { PhaseBadge } from './StatusBadge';
+import { TechPreviewBadge } from './TechPreviewBadge';
 
 type SortKey = 'vm' | 'phase' | 'strategy' | 'wave' | 'progress' | 'estimate' | 'findings' | 'downtime';
 
@@ -56,9 +57,10 @@ const MigrationRow = memo(function MigrationRow({ migration: m, override, wave }
         <PhaseBadge phase={m.phase} />
         {m.gpu_wait && (
           // its cutover waits for GPU capacity, its source running: a wait, not a problem (SDD §16, §22.7)
-          <span className="mt-1 flex items-start gap-1 text-xs leading-tight text-status-info">
-            <Hourglass aria-hidden className="mt-px size-3.5 shrink-0" />
+          <span className="mt-1 flex flex-wrap items-center gap-1 text-xs leading-tight text-status-info">
+            <Hourglass aria-hidden className="size-3.5 shrink-0" />
             Waiting for GPU capacity
+            <TechPreviewBadge />
           </span>
         )}
       </td>

@@ -139,7 +139,8 @@ export function GpuPanel({ migration: m, plan, source, destination }: { migratio
               </ul>
             ) : !preflightRan(m) ? (
               'The validation checks it.'
-            ) : m.findings.some((f) => f.code === 'MAP_GPU_FLAVOR') ? (
+            ) : m.findings.some((f) => f.code === 'MAP_GPU_FLAVOR') || gpus.length === 0 ? (
+              // a VM without a GPU of its own gets no MAP_GPU_FLAVOR: its validation ran without a capacity finding
               'The validation found room for its GPU flavor.'
             ) : (
               'The validation checks it once a GPU mapping applies.'

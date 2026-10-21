@@ -354,6 +354,9 @@ describe('Overview page (mock data)', () => {
     const item = link.closest('li')!;
     expect(item).toHaveTextContent('Waiting for GPU capacity: VGPU CUSTOM_NVIDIA_A100_3_20C, 0 free, needs 1');
     expect(item).toHaveTextContent('Next: Wait, or free GPU capacity on the destination: the cutover starts once a read finds room');
+    // a GPU element: its Technology Preview badge in words, a focusable term (SDD §16, §22.11); none for the others
+    expect(within(item).getByRole('button', { name: 'Technology Preview' })).toBeInTheDocument();
+    expect(within(attention).getAllByRole('button', { name: 'Technology Preview' })).toHaveLength(1);
     // a wait, not an approval: the inbox does not list it
     const inbox = screen.getByRole('region', { name: 'Pending approvals' });
     await within(inbox).findByRole('listitem', { name: 'analytics-node-2' });
