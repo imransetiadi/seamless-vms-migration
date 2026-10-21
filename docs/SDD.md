@@ -1976,11 +1976,14 @@ Placement allocation:
   declares for the flavor (§22.2, §22.3). A server created another way - by a kit that ignored `flavor_uuid`, for one
   (§22.4) - fails it, as one whose shown extra specs ask for no GPU does. Such a failure ends the verification at once,
   as a server in `ERROR` does: no polling changes the flavor a server was created with, and polling to `timeout_s`
-  would keep the source stopped that long before the rollback starts it again.
+  would keep the source stopped that long before the rollback starts it again. Only a wrong flavor ends it so: a
+  passed `gpu_flavor`, or a failed `gpu_allocation`, leaves the polling to go on as for any check. A server that
+  reports no flavor name - one whose flavor Nova no longer has, below compute 2.47 (§22.3) - is not judged: both GPU
+  checks are skipped with a warning, as nothing tells the flavor it was created with (G8 review).
 * `gpu_allocation`: the server's Placement allocations (`server_allocations`, §22.3: the units it holds per resource
   class, summed over its providers) hold, for each resource class the flavor's vGPU requests ask of, at least the
   units those requests ask for together. The requests are read from the server's extra specs. It is skipped with a
-  warning when Placement cannot be read (`None`, or a read that raises `ProviderError`); when the server hides its
+  warning when Placement cannot be read (`None` or an empty answer, or a read that raises `ProviderError`); when the server hides its
   flavor's extra specs, whose requests then cannot be read - Nova shows a server's embedded extra specs and a flavor's
   under one policy (`os_compute_api:os-flavor-extra-specs:index`), so no flavor read of the same credential, the
   inventory's included, tells them, and nothing is guessed -; and for a PCI alias request, whose resource class the
@@ -4704,7 +4707,9 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   the units the server holds per resource class (`GET /allocations/{server_id}`, summed over its providers), None when
   Placement refuses the read or has no allocation to read (§22.8). `get_server` adds `flavor: {name, extra_specs}`:
   compute 2.47's embedded flavor, its `original_name` and its `extra_specs`, which stay empty when Nova's policy hides
-  them.
+  them. Below 2.47 - a cloud entry that pins an older `compute_api_version` - the server holds the flavor's id alone,
+  and `get_server` looks the flavor up by it, its extra specs read apart, as the source's inventory does (review
+  RV28-08); a flavor deleted since gives no name (§7.5, G8 review).
 
 ### 22.4 GPU mapping
 
@@ -4923,7 +4928,11 @@ Binding in §13.4 with plan task G3:
   Placement providers named after hosts and asserts that none of those names or uuids reaches the inventory, the check
   report, `gpu_wait`, the events or the verification record.
 * §14.4's evidence keys, the workload description and the data-sent declaration do not change in 0.3.0 - the GPU findings stay out of the `mappings` and `findings` evidence (plan task G4) -: nothing about
-  GPUs is sent to Jev or agentmemory.
+  GPUs is sent to Jev or agentmemory but the verification's results, which carry the GPU checks (§7.5, plan task G8)
+  as they carry every check: `review_verification` sends their details and warnings - flavors, PCI aliases, resource
+  classes, traits and units - to Jev (§14.2), and a failed verification's error, which names its failed checks,
+  reaches agentmemory's lookup and lesson (§14.3). None of them names a Placement provider or holds Placement's
+  message text (above; G8 review).
 
 ### 22.13 Contract changes of 0.3.0 (each binding from its plan task)
 
