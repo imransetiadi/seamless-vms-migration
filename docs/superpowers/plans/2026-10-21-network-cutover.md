@@ -1,8 +1,7 @@
-# Network cut-over — implementation plan (2026-10-21, proposal)
+# Network cut-over — implementation plan (2026-10-21)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or
-> superpowers:executing-plans to implement this plan task by task. **Do not start a task before the owner has
-> decided SDD §23.11**: this plan is a proposal, like §23 itself.
+> superpowers:executing-plans to implement this plan task by task.
 
 **Goal (release 0.4.0; PRD FR-28 and the release table's "Octavia/Heat migration helpers"):**
 - At cutover, a VM's network identity follows it where Seamless can move it: a floating IP that keeps its address, a
@@ -13,12 +12,11 @@
 - Octavia memberships move with a helper, as a Technology Preview.
 - Everything is validated in simulation until the LAB-NET cases run on two clouds (SDD §23.10).
 
-**Spec:** SDD §23 (a proposal until the owner decides §23.11; each item is then binding once its task moves it into
-the section §23.12 names), §1 and D3 (the gap 0.1.0 left), PRD FR-28 and §3 (N1).
+**Spec:** SDD §23 (each item binding once its task moves it into the section §23.12 names), D18, §1 and D3 (the gap
+0.1.0 left); PRD goal G9, FR-28 and FR-42–FR-47 (N1).
 
-**Decisions:** the eleven of SDD §23.11, each with its proposed default, are the owner's. They are recorded here and in
-D3 once taken. The research behind the proposal was done 2026-10-21 from the platforms' documentation; see the
-references in the pull request that proposed this plan.
+**Decisions taken:** the owner approved SDD §23.11's eleven defaults on 2026-10-21 (D18). The research behind them was
+done the same day from the platforms' documentation; the pull request that proposed this plan (#75) lists its sources.
 
 ## Rules for every task
 
@@ -41,7 +39,7 @@ references in the pull request that proposed this plan.
 
 | # | Track | Task | Tests that must fail first, then pass |
 |---|---|---|---|
-| N1 | controller | The PRD amendment once the owner has decided §23.11: FR-28's scope, a goal, a journey, the release table and §3's non-goals as delivered, in its own commit; then each task's SDD commit | after each SDD commit, the SDD-reading tests: `test_catalog_matches_sdd_9_3`, `test_event_kinds_match_sdd_4_3_and_the_dashboard`, `test_every_route_is_documented_in_sdd_12`, `test_settings_read_exactly_the_variables_sdd_15_1_documents` |
+| N1 | controller | The PRD amendment (done with D18: goal G9, FR-28, FR-42–FR-47, journey 8, the release table and §3's non-goals as delivered), in its own commit; then each task's SDD commit | after each SDD commit, the SDD-reading tests: `test_catalog_matches_sdd_9_3`, `test_event_kinds_match_sdd_4_3_and_the_dashboard`, `test_every_route_is_documented_in_sdd_12`, `test_settings_read_exactly_the_variables_sdd_15_1_documents` |
 | N2 | B, C, D | The findings of §23.8 in §9.3, the catalog, the API's pre-flight and the mock. The source providers read a VM's Heat stack (the stack resources by `physical_resource_id`, nested depth) and its Octavia memberships (members by address), and the inventory reads `allowed_address_pairs`; each read is optional and its failure is a warning, never a blocker | `tests/test_preflight.py`: `test_finding_src_vm_heat_stack`, `test_finding_src_vm_autoscaled_blocks_until_acknowledged`, `test_finding_src_vm_lb_member`, `test_finding_map_fip_address_change`, `test_finding_src_port_address_pairs`, `test_finding_net_prefix_split`, `test_finding_dst_dns_integration_missing`; `tests/test_providers.py`: `test_a_source_without_heat_or_octavia_reads_no_stack_and_no_member`; the shared finding cases (`eligibility_cases.json`) |
 | N3 | B | The domain: a hook catalog (admin) with `playbook` and `webhook` kinds, a plan's network cut-over settings (hooks per point, the floating IP opt-in, DNS targets, Octavia pool mappings), and their routes in §12 | `tests/test_api_hooks.py`: `test_only_an_admin_registers_a_hook`, `test_a_plan_references_hooks_by_name_per_point`, `test_a_webhook_hook_needs_https`, `test_a_hook_in_use_cannot_be_deleted`; `tests/test_models.py`: `test_a_plans_network_cutover_settings_round_trip` |
 | N4 | B | The hook runner: the context document, the idempotency key, timeouts, secret files, `redact()` on output, and `migration.action` events | `tests/test_hooks.py`: `test_a_playbook_hook_gets_the_context_and_no_credential`, `test_a_webhook_hook_posts_the_context_with_its_bearer_secret`, `test_a_hook_that_exceeds_its_timeout_fails`, `test_a_hooks_output_is_redacted`, `test_a_rerun_hook_gets_the_same_idempotency_key` |
