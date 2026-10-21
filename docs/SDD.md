@@ -4649,7 +4649,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 |---|---|---|---|
 | D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with per-disk parallelism and read-ahead workers | 0.2.0: changed-extent sources that remove the scan — Ceph-direct `rbd diff` between pass snapshots (opt-in, Ceph credentials) and hypervisor-assisted tracking via libvirt checkpoints / incremental backup on the source compute nodes (builds on the existing `import_from_hypervisor` access model) |
 | D2 | Single-replica orchestrator | accepted | PostgreSQL + leader election — 0.2.0 |
-| D3 | Network cut-over (FIP/DNS/BGP), Octavia and Heat | out of scope up to 0.3.0, with no hook documented and no finding (the old default said "hooks documented", which was never done) | 0.4.0: the owner's decisions on §23's proposal (§23.11) |
+| D3 | Network cut-over (FIP/DNS/BGP), Octavia and Heat | out of scope up to 0.3.0, with no hook documented and no finding (the old default said "hooks documented", which was never done) | decided: D18 (0.4.0, §23) |
 | D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL`; partly decided by the §13.4 knobs (`SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`, `TODO(ADV-06)`) |
 | D5 | Dashboard navigation item **Users** for non-admins: hidden (today) or soft-disabled with the reason, as every other action (§16) | hidden | owner decision (audit C-01) |
 | D6 | Collection identity on Galaxy: FQCN `os_migrate.os_migrate` 1.1.0 with the fork's own metadata; a version scheme that cannot collide with a future upstream 1.1.0; whether `scripts/publish.sh` stays | FQCN kept for upstreamability; the tarball is attached to GitHub Releases and never published to Galaxy (RELEASING.md) | owner decision (audit D-10) |
@@ -4664,6 +4664,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D15 | Conversion host images on community clouds beyond CentOS Stream 9 and RHEL 9: the RHEL family by `ansible_os_family` (Rocky Linux, AlmaLinux, CentOS Stream 10), then Ubuntu 24.04 LTS (§21.6) | decided: the order the owner approved 2026-10-16 (the RHEL family first, then Ubuntu 24.04), implemented by plan task T7 (§6.5, §21.6) | the lab (plan task T10, §21.9) validates the images |
 | D16 | GPU workloads (§22): how GPU VMs migrate in 0.3.0 | decided by the owner 2026-10-20: a Technology Preview; the plan's GPU mapping is the opt-in (no switch); one GPU flavor per GPU key in a plan; no wave tier of their own, and never in the pilot wave; the network cut-over hooks and the Octavia/Heat helpers move from 0.3.0 to 0.4.0 (PRD, plan task G14) | the lab cases of §22.14 on GPU hosts end the Technology Preview |
 | D17 | A per-VM GPU flavor (a plan field keyed by source id, as `nic_overrides`) for VMs that share a GPU key but need flavors of different sizes | not in 0.3.0: such VMs go into separate plans (D16) | after the Technology Preview, when users ask for it |
+| D18 | Network cut-over, Octavia and Heat (§23): what 0.4.0 does | decided by the owner 2026-10-21: §23.11's eleven defaults as written - both built-in actions and generic hooks, hooks in an admin's catalog, a failure after the stop following `auto_rollback`, `auto` kept with a new-address warning and the keep-address move opt-in, the source's floating IP disassociated (journaled) during the cutover, Designate and RFC 2136 built in, BGP by verification only, Octavia findings and the member helper as a Technology Preview, Heat findings with `SRC_VM_AUTOSCALED` blocking until acknowledged, the Technology Preview label until LAB-NET passes, `allowed_address_pairs` a finding in 0.4.0 | the LAB-NET cases of §23.10 end the Technology Preview |
 
 ## 21. Destination platforms: RHOSO 18.0 and community OpenStack
 
@@ -5354,15 +5355,17 @@ Binding in §13.4 with plan task G3:
   * whether a pool's resource providers are its GPUs or, on an SR-IOV GPU (A100 and later), their virtual functions,
     which the dashboard words "on 1 GPU" (§16, §22.11).
 
-## 23. Network cut-over (0.4.0, proposal)
+## 23. Network cut-over (0.4.0, Technology Preview)
 
-Status: a proposal of 2026-10-21 for the owner's decisions (§23.11). Nothing in this section is binding, and the PRD
-is unchanged until the owner approves it (plan task N1). It answers PRD FR-28 ("Network cut-over hooks (DNS/FIP/BGP)",
-0.4.0) and the release table's "Octavia/Heat migration helpers" (PRD §9). The plan is
-`superpowers/plans/2026-10-21-network-cutover.md`. The proposed codes, fields, routes and event data stay out of the
+Status: proposed 2026-10-21 and decided by the owner the same day (D18): §23.11's defaults as written. Each item
+becomes binding in the section §23.12 names when its plan task lands; until then nothing in this section is binding.
+The PRD followed with plan task N1: goal G9, FR-28 and FR-42–FR-47, which replace the old FR-28 ("Network cut-over
+hooks (DNS/FIP/BGP)") and the release table's "Octavia/Heat migration helpers". The plan is
+`superpowers/plans/2026-10-21-network-cutover.md`. The planned codes, fields, routes and event data stay out of the
 tables the SDD-reading tests parse (§4.3, §9.3, §12, §15.1, §18) until their tasks land, as §22's did. The platform
 facts below come from the projects' and vendors' documentation, read 2026-10-21. A fact only a search excerpt showed is
-marked `TODO(LAB): confirm`, and so is every behaviour only a lab can measure.
+marked `TODO(LAB): confirm`, and so is every behaviour only a lab can measure. The network cut-over ships as a
+**Technology Preview**: it is validated in simulation only until the LAB-NET cases of §23.10 pass.
 
 ### 23.1 What 0.3.0 does with networks
 
@@ -5376,11 +5379,11 @@ marked `TODO(LAB): confirm`, and so is every behaviour only a lab can measure.
   VMware paths move no floating IP (§7.3, §7.2).
 * DNS, BGP, Octavia and Heat: nothing. §1 and PRD §3 said Heat stacks and Octavia load balancers are reported as
   findings, and that the network cut-over has documented hooks. Neither was delivered: §9.3 has no such code, and no
-  document describes a hook. §1 and D3 now say so, and this section proposes both.
+  document describes a hook. §1 and D3 now say so, and this section designs both.
 
 ### 23.2 Scope
 
-Proposed for 0.4.0, in the order of the plan:
+In 0.4.0, in the order of the plan:
 
 1. Findings for what Seamless does not move: a VM that belongs to a Heat stack or an autoscaling group, a member of
    an Octavia pool, a floating IP whose address the cutover would change, a port with `allowed_address_pairs`, a subnet
@@ -5497,9 +5500,9 @@ Not in 0.4.0:
 
 ### 23.8 Proposed findings
 
-The codes are proposed names. They enter §9.3 with plan task N2, with their catalog entries and the mock.
+The codes are planned. They enter §9.3 with plan task N2, with their catalog entries and the mock.
 
-| Code (proposed) | Severity | When |
+| Code (planned) | Severity | When |
 |---|---|---|
 | `SRC_VM_HEAT_STACK` | warning | the VM is a resource of a Heat stack (the source's stack resources by `physical_resource_id`): the stack is not moved, and a stack update at the source may recreate the server |
 | `SRC_VM_AUTOSCALED` | blocker until acknowledged (owner decision 9) | the VM is a member of a Heat autoscaling group: the source may replace a server Seamless stopped, which leaves two live copies |
@@ -5543,7 +5546,7 @@ The open questions each case closes:
 
 ### 23.11 Owner decisions
 
-Each comes with the proposed default:
+Each with the default the owner approved on 2026-10-21 (D18):
 
 1. **The hook model:** built-in actions (floating IP, DNS, Octavia) and generic hooks (playbook, webhook), both.
 2. **Who defines hooks:** an admin, in a catalog, with plans referencing them by name; never inline in a plan.
@@ -5560,11 +5563,11 @@ Each comes with the proposed default:
 10. **The Technology Preview label** stays on the network features until LAB-NET passes, as §22 does for GPUs.
 11. **`allowed_address_pairs`:** a finding in 0.4.0, and carrying them in a later release.
 
-### 23.12 Contract changes (each binding from its plan task, once the owner approves §23)
+### 23.12 Contract changes (each binding from its plan task)
 
 | Item | Becomes binding in | Plan task |
 |---|---|---|
-| PRD: FR-28's scope, goal and journey, and §3's non-goals as delivered | PRD | N1 |
+| PRD: FR-28's scope, goal and journey, and §3's non-goals as delivered | PRD (done) | N1 |
 | the findings of §23.8 | §9.3 | N2 |
 | the hook catalog, the plan's network cut-over settings, the routes | §4.2, §12 | N3 |
 | the hook runner: kinds, timeouts, the idempotency key, the context document | §7.2, §13 | N4 |
