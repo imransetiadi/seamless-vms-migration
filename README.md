@@ -112,6 +112,58 @@ Hat's virt-v2v support matrix):
 Legacy releases are flagged (`GUEST_OS_LEGACY`), never blocked. Set `os_distro`/`os_version` image properties
 or run VMware Tools so every guest is identified (`GUEST_OS_UNKNOWN` otherwise).
 
+## GPU workloads (Technology Preview, validated in simulation)
+
+0.3.0 migrates VMs with an NVIDIA vGPU, time-sliced or MIG-backed, or with a GPU passed through whole to the guest,
+instead of blocking them ([SDD §22](docs/SDD.md)). No GPU state moves: the disks move as for any VM, and the VM boots
+on the destination as it would after a shutdown.
+
+* **Read:** a VM's GPUs come from its OpenStack flavor (`resources:VGPU`, `pci_passthrough:alias`) or from vCenter (a
+  vGPU profile such as `grid_a100-4c`, a DirectPath I/O device such as `10de:20b5`), shown in the Inventory's GPU
+  column.
+* **Mapped, never matched:** the plan names the destination GPU flavor - `mappings.gpus` by vGPU profile or device id
+  for a VMware VM, `mappings.flavors` by flavor for an OpenStack VM. The mapping is the opt-in: an unmapped GPU VM
+  stays blocked.
+* **Capacity:** the validation reads the destination's free GPUs from Placement, and the cutover gate reads them again
+  before the source stops. While the pool is full, the source keeps running and the migration waits
+  (`migration.gpu_wait`). Placement does not show a PCI alias's capacity, which `DST_GPU_CAPACITY_UNKNOWN` says.
+* **Verified:** the server is created with the GPU flavor, and the verification checks its flavor and the GPU units
+  Placement holds for it (`gpu_flavor`, `gpu_allocation`).
+* **The guest's side:** `GUEST_GPU_DRIVER` and `GUEST_GPU_LICENSE` name the NVIDIA driver the guest needs on the
+  destination and the license server its vGPU must reach.
+
+**In the demo** (`make seamless-demo`, simulated clouds). A demo database seeded before 0.3.0 holds none of this:
+`make seamless-reset CONFIRM=yes` deletes the stack's containers and volumes, and the next `make seamless-demo` seeds
+it afresh.
+
+1. **Inventory.** vCenter DC2 holds `dc2-ml-01` (vGPU `grid_a100-4c`), `dc2-ml-02` (MIG-backed vGPU `grid_a100-3-20c`)
+   and `dc2-cuda-01` (passthrough `10de:20b5`, powered off). RHOSO 18.0 lists the GPU flavors `g1.a100-4c`,
+   `g1.a100-3-20c` and `p1.a100`, and its GPU capacity: A100-4C 4 free on 1 GPU, A100-3-20C 2 free on 1, and the class
+   `VGPU` 6 free on 2. Each vGPU VM that cuts over takes one unit of its pool.
+2. **The seeded plans.** The finance plan maps `gpu-ml-01`'s flavor `g1.vgpu` to `g1.a100-4c`, and the VMware plan
+   maps `dc2-ml-01`'s `grid_a100-4c` to it. Both validate with `MAP_GPU_FLAVOR`, `GUEST_GPU_DRIVER` and
+   `GUEST_GPU_LICENSE`, and nothing blocks. Each migrates in its plan's last wave, and its verification passes
+   `gpu_flavor` and `gpu_allocation`.
+3. **A wait for GPU capacity.** Plan `dc2-ml-02` (source id `vmw-054a64a2b9ff`) to RHOSO 18.0 with
+   `"gpus": {"grid_a100-3-20c": "g1.a100-3-20c"}` in its mappings - through `POST /api/v1/plans` until the
+   dashboard's plan form maps GPUs - then validate and start it. The validation finds room. The gate's first two
+   reads find the pool full, as if another tenant held its vGPUs, and the event log shows "dc2-ml-02: its cutover
+   waits for GPU capacity - VGPU CUSTOM_NVIDIA_A100_3_20C of RHOSO 18.0 has 0 units free, and flavor 'g1.a100-3-20c'
+   needs 1; the source VM keeps running".
+4. **The wait ends.** The third read, a few seconds later at the demo's speed, finds 2 units free: "RHOSO 18.0 has the
+   GPU capacity its cutover needs". The VM cuts over and passes its GPU checks, and A100-3-20C reads 1 free.
+5. **Passthrough.** Plan `dc2-cuda-01` (`vmw-e22680548bd1`) with `"gpus": {"10de:20b5": "p1.a100"}`. Only
+   `vmware_cold` takes it, while it is powered off: vSphere snapshots no running VM with a DirectPath I/O device
+   ([SDD §22.6](docs/SDD.md)). `DST_GPU_CAPACITY_UNKNOWN` warns that Placement does not show the alias's capacity,
+   so the gate does not wait, and the verification skips `gpu_allocation`: "PCI alias a100 not checked: nova.conf
+   sets its resource class, which no API shows".
+
+**Not yet run on GPU hosts.** Everything above runs against simulated clouds and recorded API answers. The lab cases
+LAB-GPU01…LAB-GPU08 ([QASuite §7.2](docs/QASuite.md)) have not run yet. They need a vSphere 8 host with an NVIDIA GPU
+under the vGPU manager (a time-sliced and a MIG-backed profile) and one with a DirectPath I/O GPU, and a RHOSO 18.0
+and a Tier 1 community destination with Nova's vGPU and a PCI alias configured. The Technology Preview label goes
+when they pass ([SDD §22.14](docs/SDD.md)).
+
 ## Quick start — Linux server with Docker (Ubuntu, Debian, RHEL, Rocky Linux, AlmaLinux)
 
 On Linux the stack runs on the machine's own Docker Engine: no Colima and no Node.js (the image builds the
