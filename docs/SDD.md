@@ -43,7 +43,8 @@ repository's root; upstream `main` after the 1.0.5 release, versioned 1.1.0 here
 
 Non-goals for 0.1.0: in-place adoption of a 17.1 control plane into RHOSO (Red Hat's *adoption*
 procedure covers that), live migration with zero downtime across clouds, Hyper-V/Nutanix sources,
-and migrating Heat stacks/Octavia load balancers (they are exported as findings, see §9.3).
+and migrating Heat stacks/Octavia load balancers. Up to 0.3.0 no finding reports them: §9.3 has no code for a
+stack or a load balancer, though 0.1.0's text said it had (D3).
 
 Naming: where a rule about the destination says "RHOSO" (a RHOSO network, flavor, volume type, credential), it
 means the destination cloud, RHOSO 18.0 or a community OpenStack destination (§21); a rule that holds for the Red Hat
@@ -4648,7 +4649,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 |---|---|---|---|
 | D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with per-disk parallelism and read-ahead workers | 0.2.0: changed-extent sources that remove the scan — Ceph-direct `rbd diff` between pass snapshots (opt-in, Ceph credentials) and hypervisor-assisted tracking via libvirt checkpoints / incremental backup on the source compute nodes (builds on the existing `import_from_hypervisor` access model) |
 | D2 | Single-replica orchestrator | accepted | PostgreSQL + leader election — 0.2.0 |
-| D3 | Network cut-over (FIP/DNS/BGP) | out of scope; hooks documented | customer demand for OVN BGP integration |
+| D3 | Network cut-over (FIP/DNS/BGP), Octavia and Heat | out of scope up to 0.3.0, with no hook documented and no finding (the old default said "hooks documented", which was never done) | 0.4.0: the owner's decisions on §23's proposal (§23.11) |
 | D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL`; partly decided by the §13.4 knobs (`SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`, `TODO(ADV-06)`) |
 | D5 | Dashboard navigation item **Users** for non-admins: hidden (today) or soft-disabled with the reason, as every other action (§16) | hidden | owner decision (audit C-01) |
 | D6 | Collection identity on Galaxy: FQCN `os_migrate.os_migrate` 1.1.0 with the fork's own metadata; a version scheme that cannot collide with a future upstream 1.1.0; whether `scripts/publish.sh` stays | FQCN kept for upstreamability; the tarball is attached to GitHub Releases and never published to Galaxy (RELEASING.md) | owner decision (audit D-10) |
