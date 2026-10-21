@@ -9678,6 +9678,153 @@
       "remediations": {
         "MAP_FLAVOR_MISSING": "Fix the mapping: the destination flavor must exist."
       }
+    },
+    {
+      "why": "a request without traits asks its class's pool: one shortfall names it, never a second one across its pools (G12 review)",
+      "source_kind": "vmware",
+      "vm": {
+        "source_id": "vm-g46",
+        "name": "ml-46",
+        "project": "finance",
+        "flavor": null,
+        "vcpus": 8,
+        "ram_mb": 32768,
+        "disks": [
+          {
+            "id": "vm-g46-disk-0",
+            "name": "ml-46-root",
+            "size_gb": 120,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": null,
+            "device": "scsi0:0",
+            "kind": "vmdk",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "10.0.0.5"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": true,
+        "snapshot_count": 0,
+        "tools_ok": true,
+        "change_rate_bps": null,
+        "key_name": null,
+        "disk_bytes": 128849018880,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        },
+        "gpus": [
+          {
+            "kind": "vgpu",
+            "profile": "grid_a100-4c",
+            "count": 1
+          }
+        ]
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "mappings": {
+          "networks": {},
+          "flavors": {},
+          "volume_types": {},
+          "projects": {},
+          "gpus": {
+            "grid_a100-4c": "g1.vgpu-any"
+          }
+        }
+      },
+      "destination": {
+        "label": "DC3 Jakarta",
+        "kind": "openstack",
+        "networks": [
+          {
+            "id": "n-app",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "flavors": [
+          {
+            "name": "m1.large",
+            "vcpus": 8,
+            "ram_mb": 16384,
+            "disk_gb": 80,
+            "extra_specs": {}
+          },
+          {
+            "name": "g1.vgpu-any",
+            "vcpus": 8,
+            "ram_mb": 32768,
+            "disk_gb": 80,
+            "extra_specs": {
+              "resources:VGPU": "1"
+            }
+          }
+        ],
+        "gpu_profiles": {},
+        "gpu_capacity": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "pools": [
+            {
+              "resource_class": "VGPU",
+              "traits": [],
+              "forbidden_traits": [],
+              "same_provider": false,
+              "free": 0,
+              "providers": 0,
+              "largest_free": 0,
+              "detail": null
+            }
+          ]
+        }
+      },
+      "expected": {
+        "VM_VGPU": null,
+        "VM_PCI_PASSTHROUGH": null,
+        "MAP_GPU_FLAVOR": "The VM's GPUs (grid_a100-4c) go to flavor 'g1.vgpu-any' of DC3 Jakarta: 8 vCPUs, 32768 MB RAM, 80 GB disk, vGPU VGPU. GPU migration is a Technology Preview.",
+        "MAP_GPU_DOWNSIZED": null,
+        "DST_GPU_CAPACITY_INSUFFICIENT": "The plan's VMs ask VGPU of DC3 Jakarta for 1 unit, more than its 0 free (ml-46).",
+        "DST_GPU_CAPACITY_UNKNOWN": null,
+        "GUEST_GPU_DRIVER": "The guest's NVIDIA driver must suit DC3 Jakarta: a vGPU guest driver of a release its hosts' vGPU manager supports (NVIDIA's compatibility table). virt-v2v neither installs nor updates the driver.",
+        "GUEST_GPU_LICENSE": "The guest licenses its vGPU from the NVIDIA License System: its license server, a CLS instance or an on-premises DLS instance, must be reachable from its network in DC3 Jakarta, or the guest runs its GPU unlicensed."
+      },
+      "severities": {
+        "DST_GPU_CAPACITY_INSUFFICIENT": "blocker"
+      }
     }
   ]
 }
