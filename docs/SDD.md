@@ -5353,3 +5353,228 @@ Binding in §13.4 with plan task G3:
   * a vGPU from the vendor-specific VFIO framework, offered as a PCI alias flavor (§22.3);
   * whether a pool's resource providers are its GPUs or, on an SR-IOV GPU (A100 and later), their virtual functions,
     which the dashboard words "on 1 GPU" (§16, §22.11).
+
+## 23. Network cut-over (0.4.0, proposal)
+
+Status: a proposal of 2026-10-21 for the owner's decisions (§23.11). Nothing in this section is binding, and the PRD
+is unchanged until the owner approves it (plan task N1). It answers PRD FR-28 ("Network cut-over hooks (DNS/FIP/BGP)",
+0.4.0) and the release table's "Octavia/Heat migration helpers" (PRD §9). The plan is
+`superpowers/plans/2026-10-21-network-cutover.md`. The proposed codes, fields, routes and event data stay out of the
+tables the SDD-reading tests parse (§4.3, §9.3, §12, §15.1, §18) until their tasks land, as §22's did. The platform
+facts below come from the projects' and vendors' documentation, read 2026-10-21. A fact only a search excerpt showed is
+marked `TODO(LAB): confirm`, and so is every behaviour only a lab can measure.
+
+### 23.1 What 0.3.0 does with networks
+
+* A migrated VM keeps its fixed IPs and MACs by default (§6.6, §7.3 step 8), and `nic_overrides` re-address a NIC
+  (§7.2). A client that reaches a VM by its fixed address needs nothing at cutover.
+* Floating IPs move on the OpenStack cold and warm paths alone, through os-migrate's `floating_ip_mode` `auto`, the
+  collection's default the control plane keeps (§7.2). The import attaches a detached destination floating IP with the
+  source's address, and without one it creates a floating IP with a **new** address, which no finding announces. The
+  source's floating IP stays associated with the stopped source VM through the cutover, and a rollback leaves the
+  destination's floating IP allocated (`roles/import_workloads_warm/tasks/rollback.yml`). The storage handover and the
+  VMware paths move no floating IP (§7.3, §7.2).
+* DNS, BGP, Octavia and Heat: nothing. §1 and PRD §3 said Heat stacks and Octavia load balancers are reported as
+  findings, and that the network cut-over has documented hooks. Neither was delivered: §9.3 has no such code, and no
+  document describes a hook. §1 and D3 now say so, and this section proposes both.
+
+### 23.2 Scope
+
+Proposed for 0.4.0, in the order of the plan:
+
+1. Findings for what Seamless does not move: a VM that belongs to a Heat stack or an autoscaling group, a member of
+   an Octavia pool, a floating IP whose address the cutover would change, a port with `allowed_address_pairs`, a subnet
+   whose announced prefix a plan's waves would split, and Neutron DNS names the destination cannot publish (§23.8).
+2. Cut-over hooks: Ansible playbooks and webhooks an admin registers, which a plan runs at fixed points of each
+   migration (§23.3).
+3. A floating IP move that keeps the address, opt-in per plan, on every OpenStack strategy (§23.4).
+4. A DNS swap through Designate or an RFC 2136 server, when an address changes (§23.5).
+5. BGP as a consequence of the floating IP move, with a reachability wait in the verification (§23.6).
+6. An Octavia member helper, as a Technology Preview (§23.7).
+
+Not in 0.4.0:
+* Seamless as a BGP speaker.
+* Recreating load balancers, and copying their TLS secrets (Barbican private keys).
+* Heat's stack abandon and adopt: a preview Heat disables by default, which its convergence engine does not support and
+  which is deprecated for removal (Heat's 2026.1 configuration reference). Nor re-running a stack's template.
+* Moving Designate zones and Manila shares, which are runbooks (Operations.md).
+
+### 23.3 Cut-over hooks
+
+* **Kinds.**
+  * A `playbook` hook is an Ansible playbook the AnsibleExecutor runs with the migration's context as extra vars. It
+    gets the executor's rules (§7.2, §13.4): secret files with mode 0600, `!unsafe` values, and output through
+    `redact()`.
+  * A `webhook` hook is an HTTPS POST of the context document, with a bearer secret from the secret store (§13.3), and
+    any 2xx answer counts as success.
+* **Who defines them.** An admin registers hooks in a catalog by name, and a plan references them by name per point. A
+  hook is code that runs with the control plane's reach (owner decision 2).
+* **Points:**
+  * `pre_stop` runs before the source stops, for reversible work such as a drain or a TTL check. A failure fails the
+    attempt with the source still running.
+  * `post_create` runs after the server is created, inside the downtime: the floating IP, DNS and the BGP wait.
+  * `post_verify` runs after the verification passed, for joining a load balancer.
+  * `on_rollback` runs before the source starts again.
+  * `on_finalize` runs after finalize, to release the source's floating IP and records.
+* **Rules:**
+  * Each hook has a timeout: 300 s by default, at most 1800 s. A hook inside the downtime counts in the downtime
+    estimate (§9.1).
+  * The context carries an idempotency key (the migration id, the attempt, the point), since a resumed step may run a
+    hook again (§8).
+  * A hook that changes state names its revert hook, which a rollback runs.
+  * A failure after the source stopped follows the plan's `auto_rollback` (§8; owner decision 3).
+  * Each run is recorded as a `migration.action` event (§4.3), so no new event kind is needed.
+  * Nothing of a hook reaches Jev or agentmemory.
+* **The context document:** the migration id, attempt, point, plan id and VM name; the source's and destination's ids
+  and labels; the server id; the addresses before and after; the floating IPs; and the idempotency key. Never a
+  credential.
+
+### 23.4 A floating IP move that keeps the address
+
+* **Opt-in.** A plan opts in for its floating IPs (owner decision 4); without the opt-in, `auto` stays as it is (§23.1).
+  The destination's external network must reach the address: one external segment both clouds share, or one BGP fabric
+  (§23.6). The address must lie in a subnet of the destination's external network, outside its allocation pool so that
+  nothing else takes it (`TODO(LAB): confirm` that Neutron takes an explicit address outside the pool for a floating
+  IP).
+* **Pre-flight** (blockers):
+  * the destination credential may choose an address: Neutron's `create_floatingip:floating_ip_address` allows admin
+    by default and a project `manager` under the secure-RBAC defaults (`TODO(LAB): confirm` on RHOSO 18.0, §21.5);
+  * the address is free, or held detached by the destination project;
+  * the floating IP quota allows it.
+* **Pre-staging** (§7.2) reserves the address, detached, in the destination project.
+* **Cutover**, after the source stopped:
+  1. The source's floating IP is disassociated, journaled as the handover's steps are (§7.3; owner decision 5).
+  2. The destination's is associated with the new server's port.
+  3. The destination announces it: the gateway's gratuitous ARP on a shared segment, or the BGP agent's announcement
+     (`TODO(LAB): confirm` both, and the ARP-cache tail on physical routers).
+
+  The gap is seconds, inside the downtime.
+* **Rollback:** the destination's floating IP is disassociated and released, then the source's is associated again, and
+  then the source starts.
+* **Finalize:** the `on_finalize` step releases the source project's allocation, after the typed confirmation of §8.1.
+* **The storage handover and the VMware paths** get the same move from the control plane rather than from os-migrate,
+  so every strategy behaves alike.
+
+### 23.5 DNS swap
+
+* **When it applies.** When an address changes — a floating IP with a new address, a `nic_overrides` re-address, a
+  VMware VM's new address — a plan may name a DNS target per VM: a Designate zone and record, reached with the
+  destination provider's credential, or an RFC 2136 server with its zone and a TSIG key as a secret (owner decision 6).
+* **The swap.** At `post_create`, a compare-and-swap moves the record from the old address to the new one. RFC 2136
+  uses its prerequisites. Designate reads the record, compares it, then updates it, and its write is asynchronous, so
+  the swap polls until the recordset is `ACTIVE`. A rollback swaps the record back.
+* **The TTL.** The pre-flight warns when a record's TTL is longer than the plan's downtime SLO, and lowering it before
+  the window is the operator's job (a `pre_stop` hook may do it). Clients may see the old address for one old TTL; the
+  estimate shows that tail apart from the downtime.
+* **Neutron's DNS integration** (`dns_name`, `dns_domain`) is checked, never driven. A finding warns when the source
+  uses it and the destination lacks the extension or the zone. A floating IP's `dns_name` and `dns_domain` are set once
+  at creation (Neutron's DNS integration guide), which os-migrate already carries (`TODO(LAB): confirm` the import on a
+  destination without the extension).
+
+### 23.6 BGP
+
+* Seamless speaks no BGP. Under the OVN BGP agent, associating a floating IP announces it and disassociating withdraws
+  it (the agent's NB driver design), so §23.4's move is the BGP cut-over. RHOSO 18.0's documentation calls the agent
+  deprecated from 18.0.10 (excerpt; `TODO(LAB): confirm` the replacement and its behaviour).
+* **Reachability wait.** The verification waits for a moved floating IP to be reachable: the probe (§7.5) must reach the
+  address within a bound, and the wait counts in the downtime.
+* **Split prefixes.** A finding warns when a plan's waves would split, across two clouds, a subnet whose tenant networks
+  are announced (`expose_tenant_networks`): that prefix would have two origins.
+
+### 23.7 Octavia member helper (Technology Preview)
+
+* **Findings:** a plan VM that is a member of a source pool (load balancer, pool, port), and a pool whose members a
+  plan's waves spread over several waves.
+* **The helper**, opt-in per plan (owner decision 8):
+  * The operator maps each source pool to a pool of a destination load balancer, created by the operator or a runbook,
+    never by Seamless.
+  * Before the source stops, its member is drained (`admin_state_up` false, `pre_stop`).
+  * After the verification passed, the migrated VM joins the destination pool (`post_verify`).
+  * A rollback removes it there and re-enables the source member.
+  * TLS containers are mapped by reference, never read.
+* **Providers.** The OVN provider is L4 only (`SOURCE_IP_PORT`, TCP and UDP-CONNECT monitors; its driver documentation).
+  A finding warns when the destination pool's provider lacks what the source pool uses.
+
+### 23.8 Proposed findings
+
+The codes are proposed names. They enter §9.3 with plan task N2, with their catalog entries and the mock.
+
+| Code (proposed) | Severity | When |
+|---|---|---|
+| `SRC_VM_HEAT_STACK` | warning | the VM is a resource of a Heat stack (the source's stack resources by `physical_resource_id`): the stack is not moved, and a stack update at the source may recreate the server |
+| `SRC_VM_AUTOSCALED` | blocker until acknowledged (owner decision 9) | the VM is a member of a Heat autoscaling group: the source may replace a server Seamless stopped, which leaves two live copies |
+| `SRC_VM_LB_MEMBER` | warning | an address of the VM is a member of a source Octavia pool; the helper (§23.7) or a runbook moves the membership |
+| `MAP_FIP_ADDRESS_CHANGE` | warning | `auto` would create a floating IP with a new address at the destination (§23.1) |
+| `SRC_PORT_ADDRESS_PAIRS` | warning | a port has `allowed_address_pairs` (a keepalived VIP, say), which the import does not carry (owner decision 11) |
+| `NET_PREFIX_SPLIT` | warning | the plan's waves split an announced tenant subnet across two clouds (§23.6) |
+| `DST_DNS_INTEGRATION_MISSING` | warning | the source publishes the VM's ports in DNS and the destination lacks the DNS extension or the zone (§23.5) |
+
+### 23.9 Dashboard, demo, security
+
+* **Dashboard.** The plan form gets a "Network cut-over" section: hooks per point, the floating IP move, DNS targets and
+  the Octavia pool mapping. While LAB-NET has not passed, each carries a "Technology Preview" badge, as §22.11's GPU
+  elements do (owner decision 10). The migration page's timeline shows each hook's run: point, kind, outcome and time.
+* **Demo.** The fakes hold floating IPs, a DNS zone, a load balancer and a stack, so every rule of this section runs in
+  simulation (§10).
+* **Security:**
+  * A hook runs code with the control plane's reach, so only an admin registers one.
+  * A webhook's URL must be HTTPS.
+  * Its bearer secret and a TSIG key are secrets (§13.3), never in the database.
+  * Hook output passes `redact()`.
+  * No customer DNS name, address or hook text reaches Jev (§13.4).
+
+### 23.10 Validation
+
+Every rule here is validated in simulation only until the LAB-NET cases pass:
+* two clouds on one external VLAN, for the keep-address move and its rollback;
+* a BGP fabric with the OVN BGP agent;
+* Designate, and BIND with TSIG;
+* Octavia's amphora and OVN providers;
+* a Heat stack with an autoscaling group.
+
+The open questions each case closes:
+* whether a stopped source VM's associated floating IP still answers ARP or stays announced;
+* the gratuitous ARP on association;
+* a floating IP outside the allocation pool;
+* the project `manager` role on RHOSO 18.0;
+* the measured BGP convergence of a disassociate and associate pair;
+* whether RHOSO 18.0.x still forbids Octavia under dynamic routing;
+* whether Heat and Octavia are enabled in RHOSO 18.0's control plane by default.
+
+### 23.11 Owner decisions
+
+Each comes with the proposed default:
+
+1. **The hook model:** built-in actions (floating IP, DNS, Octavia) and generic hooks (playbook, webhook), both.
+2. **Who defines hooks:** an admin, in a catalog, with plans referencing them by name; never inline in a plan.
+3. **A hook failure after the source stopped** follows the plan's `auto_rollback`, rather than holding in `failed`.
+4. **Floating IPs:** `auto` stays the default, with `MAP_FIP_ADDRESS_CHANGE` warning of a new address, and the
+   keep-address move is a plan's opt-in.
+5. **The cutover may disassociate the source's floating IP:** journaled, associated again on rollback, released only at
+   finalize.
+6. **DNS back ends in 0.4.0:** Designate and RFC 2136 built in, others through a webhook hook.
+7. **BGP:** a consequence of the floating IP move plus a reachability wait; never a BGP speaker.
+8. **Octavia:** findings plus the member helper as a Technology Preview; no load balancer recreation, and TLS keys are
+   never read.
+9. **Heat:** findings only, with `SRC_VM_AUTOSCALED` a blocker until acknowledged.
+10. **The Technology Preview label** stays on the network features until LAB-NET passes, as §22 does for GPUs.
+11. **`allowed_address_pairs`:** a finding in 0.4.0, and carrying them in a later release.
+
+### 23.12 Contract changes (each binding from its plan task, once the owner approves §23)
+
+| Item | Becomes binding in | Plan task |
+|---|---|---|
+| PRD: FR-28's scope, goal and journey, and §3's non-goals as delivered | PRD | N1 |
+| the findings of §23.8 | §9.3 | N2 |
+| the hook catalog, the plan's network cut-over settings, the routes | §4.2, §12 | N3 |
+| the hook runner: kinds, timeouts, the idempotency key, the context document | §7.2, §13 | N4 |
+| hook points in the cutover, verification, rollback and finalize of every strategy, resumed after a restart | §5, §7, §8 | N5 |
+| the floating IP keep-address move | §7.2, §7.3, §8 | N6 |
+| the DNS swap | §7, §13.3 | N7 |
+| the reachability wait | §7.5 | N8 |
+| the Octavia member helper | §7, §10 | N9 |
+| the hooks' time in the downtime estimate, and the TTL tail | §9.1 | N10 |
+| the demo's floating IPs, DNS zone, load balancer and stack | §7.4, §10 | N11 |
+| the dashboard (§23.9) | §16 | N12 |
+| QASuite (requirement rows, LAB-NET cases), Security.md, Operations.md's runbooks | QASuite, Security.md, Operations.md | N13 |
+| the lab on two clouds; the Technology Preview label goes when its cases pass | QASuite §13 | N14 |
