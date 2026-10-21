@@ -26,6 +26,8 @@ from seamless_migrate.executors.handover import (
     port_description,
 )
 from seamless_migrate.planning.gpu import gpu_requests
+from seamless_migrate.planning.preflight import DestinationInventory
+from seamless_migrate.providers.base import ProviderError
 from tests.cloud_support import InProcessCloud
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_plan, make_provider, make_vm
@@ -433,6 +435,8 @@ class FakeCloud:
         self.group_list = None
         # Nova's flavors (None: every name), and Cinder's types: the source's and the mapped one
         self.flavor_names = None
+        # each flavor's extra specs (by name): what makes it one of the GPU flavors (SDD §22.3)
+        self.flavor_specs = {}
         self.type_names = ("ceph-ssd", "ceph-hdd", "rbd-hdd")
         # each type's extra specs (by name), e.g. the backend it asks for
         self.type_specs = {}
@@ -517,6 +521,46 @@ def source_cloud(calls, crash_on=None):
     return cloud
 
 
+class FakeDestinations:
+    """The provider registry as step 0 reads the destination for a GPU VM (SDD §7.3 step 0,
+    §22.3): its inventory lists the destination cloud's flavors - Nova's names, each with its extra
+    specs -, and those that ask for a GPU again with their requests, as the provider lists them;
+    ``error`` fails the read. ``reads`` counts the reads."""
+
+    def __init__(self, cloud):
+        self.cloud = cloud
+        self.reads = 0
+        self.error = False
+
+    def get(self, provider):
+        assert provider.role == ProviderRole.destination, provider
+        return self
+
+    async def inventory(self):
+        self.reads += 1
+        if self.error:
+            raise ProviderError("flavors: HTTP 503")
+        names = self.cloud.flavor_names if self.cloud.flavor_names is not None else ()
+        flavors = [
+            {
+                "name": name,
+                "vcpus": 8,
+                "ram_mb": 32768,
+                "disk_gb": 80,
+                "extra_specs": dict(self.cloud.flavor_specs.get(name, {})),
+            }
+            for name in sorted(names)
+        ]
+        return DestinationInventory(
+            flavors=flavors,
+            gpu_flavors=[
+                {**{k: f[k] for k in ("name", "vcpus", "ram_mb", "disk_gb")}, "gpus": gpus}
+                for f in flavors
+                if (gpus := gpu_requests(f["extra_specs"]))
+            ],
+        )
+
+
 def setup(tmp_path, crash_on=None, dst_crash_on=None):
     calls = []
     dst_pools = [("hostgroup@ceph-ssd#ssd", CEPH), ("hostgroup@ceph-hdd#hdd", CEPH)]
@@ -527,7 +571,12 @@ def setup(tmp_path, crash_on=None, dst_crash_on=None):
     # every test's clouds share one pool whose objects a manage renames (SDD §7.3 step 6)
     shared_pool(clouds)
     settings = Settings(data_dir=tmp_path / "data")
-    executor = HandoverExecutor(settings, conn_factory=lambda p: clouds[p.cloud], poll_s=0)
+    executor = HandoverExecutor(
+        settings,
+        conn_factory=lambda p: clouds[p.cloud],
+        poll_s=0,
+        providers=FakeDestinations(clouds["dst"]),
+    )
     plan = make_plan(
         id="plan-0000beef",
         mappings=Mappings(
@@ -4718,6 +4767,8 @@ async def test_the_handover_creates_a_gpu_vms_server_with_its_mapped_flavor(tmp_
         executor, calls, clouds, plan, mig, settings = setup(tmp_path / case)
         clouds["src"].servers["srv-1"].flavor = {"original_name": "g1.vgpu"}
         clouds["dst"].flavor_names = flavors
+        # RHOSO's GPU flavors ask for the vGPU (step 0 reads them, plan task G7b)
+        clouds["dst"].flavor_specs = {"g1.vgpu": on_a100, "g1.a100-4c": on_a100}
         mapped = plan.mappings.model_copy(update={"flavors": {"g1.vgpu": "g1.a100-4c"}})
         plan = plan.model_copy(update={"mappings": mapped})
         gpu_vm = {"flavor": "g1.vgpu", "flavor_extra_specs": on_a100, "gpus": gpu_requests(on_a100)}
@@ -4737,6 +4788,119 @@ async def test_the_handover_creates_a_gpu_vms_server_with_its_mapped_flavor(tmp_
         )
         assert [op for op in ops(calls) if op[1] == "stop_server"] == []
         assert rec.downtime_marks == 0 and clouds["dst"].created == []
+
+
+#: one vGPU with the A100-4C trait, as a flavor's extra specs ask for it (SDD §22.2)
+ON_A100 = {"resources:VGPU": "1", "trait:CUSTOM_NVIDIA_A100_4C": "required"}
+#: RHOSO's flavors in the GPU cases: the source flavor's name and the GPU flavor, both GPU flavors
+GPU_FLAVORS = {"g1.vgpu", "g1.a100-4c", "m1.large"}
+GPU_SPECS = {"g1.vgpu": ON_A100, "g1.a100-4c": ON_A100}
+
+
+def gpu_handover(tmp_path, flavors=GPU_FLAVORS, specs=GPU_SPECS, mapped=None, vm_kw=None, src=SRC):
+    """A handover of the GPU VM web-01, whose flavor g1.vgpu asks for one vGPU with the A100-4C
+    trait and whose plan maps it to g1.a100-4c unless ``mapped`` gives the plan's flavor mappings;
+    RHOSO's flavors are ``flavors``, with their extra specs ``specs`` (SDD §7.3, §22.4)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    vm_kw = vm_kw or {
+        "flavor": "g1.vgpu",
+        "flavor_extra_specs": ON_A100,
+        "gpus": gpu_requests(ON_A100),
+    }
+    clouds["src"].servers["srv-1"].flavor = {"original_name": vm_kw["flavor"]}
+    clouds["dst"].flavor_names = set(flavors)
+    clouds["dst"].flavor_specs = dict(specs)
+    maps = {"g1.vgpu": "g1.a100-4c"} if mapped is None else mapped
+    plan = plan.model_copy(update={"mappings": plan.mappings.model_copy(update={"flavors": maps})})
+    mig = mig.model_copy(update={"vm": mig.vm.model_copy(update=vm_kw)})
+    ctx, rec = make_ctx(plan, mig, src, DST, settings)
+    return executor, calls, clouds, ctx, rec
+
+
+async def test_handover_step_0_refuses_a_gpu_vm_whose_mapping_no_longer_applies(tmp_path):
+    """SDD §7.3 step 0, §22.4 (plan task G7b): for a GPU VM - its GPUs read with the profile its
+    source declares for its flavor - step 0 reads the destination's inventory once, before the
+    stop, and refuses a GPU mapping that no longer applies: the mapped flavor stripped of its GPU
+    since the validation, the plan's mapping of the VM's flavor removed after a failed attempt
+    (step 8 would fall back to the same-named flavor, here one that asks for a GPU too), or the
+    mapped flavor gone. Nothing is stopped, journaled or created, and no clock opens. An inventory
+    that cannot be read fails the step as transient, unless step 0 refuses the handover anyway; a
+    VM without a GPU reads none."""
+
+    async def refused(executor, calls, clouds, ctx, rec, error=PermanentStepError):
+        with pytest.raises(error) as exc:
+            await executor.run(StepName.CUTOVER, ctx)
+        assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+        assert rec.downtime_marks == 0 and rec.downtime_at == []
+        assert clouds["dst"].created == [] and clouds["dst"].managed == []
+        assert not (executor.run_dir(ctx) / JOURNAL_FILE).exists(), "step 0 journaled"
+        assert executor.providers.reads == 1  # once, before the stop
+        return str(exc.value)
+
+    # the mapped flavor, still there, stripped of its GPU request since the validation
+    case = gpu_handover(tmp_path / "stripped", specs={"g1.vgpu": ON_A100})
+    assert await refused(*case) == (
+        "storage handover refused: the GPUs of web-01 (VGPU) cannot go to flavor 'g1.a100-4c' of "
+        "RHOSO 18.0: it asks for no GPU, and the server would lose its GPU"
+    )
+    # the plan's mapping of the VM's flavor removed: the same-named flavor is no GPU mapping
+    case = gpu_handover(tmp_path / "unmapped", mapped={"m1.small": "rhoso.small"})
+    assert await refused(*case) == (
+        "storage handover refused: the plan maps no flavor to 'g1.vgpu', which gives the GPUs of "
+        "web-01 (VGPU): map it to a GPU flavor of RHOSO 18.0"
+    )
+    # the mapped flavor gone: as the flavor step 8 asks for, and as the VM's GPU flavor
+    case = gpu_handover(tmp_path / "gone", flavors={"g1.vgpu", "m1.large"})
+    assert await refused(*case) == (
+        "storage handover refused: the server's flavor 'g1.vgpu': RHOSO 18.0 has no flavor named "
+        "'g1.a100-4c'; the GPUs of web-01 (VGPU) cannot go to flavor 'g1.a100-4c' of RHOSO 18.0: "
+        "there is no flavor named 'g1.a100-4c'"
+    )
+    # a VM recorded without GPUs whose flavor asks for a custom resource class: a vGPU once its
+    # source declares a profile for that flavor, as the pre-flight reads it (SDD §22.2)
+    custom = {"flavor": "g1.custom", "flavor_extra_specs": {"resources:CUSTOM_NVIDIA_A100_4C": "1"}}
+    declaring = make_provider(cloud="src", gpu_profiles={"g1.custom": "A100-4C"})
+    case = gpu_handover(
+        tmp_path / "declared", GPU_FLAVORS | {"g1.custom"}, mapped={}, vm_kw=custom, src=declaring
+    )
+    assert await refused(*case) == (
+        "storage handover refused: the plan maps no flavor to 'g1.custom', which gives the GPUs of "
+        "web-01 (A100-4C): map it to a GPU flavor of RHOSO 18.0"
+    )
+    # the destination's inventory cannot be read: transient, before the stop...
+    case = gpu_handover(tmp_path / "unread")
+    case[0].providers.error = True
+    assert await refused(*case, TransientStepError) == (
+        "could not read the flavors of RHOSO 18.0 for the GPU flavor of web-01: flavors: HTTP 503"
+    )
+    # ...unless step 0 refuses the handover anyway: what it found stands, and the next attempt
+    # judges the GPU flavor
+    case = gpu_handover(tmp_path / "unread-refused")
+    case[0].providers.error = True
+    case[2]["dst"].type_names = ("rbd-hdd",)
+    assert await refused(*case) == (
+        "storage handover refused: volume vol-root: RHOSO 18.0 has no volume type named 'ceph-ssd'"
+    )
+    # the mapping applies: step 8 creates the server with it, after one read
+    executor, calls, clouds, ctx, rec = gpu_handover(tmp_path / "applies")
+    await executor.run(StepName.CUTOVER, ctx)
+    assert clouds["dst"].created[0]["flavor_id"] == "flavor-g1.a100-4c"
+    assert executor.providers.reads == 1 and rec.downtime_marks == 1
+    # so it does for a VM whose GPU its source's declared profile tells, its flavor mapped
+    executor, calls, clouds, ctx, rec = gpu_handover(
+        tmp_path / "declared-applies",
+        GPU_FLAVORS | {"g1.custom"},
+        mapped={"g1.custom": "g1.a100-4c"},
+        vm_kw=custom,
+        src=declaring,
+    )
+    await executor.run(StepName.CUTOVER, ctx)
+    assert clouds["dst"].created[0]["flavor_id"] == "flavor-g1.a100-4c"
+    assert executor.providers.reads == 1
+    # a VM without a GPU reads no inventory
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "plain")
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert executor.providers.reads == 0 and clouds["dst"].created
 
 
 async def test_handover_step_0_refuses_a_flavor_or_a_volume_type_rhoso_lacks(tmp_path):

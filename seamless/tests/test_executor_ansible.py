@@ -2268,6 +2268,8 @@ async def test_an_openstack_gpu_vms_server_gets_its_mapped_flavor(env, monkeypat
     Mappings.gpus names VMware GPUs only and is not applied, and no kit variable reaches
     os-migrate."""
     monkeypatch.setenv("ANSIBLE_FAKE_FLAVOR", "g1.vgpu")  # the export names the source's flavor
+    # the destination's GPU flavor, which each run reads (plan task G7b)
+    env.registry.flavors = [dst_flavor("g1.a100-4c", ON_A100), dst_flavor("m1.large")]
     mappings = MAPPINGS.model_copy(
         update={"flavors": {"g1.vgpu": "g1.a100-4c"}, "gpus": {"grid_a100-4c": "p1.a100"}}
     )
@@ -2284,6 +2286,226 @@ async def test_an_openstack_gpu_vms_server_gets_its_mapped_flavor(env, monkeypat
     assert runs[-1]["playbook"] in ("import_workloads.yml", "import_workloads_cutover.yml")
     assert exported_server(env)["params"]["flavor_ref"]["name"] == "g1.a100-4c"
     assert not [r["playbook"] for r in runs if "flavor_uuid" in r["vars"]]
+
+
+#: an OpenStack GPU VM as its source reports it: its flavor g1.vgpu asks for one vGPU with the
+#: A100-4C trait (SDD §22.2)
+OSP_GPU_VM = {"flavor": "g1.vgpu", "flavor_extra_specs": ON_A100, "gpus": gpu_requests(ON_A100)}
+#: a flavor that asks for a custom resource class alone: a vGPU only with a declared profile (§22.2)
+CUSTOM_CLASS = {"resources:CUSTOM_NVIDIA_A100_4C": "1"}
+
+
+def osp_gpu_ctx(env, strategy=Strategy.warm, flavors=None, source=SRC, vm_kw=None):
+    """An OpenStack GPU VM whose plan maps its flavor g1.vgpu to the destination's GPU flavor
+    g1.a100-4c, unless ``flavors`` gives the plan's flavor mappings (SDD §22.4)."""
+    maps = {"g1.vgpu": "g1.a100-4c"} if flavors is None else flavors
+    mappings = MAPPINGS.model_copy(update={"flavors": maps})
+    return ctx_for(env, strategy, source=source, mappings=mappings, vm_kw=vm_kw or OSP_GPU_VM)
+
+
+@pytest.mark.parametrize("strategy", [Strategy.cold, Strategy.warm])
+async def test_an_openstack_gpu_cutover_refuses_before_the_source_stops_when_its_mapping_no_longer_applies(  # noqa: E501 - the plan task's test name
+    env, monkeypatch, strategy
+):
+    """SDD §7.2, §22.4 (plan task G7b): the cold and the warm cutover of an OpenStack GPU VM read
+    the destination's flavors once for the run and refuse, before any playbook and so before the
+    source stops, a GPU mapping that no longer applies: the mapped flavor stripped of its GPU since
+    the validation (the server would lose it, and G8's check would roll it back after the outage),
+    the plan's mapping of the VM's flavor removed after a failed attempt (the import would take the
+    same-named flavor - here one that asks for a GPU too -, and the verification would check
+    nothing), or the mapped flavor gone. The VM's GPUs are read with the profile its source
+    declares for its flavor. No playbook runs, the source never stops and no clock opens; flavors
+    that cannot be read are a transient failure. Once the mapping applies again, the cutover
+    creates the server with it."""
+    monkeypatch.setenv("ANSIBLE_FAKE_FLAVOR", "g1.vgpu")  # the export names the source's flavor
+    a100 = dst_flavor("g1.a100-4c", ON_A100)
+    same_named = dst_flavor("g1.vgpu", ON_A100)  # the source flavor's name, a GPU flavor here too
+    env.registry.flavors = [a100, same_named]
+    passes = []
+    if strategy == Strategy.warm:
+        # the pre-copy ran while the mapping applied
+        ctx, _ = osp_gpu_ctx(env, strategy)
+        first = await env.executor.run(StepName.PRECOPY, ctx)
+        assert first.cutover_refusals == []
+        passes.append(first.sync_pass)
+
+    async def refused(ctx, rec, error=PermanentStepError):
+        ctx.migration.sync_passes.extend(passes)
+        ran, reads = len(read_log(env.log)), env.registry.calls.count(("inventory",))
+        with pytest.raises(error) as exc:
+            await env.executor.run(StepName.CUTOVER, ctx)
+        assert len(read_log(env.log)) == ran, "a playbook ran"
+        assert not any(STOP_TASK.match(line) for line in rec.logs), "the source was stopped"
+        assert rec.downtime_marks == 0 and rec.downtime_at == []
+        assert env.registry.calls.count(("inventory",)) == reads + 1  # once, for the run
+        return str(exc.value)
+
+    # the mapped flavor, still there, stripped of its GPU request since the validation
+    env.registry.flavors = [dst_flavor("g1.a100-4c"), same_named]
+    ctx, rec = osp_gpu_ctx(env, strategy)
+    assert await refused(ctx, rec) == (
+        "the GPUs of web-01 (VGPU) cannot go to flavor 'g1.a100-4c' of RHOSO 18.0: it asks for no "
+        "GPU, and the server would lose its GPU"
+    )
+    # the plan's mapping of the VM's flavor removed after a failed attempt: the same-named flavor,
+    # one of the destination's GPU flavors too, is no GPU mapping
+    env.registry.flavors = [a100, same_named]
+    ctx, rec = osp_gpu_ctx(env, strategy, flavors={"m1.small": "rhoso.small"})
+    assert await refused(ctx, rec) == (
+        "the plan maps no flavor to 'g1.vgpu', which gives the GPUs of web-01 (VGPU): map it to a "
+        "GPU flavor of RHOSO 18.0"
+    )
+    # the mapped flavor gone
+    env.registry.flavors = [same_named, dst_flavor("m1.large")]
+    ctx, rec = osp_gpu_ctx(env, strategy)
+    assert await refused(ctx, rec) == (
+        "the GPUs of web-01 (VGPU) cannot go to flavor 'g1.a100-4c' of RHOSO 18.0: there is no "
+        "flavor named 'g1.a100-4c'"
+    )
+    # a VM recorded without GPUs whose flavor asks for a custom resource class: a vGPU once its
+    # source declares a profile for that flavor, as the pre-flight reads it (SDD §22.2)
+    declaring = make_provider(cloud="src", gpu_profiles={"g1.custom": "A100-4C"})
+    custom = {"flavor": "g1.custom", "flavor_extra_specs": CUSTOM_CLASS}
+    env.registry.flavors = [a100, dst_flavor("g1.custom", CUSTOM_CLASS)]
+    ctx, rec = osp_gpu_ctx(env, strategy, flavors={}, source=declaring, vm_kw=custom)
+    assert await refused(ctx, rec) == (
+        "the plan maps no flavor to 'g1.custom', which gives the GPUs of web-01 (A100-4C): map it "
+        "to a GPU flavor of RHOSO 18.0"
+    )
+    # the destination's flavors cannot be read: transient, before any playbook - for a VM whose GPU
+    # its source's declared profile tells, too
+    env.registry.flavors = [a100, same_named]
+    env.registry.inventory_error = True
+    for ctx, rec in (
+        osp_gpu_ctx(env, strategy),
+        osp_gpu_ctx(env, strategy, flavors={}, source=declaring, vm_kw=custom),
+    ):
+        assert await refused(ctx, rec, TransientStepError) == (
+            "could not read the flavors of RHOSO 18.0 for the GPU flavor of web-01: networks: "
+            "HTTP 503"
+        )
+    # the mapping applies again: the cutover creates the server with it
+    env.registry.inventory_error = False
+    ctx, rec = osp_gpu_ctx(env, strategy)
+    ctx.migration.sync_passes.extend(passes)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["playbook"] == (
+        "import_workloads.yml" if strategy == Strategy.cold else "import_workloads_cutover.yml"
+    )
+    assert exported_server(env)["params"]["flavor_ref"]["name"] == "g1.a100-4c"
+    assert rec.downtime_marks == 1
+
+
+async def test_an_openstack_warm_pass_records_a_gpu_mapping_its_cutover_will_refuse(
+    env, monkeypatch
+):
+    """SDD §7.2 (plan task G7b): a warm pre-copy or sync run, which creates no server, runs on a GPU
+    mapping that no longer applies, logs the problem once and returns it in cutover_refusals beside
+    what the destination check recorded; the cutover refuses it before the source stops. A pass
+    whose destination inventory cannot be read logs that and returns no GPU problem - its cutover
+    reads the flavors again -; a pass that finds the GPU flavor back returns none, and the cutover
+    runs."""
+    monkeypatch.setenv("ANSIBLE_FAKE_FLAVOR", "g1.vgpu")
+    role = "Destination prerequisites not met: network 'rhoso-dmz' not found"
+    monkeypatch.setenv("ANSIBLE_FAKE_REFUSALS", json.dumps([role]))
+    env.registry.flavors = [dst_flavor("g1.a100-4c")]  # its GPU request removed since validation
+    stripped = (
+        "the GPUs of web-01 (VGPU) cannot go to flavor 'g1.a100-4c' of RHOSO 18.0: it asks for no "
+        "GPU, and the server would lose its GPU"
+    )
+    ctx, rec = osp_gpu_ctx(env)
+    first = await env.executor.run(StepName.PRECOPY, ctx)
+    assert first.cutover_refusals == [stripped, role]
+    assert [r["playbook"] for r in read_log(env.log)] == [
+        "export_workloads.yml",
+        "import_workloads_precopy.yml",
+    ]
+    assert rec.logs.count(f"the cutover will refuse this before the source stops: {stripped}") == 1
+    assert rec.downtime_marks == 0
+    # its cutover refuses it before any playbook
+    ctx.migration.sync_passes.append(first.sync_pass)
+    with pytest.raises(PermanentStepError) as exc:
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert str(exc.value) == stripped
+    assert len(read_log(env.log)) == 2 and rec.downtime_marks == 0
+    # a pass that cannot read the destination's inventory says so and records no GPU problem
+    env.registry.inventory_error = True
+    second = await env.executor.run(StepName.SYNC, ctx)
+    assert second.cutover_refusals == [role]
+    assert any("could not read the networks of RHOSO 18.0" in line for line in rec.logs)
+    assert (
+        "the GPU flavor of web-01 is not judged in this pass: the cutover reads the flavors of "
+        "RHOSO 18.0 again before the source stops"
+    ) in rec.logs
+    # the operator gives the flavor its GPU request back: the next pass meets nothing of it
+    env.registry.inventory_error = False
+    env.registry.flavors = [dst_flavor("g1.a100-4c", ON_A100)]
+    monkeypatch.setenv("ANSIBLE_FAKE_REFUSALS", "[]")
+    ctx.migration.sync_passes.append(second.sync_pass)
+    third = await env.executor.run(StepName.SYNC, ctx)
+    assert third.cutover_refusals == []
+    ctx.migration.sync_passes.append(third.sync_pass)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["playbook"] == "import_workloads_cutover.yml"
+    assert exported_server(env)["params"]["flavor_ref"]["name"] == "g1.a100-4c"
+    assert rec.downtime_marks == 1
+
+
+@pytest.mark.parametrize("strategy", [Strategy.cold, Strategy.warm])
+@pytest.mark.parametrize(
+    ("case", "flavors", "vm_kw", "flavor"),
+    [
+        # mapped to a flavor the destination lacks: the destination check's to refuse (§6.6)
+        ("mapped", {"m1.small": "rhoso.small"}, {}, "rhoso.small"),
+        # a VM without a GPU that a mapping sends to a GPU flavor (§22.5)
+        ("to-a-gpu-flavor", {"m1.small": "g1.a100-4c"}, {}, "g1.a100-4c"),
+        # no mapping: the same-named flavor
+        ("unmapped", {}, {}, "m1.small"),
+        # a custom resource class alone is no GPU while its source declares no profile for it
+        (
+            "custom-class",
+            {},
+            {"flavor": "g1.custom", "flavor_extra_specs": CUSTOM_CLASS},
+            "g1.custom",
+        ),
+        # destination networks that cannot be read are only logged
+        ("unreadable", {"m1.small": "rhoso.small"}, {}, "rhoso.small"),
+    ],
+)
+async def test_an_openstack_vm_without_a_gpu_cuts_over_as_before(
+    env, monkeypatch, strategy, case, flavors, vm_kw, flavor
+):
+    """SDD §7.2 (plan task G7b): a VM without a GPU is judged as before, on a destination that
+    offers GPU flavors: none of its flavors is checked - its flavor mapped to one the destination
+    lacks or to a GPU flavor, or not mapped at all -, it cuts over with the flavor the export's
+    mapping names, and destination networks that cannot be read are only logged. Each run reads the
+    destination's inventory once."""
+    monkeypatch.setenv("ANSIBLE_FAKE_FLAVOR", vm_kw.get("flavor", "m1.small"))
+    env.registry.flavors = [dst_flavor("g1.a100-4c", ON_A100), dst_flavor("m1.large")]
+    env.registry.inventory_error = case == "unreadable"
+    mappings = MAPPINGS.model_copy(update={"flavors": flavors})
+    ctx, rec = ctx_for(env, strategy, mappings=mappings, vm_kw=vm_kw)
+    if strategy == Strategy.warm:
+        first = await env.executor.run(StepName.PRECOPY, ctx)
+        assert first.cutover_refusals == []
+        ctx.migration.sync_passes.append(first.sync_pass)
+    result = await env.executor.run(StepName.CUTOVER, ctx)
+    runs = [run["playbook"] for run in read_log(env.log)]
+    assert runs == (
+        ["export_workloads.yml", "import_workloads.yml"]
+        if strategy == Strategy.cold
+        else [
+            "export_workloads.yml",
+            "import_workloads_precopy.yml",
+            "import_workloads_cutover.yml",
+        ]
+    )
+    assert exported_server(env)["params"]["flavor_ref"]["name"] == flavor
+    assert result.destination_server_id and rec.downtime_marks == 1
+    assert env.registry.calls.count(("inventory",)) == (1 if strategy == Strategy.cold else 2)
+    assert not [line for line in rec.logs if "GPU" in line or "refuse" in line]
+    unread = [line for line in rec.logs if line.startswith("could not read the networks of")]
+    assert len(unread) == (0 if case != "unreadable" else 1 if strategy == Strategy.cold else 2)
 
 
 async def test_downtime_clock_starts_at_the_stop_task(env, monkeypatch):

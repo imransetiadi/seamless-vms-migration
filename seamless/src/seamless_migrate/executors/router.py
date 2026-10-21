@@ -43,7 +43,7 @@ class ExecutorRouter:
     @property
     def handover(self) -> Any:
         if self._handover is None:
-            self._handover = HandoverExecutor(self.settings)
+            self._handover = HandoverExecutor(self.settings, providers=self._providers)
         return self._handover
 
     def for_strategy(self, strategy: Strategy | str) -> Executor:

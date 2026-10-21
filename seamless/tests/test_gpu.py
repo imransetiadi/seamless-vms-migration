@@ -291,3 +291,14 @@ def test_gpu_flavor_is_the_one_flavor_a_vms_gpu_keys_map_to():
         gpu_flavor(make_vm(), make_plan(mappings=Mappings(flavors={"m1.small": "g1"})), openstack)
         is None
     )
+
+
+def test_gpu_flavor_reads_the_vms_gpus_with_the_profile_its_source_declares():
+    """SDD §7.2, §22.2, §22.4 (plan task G7b): a VM recorded without GPUs whose flavor asks for a
+    custom resource class alone is a GPU VM once its source declares a profile for that flavor, as
+    the cutover reads it: its GPU flavor is then its flavor's mapping; without the profile it has
+    none."""
+    vm = make_vm(flavor="g1.custom", flavor_extra_specs={"resources:CUSTOM_NVIDIA_A100_4C": "1"})
+    plan = make_plan(mappings=Mappings(flavors={"g1.custom": "g1.a100-4c"}))
+    assert gpu_flavor(vm, plan, ProviderKind.openstack) is None
+    assert gpu_flavor(vm, plan, ProviderKind.openstack, "A100-4C") == "g1.a100-4c"

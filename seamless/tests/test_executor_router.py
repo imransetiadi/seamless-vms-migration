@@ -20,3 +20,13 @@ def test_router_uses_the_simulator_in_demo_mode():
     router = ExecutorRouter(Settings(demo=True))
     assert all(isinstance(router.for_strategy(s), SimulatedExecutor) for s in Strategy)
     assert isinstance(router.prestage_executor(ProviderKind.vmware), SimulatedExecutor)
+
+
+def test_the_handover_reads_the_destination_through_the_routers_providers():
+    """SDD §7.3 step 0 (plan task G7b): the storage handover reads a GPU VM's destination inventory
+    through the providers the router was given - the control plane's one registry -, as the
+    Ansible executor does."""
+    registry = object()
+    router = ExecutorRouter(Settings(demo=False), providers=registry)
+    assert router.handover.providers is registry
+    assert router.ansible.providers is registry

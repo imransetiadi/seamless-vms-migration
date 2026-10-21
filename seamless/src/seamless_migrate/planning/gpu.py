@@ -211,13 +211,19 @@ def vm_gpus(vm: VMRef, declared_profile: str | None = None) -> list[GpuDevice]:
     return gpu_requests(specs, declared_profile)
 
 
-def gpu_flavor(vm: VMRef, plan: Plan, source_kind: ProviderKind | str) -> str | None:
+def gpu_flavor(
+    vm: VMRef,
+    plan: Plan,
+    source_kind: ProviderKind | str,
+    declared_profile: str | None = None,
+) -> str | None:
     """A GPU VM's GPU flavor, the destination flavor its server is created with, as its plan names
     it (SDD §22.4): for a VMware VM the one flavor ``mappings.gpus`` maps each of its GPU keys to -
     None when a device has no key, a key no mapping names, or its keys map to different flavors -;
     for an OpenStack VM the explicit mapping of its flavor. Never a same-named or a matched flavor;
-    None for a VM without a GPU."""
-    gpus = vm_gpus(vm)
+    None for a VM without a GPU - its GPUs read with ``declared_profile``, the profile its source
+    declares for its flavor, as `vm_gpus` reads them (§7.2, §22.2)."""
+    gpus = vm_gpus(vm, declared_profile)
     if not gpus:
         return None
     if ProviderKind(source_kind) != ProviderKind.vmware:

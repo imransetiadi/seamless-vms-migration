@@ -1478,6 +1478,25 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   project names in refs); the network references are then resolved as above. An OpenStack GPU VM's GPU flavor is
   its flavor's mapping (§22.4), which so reaches `flavor_ref.name`: the cold and warm cutovers create its server with
   it. `Mappings.gpus` names VMware GPUs only and is not applied (plan task G7).
+* OpenStack GPU flavor (§22.4, plan task G7b). On the `cold` and `warm` paths, and in the storage handover's step 0
+  (§7.3), a VM is a GPU VM when `planning/gpu.vm_gpus` finds a GPU for it with the vGPU profile its source provider
+  declares for its flavor (`Provider.gpu_profiles`, §22.3), as §9.3's two GPU rows read it: its recorded `gpus`, else
+  what its flavor's extra specs ask for - a `CUSTOM_` class among them once a profile is declared for the flavor
+  (§22.2). Before any playbook of its `cold` or `warm` cutover runs, so before the source stops, the cutover stops with
+  a permanent failure naming the VM's GPUs and the destination provider when its GPU mapping no longer applies to the
+  destination's flavors read for that run - the inventory the network references above read, once for the run: the
+  plan maps no flavor to the VM's flavor (a mapping removed after a failed attempt: no validation judges a failed
+  migration again, §5.4; the import would create the server with a same-named flavor, which is no GPU mapping), the
+  flavor it maps to no longer exists, or that flavor asks for no GPU (it is none of the inventory's `gpu_flavors`,
+  §22.3). Without the refusal the server would lose its GPU once the source stopped: the verification's `gpu_flavor`
+  check (§7.5) fails a flavor that lost it, an outage spent on a rollback, and checks nothing for a VM whose plan maps
+  its flavor to none. Destination flavors that cannot be read are then a transient failure, before any playbook. A
+  `warm` pre-copy or sync run, which creates no server, logs the problem once and records it in the migration's
+  `cutover_refusals` instead, as for a port network above; one whose destination inventory cannot be read logs that,
+  as it does for the networks, records no GPU problem and goes on - its cutover reads the flavors again. A `warm`
+  cutover that finishes the recorded destination server, and a rollback, judge no flavor: they read no inventory
+  (above). A VM without a GPU runs as before: no flavor of it is judged, and destination networks that cannot be read
+  are only logged.
 * Step → playbook map:
 
 | Strategy | precopy / sync | cutover | rollback |
@@ -1735,6 +1754,14 @@ volumes with their server, so the order is:
      same way for the port it creates. Step 8 runs after the source server was deleted (step 4): a missing group would
      leave the VM on neither cloud until the rollback;
    * the flavor step 8 creates the server with is not a RHOSO flavor (`find_flavor`, as step 8 looks it up);
+   * the VM is a GPU VM (§7.2: `vm_gpus` with the profile its source declares for its flavor) whose GPU mapping no
+     longer applies to the destination's flavors: the plan maps no flavor to its flavor - step 8 would fall back to
+     the same-named flavor, which is no GPU mapping (§22.4) -, the flavor it maps to no longer exists, or that flavor
+     asks for no GPU (none of the inventory's `gpu_flavors`, §22.3) - step 8 would create the server without its GPU.
+     The flavors are the destination's inventory (`DestinationProvider.inventory()`), read once for the step before
+     the stop, for a GPU VM only; an inventory that cannot be read fails the step as transient, before the stop, and
+     the retry reads it again - unless step 0 refuses the handover for another problem anyway, which then stands as
+     the permanent failure (plan task G7b);
    * a volume type step 6 manages a volume into is not one of RHOSO's volume types. §9.3's `MAP_VOLUME_TYPE_MISSING`
      is only a warning when the plan maps no volume type, and step 6, like step 8, runs after the source server was
      deleted;
@@ -1811,8 +1838,8 @@ volumes with their server, so the order is:
    `delete_on_termination: false`), with the source flavor's mapping — `plan.mappings.flavors` overlaid with the
    migration's resolved mappings, so the flavor preflight matched is used (§7.2) — else its name. A GPU VM's GPU
    flavor is its flavor's mapping, and its resolved mappings are empty (§22.4): its server is created with the mapped
-   GPU flavor (plan task G7). Each network is found
-   with step 0's lookup. Its NICs: with
+   GPU flavor (plan task G7), and one whose mapping no longer applies step 0 refused (plan task G7b). Each network
+   is found with step 0's lookup. Its NICs: with
    `plan.port_creation_mode` `"nova"` each port's mapped network with the port's first fixed IP (Nova creates the port with a new MAC; §9.2 rules out a port with more than one
    address). With `"neutron"` each port is first created through Neutron on the mapped network with the journaled
    MAC, every fixed IP (by address: Neutron picks the subnet) except those on a SLAAC or DHCPv6-stateless subnet of
@@ -4793,8 +4820,14 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
 * Where the GPU flavor is used:
   * the pre-flight (§22.5); the quota counts a GPU VM's cores and RAM by its GPU flavor (`DST_QUOTA_INSUFFICIENT`), a
     VMware VM's too, as the migration kit no longer sizes its server;
-  * the cold, warm and storage-handover paths create the server with it, as with any flavor mapping (`apply_mappings`,
-    §7.2; §7.3 step 8). Binding in §7.2 and §7.3 since plan task G7;
+  * the cold, warm and storage-handover paths create the server with it: it is the VM's flavor mapping, which
+    `apply_mappings` and §7.3's step 8 apply (§7.2). Binding in §7.2 and §7.3 since plan task G7. Applying it is not
+    enough: they create the server with whatever flavor the mapping names, and without a mapping with the same-named
+    flavor, which is no GPU mapping. So the cutover refuses before any playbook - the storage handover in its step 0
+    -, before the source stops, when a GPU VM's mapping no longer applies (no mapping of its flavor - one removed
+    after a failed attempt -, the flavor deleted since the validation, or one that no longer asks for a GPU), and a
+    `warm` pass records it in `cutover_refusals`. A VM is a GPU VM there by `vm_gpus` with the profile its source
+    declares for its flavor, as §9.3's GPU rows read it. Binding in §7.2 and §7.3 since plan task G7b;
   * the VMware path passes it to the migration kit as `flavor_uuid` in the vars of every kit run. The kit 2.2.7 takes a
     flavor id or name there and uses it for the server instead of its own best match (`TODO(LAB): confirm` that it
     creates no flavor of that name when its best match finds none, §22.14). The cutover refuses before the kit runs,
@@ -5006,6 +5039,7 @@ Binding in §13.4 with plan task G3:
 | the eligibility of a VMware passthrough VM; a pilot without GPU VMs; the port 9400 suggestion | §9.2, §9.4, §9.6 (binding) | G5 |
 | the gate's fifth rule, `Migration.gpu_wait` and `MigrationSummary.gpu_wait`, the event `migration.gpu_wait`, the gauge `seamless_gpu_waits` | §4.2, §4.3, §5.4, §18 | G6 |
 | the executors create the server with the GPU flavor (`flavor_uuid` for the VMware kit) | §7.2, §7.3 (binding) | G7 |
+| the OpenStack cold, warm and storage-handover cutovers refuse a GPU mapping that no longer applies before the source stops, as the VMware one does | §7.2, §7.3 step 0 (binding) | G7b |
 | the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 (binding) | G8 |
 | the demo's GPU VMs, GPU flavors, pools and gate wait | §7.4, §10 | G9 |
 | the dashboard (§22.11) | §16 (binding for G10's part: the badge rule, the Inventory, `types.ts`) | G10, G11, G12 |
