@@ -395,6 +395,11 @@ GPU_READ_FLOOR_TICKS = 3
 CUTOVERS_BEGUN_KEPT = 512
 #: what rule 5 tells the tick of a GPU VM with a cutover slot left for it (SDD §22.7)
 GpuPlace = Literal["go", "hold", "wait"]
+#: the gate's reads out at once, every destination's together (SDD §22.7): below asyncio's default
+#: thread pool, never under 5 threads (min(32, CPUs + 4)), which the store's calls share - reads
+#: that hang never take every thread the store needs. One destination has one fewer at most, so a
+#: destination whose reads hang always leaves another one a read.
+GPU_READS_MAX = 4
 
 
 @dataclass(frozen=True)
@@ -2530,13 +2535,14 @@ class Orchestrator:
         task = self._gpu_reads.get(m.id)
         if task is not None and not task.done():
             return "hold"
-        reading = sum(
-            1
+        reading = [
+            destination
             for mid, destination in self._gpu_read_destinations.items()
-            if destination == destination_id and not self._gpu_reads[mid].done()
-        )
-        if reading >= self.settings.max_concurrent_cutovers:
-            return "wait"  # the destination's reads hold their worker threads: one ends first
+            if not self._gpu_reads[mid].done()
+        ]
+        per_destination = min(self.settings.max_concurrent_cutovers, GPU_READS_MAX - 1)
+        if reading.count(destination_id) >= per_destination or len(reading) >= GPU_READS_MAX:
+            return "wait"  # the reads out hold their worker threads: one ends first
         self._start_gpu_read(m.id, destination_id)
         return "hold"
 
@@ -3273,9 +3279,9 @@ class Orchestrator:
 
         in_flight = Counter(m.wave_id for m in migs if m.phase in fsm.ACTIVE_STEP_PHASES)
 
-        def wave_room(m: Migration) -> bool:
+        def wave_room(m: Migration, held: int = 0) -> bool:
             wave = waves.get(m.wave_id or "")
-            return wave is None or in_flight[m.wave_id] < wave.max_parallel
+            return wave is None or in_flight[m.wave_id] + held < wave.max_parallel
 
         limit_steps = self.settings.max_concurrent_migrations
         ordered = sorted(
@@ -3284,18 +3290,36 @@ class Orchestrator:
         )
         gate_open: set[str] = set()
 
-        # 1. cutover gate (SDD §5.4); the destination's GPU VMs ahead hold their places (§22.7)
+        # the places the destination's GPU VMs hold in this tick (SDD §22.7): each one a cutover
+        # slot, a step and its wave's room, kept from the migrations of its destination behind it
         destination = plan.destination_provider_id
         holds = self._tick_holds
-        for m in ordered:
+        held_by_earlier_plans = holds[destination]
+        held_at: list[tuple[int, str | None]] = []  # this plan's: index in ordered, and wave
+
+        def hold(i: int, m: Migration) -> None:
+            holds[destination] += 1
+            held_at.append((i, m.wave_id))
+
+        def held_before(i: int) -> int:
+            return held_by_earlier_plans + sum(1 for j, _ in held_at if j < i)
+
+        def wave_held_before(i: int, wave_id: str | None) -> int:
+            return sum(1 for j, wave in held_at if j < i and wave == wave_id)
+
+        # 1. cutover gate (SDD §5.4)
+        for i, m in enumerate(ordered):
             waiting = m.phase == P.awaiting_cutover or (
                 m.phase == P.ready and m.strategy in SINGLE_SHOT_STRATEGIES
             )
             if not waiting or not self._gate(m, plan, now):
                 continue
-            if counts["cutover"] + holds[destination] >= self.settings.max_concurrent_cutovers:
+            held = held_before(i)
+            if counts["cutover"] + held >= self.settings.max_concurrent_cutovers:
                 continue  # waits for a cutover slot: keep-warm passes go on meanwhile
-            if counts["steps"] >= limit_steps or (m.phase == P.ready and not wave_room(m)):
+            if counts["steps"] + held >= limit_steps or (
+                m.phase == P.ready and not wave_room(m, wave_held_before(i, m.wave_id))
+            ):
                 continue
             if m.advisor_hold is not None:
                 continue  # its advisor decision waits for approval: no read, no step (§14.6)
@@ -3305,7 +3329,8 @@ class Orchestrator:
                 if place != "go":
                     # it waits for GPU capacity, or for a read of it - holding its place while the
                     # read is out (SDD §5.4 rule 5, §22.7)
-                    holds[destination] += 1 if place == "hold" else 0
+                    if place == "hold":
+                        hold(i, m)
                     continue
             if await self._begin(
                 m.id, {P.ready, P.awaiting_cutover}, P.cutover, "cutover gate open"
@@ -3316,28 +3341,28 @@ class Orchestrator:
                 in_flight[m.wave_id] += 1
             elif gpu and self._gpu_place(m, self._now(), destination) != "wait":
                 # its read still counts, or was dropped and is read again at once: its place stays
-                holds[destination] += 1
+                hold(i, m)
 
         # 2. keep-warm delta passes while waiting for the gate (or for a cutover slot)
-        for m in ordered:
+        for i, m in enumerate(ordered):
             if m.phase != P.awaiting_cutover or m.id in gate_open or not m.sync_passes:
                 continue
             ended = m.sync_passes[-1].ended_at or m.sync_passes[-1].started_at
             if (now - ended).total_seconds() < plan.keep_warm_interval_s:
                 continue
-            if counts["steps"] >= limit_steps:
+            if counts["steps"] + held_before(i) >= limit_steps:
                 break
             if await self._begin(m.id, {P.awaiting_cutover}, P.syncing, "keep-warm delta pass"):
                 counts["steps"] += 1
                 in_flight[m.wave_id] += 1
 
         # 3. start pre-copy of warm migrations
-        for m in ordered:
+        for i, m in enumerate(ordered):
             if m.phase != P.ready or m.strategy not in WARM_STRATEGIES:
                 continue
-            if counts["steps"] >= limit_steps:
+            if counts["steps"] + held_before(i) >= limit_steps:
                 break
-            if not wave_room(m):
+            if not wave_room(m, wave_held_before(i, m.wave_id)):
                 continue
             if await self._begin(m.id, {P.ready}, P.precopy, "pre-copy started"):
                 counts["steps"] += 1
