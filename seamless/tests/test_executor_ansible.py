@@ -1455,6 +1455,15 @@ async def test_a_vmware_gpu_vm_runs_the_kit_with_its_gpu_flavor_in_every_run(env
     # a flavor name the plan holds is data: Ansible never templates it (SDD §7.2)
     assert all(vars_node(run, "flavor_uuid").tag == "!unsafe" for run in runs)
     assert rec.downtime_marks == 1
+    # one inventory read a run serves the GPU flavor's check and the network map (SDD §7.2,
+    # G7 review)
+    assert env.registry.calls.count(("inventory",)) == 3
+
+    # a GPU mapping to an empty name names no flavor: no run passes the kit an empty flavor_uuid,
+    # and the cutover refuses it (G7 review)
+    blank, _ = gpu_kit_ctx(env, gpu_maps={"grid_a100-4c": ""}, name="ml-03")
+    await env.executor.run(StepName.PRECOPY, blank)
+    assert "flavor_uuid" not in read_log(env.log)[-1]["vars"]
 
     # a vmware_cold cutover of a VM whose vGPU and passed-through GPU map to one flavor
     cold, _ = gpu_kit_ctx(

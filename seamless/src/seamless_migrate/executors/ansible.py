@@ -621,9 +621,10 @@ def build_vars(
         if len(targets) == 1:
             out["cinder_volume_type"] = targets.pop()
         flavor = gpu_flavor(m.vm, ctx.plan, ctx.source.kind)
-        if flavor is not None:
+        if flavor:
             # the kit creates a GPU VM's server with its GPU flavor, never its own best match:
-            # every run gets it (SDD §7.2, §22.4)
+            # every run gets it - a mapping to an empty name names none, and the cutover refuses
+            # it (SDD §7.2, §22.4, G7 review)
             out["flavor_uuid"] = flavor
         return out
     out = _common_openstack_vars(
