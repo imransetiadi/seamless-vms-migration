@@ -695,6 +695,32 @@ export interface PhaseChange {
   actor: string;
 }
 
+/**
+ * A cutover that waits for GPU capacity, its source VM running (SDD §4.2, §5.4 rule 5, §22.7): what the last capacity
+ * read found short, or that it failed, since when.
+ */
+export interface GpuWait {
+  /** When the destination answered the read that began the wait. */
+  since: Timestamp;
+  /** When the destination answered the last read. */
+  checked_at: Timestamp;
+  /**
+   * What that read found short, by pool name: a pool - its class, its required traits, then the forbidden ones prefixed
+   * with "!" ("VGPU CUSTOM_NVIDIA_A100_4C") - or a class alone across its pools; "" while no read of the wait could
+   * list the GPU flavor's requests.
+   */
+  pool: string;
+  /**
+   * The units the cutover needs there: its GPU flavor's, plus those of the destination's other migrations in cutover
+   * with no server yet; for a request group of n > 1 units, the n one provider must have free; 0 with pool "".
+   */
+  needed: number;
+  /** The units the read found free there (the most on one provider, for such a group); null when the read failed. */
+  free: number | null;
+  /** Why, in words, naming the destination by its label; a failure by its HTTP status, Placement error code or kind. */
+  reason: string;
+}
+
 export interface Migration {
   /** `mig-<10 hex>`. */
   id: string;
@@ -753,6 +779,11 @@ export interface Migration {
   suggested_probes: AppProbe[];
   /** Completed, not finalized: when its source VM was seen running again (SDD §8.1, ADV-19). */
   source_running_at: Timestamp | null;
+  /**
+   * In ready, awaiting_cutover or a keep-warm pass: its cutover waits for GPU capacity (SDD §5.4 rule 5, §22.7); leaving
+   * those phases drops it.
+   */
+  gpu_wait: GpuWait | null;
   review_required: boolean;
   review_reason: string | null;
   destination_server_id: string | null;
@@ -793,6 +824,7 @@ export const MIGRATION_SUMMARY_FIELDS = [
   'findings',
   'suggested_probes',
   'cutover_refusals',
+  'gpu_wait',
   'created_at',
   'updated_at',
 ] as const;
@@ -837,6 +869,8 @@ export const PERSISTED_EVENT_KINDS = [
   'migration.data_inconsistent',
   'migration.source_running',
   'migration.source_stopped',
+  // once when a cutover begins to wait for GPU capacity, once when it ends (SDD §4.3, §22.7)
+  'migration.gpu_wait',
   'plan.finalized',
   'plan.cancelled',
   'migration.approved',

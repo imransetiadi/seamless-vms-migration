@@ -9,6 +9,12 @@ describe('the Events page categories (SDD §4.3, §14.5, §16)', () => {
     expect(categoriesOf(kind)).not.toEqual([]);
   });
 
+  it('files migration.gpu_wait with the migration events', () => {
+    // a cutover that waits for GPU capacity, and the read that ends the wait (SDD §4.3, §22.7)
+    expect(PERSISTED_EVENT_KINDS).toContain('migration.gpu_wait');
+    expect(categoriesOf('migration.gpu_wait')).toEqual(['migrations']);
+  });
+
   it.each(['policy.created', 'policy.updated', 'policy.deleted'])(
     'files %s under Advisor and Security: it is advisor activity, and a policy change can weaken an approval gate (review RV13-05)',
     (kind) => {

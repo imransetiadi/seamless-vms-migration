@@ -2483,6 +2483,7 @@ export class MockServer {
       verification: null,
       suggested_probes: [],
       source_running_at: null,
+      gpu_wait: null,
       review_required: false,
       review_reason: null,
       destination_server_id: null,

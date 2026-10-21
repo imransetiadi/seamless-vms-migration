@@ -2091,6 +2091,7 @@ export function buildFixtures(now: number): Fixtures {
         verification: fixtureVerification(m.phase, downtimeEndedAt, m.error ?? null),
         suggested_probes: m.phase === 'pending' ? [] : suggestProbes(vm),
         source_running_at: null,
+        gpu_wait: null,
         review_required: Boolean(m.reviewReason),
         review_reason: m.reviewReason ?? null,
         destination_server_id: m.destination ?? null,
