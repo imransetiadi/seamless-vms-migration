@@ -3,7 +3,8 @@
 Idempotent: providers and plans that already exist (by id / name) are left untouched. Plans are
 auto-waved, validated and started so the dashboard shows every phase within minutes: the finance
 plan cuts over automatically (simulated failures exercise rollback), the VMware plan waits for
-approvals. VMs blocked by pre-flight are cancelled with an explanatory reason.
+approvals. Each maps its GPU VM to a GPU flavor of the destination, so it migrates (SDD §10,
+§22.10). VMs blocked by pre-flight are cancelled with an explanatory reason.
 """
 
 from __future__ import annotations
@@ -22,8 +23,10 @@ from .domain.models import (
     Provider,
     VerificationConfig,
 )
+from .executors.simulated import server_flavor
 from .orchestrator import Orchestrator
 from .planning.probes import is_database, suggest_probes
+from .providers.base import ProviderError
 from .providers.fake import FakeSourceProvider
 from .store import Store
 
@@ -33,8 +36,15 @@ FINANCE_PLAN = "Finance apps (RHOSP 17.1 → RHOSO)"
 #: Finance VMs the demo leaves unplanned, so a new plan can take them (SDD §10): one VM has one
 #: migration across plans (§5.4), and the finance plan holds the rest for good once it completes.
 UNPLANNED_FINANCE_VMS = frozenset({"report-01", "batch-01"})
-#: left for the operator to plan: its warm passes meet what the cutover will refuse (SDD §7.4)
-UNPLANNED_VMWARE_VMS = frozenset({"dc2-portal-02"})
+#: left for the operator to plan: dc2-portal-02's warm passes meet what the cutover will refuse
+#: (SDD §7.4); dc2-ml-02's MIG-backed vGPU shows the cutover gate's wait for GPU capacity, and
+#: dc2-cuda-01's DirectPath I/O GPU a cold-only VM with a PCI alias flavor (§22.10)
+UNPLANNED_VMWARE_VMS = frozenset({"dc2-portal-02", "dc2-ml-02", "dc2-cuda-01"})
+#: the vGPU profiles the demo destinations declare for their two vGPU flavors: no API names them
+#: (SDD §10, §22.3)
+DEMO_GPU_PROFILES = {"g1.a100-4c": "A100-4C", "g1.a100-3-20c": "A100-3-20C"}
+#: the GPU flavor the demo plans map their GPU VMs to (SDD §10, §22.10)
+DEMO_GPU_FLAVOR = "g1.a100-4c"
 VMWARE_PLAN = "DC2 VMware exit"
 DEMO_PLAN_NAMES = (FINANCE_PLAN, VMWARE_PLAN)
 DEMO_ACTOR = "demo"
@@ -83,6 +93,7 @@ DEMO_PROVIDERS = (
             external_network="public",
             address="192.0.2.50",
         ),
+        gpu_profiles=dict(DEMO_GPU_PROFILES),
     ),
     # a community OpenStack destination beside RHOSO 18.0 (SDD §10, §21; plan task T9)
     Provider(
@@ -100,6 +111,7 @@ DEMO_PROVIDERS = (
             external_network="public",
             address="192.0.2.60",
         ),
+        gpu_profiles=dict(DEMO_GPU_PROFILES),
     ),
 )
 
@@ -121,6 +133,8 @@ async def _plans(settings: Settings) -> list[Plan]:
             mappings=Mappings(
                 networks={"finance-app": "finance-app", "finance-db": "finance-db"},
                 volume_types={"ceph-ssd": "ceph-ssd", "ceph-hdd": "ceph-hdd"},
+                # gpu-ml-01's GPU comes with its flavor (SDD §22.4, §22.10)
+                flavors={"g1.vgpu": DEMO_GPU_FLAVOR},
             ),
             downtime_slo_s=600,
             require_approval=False,
@@ -135,7 +149,11 @@ async def _plans(settings: Settings) -> list[Plan]:
             source_provider_id="vcenter-dc2",
             destination_provider_id="rhoso18",
             vm_ids=[vm.source_id for vm in vmware_vms if vm.name not in UNPLANNED_VMWARE_VMS],
-            mappings=Mappings(networks={"DC2-Prod": "dc2-prod", "DC2-DMZ": "dc2-dmz"}),
+            mappings=Mappings(
+                networks={"DC2-Prod": "dc2-prod", "DC2-DMZ": "dc2-dmz"},
+                # dc2-ml-01's vGPU, by its profile (SDD §22.4, §22.10)
+                gpus={"grid_a100-4c": DEMO_GPU_FLAVOR},
+            ),
             downtime_slo_s=900,
             require_approval=True,
             auto_cutover=False,
@@ -201,6 +219,7 @@ async def seed_demo(
             await _seed_cutover_approvals(orchestrator, plan.id)
         log.info("demo plan %r seeded and started", plan.name)
     await _restore_source_power(orchestrator)
+    await _restore_destination_servers(orchestrator)
 
 
 #: a migration in these stopped its source: the simulated cutover did, before a restart
@@ -220,6 +239,29 @@ async def _restore_source_power(orchestrator: Orchestrator) -> None:
         power_off = getattr(source, "power_off", None)
         if power_off is not None:
             await power_off(m.vm.source_id)
+
+
+async def _restore_destination_servers(orchestrator: Orchestrator) -> None:
+    """A restart builds new fake destinations, whose Placement holds no server (SDD §10): hand
+    them again the servers the migrations recorded, each with the flavor its plan names for it,
+    as the simulated cutover created it (§7.4), so the GPU units they hold stay taken."""
+    providers = {p.id: p for p in await orchestrator.db.list("provider", Provider)}
+    plans = {p.id: p for p in await orchestrator.db.list("plan", Plan)}
+    for m in await orchestrator.db.list("migration", Migration):
+        plan = plans.get(m.plan_id)
+        if not m.destination_server_id or plan is None:
+            continue
+        source = providers.get(plan.source_provider_id)
+        destination = providers.get(plan.destination_provider_id)
+        if source is None or destination is None:
+            continue
+        create = getattr(orchestrator.providers.get(destination), "create_server", None)
+        if create is None:
+            continue
+        try:
+            await create(m.destination_server_id, server_flavor(m.vm, plan, source))
+        except ProviderError as exc:
+            log.warning("demo server of %s not restored: %s", m.vm.name, exc)
 
 
 async def _seed_cutover_approvals(orchestrator: Orchestrator, plan_id: str) -> None:

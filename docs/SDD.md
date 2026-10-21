@@ -2045,6 +2045,23 @@ stops, as the destination check does (§6.6). The demo's VMware inventory holds 
 no seeded plan holds: planned warm from the dashboard, it shows the migration page's warning, the Cut over dialog's
 note and the plan list's marker (§16), and how they clear.
 
+**GPU VMs** (plan task G9, §22.10). A simulated cutover creates its server on the fake destination at its end, once
+the create's model seconds passed (`create_server(server_id, flavor)`, a method of the fakes alone, §10), with the
+flavor the plan names for it: a GPU VM's GPU flavor - `planning/gpu.gpu_flavor`, its GPUs read with the profile its
+source declares for its flavor, as the executors read them (§7.2, §22.4) -, else the flavor `mappings.flavors` maps
+the VM's flavor to, which the pre-flight and the gate count when it asks for a vGPU (§22.5, §22.7), else none. The
+server takes that flavor's vGPU units in the fake's Placement. A vGPU request that finds no GPU of its pool with its
+units free fails the create, as Nova finds no valid host: the cutover fails after the source stopped, its model
+seconds in the error's `details`, and the plan's automatic rollback starts the source again - the gap §22.7 names.
+The rollback deletes the server (`delete_server`) before it starts the source again, as §7.2's rollback does, and so
+gives its units back; a cutover it cancelled created none. The verification reads the server's flavor (`get_server`)
+and its allocations (`server_allocations`) from the same fake, so a demo GPU VM passes `gpu_flavor` and
+`gpu_allocation` (§7.5), and the destination's check - its provider card, §22.11 - reads its pools' free units fall
+as the demo's GPU VMs cut over. The cutover gate's wait shows with `dc2-ml-02`, which no seeded plan holds: the fake
+reads its A100-3-20C pool full on the gate's first two reads of it (§10), so a plan with it validates with room,
+waits at its gate - `gpu_wait` set, `migration.gpu_wait` announcing the wait and its end, the source running - and
+cuts over on the gate's third read (§5.4 rule 5, §22.7).
+
 ### 7.5 Verification (`seamless_migrate.verification`)
 
 Not an executor step: the orchestrator calls `Verifier.verify(ctx) -> VerificationResult` with
@@ -2684,9 +2701,13 @@ whether vCenter recorded a power-on of it since a time (`powered_on_since`, its 
 disks in vCenter's device order (`disk_keys`: `config.hardware.device`, as the migration kit reads it, §7.2); `os_type` is the VMware Tools pretty
 name when Tools report one, else the configured guest id), `FakeSourceProvider`/
 `FakeDestinationProvider` (deterministic demo data: 24 OpenStack VMs including one multi-attach,
-one vGPU flavor, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+ disks;
-13 VMware VMs with mixed CBT/snapshot/independent-disk states, `dc2-portal-02` among them tagged
-`demo-fault: cutover-refusal` (§7.4); a RHOSO destination with networks, flavors, volume types and
+one vGPU flavor - `gpu-ml-01`'s `g1.vgpu`, which asks for `resources:VGPU=1` and
+`trait:CUSTOM_NVIDIA_A100_4C=required` -, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+
+disks; 16 VMware VMs with mixed CBT/snapshot/independent-disk states, `dc2-portal-02` among them tagged
+`demo-fault: cutover-refusal` (§7.4), and three GPU VMs (§22.10): `dc2-ml-01` (8 vCPUs, 32 GiB, a `grid_a100-4c`
+vGPU, CBT on), `dc2-ml-02` (16 vCPUs, 64 GiB, a MIG-backed `grid_a100-3-20c` vGPU) and `dc2-cuda-01` (16 vCPUs,
+128 GiB, a DirectPath I/O GPU `10de:20b5`, powered off); a RHOSO destination with networks, flavors - three GPU
+flavors among them, below -, volume types and
 quotas; and a community OpenStack destination, `hibiscus-dc3` - kind `openstack`, distribution `kolla`, declared
 `release` `2026.2` - that shares that inventory and whose check reports 2026.2's maxima, compute 2.104 and block
 storage 3.71 (a plausible value: §21.3 has not confirmed 2026.2's), so Tier 1 and the secure-RBAC profile, §10.1).
@@ -2694,8 +2715,36 @@ storage 3.71 (a plausible value: §21.3 has not confirmed 2026.2's), so Tier 1 a
 destination is given its provider and reports by its kind). The demo seeds two running plans, both to `rhoso18`:
 the finance plan takes 22 of the 24 OpenStack
 VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (one VM, one migration
-across plans, §5.4) — and the VMware plan 12 of the 13 VMware VMs: `dc2-portal-02` stays unplanned,
-for the operator to plan warm (§7.4). No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
+across plans, §5.4) — and maps `g1.vgpu` to `g1.a100-4c` (`mappings.flavors`), so `gpu-ml-01` migrates; the VMware
+plan takes 13 of the 16 VMware VMs and maps `grid_a100-4c` to `g1.a100-4c` (`mappings.gpus`), so `dc2-ml-01`
+migrates: `dc2-portal-02` stays unplanned, for the operator to plan warm (§7.4), and so do `dc2-ml-02` and
+`dc2-cuda-01`, for the operator to plan with a GPU mapping (§22.10). The demo providers `rhoso18` and `hibiscus-dc3`
+declare the two vGPU flavors' profiles, `gpu_profiles` `{"g1.a100-4c": "A100-4C", "g1.a100-3-20c": "A100-3-20C"}`.
+No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
+
+**The fake destinations' GPUs** (plan task G9, §22.10). Each lists three GPU flavors, with the sizes of the
+dashboard's mock (§16): `g1.a100-4c` (8 vCPUs, 32 GiB, 200 GB; `resources:VGPU=1` and
+`trait:CUSTOM_NVIDIA_A100_4C=required`), `g1.a100-3-20c` (16 vCPUs, 64 GiB, 300 GB; one vGPU with
+`CUSTOM_NVIDIA_A100_3_20C`) and `p1.a100` (16 vCPUs, 128 GiB, 400 GB; `pci_passthrough:alias=a100:1`) - in its
+inventory's `flavors` and `gpu_flavors` and in `gpu_flavors()`, with the profiles its provider declares (§22.3). Its
+Placement holds two GPUs, each one resource provider of the class `VGPU` on a compute node whose service is enabled:
+one with the trait `CUSTOM_NVIDIA_A100_4C` and 4 units, one with `CUSTOM_NVIDIA_A100_3_20C` and 2. A pool reads as
+§22.3 counts it on them, less the units the fake's servers hold: A100-4C's 4 free on 1 provider, A100-3-20C's 2 on 1,
+and the class `VGPU` alone 6 on 2, at most 4 on one - alike in the inventory, the check's `gpu_capacity` and
+`gpu_capacity()`. `create_server(server_id, flavor)`, the simulated cutover's (§7.4), records the server with its
+flavor, and each vGPU request of that flavor takes its units from the first GPU of its pool that has them free; when
+one finds none, it records nothing and raises a provider error that names the flavor and the pool, never a GPU, as
+Nova finds no valid host (§22.12). `delete_server` gives them back. `get_server` reports the server's flavor with
+that flavor's extra specs (`{name: null, extra_specs: {}}` for a server created without a flavor, or that no
+simulated cutover created), and `server_allocations` the GPU units the server holds, per resource class - None for
+one that holds none, the fake's Placement holding GPUs alone. `gpu_capacity()` - the cutover gate's read
+(§22.7) - finds the A100-3-20C GPU's units held by another tenant on its first two reads that ask for the trait
+`CUSTOM_NVIDIA_A100_3_20C`, and released from the third, while `inventory()` - the validation's read - and `check()`
+always find them free. A restart builds new fakes: the seed hands them the servers the migrations recorded
+(`destination_server_id`) with their flavors, as it stops their sources again (§8.1). A fake rebuilt while the
+control plane runs - its provider's document changed: a rename, its declared profiles, a written credential - takes
+over the simulated cloud of the one it replaces, as a real cloud keeps its servers: the servers and their GPU units,
+the gate's reads of the other tenant's GPU and, for a source, its VMs' power states (plan task G9 review).
 
 **GPU requests** (`seamless_migrate.planning.gpu`, plan task G1, §22.2–§22.4): a pure module (no I/O) that the
 providers, the pre-flight and the cutover gate share as their GPU tasks land. `gpu_requests(extra_specs,
@@ -4897,8 +4946,8 @@ VMRef.gpus: list[GpuDevice] = []   # the VM's GPUs, in the order its source repo
   RV28-08); a flavor deleted since gives no name (§7.5, G8 review).
   Plan task G6 adds `gpu_flavors() -> list[dict[str, Any]]`: the GPU flavors as `DestinationInventory.gpu_flavors`
   lists them, the declared profiles applied, read with one flavor list (`OpenStackProvider`: Nova's flavor list, the
-  inventory's own reading of it) - the requests the cutover gate reads capacity for (§22.7). The demo's fake destination
-  lists none until plan task G9.
+  inventory's own reading of it) - the requests the cutover gate reads capacity for (§22.7). The demo's fake
+  destinations list three since plan task G9 (§10, §22.10).
 
 ### 22.4 GPU mapping
 
@@ -5111,7 +5160,7 @@ the later waves. Binding in §9.4 since plan task G5.
 
 ### 22.10 Demo and simulation
 
-Binding in §7.4 and §10 with plan task G9:
+Binding in §7.4 and §10 since plan task G9:
 
 * The fake OpenStack source's `gpu-ml-01` keeps its flavor `g1.vgpu`, which now asks for `resources:VGPU=1` and
   `trait:CUSTOM_NVIDIA_A100_4C=required`. The finance plan maps that flavor to `g1.a100-4c` (`mappings.flavors`), so the
@@ -5206,7 +5255,7 @@ Binding in §13.4 with plan task G3:
 | the executors create the server with the GPU flavor (`flavor_uuid` for the VMware kit) | §7.2, §7.3 (binding) | G7 |
 | the OpenStack cold, warm and storage-handover cutovers refuse a GPU mapping that no longer applies before the source stops, as the VMware one does | §7.2, §7.3 step 0 (binding) | G7b |
 | the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 (binding) | G8 |
-| the demo's GPU VMs, GPU flavors, pools and gate wait | §7.4, §10 | G9 |
+| the demo's GPU VMs, GPU flavors, pools and gate wait | §7.4, §10 (binding) | G9 |
 | the dashboard (§22.11) | §16 (binding for G10's and G11's parts: the badge rule, the Inventory, `types.ts`, the Providers page) | G10, G11, G12 |
 | QASuite (requirement rows, AC-7, LAB-GPU01…LAB-GPU08), Security.md, README | QASuite, Security.md, README | G13 |
 | PRD goal G8, FR-35…FR-41, journey 7, the release table (0.3.0 GPU workloads; 0.4.0 the network cut-over hooks and the Octavia/Heat helpers) | PRD | G14 |

@@ -56,7 +56,7 @@ async def test_fake_openstack_inventory_has_required_traits():
 async def test_fake_vmware_mixed_cbt():
     src = FakeSourceProvider(ProviderKind.vmware, seed=42)
     vms = await src.list_vms()
-    assert len(vms) == 13
+    assert len(vms) == 16
     assert {v.cbt_enabled for v in vms} == {True, False}
     # SDD §7.4: the demo VM whose warm passes meet what the cutover will refuse
     faults = {v.name: v.tags.get("demo-fault") for v in vms if v.tags.get("demo-fault")}
@@ -3804,8 +3804,7 @@ async def test_a_destination_without_gpu_flavors_calls_no_placement():
 async def test_gpu_flavors_lists_the_inventorys_gpu_flavors_with_one_flavor_list(tmp_path):
     """SDD §10, §22.3 (plan task G6): the cutover gate's read of a GPU flavor's requests - the
     GPU flavors as the inventory lists them, their declared profiles applied, read with one Nova
-    flavor list and nothing else: no Placement, no network or volume call. The demo's fake
-    destination lists none until plan task G9."""
+    flavor list and nothing else: no Placement, no network or volume call."""
     vgpu = {"name": "g1.a100-4c", "vcpus": 8, "ram": 32768, "disk": 80, "extra_specs": GROUP}
     small = {"name": "m1.small", "vcpus": 2, "ram": 4096, "disk": 20, "extra_specs": {}}
     alias = {**small, "name": "p1.a100", "extra_specs": {"pci_passthrough:alias": "a100:1"}}
@@ -3850,7 +3849,6 @@ async def test_gpu_flavors_lists_the_inventorys_gpu_flavors_with_one_flavor_list
     services = ("https://network.", "https://block-storage.", "https://image.")
     assert [url for _, url in cloud.seen if url.startswith(services)] == []
     assert cloud.placement_seen == []
-    assert await FakeDestinationProvider().gpu_flavors() == []
 
 
 async def test_a_pci_alias_flavor_gets_no_pool():
@@ -3916,22 +3914,39 @@ async def test_a_destination_check_whose_flavors_cannot_be_listed_reads_gpu_capa
     assert capacity["pools"] == [] and report["admin"] is True
 
 
-async def test_the_demo_destination_reads_no_gpu_pools_and_holds_no_allocation():
-    """SDD §22.3 (plan task G3): the demo's fake destination lists no GPU flavor, so its check, its
-    inventory and the gate's read find no pool, and a simulated server holds no allocation."""
+async def test_the_demo_gate_finds_the_mig_pool_full_twice_while_the_validation_sees_room():
+    """SDD §10, §22.10 (plan task G9): the fake destination's gpu_capacity() - the cutover gate's
+    read - finds the A100-3-20C GPU's units held by another tenant on its first two reads that ask
+    for its trait, and free from the third; a read of another pool is none of them, the inventory -
+    the validation's read - and the check always find them free, and a PCI alias asks no pool."""
+    from seamless_migrate.planning.gpu import pool_name
+
     dst = FakeDestinationProvider(
         provider=make_provider(id="rhoso18", role=ProviderRole.destination)
     )
-    inventory = await dst.inventory()
-    assert (inventory.gpu_flavors, inventory.gpu_capacity.status, inventory.gpu_capacity.pools) == (
-        [],
-        "ok",
-        [],
-    )
-    assert (await dst.check())["gpu_capacity"]["pools"] == []
-    gate = await dst.gpu_capacity([GpuDevice(kind="vgpu", resource_class="VGPU")])
-    assert (gate.status, gate.pools, gate.read_at is not None) == ("ok", [], True)
-    assert await dst.server_allocations("srv-1") is None
+    flavors = {flavor["name"]: flavor["gpus"] for flavor in await dst.gpu_flavors()}
+
+    def counted(capacity) -> dict[str, tuple[int, int, int]]:
+        return {
+            pool_name(p.resource_class, p.traits, p.forbidden_traits): (
+                p.free,
+                p.providers,
+                p.largest_free,
+            )
+            for p in capacity.pools
+        }
+
+    mig = "VGPU CUSTOM_NVIDIA_A100_3_20C"
+    a100 = {"VGPU CUSTOM_NVIDIA_A100_4C": (4, 1, 4), "VGPU": (6, 2, 4)}
+    assert counted(await dst.gpu_capacity(flavors["g1.a100-4c"])) == a100
+    for _ in range(2):
+        held = counted(await dst.gpu_capacity(flavors["g1.a100-3-20c"]))
+        assert held == {mig: (0, 0, 0), "VGPU": (4, 1, 4)}
+        assert counted((await dst.inventory()).gpu_capacity)[mig] == (2, 1, 2)
+        assert [p["free"] for p in (await dst.check())["gpu_capacity"]["pools"]] == [4, 2, 6]
+    released = counted(await dst.gpu_capacity(flavors["g1.a100-3-20c"]))
+    assert released == {mig: (2, 1, 2), "VGPU": (6, 2, 4)}
+    assert (await dst.gpu_capacity(flavors["p1.a100"])).pools == []
 
 
 async def test_server_allocations_add_up_the_units_per_resource_class():
