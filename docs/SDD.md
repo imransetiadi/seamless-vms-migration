@@ -5039,6 +5039,7 @@ Binding in §13.4 with plan task G3:
 | the eligibility of a VMware passthrough VM; a pilot without GPU VMs; the port 9400 suggestion | §9.2, §9.4, §9.6 (binding) | G5 |
 | the gate's fifth rule, `Migration.gpu_wait` and `MigrationSummary.gpu_wait`, the event `migration.gpu_wait`, the gauge `seamless_gpu_waits` | §4.2, §4.3, §5.4, §18 | G6 |
 | the executors create the server with the GPU flavor (`flavor_uuid` for the VMware kit) | §7.2, §7.3 (binding) | G7 |
+| the OpenStack cold, warm and storage-handover cutovers refuse a GPU mapping that no longer applies before the source stops, as the VMware one does | §7.2, §7.3 step 0 (binding) | G7b |
 | the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 (binding) | G8 |
 | the demo's GPU VMs, GPU flavors, pools and gate wait | §7.4, §10 | G9 |
 | the dashboard (§22.11) | §16 (binding for G10's part: the badge rule, the Inventory, `types.ts`) | G10, G11, G12 |
