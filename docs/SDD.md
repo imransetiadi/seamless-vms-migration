@@ -5072,7 +5072,7 @@ Binding in §13.4 with plan task G3:
 | the OpenStack cold, warm and storage-handover cutovers refuse a GPU mapping that no longer applies before the source stops, as the VMware one does | §7.2, §7.3 step 0 (binding) | G7b |
 | the verification checks `gpu_flavor` and `gpu_allocation` | §7.5 (binding) | G8 |
 | the demo's GPU VMs, GPU flavors, pools and gate wait | §7.4, §10 | G9 |
-| the dashboard (§22.11) | §16 (binding for G10's part: the badge rule, the Inventory, `types.ts`) | G10, G11, G12 |
+| the dashboard (§22.11) | §16 (binding for G10's and G11's parts: the badge rule, the Inventory, `types.ts`, the Providers page) | G10, G11, G12 |
 | QASuite (requirement rows, AC-7, LAB-G01…LAB-G08), Security.md, README | QASuite, Security.md, README | G13 |
 | PRD goal G8, FR-35…FR-41, journey 7, the release table (0.3.0 GPU workloads; 0.4.0 the network cut-over hooks and the Octavia/Heat helpers) | PRD | G14 |
 | the lab on GPU hosts; the Technology Preview label goes when its cases pass | QASuite §13 | G15 |
