@@ -2741,7 +2741,10 @@ one that holds none, the fake's Placement holding GPUs alone. `gpu_capacity()` -
 (§22.7) - finds the A100-3-20C GPU's units held by another tenant on its first two reads that ask for the trait
 `CUSTOM_NVIDIA_A100_3_20C`, and released from the third, while `inventory()` - the validation's read - and `check()`
 always find them free. A restart builds new fakes: the seed hands them the servers the migrations recorded
-(`destination_server_id`) with their flavors, as it stops their sources again (§8.1).
+(`destination_server_id`) with their flavors, as it stops their sources again (§8.1). A fake rebuilt while the
+control plane runs - its provider's document changed: a rename, its declared profiles, a written credential - takes
+over the simulated cloud of the one it replaces, as a real cloud keeps its servers: the servers and their GPU units,
+the gate's reads of the other tenant's GPU and, for a source, its VMs' power states (plan task G9 review).
 
 **GPU requests** (`seamless_migrate.planning.gpu`, plan task G1, §22.2–§22.4): a pure module (no I/O) that the
 providers, the pre-flight and the cutover gate share as their GPU tasks land. `gpu_requests(extra_specs,
