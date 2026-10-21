@@ -25,6 +25,7 @@ from seamless_migrate.executors.handover import (
     _mark_boot,
     port_description,
 )
+from seamless_migrate.planning.gpu import gpu_requests
 from tests.cloud_support import InProcessCloud
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_plan, make_provider, make_vm
@@ -4703,6 +4704,39 @@ async def test_handover_creates_the_server_with_the_flavor_preflight_matched(tmp
         mig = mig.model_copy(update={"resolved_mappings": matched})
         await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
         assert clouds["dst"].created[0]["flavor_id"] == expected, name
+
+
+async def test_the_handover_creates_a_gpu_vms_server_with_its_mapped_flavor(tmp_path):
+    """SDD §7.3 step 8, §22.4 (plan task G7): a GPU VM's GPU flavor is its flavor's mapping, and
+    step 8 creates its server with it - not with RHOSO's flavor of the source's name, nor with a
+    matched one. Step 0 checks that flavor: one RHOSO lacks refuses the handover before the stop."""
+    on_a100 = {"resources:VGPU": "1", "trait:CUSTOM_NVIDIA_A100_4C": "required"}
+    for case, flavors in (
+        ("mapped", {"g1.vgpu", "g1.a100-4c", "m1.large"}),
+        ("gone", {"g1.vgpu", "m1.large"}),
+    ):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / case)
+        clouds["src"].servers["srv-1"].flavor = {"original_name": "g1.vgpu"}
+        clouds["dst"].flavor_names = flavors
+        mapped = plan.mappings.model_copy(update={"flavors": {"g1.vgpu": "g1.a100-4c"}})
+        plan = plan.model_copy(update={"mappings": mapped})
+        gpu_vm = {"flavor": "g1.vgpu", "flavor_extra_specs": on_a100, "gpus": gpu_requests(on_a100)}
+        vm = mig.vm.model_copy(update=gpu_vm)
+        # a matched flavor, which the pre-flight never records for a GPU VM, does not win over it
+        matched = Mappings(flavors={"g1.vgpu": "m1.large"})
+        mig = mig.model_copy(update={"vm": vm, "resolved_mappings": matched})
+        ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+        if case == "mapped":
+            await executor.run(StepName.CUTOVER, ctx)
+            assert clouds["dst"].created[0]["flavor_id"] == "flavor-g1.a100-4c"
+            continue
+        with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+            await executor.run(StepName.CUTOVER, ctx)
+        assert "the server's flavor 'g1.vgpu': RHOSO 18.0 has no flavor named 'g1.a100-4c'" in (
+            str(refused.value)
+        )
+        assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+        assert rec.downtime_marks == 0 and clouds["dst"].created == []
 
 
 async def test_handover_step_0_refuses_a_flavor_or_a_volume_type_rhoso_lacks(tmp_path):

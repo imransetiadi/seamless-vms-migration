@@ -16,7 +16,7 @@ import yaml
 
 from seamless_migrate.config import Settings, find_repo_root
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy, SyncPassKind
-from seamless_migrate.domain.models import ConversionHostConfig, Mappings, Nic, utcnow
+from seamless_migrate.domain.models import ConversionHostConfig, GpuDevice, Mappings, Nic, utcnow
 from seamless_migrate.executors.ansible import (
     CONVERSION_KEY_FILE,
     KIT_PLAYBOOK,
@@ -35,7 +35,8 @@ from seamless_migrate.executors.ansible import (
 )
 from seamless_migrate.executors.ansible import _inventory as build_inventory_doc
 from seamless_migrate.executors.base import PermanentStepError, StepName, TransientStepError
-from seamless_migrate.planning.preflight import DestinationInventory
+from seamless_migrate.planning.gpu import PCI_ALIAS, gpu_requests
+from seamless_migrate.planning.preflight import DestinationInventory, flavor_prestaged
 from seamless_migrate.providers.base import ProviderError
 from tests.executor_support import make_ctx
 from tests.factories import make_migration, make_plan, make_provider, make_vm
@@ -188,7 +189,9 @@ class FakeImpl:
                 volume["metadata"] = {**volume["metadata"], **metadata}
 
     async def inventory(self):
-        """The destination's networks, for the network references (SDD §7.2)."""
+        """The destination's networks, for the network references (SDD §7.2), and its flavors -
+        those that ask for a GPU listed again with their requests, as the provider lists them
+        (SDD §22.3)."""
         self.calls.append(("inventory",))
         if self.registry.inventory_error:
             raise ProviderError("networks: HTTP 503")
@@ -196,6 +199,12 @@ class FakeImpl:
             network_details=list(self.registry.networks),
             subnets=[dst_subnet(n) for n in self.registry.networks] + self.registry.subnets,
             roles=self.registry.roles,
+            flavors=[dict(f) for f in self.registry.flavors],
+            gpu_flavors=[
+                {**{k: f[k] for k in ("name", "vcpus", "ram_mb", "disk_gb")}, "gpus": gpus}
+                for f in self.registry.flavors
+                if (gpus := gpu_requests(f["extra_specs"]))
+            ],
         )
 
 
@@ -250,6 +259,8 @@ class FakeRegistry:
         # the token's role names the destination inventory reads live; None: it could not
         # (SDD §10, review RV19-01)
         self.roles: list[str] | None = None
+        # the destination's flavors, {name, vcpus, ram_mb, disk_gb, extra_specs} (SDD §10, §22.3)
+        self.flavors: list[dict] = []
 
     def get(self, provider):
         return FakeImpl(self)
@@ -305,10 +316,16 @@ def ctx_for(
     mappings=MAPPINGS,
     nics=None,
     destination=DST,
+    vm_kw=None,
     **mig_kw,
 ):
     plan = make_plan(id="plan-00c0ffee", mappings=mappings)
-    vm = make_vm(source_id="srv-1", name=name, **({"nics": nics} if nics is not None else {}))
+    vm = make_vm(
+        source_id="srv-1",
+        name=name,
+        **({"nics": nics} if nics is not None else {}),
+        **(vm_kw or {}),
+    )
     mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy, **mig_kw)
     return make_ctx(plan, mig, source, destination, env.settings)
 
@@ -1382,6 +1399,213 @@ async def test_vmware_warm_flags(env):
     assert (cold["cbt_sync"], cold["cutover"]) == (False, True)
 
 
+#: a VMware vGPU by its profile and a DirectPath I/O GPU by its PCI ids, the GPU keys a plan maps
+#: (SDD §22.2, §22.4)
+VGPU_4C = GpuDevice(kind="vgpu", profile="grid_a100-4c")
+PASSTHROUGH = GpuDevice(kind="passthrough", vendor_id="10de", device_id="20b5")
+#: what a destination GPU flavor asks for: one vGPU with the A100-4C trait (SDD §22.2, §22.3)
+ON_A100 = {"resources:VGPU": "1", "trait:CUSTOM_NVIDIA_A100_4C": "required"}
+
+
+def dst_flavor(name, extra_specs=None):
+    """A destination flavor as the inventory lists it (SDD §10), 8 vCPUs and 32 GiB: one of its GPU
+    flavors when its extra specs ask for a GPU (§22.3)."""
+    specs = dict(extra_specs or {})
+    return {"name": name, "vcpus": 8, "ram_mb": 32768, "disk_gb": 80, "extra_specs": specs}
+
+
+def gpu_kit_ctx(env, strategy=Strategy.vmware_warm, gpus=(VGPU_4C,), gpu_maps=None, **kw):
+    """A VMware VM with these GPUs and no flavor, whose plan maps its vGPU's key to the
+    destination's GPU flavor g1.a100-4c unless ``gpu_maps`` says otherwise (SDD §22.4)."""
+    maps = {"grid_a100-4c": "g1.a100-4c"} if gpu_maps is None else gpu_maps
+    return ctx_for(
+        env,
+        strategy=strategy,
+        source=VCENTER,
+        nics=VMW_NICS,
+        mappings=Mappings(gpus=maps),
+        vm_kw={"flavor": None, "gpus": list(gpus)},
+        **kw,
+    )
+
+
+def vars_node(run, name):
+    """The YAML node of a variable in the vars.yml a run read."""
+    root = yaml.compose(run["raw"]["vars.yml"])
+    return next(value for key, value in root.value if key.value == name)
+
+
+async def test_a_vmware_gpu_vm_runs_the_kit_with_its_gpu_flavor_in_every_run(env):
+    """SDD §7.2, §22.4 (plan task G7): the kit 2.2.7 creates the server with the flavor
+    flavor_uuid names instead of its own best match. Every kit run of a GPU VM - a vmware_warm
+    pre-copy, sync and cutover, a vmware_cold cutover - gets the name of its GPU flavor, the one
+    flavor its plan maps each of its GPU keys to, written for Ansible to read verbatim."""
+    env.registry.flavors = [dst_flavor("g1.a100-4c", ON_A100), dst_flavor("m1.large")]
+    ctx, rec = gpu_kit_ctx(env)
+    first = await env.executor.run(StepName.PRECOPY, ctx)
+    ctx.migration.sync_passes.append(first.sync_pass)
+    await env.executor.run(StepName.SYNC, ctx)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    runs = read_log(env.log)
+    assert [(r["playbook"], r["vars"]["cutover"], r["vars"].get("flavor_uuid")) for r in runs] == [
+        (KIT_PLAYBOOK, False, "g1.a100-4c"),
+        (KIT_PLAYBOOK, False, "g1.a100-4c"),
+        (KIT_PLAYBOOK, True, "g1.a100-4c"),
+    ]
+    # a flavor name the plan holds is data: Ansible never templates it (SDD §7.2)
+    assert all(vars_node(run, "flavor_uuid").tag == "!unsafe" for run in runs)
+    assert rec.downtime_marks == 1
+    # one inventory read a run serves the GPU flavor's check and the network map (SDD §7.2,
+    # G7 review)
+    assert env.registry.calls.count(("inventory",)) == 3
+
+    # a GPU mapping to an empty name names no flavor: no run passes the kit an empty flavor_uuid,
+    # and the cutover refuses it (G7 review)
+    blank, _ = gpu_kit_ctx(env, gpu_maps={"grid_a100-4c": ""}, name="ml-03")
+    await env.executor.run(StepName.PRECOPY, blank)
+    assert "flavor_uuid" not in read_log(env.log)[-1]["vars"]
+
+    # a vmware_cold cutover of a VM whose vGPU and passed-through GPU map to one flavor
+    cold, _ = gpu_kit_ctx(
+        env,
+        Strategy.vmware_cold,
+        gpus=(VGPU_4C, PASSTHROUGH),
+        gpu_maps={"grid_a100-4c": "g1.a100-4c", "10de:20b5": "g1.a100-4c"},
+        name="ml-02",
+    )
+    await env.executor.run(StepName.CUTOVER, cold)
+    last = read_log(env.log)[-1]["vars"]
+    assert (last["vms_list"], last["cbt_sync"], last["flavor_uuid"]) == (
+        ["ml-02"],
+        False,
+        "g1.a100-4c",
+    )
+
+
+async def test_a_vmware_vm_without_a_gpu_runs_the_kit_without_a_flavor(env):
+    """SDD §7.2, §22.4 (plan task G7): a VM without a GPU gets no flavor_uuid in any kit run - the
+    kit sizes its server as before -, even in a plan that maps another VM's GPU key, on a
+    destination that offers GPU flavors."""
+    env.registry.flavors = [dst_flavor("g1.a100-4c", ON_A100), dst_flavor("m1.large")]
+    ctx, rec = gpu_kit_ctx(env, gpus=())
+    first = await env.executor.run(StepName.PRECOPY, ctx)
+    ctx.migration.sync_passes.append(first.sync_pass)
+    await env.executor.run(StepName.SYNC, ctx)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    cold, _ = gpu_kit_ctx(env, Strategy.vmware_cold, gpus=(), name="web-02")
+    await env.executor.run(StepName.CUTOVER, cold)
+    runs = read_log(env.log)
+    assert [r["vars"]["cutover"] for r in runs] == [False, False, True, True]
+    assert [r["playbook"] for r in runs] == [KIT_PLAYBOOK] * 4
+    assert all("flavor_uuid" not in run["vars"] for run in runs)
+    assert rec.downtime_marks == 1
+
+
+async def test_a_vmware_gpu_cutover_refuses_before_the_kit_when_its_mapping_no_longer_applies(
+    env,
+):
+    """SDD §7.2, §22.4 (plan task G7): the cutover reads the destination's flavors for its run and
+    refuses, before the kit runs and so before the power-off, a GPU mapping that no longer
+    applies: its flavor deleted since the validation, or one that asks for no GPU - the server
+    would lose its GPU without a word -, or GPU mappings, changed after a failed attempt, that map
+    the VM's GPUs to no single flavor. Nothing runs and no clock opens; flavors that cannot be read
+    are a transient failure."""
+
+    async def refused(ctx, rec, error=PermanentStepError):
+        ran = len(read_log(env.log))
+        with pytest.raises(error) as exc:
+            await env.executor.run(StepName.CUTOVER, ctx)
+        assert len(read_log(env.log)) == ran, "the kit ran"
+        assert rec.downtime_marks == 0
+        return str(exc.value)
+
+    # deleted since the validation
+    env.registry.flavors = [dst_flavor("m1.large")]
+    for strategy in (Strategy.vmware_cold, Strategy.vmware_warm):
+        ctx, rec = gpu_kit_ctx(env, strategy)
+        assert await refused(ctx, rec) == (
+            "the GPUs of web-01 (grid_a100-4c) cannot go to flavor 'g1.a100-4c' of RHOSO 18.0: "
+            "there is no flavor named 'g1.a100-4c'"
+        ), strategy
+    # still there, its GPU request removed: no GPU flavor of the destination
+    env.registry.flavors = [dst_flavor("g1.a100-4c"), dst_flavor("m1.large")]
+    ctx, rec = gpu_kit_ctx(env, Strategy.vmware_cold)
+    assert await refused(ctx, rec) == (
+        "the GPUs of web-01 (grid_a100-4c) cannot go to flavor 'g1.a100-4c' of RHOSO 18.0: it "
+        "asks for no GPU, and the server would lose its GPU"
+    )
+    # GPU mappings that map the VM's GPUs to no single flavor
+    env.registry.flavors = [
+        dst_flavor("g1.a100-4c", ON_A100),
+        dst_flavor("p1.a100", {"pci_passthrough:alias": "a100:1"}),
+    ]
+    unnamed = GpuDevice(kind="passthrough")  # no ids: no key a mapping could name
+    for gpus, maps, named in (
+        ((VGPU_4C,), {}, "grid_a100-4c"),
+        (
+            (VGPU_4C, PASSTHROUGH),
+            {"grid_a100-4c": "g1.a100-4c", "10de:20b5": "p1.a100"},
+            "grid_a100-4c, 10de:20b5",
+        ),
+        ((VGPU_4C, unnamed), {"grid_a100-4c": "g1.a100-4c"}, "grid_a100-4c, a device without ids"),
+    ):
+        ctx, rec = gpu_kit_ctx(env, Strategy.vmware_cold, gpus=gpus, gpu_maps=maps)
+        assert await refused(ctx, rec) == (
+            f"the plan's GPU mappings map the GPUs of web-01 ({named}) to no single flavor of "
+            "RHOSO 18.0"
+        ), maps
+    # a VM recorded before 0.3.0, with the vGPU extra specs its provider wrote then: no GPU key
+    old = {"flavor": None, "flavor_extra_specs": {"resources:VGPU": "1"}}
+    ctx, rec = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        nics=VMW_NICS,
+        mappings=Mappings(gpus={"grid_a100-4c": "g1.a100-4c"}),
+        vm_kw=old,
+    )
+    assert await refused(ctx, rec) == (
+        "the plan's GPU mappings map the GPUs of web-01 (VGPU) to no single flavor of RHOSO 18.0"
+    )
+    # the destination's flavors cannot be read: transient, before the kit
+    env.registry.inventory_error = True
+    ctx, rec = gpu_kit_ctx(env, Strategy.vmware_cold)
+    assert "could not read the networks of RHOSO 18.0" in await refused(
+        ctx, rec, TransientStepError
+    )
+    # it applies again: the kit runs with it
+    env.registry.inventory_error = False
+    ctx, rec = gpu_kit_ctx(env, Strategy.vmware_cold)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["vars"]["flavor_uuid"] == "g1.a100-4c"
+    assert rec.downtime_marks == 1
+
+
+async def test_a_vmware_warm_pass_records_a_gpu_mapping_its_cutover_will_refuse(env):
+    """SDD §7.2 (plan task G7): a vmware_warm pre-copy or sync run, in which the kit creates no
+    server, runs on a GPU mapping that no longer applies - its GPU flavor still in flavor_uuid -,
+    logs the problem once and returns it in cutover_refusals; a pass that finds the flavor back
+    returns none, and the cutover runs."""
+    env.registry.flavors = [dst_flavor("m1.large")]
+    gone = (
+        "the GPUs of web-01 (grid_a100-4c) cannot go to flavor 'g1.a100-4c' of RHOSO 18.0: there "
+        "is no flavor named 'g1.a100-4c'"
+    )
+    ctx, rec = gpu_kit_ctx(env)
+    first = await env.executor.run(StepName.PRECOPY, ctx)
+    assert first.cutover_refusals == [gone]
+    assert read_log(env.log)[-1]["vars"]["flavor_uuid"] == "g1.a100-4c"
+    assert rec.logs.count(f"the cutover will refuse this before the source stops: {gone}") == 1
+    assert rec.downtime_marks == 0
+    # the operator gives RHOSO 18.0 its GPU flavor back: the next pass meets nothing
+    env.registry.flavors.append(dst_flavor("g1.a100-4c", ON_A100))
+    ctx.migration.sync_passes.append(first.sync_pass)
+    assert (await env.executor.run(StepName.SYNC, ctx)).cutover_refusals == []
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["vars"]["cutover"] is True
+    assert rec.downtime_marks == 1
+
+
 async def test_vmware_rollback_deletes_destination_and_powers_on_source(env):
     ctx, _ = ctx_for(
         env, strategy=Strategy.vmware_cold, source=VCENTER, destination_server_id="dst-9"
@@ -1819,6 +2043,34 @@ async def test_prestage_scopes_keypairs_to_the_plan(env):
     assert read_log(env.log)[before:] == []
 
 
+async def test_flavor_pre_staging_leaves_out_gpu_flavors(env):
+    """SDD §7.2, §22.4 (plan task G7): pre-staging exports and imports the flavors the orchestrator
+    names - those of the plan's VMs flavor_prestaged holds for -, never a GPU VM's: os-migrate would
+    create it at the destination with the source's extra specs, whose GPU type may not exist
+    there. A VM recorded before 0.3.0 counts by its flavor's extra specs, and a plan whose only
+    unmapped flavors are GPU VMs' runs no flavor playbook."""
+    plan = make_plan(id="plan-00c0ffee", prestage_resources=["flavors"])
+    vgpu = make_vm(flavor="g1.vgpu", flavor_extra_specs=ON_A100, gpus=gpu_requests(ON_A100))
+    # recorded before 0.3.0: no gpus, a flavor that asks for a PCI device
+    alias = make_vm(source_id="vm-2", flavor="p1.src", flavor_extra_specs={PCI_ALIAS: "a100:1"})
+    plain = make_vm(source_id="vm-3", flavor="m1.custom")
+    dst_inv = DestinationInventory(flavors=[dst_flavor("m1.small")])
+
+    async def prestage(*vms):
+        # the names as the orchestrator gives them (SDD §7.2)
+        names = sorted({vm.flavor for vm in vms if flavor_prestaged(vm, plan, dst_inv)})
+        before = len(read_log(env.log))
+        await env.executor.prestage(
+            plan, SRC, DST, deploy_conversion_hosts=False, prestage_flavors=names
+        )
+        return read_log(env.log)[before:]
+
+    runs = await prestage(vgpu, alias, plain)
+    assert [run["playbook"] for run in runs] == ["export_flavors.yml", "import_flavors.yml"]
+    assert all(r["vars"]["os_migrate_flavors_filter"] == [{"regex": "^m1\\.custom$"}] for r in runs)
+    assert await prestage(vgpu, alias) == []
+
+
 def test_build_vars_and_inventory_are_pure(env):
     ctx, _ = ctx_for(env, strategy=Strategy.cold)
     v1 = build_vars(StepName.CUTOVER, ctx)
@@ -2006,6 +2258,32 @@ async def test_resolved_flavor_is_applied_to_the_export(env):
     params = exported["resources"][0]["params"]
     assert params["flavor_ref"]["name"] == "auto.small"
     assert params["ports"][0]["params"]["network_ref"]["name"] == "rhoso-app"
+
+
+@pytest.mark.parametrize("strategy", [Strategy.cold, Strategy.warm])
+async def test_an_openstack_gpu_vms_server_gets_its_mapped_flavor(env, monkeypatch, strategy):
+    """SDD §7.2, §22.4 (plan task G7): an OpenStack GPU VM's GPU flavor is its flavor's mapping,
+    which apply_mappings writes to flavor_ref.name after the export: the cold and the warm cutover
+    create its server with it - not with the source flavor's name, nor with a matched flavor.
+    Mappings.gpus names VMware GPUs only and is not applied, and no kit variable reaches
+    os-migrate."""
+    monkeypatch.setenv("ANSIBLE_FAKE_FLAVOR", "g1.vgpu")  # the export names the source's flavor
+    mappings = MAPPINGS.model_copy(
+        update={"flavors": {"g1.vgpu": "g1.a100-4c"}, "gpus": {"grid_a100-4c": "p1.a100"}}
+    )
+    gpu_vm = {"flavor": "g1.vgpu", "flavor_extra_specs": ON_A100, "gpus": gpu_requests(ON_A100)}
+    # a matched flavor, which the pre-flight never records for a GPU VM, does not win over it
+    matched = Mappings(flavors={"g1.vgpu": "m1.large"})
+    ctx, _ = ctx_for(env, strategy, mappings=mappings, vm_kw=gpu_vm, resolved_mappings=matched)
+    if strategy == Strategy.warm:
+        first = await env.executor.run(StepName.PRECOPY, ctx)
+        assert exported_server(env)["params"]["flavor_ref"]["name"] == "g1.a100-4c"
+        ctx.migration.sync_passes.append(first.sync_pass)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    runs = read_log(env.log)
+    assert runs[-1]["playbook"] in ("import_workloads.yml", "import_workloads_cutover.yml")
+    assert exported_server(env)["params"]["flavor_ref"]["name"] == "g1.a100-4c"
+    assert not [r["playbook"] for r in runs if "flavor_uuid" in r["vars"]]
 
 
 async def test_downtime_clock_starts_at_the_stop_task(env, monkeypatch):
