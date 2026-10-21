@@ -3772,9 +3772,10 @@ is no origin a browser sends (review RV31-03).
   where it lists platforms (the Providers page, its empty state, the sign-in page), and wherever it means the
   destination cloud it says "the destination" - or the destination provider's name where a plan or a migration is
   shown, as the API's messages do; the offline mock mirrors the API's messages word for word.
-* GPU workloads (§22, from 0.3.0, plan tasks G10 and G11): every GPU element the dashboard shows (§22.11) - the
-  Inventory's GPU column and GPU filter, a destination's GPU flavors and GPU capacity, a destination card's GPU capacity
-  and the provider form's vGPU profiles among them - carries a "Technology Preview"
+* GPU workloads (§22, from 0.3.0, plan tasks G10, G11 and G12): every GPU element the dashboard shows (§22.11) - the
+  Inventory's GPU column and GPU filter, a destination's GPU flavors and GPU capacity, a destination card's GPU capacity,
+  the provider form's vGPU profiles, the plan form's GPU mappings and its flavor mappings' GPU hint, and the migration
+  page's GPU panel among them - carries a "Technology Preview"
   badge, its label in words beside its icon and never colour alone, whose detail (a focusable term, as a status
   badge's) reads "Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts." (§22.14),
   until §22.14's lab cases pass (plan task G15).
@@ -3793,7 +3794,9 @@ is no origin a browser sends (review RV31-03).
   {policy}; a provider card's Check {provider}, Inventory of {provider}, Edit {provider} and Delete {provider}), so a
   list of the page's controls never reads "Edit" three times, `aria-live`
   for progress, for the outcome of an action (a plan started, resumed, paused, saved or validated — with
-  the report's counts — or its waves planned; a migration's action or strategy change) and for what a list's
+  the report's counts — or its waves planned; a migration's action or strategy change), for a migration's wait for GPU
+  capacity (`gpu_wait`, §22.7; plan task G12) once when it begins and once when it ends — never for a read that only
+  updates it, nor for a wait already set when its page opened — and for what a list's
   filters show ("Showing 3 of 12 plans", also when none match; on Events only that none match, as its count moves
   with every live event) and for the live event stream once it has been live — lost (reconnecting), back, stopped or
   signed out, said once for the page, not by each Live indicator, and not its first connection —, announced from a live
@@ -3875,16 +3878,24 @@ is no origin a browser sends (review RV31-03).
   `pending_approval` holds its migration, `Migration.advisor_hold`, until a person with `advisor.approve` approves or
   overrides it, §14.6). A cutover approval is pending while a migration waits at the cutover gate — `awaiting_cutover`;
   a single-shot strategy in `ready` whose wave runs; a forced cutover during `precopy`/`syncing` — in a plan that
-  requires approval, and no approval counts; the window and the cutover slots are waits, not approvals. The
+  requires approval, and no approval counts; the window, the cutover slots and a wait for GPU capacity (`gpu_wait`,
+  §5.4 rule 5) are waits, not approvals. The
   dashboard builds both from the routes it already reads (no approvals route). On the Overview a pending approval
-  is listed once, in Pending approvals: Needs attention keeps every other human action — a cutover request or a
-  closed window once the approvals are in — and, while the plans cannot be loaded, a converged migration whose wait
+  is listed once, in Pending approvals: Needs attention keeps every other human action — a cutover request, a
+  closed window or a wait for GPU capacity once the approvals are in — and, while the plans cannot be loaded, a converged migration whose wait
   is unknown (Pending approvals then says its cutover approvals are unavailable). A warm migration whose passes
   found what its cutover will refuse (`cutover_refusals`, in `precopy`, `syncing` or `awaiting_cutover`) is listed
   there ahead of what it waits for, as the plan list marks it — "Cutover will refuse {n} problem(s)" — with "fix
   it, then Sync now" once it waits for its cutover and "fix it before it converges" while its passes run (the next
   pass looks again); an approval it still needs stays in Pending approvals, whose row then adds to what it waits
   for "The cutover will refuse {n} problem(s): fix it first.", so the approver sees it where the approval is given.
+  A migration whose cutover waits for GPU capacity (`gpu_wait` set, in `ready`, `awaiting_cutover` or a keep-warm
+  pass, §5.4 rule 5, §22.7; plan task G12) is listed there as a wait, ranked with the window's, its source still
+  running: "Waiting for GPU capacity: {pool}, {free} free, needs {needed}" — after a read that failed, whose `free` is
+  null, "Waiting for GPU capacity: {reason}" with the wait's reason, which names the failure (§22.12) — and "Wait, or
+  free GPU capacity on the destination: the cutover starts once a read finds room"; a read is made once the gate's
+  other rules hold, so its approvals are in and Pending approvals never lists it, and what its cutover will refuse
+  is listed ahead of it, as ahead of any wait.
   A rolled-back migration waits for a person too — to fix the cause and retry it, or to cancel it — so Needs
   attention lists it last, after the overdue finalizes: "Rolled back — the source VM runs again", with "Fix the
   cause, then retry or cancel (operator)". A failed migration is offered only what it can take, alike in Needs
@@ -3925,7 +3936,27 @@ is no origin a browser sends (review RV31-03).
   source inventory is listed with Remove: validation cannot reach it), strategy and selection policy, per-VM
   strategy overrides (`strategy_overrides`, for selected VMs only: any strategy of the source kind — one that is
   not eligible for the VM is ignored at validation, with the reason, §9.2), SLO,
-  approval policy and window, network/flavor/volume-type/project mappings, sync settings — link bandwidth,
+  approval policy and window, network/flavor/volume-type/project mappings — while a selected VM of an OpenStack source
+  asks for a GPU (`vm_gpus` with the profile its source declares, §22.2), the flavor mappings carry a GPU hint with a
+  "Technology Preview" badge: each flavor of the selected VMs that asks for a GPU, with its VMs, and the destination's
+  GPU flavors to map it to, as a same-named flavor is no mapping (§22.4; plan task G12) —, the GPU mappings
+  (`mappings.gpus`, §22.4; plan task G12) under "GPU mappings" with a "Technology Preview" badge, shown while a selected
+  VM has a GPU and outside the advanced settings, as a plan's mapping is its GPU VMs' opt-in: the destination's GPU
+  flavors (`gpu_flavors` of `GET /providers/{id}/inventory`, read while the section shows; from an answer without
+  them, its flavors that ask for a GPU with the profiles it declares, §22.3), each with its size and its GPU requests
+  as the Inventory words them, or why none is offered — no destination chosen yet, its inventory being read or not
+  read (with Retry), or none listed; for a VMware source one row per GPU key among the selected VMs (§22.2), by key,
+  naming how many VMs have it and their size ("grid_a100-4c: 2 VMs, 8–16 vCPUs, 32–64 GiB"), each a choice among those
+  flavors or None — nothing is chosen for the operator: a new plan's rows read None, an edited plan's its mapping, and
+  a flavor it maps that is not one of the destination's GPU flavors stays selected, marked so — and marking each
+  selected VM its flavor does not fit, as `MAP_GPU_FLAVOR` warns (fewer vCPUs, less RAM or a smaller local root disk,
+  each with what the flavor gives for what the VM has); a VMware device without a GPU key — a passthrough device
+  without ids — is named with its VMs as one no mapping can take (`VM_PCI_PASSTHROUGH`); None removes the key's
+  mapping, and a key no selected VM has keeps its mapping as the plan has it, as the form sends `mappings` whole; for
+  an OpenStack source each flavor of the selected VMs that asks for a GPU, with its VMs, their size and what it asks
+  for, and how the flavor mappings map it — to a GPU flavor of the destination, with the VMs it does not fit; to a
+  flavor that asks for no GPU, so its server would lose it; to a flavor the destination lacks; or not at all —, with a
+  link to the flavor mappings; sync settings — link bandwidth,
   convergence threshold (0 or more), maximum passes (1 or more) and the keep-warm interval (at least a minute, §5.4) —
   the finalize reminder (`finalize_warning_h`, hours, 1 or more), estimator overrides (scan rate per disk stream, disks scanned in parallel (1 or more), guest write rate
   `change_rate_bps`, aggregate scan cap
@@ -4042,7 +4073,23 @@ is no origin a browser sends (review RV31-03).
   entries offers "Remove the overrides" (the same plan edit) —, a Verification panel — the VM's
   application probes (the plan's or its override, §7.5) with Edit for an operator (its `probe_overrides` entry, a
   plan edit, §12, gated like the Network panel's) and its suggested probes, and the last verification's checks and probes: target, result (Passed,
-  Failed, Unreachable), latency and time (ADV-18) —, advisor notes, timeline,
+  Failed, Unreachable), latency and time (ADV-18) —, a GPU panel (§22.11; plan task G12) for a VM with a GPU (`vm_gpus`
+  with the profile its source declares, §22.2), a GPU finding, a wait for GPU capacity or a GPU check — "GPU" with a
+  "Technology Preview" badge: the VM's GPUs as the Inventory's GPU column words them; its GPU flavor and the mapping
+  that chose it (`planning/gpu.gpu_flavor`, §22.4) — "by the GPU mapping grid_a100-4c → g1.a100-4c" for a VMware VM,
+  "by the flavor mapping g1.vgpu → g1.a100-4c" for an OpenStack one, and that flavor mapping for a VM without a GPU of
+  its own whose capacity a finding judges —, or why no mapping applies (a GPU key no mapping names, a device without
+  ids, keys that map to different flavors, a flavor no mapping names), unknown while the plan is not loaded; the vGPU
+  profiles its source declares for its flavor and its destination for its GPU flavor (`gpu_profiles`, §22.3), each
+  with its provider, or "None declared"; the capacity findings (`DST_GPU_CAPACITY_INSUFFICIENT`,
+  `DST_GPU_CAPACITY_UNKNOWN`) with their severity — else that the validation found room, once its GPU mapping applied
+  there (`MAP_GPU_FLAVOR`), or that the validation checks it —; and the last verification's GPU checks (`gpu_flavor`,
+  `gpu_allocation`, §7.5) with their results and details, or that none ran yet. While `gpu_wait` is set it reads
+  "Waiting for GPU capacity: {free} free of {needed} in {pool}, checked {time}. The source VM keeps running." with the
+  wait's reason under it — after a failed read, whose `free` is null, "Waiting for GPU capacity: {reason}, checked
+  {time}. The source VM keeps running." —, announced once when the wait begins ("{vm} waits for GPU capacity: {free}
+  free of {needed} in {pool}. The source VM keeps running.", the reason in place of the numbers after a failed read)
+  and once when it ends ("{vm} no longer waits for GPU capacity.") —, advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — those available now
   first, the next step's action first and primary, then the unavailable ones in a quieter, smaller row under
   "Unavailable now", each still focusable and saying why (a button that changes rows as the migration moves keeps
@@ -4070,7 +4117,8 @@ is no origin a browser sends (review RV31-03).
   sync, so a pass looks again, with Sync its action; failed before its source stopped, it says the cutover refused
   them and that the retry's pass looks again —; the
   plan page's migration list marks such a migration with a warning naming how many problems the cutover will
-  refuse; while a requested cutover waits for a closed window, an approver can let it cut over
+  refuse, and one whose cutover waits for GPU capacity (`gpu_wait`, §22.7; plan task G12) "Waiting for GPU capacity"
+  under its phase, as a wait, in the info tone with its icon; while a requested cutover waits for a closed window, an approver can let it cut over
   outside the window — the plan, its wave and the cutover slots still gate it (§5.4); a cutover request is shown
   whether or not the plan needs approval, and while it waits the page says when it may start outside the window
   (`force_window`, §4.2); a request that waits for another approver — maker-checker, and no approval counts but
@@ -4329,7 +4377,19 @@ is no origin a browser sends (review RV31-03).
   `CUSTOM_NVIDIA_A100_4C`), `g1.a100-3-20c` (one with `CUSTOM_NVIDIA_A100_3_20C`) and `p1.a100`
   (`pci_passthrough:alias=a100:1`) and their pools as §22.3 reads them - A100-4C's with 4 units free on 1 provider,
   A100-3-20C's with 2 free on 1, and the class `VGPU` alone, which unites them -, read alike by the inventory and the
-  destination's check; a destination without a GPU flavor reads `ok` with no pools. Its estimates are §9.1's, as a
+  destination's check; a destination without a GPU flavor reads `ok` with no pools. Its pre-flight gives the API's GPU
+  findings (§22.5; plan task G12) — `MAP_GPU_FLAVOR`, `MAP_GPU_DOWNSIZED`, `DST_GPU_CAPACITY_INSUFFICIENT`,
+  `DST_GPU_CAPACITY_UNKNOWN`, `GUEST_GPU_DRIVER` and `GUEST_GPU_LICENSE`, beside the mapping rule and the two GPU
+  blockers (plan task G4) — in the API's words, severities and remediations, held to the API's by the shared finding
+  cases (`seamless/tests/fixtures/eligibility_cases.json`), with the destination's GPU flavors and capacity as its
+  validation reads them and each VM of the plan counted by what its cutover will still create (`quota_share`, §9.3).
+  Its cutover gate holds a GPU VM's cutover until a capacity read finds room (§5.4 rule 5, §22.7; plan task G12): once
+  the gate's other rules hold, a read takes the destination's GPU flavors and the pools of the VM's GPU flavor as the
+  destination holds them — the A100-3-20C pool full on each destination's first two gate reads that ask of it, the
+  class's pool short by its units then, while the validation sees room (§22.10) —, counting the destination's other
+  cutovers that have no server yet; it records `gpu_wait`, with `migration.gpu_wait` once when the wait begins and once
+  when it ends, in the API's words, and a read counts for three ticks, as the API demo's do at its default speed (§7.4,
+  §22.7). Its estimates are §9.1's, as a
   validation computes them: the control plane's `estimate` with the plan's parameters (`params_for_plan`: the plan's overrides, its own link, threshold and pass limit),
   ported to `src/lib/forcedEstimate.ts` and checked against a case table the control plane generates
   (`seamless/tests/fixtures/estimate_cases.json`); the mock shows each part rounded to 0.1 s, the downtime as their
@@ -5182,12 +5242,13 @@ Binding in §7.4 and §10 since plan task G9:
   again, as if another tenant had released a vGPU. A plan with `dc2-ml-02` shows the gate's wait (§22.7) and how it
   clears.
 * The dashboard's offline mock (`VITE_SEAMLESS_MOCK=1`) holds the same GPU VMs, flavors, pools, findings and wait
-  (§16; its GPU VMs, flavors and pools since plan task G10).
+  (§16; its GPU VMs, flavors and pools since plan task G10, its GPU findings and the gate's wait since plan task G12).
 
 ### 22.11 Dashboard
 
 Binding in §16 with plan tasks G10–G12 (track C); the badge rule, the Inventory and `types.ts` since plan task G10,
-the Providers since plan task G11. §16's design tokens hold. Every GPU element carries a "Technology Preview" badge,
+the Providers since plan task G11, the plan form, the migration page, the findings and the Overview since plan task
+G12. §16's design tokens hold. Every GPU element carries a "Technology Preview" badge,
 in words and never by colour alone, until §22.14's lab cases pass.
 
 * **Inventory**. For a source: a GPU column ("vGPU grid_a100-4c ×2", "Passthrough 10de:20b5", or for an OpenStack
@@ -5206,8 +5267,8 @@ in words and never by colour alone, until §22.14's lab cases pass.
   `gpu_profiles` for an OpenStack or RHOSO provider, as pairs of a flavor and a profile, offering the provider's GPU
   flavors once its inventory is read.
 * **Plan form**. For a VMware source, a GPU mappings section with one row per GPU key among the selected VMs
-  ("grid_a100-4c: 2 VMs, 8–16 vCPUs"), each a choice among the destination's GPU flavors (with their size and GPU) or
-  none. Nothing is chosen for the operator. A row marks the VMs its flavor does not fit, as `MAP_GPU_FLAVOR` warns, and a
+  ("grid_a100-4c: 2 VMs, 8–16 vCPUs, 32–64 GiB"), each a choice among the destination's GPU flavors (with their size
+  and GPU) or none. Nothing is chosen for the operator. A row marks the VMs its flavor does not fit, as `MAP_GPU_FLAVOR` warns, and a
   passthrough device without ids is named as one no mapping can take. For an OpenStack source, the flavor mappings say
   which selected VMs' flavors ask for a GPU and offer the destination's GPU flavors for them.
 * **Migration page**. A GPU panel: the VM's GPUs, its GPU flavor and the mapping that chose it (the GPU mapping or the
