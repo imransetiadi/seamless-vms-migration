@@ -3650,8 +3650,9 @@ is no origin a browser sends (review RV31-03).
   where it lists platforms (the Providers page, its empty state, the sign-in page), and wherever it means the
   destination cloud it says "the destination" - or the destination provider's name where a plan or a migration is
   shown, as the API's messages do; the offline mock mirrors the API's messages word for word.
-* GPU workloads (§22, from 0.3.0, plan task G10): every GPU element the dashboard shows (§22.11) - the Inventory's GPU
-  column and GPU filter, a destination's GPU flavors and GPU capacity among them - carries a "Technology Preview"
+* GPU workloads (§22, from 0.3.0, plan tasks G10 and G11): every GPU element the dashboard shows (§22.11) - the
+  Inventory's GPU column and GPU filter, a destination's GPU flavors and GPU capacity, a destination card's GPU capacity
+  and the provider form's vGPU profiles among them - carries a "Technology Preview"
   badge, its label in words beside its icon and never colour alone, whose detail (a focusable term, as a status
   badge's) reads "Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts." (§22.14),
   until §22.14's lab cases pass (plan task G15).
@@ -3680,7 +3681,8 @@ is no origin a browser sends (review RV31-03).
   it appears or changes, so it is seen as well as heard; an error a page shows while loading is never scrolled to, so
   a refetch in the background never moves the page —, focus that never drops to the
   page when the focused control goes away (Clear filters → the search field; a dialog's next step → its
-  heading; a deleted item → its list's heading, a removed probe → its list's legend; a plan action whose button
+  heading; a deleted item → its list's heading, a removed probe → its list's legend, a removed vGPU profile of the
+  provider form → its section's heading; a plan action whose button
   goes with it — Start, Resume, Start again, Finalize all, Finalize wave, the not-finalized notice's Dismiss — → the
   plan's heading; the migration page's Use suggested probe, whose suggestion goes once the VM has probes → Edit probes
   beside it; a failure's Retry that succeeds, its message going with it → the page's heading; while Cancel returns
@@ -3980,11 +3982,34 @@ is no origin a browser sends (review RV31-03).
   newer than the window when the maxima were read, "Not detected" only when they were not -, its support tier
   (Validated, Tier 1, 2 or 3, or Outside, with the reason in words) and its policy profile, and warns when the
   detected range contradicts its declared series or its profile is unknown (check it so its series is detected, or
-  declare its policy profile or series: §21.5's two ways out, review RV20-09); a provider whose check
+  declare its policy profile or series: §21.5's two ways out, review RV20-09), and its check's GPU capacity
+  (`gpu_capacity`, §22.3; plan task G11) under "GPU capacity" with a "Technology Preview" badge and the check's time
+  ("Checked 3 min ago", the read's `read_at`): each pool as the Inventory words it, its class and traits, then its free
+  units and providers ("VGPU, CUSTOM_NVIDIA_A100_4C: 4 free on 1 GPU", "VGPU: 6 free on 2 GPUs, at most 4 on one",
+  "None free", a pool Placement refused as a bad request with its detail; the Inventory's `TODO(LAB): confirm` of the
+  word "GPU", §22.14), or "Not read: {reason}." with the Inventory's reasons in words - a check report holds pools, not
+  the flavors that ask of them, so a pool is named by what it asks Placement for, never by a declared profile, and the
+  card reads nothing more for it -, and nothing for a destination whose check read no pool (one without a vGPU flavor
+  reads `ok` with none and sends Placement nothing, §22.3; a PCI alias flavor's capacity is the Inventory's to mark
+  unknown) or whose report holds no `gpu_capacity` (not checked since it was added, since a PATCH reset its report,
+  §12, or since 0.3.0); a provider whose check
   reports plain HTTP says so, naming `plain_http`'s endpoints; the form
   takes, for an OpenStack destination, the declared release series (blank: detect it, the window's series offered
-  newest first) and, for an OpenStack or RHOSO destination, the declared policy profile (blank: by kind and series,
-  §4.2); admins add and edit providers with a distribution preset —
+  newest first), for an OpenStack or RHOSO destination, the declared policy profile (blank: by kind and series,
+  §4.2), and for an OpenStack or RHOSO provider, source or destination alike, its declared vGPU profiles
+  (`gpu_profiles`, §22.3; plan task G11) under "vGPU profiles" with a "Technology Preview" badge, as rows of a flavor
+  and the profile it gives (Add vGPU profile; Remove vGPU profile {n}; "No vGPU profile declared." without one): it
+  trims each name and refuses before anything is sent what the API refuses - an empty flavor or profile, a flavor of
+  more than 255 characters or a profile of more than 64, counted in code points as Python counts them - and a flavor
+  declared twice, which one map cannot hold, each in the error summary with a link to its field; it sends the map
+  whole, with `POST`, and with `PATCH` only when it changed, its pairs in any order (a PATCH resets the check report,
+  §12); while it edits a provider, it offers the provider's GPU flavors once its inventory is read
+  (`GET /providers/{id}/inventory`, which the Inventory shares): a destination's `gpu_flavors`, a source's the flavors
+  of its VMs with a GPU (`vm_gpus`, §22.2), named in the section's hint and suggested by each Flavor field, less those
+  declared (a suggestion, never a restriction: a flavor its inventory does not list is typed); the hint says so while
+  the inventory is read, when it cannot be read or lists no GPU flavor, and for a provider not added yet; a vCenter's
+  form shows no vGPU profiles and sends none (vCenter reports each VM's own, §22.3); admins add and edit providers
+  with a distribution preset —
   OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
   enter write-only credentials and the conversion-host SSH key, or name instead a secret managed outside Seamless
   (`credentials_secret`, `conversion_host.ssh_key_secret`, §13.3: mounted files, the Kubernetes store or
@@ -4974,9 +4999,9 @@ Binding in §7.4 and §10 with plan task G9:
 
 ### 22.11 Dashboard
 
-Binding in §16 with plan tasks G10–G12 (track C); the badge rule, the Inventory and `types.ts` since plan task G10.
-§16's design tokens hold. Every GPU element carries a "Technology Preview" badge, in words and never by colour alone,
-until §22.14's lab cases pass.
+Binding in §16 with plan tasks G10–G12 (track C); the badge rule, the Inventory and `types.ts` since plan task G10,
+the Providers since plan task G11. §16's design tokens hold. Every GPU element carries a "Technology Preview" badge,
+in words and never by colour alone, until §22.14's lab cases pass.
 
 * **Inventory**. For a source: a GPU column ("vGPU grid_a100-4c ×2", "Passthrough 10de:20b5", or for an OpenStack
   request "vGPU · VGPU, CUSTOM_NVIDIA_A100_4C"; empty for a VM without a GPU) and a GPU filter (all VMs, those with a
@@ -4985,10 +5010,12 @@ until §22.14's lab cases pass.
   declared profile) and its GPU capacity, each pool's free units and providers, or "Not read" with the reason in
   words (the credential lacks the role Placement asks for, the catalog lists no Placement, or the failure), and "Capacity
   unknown: PCI aliases are configured in nova.conf" for an alias flavor.
-* **Providers**. A destination's card summarizes its check's `gpu_capacity` with the check's time ("A100-4C: 4 free on
-  1 GPU", or "GPU capacity not read: …"; `TODO(LAB): confirm` the word: Placement counts resource providers, and on an
-  SR-IOV GPU, A100 and later, Nova makes each virtual function one, so the count may read in virtual functions, not
-  GPUs, §22.14), and nothing when the destination has no GPU flavor. The provider form takes
+* **Providers**. A destination's card summarizes its check's `gpu_capacity` with the check's time ("VGPU,
+  CUSTOM_NVIDIA_A100_4C: 4 free on 1 GPU", a pool by its class and traits as the Inventory names it - a check report
+  holds no flavor to name a pool by its declared profile -, or "Not read: …" under "GPU capacity";
+  `TODO(LAB): confirm` the word: Placement counts resource providers, and on an SR-IOV GPU, A100 and later, Nova makes
+  each virtual function one, so the count may read in virtual functions, not GPUs, §22.14), and nothing when its check
+  read no pool, as for a destination without a vGPU flavor. The provider form takes
   `gpu_profiles` for an OpenStack or RHOSO provider, as pairs of a flavor and a profile, offering the provider's GPU
   flavors once its inventory is read.
 * **Plan form**. For a VMware source, a GPU mappings section with one row per GPU key among the selected VMs
