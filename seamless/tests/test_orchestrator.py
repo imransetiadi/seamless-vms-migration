@@ -3399,40 +3399,38 @@ async def _gpu_outcome_with_room(h, mid: str):
 async def test_a_read_made_before_another_gpu_cutover_began_never_lets_a_second_cut_over(
     tmp_path, store
 ):
-    """SDD §5.4 rule 5, §22.7 (G6 review): one cutover slot, one unit free. B's read finds room but
-    its cutover cannot start - its plan is busy -; A reads, finds room, cuts over and ends its step,
-    its server holding the unit. B's read, made before A's cutover began, no longer counts whatever
-    phase A is in now: B reads again and waits."""
-    from seamless_migrate.domain.models import Mappings
-
-    settings = make_settings(tmp_path, max_concurrent_cutovers=1)
+    """SDD §5.4 rule 5, §22.7 (G6 review): two cutover slots, one unit free, both reads out at once;
+    B's read cannot be recorded - a person's action holds B's migration - until A has cut over on
+    its own read and ended its step, its server holding the unit. B's read, made before A's cutover
+    began, no longer counts whatever phase A is in now: B reads again and waits."""
+    settings = make_settings(tmp_path, max_concurrent_cutovers=2)
     gates: dict[str, asyncio.Event] = {}
     started: list[str] = []
     executor = ScriptedExecutor(
         settings, hooks={StepName.CUTOVER: blocking_cutover(gates, started)}
     )
-    dst = GateDestination()
-    h = build_harness(
+    h, plan, dst = await _gate_plan(
         tmp_path,
         store,
         [gate_vm(1), gate_vm(2)],
+        {"default_strategy": Strategy.cold},
+        dst=GateDestination(free={GATE_POOL: 2, "VGPU": 2}),  # the validation counts both
         executor=executor,
         settings=settings,
-        destination=dst,
     )
-    kw = {"default_strategy": Strategy.cold, "mappings": Mappings(flavors={"g1.vgpu": GATE_FLAVOR})}
-    plan_b = plan_for([gate_vm(2)], name="B", **kw)
-    plan_a = plan_for([gate_vm(1)], name="A", **kw)
-    for plan in (plan_b, plan_a):  # B's plan is ticked first
-        store.put("plan", plan)
-        await h.orch.validate_plan(plan.id, "alice")
-        await h.orch.start_plan(plan.id, "alice")
-    a, b = await h.by_vm(plan_a.id, "vm-1"), await h.by_vm(plan_b.id, "vm-2")
-    busy = h.orch.plan_lock(plan_b.id)
-    await busy.acquire()  # a pause or an edit of B's plan holds it: B's step waits
+    dst.free = dict(GATE_ROOM)
+    dst.hold = asyncio.Event()
+    await h.orch.start()
+    a, b = await h.by_vm(plan.id, "vm-1"), await h.by_vm(plan.id, "vm-2")
+
+    async def both_read():
+        return len(dst.reads) == 2
+
+    await _eventually(both_read)
+    held = h.orch._lock(b.id)
+    await held.acquire()
     try:
-        await h.orch.start()
-        await _gpu_outcome_with_room(h, b.id)
+        dst.hold.set()
 
         async def a_started():
             return started == ["vm-1"]
@@ -3442,7 +3440,7 @@ async def test_a_read_made_before_another_gpu_cutover_began_never_lets_a_second_
         gates.setdefault("vm-1", asyncio.Event()).set()
         await h.wait_phase(a.id, P.completed)
     finally:
-        busy.release()
+        held.release()
     m = await _gpu_wait(h, b.id)
     await asyncio.sleep(0.1)  # many ticks
     await h.orch.stop()
@@ -3798,6 +3796,216 @@ async def test_a_migration_held_by_its_advisor_decision_is_not_read_for(tmp_path
     await _gpu_wait(h, mid)
     await h.orch.stop()
     assert len(dst.reads) == 1
+
+
+class GateDestinations:
+    """A registry that hands each destination provider its own double, by id (SDD §10)."""
+
+    def __init__(self, source, by_id) -> None:
+        self.source, self.by_id = source, by_id
+
+    def get(self, provider):
+        return self.by_id[provider.id] if provider.role == "destination" else self.source
+
+
+async def _set_advisor_hold(h, mid: str, hold: str | None) -> None:
+    async with h.orch._lock(mid):
+        cur, v = await h.orch._load(mid)
+        cur.advisor_hold = hold
+        await h.orch._save(cur, v)
+
+
+@pytest.mark.parametrize("slots", [1, 3])
+async def test_a_destination_whose_gpu_reads_hang_never_holds_another_destinations(
+    tmp_path, store, slots
+):
+    """SDD §5.4 rule 5, §22.7 (G6 review): plan H's destination never answers its GPU reads; plan
+    G's has room. Reads and the places they hold count per destination, so H's hung reads - at
+    most one per cutover slot, the worker threads they take - hold none of G's: G's GPU VMs read
+    and cut over while H's wait."""
+    from seamless_migrate.domain.models import Mappings
+
+    settings = make_settings(tmp_path, max_concurrent_cutovers=slots)
+    room = {GATE_POOL: 3, "VGPU": 3}
+    hung, healthy = GateDestination(free=room), GateDestination(free=room)
+    vms = [gate_vm(i) for i in range(1, 7)]
+    h = build_harness(tmp_path, store, vms, destination=hung, settings=settings)
+    h.orch.providers = GateDestinations(h.source, {DST_PROVIDER.id: hung, "dst-two": healthy})
+    store.put("provider", DST_PROVIDER.model_copy(update={"id": "dst-two", "name": "RHOSO two"}))
+    kw = {"default_strategy": Strategy.cold, "mappings": Mappings(flavors={"g1.vgpu": GATE_FLAVOR})}
+    plan_h = plan_for(vms[:3], name="H", **kw)
+    plan_g = plan_for(vms[3:], name="G", destination_provider_id="dst-two", **kw)
+    for plan in (plan_h, plan_g):  # H is ticked first
+        store.put("plan", plan)
+        await h.orch.validate_plan(plan.id, "alice")
+        await h.orch.start_plan(plan.id, "alice")
+    hung.hold = asyncio.Event()  # H's reads hang, as a provider call may for minutes
+    await h.orch.start()
+    try:
+        await h.wait_plan(plan_g.id, PlanStatus.completed, timeout=20)
+        assert len(hung.reads) == slots and len(healthy.reads) >= 3
+        assert {m.phase for m in await h.migrations(plan_h.id)} == {P.ready}
+    finally:
+        hung.hold.set()
+        await h.orch.pause_plan(plan_h.id, "alice")
+        await h.orch.stop()
+
+
+async def test_a_gpu_vm_keeps_its_cutover_slot_while_its_read_is_out(tmp_path, store):
+    """SDD §5.4 rule 5, §22.7 (G6 review): one cutover slot, the GPU VM first in its wave order and
+    four VMs without a GPU behind it. While its read is out, the tick gives its slot to none of
+    them: the GPU VM cuts over first, after one read, and the others after it."""
+    settings = make_settings(tmp_path, max_concurrent_cutovers=1)
+    started: list[str] = []
+
+    async def recording(ctx):
+        started.append(ctx.migration.vm.source_id)
+        return await executor.sim.run(StepName.CUTOVER, ctx)
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: recording})
+    h, plan, dst = await _gate_plan(
+        tmp_path,
+        store,
+        [gate_vm(1)] + [vm(i) for i in range(2, 6)],
+        {"default_strategy": Strategy.cold},
+        executor=executor,
+        settings=settings,
+    )
+    dst.free = dict(GATE_ROOM)
+    dst.hold = asyncio.Event()  # its read is out a while
+    await h.orch.start()
+
+    async def reading():
+        return dst.reads
+
+    await _eventually(reading)
+    await asyncio.sleep(0.2)  # many ticks
+    assert started == []
+    dst.hold.set()
+    await h.wait_plan(plan.id, PlanStatus.completed, timeout=20)
+    await h.orch.stop()
+    assert started[0] == "vm-1" and len(started) == 5 and len(dst.reads) == 1
+
+
+async def test_a_gpu_vm_whose_cutover_cannot_start_yet_keeps_its_place(tmp_path, store):
+    """SDD §22.7 (G6 review): one cutover slot; B's GPU VM read and found room, but its cutover
+    cannot start - a person's action holds its plan -, and A's VM of the same destination waits
+    behind it in the tick's order. While B's read counts, A's VM does not take the slot: once B's
+    plan is free, B cuts over first."""
+    from seamless_migrate.domain.models import Mappings
+
+    settings = make_settings(tmp_path, max_concurrent_cutovers=1)
+    started: list[str] = []
+
+    async def recording(ctx):
+        started.append(ctx.migration.vm.source_id)
+        return await executor.sim.run(StepName.CUTOVER, ctx)
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: recording})
+    dst = GateDestination()
+    h = build_harness(
+        tmp_path, store, [gate_vm(1), vm(2)], executor=executor, settings=settings, destination=dst
+    )
+    kw = {"default_strategy": Strategy.cold, "mappings": Mappings(flavors={"g1.vgpu": GATE_FLAVOR})}
+    plan_b = plan_for([gate_vm(1)], name="B", **kw)
+    plan_a = plan_for([vm(2)], name="A", **kw)
+    for plan in (plan_b, plan_a):  # B's plan is ticked first
+        store.put("plan", plan)
+        await h.orch.validate_plan(plan.id, "alice")
+        await h.orch.start_plan(plan.id, "alice")
+    b = await h.by_vm(plan_b.id, "vm-1")
+    busy = h.orch.plan_lock(plan_b.id)
+    await busy.acquire()
+    try:
+        await h.orch.start()
+        await _gpu_outcome_with_room(h, b.id)
+        await asyncio.sleep(0.2)  # many ticks: B keeps its place
+        assert started == []
+    finally:
+        busy.release()
+    await h.wait_plan(plan_a.id, PlanStatus.completed)
+    await h.orch.stop()
+    assert started == ["vm-1", "vm-2"]
+
+
+async def test_a_gpu_vm_waiting_for_capacity_leaves_its_cutover_slot_to_the_vms_behind_it(
+    tmp_path, store
+):
+    """SDD §22.7 (G6 review): a read that finds no room releases the GPU VM's place at once: with
+    one cutover slot, the VMs behind it cut over while it waits for GPU capacity."""
+    settings = make_settings(tmp_path, max_concurrent_cutovers=1)
+    h, plan, dst = await _gate_plan(
+        tmp_path,
+        store,
+        [gate_vm(1), vm(2), vm(3)],
+        {"default_strategy": Strategy.cold},
+        settings=settings,
+    )
+    await h.orch.start()
+    gpu = await h.by_vm(plan.id, "vm-1")
+    await _gpu_wait(h, gpu.id)
+    for vm_id in ("vm-2", "vm-3"):
+        await h.wait_phase((await h.by_vm(plan.id, vm_id)).id, P.completed)
+    m = await h.migration(gpu.id)
+    await h.orch.pause_plan(plan.id, "alice")
+    await h.orch.stop()
+    assert m.phase == P.ready and m.gpu_wait is not None
+
+
+async def test_a_destinations_gpu_reads_never_pass_its_cutover_slots(tmp_path, store):
+    """SDD §22.7 (G6 review): a destination has at most max_concurrent_cutovers reads out - the
+    worker threads its reads take -, also when GPU VMs ahead of the ones reading come to their
+    gates later: with two slots and the destination silent, a third read waits for one to end."""
+    settings = make_settings(tmp_path, max_concurrent_cutovers=2)
+    room = {GATE_POOL: 3, "VGPU": 3}
+    h, plan, dst = await _gate_plan(
+        tmp_path,
+        store,
+        [gate_vm(1), gate_vm(2), gate_vm(3)],
+        {"default_strategy": Strategy.cold},
+        dst=GateDestination(free=room),
+        settings=settings,
+    )
+    first, second, third = [await h.by_vm(plan.id, f"vm-{i}") for i in (1, 2, 3)]
+    for m in (first, second):  # they come to their gates later
+        await _set_advisor_hold(h, m.id, "rec-000000000001")
+    dst.hold = asyncio.Event()  # the destination answers no read
+    await h.orch.start()
+
+    async def reads(n: int):
+        async def counted():
+            return len(dst.reads) == n
+
+        return await _eventually(counted)
+
+    await reads(1)  # the third one reads
+    await _set_advisor_hold(h, second.id, None)
+    await reads(2)  # the second one, ahead of it, reads too
+    await _set_advisor_hold(h, first.id, None)
+    await asyncio.sleep(0.2)  # many ticks: the first one, ahead of both, waits for a read to end
+    assert len(dst.reads) == 2
+    dst.hold.set()
+    await h.orch.pause_plan(plan.id, "alice")
+    await h.orch.stop()
+
+
+async def test_a_demo_gpu_read_counts_at_least_three_ticks(tmp_path, store):
+    """SDD §22.7 (G6 review): in demo mode a read counts its model minute but never under three
+    ticks - at demo_speed 6000 and a 0.2 s tick, 0.6 s rather than 10 ms -, so a read without room
+    is not made again on the next tick, and is once its three ticks are over."""
+    settings = make_settings(tmp_path, demo=True, demo_speed=6000.0, tick_s=0.2)
+    h, plan, dst = await _gate_plan(
+        tmp_path, store, [gate_vm(1)], {"default_strategy": Strategy.cold}, settings=settings
+    )
+    assert h.orch._gpu_read_s() == pytest.approx(0.6)
+    await h.orch.start()
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    first = (await _gpu_wait(h, mid)).gpu_wait
+    await asyncio.sleep(0.25)  # past a tick, within three
+    assert len(dst.reads) == 1
+    await _gpu_wait(h, mid, after=first.checked_at)
+    await h.orch.pause_plan(plan.id, "alice")
+    await h.orch.stop()
 
 
 async def test_step_timeout_fails_the_attempt_and_rolls_back_after_a_stop(tmp_path, store):

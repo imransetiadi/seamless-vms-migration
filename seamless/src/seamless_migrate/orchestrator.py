@@ -393,6 +393,8 @@ GPU_READ_FLOOR_TICKS = 3
 #: per destination, the cutovers begun that a read's re-check looks back on (SDD §22.7); a read
 #: older than all of them no longer counts
 CUTOVERS_BEGUN_KEPT = 512
+#: what rule 5 tells the tick of a GPU VM with a cutover slot left for it (SDD §22.7)
+GpuPlace = Literal["go", "hold", "wait"]
 
 
 @dataclass(frozen=True)
@@ -668,8 +670,11 @@ class Orchestrator:
         #: the source watch in progress: the tick starts it and never waits for it (SDD §8.1)
         self._watch_task: asyncio.Task[None] | None = None
         #: per migration, its GPU capacity read in progress, one at a time: the tick starts it and
-        #: never waits for it (SDD §5.4 rule 5, §22.7)
+        #: never waits for it (SDD §5.4 rule 5, §22.7); and the destination each one reads
         self._gpu_reads: dict[str, asyncio.Task[None]] = {}
+        self._gpu_read_destinations: dict[str, str] = {}
+        #: per destination, the cutover slots its GPU VMs ahead hold in the running tick (§22.7)
+        self._tick_holds: Counter[str] = Counter()
         #: per migration at its cutover gate, its last GPU capacity read's outcome (SDD §22.7)
         self._gpu_outcomes: dict[str, _GpuOutcome] = {}
         #: per destination provider, the cutovers this process began: a read notes their count
@@ -2513,20 +2518,27 @@ class Orchestrator:
             return None
         return outcome
 
-    def _gpu_gate(self, m: Migration, now: datetime, cutovers: int) -> bool:
-        """Rule 5 on the tick's snapshot, once rules 1-4 hold (SDD §5.4, §22.7): a GPU VM's cutover
-        starts on a read that counts and found room; without one, a read starts - a task of its
-        own, which the tick never waits for - while a cutover slot is left for it, the
-        ``cutovers`` in cutover and the reads already out taking theirs; the cutover waits."""
-        if not vm_gpus(m.vm):
-            return True
+    def _gpu_place(self, m: Migration, now: datetime, destination_id: str) -> GpuPlace:
+        """Rule 5 on the tick's snapshot for a GPU VM with a cutover slot left for it (SDD §5.4,
+        §22.7): "go" on a read that counts and found room; "hold" while its read is out - started
+        here, as a task of its own the tick never waits for, unless its destination already has
+        max_concurrent_cutovers reads out -, so its place is kept; "wait" on a read that counts and
+        found no room or failed, and while no read can start for it."""
         outcome = self._gpu_outcome(m, now)
-        if outcome is None:
-            reading = {mid for mid, task in self._gpu_reads.items() if not task.done()}
-            if m.id in reading or cutovers + len(reading) < self.settings.max_concurrent_cutovers:
-                self._start_gpu_read(m.id)
-            return False
-        return outcome.read.room
+        if outcome is not None:
+            return "go" if outcome.read.room else "wait"
+        task = self._gpu_reads.get(m.id)
+        if task is not None and not task.done():
+            return "hold"
+        reading = sum(
+            1
+            for mid, destination in self._gpu_read_destinations.items()
+            if destination == destination_id and not self._gpu_reads[mid].done()
+        )
+        if reading >= self.settings.max_concurrent_cutovers:
+            return "wait"  # the destination's reads hold their worker threads: one ends first
+        self._start_gpu_read(m.id, destination_id)
+        return "hold"
 
     async def _gpu_room_now(self, m: Migration) -> bool:
         """Rule 5 under the locks (SDD §5.4, §22.7): ``m``'s read still counts and found room, and
@@ -2576,14 +2588,13 @@ class Orchestrator:
         begun.count += 1
         begun.latest.append((begun.count, mid))
 
-    def _start_gpu_read(self, mid: str) -> None:
-        """Start ``mid``'s GPU capacity read as a task of its own, one per migration at a time;
-        the tick never waits for it (SDD §5.4 rule 5, §22.7)."""
+    def _start_gpu_read(self, mid: str, destination_id: str) -> None:
+        """Start ``mid``'s GPU capacity read of the destination as a task of its own; the tick
+        never waits for it, and ``_gpu_place`` starts none while one is out for ``mid`` - a slow
+        read delays that cutover, nothing else (SDD §5.4 rule 5, §22.7)."""
         if self._stopping:
             return
-        task = self._gpu_reads.get(mid)
-        if task is not None and not task.done():
-            return  # a slow read delays this cutover, nothing else
+        self._gpu_read_destinations[mid] = destination_id
         self._gpu_reads[mid] = asyncio.create_task(self._read_gpu(mid), name=f"gpu-read:{mid}")
 
     async def _read_gpu(self, mid: str) -> None:
@@ -2627,6 +2638,7 @@ class Orchestrator:
         finally:
             if self._gpu_reads.get(mid) is asyncio.current_task():
                 del self._gpu_reads[mid]
+                self._gpu_read_destinations.pop(mid, None)
 
     async def _gpu_capacity_read(
         self, client: Any, flavor: str, others: list[tuple[Migration, Plan]], where: str
@@ -3095,6 +3107,7 @@ class Orchestrator:
         self._tick_task = None
         self._watch_task = None
         self._gpu_reads.clear()
+        self._gpu_read_destinations.clear()
         self._started = False
         self._drivers.clear()
         self._steps.clear()
@@ -3206,6 +3219,7 @@ class Orchestrator:
             "steps": sum(1 for m in migrations if m.phase in fsm.ACTIVE_STEP_PHASES),
             "cutover": sum(1 for m in migrations if m.phase == P.cutover),
         }
+        self._tick_holds = Counter()  # no place is held yet in this tick (SDD §22.7)
         now = self._now()
         for plan in plans:
             # each plan on its own: one plan's error - a write the store refuses, a provider down -
@@ -3270,21 +3284,29 @@ class Orchestrator:
         )
         gate_open: set[str] = set()
 
-        # 1. cutover gate (SDD §5.4)
+        # 1. cutover gate (SDD §5.4); the destination's GPU VMs ahead hold their places (§22.7)
+        destination = plan.destination_provider_id
+        holds = self._tick_holds
         for m in ordered:
             waiting = m.phase == P.awaiting_cutover or (
                 m.phase == P.ready and m.strategy in SINGLE_SHOT_STRATEGIES
             )
             if not waiting or not self._gate(m, plan, now):
                 continue
-            if counts["cutover"] >= self.settings.max_concurrent_cutovers:
+            if counts["cutover"] + holds[destination] >= self.settings.max_concurrent_cutovers:
                 continue  # waits for a cutover slot: keep-warm passes go on meanwhile
             if counts["steps"] >= limit_steps or (m.phase == P.ready and not wave_room(m)):
                 continue
             if m.advisor_hold is not None:
                 continue  # its advisor decision waits for approval: no read, no step (§14.6)
-            if not self._gpu_gate(m, now, counts["cutover"]):
-                continue  # it waits for GPU capacity, or for a read of it (SDD §5.4 rule 5)
+            gpu = bool(vm_gpus(m.vm))
+            if gpu:
+                place = self._gpu_place(m, now, destination)
+                if place != "go":
+                    # it waits for GPU capacity, or for a read of it - holding its place while the
+                    # read is out (SDD §5.4 rule 5, §22.7)
+                    holds[destination] += 1 if place == "hold" else 0
+                    continue
             if await self._begin(
                 m.id, {P.ready, P.awaiting_cutover}, P.cutover, "cutover gate open"
             ):
@@ -3292,6 +3314,9 @@ class Orchestrator:
                 counts["cutover"] += 1
                 counts["steps"] += 1
                 in_flight[m.wave_id] += 1
+            elif gpu and self._gpu_place(m, self._now(), destination) != "wait":
+                # its read still counts, or was dropped and is read again at once: its place stays
+                holds[destination] += 1
 
         # 2. keep-warm delta passes while waiting for the gate (or for a cutover slot)
         for m in ordered:
