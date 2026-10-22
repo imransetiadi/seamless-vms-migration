@@ -2775,13 +2775,17 @@ async def test_finalize_variants(env):
     ctx, _ = make_ctx(plan, mig, SRC, DST, env.settings, delete_source=True)
     assert (await env.executor.run(StepName.FINALIZE, ctx)).details == {"source_deleted": True}
     assert ("delete_server", "srv-1") in env.registry.calls
-    # VMware sources are never deleted automatically in 0.1.0
+    # a VMware source is never deleted automatically: the reason says so and what to do, and names
+    # no release - one that outlived its release misled (0.4.0 release review)
     vmw = make_migration(
         plan_id=plan.id, vm=make_vm(source_id="vm-9"), strategy=Strategy.vmware_cold
     )
     ctx, _ = make_ctx(plan, vmw, VCENTER, DST, env.settings, delete_source=True)
     details = (await env.executor.run(StepName.FINALIZE, ctx)).details
-    assert details["source_deleted"] is False and "not automated" in details["reason"]
+    assert details == {
+        "source_deleted": False,
+        "reason": "deleting a VMware source VM is not automated: delete it in vCenter",
+    }
     # a provider failure is transient (retried)
     failing = AnsibleExecutor(env.settings, providers=FailingRegistry(), poll_s=0.02)
     ctx, _ = make_ctx(plan, mig, SRC, DST, env.settings, delete_source=True)
