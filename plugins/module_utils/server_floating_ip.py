@@ -83,6 +83,7 @@ class ServerFloatingIP(osm_resource.Resource):
 
         my_port = self._find_my_server_port(conn, sdk_srv)
         if mode == "skip":
+            self.outcome = "skipped"
             return None
         # A re-run finishing a server it created before (SDD §6.5) keeps the
         # floating IP already on the port for this fixed address: never a second.
@@ -93,11 +94,14 @@ class ServerFloatingIP(osm_resource.Resource):
             )
         )
         if on_port:
+            self.outcome = "kept"
             return on_port[0]
 
         if mode == "existing":
+            self.outcome = "attached"
             return self._attach_existing(conn, my_port, sdk_srv, required=True)
         elif mode == "new":
+            self.outcome = "created"
             return self._create_new(conn, my_port, sdk_srv)
         elif mode == "auto":
             return self._create_auto(conn, my_port, sdk_srv)
@@ -105,9 +109,30 @@ class ServerFloatingIP(osm_resource.Resource):
     def _create_auto(self, conn, my_port, sdk_srv):
         attached = self._attach_existing(conn, my_port, sdk_srv, required=False)
         if attached:
+            self.outcome = "attached"
             return attached
         else:
+            self.outcome = "created"
             return self._create_new(conn, my_port, sdk_srv)
+
+    def report(self, sdk_fip):
+        """What `create` did with this floating IP (Seamless Migrate SDD 7.2, plan task N6b):
+        the source's address, its fixed IP, the outcome - kept, attached, created or skipped -
+        and the destination floating IP's address, None when skipped."""
+        params = self.params()
+        outcome = getattr(self, "outcome", None)
+        new_address = None
+        if sdk_fip is not None:
+            new_address = sdk_fip.get("floating_ip_address")
+            if new_address is None and outcome == "attached":
+                # attached by its address: the source's
+                new_address = params.get("floating_ip_address")
+        return {
+            "address": params.get("floating_ip_address"),
+            "fixed_ip_address": params.get("fixed_ip_address"),
+            "outcome": outcome,
+            "new_address": new_address,
+        }
 
     def _create_new(self, conn, my_port, sdk_srv):
         sdk_params = self._to_sdk_params(self._refs_from_ser(conn))

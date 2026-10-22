@@ -1475,7 +1475,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 * Name filter: `os_migrate_workloads_filter: [{regex: "^" + re.escape(vm.name) + "$"}]`.
 * Floating IPs: a plan whose `network_cutover.floating_ips` is `"keep_address"` writes the workload's
   `floating_ip_mode` `skip`, so the cold and warm imports leave its floating IPs to the control plane's move (§8.3);
-  otherwise the collection's `auto` stays (§23.1).
+  otherwise the collection's `auto` stays (§23.1). The import reports each floating IP's outcome (plan task N6b):
+  `import_workload_create_instance`'s result holds `floating_ips: [{address, fixed_ip_address, outcome, new_address}]`
+  - `outcome` `kept` (already on the port: a re-run), `attached` (a detached floating IP of the address), `created`
+  (a new one: under `auto` when the destination holds none of the address, which `MAP_FIP_ADDRESS_CHANGE` warned of)
+  or `skipped` (`floating_ip_mode: skip`); `new_address` is the destination floating IP's address, null when skipped.
 * Every string in `vars.yml`, `secrets.yml` and the inventory is written with the YAML tag `!unsafe`
   (`ansible_yaml`): every value and every key of a nested mapping (a source network's name keys
   `network_map`); only the top-level keys — the variable names, the inventory's group names — stay
@@ -5852,7 +5856,7 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | the hook catalog, the plan's network cut-over settings, the routes | §4.2, §4.3, §11, §12 (binding) | N3 |
 | the hook runner: kinds, timeouts, the idempotency key, the context document | §7.2, §13.3 (binding) | N4 |
 | hook points in the cutover, verification, rollback and finalize of every strategy, resumed after a restart | §8.2 (binding) | N5 |
-| the floating IP keep-address move: the blocker, the reservation, the journaled move, the return and the release (N6a); os-migrate's `auto` reporting whether it reused or created an address (N6b) | §4.2, §7.2, §8.3, §9.3, §10 (binding for N6a) | N6 |
+| the floating IP keep-address move: the blocker, the reservation, the journaled move, the return and the release (N6a); os-migrate's `auto` reporting whether it reused or created an address (N6b) | §4.2, §7.2, §8.3, §9.3, §10 (binding) | N6 |
 | the DNS swap | §7, §13.3 | N7 |
 | the reachability wait | §7.5 | N8 |
 | the Octavia member helper | §7, §10 | N9 |

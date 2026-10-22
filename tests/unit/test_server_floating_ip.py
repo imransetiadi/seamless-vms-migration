@@ -220,6 +220,51 @@ class TestServerFloatingIP(unittest.TestCase):
                 port_id="uuid-test-server-port", fixed_ip_address="192.168.20.7"
             )
 
+    def test_auto_reports_a_new_address(self):
+        """Seamless Migrate SDD 7.2 (plan task N6b): under auto, a floating IP the destination
+        holds no detached one of is created with a new address, and the report says so - the
+        source's address, the fixed IP, the outcome and the address it got; a detached one of
+        the address is attached and keeps it; skip reports nothing attached."""
+        port = {"id": "uuid-test-server-port", "fixed_ips": [{"ip_address": "192.168.20.7"}]}
+        conn = mock.Mock()
+        conn.network.ports.return_value = [port]
+        conn.network.ips.return_value = []
+        conn.network.create_ip.return_value = {
+            "id": "uuid-new-fip",
+            "floating_ip_address": "172.20.9.200",
+            "port_id": "uuid-test-server-port",
+        }
+        fip = ServerFloatingIP.from_sdk(None, sdk_server_floating_ip())
+        created = fip.create(conn, {"id": "uuid-test-server"}, "auto")
+        self.assertEqual(
+            {
+                "address": "172.20.9.135",
+                "fixed_ip_address": "192.168.20.7",
+                "outcome": "created",
+                "new_address": "172.20.9.200",
+            },
+            fip.report(created),
+        )
+        conn.network.update_ip.assert_not_called()
+
+        attached = self._conn_with_port_fips([])
+        conn.network.ips.side_effect = None
+        reused = fip.create(attached, {"id": "uuid-test-server"}, "auto")
+        self.assertEqual("attached", fip.report(reused)["outcome"])
+        self.assertEqual("172.20.9.135", fip.report(reused)["new_address"])
+
+        kept_on = {"id": "uuid-test-server-fip", "port_id": "uuid-test-server-port",
+                   "fixed_ip_address": "192.168.20.7", "floating_ip_address": "172.20.9.135"}
+        kept = fip.create(self._conn_with_port_fips([kept_on]), {"id": "uuid-test-server"}, "auto")
+        self.assertEqual("kept", fip.report(kept)["outcome"])
+
+        skipped = fip.create(self._conn_with_port_fips([]), {"id": "uuid-test-server"}, "skip")
+        self.assertEqual(
+            {"address": "172.20.9.135", "fixed_ip_address": "192.168.20.7",
+             "outcome": "skipped", "new_address": None},
+            fip.report(skipped),
+        )
+
     def test_create_adds_a_floating_ip_the_port_lacks(self):
         fip = ServerFloatingIP.from_sdk(None, sdk_server_floating_ip())
         conn = self._conn_with_port_fips([])
