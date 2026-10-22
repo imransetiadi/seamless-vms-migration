@@ -16,6 +16,7 @@ const PlanDetail = lazy(() => import('./pages/PlanDetail'));
 const MigrationDetail = lazy(() => import('./pages/MigrationDetail'));
 const Providers = lazy(() => import('./pages/Providers'));
 const Users = lazy(() => import('./pages/Users'));
+const Hooks = lazy(() => import('./pages/Hooks'));
 const Inventory = lazy(() => import('./pages/Inventory'));
 const Events = lazy(() => import('./pages/Events'));
 const Advisor = lazy(() => import('./pages/Advisor'));
@@ -64,6 +65,7 @@ const ROUTES: Array<{ path?: string; index?: true; element: ReactNode }> = [
   { index: true, element: <Overview /> },
   { path: 'plans', element: <Plans /> },
   { path: 'plans/:planId', element: <PlanDetail /> },
+  { path: 'hooks', element: <Hooks /> },
   { path: 'migrations/:migrationId', element: <MigrationDetail /> },
   { path: 'providers', element: <Providers /> },
   { path: 'users', element: <Users /> },

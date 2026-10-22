@@ -24,6 +24,7 @@ const ROUTES: Array<[string, string]> = [
   ['/migrations/mig-e5f7a9b1a0', 'legacy-rhel6-app'],
   ['/providers', 'Providers'],
   ['/users', 'Users'],
+  ['/hooks', 'Hooks'],
   ['/inventory/rhosp17-dc1', 'Inventory'],
   ['/inventory/rhoso-prod', 'Inventory'],
   ['/events', 'Events'],
@@ -65,7 +66,7 @@ async function settled() {
 
 beforeAll(async () => {
   await Promise.all(
-    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Users', 'Inventory', 'Events', 'Advisor', 'AdvisorAudit', 'AdvisorPolicies', 'RecommendationDetail', 'Login'].map(
+    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Users', 'Hooks', 'Inventory', 'Events', 'Advisor', 'AdvisorAudit', 'AdvisorPolicies', 'RecommendationDetail', 'Login'].map(
       (page) => import(`./pages/${page}.tsx`),
     ),
   );
@@ -317,6 +318,27 @@ describe('axe-core: no WCAG violations', () => {
     await screen.findByRole('heading', { level: 1, name: 'analytics-node-2' }, { timeout: 8_000 });
     await settled();
     await within(screen.getByRole('region', { name: 'Approvals' })).findByText('Advisor decision · Migration strategy');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('the hook catalog: a hook, its register form refused, and the delete confirmation (SDD §16, plan task N12a)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/hooks', 'admin', (server) => {
+      const at = '2026-10-08T12:00:00Z';
+      server.hooks.set('drain-lb', { name: 'drain-lb', kind: 'playbook', description: 'Drain the member', playbook: '/opt/hooks/drain-lb.yml', url: null, secret: null, timeout_s: 120, revert: null, created_at: at, updated_at: at });
+    });
+    await screen.findByRole('heading', { level: 1, name: 'Hooks' }, { timeout: 8_000 });
+    await settled();
+    await screen.findByRole('listitem', { name: 'drain-lb' });
+    await user.selectOptions(screen.getByLabelText('Kind'), 'webhook');
+    await user.type(screen.getByLabelText(/^Name/), 'notify');
+    await user.type(screen.getByLabelText(/^URL/), 'http://hooks.example/notify');
+    await user.type(screen.getByLabelText(/^Secret/), 'notify-token');
+    await user.click(screen.getByRole('button', { name: 'Register hook' }));
+    await screen.findByRole('alert');
+    expect(await violations()).toEqual([]);
+    await user.click(screen.getByRole('button', { name: 'Delete drain-lb' }));
+    await screen.findByRole('alertdialog');
     expect(await violations()).toEqual([]);
   }, 30_000);
 

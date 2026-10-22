@@ -35,6 +35,7 @@ import {
   type Event,
   type GpuCapacity,
   type GpuCheckReport,
+  type Hook,
   type Migration,
   type Plan,
   type Provider,
@@ -3183,6 +3184,56 @@ describe('mock plans: network_cutover (SDD §4.2, §12, plan task N3)', () => {
       status: 422,
       message: "network_cutover.hooks.pre_stop: no hook 'drain-lb' in the catalog",
     });
+  });
+});
+
+describe('mock hooks: the catalog an admin keeps (SDD §12, §23.3, plan task N12a)', () => {
+  const drain = { name: 'drain-lb', kind: 'playbook', playbook: '/opt/hooks/drain-lb.yml' };
+
+  it("registers, edits and deletes hooks with the API's rules and words, and lets a plan name them", async () => {
+    const { client } = setup('admin');
+    expect(await client.get('/hooks')).toEqual([]);
+    const created = await client.post<Hook>('/hooks', drain);
+    expect(created).toMatchObject({ ...drain, description: null, url: null, secret: null, timeout_s: 300, revert: null });
+    await expect(client.post('/hooks', drain)).rejects.toMatchObject({ status: 409, message: "hook 'drain-lb' already exists" });
+    const refusals: Array<[Record<string, unknown>, string]> = [
+      [{}, 'name: Field required; kind: Field required'],
+      [{ name: 'Bad_Name', kind: 'playbook', playbook: '/opt/h.yml' }, "name: String should match pattern '^[a-z0-9][a-z0-9-]{1,62}$'"],
+      [{ name: 'x1', kind: 'script' }, "kind: Input should be 'playbook' or 'webhook'"],
+      [{ name: 'x1', kind: 'playbook' }, 'Value error, playbook: a playbook hook needs it'],
+      [{ name: 'x1', kind: 'playbook', playbook: '/opt/h.yml', url: 'https://h.example/x' }, 'Value error, url: a playbook hook takes none'],
+      [{ name: 'x1', kind: 'playbook', playbook: 'opt/h.yml' }, 'Value error, playbook: an absolute path'],
+      [{ name: 'x1', kind: 'playbook', playbook: '/opt/h.sh' }, 'Value error, playbook: a .yml or .yaml file'],
+      [{ name: 'x1', kind: 'webhook', secret: 'hook-token' }, 'Value error, url: a webhook hook needs it'],
+      [{ name: 'x1', kind: 'webhook', url: 'http://h.example/x', secret: 'hook-token' }, 'Value error, url: an https:// URL with a host'],
+      [{ name: 'x1', kind: 'webhook', url: 'https://u:p@h.example/x', secret: 'hook-token' }, "Value error, url: no user information - put the credential in the hook's secret"],
+      [{ name: 'x1', kind: 'webhook', url: 'https://h.example/x', secret: '../etc' }, "Value error, secret: a secret name is 1-128 letters, digits, '.', '_' or '-', starting with a letter or digit"],
+      [{ name: 'x1', kind: 'playbook', playbook: '/opt/h.yml', revert: 'x1' }, 'Value error, revert: a hook cannot revert itself'],
+      [{ name: 'x1', kind: 'playbook', playbook: '/opt/h.yml', timeout_s: 1801 }, 'timeout_s: Input should be less than or equal to 1800'],
+      [{ name: 'x1', kind: 'playbook', playbook: '/opt/h.yml', nope: 1, also: 2 }, 'not a field of this object: also, nope'],
+      [{ name: 'x1', kind: 'playbook', playbook: '/opt/h.yml', revert: 'gone' }, "revert: no hook 'gone' in the catalog"],
+      [{ name: 'x1', kind: 'webhook', url: 'https://h.example/x', secret: 'provider_dc1' }, 'secret: provider-* names belong to the secrets Seamless stores for each provider; a webhook would send it to its URL'],
+    ];
+    for (const [body, message] of refusals) await expect(client.post('/hooks', body)).rejects.toMatchObject({ status: 422, message });
+    await expect(client.patch('/hooks/drain-lb', { kind: 'webhook' })).rejects.toMatchObject({ status: 422, message: 'fields cannot be changed: kind' });
+    await expect(client.patch('/hooks/gone', { timeout_s: 60 })).rejects.toMatchObject({ status: 404, message: "hook 'gone' not found" });
+    expect(await client.patch<Hook>('/hooks/drain-lb', { timeout_s: 60 })).toMatchObject({ timeout_s: 60 });
+    // a plan names catalog hooks alone; one named by a plan cannot be deleted
+    const body = { name: 'hooked', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [] };
+    const plan = await client.post<Plan>('/plans', { ...body, network_cutover: { hooks: { pre_stop: ['drain-lb'] } } });
+    expect(plan.network_cutover.hooks).toEqual({ pre_stop: ['drain-lb'] });
+    await expect(client.delete('/hooks/drain-lb')).rejects.toMatchObject({
+      status: 409,
+      message: `hook drain-lb is named by plan(s) hooked (${plan.id}): remove it from their network_cutover first`,
+    });
+  });
+
+  it('lets every role read the catalog and an admin alone write it', async () => {
+    for (const role of ['viewer', 'operator', 'approver'] as const) {
+      const { client } = setup(role);
+      expect(await client.get('/hooks')).toEqual([]);
+      await expect(client.post('/hooks', drain)).rejects.toMatchObject({ status: 403 });
+    }
   });
 });
 

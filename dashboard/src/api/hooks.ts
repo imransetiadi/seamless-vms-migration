@@ -29,6 +29,8 @@ import type {
   FinalizeRequest,
   ForceCutoverRequest,
   Health,
+  Hook,
+  HookPatch,
   Me,
   UserCreated,
   Migration,
@@ -89,6 +91,7 @@ export const queryKeys = {
   snapshot: (sha256: string) => ['advisor', 'snapshot', sha256] as const,
   advisorNotes: (limit: number) => ['advisor', 'notes', limit] as const,
   policies: ['advisor', 'policies'] as const,
+  hooks: ['hooks'] as const,
 };
 
 function noRetryOnClientErrors(failureCount: number, error: Error): boolean {
@@ -414,6 +417,41 @@ function useProviderWrite<V>(request: (api: ReturnType<typeof useApi>, vars: V) 
 /** POST /providers (admin). */
 export function useCreateProvider() {
   return useProviderWrite((api, body: ProviderCreate) => api.post<Provider>('/providers', body));
+}
+
+/** GET /hooks (viewer): the hook catalog in name order (SDD §12, §23.3). */
+export function useHooks() {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.hooks,
+    queryFn: ({ signal }) => api.get<Hook[]>('/hooks', { signal }),
+    retry: noRetryOnClientErrors,
+  });
+}
+
+function useHookWrite<V, T>(write: (api: ApiClient, variables: V) => Promise<T>) {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (variables: V) => write(api, variables),
+    retry: false,
+    onSuccess: () => invalidateAll(queryClient, [queryKeys.hooks, ['events', 'tail']]),
+  });
+}
+
+/** POST /hooks (admin, SDD §12). */
+export function useCreateHook() {
+  return useHookWrite((api, hook: HookPatch & Pick<Hook, 'name' | 'kind'>) => api.post<Hook>('/hooks', hook));
+}
+
+/** PATCH /hooks/{name} (admin, SDD §12): its name and kind are immutable. */
+export function useUpdateHook() {
+  return useHookWrite((api, { name, patch }: { name: string; patch: HookPatch }) => api.patch<Hook>(`/hooks/${enc(name)}`, patch));
+}
+
+/** DELETE /hooks/{name} (admin, SDD §12): refused while a plan or another hook names it. */
+export function useDeleteHook() {
+  return useHookWrite((api, name: string) => api.delete(`/hooks/${enc(name)}`));
 }
 
 /** PATCH /providers/{id} (admin). */

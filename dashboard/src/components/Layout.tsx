@@ -14,6 +14,7 @@ import {
   Server,
   SlidersHorizontal,
   Users,
+  Webhook,
   X,
   type LucideIcon,
 } from 'lucide-react';
@@ -50,6 +51,8 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: '/', label: 'Overview', icon: LayoutDashboard, match: (p) => p === '/' },
       { to: '/plans', label: 'Plans', icon: ClipboardList, match: (p) => p.startsWith('/plans') || p.startsWith('/migrations') },
+      // the hook catalog every role reads, an admin keeps (SDD §16, §23.3, plan task N12a)
+      { to: '/hooks', label: 'Hooks', icon: Webhook, match: (p) => p.startsWith('/hooks') },
     ],
   },
   {
