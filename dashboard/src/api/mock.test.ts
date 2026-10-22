@@ -3873,6 +3873,24 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
     expect(waved.waves[1]!.vm_ids).toEqual([first!.source_id, second!.source_id]);
   });
 
+  it('reads a VM recorded before 0.3.0 with the profile its source declares for its flavor, as the API plans waves (SDD §9.4, §22.2, GPU follow-up 2)', async () => {
+    const { server, client } = setup('operator');
+    const vms = freeVms(server, 'rhosp17-dc1', 4);
+    // the smallest VM asks for a CUSTOM_ class: a vGPU once its source declares a profile for its flavor (§22.2)
+    const [smallest] = [...vms].sort((a, b) => a.disk_bytes - b.disk_bytes);
+    const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['rhosp17-dc1']!;
+    const at = inventory.findIndex((v) => v.source_id === smallest!.source_id);
+    inventory[at] = { ...inventory[at]!, gpus: [], flavor: 'g1.custom', flavor_extra_specs: { 'resources:CUSTOM_NVIDIA_A100_4C': '1' } };
+    const plan = await client.post<Plan>('/plans', { name: 'Declared', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: vms.map((v) => v.source_id) });
+    // no profile declared: the class alone is no GPU, and the smallest VM leads the pilot
+    const plain = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    expect(plain.waves[0]!.vm_ids[0]).toBe(smallest!.source_id);
+    server.providers.find((p) => p.id === 'rhosp17-dc1')!.gpu_profiles = { 'g1.custom': 'A100-4C' };
+    const waved = await client.post<Plan>(`/plans/${plan.id}/waves/auto`, { max_wave_size: 10 });
+    expect(waved.waves[0]!.vm_ids).not.toContain(smallest!.source_id);
+    expect(waved.waves[1]!.vm_ids).toContain(smallest!.source_id);
+  });
+
   it('plans a plan of GPU VMs alone without a pilot: its first wave depends on none, as the API (SDD §9.4, PR #64 review)', async () => {
     const { server, client } = setup('operator');
     const vms = freeVms(server, 'rhosp17-dc1', 2);

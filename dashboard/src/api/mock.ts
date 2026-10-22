@@ -2751,8 +2751,10 @@ export class MockServer {
     // a fresh plan's and one added since too - a migration a validation leaves alone as its recorded vm
     const vms = this.planVms(plan).sort((a, b) => a.disk_bytes - b.disk_bytes);
     // the pilot never holds a GPU VM, whose driver, license and capacity are risks of their own: the next smallest VM
-    // takes its room (SDD §9.4, §22.9, PR #64 review)
-    const pilot = vms.filter((vm) => !vmGpus(vm).length).slice(0, 3);
+    // takes its room (SDD §9.4, §22.9, PR #64 review) - one recorded before 0.3.0 read with the profile its source
+    // declares for its flavor, as the pre-flight's GPU rows read it (§22.2, GPU follow-up 2)
+    const profiles = this.sourceFor(plan).gpu_profiles;
+    const pilot = vms.filter((vm) => !vmGpus(vm, declaredProfileOf(vm, profiles)).length).slice(0, 3);
     const rest = vms.filter((vm) => !pilot.includes(vm));
     const waves: Wave[] = [];
     if (pilot.length) waves.push({ id: 'wave-1', name: 'Pilot', order: 1, vm_ids: pilot.map((vm) => vm.source_id), depends_on: [], max_parallel: 5 });
