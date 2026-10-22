@@ -2745,6 +2745,7 @@ Finding catalog (code — severity — condition):
 | `NET_PORT_NOT_PERMITTED` | blocker | a VM's NIC resolves, by the rule of §7.3 step 0 (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name — the migration kit creates every port with the NIC's MAC, §7.2), to a network (`DestinationInventory.network_details`) where the destination credential may not put a port, by §6.6's rule. Either it is another project's network (`own` false) that is neither `shared` with the credential's project nor `external`, or using it needs a role the credential's token lacks: for another project's network one the destination's `policy_profile` counts (§6.6: `admin` or `advsvc` under `legacy`; `admin` or `service` under `secure_rbac`; `admin` under `unknown`; a report that names no profile reads as the provider's declarations alone, §21.5), and `admin` for any external network that is not `shared`, the credential's own included (the `roles` and `policy_profile` of the destination's capabilities, as validation's check reports them; when the destination reports no `roles`, the role half is not judged). The cutover recreates every port with its address or MAC, which Neutron's policy would refuse after the source stops, and Nova attaches no unshared external network for a token without `admin`; the destination check refuses both before the stop. The message names the NIC's MAC, the network, its project and the half of the rule that fails |
 | `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
 | `NET_PREFIX_SPLIT` | warning | the source or the destination provider declares `announces_tenant_networks` (§4.2, §23.6), and the plan's waves put the VMs of one source network into more than one wave: while one wave is cut over and the next is not, the network's prefix has an origin in each cloud, and its tenant routes cannot be correct. The message names the network, its waves by name and the declaring provider; nothing is judged before the waves are planned |
+| `NET_LB_POOL_SPLIT` | warning | the VM is a member of an Octavia pool of the source (a membership as `SRC_VM_LB_MEMBER` reads it, of a pool the plan maps too: the member helper moves each member with its own VM's cutover, §8.5), and the plan's waves put the pool's members among the plan's VMs into more than one wave: while one wave is cut over and the next is not, the pool's members are in both clouds, and its load balancer reaches only those not yet cut over (§23.7). A member that is no VM of the plan, or a VM of the plan in no wave, is not counted. The message names each such pool with its load balancer, its waves by name in their order and the source provider; nothing is judged before the waves are planned |
 | `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one, resolved by the rule of §7.3 step 0; its `DestinationInventory.subnets` by `network_id`) or is no host address there — as Neutron's `check_subnet_ip` rules for a port created with no owner, an IPv4 subnet's network address (at any prefix length) and its broadcast address below a /31 (a /31 or /32 has none), while an IPv6 subnet's first address is taken (§6.6); on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode, and no address in `"nova"` mode (§6.6); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
 | `MAP_FIP_ADDRESS_CHANGE` | warning (cold, warm) | the plan's `network_cutover.floating_ips` is `"auto"` (under `"keep_address"` the move of §8.3 keeps the address, and `DST_FIP_ADDRESS_UNAVAILABLE` judges it) and an OpenStack VM's NIC has a floating IP (`Nic.floating_ips`) whose address the destination credential's project does not hold detached (`DestinationInventory.floating_ips`, §10): os-migrate's `floating_ip_mode` `auto` (§7.2, §23.1) attaches a detached floating IP with the source's address, and without one creates a floating IP with a **new** address, so clients, allowlists and DNS records of the old one lose the VM. The message names each address and the destination; the storage handover and the VMware paths move no floating IP (§23.1) |
@@ -2794,8 +2795,9 @@ runbooks for Heat stacks and for Octavia load balancers (Operations.md). Those n
 
 The network rows of §23.8 (plan task N2b) read the VM's NICs as the source inventories them - their allowed address
 pairs, floating IPs and DNS names (§4.2, §10) - and the destination's floating IPs and DNS (§10); `NET_PREFIX_SPLIT`
-reads the plan's waves and the providers' `announces_tenant_networks`. None of them blocks: each warns of what the
-migration does not carry, and its remediation says what the operator does about it.
+reads the plan's waves and the providers' `announces_tenant_networks`, and `NET_LB_POOL_SPLIT` (§23.7) the plan's waves
+and the source's `lb_members` for each VM of the plan. None of them blocks: each warns of what the migration does not
+carry or its waves split, and its remediation says what the operator does about it.
 
 ### 9.4 Wave planner (`planning/waves.py`)
 
@@ -3097,8 +3099,9 @@ No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
   "example-portal-pool-rhoso"}`, so the member helper drains each web server's member before its stop and joins its
   address after the verification (§8.5). The plan acknowledges `app-01`'s and `app-02`'s `SRC_VM_AUTOSCALED`, so its
   validation warns of them (owner decision 9), with `web-01`'s `SRC_VM_HEAT_STACK` and `api-gw-01`'s
-  `SRC_VM_LB_MEMBER` - the portal pool's members are the helper's. The plan runs no hook: the demo catalog holds
-  none, since a hook runs code with the control plane's reach (§23.9).
+  `SRC_VM_LB_MEMBER` - the portal pool's members are the helper's -, and with each web server's `NET_LB_POOL_SPLIT`
+  when its waves split the portal pool: `web-03` shares no app tag with the `portal` pair (§9.4). The plan runs no
+  hook: the demo catalog holds none, since a hook runs code with the control plane's reach (§23.9).
 
 **The fake destinations' GPUs** (plan task G9, §22.10). Each lists three GPU flavors, with the sizes of the
 dashboard's mock (§16): `g1.a100-4c` (8 vCPUs, 32 GiB, 200 GB; `resources:VGPU=1` and
@@ -4238,10 +4241,10 @@ is no origin a browser sends (review RV31-03).
   form's network cut-over section, the migration page's hook runs and the network findings - carries a "Technology
   Preview" badge as the GPU elements do, its detail "Technology Preview, validated in simulation: the network cut-over
   has not yet run on the lab's clouds." (§23.10), until the LAB-NET cases pass (plan task N14). The network findings are
-  §9.3's rows of plan tasks N2, N6, N7 and N9: `SRC_VM_HEAT_STACK`, `SRC_VM_AUTOSCALED`, `SRC_VM_HEAT_UNKNOWN`,
-  `SRC_VM_LB_MEMBER`, `SRC_VM_LB_UNKNOWN`, `SRC_PORT_ADDRESS_PAIRS`, `MAP_FIP_ADDRESS_CHANGE`,
-  `DST_DNS_INTEGRATION_MISSING`, `NET_PREFIX_SPLIT`, `DST_FIP_ADDRESS_UNAVAILABLE`, `NET_DNS_TTL_LONG` and
-  `MAP_LB_POOL_INCOMPATIBLE`; a findings list shows the badge beside each. Binding with plan task
+  §9.3's rows of plan tasks N2, N6, N7 and N9, and §23.7's pool split: `SRC_VM_HEAT_STACK`, `SRC_VM_AUTOSCALED`,
+  `SRC_VM_HEAT_UNKNOWN`, `SRC_VM_LB_MEMBER`, `SRC_VM_LB_UNKNOWN`, `SRC_PORT_ADDRESS_PAIRS`, `MAP_FIP_ADDRESS_CHANGE`,
+  `DST_DNS_INTEGRATION_MISSING`, `NET_PREFIX_SPLIT`, `NET_LB_POOL_SPLIT`, `DST_FIP_ADDRESS_UNAVAILABLE`,
+  `NET_DNS_TTL_LONG` and `MAP_LB_POOL_INCOMPATIBLE`; a findings list shows the badge beside each. Binding with plan task
   N12a for the rule and the Hooks page, N12b for the plan form, N12c for the migration page and the findings.
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
@@ -5890,8 +5893,9 @@ marked `TODO(LAB): confirm`, and so is every behaviour only a lab can measure. T
 In 0.4.0, in the order of the plan:
 
 1. Findings for what Seamless does not move: a VM that belongs to a Heat stack or an autoscaling group, a member of
-   an Octavia pool, a floating IP whose address the cutover would change, a port with `allowed_address_pairs`, a subnet
-   whose announced prefix a plan's waves would split, and Neutron DNS names the destination cannot publish (§23.8).
+   an Octavia pool, a pool whose members a plan's waves would spread over several waves, a floating IP whose address
+   the cutover would change, a port with `allowed_address_pairs`, a subnet whose announced prefix a plan's waves would
+   split, and Neutron DNS names the destination cannot publish (§23.8).
 2. Cut-over hooks: Ansible playbooks and webhooks an admin registers, which a plan runs at fixed points of each
    migration (§23.3).
 3. A floating IP move that keeps the address, opt-in per plan, on every OpenStack strategy (§23.4).
@@ -5991,8 +5995,8 @@ Not in 0.4.0:
 
 ### 23.7 Octavia member helper (Technology Preview)
 
-* **Findings:** a plan VM that is a member of a source pool (load balancer, pool, port), and a pool whose members a
-  plan's waves spread over several waves.
+* **Findings:** a plan VM that is a member of a source pool (load balancer, pool, port), `SRC_VM_LB_MEMBER`, and a
+  pool whose members a plan's waves spread over several waves, `NET_LB_POOL_SPLIT` (§9.3).
 * **The helper**, opt-in per plan (owner decision 8):
   * The operator maps each source pool to a pool of a destination load balancer, created by the operator or a runbook,
     never by Seamless.
@@ -6006,7 +6010,9 @@ Not in 0.4.0:
 
 ### 23.8 Proposed findings
 
-The codes are planned. They enter §9.3 with plan task N2, with their catalog entries and the mock.
+The codes are planned. They enter §9.3 with plan task N2, with their catalog entries and the mock. `NET_LB_POOL_SPLIT`,
+the second finding §23.7 names, was left out of this table and of plan task N2; it entered §9.3 on its own on
+2026-10-22, with its catalog entry and the mock's.
 
 | Code (planned) | Severity | When |
 |---|---|---|
@@ -6016,6 +6022,7 @@ The codes are planned. They enter §9.3 with plan task N2, with their catalog en
 | `MAP_FIP_ADDRESS_CHANGE` | warning | `auto` would create a floating IP with a new address at the destination (§23.1) |
 | `SRC_PORT_ADDRESS_PAIRS` | warning | a port has `allowed_address_pairs` (a keepalived VIP, say), which the import does not carry (owner decision 11) |
 | `NET_PREFIX_SPLIT` | warning | the plan's waves split an announced tenant subnet across two clouds (§23.6) |
+| `NET_LB_POOL_SPLIT` | warning | the plan's waves spread a source Octavia pool's members over several waves, so between them its members are in both clouds (§23.7) |
 | `DST_DNS_INTEGRATION_MISSING` | warning | the source publishes the VM's ports in DNS and the destination lacks the DNS extension or the zone (§23.5) |
 
 ### 23.9 Dashboard, demo, security

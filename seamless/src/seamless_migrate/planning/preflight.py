@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from ..domain.enums import Phase, ProviderKind, Severity, Strategy
-from ..domain.models import Finding, GpuDevice, Mappings, NicOverride, Plan, Provider, VMRef
+from ..domain.models import Finding, GpuDevice, Mappings, NicOverride, Plan, Provider, VMRef, Wave
 from ..guest_os import identify
 from .gpu import (
     PoolKey,
@@ -398,6 +398,15 @@ CATALOG: dict[str, CatalogEntry] = {
         (),
         "Put the VMs of each announced network into one wave, or have the network's prefix "
         "routed by hand while its waves are cut over.",
+    ),
+    "NET_LB_POOL_SPLIT": CatalogEntry(
+        Severity.warning,
+        (),
+        "Put each pool's members into one wave: give them one app tag and plan the waves again, "
+        "as VMs that share an app tag stay together. Or accept that between its waves the pool "
+        "serves from both clouds: its members already cut over are drained from the source pool "
+        "and join the destination pool once verified - by the member helper for a pool the plan "
+        "maps, else as the runbook for Octavia load balancers says.",
     ),
     "MAP_NETWORK_AMBIGUOUS": CatalogEntry(
         Severity.blocker,
@@ -2095,6 +2104,7 @@ def run_preflight(
         out.extend(_port_findings(vm, plan, dst_inv, source, where))
         out.extend(_fip_keep_findings(vm, plan, dst_inv, selected, destination, dst_caps, where))
     out.extend(_prefix_split(vm, plan, selected, source, destination))
+    out.extend(_pool_split(vm, plan, src_inv.lb_members, selected, source))
 
     out.extend(_gpu_findings(vm, plan, dst_inv, source, where, selected, shares or {}))
 
@@ -2253,15 +2263,15 @@ def _stack_findings(
     return out
 
 
-def _memberships(vm: VMRef, read: MemberRead) -> list[PoolMember]:
-    """The VM's memberships of the source's Octavia pools (SDD §9.3): each member that is an
-    address of a NIC of the VM, on the NIC's network when the read names the member's."""
+def _memberships(vm: VMRef, members: Sequence[PoolMember]) -> list[PoolMember]:
+    """The VM's memberships of the source's Octavia pools (SDD §9.3): each of ``members`` that is
+    an address of a NIC of the VM, on the NIC's network when the read names the member's."""
     held: list[PoolMember] = []
     for nic in vm.nics:
         addresses = {_canonical_ip(a) for a in nic.fixed_ips}
         held += [
             m
-            for m in read.members
+            for m in members
             if _canonical_ip(m.address) in addresses and m.network in (None, nic.network)
         ]
     return held
@@ -2286,7 +2296,7 @@ def _member_findings(
     held = [
         f"{_canonical_ip(m.address)} port {m.port} in pool {m.pool!r} of load balancer "
         f"{m.load_balancer!r}"
-        for m in _memberships(vm, read)
+        for m in _memberships(vm, read.members)
         if m.pool_id not in mapped
     ]
     if not held:
@@ -2311,7 +2321,7 @@ def _lb_pool_findings(
 
     out: list[Finding] = []
     seen: set[str] = set()
-    for m in _memberships(vm, read):
+    for m in _memberships(vm, read.members):
         pair = (pairs or {}).get(m.pool_id)
         if m.pool_id not in plan.network_cutover.lb_pools or m.pool_id in seen or pair is None:
             continue
@@ -2515,6 +2525,51 @@ def _prefix_split(
             f"The plan's waves split networks of {vm.name} that {' and '.join(declaring)} {verb} "
             f"as tenant networks: {'; '.join(split)}. While one wave is cut over and the next is "
             "not, each prefix has an origin in both clouds, so its routes cannot be correct.",
+        )
+    ]
+
+
+def _pool_split(
+    vm: VMRef,
+    plan: Plan,
+    read: MemberRead,
+    selected: Sequence[VMRef],
+    source: Provider | None,
+) -> list[Finding]:
+    """NET_LB_POOL_SPLIT (SDD §9.3, §23.7): each Octavia pool at the source the VM is a member of -
+    one the plan maps too - whose members among the plan's VMs the plan's waves put into more than
+    one wave: between those waves the pool's members are in both clouds. A member that is no VM of
+    the plan, or a VM of the plan in no wave, is not counted; nothing is judged before the waves
+    are planned."""
+    pools: dict[str, PoolMember] = {}
+    for m in _memberships(vm, read.members):
+        pools.setdefault(m.pool_id, m)
+    if not pools or not plan.waves:
+        return []
+    # the members of the VM's pools alone: each VM of the plan is matched against those
+    members = [m for m in read.members if m.pool_id in pools]
+    waves: dict[str, dict[str, Wave]] = {pool_id: {} for pool_id in pools}
+    for other in selected:
+        wave = plan.wave_of(other.source_id)
+        if wave is None:
+            continue
+        for m in _memberships(other, members):
+            waves[m.pool_id][wave.id] = wave
+    split = [
+        f"pool {m.pool!r} of load balancer {m.load_balancer!r} in waves "
+        + ", ".join(repr(w.name) for w in sorted(held.values(), key=lambda w: w.order))
+        for pool_id, m in pools.items()
+        if len(held := waves[pool_id]) > 1
+    ]
+    if not split:
+        return []
+    return [
+        finding(
+            "NET_LB_POOL_SPLIT",
+            f"The plan's waves split Octavia pools at {_source_label(source)} that {vm.name} is a "
+            f"member of: {'; '.join(split)}. While one wave is cut over and the next is not, each "
+            "pool's members are in both clouds, and its load balancer reaches only those not yet "
+            "cut over.",
         )
     ]
 

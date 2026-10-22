@@ -193,6 +193,7 @@ def test_catalog_is_complete():
         "NET_SRIOV_PORT",
         "NET_PORT_IPS",
         "NET_PREFIX_SPLIT",
+        "NET_LB_POOL_SPLIT",
         "MAP_NETWORK_AMBIGUOUS",
         "NET_ADDRESS_REFUSED",
         "NET_PORT_NOT_PERMITTED",
@@ -704,6 +705,150 @@ def test_finding_net_prefix_split():
     assert (
         found_codes(check(web, plan=unplanned, all_vms=vms, destination=bgp), NETWORK_CODES) == []
     )
+
+
+def pool_member(address, pool="web-pool", port=443, network="app-net"):
+    """A member of a pool of example-lb at the source (SDD §10), its id the pool's name + '-id'."""
+    return PoolMember(
+        load_balancer="example-lb",
+        pool=pool,
+        pool_id=f"{pool}-id",
+        address=address,
+        port=port,
+        network=network,
+    )
+
+
+def app_vm(n, address):
+    """web-0<n>, source id vm-<n>, with one NIC on app-net at ``address``."""
+    nic = Nic(network="app-net", mac=f"fa:16:3e:00:00:{n:02d}", fixed_ips=[address])
+    return make_vm(source_id=f"vm-{n}", name=f"web-0{n}", nics=[nic])
+
+
+def waved(*waves, **kw):
+    """A plan of vm-1…vm-4 whose waves hold the given source ids, Wave <n> in order <n>; listed
+    last wave first, as a planner need not order them."""
+    planned = [
+        Wave(id=f"w{n}", name=f"Wave {n}", order=n, vm_ids=list(ids))
+        for n, ids in enumerate(waves, start=1)
+    ]
+    return make_plan(vm_ids=["vm-1", "vm-2", "vm-3", "vm-4"], waves=planned[::-1], **kw)
+
+
+def test_finding_net_lb_pool_split():
+    """SDD §9.3, §23.7: a source Octavia pool whose members among the plan's VMs the plan's waves
+    put into more than one wave warns each of them - between those waves the pool's members are in
+    both clouds: the message names each such pool with its load balancer, its waves by name in
+    their order and the source provider. A pool the plan maps is split alike: the member helper
+    moves each member with its own VM's cutover (§8.5)."""
+    web, peer = app_vm(1, "192.0.2.10"), app_vm(2, "192.0.2.11")
+    src = src_inv(
+        lb_members=MemberRead(
+            members=[
+                pool_member("192.0.2.10"),
+                pool_member("192.0.2.11"),
+                pool_member("192.0.2.10", pool="admin-pool", port=8443),
+                pool_member("192.0.2.11", pool="admin-pool", port=8443),
+            ]
+        )
+    )
+    plan = waved(["vm-1"], ["vm-2"])
+    # the plan's VMs in an order other than their waves'
+    vms = [peer, web]
+    f = only(check(web, plan=plan, src=src, all_vms=vms), "NET_LB_POOL_SPLIT")
+    assert (f.severity, f.strategies) == (Severity.warning, [])
+    assert f.message == (
+        "The plan's waves split Octavia pools at RHOSP 17.1 that web-01 is a member of: pool "
+        "'web-pool' of load balancer 'example-lb' in waves 'Wave 1', 'Wave 2'; pool 'admin-pool' "
+        "of load balancer 'example-lb' in waves 'Wave 1', 'Wave 2'. While one wave is cut over and "
+        "the next is not, each pool's members are in both clouds, and its load balancer reaches "
+        "only those not yet cut over."
+    )
+    assert f.remediation == CATALOG["NET_LB_POOL_SPLIT"].remediation
+    assert "app tag" in f.remediation
+    # the member of the other wave is warned alike
+    other = only(check(peer, plan=plan, src=src, all_vms=vms), "NET_LB_POOL_SPLIT")
+    assert other.message.startswith(
+        "The plan's waves split Octavia pools at RHOSP 17.1 that web-02 is a member of: pool "
+        "'web-pool' of load balancer 'example-lb' in waves 'Wave 1', 'Wave 2';"
+    )
+    # a pool the plan maps is still split; SRC_VM_LB_MEMBER leaves its membership to the helper
+    mapped = waved(["vm-1"], ["vm-2"], network_cutover={"lb_pools": {"web-pool-id": "dst-pool"}})
+    found = check(web, plan=mapped, src=src, all_vms=vms)
+    assert "pool 'web-pool' of load balancer 'example-lb' in waves 'Wave 1', 'Wave 2'" in (
+        only(found, "NET_LB_POOL_SPLIT").message
+    )
+    assert "'web-pool'" not in only(found, "SRC_VM_LB_MEMBER").message
+    assert not has_blocker(found)
+
+
+def test_finding_net_lb_pool_split_judges_nothing_for_a_pool_in_one_wave():
+    """SDD §9.3, §23.7: a pool whose members among the plan's VMs share one wave is not split,
+    though the plan has other waves and the VM's other pool is split; a VM that is no member of a
+    split pool gets nothing."""
+    web, peer, db, spare = (
+        app_vm(1, "192.0.2.10"),
+        app_vm(2, "192.0.2.11"),
+        app_vm(3, "192.0.2.12"),
+        app_vm(4, "192.0.2.13"),
+    )
+    vms = [web, peer, db, spare]
+    src = src_inv(
+        lb_members=MemberRead(
+            members=[
+                pool_member("192.0.2.10"),
+                pool_member("192.0.2.11"),
+                pool_member("192.0.2.11", pool="db-pool", port=5432),
+                pool_member("192.0.2.12", pool="db-pool", port=5432),
+            ]
+        )
+    )
+    plan = waved(["vm-1", "vm-2", "vm-4"], ["vm-3"])
+    assert "NET_LB_POOL_SPLIT" not in [f.code for f in check(web, plan=plan, src=src, all_vms=vms)]
+    # web-02 is a member of both pools: the split one alone is named
+    split = only(check(peer, plan=plan, src=src, all_vms=vms), "NET_LB_POOL_SPLIT")
+    assert ": pool 'db-pool' of load balancer 'example-lb' in waves 'Wave 1', 'Wave 2'." in (
+        split.message
+    )
+    assert "'web-pool'" not in split.message
+    assert "NET_LB_POOL_SPLIT" not in [
+        f.code for f in check(spare, plan=plan, src=src, all_vms=vms)
+    ]
+
+
+def test_finding_net_lb_pool_split_counts_only_the_plans_vms_in_its_waves():
+    """SDD §9.3, §23.7: a member that is no VM of the plan, and a VM of the plan in no wave - one
+    added to vm_ids after the waves were planned -, are not counted, though the plan has another
+    wave."""
+    web, late, other = app_vm(1, "192.0.2.10"), app_vm(2, "192.0.2.11"), app_vm(3, "192.0.2.12")
+    src = src_inv(
+        lb_members=MemberRead(
+            members=[
+                pool_member("192.0.2.10"),
+                pool_member("192.0.2.11"),
+                pool_member("192.0.2.99"),
+            ]
+        )
+    )
+    plan = waved(["vm-1"], ["vm-3"])
+    for vm in (web, late):
+        found = check(vm, plan=plan, src=src, all_vms=[web, late, other])
+        assert "NET_LB_POOL_SPLIT" not in [f.code for f in found]
+
+
+def test_finding_net_lb_pool_split_judges_nothing_before_the_waves_are_planned():
+    """SDD §9.3, §23.7: a plan without waves splits no pool; nor does a source whose Octavia could
+    not be read (SRC_VM_LB_UNKNOWN says so)."""
+    web, peer = app_vm(1, "192.0.2.10"), app_vm(2, "192.0.2.11")
+    members = MemberRead(members=[pool_member("192.0.2.10"), pool_member("192.0.2.11")])
+    unplanned = make_plan(vm_ids=["vm-1", "vm-2"])
+    found = check(web, plan=unplanned, src=src_inv(lb_members=members), all_vms=[web, peer])
+    assert "NET_LB_POOL_SPLIT" not in [f.code for f in found]
+    unread = MemberRead(status="unknown", reason="error", detail="HTTP 503")
+    found = check(
+        web, plan=waved(["vm-1"], ["vm-2"]), src=src_inv(lb_members=unread), all_vms=[web, peer]
+    )
+    assert found_codes(found, ("NET_LB_POOL_SPLIT", *LB_CODES)) == ["SRC_VM_LB_UNKNOWN"]
 
 
 def test_finding_net_dns_ttl_long():
@@ -2656,8 +2801,8 @@ def test_catalog_matches_sdd_9_3():
 
 def test_the_dashboard_marks_the_network_findings_sdd_16_names():
     """SDD §16, §23.9 (plan task N12c): a findings list shows the network Technology Preview badge
-    beside each network finding §16 names - §9.3's rows of N2, N6, N7 and N9 -, which are the
-    dashboard's NETWORK_CODES, each a code of the catalog."""
+    beside each network finding §16 names - §9.3's rows of N2, N6, N7 and N9, and §23.7's pool
+    split -, which are the dashboard's NETWORK_CODES, each a code of the catalog."""
     from seamless_migrate.config import find_repo_root
 
     root = find_repo_root()
@@ -2667,7 +2812,7 @@ def test_the_dashboard_marks_the_network_findings_sdd_16_names():
     )
     assert rule is not None
     named = re.findall(r"`([A-Z][A-Z0-9_]+)`", rule.group(1))
-    assert len(named) == 12
+    assert len(named) == 13
     assert set(named) <= set(CATALOG)
     catalog_ts = (root / "dashboard" / "src" / "api" / "findingCatalog.ts").read_text(
         encoding="utf-8"

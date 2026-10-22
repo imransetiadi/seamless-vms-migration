@@ -18,8 +18,8 @@ export const GPU_CODES: ReadonlySet<string> = new Set([
   'GUEST_GPU_LICENSE',
 ]);
 
-/** The network findings §16 names - §9.3's rows of plan tasks N2, N6, N7 and N9 -: a findings list shows the network
- * cut-over's Technology Preview badge beside each (SDD §16, §23.9). */
+/** The network findings §16 names - §9.3's rows of plan tasks N2, N6, N7 and N9, and §23.7's pool split -: a findings
+ * list shows the network cut-over's Technology Preview badge beside each (SDD §16, §23.9). */
 export const NETWORK_CODES: ReadonlySet<string> = new Set([
   'SRC_VM_HEAT_STACK',
   'SRC_VM_AUTOSCALED',
@@ -30,6 +30,7 @@ export const NETWORK_CODES: ReadonlySet<string> = new Set([
   'MAP_FIP_ADDRESS_CHANGE',
   'DST_DNS_INTEGRATION_MISSING',
   'NET_PREFIX_SPLIT',
+  'NET_LB_POOL_SPLIT',
   'DST_FIP_ADDRESS_UNAVAILABLE',
   'NET_DNS_TTL_LONG',
   'MAP_LB_POOL_INCOMPATIBLE',
@@ -176,6 +177,11 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     severity: 'warning',
     strategies: [],
     remediation: 'Put the VMs of each announced network into one wave, or have the network\'s prefix routed by hand while its waves are cut over.',
+  },
+  NET_LB_POOL_SPLIT: {
+    severity: 'warning',
+    strategies: [],
+    remediation: "Put each pool's members into one wave: give them one app tag and plan the waves again, as VMs that share an app tag stay together. Or accept that between its waves the pool serves from both clouds: its members already cut over are drained from the source pool and join the destination pool once verified - by the member helper for a pool the plan maps, else as the runbook for Octavia load balancers says.",
   },
   MAP_NETWORK_AMBIGUOUS: {
     severity: 'blocker',
