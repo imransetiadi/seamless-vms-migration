@@ -2807,9 +2807,11 @@ database, review PL-03):
 `manual_review`. Wave 1 is a **pilot** of up to 3 lowest-risk VMs (`stateless_web` first, smallest
 disks first): app groups are taken whole in that order while they fit, and once one does not fit, only
 groups of the same risk may still fill the pilot — never a riskier one, so a pilot may hold fewer than 3
-VMs. The pilot never holds a GPU VM (one with `gpus`, §22.2), nor an app group that holds one: a GPU VM's driver,
-license and capacity are risks of their own, and GPU VMs keep their service tier, ordered with it in the later waves
-(§22.9, plan task G5). Remaining VMs are ordered by tier (the order above) then disk size ascending and
+VMs. The pilot never holds a GPU VM (one with `gpus`, §22.2, or - a VM recorded before 0.3.0, which a migration a
+validation does not re-assess keeps, a failed one's among them - one whose flavor asks for a GPU, read with the
+profile its source declares for the flavor as §9.3's GPU rows read it, §22.2, §22.3), nor an app group that holds
+one: a GPU VM's driver, license and capacity are risks of their own, and GPU VMs keep their service tier, ordered
+with it in the later waves (§22.9, plan task G5). Remaining VMs are ordered by tier (the order above) then disk size ascending and
 chunked by `max_wave_size`; VMs sharing `tags["app"]` stay in the same wave (a wave may exceed
 `max_wave_size` to keep an app together). Each wave depends on the previous one. `manual_review`
 VMs go to a final wave named `Manual review`.
