@@ -42,13 +42,13 @@ RUN dnf -y update --setopt=install_weak_deps=False \
  && dnf clean all \
  && rm -rf /var/cache/dnf
 
-# Control plane with the OpenStack, VMware and Jev extras, plus ansible-core.
+# Control plane with the OpenStack, VMware, Jev and DNS extras (SDD §17), plus ansible-core.
 COPY seamless/pyproject.toml seamless/README.md /opt/seamless/src/seamless/
 COPY seamless/src /opt/seamless/src/seamless/src
 # pip/setuptools/urllib3/msgpack are upgraded past their advisories (image scan, QASuite §10).
 # hadolint ignore=DL3013
 RUN python3 -m pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" \
- && python3 -m pip install --no-cache-dir "/opt/seamless/src/seamless[openstack,vmware,jev]" \
+ && python3 -m pip install --no-cache-dir "/opt/seamless/src/seamless[openstack,vmware,jev,dns]" \
         "ansible-core${ANSIBLE_CORE_VERSION}" "urllib3>=2.8.0" "msgpack>=1.2.1"
 
 # The os-migrate collection from this repository and the VMware migration kit.
