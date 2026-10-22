@@ -4235,7 +4235,11 @@ is no origin a browser sends (review RV31-03).
 * The network cut-over (§23, from 0.4.0, plan task N12): every network cut-over element - the Hooks page, the plan
   form's network cut-over section, the migration page's hook runs and the network findings - carries a "Technology
   Preview" badge as the GPU elements do, its detail "Technology Preview, validated in simulation: the network cut-over
-  has not yet run on the lab's clouds." (§23.10), until the LAB-NET cases pass (plan task N14). Binding with plan task
+  has not yet run on the lab's clouds." (§23.10), until the LAB-NET cases pass (plan task N14). The network findings are
+  §9.3's rows of plan tasks N2, N6, N7 and N9: `SRC_VM_HEAT_STACK`, `SRC_VM_AUTOSCALED`, `SRC_VM_HEAT_UNKNOWN`,
+  `SRC_VM_LB_MEMBER`, `SRC_VM_LB_UNKNOWN`, `SRC_PORT_ADDRESS_PAIRS`, `MAP_FIP_ADDRESS_CHANGE`,
+  `DST_DNS_INTEGRATION_MISSING`, `NET_PREFIX_SPLIT`, `DST_FIP_ADDRESS_UNAVAILABLE`, `NET_DNS_TTL_LONG` and
+  `MAP_LB_POOL_INCOMPATIBLE`; a findings list shows the badge beside each. Binding with plan task
   N12a for the rule and the Hooks page, N12b for the plan form, N12c for the migration page and the findings.
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
@@ -4510,8 +4514,10 @@ is no origin a browser sends (review RV31-03).
   same way; once a long wait dropped passes from `sync_passes`, it says how many earlier passes are no longer listed
   and that the bytes they transferred stay counted, §5.4), downtime clock (in demo mode it runs in model time,
   `/health` `demo_speed`; it counts whole seconds while it runs, and once the downtime ended it shows the actual
-  downtime rounded to the second, as every other view and the text under it give it; the estimate's parts — shutdown, final sync or copy, conversion, create, boot — and the
-  difference between estimate and actual, ADV-16), a "Data inconsistent" badge with the issues (§5.5), an Estimate
+  downtime rounded to the second, as every other view and the text under it give it; the estimate's parts — shutdown, final sync or copy, conversion, create, boot, hooks (§9.1) — and the
+  difference between estimate and actual, ADV-16; apart from them, a migration's DNS tail (`Estimate.dns_tail_s`, §9.1,
+  plan task N12c) reads "DNS tail {tail}: after the swap, resolvers may still answer with the old address for up to the
+  record's TTL; not part of the downtime." with the network Technology Preview badge), a "Data inconsistent" badge with the issues (§5.5), an Estimate
   inputs panel — what the downtime estimate rests on (§9.1): the guest write rate and the scan rate per disk stream,
   each with its source (measured by a delta pass, from the inventory, a plan override or the planning default; VMware
   CBT needs no scan rate), the plan's link speed, every other estimator override the plan sets with its value
@@ -4564,7 +4570,12 @@ is no origin a browser sends (review RV31-03).
   wait's reason under it — after a failed read, whose `free` is null, "Waiting for GPU capacity: {reason}, checked
   {time}. The source VM keeps running." —, announced once when the wait begins ("{vm} waits for GPU capacity: {free}
   free of {needed} in {pool}. The source VM keeps running.", the reason in place of the numbers after a failed read)
-  and once when it ends ("{vm} no longer waits for GPU capacity.") —, advisor notes, timeline,
+  and once when it ends ("{vm} no longer waits for GPU capacity.") —, advisor notes, timeline — the network
+  cut-over's steps among its entries (`migration.action`, plan task N12c): a hook's run reads "Hook {name} at {point}:
+  Succeeded" or "Failed", its kind, duration and detail under it (§8.2), and a floating IP's, a DNS swap's or an Octavia
+  member's step as its event words it, with the step's detail (§8.3-§8.5), each in its outcome's tone - succeeded the
+  success tone, failed the danger tone, a conflict or an unchanged record the warning tone - and with the network
+  Technology Preview badge —,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — those available now
   first, the next step's action first and primary, then the unavailable ones in a quieter, smaller row under
   "Unavailable now", each still focusable and saying why (a button that changes rows as the migration moves keeps
@@ -6071,6 +6082,6 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | the Octavia member helper: the drain, the join, the restore, the provider finding | §4.2, §8.5, §9.3, §10 (binding) | N9 |
 | the hooks' time in the downtime estimate (`hooks_s`), and the DNS TTL tail apart (`Estimate.dns_tail_s`) | §4.2, §5.3, §9.1 (binding) | N10 |
 | the demo's floating IPs, DNS zone, load balancer and stack | §7.4, §10 (binding) | N11 |
-| the dashboard (§23.9): the Hooks page and the badge rule (N12a), the plan form (N12b), the migration page and the findings (N12c) | §16 (binding for N12a, N12b) | N12 |
+| the dashboard (§23.9): the Hooks page and the badge rule (N12a), the plan form (N12b), the migration page and the findings (N12c) | §16 (binding) | N12 |
 | QASuite (requirement rows, LAB-NET cases), Security.md, Operations.md's runbooks | QASuite, Security.md, Operations.md | N13 |
 | the lab on two clouds; the Technology Preview label goes when its cases pass | QASuite §13 | N14 |
