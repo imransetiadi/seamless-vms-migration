@@ -2654,6 +2654,28 @@ def test_catalog_matches_sdd_9_3():
         assert CATALOG[code].severity == severity, code
 
 
+def test_the_dashboard_marks_the_network_findings_sdd_16_names():
+    """SDD §16, §23.9 (plan task N12c): a findings list shows the network Technology Preview badge
+    beside each network finding §16 names - §9.3's rows of N2, N6, N7 and N9 -, which are the
+    dashboard's NETWORK_CODES, each a code of the catalog."""
+    from seamless_migrate.config import find_repo_root
+
+    root = find_repo_root()
+    sdd = (root / "docs" / "SDD.md").read_text(encoding="utf-8")
+    rule = re.search(
+        r"The network findings are(.*?)a findings list shows the badge beside each", sdd, re.S
+    )
+    assert rule is not None
+    named = re.findall(r"`([A-Z][A-Z0-9_]+)`", rule.group(1))
+    assert len(named) == 12
+    assert set(named) <= set(CATALOG)
+    catalog_ts = (root / "dashboard" / "src" / "api" / "findingCatalog.ts").read_text(
+        encoding="utf-8"
+    )
+    listed = catalog_ts.split("export const NETWORK_CODES", 1)[1].split("]", 1)[0]
+    assert sorted(re.findall(r"'([A-Z][A-Z0-9_]+)'", listed)) == sorted(named)
+
+
 def test_each_finding_code_has_a_test_named_for_it():
     """QASuite FR-04: each finding code of SDD §9.3 has a ``test_finding_<code_lower>`` test or
     ``test_finding_<code_lower>_<case>`` tests, and each such test is named for a code. A test
