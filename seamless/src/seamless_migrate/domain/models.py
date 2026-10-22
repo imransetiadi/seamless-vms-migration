@@ -1339,6 +1339,17 @@ class FipMove(_Model):
     state: Literal["releasing", "released", "moved", "returned", "finalized"] = "releasing"
 
 
+class DnsSwap(_Model):
+    """A migration's DNS swap (SDD §4.2, §8.4): the record's fully qualified name and type, the
+    VM's address at the source and the one taking its place, and how far the swap went."""
+
+    name: str
+    rdtype: Literal["A", "AAAA"]
+    old: str
+    new: str
+    state: Literal["swapping", "swapped", "unchanged", "conflict", "reverted"] = "swapping"
+
+
 class Migration(_Model):
     id: str = Field(default_factory=new_migration_id)
     plan_id: str
@@ -1411,6 +1422,8 @@ class Migration(_Model):
     hook_reverts: list[str] = Field(default_factory=list)
     #: the journal of its floating IPs' keep-address move (SDD §4.2, §8.3)
     fip_moves: list[FipMove] = Field(default_factory=list)
+    #: the journal of its DNS target's swap (SDD §4.2, §8.4)
+    dns_swap: DnsSwap | None = None
     created_at: UTCDateTime = Field(default_factory=utcnow)
     updated_at: UTCDateTime = Field(default_factory=utcnow)
 

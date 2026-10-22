@@ -889,3 +889,13 @@ class FakeDestinationProvider(_FloatingIPs):
 
     async def server_port(self, server_id: str, address: str) -> str | None:
         return f"port-{server_id}" if server_id in self._cloud.servers else None
+
+    async def dns_recordset(self, zone: str, name: str, rdtype: str) -> dict[str, Any] | None:
+        """SDD §8.4, §10: the demo's Designate holds its zones without a recordset - a swap finds
+        nothing to move (a conflict) and the migration goes on."""
+        return None
+
+    async def update_dns_recordset(
+        self, zone_id: str, recordset_id: str, records: list[str]
+    ) -> None:
+        raise ProviderError(f"Designate holds no recordset {recordset_id} in zone {zone_id}")

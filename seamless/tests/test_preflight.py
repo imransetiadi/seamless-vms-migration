@@ -95,6 +95,7 @@ def check(
     destination=DST,
     dst_caps=None,
     shares=None,
+    dns_ttl=None,
 ):
     vm = vm or make_vm()
     return run_preflight(
@@ -107,6 +108,7 @@ def check(
         destination=destination,
         dst_caps=dst_caps,
         shares=shares,
+        dns_ttl=dns_ttl,
     )
 
 
@@ -196,6 +198,7 @@ def test_catalog_is_complete():
         "MAP_NIC_OVERRIDE",
         "MAP_FIP_ADDRESS_CHANGE",
         "DST_FIP_ADDRESS_UNAVAILABLE",
+        "NET_DNS_TTL_LONG",
         "VM_PCI_PASSTHROUGH",
         "VM_VGPU",
         # the GPU codes (SDD §22.5, plan task G4)
@@ -693,6 +696,18 @@ def test_finding_net_prefix_split():
     assert (
         found_codes(check(web, plan=unplanned, all_vms=vms, destination=bgp), NETWORK_CODES) == []
     )
+
+
+def test_finding_net_dns_ttl_long():
+    """SDD §9.3 (plan task N7): the record's name as the target writes it - relative to its zone,
+    or fully qualified - in the warning, which a TTL one second over the SLO gets and one equal to
+    it does not (tests/test_dns_swap.py has the rest)."""
+    target = {"kind": "designate", "zone": "example.com", "record": "db.example.com."}
+    plan = make_plan(downtime_slo_s=300, network_cutover={"dns_targets": {"vm-1": target}})
+    f = only(check(plan=plan, dns_ttl=301), "NET_DNS_TTL_LONG")
+    assert f.message.startswith("The DNS record db.example.com. holds a TTL of 301 s")
+    assert f.remediation == CATALOG["NET_DNS_TTL_LONG"].remediation
+    assert "NET_DNS_TTL_LONG" not in [x.code for x in check(plan=plan, dns_ttl=300)]
 
 
 def test_finding_dst_fip_address_unavailable():
