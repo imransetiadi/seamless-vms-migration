@@ -342,6 +342,31 @@ describe('axe-core: no WCAG violations', () => {
     expect(await violations()).toEqual([]);
   }, 30_000);
 
+  it("the plan form's network cut-over: hooks, a DNS target and a pool mapping, then its error (SDD §16, plan task N12b)", async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/plans', 'operator', (server) => {
+      const at = '2026-10-08T12:00:00Z';
+      for (const name of ['drain-lb', 'smoke'])
+        server.hooks.set(name, { name, kind: 'playbook', description: null, playbook: `/opt/hooks/${name}.yml`, url: null, secret: null, timeout_s: 300, revert: null, created_at: at, updated_at: at });
+    });
+    await screen.findByRole('heading', { level: 1, name: 'Plans' }, { timeout: 8_000 });
+    await settled();
+    await user.click(screen.getByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const section = within(dialog).getByRole('group', { name: /^network cut-over/i });
+    const preStop = within(section).getByRole('group', { name: /^before the stop/i });
+    await user.selectOptions(await within(preStop).findByLabelText(/^hook to add/i), 'drain-lb');
+    await user.click(within(preStop).getByRole('button', { name: /^add hook/i }));
+    await user.click(within(section).getByRole('button', { name: 'Add DNS target' }));
+    await user.selectOptions(within(section).getByLabelText(/^DNS target 1 kind/), 'rfc2136');
+    await user.click(within(section).getByRole('button', { name: 'Add pool mapping' }));
+    expect(await violations()).toEqual([]);
+    await user.click(within(dialog).getByRole('button', { name: /^create plan/i }));
+    await within(dialog).findByRole('alert');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
   it('the new-plan dialog with validation errors', async () => {
     const user = userEvent.setup({ delay: null });
     renderAt('/plans', 'operator');
