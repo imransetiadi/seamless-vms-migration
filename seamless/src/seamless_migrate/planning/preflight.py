@@ -32,6 +32,59 @@ from .platforms import SERIES, parse_microversion
 
 S = Strategy
 
+#: the Heat resource types of an autoscaling group: a scaling policy resizes them on an alarm's
+#: signal, without a stack update; a ResourceGroup's member is a stack's resource only (SDD §9.3)
+AUTOSCALING_GROUP_TYPES = frozenset(
+    {"OS::Heat::AutoScalingGroup", "AWS::AutoScaling::AutoScalingGroup"}
+)
+
+
+@dataclass
+class StackPlace:
+    """Where a server is in the source's Heat stacks (SDD §10): the top-level stack, its resource
+    the server is or is nested under, and the autoscaling group it is a member of, if any."""
+
+    stack: str
+    resource: str
+    group: str | None = None
+    group_type: str | None = None
+
+
+@dataclass
+class StackRead:
+    """The source's Heat stacks, by the servers they hold (SDD §10, plan task N2). `unknown` when
+    they cannot be read: Heat refused the credential (`forbidden`) or another failure (`error`),
+    `detail` naming it by its HTTP status or its kind, never by its message text; a catalog
+    without Heat reads `ok` with nothing."""
+
+    status: Literal["ok", "unknown"] = "ok"
+    reason: Literal["forbidden", "error"] | None = None
+    detail: str | None = None
+    servers: dict[str, StackPlace] = field(default_factory=dict)
+
+
+@dataclass
+class PoolMember:
+    """A member of an Octavia pool of the source (SDD §10): its load balancer and pool by their
+    names (else ids), its address as Neutron writes it, its protocol port, and its subnet's
+    network - None when the subnets cannot be read."""
+
+    load_balancer: str
+    pool: str
+    address: str
+    port: int
+    network: str | None = None
+
+
+@dataclass
+class MemberRead:
+    """The members of the source's Octavia pools (SDD §10, plan task N2), read as `StackRead`."""
+
+    status: Literal["ok", "unknown"] = "ok"
+    reason: Literal["forbidden", "error"] | None = None
+    detail: str | None = None
+    members: list[PoolMember] = field(default_factory=list)
+
 
 @dataclass
 class SourceInventory:
@@ -40,6 +93,10 @@ class SourceInventory:
     projects: list[str] = field(default_factory=list)
     #: the source credential's own keypairs: what export_keypairs.yml can export (SDD §10)
     keypairs: list[str] = field(default_factory=list)
+    #: the servers of the credential's project's Heat stacks, where each one is (SDD §10)
+    stacks: StackRead = field(default_factory=StackRead)
+    #: the members of the credential's project's Octavia pools (SDD §10)
+    lb_members: MemberRead = field(default_factory=MemberRead)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -171,6 +228,43 @@ CATALOG: dict[str, CatalogEntry] = {
         (S.warm,),
         "The image-booted root disk is pre-copied through server snapshots (boot_disk_copy), "
         "which makes passes slower.",
+    ),
+    # the source's Heat stacks and Octavia pools (SDD §9.3, §10, plan task N2)
+    "SRC_VM_HEAT_STACK": CatalogEntry(
+        Severity.warning,
+        (),
+        "Seamless moves the server, not its stack: run no stack update at the source until the VM "
+        "is finalized - an update may recreate the server - and follow the runbook for Heat "
+        "stacks for the stack's other resources.",
+    ),
+    "SRC_VM_AUTOSCALED": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Suspend the group's scaling at the source - its scaling policies' alarms - as the runbook "
+        "for Heat stacks says, then acknowledge the finding for the VM in the plan "
+        "(acknowledged_findings) and re-validate.",
+    ),
+    "SRC_VM_HEAT_UNKNOWN": CatalogEntry(
+        Severity.warning,
+        (),
+        "Give the source credential a role Heat's policy lets list the project's stacks and their "
+        "resources, or check with the runbook for Heat stacks whether the VM belongs to a stack or "
+        "an autoscaling group: an autoscaling group may replace the server once the cutover stops "
+        "it.",
+    ),
+    "SRC_VM_LB_MEMBER": CatalogEntry(
+        Severity.warning,
+        (),
+        "Move the membership as the runbook for Octavia load balancers says: drain the source "
+        "member before the cutover, and add the migrated server to a pool at the destination once "
+        "it is verified.",
+    ),
+    "SRC_VM_LB_UNKNOWN": CatalogEntry(
+        Severity.warning,
+        (),
+        "Give the source credential a role Octavia's policy lets list the project's pools and "
+        "their members, or check the VM's memberships yourself with the runbook for Octavia load "
+        "balancers.",
     ),
     "MAP_NETWORK_MISSING": CatalogEntry(
         Severity.blocker,
@@ -461,6 +555,12 @@ def _port_remediation(profile: str) -> str:
         "role: Nova attaches it for no other."
     )
 
+
+#: SRC_VM_AUTOSCALED's remediation once the plan acknowledges it (SDD §9.3, owner decision 9)
+AUTOSCALED_ACKNOWLEDGED_REMEDIATION = (
+    "Keep the group's scaling suspended at the source until the VM is finalized, as the runbook "
+    "for Heat stacks says: a server the group creates meanwhile is a second live copy."
+)
 
 #: SRC_VM_DUPLICATE_NAME's remediation for two VMware VMs the migration kit names alike (§9.3)
 KIT_TWIN_REMEDIATION = (
@@ -1528,6 +1628,9 @@ def run_preflight(
             finding("SRC_VM_EPHEMERAL_ROOT", f"The root disk is {root.kind.replace('_', ' ')}.")
         )
 
+    out.extend(_stack_findings(vm, plan, src_inv.stacks, source))
+    out.extend(_member_findings(vm, src_inv.lb_members, source))
+
     # a NIC its override sends to another network is checked by MAP_NIC_OVERRIDE_INVALID
     mapped_nics = [
         nic
@@ -1985,6 +2088,97 @@ def run_preflight(
     if missing is not None:
         out.append(missing)
     return out
+
+
+def _source_label(source: Provider | None) -> str:
+    return source.label if source is not None else "the source"
+
+
+def _unread(service: str, read: StackRead | MemberRead) -> str:
+    """Why a read of the source's Heat or Octavia is unknown (SDD §10): by its HTTP status or the
+    failure's kind, never its message text."""
+    if read.reason == "forbidden":
+        return f"{service} refused the source credential ({read.detail or 'HTTP 403'})"
+    return f"its read failed ({read.detail or 'no answer'})"
+
+
+def _stack_findings(
+    vm: VMRef, plan: Plan, stacks: StackRead, source: Provider | None
+) -> list[Finding]:
+    """SRC_VM_HEAT_STACK, SRC_VM_AUTOSCALED and SRC_VM_HEAT_UNKNOWN (SDD §9.3, plan task N2): the
+    VM's place in the source's Heat stacks, or why it is not known; an autoscaling group's member
+    is blocked until the plan acknowledges it (owner decision 9)."""
+    at = _source_label(source)
+    if stacks.status == "unknown":
+        return [
+            finding(
+                "SRC_VM_HEAT_UNKNOWN",
+                f"Whether {vm.name} belongs to a Heat stack or an autoscaling group at {at} is not "
+                f"known: {_unread('Heat', stacks)}.",
+            )
+        ]
+    place = stacks.servers.get(vm.source_id)
+    if place is None:
+        return []
+    out = [
+        finding(
+            "SRC_VM_HEAT_STACK",
+            f"{vm.name} belongs to Heat stack {place.stack!r} at {at} (its resource "
+            f"{place.resource!r}): the stack is not moved, and a stack update there may recreate "
+            "the server.",
+        )
+    ]
+    if place.group is not None:
+        text = (
+            f"{vm.name} is a member of autoscaling group {place.group!r} ({place.group_type}) of "
+            f"Heat stack {place.stack!r} at {at}: the group may replace the server once the "
+            "cutover stops it, which leaves two live copies."
+        )
+        if "SRC_VM_AUTOSCALED" in plan.acknowledged_findings.get(vm.source_id, []):
+            out.append(
+                finding(
+                    "SRC_VM_AUTOSCALED",
+                    f"{text} The plan acknowledges it (acknowledged_findings).",
+                    severity=Severity.warning,
+                    remediation=AUTOSCALED_ACKNOWLEDGED_REMEDIATION,
+                )
+            )
+        else:
+            out.append(finding("SRC_VM_AUTOSCALED", text))
+    return out
+
+
+def _member_findings(vm: VMRef, read: MemberRead, source: Provider | None) -> list[Finding]:
+    """SRC_VM_LB_MEMBER and SRC_VM_LB_UNKNOWN (SDD §9.3, plan task N2): each Octavia pool member at
+    the source that is an address of the VM's NIC - on the NIC's network when the read names the
+    member's -, or why it is not known."""
+    at = _source_label(source)
+    if read.status == "unknown":
+        return [
+            finding(
+                "SRC_VM_LB_UNKNOWN",
+                f"Whether addresses of {vm.name} are members of Octavia pools at {at} is not "
+                f"known: {_unread('Octavia', read)}.",
+            )
+        ]
+    held: list[str] = []
+    for nic in vm.nics:
+        addresses = {_canonical_ip(a) for a in nic.fixed_ips}
+        for m in read.members:
+            if _canonical_ip(m.address) in addresses and m.network in (None, nic.network):
+                held.append(
+                    f"{_canonical_ip(m.address)} port {m.port} in pool {m.pool!r} of load "
+                    f"balancer {m.load_balancer!r}"
+                )
+    if not held:
+        return []
+    return [
+        finding(
+            "SRC_VM_LB_MEMBER",
+            f"Addresses of {vm.name} are members of Octavia pools at {at}: "
+            f"{'; '.join(dict.fromkeys(held))}. The memberships are not moved.",
+        )
+    ]
 
 
 #: (service, check-report key, floor, why) every strategy needs (SDD §21.4); a gap one strategy

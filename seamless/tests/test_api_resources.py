@@ -215,6 +215,51 @@ def test_plan_nic_overrides_round_trip_and_refuse_bad_entries(api):
     assert "nic_overrides[vm-1][fa:16:3e:00:00:01]" in bad.json()["error"]["message"]
 
 
+def test_plan_acknowledged_findings_round_trip_refuse_other_codes_and_are_audited(api):
+    """SDD §4.2, §12, §9.3 (plan task N2): acknowledged_findings is empty unless set; a plan
+    acknowledges SRC_VM_AUTOSCALED alone - any other code is a 422 naming the entry, on create
+    and on edit -; and an acknowledgement is an operator's plan edit, which plan.updated records
+    with the field's name and the actor."""
+    body = {
+        "name": "acks",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    created = api.post("/api/v1/plans", Role.operator, json=body)
+    assert created.status_code == 201, created.text
+    assert created.json()["acknowledged_findings"] == {}
+    plan_id = created.json()["id"]
+    patched = api.client.patch(
+        f"/api/v1/plans/{plan_id}",
+        headers=api.h(Role.operator),
+        json={"acknowledged_findings": {"vm-1": ["SRC_VM_AUTOSCALED"]}},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["acknowledged_findings"] == {"vm-1": ["SRC_VM_AUTOSCALED"]}
+    audited = [
+        e
+        for e in api.get("/api/v1/events").json()
+        if e["kind"] == "plan.updated" and e["plan_id"] == plan_id
+    ]
+    assert [(e["actor"], e["data"]) for e in audited] == [
+        ("operator-user", {"fields": ["acknowledged_findings"]})
+    ]
+    for code in ("SRC_VM_HEAT_STACK", "MAP_NETWORK_MISSING"):
+        bad = {"acknowledged_findings": {"vm-1": [code]}}
+        refused = api.post("/api/v1/plans", Role.operator, json={**body, **bad})
+        assert refused.status_code == 422, refused.text
+        assert (
+            f"acknowledged_findings[vm-1]: {code} cannot be acknowledged"
+            in (refused.json()["error"]["message"])
+        )
+        edit = api.client.patch(f"/api/v1/plans/{plan_id}", headers=api.h(Role.operator), json=bad)
+        assert edit.status_code == 422, edit.text
+    assert api.get(f"/api/v1/plans/{plan_id}").json()["acknowledged_findings"] == {
+        "vm-1": ["SRC_VM_AUTOSCALED"]
+    }
+
+
 def test_plan_rejects_out_of_range_tcp_port(api):
     """SDD §12: verification settings that would roll back a good cutover or never open the gate
     are a 422 on create and on edit."""

@@ -4010,3 +4010,370 @@ async def test_get_server_looks_up_a_flavor_nova_did_not_embed():
 
     conn.compute.get_flavor = gone
     assert (await dst.get_server("srv-1"))["flavor"] == {"name": None, "extra_specs": {}}
+
+
+# --------------------------------------------------------------------------------------------
+# a source's Heat stacks and Octavia pool members (SDD §10, plan task N2)
+
+#: the source's networks and subnets: app-net's subnet is the load balancer's VIP subnet
+NETWORKS = [{"id": "net-app", "name": "app-net", "mtu": 1500}]
+SUBNETS = [{"id": "sub-app", "network_id": "net-app", "cidr": "192.0.2.0/24"}]
+
+
+def heat_resource(name, kind, physical, stack, nested=None):
+    """A resource as Heat lists it with nested_depth: its stack's link, and a nested one's."""
+    links = [
+        {"rel": "self", "href": f"{cloud_heat()}/stacks/{stack}/resources/{name}"},
+        {"rel": "stack", "href": f"{cloud_heat()}/stacks/{stack}"},
+    ]
+    if nested:
+        links.append({"rel": "nested", "href": f"{cloud_heat()}/stacks/{nested}"})
+    return {
+        "resource_name": name,
+        "logical_resource_id": name,
+        "resource_type": kind,
+        "physical_resource_id": physical,
+        "resource_status": "CREATE_COMPLETE",
+        "links": links,
+    }
+
+
+def cloud_heat():
+    from tests.cloud_support import HEAT_URL
+
+    return HEAT_URL
+
+
+#: example-web: a server of its own, an autoscaling group whose members are a template's nested
+#: stacks, and a ResourceGroup; a port and a server that has no id yet are no servers
+WEB_RESOURCES = [
+    heat_resource("web_server", "OS::Nova::Server", "srv-1", "example-web/s1"),
+    heat_resource("web_port", "OS::Neutron::Port", "port-1", "example-web/s1"),
+    heat_resource(
+        "web_asg", "OS::Heat::AutoScalingGroup", "n1", "example-web/s1", "example-web-asg/n1"
+    ),
+    heat_resource("a1b2", "web_member.yaml", "n2", "example-web-asg/n1", "example-web-asg-a1b2/n2"),
+    heat_resource("server", "OS::Nova::Server", "srv-2", "example-web-asg-a1b2/n2"),
+    heat_resource(
+        "workers", "OS::Heat::ResourceGroup", "n3", "example-web/s1", "example-web-workers/n3"
+    ),
+    heat_resource("0", "AWS::EC2::Instance", "srv-3", "example-web-workers/n3"),
+    heat_resource("pending", "OS::Nova::Server", "", "example-web/s1"),
+]
+STACKS = {
+    "stacks": [
+        {"id": "s1", "stack_name": "example-web", "stack_status": "CREATE_COMPLETE"},
+        {"id": "s2", "stack_name": "example-gone", "stack_status": "DELETE_IN_PROGRESS"},
+    ]
+}
+#: example-lb on app-net: a pool with two members, one naming its subnet and one taking the VIP's,
+#: and a pool without members, whose members are never asked for
+OCTAVIA = {
+    "/v2.0/lbaas/loadbalancers": (
+        200,
+        {"loadbalancers": [{"id": "lb-1", "name": "example-lb", "vip_subnet_id": "sub-app"}]},
+    ),
+    "/v2.0/lbaas/pools": (
+        200,
+        {
+            "pools": [
+                {
+                    "id": "pool-1",
+                    "name": "web-pool",
+                    "loadbalancers": [{"id": "lb-1"}],
+                    "members": [{"id": "m-1"}, {"id": "m-2"}],
+                },
+                {"id": "pool-2", "name": "", "loadbalancers": [{"id": "lb-1"}], "members": []},
+            ]
+        },
+    ),
+    "/v2.0/lbaas/pools/pool-1/members": (
+        200,
+        {
+            "members": [
+                {
+                    "id": "m-1",
+                    "address": "192.0.2.10",
+                    "protocol_port": 443,
+                    "subnet_id": "sub-app",
+                },
+                {"id": "m-2", "address": "2001:0db8::0011", "protocol_port": 8443},
+            ]
+        },
+    ),
+}
+
+
+def source_cloud(tmp_path, **kw):
+    """A real source OpenStackProvider over the in-process cloud (SDD §10)."""
+    cloud = InProcessCloud(tmp_path, networks=NETWORKS, subnets=SUBNETS, **kw)
+    provider = make_provider(endpoint=AUTH_URL, cloud="dst")
+    return cloud, OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect)
+
+
+async def test_a_source_without_heat_or_octavia_reads_no_stack_and_no_member(tmp_path):
+    """SDD §10, §9.3 (plan task N2): a source whose catalog has neither Heat nor Octavia has no
+    stack and no pool member to read - both reads are ok and empty, nothing is sent to either
+    service, and the inventory goes on; nor do a VMware source and the demo's source read them,
+    so the pre-flight finds none of the Heat and Octavia codes for their VMs."""
+    from seamless_migrate.planning.preflight import MemberRead, StackRead
+
+    cloud, src = source_cloud(tmp_path)
+    inv = await src.inventory()
+    assert inv.networks == {"app-net": 1500}
+    assert (inv.stacks, inv.lb_members) == (StackRead(), MemberRead())
+    assert (inv.stacks.status, inv.stacks.servers) == ("ok", {})
+    assert (inv.lb_members.status, inv.lb_members.members) == ("ok", [])
+    hosts = {urllib.parse.urlsplit(url).netloc for _, url in cloud.seen}
+    assert not hosts & {"orchestration.example.org", "load-balancer.example.org"}
+    for fake in (
+        FakeSourceProvider(ProviderKind.openstack),
+        FakeSourceProvider(ProviderKind.vmware),
+    ):
+        inv = await fake.inventory()
+        assert (inv.stacks, inv.lb_members) == (StackRead(), MemberRead())
+    assert SourceInventory().stacks == StackRead() and SourceInventory().lb_members == MemberRead()
+
+
+async def test_a_source_reads_each_servers_stack_with_one_resource_list_per_top_level_stack(
+    tmp_path,
+):
+    """SDD §10 (plan task N2): the stack list, then one resource list per top-level stack with
+    nested_depth 5 - whatever the plan's size - and each server's place by its stack links: the
+    top-level stack, its resource the server is or is nested under, and the autoscaling group it
+    is a member of. A ResourceGroup's member is no group's; a stack gone between the calls (404)
+    holds nothing; a port, or a server without an id, is no server."""
+    heat = {
+        "/stacks": (200, STACKS),
+        "/stacks/example-web/s1/resources": (200, {"resources": WEB_RESOURCES}),
+        "/stacks/example-gone/s2/resources": (404, {"error": {"message": "Stack not found"}}),
+    }
+    cloud, src = source_cloud(tmp_path, heat=heat)
+    stacks = (await src.inventory()).stacks
+    assert (stacks.status, stacks.reason, stacks.detail) == ("ok", None, None)
+    assert {k: vars(v) for k, v in stacks.servers.items()} == {
+        "srv-1": {
+            "stack": "example-web",
+            "resource": "web_server",
+            "group": None,
+            "group_type": None,
+        },
+        "srv-2": {
+            "stack": "example-web",
+            "resource": "web_asg",
+            "group": "web_asg",
+            "group_type": "OS::Heat::AutoScalingGroup",
+        },
+        "srv-3": {"stack": "example-web", "resource": "workers", "group": None, "group_type": None},
+    }
+    assert cloud.heat_seen == [
+        ("/stacks", {}),
+        ("/stacks/example-web/s1/resources", {"nested_depth": ["5"]}),
+        ("/stacks/example-gone/s2/resources", {"nested_depth": ["5"]}),
+    ]
+
+
+async def test_a_source_reads_its_projects_pool_members_with_their_networks(tmp_path):
+    """SDD §10 (plan task N2): the project's load balancers and pools, the members of each pool
+    that lists some, and the subnets once - each member named by its load balancer and pool, its
+    address as Neutron writes it, its port, and its subnet's network, the load balancer's VIP
+    subnet when it names none."""
+    from seamless_migrate.planning.preflight import PoolMember
+
+    cloud, src = source_cloud(tmp_path, octavia=OCTAVIA)
+    members = (await src.inventory()).lb_members
+    assert (members.status, members.reason, members.detail) == ("ok", None, None)
+    assert members.members == [
+        PoolMember(
+            load_balancer="example-lb",
+            pool="web-pool",
+            address="192.0.2.10",
+            port=443,
+            network="app-net",
+        ),
+        PoolMember(
+            load_balancer="example-lb",
+            pool="web-pool",
+            address="2001:db8::11",
+            port=8443,
+            network="app-net",
+        ),
+    ]
+    paths = [path for path, _ in cloud.octavia_seen]
+    assert sorted(set(paths)) == [
+        "/v2.0/lbaas/loadbalancers",
+        "/v2.0/lbaas/pools",
+        "/v2.0/lbaas/pools/pool-1/members",
+    ]
+    # the credential's project's load balancers and pools alone
+    assert all(
+        query.get("project_id") == ["p1"]
+        for path, query in cloud.octavia_seen
+        if not path.endswith("/members")
+    )
+
+
+@pytest.mark.parametrize(
+    "heat, octavia, stacks, members",
+    [
+        (
+            {"/stacks": (403, {"error": {"message": "example-web is forbidden"}})},
+            {"/v2.0/lbaas/loadbalancers": (403, {"faultstring": "example-lb is forbidden"})},
+            ("forbidden", "HTTP 403"),
+            ("forbidden", "HTTP 403"),
+        ),
+        (
+            # the first stack read, then the second fails: nothing is kept of the first
+            {
+                "/stacks": (200, STACKS),
+                "/stacks/example-web/s1/resources": (200, {"resources": WEB_RESOURCES}),
+                "/stacks/example-gone/s2/resources": (503, {"error": "example-gone is down"}),
+            },
+            {**OCTAVIA, "/v2.0/lbaas/pools/pool-1/members": (500, {"faultstring": "m-1 broke"})},
+            ("error", "HTTP 503"),
+            ("error", "HTTP 500"),
+        ),
+    ],
+    ids=["refused", "failed"],
+)
+async def test_a_heat_or_octavia_read_refused_or_failed_reads_unknown_and_keeps_nothing(
+    tmp_path, caplog, heat, octavia, stacks, members
+):
+    """SDD §10, §9.3 (plan task N2): Heat or Octavia refusing the credential (403) reads unknown,
+    reason forbidden; any other failure unknown, reason error - by its HTTP status, never its
+    message text, which names the customer's stacks - and the first failure ends the read with
+    nothing of it kept: a partial read would guess. The inventory goes on, and neither the log nor
+    the read holds a name."""
+    caplog.set_level(logging.DEBUG)
+    cloud, src = source_cloud(tmp_path, heat=heat, octavia=octavia)
+    inv = await src.inventory()
+    assert inv.networks == {"app-net": 1500}
+    assert (inv.stacks.status, inv.stacks.reason, inv.stacks.detail) == ("unknown", *stacks)
+    assert inv.stacks.servers == {}
+    assert (inv.lb_members.status, inv.lb_members.reason, inv.lb_members.detail) == (
+        "unknown",
+        *members,
+    )
+    assert inv.lb_members.members == []
+    for name in ("example-web", "example-gone", "example-lb", "m-1", "web-pool"):
+        assert name not in caplog.text
+
+
+async def test_a_heat_or_octavia_that_cannot_be_reached_reads_unknown_by_the_failures_kind(
+    tmp_path,
+):
+    """SDD §10 (plan task N2): a connection that fails gives no answer - the read is unknown,
+    reason error, its detail the failure's kind; the inventory goes on."""
+    import requests
+
+    refused = requests.exceptions.ConnectionError("orchestration.example.org refused")
+    gone = requests.exceptions.ConnectionError("load-balancer.example.org refused")
+    cloud, src = source_cloud(
+        tmp_path, heat={"/stacks": refused}, octavia={"/v2.0/lbaas/loadbalancers": gone}
+    )
+    inv = await src.inventory()
+    assert (inv.stacks.status, inv.stacks.reason, inv.stacks.detail) == (
+        "unknown",
+        "error",
+        "ConnectFailure",
+    )
+    assert (inv.lb_members.status, inv.lb_members.reason) == ("unknown", "error")
+    assert inv.lb_members.detail == "ConnectFailure"
+
+
+async def test_a_heat_or_octavia_read_that_runs_past_its_budget_ends_unknown(tmp_path, monkeypatch):
+    """SDD §10 (plan task N2): a read that has run for the provider API timeout sends no further
+    request and reads unknown, reason error - so both reads fit in the inventory's bound, and a
+    slow Heat or Octavia never fails the validation."""
+    from seamless_migrate.providers import openstack as module
+
+    now = [1000.0]
+
+    def clock():
+        now[0] += 25.0  # every look at the clock finds the read 25 s older
+        return now[0]
+
+    monkeypatch.setattr(module, "_monotonic", clock)
+    heat = {
+        "/stacks": (200, STACKS),
+        "/stacks/example-web/s1/resources": (200, {"resources": WEB_RESOURCES}),
+        "/stacks/example-gone/s2/resources": (200, {"resources": []}),
+    }
+    pools = {
+        "pools": [
+            {
+                "id": f"pool-{i}",
+                "name": f"p{i}",
+                "loadbalancers": [{"id": "lb-1"}],
+                "members": [{"id": "m"}],
+            }
+            for i in (1, 2, 3)
+        ]
+    }
+    octavia = {**OCTAVIA, "/v2.0/lbaas/pools": (200, pools)}
+    cloud, src = source_cloud(tmp_path, heat=heat, octavia=octavia)
+    inv = await src.inventory()
+    assert (inv.stacks.status, inv.stacks.reason, inv.stacks.detail) == (
+        "unknown",
+        "error",
+        "TimeoutError",
+    )
+    assert (inv.lb_members.status, inv.lb_members.detail) == ("unknown", "TimeoutError")
+    # the read stopped sending once its budget was spent
+    assert [path for path, _ in cloud.heat_seen] == ["/stacks", "/stacks/example-web/s1/resources"]
+    assert "/v2.0/lbaas/pools/pool-3/members" not in [path for path, _ in cloud.octavia_seen]
+
+
+async def test_a_heat_or_octavia_list_is_paged_at_its_own_endpoint(tmp_path):
+    """SDD §10 (plan task N2): a list the service pages - Heat's `links`, Octavia's
+    `<key>_links` - is read to its end, each next page asked at the service's own endpoint with
+    the link's query (its project filter kept), so the token never follows a link to another
+    host; a next link back to the page just read ends the list."""
+    elsewhere = "https://elsewhere.example.net/v2.0/lbaas/pools?marker=pool-1&limit=1"
+    first = {
+        "pools": [{"id": "pool-1", "name": "web-pool", "loadbalancers": [{"id": "lb-1"}]}],
+        "pools_links": [{"rel": "next", "href": elsewhere}],
+    }
+    second = {
+        "pools": [
+            {
+                "id": "pool-2",
+                "name": "api-pool",
+                "loadbalancers": [{"id": "lb-1"}],
+                "members": [{"id": "m-3"}],
+            }
+        ],
+        "pools_links": [{"rel": "next", "href": elsewhere}],  # the same page again
+    }
+
+    class Pages(dict):
+        def get(self, path, default=None):
+            if path != "/v2.0/lbaas/pools":
+                return super().get(path, default)
+            asked = cloud.octavia_seen[-1][1]
+            return (200, second if asked.get("marker") == ["pool-1"] else first)
+
+    members = {"members": [{"id": "m-3", "address": "192.0.2.30", "protocol_port": 80}]}
+    octavia = Pages(
+        {
+            "/v2.0/lbaas/loadbalancers": OCTAVIA["/v2.0/lbaas/loadbalancers"],
+            "/v2.0/lbaas/pools/pool-2/members": (200, members),
+        }
+    )
+    stacks = {
+        "stacks": [{"id": "s1", "stack_name": "example-web"}],
+        "links": [{"rel": "next", "href": f"{cloud_heat()}/stacks?marker=s1"}],
+    }
+    heat = {"/stacks": (200, stacks), "/stacks/example-web/s1/resources": (200, {"resources": []})}
+    cloud, src = source_cloud(tmp_path, heat=heat, octavia=octavia)
+    inv = await src.inventory()
+    assert inv.lb_members.status == "ok"
+    assert [(m.pool, m.address) for m in inv.lb_members.members] == [("api-pool", "192.0.2.30")]
+    pools = [query for path, query in cloud.octavia_seen if path == "/v2.0/lbaas/pools"]
+    assert pools == [
+        {"project_id": ["p1"]},
+        {"project_id": ["p1"], "marker": ["pool-1"], "limit": ["1"]},
+    ]
+    assert not any("elsewhere" in url for _, url in cloud.seen)
+    assert inv.stacks.status == "ok"
+    assert [q for path, q in cloud.heat_seen if path == "/stacks"] == [{}, {"marker": ["s1"]}]

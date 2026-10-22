@@ -11,7 +11,7 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from ..ai.redaction import redact_cut
 from ..config import Settings
@@ -20,7 +20,17 @@ from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef, utcnow
 from ..guest_os import identify
 from ..planning.gpu import PoolRequest, gpu_pools, gpu_requests
 from ..planning.platforms import destination_release
-from ..planning.preflight import DestinationInventory, GpuCapacity, GpuPool, SourceInventory
+from ..planning.preflight import (
+    AUTOSCALING_GROUP_TYPES,
+    DestinationInventory,
+    GpuCapacity,
+    GpuPool,
+    MemberRead,
+    PoolMember,
+    SourceInventory,
+    StackPlace,
+    StackRead,
+)
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
 from ..storage import storage_family
 from .base import ProviderError, VMNotFound, microversion_text, missing_dependency
@@ -277,9 +287,10 @@ def _placement_get(conn: Any, url: str, params: dict[str, str] | None = None) ->
     raise _PlacementAnswer(status, f"HTTP {status}")
 
 
-def _no_placement(exc: Exception) -> bool:
-    """Whether ``exc`` says the catalog has no Placement: keystoneauth finds no endpoint, or
-    openstacksdk's proxy of a service the catalog lacks refuses every call (SDD §22.3)."""
+def _not_in_catalog(exc: Exception) -> bool:
+    """Whether ``exc`` says the catalog lacks the service - Placement, Heat, Octavia: keystoneauth
+    finds no endpoint, or openstacksdk's proxy of a service the catalog lacks refuses every call
+    (SDD §10, §22.3)."""
     try:
         from keystoneauth1.exceptions import EndpointNotFound
         from openstack.exceptions import ServiceDisabledException
@@ -295,7 +306,7 @@ def _gpu_read_failure(exc: Exception) -> tuple[str, str | None]:
     which may name a provider (§22.12)."""
     if isinstance(exc, _PlacementAnswer):
         return ("forbidden" if exc.status == 403 else "error"), exc.detail
-    if _no_placement(exc):
+    if _not_in_catalog(exc):
         return "no_placement", None
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and not isinstance(status, bool):
@@ -405,6 +416,168 @@ def _read_pool(read: _Candidates, pool: PoolRequest) -> GpuPool:
         providers=sum(1 for left in free.values() if left > 0),
         largest_free=largest,
     )
+
+
+#: the Heat resource types of a server (SDD §10)
+_HEAT_SERVER_TYPES = frozenset({"OS::Nova::Server", "AWS::EC2::Instance"})
+#: how deep Heat lists a stack's nested stacks' resources: its default max_nested_stack_depth, its
+#: ceiling (SDD §10)
+_HEAT_NESTED_DEPTH = 5
+
+
+class _ServiceAnswer(Exception):
+    """Heat or Octavia answered a read with an error: its HTTP status alone (SDD §10)."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
+
+
+class _BudgetedGet:
+    """The GETs of one optional read of a source's Heat or Octavia (SDD §10, plan task N2): each is
+    sent while the read has run for less than PROVIDER_API_TIMEOUT_S - past it, TimeoutError -, so
+    a slow service costs about one request's timeout; and none is logged: keystoneauth would write
+    each URL and body, which name the customer's stacks and load balancers (§13.4)."""
+
+    def __init__(self, adapter: Any) -> None:
+        self.adapter = adapter
+        self.deadline = _monotonic() + PROVIDER_API_TIMEOUT_S
+
+    def get(self, path: str, params: Mapping[str, str], *, may_be_gone: bool = False) -> Any:
+        """The body of the service's 200; None for a 404 of what ``may_be_gone``; else
+        _ServiceAnswer."""
+        if _monotonic() >= self.deadline:
+            raise TimeoutError
+        response = self.adapter.get(path, params=dict(params), raise_exc=False, log=False)
+        status = int(response.status_code)
+        if status == 404 and may_be_gone:
+            return None
+        if status != 200:
+            raise _ServiceAnswer(status)
+        return response.json()
+
+    def pages(self, path: str, key: str, params: Mapping[str, str] | None = None) -> list[Any]:
+        """Every item of a list the service pages - by its ``<key>_links`` next link, Octavia's as
+        openstacksdk follows it, or ``links``, Heat's -, the next page asked at the same path with
+        that link's query: the token never follows a link to another host."""
+        base = dict(params or {})
+        query, items = base, []
+        while True:
+            body = self.get(path, query)
+            items += body.get(key) or []
+            links = body.get(f"{key}_links") or body.get("links") or []
+            href = next((link.get("href") for link in links if link.get("rel") == "next"), None)
+            if not href:
+                return items
+            asked = urllib.parse.parse_qs(urllib.parse.urlsplit(str(href)).query)
+            following = {**base, **{name: values[-1] for name, values in asked.items()}}
+            if following == query:  # the page just read: there is no other
+                return items
+            query = following
+
+
+def _read_failure(exc: Exception) -> tuple[Literal["forbidden", "error"], str]:
+    """Why a read of a source's Heat or Octavia failed (SDD §10): `forbidden` when the service
+    refused the credential (403), else `error` - its detail the HTTP status, or the failure's kind
+    when nothing answered; never a message's text, which may name a stack or a load balancer."""
+    status = exc.status if isinstance(exc, _ServiceAnswer) else getattr(exc, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return ("forbidden" if status == 403 else "error"), f"HTTP {status}"
+    return "error", type(exc).__name__
+
+
+def _link_id(resource: Mapping[str, Any], rel: str) -> str | None:
+    """The last path segment of a Heat resource's link ``rel``: the id of the stack it names."""
+    for link in resource.get("links") or []:
+        if isinstance(link, Mapping) and link.get("rel") == rel and link.get("href"):
+            return urllib.parse.urlsplit(str(link["href"])).path.rstrip("/").rsplit("/", 1)[-1]
+    return None
+
+
+def _servers_of_stack(
+    stack: str, stack_id: str, resources: list[Mapping[str, Any]]
+) -> dict[str, StackPlace]:
+    """The servers of a top-level stack's resource list, those of its nested stacks included
+    (SDD §10): a nested stack's id is the physical_resource_id of the resource that holds it, so a
+    server's chain of stack links runs up to the top-level stack - its resource there is the server
+    or the one it is nested under, and the nearest autoscaling group on the way its group."""
+    holders = {
+        str(r["physical_resource_id"]): r for r in resources if r.get("physical_resource_id")
+    }
+    places: dict[str, StackPlace] = {}
+    for resource in resources:
+        server_id = resource.get("physical_resource_id")
+        if resource.get("resource_type") not in _HEAT_SERVER_TYPES or not server_id:
+            continue
+        at, group = resource, None
+        for _ in range(_HEAT_NESTED_DEPTH + 1):
+            parent = _link_id(at, "stack")
+            holder = holders.get(parent) if parent is not None and parent != stack_id else None
+            if holder is None:
+                break
+            at = holder
+            if group is None and at.get("resource_type") in AUTOSCALING_GROUP_TYPES:
+                group = at
+        places[str(server_id)] = StackPlace(
+            stack=stack,
+            resource=str(at.get("resource_name")),
+            group=str(group.get("resource_name")) if group is not None else None,
+            group_type=str(group.get("resource_type")) if group is not None else None,
+        )
+    return places
+
+
+def _stack_places(get: _BudgetedGet) -> dict[str, StackPlace]:
+    """Where each server of the credential's project's Heat stacks is (SDD §10): the stack list,
+    then each top-level stack's resources with its nested stacks' (nested_depth) - one call per
+    stack, whatever the plan's size. A stack gone between the two calls (404) holds nothing."""
+    places: dict[str, StackPlace] = {}
+    for stack in get.pages("/stacks", "stacks"):
+        name, stack_id = str(stack.get("stack_name")), str(stack.get("id"))
+        path = "/stacks/{}/{}/resources".format(
+            urllib.parse.quote(name, safe=""), urllib.parse.quote(stack_id, safe="")
+        )
+        body = get.get(path, {"nested_depth": str(_HEAT_NESTED_DEPTH)}, may_be_gone=True)
+        if body is None:
+            continue
+        resources = [r for r in body.get("resources") or [] if isinstance(r, Mapping)]
+        for server_id, place in _servers_of_stack(name, stack_id, resources).items():
+            places.setdefault(server_id, place)
+    return places
+
+
+def _pool_members(
+    get: _BudgetedGet, project: str | None, subnets: Callable[[], dict[str, str | None] | None]
+) -> list[PoolMember]:
+    """The members of the credential's project's Octavia pools (SDD §10): its load balancers and
+    pools, the members of each pool that lists some, and - once one does - the subnets once, to
+    name each member's network: its subnet's, else its load balancer's VIP subnet's."""
+    scope = {"project_id": project} if project else {}
+    balancers = {
+        str(lb.get("id")): lb for lb in get.pages("/lbaas/loadbalancers", "loadbalancers", scope)
+    }
+    pools = [pool for pool in get.pages("/lbaas/pools", "pools", scope) if pool.get("members")]
+    if not pools:
+        return []
+    networks = subnets()
+    members: list[PoolMember] = []
+    for pool in pools:
+        refs = [str(ref.get("id")) for ref in pool.get("loadbalancers") or [] if ref.get("id")]
+        lb_id = refs[0] if refs else ""
+        lb = balancers.get(lb_id, {})
+        path = "/lbaas/pools/{}/members".format(urllib.parse.quote(str(pool.get("id")), safe=""))
+        for member in get.pages(path, "members"):
+            subnet = member.get("subnet_id") or lb.get("vip_subnet_id")
+            members.append(
+                PoolMember(
+                    load_balancer=str(lb.get("name") or lb_id),
+                    pool=str(pool.get("name") or pool.get("id")),
+                    address=_canonical_ip(str(member.get("address"))),
+                    port=int(member.get("protocol_port")),
+                    network=networks.get(str(subnet)) if networks is not None else None,
+                )
+            )
+    return members
 
 
 class OpenStackProvider:
@@ -667,8 +840,15 @@ class OpenStackProvider:
         # the credential's own keypairs: what it can export, or owns as the creator (SDD §10)
         keypairs = sorted(str(_attr(k, "name")) for k in conn.compute.keypairs())
         if self.provider.role == ProviderRole.source:
+            names = {_attr(n, "id"): str(_attr(n, "name")) for n in visible}
             return SourceInventory(
-                networks=networks, projects=[project] if project else [], keypairs=keypairs
+                networks=networks,
+                projects=[project] if project else [],
+                keypairs=keypairs,
+                # where its servers are in the project's Heat stacks and Octavia pools: optional
+                # reads, which fail nothing (SDD §9.3, §10)
+                stacks=self._read_stacks(conn),
+                lb_members=self._read_members(conn, names),
             )
         flavors = _flavors(conn)
         # the flavors that ask for a GPU, with their declared profiles, and the Placement pools of
@@ -725,6 +905,44 @@ class OpenStackProvider:
             gpu_flavors=gpu_flavors,
             gpu_capacity=gpu_capacity,
         )
+
+    def _read_stacks(self, conn: Any) -> StackRead:
+        """The servers of the credential's project's Heat stacks (SDD §10, plan task N2): `ok` with
+        nothing when the catalog has no Heat; refused (403) or failed, `unknown` with nothing of it
+        kept - a partial read would guess -, its kind logged, never a name."""
+        try:
+            return StackRead(servers=_stack_places(_BudgetedGet(conn.orchestration)))
+        except Exception as exc:
+            if _not_in_catalog(exc):
+                return StackRead()
+            reason, detail = _read_failure(exc)
+            log.info("%s: Heat stacks not read: %s %s", self.provider.id, reason, detail)
+            return StackRead(status="unknown", reason=reason, detail=detail)
+
+    def _read_members(self, conn: Any, networks: Mapping[Any, str]) -> MemberRead:
+        """The members of the credential's project's Octavia pools (SDD §10, plan task N2), their
+        networks by ``networks`` (network id -> name) - none when the subnets cannot be read;
+        absent, refused or failed as ``_read_stacks``."""
+
+        def subnets() -> dict[str, str | None] | None:
+            return _try(
+                lambda: {
+                    str(_attr(s, "id")): networks.get(_attr(s, "network_id"))
+                    for s in conn.network.subnets()
+                },
+                None,
+            )
+
+        project = _attr(conn, "current_project_id", default=None)
+        try:
+            get = _BudgetedGet(conn.load_balancer)
+            return MemberRead(members=_pool_members(get, project, subnets))
+        except Exception as exc:
+            if _not_in_catalog(exc):
+                return MemberRead()
+            reason, detail = _read_failure(exc)
+            log.info("%s: Octavia pools not read: %s %s", self.provider.id, reason, detail)
+            return MemberRead(status="unknown", reason=reason, detail=detail)
 
     @staticmethod
     def _free_quota(conn: Any) -> dict[str, int | None]:
