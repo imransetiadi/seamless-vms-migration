@@ -21,7 +21,11 @@ from ..planning.preflight import (
     DnsRead,
     GpuCapacity,
     GpuPool,
+    MemberRead,
+    PoolMember,
     SourceInventory,
+    StackPlace,
+    StackRead,
 )
 from .base import ProviderError, VMNotFound
 
@@ -84,6 +88,27 @@ _FLAVORS = {
 DEMO_DNS_DOMAIN = "example.com."
 #: the Designate zones the demo destination holds
 DEMO_DNS_ZONES = ("internal.example.org.",)
+
+# the demo's network cut-over (SDD §10, §23.9, plan task N11)
+#: the source's Heat stack: web-01 a server resource, the Tomcat pair its autoscaling group's
+DEMO_STACK = "example-portal"
+DEMO_STACK_SERVERS = {
+    "web-01": ("portal_web", None),
+    "app-01": ("app_group", "app_group"),
+    "app-02": ("app_group", "app_group"),
+}
+#: the source's Octavia pools, by id: their load balancer, members (VM names) and protocol port
+DEMO_PORTAL_POOL = "example-portal-pool"
+DEMO_SOURCE_POOLS = {
+    DEMO_PORTAL_POOL: ("example-portal-lb", ("web-01", "web-02", "web-03"), 80),
+    "example-api-pool": ("example-api-lb", ("api-gw-01",), 8443),
+}
+#: the pool the finance plan maps the portal pool to, on the destination's amphora load balancer
+DEMO_DESTINATION_POOL = "example-portal-pool-rhoso"
+#: the VM whose record the demo destination's Designate holds, and the address its NIC override
+#: gives it there (SDD §10)
+DEMO_DNS_VM = "ledger-web-01"
+DEMO_DNS_NEW_ADDRESS = "10.20.1.133"
 
 # 24 OpenStack VMs of the "Finance apps" estate (RHOSP 17.1).
 _OPENSTACK: tuple[_Spec, ...] = (
@@ -286,6 +311,70 @@ def _mac(rng: random.Random) -> str:
     return "fa:16:3e:" + ":".join(f"{rng.randrange(256):02x}" for _ in range(3))
 
 
+def _openstack_address(name: str) -> str:
+    """A demo OpenStack VM's fixed IP, as _openstack_vm gives it (SDD §10)."""
+    index, spec = next((i, s) for i, s in enumerate(_OPENSTACK) if s.name == name)
+    return f"10.20.{1 if spec.network == 'finance-app' else 2}.{10 + index}"
+
+
+def _pool_facts(name: str, balancer: str) -> dict[str, Any]:
+    """A demo Octavia pool as lb_pool reads it (SDD §8.5, §10): HTTP behind an amphora."""
+    return {
+        "name": name,
+        "protocol": "HTTP",
+        "lb_algorithm": "ROUND_ROBIN",
+        "persistence": None,
+        "monitor": "HTTP",
+        "listeners": ["HTTP"],
+        "provider": "amphora",
+        "load_balancer": balancer,
+    }
+
+
+class _DemoOctavia:
+    """A demo cloud's Octavia pools for the member helper (SDD §8.5, §10): each pool's facts and
+    members by id; a change is ACTIVE at once."""
+
+    _pools: dict[str, dict[str, Any]]
+
+    async def lb_pool(self, pool_id: str) -> dict[str, Any] | None:
+        pool = self._pools.get(pool_id)
+        if pool is None:
+            return None
+        facts = {k: v for k, v in pool["facts"].items() if k != "load_balancer"}
+        return {**facts, "id": pool_id}
+
+    async def pool_members(self, pool_id: str) -> list[dict[str, Any]]:
+        pool = self._pools.get(pool_id)
+        return [] if pool is None else [{**m, "id": i} for i, m in pool["members"].items()]
+
+    async def set_pool_member(self, pool_id: str, member_id: str, admin_state_up: bool) -> None:
+        member = self._pools.get(pool_id, {}).get("members", {}).get(member_id)
+        if member is None:
+            raise ProviderError(f"Octavia holds no member {member_id} in pool {pool_id}")
+        member["admin_state_up"] = admin_state_up
+
+    async def add_pool_member(self, pool_id: str, address: str, protocol_port: int) -> str:
+        pool = self._pools.get(pool_id)
+        if pool is None:
+            raise ProviderError(f"Octavia holds no pool {pool_id}")
+        member_id = _stable_id("member", f"{pool_id}-{address}-{protocol_port}")
+        pool["members"][member_id] = _member(address, protocol_port)
+        return member_id
+
+    async def delete_pool_member(self, pool_id: str, member_id: str) -> None:
+        self._pools.get(pool_id, {}).get("members", {}).pop(member_id, None)
+
+
+def _member(address: str, port: int) -> dict[str, Any]:
+    return {
+        "address": address,
+        "protocol_port": port,
+        "admin_state_up": True,
+        "provisioning_status": "ACTIVE",
+    }
+
+
 def _openstack_vm(spec: _Spec, rng: random.Random, index: int) -> VMRef:
     vcpus, ram, flavor_disk = _FLAVORS[spec.flavor]
     disks: list[Disk] = []
@@ -409,27 +498,7 @@ class _FloatingIPs:
         self._floating.pop(address, None)
 
 
-class _Octavia:
-    """A fake's Octavia for the member helper (SDD §8.5, §10): the demo holds no pool yet (its load
-    balancer comes with plan task N11), so a mapped pool has no member to move."""
-
-    async def lb_pool(self, pool_id: str) -> dict[str, Any] | None:
-        return None
-
-    async def pool_members(self, pool_id: str) -> list[dict[str, Any]]:
-        return []
-
-    async def set_pool_member(self, pool_id: str, member_id: str, admin_state_up: bool) -> None:
-        raise ProviderError(f"Octavia holds no pool {pool_id}")
-
-    async def add_pool_member(self, pool_id: str, address: str, protocol_port: int) -> str:
-        raise ProviderError(f"Octavia holds no pool {pool_id}")
-
-    async def delete_pool_member(self, pool_id: str, member_id: str) -> None:
-        return None
-
-
-class FakeSourceProvider(_FloatingIPs, _Octavia):
+class FakeSourceProvider(_FloatingIPs, _DemoOctavia):
     def __init__(self, kind: ProviderKind | str, seed: int = 42) -> None:
         self.kind = ProviderKind(kind)
         self.seed = seed
@@ -449,14 +518,32 @@ class FakeSourceProvider(_FloatingIPs, _Octavia):
             for i, nic in enumerate(vm.nics)
             for address in nic.floating_ips
         }
+        #: its Octavia pools and their members, the OpenStack source's alone (SDD §10, N11)
+        self._pools: dict[str, dict[str, Any]] = (
+            {
+                pool: {
+                    "facts": _pool_facts(pool, balancer),
+                    "members": {
+                        _stable_id("member", f"{pool}-{name}"): _member(
+                            _openstack_address(name), port
+                        )
+                        for name in names
+                    },
+                }
+                for pool, (balancer, names, port) in DEMO_SOURCE_POOLS.items()
+            }
+            if self.kind != ProviderKind.vmware
+            else {}
+        )
 
     def adopt(self, old: FakeSourceProvider) -> None:
         """Rebuilt for a changed provider document (SDD §10): its VMs keep the power states the
-        replaced fake gave them - the same states, which a call on either changes -, and their
-        floating IPs where the replaced fake left them."""
+        replaced fake gave them - the same states, which a call on either changes -, their
+        floating IPs where the replaced fake left them, and its pools' members as they are."""
         if old.kind == self.kind:
             self._power = old._power
             self._floating = old._floating
+            self._pools = old._pools
 
     def _as_now(self, vm: VMRef) -> VMRef:
         copy = vm.model_copy(deep=True)
@@ -522,8 +609,34 @@ class FakeSourceProvider(_FloatingIPs, _Octavia):
     async def inventory(self) -> SourceInventory:
         if self.kind == ProviderKind.vmware:
             return SourceInventory(networks={"DC2-Prod": None, "DC2-DMZ": None}, projects=["DC2"])
+        # its Heat stack and Octavia pools, as an OpenStack source reads them (SDD §10, N11)
+        ids = {vm.name: vm.source_id for vm in self._vms}
+        servers = {
+            ids[name]: StackPlace(
+                stack=DEMO_STACK,
+                resource=resource,
+                group=group,
+                group_type="OS::Heat::AutoScalingGroup" if group else None,
+            )
+            for name, (resource, group) in DEMO_STACK_SERVERS.items()
+        }
+        members = [
+            PoolMember(
+                load_balancer=balancer,
+                pool=pool,
+                pool_id=pool,
+                address=_openstack_address(name),
+                port=port,
+                network="finance-app",
+            )
+            for pool, (balancer, names, port) in DEMO_SOURCE_POOLS.items()
+            for name in names
+        ]
         return SourceInventory(
-            networks={"finance-app": 1500, "finance-db": 9000}, projects=["finance"]
+            networks={"finance-app": 1500, "finance-db": 9000},
+            projects=["finance"],
+            stacks=StackRead(servers=servers),
+            lb_members=MemberRead(members=members),
         )
 
 
@@ -594,9 +707,34 @@ class _DestinationCloud:
     tenant_reads: int = 0
     #: its project's floating IPs by address: the port each is on, None detached (SDD §8.3)
     floating: dict[str, str | None] = field(default_factory=dict)
+    #: its Octavia pools: the one the finance plan maps the portal pool to, empty (SDD §10, N11)
+    pools: dict[str, dict[str, Any]] = field(
+        default_factory=lambda: {
+            DEMO_DESTINATION_POOL: {
+                "facts": _pool_facts(DEMO_DESTINATION_POOL, "example-portal-lb-rhoso"),
+                "members": {},
+            }
+        }
+    )
+    #: its Designate recordsets by (zone, name, type): ledger-web-01's record (SDD §10, N11)
+    recordsets: dict[tuple[str, str, str], dict[str, Any]] = field(
+        default_factory=lambda: {
+            (
+                DEMO_DNS_ZONES[0],
+                f"{DEMO_DNS_VM}.{DEMO_DNS_ZONES[0]}",
+                "A",
+            ): {
+                "zone_id": _stable_id("zone", DEMO_DNS_ZONES[0]),
+                "id": _stable_id("recordset", DEMO_DNS_VM),
+                "records": [_openstack_address(DEMO_DNS_VM)],
+                "ttl": 300,
+                "status": "ACTIVE",
+            }
+        }
+    )
 
 
-class FakeDestinationProvider(_FloatingIPs, _Octavia):
+class FakeDestinationProvider(_FloatingIPs, _DemoOctavia):
     def __init__(self, seed: int = 42, provider: Provider | None = None) -> None:
         self.seed = seed
         #: the demo provider it stands for: its kind, declared series and profile (SDD §10)
@@ -608,6 +746,10 @@ class FakeDestinationProvider(_FloatingIPs, _Octavia):
         credential (SDD §10): it takes over the replaced fake's cloud, its servers, their GPU
         units and the gate's reads, which a call on either fake changes from then on."""
         self._cloud = old._cloud
+
+    @property
+    def _pools(self) -> dict[str, dict[str, Any]]:  # type: ignore[override]
+        return self._cloud.pools
 
     @property
     def deleted(self) -> set[str]:
@@ -911,11 +1053,17 @@ class FakeDestinationProvider(_FloatingIPs, _Octavia):
         return f"port-{server_id}" if server_id in self._cloud.servers else None
 
     async def dns_recordset(self, zone: str, name: str, rdtype: str) -> dict[str, Any] | None:
-        """SDD §8.4, §10: the demo's Designate holds its zones without a recordset - a swap finds
-        nothing to move (a conflict) and the migration goes on."""
-        return None
+        """SDD §8.4, §10: the demo's Designate holds ledger-web-01's record in internal.example.org.
+        (plan task N11); another name has none - a swap finds nothing to move, a conflict."""
+        found = self._cloud.recordsets.get((zone, name, rdtype))
+        return None if found is None else {**found, "records": list(found["records"])}
 
     async def update_dns_recordset(
         self, zone_id: str, recordset_id: str, records: list[str]
     ) -> None:
+        """The recordset's records replaced, ACTIVE at once (SDD §8.4, §10)."""
+        for found in self._cloud.recordsets.values():
+            if (found["zone_id"], found["id"]) == (zone_id, recordset_id):
+                found["records"] = list(records)
+                return
         raise ProviderError(f"Designate holds no recordset {recordset_id} in zone {zone_id}")

@@ -831,3 +831,108 @@ async def test_the_cutover_refusal_demo_vm_is_left_for_the_operator_to_plan(tmp_
     assert portal.source_id not in held
     # dc2-ml-02 and dc2-cuda-01 stay unplanned too (SDD §10, §22.10)
     assert len(plans[VMWARE_PLAN].vm_ids) == len(inventory) - 3
+
+
+# -- the demo's network cut-over (SDD §10, §23.9, plan task N11) -------------------------------
+
+
+async def _run_finance(tmp_path, store, names, timeout=60.0):
+    """The seeded demo run until the finance migrations of ``names`` end (SDD §10)."""
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e6, demo_failure_rate=0.0, tick_s=0.01
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    orch = services.orchestrator
+    await orch.start()
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        ends = (Phase.completed, Phase.rolled_back, Phase.failed, Phase.cancelled)
+        while loop.time() < deadline:
+            mine = [m for m in store.list("migration", Migration) if m.vm.name in names]
+            if len(mine) == len(names) and all(m.phase in ends for m in mine):
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await orch.stop()
+    by_name = {m.vm.name: m for m in store.list("migration", Migration) if m.vm.name in names}
+    providers = {p.id: p for p in store.list("provider", Provider)}
+    source = orch.providers.get(providers["rhosp17-finance"])
+    destination = orch.providers.get(providers["rhoso18"])
+    return by_name, source, destination
+
+
+def _actions(store, m, action):
+    return [
+        (e.data["step"], e.data["outcome"])
+        for e in store.events(since_seq=0, migration_id=m.id, limit=10000)
+        if e.kind == "migration.action" and e.data.get("action") == action
+    ]
+
+
+async def test_the_demo_moves_a_floating_ip_with_its_address(tmp_path, store):
+    """SDD §8.3, §10 (plan task N11): the finance plan keeps web-01's floating IP's address -
+    reserved at the destination with the pre-staging, moved from the source's port to the new
+    server's after the stop -, and the portal pool's member helper drains and joins web-01."""
+    by_name, source, destination = await _run_finance(tmp_path, store, {"web-01"})
+    m = by_name["web-01"]
+    assert m.phase == Phase.completed
+    [move] = m.fip_moves
+    assert (move.address, move.state) == ("203.0.113.10", "moved")
+    assert destination._cloud.floating["203.0.113.10"] == f"port-{m.destination_server_id}"
+    assert source._floating["203.0.113.10"] is None
+    assert _actions(store, m, "floating_ip") == [("reserve", "succeeded"), ("move", "succeeded")]
+    # the member helper: drained at the source, joined at the destination (SDD §8.5)
+    [lb] = m.lb_moves
+    assert (lb.source_pool, lb.pool, lb.state) == (
+        "example-portal-pool",
+        "example-portal-pool-rhoso",
+        "joined",
+    )
+    assert _actions(store, m, "lb_member") == [("drain", "succeeded"), ("join", "succeeded")]
+
+
+async def test_the_demo_swaps_a_dns_record(tmp_path, store):
+    """SDD §8.4, §10 (plan task N11): ledger-web-01's NIC override gives it 10.20.1.133 at the
+    destination, so the swap moves its record in the demo destination's Designate zone from its
+    source address to that one."""
+    by_name, _, destination = await _run_finance(tmp_path, store, {"ledger-web-01"})
+    m = by_name["ledger-web-01"]
+    assert m.phase == Phase.completed
+    swap = m.dns_swap
+    assert (swap.name, swap.old, swap.new, swap.state) == (
+        "ledger-web-01.internal.example.org.",
+        m.vm.nics[0].fixed_ips[0],
+        "10.20.1.133",
+        "swapped",
+    )
+    record = await destination.dns_recordset(
+        "internal.example.org.", "ledger-web-01.internal.example.org.", "A"
+    )
+    assert (record["records"], record["ttl"], record["status"]) == (["10.20.1.133"], 300, "ACTIVE")
+    assert _actions(store, m, "dns") == [("swap", "succeeded")]
+
+
+async def test_the_demo_shows_the_heat_and_octavia_findings(tmp_path, store):
+    """SDD §9.3, §10 (plan task N11): the seeded finance plan's validation warns of web-01's
+    place in the example-portal stack, of app-01's and app-02's in its autoscaling group - which
+    the plan acknowledges, so neither is blocked -, and of api-gw-01's membership of a pool the
+    plan does not map; the portal pool's members are the helper's."""
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e7, demo_failure_rate=0.0
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    findings = {
+        m.vm.name: {f.code: f for f in m.findings} for m in store.list("migration", Migration)
+    }
+    assert "SRC_VM_HEAT_STACK" in findings["web-01"]
+    for name in ("app-01", "app-02"):
+        autoscaled = findings[name]["SRC_VM_AUTOSCALED"]
+        assert autoscaled.severity == "warning"
+        assert autoscaled.message.endswith("The plan acknowledges it (acknowledged_findings).")
+    assert "SRC_VM_LB_MEMBER" in findings["api-gw-01"]
+    for name in ("web-01", "web-02", "web-03"):
+        assert "SRC_VM_LB_MEMBER" not in findings[name]
+    assert not [m for m in store.list("migration", Migration) if m.phase == Phase.blocked]

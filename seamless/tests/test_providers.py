@@ -4122,8 +4122,9 @@ def source_cloud(tmp_path, **kw):
 async def test_a_source_without_heat_or_octavia_reads_no_stack_and_no_member(tmp_path):
     """SDD §10, §9.3 (plan task N2): a source whose catalog has neither Heat nor Octavia has no
     stack and no pool member to read - both reads are ok and empty, nothing is sent to either
-    service, and the inventory goes on; nor do a VMware source and the demo's source read them,
-    so the pre-flight finds none of the Heat and Octavia codes for their VMs."""
+    service, and the inventory goes on; nor does the demo's VMware source read them, so the
+    pre-flight finds none of the Heat and Octavia codes for its VMs - the demo's OpenStack source
+    reads its stack and pools (plan task N11, tests/test_demo.py)."""
     from seamless_migrate.planning.preflight import MemberRead, StackRead
 
     cloud, src = source_cloud(tmp_path)
@@ -4134,12 +4135,8 @@ async def test_a_source_without_heat_or_octavia_reads_no_stack_and_no_member(tmp
     assert (inv.lb_members.status, inv.lb_members.members) == ("ok", [])
     hosts = {urllib.parse.urlsplit(url).netloc for _, url in cloud.seen}
     assert not hosts & {"orchestration.example.org", "load-balancer.example.org"}
-    for fake in (
-        FakeSourceProvider(ProviderKind.openstack),
-        FakeSourceProvider(ProviderKind.vmware),
-    ):
-        inv = await fake.inventory()
-        assert (inv.stacks, inv.lb_members) == (StackRead(), MemberRead())
+    inv = await FakeSourceProvider(ProviderKind.vmware).inventory()
+    assert (inv.stacks, inv.lb_members) == (StackRead(), MemberRead())
     assert SourceInventory().stacks == StackRead() and SourceInventory().lb_members == MemberRead()
 
 

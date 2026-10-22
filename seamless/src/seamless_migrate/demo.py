@@ -16,8 +16,11 @@ from .domain.enums import DecisionType, Phase, ProviderKind, ProviderRole
 from .domain.models import (
     AdvisorPolicy,
     ConversionHostConfig,
+    DnsTarget,
     Mappings,
     Migration,
+    NetworkCutover,
+    NicOverride,
     Plan,
     PolicyScope,
     Provider,
@@ -27,7 +30,15 @@ from .executors.simulated import server_flavor
 from .orchestrator import Orchestrator
 from .planning.probes import is_database, suggest_probes
 from .providers.base import ProviderError
-from .providers.fake import FakeSourceProvider
+from .providers.fake import (
+    DEMO_DESTINATION_POOL,
+    DEMO_DNS_NEW_ADDRESS,
+    DEMO_DNS_VM,
+    DEMO_DNS_ZONES,
+    DEMO_PORTAL_POOL,
+    DEMO_STACK_SERVERS,
+    FakeSourceProvider,
+)
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -123,6 +134,8 @@ async def _plans(settings: Settings) -> list[Plan]:
     # the finance plan probes its databases' services (ADV-18, SDD §7.4); the VMware plan probes
     # nothing, so its validation warns about its database VMs (APP_PROBE_MISSING)
     probed = {vm.source_id: suggest_probes(vm) for vm in planned if is_database(vm)}
+    by_name = {vm.name: vm for vm in finance_vms}
+    renamed = by_name[DEMO_DNS_VM]
     return [
         Plan(
             name=FINANCE_PLAN,
@@ -142,6 +155,30 @@ async def _plans(settings: Settings) -> list[Plan]:
             keep_warm_interval_s=120,
             verification=VerificationConfig(timeout_s=120),
             probe_overrides={vm_id: probes for vm_id, probes in probed.items() if probes},
+            # every network cut-over rule runs in the demo (SDD §10, §23.9, plan task N11):
+            # web-01's floating IP keeps its address, ledger-web-01's record moves to the
+            # address its NIC override gives it, and the portal pool's members move with
+            # the member helper
+            network_cutover=NetworkCutover(
+                floating_ips="keep_address",
+                dns_targets={
+                    renamed.source_id: DnsTarget(
+                        kind="designate", zone=DEMO_DNS_ZONES[0], record=DEMO_DNS_VM
+                    )
+                },
+                lb_pools={DEMO_PORTAL_POOL: DEMO_DESTINATION_POOL},
+            ),
+            nic_overrides={
+                renamed.source_id: {
+                    str(renamed.nics[0].mac): NicOverride(fixed_ips=[DEMO_DNS_NEW_ADDRESS])
+                }
+            },
+            # the portal's autoscaled pair is the plan's to move (owner decision 9)
+            acknowledged_findings={
+                by_name[name].source_id: ["SRC_VM_AUTOSCALED"]
+                for name, (_, group) in DEMO_STACK_SERVERS.items()
+                if group
+            },
         ),
         Plan(
             name=VMWARE_PLAN,
