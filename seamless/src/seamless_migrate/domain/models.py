@@ -1395,6 +1395,9 @@ class Migration(_Model):
     attempts: int = 0
     #: each retried attempt's strategy, oldest first: the evidence names them (SDD §14.4)
     attempt_strategies: list[Strategy] = Field(default_factory=list)
+    #: the reverts a rollback owes: the revert of each hook that ran with success at pre_stop,
+    #: post_create or post_verify since the last rollback, in run order (SDD §4.2, §8.2)
+    hook_reverts: list[str] = Field(default_factory=list)
     created_at: UTCDateTime = Field(default_factory=utcnow)
     updated_at: UTCDateTime = Field(default_factory=utcnow)
 

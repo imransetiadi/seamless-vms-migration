@@ -847,6 +847,9 @@ export interface Migration {
   attempts: number;
   /** Each retried attempt's strategy, oldest first: the evidence names them (SDD §4.2, §14.4). */
   attempt_strategies: Strategy[];
+  /** The reverts a rollback owes: the revert of each hook that ran with success since the last rollback, in run order
+   * (SDD §4.2, §8.2); older answers omit it. */
+  hook_reverts?: string[];
   created_at: Timestamp;
   updated_at: Timestamp;
 }
