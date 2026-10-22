@@ -429,6 +429,17 @@ export interface FipMove {
   state: 'releasing' | 'released' | 'moved' | 'returned' | 'finalized';
 }
 
+/** The journal of a migration's DNS swap (SDD §4.2, §8.4): its record moved from the VM's address at the source to the
+ * one taking its place. */
+export interface DnsSwap {
+  /** The record's fully qualified name. */
+  name: string;
+  rdtype: 'A' | 'AAAA';
+  old: string;
+  new: string;
+  state: 'swapping' | 'swapped' | 'unchanged' | 'conflict' | 'reverted';
+}
+
 /** Where a migration runs a plan's hooks (SDD §4.2, §23.3). */
 export type HookPoint = 'pre_stop' | 'post_create' | 'post_verify' | 'on_rollback' | 'on_finalize';
 
@@ -860,6 +871,8 @@ export interface Migration {
   hook_reverts?: string[];
   /** The journal of its floating IPs' keep-address move (SDD §4.2, §8.3); older answers omit it. */
   fip_moves?: FipMove[];
+  /** The journal of its DNS target's swap (SDD §4.2, §8.4); null without one, older answers omit it. */
+  dns_swap?: DnsSwap | null;
   created_at: Timestamp;
   updated_at: Timestamp;
 }

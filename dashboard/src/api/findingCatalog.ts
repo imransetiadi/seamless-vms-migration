@@ -190,6 +190,11 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     strategies: [],
     remediation: 'Keep only addresses the destination can hold: an address of a subnet of its external network, free there or held detached by the destination credential\'s project, a token with a role that may choose a floating IP\'s address, and the quota for them - or let the plan take new addresses (network_cutover.floating_ips "auto").',
   },
+  NET_DNS_TTL_LONG: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Lower the record\'s TTL below the plan\'s downtime SLO well before the window - a pre_stop hook may do it - or accept that clients keep the old address until the TTL runs out.',
+  },
   VM_PCI_PASSTHROUGH: {
     severity: 'blocker',
     strategies: [],
