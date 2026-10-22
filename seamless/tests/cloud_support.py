@@ -32,6 +32,9 @@ CATALOG = {
 }
 #: where the catalog lists Placement, when a cloud has one
 PLACEMENT_URL = "https://placement.example.org"
+#: where the catalog lists Heat and Octavia, when a cloud has them (SDD §10, plan task N2)
+HEAT_URL = "https://orchestration.example.org/v1/p1"
+OCTAVIA_URL = "https://load-balancer.example.org"
 
 
 @dataclass
@@ -46,7 +49,12 @@ class InProcessCloud:
     are what ``GET /flavors/detail`` lists (``{name, vcpus, ram, disk, extra_specs}``).
     ``placement`` gives Placement's answers by path (``/allocation_candidates``: ``(status, body)``)
     and puts Placement in the catalog at ``placement_url``; ``placement_seen`` records each request
-    it answers with its headers. ``connect`` is what OpenStackProvider takes as ``connect_fn``."""
+    it answers with its headers. ``heat`` and ``octavia`` give Heat's and Octavia's answers by path
+    below their endpoints (``/stacks``, ``/v2.0/lbaas/pools``: ``(status, body)``, or an exception
+    the transport raises) and put them in the catalog; ``heat_seen`` and ``octavia_seen`` record
+    each request's path and query. ``networks``, ``subnets`` and ``keypairs`` are what Neutron's and
+    Nova's lists answer, as a source's inventory reads them. ``connect`` is what OpenStackProvider
+    takes as ``connect_fn``."""
 
     root: Path
     compute: str = "2.96"
@@ -61,6 +69,13 @@ class InProcessCloud:
     placement: dict[str, tuple[int, Any]] | None = None
     placement_url: str = PLACEMENT_URL
     placement_seen: list[tuple[str, str, dict[str, str]]] = field(default_factory=list)
+    heat: dict[str, Any] | None = None
+    heat_seen: list[tuple[str, dict[str, list[str]]]] = field(default_factory=list)
+    octavia: dict[str, Any] | None = None
+    octavia_seen: list[tuple[str, dict[str, list[str]]]] = field(default_factory=list)
+    networks: list[dict[str, Any]] = field(default_factory=list)
+    subnets: list[dict[str, Any]] = field(default_factory=list)
+    keypairs: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         pytest.importorskip("requests")
@@ -82,6 +97,10 @@ class InProcessCloud:
         urls = {**CATALOG, **self.catalog}
         if self.placement is not None:
             urls["placement"] = self.placement_url
+        if self.heat is not None:
+            urls["orchestration"] = HEAT_URL
+        if self.octavia is not None:
+            urls["load-balancer"] = OCTAVIA_URL
         token = {
             "token": {
                 "methods": ["password"],
@@ -180,12 +199,20 @@ class InProcessCloud:
         from seamless_migrate.providers.openstack import connect
 
         routes, seen = self._routes(), self.seen
-        answers = (self._servers_answer, self._flavors_answer, self._placement_answer)
+        answers = (
+            self._servers_answer,
+            self._flavors_answer,
+            self._placement_answer,
+            self._service_answer,
+            self._lists_answer,
+        )
 
         class Transport(requests.adapters.BaseAdapter):
             def send(self, request, **kwargs):
                 seen.append((request.method, request.url))
                 answer = next((a for a in (f(request) for f in answers) if a), None)
+                if isinstance(answer, BaseException):
+                    raise answer
                 status, body, headers = answer or routes.get(
                     (request.method, request.url.rstrip("/")), (404, {"error": "none"}, {})
                 )
@@ -232,6 +259,42 @@ class InProcessCloud:
         self.placement_seen.append((request.method, request.url, dict(request.headers)))
         status, body = self.placement.get(path, (404, {"errors": []}))
         return status, body, {}
+
+    def _service_answer(self, request: Any) -> Any:
+        """Heat's or Octavia's answer to a request below its endpoint, by path - an exception for
+        the transport to raise; None for any other request (SDD §10, plan task N2)."""
+        parts = urllib.parse.urlsplit(request.url)
+        url = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")
+        for root, answers, seen in (
+            (HEAT_URL, self.heat, self.heat_seen),
+            (OCTAVIA_URL, self.octavia, self.octavia_seen),
+        ):
+            if answers is None or not url.startswith(root + "/"):
+                continue
+            path = url[len(root) :]
+            seen.append((path, urllib.parse.parse_qs(parts.query)))
+            answer = answers.get(path, (404, {"error": "none"}))
+            if isinstance(answer, BaseException):
+                return answer
+            status, body = answer
+            return status, body, {}
+        return None
+
+    def _lists_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
+        """Neutron's network and subnet lists and Nova's keypairs, as a source's inventory reads
+        them; None for any other request."""
+        urls = {**CATALOG, **self.catalog}
+        parts = urllib.parse.urlsplit(request.url)
+        url = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")
+        network, compute = urls["network"].rstrip("/"), urls["compute"].rstrip("/")
+        lists = {
+            network + "/v2.0/networks": {"networks": self.networks},
+            network + "/v2.0/subnets": {"subnets": self.subnets},
+            compute + "/os-keypairs": {"keypairs": [{"keypair": k} for k in self.keypairs]},
+        }
+        if request.method != "GET" or url not in lists:
+            return None
+        return 200, lists[url], {}
 
     def _servers_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
         """Nova's answer to a list of the project's servers, None for any other request."""

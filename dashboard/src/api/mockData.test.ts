@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import eligibilityRaw from '../../../seamless/tests/fixtures/eligibility_cases.json?raw';
 import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, gpuFlavorsOf, iso, makeVm, preflight, quotaShare, readDestinationGpus, replaceNames } from './mockData';
+import type { MemberRead, StackRead } from './mockData';
 import { gpuRequests } from '../lib/gpu';
 import { capabilityRoles } from '../lib/networks';
 import type { DestinationFlavor, DestinationInventory, DestinationNetwork, DestinationSubnet, Finding, GpuCapacity, GpuCheckReport, Phase, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
@@ -636,7 +637,11 @@ interface FindingCase {
   others?: VMRef[];
   /** the source provider's kind, openstack when not given */
   source_kind?: ProviderKind;
-  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'> & Partial<Pick<Plan, 'mappings' | 'prestage_resources'>>;
+  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'> & Partial<Pick<Plan, 'mappings' | 'prestage_resources' | 'acknowledged_findings'>>;
+  /** a Heat or Octavia case's source provider label (SDD §1 naming, §9.3) */
+  source_label?: string;
+  /** a Heat or Octavia case's source reads, as its inventory reads them (SDD §10, plan task N2) */
+  source_inventory?: { stacks?: StackRead; lb_members?: MemberRead };
   /**
    * a network case's destination: its label, networks, subnets, the token's roles and the policy profile; a GPU case's
    * its flavors too, the vGPU profiles it declares and its GPU capacity, as its inventory reads them (SDD §22.3)
@@ -806,6 +811,10 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
       ...(dest?.gpu_capacity ? { gpuCapacity: dest.gpu_capacity } : {}),
       shares: Object.fromEntries(Object.entries(c.phases ?? {}).map(([vmId, phase]) => [vmId, quotaShare(phase)])),
       gpuProfiles: c.gpu_profiles,
+      // a Heat or Octavia case's source, by its label, and its reads (SDD §9.3, §10, plan task N2)
+      source: c.source_label,
+      stacks: c.source_inventory?.stacks,
+      lbMembers: c.source_inventory?.lb_members,
     };
     const found = preflight(c.vm, c.source_kind ?? 'openstack', plan, networks, context);
     const messages = new Map(found.map((f) => [f.code, f.message]));

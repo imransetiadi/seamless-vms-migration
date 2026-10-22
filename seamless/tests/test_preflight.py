@@ -8,6 +8,7 @@ import pytest
 
 from seamless_migrate.domain.enums import Phase, ProviderKind, ProviderRole, Severity, Strategy
 from seamless_migrate.domain.models import (
+    ACKNOWLEDGEABLE_FINDINGS,
     DEFAULT_PRESTAGE,
     AppProbe,
     GpuDevice,
@@ -16,19 +17,26 @@ from seamless_migrate.domain.models import (
     Nic,
     VerificationConfig,
     VMRef,
+    invalid_plan_settings,
 )
 from seamless_migrate.planning.gpu import gpu_requests
 from seamless_migrate.planning.platforms import destination_release
 from seamless_migrate.planning.preflight import (
+    AUTOSCALED_ACKNOWLEDGED_REMEDIATION,
     CATALOG,
     KIT_TWIN_REMEDIATION,
     DestinationInventory,
     GpuCapacity,
     GpuPool,
+    MemberRead,
+    PoolMember,
     SourceInventory,
+    StackPlace,
+    StackRead,
     destination_flavor,
     fitting_flavor,
     flavor_prestaged,
+    has_blocker,
     quota_share,
     resolve_mappings,
     resource_demand,
@@ -154,6 +162,12 @@ def test_catalog_is_complete():
         "SRC_VM_VOLUME_DETACHED",
         "SRC_VM_MULTIATTACH",
         "SRC_VM_EPHEMERAL_ROOT",
+        # the Heat and Octavia codes (SDD §9.3, plan task N2)
+        "SRC_VM_HEAT_STACK",
+        "SRC_VM_AUTOSCALED",
+        "SRC_VM_HEAT_UNKNOWN",
+        "SRC_VM_LB_MEMBER",
+        "SRC_VM_LB_UNKNOWN",
         "MAP_NETWORK_MISSING",
         "MAP_NETWORK_PRESTAGED",
         "MAP_FLAVOR_MISSING",
@@ -282,6 +296,217 @@ def test_a_nova_task_in_flight_is_a_transitional_blocker_naming_the_task(power_s
     # a server in error with a task - a delete Nova runs on it - meets both conditions (SDD §9.3)
     codes = {x.code for x in check(make_vm(power_state="error", task_state="deleting"))}
     assert {"SRC_VM_ERROR_STATE", "SRC_VM_TRANSITIONAL_STATE"} <= codes
+
+
+#: the source's Heat and Octavia reads (SDD §10, plan task N2): synthetic names under example,
+#: addresses of the documentation ranges
+ASG = "OS::Heat::AutoScalingGroup"
+HEAT_CODES = ("SRC_VM_HEAT_STACK", "SRC_VM_AUTOSCALED", "SRC_VM_HEAT_UNKNOWN")
+LB_CODES = ("SRC_VM_LB_MEMBER", "SRC_VM_LB_UNKNOWN")
+
+
+def web_vm(**kw):
+    """A VM with one NIC on app-net at 192.0.2.10 and one on db-net at 2001:db8::10."""
+    nics = [
+        Nic(network="app-net", mac="fa:16:3e:00:00:01", fixed_ips=["192.0.2.10"], mtu=1500),
+        Nic(network="db-net", mac="fa:16:3e:00:00:02", fixed_ips=["2001:db8::10"], mtu=1500),
+    ]
+    return make_vm(**{"nics": nics, **kw})
+
+
+def stacked(**places):
+    """A source inventory whose Heat read holds each server's place (SDD §10)."""
+    return src_inv(stacks=StackRead(servers={k: StackPlace(**v) for k, v in places.items()}))
+
+
+def found_codes(findings, codes):
+    return [f.code for f in findings if f.code in codes]
+
+
+def test_finding_src_vm_heat_stack():
+    """SDD §9.3 (plan task N2): a VM whose server is a resource of a Heat stack at the source - the
+    stack is not moved, and a stack update there may recreate the server: a warning naming the
+    top-level stack and its resource. A ResourceGroup's member is a stack's resource, never an
+    autoscaling group's; a VM no stack holds gets nothing, nor one the read did not name."""
+    src = stacked(**{"vm-1": {"stack": "example-web", "resource": "web_server"}})
+    f = only(check(web_vm(), src=src), "SRC_VM_HEAT_STACK")
+    assert (f.severity, f.strategies) == (Severity.warning, [])
+    assert f.message == (
+        "web-01 belongs to Heat stack 'example-web' at RHOSP 17.1 (its resource 'web_server'): "
+        "the stack is not moved, and a stack update there may recreate the server."
+    )
+    assert f.remediation == CATALOG["SRC_VM_HEAT_STACK"].remediation
+    assert "runbook for Heat stacks" in f.remediation
+    assert found_codes(check(web_vm(), src=src), HEAT_CODES) == ["SRC_VM_HEAT_STACK"]
+    # a ResourceGroup's member: the read names no autoscaling group for it
+    group = stacked(**{"vm-1": {"stack": "example-web", "resource": "web_group"}})
+    assert found_codes(check(web_vm(), src=group), HEAT_CODES) == ["SRC_VM_HEAT_STACK"]
+    assert found_codes(check(web_vm(source_id="vm-2"), src=src), HEAT_CODES) == []
+    assert found_codes(check(web_vm()), HEAT_CODES) == []
+
+
+def test_finding_src_vm_autoscaled_blocks_until_acknowledged():
+    """SDD §9.3 (owner decision 9, §23.8): a member of a Heat autoscaling group is blocked - the
+    group may replace a server the cutover stopped, which leaves two live copies - until the plan
+    acknowledges it for the VM (plan.acknowledged_findings, §4.2). Acknowledged, it stays a
+    finding, a warning that says so, with its own remediation; another VM's acknowledgement, or a
+    plan acknowledging nothing, keeps it a blocker. The stack warning comes beside it."""
+    place = {"stack": "example-web", "resource": "web_asg", "group": "web_asg", "group_type": ASG}
+    src = stacked(**{"vm-1": place})
+    found = check(web_vm(), src=src)
+    assert found_codes(found, HEAT_CODES) == ["SRC_VM_HEAT_STACK", "SRC_VM_AUTOSCALED"]
+    f = only(found, "SRC_VM_AUTOSCALED")
+    assert (f.severity, f.strategies) == (Severity.blocker, [])
+    text = (
+        "web-01 is a member of autoscaling group 'web_asg' (OS::Heat::AutoScalingGroup) of Heat "
+        "stack 'example-web' at RHOSP 17.1: the group may replace the server once the cutover "
+        "stops it, which leaves two live copies."
+    )
+    assert f.message == text
+    assert f.remediation == CATALOG["SRC_VM_AUTOSCALED"].remediation
+    assert "acknowledged_findings" in f.remediation
+    assert has_blocker(found)
+    # the plan acknowledges it for the VM: a warning that names the acknowledgement
+    plan = make_plan(acknowledged_findings={"vm-1": ["SRC_VM_AUTOSCALED"]})
+    assert plan.acknowledged_findings == {"vm-1": ["SRC_VM_AUTOSCALED"]}
+    acknowledged = check(web_vm(), plan=plan, src=src)
+    f = only(acknowledged, "SRC_VM_AUTOSCALED")
+    assert f.severity == Severity.warning
+    assert f.message == f"{text} The plan acknowledges it (acknowledged_findings)."
+    assert f.remediation == AUTOSCALED_ACKNOWLEDGED_REMEDIATION
+    assert f.remediation != CATALOG["SRC_VM_AUTOSCALED"].remediation
+    assert not has_blocker(acknowledged)
+    # another VM's acknowledgement is not this one's
+    other = make_plan(acknowledged_findings={"vm-2": ["SRC_VM_AUTOSCALED"]})
+    assert only(check(web_vm(), plan=other, src=src), "SRC_VM_AUTOSCALED").severity == "blocker"
+    # an AWS autoscaling group counts alike
+    aws = stacked(**{"vm-1": {**place, "group_type": "AWS::AutoScaling::AutoScalingGroup"}})
+    assert only(check(web_vm(), src=aws), "SRC_VM_AUTOSCALED").severity == Severity.blocker
+
+
+def test_finding_src_vm_heat_unknown_when_heat_cannot_be_read():
+    """SDD §9.3, §10 (plan task N2): Heat refused the source credential, or its read failed -
+    whether the VM is a stack's resource or an autoscaling group's member is not known. A warning
+    naming why, never a guess and never a blocker; a source without Heat reads ok and says
+    nothing."""
+    refused = src_inv(stacks=StackRead(status="unknown", reason="forbidden", detail="HTTP 403"))
+    found = check(web_vm(), src=refused)
+    f = only(found, "SRC_VM_HEAT_UNKNOWN")
+    assert (f.severity, f.strategies) == (Severity.warning, [])
+    assert f.message == (
+        "Whether web-01 belongs to a Heat stack or an autoscaling group at RHOSP 17.1 is not "
+        "known: Heat refused the source credential (HTTP 403)."
+    )
+    assert found_codes(found, HEAT_CODES) == ["SRC_VM_HEAT_UNKNOWN"] and not has_blocker(found)
+    failed = src_inv(stacks=StackRead(status="unknown", reason="error", detail="ConnectTimeout"))
+    assert only(check(web_vm(), src=failed), "SRC_VM_HEAT_UNKNOWN").message == (
+        "Whether web-01 belongs to a Heat stack or an autoscaling group at RHOSP 17.1 is not "
+        "known: its read failed (ConnectTimeout)."
+    )
+
+
+def test_finding_src_vm_lb_member():
+    """SDD §9.3 (plan task N2): an address of the VM's NIC is a member of an Octavia pool at the
+    source - matched by its address as Neutron writes it, on the NIC's network when the read names
+    the member's -: one warning naming each membership, its address and port, pool and load
+    balancer. A member on another network, or of another address, is not the VM's."""
+    members = [
+        PoolMember(
+            load_balancer="example-lb",
+            pool="web-pool",
+            address="192.0.2.10",
+            port=443,
+            network="app-net",
+        ),
+        PoolMember(
+            load_balancer="example-lb",
+            pool="admin-pool",
+            address="192.0.2.10",
+            port=8443,
+            network=None,
+        ),
+        # the same address on another network: another project's VM, not this one
+        PoolMember(
+            load_balancer="other-lb",
+            pool="other-pool",
+            address="192.0.2.10",
+            port=80,
+            network="other-net",
+        ),
+        PoolMember(
+            load_balancer="example-lb",
+            pool="db-pool",
+            address="2001:db8::10",
+            port=5432,
+            network="db-net",
+        ),
+        PoolMember(
+            load_balancer="example-lb",
+            pool="web-pool",
+            address="192.0.2.11",
+            port=443,
+            network="app-net",
+        ),
+    ]
+    src = src_inv(lb_members=MemberRead(members=members))
+    f = only(check(web_vm(), src=src), "SRC_VM_LB_MEMBER")
+    assert (f.severity, f.strategies) == (Severity.warning, [])
+    assert f.message == (
+        "Addresses of web-01 are members of Octavia pools at RHOSP 17.1: 192.0.2.10 port 443 in "
+        "pool 'web-pool' of load balancer 'example-lb'; 192.0.2.10 port 8443 in pool 'admin-pool' "
+        "of load balancer 'example-lb'; 2001:db8::10 port 5432 in pool 'db-pool' of load balancer "
+        "'example-lb'. The memberships are not moved."
+    )
+    assert "runbook for Octavia load balancers" in f.remediation
+    assert f.remediation == CATALOG["SRC_VM_LB_MEMBER"].remediation
+    # an address written another way is the same address
+    long_form = web_vm(
+        nics=[Nic(network="db-net", mac="fa:16:3e:00:00:02", fixed_ips=["2001:0db8:0:0::10"])]
+    )
+    assert "2001:db8::10 port 5432" in only(check(long_form, src=src), "SRC_VM_LB_MEMBER").message
+    lonely = web_vm(
+        nics=[Nic(network="app-net", mac="fa:16:3e:00:00:03", fixed_ips=["192.0.2.99"])]
+    )
+    assert found_codes(check(lonely, src=src), LB_CODES) == []
+    assert found_codes(check(web_vm()), LB_CODES) == []
+
+
+def test_finding_src_vm_lb_unknown_when_octavia_cannot_be_read():
+    """SDD §9.3, §10 (plan task N2): Octavia refused the source credential, or its read failed -
+    whether an address of the VM is a pool member is not known: a warning naming why, never a
+    blocker."""
+    refused = src_inv(
+        lb_members=MemberRead(status="unknown", reason="forbidden", detail="HTTP 403")
+    )
+    found = check(web_vm(), src=refused)
+    f = only(found, "SRC_VM_LB_UNKNOWN")
+    assert (f.severity, f.strategies) == (Severity.warning, [])
+    assert f.message == (
+        "Whether addresses of web-01 are members of Octavia pools at RHOSP 17.1 is not known: "
+        "Octavia refused the source credential (HTTP 403)."
+    )
+    assert found_codes(found, LB_CODES) == ["SRC_VM_LB_UNKNOWN"] and not has_blocker(found)
+    failed = src_inv(lb_members=MemberRead(status="unknown", reason="error", detail="HTTP 503"))
+    assert only(check(web_vm(), src=failed), "SRC_VM_LB_UNKNOWN").message.endswith(
+        "is not known: its read failed (HTTP 503)."
+    )
+
+
+def test_a_plan_acknowledges_only_the_acknowledgeable_findings():
+    """SDD §4.2, §12 (plan task N2): plan.acknowledged_findings names, per VM, the codes the plan
+    acknowledges - SRC_VM_AUTOSCALED alone; any other code is refused before the plan is stored,
+    and a validation refuses a stored plan with one."""
+    assert ACKNOWLEDGEABLE_FINDINGS == frozenset({"SRC_VM_AUTOSCALED"})
+    fine = make_plan(acknowledged_findings={"vm-1": ["SRC_VM_AUTOSCALED"], "vm-2": []})
+    assert fine.acknowledged_findings == {"vm-1": ["SRC_VM_AUTOSCALED"], "vm-2": []}
+    assert invalid_plan_settings(fine) == []
+    wrong = make_plan(
+        acknowledged_findings={"vm-1": ["SRC_VM_HEAT_STACK", "SRC_VM_AUTOSCALED", "NOPE"]}
+    )
+    assert invalid_plan_settings(wrong) == [
+        "acknowledged_findings[vm-1]: SRC_VM_HEAT_STACK, NOPE cannot be acknowledged "
+        "(only SRC_VM_AUTOSCALED can)"
+    ]
 
 
 @pytest.mark.parametrize("quotas", [{}, None], ids=["quotas unreadable", "quotas read"])
@@ -3434,16 +3659,25 @@ def test_the_shared_handover_finding_cases(case):
     and `phases` the phase of the plan's migration of a VM that has one, by which its share is
     counted (quota_share, §9.3, §22.5). A code a case expects as null is not found (PR #64 review);
     `severities` and `remediations` give a finding's own where they are not its catalog's (a
-    MAP_GPU_FLAVOR warning, plan task G12)."""
+    MAP_GPU_FLAVOR warning, plan task G12). A Heat or Octavia case gives the source's label and its
+    inventory's reads, and the plan its acknowledgements (plan task N2)."""
     plan = make_plan(**case["plan"])
     vm = VMRef.model_validate(case["vm"])
     others = [VMRef.model_validate(other) for other in case.get("others", [])]
     source = VMWARE if case.get("source_kind") == "vmware" else SRC
     if "gpu_profiles" in case:
         source = source.model_copy(update={"gpu_profiles": case["gpu_profiles"]})
+    if "source_label" in case:
+        source = source.model_copy(update={"name": case["source_label"]})
     shares = {vm_id: quota_share(Phase(phase)) for vm_id, phase in case.get("phases", {}).items()}
     found = check(
-        vm, plan=plan, all_vms=[vm, *others], source=source, shares=shares, **_destination(case)
+        vm,
+        plan=plan,
+        src=_source_inventory(case),
+        all_vms=[vm, *others],
+        source=source,
+        shares=shares,
+        **_destination(case),
     )
     messages = {f.code: f.message for f in found}
     assert {code: messages.get(code) for code in case["expected"]} == case["expected"]
@@ -3494,6 +3728,27 @@ def test_the_kits_names_judge_a_vmware_sources_vms_only_and_once():
         make_vm(source_id="vm-6", name="веб"),
     )
     assert codes(japanese, [cyrillic], VMWARE) == ["SRC_VM_NAME_UNUSABLE"]
+
+
+def _source_inventory(case):
+    """check()'s source inventory for a Heat or Octavia case: its stacks and pool members as the
+    source's inventory reads them (SDD §10, plan task N2); the default one for any other case."""
+    reads = case.get("source_inventory")
+    if reads is None:
+        return None
+    stacks = reads.get("stacks", {})
+    members = reads.get("lb_members", {})
+    return src_inv(
+        stacks=StackRead(
+            **{
+                **stacks,
+                "servers": {k: StackPlace(**v) for k, v in stacks.get("servers", {}).items()},
+            }
+        ),
+        lb_members=MemberRead(
+            **{**members, "members": [PoolMember(**m) for m in members.get("members", [])]}
+        ),
+    )
 
 
 def _destination(case):

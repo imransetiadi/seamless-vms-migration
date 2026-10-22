@@ -583,6 +583,9 @@ def _rewrite_vm_id(plan: Plan, old: str, new: str) -> bool:
     # its ports keep their MACs (the rollback recreates them with theirs, §7.3)
     if old in plan.nic_overrides:
         plan.nic_overrides[new] = plan.nic_overrides.pop(old)
+    # what the plan acknowledges for the VM: a recreated server stays its group's member (§9.3)
+    if old in plan.acknowledged_findings:
+        plan.acknowledged_findings[new] = plan.acknowledged_findings.pop(old)
     return plan.model_dump() != before
 
 

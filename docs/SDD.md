@@ -301,6 +301,10 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
        probe_overrides: dict[str, list[AppProbe]] = {},   # per VM (source id): replaces verification.app_probes; [] = none (§7.5, ADV-18)
        nic_overrides: dict[str, dict[str, NicOverride]] = {},   # per VM (source id), per NIC MAC (lower case): its RHOSO
                                         # network and addresses; OpenStack sources (§7.2, §7.3, §9.2, §9.3)
+       acknowledged_findings: dict[str, list[str]] = {},   # per VM (source id): the pre-flight codes the plan
+                                        # acknowledges for it, each an acknowledgeable one - SRC_VM_AUTOSCALED alone
+                                        # (§9.3) -, else refused (422, §12); an acknowledged blocker stays a finding,
+                                        # a warning that says so (owner decision 9, §23.8, plan task N2)
        prestage_resources: list[str] = ["networks","subnets","routers","router_interfaces",
                                         "security_groups","security_group_rules"],   # each names os-migrate resources with an
                                         # export_<r>.yml/import_<r>.yml pair other than workloads (the
@@ -1998,7 +2002,7 @@ is journaled as *sent* with the new server's id as soon as Nova accepts it: a cr
 it resumes by waiting for that server instead of creating a second one on the same volumes (one Nova no longer
 knows is created again), and the rollback deletes a sent destination server before it unmanages the volumes it
 holds. A recreated source server has a new id, and the plan follows it — `vm_ids`, the waves'
-`vm_ids`, `strategy_overrides`, `probe_overrides` and `nic_overrides` (event `plan.updated`, data `{"vm_id_changed": {"from",
+`vm_ids`, `strategy_overrides`, `probe_overrides`, `nic_overrides` and `acknowledged_findings` (event `plan.updated`, data `{"vm_id_changed": {"from",
 "to"}}`) — in one transaction with the migration's new `vm` (§11), before the migration becomes `rolled_back`: a stop
 before it leaves both naming the old VM and resumes `rolling_back`, after it both name the new one, so a validation
 meanwhile never plans a second migration of the VM (audit OC-06), and a rolled-back migration's plan never names a VM
@@ -2455,6 +2459,11 @@ Finding catalog (code — severity — condition):
 | `SRC_VM_NAME_UNUSABLE` | blocker | a VMware VM's name of which the migration kit keeps no character (§7.2's `<kit name>` is empty: Japanese, Cyrillic, punctuation): the kit would create its server, ports and volumes without a name, after its migrate task powered the VM off (review RV26-04) |
 | `SRC_VM_MULTIATTACH` | warning (warm, storage_handover) | any multi-attach disk |
 | `SRC_VM_EPHEMERAL_ROOT` | info (warm) | root disk `image_root`/`ephemeral` |
+| `SRC_VM_HEAT_STACK` | warning | the VM's server is a resource of a Heat stack of the source (`SourceInventory.stacks`, §10: a resource of the stack, or of a stack nested in it, has the server's id as its `physical_resource_id`): the stack is not moved, and a stack update at the source may recreate the server. The message names the top-level stack and its resource the server is, or is nested under |
+| `SRC_VM_AUTOSCALED` | blocker; **warning** when the plan acknowledges it (`plan.acknowledged_findings[vm.source_id]` lists it, §4.2) | the VM's server is a member of an autoscaling group: a resource it is nested under is of type `OS::Heat::AutoScalingGroup` or `AWS::AutoScaling::AutoScalingGroup`, the groups a scaling policy (`OS::Heat::ScalingPolicy`, `AWS::AutoScaling::ScalingPolicy`) resizes on an alarm's signal, without a stack update - so the source may replace a server the cutover stopped, which leaves two live copies (owner decision 9, §23.8). An `OS::Heat::ResourceGroup` changes its size only by a stack update, which `SRC_VM_HEAT_STACK` warns of: its member is not autoscaled. The message names the group, its type and the stack; acknowledged, it adds that the plan acknowledges it, and its remediation is to keep the group's scaling suspended until the VM is finalized |
+| `SRC_VM_HEAT_UNKNOWN` | warning | an OpenStack source's Heat stacks could not be read (`SourceInventory.stacks` is `unknown`, §10: Heat refused the credential, or another failure, which the message names by its HTTP status or its kind): whether the VM belongs to a stack or an autoscaling group is not known. Nothing is guessed, and the VM is not blocked; a source whose catalog has no Heat has no stack and reads `ok` |
+| `SRC_VM_LB_MEMBER` | warning | an address of the VM's NIC is a member of an Octavia pool of the source (`SourceInventory.lb_members`, §10: a member whose address is one of the NIC's fixed IPs, on the NIC's network when the read names the member's): the membership is not moved, so the load balancer keeps sending to the stopped source. The message names each membership - the address and port, the pool and its load balancer |
+| `SRC_VM_LB_UNKNOWN` | warning | an OpenStack source's Octavia pools could not be read (`SourceInventory.lb_members` is `unknown`, as for `SRC_VM_HEAT_UNKNOWN`): whether an address of the VM is a pool member is not known; a source whose catalog has no Octavia has no member and reads `ok` |
 | `MAP_NETWORK_MISSING` | blocker | a NIC network has no mapping and no same-named destination network, and `"networks"` is not in `plan.prestage_resources` (when it is — and the source is OpenStack; VMware sources have no pre-stage step — emit `MAP_NETWORK_PRESTAGED` — info — instead: the network will be created with the same name); also when a mapping's *target* network does not exist in the destination |
 | `MAP_FLAVOR_PRESTAGED` | info | `"flavors"` is in `plan.prestage_resources`, the source is OpenStack, the VM has no GPU (§22.4: pre-staging never creates a GPU VM's flavor), and the VM's flavor has no mapping and no same-named destination flavor: pre-staging creates it in RHOSO with the same name, size and extra specs, so nothing is matched automatically (`resolved_mappings` stays empty for it, and neither `MAP_FLAVOR_MISSING` nor `MAP_FLAVOR_AUTO` is emitted) |
 | `MAP_FLAVOR_MISSING` | blocker | no flavor mapping and no destination flavor with ≥ vcpus, ≥ ram, ≥ root disk — flavors carrying `pci_passthrough:*`, `resources:*`, `trait:*` (or their request-group forms `resources<suffix>:*`, `trait<suffix>:*`, review PL-08) or `aggregate_instance_extra_specs:*` extra specs are never matched automatically (when one fits, the smallest fitting flavor is recorded in `Migration.resolved_mappings.flavors` and `MAP_FLAVOR_AUTO` names it: info, or **warning** when the source flavor carries `hw:*` extra specs the match drops; VMware VMs carry no flavor and get no `MAP_FLAVOR_AUTO`, the migration kit sizes the server); also when a mapping's *target* flavor does not exist in the destination. A GPU VM (§22.4) gets it only for a mapped flavor that does not exist - its flavor mapping, or for a VMware VM the flavor its GPU mappings name - and never `MAP_FLAVOR_AUTO`: the GPU mapping owns its flavor (plan task G4) |
@@ -2501,6 +2510,19 @@ and no `MAP_FLAVOR_PRESTAGED`, and `MAP_FLAVOR_MISSING` only for a mapped flavor
 its cores and ram by its GPU flavor. The capacity counts every VM of the plan whose server is created with a vGPU
 flavor, a VM without a GPU that a mapping sends to one included, by the flavor's requests; other plans' VMs are not
 counted, as for the quota (§22.5).
+
+The Heat and Octavia rows (plan task N2, §23.8) read the source's inventory (§10): `SourceInventory.stacks` and
+`lb_members`, which an OpenStack source reads and a VMware source leaves empty. A VM of a stack gets
+`SRC_VM_HEAT_STACK`, and a member of an autoscaling group `SRC_VM_AUTOSCALED` beside it. A read the source could not
+make gives its warning, `SRC_VM_HEAT_UNKNOWN` or `SRC_VM_LB_UNKNOWN`, in place of the rows it would have judged, and a
+source whose catalog lacks the service gives none: no row of them blocks but an autoscaling group's member. The plan
+acknowledges `SRC_VM_AUTOSCALED` for a VM in `plan.acknowledged_findings` (§4.2), the one code it takes: the finding
+stays, as a warning whose message says that the plan acknowledges it and whose remediation is to keep the group's
+scaling suspended at the source until the VM is finalized. An acknowledgement is a plan edit, the operator's - the
+planner acknowledges in PRD journey 8 - and `plan.updated` records it with the field's name and the actor (§12,
+§13.2). The messages name the source provider by its label (§1 naming), the stack and its resource, the group and its
+type, and each membership by its address and port, its pool and its load balancer; the remediations name the
+runbooks for Heat stacks and for Octavia load balancers (Operations.md). Those names reach the operator alone (§13.4).
 
 ### 9.4 Wave planner (`planning/waves.py`)
 
@@ -2656,7 +2678,9 @@ class DestinationProvider(Protocol):
 ```
 
 `SourceInventory {networks: dict[str, int|None] (name→mtu), projects: list[str], keypairs: list[str] (the names of
-the source credential's own keypairs — what `export_keypairs.yml` can export)}`;
+the source credential's own keypairs — what `export_keypairs.yml` can export), stacks: StackRead (the servers of the
+credential's project's Heat stacks, where each one is) and lb_members: MemberRead (the members of its project's Octavia
+pools) - both read by an OpenStack source alone, below (plan task N2, §9.3)}`;
 `DestinationInventory {networks: dict[str, int|None], flavors: list[{name, vcpus, ram_mb, disk_gb,
 extra_specs}], volume_types: list[str], quotas: dict[project, {cores, ram_mb, instances, volumes,
 gigabytes}] (free amounts: -1 is unlimited and null not reported — pre-flight blocks on neither), projects:
@@ -2751,6 +2775,51 @@ always find them free. A restart builds new fakes: the seed hands them the serve
 control plane runs - its provider's document changed: a rename, its declared profiles, a written credential - takes
 over the simulated cloud of the one it replaces, as a real cloud keeps its servers: the servers and their GPU units,
 the gate's reads of the other tenant's GPU and, for a source, its VMs' power states (plan task G9 review).
+
+**Heat stacks and Octavia members** (plan task N2; the findings of §9.3, §23.8). An OpenStack source's inventory reads
+them, keeping only what a finding names:
+
+```text
+StackRead  { status: "ok"|"unknown",
+             reason: "forbidden"|"error"|null,  # unknown: Heat refused the credential (403), or another failure
+             detail: str|null,                  # the failure's HTTP status ("HTTP 503"), or its kind when nothing
+                                                # answered ("ConnectTimeout"); never its message text
+             servers: dict[str, StackPlace] }   # by server id
+StackPlace { stack: str,                        # the top-level stack's name
+             resource: str,                     # that stack's resource the server is, or is nested under
+             group: str|null,                   # the autoscaling group resource it is a member of, by its name
+             group_type: str|null }             # OS::Heat::AutoScalingGroup or AWS::AutoScaling::AutoScalingGroup
+MemberRead { status, reason, detail,            # as StackRead's, for Octavia
+             members: list[PoolMember] }
+PoolMember { load_balancer: str, pool: str,     # their names, else their ids
+             address: str,                      # the member's address, as Neutron writes it
+             port: int,                         # its protocol port
+             network: str|null }                # the network of its subnet - the load balancer's VIP subnet when it
+                                                # names none -; null when the subnets cannot be read
+```
+
+* **Heat.** The stack list (`GET /stacks`: the credential's project's top-level stacks), then for each stack its
+  resources with those of the stacks nested in it, `GET /stacks/{name}/{id}/resources?nested_depth=5` - 5 is Heat's
+  default `max_nested_stack_depth`, its ceiling. A resource of type `OS::Nova::Server` or `AWS::EC2::Instance` that
+  has a `physical_resource_id` is a server; its stack is the one its `stack` link names, and a nested stack's id is
+  the `physical_resource_id` of the resource that holds it, so the chain runs up to the top-level stack. The read
+  makes one call for the list and one per top-level stack, whatever the plan's size: 200 VMs in 5 stacks cost 6
+  calls, where a resource list filtered by `physical_resource_id` would cost one per VM and stack. A stack gone
+  between the two calls (404) holds nothing (`TODO(LAB): confirm` the links on each series, §23.10).
+* **Octavia.** The project's load balancers and pools (Octavia's lists, filtered by the credential's project -
+  `project_id` - and paged as openstacksdk pages them), the members of each pool that lists some, and - once a pool has members - the subnets once (Neutron's list), to name each member's network: three lists
+  and one per pool with members.
+* **Absent, refused, failed.** A catalog without the service (`orchestration`, `load-balancer`) has nothing to read:
+  `ok`, no stack and no member. Heat or Octavia refusing the credential (403) reads `unknown`, reason `forbidden`; any
+  other failure - an HTTP error, a timeout, a connection - `unknown`, reason `error`. The first failure ends that
+  read and keeps nothing of it, since a partial read would guess, and costs at most one request's timeout (60 s,
+  below). Neither read fails the inventory, the validation or a pre-staging.
+* `VMwareProvider` and the demo's `FakeSourceProvider` read neither: their inventory holds both reads `ok` and empty
+  (the demo's stack and load balancer come with plan task N11).
+* **Data minimization** (as §22.12 for Placement): the names of a stack, a resource, a group, a pool and a load
+  balancer, and a member's address, are customer data. The read keeps them for the finding that shows them to the
+  operator (§9.3), logs neither them nor a failure's message text, and the advisor sends Jev finding codes and
+  severities alone (§13.4, ADV-06): none of them reaches Jev or agentmemory.
 
 **GPU requests** (`seamless_migrate.planning.gpu`, plan task G1, §22.2–§22.4): a pure module (no I/O) that the
 providers, the pre-flight and the cutover gate share as their GPU tasks land. `gpu_requests(extra_specs,
@@ -3008,7 +3077,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
-| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them; a field `PlanCreate` does not have — a misspelt one too — is refused with 422, never dropped) | `201 Plan` |
+| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, an `acknowledged_findings` entry that names a code the pre-flight does not take as acknowledged (`SRC_VM_AUTOSCALED` alone, §9.3), and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them; a field `PlanCreate` does not have — a misspelt one too — is refused with 422, never dropped) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
 | PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry — except its providers: a changed `source_provider_id` or `destination_provider_id` is refused (409) while a migration of the plan is `failed`, since its rollback acts on the clouds its attempt used (on the cold path it finds the destination server by the migration's record; a name serves only a migration cut over before records existed, after the stop, §7.2) — roll it back or cancel it first; the 409 names each such VM with what releases it — roll back or retry a `failed` one whose source is stopped, finish, roll back or cancel one in flight, finalize or roll back a `completed` one (§8.1); resets status to `draft`); setting `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}`, 1–1000 (422 outside); in `draft`, `validated` or `paused` (409 otherwise, and while a migration of the plan is in flight, as for `PATCH`: the plan returns to `draft`, which the tick does not drive) | `Plan` |
@@ -3275,6 +3344,11 @@ Placement's resource providers - a destination's compute hosts, named after them
 uuids - never leave the GPU capacity read: `GpuCapacity` keeps counts, and it, a GPU wait and the verification's GPU
 checks name a failure by its HTTP status and Placement error code, never by Placement's message text, so no
 document, event, log line, finding or advisor payload holds one (§22.3, §22.12, plan task G3).
+
+A source's Heat stacks and Octavia load balancers - their names and those of their resources and pools, a member's
+address - reach the operator alone, in the message of a finding (§9.3, §10, plan task N2): the source's read logs none
+of them, and the strategy evidence sends finding codes and severities alone (`findings`, ADV-06), so none of them
+reaches Jev or agentmemory.
 
 The destination provider's name never reaches Jev, whatever `SEAMLESS_MEMORY_REDACT_NAMES` says (§1 naming). The
 advisor's strategy question names the destination by kind and series (`planning/platforms.destination_descriptor`, by
@@ -4396,6 +4470,11 @@ is no origin a browser sends (review RV31-03).
   blockers (plan task G4) — in the API's words, severities and remediations, held to the API's by the shared finding
   cases (`seamless/tests/fixtures/eligibility_cases.json`), with the destination's GPU flavors and capacity as its
   validation reads them and each VM of the plan counted by what its cutover will still create (`quota_share`, §9.3).
+  Its OpenStack source holds one Heat stack, `example-mq`, whose autoscaling group (`OS::Heat::AutoScalingGroup`)
+  holds `mq-broker-01` and `mq-broker-02`, and one Octavia pool of a load balancer, `example-mq-pool` of
+  `example-mq-lb`, whose members are their addresses; the seeded production plan acknowledges `mq-broker-02`'s
+  `SRC_VM_AUTOSCALED`. Its pre-flight gives §9.3's Heat and Octavia findings (plan task N2) from that source's reads,
+  in the API's words, severities and remediations, held to the API's by the shared finding cases.
   Its cutover gate holds a GPU VM's cutover until a capacity read finds room (§5.4 rule 5, §22.7; plan task G12): once
   the gate's other rules hold, a read takes the destination's GPU flavors and the pools of the VM's GPU flavor as the
   destination holds them — the A100-3-20C pool full on each destination's first two gate reads that ask of it, the
@@ -5573,7 +5652,7 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | Item | Becomes binding in | Plan task |
 |---|---|---|
 | PRD: FR-28's scope, goal and journey, and §3's non-goals as delivered | PRD (done) | N1 |
-| the findings of §23.8 | §9.3 | N2 |
+| the findings of §23.8: the Heat and Octavia ones, the source's reads and `Plan.acknowledged_findings` (N2a); the network ones (N2b) | §9.3, §10, §4.2, §12 (binding for N2a) | N2 |
 | the hook catalog, the plan's network cut-over settings, the routes | §4.2, §12 | N3 |
 | the hook runner: kinds, timeouts, the idempotency key, the context document | §7.2, §13 | N4 |
 | hook points in the cutover, verification, rollback and finalize of every strategy, resumed after a restart | §5, §7, §8 | N5 |

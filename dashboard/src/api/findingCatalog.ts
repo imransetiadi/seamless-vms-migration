@@ -54,6 +54,32 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     strategies: ['warm'],
     remediation: 'The image-booted root disk is pre-copied through server snapshots (boot_disk_copy), which makes passes slower.',
   },
+  // the source's Heat stacks and Octavia pools (SDD §9.3, §10, plan task N2)
+  SRC_VM_HEAT_STACK: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Seamless moves the server, not its stack: run no stack update at the source until the VM is finalized - an update may recreate the server - and follow the runbook for Heat stacks for the stack\'s other resources.',
+  },
+  SRC_VM_AUTOSCALED: {
+    severity: 'blocker',
+    strategies: [],
+    remediation: 'Suspend the group\'s scaling at the source - its scaling policies\' alarms - as the runbook for Heat stacks says, then acknowledge the finding for the VM in the plan (acknowledged_findings) and re-validate.',
+  },
+  SRC_VM_HEAT_UNKNOWN: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Give the source credential a role Heat\'s policy lets list the project\'s stacks and their resources, or check with the runbook for Heat stacks whether the VM belongs to a stack or an autoscaling group: an autoscaling group may replace the server once the cutover stops it.',
+  },
+  SRC_VM_LB_MEMBER: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Move the membership as the runbook for Octavia load balancers says: drain the source member before the cutover, and add the migrated server to a pool at the destination once it is verified.',
+  },
+  SRC_VM_LB_UNKNOWN: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Give the source credential a role Octavia\'s policy lets list the project\'s pools and their members, or check the VM\'s memberships yourself with the runbook for Octavia load balancers.',
+  },
   MAP_NETWORK_MISSING: {
     severity: 'blocker',
     strategies: [],

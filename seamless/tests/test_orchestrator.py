@@ -8718,7 +8718,8 @@ async def test_rollback_with_new_source_ids_rewrites_the_plan(tmp_path, store):
         tmp_path, store, [vm(1, nics=[nic]), vm(2)],
         {"default_strategy": Strategy.cold, "strategy_overrides": {"vm-1": Strategy.cold},
          "probe_overrides": {"vm-1": [probe]},
-         "nic_overrides": {"vm-1": {"fa:16:3e:00:00:0a": {"fixed_ips": ["10.0.0.9"]}}}},
+         "nic_overrides": {"vm-1": {"fa:16:3e:00:00:0a": {"fixed_ips": ["10.0.0.9"]}}},
+         "acknowledged_findings": {"vm-1": ["SRC_VM_AUTOSCALED"]}},
         executor=executor, settings=settings,
     )  # fmt: skip
     await h.orch.auto_waves(plan.id, 10, "alice")  # resets the plan to draft: validate after
@@ -8740,6 +8741,8 @@ async def test_rollback_with_new_source_ids_rewrites_the_plan(tmp_path, store):
     assert updated.probe_overrides == {"vm-1-recreated": [probe]}
     # its NICs keep their MACs (the rollback recreates its ports with them): the overrides follow
     assert list(updated.nic_overrides) == ["vm-1-recreated"]
+    # and so does what the plan acknowledges for it (SDD §4.2, §9.3, plan task N2)
+    assert updated.acknowledged_findings == {"vm-1-recreated": ["SRC_VM_AUTOSCALED"]}
     assert (await h.by_vm(plan.id, "vm-1-recreated")).id == m.id
     assert updated.status == PlanStatus.completed
 

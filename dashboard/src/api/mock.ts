@@ -38,6 +38,7 @@ import {
   JEV_MIN_CONFIDENCE,
   MiB,
   preflight,
+  sourceReads,
   prng,
   auditEventsOf,
   decisionEventOf,
@@ -561,6 +562,9 @@ function overrideProblems(overrides: Record<string, unknown>): string[] {
     });
 }
 
+/** The pre-flight codes a plan may acknowledge for a VM, as the API's ACKNOWLEDGEABLE_FINDINGS (SDD §4.2, §9.3). */
+const ACKNOWLEDGEABLE_FINDINGS: readonly string[] = ['SRC_VM_AUTOSCALED'];
+
 function refusePlanSpec(spec: Record<string, unknown>): void {
   // the model validates the body first (pydantic's words, five at most), then the API's checks run in their order
   const bounds = PLAN_BOUNDS.flatMap(([field, op, limit]) => {
@@ -605,6 +609,12 @@ function refusePlanSpec(spec: Record<string, unknown>): void {
       const twice = [...new Set(ips.filter((a, i) => ips.indexOf(a) !== i))].sort();
       if (twice.length) problems.push(`${where}: ${twice.join(', ')} given twice`);
     }
+  }
+  // like the API (SDD §4.2, §12): a plan acknowledges an autoscaling group's member alone
+  const acknowledged = (spec.acknowledged_findings ?? {}) as Record<string, string[]>;
+  for (const [vmId, codes] of Object.entries(acknowledged)) {
+    const refused = (codes ?? []).filter((code) => !ACKNOWLEDGEABLE_FINDINGS.includes(code));
+    if (refused.length) problems.push(`acknowledged_findings[${vmId}]: ${refused.join(', ')} cannot be acknowledged (only ${[...ACKNOWLEDGEABLE_FINDINGS].sort().join(', ')} can)`);
   }
   const prestage = Array.isArray(spec.prestage_resources) ? (spec.prestage_resources as string[]) : [];
   const unknown = prestage.filter((r) => !PRESTAGE_RESOURCES.includes(r));
@@ -1517,6 +1527,9 @@ export class MockServer {
       roles,
       profile,
       destination: providerLabel(destination),
+      // the source by its label, and its Heat stacks and Octavia pool members as its inventory reads them (SDD §9.3, §10)
+      source: providerLabel(source),
+      ...sourceReads(source.id, Array.isArray(inventory) ? inventory : []),
       // the flavors a GPU VM's mapping may name, those of them that ask for a GPU with the profiles the destination
       // declares now, and its GPU capacity as this read finds it (SDD §22.3, §22.4, §22.5)
       ...flavorContext(dst, destination.gpu_profiles, new Date(this.now()).toISOString()),

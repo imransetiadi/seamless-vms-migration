@@ -1,5 +1,5 @@
 {
-  "_comment": "The API's eligibility reasons per strategy (planning/selector.py) and its finding messages (planning/preflight.py) for each finding case - `others` are the plan's other selected VMs, `source_kind` the source provider's kind (openstack when not given), `holds_volumes` whether the migration holds the destination volumes an earlier attempt created (false when not given): test_selector.py and test_preflight.py run them against the API, mockData.test.ts against the dashboard's mock, which words them as the API does (SDD §9.2, §9.3, §16, review RV20-08). source/destination give a provider's capabilities and whether it has a conversion host, as provider_caps reads them. A network or GPU case gives `destination` - its label, kind, networks (id, name, mtu, project_id, own, shared, external), subnets, the token's roles and its policy profile, as the check reports them - and the plan its mappings, prestage_resources and nic_overrides (SDD §6.6, §7.3 step 0, §9.3, §21.5). A GPU case's `destination` also gives its flavors, the vGPU profiles it declares (`gpu_profiles`) and its GPU capacity, as its inventory reads them, and the plan its GPU mappings; `phases` gives the phase of the migration of a selected VM that has one, which its share is counted by (quota_share), `severities` and `remediations` a finding's own where they are not its catalog's, and an entry of `others` may give only the fields its count reads (SDD §9.3, §22.3, §22.5, plan task G12).",
+  "_comment": "The API's eligibility reasons per strategy (planning/selector.py) and its finding messages (planning/preflight.py) for each finding case - `others` are the plan's other selected VMs, `source_kind` the source provider's kind (openstack when not given), `holds_volumes` whether the migration holds the destination volumes an earlier attempt created (false when not given): test_selector.py and test_preflight.py run them against the API, mockData.test.ts against the dashboard's mock, which words them as the API does (SDD §9.2, §9.3, §16, review RV20-08). source/destination give a provider's capabilities and whether it has a conversion host, as provider_caps reads them. A network or GPU case gives `destination` - its label, kind, networks (id, name, mtu, project_id, own, shared, external), subnets, the token's roles and its policy profile, as the check reports them - and the plan its mappings, prestage_resources and nic_overrides (SDD §6.6, §7.3 step 0, §9.3, §21.5). A GPU case's `destination` also gives its flavors, the vGPU profiles it declares (`gpu_profiles`) and its GPU capacity, as its inventory reads them, and the plan its GPU mappings; `phases` gives the phase of the migration of a selected VM that has one, which its share is counted by (quota_share), `severities` and `remediations` a finding's own where they are not its catalog's, and an entry of `others` may give only the fields its count reads (SDD §9.3, §22.3, §22.5, plan task G12). A Heat or Octavia case gives `source_label`, the source provider's label, and `source_inventory`, the source's `stacks` and `lb_members` as its inventory reads them, and the plan its `acknowledged_findings` (SDD §9.3, §10, plan task N2).",
   "cases": [
     {
       "why": "an OpenStack VM every strategy takes",
@@ -9824,6 +9824,693 @@
       },
       "severities": {
         "DST_GPU_CAPACITY_INSUFFICIENT": "blocker"
+      }
+    },
+    {
+      "why": "a resource of a Heat stack at the source: the stack is not moved (plan task N2)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "source_label": "DC1 Jakarta",
+      "source_inventory": {
+        "stacks": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "servers": {
+            "vm-1": {
+              "stack": "example-web",
+              "resource": "web_server",
+              "group": null,
+              "group_type": null
+            }
+          }
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "expected": {
+        "SRC_VM_HEAT_STACK": "web-01 belongs to Heat stack 'example-web' at DC1 Jakarta (its resource 'web_server'): the stack is not moved, and a stack update there may recreate the server.",
+        "SRC_VM_AUTOSCALED": null,
+        "SRC_VM_HEAT_UNKNOWN": null
+      },
+      "severities": {
+        "SRC_VM_HEAT_STACK": "warning"
+      }
+    },
+    {
+      "why": "a member of a Heat autoscaling group, beside the stack's warning: a blocker until the plan acknowledges it for this VM (plan task N2)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "source_label": "DC1 Jakarta",
+      "source_inventory": {
+        "stacks": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "servers": {
+            "vm-1": {
+              "stack": "example-web",
+              "resource": "web_asg",
+              "group": "web_asg",
+              "group_type": "OS::Heat::AutoScalingGroup"
+            }
+          }
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "acknowledged_findings": {
+          "vm-2": [
+            "SRC_VM_AUTOSCALED"
+          ]
+        }
+      },
+      "expected": {
+        "SRC_VM_HEAT_STACK": "web-01 belongs to Heat stack 'example-web' at DC1 Jakarta (its resource 'web_asg'): the stack is not moved, and a stack update there may recreate the server.",
+        "SRC_VM_AUTOSCALED": "web-01 is a member of autoscaling group 'web_asg' (OS::Heat::AutoScalingGroup) of Heat stack 'example-web' at DC1 Jakarta: the group may replace the server once the cutover stops it, which leaves two live copies."
+      },
+      "severities": {
+        "SRC_VM_HEAT_STACK": "warning",
+        "SRC_VM_AUTOSCALED": "blocker"
+      }
+    },
+    {
+      "why": "an autoscaling group's member the plan acknowledges: a warning that says so, with its own remediation (plan task N2)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "source_label": "DC1 Jakarta",
+      "source_inventory": {
+        "stacks": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "servers": {
+            "vm-1": {
+              "stack": "example-web",
+              "resource": "web_asg",
+              "group": "web_asg",
+              "group_type": "OS::Heat::AutoScalingGroup"
+            }
+          }
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "acknowledged_findings": {
+          "vm-1": [
+            "SRC_VM_AUTOSCALED"
+          ]
+        }
+      },
+      "expected": {
+        "SRC_VM_HEAT_STACK": "web-01 belongs to Heat stack 'example-web' at DC1 Jakarta (its resource 'web_asg'): the stack is not moved, and a stack update there may recreate the server.",
+        "SRC_VM_AUTOSCALED": "web-01 is a member of autoscaling group 'web_asg' (OS::Heat::AutoScalingGroup) of Heat stack 'example-web' at DC1 Jakarta: the group may replace the server once the cutover stops it, which leaves two live copies. The plan acknowledges it (acknowledged_findings)."
+      },
+      "severities": {
+        "SRC_VM_AUTOSCALED": "warning"
+      },
+      "remediations": {
+        "SRC_VM_AUTOSCALED": "Keep the group's scaling suspended at the source until the VM is finalized, as the runbook for Heat stacks says: a server the group creates meanwhile is a second live copy."
+      }
+    },
+    {
+      "why": "an AWS autoscaling group's member is autoscaled too (plan task N2)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "source_label": "DC1 Jakarta",
+      "source_inventory": {
+        "stacks": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "servers": {
+            "vm-1": {
+              "stack": "example-web",
+              "resource": "web_asg",
+              "group": "web_asg",
+              "group_type": "AWS::AutoScaling::AutoScalingGroup"
+            }
+          }
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "expected": {
+        "SRC_VM_AUTOSCALED": "web-01 is a member of autoscaling group 'web_asg' (AWS::AutoScaling::AutoScalingGroup) of Heat stack 'example-web' at DC1 Jakarta: the group may replace the server once the cutover stops it, which leaves two live copies."
+      },
+      "severities": {
+        "SRC_VM_AUTOSCALED": "blocker"
+      }
+    },
+    {
+      "why": "addresses of the VM in Octavia pools: each membership named by address and port, pool and load balancer - an address written another way too -, a member on another network not, and one two NICs hold named once (plan task N2)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          },
+          {
+            "network": "db-net",
+            "mac": "fa:16:3e:00:00:02",
+            "fixed_ips": [
+              "2001:0db8:0:0::10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          },
+          {
+            "network": "mgmt-net",
+            "mac": "fa:16:3e:00:00:03",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "source_label": "DC1 Jakarta",
+      "source_inventory": {
+        "lb_members": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "members": [
+            {
+              "load_balancer": "example-lb",
+              "pool": "web-pool",
+              "address": "192.0.2.10",
+              "port": 443,
+              "network": "app-net"
+            },
+            {
+              "load_balancer": "example-lb",
+              "pool": "admin-pool",
+              "address": "192.0.2.10",
+              "port": 8443,
+              "network": null
+            },
+            {
+              "load_balancer": "other-lb",
+              "pool": "other-pool",
+              "address": "192.0.2.10",
+              "port": 80,
+              "network": "other-net"
+            },
+            {
+              "load_balancer": "example-lb",
+              "pool": "db-pool",
+              "address": "2001:db8::10",
+              "port": 5432,
+              "network": "db-net"
+            },
+            {
+              "load_balancer": "example-lb",
+              "pool": "web-pool",
+              "address": "192.0.2.11",
+              "port": 443,
+              "network": "app-net"
+            }
+          ]
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "expected": {
+        "SRC_VM_LB_MEMBER": "Addresses of web-01 are members of Octavia pools at DC1 Jakarta: 192.0.2.10 port 443 in pool 'web-pool' of load balancer 'example-lb'; 192.0.2.10 port 8443 in pool 'admin-pool' of load balancer 'example-lb'; 2001:db8::10 port 5432 in pool 'db-pool' of load balancer 'example-lb'. The memberships are not moved.",
+        "SRC_VM_LB_UNKNOWN": null
+      },
+      "severities": {
+        "SRC_VM_LB_MEMBER": "warning"
+      }
+    },
+    {
+      "why": "Heat refused the source credential, so whether the VM is in a stack or an autoscaling group is not known, and nothing blocks it (plan task N2)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "source_label": "DC1 Jakarta",
+      "source_inventory": {
+        "stacks": {
+          "status": "unknown",
+          "reason": "forbidden",
+          "detail": "HTTP 403",
+          "servers": {}
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "expected": {
+        "SRC_VM_HEAT_UNKNOWN": "Whether web-01 belongs to a Heat stack or an autoscaling group at DC1 Jakarta is not known: Heat refused the source credential (HTTP 403).",
+        "SRC_VM_HEAT_STACK": null,
+        "SRC_VM_AUTOSCALED": null
+      },
+      "severities": {
+        "SRC_VM_HEAT_UNKNOWN": "warning"
+      }
+    },
+    {
+      "why": "the source's Octavia read failed: whether an address of the VM is a pool member is not known (plan task N2)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "source_label": "DC1 Jakarta",
+      "source_inventory": {
+        "lb_members": {
+          "status": "unknown",
+          "reason": "error",
+          "detail": "HTTP 503",
+          "members": []
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "expected": {
+        "SRC_VM_LB_UNKNOWN": "Whether addresses of web-01 are members of Octavia pools at DC1 Jakarta is not known: its read failed (HTTP 503).",
+        "SRC_VM_LB_MEMBER": null
+      },
+      "severities": {
+        "SRC_VM_LB_UNKNOWN": "warning"
       }
     }
   ]

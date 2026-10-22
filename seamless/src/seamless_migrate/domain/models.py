@@ -606,6 +606,11 @@ PRESTAGE_RESOURCES = (
 )
 
 
+#: the pre-flight codes a plan may acknowledge for a VM (SDD §4.2, §9.3): a blocker it then reports
+#: as a warning that says so - an autoscaling group's member (owner decision 9)
+ACKNOWLEDGEABLE_FINDINGS = frozenset({"SRC_VM_AUTOSCALED"})
+
+
 class PlanSpec(_Model):
     """Editable plan fields; ``PlanCreate``, the wire schema of SDD §12, refuses the rest."""
 
@@ -645,6 +650,9 @@ class PlanSpec(_Model):
     #: per VM (source id), per NIC MAC (lower case): its network and addresses at RHOSO; OpenStack
     #: sources (SDD §4.2, §7.2, §7.3, §9.2, §9.3)
     nic_overrides: dict[str, dict[str, NicOverride]] = Field(default_factory=dict)
+    #: per VM (source id): the pre-flight codes the plan acknowledges for it, each one of
+    #: ACKNOWLEDGEABLE_FINDINGS (SDD §4.2, §9.3, owner decision 9)
+    acknowledged_findings: dict[str, list[str]] = Field(default_factory=dict)
 
     def nic_override(self, vm_id: str, mac: str | None) -> NicOverride | None:
         """The plan's override of a VM's NIC, by its MAC (SDD §4.2)."""
@@ -766,6 +774,14 @@ def invalid_plan_settings(spec: PlanSpec) -> list[str]:
     for vm_id, probes in spec.probe_overrides.items():
         problems += _probe_problems(f"probe_overrides[{vm_id}]", probes)
     problems += _nic_override_problems(spec.nic_overrides)
+    # a blocker the plan may take as acknowledged: an autoscaling group's member (SDD §4.2, §9.3)
+    for vm_id, codes in spec.acknowledged_findings.items():
+        refused = [code for code in codes if code not in ACKNOWLEDGEABLE_FINDINGS]
+        if refused:
+            problems.append(
+                f"acknowledged_findings[{vm_id}]: {', '.join(refused)} cannot be acknowledged "
+                f"(only {', '.join(sorted(ACKNOWLEDGEABLE_FINDINGS))} can)"
+            )
     unknown = [r for r in spec.prestage_resources if r not in PRESTAGE_RESOURCES]
     if unknown:
         problems.append(f"prestage_resources: cannot pre-stage {', '.join(map(repr, unknown))}")
