@@ -1820,6 +1820,30 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   destination flavors up when it pre-stages. `keypairs` is scoped the same way: only the `key_name`s of the plan's
   VMs that the source credential owns and the destination credential lacks (`os_migrate_keypairs_filter`); with
   none, its playbooks are skipped.
+* **Hooks** (`seamless_migrate.hooks`, plan task N4, §23.3): how a catalog hook runs at a migration's point; the points
+  that call it are §23.3's (plan task N5).
+  * **The context document** a hook gets, never a credential: `{"migration_id", "attempt", "point", "plan_id",
+    "vm_name", "source": {"id", "label"}, "destination": {"id", "label"}, "server_id"` (the destination server, null
+    before it exists)`, "addresses": {"before", "after"}` (the source NICs' fixed IPs; the addresses each NIC gets at
+    the destination - its `nic_overrides` entry's, else its own)`, "floating_ips"` (the source NICs')`,
+    "idempotency_key"}`.
+  * **The idempotency key** is `<migration id>.<attempt>.<point>`: every run of a point within an attempt - a step a
+    restart resumes runs its hooks again (§8) - gets the same one, and a retry, a new attempt, a new one.
+  * **A `playbook` hook** runs as `ansible-playbook -i localhost, -c local <playbook> -e @context.yml` in
+    `{run directory}/hooks/<point>-<hook>/` (0700, removed after the run). `context.yml` (0600) holds the document as
+    `seamless_hook`, its strings `!unsafe` as `vars.yml`'s are. The process gets the executor's environment - the
+    passthrough variables and the allowed `ANSIBLE_*` -, so no secret, `clouds.yaml` or token of the control plane
+    reaches it. Each output line goes to the migration's log through `redact()`, as a step's do (§4.3).
+  * **A `webhook` hook** is an HTTPS POST of the document as JSON with `Authorization: Bearer <token>` - the key
+    `token` of its secret, read when it runs (§13.3) - and `Idempotency-Key: <key>`. A redirect is not followed, so
+    the token never reaches another URL: a 3xx fails, any 2xx succeeds. The server's certificate is verified with
+    the system's CAs. The answer's body is never logged or kept.
+  * **The timeout:** a run past the hook's `timeout_s` fails ("timed out after N s"): the playbook's process group is
+    stopped (SIGTERM, then SIGKILL), the webhook's request abandoned.
+  * **Each run is a `migration.action` event**, data `{"action": "hook", "hook", "kind", "point",
+    "idempotency_key", "outcome": "succeeded"|"failed", "duration_s", "detail"}`: `detail` is a failure's reason -
+    the playbook's exit status and its last error line through `redact()`, a webhook's HTTP status or the failure's
+    kind, or the timeout -, null on success; never the URL, the secret's name or the answer.
 
 ### 7.3 HandoverExecutor (`executors/handover.py`) — `storage_handover`
 
@@ -3331,7 +3355,9 @@ holds the new value, the provider does not record it yet, and the operator sends
 deleted meanwhile answers 404, and the secret just written is removed again. A connection to a provider is built
 again once its document (its state fields aside) or the mounted `clouds.yaml` changed — the provider registry's and
 the storage handover's alike — and the replaced one is closed, so the step after a rotation signs in with the new
-credentials, a running plan's rollback included (audit EX-14). `SEAMLESS_SECRET_STORE` selects it:
+credentials, a running plan's rollback included (audit EX-14). A webhook hook's secret holds its bearer token as the
+key `token`, read each time the hook runs, and an RFC 2136 DNS target's TSIG key is a secret alike (§7.2, §23.3,
+§23.5); a hook's or a target's secret is never a provider's (§12). `SEAMLESS_SECRET_STORE` selects it:
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory, each key written
   to a temporary file and renamed. A secret is written and deleted under a lock of its name (`flock` on
@@ -5732,7 +5758,7 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | PRD: FR-28's scope, goal and journey, and §3's non-goals as delivered | PRD (done) | N1 |
 | the findings of §23.8: the Heat and Octavia ones, the source's reads and `Plan.acknowledged_findings` (N2a); the network ones, `Nic`'s pairs, floating IPs and DNS names, the destination's floating IPs and DNS, `Provider.announces_tenant_networks` (N2b) | §4.2, §9.3, §10, §12 (binding) | N2 |
 | the hook catalog, the plan's network cut-over settings, the routes | §4.2, §4.3, §11, §12 (binding) | N3 |
-| the hook runner: kinds, timeouts, the idempotency key, the context document | §7.2, §13 | N4 |
+| the hook runner: kinds, timeouts, the idempotency key, the context document | §7.2, §13.3 (binding) | N4 |
 | hook points in the cutover, verification, rollback and finalize of every strategy, resumed after a restart | §5, §7, §8 | N5 |
 | the floating IP keep-address move | §7.2, §7.3, §8 | N6 |
 | the DNS swap | §7, §13.3 | N7 |
