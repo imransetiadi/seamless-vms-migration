@@ -152,6 +152,9 @@ export interface Provider {
   policy_profile: 'secure_rbac' | 'legacy' | null;
   /** The NVIDIA vGPU profile each of its GPU flavors gives, as its operator declares it (SDD §4.2, §22.3). Refused on vmware; older fixtures omit it. */
   gpu_profiles?: Record<string, string>;
+  /** Its operator declares that the cloud's OVN BGP agent announces tenant networks, which no API shows: NET_PREFIX_SPLIT
+   * (SDD §4.2, §9.3, §23.6). Refused on vmware; older fixtures omit it (false). */
+  announces_tenant_networks?: boolean;
   /** Server-owned: when the write-only credentials / conversion key were last stored. */
   credentials_updated_at: Timestamp | null;
   conversion_key_updated_at: Timestamp | null;
@@ -159,11 +162,11 @@ export interface Provider {
 
 /** `POST /providers` body (status and server-owned fields are ignored by the API). */
 export type ProviderCreate = Pick<Provider, 'id' | 'name' | 'kind' | 'role' | 'endpoint' | 'cloud' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'credentials_secret'> &
-  Partial<Pick<Provider, 'release' | 'policy_profile' | 'gpu_profiles'>>;
+  Partial<Pick<Provider, 'release' | 'policy_profile' | 'gpu_profiles' | 'announces_tenant_networks'>>;
 
 /** `PATCH /providers/{id}`: the editable fields (SDD §12). */
 export type ProviderPatch = Partial<
-  Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'release' | 'policy_profile' | 'gpu_profiles'>
+  Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'release' | 'policy_profile' | 'gpu_profiles' | 'announces_tenant_networks'>
 >;
 
 /** `PUT /providers/{id}/credentials`: write-only; never returned (SDD §13.3). */
@@ -212,6 +215,14 @@ export interface Nic {
   fixed_ips: string[];
   vnic_type: string;
   mtu: number | null;
+  /** OpenStack: the addresses of the port's allowed address pairs, which the import does not carry (SDD §4.2, §9.3); older
+   * answers omit them. */
+  allowed_address_pairs?: string[];
+  /** OpenStack: the addresses of the floating IPs associated with the port (SDD §4.2, §9.3). */
+  floating_ips?: string[];
+  /** OpenStack: the port's DNS name and its domain - the port's, else its network's - under Neutron's DNS integration (SDD §4.2). */
+  dns_name?: string | null;
+  dns_domain?: string | null;
   /** VMware: what the migration kit maps the NIC by, its distributed port group's key or device summary (SDD §4, §7.2). */
   network_key?: string | null;
 }
@@ -981,6 +992,17 @@ export interface DestinationInventory {
   gpu_flavors?: GpuFlavor[];
   /** The Placement pools of their vGPU requests, read with the inventory (SDD §22.3). */
   gpu_capacity?: GpuCapacity;
+  /** The addresses of the credential's project's floating IPs that no port holds: what os-migrate's `auto` attaches (SDD §10). */
+  floating_ips?: string[];
+  /** Neutron's DNS integration and Designate's zones (SDD §10, §9.3). */
+  dns?: DnsRead;
+}
+
+/** Whether Neutron lists the dns-integration extension, and the Designate zones the credential sees; null where they could
+ * not be read, which is not judged (SDD §10, plan task N2b). */
+export interface DnsRead {
+  extension: boolean | null;
+  zones: string[] | null;
 }
 
 /** A destination flavor that asks for a GPU, with its GPU requests (SDD §22.3). */

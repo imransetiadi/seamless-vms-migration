@@ -144,6 +144,17 @@ class GpuCapacity:
 
 
 @dataclass
+class DnsRead:
+    """The destination's DNS as Neutron's DNS integration needs it (SDD §10, plan task N2b):
+    whether Neutron lists the `dns-integration` extension - None when its extensions cannot be
+    read - and the names of the Designate zones the credential sees - [] for a catalog without
+    Designate, None when Designate cannot be read. What is None is not judged (§9.3)."""
+
+    extension: bool | None = None
+    zones: list[str] | None = None
+
+
+@dataclass
 class DestinationInventory:
     networks: dict[str, int | None] = field(default_factory=dict)
     #: [{name, vcpus, ram_mb, disk_gb, extra_specs}]
@@ -168,6 +179,11 @@ class DestinationInventory:
     gpu_flavors: list[dict[str, Any]] = field(default_factory=list)
     #: the Placement pools of their vGPU requests, read with the inventory (SDD §22.3)
     gpu_capacity: GpuCapacity = field(default_factory=GpuCapacity)
+    #: the addresses of the credential's project's floating IPs that no port holds: what
+    #: os-migrate's `auto` attaches; [] when they cannot be read (SDD §10, §9.3)
+    floating_ips: list[str] = field(default_factory=list)
+    #: Neutron's DNS integration and Designate's zones (SDD §10, §9.3)
+    dns: DnsRead = field(default_factory=DnsRead)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -266,6 +282,14 @@ CATALOG: dict[str, CatalogEntry] = {
         "their members, or check the VM's memberships yourself with the runbook for Octavia load "
         "balancers.",
     ),
+    # the network codes (SDD §9.3, §23.8, plan task N2b): none blocks
+    "SRC_PORT_ADDRESS_PAIRS": CatalogEntry(
+        Severity.warning,
+        (),
+        "Add the address pairs to the migrated server's ports at the destination once it is "
+        "created (openstack port set --allowed-address), and check that the peers sharing an "
+        "address - a keepalived pair's other member - reach it there.",
+    ),
     "MAP_NETWORK_MISSING": CatalogEntry(
         Severity.blocker,
         (),
@@ -319,6 +343,14 @@ CATALOG: dict[str, CatalogEntry] = {
         (),
         "Map the VM's project to an existing destination project (plan.mappings.projects).",
     ),
+    "DST_DNS_INTEGRATION_MISSING": CatalogEntry(
+        Severity.warning,
+        (),
+        "Enable Neutron's DNS integration at the destination (an extension driver with Designate "
+        "as its external DNS driver) and create the domain's zone for the destination "
+        "credential's project, or publish the migrated VM's names in DNS yourself after the "
+        "cutover.",
+    ),
     "NET_MTU_SHRINK": CatalogEntry(
         Severity.warning,
         (),
@@ -337,6 +369,12 @@ CATALOG: dict[str, CatalogEntry] = {
         'Turn on "Keep MAC addresses and every fixed IP" in the plan (port_creation_mode '
         '"neutron"), give each such port exactly one fixed IP before the cutover, or migrate the '
         "VM by storage handover when its ports have at most one address each.",
+    ),
+    "NET_PREFIX_SPLIT": CatalogEntry(
+        Severity.warning,
+        (),
+        "Put the VMs of each announced network into one wave, or have the network's prefix "
+        "routed by hand while its waves are cut over.",
     ),
     "MAP_NETWORK_AMBIGUOUS": CatalogEntry(
         Severity.blocker,
@@ -373,6 +411,14 @@ CATALOG: dict[str, CatalogEntry] = {
         Severity.info,
         (),
         "Nothing to do: each NIC goes where its override says.",
+    ),
+    "MAP_FIP_ADDRESS_CHANGE": CatalogEntry(
+        Severity.warning,
+        (S.cold, S.warm),
+        "To keep an address, have the destination credential's project hold a floating IP of that "
+        "address, with no port, before the cutover (an admin can create one with a given address "
+        "on the external network); else update the clients, allowlists and DNS records of the "
+        "old address after it.",
     ),
     "VM_PCI_PASSTHROUGH": CatalogEntry(
         Severity.blocker,
@@ -2003,6 +2049,9 @@ def run_preflight(
             )
 
     out.extend(_nic_override_findings(vm, plan, dst_inv, selected, source, where))
+    if openstack_source:
+        out.extend(_port_findings(vm, dst_inv, source, where))
+    out.extend(_prefix_split(vm, plan, selected, source, destination))
 
     out.extend(_gpu_findings(vm, plan, dst_inv, source, where, selected, shares or {}))
 
@@ -2177,6 +2226,121 @@ def _member_findings(vm: VMRef, read: MemberRead, source: Provider | None) -> li
             "SRC_VM_LB_MEMBER",
             f"Addresses of {vm.name} are members of Octavia pools at {at}: "
             f"{'; '.join(dict.fromkeys(held))}. The memberships are not moved.",
+        )
+    ]
+
+
+def _dns_domain(domain: str) -> str:
+    """A DNS domain as §9.3 compares it: lower case, with its trailing dot."""
+    return domain.lower().rstrip(".") + "."
+
+
+def _port_findings(
+    vm: VMRef, dst_inv: DestinationInventory, source: Provider | None, where: str
+) -> list[Finding]:
+    """SRC_PORT_ADDRESS_PAIRS, MAP_FIP_ADDRESS_CHANGE and DST_DNS_INTEGRATION_MISSING (SDD §9.3,
+    plan task N2b): what an OpenStack VM's ports carry at the source that the migration does not -
+    their allowed address pairs, their floating IPs' addresses, their names in DNS."""
+    out: list[Finding] = []
+    paired = [
+        f"{(nic.mac or '?').lower()} on {nic.network!r} ({', '.join(nic.allowed_address_pairs)})"
+        for nic in vm.nics
+        if nic.allowed_address_pairs
+    ]
+    if paired:
+        out.append(
+            finding(
+                "SRC_PORT_ADDRESS_PAIRS",
+                f"NICs of {vm.name} have allowed address pairs, which the import does not carry: "
+                f"{'; '.join(paired)}. An address the VM takes over from a peer is not reachable "
+                f"in {where}.",
+            )
+        )
+    # os-migrate's `auto` attaches a detached floating IP of the source's address, else creates
+    # one with a new address (SDD §7.2, §23.1)
+    detached = {_canonical_ip(a) for a in dst_inv.floating_ips}
+    moved = [
+        address
+        for address in dict.fromkeys(_canonical_ip(a) for nic in vm.nics for a in nic.floating_ips)
+        if address not in detached
+    ]
+    if moved:
+        out.append(
+            finding(
+                "MAP_FIP_ADDRESS_CHANGE",
+                f"Floating IPs of {vm.name} that {where} does not hold detached in its project: "
+                f"{', '.join(moved)}. os-migrate creates a floating IP with a new address for "
+                "each, so clients, allowlists and DNS records of the old address lose the VM.",
+            )
+        )
+    # Neutron's DNS integration is checked, never driven; what could not be read is not judged
+    # (SDD §9.3, §23.5)
+    dns = dst_inv.dns
+    zones = None if dns.zones is None else {_dns_domain(z) for z in dns.zones}
+    published = [nic for nic in vm.nics if nic.dns_name and nic.dns_domain]
+    no_zone = [
+        nic
+        for nic in published
+        if zones is not None and _dns_domain(nic.dns_domain or "") not in zones
+    ]
+    lacking = published if dns.extension is False else no_zone
+    if lacking:
+        named = ", ".join(
+            f"{(nic.mac or '?').lower()} as {nic.dns_name}.{_dns_domain(nic.dns_domain or '')}"
+            for nic in lacking
+        )
+        why = []
+        if dns.extension is False:
+            why.append("lacks Neutron's dns-integration extension")
+        if no_zone:
+            domains = dict.fromkeys(_dns_domain(nic.dns_domain or "") for nic in no_zone)
+            why.append(f"has no Designate zone {', '.join(domains)}")
+        out.append(
+            finding(
+                "DST_DNS_INTEGRATION_MISSING",
+                f"NICs of {vm.name} are published in DNS at {_source_label(source)} - {named} - "
+                f"and {where} {' and '.join(why)}: the migrated ports are not published.",
+            )
+        )
+    return out
+
+
+def _prefix_split(
+    vm: VMRef,
+    plan: Plan,
+    selected: Sequence[VMRef],
+    source: Provider | None,
+    destination: Provider | None,
+) -> list[Finding]:
+    """NET_PREFIX_SPLIT (SDD §9.3, §23.6, plan task N2b): a network of the VM whose VMs the plan's
+    waves put into more than one wave, while a provider declares that its cloud announces tenant
+    networks - between those waves the prefix has an origin in each cloud. Nothing is judged before
+    the waves are planned."""
+    declaring = [
+        p.label for p in (source, destination) if p is not None and p.announces_tenant_networks
+    ]
+    if not declaring or not plan.waves:
+        return []
+    split: list[str] = []
+    for network in dict.fromkeys(nic.network for nic in vm.nics):
+        waves = {
+            wave.id: wave
+            for other in selected
+            if any(nic.network == network for nic in other.nics)
+            and (wave := plan.wave_of(other.source_id)) is not None
+        }
+        if len(waves) > 1:
+            names = ", ".join(repr(w.name) for w in sorted(waves.values(), key=lambda w: w.order))
+            split.append(f"{network!r} in waves {names}")
+    if not split:
+        return []
+    verb = "announces" if len(declaring) == 1 else "announce"
+    return [
+        finding(
+            "NET_PREFIX_SPLIT",
+            f"The plan's waves split networks of {vm.name} that {' and '.join(declaring)} {verb} "
+            f"as tenant networks: {'; '.join(split)}. While one wave is cut over and the next is "
+            "not, each prefix has an origin in both clouds, so its routes cannot be correct.",
         )
     ]
 

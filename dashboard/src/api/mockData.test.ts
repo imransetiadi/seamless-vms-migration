@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import eligibilityRaw from '../../../seamless/tests/fixtures/eligibility_cases.json?raw';
-import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, gpuFlavorsOf, iso, makeVm, preflight, quotaShare, readDestinationGpus, replaceNames } from './mockData';
+import { buildFixtures, buildInventories, buildProviders, destinationDescriptor, eligibility, gpuFlavorsOf, iso, makeVm, networkContext, preflight, quotaShare, readDestinationGpus, replaceNames } from './mockData';
 import type { MemberRead, StackRead } from './mockData';
 import { gpuRequests } from '../lib/gpu';
 import { capabilityRoles } from '../lib/networks';
-import type { DestinationFlavor, DestinationInventory, DestinationNetwork, DestinationSubnet, Finding, GpuCapacity, GpuCheckReport, Phase, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
+import type { DestinationFlavor, DestinationInventory, DestinationNetwork, DestinationSubnet, DnsRead, Finding, GpuCapacity, GpuCheckReport, Phase, Plan, Provider, ProviderKind, Severity, VMRef } from './types';
 
 const now = Date.parse('2026-10-09T12:00:00Z');
 
@@ -637,7 +637,7 @@ interface FindingCase {
   others?: VMRef[];
   /** the source provider's kind, openstack when not given */
   source_kind?: ProviderKind;
-  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'> & Partial<Pick<Plan, 'mappings' | 'prestage_resources' | 'acknowledged_findings'>>;
+  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'> & Partial<Pick<Plan, 'mappings' | 'prestage_resources' | 'acknowledged_findings' | 'vm_ids' | 'waves'>>;
   /** a Heat or Octavia case's source provider label (SDD §1 naming, §9.3) */
   source_label?: string;
   /** a Heat or Octavia case's source reads, as its inventory reads them (SDD §10, plan task N2) */
@@ -655,6 +655,10 @@ interface FindingCase {
     flavors?: DestinationFlavor[];
     gpu_profiles?: Record<string, string>;
     gpu_capacity?: GpuCapacity;
+    /** a network case's detached floating IPs, DNS and BGP declaration (SDD §9.3, §10, plan task N2b) */
+    floating_ips?: string[];
+    dns?: DnsRead;
+    announces_tenant_networks?: boolean;
   };
   /** the source provider's declared vGPU profiles, by flavor (SDD §22.3) */
   gpu_profiles?: Record<string, string>;
@@ -815,6 +819,10 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
       source: c.source_label,
       stacks: c.source_inventory?.stacks,
       lbMembers: c.source_inventory?.lb_members,
+      // a network case's destination floating IPs, DNS and BGP declaration (SDD §9.3, §10, plan task N2b)
+      floatingIps: dest?.floating_ips,
+      dns: dest?.dns,
+      announcers: dest?.announces_tenant_networks ? [dest.label] : [],
     };
     const found = preflight(c.vm, c.source_kind ?? 'openstack', plan, networks, context);
     const messages = new Map(found.map((f) => [f.code, f.message]));
@@ -856,5 +864,29 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
       "Another selected VM is also named 'web.01' (-/vm-4); os-migrate selects workloads by name.",
     ]);
     expect(judged(vmOf('vm-5', 'サーバー'), [vmOf('vm-6', 'веб')], 'vmware').map((f) => f.code)).toEqual(['SRC_VM_NAME_UNUSABLE']);
+  });
+});
+
+describe("the mock's network context, as the API's validation reads it (SDD §9.3, §10, plan task N2b)", () => {
+  const providers = buildProviders(now);
+  const inventories = buildInventories(now);
+  const source = providers.find((p) => p.id === 'rhosp17-dc1')!;
+  const production = providers.find((p) => p.id === 'rhoso-prod')!;
+  const staging = providers.find((p) => p.id === 'rhoso-staging')!;
+
+  it("reads the destination's detached floating IPs and DNS, and names each provider announcing tenant networks", () => {
+    const held = { ...(inventories['rhoso-prod'] as DestinationInventory), floating_ips: ['203.0.113.80'] };
+    expect(networkContext(held, source, production)).toEqual({
+      floatingIps: ['203.0.113.80'],
+      dns: { extension: true, zones: ['apps.ocp.example.com.'] },
+      announcers: ['RHOSO 18.0 — Production'],
+    });
+    const announcing = { ...source, announces_tenant_networks: true };
+    expect(networkContext(held, announcing, production).announcers).toEqual(['RHOSP 17.1 — DC1', 'RHOSO 18.0 — Production']);
+  });
+
+  it('reads nothing where the inventory gives nothing: no floating IP held, DNS not judged, no announcer', () => {
+    expect(networkContext(undefined, source, staging)).toEqual({ floatingIps: [], dns: { extension: null, zones: null }, announcers: [] });
+    expect(networkContext([], source, staging)).toEqual({ floatingIps: [], dns: { extension: null, zones: null }, announcers: [] });
   });
 });

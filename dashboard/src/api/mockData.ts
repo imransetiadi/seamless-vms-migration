@@ -15,6 +15,7 @@ import type {
   DestinationNetwork,
   DestinationSubnet,
   Disk,
+  DnsRead,
   Estimate,
   Event,
   EvidenceItem,
@@ -38,6 +39,7 @@ import type {
   SyncPass,
   VerificationRecord,
   VMRef,
+  Wave,
 } from './types';
 import { DOWNTIME_PARTS } from './types';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
@@ -932,6 +934,11 @@ export function makeVm(spec: VmSpec): VMRef {
       fixed_ips: n.fixed_ips ?? [`10.20.${i + 1}.${(parseInt(spec.id.slice(-2), 16) % 200) + 10}`],
       vnic_type: n.vnic_type ?? 'normal',
       mtu: n.mtu === undefined ? 1450 : n.mtu,
+      // what its port carries that the migration does not, as the API's Nic (SDD §4.2, §9.3, plan task N2b)
+      allowed_address_pairs: n.allowed_address_pairs ?? [],
+      floating_ips: n.floating_ips ?? [],
+      dns_name: n.dns_name ?? null,
+      dns_domain: n.dns_domain ?? null,
     })),
     power_state: spec.power_state ?? 'running',
     os_type: spec.os_type ?? 'rhel9',
@@ -952,18 +959,23 @@ export function makeVm(spec: VmSpec): VMRef {
 /** What the demo's `g1.vgpu` flavor asks for: one vGPU with the trait of the A100-4C type (SDD §22.10). */
 const GPU_ML_SPECS: Record<string, string> = { 'resources:VGPU': '1', 'trait:CUSTOM_NVIDIA_A100_4C': 'required' };
 
+/** The domain the demo source publishes its web servers' names in, which its destinations hold no zone of (SDD §16, plan task N2b). */
+const DEMO_DNS_DOMAIN = 'example.com.';
+/** The keepalived address the demo's database pair shares (allowed_address_pairs, SDD §16). */
+const DEMO_DB_VIP = '10.20.1.250';
+
 const OS_VMS: VmSpec[] = [
-  { id: 'os-0a11', name: 'web-01', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 40, used_gb: 12 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-01' },
-  { id: 'os-0a12', name: 'web-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, os_type: 'ubuntu 22.04', disks: [{ size_gb: 40, used_gb: 14 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-02' },
-  { id: 'os-0a13', name: 'web-03', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 40, used_gb: 13 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-03' },
+  { id: 'os-0a11', name: 'web-01', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 40, used_gb: 12 }], nics: [{ network: 'tenant-web', floating_ips: ['203.0.113.80'], dns_name: 'web-01', dns_domain: DEMO_DNS_DOMAIN }], tags: { app: 'shop', tier: 'web' }, host: 'compute-01' },
+  { id: 'os-0a12', name: 'web-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, os_type: 'ubuntu 22.04', disks: [{ size_gb: 40, used_gb: 14 }], nics: [{ network: 'tenant-web', dns_name: 'web-02', dns_domain: DEMO_DNS_DOMAIN }], tags: { app: 'shop', tier: 'web' }, host: 'compute-02' },
+  { id: 'os-0a13', name: 'web-03', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 40, used_gb: 13 }], nics: [{ network: 'tenant-web', dns_name: 'web-03', dns_domain: DEMO_DNS_DOMAIN }], tags: { app: 'shop', tier: 'web' }, host: 'compute-03' },
   { id: 'os-0a14', name: 'web-cache-01', project: 'shop', flavor: 'm1.small', disks: [{ size_gb: 30, used_gb: 9 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'cache' } },
   { id: 'os-0b21', name: 'api-gw-01', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, os_type: 'rocky 9.4', disks: [{ size_gb: 60, used_gb: 21 }], tags: { app: 'gateway' } },
   { id: 'os-0b22', name: 'api-gw-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, os_type: 'debian 12', disks: [{ size_gb: 60, used_gb: 20 }], tags: { app: 'gateway' } },
   { id: 'os-0b31', name: 'mq-broker-01', project: 'platform', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 40, used_gb: 15 }, { size_gb: 100, used_gb: 46, volume_type: 'tripleo-ceph-ssd' }], tags: { app: 'rabbitmq' } },
   { id: 'os-0b32', name: 'mq-broker-02', project: 'platform', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 40, used_gb: 15 }, { size_gb: 100, used_gb: 51, volume_type: 'tripleo-ceph-ssd' }], tags: { app: 'rabbitmq' } },
   { id: 'os-0c41', name: 'ad-dc-01', project: 'platform', flavor: 'm1.large', vcpus: 4, ram_mb: 16384, os_type: 'windows2019', disks: [{ size_gb: 80, used_gb: 38 }], nics: [{ network: 'tenant-infra', mtu: 1500 }], tags: { app: 'active-directory' } },
-  { id: 'os-0d51', name: 'db-pg-01', project: 'finance', flavor: 'db.xlarge', vcpus: 16, ram_mb: 65536, disks: [{ size_gb: 50, used_gb: 18 }, { size_gb: 600, used_gb: 410, volume_type: 'tripleo-ceph-ssd', encrypted: true }], nics: [{ network: 'tenant-db' }], tags: { app: 'ledger', tier: 'database' }, change_rate_mibps: 8 },
-  { id: 'os-0d52', name: 'db-mysql-02', project: 'shop', flavor: 'db.xlarge', vcpus: 16, ram_mb: 65536, disks: [{ size_gb: 50, used_gb: 16 }, { size_gb: 520, used_gb: 300, volume_type: 'tripleo-ceph-ssd' }], nics: [{ network: 'tenant-db' }], tags: { app: 'shop', tier: 'database' }, change_rate_mibps: 5 },
+  { id: 'os-0d51', name: 'db-pg-01', project: 'finance', flavor: 'db.xlarge', vcpus: 16, ram_mb: 65536, disks: [{ size_gb: 50, used_gb: 18 }, { size_gb: 600, used_gb: 410, volume_type: 'tripleo-ceph-ssd', encrypted: true }], nics: [{ network: 'tenant-db', allowed_address_pairs: [DEMO_DB_VIP] }], tags: { app: 'ledger', tier: 'database' }, change_rate_mibps: 8 },
+  { id: 'os-0d52', name: 'db-mysql-02', project: 'shop', flavor: 'db.xlarge', vcpus: 16, ram_mb: 65536, disks: [{ size_gb: 50, used_gb: 16 }, { size_gb: 520, used_gb: 300, volume_type: 'tripleo-ceph-ssd' }], nics: [{ network: 'tenant-db', allowed_address_pairs: [DEMO_DB_VIP] }], tags: { app: 'shop', tier: 'database' }, change_rate_mibps: 5 },
   { id: 'os-0d53', name: 'db-oracle-03', project: 'finance', flavor: 'db.xlarge', vcpus: 16, ram_mb: 131072, disks: [{ size_gb: 100, used_gb: 40 }, { size_gb: 1200, used_gb: 900, volume_type: 'tripleo-ceph-ssd' }], nics: [{ network: 'tenant-db' }], tags: { app: 'erp-finance', tier: 'database' }, change_rate_mibps: 12 },
   { id: 'os-0e61', name: 'legacy-rhel6-app', project: 'finance', flavor: 'm1.medium', os_type: 'rhel6', disks: [{ size_gb: 80, used_gb: 33 }], tags: { app: 'payroll' } },
   { id: 'os-0e62', name: 'gpu-render-01', project: 'media', flavor: 'g1.a10', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 200, used_gb: 120 }], flavor_extra_specs: { 'resources:VGPU': '1' }, tags: { app: 'render' } },
@@ -1129,6 +1141,8 @@ export function buildProviders(now: number): Provider[] {
       policy_profile: null,
       // the vGPU profiles of its GPU flavors, which no API names (SDD §22.3, §22.10)
       gpu_profiles: { ...DEMO_GPU_PROFILES },
+      // its OVN BGP agent announces tenant networks, which no API shows (SDD §16, §23.6, plan task N2b)
+      announces_tenant_networks: true,
       credentials_updated_at: null,
       conversion_key_updated_at: null,
     },
@@ -1228,6 +1242,9 @@ function destinationInventory(readAt: string): DestinationInventory {
     ],
     // what the destination's Placement holds for its GPU flavors' pools, which each read takes its pools from (SDD §22.3)
     gpu_capacity: { status: 'ok', reason: null, detail: null, read_at: readAt, pools: demoGpuPools() },
+    // no floating IP held detached, and Neutron's DNS integration without the demo source's zone (SDD §10, §16, plan task N2b)
+    floating_ips: [],
+    dns: { extension: true, zones: ['apps.ocp.example.com.'] },
   };
   // what a NIC's network name resolves to (SDD §10): the credential's own networks, and a provider network another project shares
   destination.network_details = Object.entries(destination.networks).map(([name, mtu]) => ({
@@ -1591,6 +1608,96 @@ function memberFindings(vm: VMRef, read: MemberRead, at: string): Array<[string,
   return [['SRC_VM_LB_MEMBER', `Addresses of ${vm.name} are members of Octavia pools at ${at}: ${[...new Set(held)].join('; ')}. The memberships are not moved.`]];
 }
 
+/** A DNS domain as the API's _dns_domain compares it: lower case, with its trailing dot (SDD §9.3). */
+function dnsDomain(domain: string): string {
+  return `${domain.toLowerCase().replace(/\.+$/, '')}.`;
+}
+
+/**
+ * SRC_PORT_ADDRESS_PAIRS, MAP_FIP_ADDRESS_CHANGE and DST_DNS_INTEGRATION_MISSING, as the API's _port_findings (SDD §9.3,
+ * plan task N2b): what an OpenStack VM's ports carry at the source that the migration does not.
+ */
+function portFindings(vm: VMRef, floatingIps: readonly string[], dns: DnsRead, at: string, where: string): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  const paired = vm.nics
+    .filter((nic) => nic.allowed_address_pairs?.length)
+    .map((nic) => `${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(nic.network)} (${(nic.allowed_address_pairs ?? []).join(', ')})`);
+  if (paired.length)
+    out.push([
+      'SRC_PORT_ADDRESS_PAIRS',
+      `NICs of ${vm.name} have allowed address pairs, which the import does not carry: ${paired.join('; ')}. An address the VM takes over from a peer is not reachable in ${where}.`,
+    ]);
+  // os-migrate's `auto` attaches a detached floating IP of the source's address, else creates one with a new address (§23.1)
+  const detached = new Set(floatingIps.map(canonicalIp));
+  const moved = [...new Set(vm.nics.flatMap((nic) => (nic.floating_ips ?? []).map(canonicalIp)))].filter((a) => !detached.has(a));
+  if (moved.length)
+    out.push([
+      'MAP_FIP_ADDRESS_CHANGE',
+      `Floating IPs of ${vm.name} that ${where} does not hold detached in its project: ${moved.join(', ')}. os-migrate creates a floating IP with a new address for each, so clients, allowlists and DNS records of the old address lose the VM.`,
+    ]);
+  // Neutron's DNS integration is checked, never driven; what could not be read is not judged (§9.3, §23.5)
+  const zones = dns.zones === null ? null : new Set(dns.zones.map(dnsDomain));
+  const published = vm.nics.filter((nic) => nic.dns_name && nic.dns_domain);
+  const noZone = published.filter((nic) => zones !== null && !zones.has(dnsDomain(nic.dns_domain ?? '')));
+  const lacking = dns.extension === false ? published : noZone;
+  if (lacking.length) {
+    const named = lacking.map((nic) => `${(nic.mac ?? '?').toLowerCase()} as ${nic.dns_name}.${dnsDomain(nic.dns_domain ?? '')}`).join(', ');
+    const why: string[] = [];
+    if (dns.extension === false) why.push("lacks Neutron's dns-integration extension");
+    if (noZone.length) why.push(`has no Designate zone ${[...new Set(noZone.map((nic) => dnsDomain(nic.dns_domain ?? '')))].join(', ')}`);
+    out.push([
+      'DST_DNS_INTEGRATION_MISSING',
+      `NICs of ${vm.name} are published in DNS at ${at} - ${named} - and ${where} ${why.join(' and ')}: the migrated ports are not published.`,
+    ]);
+  }
+  return out;
+}
+
+/**
+ * NET_PREFIX_SPLIT, as the API's _prefix_split (SDD §9.3, §23.6, plan task N2b): a network of the VM whose VMs the plan's
+ * waves put into more than one wave while a provider declares that its cloud announces tenant networks; nothing is judged
+ * before the waves are planned.
+ */
+function prefixSplit(vm: VMRef, plan: Plan, selected: readonly VMRef[], announcers: readonly string[]): Array<[string, string]> {
+  const waves = plan.waves ?? [];
+  if (!announcers.length || !waves.length) return [];
+  const split: string[] = [];
+  for (const network of new Set(vm.nics.map((nic) => nic.network))) {
+    const holding = new Map<string, Wave>();
+    for (const other of selected) {
+      const wave = other.nics.some((nic) => nic.network === network) ? waves.find((w) => w.vm_ids.includes(other.source_id)) : undefined;
+      if (wave && !holding.has(wave.id)) holding.set(wave.id, wave);
+    }
+    if (holding.size > 1)
+      split.push(`${pyRepr(network)} in waves ${[...holding.values()].sort((a, b) => a.order - b.order).map((w) => pyRepr(w.name)).join(', ')}`);
+  }
+  if (!split.length) return [];
+  return [
+    [
+      'NET_PREFIX_SPLIT',
+      `The plan's waves split networks of ${vm.name} that ${announcers.join(' and ')} ${announcers.length === 1 ? 'announces' : 'announce'} as tenant networks: ${split.join('; ')}. While one wave is cut over and the next is not, each prefix has an origin in both clouds, so its routes cannot be correct.`,
+    ],
+  ];
+}
+
+/**
+ * What the network findings read beside the VM (SDD §9.3, §10, plan task N2b): the destination's detached floating IPs and its
+ * DNS as its inventory gives them - none and not read when it gives none -, and the providers that declare that their cloud
+ * announces tenant networks, by their labels.
+ */
+export function networkContext(
+  inventory: DestinationInventory | VMRef[] | undefined,
+  source: Provider,
+  destination: Provider,
+): { floatingIps: string[]; dns: DnsRead; announcers: string[] } {
+  const dst = inventory && !Array.isArray(inventory) ? inventory : undefined;
+  return {
+    floatingIps: dst?.floating_ips ?? [],
+    dns: dst?.dns ?? { extension: null, zones: null },
+    announcers: [source, destination].filter((p) => p.announces_tenant_networks).map(providerLabel),
+  };
+}
+
 /** SRC_VM_DUPLICATE_NAME's remediation for two VMware VMs the migration kit names alike, as the API's (SDD §9.3). */
 const KIT_TWIN_REMEDIATION =
   'Rename one of the VMs in vCenter: the migration kit names a VM\'s server, ports and volumes after its name as it writes it, so the two would share them - in separate plans too, when they go to one destination project.';
@@ -1626,6 +1733,11 @@ export function preflight(
     /** The source's Heat stacks and Octavia pool members as its inventory reads them; ok and empty when not given (SDD §10). */
     stacks?: StackRead;
     lbMembers?: MemberRead;
+    /** The destination's detached floating IPs and its DNS, none and not read when not given, and the labels of the providers
+     * that declare that their cloud announces tenant networks (SDD §9.3, §10, plan task N2b). */
+    floatingIps?: string[];
+    dns?: DnsRead;
+    announcers?: string[];
   } = {},
 ): Finding[] {
   const findings: Finding[] = [];
@@ -1762,6 +1874,10 @@ export function preflight(
   }
   for (const [code, message] of nicOverrideFindings(vm, sourceKind, plan, destinationNetworks, context))
     add(code, message);
+  // what the VM's ports carry that the migration does not, and a network the waves split, as the API's (plan task N2b)
+  if (sourceKind !== 'vmware')
+    for (const [code, message] of portFindings(vm, context.floatingIps ?? [], context.dns ?? { extension: null, zones: null }, at, where)) add(code, message);
+  for (const [code, message] of prefixSplit(vm, plan, context.selected ?? [vm], context.announcers ?? [])) add(code, message);
   // the API's _gpu_blockers (SDD §9.3, §22.4, §22.5, plan task G4): a GPU VM no GPU mapping applies to - an OpenStack
   // flavor's requests named by their extra specs, a VMware VM's devices by what names them - and why none applies; its
   // GPUs as the API's _vm_gpus reads them, with the profile its source declares for its flavor (PR #64 review)
@@ -2404,6 +2520,8 @@ export function buildFixtures(now: number): Fixtures {
         // the source by its label, and its Heat and Octavia reads (SDD §9.3, §10, §16, plan task N2)
         source: providerLabel(source),
         ...sourceReads(source.id, vms),
+        // the destination's floating IPs and DNS, and who announces tenant networks (SDD §9.3, §16, plan task N2b)
+        ...networkContext(dstInventory, source, destination),
         ...flavorContext(dstInventory, destination.gpu_profiles, iso(now)),
         shares,
         gpuProfiles: source.gpu_profiles,

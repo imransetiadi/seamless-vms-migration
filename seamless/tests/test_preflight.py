@@ -17,6 +17,7 @@ from seamless_migrate.domain.models import (
     Nic,
     VerificationConfig,
     VMRef,
+    Wave,
     invalid_plan_settings,
 )
 from seamless_migrate.planning.gpu import gpu_requests
@@ -26,6 +27,7 @@ from seamless_migrate.planning.preflight import (
     CATALOG,
     KIT_TWIN_REMEDIATION,
     DestinationInventory,
+    DnsRead,
     GpuCapacity,
     GpuPool,
     MemberRead,
@@ -168,6 +170,8 @@ def test_catalog_is_complete():
         "SRC_VM_HEAT_UNKNOWN",
         "SRC_VM_LB_MEMBER",
         "SRC_VM_LB_UNKNOWN",
+        # the network codes (SDD §9.3, plan task N2b)
+        "SRC_PORT_ADDRESS_PAIRS",
         "MAP_NETWORK_MISSING",
         "MAP_NETWORK_PRESTAGED",
         "MAP_FLAVOR_MISSING",
@@ -180,14 +184,17 @@ def test_catalog_is_complete():
         "DST_PROJECT_MISSING",
         "DST_CAPABILITY_MISSING",
         "DST_RELEASE_OUTSIDE_SUPPORT",
+        "DST_DNS_INTEGRATION_MISSING",
         "NET_MTU_SHRINK",
         "NET_SRIOV_PORT",
         "NET_PORT_IPS",
+        "NET_PREFIX_SPLIT",
         "MAP_NETWORK_AMBIGUOUS",
         "NET_ADDRESS_REFUSED",
         "NET_PORT_NOT_PERMITTED",
         "MAP_NIC_OVERRIDE_INVALID",
         "MAP_NIC_OVERRIDE",
+        "MAP_FIP_ADDRESS_CHANGE",
         "VM_PCI_PASSTHROUGH",
         "VM_VGPU",
         # the GPU codes (SDD §22.5, plan task G4)
@@ -489,6 +496,224 @@ def test_finding_src_vm_lb_unknown_when_octavia_cannot_be_read():
     failed = src_inv(lb_members=MemberRead(status="unknown", reason="error", detail="HTTP 503"))
     assert only(check(web_vm(), src=failed), "SRC_VM_LB_UNKNOWN").message.endswith(
         "is not known: its read failed (HTTP 503)."
+    )
+
+
+NETWORK_CODES = (
+    "SRC_PORT_ADDRESS_PAIRS",
+    "MAP_FIP_ADDRESS_CHANGE",
+    "DST_DNS_INTEGRATION_MISSING",
+    "NET_PREFIX_SPLIT",
+)
+VMWARE_SRC = make_provider(id="src-vc", name="vCenter 8", kind=ProviderKind.vmware)
+
+
+def test_finding_src_port_address_pairs():
+    """SDD §9.3 (plan task N2b, owner decision 11): a NIC of an OpenStack VM with allowed address
+    pairs - a keepalived VIP, say - is created at the destination without them: one warning
+    naming each such NIC by its MAC and network, with its pairs' addresses. A NIC without pairs is
+    not named; a VM without any gets nothing."""
+    vm = web_vm(
+        nics=[
+            Nic(
+                network="app-net",
+                mac="FA:16:3E:00:00:01",
+                fixed_ips=["192.0.2.10"],
+                allowed_address_pairs=["192.0.2.100", "192.0.2.96/28"],
+            ),
+            Nic(network="db-net", mac="fa:16:3e:00:00:02", fixed_ips=["2001:db8::10"]),
+            Nic(
+                network="db-net",
+                mac="fa:16:3e:00:00:03",
+                fixed_ips=["2001:db8::11"],
+                allowed_address_pairs=["2001:db8::100"],
+            ),
+        ]
+    )
+    f = only(check(vm), "SRC_PORT_ADDRESS_PAIRS")
+    assert (f.severity, f.strategies) == (Severity.warning, [])
+    assert f.message == (
+        "NICs of web-01 have allowed address pairs, which the import does not carry: "
+        "fa:16:3e:00:00:01 on 'app-net' (192.0.2.100, 192.0.2.96/28); fa:16:3e:00:00:03 on "
+        "'db-net' (2001:db8::100). An address the VM takes over from a peer is not reachable in "
+        "RHOSO 18.0."
+    )
+    assert f.remediation == CATALOG["SRC_PORT_ADDRESS_PAIRS"].remediation
+    assert "allowed-address" in f.remediation
+    found = check(vm)
+    assert found_codes(found, NETWORK_CODES) == ["SRC_PORT_ADDRESS_PAIRS"]
+    assert not has_blocker(found)
+    assert found_codes(check(web_vm()), NETWORK_CODES) == []
+
+
+def test_finding_map_fip_address_change():
+    """SDD §9.3 (plan task N2b, §23.1): os-migrate's floating_ip_mode auto attaches a detached
+    floating IP of the source's address, else creates one with a new address: a warning for cold
+    and warm naming each floating IP of the VM the destination's project does not hold detached -
+    an address written another way is the same; none when it holds each, nor for a VM without."""
+    vm = web_vm(
+        nics=[
+            Nic(
+                network="app-net",
+                mac="fa:16:3e:00:00:01",
+                fixed_ips=["192.0.2.10"],
+                floating_ips=["203.0.113.10", "203.0.113.11"],
+            ),
+            Nic(
+                network="db-net",
+                mac="fa:16:3e:00:00:02",
+                fixed_ips=["2001:db8::10"],
+                floating_ips=["2001:db8:f::0010"],
+            ),
+        ]
+    )
+    held = dst_inv(floating_ips=["203.0.113.11"])
+    f = only(check(vm, dst=held), "MAP_FIP_ADDRESS_CHANGE")
+    assert (f.severity, f.strategies) == (Severity.warning, [Strategy.cold, Strategy.warm])
+    assert f.message == (
+        "Floating IPs of web-01 that RHOSO 18.0 does not hold detached in its project: "
+        "203.0.113.10, 2001:db8:f::10. os-migrate creates a floating IP with a new address for "
+        "each, so clients, allowlists and DNS records of the old address lose the VM."
+    )
+    assert f.remediation == CATALOG["MAP_FIP_ADDRESS_CHANGE"].remediation
+    every = dst_inv(floating_ips=["203.0.113.10", "203.0.113.11", "2001:db8:f::10"])
+    assert found_codes(check(vm, dst=every), NETWORK_CODES) == []
+    assert found_codes(check(web_vm()), NETWORK_CODES) == []
+    # the strategies that move no floating IP stay eligible: a warning bars none (SDD §9.2)
+    assert not has_blocker(check(vm, dst=held))
+
+
+def test_finding_dst_dns_integration_missing():
+    """SDD §9.3 (plan task N2b, §23.5): a NIC published in DNS by Neutron's DNS integration at the
+    source - a DNS name with a domain - and a destination without the dns-integration extension,
+    or without a Designate zone of that domain (compared lower case with its trailing dot): a
+    warning naming the NICs and what is lacking. A destination whose extensions or zones could not
+    be read is not judged on them; a NIC without a DNS name gets nothing."""
+    vm = web_vm(
+        nics=[
+            Nic(
+                network="app-net",
+                mac="fa:16:3e:00:00:01",
+                fixed_ips=["192.0.2.10"],
+                dns_name="web-01",
+                dns_domain="Example.COM.",
+            ),
+            Nic(
+                network="db-net",
+                mac="fa:16:3e:00:00:02",
+                fixed_ips=["2001:db8::10"],
+                dns_name="web-01-db",
+                dns_domain="db.example.com.",
+            ),
+            # a domain without a name publishes nothing
+            Nic(network="db-net", mac="fa:16:3e:00:00:03", dns_domain="example.com."),
+        ]
+    )
+
+    def dns(extension, zones):
+        return dst_inv(dns=DnsRead(extension=extension, zones=zones))
+
+    f = only(
+        check(vm, dst=dns(False, ["example.com.", "db.example.com."])),
+        "DST_DNS_INTEGRATION_MISSING",
+    )
+    assert (f.severity, f.strategies) == (Severity.warning, [])
+    assert f.message == (
+        "NICs of web-01 are published in DNS at RHOSP 17.1 - fa:16:3e:00:00:01 as "
+        "web-01.example.com., fa:16:3e:00:00:02 as web-01-db.db.example.com. - and RHOSO 18.0 "
+        "lacks Neutron's dns-integration extension: the migrated ports are not published."
+    )
+    assert f.remediation == CATALOG["DST_DNS_INTEGRATION_MISSING"].remediation
+    # the extension is there, one zone is not (its domain written without the trailing dot)
+    zone = only(check(vm, dst=dns(True, ["EXAMPLE.com"])), "DST_DNS_INTEGRATION_MISSING")
+    assert zone.message == (
+        "NICs of web-01 are published in DNS at RHOSP 17.1 - fa:16:3e:00:00:02 as "
+        "web-01-db.db.example.com. - and RHOSO 18.0 has no Designate zone db.example.com.: the "
+        "migrated ports are not published."
+    )
+    both = only(check(vm, dst=dns(False, [])), "DST_DNS_INTEGRATION_MISSING")
+    assert both.message.endswith(
+        "lacks Neutron's dns-integration extension and has no Designate zone example.com., "
+        "db.example.com.: the migrated ports are not published."
+    )
+    for fine in (
+        dns(True, ["example.com.", "db.example.com."]),
+        dns(None, ["example.com", "db.example.com"]),  # extensions unread: not judged
+        dns(True, None),  # Designate unread: not judged
+        dns(None, None),
+    ):
+        assert found_codes(check(vm, dst=fine), NETWORK_CODES) == []
+    assert found_codes(check(web_vm(), dst=dns(False, [])), NETWORK_CODES) == []
+
+
+def test_finding_net_prefix_split():
+    """SDD §9.3 (plan task N2b, §23.6): when the source or the destination provider declares
+    announces_tenant_networks, the plan's waves putting the VMs of one source network into more
+    than one wave warn - the prefix would have an origin in each cloud: the message names each
+    network, its waves by name in their order and the declaring providers. Nothing is judged
+    before the waves are planned, nor without a declaration, nor for a network in one wave."""
+    web = web_vm()
+    peer = make_vm(
+        source_id="vm-2", name="web-02", nics=[Nic(network="app-net", mac="fa:16:3e:00:00:12")]
+    )
+    db = make_vm(
+        source_id="vm-3", name="db-01", nics=[Nic(network="db-net", mac="fa:16:3e:00:00:13")]
+    )
+    vms = [web, peer, db]
+    waves = [
+        Wave(id="w2", name="Wave 2", order=2, vm_ids=["vm-2"]),
+        Wave(id="w1", name="Wave 1", order=1, vm_ids=["vm-1", "vm-3"]),
+    ]
+    plan = make_plan(vm_ids=["vm-1", "vm-2", "vm-3"], waves=waves)
+    bgp = DST.model_copy(update={"announces_tenant_networks": True})
+    f = only(check(web, plan=plan, all_vms=vms, destination=bgp), "NET_PREFIX_SPLIT")
+    assert (f.severity, f.strategies) == (Severity.warning, [])
+    assert f.message == (
+        "The plan's waves split networks of web-01 that RHOSO 18.0 announces as tenant networks: "
+        "'app-net' in waves 'Wave 1', 'Wave 2'. While one wave is cut over and the next is not, "
+        "each prefix has an origin in both clouds, so its routes cannot be correct."
+    )
+    assert f.remediation == CATALOG["NET_PREFIX_SPLIT"].remediation
+    # the VM of the other wave is named alike; the one whose network is in one wave is not
+    assert (
+        "'app-net' in waves 'Wave 1', 'Wave 2'"
+        in only(check(peer, plan=plan, all_vms=vms, destination=bgp), "NET_PREFIX_SPLIT").message
+    )
+    assert found_codes(check(db, plan=plan, all_vms=vms, destination=bgp), NETWORK_CODES) == []
+    # both providers declaring it are named
+    announcing = SRC.model_copy(update={"announces_tenant_networks": True})
+    both = only(
+        check(web, plan=plan, all_vms=vms, source=announcing, destination=bgp), "NET_PREFIX_SPLIT"
+    )
+    assert "that RHOSP 17.1 and RHOSO 18.0 announce as tenant networks" in both.message
+    # no declaration, or no waves yet: nothing
+    assert found_codes(check(web, plan=plan, all_vms=vms), NETWORK_CODES) == []
+    unplanned = make_plan(vm_ids=["vm-1", "vm-2", "vm-3"])
+    assert (
+        found_codes(check(web, plan=unplanned, all_vms=vms, destination=bgp), NETWORK_CODES) == []
+    )
+
+
+def test_a_provider_declares_announced_tenant_networks_only_for_openstack():
+    """SDD §4.2 (plan task N2b): announces_tenant_networks defaults to false, an OpenStack or
+    RHOSO provider may declare it, and a vmware one is refused - vCenter announces nothing."""
+    assert make_provider().announces_tenant_networks is False
+    assert make_provider(announces_tenant_networks=True).announces_tenant_networks is True
+    with pytest.raises(ValueError, match="announces_tenant_networks"):
+        make_provider(kind=ProviderKind.vmware, announces_tenant_networks=True)
+    assert VMWARE_SRC.announces_tenant_networks is False
+
+
+def test_a_vmware_vms_nics_carry_none_of_the_network_findings():
+    """SDD §9.3 (plan task N2b): the pairs, floating IPs and DNS names are an OpenStack port's; a
+    VMware VM's NICs have none, so none of those findings is reported for it."""
+    vm = make_vm(flavor=None, nics=[Nic(network="VM Network", mac="00:50:56:00:00:01")])
+    assert (
+        found_codes(
+            check(vm, source=VMWARE_SRC, dst=dst_inv(dns=DnsRead(extension=False, zones=[]))),
+            NETWORK_CODES,
+        )
+        == []
     )
 
 
@@ -2900,6 +3125,10 @@ DESTINATION_FINDINGS = {
     "NET_MTU_SHRINK",
     "DST_CAPABILITY_MISSING",
     "DST_RELEASE_OUTSIDE_SUPPORT",
+    # plan task N2b
+    "SRC_PORT_ADDRESS_PAIRS",
+    "MAP_FIP_ADDRESS_CHANGE",
+    "DST_DNS_INTEGRATION_MISSING",
 }
 
 
@@ -2941,6 +3170,20 @@ def _destination_findings(destination):
         destination=destination,
         dst_caps=community_caps(release_range=["2024.1", "2024.2"], support_tier=TIER3),
     )
+    # a port's address pairs, a floating IP and a DNS name the destination does not carry
+    # (plan task N2b)
+    ported = make_vm(
+        nics=[
+            Nic(
+                network="app-net",
+                allowed_address_pairs=["10.0.0.100"],
+                floating_ips=["203.0.113.10"],
+                dns_name="web-01",
+                dns_domain="example.com.",
+            )
+        ]
+    )
+    found += check(ported, dst=dst_inv(dns=DnsRead(extension=False)), destination=destination)
     return [f for f in found if f is not None]
 
 
@@ -3660,7 +3903,9 @@ def test_the_shared_handover_finding_cases(case):
     counted (quota_share, §9.3, §22.5). A code a case expects as null is not found (PR #64 review);
     `severities` and `remediations` give a finding's own where they are not its catalog's (a
     MAP_GPU_FLAVOR warning, plan task G12). A Heat or Octavia case gives the source's label and its
-    inventory's reads, and the plan its acknowledgements (plan task N2)."""
+    inventory's reads, and the plan its acknowledgements (plan task N2); a network case's
+    `destination` its detached floating IPs, its DNS and whether it announces tenant networks, and
+    the plan its waves (plan task N2b)."""
     plan = make_plan(**case["plan"])
     vm = VMRef.model_validate(case["vm"])
     others = [VMRef.model_validate(other) for other in case.get("others", [])]
@@ -3776,6 +4021,11 @@ def _destination(case):
             detail=capacity.get("detail"),
             pools=[GpuPool(**pool) for pool in capacity["pools"]],
         )
+    # a network case's floating IPs, DNS and BGP declaration (SDD §9.3, §10, plan task N2b)
+    if "floating_ips" in dest:
+        gpu["floating_ips"] = dest["floating_ips"]
+    if "dns" in dest:
+        gpu["dns"] = DnsRead(**dest["dns"])
     return {
         "dst": dst_inv(
             networks={n["name"]: n.get("mtu") for n in details},
@@ -3789,6 +4039,7 @@ def _destination(case):
             kind=ProviderKind(dest.get("kind", "openstack")),
             role=ProviderRole.destination,
             cloud="dst",
+            announces_tenant_networks=dest.get("announces_tenant_networks", False),
         ),
         "dst_caps": {k: dest[k] for k in ("roles", "policy_profile") if k in dest} or None,
     }
