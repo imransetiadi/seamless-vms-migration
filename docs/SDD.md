@@ -4208,7 +4208,7 @@ is no origin a browser sends (review RV31-03).
   "Expand navigation" at the column's foot switches between the two at any width from 768 px and is remembered
   in the browser for that viewer (`localStorage`; without a stored choice the width decides, and a failing storage
   only forgets it). The items stand in five labelled groups, in this order: Migrations — Overview (`/`), Plans
-  (`/plans`, also current on a migration's page); Clouds — Providers, Inventory; Activity — Events; Advisor —
+  (`/plans`, also current on a migration's page), Hooks (`/hooks`, plan task N12a); Clouds — Providers, Inventory; Activity — Events; Advisor —
   Recommendations (`/advisor`, also current on a recommendation's page), Policies (`/advisor/policies`), Audit
   trail (`/advisor/audit`); Administration — Users (`/users`), for an admin alone: every other role's navigation
   leaves the group out — the item is hidden, not kept in place unavailable with its reason as an action is
@@ -4232,6 +4232,11 @@ is no origin a browser sends (review RV31-03).
   badge, its label in words beside its icon and never colour alone, whose detail (a focusable term, as a status
   badge's) reads "Technology Preview, validated in simulation: GPU migration has not yet run on GPU hosts." (§22.14),
   until §22.14's lab cases pass (plan task G15).
+* The network cut-over (§23, from 0.4.0, plan task N12): every network cut-over element - the Hooks page, the plan
+  form's network cut-over section, the migration page's hook runs and the network findings - carries a "Technology
+  Preview" badge as the GPU elements do, its detail "Technology Preview, validated in simulation: the network cut-over
+  has not yet run on the lab's clouds." (§23.10), until the LAB-NET cases pass (plan task N14). Binding with plan task
+  N12a for the rule and the Hooks page, N12b for the plan form, N12c for the migration page and the findings.
 * Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
   the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
   when the caller names it, the object it acts on under it (its kind and id); a close button (×, "Close") in the
@@ -4652,6 +4657,22 @@ is no origin a browser sends (review RV31-03).
   nor cancelled, with its status, or a completed one with VMs not finalized, rolled back or cancelled, with their
   number — so nobody types its id to learn that; a cancelled migration's cleanup still under way, and a rolled-back VM keeping
   its copied data, which the plan list does not carry, are refused by the API alone, its 409 naming the plan; the dialog's Then says what stays: finished plans keep its id),
+  `/hooks` (Hooks, plan task N12a, §23.3 — "Playbooks and webhooks a plan runs at the points of its network cut-over.
+  A hook runs code with the control plane's reach, so only an admin registers one.", with the Technology Preview badge
+  — on `GET /hooks` for every role and its writes for an admin alone, §12. The catalog, in name order: each hook's
+  name, kind (Playbook, Webhook), description, what it runs - the playbook's path, or the webhook's URL and the name
+  of its secret, never a value the API does not hold -, timeout and the hook that reverts it; "No hooks registered."
+  when there are none, unavailable with Retry when the catalog cannot be loaded. For an admin, Register hook: Name
+  (the API's rule, its hint: 2-63 lowercase letters, digits and hyphens, starting with a letter or a digit), Kind
+  (Playbook by default), Description, the kind's own fields - Playbook path (an absolute path to a .yml or .yaml
+  file), or URL (https://, with no user information) and Secret (the name of the secret §13.3 reads, its key `token`
+  the bearer token) -, Timeout (seconds; 300 by default, 1-1800) and Revert (another hook of the catalog, or none);
+  a refused registration keeps what was typed and shows the API's reason. A hook's Edit opens that form with its
+  values, its name and kind read only (§12: immutable), saved with `PATCH /hooks/{name}`; its Delete asks to confirm
+  in a `ConfirmDialog` naming the hook, and a refused one shows the API's reason - the plans that name it, the hooks it
+  reverts. Any other role reads the catalog and is told that registering hooks requires the admin role. The offline
+  mock keeps a hook catalog as the API does - `GET`, `POST`, `PATCH` and `DELETE /hooks` with §12's rules and refusals
+  in the API's words, an admin's writes alone, and a plan naming catalog hooks alone - and holds none at first),
   `/users` (Users, the Administration group's page — "Give each person their own dashboard access and role. Their
   name identifies their actions in Events." — on `GET /users` and `POST /users` alone, §12, §13.1. For an admin,
   two panels. Add user: User name, its hint the rule of §13.1 (1-128 letters, digits, dots, underscores, `@` or
@@ -6039,6 +6060,6 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | the Octavia member helper: the drain, the join, the restore, the provider finding | §4.2, §8.5, §9.3, §10 (binding) | N9 |
 | the hooks' time in the downtime estimate (`hooks_s`), and the DNS TTL tail apart (`Estimate.dns_tail_s`) | §4.2, §5.3, §9.1 (binding) | N10 |
 | the demo's floating IPs, DNS zone, load balancer and stack | §7.4, §10 (binding) | N11 |
-| the dashboard (§23.9) | §16 | N12 |
+| the dashboard (§23.9): the Hooks page and the badge rule (N12a), the plan form (N12b), the migration page and the findings (N12c) | §16 (binding for N12a) | N12 |
 | QASuite (requirement rows, LAB-NET cases), Security.md, Operations.md's runbooks | QASuite, Security.md, Operations.md | N13 |
 | the lab on two clouds; the Technology Preview label goes when its cases pass | QASuite §13 | N14 |

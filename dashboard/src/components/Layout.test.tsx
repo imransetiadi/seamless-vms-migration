@@ -112,7 +112,8 @@ describe('Layout navigation (SDD §16)', () => {
     expect(groups).toHaveLength(5);
     ['Migrations', 'Clouds', 'Activity', 'Advisor', 'Administration'].forEach((name, i) => expect(groups[i]).toHaveAccessibleName(name));
     const items = (group: HTMLElement) => within(group).getAllByRole('link').map((link) => [link.textContent, link.getAttribute('href')]);
-    expect(items(groups[0]!)).toEqual([['Overview', '/'], ['Plans', '/plans']]);
+    // the hook catalog every role reads, after Plans (SDD §16, plan task N12a)
+    expect(items(groups[0]!)).toEqual([['Overview', '/'], ['Plans', '/plans'], ['Hooks', '/hooks']]);
     expect(items(groups[1]!)).toEqual([['Providers', '/providers'], ['Inventory', '/inventory']]);
     expect(items(groups[2]!)).toEqual([['Events', '/events']]);
     expect(items(groups[3]!)).toEqual([['Recommendations', '/advisor'], ['Policies', '/advisor/policies'], ['Audit trail', '/advisor/audit']]);

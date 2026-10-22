@@ -63,6 +63,7 @@ import { isDatabase, suggestProbes } from './mockProbes';
 import type {
   AppProbe,
   Health,
+  Hook,
   ProbeKind,
   ProbeResult,
   VerificationCheck,
@@ -617,10 +618,6 @@ function refusePlanSpec(spec: Record<string, unknown>): void {
     const refused = (codes ?? []).filter((code) => !ACKNOWLEDGEABLE_FINDINGS.includes(code));
     if (refused.length) problems.push(`acknowledged_findings[${vmId}]: ${refused.join(', ')} cannot be acknowledged (only ${[...ACKNOWLEDGEABLE_FINDINGS].sort().join(', ')} can)`);
   }
-  // like the API (SDD §12, plan task N3): a plan names catalog hooks alone - the mock's catalog holds none yet
-  const cutover = (spec.network_cutover ?? {}) as { hooks?: Record<string, string[]> };
-  for (const [point, names] of Object.entries(cutover.hooks ?? {}))
-    for (const name of names ?? []) problems.push(`network_cutover.hooks.${point}: no hook ${pyRepr(name)} in the catalog`);
   const prestage = Array.isArray(spec.prestage_resources) ? (spec.prestage_resources as string[]) : [];
   const unknown = prestage.filter((r) => !PRESTAGE_RESOURCES.includes(r));
   if (unknown.length) problems.push(`prestage_resources: cannot pre-stage ${unknown.map((r) => `'${r}'`).join(', ')}`);
@@ -959,6 +956,64 @@ function checkDeclarations(input: Record<string, unknown> | Provider) {
   }
 }
 
+/** A hook's name, as the API's HOOK_NAME (SDD §4.2, §23.3). */
+const HOOK_NAME = /^[a-z0-9][a-z0-9-]{1,62}$/;
+/** The fields a Hook has, in the model's order: what pydantic reports its errors by (SDD §4.2). */
+const HOOK_FIELDS = ['name', 'kind', 'description', 'playbook', 'url', 'secret', 'timeout_s', 'revert', 'created_at', 'updated_at'];
+/** PATCH /hooks/{name}'s fields (SDD §12): the name, the kind and the server-owned ones are immutable. */
+const HOOK_EDITABLE = ['description', 'playbook', 'url', 'secret', 'timeout_s', 'revert'];
+
+/** What the API's Hook model refuses in `body` (SDD §4.2, §12), in pydantic's words as the API's 422 carries them. */
+function hookProblem(body: Record<string, unknown>): string | null {
+  const extra = Object.keys(body).filter((key) => !HOOK_FIELDS.includes(key)).sort();
+  if (extra.length) return `not a field of this object: ${extra.join(', ')}`;
+  const fields: string[] = [];
+  const text = (key: string) => body[key] === undefined || body[key] === null || typeof body[key] === 'string';
+  if (body.name === undefined) fields.push('name: Field required');
+  else if (typeof body.name !== 'string') fields.push('name: Input should be a valid string');
+  else if (!HOOK_NAME.test(body.name)) fields.push(`name: String should match pattern '${HOOK_NAME.source}'`);
+  if (body.kind === undefined) fields.push('kind: Field required');
+  else if (body.kind !== 'playbook' && body.kind !== 'webhook') fields.push("kind: Input should be 'playbook' or 'webhook'");
+  for (const key of ['description', 'playbook', 'url', 'secret']) if (!text(key)) fields.push(`${key}: Input should be a valid string`);
+  const timeout = body.timeout_s;
+  if (timeout !== undefined) {
+    if (typeof timeout !== 'number' || !Number.isInteger(timeout)) fields.push('timeout_s: Input should be a valid integer');
+    else if (timeout < 1) fields.push('timeout_s: Input should be greater than or equal to 1');
+    else if (timeout > 1800) fields.push('timeout_s: Input should be less than or equal to 1800');
+  }
+  if (!text('revert')) fields.push('revert: Input should be a valid string');
+  if (fields.length) return fields.slice(0, 5).join('; ');
+  // the model's own rules, in its order (SDD §4.2)
+  const kind = body.kind as Hook['kind'];
+  const own = kind === 'playbook' ? ['playbook'] : ['url', 'secret'];
+  const other = kind === 'playbook' ? ['url', 'secret'] : ['playbook'];
+  const missing = own.find((key) => body[key] === undefined || body[key] === null);
+  if (missing) return `Value error, ${missing}: a ${kind} hook needs it`;
+  const extraneous = other.find((key) => body[key] !== undefined && body[key] !== null);
+  if (extraneous) return `Value error, ${extraneous}: a ${kind} hook takes none`;
+  const playbook = body.playbook as string | null | undefined;
+  if (playbook) {
+    if (!playbook.startsWith('/')) return 'Value error, playbook: an absolute path';
+    if (!/\.ya?ml$/i.test(playbook)) return 'Value error, playbook: a .yml or .yaml file';
+  }
+  const url = body.url as string | null | undefined;
+  if (url) {
+    let parsed: URL | null = null;
+    try {
+      parsed = new URL(url);
+    } catch {
+      parsed = null;
+    }
+    if (!parsed || parsed.protocol !== 'https:' || !parsed.hostname) return 'Value error, url: an https:// URL with a host';
+    if (parsed.username || parsed.password || /^https:\/\/[^/?#]*@/i.test(url)) return "Value error, url: no user information - put the credential in the hook's secret";
+  }
+  const secret = body.secret as string | null | undefined;
+  if (typeof secret === 'string' && (!SECRET_NAME.test(secret) || secret === '.' || secret === '..'))
+    return "Value error, secret: a secret name is 1-128 letters, digits, '.', '_' or '-', starting with a letter or digit";
+  if (body.revert === body.name && body.revert) return 'Value error, revert: a hook cannot revert itself';
+  return null;
+}
+
 export class MockServer {
   private readonly users = new Map<string, Me>();
   /** What GET /health answers; tests flip it to a degraded state. */
@@ -984,6 +1039,8 @@ export class MockServer {
   /** Stored advisor policies (SDD §14.6). */
   readonly policies: AdvisorPolicy[];
   readonly events: Event[];
+  /** The hook catalog an admin keeps, by name (SDD §12, §23.3): none at first. */
+  readonly hooks = new Map<string, Hook>();
   /** Source power states the demo set (POST /demo/vms/…/power, SDD §8.1). */
   private readonly power = new Map<string, 'running' | 'stopped'>();
   private seq: number;
@@ -1782,6 +1839,8 @@ export class MockServer {
       }
     }
 
+    if (root === 'hooks') return this.hooksRoute(method, id, input, token, path);
+
     if (root === 'providers') {
       if (!id) {
         if (method === 'GET') {
@@ -2479,6 +2538,92 @@ export class MockServer {
     }
   }
 
+  /** Like the API's check_plan_hooks (SDD §12, plan task N3): the first point naming a hook the catalog lacks. */
+  private refuseUnknownHooks(spec: Record<string, unknown>): void {
+    const cutover = (spec.network_cutover ?? {}) as { hooks?: Record<string, string[]> };
+    for (const [point, names] of Object.entries(cutover.hooks ?? {}))
+      for (const name of names ?? [])
+        if (!this.hooks.has(name)) throw new HttpError(422, 'validation_error', `network_cutover.hooks.${point}: no hook ${pyRepr(name)} in the catalog`);
+  }
+
+  /** Like the API's _check_hook (SDD §12): a revert of the catalog, and a secret no provider's credential. */
+  private refuseHookSecretAndRevert(hook: Hook): void {
+    if (hook.revert !== null && !this.hooks.has(hook.revert)) throw new HttpError(422, 'validation_error', `revert: no hook ${pyRepr(hook.revert)} in the catalog`);
+    if (hook.secret === null) return;
+    if (hook.secret.toLowerCase().replace(/[^a-z0-9]/g, '-').startsWith('provider-'))
+      throw new HttpError(422, 'validation_error', 'secret: provider-* names belong to the secrets Seamless stores for each provider; a webhook would send it to its URL');
+    const owner = this.providers.find((p) => p.credentials_secret === hook.secret || p.conversion_host?.ssh_key_secret === hook.secret);
+    if (owner) throw new HttpError(422, 'validation_error', `secret: provider ${owner.id} names it as its credential; a webhook would send it to its URL`);
+  }
+
+  /** GET, POST, PATCH and DELETE /hooks (SDD §12, §23.3, plan task N12a): the API's rules, refusals and events. */
+  private hooksRoute(method: string, name: string | undefined, input: Record<string, unknown>, token: string | null, path: string): MockResponse {
+    const writes = method !== 'GET';
+    const me = this.require(token, writes ? 'admin' : 'viewer', path);
+    const event = (kind: string, hook: Hook, data: Record<string, unknown> = {}) =>
+      this.emit({ kind, plan_id: null, migration_id: null, actor: me.name, message: `hook ${hook.name} ${kind.split('.')[1]}`, data: { name: hook.name, kind: hook.kind, ...data } });
+    if (!name) {
+      if (method === 'GET') return ok([...this.hooks.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)));
+      if (method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'Method Not Allowed');
+      const problem = hookProblem(input);
+      if (problem) throw new HttpError(422, 'validation_error', problem);
+      const now = new Date(this.now()).toISOString();
+      const hook: Hook = {
+        name: input.name as string,
+        kind: input.kind as Hook['kind'],
+        description: (input.description as string | null | undefined) ?? null,
+        playbook: (input.playbook as string | null | undefined) ?? null,
+        url: (input.url as string | null | undefined) ?? null,
+        secret: (input.secret as string | null | undefined) ?? null,
+        timeout_s: (input.timeout_s as number | undefined) ?? 300,
+        revert: (input.revert as string | null | undefined) ?? null,
+        created_at: now,
+        updated_at: now,
+      };
+      this.refuseHookSecretAndRevert(hook);
+      if (this.hooks.has(hook.name)) throw new HttpError(409, 'conflict', `hook ${pyRepr(hook.name)} already exists`);
+      this.hooks.set(hook.name, hook);
+      event('hook.created', hook);
+      return ok(hook, 201);
+    }
+    if (method === 'GET') {
+      const hook = this.hooks.get(name);
+      if (!hook) throw notFound('hook', name);
+      return ok(hook);
+    }
+    if (method === 'PATCH') {
+      const unknown = Object.keys(input).filter((key) => !HOOK_EDITABLE.includes(key)).sort();
+      if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);
+      const hook = this.hooks.get(name);
+      if (!hook) throw notFound('hook', name);
+      const merged = { ...hook, ...input } as Record<string, unknown>;
+      const problem = hookProblem(merged);
+      if (problem) throw new HttpError(422, 'validation_error', problem);
+      const updated = { ...(merged as unknown as Hook), updated_at: new Date(this.now()).toISOString() };
+      this.refuseHookSecretAndRevert(updated);
+      this.hooks.set(name, updated);
+      event('hook.updated', updated, { fields: Object.keys(input).sort() });
+      return ok(updated);
+    }
+    if (method === 'DELETE') {
+      const hook = this.hooks.get(name);
+      if (!hook) throw notFound('hook', name);
+      const plans = this.plans
+        .filter((p) => p.status !== 'cancelled' && Object.values(p.network_cutover?.hooks ?? {}).some((names) => (names ?? []).includes(name)))
+        .map((p) => `${p.name} (${p.id})`);
+      if (plans.length) {
+        const rest = plans.length - 10;
+        throw new HttpError(409, 'conflict', `hook ${name} is named by plan(s) ${plans.slice(0, 10).join(', ')}${rest > 0 ? ` and ${rest} more` : ''}: remove it from their network_cutover first`);
+      }
+      const reverting = [...this.hooks.values()].filter((h) => h.revert === name).map((h) => h.name).sort();
+      if (reverting.length) throw new HttpError(409, 'conflict', `hook ${name} is the revert of hook(s) ${reverting.join(', ')}: change their revert first`);
+      this.hooks.delete(name);
+      event('hook.deleted', hook);
+      return { status: 204 };
+    }
+    throw new HttpError(405, 'method_not_allowed', 'Method Not Allowed');
+  }
+
   private createPlan(me: Me, raw: Record<string, unknown>): MockResponse {
     const input = withCanonicalNicOverrides(raw);
     this.refusePolicyChange(me, input, defaultPlanFields(this.now()));
@@ -2492,6 +2637,7 @@ export class MockServer {
     const source = this.providers.find((p) => p.id === body.source_provider_id && p.role === 'source');
     const destination = this.providers.find((p) => p.id === body.destination_provider_id && p.role === 'destination');
     if (!source || !destination) throw new HttpError(400, 'bad_request', 'Unknown source or destination provider.');
+    this.refuseUnknownHooks(input);
     const now = this.now();
     const plan: Plan = {
       ...defaultPlanFields(now),
@@ -2567,6 +2713,7 @@ export class MockServer {
     }
     // like the API (SDD §12): the plan it would store is checked, kept fields included
     refusePlanSpec({ ...(plan as unknown as Record<string, unknown>), ...input });
+    this.refuseUnknownHooks({ ...(plan as unknown as Record<string, unknown>), ...input });
     for (const key of Object.keys(input)) (plan as unknown as Record<string, unknown>)[key] = input[key];
     plan.status = 'draft';
     plan.updated_at = new Date(this.now()).toISOString();

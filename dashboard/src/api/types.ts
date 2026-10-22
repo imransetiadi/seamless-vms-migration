@@ -490,6 +490,9 @@ export interface Hook {
   updated_at: Timestamp;
 }
 
+/** The fields `PATCH /hooks/{name}` takes (SDD §12): its name and kind are immutable. */
+export type HookPatch = Partial<Pick<Hook, 'description' | 'playbook' | 'url' | 'secret' | 'timeout_s' | 'revert'>>;
+
 export interface Plan {
   /** `plan-<8 hex>`. */
   id: string;
