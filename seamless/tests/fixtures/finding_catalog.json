@@ -311,6 +311,11 @@
    "strategies": [],
    "remediation": "Put the VMs of each announced network into one wave, or have the network's prefix routed by hand while its waves are cut over."
   },
+  "NET_LB_POOL_SPLIT": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Put each pool's members into one wave: give them one app tag and plan the waves again, as VMs that share an app tag stay together. Or accept that between its waves the pool serves from both clouds: its members already cut over are drained from the source pool and join the destination pool once verified - by the member helper for a pool the plan maps, else as the runbook for Octavia load balancers says."
+  },
   "DST_FIP_ADDRESS_UNAVAILABLE": {
    "severity": "blocker",
    "strategies": [],
