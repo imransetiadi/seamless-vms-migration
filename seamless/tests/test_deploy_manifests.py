@@ -107,6 +107,32 @@ def test_security_md_describes_the_api_token_the_deployment_mounts():
         assert "service account has no Kubernetes API token" not in " ".join(text.split())
 
 
+def _external_tcp_ports() -> set[int]:
+    """The TCP ports seamless-allow-egress-external opens towards networks outside the cluster."""
+    policies = yaml.safe_load_all(
+        (ROOT / "deploy" / "openshift" / "networkpolicy.yaml").read_text(encoding="utf-8")
+    )
+    external = next(
+        p for p in policies if p and p["metadata"]["name"] == "seamless-allow-egress-external"
+    )
+    return {
+        port["port"]
+        for rule in external["spec"]["egress"]
+        for port in rule.get("ports", [])
+        if port.get("protocol", "TCP") == "TCP"
+    }
+
+
+def test_external_egress_reaches_the_services_the_gpu_and_network_cut_over_call():
+    """SDD §17 (0.4.0 release review): Placement (the GPU capacity read, §22.3), Heat and Octavia
+    (the source's stack and pool reads, §10; the member helper, §8.5) and Designate (the DNS swap,
+    §8.4) on their community and RHOSP 17.1 public ports, and an RFC 2136 server's TCP 53 (§8.4): a
+    call the policy blocks times out, so a read reports unknown and a cut-over step fails."""
+    community = {8778, 8004, 9876, 9001}
+    rhosp_public = {13778, 13004, 13876, 13001}
+    assert community | rhosp_public | {53} <= _external_tcp_ports()
+
+
 def test_external_egress_reaches_the_verification_ports_the_plan_form_proposes():
     """SDD §17, §7.5: a `tcp:<port>` check the policy blocks times out and fails the verification,
     so auto_rollback would roll back a migration that worked: the dashboard's defaults pass."""

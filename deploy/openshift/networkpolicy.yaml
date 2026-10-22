@@ -116,7 +116,10 @@ spec:
                         # it times out, fails the verification and auto_rollback rolls the VM back. Add any
                         # other verification or application-probe port of your plans here (Security.md 8).
         - protocol: TCP
-          port: 443     # RHOSO/OpenStack APIs, vCenter, Jev provider API, npm registry (Jev stdio)
+          port: 443     # RHOSO/OpenStack APIs, vCenter, Jev provider API, npm registry (Jev stdio), webhook
+                        # hooks (SDD 23.3): add a webhook served on another port here
+        - protocol: TCP
+          port: 53      # an RFC 2136 DNS target's server: the DNS swap's signed UPDATE over TCP (SDD 8.4)
         - protocol: TCP
           port: 3111    # agentmemory REST
         - protocol: TCP
@@ -130,6 +133,14 @@ spec:
         - protocol: TCP
           port: 9696    # Neutron
         - protocol: TCP
+          port: 8778    # Placement: the GPU capacity read (SDD 22.3)
+        - protocol: TCP
+          port: 8004    # Heat: the source's stack reads (SDD 10)
+        - protocol: TCP
+          port: 9876    # Octavia: the source's pool reads, the member helper (SDD 8.5)
+        - protocol: TCP
+          port: 9001    # Designate: the DNS swap (SDD 8.4)
+        - protocol: TCP
           port: 13000   # RHOSP 17.1 public Keystone (TLS)
         - protocol: TCP
           port: 13292   # RHOSP 17.1 public Glance
@@ -139,6 +150,14 @@ spec:
           port: 13774   # RHOSP 17.1 public Nova
         - protocol: TCP
           port: 13776   # RHOSP 17.1 public Cinder
+        - protocol: TCP
+          port: 13778   # RHOSP 17.1 public Placement
+        - protocol: TCP
+          port: 13004   # RHOSP 17.1 public Heat
+        - protocol: TCP
+          port: 13876   # RHOSP 17.1 public Octavia
+        - protocol: TCP
+          port: 13001   # RHOSP 17.1 public Designate
 ---
 # Kubernetes API for the dashboard's secret store (SEAMLESS_SECRET_STORE=kubernetes, SDD 13.3/17).
 # kubernetes.default.svc is DNATed to the API server endpoints (control-plane node IPs, port 6443) before
