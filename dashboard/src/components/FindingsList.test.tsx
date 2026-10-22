@@ -35,4 +35,16 @@ describe('the findings lists', () => {
     );
     marked();
   });
+
+  it("say in a network badge's detail that the network cut-over has not yet run on the lab's clouds (SDD §16, §23.10, FR-47)", () => {
+    render(
+      <MemoryRouter>
+        <FindingsList findings={[finding('SRC_VM_LB_MEMBER', 'web-01')]} />
+      </MemoryRouter>,
+    );
+    // word for word: no network element claims a lab validation until the LAB-NET cases pass
+    expect(screen.getByRole('button', { name: 'Technology Preview' })).toHaveAccessibleDescription(
+      "Technology Preview, validated in simulation: the network cut-over has not yet run on the lab's clouds.",
+    );
+  });
 });

@@ -15,6 +15,8 @@ scripts/seamless-ctl.sh PLATFORM ACTION [ARGUMENTS] [OPTIONS]
 | `openshift` | the manifests in `deploy/openshift/` (OpenShift 4.16+) | `oc` |
 
 The binding description is [SDD §17.2](SDD.md); `scripts/seamless-ctl.sh --help` prints the same options.
+Section 8 holds the runbooks for what a migration leaves to the operator: Heat stacks, Octavia load balancers,
+Designate zones and Manila shares (SDD §23.2).
 
 ---
 
@@ -362,3 +364,205 @@ version, then resume the plans.
 
 The tests that pin the script's behaviour are `seamless/tests/test_seamless_ctl.py` (stub tools record every
 call; QASuite FR-25).
+
+---
+
+## 8. Runbooks: what a migration leaves to the operator
+
+A migration moves a VM: its server, disks and ports and, as its plan asks, its floating IPs with their addresses, its
+DNS record and its Octavia memberships (SDD §23). Four things around the VM stay the operator's (SDD §23.2): the Heat
+stack that created it, the Octavia load balancer it serves behind, the Designate zone that holds its names and the
+Manila shares it mounts. The pre-flight names the first two - `SRC_VM_HEAT_STACK`, `SRC_VM_AUTOSCALED`,
+`SRC_VM_HEAT_UNKNOWN`, `SRC_VM_LB_MEMBER`, `SRC_VM_LB_UNKNOWN` and `MAP_LB_POOL_INCOMPATIBLE` (SDD §9.3) - and their
+remediations point here. Like the network cut-over, these runbooks have not yet run on the lab's clouds: the LAB-NET
+cases run those for Heat stacks, Octavia load balancers and Designate zones (QASuite §7.2, SDD §23.10), and no lab
+case runs the one for Manila shares yet.
+
+Each command runs with a credential of the cloud it names - the source's or the destination's - and `<...>` marks
+what you fill in.
+
+### 8.1 Heat stacks
+
+Seamless moves the server, never its stack: Heat's stack abandon and adopt are a preview its convergence engine does
+not support, and running the template again would create a second server (SDD §23.2). After the cutover the source
+stack still describes the server, and two things can bring that server back: a stack update, which may recreate it,
+and an autoscaling group, which may replace it - a second live copy of the VM.
+
+1. **Find the VM's stack** when the pre-flight could not read Heat (`SRC_VM_HEAT_UNKNOWN`), with a credential whose
+   role Heat's policy lets list the project's stacks and their resources:
+
+   ```bash
+   openstack stack list -f value -c 'Stack Name'
+   # in each stack and its nested stacks: the resource whose physical resource is the VM's server
+   openstack stack resource list -n 5 --filter physical_resource_id=<server-id> <stack>
+   # the stack's autoscaling groups: a group's physical resource is the nested stack of its members
+   openstack stack resource list -n 5 --filter type=OS::Heat::AutoScalingGroup <stack>
+   ```
+
+   The VM is a group's member (`SRC_VM_AUTOSCALED`) when the stack its server's resource is listed in is the group's
+   nested stack, or one nested below it.
+
+2. **Suspend the group's scaling** before the plan validates again: disable each alarm that signals one of the
+   group's scaling policies - the stack's `OS::Aodh::*` resources whose alarm actions name a policy's signal URL; the
+   alarm's id is the resource's physical resource id - and send the policies no signal yourself:
+
+   ```bash
+   openstack stack resource list -n 5 <stack>
+   openstack alarm update --enabled False <alarm-id>
+   ```
+
+   Then acknowledge `SRC_VM_AUTOSCALED` for the VM in the plan (`acknowledged_findings`, SDD §4.2) and validate: the
+   finding stays, as a warning that says the plan acknowledges it.
+
+3. **Until the VM is finalized**, run no stack update at the source: an update may recreate the server, and a
+   rollback starts the source server as it was.
+
+4. **After the finalize**, keep the alarms disabled while a member of the group still has to move. Once the
+   application has moved whole - every VM of the stack finalized, its other resources migrated or no longer needed -
+   delete the source stack:
+
+   ```bash
+   openstack stack resource list -n 5 <stack>     # what the delete removes
+   openstack stack delete <stack>
+   ```
+
+   A stack delete deletes every physical resource the stack still manages, unless the resource's `deletion_policy`
+   is `Retain` (Heat's default is `Delete`). When part of the stack stays at the source for good, change its
+   template so that it no longer holds the migrated server, update the stack - only once the VM is finalized -, and
+   then enable the alarms again (`openstack alarm update --enabled True <alarm-id>`).
+
+5. **At the destination**, a stack that should record the migrated server names it with `external_id`: Heat neither
+   builds, manages nor deletes such a resource, and the attribute cannot be updated (Heat's template guide,
+   *Resources*), so the stack never recreates what Seamless created. New resources of the application - an
+   autoscaling group for its new members, say - go into that stack as usual.
+
+### 8.2 Octavia load balancers
+
+Seamless creates no load balancer and reads no TLS key: the destination's load balancer, its listeners, pools and
+health monitors are the operator's, and so are the certificates its listeners use (SDD §23.7). What Seamless moves,
+when the plan maps the VM's pool, is the VM's membership (SDD §8.5, the member helper).
+
+1. **Read the source's load balancer**, its listeners, pools, members and health monitors in one tree:
+
+   ```bash
+   openstack loadbalancer status show <source-lb>
+   openstack loadbalancer listener show <listener>     # protocol, port, TLS container references
+   openstack loadbalancer pool show <pool>             # algorithm, session persistence
+   ```
+
+   When the pre-flight could not read Octavia (`SRC_VM_LB_UNKNOWN`), check the memberships yourself: the VM is a
+   member of a pool when one of the pool's member addresses is one of its fixed IPs
+   (`openstack loadbalancer member list <pool>`, `openstack server show -c addresses <server>`).
+
+2. **Create the destination's load balancer** before the plan validates, with a listener, a pool and a health monitor
+   for each source pool. Its provider must serve what the pool uses: the OVN provider serves TCP, UDP and SCTP with
+   the `SOURCE_IP_PORT` algorithm, TCP, UDP-CONNECT and SCTP health monitors and no session persistence, so HTTP, TLS
+   termination or session persistence needs an amphora load balancer (`MAP_LB_POOL_INCOMPATIBLE` names what the
+   mapped pool's provider lacks). A TLS-terminating listener needs its certificate in the destination's key manager:
+   store it there from your own copy and reference it from the listener.
+
+3. **Map each source pool** to its destination pool in the plan (`network_cutover.lb_pools`: the source pool's id to
+   the destination pool's id, SDD §4.2). The helper then drains the VM's source member before the source stops,
+   joins the VM to the destination pool after its verification, and on a rollback deletes that member and enables the
+   source member again; each step is on the migration's timeline (SDD §8.5).
+
+4. **A pool the plan does not map** moves by hand, in the same order:
+
+   ```bash
+   # before the cutover, at the source: no new connection to the VM's member
+   openstack loadbalancer member set --disable <source-pool> <source-member>
+   # after the verification, at the destination: the VM's address there, on the member's port
+   openstack loadbalancer member create --address <address> --protocol-port <port> --subnet-id <subnet> <destination-pool>
+   # on a rollback: the reverse
+   openstack loadbalancer member delete <destination-pool> <destination-member>
+   openstack loadbalancer member set --enable <source-pool> <source-member>
+   ```
+
+5. **Send the clients to the destination's load balancer** once its pools have members. A DNS name moves to its VIP's
+   address - a plan's DNS target swaps a VM's own record (SDD §23.5); a service's name you swap yourself, or with a
+   hook. A floating IP on the source VIP can keep its address as a VM's does (SDD §8.3), by hand and with both clouds
+   on one external network: reserve the address at the destination, disassociate it at the source, associate it
+   with the destination VIP's port. Creating a floating IP with a given address needs a role Neutron's policy grants
+   it (admin by default):
+
+   ```bash
+   openstack floating ip create --floating-ip-address <address> <external-network>   # destination
+   openstack floating ip unset --port <source-floating-ip>                             # source
+   openstack floating ip set --port <vip-port> <destination-floating-ip>               # destination
+   ```
+
+6. **After the finalize** the drained source member stays, as the source's load balancer is the operator's (SDD §8.5):
+   delete the member, and the source's load balancer once nothing uses it:
+
+   ```bash
+   openstack loadbalancer member delete <source-pool> <source-member>
+   openstack loadbalancer delete --cascade <source-lb>
+   ```
+
+### 8.3 Designate zones
+
+A plan's Designate DNS target is reached with the destination provider's credential (SDD §23.5), so the target's
+zone must be in the destination's Designate, in that credential's project, before the swap runs; Neutron's DNS
+integration at the destination needs the zone there too (`DST_DNS_INTEGRATION_MISSING`). When the zone lives in the
+source's Designate, move it before the window. A zone transfer request moves a zone between the projects of one
+Designate, never to another cloud; between clouds the zone file moves:
+
+1. Lower the TTLs of the zone's records and of its delegation well before, so that the change of name servers takes
+   effect fast.
+2. Export the zone at the source and import it at the destination:
+
+   ```bash
+   openstack zone export create <zone>                                # source: the export's id
+   openstack zone export showfile <export-id> -f value > zone.txt     # source
+   openstack zone import create zone.txt                              # destination
+   openstack zone import show <import-id>                             # destination: until it is COMPLETE
+   ```
+
+3. Delegate the zone to the destination's name servers at its parent - the parent zone's NS records, or the
+   registrar - as the destination lists them:
+
+   ```bash
+   openstack recordset list --type NS <zone>                          # destination
+   ```
+
+4. Until the parent's NS TTL has run out, both clouds answer for the zone: make each change in both, or in neither.
+   Then run the plan's window - its swaps write to the destination's copy - and delete the source's:
+
+   ```bash
+   openstack zone delete <zone>                                       # source
+   ```
+
+A zone whose authoritative server is not Designate - BIND, or another server that takes RFC 2136 updates - needs no
+move: its DNS target is an `rfc2136` one, with the server and a TSIG key (SDD §8.4).
+
+### 8.4 Manila shares
+
+Seamless moves no share: a VM's NFS or CephFS mount stays as the guest has it (SDD §23.2). Manila's own share
+migration and replication move a share within one Manila - to another pool or back end, another availability zone -,
+not to another cloud. Choose, per share, before the window:
+
+* **Keep the share where it is**, when the migrated VM reaches its export from the destination's network - a storage
+  network both clouds route to. An NFS share's access rules name client addresses: when the VM's address changes,
+  allow the new one before the window, and remove the old one after the finalize:
+
+  ```bash
+  openstack share access create <share> ip <new-address> --access-level rw    # the share's cloud
+  openstack share access list <share>
+  openstack share access delete <share> <access-id>
+  ```
+
+* **Move the data** to a share at the destination: create it, allow the VM's new address, and copy from a host that
+  mounts both shares - a first pass while the VM runs, the last once its source has stopped, inside the downtime,
+  where a `post_create` hook runs with its timeout counting in the estimate (SDD §23.3, §9.1). Nothing may write to
+  either share between the stop and the end of the last pass:
+
+  ```bash
+  openstack share create NFS <size-gib> --name <name> --share-type <type>      # destination; --share-network if its type needs one
+  openstack share access create <share> ip <address> --access-level rw         # destination
+  openstack share export location list <share>                                 # destination: the new export
+  rsync -aH --numeric-ids --delete /mnt/source-share/ /mnt/destination-share/  # the copy host, each pass
+  ```
+
+  Point the guest's mount - its `/etc/fstab` or automount map - at the new export location, and let the guest mount
+  it only once the last pass is done, by hand or with a playbook hook; delete the source share after the finalize
+  (`openstack share delete <share>`).
