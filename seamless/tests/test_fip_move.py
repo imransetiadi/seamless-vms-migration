@@ -100,12 +100,14 @@ def floating_vm(i=1):
     return vm(i, nics=[nic])
 
 
-async def fip_setup(tmp_path, store, plan_kw=None, source_kw=None, destination_kw=None):
+async def fip_setup(
+    tmp_path, store, plan_kw=None, source_kw=None, destination_kw=None, destination_cls=None
+):
     """A plan of one OpenStack VM with a floating IP whose network cut-over keeps the address; the
-    clouds' calls and the steps in one log."""
+    clouds' calls and the steps in one log. ``destination_cls``: a FipDestination of the test's."""
     log: list[str] = []
     vms = [floating_vm()]
-    destination = FipDestination(log, **(destination_kw or {}))
+    destination = (destination_cls or FipDestination)(log, **(destination_kw or {}))
     h = build_harness(tmp_path, store, vms, destination=destination)
     source = FipSource(vms, log, **(source_kw or {}))
     h.orch.providers.source = h.source = source

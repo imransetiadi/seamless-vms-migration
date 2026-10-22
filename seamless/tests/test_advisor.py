@@ -329,6 +329,24 @@ async def test_verification_blocked_console_sets_review_required():
     assert verify_args["claims"] == VERIFICATION_CLAIMS
 
 
+async def test_the_verification_review_sends_no_moved_floating_ip():
+    """SDD §7.5, §13.4, §23.9 (plan task N8): a moved floating IP's check names its address; the
+    review leaves it out of what it sends to Jev, and sends the other checks."""
+    advisor, session = advisor_for(
+        {"screen": {"recommendation": {"action": "pass"}}}, settings=ON_PREM
+    )
+    res = result()
+    res.checks.insert(
+        1,
+        {"name": "floating_ip:203.0.113.10", "ok": True, "detail": "connected to 203.0.113.10:22"},
+    )
+    await advisor.review_verification(make_vm(), res)
+    [args] = [c[1] for c in session.calls if c[0] == "jev_verify"]
+    text = json.dumps(args)
+    assert "203.0.113.10" not in text and "floating_ip" not in text
+    assert "server_active" in text and "console" in text
+
+
 async def test_verification_redacts_the_console_before_screening():
     """SDD §13.4/§14.2 (Security.md R-08): secrets never reach jev_screen either."""
     advisor, session = advisor_for(

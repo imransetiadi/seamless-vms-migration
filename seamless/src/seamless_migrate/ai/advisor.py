@@ -351,6 +351,9 @@ class Advisor:
             f"{c.get('name')}={_check_state(c)}"
             + (f" ({c.get('detail')})" if c.get("detail") else "")
             for c in result.checks
+            # a moved floating IP's check names its address, which never reaches Jev (SDD §7.5,
+            # §13.4, §23.9)
+            if not str(c.get("name") or "").startswith("floating_ip:")
         )
         evidence = [{"id": "checks", "text": self._redact(checks, [vm.name])}]
         reasons: list[str] = [review_reason] if review_reason else []
