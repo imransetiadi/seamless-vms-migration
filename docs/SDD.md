@@ -4432,7 +4432,18 @@ is no origin a browser sends (review RV31-03).
   Neutron with its MAC, all its fixed IPs and its security groups, §6.6, §7.3; the hint says the ports then outlive
   their server and that VMware sources ignore it), the verification settings — TCP and Windows ports,
   probe address, console success patterns, timeout, automatic rollback, advisor review, the application probes of
-  every VM (kind, port, path, expected status, §7.5) — and storage handover;
+  every VM (kind, port, path, expected status, §7.5) — and storage handover; the network cut-over (plan task N12b,
+  §23.3-§23.7) under "Network cut-over" with a "Technology Preview" badge — Floating IPs: New addresses (`auto`, the
+  default: os-migrate's, which may take new addresses) or Keep each address (`keep_address`: the cutover moves each
+  floating IP with its address, §8.3); each point's hooks (§8.2) — Before the stop (`pre_stop`), After the server is
+  created (`post_create`), After the verification (`post_verify`), On rollback (`on_rollback`), On finalize
+  (`on_finalize`) — in their run order, each with Move up and Remove, and Add hook offering the catalog's hooks the
+  point does not run yet (`GET /hooks`), or saying why none is offered: none registered (an admin registers them on the
+  Hooks page, linked) or the catalog not read (with Retry); the DNS targets (§8.4), each a selected VM, its kind —
+  Designate, reached with the destination provider's credential, or RFC 2136, with its server and TSIG secret —, zone
+  and record, with Add DNS target and Remove, a VM taken out of the plan taking its target with it; and the Octavia
+  pool mappings (§8.5), each a source pool's id to a destination pool's id, with Add pool mapping and Remove — the
+  advanced settings' summary naming the network cut-over;
   each field accepts what the API accepts, so a plan created through the API or `seamless plan apply` stays
   editable; while a migration of the plan is `failed`, the destination is unavailable with the reason — the
   failed VMs named, roll them back or cancel them first (§12) — as the source of an existing plan is),
@@ -6060,6 +6071,6 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | the Octavia member helper: the drain, the join, the restore, the provider finding | §4.2, §8.5, §9.3, §10 (binding) | N9 |
 | the hooks' time in the downtime estimate (`hooks_s`), and the DNS TTL tail apart (`Estimate.dns_tail_s`) | §4.2, §5.3, §9.1 (binding) | N10 |
 | the demo's floating IPs, DNS zone, load balancer and stack | §7.4, §10 (binding) | N11 |
-| the dashboard (§23.9): the Hooks page and the badge rule (N12a), the plan form (N12b), the migration page and the findings (N12c) | §16 (binding for N12a) | N12 |
+| the dashboard (§23.9): the Hooks page and the badge rule (N12a), the plan form (N12b), the migration page and the findings (N12c) | §16 (binding for N12a, N12b) | N12 |
 | QASuite (requirement rows, LAB-NET cases), Security.md, Operations.md's runbooks | QASuite, Security.md, Operations.md | N13 |
 | the lab on two clouds; the Technology Preview label goes when its cases pass | QASuite §13 | N14 |

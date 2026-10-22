@@ -722,6 +722,108 @@ describe('Plans page', () => {
     expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
   });
 
+  it("maps a plan's network cut-over: hooks per point, the floating IP move, DNS targets and Octavia pools", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const at = '2026-10-08T12:00:00Z';
+    for (const name of ['drain-lb', 'warm-cache', 'smoke'])
+      server.hooks.set(name, { name, kind: 'playbook', description: null, playbook: `/opt/hooks/${name}.yml`, url: null, secret: null, timeout_s: 300, revert: null, created_at: at, updated_at: at });
+    const web = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories['rhosp17-dc1']!.find((vm) => vm.name === 'web-01')!;
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+    const dialog = await newPlan(user, 'Cut over the portal', 'rhosp17-dc1');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:.*network cut-over/i));
+    const section = within(dialog).getByRole('group', { name: /^network cut-over/i });
+    expect(within(section).getByText('Technology Preview')).toBeInTheDocument();
+    await user.click(within(section).getByRole('radio', { name: /keep each address/i }));
+    // each point's hooks in their run order: Add hook offers what the point does not run yet
+    const addTo = async (point: RegExp, hook: string) => {
+      const group = within(section).getByRole('group', { name: point });
+      await user.selectOptions(within(group).getByLabelText(/^hook to add/i), hook);
+      await user.click(within(group).getByRole('button', { name: /^add hook/i }));
+      return group;
+    };
+    await addTo(/^before the stop/i, 'drain-lb');
+    await addTo(/^after the server is created/i, 'warm-cache');
+    const postCreate = await addTo(/^after the server is created/i, 'smoke');
+    expect(within(within(postCreate).getByLabelText(/^hook to add/i)).queryByRole('option', { name: 'smoke' })).not.toBeInTheDocument();
+    await user.click(within(postCreate).getByRole('button', { name: 'Move smoke up' }));
+    expect(within(postCreate).getAllByRole('listitem').map((item) => item.getAttribute('aria-label'))).toEqual(['smoke', 'warm-cache']);
+    // a DNS target of a selected VM, its server and TSIG secret asked for an RFC 2136 one
+    await user.click(within(section).getByRole('button', { name: 'Add DNS target' }));
+    await user.selectOptions(within(section).getByLabelText(/^DNS target 1 VM/), web.source_id);
+    await user.selectOptions(within(section).getByLabelText(/^DNS target 1 kind/), 'rfc2136');
+    await user.type(within(section).getByLabelText(/^DNS target 1 zone/), 'example.com.');
+    await user.type(within(section).getByLabelText(/^DNS target 1 record/), 'web-01');
+    await user.type(within(section).getByLabelText(/^DNS target 1 server/), 'ns1.example.com:53');
+    await user.type(within(section).getByLabelText(/^DNS target 1 TSIG secret/), 'web-tsig');
+    // an Octavia pool mapping
+    await user.click(within(section).getByRole('button', { name: 'Add pool mapping' }));
+    await user.type(within(section).getByLabelText(/^Pool mapping 1 source pool/), 'pool-src-1');
+    await user.type(within(section).getByLabelText(/^Pool mapping 1 destination pool/), 'pool-dst-9');
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Cut over the portal')).toBe(true));
+    const created = server.plans.find((p) => p.name === 'Cut over the portal')!;
+    expect(created.network_cutover).toEqual({
+      hooks: { pre_stop: ['drain-lb'], post_create: ['smoke', 'warm-cache'] },
+      floating_ips: 'keep_address',
+      dns_targets: { [web.source_id]: { kind: 'rfc2136', zone: 'example.com.', record: 'web-01', server: 'ns1.example.com:53', tsig_secret: 'web-tsig' } },
+      lb_pools: { 'pool-src-1': 'pool-dst-9' },
+    });
+  });
+
+  it("says why a point offers no hook, and refuses an incomplete DNS target or pool mapping (SDD §16, plan task N12b)", async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const dialog = await newPlan(user, 'No hooks yet', 'rhosp17-dc1');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:.*network cut-over/i));
+    const section = within(dialog).getByRole('group', { name: /^network cut-over/i });
+    expect(await within(section).findAllByText(/no hooks registered: an admin registers them on the/i)).toHaveLength(5);
+    expect(within(section).getAllByRole('link', { name: 'Hooks page' })[0]).toHaveAttribute('href', '/hooks');
+    await user.click(within(section).getByRole('button', { name: 'Add DNS target' }));
+    await user.click(within(section).getByRole('button', { name: 'Add pool mapping' }));
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    // in the error summary, which links to the section, and in the section itself
+    expect(await within(dialog).findAllByText('DNS target 1: choose a VM, and enter its zone and record.')).toHaveLength(2);
+    expect(within(dialog).getByRole('group', { name: /^network cut-over/i })).toHaveAccessibleDescription('DNS target 1: choose a VM, and enter its zone and record.');
+  });
+
+  it('lets a VM taken out of the plan take its DNS target with it (SDD §16, plan task N12b)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const dialog = await newPlan(user, 'Targets follow their VMs', 'rhosp17-dc1');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Select web-02' }));
+    await user.click(within(dialog).getByText(/^advanced:.*network cut-over/i));
+    const section = within(dialog).getByRole('group', { name: /^network cut-over/i });
+    for (const [n, vm] of [
+      [1, 'os-0a11'],
+      [2, 'os-0a12'],
+    ] as const) {
+      await user.click(within(section).getByRole('button', { name: 'Add DNS target' }));
+      await user.selectOptions(within(section).getByLabelText(new RegExp(`^DNS target ${n} VM`)), vm);
+      await user.type(within(section).getByLabelText(new RegExp(`^DNS target ${n} zone`)), 'example.com.');
+    }
+    await user.type(within(section).getByLabelText(/^DNS target 1 record/), 'record-1');
+    // web-02 leaves the plan, and its target with it; back in the plan, its target is too, as its strategy override is
+    const web02 = within(dialog).getByRole('checkbox', { name: 'Select web-02' });
+    await user.click(web02);
+    expect(within(section).queryByLabelText(/^DNS target 2 VM/)).not.toBeInTheDocument();
+    await user.click(web02);
+    expect(within(section).getByLabelText(/^DNS target 2 zone/)).toHaveValue('example.com.');
+    // out again: its target, without a record yet, is not for the form to refuse, and only web-01's is sent
+    await user.click(web02);
+    expect(within(section).queryByLabelText(/^DNS target 2 VM/)).not.toBeInTheDocument();
+    expect(within(section).getByLabelText(/^DNS target 1 VM/)).toHaveValue('os-0a11');
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Targets follow their VMs')).toBe(true));
+    const created = server.plans.find((p) => p.name === 'Targets follow their VMs')!;
+    expect(created.network_cutover.dns_targets).toEqual({ 'os-0a11': { kind: 'designate', zone: 'example.com.', record: 'record-1', server: null, tsig_secret: null } });
+  });
+
   it('sets project mappings and every verification setting from the form (dashboard-first, SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });

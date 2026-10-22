@@ -7,6 +7,7 @@ import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan,
 import { MAX_DURATION_S, MAX_SYNC_PASSES, MIN_RATE_BPS } from '../lib/forcedEstimate';
 import { declaredProfileOf, destinationGpuFlavors, gpuFlavorRows, gpuKeyRows, vmGpus, type GpuVm } from '../lib/gpu';
 import { heldElsewhere, holdersOf } from '../lib/holds';
+import { cutoverBody, cutoverProblem, type CutoverDraft } from '../lib/cutover';
 import { parseDrafts, toDraft, type ProbeDraft } from '../lib/probes';
 import { providerLabel } from '../lib/providerUse';
 import { formatMappings, parseMappings } from '../lib/mappings';
@@ -21,6 +22,7 @@ import { ErrorBanner } from './ErrorBanner';
 import { SelectField, TextAreaField, TextField } from './Field';
 import { GpuMappings, type OfferedGpuFlavors } from './GpuMappings';
 import { Modal } from './Modal';
+import { NetworkCutoverSection } from './NetworkCutoverSection';
 import { ProbeListEditor } from './ProbeListEditor';
 import { LoadingBlock } from './Skeleton';
 import { TechPreviewBadge } from './TechPreviewBadge';
@@ -85,6 +87,8 @@ interface FormState {
   handoverMap: Record<string, string>;
   /** A VMware GPU key -> the destination GPU flavor its row names (SDD §4.2 `mappings.gpus`, §22.4): never prefilled. */
   gpuMappings: Record<string, string>;
+  /** The network cut-over (SDD §4.2, §16, plan task N12b): floating IPs, each point's hooks, DNS targets, pool mappings. */
+  cutover: CutoverDraft;
 }
 
 /** The step times an operator measures on the first migrations (SDD §16, Performance.md §6.4). */
@@ -97,7 +101,7 @@ const STEP_TIMES = [
 type StepTimeKey = (typeof STEP_TIMES)[number]['key'];
 const NO_STEP_TIMES = Object.fromEntries(STEP_TIMES.map(({ key }) => [key, ''])) as Record<StepTimeKey, string>;
 
-type FieldKey = 'keepWarm' | 'finalizeReminder' | 'projects' | 'timeout' | 'windowsPorts' | 'appProbes' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover' | (typeof STEP_TIMES)[number]['field'];
+type FieldKey = 'keepWarm' | 'finalizeReminder' | 'projects' | 'timeout' | 'windowsPorts' | 'appProbes' | 'cutover' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover' | (typeof STEP_TIMES)[number]['field'];
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialForm(sourceId = '', vmIds: string[] = []): FormState {
@@ -144,6 +148,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     handoverEnabled: false,
     handoverMap: {},
     gpuMappings: {},
+    cutover: { floatingIps: 'auto', hooks: {}, dnsTargets: [], poolMappings: [] },
   };
 }
 
@@ -244,6 +249,25 @@ function formFromPlan(plan: Plan): FormState {
     handoverEnabled: plan.handover.enabled,
     handoverMap: { ...plan.handover.backend_map },
     gpuMappings: { ...(plan.mappings.gpus ?? {}) },
+    cutover: cutoverOf(plan),
+  };
+}
+
+/** A plan's network cut-over as the form edits it (SDD §4.2, §16, plan task N12b). */
+function cutoverOf(plan: Plan): CutoverDraft {
+  const c = plan.network_cutover;
+  return {
+    floatingIps: c?.floating_ips ?? 'auto',
+    hooks: Object.fromEntries(Object.entries(c?.hooks ?? {}).map(([point, names]) => [point, [...(names ?? [])]])),
+    dnsTargets: Object.entries(c?.dns_targets ?? {}).map(([vmId, t]) => ({
+      vmId,
+      kind: t.kind,
+      zone: t.zone,
+      record: t.record,
+      server: t.server ?? '',
+      tsigSecret: t.tsig_secret ?? '',
+    })),
+    poolMappings: Object.entries(c?.lb_pools ?? {}).map(([source, destination]) => ({ source, destination })),
   };
 }
 
@@ -518,6 +542,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     // like the API (SDD §12): what it refuses, the first problem at a time
     const appProbes = parseDrafts(f.appProbes);
     if (appProbes.problems.length) e.appProbes = appProbes.problems[0];
+    const cutover = cutoverProblem(f.cutover, f.vmIds);
+    if (cutover) e.cutover = cutover;
     let backendMap: Record<string, string> = {};
     if (f.handoverEnabled && source?.kind !== 'vmware') {
       const missing = handoverTypes.filter((t) => !chosenTarget(t, f));
@@ -587,6 +613,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           use_advisor: f.useAdvisor,
           app_probes: appProbes.probes,
         },
+        network_cutover: cutoverBody(f.cutover, f.vmIds),
       },
     };
   };
@@ -653,9 +680,10 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     ports: id('ports'),
     windowsPorts: id('windows-ports'),
     appProbes: id('app-probes'),
+    cutover: id('cutover'),
     handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
-  const advancedHasErrors = ['keepWarm', 'finalizeReminder', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'appProbes', 'handover'].some((k) => k in errors);
+  const advancedHasErrors = ['keepWarm', 'finalizeReminder', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'appProbes', 'handover', 'cutover'].some((k) => k in errors);
   const close = () => {
     if (stable({ ...form, vmIds: [...form.vmIds].sort() }) !== baseline.current) setDiscarding(true);
     else onClose();
@@ -978,7 +1006,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           </Fieldset>
 
           <details id={id('advanced')} className="rounded-md border border-border px-3 py-2" open={advancedHasErrors || undefined}>
-            <summary className="flex min-h-9 cursor-pointer items-center text-sm font-medium text-foreground">Advanced: window, mappings, sync, pre-staging, verification and storage handover</summary>
+            <summary className="flex min-h-9 cursor-pointer items-center text-sm font-medium text-foreground">Advanced: window, mappings, sync, pre-staging, verification, storage handover and network cut-over</summary>
             <div className="mt-3 flex flex-col gap-4 pb-2">
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField
@@ -1294,6 +1322,13 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                     ))}
                 </Fieldset>
               )}
+              <NetworkCutoverSection
+                id={id('cutover')}
+                value={form.cutover}
+                onChange={(cutover) => set('cutover', cutover)}
+                vms={selectedVms}
+                error={errors.cutover}
+              />
             </div>
           </details>
 
