@@ -80,6 +80,11 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     strategies: [],
     remediation: 'Give the source credential a role Octavia\'s policy lets list the project\'s pools and their members, or check the VM\'s memberships yourself with the runbook for Octavia load balancers.',
   },
+  SRC_PORT_ADDRESS_PAIRS: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Add the address pairs to the migrated server\'s ports at the destination once it is created (openstack port set --allowed-address), and check that the peers sharing an address - a keepalived pair\'s other member - reach it there.',
+  },
   MAP_NETWORK_MISSING: {
     severity: 'blocker',
     strategies: [],
@@ -145,6 +150,11 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     strategies: [],
     remediation: 'Turn on "Keep MAC addresses and every fixed IP" in the plan (port_creation_mode "neutron"), give each such port exactly one fixed IP before the cutover, or migrate the VM by storage handover when its ports have at most one address each.',
   },
+  NET_PREFIX_SPLIT: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Put the VMs of each announced network into one wave, or have the network\'s prefix routed by hand while its waves are cut over.',
+  },
   MAP_NETWORK_AMBIGUOUS: {
     severity: 'blocker',
     strategies: [],
@@ -169,6 +179,11 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     severity: 'info',
     strategies: [],
     remediation: 'Nothing to do: each NIC goes where its override says.',
+  },
+  MAP_FIP_ADDRESS_CHANGE: {
+    severity: 'warning',
+    strategies: ['cold', 'warm'],
+    remediation: 'To keep an address, have the destination credential\'s project hold a floating IP of that address, with no port, before the cutover (an admin can create one with a given address on the external network); else update the clients, allowlists and DNS records of the old address after it.',
   },
   VM_PCI_PASSTHROUGH: {
     severity: 'blocker',
@@ -264,6 +279,11 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     severity: 'warning',
     strategies: [],
     remediation: "Prefer a Tier 1 series for production (SDD §21.1); declare the destination's series on the provider when its APIs cannot tell it, and run the destination lab matrix (QASuite §7.1) before relying on it.",
+  },
+  DST_DNS_INTEGRATION_MISSING: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Enable Neutron\'s DNS integration at the destination (an extension driver with Designate as its external DNS driver) and create the domain\'s zone for the destination credential\'s project, or publish the migrated VM\'s names in DNS yourself after the cutover.',
   },
   CONV_HOST_MISSING: {
     severity: 'warning',

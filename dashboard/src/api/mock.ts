@@ -38,6 +38,7 @@ import {
   JEV_MIN_CONFIDENCE,
   MiB,
   preflight,
+  networkContext,
   sourceReads,
   prng,
   auditEventsOf,
@@ -871,7 +872,7 @@ function checkSecretNames(input: Record<string, unknown>, fields: Set<string>, p
 }
 
 /** The API's PROVIDER_EDITABLE_FIELDS (SDD §12): what PATCH /providers/{id} may set. */
-export const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile', 'gpu_profiles']);
+export const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution', 'release', 'policy_profile', 'gpu_profiles', 'announces_tenant_networks']);
 const DISTRIBUTION_KIND: Record<string, string> = { openstack_community: 'openstack', kolla: 'openstack', rhosp: 'openstack', rhoso: 'rhoso', vmware: 'vmware' };
 
 function checkDistribution(input: Record<string, unknown> | Provider) {
@@ -904,10 +905,35 @@ function checkGpuProfiles(profiles: unknown): void {
   if (problems.length) throw new HttpError(422, 'validation_error', problems.slice(0, 5).join('; '));
 }
 
-/** A declared series, policy profile and vGPU profiles, as the API's Provider validates them (SDD §4.2, §22.3): OpenStack's alone. */
+/** The words pydantic's lax mode reads as a boolean, lower case (pydantic-core's str_as_bool). */
+const LAX_TRUE = new Set(['1', 'on', 't', 'true', 'y', 'yes']);
+const LAX_FALSE = new Set(['0', 'off', 'f', 'false', 'n', 'no']);
+
+/** A boolean field as the API's model reads it in lax mode (SDD §12): a boolean, 0 or 1, or one of pydantic's words. */
+function laxBool(name: string, value: unknown): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number' || typeof value === 'string') {
+    const word = String(value).trim().toLowerCase();
+    if (LAX_TRUE.has(word)) return true;
+    if (LAX_FALSE.has(word)) return false;
+    throw new HttpError(422, 'validation_error', `${name}: Input should be a valid boolean, unable to interpret input`);
+  }
+  throw new HttpError(422, 'validation_error', `${name}: Input should be a valid boolean`);
+}
+
+/** A provider body's boolean declarations as the API's model stores them, once checkDeclarations took them (SDD §4.2). */
+function readBooleans(input: Record<string, unknown>): void {
+  if (input.announces_tenant_networks !== undefined) input.announces_tenant_networks = laxBool('announces_tenant_networks', input.announces_tenant_networks);
+}
+
+/**
+ * A declared series, policy profile, vGPU profiles and announced tenant networks, as the API's Provider validates them (SDD
+ * §4.2, §22.3, §23.6): OpenStack's alone.
+ */
 function checkDeclarations(input: Record<string, unknown> | Provider) {
   const fields = input as Record<string, unknown>;
   checkGpuProfiles(fields.gpu_profiles);
+  const announces = fields.announces_tenant_networks === undefined ? undefined : laxBool('announces_tenant_networks', fields.announces_tenant_networks);
   const release = fields.release;
   if (release !== undefined && release !== null && !(typeof release === 'string' && /^20[0-9]{2}\.[12]$/.test(release))) {
     throw new HttpError(422, 'validation_error', "release: String should match pattern '^20[0-9]{2}\\.[12]$'");
@@ -922,6 +948,9 @@ function checkDeclarations(input: Record<string, unknown> | Provider) {
     }
     if (Object.keys((fields.gpu_profiles as Record<string, string> | undefined) ?? {}).length) {
       throw new HttpError(422, 'validation_error', "Value error, gpu_profiles: vGPU profiles cannot be declared for vmware: vCenter reports each VM's own");
+    }
+    if (announces === true) {
+      throw new HttpError(422, 'validation_error', 'Value error, announces_tenant_networks: an OpenStack BGP declaration cannot be made for vmware');
     }
   }
 }
@@ -1530,6 +1559,8 @@ export class MockServer {
       // the source by its label, and its Heat stacks and Octavia pool members as its inventory reads them (SDD §9.3, §10)
       source: providerLabel(source),
       ...sourceReads(source.id, Array.isArray(inventory) ? inventory : []),
+      // the destination's detached floating IPs and DNS, and the providers announcing tenant networks (SDD §9.3, plan task N2b)
+      ...networkContext(dst, source, destination),
       // the flavors a GPU VM's mapping may name, those of them that ask for a GPU with the profiles the destination
       // declares now, and its GPU capacity as this read finds it (SDD §22.3, §22.4, §22.5)
       ...flavorContext(dst, destination.gpu_profiles, new Date(this.now()).toISOString()),
@@ -2176,6 +2207,7 @@ export class MockServer {
     }
     checkDistribution(input);
     checkDeclarations(input);
+    readBooleans(input);
     checkSecretNames(input, new Set(['credentials_secret', 'conversion_host']), id);
     const defaults: Partial<Provider> = {
       cloud: null,
@@ -2188,6 +2220,7 @@ export class MockServer {
       release: null,
       policy_profile: null,
       gpu_profiles: {},
+      announces_tenant_networks: false,
     };
     const provider = {
       ...defaults,
@@ -2223,6 +2256,7 @@ export class MockServer {
     if ('name' in input && typeof input.name !== 'string') throw new HttpError(422, 'validation_error', 'name: Input should be a valid string');
     checkDistribution({ ...provider, ...input });
     checkDeclarations({ ...provider, ...input });
+    readBooleans(input);
     checkSecretNames(input, new Set(Object.keys(input)), provider.id);
     Object.assign(provider, input, { status: 'unknown', status_message: null, last_checked_at: null, capabilities: {} });
     this.emit({ kind: 'provider.updated', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} updated`, data: { provider_id: provider.id, fields: Object.keys(input).sort(), ...secretNames(provider) } });

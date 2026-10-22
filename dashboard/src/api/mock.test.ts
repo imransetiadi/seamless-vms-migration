@@ -1179,6 +1179,7 @@ describe('mock API', () => {
     const refused = (message: string) => ({ status: 422, body: { error: { code: 'validation_error', message } } });
     // the API's PROVIDER_EDITABLE_FIELDS, field for field
     expect([...PROVIDER_EDITABLE].sort()).toEqual([
+      'announces_tenant_networks',
       'ca_cert_path',
       'cloud',
       'conversion_host',
@@ -1212,6 +1213,26 @@ describe('mock API', () => {
     expect(call('POST', '/providers', vcenter)).toMatchObject({ status: 201, body: { gpu_profiles: {} } });
     expect(call('PATCH', '/providers/vc-gpu', { gpu_profiles: { x: 'A100-4C' } })).toMatchObject(refused(vmware));
     expect(call('PATCH', '/providers/vc-gpu', { gpu_profiles: {} }).status).toBe(200);
+  });
+
+  it('takes and refuses announces_tenant_networks as the API does (SDD §4.2, §12, §23.6, plan task N2b)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (method: string, path: string, body: Record<string, unknown>) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const refused = (message: string) => ({ status: 422, body: { error: { code: 'validation_error', message } } });
+    const created = call('POST', '/providers', { id: 'bgp-dst', name: 'BGP destination', kind: 'rhoso', role: 'destination', endpoint: 'https://keystone.example:5000/v3', cloud: 'bgp' });
+    expect(created).toMatchObject({ status: 201, body: { announces_tenant_networks: false } });
+    expect(call('PATCH', '/providers/bgp-dst', { announces_tenant_networks: true })).toMatchObject({ status: 200, body: { announces_tenant_networks: true } });
+    // pydantic's lax words: 'no' reads false; what it cannot read, or no boolean at all, is refused in its words
+    expect(call('PATCH', '/providers/bgp-dst', { announces_tenant_networks: 'no' })).toMatchObject({ status: 200, body: { announces_tenant_networks: false } });
+    expect(call('PATCH', '/providers/bgp-dst', { announces_tenant_networks: 'maybe' })).toMatchObject(refused('announces_tenant_networks: Input should be a valid boolean, unable to interpret input'));
+    expect(call('PATCH', '/providers/bgp-dst', { announces_tenant_networks: [] })).toMatchObject(refused('announces_tenant_networks: Input should be a valid boolean'));
+    // vCenter announces nothing: a vmware provider is refused the declaration, created or edited
+    const vmware = 'Value error, announces_tenant_networks: an OpenStack BGP declaration cannot be made for vmware';
+    const vcenter = { id: 'vc-bgp', name: 'vCenter', kind: 'vmware', role: 'source', endpoint: 'https://vc.example/sdk' };
+    expect(call('POST', '/providers', { ...vcenter, announces_tenant_networks: true })).toMatchObject(refused(vmware));
+    expect(call('POST', '/providers', vcenter)).toMatchObject({ status: 201, body: { announces_tenant_networks: false } });
+    expect(call('PATCH', '/providers/vc-bgp', { announces_tenant_networks: true })).toMatchObject(refused(vmware));
+    expect(call('PATCH', '/providers/vc-bgp', { announces_tenant_networks: false }).status).toBe(200);
   });
 
   it('refuses the plans the API refuses on create and on edit, with its words (SDD §12)', async () => {
@@ -3176,6 +3197,43 @@ describe('mock plans: acknowledged_findings (SDD §4.2, §9.3, §12, plan task N
     expect(byCode.get('SRC_VM_AUTOSCALED')?.message).toMatch(/autoscaling group 'broker_group' \(OS::Heat::AutoScalingGroup\).*The plan acknowledges it \(acknowledged_findings\)\.$/);
     expect(byCode.get('SRC_VM_LB_MEMBER')?.message).toMatch(/port 5672 in pool 'example-mq-pool' of load balancer 'example-mq-lb'/);
     expect(broker.findings.filter((f) => f.severity === 'blocker')).toEqual([]);
+  });
+
+  it("finds the demo's network findings - a floating IP, a keepalived address, DNS names and a split prefix - as the API words them (SDD §16, plan task N2b)", () => {
+    const { server } = setup('operator');
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const network = new Set(['SRC_PORT_ADDRESS_PAIRS', 'MAP_FIP_ADDRESS_CHANGE', 'DST_DNS_INTEGRATION_MISSING', 'NET_PREFIX_SPLIT']);
+    const found = Object.fromEntries(
+      server.migrations
+        .filter((m) => m.plan_id === plan.id)
+        .map((m): [string, string[]] => [m.vm.name, m.findings.filter((f) => network.has(f.code)).map((f) => f.code).sort()])
+        .filter(([, codes]) => codes.length),
+    );
+    expect(found).toEqual({
+      'web-01': ['DST_DNS_INTEGRATION_MISSING', 'MAP_FIP_ADDRESS_CHANGE'],
+      'web-02': ['DST_DNS_INTEGRATION_MISSING'],
+      'web-03': ['DST_DNS_INTEGRATION_MISSING'],
+      'db-pg-01': ['SRC_PORT_ADDRESS_PAIRS'],
+      'db-mysql-02': ['SRC_PORT_ADDRESS_PAIRS'],
+      'app-billing-01': ['NET_PREFIX_SPLIT'],
+      'api-gw-02': ['NET_PREFIX_SPLIT'],
+      'mq-broker-02': ['NET_PREFIX_SPLIT'],
+      'gpu-render-01': ['NET_PREFIX_SPLIT'],
+    });
+    const web = server.migrations.find((m) => m.plan_id === plan.id && m.vm.source_id === 'os-0a11')!;
+    const message = (code: string) => web.findings.find((f) => f.code === code)?.message;
+    expect(message('MAP_FIP_ADDRESS_CHANGE')).toBe(
+      'Floating IPs of web-01 that RHOSO 18.0 — Production does not hold detached in its project: 203.0.113.80. os-migrate creates a floating IP with a new address for each, so clients, allowlists and DNS records of the old address lose the VM.',
+    );
+    expect(message('DST_DNS_INTEGRATION_MISSING')).toBe(
+      'NICs of web-01 are published in DNS at RHOSP 17.1 — DC1 - fa:16:3e:0a:0a:11 as web-01.example.com. - and RHOSO 18.0 — Production has no Designate zone example.com.: the migrated ports are not published.',
+    );
+    const billing = server.migrations.find((m) => m.plan_id === plan.id && m.vm.source_id === 'os-0e64')!;
+    expect(billing.findings.find((f) => f.code === 'NET_PREFIX_SPLIT')?.message).toBe(
+      "The plan's waves split networks of app-billing-01 that RHOSO 18.0 — Production announces as tenant networks: 'tenant-app' in waves 'Databases — warm pre-copy', 'Middleware'. While one wave is cut over and the next is not, each prefix has an origin in both clouds, so its routes cannot be correct.",
+    );
+    // none of them blocks (SDD §9.3)
+    expect(server.migrations.filter((m) => m.plan_id === plan.id).flatMap((m) => m.findings).filter((f) => network.has(f.code) && f.severity !== 'warning')).toEqual([]);
   });
 });
 
