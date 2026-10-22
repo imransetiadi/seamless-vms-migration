@@ -578,11 +578,17 @@ export interface Estimate {
   meets_slo: boolean;
   /** The downtime's parts (SDD §4, ADV-16); empty in an estimate written before them. */
   downtime_parts: Partial<Record<DowntimePart, number>>;
+  /** The VM's DNS record's TTL, apart from the downtime: clients may reach the old address that long after the swap
+   * (SDD §8.4, §9.1, plan task N10); null without a DNS target, older answers omit it. */
+  dns_tail_s?: number | null;
 }
 
-/** The parts of a downtime estimate, in display order (SDD §4, §9.1, ADV-16): they add up to `downtime_s`. */
+/** The parts every downtime estimate has, in display order (SDD §4, §9.1, ADV-16): they add up to `downtime_s`, with
+ * {@link HOOKS_PART} when the plan runs post_create hooks. */
 export const DOWNTIME_PARTS = ['shutdown_s', 'copy_s', 'conversion_s', 'create_s', 'boot_s'] as const;
-export type DowntimePart = (typeof DOWNTIME_PARTS)[number];
+/** The plan's post_create hooks' timeouts: a part of the downtime only when it runs some (SDD §9.1, plan task N10). */
+export const HOOKS_PART = 'hooks_s' as const;
+export type DowntimePart = (typeof DOWNTIME_PARTS)[number] | typeof HOOKS_PART;
 
 export interface AdvisorNote {
   kind: AdvisorNoteKind;

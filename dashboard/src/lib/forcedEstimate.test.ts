@@ -20,6 +20,8 @@ interface Case {
   plan: PlanEstimatorSettings;
   observed_scan_bps: number | null;
   last_pass_s: number | null;
+  /** The post_create hooks' part of the migration's estimate, none when not given (SDD §9.1, plan task N10). */
+  hooks_s?: number;
   expected_s: number;
 }
 
@@ -29,7 +31,16 @@ describe("the Force cutover's estimated downtime, like the control plane (SDD §
   it.each(cases.map((c) => [c.name, c] as const))('%s', (_name, c) => {
     const p = paramsFor(c.plan, c.observed_scan_bps);
     const last = c.last_pass_s ?? firstPassSeconds(c.vm, c.strategy, p);
-    expect(finalDowntime(c.vm, c.strategy, last, p)).toBeCloseTo(c.expected_s, 9);
+    expect(finalDowntime(c.vm, c.strategy, last, p, c.hooks_s ?? 0)).toBeCloseTo(c.expected_s, 9);
+  });
+
+  it("adds the post_create hooks' part of the migration's estimate (SDD §9.1, plan task N10)", () => {
+    const c = cases.find((x) => x.hooks_s)!;
+    const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration;
+    const estimate = { ...base.estimate!, downtime_parts: { ...base.estimate!.downtime_parts, hooks_s: c.hooks_s } };
+    const m = { ...base, vm: c.vm, strategy: c.strategy, observed_scan_bps: c.observed_scan_bps, sync_passes: [] as SyncPass[] };
+    expect(forcedDowntime({ ...m, estimate }, c.plan)).toBeCloseTo(c.expected_s, 9);
+    expect(forcedDowntime({ ...m, estimate }, c.plan) - forcedDowntime(m, c.plan)).toBeCloseTo(c.hooks_s!, 9);
   });
 
   it('takes the last pass that ended, or the expected first pass while none has', () => {
