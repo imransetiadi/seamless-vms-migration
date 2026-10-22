@@ -481,7 +481,10 @@ outside the cluster, excluding the pod/service networks and `169.254.0.0/16` (th
 cluster's own networks — kubeadm/kind defaults `10.244.0.0/16` and `10.96.0.0/12`, to adjust per cluster — and
 keeps them out of the 6443 rule too). The port list includes the verification checks the plan form proposes —
 TCP 22 (Linux) and 3389 (Windows), SDD §7.5, §17 — as a blocked check fails the verification and rolls a working
-migration back; a plan that verifies other ports, or application probes on them, needs those ports added.
+migration back; a plan that verifies other ports, or application probes on them, needs those ports added. It
+also opens what the GPU capacity read and the network cut-over call (SDD §17): Placement, Heat, Octavia and
+Designate on their community and RHOSP 17.1 public ports, TCP 53 to an RFC 2136 DNS target's server, and 443 for
+webhook hooks - a webhook served on another port needs its own entry.
 **Tighten** `0.0.0.0/0` to the
 CIDRs of your clouds, vCenter, conversion hosts, Jev provider, agentmemory and the destination's tenant networks
 (the migrated VMs) before production.
