@@ -469,6 +469,9 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             review_required: bool = false, review_reason: str|null,
             destination_server_id: str|null, error: str|null, attempts: int = 0,
             attempt_strategies: list[Strategy] = [],   # each retried attempt's strategy, oldest first (§14.4)
+            hook_reverts: list[str] = [],   # the reverts a rollback owes: the `revert` of each hook that ran with
+                                      # success at pre_stop, post_create or post_verify since the last rollback,
+                                      # in run order; a retry keeps them (§8.2, plan task N5)
             created_at: datetime, updated_at: datetime }
 
 MigrationSummary { id, plan_id, wave_id, vm: { source_id, name, project }, strategy, phase,
@@ -2383,6 +2386,36 @@ data names the finalized VMs and the skipped ones with why: a migration that lef
 source VM runs again (the reason `POST …/finalize` gives), or one whose finalize failed with any error (`finalize failed: …`, the error redacted and cut, §13.4) — it stays
 `completed` for a later finalize, and one VM's error never stops the others. It answers
 `{"finalized": [migration id], "skipped": [{"migration_id", "reason"}]}`; 409 when none is `completed`.
+
+### 8.2 Hook points (plan task N5, §23.3)
+
+The orchestrator runs a plan's hooks (`network_cutover.hooks`, §4.2) at five points of a migration of every strategy,
+the hooks of a point one after the other in the plan's order, each through the runner of §7.2 and recorded as its
+`migration.action`:
+
+* **`pre_stop`**, in `cutover`, before the cutover step - while the source runs. It is skipped once the attempt's clock
+  is open (`downtime_started_at` set: the step stopped the source before a restart, or an earlier attempt left it
+  stopped). A failure fails the attempt with the source running: `cutover → failed`, the step not run, no rollback.
+* **`post_create`**, in `verifying`, before the verification: the cutover step created the server and the clock is
+  open. A failure fails the migration as a failed verification does - `verifying → failed`, then the plan's
+  `verification.auto_rollback` decides (owner decision 3).
+* **`post_verify`**, in `verifying`, once the verification passed, before its record and the end of the downtime are
+  saved - the downtime ends when the verification ended, the hooks after it -; a failed verification runs none. A
+  failure fails the migration as `post_create`'s does.
+* **`on_rollback`**, in `rolling_back`, before the rollback step starts the source again: first the reverts the
+  migration owes (`hook_reverts`, §4.2), the latest first, each dropped from the list once it ran, then the point's own
+  hooks. A hook that ran with success at another point and names a `revert` adds it to `hook_reverts`, saved before
+  its record; a retry keeps the list, so a rollback after a failed attempt held in `failed` and a retry still undoes
+  the first attempt's `pre_stop`; a restart in the middle of a rollback runs the reverts still listed. A failure is
+  recorded and the rollback goes on: the source must run again. A cancel runs none: `hook_reverts` names what the
+  operator undoes.
+* **`on_finalize`**, in a finalize (§8.1), after its step succeeded and before `finalized`: a failure is recorded and
+  the migration is finalized.
+
+A restart resumes a point with its phase: its driver runs again (§8), and so do the point's hooks, with the same
+idempotency key (§7.2). A hook's failure is no step's for the advisor and agentmemory: no similar incident is looked up
+for it and nothing of it reaches Jev or agentmemory (§13.4); its `migration.error` names the point and the hook
+(`step` `hook:<point>`), its message the run's `detail`.
 
 ---
 
@@ -5759,7 +5792,7 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | the findings of §23.8: the Heat and Octavia ones, the source's reads and `Plan.acknowledged_findings` (N2a); the network ones, `Nic`'s pairs, floating IPs and DNS names, the destination's floating IPs and DNS, `Provider.announces_tenant_networks` (N2b) | §4.2, §9.3, §10, §12 (binding) | N2 |
 | the hook catalog, the plan's network cut-over settings, the routes | §4.2, §4.3, §11, §12 (binding) | N3 |
 | the hook runner: kinds, timeouts, the idempotency key, the context document | §7.2, §13.3 (binding) | N4 |
-| hook points in the cutover, verification, rollback and finalize of every strategy, resumed after a restart | §5, §7, §8 | N5 |
+| hook points in the cutover, verification, rollback and finalize of every strategy, resumed after a restart | §8.2 (binding) | N5 |
 | the floating IP keep-address move | §7.2, §7.3, §8 | N6 |
 | the DNS swap | §7, §13.3 | N7 |
 | the reachability wait | §7.5 | N8 |
