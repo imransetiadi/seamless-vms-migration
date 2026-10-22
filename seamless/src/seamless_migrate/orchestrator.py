@@ -71,6 +71,8 @@ from .domain.models import (
     Finding,
     ForceCutover,
     GpuWait,
+    Hook,
+    HookPoint,
     Mappings,
     Migration,
     PhaseChange,
@@ -91,7 +93,7 @@ from .domain.models import (
     utcnow,
 )
 from .events import EventBus, emit, new_event, put_all_and_emit, put_and_emit
-from .executors.ansible import recorded_copied_data, recorded_destination_volumes
+from .executors.ansible import recorded_copied_data, recorded_destination_volumes, run_dir
 from .executors.base import (
     PermanentStepError,
     StepContext,
@@ -100,6 +102,7 @@ from .executors.base import (
     TransientStepError,
     outlive_cancel,
 )
+from .hooks import HookRun, HookRunner, context_document, hook_action_event
 from .invariants import check_invariants
 from .planning.estimator import (
     EstimatorParams,
@@ -142,6 +145,21 @@ PROGRESS_MIN_INTERVAL_S = 1.0
 PRESTAGE_RETRY_S = 60.0
 #: a migration.log line is cut to this many characters, after redaction (SDD §4)
 LOG_LINE_CHARS = 2000
+
+
+#: the points whose hooks a rollback reverts (SDD §8.2)
+_REVERTED = frozenset({"pre_stop", "post_create", "post_verify"})
+
+
+class HookFailed(Exception):
+    """A hook's failure at its point, which fails the migration there (SDD §8.2): named by the
+    hook and the run's redacted detail."""
+
+    def __init__(self, run: HookRun) -> None:
+        super().__init__(f"hook {run.hook} failed: {run.detail or 'no detail'}")
+        self.run = run
+
+
 APPROVABLE = frozenset(
     {
         P.pending,
@@ -658,6 +676,7 @@ class Orchestrator:
         clock: Callable[[], datetime] = utcnow,
         verify_poll_s: float = 10.0,
         verifier_factory: Callable[[Any], Any] | None = None,
+        hook_runner: Any = None,
     ) -> None:
         self.store = store
         self.db = AsyncStore(store)
@@ -675,6 +694,8 @@ class Orchestrator:
         self._verifier_factory = verifier_factory or (
             lambda dst: Verifier(dst, settings, poll_s=verify_poll_s)
         )
+        #: runs a plan's hooks at their points (SDD §7.2, §8.2)
+        self.hook_runner = hook_runner or HookRunner(settings)
         # SDD §8: a lock lives while a coroutine holds it or waits for it
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         #: when the next source watch is due (SDD §8.1); set by the first tick
@@ -2285,6 +2306,8 @@ class Orchestrator:
             except (TransientStepError, PermanentStepError) as exc:
                 # redacted and cut like any reason a skipped VM reports (SDD §8.1)
                 raise NotAllowed(f"finalize failed: {redact_cut(str(exc), 500)}") from exc
+            # SDD §8.2: on_finalize after the step; a failure is recorded, the VM finalized
+            await self._run_hooks(m, "on_finalize", keep_going=True)
             m.checkpoint = "finalized"
             # a store error leaves it completed for a later finalize, as a bulk finalize reports
             # it (SDD §8.1, review RV51-13)
@@ -4017,6 +4040,12 @@ class Orchestrator:
             self.wake()
 
     async def _do_cutover(self, m: Migration) -> None:
+        # SDD §8.2: pre_stop while the source runs - never again once the attempt's clock is open
+        if m.downtime_started_at is None:
+            failed = await self._run_hooks(m, "pre_stop")
+            if failed is not None:
+                await self._fail(m.id, P.cutover, "hook:pre_stop", HookFailed(failed))
+                return
         try:
             result: StepResult | None = await self._run_step(m, StepName.CUTOVER)
         except asyncio.CancelledError:
@@ -4061,6 +4090,11 @@ class Orchestrator:
             )
 
     async def _do_verify(self, m: Migration) -> None:
+        # SDD §8.2: post_create before the verification - the server exists, the clock is open
+        failed = await self._run_hooks(m, "post_create")
+        if failed is not None:
+            await self._fail(m.id, P.verifying, "hook:post_create", HookFailed(failed))
+            return
         plan = await self._plan(m.plan_id)
         destination = await self.db.get("provider", plan.destination_provider_id, Provider)
         verifier = self._verifier_factory(self.providers.get(destination))
@@ -4091,6 +4125,12 @@ class Orchestrator:
                 )
             except Exception:
                 log.warning("verification review failed", exc_info=True)
+        if result.passed:
+            # SDD §8.2: post_verify once the verification passed - the downtime ended with it
+            failed = await self._run_hooks(m, "post_verify")
+            if failed is not None:
+                await self._fail(m.id, P.verifying, "hook:post_verify", HookFailed(failed))
+                return
         summary = result.summary()
         async with self._lock(m.id):
             cur, v = await self._load(m.id)
@@ -4164,6 +4204,8 @@ class Orchestrator:
         self.wake()
 
     async def _do_rollback(self, m: Migration) -> None:
+        # SDD §8.2: the reverts of the attempt's hooks, then on_rollback, before the source starts
+        await self._run_rollback_hooks(m)
         try:
             result: StepResult | None = await self._run_step(m, StepName.ROLLBACK)
         except asyncio.CancelledError:
@@ -4255,6 +4297,85 @@ class Orchestrator:
                     continue  # another writer moved the plan: read both again
         raise ConflictError(f"plan of {mid} changed too often to follow its recreated source VM")
 
+    async def _run_hooks(
+        self,
+        m: Migration,
+        point: HookPoint,
+        names: Sequence[str] | None = None,
+        *,
+        keep_going: bool = False,
+    ) -> HookRun | None:
+        """Run the plan's hooks at ``point`` - or ``names``, at it - one after the other, each
+        recorded as its migration.action (SDD §7.2, §8.2); the first failure ends the point and is
+        returned, unless ``keep_going``."""
+        plan = await self._plan(m.plan_id)
+        wanted = list(plan.network_cutover.hooks.get(point, []) if names is None else names)
+        if not wanted:
+            return None
+        source = await self.db.get("provider", plan.source_provider_id, Provider)
+        destination = await self.db.get("provider", plan.destination_provider_id, Provider)
+        context = context_document(m, plan, point, source, destination)
+
+        async def log_line(line: str) -> None:
+            text = redact_cut(line, LOG_LINE_CHARS)
+            await self._emit("migration.log", text, persist=False, migration=m)
+
+        first: HookRun | None = None
+        for name in wanted:
+            try:
+                hook = await self.db.get("hook", name, Hook)
+            except NotFound:
+                run = HookRun(
+                    hook=name,
+                    kind="unknown",
+                    point=point,
+                    idempotency_key=str(context["idempotency_key"]),
+                    outcome="failed",
+                    duration_s=0.0,
+                    detail="no such hook in the catalog",
+                )
+            else:
+                run = await self.hook_runner.run(
+                    hook, context, run_dir(self.settings, plan.id, m.id), log_line
+                )
+                if run.outcome == "succeeded" and hook.revert is not None and point in _REVERTED:
+                    # SDD §8.2: what a rollback owes, saved before the run's record
+                    await self._owe_revert(m.id, hook.revert)
+            event = hook_action_event(m, run)
+            await self._emit(
+                event.kind, event.message, migration=m, actor=event.actor, data=event.data
+            )
+            if run.outcome == "failed" and first is None:
+                first = run
+                if not keep_going:
+                    break
+        return first
+
+    async def _owe_revert(self, mid: str, revert: str) -> None:
+        """Add ``revert`` to what the migration's rollback owes (SDD §4.2, §8.2)."""
+        async with self._lock(mid):
+            cur, v = await self._load(mid)
+            cur.hook_reverts.append(revert)
+            await self._save(cur, v)
+
+    async def _run_rollback_hooks(self, m: Migration) -> None:
+        """Before a rollback's step (SDD §8.2): the reverts the migration owes, the latest first,
+        each dropped once it ran - a restart runs those still listed -, then the on_rollback
+        hooks; a failure is recorded and the rollback goes on."""
+        while True:
+            async with self._lock(m.id):
+                cur, _ = await self._load(m.id)
+            if not cur.hook_reverts:
+                break
+            revert = cur.hook_reverts[-1]
+            await self._run_hooks(cur, "on_rollback", [revert], keep_going=True)
+            async with self._lock(m.id):
+                cur, v = await self._load(m.id)
+                if cur.hook_reverts and cur.hook_reverts[-1] == revert:
+                    cur.hook_reverts.pop()
+                    await self._save(cur, v)
+        await self._run_hooks(cur, "on_rollback", keep_going=True)
+
     async def _fail(
         self,
         mid: str,
@@ -4294,7 +4415,8 @@ class Orchestrator:
         )
         if rollback:
             self._launch(mid)
-        if self.knowledge is not None:
+        # nothing of a hook reaches agentmemory (SDD §8.2, §13.4)
+        if self.knowledge is not None and not str(step).startswith("hook:"):
             # SDD §8 (audit OC-04): a task of its own - the driver that runs this goes on to the
             # rollback at once, never waiting for agentmemory; a stop cancels it
             lookup = asyncio.create_task(

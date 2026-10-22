@@ -12111,3 +12111,320 @@ async def test_the_text_a_person_gives_with_an_action_is_kept_as_pythons_strip_l
     assert actions[(ms[1].id, "cutover")]["comment"] == "go"
     assert actions[(ms[3].id, "cancel")]["reason"] == "window closed"
     assert actions[(ms[4].id, "cancel")]["reason"] is None
+
+
+# -- hook points (SDD §8.2, §23.3, plan task N5) --------------------------------------------------
+
+
+class _FakeHookRunner:
+    """The hook runner of SDD §7.2 as a test sees it: records each run - its hook, point and key -
+    in ``sequence`` beside the steps a scripted executor adds there; fails the hooks named in
+    ``fail``; ``block`` holds a hook's first run until released."""
+
+    def __init__(self, fail=(), block=None, sequence=None):
+        self.fail = set(fail)
+        self.block = block
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.runs: list[tuple[str, str, str]] = []
+        self.sequence = sequence if sequence is not None else []
+
+    async def run(self, hook, context, run_dir, log=None):
+        from seamless_migrate.hooks import HookRun
+
+        point, key = context["point"], context["idempotency_key"]
+        self.runs.append((hook.name, point, key))
+        self.sequence.append(f"{point}:{hook.name}")
+        if hook.name == self.block:
+            self.block = None
+            self.entered.set()
+            await self.release.wait()
+        failed = hook.name in self.fail
+        return HookRun(
+            hook=hook.name,
+            kind=hook.kind,
+            point=point,
+            idempotency_key=key,
+            outcome="failed" if failed else "succeeded",
+            duration_s=0.0,
+            detail=f"exit 2: {hook.name} failed" if failed else None,
+        )
+
+
+class _RecordingKnowledge(_HangingKnowledge):
+    """agentmemory that answers at once and records each failure it is asked about."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures: list[str] = []
+
+    async def on_failure(self, migration, step, error):
+        self.failures.append(str(step))
+        return None
+
+
+async def _hooked(
+    tmp_path, store, hooks, runner, *, reverts=None, auto_rollback=True, vms=None, **kw
+):
+    """A cold plan of one VM whose network cut-over runs ``hooks`` per point, its catalog holding
+    each hook named - a playbook - with the revert ``reverts`` gives it."""
+    from seamless_migrate.domain.models import Hook
+
+    names = {n for names in hooks.values() for n in names} | set((reverts or {}).values())
+    for name in sorted(names):
+        store.put(
+            "hook",
+            Hook(
+                name=name,
+                kind="playbook",
+                playbook=f"/opt/hooks/{name}.yml",
+                revert=(reverts or {}).get(name),
+            ),
+        )
+    plan_kw = {
+        "default_strategy": Strategy.cold,
+        "network_cutover": {"hooks": hooks},
+        "verification": VerificationConfig(timeout_s=2, auto_rollback=auto_rollback),
+    }
+    h, plan = await setup(tmp_path, store, vms or [vm(1)], plan_kw, **kw)
+    h.orch.hook_runner = runner
+    return h, plan
+
+
+def _hook_actions(h, mid):
+    return [
+        e.data
+        for e in h.store.events(since_seq=0, migration_id=mid, limit=1000)
+        if e.kind == "migration.action" and e.data.get("action") == "hook"
+    ]
+
+
+async def test_a_pre_stop_hook_failure_keeps_the_source_running(tmp_path, store):
+    """SDD §8.2: a pre_stop hook runs in cutover before the cutover step, while the source runs;
+    its failure fails the attempt there - the step never runs, no clock opens, no rollback - and
+    is recorded, the hook named; agentmemory is not asked about it (§13.4)."""
+    knowledge = _RecordingKnowledge()
+    runner = _FakeHookRunner(fail={"drain-lb"})
+    h, plan = await _hooked(
+        tmp_path, store, {"pre_stop": ["drain-lb"]}, runner, knowledge=knowledge
+    )
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    m = await h.wait_phase(mid, P.failed)
+    await h.orch.stop()
+    assert m.downtime_started_at is None
+    assert h.history(m)[-2:] == [P.cutover, P.failed]
+    assert (mid, StepName.CUTOVER) not in h.executor.calls
+    assert m.error == "hook:pre_stop: hook drain-lb failed: exit 2: drain-lb failed"
+    assert runner.runs == [("drain-lb", "pre_stop", f"{mid}.0.pre_stop")]
+    [action] = _hook_actions(h, mid)
+    assert (action["hook"], action["point"], action["outcome"]) == (
+        "drain-lb",
+        "pre_stop",
+        "failed",
+    )
+    errors = [
+        e for e in h.store.events(since_seq=0, migration_id=mid) if e.kind == "migration.error"
+    ]
+    assert [e.data["step"] for e in errors] == ["hook:pre_stop"]
+    assert knowledge.failures == []
+
+
+@pytest.mark.parametrize("auto_rollback", [True, False], ids=["auto_rollback", "held"])
+async def test_a_post_create_hook_failure_rolls_back_under_auto_rollback(
+    tmp_path, store, auto_rollback
+):
+    """SDD §8.2 (owner decision 3): post_create runs in verifying, before the verification - the
+    server exists, the clock is open; its failure fails the migration as a failed verification
+    does, so the plan's auto_rollback decides: rolled back, or held in failed with the source
+    stopped."""
+    runner = _FakeHookRunner(fail={"dns-swap"})
+    h, plan = await _hooked(
+        tmp_path, store, {"post_create": ["dns-swap"]}, runner, auto_rollback=auto_rollback
+    )
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    m = await h.wait_phase(mid, P.rolled_back if auto_rollback else P.failed)
+    if not auto_rollback:
+        await asyncio.sleep(0.05)
+        m = await h.migration(mid)
+    await h.orch.stop()
+    assert runner.runs == [("dns-swap", "post_create", f"{mid}.0.post_create")]
+    assert m.downtime_started_at is not None
+    assert P.verifying in h.history(m)
+    assert m.verification is None  # the hook failed before the verification ran
+    if auto_rollback:
+        assert h.history(m)[-3:] == [P.failed, P.rolling_back, P.rolled_back]
+    else:
+        assert m.phase == P.failed and m.downtime_ended_at is None
+        assert m.error.startswith("hook:post_create: hook dns-swap failed")
+
+
+async def test_a_hooks_revert_runs_on_rollback(tmp_path, store):
+    """SDD §8.2: a rollback runs, before its step starts the source again, the revert of each hook
+    the attempt ran with success - the latest first, a hook without one skipped -, then the
+    on_rollback hooks; a failed hook is not reverted, and a failure among them is recorded while
+    the rollback goes on."""
+    sequence: list[str] = []
+    runner = _FakeHookRunner(fail={"join-lb", "notify"}, sequence=sequence)
+    hooks = {
+        "pre_stop": ["drain-lb"],
+        "post_create": ["dns-swap", "tag-server"],
+        "post_verify": ["join-lb"],
+        "on_rollback": ["notify"],
+    }
+    reverts = {"drain-lb": "undrain-lb", "dns-swap": "dns-back", "join-lb": "leave-lb"}
+    h, plan = await _hooked(tmp_path, store, hooks, runner, reverts=reverts)
+
+    async def rollback(ctx):
+        sequence.append("step:rollback")
+        return await h.executor.sim.run(StepName.ROLLBACK, ctx)
+
+    h.executor.hooks[StepName.ROLLBACK] = rollback
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    m = await h.wait_phase(mid, P.rolled_back)
+    await h.orch.stop()
+    assert sequence == [
+        "pre_stop:drain-lb",
+        "post_create:dns-swap",
+        "post_create:tag-server",
+        "post_verify:join-lb",
+        "on_rollback:dns-back",
+        "on_rollback:undrain-lb",
+        "on_rollback:notify",
+        "step:rollback",
+    ]
+    assert m.error.startswith("hook:post_verify: hook join-lb failed")
+    outcomes = [(a["hook"], a["outcome"]) for a in _hook_actions(h, mid)]
+    assert outcomes[-3:] == [
+        ("dns-back", "succeeded"),
+        ("undrain-lb", "succeeded"),
+        ("notify", "failed"),
+    ]
+
+
+async def test_a_restart_resumes_a_hook_point_with_the_same_key(tmp_path, store):
+    """SDD §8.2, §7.2: a restart while a point's hook runs resumes the point with its phase - the
+    hook runs again with the same idempotency key, and the migration goes on."""
+    runner = _FakeHookRunner(block="dns-swap")
+    h, plan = await _hooked(tmp_path, store, {"post_create": ["dns-swap"]}, runner)
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await asyncio.wait_for(runner.entered.wait(), 10)
+    assert (await h.migration(mid)).phase == P.verifying
+    await h.orch.stop()
+    restarted = build_harness(tmp_path, store, [vm(1)], clock=h.clock)
+    again = _FakeHookRunner()
+    restarted.orch.hook_runner = again
+    await restarted.orch.start()
+    m = await restarted.wait_phase(mid, P.completed)
+    await restarted.orch.stop()
+    assert runner.runs == again.runs == [("dns-swap", "post_create", f"{mid}.0.post_create")]
+    assert m.downtime_ended_at is not None
+
+
+async def test_post_verify_hooks_run_only_after_the_verification_passed(tmp_path, store):
+    """SDD §8.2: post_verify runs once the verification passed, after post_create; a verification
+    that fails runs none of them, and its downtime ends when the verification ended."""
+    runner = _FakeHookRunner()
+    hooks = {"post_create": ["dns-swap"], "post_verify": ["join-lb"]}
+    h, plan = await _hooked(tmp_path, store, hooks, runner, auto_rollback=False)
+    h.destination.status = "ERROR"
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.failed)
+    await h.orch.stop()
+    assert [r[:2] for r in runner.runs] == [("dns-swap", "post_create")]
+
+    runner = _FakeHookRunner()
+    h, plan = await _hooked(tmp_path / "passing", store, hooks, runner, vms=[vm(2)])
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-2")).id
+    m = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert [r[:2] for r in runner.runs] == [("dns-swap", "post_create"), ("join-lb", "post_verify")]
+    assert m.verification is not None and m.verification.passed
+    assert m.downtime_ended_at == m.verification.at
+
+
+async def test_on_finalize_hooks_run_after_the_finalize_step(tmp_path, store):
+    """SDD §8.2: on_finalize runs in a finalize after its step succeeded; a failure is recorded
+    and the migration is finalized all the same."""
+    runner = _FakeHookRunner(fail={"release-fip"})
+    h, plan = await _hooked(tmp_path, store, {"on_finalize": ["release-fip"]}, runner)
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    m = await h.wait_phase(mid, P.completed)
+    assert runner.runs == []
+    finalized = await h.orch.finalize(mid, "sari", confirm=m.vm.name)
+    await h.orch.stop()
+    assert finalized.phase == P.finalized
+    assert runner.runs == [("release-fip", "on_finalize", f"{mid}.0.on_finalize")]
+    assert [(a["hook"], a["outcome"]) for a in _hook_actions(h, mid)] == [("release-fip", "failed")]
+
+
+async def test_a_held_attempts_pre_stop_is_reverted_by_a_later_rollback_and_never_run_again(
+    tmp_path, store
+):
+    """SDD §8.2, §4.2: a cutover that stopped the source and failed, held in failed, is retried -
+    its pre_stop does not run again, the clock being open -; the revert its first attempt owes
+    stays on the migration through the retry, and a rollback of the retried attempt runs it."""
+    from seamless_migrate.executors.base import PermanentStepError
+
+    runner = _FakeHookRunner()
+    h, plan = await _hooked(
+        tmp_path,
+        store,
+        {"pre_stop": ["drain-lb"]},
+        runner,
+        reverts={"drain-lb": "undrain-lb"},
+        auto_rollback=False,
+    )
+    cutovers = []
+
+    async def cutover(ctx):
+        cutovers.append(ctx.migration.attempts)
+        if len(cutovers) == 1:
+            await ctx.mark_downtime_start()
+            raise PermanentStepError("the import failed after the stop")
+        return await h.executor.sim.run(StepName.CUTOVER, ctx)
+
+    h.executor.hooks[StepName.CUTOVER] = cutover
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    held = await h.wait_phase(mid, P.failed)
+    assert held.downtime_started_at is not None and held.hook_reverts == ["undrain-lb"]
+    await h.orch.retry(mid, "alice")
+    done = await h.wait_phase(mid, P.completed)
+    assert cutovers == [0, 1]
+    assert runner.runs == [("drain-lb", "pre_stop", f"{mid}.0.pre_stop")]
+    assert done.hook_reverts == ["undrain-lb"]
+    await h.orch.rollback(mid, "alice", "the application team asked for it")
+    back = await h.wait_phase(mid, P.rolled_back)
+    await h.orch.stop()
+    assert runner.runs[-1] == ("undrain-lb", "on_rollback", f"{mid}.1.on_rollback")
+    assert back.hook_reverts == []
+
+
+async def test_a_restart_in_a_rollback_runs_the_reverts_still_owed(tmp_path, store):
+    """SDD §8.2: each revert leaves hook_reverts once it ran, so a restart in the middle of a
+    rollback runs the one it interrupted and those after it - never one that already ran."""
+    runner = _FakeHookRunner(fail={"join-lb"}, block="dns-back")
+    hooks = {"pre_stop": ["drain-lb"], "post_create": ["dns-swap"], "post_verify": ["join-lb"]}
+    reverts = {"drain-lb": "undrain-lb", "dns-swap": "dns-back"}
+    h, plan = await _hooked(tmp_path, store, hooks, runner, reverts=reverts)
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await asyncio.wait_for(runner.entered.wait(), 10)
+    m = await h.migration(mid)
+    assert m.phase == P.rolling_back and m.hook_reverts == ["undrain-lb", "dns-back"]
+    await h.orch.stop()
+    restarted = build_harness(tmp_path, store, [vm(1)], clock=h.clock)
+    again = _FakeHookRunner()
+    restarted.orch.hook_runner = again
+    await restarted.orch.start()
+    back = await restarted.wait_phase(mid, P.rolled_back)
+    await restarted.orch.stop()
+    assert [r[0] for r in again.runs] == ["dns-back", "undrain-lb"]
+    assert back.hook_reverts == []
