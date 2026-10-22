@@ -1065,6 +1065,63 @@ def _remove_kept(rdir: Path) -> None:
                 path.unlink(missing_ok=True)
 
 
+async def stop_process_group(proc: asyncio.subprocess.Process) -> None:
+    """Stop a playbook started in its own session: SIGTERM to its process group, then SIGKILL."""
+    for sig, grace in ((signal.SIGTERM, 10.0), (signal.SIGKILL, 5.0)):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, sig)
+        try:
+            await asyncio.wait_for(proc.wait(), grace)
+            return
+        except TimeoutError:
+            continue
+
+
+def _collections_path(settings: Settings) -> str:
+    base = Path(settings.data_dir) / "collections"
+    link = base / "ansible_collections" / "os_migrate" / "os_migrate"
+    root = Path(settings.collection_root)
+    if (root / "galaxy.yml").is_file() and not link.exists():
+        link.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(FileExistsError):
+            link.symlink_to(root.resolve(), target_is_directory=True)
+    existing = os.environ.get("ANSIBLE_COLLECTIONS_PATH") or (
+        "~/.ansible/collections:/usr/share/ansible/collections"
+    )
+    return f"{base}:{existing}"
+
+
+def ansible_env(settings: Settings) -> dict[str, str]:
+    """The environment of every ansible-playbook the control plane runs - a step's and a hook's
+    (SDD §7.2, §10): the passthrough variables and the allowed ``ANSIBLE_*``, never a secret, a
+    token or a cloud credential of its own environment."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k in ENV_PASSTHROUGH or (k.startswith("ANSIBLE_") and k not in ANSIBLE_ENV_DENIED)
+    }
+    home = Path(settings.data_dir) / ".ansible"
+    checking = settings.ansible_host_key_checking
+    env.update(
+        {
+            "ANSIBLE_COLLECTIONS_PATH": _collections_path(settings),
+            "ANSIBLE_HOME": str(home),
+            "ANSIBLE_LOCAL_TEMP": str(home / "tmp"),
+            # modules of the local connection run from remote_tmp, which Ansible derives from
+            # the passwd home of the UID (/opt/app-root/src in the image: not writable)
+            "ANSIBLE_REMOTE_TEMP": str(home / "tmp"),
+            "ANSIBLE_RETRY_FILES_ENABLED": "0",
+            "ANSIBLE_NOCOLOR": "1",
+            # the downtime clock reads the stop task's result line: never hide skipped hosts
+            "ANSIBLE_DISPLAY_SKIPPED_HOSTS": "True",
+            # SDD §15.1: the setting decides, never the control plane's own environment
+            "ANSIBLE_HOST_KEY_CHECKING": "True" if checking else "False",
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+    return env
+
+
 @dataclass(frozen=True)
 class _Playbook:
     name: str
@@ -2061,52 +2118,15 @@ class AnsibleExecutor:
         return StepResult(details={"source_deleted": True})
 
     # -- process plumbing ----------------------------------------------------------------------
-    def _collections_path(self) -> str:
-        base = Path(self.settings.data_dir) / "collections"
-        link = base / "ansible_collections" / "os_migrate" / "os_migrate"
-        root = Path(self.settings.collection_root)
-        if (root / "galaxy.yml").is_file() and not link.exists():
-            link.parent.mkdir(parents=True, exist_ok=True)
-            with contextlib.suppress(FileExistsError):
-                link.symlink_to(root.resolve(), target_is_directory=True)
-        existing = os.environ.get("ANSIBLE_COLLECTIONS_PATH") or (
-            "~/.ansible/collections:/usr/share/ansible/collections"
-        )
-        return f"{base}:{existing}"
-
     def _env(self) -> dict[str, str]:
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k in ENV_PASSTHROUGH or (k.startswith("ANSIBLE_") and k not in ANSIBLE_ENV_DENIED)
-        }
-        home = Path(self.settings.data_dir) / ".ansible"
-        checking = self.settings.ansible_host_key_checking
-        if not checking:
+        if not self.settings.ansible_host_key_checking:
             # SEC-02 (Security.md §6.3) is open: a conversion host made for the migration has no
             # key to compare with; said once per run (SDD §15.1), not once per playbook
             log.warning(
                 "the conversion hosts' SSH host keys are not verified "
                 "(SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is off)"
             )
-        env.update(
-            {
-                "ANSIBLE_COLLECTIONS_PATH": self._collections_path(),
-                "ANSIBLE_HOME": str(home),
-                "ANSIBLE_LOCAL_TEMP": str(home / "tmp"),
-                # modules of the local connection run from remote_tmp, which Ansible derives from
-                # the passwd home of the UID (/opt/app-root/src in the image: not writable)
-                "ANSIBLE_REMOTE_TEMP": str(home / "tmp"),
-                "ANSIBLE_RETRY_FILES_ENABLED": "0",
-                "ANSIBLE_NOCOLOR": "1",
-                # the downtime clock reads the stop task's result line: never hide skipped hosts
-                "ANSIBLE_DISPLAY_SKIPPED_HOSTS": "True",
-                # SDD §15.1: the setting decides, never the control plane's own environment
-                "ANSIBLE_HOST_KEY_CHECKING": "True" if checking else "False",
-                "PYTHONUNBUFFERED": "1",
-            }
-        )
-        return env
+        return ansible_env(self.settings)
 
     async def _execute(
         self,
@@ -2401,14 +2421,7 @@ class AnsibleExecutor:
 
     @staticmethod
     async def _stop_process(proc: asyncio.subprocess.Process) -> None:
-        for sig, grace in ((signal.SIGTERM, 10.0), (signal.SIGKILL, 5.0)):
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, sig)
-            try:
-                await asyncio.wait_for(proc.wait(), grace)
-                return
-            except TimeoutError:
-                continue
+        await stop_process_group(proc)
 
     async def _tail(self, ctx: StepContext | None, osm: Path) -> None:
         if ctx is None:
