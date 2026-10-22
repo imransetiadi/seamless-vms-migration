@@ -1,12 +1,14 @@
 import { CircleCheck } from 'lucide-react';
 import { memo } from 'react';
 import { Link } from 'react-router-dom';
+import { NETWORK_CODES } from '../api/findingCatalog';
 import { SEVERITIES, type Finding, type Severity } from '../api/types';
 import { cn } from '../lib/cn';
 import type { FindingGroup } from '../lib/findings';
 import { SEVERITY_ORDER, severityMeta, STRATEGY_LABELS, TONE_CLASSES } from '../lib/status';
 import { EmptyState } from './EmptyState';
 import { SeverityBadge } from './StatusBadge';
+import { TechPreviewBadge } from './TechPreviewBadge';
 
 const NOUN: Record<Severity, [string, string]> = {
   blocker: ['blocker', 'blockers'],
@@ -54,6 +56,7 @@ export function FindingsList({ findings, emptyText = 'No findings — pre-flight
           <div className="min-w-0 flex-1 text-sm">
             <p className="flex flex-wrap items-center gap-x-2">
               <code className="text-xs font-semibold text-foreground">{f.code}</code>
+              {NETWORK_CODES.has(f.code) && <TechPreviewBadge feature="network" />}
               {f.vmName &&
                 (f.migrationId ? (
                   <Link to={`/migrations/${f.migrationId}`} className="font-mono text-xs underline underline-offset-4">
@@ -96,6 +99,7 @@ export const FindingGroupsList = memo(function FindingGroupsList({
           <div className="min-w-0 flex-1 text-sm">
             <p className="flex flex-wrap items-baseline gap-x-2">
               <code className="text-xs font-semibold text-foreground">{g.code}</code>
+              {NETWORK_CODES.has(g.code) && <TechPreviewBadge feature="network" />}
               <span className="text-xs text-muted-foreground">
                 {g.items.length} VM{g.items.length === 1 ? '' : 's'}
               </span>

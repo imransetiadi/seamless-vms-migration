@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { queryKeys } from '../api/hooks';
 import type { MockServer } from '../api/mock';
 import type { DestinationInventory, Migration, Plan, PlanCreate } from '../api/types';
-import { STRATEGY_LABELS } from '../lib/status';
+import { STRATEGY_LABELS, TONE_CLASSES } from '../lib/status';
 import { createTestClient, createTestServer, renderWithApp } from '../test/utils';
 import MigrationDetail from './MigrationDetail';
 
@@ -1367,6 +1367,76 @@ describe('MigrationDetail', () => {
       expect(within(target).getByRole('heading', { level: 2, name: part === 'findings' ? 'Findings' : 'Estimates' })).toBeInTheDocument();
       view.unmount();
     }
+  });
+
+  it("shows each hook's run on the timeline", async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'web-cache-01')!;
+    // the network cut-over's steps as the control plane records them (SDD §8.2-§8.5)
+    const action = (message: string, data: Record<string, unknown>) =>
+      server.emit({ kind: 'migration.action', plan_id: m.plan_id, migration_id: m.id, actor: 'orchestrator', message, data });
+    const hook = (name: string, kind: string, point: string, outcome: string, duration_s: number, detail: string | null) =>
+      action(`hook ${name} at ${point} ${outcome}`, { action: 'hook', hook: name, kind, point, idempotency_key: `${m.id}:${point}:${name}`, outcome, duration_s, detail });
+    hook('warm-cache', 'playbook', 'post_create', 'succeeded', 4.2, null);
+    hook('notify-cmdb', 'webhook', 'post_verify', 'failed', 30, 'the webhook answered 503');
+    action(`${m.vm.name}: floating IP 203.0.113.80: move succeeded`, { action: 'floating_ip', address: '203.0.113.80', step: 'move', outcome: 'succeeded', detail: null });
+    action(`${m.vm.name}: DNS record web-cache-01.example.com.: swap conflict`, {
+      action: 'dns',
+      name: 'web-cache-01.example.com.',
+      step: 'swap',
+      outcome: 'conflict',
+      detail: 'it holds 192.0.2.9, not 192.0.2.5: left as it is',
+    });
+    action(`${m.vm.name}: DNS record web-cache-01.example.com.: swap unchanged`, { action: 'dns', name: 'web-cache-01.example.com.', step: 'swap', outcome: 'unchanged', detail: 'the address stays 192.0.2.5' });
+    action(`${m.vm.name}: Octavia member 192.0.2.5:80 of pool pool-1: drain failed`, { action: 'lb_member', pool: 'pool-1', address: '192.0.2.5', port: 80, step: 'drain', outcome: 'failed', detail: 'Octavia answered 409' });
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const timeline = await screen.findByRole('list', { name: 'Timeline, newest first' });
+    const entry = async (title: string) => (await within(timeline).findByText(title)).closest('li')!;
+    // the tone of an entry's icon, never its only sign: the words say the outcome
+    const toneOf = (item: HTMLElement) => (Object.keys(TONE_CLASSES) as Array<keyof typeof TONE_CLASSES>).filter((tone) => [...item.children].some((child) => child.classList.contains(TONE_CLASSES[tone].text)));
+
+    // a hook's run: its name, point and outcome, with its kind, duration and detail under it (SDD §16)
+    const ran = await entry('Hook warm-cache at post_create: Succeeded');
+    expect(within(ran).getByText('Playbook · 4.2 s')).toBeInTheDocument();
+    expect(toneOf(ran)).toEqual(['success']);
+    const failed = await entry('Hook notify-cmdb at post_verify: Failed');
+    expect(within(failed).getByText('Webhook · 30 s · the webhook answered 503')).toBeInTheDocument();
+    expect(toneOf(failed)).toEqual(['danger']);
+    // a floating IP's, a DNS swap's or an Octavia member's step as its event words it, with its detail
+    const moved = await entry(`${m.vm.name}: floating IP 203.0.113.80: move succeeded`);
+    expect(toneOf(moved)).toEqual(['success']);
+    const conflict = await entry(`${m.vm.name}: DNS record web-cache-01.example.com.: swap conflict`);
+    expect(within(conflict).getByText('it holds 192.0.2.9, not 192.0.2.5: left as it is')).toBeInTheDocument();
+    expect(toneOf(conflict)).toEqual(['warning']);
+    const unchanged = await entry(`${m.vm.name}: DNS record web-cache-01.example.com.: swap unchanged`);
+    expect(within(unchanged).getByText('the address stays 192.0.2.5')).toBeInTheDocument();
+    expect(toneOf(unchanged)).toEqual(['warning']);
+    const drain = await entry(`${m.vm.name}: Octavia member 192.0.2.5:80 of pool pool-1: drain failed`);
+    expect(within(drain).getByText('Octavia answered 409')).toBeInTheDocument();
+    expect(toneOf(drain)).toEqual(['danger']);
+    // each with the network Technology Preview badge, which no other entry carries
+    for (const item of [ran, failed, moved, conflict, unchanged, drain]) expect(within(item).getByText('Technology Preview')).toBeInTheDocument();
+    expect(within(timeline).getAllByText('Technology Preview')).toHaveLength(6);
+  });
+
+  it('shows the DNS tail apart from the downtime, with the network badge (SDD §9.1, §16, plan task N12c)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'web-cache-01')!;
+    m.estimate = { ...m.estimate!, dns_tail_s: 300 };
+    const view = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const panel = await screen.findByRole('region', { name: /^Downtime/ });
+    const tail = within(panel).getByText(/^DNS tail/).closest('p')!;
+    expect(tail).toHaveTextContent("DNS tail 5m 00s: after the swap, resolvers may still answer with the old address for up to the record's TTL; not part of the downtime.");
+    expect(within(tail).getByText('Technology Preview')).toBeInTheDocument();
+    // not a part of the downtime
+    expect(within(panel).getByLabelText('Estimated downtime, by part')).not.toHaveTextContent(/DNS/);
+    view.unmount();
+
+    // none without a DNS target or a record read
+    m.estimate = { ...m.estimate, dns_tail_s: null };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const again = await screen.findByRole('region', { name: /^Downtime/ });
+    expect(within(again).queryByText(/^DNS tail/)).not.toBeInTheDocument();
   });
 
   it('shows no demo power control outside demo mode', async () => {

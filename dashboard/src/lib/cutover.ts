@@ -1,4 +1,4 @@
-import type { HookPoint } from '../api/types';
+import type { Hook, HookPoint } from '../api/types';
 
 /** The points a plan runs hooks at, in the cutover's order, with their names on the form (SDD §8.2, §16). */
 export const HOOK_POINTS: ReadonlyArray<readonly [HookPoint, string]> = [
@@ -8,6 +8,15 @@ export const HOOK_POINTS: ReadonlyArray<readonly [HookPoint, string]> = [
   ['on_rollback', 'On rollback'],
   ['on_finalize', 'On finalize'],
 ];
+
+/** The names of the hook kinds (SDD §8.2, §16). */
+export const HOOK_KIND_LABELS: Readonly<Record<Hook['kind'], string>> = { playbook: 'Playbook', webhook: 'Webhook' };
+
+/** A hook kind's name as an event's data gives it (SDD §8.2): a kind it does not know as it is, none as none. */
+export function hookKindLabel(kind: unknown): string | null {
+  if (kind === 'playbook' || kind === 'webhook') return HOOK_KIND_LABELS[kind];
+  return typeof kind === 'string' && kind ? kind : null;
+}
 
 /** A DNS target as the form edits it (SDD §4.2 DnsTarget, §8.4). */
 export interface DnsTargetDraft {
