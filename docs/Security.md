@@ -44,6 +44,8 @@ can print anything to its console and can name its VM anything).
 | Cloud credentials (`clouds.yaml`, Keystone application credentials, vCenter user/password) | **Secret** | OpenShift Secret / mounted file; 0600 temp files per run (SDD §13.3) | Never in DB, API, logs, git or images; read-only mounts; rotation (§7) |
 | API tokens (`smg_…`) | **Secret** (plaintext), Internal (SHA-256 hash) | Operators' password managers; hashes in `tokens.yaml` / Secret (bootstrap tokens) and in the database's `documents` rows of kind `user` (dashboard users, `POST /users`, §5.1) | Shown once; hash-only storage; constant-time compare |
 | `POSTGRES_PASSWORD`, `JEV_MCP_AUTH_TOKEN`, `TYPESAFE_API_KEY`, `AGENTMEMORY_SECRET` | **Secret** | `deploy/compose/.env` (0600, git-ignored) or OpenShift Secrets | Environment/Secret only; never committed (§7, §10) |
+| A webhook hook's bearer token and an RFC 2136 DNS target's TSIG key (0.4.0, SDD §23) | **Secret** | The secret store, under the name the hook or the target gives (`SEAMLESS_SECRET_STORE`: files 0600 in a 0700 directory, or the namespace's Secrets; SDD §13.3) | Never in the database, the API, events or logs; read each time it is used; never a provider's secret (§7.1, C2-11, C2-13) |
+| The hook catalog - each hook's playbook path or webhook URL (SDD §23.3) | **Integrity-critical**: a hook runs code with the control plane's reach | PostgreSQL `documents`, kind `hook` | Admin-only writes, each a `hook.*` event with its actor; hook playbooks on a reviewed, read-only mount (C2-09) |
 | SSH keys: conversion keypair, dst→src link keypair | **Secret** | `{os_migrate_data_dir}/conversion/` (dir 0700, key 0600), per-migration run directory (SDD §7.2) | Per-migration scope; delete with the run directory |
 | Disk contents in transit and on conversion hosts | **Confidential** (customer data, may include secrets) | SSH channel, NBD on loopback, attached volumes | Encrypted in transit; loopback-only NBD; temporary volumes deleted |
 | VM inventory, plans, advisor notes, events (names, addresses, sizes, actors) | **Confidential** | PostgreSQL `documents`, `events`; dashboard | RBAC, TLS, DB isolation, backup encryption |
@@ -82,6 +84,7 @@ can print anything to its console and can name its VM anything).
 |---|---|---|
 | TB1 operator → API | commands, plan data, tokens | TLS at the Route; `Authorization: Bearer` header only (never in URLs; the dashboard streams with `fetch`, not `EventSource`, SDD §12) |
 | TB2 control plane → clouds, vCenter | credentials, inventory, volume/server operations | TLS with verification on by default (`verify_tls=true`, `ca_cert_path`); Keystone application credentials recommended |
+| TB2 control plane → webhook endpoints and DNS servers (0.4.0, SDD §23) | a hook's context document - ids, labels, addresses, floating IPs, never a credential - with its bearer token; DNS reads and compare-and-swap updates | a webhook: an `https://` URL without user information, TLS verified, no redirect followed; Designate with the destination provider's credential, as TB2; RFC 2136 over TCP, each message TSIG-signed (SDD §8.4) |
 | TB3 control plane → conversion hosts | Ansible over SSH | key auth, `BatchMode=yes`; host-key policy in §6.3 |
 | TB4 src ↔ dst conversion hosts | disk blocks | SSH encryption; NBD exports bound to loopback and read-only; blocksync manifest digest compared end-to-end (SDD §6.2) |
 | TB5 control plane → PostgreSQL | documents, events | NetworkPolicy / internal Compose network; a password (scram-sha-256) on every `pg_hba` line (§9.4); TLS recommended (§8) |
@@ -122,9 +125,14 @@ QASuite case that exercises the control.
 | C2-03 | Tampering | Wrong workload selected (name collisions, regex metacharacters) | `os_migrate_workloads_filter: [{regex: "^" + re.escape(name) + "$"}]`; `SRC_VM_DUPLICATE_NAME` blocker | Impl | L | `test_workload_filter_escapes_regex`, `test_duplicate_names_blocked` |
 | C2-04 | Tampering | Data loss in storage handover (unmanage succeeded, manage failed) | Journal of the server definition and of completed sub-steps (`handover-journal.json`, 0600), with every unmanage and manage journaled as sent before its wait so a crash during a Cinder wait neither repeats the call nor loses the RHOSO volume; `delete_on_termination=false` is set and verified before the source server is deleted, and a cloud without compute microversion 2.85 aborts before any destructive step; rollback walks the journal backwards (SDD §7.3); eligibility needs admin on both clouds, a complete backend map, `plan.handover.enabled` | Impl | M (inherently destructive; operator error) | `test_handover_journal_resume_skips_done_steps`, `test_handover_rollback_reverses_order`, `test_handover_requires_backend_map_and_admin`, `test_handover_resume_after_a_crash_while_managing_waits_for_the_same_volume`, `test_handover_rollback_after_a_crash_while_managing_unmanages_that_volume` |
 | C2-05 | Denial of service | Retry storms, runaway concurrency | `max_step_retries`, exponential backoff, `max_concurrent_migrations/cutovers`, per-wave `max_parallel` | Impl | L | `test_max_concurrent_cutovers`, `test_retry_after_failure` |
-| C2-06 | Elevation | Playbooks run arbitrary code on conversion hosts | Playbooks come from the image (read-only root filesystem); `SEAMLESS_ANSIBLE_PLAYBOOK`/`SEAMLESS_COLLECTION_ROOT` are deployer-controlled; no user-supplied playbook paths in the API | Impl + Cfg | L | image review; QASuite §10 |
+| C2-06 | Elevation | Playbooks run arbitrary code on conversion hosts | Playbooks come from the image (read-only root filesystem); `SEAMLESS_ANSIBLE_PLAYBOOK`/`SEAMLESS_COLLECTION_ROOT` are deployer-controlled; no playbook path in the API but a `playbook` hook's, which an admin registers (C2-09) | Impl + Cfg | L | image review; QASuite §10 |
 | C2-07 | Repudiation | Executor actions without attribution | `migration.action`, `migration.downtime_started/ended`, `migration.phase` events with actor `system` or the requesting principal | Impl | L | `test_warm_flow_reaches_completed_with_downtime` |
 | C2-08 | Spoofing | Something other than the migrated service answers an application probe (address reuse, a host on the tenant network) and a broken cutover passes verification | Probes add to `server_active`, `ports_up` and the console check, never replace them; a refused or wrong-status probe fails the verification and the plan's automatic rollback runs; an unreachable probe asks for review (SDD §7.5, ADV-18) | Impl | L | `test_a_failed_application_probe_rolls_the_vm_back`, `test_an_unreachable_application_probe_passes_with_review_required` |
+| C2-09 | Elevation | A hook runs code with the control plane's reach (0.4.0, SDD §23.3): a `playbook` hook runs on the control plane itself (`ansible-playbook -c local`) as its user, and a `webhook` hook makes it call a URL | Only an admin registers, changes or deletes a hook (`/hooks`, §5.2); a plan names hooks of the catalog alone; every change is a `hook.*` event with its actor, never a URL or a secret's name; a playbook path is absolute; a hook in use cannot be deleted. **Keep hook playbooks on a reviewed, read-only mount, and treat the admin role as one that can run code** (owner decision 2) | Impl + **Cfg** | M (the admin role can run code) | `test_only_an_admin_registers_a_hook`, `test_a_plan_references_hooks_by_name_per_point`, `test_a_hook_in_use_cannot_be_deleted` |
+| C2-10 | Info disclosure | A credential or a secret leaves through a hook: its context, its output, its event | The context document never carries a credential; a playbook gets the executor's credential-free environment and its context as a 0600 file in a 0700 directory removed after the run; its output passes `redact()`; a run's `migration.action` names neither the URL, the secret's name, the answer nor the output; nothing of a hook reaches Jev or agentmemory (SDD §7.2, §13.4, §23.3) | Impl | L | `test_the_context_document_carries_the_migration_and_no_credential`, `test_a_playbook_hook_gets_the_context_and_no_credential`, `test_a_hooks_output_is_redacted` |
+| C2-11 | Spoofing | A webhook's call goes to another host, or its token travels in clear | `https://` URLs alone, without user information (422 otherwise); TLS verified; no redirect followed; the bearer token is the secret's `token`, read at each run, and a hook's secret is never a provider's (SDD §13.3) | Impl | L | `test_a_webhook_hook_needs_https`, `test_a_webhook_hook_posts_the_context_with_its_bearer_secret` |
+| C2-12 | Denial of service | A hook that hangs holds the downtime, or runs twice after a restart | A timeout per hook (300 s by default, 1-1800 s), past which a playbook's process group is stopped; a `post_create` hook's timeout counts in the downtime estimate (SDD §9.1); the idempotency key - the migration, the attempt, the point - is the same when a resumed step runs a hook again | Impl | L | `test_a_hook_that_exceeds_its_timeout_fails`, `test_hooks_inside_the_downtime_add_their_timeouts`, `test_a_rerun_hook_gets_the_same_idempotency_key` |
+| C2-13 | Tampering | The network cut-over changes what is not its own: a DNS record another writer changed, an address left on two ports, a load balancer's TLS keys | The DNS swap is a compare-and-swap - a record that holds another address is left as it is -, and an RFC 2136 update is TSIG-signed with a key from the secret store, never logged; the floating IP move is journaled and returns the address to the source before a rollback starts it; the member helper never reads a TLS container (SDD §8.3-§8.5) | Impl | L | `test_a_swap_that_finds_another_address_changes_nothing`, `test_an_rfc2136_swap_is_a_compare_and_swap`, `test_no_tsig_key_reaches_a_log_line`, `test_a_rollback_gives_the_address_back_to_the_source_before_it_starts`, `test_tls_containers_are_mapped_never_read` |
 
 ### 4.3 Conversion hosts and the data path (C3)
 
@@ -261,6 +269,7 @@ The main routes by role; SDD §12 lists every route with its minimum role (`test
 | `GET /health` | public | ✓ | ✓ | ✓ | ✓ |
 | `GET /users`, `POST /users` | admin | — | — | — | ✓ |
 | `GET /me`, `GET /providers`, `GET /providers/{id}`, `GET /providers/{id}/inventory` | viewer | ✓ | ✓ | ✓ | ✓ |
+| `GET /hooks`, `GET /hooks/{name}` | viewer | ✓ | ✓ | ✓ | ✓ |
 | `GET /plans`, `/plans/{id}`, `/migrations`, `/migrations/{id}`, `/events`, `/events/stream`, `/stats`, `/advisor/status` | viewer | ✓ | ✓ | ✓ | ✓ |
 | `GET /metrics` | viewer (public when `SEAMLESS_METRICS_PUBLIC`) | ✓ | ✓ | ✓ | ✓ |
 | `POST /providers/{id}/check` | operator | ✗ | ✓ | ✓ | ✓ |
@@ -270,6 +279,7 @@ The main routes by role; SDD §12 lists every route with its minimum role (`test
 | `POST /advisor/similar-incidents` | operator | ✗ | ✓ | ✓ | ✓ |
 | `POST /migrations/{id}/approve`, `…/cutover`, `…/finalize` | approver | ✗ | ✗ | ✓ | ✓ |
 | `POST /providers`, `PATCH /providers/{id}`, `PUT /providers/{id}/credentials`, `PUT /providers/{id}/conversion-key`, `DELETE /providers/{id}` | admin | ✗ | ✗ | ✗ | ✓ |
+| `POST /hooks`, `PATCH /hooks/{name}`, `DELETE /hooks/{name}` (code the control plane runs, C2-09) | admin | ✗ | ✗ | ✗ | ✓ |
 
 Design intent: operators can run and *undo* (rollback, cancel) but cannot authorize the risky forward steps
 (cutover, finalize) nor change the policy that gates them (approval required, automatic cutover, change window: SDD §12); only admins can define the endpoints the control plane connects to (the SSRF surface,
@@ -410,6 +420,8 @@ malicious, corruption).
 | vCenter service account | vCenter admin | Secret `seamless-vmware` | per policy; least privilege (read inventory, CBT snapshot, power ops on migration folders) |
 | Conversion and link SSH keys | `ssh-keygen -t ed25519` in `generate_keypair.yml` | per-migration run dir (dir 0700, key 0600) | per migration; deleted with the run directory |
 | SSH key for an **existing** conversion host (`conversion_host.ssh_key_secret`; required for VMware sources, whose kit has no prestage step) | operator (`ssh-keygen -t ed25519`) | the secret named by `ssh_key_secret`, referenced by name only — never in the database or API (SDD §13.3) | on suspicion or staff change; remove the matching `authorized_keys` entry on the host and restrict it (SEC-06) |
+| A webhook hook's bearer token (0.4.0) | the webhook's owner; an admin stores it as the hook's secret, key `token` (SDD §13.3) | the secret store, by the name the hook gives - never a provider's secret | when the webhook's owner rotates it: replace the secret's `token`; each run reads it anew |
+| An RFC 2136 DNS target's TSIG key (0.4.0) | the DNS server's administrator (BIND's `tsig-keygen`, for one) | the secret store, keys `name`, `secret` and `algorithm` (SDD §13.3) | per the DNS server's policy: add the new key there, replace the secret, remove the old key; let the key update the plan's records alone |
 | TLS private keys (Route certificate) | PKI | OpenShift Secret / external certificate | per PKI policy; never in git |
 
 ### 7.2 Handling rules
@@ -640,6 +652,11 @@ business context a pattern cannot recognize: for sensitive tenants run with `SEA
 self-hosted endpoint. `GET /advisor/data-sent` (viewer) lists, per decision type, the Jev tool and the fields its
 serializer sends (SDD §13.4).
 
+The network cut-over (0.4.0) adds nothing to what Jev and agentmemory receive: a hook's context, URL, output and
+answer, a DNS name or record, a floating IP, and a source's Heat stacks and Octavia pools reach neither; the
+strategy evidence sends finding codes and severities alone, and the verification's `floating_ip:` checks stay out of
+the evidence `jev_verify` judges (SDD §13.4, §23.9).
+
 ### 10.5 Provider choice
 
 | Environment | Recommended mode |
@@ -797,6 +814,15 @@ repository at commit `fbf3509` (upstream os-migrate `main` after 1.0.5, the fork
 - [ ] Provider data-handling terms reviewed; separate key per environment; rotation scheduled.
 - [ ] agentmemory bound to loopback or protected by secret + TLS; project id per environment.
 
+**Network cut-over (0.4.0, SDD §23, a Technology Preview)**
+- [ ] Hook playbooks sit on a reviewed, read-only mount; the admin role is held by those who may run code on the
+      control plane (C2-09).
+- [ ] Each webhook has a bearer token of its own, in a secret of its own (key `token`), and an `https://` URL whose
+      certificate the control plane trusts; the receiving end checks the token and the `Idempotency-Key`.
+- [ ] Each RFC 2136 DNS target has a TSIG key of its own, and the DNS server's update policy lets that key change
+      the plan's records alone.
+- [ ] The destination credential reaches the Designate zones the plan's DNS targets name, project-scoped.
+
 **Operations**
 - [ ] Logs forwarded; `events` exported to write-once storage (`seamless events export -o …`, or Export the whole trail on
       the dashboard's Events page — the same JSON lines, 5bdfe79; it holds the trail in the browser's memory, so for a
@@ -935,6 +961,9 @@ rescan with `gitleaks` → add the pattern to the scanning rules → record the 
 | Injection screening | `test_verification_blocked_console_sets_review_required` (+ `test_live_jev_decide` as a live canary) | control-plane suite (+ live) |
 | Irreversible-action guards | `test_finalize_confirm_mismatch_400`, `test_finalize_requires_confirm_name`, `test_cutover_window_respected_and_force_window` | control-plane suite |
 | Memory failures harmless | `test_memory_failures_swallowed` | control-plane suite |
+| Hooks: an admin's catalog, no credential in a hook's context, its output redacted, HTTPS webhooks (SDD §23.3) | `test_only_an_admin_registers_a_hook`, `test_a_playbook_hook_gets_the_context_and_no_credential`, `test_a_hooks_output_is_redacted`, `test_a_webhook_hook_needs_https` | control-plane suite |
+| The DNS swap: a compare-and-swap, no TSIG key in a log line (SDD §8.4) | `test_a_swap_that_finds_another_address_changes_nothing`, `test_no_tsig_key_reaches_a_log_line` | control-plane suite |
+| No TLS container read by the member helper (SDD §8.5) | `test_tls_containers_are_mapped_never_read` | control-plane suite |
 
 External and manual checks (commands in [QASuite.md](QASuite.md) §10): secret scanning (`gitleaks`),
 dependency audit (`pip-audit`, `npm audit`), image scan and SBOM (`trivy`), manifest linting
