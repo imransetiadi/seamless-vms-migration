@@ -2119,7 +2119,7 @@ class AnsibleExecutor:
             return StepResult(
                 details={
                     "source_deleted": False,
-                    "reason": "deleting VMware source VMs is not automated in 0.1.0",
+                    "reason": "deleting a VMware source VM is not automated: delete it in vCenter",
                 }
             )
         try:
