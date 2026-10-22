@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Literal
 
 from .domain.models import PlanSpec, invalid_plan_settings, repeated_vm_ids
@@ -45,3 +46,13 @@ def check_plan_spec(spec: PlanSpec) -> None:
     overrides = invalid_estimator_overrides(spec.estimator_overrides)
     if overrides:
         raise PlanSpecError("bad_request", f"invalid estimator_overrides: {'; '.join(overrides)}")
+
+
+def unknown_hook(spec: PlanSpec, catalog: Collection[str]) -> str | None:
+    """Why ``spec`` cannot be stored with the hook catalog ``catalog`` (SDD §12, §15, plan task N3):
+    the first point naming a hook the catalog lacks; None when it names catalog hooks alone."""
+    for point, names in spec.network_cutover.hooks.items():
+        for name in names:
+            if name not in catalog:
+                return f"network_cutover.hooks.{point}: no hook {name!r} in the catalog"
+    return None

@@ -1019,3 +1019,36 @@ def test_a_value_the_store_refuses_is_one_error_line_never_a_traceback(env, caps
         assert store.list("plan", Plan) == []
     finally:
         store.dispose()
+
+
+def test_plan_apply_names_catalog_hooks_alone_like_post(env, capsys):
+    """SDD §15, §12 (plan task N3): a plan file naming a hook the catalog lacks is refused as POST
+    and PATCH /plans refuse it, and stores nothing; one naming catalog hooks is stored."""
+    from seamless_migrate.domain.models import Hook
+
+    store = store_for(env)
+    store.put("provider", make_provider(id="src-osp"))
+    store.put(
+        "provider",
+        make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    store.put("hook", Hook(name="drain-lb", kind="playbook", playbook="/opt/hooks/drain.yml"))
+    doc = {
+        "name": "Finance web tier",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": ["vm-1"],
+        "network_cutover": {"hooks": {"pre_stop": ["drain-lb", "nope"]}},
+    }
+    path = env / "plan.yaml"
+    path.write_text(yaml.safe_dump(doc))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    assert "network_cutover.hooks.pre_stop: no hook 'nope' in the catalog" in (
+        capsys.readouterr().err
+    )
+    assert store.list("plan", Plan) == []
+    doc["network_cutover"]["hooks"]["pre_stop"] = ["drain-lb"]
+    path.write_text(yaml.safe_dump(doc))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 0
+    [plan] = store.list("plan", Plan)
+    assert plan.network_cutover.hooks == {"pre_stop": ["drain-lb"]}

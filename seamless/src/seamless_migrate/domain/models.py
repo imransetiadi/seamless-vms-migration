@@ -624,6 +624,147 @@ PRESTAGE_RESOURCES = (
 )
 
 
+#: where a migration runs a plan's hooks (SDD §4.2, §23.3)
+HookPoint = Literal["pre_stop", "post_create", "post_verify", "on_rollback", "on_finalize"]
+#: a hook's name, the catalog's key - a provider id's form (SDD §4.2)
+HOOK_NAME = r"^[a-z0-9][a-z0-9-]{1,62}$"
+#: a DNS target's zone and record, an Octavia pool's id (SDD §4.2): 1-255 characters
+_Text255 = Annotated[str, StringConstraints(min_length=1, max_length=255)]
+
+
+def _secret_name(field: str, name: str | None) -> str | None:
+    """A secret's name as SDD §13.3 reads it, else a ValueError naming ``field``."""
+    from ..security.secrets import valid_secret_name  # the security package reads the config
+
+    if name is not None and not valid_secret_name(name):
+        raise ValueError(
+            f"{field}: a secret name is 1-128 letters, digits, '.', '_' or '-', starting with a "
+            "letter or digit"
+        )
+    return name
+
+
+class DnsTarget(_Model):
+    """Where a VM's new address goes in DNS (SDD §4.2, §23.5): a Designate zone's record, reached
+    with the destination provider's credential, or an RFC 2136 server's, signed with a TSIG key
+    held as a secret (owner decision 6)."""
+
+    kind: Literal["designate", "rfc2136"]
+    zone: _Text255
+    record: _Text255
+    server: _Text255 | None = None
+    tsig_secret: str | None = None
+
+    @model_validator(mode="after")
+    def _kind_fields(self) -> DnsTarget:
+        if self.kind == "designate":
+            for name in ("server", "tsig_secret"):
+                if getattr(self, name) is not None:
+                    raise ValueError(
+                        f"{name}: a designate target takes none - Seamless reaches Designate with "
+                        "the plan's own provider credential"
+                    )
+        else:
+            for name in ("server", "tsig_secret"):
+                if getattr(self, name) is None:
+                    raise ValueError(f"{name}: an rfc2136 target needs it")
+            _secret_name("tsig_secret", self.tsig_secret)
+        return self
+
+
+class NetworkCutover(_Model):
+    """A plan's network cut-over settings (SDD §4.2, §23.3-§23.7, plan task N3): the catalog hooks
+    it runs per point, the floating IP move, a DNS target per VM and the Octavia pool mapping."""
+
+    #: per point, the names of catalog hooks in their run order, each once per point
+    hooks: dict[HookPoint, list[Annotated[str, StringConstraints(min_length=1)]]] = Field(
+        default_factory=dict
+    )
+    #: "keep_address": the move that keeps a floating IP's address (SDD §23.4, owner decision 4)
+    floating_ips: Literal["auto", "keep_address"] = "auto"
+    #: per VM (source id): the record its new address goes to (SDD §23.5)
+    dns_targets: dict[str, DnsTarget] = Field(default_factory=dict)
+    #: a source Octavia pool (its id) to a destination pool (its id) (SDD §23.7)
+    lb_pools: dict[_Text255, _Text255] = Field(default_factory=dict)
+
+    @field_validator("hooks")
+    @classmethod
+    def _once_per_point(cls, hooks: dict[str, list[str]]) -> dict[str, list[str]]:
+        for point, names in hooks.items():
+            twice = sorted(name for name, n in Counter(names).items() if n > 1)
+            if twice:
+                raise ValueError(f"{point}: names {', '.join(twice)} more than once")
+        return hooks
+
+    def hook_names(self) -> set[str]:
+        """Every hook the settings name, at any point."""
+        return {name for names in self.hooks.values() for name in names}
+
+
+class Hook(_Model):
+    """A hook of the catalog an admin keeps (SDD §4.2, §23.3): a playbook the AnsibleExecutor runs,
+    or a webhook POSTed the context document with a bearer token; plans name it per point."""
+
+    name: str = Field(pattern=HOOK_NAME)
+    kind: Literal["playbook", "webhook"]
+    description: str | None = None
+    #: playbook: its absolute path, a .yml or .yaml file
+    playbook: str | None = None
+    #: webhook: an https:// URL without user information
+    url: str | None = None
+    #: webhook: the secret (SDD §13.3) whose key `token` is its bearer token
+    secret: str | None = None
+    timeout_s: int = Field(default=300, ge=1, le=1800)
+    #: the hook a rollback runs to undo this one: another hook of the catalog
+    revert: str | None = None
+    #: server-owned
+    created_at: UTCDateTime = Field(default_factory=utcnow)
+    updated_at: UTCDateTime = Field(default_factory=utcnow)
+
+    @property
+    def id(self) -> str:
+        """The store's key: the hook's name (SDD §11)."""
+        return self.name
+
+    @model_validator(mode="after")
+    def _kind_fields(self) -> Hook:
+        own = {"playbook": ("playbook",), "webhook": ("url", "secret")}[self.kind]
+        other = {"playbook": ("url", "secret"), "webhook": ("playbook",)}[self.kind]
+        for name in own:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name}: a {self.kind} hook needs it")
+        for name in other:
+            if getattr(self, name) is not None:
+                raise ValueError(f"{name}: a {self.kind} hook takes none")
+        if self.playbook is not None:
+            if not self.playbook.startswith("/"):
+                raise ValueError("playbook: an absolute path")
+            if not self.playbook.lower().endswith((".yml", ".yaml")):
+                raise ValueError("playbook: a .yml or .yaml file")
+        if self.url is not None:
+            _https_url(self.url)
+        _secret_name("secret", self.secret)
+        if self.revert == self.name:
+            raise ValueError("revert: a hook cannot revert itself")
+        return self
+
+
+def _https_url(url: str) -> None:
+    """A webhook's URL (SDD §4.2, §23.9): https:// with a host, and no user information - a
+    credential belongs in its secret."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        host, parts = None, None
+    if parts is None or parts.scheme.lower() != "https" or not host:
+        raise ValueError("url: an https:// URL with a host")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("url: no user information - put the credential in the hook's secret")
+
+
 #: the pre-flight codes a plan may acknowledge for a VM (SDD §4.2, §9.3): a blocker it then reports
 #: as a warning that says so - an autoscaling group's member (owner decision 9)
 ACKNOWLEDGEABLE_FINDINGS = frozenset({"SRC_VM_AUTOSCALED"})
@@ -671,6 +812,9 @@ class PlanSpec(_Model):
     #: per VM (source id): the pre-flight codes the plan acknowledges for it, each one of
     #: ACKNOWLEDGEABLE_FINDINGS (SDD §4.2, §9.3, owner decision 9)
     acknowledged_findings: dict[str, list[str]] = Field(default_factory=dict)
+    #: the hooks per point, the floating IP move, DNS targets and Octavia pool mappings (SDD §4.2,
+    #: §23.3-§23.7, plan task N3)
+    network_cutover: NetworkCutover = Field(default_factory=NetworkCutover)
 
     def nic_override(self, vm_id: str, mac: str | None) -> NicOverride | None:
         """The plan's override of a VM's NIC, by its MAC (SDD §4.2)."""

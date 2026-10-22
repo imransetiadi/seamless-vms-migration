@@ -40,6 +40,7 @@ from ..store import ConflictError, NotFound, Store, UnstorableValue
 from . import (
     routes_advisor,
     routes_events,
+    routes_hooks,
     routes_migrations,
     routes_misc,
     routes_plans,
@@ -414,6 +415,7 @@ def create_app(
         routes_misc,
         routes_advisor,
         routes_providers,
+        routes_hooks,
         routes_plans,
         routes_migrations,
         routes_events,

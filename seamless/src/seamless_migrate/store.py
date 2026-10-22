@@ -43,6 +43,7 @@ KINDS = (
     "advisor_snapshot",
     "advisor_policy",
     "user",
+    "hook",
 )
 
 JSONType = sa.JSON().with_variant(JSONB(), "postgresql")

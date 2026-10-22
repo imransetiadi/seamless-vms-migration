@@ -8719,7 +8719,9 @@ async def test_rollback_with_new_source_ids_rewrites_the_plan(tmp_path, store):
         {"default_strategy": Strategy.cold, "strategy_overrides": {"vm-1": Strategy.cold},
          "probe_overrides": {"vm-1": [probe]},
          "nic_overrides": {"vm-1": {"fa:16:3e:00:00:0a": {"fixed_ips": ["10.0.0.9"]}}},
-         "acknowledged_findings": {"vm-1": ["SRC_VM_AUTOSCALED"]}},
+         "acknowledged_findings": {"vm-1": ["SRC_VM_AUTOSCALED"]},
+         "network_cutover": {"dns_targets": {"vm-1": {
+             "kind": "designate", "zone": "example.com.", "record": "web-01"}}}},
         executor=executor, settings=settings,
     )  # fmt: skip
     await h.orch.auto_waves(plan.id, 10, "alice")  # resets the plan to draft: validate after
@@ -8743,6 +8745,8 @@ async def test_rollback_with_new_source_ids_rewrites_the_plan(tmp_path, store):
     assert list(updated.nic_overrides) == ["vm-1-recreated"]
     # and so does what the plan acknowledges for it (SDD §4.2, §9.3, plan task N2)
     assert updated.acknowledged_findings == {"vm-1-recreated": ["SRC_VM_AUTOSCALED"]}
+    # and its DNS target (SDD §7.3, plan task N3)
+    assert list(updated.network_cutover.dns_targets) == ["vm-1-recreated"]
     assert (await h.by_vm(plan.id, "vm-1-recreated")).id == m.id
     assert updated.status == PlanStatus.completed
 

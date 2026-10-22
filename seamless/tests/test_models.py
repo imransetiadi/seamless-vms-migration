@@ -516,3 +516,126 @@ def test_the_migration_summary_carries_the_gpu_wait():
     assert (failed.pool, failed.free, failed.reason) == ("�", None, "read� failed")
     with pytest.raises(ValidationError):
         GpuWait(since=at, checked_at=at, pool="VGPU", needed=1, free=0)  # a wait says why
+
+
+def test_a_plans_network_cutover_settings_round_trip():
+    """SDD §4.2 (plan task N3): a plan's network cut-over settings - the hooks it runs per point,
+    the floating IP move, a DNS target per VM and the Octavia pool mapping - are stored and read
+    back as given; a plan without them, or stored before they existed, has the defaults; a DNS
+    target that lacks what its kind needs, a point named twice or an unknown point is refused."""
+    from seamless_migrate.domain.models import DnsTarget, NetworkCutover, Plan
+    from tests.factories import make_plan
+
+    settings = NetworkCutover(
+        hooks={"pre_stop": ["drain-lb"], "post_create": ["dns-swap", "drain-lb"]},
+        floating_ips="keep_address",
+        dns_targets={
+            "vm-1": DnsTarget(kind="designate", zone="example.com.", record="web-01"),
+            "vm-2": DnsTarget(
+                kind="rfc2136",
+                zone="example.org.",
+                record="db",
+                server="ns1.example.org:53",
+                tsig_secret="tsig-example",
+            ),
+        },
+        lb_pools={"pool-src-1": "pool-dst-9"},
+    )
+    plan = make_plan(network_cutover=settings)
+    again = Plan.model_validate_json(plan.model_dump_json())
+    assert again.network_cutover == settings
+    assert json.loads(plan.model_dump_json())["network_cutover"] == {
+        "hooks": {"pre_stop": ["drain-lb"], "post_create": ["dns-swap", "drain-lb"]},
+        "floating_ips": "keep_address",
+        "dns_targets": {
+            "vm-1": {
+                "kind": "designate",
+                "zone": "example.com.",
+                "record": "web-01",
+                "server": None,
+                "tsig_secret": None,
+            },
+            "vm-2": {
+                "kind": "rfc2136",
+                "zone": "example.org.",
+                "record": "db",
+                "server": "ns1.example.org:53",
+                "tsig_secret": "tsig-example",
+            },
+        },
+        "lb_pools": {"pool-src-1": "pool-dst-9"},
+    }
+    # the defaults: os-migrate's floating IPs, no hook, no DNS target, no pool mapping
+    assert make_plan().network_cutover == NetworkCutover()
+    assert NetworkCutover().model_dump(mode="json") == {
+        "hooks": {},
+        "floating_ips": "auto",
+        "dns_targets": {},
+        "lb_pools": {},
+    }
+    stored = json.loads(make_plan().model_dump_json())
+    del stored["network_cutover"]
+    assert Plan.model_validate(stored).network_cutover == NetworkCutover()
+
+    refused = [
+        {"hooks": {"pre_start": ["drain-lb"]}},
+        {"hooks": {"pre_stop": ["drain-lb", "drain-lb"]}},
+        {"hooks": {"pre_stop": [""]}},
+        {"floating_ips": "move"},
+        {
+            "dns_targets": {
+                "vm-1": {
+                    "kind": "designate",
+                    "zone": "example.com.",
+                    "record": "web",
+                    "server": "ns1",
+                }
+            }
+        },
+        {
+            "dns_targets": {
+                "vm-1": {
+                    "kind": "designate",
+                    "zone": "example.com.",
+                    "record": "web",
+                    "tsig_secret": "t",
+                }
+            }
+        },
+        {
+            "dns_targets": {
+                "vm-1": {
+                    "kind": "rfc2136",
+                    "zone": "example.com.",
+                    "record": "web",
+                    "tsig_secret": "t",
+                }
+            }
+        },
+        {
+            "dns_targets": {
+                "vm-1": {
+                    "kind": "rfc2136",
+                    "zone": "example.com.",
+                    "record": "web",
+                    "server": "ns1",
+                }
+            }
+        },
+        {
+            "dns_targets": {
+                "vm-1": {
+                    "kind": "rfc2136",
+                    "zone": "example.com.",
+                    "record": "web",
+                    "server": "ns1",
+                    "tsig_secret": "../key",
+                }
+            }
+        },
+        {"dns_targets": {"vm-1": {"kind": "designate", "zone": "", "record": "web"}}},
+        {"lb_pools": {"pool-src-1": ""}},
+    ]
+    for body in refused:
+        with pytest.raises(ValidationError):
+            NetworkCutover.model_validate(body)

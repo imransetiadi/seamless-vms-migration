@@ -21,4 +21,12 @@ describe('the Events page categories (SDD §4.3, §14.5, §16)', () => {
       expect(categoriesOf(kind)).toEqual(['advisor', 'security']);
     },
   );
+
+  it.each(['hook.created', 'hook.updated', 'hook.deleted'])(
+    'files %s under Security: a hook runs code with the control plane\'s reach (SDD §23.3, plan task N3)',
+    (kind) => {
+      expect(PERSISTED_EVENT_KINDS).toContain(kind);
+      expect(categoriesOf(kind)).toEqual(['security']);
+    },
+  );
 });
