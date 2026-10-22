@@ -16,6 +16,11 @@ class VMNotFound(ProviderError):
     """The cloud answered that it has no such VM (SDD §10): gone, never merely unreachable."""
 
 
+class ProviderConflict(ProviderError):
+    """A change the service refused while another is under way (HTTP 409): Octavia's load balancer
+    in PENDING_* (SDD §8.5, §10), which the change may be sent again after."""
+
+
 @runtime_checkable
 class SourceProvider(Protocol):
     async def check(self) -> dict[str, Any]:

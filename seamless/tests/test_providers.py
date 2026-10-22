@@ -4195,6 +4195,7 @@ async def test_a_source_reads_its_projects_pool_members_with_their_networks(tmp_
         PoolMember(
             load_balancer="example-lb",
             pool="web-pool",
+            pool_id="pool-1",
             address="192.0.2.10",
             port=443,
             network="app-net",
@@ -4202,6 +4203,7 @@ async def test_a_source_reads_its_projects_pool_members_with_their_networks(tmp_
         PoolMember(
             load_balancer="example-lb",
             pool="web-pool",
+            pool_id="pool-1",
             address="2001:db8::11",
             port=8443,
             network="app-net",

@@ -1350,6 +1350,20 @@ class DnsSwap(_Model):
     state: Literal["swapping", "swapped", "unchanged", "conflict", "reverted"] = "swapping"
 
 
+class LbMove(_Model):
+    """A membership the Octavia member helper moves (SDD §4.2, §8.5): the mapped source pool and the
+    VM's member there, that member's address and port, the destination pool and the member created
+    there, and how far the move went."""
+
+    source_pool: str
+    source_member: str
+    address: str
+    port: int
+    pool: str
+    member: str | None = None
+    state: Literal["draining", "drained", "joining", "joined", "restored"] = "draining"
+
+
 class Migration(_Model):
     id: str = Field(default_factory=new_migration_id)
     plan_id: str
@@ -1424,6 +1438,8 @@ class Migration(_Model):
     fip_moves: list[FipMove] = Field(default_factory=list)
     #: the journal of its DNS target's swap (SDD §4.2, §8.4)
     dns_swap: DnsSwap | None = None
+    #: the journal of its Octavia memberships' move by the member helper (SDD §4.2, §8.5)
+    lb_moves: list[LbMove] = Field(default_factory=list)
     created_at: UTCDateTime = Field(default_factory=utcnow)
     updated_at: UTCDateTime = Field(default_factory=utcnow)
 

@@ -10293,6 +10293,7 @@
             {
               "load_balancer": "example-lb",
               "pool": "web-pool",
+              "pool_id": "web-pool-id",
               "address": "192.0.2.10",
               "port": 443,
               "network": "app-net"
@@ -10300,6 +10301,7 @@
             {
               "load_balancer": "example-lb",
               "pool": "admin-pool",
+              "pool_id": "admin-pool-id",
               "address": "192.0.2.10",
               "port": 8443,
               "network": null
@@ -10307,6 +10309,7 @@
             {
               "load_balancer": "other-lb",
               "pool": "other-pool",
+              "pool_id": "other-pool-id",
               "address": "192.0.2.10",
               "port": 80,
               "network": "other-net"
@@ -10314,6 +10317,7 @@
             {
               "load_balancer": "example-lb",
               "pool": "db-pool",
+              "pool_id": "db-pool-id",
               "address": "2001:db8::10",
               "port": 5432,
               "network": "db-net"
@@ -10321,6 +10325,7 @@
             {
               "load_balancer": "example-lb",
               "pool": "web-pool",
+              "pool_id": "web-pool-id",
               "address": "192.0.2.11",
               "port": 443,
               "network": "app-net"
@@ -10338,6 +10343,156 @@
       },
       "expected": {
         "SRC_VM_LB_MEMBER": "Addresses of web-01 are members of Octavia pools at DC1 Jakarta: 192.0.2.10 port 443 in pool 'web-pool' of load balancer 'example-lb'; 192.0.2.10 port 8443 in pool 'admin-pool' of load balancer 'example-lb'; 2001:db8::10 port 5432 in pool 'db-pool' of load balancer 'example-lb'. The memberships are not moved.",
+        "SRC_VM_LB_UNKNOWN": null
+      },
+      "severities": {
+        "SRC_VM_LB_MEMBER": "warning"
+      }
+    },
+    {
+      "why": "a member of a pool the plan maps (network_cutover.lb_pools) is left out of SRC_VM_LB_MEMBER: the member helper moves it; the VM's other memberships are still named (plan task N9)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          },
+          {
+            "network": "db-net",
+            "mac": "fa:16:3e:00:00:02",
+            "fixed_ips": [
+              "2001:0db8:0:0::10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          },
+          {
+            "network": "mgmt-net",
+            "mac": "fa:16:3e:00:00:03",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "source_label": "DC1 Jakarta",
+      "source_inventory": {
+        "lb_members": {
+          "status": "ok",
+          "reason": null,
+          "detail": null,
+          "members": [
+            {
+              "load_balancer": "example-lb",
+              "pool": "web-pool",
+              "pool_id": "web-pool-id",
+              "address": "192.0.2.10",
+              "port": 443,
+              "network": "app-net"
+            },
+            {
+              "load_balancer": "example-lb",
+              "pool": "admin-pool",
+              "pool_id": "admin-pool-id",
+              "address": "192.0.2.10",
+              "port": 8443,
+              "network": null
+            },
+            {
+              "load_balancer": "other-lb",
+              "pool": "other-pool",
+              "pool_id": "other-pool-id",
+              "address": "192.0.2.10",
+              "port": 80,
+              "network": "other-net"
+            },
+            {
+              "load_balancer": "example-lb",
+              "pool": "db-pool",
+              "pool_id": "db-pool-id",
+              "address": "2001:db8::10",
+              "port": 5432,
+              "network": "db-net"
+            },
+            {
+              "load_balancer": "example-lb",
+              "pool": "web-pool",
+              "pool_id": "web-pool-id",
+              "address": "192.0.2.11",
+              "port": 443,
+              "network": "app-net"
+            }
+          ]
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "network_cutover": {
+          "lb_pools": {
+            "web-pool-id": "dst-pool"
+          }
+        }
+      },
+      "expected": {
+        "SRC_VM_LB_MEMBER": "Addresses of web-01 are members of Octavia pools at DC1 Jakarta: 192.0.2.10 port 8443 in pool 'admin-pool' of load balancer 'example-lb'; 2001:db8::10 port 5432 in pool 'db-pool' of load balancer 'example-lb'. The memberships are not moved.",
         "SRC_VM_LB_UNKNOWN": null
       },
       "severities": {

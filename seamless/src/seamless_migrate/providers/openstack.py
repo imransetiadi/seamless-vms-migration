@@ -34,7 +34,13 @@ from ..planning.preflight import (
 )
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
 from ..storage import storage_family
-from .base import ProviderError, VMNotFound, microversion_text, missing_dependency
+from .base import (
+    ProviderConflict,
+    ProviderError,
+    VMNotFound,
+    microversion_text,
+    missing_dependency,
+)
 
 log = logging.getLogger(__name__)
 
@@ -578,6 +584,7 @@ def _pool_members(
                 PoolMember(
                     load_balancer=str(lb.get("name") or lb_id),
                     pool=str(pool.get("name") or pool.get("id")),
+                    pool_id=str(pool.get("id")),
                     address=_canonical_ip(str(member.get("address"))),
                     port=int(member.get("protocol_port")),
                     network=networks.get(str(subnet)) if networks is not None else None,
@@ -714,6 +721,22 @@ class OpenStackProvider:
 
     async def release_floating_ip(self, address: str) -> None:
         await self._run(self._release_floating_ip, address)
+
+    # the Octavia member helper's calls (SDD §8.5, §10, plan task N9)
+    async def lb_pool(self, pool_id: str) -> dict[str, Any] | None:
+        return await self._run(self._lb_pool, pool_id)
+
+    async def pool_members(self, pool_id: str) -> list[dict[str, Any]]:
+        return await self._run(self._list_pool_members, pool_id)
+
+    async def set_pool_member(self, pool_id: str, member_id: str, admin_state_up: bool) -> None:
+        await self._run(self._set_pool_member, pool_id, member_id, admin_state_up)
+
+    async def add_pool_member(self, pool_id: str, address: str, protocol_port: int) -> str:
+        return await self._run(self._add_pool_member, pool_id, address, protocol_port)
+
+    async def delete_pool_member(self, pool_id: str, member_id: str) -> None:
+        await self._run(self._delete_pool_member, pool_id, member_id)
 
     # the DNS swap's Designate calls (SDD §8.4, §10, plan task N7)
     async def dns_recordset(self, zone: str, name: str, rdtype: str) -> dict[str, Any] | None:
@@ -1326,6 +1349,124 @@ class OpenStackProvider:
         fip = self._project_fip(conn, address)
         if fip is not None:
             conn.network.delete_ip(fip, ignore_missing=True)
+
+    def _lb_pool(self, pool_id: str) -> dict[str, Any] | None:
+        """The pool as MAP_LB_POOL_INCOMPATIBLE compares it (SDD §8.5, §10): its protocol,
+        algorithm, session persistence's and health monitor's types, its listeners' protocols and
+        its load balancer's provider - raw GETs under one read's bound, none logged. A listener's
+        TLS container references are neither followed nor kept (§23.7)."""
+        get = _BudgetedGet(self._connection().load_balancer)
+
+        def one(kind: str, key: str, ref: Any) -> dict[str, Any]:
+            path = f"/lbaas/{kind}/{urllib.parse.quote(str(ref), safe='')}"
+            return dict((get.get(path, {}, may_be_gone=True) or {}).get(key) or {})
+
+        try:
+            pool = one("pools", "pool", pool_id)
+            if not pool:
+                return None
+            monitor = pool.get("healthmonitor_id")
+            listeners = [
+                one("listeners", "listener", ref.get("id")).get("protocol")
+                for ref in pool.get("listeners") or []
+                if ref.get("id")
+            ]
+            balancers = [ref.get("id") for ref in pool.get("loadbalancers") or [] if ref.get("id")]
+            provider = (
+                one("loadbalancers", "loadbalancer", balancers[0]).get("provider")
+                if balancers
+                else None
+            )
+            monitor_type = (
+                one("healthmonitors", "healthmonitor", monitor).get("type") if monitor else None
+            )
+        except Exception as exc:
+            raise ProviderError(f"{self.provider.id}: Octavia: {_read_failure(exc)[1]}") from None
+        return {
+            "id": str(pool.get("id") or pool_id),
+            "name": pool.get("name"),
+            "protocol": pool.get("protocol"),
+            "lb_algorithm": pool.get("lb_algorithm"),
+            "persistence": (pool.get("session_persistence") or {}).get("type"),
+            "monitor": monitor_type,
+            "listeners": [str(p) for p in listeners if p],
+            "provider": provider,
+        }
+
+    def _list_pool_members(self, pool_id: str) -> list[dict[str, Any]]:
+        """The pool's members (SDD §8.5, §10); [] for a pool the credential does not see."""
+        get = _BudgetedGet(self._connection().load_balancer)
+        path = f"/lbaas/pools/{urllib.parse.quote(pool_id, safe='')}/members"
+        try:
+            members = get.pages(path, "members")
+        except _ServiceAnswer as exc:
+            if exc.status == 404:
+                return []
+            raise ProviderError(f"{self.provider.id}: Octavia: HTTP {exc.status}") from None
+        except Exception as exc:
+            raise ProviderError(f"{self.provider.id}: Octavia: {_read_failure(exc)[1]}") from None
+        return [
+            {
+                "id": str(m.get("id")),
+                "address": _canonical_ip(str(m.get("address"))),
+                "protocol_port": int(m.get("protocol_port")),
+                "admin_state_up": bool(m.get("admin_state_up", True)),
+                "provisioning_status": m.get("provisioning_status"),
+            }
+            for m in members
+        ]
+
+    def _octavia_change(
+        self, method: str, path: str, body: dict[str, Any] | None = None, *, gone_ok: bool = False
+    ) -> dict[str, Any]:
+        """One change sent to Octavia (SDD §8.5, §10): raw, not logged; its answer's body. A 409 -
+        the load balancer PENDING_* - is ProviderConflict, any other refusal a provider error by
+        its HTTP status alone; a 404 is no error when ``gone_ok``."""
+        adapter = self._connection().load_balancer
+        try:
+            response = adapter.request(path, method, json=body, raise_exc=False, log=False)
+        except Exception as exc:
+            raise ProviderError(f"{self.provider.id}: Octavia: {type(exc).__name__}") from None
+        status = int(response.status_code)
+        if status in (200, 201, 202):
+            return dict(response.json() or {}) if response.content else {}
+        if status == 204 or (status == 404 and gone_ok):
+            return {}
+        if status == 409:
+            raise ProviderConflict(f"{self.provider.id}: Octavia refused the change: HTTP 409")
+        raise ProviderError(f"{self.provider.id}: Octavia refused the change: HTTP {status}")
+
+    @staticmethod
+    def _member_path(pool_id: str, member_id: str | None = None) -> str:
+        path = f"/lbaas/pools/{urllib.parse.quote(pool_id, safe='')}/members"
+        return path if member_id is None else f"{path}/{urllib.parse.quote(member_id, safe='')}"
+
+    def _set_pool_member(self, pool_id: str, member_id: str, admin_state_up: bool) -> None:
+        body = {"member": {"admin_state_up": admin_state_up}}
+        self._octavia_change("PUT", self._member_path(pool_id, member_id), body)
+
+    def _add_pool_member(self, pool_id: str, address: str, protocol_port: int) -> str:
+        """A member of the address, on the credential's subnet that holds it - none when no
+        subnet does, Octavia then reaching it from the VIP subnet (SDD §8.5, §10)."""
+        conn = self._connection()
+        ip = ipaddress.ip_address(address)
+        subnet = next(
+            (
+                str(_attr(sub, "id"))
+                for sub in _try(lambda: list(conn.network.subnets()), [])
+                if _attr(sub, "cidr")
+                and ip in ipaddress.ip_network(str(_attr(sub, "cidr")), strict=False)
+            ),
+            None,
+        )
+        member: dict[str, Any] = {"address": address, "protocol_port": protocol_port}
+        if subnet is not None:
+            member["subnet_id"] = subnet
+        answer = self._octavia_change("POST", self._member_path(pool_id), {"member": member})
+        return str((answer.get("member") or {}).get("id"))
+
+    def _delete_pool_member(self, pool_id: str, member_id: str) -> None:
+        self._octavia_change("DELETE", self._member_path(pool_id, member_id), gone_ok=True)
 
     def _dns_recordset(self, zone: str, name: str, rdtype: str) -> dict[str, Any] | None:
         """Designate's recordset of the name and type in the zone the credential sees by that
