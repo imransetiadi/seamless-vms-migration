@@ -185,6 +185,11 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     strategies: ['cold', 'warm'],
     remediation: 'To keep an address, have the destination credential\'s project hold a floating IP of that address, with no port, before the cutover (an admin can create one with a given address on the external network); else update the clients, allowlists and DNS records of the old address after it.',
   },
+  DST_FIP_ADDRESS_UNAVAILABLE: {
+    severity: 'blocker',
+    strategies: [],
+    remediation: 'Keep only addresses the destination can hold: an address of a subnet of its external network, free there or held detached by the destination credential\'s project, a token with a role that may choose a floating IP\'s address, and the quota for them - or let the plan take new addresses (network_cutover.floating_ips "auto").',
+  },
   VM_PCI_PASSTHROUGH: {
     severity: 'blocker',
     strategies: [],

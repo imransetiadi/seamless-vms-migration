@@ -1617,7 +1617,7 @@ function dnsDomain(domain: string): string {
  * SRC_PORT_ADDRESS_PAIRS, MAP_FIP_ADDRESS_CHANGE and DST_DNS_INTEGRATION_MISSING, as the API's _port_findings (SDD §9.3,
  * plan task N2b): what an OpenStack VM's ports carry at the source that the migration does not.
  */
-function portFindings(vm: VMRef, floatingIps: readonly string[], dns: DnsRead, at: string, where: string): Array<[string, string]> {
+function portFindings(vm: VMRef, plan: Plan, floatingIps: readonly string[], dns: DnsRead, at: string, where: string): Array<[string, string]> {
   const out: Array<[string, string]> = [];
   const paired = vm.nics
     .filter((nic) => nic.allowed_address_pairs?.length)
@@ -1629,7 +1629,11 @@ function portFindings(vm: VMRef, floatingIps: readonly string[], dns: DnsRead, a
     ]);
   // os-migrate's `auto` attaches a detached floating IP of the source's address, else creates one with a new address (§23.1)
   const detached = new Set(floatingIps.map(canonicalIp));
-  const moved = [...new Set(vm.nics.flatMap((nic) => (nic.floating_ips ?? []).map(canonicalIp)))].filter((a) => !detached.has(a));
+  // under keep_address the move keeps each address (SDD §8.3): no new one to warn of
+  const moved =
+    plan.network_cutover?.floating_ips === 'keep_address'
+      ? []
+      : [...new Set(vm.nics.flatMap((nic) => (nic.floating_ips ?? []).map(canonicalIp)))].filter((a) => !detached.has(a));
   if (moved.length)
     out.push([
       'MAP_FIP_ADDRESS_CHANGE',
@@ -1876,7 +1880,7 @@ export function preflight(
     add(code, message);
   // what the VM's ports carry that the migration does not, and a network the waves split, as the API's (plan task N2b)
   if (sourceKind !== 'vmware')
-    for (const [code, message] of portFindings(vm, context.floatingIps ?? [], context.dns ?? { extension: null, zones: null }, at, where)) add(code, message);
+    for (const [code, message] of portFindings(vm, plan, context.floatingIps ?? [], context.dns ?? { extension: null, zones: null }, at, where)) add(code, message);
   for (const [code, message] of prefixSplit(vm, plan, context.selected ?? [vm], context.announcers ?? [])) add(code, message);
   // the API's _gpu_blockers (SDD §9.3, §22.4, §22.5, plan task G4): a GPU VM no GPU mapping applies to - an OpenStack
   // flavor's requests named by their extra specs, a VMware VM's devices by what names them - and why none applies; its
