@@ -1006,3 +1006,175 @@ async def test_a_vm_whose_gpu_its_source_declares_a_profile_for_gets_the_gpu_che
     undeclared = gpu_ctx(vm, profiles={"g1.a100-4c": "A100-4C"})
     result = await Verifier(GpuDest(flavor=flavor), Settings(), poll_s=0).verify(undeclared)
     assert not [c for c in result.checks if c["name"].startswith("gpu_")]
+
+
+# -- moved floating IPs: the reachability wait (SDD §7.5, §23.6, plan task N8) ----------------
+
+from datetime import timedelta  # noqa: E402
+
+from seamless_migrate.domain.enums import Phase as P  # noqa: E402
+from seamless_migrate.domain.models import FipMove  # noqa: E402
+
+MOVED = "203.0.113.10"
+
+
+def fip_ctx(*states, tcp_ports=(22,), timeout_s=60, vm=None, **kw):
+    """A migration whose keep-address move journaled 203.0.113.10 in each of ``states``."""
+    moves = [
+        FipMove(address=MOVED, fixed_ip="10.0.0.5", source_port="src-port-1", state=state)
+        for state in states
+    ]
+    plan = make_plan(
+        verification=VerificationConfig(tcp_ports=list(tcp_ports), timeout_s=timeout_s, **kw)
+    )
+    migration = make_migration(destination_server_id="srv-9", fip_moves=moves)
+    if vm is not None:
+        migration = migration.model_copy(update={"vm": vm})
+    return SimpleNamespace(plan=plan, migration=migration)
+
+
+class Answers:
+    """A probe of the moved address that answers ``results`` in turn, then the last one again;
+    any other address answers at once."""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.asked: list[tuple[str, int]] = []
+
+    async def __call__(self, host, probe):
+        from seamless_migrate.verification import ProbeAnswer
+
+        self.asked.append((host, probe.port))
+        result = self.results.pop(0) if len(self.results) > 1 else self.results[0]
+        if host != MOVED:
+            result = "passed"
+        detail = {
+            "passed": f"connected to {host}:{probe.port}",
+            "failed": f"{host}:{probe.port} refused the connection",
+            "unreachable": f"{host}:{probe.port} unreachable (TimeoutError)",
+        }[result]
+        return ProbeAnswer(result, detail, result != "unreachable")
+
+
+def clocked_verifier(answers, dest=None, poll_s=10):
+    clock = {"t": 0.0}
+
+    async def sleep(seconds):
+        clock["t"] += seconds
+
+    async def tcp(host, port):
+        return True, f"connected to {host}:{port}"
+
+    verifier = Verifier(
+        dest or Dest(),
+        Settings(),
+        poll_s=poll_s,
+        sleep=sleep,
+        clock=lambda: clock["t"],
+        probe=tcp,
+        app_probe=answers,
+    )
+    return verifier, clock
+
+
+def fip_check(result):
+    return next(c for c in result.checks if c["name"] == f"floating_ip:{MOVED}")
+
+
+async def test_a_moved_floating_ip_must_be_reachable_within_the_bound():
+    """SDD §7.5, §23.6 (FR-45): each moved floating IP gets a check that connects to it on the
+    first port the verification probes; an answer - connected, or refused: the address routes
+    there - is reachable, no answer is polled until timeout_s and then fails the verification,
+    unlike an unreachable application probe. An address not moved gets no check; with no port to
+    probe, the check is skipped with a warning."""
+    # unreachable twice, then refused: reachable on the third poll
+    answers = Answers("unreachable", "unreachable", "failed")
+    verifier, clock = clocked_verifier(answers)
+    result = await verifier.verify(fip_ctx("moved"))
+    assert result.passed is True
+    assert result.evidence["attempts"] == 3 and clock["t"] == 20
+    check = fip_check(result)
+    assert check["ok"] is True and "refused" in check["detail"]
+    assert answers.asked == [(MOVED, 22)] * 3
+    names = [c["name"] for c in result.checks]
+    assert names.index(f"floating_ip:{MOVED}") == names.index("ports_up") + 1
+
+    # never reachable: polled to the bound, then the verification fails
+    verifier, clock = clocked_verifier(Answers("unreachable"))
+    result = await verifier.verify(fip_ctx("moved", timeout_s=60))
+    assert result.passed is False
+    assert clock["t"] == 60
+    check = fip_check(result)
+    assert check["ok"] is False and not check.get("skipped")
+    assert check["detail"] == f"{MOVED}:22 unreachable (TimeoutError)"
+    assert f"floating_ip:{MOVED}" in result.failed_checks()
+
+    # the first application probe's port when the plan names no TCP port
+    answers = Answers("passed")
+    verifier, _ = clocked_verifier(answers)
+    http = AppProbe(kind="http", port=8080, path="/health")
+    result = await verifier.verify(fip_ctx("moved", tcp_ports=(), app_probes=[http]))
+    assert (MOVED, 8080) in answers.asked and fip_check(result)["ok"] is True
+
+    # a journal entry that is not moved - returned, finalized - gets no check
+    verifier, _ = clocked_verifier(Answers("unreachable"))
+    result = await verifier.verify(fip_ctx("returned"))
+    assert result.passed is True
+    assert not [c for c in result.checks if c["name"].startswith("floating_ip:")]
+
+    # no port to probe it with: skipped, with a warning
+    verifier, _ = clocked_verifier(Answers("unreachable"))
+    result = await verifier.verify(fip_ctx("moved", tcp_ports=()))
+    check = fip_check(result)
+    assert check["skipped"] is True and result.passed is True
+    warning = f"no TCP port to probe the moved floating IP {MOVED} with"
+    assert check["detail"] == warning and warning in result.evidence["warnings"]
+
+
+async def test_the_reachability_wait_counts_in_the_downtime(tmp_path, store):
+    """SDD §5.2, §7.5: the verification waits for the moved address to answer - three polls 30 s
+    apart here - and the downtime, which ends when the verification passes, holds that wait."""
+    from tests.test_fip_move import FipDestination, fip_setup
+    from tests.test_orchestrator import run_plan
+
+    class SlowRoute(FipDestination):
+        """The moved address answers on the third probe (the BGP agent's announcement)."""
+
+        def __init__(self, log, **kw):
+            super().__init__(log, **kw)
+            self.probes: list[str] = []
+
+        async def probe_service(self, server_id, vm, probe, address):
+            from seamless_migrate.verification import ProbeAnswer
+
+            self.probes.append(address)
+            if address == MOVED and self.probes.count(MOVED) < 3:
+                return ProbeAnswer("unreachable", f"{address}:22 unreachable", False)
+            return ProbeAnswer("passed", f"connected to {address}:{probe.port}", True)
+
+    h, plan, _, _, _ = await fip_setup(
+        tmp_path,
+        store,
+        plan_kw={"verification": VerificationConfig(tcp_ports=[22], timeout_s=600)},
+        destination_cls=SlowRoute,
+    )
+    waited: list[float] = []
+
+    async def sleep(seconds):
+        waited.append(seconds)
+        h.clock.advance(seconds)
+        await asyncio.sleep(0)
+
+    h.orch._verifier_factory = lambda dst: Verifier(
+        dst, h.settings, poll_s=30, sleep=sleep, clock=lambda: h.clock.offset.total_seconds()
+    )
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    m = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert waited == [30, 30]
+    assert m.verification.passed is True
+    check = next(c for c in m.verification.checks if c["name"] == f"floating_ip:{MOVED}")
+    assert check["ok"] is True
+    assert m.actual_downtime_s >= 60  # the two waits, inside the outage
+    assert m.downtime_ended_at - m.downtime_started_at >= timedelta(seconds=60)

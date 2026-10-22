@@ -99,6 +99,12 @@ class ProbeAnswer:
     answered: bool
 
 
+def _moved_addresses(migration: Any) -> list[str]:
+    """The addresses the keep-address move moved (SDD §4.2, §8.3): its journal's moved entries."""
+    moves = getattr(migration, "fip_moves", None) or []
+    return list(dict.fromkeys(e.address for e in moves if e.state == "moved"))
+
+
 def _check(name: str, ok: bool, detail: str, skipped: bool = False) -> dict[str, Any]:
     # a detail may quote a provider's error: it reaches events any viewer reads (SDD §12, §13.3)
     out: dict[str, Any] = {"name": name, "ok": ok, "detail": redact(detail)}
@@ -290,6 +296,29 @@ class Verifier:
             return answer
         return await self._app_probe(address, probe)
 
+    async def _floating_ip_check(
+        self, server_id: str, vm: Any, address: str, port: int | None, warnings: list[str]
+    ) -> dict[str, Any]:
+        """A moved floating IP's check (SDD §7.5, §23.6): reachable when the guest answers on
+        ``port`` - connected, or refused: the refusal comes back over the route -; no answer
+        fails it, so the verification polls it until its timeout. Skipped, with a warning, without
+        a port to probe it with."""
+        name = f"floating_ip:{address}"
+        if port is None:
+            warning = f"no TCP port to probe the moved floating IP {address} with"
+            warnings.append(warning)
+            return _check(name, True, warning, skipped=True)
+        probe = AppProbe(kind="tcp", port=port)
+        if vm is not None:
+            answer = await self._run_app_probe(server_id, vm, probe, address)
+        else:
+            answer = await self._app_probe(address, probe)
+        if answer.result == "unreachable":
+            return _check(name, False, answer.detail)
+        if answer.result == "failed":
+            return _check(name, True, f"{answer.detail}: the address routes to the guest")
+        return _check(name, True, answer.detail)
+
     async def _gpu_checks(
         self,
         server_id: str,
@@ -405,6 +434,15 @@ class Verifier:
         probe_ports = list(cfg.windows_tcp_ports if windows else cfg.tcp_ports)
         if windows and not probe_ports:
             warnings.append(WINDOWS_NO_PORTS)
+        app_probes = probes_for(vm, ctx.plan) if vm is not None else []
+
+        # each floating IP the keep-address move moved answers before the verification passes
+        # (SDD §7.5, §23.6): on the first port the verification probes
+        first_port = next(iter([*probe_ports, *(p.port for p in app_probes)]), None)
+        for address in _moved_addresses(ctx.migration):
+            checks.append(
+                await self._floating_ip_check(server_id, vm, address, first_port, warnings)
+            )
 
         key = "floating_ips" if cfg.probe_address == "floating" else "fixed_ips"
         address = next((ip for p in ports for ip in (p.get(key) or []) if ip), None)
@@ -424,7 +462,6 @@ class Verifier:
 
         # application probes (SDD §7.5, ADV-18): the VM's override, else the plan's
         probes: list[ProbeResult] = []
-        app_probes = probes_for(vm, ctx.plan) if vm is not None else []
         for app in app_probes:
             name = f"app:{app.kind}:{app.port}"
             if address is None:
