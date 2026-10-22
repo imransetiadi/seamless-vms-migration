@@ -1593,6 +1593,17 @@ function stackFindings(vm: VMRef, plan: Plan, stacks: StackRead, at: string): Ar
 }
 
 /**
+ * The VM's memberships of the source's Octavia pools, as the API's _memberships (SDD §9.3): each of `members` that is an
+ * address of a NIC of the VM, on the NIC's network when the read names the member's, NIC by NIC.
+ */
+function memberships(vm: VMRef, members: readonly PoolMember[]): PoolMember[] {
+  return vm.nics.flatMap((nic) => {
+    const addresses = new Set(nic.fixed_ips.map(canonicalIp));
+    return members.filter((m) => addresses.has(canonicalIp(m.address)) && (m.network === null || m.network === nic.network));
+  });
+}
+
+/**
  * SRC_VM_LB_MEMBER and SRC_VM_LB_UNKNOWN, as the API's _member_findings (SDD §9.3, plan task N2): each pool member that is
  * an address of the VM's NIC - on the NIC's network when the read names the member's -, NIC by NIC, each named once; a
  * member of a pool the plan maps is the member helper's, left out (SDD §8.5, plan task N9).
@@ -1600,14 +1611,10 @@ function stackFindings(vm: VMRef, plan: Plan, stacks: StackRead, at: string): Ar
 function memberFindings(vm: VMRef, plan: Plan, read: MemberRead, at: string): Array<[string, string]> {
   if (read.status === 'unknown')
     return [['SRC_VM_LB_UNKNOWN', `Whether addresses of ${vm.name} are members of Octavia pools at ${at} is not known: ${unread('Octavia', read)}.`]];
-  const held: string[] = [];
   const mapped = plan.network_cutover?.lb_pools ?? {};
-  for (const nic of vm.nics) {
-    const addresses = new Set(nic.fixed_ips.map(canonicalIp));
-    for (const m of read.members)
-      if (addresses.has(canonicalIp(m.address)) && (m.network === null || m.network === nic.network) && !Object.hasOwn(mapped, m.pool_id))
-        held.push(`${canonicalIp(m.address)} port ${m.port} in pool ${pyRepr(m.pool)} of load balancer ${pyRepr(m.load_balancer)}`);
-  }
+  const held = memberships(vm, read.members)
+    .filter((m) => !Object.hasOwn(mapped, m.pool_id))
+    .map((m) => `${canonicalIp(m.address)} port ${m.port} in pool ${pyRepr(m.pool)} of load balancer ${pyRepr(m.load_balancer)}`);
   if (!held.length) return [];
   return [['SRC_VM_LB_MEMBER', `Addresses of ${vm.name} are members of Octavia pools at ${at}: ${[...new Set(held)].join('; ')}. The memberships are not moved.`]];
 }
@@ -1684,6 +1691,42 @@ function prefixSplit(vm: VMRef, plan: Plan, selected: readonly VMRef[], announce
     [
       'NET_PREFIX_SPLIT',
       `The plan's waves split networks of ${vm.name} that ${announcers.join(' and ')} ${announcers.length === 1 ? 'announces' : 'announce'} as tenant networks: ${split.join('; ')}. While one wave is cut over and the next is not, each prefix has an origin in both clouds, so its routes cannot be correct.`,
+    ],
+  ];
+}
+
+/**
+ * NET_LB_POOL_SPLIT, as the API's _pool_split (SDD §9.3, §23.7): each Octavia pool at the source the VM is a member of - one
+ * the plan maps too - whose members among the plan's VMs the plan's waves put into more than one wave; a member that is no
+ * VM of the plan, or a VM of the plan in no wave, is not counted, and nothing is judged before the waves are planned.
+ */
+function poolSplit(vm: VMRef, plan: Plan, read: MemberRead, selected: readonly VMRef[], at: string): Array<[string, string]> {
+  const pools = new Map<string, PoolMember>();
+  for (const m of memberships(vm, read.members)) if (!pools.has(m.pool_id)) pools.set(m.pool_id, m);
+  const waves = plan.waves ?? [];
+  if (!pools.size || !waves.length) return [];
+  // the members of the VM's pools alone: each VM of the plan is matched against those
+  const members = read.members.filter((m) => pools.has(m.pool_id));
+  const holding = new Map<string, Map<string, Wave>>([...pools.keys()].map((id) => [id, new Map<string, Wave>()]));
+  for (const other of selected) {
+    const wave = waves.find((w) => w.vm_ids.includes(other.source_id));
+    if (!wave) continue;
+    for (const m of memberships(other, members)) holding.get(m.pool_id)!.set(wave.id, wave);
+  }
+  const split = [...pools.entries()]
+    .filter(([id]) => holding.get(id)!.size > 1)
+    .map(
+      ([id, m]) =>
+        `pool ${pyRepr(m.pool)} of load balancer ${pyRepr(m.load_balancer)} in waves ${[...holding.get(id)!.values()]
+          .sort((a, b) => a.order - b.order)
+          .map((w) => pyRepr(w.name))
+          .join(', ')}`,
+    );
+  if (!split.length) return [];
+  return [
+    [
+      'NET_LB_POOL_SPLIT',
+      `The plan's waves split Octavia pools at ${at} that ${vm.name} is a member of: ${split.join('; ')}. While one wave is cut over and the next is not, each pool's members are in both clouds, and its load balancer reaches only those not yet cut over.`,
     ],
   ];
 }
@@ -1886,6 +1929,8 @@ export function preflight(
   if (sourceKind !== 'vmware')
     for (const [code, message] of portFindings(vm, plan, context.floatingIps ?? [], context.dns ?? { extension: null, zones: null }, at, where)) add(code, message);
   for (const [code, message] of prefixSplit(vm, plan, context.selected ?? [vm], context.announcers ?? [])) add(code, message);
+  // an Octavia pool whose members the plan's waves split, as the API's (SDD §9.3, §23.7)
+  if (context.lbMembers) for (const [code, message] of poolSplit(vm, plan, context.lbMembers, context.selected ?? [vm], at)) add(code, message);
   // the API's _gpu_blockers (SDD §9.3, §22.4, §22.5, plan task G4): a GPU VM no GPU mapping applies to - an OpenStack
   // flavor's requests named by their extra specs, a VMware VM's devices by what names them - and why none applies; its
   // GPUs as the API's _vm_gpus reads them, with the profile its source declares for its flavor (PR #64 review)

@@ -26,8 +26,8 @@ describe("the offline mock's finding catalog is the API's (SDD §9.3, §16)", ()
   });
 
   // seamless/tests/test_preflight.py holds them to §16's list, which a dashboard test cannot read (vite.config.ts fs.allow)
-  it('holds the twelve network findings, each a code of the catalog (SDD §16, §23.9, plan task N12c)', () => {
-    expect(NETWORK_CODES.size).toBe(12);
+  it('holds the thirteen network findings, each a code of the catalog (SDD §16, §23.7, §23.9, plan task N12c)', () => {
+    expect(NETWORK_CODES.size).toBe(13);
     expect([...NETWORK_CODES].filter((code) => !(code in FINDING_CATALOG))).toEqual([]);
   });
 });
