@@ -154,14 +154,18 @@ export function estimateStrategy(vm: DiskVM, strategy: Strategy, p: EstimatorPar
   };
 }
 
-/** The downtime if cut over after a pass of `lastPassS` seconds (`estimate_final_downtime`, SDD §5.3). */
-export function finalDowntime(vm: DiskVM, strategy: Strategy, lastPassS: number, p: EstimatorParams): number {
+/**
+ * The downtime if cut over after a pass of `lastPassS` seconds (`estimate_final_downtime`, SDD §5.3), the plan's
+ * post_create hooks' `hooksS` included (SDD §9.1, plan task N10).
+ */
+export function finalDowntime(vm: DiskVM, strategy: Strategy, lastPassS: number, p: EstimatorParams, hooksS = 0): number {
   const rate = vm.change_rate_bps ?? p.change_rate_bps;
   const delta = Math.min(vm.disk_bytes, rate * Math.max(0, lastPassS));
   const [copy, conversion] =
     strategy === 'vmware_warm' ? [delta / p.link_bps, p.v2v_inplace_s] : [p.snapshot_s + Math.max(scanSeconds(vm, p), delta / p.link_bps), 0];
-  // in the control plane's order: shutdown, copy, conversion, create, boot
-  return p.shutdown_s + copy + conversion + p.create_s + p.boot_s;
+  // in the control plane's order: shutdown, copy, conversion, create, boot, then the hooks when the plan runs some
+  const downtime = p.shutdown_s + copy + conversion + p.create_s + p.boot_s;
+  return hooksS > 0 ? downtime + hooksS : downtime;
 }
 
 /**
@@ -175,13 +179,15 @@ export function wholePassSeconds(pass: Pick<SyncPass, 'duration_s'>, strategy: S
 
 /**
  * What a Force cutover of `m` records now (SDD §5.4): the downtime after the running pass — as long as
- * the last pass that ended, its whole time, or, in pre-copy before any pass ended, the expected first pass.
+ * the last pass that ended, its whole time, or, in pre-copy before any pass ended, the expected first pass —, the
+ * post_create hooks' part of its estimate included (SDD §9.1, plan task N10).
  */
 export function forcedDowntime(
-  m: Pick<Migration, 'vm' | 'strategy' | 'sync_passes' | 'observed_scan_bps'>,
+  m: Pick<Migration, 'vm' | 'strategy' | 'sync_passes' | 'observed_scan_bps'> & Partial<Pick<Migration, 'estimate'>>,
   plan: PlanEstimatorSettings,
 ): number {
   const p = paramsFor(plan, m.observed_scan_bps);
   const last = m.sync_passes.filter((s) => s.ended_at !== null).sort((a, b) => a.number - b.number).at(-1);
-  return finalDowntime(m.vm, m.strategy, last ? wholePassSeconds(last, m.strategy, p) : firstPassSeconds(m.vm, m.strategy, p), p);
+  const lastS = last ? wholePassSeconds(last, m.strategy, p) : firstPassSeconds(m.vm, m.strategy, p);
+  return finalDowntime(m.vm, m.strategy, lastS, p, m.estimate?.downtime_parts.hooks_s ?? 0);
 }

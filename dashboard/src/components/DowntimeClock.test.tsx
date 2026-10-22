@@ -153,6 +153,16 @@ describe('DowntimeClock', () => {
     expect(screen.queryByRole('definition')).not.toBeInTheDocument();
   });
 
+  it("lists the post_create hooks' part last, when the plan runs some (SDD §9.1, plan task N10)", () => {
+    const parts = { shutdown_s: 60, copy_s: 300, conversion_s: 0, create_s: 60, boot_s: 120, hooks_s: 420 };
+    const { rerender } = render(<DowntimeClock startedAt={null} endedAt={null} actualS={null} estimateS={960} parts={parts} strategy="cold" />);
+    const terms = screen.getAllByRole('term').map((t) => t.textContent);
+    expect(terms.at(-1)).toBe('Hooks');
+    expect(screen.getByRole('definition', { name: 'Hooks' })).toHaveTextContent('7m 00s');
+    rerender(<DowntimeClock startedAt={null} endedAt={null} actualS={null} estimateS={540} parts={{ ...parts, hooks_s: undefined }} strategy="cold" />);
+    expect(screen.queryByRole('definition', { name: 'Hooks' })).not.toBeInTheDocument();
+  });
+
   it('explains that no downtime has started yet', () => {
     render(<DowntimeClock startedAt={null} endedAt={null} actualS={null} sloS={900} />);
     expect(screen.getByRole('timer')).toHaveTextContent('0:00');

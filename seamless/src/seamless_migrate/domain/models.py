@@ -1015,9 +1015,12 @@ class Estimate(_Model):
     total_s: float
     final_delta_bytes: int
     meets_slo: bool
-    #: shutdown_s, copy_s (final sync or full copy), conversion_s, create_s, boot_s: they add up to
-    #: downtime_s (SDD §4, §9.1, ADV-16)
+    #: shutdown_s, copy_s (final sync or full copy), conversion_s, create_s, boot_s, and hooks_s
+    #: when the plan runs post_create hooks: they add up to downtime_s (SDD §4, §9.1, ADV-16, N10)
     downtime_parts: dict[str, float] = Field(default_factory=dict)
+    #: the VM's DNS record's TTL, apart from the downtime: clients may reach the old address that
+    #: long after the swap (SDD §8.4, §9.1, plan task N10)
+    dns_tail_s: float | None = None
 
 
 AdvisorKind = Literal["strategy", "classification", "verification", "similar_incidents", "screen"]

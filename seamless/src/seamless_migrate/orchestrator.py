@@ -135,6 +135,7 @@ from .planning.estimator import (
     estimate_final_downtime,
     estimate_forced_downtime,
     final_downtime_parts,
+    hooks_part,
     observed_scan_rate,
     params_for_plan,
     whole_pass_seconds,
@@ -1192,6 +1193,8 @@ class Orchestrator:
         memory_up = True
         # the TTL of each DNS target's record, for NET_DNS_TTL_LONG (SDD §8.4, §9.3)
         ttls = await record_ttls(plan, vms, dst_impl, self.settings)
+        # the plan's post_create hooks run inside the downtime: their timeouts (SDD §9.1)
+        hooks_s = await self._post_create_hooks_s(plan)
         # each mapped pair of Octavia pools, for MAP_LB_POOL_INCOMPATIBLE (SDD §8.5, §9.3)
         lb_pairs = {
             source_pool: PoolPair(
@@ -1242,10 +1245,17 @@ class Orchestrator:
                 # what an earlier attempt left at the destination (SDD §9.2, review 39 lead L1)
                 holds_volumes=vm.source_id in holding_volumes,
             )
+            # the DNS record's TTL, apart from the downtime (SDD §9.1)
+            ttl = ttls.get(vm.source_id)
             estimates = [
-                estimate(vm, strategy, params, plan.downtime_slo_s).model_copy(
-                    update={"eligible": not why, "reasons": list(why)}
-                )
+                estimate(
+                    vm,
+                    strategy,
+                    params,
+                    plan.downtime_slo_s,
+                    hooks_s=hooks_s,
+                    dns_tail_s=float(ttl) if ttl is not None else None,
+                ).model_copy(update={"eligible": not why, "reasons": list(why)})
                 for strategy, why in reasons.items()
             ]
             strategy, why = select_strategy(vm, estimates, plan)
@@ -1904,6 +1914,8 @@ class Orchestrator:
                 m.strategy,
                 whole_pass_seconds(last, m.strategy, params) if last is not None else None,
                 params,
+                # the post_create hooks' part of its estimate (SDD §9.1)
+                hooks_part(m.estimate),
             )
             now = self._now()
             m.force_cutover = ForceCutover(
@@ -3982,7 +3994,15 @@ class Orchestrator:
                 m.observed_scan_bps = observed
         if sync_pass.kind == SyncPassKind.final:
             return  # the estimate stays the one the convergence rule used (SDD §5.3, ADV-16)
-        fresh = estimate(m.vm, m.strategy, self._params(m, plan), plan.downtime_slo_s)
+        # the hooks' part and the DNS tail as validation gave them (SDD §9.1)
+        fresh = estimate(
+            m.vm,
+            m.strategy,
+            self._params(m, plan),
+            plan.downtime_slo_s,
+            hooks_s=hooks_part(m.estimate),
+            dns_tail_s=m.estimate.dns_tail_s if m.estimate is not None else None,
+        )
         if m.estimate is not None:
             fresh = fresh.model_copy(
                 update={"eligible": m.estimate.eligible, "reasons": list(m.estimate.reasons)}
@@ -4022,9 +4042,14 @@ class Orchestrator:
         if counted and last.bytes_changed <= plan.convergence_threshold_bytes:
             return "threshold", f"converged: last pass changed {_fmt_bytes(last.bytes_changed)}"
         params = self._params(m, plan)
-        # after a pass as long as the last one's whole time (SDD §9.1 T_last, review RV39-07)
+        # after a pass as long as the last one's whole time (SDD §9.1 T_last, review RV39-07),
+        # the post_create hooks' part of the estimate included (§9.1)
         final = estimate_final_downtime(
-            m.vm, m.strategy, whole_pass_seconds(last, m.strategy, params), params
+            m.vm,
+            m.strategy,
+            whole_pass_seconds(last, m.strategy, params),
+            params,
+            hooks_part(m.estimate),
         )
         if final <= plan.downtime_slo_s:
             return "slo", f"estimated final downtime {final:.0f} s is within the SLO"
@@ -4044,7 +4069,11 @@ class Orchestrator:
         last = m.sync_passes[-1]
         params = self._params(m, plan)
         parts = final_downtime_parts(
-            m.vm, m.strategy, whole_pass_seconds(last, m.strategy, params), params
+            m.vm,
+            m.strategy,
+            whole_pass_seconds(last, m.strategy, params),
+            params,
+            hooks_part(m.estimate),
         )
         if m.estimate is not None:
             downtime = sum(parts.values())
@@ -4714,6 +4743,17 @@ class Orchestrator:
                 f"it holds {holds}, not {swap.new}: left as it is",
             )
         return None
+
+    async def _post_create_hooks_s(self, plan: Plan) -> float:
+        """The timeouts of the plan's post_create hooks, the part of the downtime they may take
+        (SDD §9.1, §23.3); a name the catalog no longer holds counts nothing."""
+        total = 0.0
+        for name in plan.network_cutover.hooks.get("post_create", []):
+            try:
+                total += (await self.db.get("hook", name, Hook)).timeout_s
+            except NotFound:
+                continue
+        return total
 
     async def _lb_action(
         self, m: Migration, entry: LbMove, step: str, error: BaseException | None = None

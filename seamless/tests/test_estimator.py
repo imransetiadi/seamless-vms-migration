@@ -577,7 +577,10 @@ def test_the_shared_forced_estimate_cases(case):
     if case["observed_scan_bps"]:
         params = replace(params, scan_bps=float(case["observed_scan_bps"]))
     vm = VMRef.model_validate(case["vm"])
-    got = estimate_forced_downtime(vm, Strategy(case["strategy"]), case["last_pass_s"], params)
+    # the post_create hooks' part of the migration's estimate, when a case gives it (§9.1)
+    got = estimate_forced_downtime(
+        vm, Strategy(case["strategy"]), case["last_pass_s"], params, case.get("hooks_s", 0.0)
+    )
     assert got == pytest.approx(case["expected_s"], rel=1e-12)
 
 
@@ -607,3 +610,153 @@ def test_the_shared_estimate_cases(case):
 def test_the_shared_estimate_cases_cover_every_strategy():
     """Each strategy's formula is in the table the dashboard's port is checked against."""
     assert {c["strategy"] for c in ESTIMATE_CASES} == {s.value for s in Strategy}
+
+
+# -- the hooks inside the downtime and the DNS tail (SDD §9.1, plan task N10) -----------------
+
+
+def test_hooks_inside_the_downtime_add_their_timeouts():
+    """SDD §9.1 (plan task N10): a plan's post_create hooks run inside the downtime, so their
+    timeouts add the part hooks_s - for every strategy -, which downtime_s, total_s and meets_slo
+    count, as the final downtime after a pass and a Force cutover's figure do; a plan that runs
+    none has no such part."""
+    vm = vm_with(100, 40)
+    for strategy in Strategy:
+        plain = estimate(vm, strategy, P, 10_000)
+        hooked = estimate(vm, strategy, P, 10_000, hooks_s=420.0)
+        assert "hooks_s" not in plain.downtime_parts
+        assert hooked.downtime_parts == {**plain.downtime_parts, "hooks_s": 420.0}
+        assert hooked.downtime_s == pytest.approx(plain.downtime_s + 420)
+        assert hooked.total_s == pytest.approx(plain.total_s + 420)
+        assert hooked.downtime_s == pytest.approx(sum(hooked.downtime_parts.values()))
+    slo = estimate(vm, Strategy.cold, P, 0).downtime_s + 100
+    assert estimate(vm, Strategy.cold, P, slo).meets_slo is True
+    assert estimate(vm, Strategy.cold, P, slo, hooks_s=420.0).meets_slo is False
+    # the final downtime after a pass - the SLO rule's - and a Force cutover's figure
+    for strategy in (Strategy.warm, Strategy.vmware_warm):
+        parts = final_downtime_parts(vm, strategy, 300.0, P, hooks_s=420.0)
+        assert parts == {**final_downtime_parts(vm, strategy, 300.0, P), "hooks_s": 420.0}
+        assert estimate_final_downtime(vm, strategy, 300.0, P, hooks_s=420.0) == pytest.approx(
+            estimate_final_downtime(vm, strategy, 300.0, P) + 420
+        )
+        assert estimate_forced_downtime(vm, strategy, None, P, hooks_s=420.0) == pytest.approx(
+            estimate_forced_downtime(vm, strategy, None, P) + 420
+        )
+
+
+def test_the_ttl_tail_is_reported_apart_from_the_downtime():
+    """SDD §9.1 (plan task N10): the VM's DNS record's TTL is the estimate's dns_tail_s - clients
+    may reach the old address that long after the swap -, apart from the downtime: in neither
+    downtime_s, total_s, meets_slo nor the parts."""
+    vm = vm_with(100, 40)
+    plain = estimate(vm, Strategy.cold, P, 10_000)
+    tailed = estimate(vm, Strategy.cold, P, 10_000, dns_tail_s=3600.0)
+    assert (plain.dns_tail_s, tailed.dns_tail_s) == (None, 3600.0)
+    assert (tailed.downtime_s, tailed.total_s, tailed.downtime_parts) == (
+        plain.downtime_s,
+        plain.total_s,
+        plain.downtime_parts,
+    )
+    assert estimate(vm, Strategy.cold, P, plain.downtime_s, dns_tail_s=3600.0).meets_slo is True
+
+
+async def test_a_validation_counts_the_post_create_hooks_and_reads_the_dns_tail(tmp_path, store):
+    """SDD §9.1: validation adds the timeouts of the plan's post_create hooks from the catalog to
+    every strategy's downtime - its pre_stop and post_verify hooks run outside it - and gives the
+    VM's DNS record's TTL as dns_tail_s; a VM without a DNS target has none."""
+    from seamless_migrate.domain.models import Hook
+    from tests.orch_support import build_harness
+    from tests.test_dns_swap import DESIGNATE, DnsDestination, moved_vm
+    from tests.test_orchestrator import plan_for, vm
+
+    for name, timeout in (("warm-cache", 120), ("smoke", 300), ("drain", 900), ("join", 600)):
+        store.put(
+            "hook",
+            Hook(name=name, kind="playbook", playbook=f"/opt/hooks/{name}.yml", timeout_s=timeout),
+        )
+    vms = [moved_vm(), vm(2)]
+    h = build_harness(tmp_path, store, vms, destination=DnsDestination(ttl=3600))
+    hooks = {"pre_stop": ["drain"], "post_create": ["warm-cache", "smoke"], "post_verify": ["join"]}
+    plan = plan_for(
+        vms,
+        default_strategy=Strategy.cold,
+        network_cutover={"hooks": hooks, "dns_targets": {"vm-1": DESIGNATE.model_dump()}},
+    )
+    store.put("plan", plan)
+    report = await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.stop()
+    by_name = {item.vm_name: item for item in report.migrations}
+    for name, tail in (("web-01", 3600.0), ("web-02", None)):
+        for est in by_name[name].estimates:
+            assert (est.downtime_parts["hooks_s"], est.dns_tail_s) == (420.0, tail)
+        m = await h.migration(by_name[name].migration_id)
+        assert (m.estimate.downtime_parts["hooks_s"], m.estimate.dns_tail_s) == (420.0, tail)
+
+
+async def test_the_later_figures_take_the_hooks_part_from_the_estimate(tmp_path, store):
+    """SDD §5.3, §5.4, §9.1: the SLO rule's final downtime, the estimate it records and a Force
+    cutover's figure take hooks_s from the migration's estimate; a re-estimate after a pass keeps
+    it and the DNS tail."""
+    from seamless_migrate.domain.enums import Phase
+    from seamless_migrate.planning.estimator import whole_pass_seconds
+    from tests.factories import make_migration
+    from tests.test_orchestrator import setup, vm
+
+    the_vm = make_vm(disks=[make_disk(id="d0", size_gb=100, used_gb=60.0)], change_rate_bps=None)
+    first = SyncPass(
+        number=1,
+        kind="full",
+        started_at=datetime.now(UTC),
+        duration_s=521.5,
+        bytes_scanned=the_vm.disk_bytes,
+        bytes_changed=the_vm.used_bytes,
+        bytes_transferred=the_vm.used_bytes,
+    )
+    final = estimate_final_downtime(
+        the_vm, Strategy.warm, whole_pass_seconds(first, Strategy.warm, P), P
+    )
+    # within the SLO without the hooks, beyond it with them
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm, "downtime_slo_s": int(final) + 100},
+    )
+    est = estimate(the_vm, Strategy.warm, P, plan.downtime_slo_s, hooks_s=420.0, dns_tail_s=60.0)
+    m = make_migration(
+        plan_id=plan.id,
+        vm=the_vm,
+        strategy=Strategy.warm,
+        phase=Phase.syncing,
+        sync_passes=[first],
+        estimate=est,
+    )
+    try:
+        assert h.orch._converged(m, plan)[0] != "slo"
+        recorded = m.model_copy(deep=True)
+        h.orch._converge(recorded, plan, "max_passes")
+        assert recorded.estimate.downtime_parts["hooks_s"] == 420.0
+        assert recorded.estimate.downtime_s == pytest.approx(final + 420)
+        assert recorded.estimate.dns_tail_s == 60.0
+        second = SyncPass(
+            number=2,
+            kind="delta",
+            started_at=first.started_at + timedelta(seconds=1000),
+            duration_s=500.0,
+            bytes_scanned=the_vm.disk_bytes,
+            bytes_changed=2 * GIB,
+            bytes_transferred=2 * GIB,
+        )
+        calibrated = m.model_copy(deep=True)
+        calibrated.sync_passes.append(second)
+        h.orch._calibrate(calibrated, plan, second)
+        assert calibrated.estimate.downtime_parts["hooks_s"] == 420.0
+        assert calibrated.estimate.dns_tail_s == 60.0
+        store.put("migration", m)
+        forced = await h.orch.force_cutover(m.id, "sari", "the window closes in ten minutes")
+        expected = estimate_forced_downtime(
+            the_vm, Strategy.warm, whole_pass_seconds(first, Strategy.warm, P), P
+        )
+        assert forced.force_cutover.estimated_downtime_s == pytest.approx(expected + 420)
+    finally:
+        await h.orch.stop()

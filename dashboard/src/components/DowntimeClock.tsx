@@ -1,6 +1,6 @@
 import { CircleCheck, Pause, Timer } from 'lucide-react';
 import { Fragment, useEffect, useId, useRef, useState } from 'react';
-import { DOWNTIME_PARTS, type DowntimePart, type Estimate, type Strategy, type Timestamp } from '../api/types';
+import { DOWNTIME_PARTS, HOOKS_PART, type DowntimePart, type Estimate, type Strategy, type Timestamp } from '../api/types';
 import { cn } from '../lib/cn';
 import { SLO_ICONS, sloTone, type SloTone } from '../lib/slo';
 import { demoTimeText, speedOf } from '../lib/stats';
@@ -32,6 +32,7 @@ const PART_LABELS: Record<DowntimePart, string> = {
   conversion_s: 'Conversion',
   create_s: 'Create',
   boot_s: 'Boot',
+  hooks_s: 'Hooks',
 };
 
 function partLabel(part: DowntimePart, strategy: Strategy | undefined): string {
@@ -76,7 +77,8 @@ export function DowntimeClock({
   // a running clock counts whole seconds; an ended one shows the actual downtime as every view rounds it (SDD §16)
   const shown = running ? elapsed : Math.round(elapsed);
   const id = useId();
-  const shownParts = DOWNTIME_PARTS.filter((part) => (parts[part] ?? 0) > 0);
+  // the post_create hooks' part last, when the plan runs some (SDD §9.1, plan task N10)
+  const shownParts = [...DOWNTIME_PARTS, HOOKS_PART].filter((part) => (parts[part] ?? 0) > 0);
   const demoNote = startedAt ? demoTimeText(speed) : null;
 
   let state: { text: string; tone: Tone; icon: typeof Timer };
