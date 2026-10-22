@@ -282,6 +282,29 @@
    "severity": "warning",
    "strategies": [],
    "remediation": "Add an application probe for its service to the plan, for every VM or for this one (probe_overrides), or use the suggested probe on the plan page."
+  },
+  "SRC_PORT_ADDRESS_PAIRS": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Add the address pairs to the migrated server's ports at the destination once it is created (openstack port set --allowed-address), and check that the peers sharing an address - a keepalived pair's other member - reach it there."
+  },
+  "MAP_FIP_ADDRESS_CHANGE": {
+   "severity": "warning",
+   "strategies": [
+    "cold",
+    "warm"
+   ],
+   "remediation": "To keep an address, have the destination credential's project hold a floating IP of that address, with no port, before the cutover (an admin can create one with a given address on the external network); else update the clients, allowlists and DNS records of the old address after it."
+  },
+  "DST_DNS_INTEGRATION_MISSING": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Enable Neutron's DNS integration at the destination (an extension driver with Designate as its external DNS driver) and create the domain's zone for the destination credential's project, or publish the migrated VM's names in DNS yourself after the cutover."
+  },
+  "NET_PREFIX_SPLIT": {
+   "severity": "warning",
+   "strategies": [],
+   "remediation": "Put the VMs of each announced network into one wave, or have the network's prefix routed by hand while its waves are cut over."
   }
  }
 }

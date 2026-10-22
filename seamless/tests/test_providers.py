@@ -240,8 +240,16 @@ class FakeNetwork:
             )
         ]
 
-    def ips(self, port_id=None, **_):
-        return [NS(floating_ip_address="203.0.113.10")] if port_id == "port-1" else []
+    #: Neutron's floating IPs: the one of port-1 by default (SDD §10, plan task N2b)
+    floating = (NS(floating_ip_address="203.0.113.10", port_id="port-1", project_id="proj-1"),)
+
+    def ips(self, port_id=None, project_id=None, **_):
+        """Neutron's floating IP list, filtered by port and project as Neutron filters it."""
+        return [
+            ip
+            for ip in self.floating
+            if port_id in (None, ip.port_id) and project_id in (None, ip.project_id)
+        ]
 
 
 def fake_conn(admin=True, ovn=True):
@@ -4377,3 +4385,182 @@ async def test_a_heat_or_octavia_list_is_paged_at_its_own_endpoint(tmp_path):
     assert not any("elsewhere" in url for _, url in cloud.seen)
     assert inv.stacks.status == "ok"
     assert [q for path, q in cloud.heat_seen if path == "/stacks"] == [{}, {"marker": ["s1"]}]
+
+
+#: the destination's floating IPs: one a port holds, two detached of its project - one written
+#: long -, one of another project (SDD §10, plan task N2b)
+FLOATING_IPS = [
+    {"id": "f1", "floating_ip_address": "203.0.113.10", "port_id": "port-1", "project_id": "p1"},
+    {"id": "f2", "floating_ip_address": "203.0.113.20", "port_id": None, "project_id": "p1"},
+    {"id": "f3", "floating_ip_address": "2001:db8:f::0020", "port_id": None, "project_id": "p1"},
+    {"id": "f4", "floating_ip_address": "203.0.113.30", "port_id": None, "project_id": "p9"},
+]
+
+
+def destination_cloud(tmp_path, **kw):
+    """A real destination OpenStackProvider over the in-process cloud (SDD §10)."""
+    cloud = InProcessCloud(tmp_path, networks=NETWORKS, subnets=SUBNETS, **kw)
+    provider = make_provider(
+        id="dst",
+        kind=ProviderKind.rhoso,
+        role=ProviderRole.destination,
+        endpoint=AUTH_URL,
+        cloud="dst",
+    )
+    return cloud, OpenStackProvider(provider, cloud.settings, connect_fn=cloud.connect)
+
+
+async def test_openstack_source_reads_a_ports_address_pairs_floating_ips_and_dns_name(
+    stub_openstack,
+):
+    """SDD §4.2, §10 (plan task N2b): an OpenStack source reads each port's allowed address pairs
+    (their addresses), its DNS name and domain - the port's, else its network's - and the floating
+    IPs associated with it; a floating IP list that cannot be read leaves them empty, never a failed
+    inventory."""
+    conn = fake_conn()
+    [port] = conn.network.ports()
+    port.allowed_address_pairs = [
+        {"ip_address": "10.0.0.100", "mac_address": "fa:16:3e:aa"},
+        {"ip_address": "10.0.0.96/28"},
+    ]
+    port.dns_name, port.dns_domain = "web-01", ""
+    conn.network.get_network("net-1").dns_domain = "example.com."
+    stub_openstack(conn)
+    source = OpenStackProvider(make_provider(), settings())
+    [nic] = (await source.list_vms())[0].nics
+    assert nic.allowed_address_pairs == ["10.0.0.100", "10.0.0.96/28"]
+    assert nic.floating_ips == ["203.0.113.10"]
+    assert (nic.dns_name, nic.dns_domain) == ("web-01", "example.com.")
+    # the port's own domain before its network's; a port without a DNS name keeps none
+    port.dns_domain, port.dns_name = "web.example.com.", ""
+    [nic] = (await source.get_vm("srv-1")).nics
+    assert (nic.dns_name, nic.dns_domain) == (None, "web.example.com.")
+
+    def refused(**_):
+        raise RuntimeError("HTTP 403")
+
+    conn.network.ips = refused
+    [vm] = await source.list_vms()
+    assert vm.nics[0].floating_ips == [] and vm.nics[0].allowed_address_pairs
+
+
+async def test_openstack_source_lists_the_floating_ips_once_for_many_vms(stub_openstack):
+    """SDD §10 (plan task N2b): the inventory of many VMs reads one list of floating IPs, as it
+    reads the ports, and gives each port the addresses of its own; a list it cannot read falls back
+    to one list per port."""
+    conn = fake_conn()
+    [server] = conn.compute.servers()
+    twin = NS(**{**vars(server), "id": "srv-2", "name": "web-02", "attachments": []})
+    conn.compute = FakeCompute([server, twin])
+    asked = []
+    listed = conn.network.ips
+
+    def ips(**query):
+        asked.append(query)
+        return listed(**query)
+
+    conn.network.ips = ips
+    stub_openstack(conn)
+    vms = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert [[nic.floating_ips for nic in vm.nics] for vm in vms] == [[["203.0.113.10"]], []]
+    assert asked == [{}]
+
+
+async def test_a_destination_reads_its_projects_detached_floating_ips_and_its_dns(tmp_path):
+    """SDD §10 (plan task N2b): the destination credential's project's floating IPs that no port
+    holds, by address as §9.3 compares them; whether Neutron lists the dns-integration extension;
+    and the names of the Designate zones the credential sees - each page asked at Designate's own
+    endpoint, its links a mapping there -, with no request logged."""
+    designate = {
+        "/v2/zones": (
+            200,
+            {
+                "zones": [{"name": "example.com."}, {"name": "db.example.com."}],
+                "links": {
+                    "self": "https://dns.example.org/v2/zones",
+                    "next": "https://elsewhere.example/v2/zones?marker=z2",
+                },
+            },
+        )
+    }
+    cloud, dst = destination_cloud(
+        tmp_path,
+        floatingips=FLOATING_IPS,
+        extensions=[{"alias": "dns-integration", "name": "DNS Integration"}],
+        designate=designate,
+    )
+    inv = await dst.inventory()
+    assert inv.floating_ips == ["203.0.113.20", "2001:db8:f::20"]
+    assert (inv.dns.extension, inv.dns.zones) == (True, ["db.example.com.", "example.com."])
+    assert cloud.designate_seen == [("/v2/zones", {}), ("/v2/zones", {"marker": ["z2"]})]
+    assert "elsewhere.example" not in {urllib.parse.urlsplit(u).netloc for _, u in cloud.seen}
+    assert inv.to_dict()["dns"] == {
+        "extension": True,
+        "zones": ["db.example.com.", "example.com."],
+    }
+
+
+async def test_a_destination_without_designate_or_the_extension_reads_no_zone(tmp_path, caplog):
+    """SDD §10, §9.3 (plan task N2b): a catalog without Designate has no zone ([]) and nothing is
+    sent there; a Neutron without the extension reads false; a Designate that refuses or fails is
+    not judged (None), logged by its kind alone - never a zone's name."""
+    cloud, dst = destination_cloud(tmp_path / "bare")
+    inv = await dst.inventory()
+    assert (inv.dns.extension, inv.dns.zones) == (False, [])
+    assert "dns.example.org" not in {urllib.parse.urlsplit(u).netloc for _, u in cloud.seen}
+    for status in (403, 503):
+        _, dst = destination_cloud(
+            tmp_path / str(status),
+            designate={"/v2/zones": (status, {"message": "zone example.com. hidden"})},
+        )
+        with caplog.at_level(logging.INFO):
+            inv = await dst.inventory()
+        assert inv.dns.zones is None
+        assert f"HTTP {status}" in caplog.text and "example.com" not in caplog.text
+        caplog.clear()
+
+
+async def test_the_demo_fakes_give_the_network_findings_their_data():
+    """SDD §10, §16 (plan task N2b): the demo source's web-01 has a floating IP and a DNS name under
+    example.com., and ledger-db-01 a keepalived address; the demo destination holds no detached
+    floating IP and has Neutron's DNS integration without that zone - so its pre-flight reports the
+    network findings from the fakes' own data."""
+    from seamless_migrate.planning.preflight import run_preflight
+
+    vms = {vm.name: vm for vm in await FakeSourceProvider(ProviderKind.openstack).list_vms()}
+    [web] = vms["web-01"].nics
+    assert (web.floating_ips, web.dns_name, web.dns_domain) == (
+        ["203.0.113.10"],
+        "web-01",
+        "example.com.",
+    )
+    assert vms["ledger-db-01"].nics[0].allowed_address_pairs == ["10.20.2.200"]
+    plain = [vm for name, vm in vms.items() if name not in ("web-01", "ledger-db-01")]
+    assert all(
+        not (nic.floating_ips or nic.allowed_address_pairs or nic.dns_name)
+        for vm in plain
+        for nic in vm.nics
+    )
+    dst = await FakeDestinationProvider(seed=42).inventory()
+    assert (dst.floating_ips, dst.dns.extension, dst.dns.zones) == (
+        [],
+        True,
+        ["internal.example.org."],
+    )
+    src = await FakeSourceProvider(ProviderKind.openstack).inventory()
+    plan = make_plan_for(list(vms.values()))
+    codes = {
+        name: [f.code for f in run_preflight(vm, plan, src, dst, list(vms.values()))]
+        for name, vm in vms.items()
+    }
+    network = {"SRC_PORT_ADDRESS_PAIRS", "MAP_FIP_ADDRESS_CHANGE", "DST_DNS_INTEGRATION_MISSING"}
+    assert {name: sorted(network & set(c)) for name, c in codes.items() if network & set(c)} == {
+        "web-01": ["DST_DNS_INTEGRATION_MISSING", "MAP_FIP_ADDRESS_CHANGE"],
+        "ledger-db-01": ["SRC_PORT_ADDRESS_PAIRS"],
+    }
+
+
+def make_plan_for(vms):
+    from tests.factories import make_plan
+
+    return make_plan(vm_ids=[vm.source_id for vm in vms])

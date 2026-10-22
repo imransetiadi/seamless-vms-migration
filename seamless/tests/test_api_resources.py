@@ -90,7 +90,10 @@ def test_provider_crud(api):
         "roles",  # SDD §10: the token's role names, read live (review RV19-01)
         "gpu_flavors",  # SDD §22.3: the flavors that ask for a GPU, with declared profiles
         "gpu_capacity",  # SDD §22.3: the Placement pools of their vGPU requests
+        "floating_ips",  # SDD §10: the project's floating IPs no port holds (plan task N2b)
+        "dns",  # SDD §10: Neutron's DNS integration and Designate's zones (plan task N2b)
     }
+    assert dst_inventory["dns"] == {"extension": True, "zones": ["internal.example.org."]}
 
     # a provider used by a non-terminal plan cannot be deleted
     plan = api.post(
@@ -714,6 +717,42 @@ def test_a_provider_is_created_and_patched_with_gpu_profiles(api):
     refused = api.post("/api/v1/providers", json=vmware)
     assert refused.status_code == 422 and "gpu_profiles" in refused.text
     assert api.get("/api/v1/providers/vc-01").status_code == 404
+
+
+def test_a_provider_declares_that_its_cloud_announces_tenant_networks(api):
+    """SDD §4.2, §12, §23.6 (plan task N2b): POST /providers and PATCH /providers/{id} take
+    announces_tenant_networks for an OpenStack or RHOSO provider - false unless declared -; a
+    vmware provider is refused it (422) and keeps none."""
+    bgp = {**DESTINATION, "id": "dst-bgp", "name": "RHOSO 18.0 (BGP)"}
+    created = api.post("/api/v1/providers", json={**bgp, "announces_tenant_networks": True})
+    assert created.status_code == 201, created.text
+    assert created.json()["announces_tenant_networks"] is True
+
+    def patch(provider_id, body):
+        return api.client.patch(
+            f"/api/v1/providers/{provider_id}", headers=api.h(Role.admin), json=body
+        )
+
+    patched = patch("dst-bgp", {"announces_tenant_networks": False})
+    assert patched.status_code == 200, patched.text
+    assert api.get("/api/v1/providers/dst-bgp").json()["announces_tenant_networks"] is False
+    assert {p["id"]: p["announces_tenant_networks"] for p in api.get("/api/v1/providers").json()}[
+        "src-osp"
+    ] is False
+
+    vmware = {
+        "id": "vc-03",
+        "name": "vCenter",
+        "kind": "vmware",
+        "role": "source",
+        "endpoint": "https://vcenter.example",
+    }
+    refused = api.post("/api/v1/providers", json={**vmware, "announces_tenant_networks": True})
+    assert refused.status_code == 422 and "announces_tenant_networks" in refused.text
+    assert api.post("/api/v1/providers", json=vmware).status_code == 201
+    refused = patch("vc-03", {"announces_tenant_networks": True})
+    assert refused.status_code == 422 and "announces_tenant_networks" in refused.text
+    assert api.get("/api/v1/providers/vc-03").json()["announces_tenant_networks"] is False
 
 
 NAME_CASES = json.loads(

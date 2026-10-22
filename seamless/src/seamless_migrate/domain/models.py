@@ -169,6 +169,9 @@ class Provider(_Model):
     #: the NVIDIA vGPU profile each of its GPU flavors gives, as its operator declares it: no API
     #: tells a flavor's framebuffer (SDD §4.2, §22.3)
     gpu_profiles: dict[FlavorName, ProfileName] = Field(default_factory=dict)
+    #: its operator declares that the cloud's OVN BGP agent announces tenant networks
+    #: (expose_tenant_networks), which no API shows: NET_PREFIX_SPLIT (SDD §4.2, §9.3, §23.6)
+    announces_tenant_networks: bool = False
     #: server-owned: when PUT …/credentials / …/conversion-key last wrote the secret store
     credentials_updated_at: UTCDateTime | None = None
     conversion_key_updated_at: UTCDateTime | None = None
@@ -184,8 +187,9 @@ class Provider(_Model):
 
     @model_validator(mode="after")
     def _openstack_declarations(self) -> Provider:
-        """A series, a policy profile and vGPU profiles are OpenStack's: a vmware provider declares
-        none - vCenter reports each VM's own vGPU profile (SDD §4.2, §22.3)."""
+        """A series, a policy profile, vGPU profiles and announced tenant networks are OpenStack's:
+        a vmware provider declares none - vCenter reports each VM's own vGPU profile (SDD §4.2,
+        §22.3, §23.6)."""
         if self.kind == ProviderKind.vmware:
             for name in ("release", "policy_profile"):
                 if getattr(self, name) is not None:
@@ -194,6 +198,11 @@ class Provider(_Model):
                 raise ValueError(
                     "gpu_profiles: vGPU profiles cannot be declared for vmware: vCenter reports "
                     "each VM's own"
+                )
+            if self.announces_tenant_networks:
+                raise ValueError(
+                    "announces_tenant_networks: an OpenStack BGP declaration cannot be made for "
+                    "vmware"
                 )
         return self
 
@@ -293,6 +302,15 @@ class Nic(_Model):
     fixed_ips: list[str] = Field(default_factory=list)
     vnic_type: str = "normal"
     mtu: int | None = None
+    #: OpenStack: the addresses of the port's allowed address pairs (an address or a CIDR, as
+    #: Neutron writes it), which the import does not carry (SDD §4.2, owner decision 11)
+    allowed_address_pairs: list[str] = Field(default_factory=list)
+    #: OpenStack: the addresses of the floating IPs associated with the port (SDD §4.2, §9.3)
+    floating_ips: list[str] = Field(default_factory=list)
+    #: OpenStack: the port's DNS name and its domain - the port's, else its network's - under
+    #: Neutron's DNS integration; None when it has none (SDD §4.2, §9.3)
+    dns_name: str | None = None
+    dns_domain: str | None = None
     #: VMware: what the migration kit maps the NIC by - its distributed port group's key, else its
     #: device summary (a standard port group's name); None for OpenStack (SDD §4, §7.2)
     network_key: str | None = None

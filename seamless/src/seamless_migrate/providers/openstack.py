@@ -23,6 +23,7 @@ from ..planning.platforms import destination_release
 from ..planning.preflight import (
     AUTOSCALING_GROUP_TYPES,
     DestinationInventory,
+    DnsRead,
     GpuCapacity,
     GpuPool,
     MemberRead,
@@ -434,10 +435,11 @@ class _ServiceAnswer(Exception):
 
 
 class _BudgetedGet:
-    """The GETs of one optional read of a source's Heat or Octavia (SDD §10, plan task N2): each is
-    sent while the read has run for less than PROVIDER_API_TIMEOUT_S - past it, TimeoutError -, so
-    a slow service costs about one request's timeout; and none is logged: keystoneauth would write
-    each URL and body, which name the customer's stacks and load balancers (§13.4)."""
+    """The GETs of one optional read of a source's Heat or Octavia, or a destination's Designate
+    (SDD §10, plan tasks N2, N2b): each is sent while the read has run for less than
+    PROVIDER_API_TIMEOUT_S - past it, TimeoutError -, so a slow service costs about one request's
+    timeout; and none is logged: keystoneauth would write each URL and body, which name the
+    customer's stacks, load balancers and DNS zones (§13.4)."""
 
     def __init__(self, adapter: Any) -> None:
         self.adapter = adapter
@@ -458,15 +460,19 @@ class _BudgetedGet:
 
     def pages(self, path: str, key: str, params: Mapping[str, str] | None = None) -> list[Any]:
         """Every item of a list the service pages - by its ``<key>_links`` next link, Octavia's as
-        openstacksdk follows it, or ``links``, Heat's -, the next page asked at the same path with
-        that link's query: the token never follows a link to another host."""
+        openstacksdk follows it, or ``links``, Heat's, or Designate's mapping of ``links`` -, the
+        next page asked at the same path with that link's query: the token never follows a link
+        to another host."""
         base = dict(params or {})
         query, items = base, []
         while True:
             body = self.get(path, query)
             items += body.get(key) or []
             links = body.get(f"{key}_links") or body.get("links") or []
-            href = next((link.get("href") for link in links if link.get("rel") == "next"), None)
+            if isinstance(links, Mapping):  # Designate's: {"self": ..., "next": ...}
+                href = links.get("next")
+            else:
+                href = next((link.get("href") for link in links if link.get("rel") == "next"), None)
             if not href:
                 return items
             asked = urllib.parse.parse_qs(urllib.parse.urlsplit(str(href)).query)
@@ -892,6 +898,16 @@ class OpenStackProvider:
         roles = _try(
             lambda: sorted(set(conn.session.auth.get_access(conn.session).role_names or [])), None
         )
+        # what os-migrate's `auto` attaches: the project's floating IPs no port holds (SDD §10,
+        # §9.3); [] when they cannot be read
+        floating_ips = _try(
+            lambda: [
+                _canonical_ip(str(_attr(ip, "floating_ip_address")))
+                for ip in conn.network.ips(project_id=own_project)
+                if not _attr(ip, "port_id")
+            ],
+            [],
+        )
         return DestinationInventory(
             networks=networks,
             flavors=flavors,
@@ -904,7 +920,33 @@ class OpenStackProvider:
             roles=roles,
             gpu_flavors=gpu_flavors,
             gpu_capacity=gpu_capacity,
+            floating_ips=floating_ips,
+            dns=self._read_dns(conn),
         )
+
+    def _read_dns(self, conn: Any) -> DnsRead:
+        """Neutron's DNS integration and Designate's zones (SDD §10, plan task N2b), each read once:
+        whether Neutron lists the dns-integration extension - None when its extensions cannot be
+        read -, and the names of the zones the credential sees: [] for a catalog without Designate;
+        a Designate that refuses or fails is not judged (None), its kind logged, never a name."""
+        extension = _try(
+            lambda: any(_attr(e, "alias") == "dns-integration" for e in conn.network.extensions()),
+            None,
+        )
+        zones: list[str] | None
+        try:
+            listed = _BudgetedGet(conn.dns).pages("/zones", "zones")
+            zones = sorted(
+                {str(z["name"]) for z in listed if isinstance(z, Mapping) and z.get("name")}
+            )
+        except Exception as exc:
+            if _not_in_catalog(exc):
+                zones = []
+            else:
+                reason, detail = _read_failure(exc)
+                log.info("%s: Designate zones not read: %s %s", self.provider.id, reason, detail)
+                zones = None
+        return DnsRead(extension=extension, zones=zones)
 
     def _read_stacks(self, conn: Any) -> StackRead:
         """The servers of the credential's project's Heat stacks (SDD §10, plan task N2): `ok` with
@@ -1276,6 +1318,8 @@ class _MapContext:
         # None means "not prefetched" and the per-VM calls are used.
         self._volumes: dict[str, Any] | None = None
         self._ports: dict[str, list[Any]] | None = None
+        #: the addresses of the floating IPs by the port they are associated with (SDD §10)
+        self._floating: dict[str, list[str]] | None = None
 
     def prefetch(self) -> None:
         """Lists the volumes and ports of the connection's scope once (inventory of many VMs).
@@ -1292,6 +1336,15 @@ class _MapContext:
             for port in ports:
                 grouped.setdefault(str(_attr(port, "device_id", default="")), []).append(port)
             self._ports = grouped
+        floating = _try(lambda: list(self.conn.network.ips()), None)
+        if floating is not None:
+            held: dict[str, list[str]] = {}
+            for ip in floating:
+                if _attr(ip, "port_id"):
+                    held.setdefault(str(_attr(ip, "port_id")), []).append(
+                        str(_attr(ip, "floating_ip_address"))
+                    )
+            self._floating = held
 
     def volume(self, volume_id: str) -> Any:
         if self._volumes is not None and volume_id in self._volumes:
@@ -1303,6 +1356,15 @@ class _MapContext:
         if self._ports is not None:
             return self._ports.get(server_id, [])
         return list(self.conn.network.ports(device_id=server_id))
+
+    def floating_ips(self, port_id: str) -> list[str]:
+        """The addresses of the floating IPs associated with a port (SDD §10, plan task N2b): from
+        the one list prefetch() read, else the port's own; [] when they cannot be read - a missing
+        finding, never a failed inventory."""
+        if self._floating is not None:
+            return self._floating.get(port_id, [])
+        listed = _try(lambda: list(self.conn.network.ips(port_id=port_id)), [])
+        return [str(_attr(ip, "floating_ip_address")) for ip in listed]
 
     def project_name(self, project_id: str | None) -> str | None:
         if not project_id:
@@ -1427,6 +1489,17 @@ class _MapContext:
                     fixed_ips=[ip.get("ip_address") for ip in _attr(port, "fixed_ips", default=[])],
                     vnic_type=_attr(port, "binding_vnic_type", default="normal") or "normal",
                     mtu=_attr(network, "mtu") if network is not None else None,
+                    # what the import does not carry or may change (SDD §4.2, §9.3, plan task N2b)
+                    allowed_address_pairs=[
+                        str(pair["ip_address"])
+                        for pair in _attr(port, "allowed_address_pairs", default=[]) or []
+                        if isinstance(pair, Mapping) and pair.get("ip_address")
+                    ],
+                    floating_ips=self.floating_ips(str(_attr(port, "id"))),
+                    dns_name=_attr(port, "dns_name") or None,
+                    dns_domain=_attr(port, "dns_domain")
+                    or (_attr(network, "dns_domain") if network is not None else None)
+                    or None,
                 )
             )
 

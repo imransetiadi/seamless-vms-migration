@@ -16,7 +16,13 @@ from ..domain.enums import ProviderKind
 from ..domain.models import Disk, GpuDevice, Nic, Provider, VMRef, utcnow
 from ..planning.gpu import gpu_pools, gpu_requests, pool_name
 from ..planning.platforms import destination_release
-from ..planning.preflight import DestinationInventory, GpuCapacity, GpuPool, SourceInventory
+from ..planning.preflight import (
+    DestinationInventory,
+    DnsRead,
+    GpuCapacity,
+    GpuPool,
+    SourceInventory,
+)
 from .base import ProviderError, VMNotFound
 
 MIB = 2**20
@@ -37,6 +43,11 @@ class _Spec:
     encrypted: bool = False
     extra_specs: tuple[tuple[str, str], ...] = ()
     netapp: bool = False  # volumes on the ONTAP NFS backend instead of Ceph
+    # what its port carries that the migration does not (SDD §4.2, §9.3, plan task N2b): its
+    # floating IPs, its allowed address pairs, and its DNS name under the domain DEMO_DNS_DOMAIN
+    floating_ips: tuple[str, ...] = ()
+    address_pairs: tuple[str, ...] = ()
+    dns_name: str | None = None
 
 
 # Cinder pools of the demo clouds: Ceph RBD and NetApp ONTAP over NFS (SDD §7.3.1, §10).
@@ -68,9 +79,25 @@ _FLAVORS = {
     "g1.vgpu": (8, 32768, 80),
 }
 
+#: the domain the demo source publishes its ports' DNS names in, which its destination has no
+#: Designate zone of (SDD §9.3, plan task N2b)
+DEMO_DNS_DOMAIN = "example.com."
+#: the Designate zones the demo destination holds
+DEMO_DNS_ZONES = ("internal.example.org.",)
+
 # 24 OpenStack VMs of the "Finance apps" estate (RHOSP 17.1).
 _OPENSTACK: tuple[_Spec, ...] = (
-    _Spec("web-01", "m1.small", (20,), "rhel9", rate_mib=0.5, tags=(("app", "portal"),)),
+    _Spec(
+        "web-01",
+        "m1.small",
+        (20,),
+        "rhel9",
+        rate_mib=0.5,
+        tags=(("app", "portal"),),
+        # a public address the destination does not hold, and a name in DNS (plan task N2b)
+        floating_ips=("203.0.113.10",),
+        dns_name="web-01",
+    ),
     _Spec("web-02", "m1.small", (20,), "ubuntu 24.04", rate_mib=0.5, tags=(("app", "portal"),)),
     _Spec("web-03", "m1.small", (40,), "rhel9", rate_mib=0.8, image_root=True),
     _Spec("api-gw-01", "m1.medium", (30,), "rocky 9.4", rate_mib=1.0),
@@ -109,6 +136,8 @@ _OPENSTACK: tuple[_Spec, ...] = (
         network="finance-db",
         rate_mib=8.0,
         tags=(("app", "ledger"), ("role", "postgresql")),
+        # its keepalived address, which a standby takes over (plan task N2b)
+        address_pairs=("10.20.2.200",),
     ),
     _Spec(
         "payroll-db-01",
@@ -297,6 +326,10 @@ def _openstack_vm(spec: _Spec, rng: random.Random, index: int) -> VMRef:
                 mac=_mac(rng),
                 fixed_ips=[f"10.20.{1 if spec.network == 'finance-app' else 2}.{10 + index}"],
                 mtu=net_mtu,
+                allowed_address_pairs=list(spec.address_pairs),
+                floating_ips=list(spec.floating_ips),
+                dns_name=spec.dns_name,
+                dns_domain=DEMO_DNS_DOMAIN if spec.dns_name else None,
             )
         ],
         power_state=spec.power_state,  # type: ignore[arg-type]
@@ -660,6 +693,10 @@ class FakeDestinationProvider:
             # the GPU flavors with their declared profiles, and their pools (SDD §22.3, §22.10)
             gpu_flavors=self._gpu_flavor_list(),
             gpu_capacity=self._flavor_capacity(),
+            # no floating IP held detached, and Neutron's DNS integration without the demo
+            # source's zone (SDD §10, plan task N2b)
+            floating_ips=[],
+            dns=DnsRead(extension=True, zones=list(DEMO_DNS_ZONES)),
         )
 
     async def gpu_capacity(self, requests: list[GpuDevice]) -> GpuCapacity:

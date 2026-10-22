@@ -10512,6 +10512,831 @@
       "severities": {
         "SRC_VM_LB_UNKNOWN": "warning"
       }
+    },
+    {
+      "why": "NICs with allowed address pairs - a keepalived address and a CIDR -: the import does not carry them (plan task N2b)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "db-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "db-net",
+            "mac": "FA:16:3E:00:00:01",
+            "fixed_ips": [
+              "192.0.2.21"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null,
+            "allowed_address_pairs": [
+              "192.0.2.20",
+              "192.0.2.32/28"
+            ]
+          },
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:02",
+            "fixed_ips": [
+              "192.0.2.31"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "destination": {
+        "label": "RHOSO 18.0",
+        "kind": "rhoso",
+        "networks": [
+          {
+            "id": "n-app-net",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          },
+          {
+            "id": "n-db-net",
+            "name": "db-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": []
+      },
+      "expected": {
+        "SRC_PORT_ADDRESS_PAIRS": "NICs of db-01 have allowed address pairs, which the import does not carry: fa:16:3e:00:00:01 on 'db-net' (192.0.2.20, 192.0.2.32/28). An address the VM takes over from a peer is not reachable in RHOSO 18.0.",
+        "MAP_FIP_ADDRESS_CHANGE": null
+      },
+      "severities": {
+        "SRC_PORT_ADDRESS_PAIRS": "warning"
+      }
+    },
+    {
+      "why": "floating IPs the destination's project does not hold detached get new addresses, an address written another way is held (plan task N2b)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null,
+            "floating_ips": [
+              "203.0.113.10",
+              "2001:db8:f::0010"
+            ]
+          },
+          {
+            "network": "db-net",
+            "mac": "fa:16:3e:00:00:02",
+            "fixed_ips": [
+              "192.0.2.11"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null,
+            "floating_ips": [
+              "203.0.113.11"
+            ]
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "destination": {
+        "label": "RHOSO 18.0",
+        "kind": "rhoso",
+        "networks": [
+          {
+            "id": "n-app-net",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          },
+          {
+            "id": "n-db-net",
+            "name": "db-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "floating_ips": [
+          "2001:db8:f:0::10"
+        ]
+      },
+      "expected": {
+        "MAP_FIP_ADDRESS_CHANGE": "Floating IPs of web-01 that RHOSO 18.0 does not hold detached in its project: 203.0.113.10, 203.0.113.11. os-migrate creates a floating IP with a new address for each, so clients, allowlists and DNS records of the old address lose the VM.",
+        "SRC_PORT_ADDRESS_PAIRS": null
+      },
+      "severities": {
+        "MAP_FIP_ADDRESS_CHANGE": "warning"
+      }
+    },
+    {
+      "why": "NICs published in DNS at the source and a destination without Neutron's dns-integration extension (plan task N2b)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null,
+            "dns_name": "web-01",
+            "dns_domain": "example.com."
+          },
+          {
+            "network": "db-net",
+            "mac": "fa:16:3e:00:00:02",
+            "fixed_ips": [
+              "192.0.2.11"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null,
+            "dns_domain": "example.com."
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "source_label": "DC1 Jakarta",
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "destination": {
+        "label": "RHOSO 18.0",
+        "kind": "rhoso",
+        "networks": [
+          {
+            "id": "n-app-net",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          },
+          {
+            "id": "n-db-net",
+            "name": "db-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "dns": {
+          "extension": false,
+          "zones": [
+            "example.com."
+          ]
+        }
+      },
+      "expected": {
+        "DST_DNS_INTEGRATION_MISSING": "NICs of web-01 are published in DNS at DC1 Jakarta - fa:16:3e:00:00:01 as web-01.example.com. - and RHOSO 18.0 lacks Neutron's dns-integration extension: the migrated ports are not published."
+      },
+      "severities": {
+        "DST_DNS_INTEGRATION_MISSING": "warning"
+      }
+    },
+    {
+      "why": "NICs published in DNS at the source and a destination without a Designate zone of one domain, compared lower case with its trailing dot (plan task N2b)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null,
+            "dns_name": "web-01",
+            "dns_domain": "Example.com"
+          },
+          {
+            "network": "db-net",
+            "mac": "fa:16:3e:00:00:02",
+            "fixed_ips": [
+              "192.0.2.11"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null,
+            "dns_name": "web-01",
+            "dns_domain": "db.example.com."
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "source_label": "DC1 Jakarta",
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "destination": {
+        "label": "RHOSO 18.0",
+        "kind": "rhoso",
+        "networks": [
+          {
+            "id": "n-app-net",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          },
+          {
+            "id": "n-db-net",
+            "name": "db-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "dns": {
+          "extension": true,
+          "zones": [
+            "EXAMPLE.COM."
+          ]
+        }
+      },
+      "expected": {
+        "DST_DNS_INTEGRATION_MISSING": "NICs of web-01 are published in DNS at DC1 Jakarta - fa:16:3e:00:00:02 as web-01.db.example.com. - and RHOSO 18.0 has no Designate zone db.example.com.: the migrated ports are not published."
+      },
+      "severities": {
+        "DST_DNS_INTEGRATION_MISSING": "warning"
+      }
+    },
+    {
+      "why": "DNS the destination could not read is not judged (plan task N2b)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null,
+            "dns_name": "web-01",
+            "dns_domain": "example.com."
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {}
+      },
+      "destination": {
+        "label": "RHOSO 18.0",
+        "kind": "rhoso",
+        "networks": [
+          {
+            "id": "n-app-net",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          },
+          {
+            "id": "n-db-net",
+            "name": "db-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "dns": {
+          "extension": null,
+          "zones": null
+        }
+      },
+      "expected": {
+        "DST_DNS_INTEGRATION_MISSING": null
+      }
+    },
+    {
+      "why": "a network whose VMs the plan's waves split, at a destination announcing tenant networks: each wave by name in its order (plan task N2b)",
+      "vm": {
+        "source_id": "vm-1",
+        "name": "web-01",
+        "project": "finance",
+        "flavor": "m1.small",
+        "vcpus": 2,
+        "ram_mb": 4096,
+        "disks": [
+          {
+            "id": "vol-1",
+            "name": null,
+            "size_gb": 20,
+            "used_gb": 10.0,
+            "bootable": true,
+            "volume_type": "ceph-ssd",
+            "device": "/dev/vda",
+            "kind": "volume",
+            "multiattach": false,
+            "encrypted": false,
+            "independent": false,
+            "pool": null
+          }
+        ],
+        "nics": [
+          {
+            "network": "app-net",
+            "mac": "fa:16:3e:00:00:01",
+            "fixed_ips": [
+              "192.0.2.10"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          },
+          {
+            "network": "db-net",
+            "mac": "fa:16:3e:00:00:02",
+            "fixed_ips": [
+              "192.0.2.11"
+            ],
+            "vnic_type": "normal",
+            "mtu": 1500,
+            "network_key": null
+          }
+        ],
+        "power_state": "running",
+        "os_type": "rhel9",
+        "host": null,
+        "tags": {},
+        "flavor_extra_specs": {},
+        "cbt_enabled": null,
+        "snapshot_count": 0,
+        "tools_ok": null,
+        "change_rate_bps": null,
+        "key_name": null,
+        "gpus": [],
+        "disk_bytes": 21474836480,
+        "used_bytes": 10737418240,
+        "guest_os": {
+          "family": "linux",
+          "distro": "rhel",
+          "version": "9",
+          "label": "RHEL 9",
+          "lifecycle": "current",
+          "v2v": "supported"
+        }
+      },
+      "others": [
+        {
+          "source_id": "vm-2",
+          "name": "web-02",
+          "project": "finance",
+          "flavor": "m1.small",
+          "vcpus": 2,
+          "ram_mb": 4096,
+          "disks": [
+            {
+              "id": "vol-1",
+              "name": null,
+              "size_gb": 20,
+              "used_gb": 10.0,
+              "bootable": true,
+              "volume_type": "ceph-ssd",
+              "device": "/dev/vda",
+              "kind": "volume",
+              "multiattach": false,
+              "encrypted": false,
+              "independent": false,
+              "pool": null
+            }
+          ],
+          "nics": [
+            {
+              "network": "app-net",
+              "mac": "fa:16:3e:00:00:12",
+              "fixed_ips": [],
+              "vnic_type": "normal",
+              "mtu": 1500,
+              "network_key": null
+            }
+          ],
+          "power_state": "running",
+          "os_type": "rhel9",
+          "host": null,
+          "tags": {},
+          "flavor_extra_specs": {},
+          "cbt_enabled": null,
+          "snapshot_count": 0,
+          "tools_ok": null,
+          "change_rate_bps": null,
+          "key_name": null,
+          "gpus": [],
+          "disk_bytes": 21474836480,
+          "used_bytes": 10737418240,
+          "guest_os": {
+            "family": "linux",
+            "distro": "rhel",
+            "version": "9",
+            "label": "RHEL 9",
+            "lifecycle": "current",
+            "v2v": "supported"
+          }
+        },
+        {
+          "source_id": "vm-3",
+          "name": "db-01",
+          "project": "finance",
+          "flavor": "m1.small",
+          "vcpus": 2,
+          "ram_mb": 4096,
+          "disks": [
+            {
+              "id": "vol-1",
+              "name": null,
+              "size_gb": 20,
+              "used_gb": 10.0,
+              "bootable": true,
+              "volume_type": "ceph-ssd",
+              "device": "/dev/vda",
+              "kind": "volume",
+              "multiattach": false,
+              "encrypted": false,
+              "independent": false,
+              "pool": null
+            }
+          ],
+          "nics": [
+            {
+              "network": "db-net",
+              "mac": "fa:16:3e:00:00:13",
+              "fixed_ips": [],
+              "vnic_type": "normal",
+              "mtu": 1500,
+              "network_key": null
+            }
+          ],
+          "power_state": "running",
+          "os_type": "rhel9",
+          "host": null,
+          "tags": {},
+          "flavor_extra_specs": {},
+          "cbt_enabled": null,
+          "snapshot_count": 0,
+          "tools_ok": null,
+          "change_rate_bps": null,
+          "key_name": null,
+          "gpus": [],
+          "disk_bytes": 21474836480,
+          "used_bytes": 10737418240,
+          "guest_os": {
+            "family": "linux",
+            "distro": "rhel",
+            "version": "9",
+            "label": "RHEL 9",
+            "lifecycle": "current",
+            "v2v": "supported"
+          }
+        }
+      ],
+      "plan": {
+        "handover": {
+          "enabled": false,
+          "backend_map": {}
+        },
+        "port_creation_mode": "nova",
+        "nic_overrides": {},
+        "vm_ids": [
+          "vm-1",
+          "vm-2",
+          "vm-3"
+        ],
+        "waves": [
+          {
+            "id": "w-late",
+            "name": "Wave 2",
+            "order": 2,
+            "vm_ids": [
+              "vm-2"
+            ],
+            "depends_on": [],
+            "max_parallel": 5
+          },
+          {
+            "id": "w-first",
+            "name": "Wave 1",
+            "order": 1,
+            "vm_ids": [
+              "vm-1",
+              "vm-3"
+            ],
+            "depends_on": [],
+            "max_parallel": 5
+          }
+        ]
+      },
+      "destination": {
+        "label": "RHOSO 18.0",
+        "kind": "rhoso",
+        "networks": [
+          {
+            "id": "n-app-net",
+            "name": "app-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          },
+          {
+            "id": "n-db-net",
+            "name": "db-net",
+            "mtu": 1500,
+            "project_id": "dst-project",
+            "own": true,
+            "shared": false,
+            "external": false
+          }
+        ],
+        "subnets": [],
+        "announces_tenant_networks": true
+      },
+      "expected": {
+        "NET_PREFIX_SPLIT": "The plan's waves split networks of web-01 that RHOSO 18.0 announces as tenant networks: 'app-net' in waves 'Wave 1', 'Wave 2'. While one wave is cut over and the next is not, each prefix has an origin in both clouds, so its routes cannot be correct."
+      },
+      "severities": {
+        "NET_PREFIX_SPLIT": "warning"
+      }
     }
   ]
 }
