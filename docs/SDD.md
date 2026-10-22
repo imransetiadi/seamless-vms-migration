@@ -473,7 +473,13 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
                                       # success at pre_stop, post_create or post_verify since the last rollback,
                                       # in run order; a retry keeps them (§8.2, plan task N5)
             fip_moves: list[FipMove] = [],   # the journal of its floating IPs' keep-address move (§8.3, plan task N6)
+            dns_swap: DnsSwap|null = null,   # the journal of its DNS target's swap (§8.4, plan task N7)
             created_at: datetime, updated_at: datetime }
+
+DnsSwap { name: str,                   # the record's fully qualified name: its target's record in its zone
+          rdtype: "A"|"AAAA",          # by the old address's family
+          old: str, new: str,          # the VM's address at the source and the one taking its place (§8.4)
+          state: "swapping"|"swapped"|"unchanged"|"conflict"|"reverted" }   # §8.4
 
 FipMove { address: str,                # the floating IP's address, kept at the destination
           fixed_ip: str,               # the NIC's first address at the destination - its nic_overrides entry's,
@@ -2459,6 +2465,49 @@ alone (`floating_ip_mode: skip`, §7.2). A VMware VM has none. Each step is a `m
   floating IP of each `moved` entry is deleted (`finalized`) - the address lives at the destination now. A failure is
   recorded and the migration is finalized; the operator releases that allocation.
 
+### 8.4 The DNS swap (plan task N7, §23.5)
+
+A VM the plan names a DNS target for (`network_cutover.dns_targets[vm.source_id]`, §4.2) has its record moved from its
+address at the source to the one that takes its place, with a compare-and-swap, so a record someone else changed is
+never overwritten. Each swap is a `migration.action`, data `{"action": "dns", "name", "step": "swap"|"revert",
+"outcome": "succeeded"|"unchanged"|"conflict"|"failed", "detail"}`.
+
+* **The addresses.** The old address is the VM's first floating IP (`Nic.floating_ips`) when it has one, else its first
+  fixed IP. The new one is the destination server's floating IP on the port holding that NIC's address
+  (`get_server`, §10) when the old one was floating, else the NIC's first address of the old one's family at the
+  destination - its `nic_overrides` entry's, else its own. The record type is `A` for an IPv4 old address, `AAAA` for IPv6. When both
+  addresses are equal - a floating IP the move of §8.3 kept, a fixed IP that stays - the swap is `unchanged` and
+  touches no record.
+* **When.** In `verifying`, after the floating IP move (§8.3) and before the `post_create` hooks (§8.2): the server
+  exists and the clock is open. The `DnsSwap` (§4.2) is saved as `swapping` before the first request, so a restart
+  resumes the same swap. One `swapped`, `unchanged` or `conflict` is not made again - by a restart or a retry -; a
+  retry after a rollback (`reverted`) makes it anew.
+* **Designate** (`kind: designate`), with the destination provider's credential (§10: `dns_recordset`,
+  `update_dns_recordset`): the recordset of the name and type in the zone must hold exactly the old address; its
+  records become the new one, its TTL unchanged. Designate writes asynchronously, so the swap reads the recordset every
+  2 s until it is `ACTIVE`, for at most 60 s; `ERROR`, or no `ACTIVE` in that time, fails it.
+* **RFC 2136** (`kind: rfc2136`), over TCP to the target's `server` (port 53 unless it names one), signed with the TSIG
+  key of `tsig_secret` (§13.3): one UPDATE whose prerequisite is that the name's RRset of the type is exactly the old
+  address (RFC 2136 §2.4.2), deleting it and adding the new one with the TTL a signed query read just before. The
+  `dns` extra (dnspython) builds and signs it; without it an rfc2136 target fails with the extra's name (§10's
+  `missing_dependency`).
+* **A record that holds anything else** - another address, more addresses, none - is a `conflict`: nothing is changed,
+  the migration goes on, and the action names what the record holds. A record that already holds the new address -
+  a swap a restart interrupted after its write - is `swapped`.
+* **A failure** - the server unreachable, the update refused, Designate's error or its timeout - fails the migration
+  as a `post_create` hook's does (§8.2): the plan's `auto_rollback` decides. Its `migration.error` names the step
+  `dns`; as a hook's, no similar incident is looked up for it and nothing of it reaches Jev or agentmemory (§13.4).
+* **The revert**, in `rolling_back`, before the floating IP return (§8.3): a `swapping` or `swapped` swap is swapped
+  back, new to old, by the same compare-and-swap (`reverted`; a record changed meanwhile is a `conflict` and is left
+  as it is). A failure fails the rollback as the floating IP return's does. A plan whose edit dropped the VM's target
+  has nothing to revert with: that revert is recorded as `failed`, naming the address the record was left with, and
+  the rollback goes on.
+* **The TTL** is the pre-flight's (`NET_DNS_TTL_LONG`, §9.3): validation reads each target's record (§10, §9.3) and
+  warns when its TTL is longer than the plan's `downtime_slo_s`; lowering it before the window is the operator's
+  job, a `pre_stop` hook may do it.
+* The TSIG key reaches neither a log line, an event nor an error message; a DNS name and an address reach the operator
+  in events and findings alone (§13.4).
+
 ---
 
 ## 9. Planning
@@ -2627,6 +2676,7 @@ Finding catalog (code — severity — condition):
 | `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one, resolved by the rule of §7.3 step 0; its `DestinationInventory.subnets` by `network_id`) or is no host address there — as Neutron's `check_subnet_ip` rules for a port created with no owner, an IPv4 subnet's network address (at any prefix length) and its broadcast address below a /31 (a /31 or /32 has none), while an IPv6 subnet's first address is taken (§6.6); on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode, and no address in `"nova"` mode (§6.6); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
 | `MAP_FIP_ADDRESS_CHANGE` | warning (cold, warm) | the plan's `network_cutover.floating_ips` is `"auto"` (under `"keep_address"` the move of §8.3 keeps the address, and `DST_FIP_ADDRESS_UNAVAILABLE` judges it) and an OpenStack VM's NIC has a floating IP (`Nic.floating_ips`) whose address the destination credential's project does not hold detached (`DestinationInventory.floating_ips`, §10): os-migrate's `floating_ip_mode` `auto` (§7.2, §23.1) attaches a detached floating IP with the source's address, and without one creates a floating IP with a **new** address, so clients, allowlists and DNS records of the old one lose the VM. The message names each address and the destination; the storage handover and the VMware paths move no floating IP (§23.1) |
+| `NET_DNS_TTL_LONG` | warning | the plan names a DNS target for the VM (`network_cutover.dns_targets`, §4.2) whose record validation read (§8.4, §10: Designate's recordset with the destination provider's credential, or a TSIG-signed query to the RFC 2136 server) and its TTL is longer than the plan's `downtime_slo_s`: after the swap, clients may reach the old address for up to that TTL. The message names the record, its TTL and the SLO; a record that cannot be read is not judged |
 | `DST_FIP_ADDRESS_UNAVAILABLE` | blocker | the plan's `network_cutover.floating_ips` is `"keep_address"` (§8.3, §23.4) and a floating IP of an OpenStack VM (`Nic.floating_ips`) cannot be kept at the destination: its address lies in no subnet of an external network of the destination (`DestinationInventory.subnets` of a `network_details` entry with `external`; not judged when the credential sees no such subnet); a port of the destination credential's project holds it (`DestinationInventory.attached_floating_ips`); the project does not hold it detached and the token lacks a role Neutron's `create_floatingip:floating_ip_address` takes - `admin`, and under the `secure_rbac` profile a project `manager` too (`TODO(LAB): confirm` on RHOSO 18.0; the roles and profile of the destination's check report, as `NET_PORT_NOT_PERMITTED` reads them; not judged without `roles`); or the project's floating IP quota leaves fewer than the addresses of the plan's VMs it does not hold (`DestinationInventory.floating_ip_quota`; not judged when unknown). The message names each address with its reason and the destination. A VMware VM has no floating IP |
 | `VM_PCI_PASSTHROUGH` | blocker | the VM has a passthrough device - an entry of kind `passthrough` in its `gpus` (§22.2): an OpenStack flavor's `pci_passthrough:alias`, a VMware `VirtualPCIPassthrough` device that is no vGPU (plan task G2) - and no GPU mapping applies to it, as for `VM_VGPU`; for a VMware device without ids, the message says that no mapping can name it (§22.4, plan task G4) |
 | `VM_VGPU` | blocker | the VM has a vGPU - an entry of kind `vgpu` in its `gpus` (§22.2): an OpenStack flavor's `resources:VGPU`, bare or in its request-group form `resources<suffix>:VGPU` (Nova's granular requests, e.g. `resources1:VGPU`; the suffix is `[A-Za-z0-9_-]`, review PL-08), or a custom resource class its source declares a profile for (§22.3); a VMware vGPU device (plan task G2) - and no GPU mapping applies to it (§22.4): no mapping names it (the message names the GPU key or the flavor to map), its mapping's flavor asks for no GPU (the message names the mapping and says the server would lose its GPU), or its GPUs' keys map to different flavors (plan task G4) |
@@ -2832,6 +2882,14 @@ class DestinationProvider(Protocol):
         # the address - a provider error when none does, or when Neutron refuses it (another project holds it)
     async def server_port(self, server_id: str, address: str) -> str | None
         # the id of the server's port with the fixed address, None when it has none (§8.3)
+    async def dns_recordset(self, zone: str, name: str, rdtype: str) -> dict[str, Any] | None
+        # Designate's recordset of the fully qualified name and type in the zone the credential sees by that name:
+        # {zone_id, id, records: [address, …], ttl: the recordset's, else its zone's, status}; None when the zone or
+        # the recordset is absent. Raw GETs, none logged (§13.4), under one read's bound; a failure names its HTTP
+        # status or its kind alone (§8.4, plan task N7)
+    async def update_dns_recordset(self, zone_id: str, recordset_id: str, records: list[str]) -> None
+        # the recordset's records replaced, its TTL kept (§8.4): a raw PUT, not logged; a refusal names its HTTP
+        # status alone
 
 # an OpenStack provider, source or destination, moves floating IPs (§8.3, plan task N6):
     async def floating_ip_port(self, address: str) -> str | None
@@ -3453,7 +3511,8 @@ again once its document (its state fields aside) or the mounted `clouds.yaml` ch
 the storage handover's alike — and the replaced one is closed, so the step after a rotation signs in with the new
 credentials, a running plan's rollback included (audit EX-14). A webhook hook's secret holds its bearer token as the
 key `token`, read each time the hook runs, and an RFC 2136 DNS target's TSIG key is a secret alike (§7.2, §23.3,
-§23.5); a hook's or a target's secret is never a provider's (§12). `SEAMLESS_SECRET_STORE` selects it:
+§23.5); a hook's or a target's secret is never a provider's (§12). An RFC 2136 target's TSIG secret holds the key as
+`name`, `secret` (base64) and, optionally, `algorithm` (`hmac-sha256` by default) (§8.4). `SEAMLESS_SECRET_STORE` selects it:
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory, each key written
   to a temporary file and renamed. A secret is written and deleted under a lock of its name (`flock` on
@@ -4693,7 +4752,7 @@ is no origin a browser sends (review RV31-03).
 ## 17. Deployment
 
 * Container: `seamless/Containerfile` (UBI 9 Python 3.11 base; installs the control plane with
-  `[openstack,vmware,jev]` extras, `ansible-core`, this collection with the `openstack.cloud` modules the roles call as `os_migrate.os_migrate.<module>` vendored from the pinned Galaxy release (`scripts/vendor-openstack-cloud.sh`, `OS_CLOUD_VERSION` 2.6.0 — 2.5.0 crashes with openstacksdk 4.x (`openstack.version`) — the checkout uses `make vendor-links` instead), `os_migrate.vmware_migration_kit`,
+  `[openstack,vmware,jev,dns]` extras (`dns`: dnspython, the RFC 2136 swap of §8.4), `ansible-core`, this collection with the `openstack.cloud` modules the roles call as `os_migrate.os_migrate.<module>` vendored from the pinned Galaxy release (`scripts/vendor-openstack-cloud.sh`, `OS_CLOUD_VERSION` 2.6.0 — 2.5.0 crashes with openstacksdk 4.x (`openstack.version`) — the checkout uses `make vendor-links` instead), `os_migrate.vmware_migration_kit`,
   Node 22 runtime for `npx`-launched Jev, and the dashboard: the build context's built one, else built in the image,
   §17.1). Runs as non-root UID.
 * OpenShift manifests (`deploy/openshift/`, kustomize): Namespace, ServiceAccount, PVC (data dir),
@@ -5857,7 +5916,7 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | the hook runner: kinds, timeouts, the idempotency key, the context document | §7.2, §13.3 (binding) | N4 |
 | hook points in the cutover, verification, rollback and finalize of every strategy, resumed after a restart | §8.2 (binding) | N5 |
 | the floating IP keep-address move: the blocker, the reservation, the journaled move, the return and the release (N6a); os-migrate's `auto` reporting whether it reused or created an address (N6b) | §4.2, §7.2, §8.3, §9.3, §10 (binding) | N6 |
-| the DNS swap | §7, §13.3 | N7 |
+| the DNS swap: Designate and RFC 2136, the compare-and-swap, the revert, the TTL warning | §4.2, §8.4, §9.3, §10, §13.3 (binding) | N7 |
 | the reachability wait | §7.5 | N8 |
 | the Octavia member helper | §7, §10 | N9 |
 | the hooks' time in the downtime estimate, and the TTL tail | §9.1 | N10 |
