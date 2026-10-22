@@ -299,6 +299,17 @@ ROUTES = [
     ("DELETE", "/api/v1/providers/nope-1", Role.admin, None),
     ("POST", "/api/v1/providers/src-osp/check", Role.operator, None),
     ("GET", "/api/v1/providers/src-osp/inventory", Role.viewer, None),
+    # the hook catalog (SDD §12, plan task N3)
+    ("GET", "/api/v1/hooks", Role.viewer, None),
+    (
+        "POST",
+        "/api/v1/hooks",
+        Role.admin,
+        {"name": "drain-lb", "kind": "playbook", "playbook": "/opt/hooks/drain-lb.yml"},
+    ),
+    ("GET", "/api/v1/hooks/nope-1", Role.viewer, None),
+    ("PATCH", "/api/v1/hooks/nope-1", Role.admin, {"timeout_s": 60}),
+    ("DELETE", "/api/v1/hooks/nope-1", Role.admin, None),
     ("GET", "/api/v1/plans", Role.viewer, None),
     (
         "POST",

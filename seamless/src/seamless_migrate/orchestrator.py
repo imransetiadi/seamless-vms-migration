@@ -586,6 +586,10 @@ def _rewrite_vm_id(plan: Plan, old: str, new: str) -> bool:
     # what the plan acknowledges for the VM: a recreated server stays its group's member (§9.3)
     if old in plan.acknowledged_findings:
         plan.acknowledged_findings[new] = plan.acknowledged_findings.pop(old)
+    # and the record its new address goes to (§7.3, §23.5)
+    targets = plan.network_cutover.dns_targets
+    if old in targets:
+        targets[new] = targets.pop(old)
     return plan.model_dump() != before
 
 

@@ -32,6 +32,7 @@ from .deps import (
     services,
     validation_message,
 )
+from .routes_hooks import check_plan_hooks
 from .schemas import (
     CancelRequest,
     EmptyRequest,
@@ -160,6 +161,7 @@ async def create_plan(
     # SDD §12: a provider's deletion waits until the plan that uses it is saved, and then refuses
     async with svc.orchestrator.provider_lock():
         await _check_providers(request, body)
+        await check_plan_hooks(request, body)  # SDD §12: the hooks it names, under the same lock
         await svc.db.put("plan", plan, expected_version=0)
     await emit(
         svc.store,
@@ -229,6 +231,7 @@ async def update_plan(
         )
         async with svc.orchestrator.provider_lock():  # SDD §12, as for a new plan
             await _check_providers(request, merged)
+            await check_plan_hooks(request, merged)
             await svc.db.put("plan", updated, expected_version=version)
     await emit(
         svc.store,
