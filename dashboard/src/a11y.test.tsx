@@ -5,6 +5,7 @@ import axe from 'axe-core';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import App from './App';
 import { ApiClient } from './api/client';
+import { FINDING_CATALOG } from './api/findingCatalog';
 import { createMockFetch, type MockServer } from './api/mock';
 import { makeVm } from './api/mockData';
 import type { DestinationInventory, VMRef } from './api/types';
@@ -318,6 +319,30 @@ describe('axe-core: no WCAG violations', () => {
     await screen.findByRole('heading', { level: 1, name: 'analytics-node-2' }, { timeout: 8_000 });
     await settled();
     await within(screen.getByRole('region', { name: 'Approvals' })).findByText('Advisor decision · Migration strategy');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it("a migration's network cut-over steps on its timeline and its network finding, each with the badge (SDD §16, plan task N12c)", async () => {
+    renderAt('/migrations/mig-d4e6f8a091', 'viewer', (server) => {
+      const m = server.migrations.find((x) => x.id === 'mig-d4e6f8a091')!;
+      m.findings = [
+        ...m.findings,
+        {
+          code: 'SRC_VM_LB_MEMBER',
+          severity: 'warning',
+          message: `Addresses of ${m.vm.name} are members of Octavia pools at RHOSP 17.1 — DC1: 192.0.2.5:80 of pool portal-pool. The memberships are not moved.`,
+          remediation: FINDING_CATALOG.SRC_VM_LB_MEMBER!.remediation,
+          strategies: [],
+        },
+      ];
+      const action = (message: string, data: Record<string, unknown>) =>
+        server.emit({ kind: 'migration.action', plan_id: m.plan_id, migration_id: m.id, actor: 'orchestrator', message, data });
+      action('hook warm-cache at post_create succeeded', { action: 'hook', hook: 'warm-cache', kind: 'playbook', point: 'post_create', idempotency_key: `${m.id}:post_create:warm-cache`, outcome: 'succeeded', duration_s: 4.2, detail: null });
+      action(`${m.vm.name}: DNS record web-cache-01.example.com.: swap conflict`, { action: 'dns', name: 'web-cache-01.example.com.', step: 'swap', outcome: 'conflict', detail: 'it holds 192.0.2.9, not 192.0.2.5: left as it is' });
+    });
+    await screen.findByRole('heading', { level: 1, name: 'web-cache-01' }, { timeout: 8_000 });
+    await settled();
+    await within(screen.getByRole('list', { name: 'Timeline, newest first' })).findByText('Hook warm-cache at post_create: Succeeded');
     expect(await violations()).toEqual([]);
   }, 30_000);
 

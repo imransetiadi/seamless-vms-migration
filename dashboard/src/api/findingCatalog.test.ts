@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 // the API's finding catalog (SDD §9.3): one copy the API and the offline mock are held to
 import catalogRaw from '../../../seamless/tests/fixtures/finding_catalog.json?raw';
-import { FINDING_CATALOG } from './findingCatalog';
+import { FINDING_CATALOG, NETWORK_CODES } from './findingCatalog';
 import { buildFixtures } from './mockData';
 
 const SHARED = JSON.parse(catalogRaw) as { catalog: Record<string, { severity: string; strategies: string[]; remediation: string }> };
@@ -23,5 +23,11 @@ describe("the offline mock's finding catalog is the API's (SDD §9.3, §16)", ()
       return f.severity !== entry.severity || JSON.stringify(f.strategies) !== JSON.stringify(entry.strategies) || f.remediation !== entry.remediation;
     });
     expect([...new Set(off.map((f) => `${f.code}: ${f.remediation}`))]).toEqual([]);
+  });
+
+  // seamless/tests/test_preflight.py holds them to §16's list, which a dashboard test cannot read (vite.config.ts fs.allow)
+  it('holds the twelve network findings, each a code of the catalog (SDD §16, §23.9, plan task N12c)', () => {
+    expect(NETWORK_CODES.size).toBe(12);
+    expect([...NETWORK_CODES].filter((code) => !(code in FINDING_CATALOG))).toEqual([]);
   });
 });

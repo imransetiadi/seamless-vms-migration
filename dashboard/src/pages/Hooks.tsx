@@ -11,9 +11,8 @@ import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
 import { TechPreviewBadge } from '../components/TechPreviewBadge';
+import { HOOK_KIND_LABELS } from '../lib/cutover';
 import { usePageTitle } from '../lib/usePageTitle';
-
-const KIND_LABELS: Record<Hook['kind'], string> = { playbook: 'Playbook', webhook: 'Webhook' };
 
 interface HookForm {
   name: string;
@@ -111,7 +110,7 @@ export default function Hooks() {
                 label="Kind"
                 value={form.kind}
                 onChange={(event) => setForm((current) => ({ ...current, kind: event.target.value as Hook['kind'] }))}
-                options={(['playbook', 'webhook'] as const).map((value) => ({ value, label: KIND_LABELS[value] }))}
+                options={(['playbook', 'webhook'] as const).map((value) => ({ value, label: HOOK_KIND_LABELS[value] }))}
                 disabled={editing !== null}
                 hint={editing ? 'A hook keeps its kind.' : form.kind === 'playbook' ? 'The AnsibleExecutor runs the playbook with the context document.' : 'The webhook is POSTed the context document with its bearer token.'}
               />
@@ -160,7 +159,7 @@ export default function Hooks() {
                   <li key={hook.name} aria-label={hook.name} className="flex flex-col gap-1 py-3">
                     <div className="flex flex-wrap items-baseline justify-between gap-2">
                       <span className="min-w-0 font-medium">{hook.name}</span>
-                      <span className="text-sm text-muted-foreground">{KIND_LABELS[hook.kind]}</span>
+                      <span className="text-sm text-muted-foreground">{HOOK_KIND_LABELS[hook.kind]}</span>
                     </div>
                     {hook.description && <p className="text-sm">{hook.description}</p>}
                     {hook.kind === 'playbook' ? (

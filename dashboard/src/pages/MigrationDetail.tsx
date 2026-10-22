@@ -26,6 +26,7 @@ import { RecommendationList } from '../components/Recommendations';
 import { LoadingBlock } from '../components/Skeleton';
 import { PhaseBadge, StatusBadge } from '../components/StatusBadge';
 import { SyncPassChart } from '../components/SyncPassChart';
+import { TechPreviewBadge } from '../components/TechPreviewBadge';
 import { Timeline } from '../components/Timeline';
 import { Unavailable } from '../components/Unavailable';
 import { NetworkPanel } from '../components/NetworkPanel';
@@ -267,6 +268,21 @@ function ProgressPanel({ m }: { m: Migration }) {
         </dl>
       </div>
     </Panel>
+  );
+}
+
+/**
+ * The DNS tail (SDD §9.1, §16): after the swap, how long resolvers may still answer with the old address - the record's
+ * TTL, apart from the downtime and its parts -, with the network cut-over's Technology Preview badge.
+ */
+function DnsTail({ seconds }: { seconds: number }) {
+  return (
+    <p className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+      <span>
+        DNS tail {formatDuration(seconds)}: after the swap, resolvers may still answer with the old address for up to the record&apos;s TTL; not part of the downtime.
+      </span>
+      <TechPreviewBadge feature="network" />
+    </p>
   );
 }
 
@@ -794,6 +810,7 @@ export default function MigrationDetail() {
               strategy={m.strategy}
               demoSpeed={demoSpeed}
             />
+            {typeof m.estimate?.dns_tail_s === 'number' && <DnsTail seconds={m.estimate.dns_tail_s} />}
           </Panel>
           <Panel
             title="Approvals"
