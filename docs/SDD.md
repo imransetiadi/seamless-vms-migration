@@ -5652,7 +5652,7 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | Item | Becomes binding in | Plan task |
 |---|---|---|
 | PRD: FR-28's scope, goal and journey, and §3's non-goals as delivered | PRD (done) | N1 |
-| the findings of §23.8 | §9.3 | N2 |
+| the findings of §23.8: the Heat and Octavia ones, the source's reads and `Plan.acknowledged_findings` (N2a); the network ones (N2b) | §9.3, §10, §4.2, §12 (binding for N2a) | N2 |
 | the hook catalog, the plan's network cut-over settings, the routes | §4.2, §12 | N3 |
 | the hook runner: kinds, timeouts, the idempotency key, the context document | §7.2, §13 | N4 |
 | hook points in the cutover, verification, rollback and finalize of every strategy, resumed after a restart | §5, §7, §8 | N5 |
