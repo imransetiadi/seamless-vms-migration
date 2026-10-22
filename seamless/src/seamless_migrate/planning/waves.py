@@ -145,11 +145,8 @@ class _Unit:
 
     vms: list[VMRef] = field(default_factory=list)
     rank: int = 0
-
-    @property
-    def gpu(self) -> bool:
-        """It holds a GPU VM, which never goes to the pilot (SDD §9.4, §22.9)."""
-        return any(vm_gpus(vm) for vm in self.vms)
+    #: it holds a GPU VM, which never goes to the pilot (SDD §9.4, §22.9)
+    gpu: bool = False
 
     @property
     def size(self) -> int:
@@ -160,7 +157,9 @@ class _Unit:
         return (self.rank, self.size, min(v.name for v in self.vms))
 
 
-def _units(vms: Sequence[VMRef], tiers: Mapping[str, str]) -> list[_Unit]:
+def _units(
+    vms: Sequence[VMRef], tiers: Mapping[str, str], gpu_profiles: Mapping[str, str]
+) -> list[_Unit]:
     groups: dict[str, _Unit] = {}
     units: list[_Unit] = []
     for vm in vms:
@@ -176,6 +175,10 @@ def _units(vms: Sequence[VMRef], tiers: Mapping[str, str]) -> list[_Unit]:
             units.append(unit)
         unit.vms.append(vm)
         unit.rank = max(unit.rank, rank)
+        # a VM recorded before 0.3.0 read with the profile its source declares for its flavor, as
+        # §9.3's GPU rows read it (SDD §9.4, §22.2)
+        declared = gpu_profiles.get(vm.flavor) if vm.flavor else None
+        unit.gpu = unit.gpu or bool(vm_gpus(vm, declared))
     for unit in units:
         unit.vms.sort(
             key=lambda v: (_rank(tiers.get(v.source_id) or heuristic_tier(v)), v.disk_bytes, v.name)
@@ -184,15 +187,20 @@ def _units(vms: Sequence[VMRef], tiers: Mapping[str, str]) -> list[_Unit]:
 
 
 def plan_waves(
-    vms: Sequence[VMRef], tiers: Mapping[str, str], max_wave_size: int = 10
+    vms: Sequence[VMRef],
+    tiers: Mapping[str, str],
+    max_wave_size: int = 10,
+    gpu_profiles: Mapping[str, str] | None = None,
 ) -> list[Wave]:
     """Pilot wave, then tier/size ordered waves, then a final ``Manual review`` wave.
 
     VMs sharing ``tags['app']`` always land in the same wave (a wave may then exceed
     ``max_wave_size``); a unit containing a ``manual_review`` VM goes to the review wave.
+    ``gpu_profiles`` are the vGPU profiles the source declares per flavor (`Provider.gpu_profiles`,
+    SDD §22.3), with which a VM recorded before 0.3.0 is read for its GPUs (§9.4, §22.2).
     """
     max_wave_size = max(1, int(max_wave_size))
-    units = _units(vms, tiers)
+    units = _units(vms, tiers, gpu_profiles or {})
     review_rank = _rank(MANUAL_REVIEW)
     regular = [u for u in units if u.rank < review_rank]
     review = [u for u in units if u.rank >= review_rank]

@@ -1680,7 +1680,7 @@ class Orchestrator:
                 summary=f"Classified {len(vms)} VM(s) with the heuristic",
                 data={"tiers": dict(tiers)},
             )
-        waves = plan_waves(vms, tiers, max_wave_size)
+        waves = plan_waves(vms, tiers, max_wave_size, source.gpu_profiles)
 
         def set_waves(fresh: Plan) -> None:
             if fresh.status not in (PlanStatus.draft, PlanStatus.validated, PlanStatus.paused):

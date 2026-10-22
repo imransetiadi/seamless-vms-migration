@@ -262,6 +262,38 @@ async def test_a_validation_writes_the_plans_wave_into_a_migration_it_leaves_alo
         await h.orch.stop()
 
 
+async def test_the_wave_planner_reads_a_recorded_vm_with_the_profile_its_source_declares(
+    tmp_path, store
+):
+    """SDD §9.4, §22.2, §22.3 (GPU follow-up 2): web-02's failed migration, which a validation
+    leaves alone, keeps a VM recorded before 0.3.0 - no gpus, a flavor asking for a CUSTOM_ class.
+    Once its source declares a vGPU profile for that flavor, the planner reads it as §9.3's GPU rows
+    do: a GPU VM, never in the pilot."""
+    h, plan, failed = await _a_plan_in_two_waves(tmp_path, store)
+    failed.vm = failed.vm.model_copy(
+        update={
+            "gpus": [],
+            "flavor": "g1.custom",
+            "flavor_extra_specs": {"resources:CUSTOM_NVIDIA_A100_4C": "1"},
+        }
+    )
+    store.put("migration", failed)
+    try:
+        # no profile declared: the class alone is no GPU (§22.2), and web-02 joins the pilot
+        planned = await h.orch.auto_waves(plan.id, 10, "alice")
+        assert [w.vm_ids for w in planned.waves] == [["vm-1", "vm-2"]]
+        store.put(
+            "provider", SRC_PROVIDER.model_copy(update={"gpu_profiles": {"g1.custom": "A100-4C"}})
+        )
+        replanned = await h.orch.auto_waves(plan.id, 10, "alice")
+        assert [(w.name, w.vm_ids) for w in replanned.waves] == [
+            ("Pilot", ["vm-1"]),
+            ("Wave 2", ["vm-2"]),
+        ]
+    finally:
+        await h.orch.stop()
+
+
 async def test_a_validation_clears_the_wave_of_a_migration_whose_vm_left_every_wave(
     tmp_path, store
 ):

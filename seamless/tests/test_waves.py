@@ -159,6 +159,27 @@ def gpu_vm(source_id: str, name: str, size_gb: int = 20, os_type: str = "rhel9",
     )
 
 
+def test_the_pilot_reads_a_vm_recorded_before_0_3_0_with_the_profile_its_source_declares():
+    """SDD §9.4, §22.2, §22.3 (GPU follow-up 2): a VM recorded before 0.3.0 has no gpus, and its
+    flavor asks for a CUSTOM_ class - a vGPU once its source declares a profile for the flavor, as
+    §9.3's GPU rows read it. The wave planner reads it so, and keeps it out of the pilot."""
+    specs = {"resources:CUSTOM_NVIDIA_A100_4C": "1"}
+    recorded = vm("web-old", "web-04", 5).model_copy(
+        update={"flavor": "g1.custom", "flavor_extra_specs": specs}
+    )
+    vms = [recorded, vm("web-a", "web-01", 10), vm("web-b", "web-02", 20), vm("web-c", "web-03")]
+    tiers = {v.source_id: heuristic_tier(v) for v in vms}
+    # no profile declared: the class alone is no GPU (§22.2); the smallest web VM leads the pilot
+    assert plan_waves(vms, tiers)[0].vm_ids == ["web-old", "web-a", "web-b"]
+    # one declared for another flavor reads nothing for it
+    assert plan_waves(vms, tiers, gpu_profiles={"g1.other": "A100-4C"})[0].vm_ids[0] == "web-old"
+    waves = plan_waves(vms, tiers, gpu_profiles={"g1.custom": "A100-4C"})
+    assert [(w.name, w.vm_ids) for w in waves] == [
+        ("Pilot", ["web-a", "web-b", "web-c"]),
+        ("Wave 2", ["web-old"]),
+    ]
+
+
 def test_the_pilot_wave_never_holds_a_gpu_vm():
     """SDD §9.4, §22.9 (plan task G5): the pilot takes the lowest-risk VMs, and a GPU VM's driver,
     license and capacity are risks of their own - the smallest web VM waits when it has a GPU."""
