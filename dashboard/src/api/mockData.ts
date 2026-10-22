@@ -1998,6 +1998,7 @@ export function defaultPlanFields(now: number) {
     port_creation_mode: 'nova' as const,
     nic_overrides: {} as Plan['nic_overrides'],
     acknowledged_findings: {} as Plan['acknowledged_findings'],
+    network_cutover: { hooks: {}, floating_ips: 'auto' as const, dns_targets: {}, lb_pools: {} },
     waves: [],
     // what the API derives from the migrations (SDD §8.1); the mock sets it on every response
     derived_status: 'draft' as const,

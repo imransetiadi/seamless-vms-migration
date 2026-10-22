@@ -421,6 +421,44 @@ export interface NicOverride {
   fixed_ips: string[] | null;
 }
 
+/** Where a migration runs a plan's hooks (SDD §4.2, §23.3). */
+export type HookPoint = 'pre_stop' | 'post_create' | 'post_verify' | 'on_rollback' | 'on_finalize';
+
+/** Where a VM's new address goes in DNS (SDD §4.2, §23.5): rfc2136 needs a server and a TSIG secret, designate takes neither. */
+export interface DnsTarget {
+  kind: 'designate' | 'rfc2136';
+  zone: string;
+  record: string;
+  server: string | null;
+  tsig_secret: string | null;
+}
+
+/** A plan's network cut-over settings (SDD §4.2, plan task N3). */
+export interface NetworkCutover {
+  /** Per point, the names of catalog hooks in their run order, each once per point. */
+  hooks: Partial<Record<HookPoint, string[]>>;
+  /** `keep_address`: the move that keeps a floating IP's address (SDD §23.4); `auto`: os-migrate's. */
+  floating_ips: 'auto' | 'keep_address';
+  /** Per VM (source id). */
+  dns_targets: Record<string, DnsTarget>;
+  /** A source Octavia pool (its id) to a destination pool (its id) (SDD §23.7). */
+  lb_pools: Record<string, string>;
+}
+
+/** A hook of the catalog an admin keeps (SDD §4.2, §23.3). */
+export interface Hook {
+  name: string;
+  kind: 'playbook' | 'webhook';
+  description: string | null;
+  playbook: string | null;
+  url: string | null;
+  secret: string | null;
+  timeout_s: number;
+  revert: string | null;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
 export interface Plan {
   /** `plan-<8 hex>`. */
   id: string;
@@ -464,6 +502,8 @@ export interface Plan {
    * acknowledged blocker stays a finding, a warning that says so (SDD §4.2, §9.3, plan task N2).
    */
   acknowledged_findings: Record<string, string[]>;
+  /** The hooks it runs per point, the floating IP move, DNS targets and Octavia pool mappings (SDD §4.2, §23.3-§23.7). */
+  network_cutover: NetworkCutover;
   waves: Wave[];
   status: PlanStatus;
   /** Read-only: from the plan and its migrations (SDD §8.1); every view shows it, never `status`. */
@@ -901,6 +941,10 @@ export const PERSISTED_EVENT_KINDS = [
   'provider.credentials_updated',
   'provider.deleted',
   'provider.checked',
+  // the hook catalog's changes (SDD §4.3, §23.3, plan task N3)
+  'hook.created',
+  'hook.updated',
+  'hook.deleted',
   'auth.denied',
   'user.created',
   'events.pruned',

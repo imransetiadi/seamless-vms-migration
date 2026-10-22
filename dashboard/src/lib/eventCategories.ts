@@ -13,10 +13,11 @@ export const EVENT_CATEGORIES: Array<{ value: string; label: string; match: (kin
   },
   { value: 'providers', label: 'Providers', match: (k) => k.startsWith('provider.') },
   // a prune cuts the audit trail itself (SDD §15); a dashboard user created grants access (SDD §13.1); a policy change
-  // can weaken an approval gate (SDD §14.5)
+  // can weaken an approval gate (SDD §14.5); a hook runs code with the control plane's reach (SDD §23.3)
   {
     value: 'security',
     label: 'Security',
-    match: (k) => k.startsWith('auth.') || k.startsWith('user.') || k.startsWith('policy.') || k === 'events.pruned',
+    match: (k) =>
+      k.startsWith('auth.') || k.startsWith('user.') || k.startsWith('policy.') || k.startsWith('hook.') || k === 'events.pruned',
   },
 ];

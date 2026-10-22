@@ -1159,6 +1159,7 @@ describe('mock API', () => {
       'mappings',
       'max_sync_passes',
       'name',
+      'network_cutover',
       'nic_overrides',
       'port_creation_mode',
       'prestage_resources',
@@ -3165,6 +3166,22 @@ describe('mock plans: nic_overrides (SDD §4.2, §12)', () => {
     await expect(client.post('/plans', { ...body, nic_overrides: { 'vm-1': { 'fa:16:3e:00:00:01': { fixed_ips: ['fd00::5', 'FD00:0::0005', '10.20.1.300'] } } } })).rejects.toMatchObject({
       status: 422,
       message: 'nic_overrides[vm-1][fa:16:3e:00:00:01]: not an IP address: 10.20.1.300; nic_overrides[vm-1][fa:16:3e:00:00:01]: fd00::5 given twice',
+    });
+  });
+});
+
+describe('mock plans: network_cutover (SDD §4.2, §12, plan task N3)', () => {
+  it("stores a plan's network cut-over settings and refuses a hook the catalog lacks with the API's message", async () => {
+    const { client } = setup('operator');
+    const body = { name: 'cutover', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [] };
+    const created = await client.post<Plan>('/plans', body);
+    expect(created.network_cutover).toEqual({ hooks: {}, floating_ips: 'auto', dns_targets: {}, lb_pools: {} });
+    const settings = { hooks: {}, floating_ips: 'keep_address', dns_targets: {}, lb_pools: { 'pool-src-1': 'pool-dst-9' } };
+    const patched = await client.patch<Plan>(`/plans/${created.id}`, { network_cutover: settings });
+    expect(patched.network_cutover).toEqual(settings);
+    await expect(client.post('/plans', { ...body, network_cutover: { hooks: { pre_stop: ['drain-lb'] } } })).rejects.toMatchObject({
+      status: 422,
+      message: "network_cutover.hooks.pre_stop: no hook 'drain-lb' in the catalog",
     });
   });
 });

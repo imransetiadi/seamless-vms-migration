@@ -617,6 +617,10 @@ function refusePlanSpec(spec: Record<string, unknown>): void {
     const refused = (codes ?? []).filter((code) => !ACKNOWLEDGEABLE_FINDINGS.includes(code));
     if (refused.length) problems.push(`acknowledged_findings[${vmId}]: ${refused.join(', ')} cannot be acknowledged (only ${[...ACKNOWLEDGEABLE_FINDINGS].sort().join(', ')} can)`);
   }
+  // like the API (SDD §12, plan task N3): a plan names catalog hooks alone - the mock's catalog holds none yet
+  const cutover = (spec.network_cutover ?? {}) as { hooks?: Record<string, string[]> };
+  for (const [point, names] of Object.entries(cutover.hooks ?? {}))
+    for (const name of names ?? []) problems.push(`network_cutover.hooks.${point}: no hook ${pyRepr(name)} in the catalog`);
   const prestage = Array.isArray(spec.prestage_resources) ? (spec.prestage_resources as string[]) : [];
   const unknown = prestage.filter((r) => !PRESTAGE_RESOURCES.includes(r));
   if (unknown.length) problems.push(`prestage_resources: cannot pre-stage ${unknown.map((r) => `'${r}'`).join(', ')}`);
