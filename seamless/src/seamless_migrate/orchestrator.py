@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import inspect
 import ipaddress
 import logging
@@ -85,6 +86,7 @@ from .domain.models import (
     GpuWait,
     Hook,
     HookPoint,
+    LbMove,
     Mappings,
     Migration,
     Nic,
@@ -117,6 +119,15 @@ from .executors.base import (
 )
 from .hooks import HookRun, HookRunner, context_document, hook_action_event
 from .invariants import check_invariants
+from .lb_helper import (
+    LbHelperError,
+    Pace,
+    canonical,
+    join_address,
+    member_of,
+    vm_addresses,
+)
+from .lb_helper import describe as describe_lb
 from .planning.estimator import (
     EstimatorParams,
     calibrated_change_rate,
@@ -131,6 +142,7 @@ from .planning.estimator import (
 from .planning.gpu import PoolKey, gpu_flavor, gpu_units, pool_key, pool_name, vm_gpus
 from .planning.platforms import destination_descriptor
 from .planning.preflight import (
+    PoolPair,
     QuotaShare,
     Shortfall,
     flavor_prestaged,
@@ -175,6 +187,20 @@ def _floating_addresses(vm: VMRef) -> list[str]:
 
 def _journal_entry(m: Migration, address: str) -> FipMove | None:
     return next((e for e in m.fip_moves if e.address == address), None)
+
+
+async def _read_pool(provider: Any, pool_id: str) -> dict[str, Any] | None:
+    """An Octavia pool as validation reads it (SDD §8.5, §10 ``lb_pool``): None when the provider
+    has no Octavia - a VMware source - or the read fails, its kind logged, never a name."""
+    read = getattr(provider, "lb_pool", None)
+    if read is None:
+        return None
+    try:
+        found: dict[str, Any] | None = await read(pool_id)
+    except Exception as exc:
+        log.info("an Octavia pool was not read: %s", type(exc).__name__)
+        return None
+    return found
 
 
 #: the points whose hooks a rollback reverts (SDD §8.2)
@@ -726,6 +752,8 @@ class Orchestrator:
         )
         #: runs a plan's hooks at their points (SDD §7.2, §8.2)
         self.hook_runner = hook_runner or HookRunner(settings)
+        #: Octavia's pace for the member helper (SDD §8.5)
+        self.lb_pace = Pace()
         # SDD §8: a lock lives while a coroutine holds it or waits for it
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         #: when the next source watch is due (SDD §8.1); set by the first tick
@@ -1164,6 +1192,14 @@ class Orchestrator:
         memory_up = True
         # the TTL of each DNS target's record, for NET_DNS_TTL_LONG (SDD §8.4, §9.3)
         ttls = await record_ttls(plan, vms, dst_impl, self.settings)
+        # each mapped pair of Octavia pools, for MAP_LB_POOL_INCOMPATIBLE (SDD §8.5, §9.3)
+        lb_pairs = {
+            source_pool: PoolPair(
+                source=await _read_pool(src_impl, source_pool),
+                destination=await _read_pool(dst_impl, pool),
+            )
+            for source_pool, pool in plan.network_cutover.lb_pools.items()
+        }
         for vm in vms:
             current = existing.get(vm.source_id)
             detached: list[Finding] = []
@@ -1191,6 +1227,7 @@ class Orchestrator:
                 # the quota counts what a cutover will still create (SDD §9.3, review PL-02)
                 shares=shares,
                 dns_ttl=ttls.get(vm.source_id),
+                lb_pools=lb_pairs,
             )
             findings = [*findings, *detached]
             resolved = resolve_mappings(vm, plan, dst_inv)
@@ -4080,6 +4117,11 @@ class Orchestrator:
     async def _do_cutover(self, m: Migration) -> None:
         # SDD §8.2: pre_stop while the source runs - never again once the attempt's clock is open
         if m.downtime_started_at is None:
+            # SDD §8.5: the member helper's drain first, then the point's hooks
+            drained = await self._drain_lb_members(m)
+            if drained is not None:
+                await self._fail(m.id, P.cutover, "lb_member", drained)
+                return
             failed = await self._run_hooks(m, "pre_stop")
             if failed is not None:
                 await self._fail(m.id, P.cutover, "hook:pre_stop", HookFailed(failed))
@@ -4174,6 +4216,11 @@ class Orchestrator:
             except Exception:
                 log.warning("verification review failed", exc_info=True)
         if result.passed:
+            # SDD §8.5: the member helper's join first, then the point's hooks
+            joined = await self._join_lb_members(m)
+            if joined is not None:
+                await self._fail(m.id, P.verifying, "lb_member", joined)
+                return
             # SDD §8.2: post_verify once the verification passed - the downtime ended with it
             failed = await self._run_hooks(m, "post_verify")
             if failed is not None:
@@ -4262,6 +4309,8 @@ class Orchestrator:
         if returned is not None:
             await self._fail(m.id, P.rolling_back, "floating_ips", returned)
             return
+        # SDD §8.5: then the Octavia memberships - a failure is recorded, the rollback goes on
+        await self._restore_lb_members(m)
         # SDD §8.2: the reverts of the attempt's hooks, then on_rollback, before the source starts
         await self._run_rollback_hooks(m)
         try:
@@ -4666,6 +4715,182 @@ class Orchestrator:
             )
         return None
 
+    async def _lb_action(
+        self, m: Migration, entry: LbMove, step: str, error: BaseException | None = None
+    ) -> None:
+        """A member helper step's migration.action (SDD §8.5); a failure's detail redacted."""
+        outcome = "succeeded" if error is None else "failed"
+        detail = None if error is None else redact_cut(describe_lb(error), 500)
+        await self._emit(
+            "migration.action",
+            f"{m.vm.name}: Octavia member {entry.address}:{entry.port} of pool "
+            f"{entry.source_pool}: {step} {outcome}",
+            migration=m,
+            actor="orchestrator",
+            data={
+                "action": "lb_member",
+                "pool": entry.source_pool,
+                "address": entry.address,
+                "port": entry.port,
+                "step": step,
+                "outcome": outcome,
+                "detail": detail,
+            },
+        )
+
+    async def _lb_journal(self, mid: str, entry: LbMove) -> LbMove:
+        """Save the LbMove of its source member, in its place or as a new one (SDD §4.2, §8.5); the
+        entry as saved."""
+        key = (entry.source_pool, entry.source_member)
+        async with self._lock(mid):
+            cur, v = await self._load(mid)
+            moves = [entry if (e.source_pool, e.source_member) == key else e for e in cur.lb_moves]
+            if entry not in moves:
+                moves.append(entry)
+            cur.lb_moves = moves
+            await self._save(cur, v)
+        return entry
+
+    async def _lb_clouds(self, m: Migration) -> tuple[Plan, Any, Any]:
+        plan = await self._plan(m.plan_id)
+        source = await self.db.get("provider", plan.source_provider_id, Provider)
+        destination = await self.db.get("provider", plan.destination_provider_id, Provider)
+        return plan, self.providers.get(source), self.providers.get(destination)
+
+    async def _drain_lb_members(self, m: Migration) -> BaseException | None:
+        """SDD §8.5: at pre_stop, each member of a mapped source pool whose address is one of the
+        VM's is journaled draining, its admin_state_up set to false, and drained once Octavia reads
+        it ACTIVE; one drained, joining or joined is not drained again, one restored is anew. The
+        failure, None otherwise."""
+        plan = await self._plan(m.plan_id)
+        addresses = vm_addresses(m.vm)
+        if not plan.network_cutover.lb_pools or not addresses:
+            return None
+        _, src, _ = await self._lb_clouds(m)
+        if getattr(src, "pool_members", None) is None:
+            return None  # a VMware source has no Octavia pool
+        for source_pool, pool in plan.network_cutover.lb_pools.items():
+            try:
+                members = await src.pool_members(source_pool)
+            except Exception as exc:
+                return LbHelperError(describe_lb(exc))
+            for member in members:
+                address = canonical(str(member.get("address")))
+                if address not in addresses:
+                    continue
+                key = (source_pool, str(member.get("id")))
+                cur = await self.db.get("migration", m.id, Migration)
+                entry = next(
+                    (e for e in cur.lb_moves if (e.source_pool, e.source_member) == key), None
+                )
+                if entry is not None and entry.state in ("drained", "joining", "joined"):
+                    continue
+                entry = LbMove(
+                    source_pool=source_pool,
+                    source_member=key[1],
+                    address=address,
+                    port=int(member.get("protocol_port") or 0),
+                    pool=pool,
+                )
+                try:
+                    await self._lb_journal(m.id, entry)
+                    await self.lb_pace.change(
+                        functools.partial(src.set_pool_member, source_pool, key[1], False)
+                    )
+                    await self.lb_pace.active(
+                        functools.partial(member_of, src, source_pool, key[1]),
+                        f"member {address}:{entry.port} of pool {source_pool}",
+                    )
+                    entry = await self._lb_journal(
+                        m.id, entry.model_copy(update={"state": "drained"})
+                    )
+                except Exception as exc:
+                    failure = LbHelperError(describe_lb(exc))
+                    await self._lb_action(m, entry, "drain", failure)
+                    return failure
+                await self._lb_action(m, entry, "drain")
+        return None
+
+    async def _join_lb_members(self, m: Migration) -> BaseException | None:
+        """SDD §8.5: at post_verify, each entry drained gets a member of the address that takes its
+        address's place, on the same port, in the destination pool - one the pool holds already, a
+        restart's, is taken -, and is joined once Octavia reads it ACTIVE. The failure, None
+        otherwise."""
+        cur = await self.db.get("migration", m.id, Migration)
+        pending = [e for e in cur.lb_moves if e.state in ("drained", "joining")]
+        if not pending:
+            return None
+        plan, _, dst = await self._lb_clouds(m)
+        for entry in pending:
+            try:
+                address = join_address(cur, plan, entry.address)
+                entry = await self._lb_journal(m.id, entry.model_copy(update={"state": "joining"}))
+                held = [
+                    str(x.get("id"))
+                    for x in await dst.pool_members(entry.pool)
+                    if canonical(str(x.get("address"))) == address
+                    and int(x.get("protocol_port") or 0) == entry.port
+                ]
+                member = held[0] if held else None
+                if member is None:
+                    member = await self.lb_pace.change(
+                        functools.partial(dst.add_pool_member, entry.pool, address, entry.port)
+                    )
+                entry = await self._lb_journal(m.id, entry.model_copy(update={"member": member}))
+                await self.lb_pace.active(
+                    functools.partial(member_of, dst, entry.pool, member),
+                    f"member {address}:{entry.port} of pool {entry.pool}",
+                )
+                entry = await self._lb_journal(m.id, entry.model_copy(update={"state": "joined"}))
+            except Exception as exc:
+                failure = LbHelperError(describe_lb(exc))
+                await self._lb_action(m, entry, "join", failure)
+                return failure
+            await self._lb_action(m, entry, "join")
+        return None
+
+    async def _restore_lb_members(self, m: Migration) -> None:
+        """SDD §8.5: before a rollback starts the source, each entry not restored has its
+        destination member deleted - a create a restart may have sent included - and its source
+        member's admin_state_up set to true again; a failure is recorded and the rollback goes
+        on."""
+        cur = await self.db.get("migration", m.id, Migration)
+        pending = [e for e in cur.lb_moves if e.state != "restored"]
+        if not pending:
+            return
+        plan, src, dst = await self._lb_clouds(m)
+        for entry in pending:
+            try:
+                gone = {entry.member} if entry.member else set()
+                if entry.state == "joining":
+                    address = join_address(cur, plan, entry.address)
+                    gone |= {
+                        str(x.get("id"))
+                        for x in await dst.pool_members(entry.pool)
+                        if canonical(str(x.get("address"))) == address
+                        and int(x.get("protocol_port") or 0) == entry.port
+                    }
+                for member in sorted(gone):
+                    await self.lb_pace.change(
+                        functools.partial(dst.delete_pool_member, entry.pool, member)
+                    )
+                await self.lb_pace.change(
+                    functools.partial(
+                        src.set_pool_member, entry.source_pool, entry.source_member, True
+                    )
+                )
+                await self.lb_pace.active(
+                    functools.partial(member_of, src, entry.source_pool, entry.source_member),
+                    f"member {entry.address}:{entry.port} of pool {entry.source_pool}",
+                )
+                entry = await self._lb_journal(
+                    m.id, entry.model_copy(update={"state": "restored", "member": None})
+                )
+            except Exception as exc:
+                await self._lb_action(m, entry, "restore", LbHelperError(describe_lb(exc)))
+                continue
+            await self._lb_action(m, entry, "restore")
+
     async def _owe_revert(self, mid: str, revert: str) -> None:
         """Add ``revert`` to what the migration's rollback owes (SDD §4.2, §8.2)."""
         async with self._lock(mid):
@@ -4730,8 +4955,13 @@ class Orchestrator:
         )
         if rollback:
             self._launch(mid)
-        # nothing of a hook or a DNS swap reaches agentmemory (SDD §8.2, §8.4, §13.4)
-        if self.knowledge is not None and not str(step).startswith("hook:") and step != "dns":
+        # nothing of a hook, a DNS swap or the member helper reaches agentmemory (SDD §8.2, §8.4,
+        # §8.5, §13.4)
+        if (
+            self.knowledge is not None
+            and not str(step).startswith("hook:")
+            and step not in ("dns", "lb_member")
+        ):
             # SDD §8 (audit OC-04): a task of its own - the driver that runs this goes on to the
             # rollback at once, never waiting for agentmemory; a stop cancels it
             lookup = asyncio.create_task(

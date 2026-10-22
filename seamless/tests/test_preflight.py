@@ -96,6 +96,7 @@ def check(
     dst_caps=None,
     shares=None,
     dns_ttl=None,
+    lb_pools=None,
 ):
     vm = vm or make_vm()
     return run_preflight(
@@ -109,6 +110,7 @@ def check(
         dst_caps=dst_caps,
         shares=shares,
         dns_ttl=dns_ttl,
+        lb_pools=lb_pools,
     )
 
 
@@ -199,6 +201,7 @@ def test_catalog_is_complete():
         "MAP_FIP_ADDRESS_CHANGE",
         "DST_FIP_ADDRESS_UNAVAILABLE",
         "NET_DNS_TTL_LONG",
+        "MAP_LB_POOL_INCOMPATIBLE",
         "VM_PCI_PASSTHROUGH",
         "VM_VGPU",
         # the GPU codes (SDD §22.5, plan task G4)
@@ -425,6 +428,7 @@ def test_finding_src_vm_lb_member():
         PoolMember(
             load_balancer="example-lb",
             pool="web-pool",
+            pool_id="web-pool-id",
             address="192.0.2.10",
             port=443,
             network="app-net",
@@ -432,6 +436,7 @@ def test_finding_src_vm_lb_member():
         PoolMember(
             load_balancer="example-lb",
             pool="admin-pool",
+            pool_id="admin-pool-id",
             address="192.0.2.10",
             port=8443,
             network=None,
@@ -440,6 +445,7 @@ def test_finding_src_vm_lb_member():
         PoolMember(
             load_balancer="other-lb",
             pool="other-pool",
+            pool_id="other-pool-id",
             address="192.0.2.10",
             port=80,
             network="other-net",
@@ -447,6 +453,7 @@ def test_finding_src_vm_lb_member():
         PoolMember(
             load_balancer="example-lb",
             pool="db-pool",
+            pool_id="db-pool-id",
             address="2001:db8::10",
             port=5432,
             network="db-net",
@@ -454,6 +461,7 @@ def test_finding_src_vm_lb_member():
         PoolMember(
             load_balancer="example-lb",
             pool="web-pool",
+            pool_id="web-pool-id",
             address="192.0.2.11",
             port=443,
             network="app-net",
@@ -708,6 +716,38 @@ def test_finding_net_dns_ttl_long():
     assert f.message.startswith("The DNS record db.example.com. holds a TTL of 301 s")
     assert f.remediation == CATALOG["NET_DNS_TTL_LONG"].remediation
     assert "NET_DNS_TTL_LONG" not in [x.code for x in check(plan=plan, dns_ttl=300)]
+
+
+def test_finding_map_lb_pool_incompatible():
+    """SDD §9.3 (plan task N9): a member of a source pool the plan maps to a pool whose load
+    balancer runs the OVN provider is warned of what the source pool uses that OVN lacks - its
+    listener's TLS termination here (tests/test_octavia_helper.py has the rest)."""
+    from seamless_migrate.planning.preflight import PoolPair
+
+    nic = Nic(network="app-net", mac="fa:16:3e:00:00:01", fixed_ips=["192.0.2.10"])
+    member = PoolMember(
+        load_balancer="example-lb",
+        pool="web-pool",
+        pool_id="pool-1",
+        address="192.0.2.10",
+        port=443,
+        network="app-net",
+    )
+    src = src_inv(lb_members=MemberRead(members=[member]))
+    plan = make_plan(network_cutover={"lb_pools": {"pool-1": "pool-9"}})
+    l4 = {"protocol": "TCP", "lb_algorithm": "SOURCE_IP_PORT", "monitor": "TCP"}
+    pair = PoolPair(
+        source={"name": "web-pool", **l4, "listeners": ["TERMINATED_HTTPS"]},
+        destination={"id": "pool-9", "name": "web-l4", "provider": "ovn"},
+    )
+    f = only(
+        check(make_vm(nics=[nic]), plan=plan, src=src, lb_pools={"pool-1": pair}),
+        "MAP_LB_POOL_INCOMPATIBLE",
+    )
+    assert f.message.endswith(
+        "so the pool loses a TERMINATED_HTTPS listener (TLS terminated at the load balancer)."
+    )
+    assert f.remediation == CATALOG["MAP_LB_POOL_INCOMPATIBLE"].remediation
 
 
 def test_finding_dst_fip_address_unavailable():

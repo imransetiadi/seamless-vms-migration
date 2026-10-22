@@ -409,7 +409,27 @@ class _FloatingIPs:
         self._floating.pop(address, None)
 
 
-class FakeSourceProvider(_FloatingIPs):
+class _Octavia:
+    """A fake's Octavia for the member helper (SDD §8.5, §10): the demo holds no pool yet (its load
+    balancer comes with plan task N11), so a mapped pool has no member to move."""
+
+    async def lb_pool(self, pool_id: str) -> dict[str, Any] | None:
+        return None
+
+    async def pool_members(self, pool_id: str) -> list[dict[str, Any]]:
+        return []
+
+    async def set_pool_member(self, pool_id: str, member_id: str, admin_state_up: bool) -> None:
+        raise ProviderError(f"Octavia holds no pool {pool_id}")
+
+    async def add_pool_member(self, pool_id: str, address: str, protocol_port: int) -> str:
+        raise ProviderError(f"Octavia holds no pool {pool_id}")
+
+    async def delete_pool_member(self, pool_id: str, member_id: str) -> None:
+        return None
+
+
+class FakeSourceProvider(_FloatingIPs, _Octavia):
     def __init__(self, kind: ProviderKind | str, seed: int = 42) -> None:
         self.kind = ProviderKind(kind)
         self.seed = seed
@@ -576,7 +596,7 @@ class _DestinationCloud:
     floating: dict[str, str | None] = field(default_factory=dict)
 
 
-class FakeDestinationProvider(_FloatingIPs):
+class FakeDestinationProvider(_FloatingIPs, _Octavia):
     def __init__(self, seed: int = 42, provider: Provider | None = None) -> None:
         self.seed = seed
         #: the demo provider it stands for: its kind, declared series and profile (SDD §10)

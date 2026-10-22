@@ -637,7 +637,7 @@ interface FindingCase {
   others?: VMRef[];
   /** the source provider's kind, openstack when not given */
   source_kind?: ProviderKind;
-  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'> & Partial<Pick<Plan, 'mappings' | 'prestage_resources' | 'acknowledged_findings' | 'vm_ids' | 'waves'>>;
+  plan: Pick<Plan, 'handover' | 'port_creation_mode' | 'nic_overrides'> & Partial<Pick<Plan, 'mappings' | 'prestage_resources' | 'acknowledged_findings' | 'vm_ids' | 'waves'>> & { network_cutover?: Partial<Plan['network_cutover']> };
   /** a Heat or Octavia case's source provider label (SDD §1 naming, §9.3) */
   source_label?: string;
   /** a Heat or Octavia case's source reads, as its inventory reads them (SDD §10, plan task N2) */
@@ -802,7 +802,8 @@ describe('the mock words eligibility and the handover findings as the API (SDD �
   });
 
   it.each(ELIGIBILITY.finding_cases)('$why', (c) => {
-    const plan = { ...base, ...c.plan } as Plan;
+    // a case's network cut-over settings over the plan's own (SDD §4.2, plan task N9)
+    const plan = { ...base, ...c.plan, network_cutover: { ...base.network_cutover, ...c.plan.network_cutover } } as Plan;
     const selected = [c.vm, ...(c.others ?? [])];
     const dest = c.destination;
     const networks = Object.fromEntries((dest?.networks ?? []).map((n) => [n.name, n.mtu]));

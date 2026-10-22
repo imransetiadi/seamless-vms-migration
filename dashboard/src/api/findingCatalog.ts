@@ -75,6 +75,11 @@ export const FINDING_CATALOG: Readonly<Record<string, { severity: Finding['sever
     strategies: [],
     remediation: 'Move the membership as the runbook for Octavia load balancers says: drain the source member before the cutover, and add the migrated server to a pool at the destination once it is verified.',
   },
+  MAP_LB_POOL_INCOMPATIBLE: {
+    severity: 'warning',
+    strategies: [],
+    remediation: 'Map the source pool to a pool of a load balancer whose provider serves what the pool uses - an amphora one for HTTP, TLS termination or session persistence -, or accept that the clients reach the VM through an L4 pool after the cutover.',
+  },
   SRC_VM_LB_UNKNOWN: {
     severity: 'warning',
     strategies: [],

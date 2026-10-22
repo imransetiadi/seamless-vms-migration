@@ -66,11 +66,13 @@ class StackRead:
 @dataclass
 class PoolMember:
     """A member of an Octavia pool of the source (SDD §10): its load balancer and pool by their
-    names (else ids), its address as Neutron writes it, its protocol port, and its subnet's
-    network - None when the subnets cannot be read."""
+    names (else ids), the pool's id - what a plan's lb_pools maps (§8.5) -, its address as Neutron
+    writes it, its protocol port, and its subnet's network - None when the subnets cannot be
+    read."""
 
     load_balancer: str
     pool: str
+    pool_id: str
     address: str
     port: int
     network: str | None = None
@@ -84,6 +86,15 @@ class MemberRead:
     reason: Literal["forbidden", "error"] | None = None
     detail: str | None = None
     members: list[PoolMember] = field(default_factory=list)
+
+
+@dataclass
+class PoolPair:
+    """A mapped pair of Octavia pools as validation read it (SDD §8.5, §10 ``lb_pool``): the source
+    pool and the destination pool the plan maps it to; None for one the read could not see."""
+
+    source: dict[str, Any] | None = None
+    destination: dict[str, Any] | None = None
 
 
 @dataclass
@@ -279,6 +290,13 @@ CATALOG: dict[str, CatalogEntry] = {
         "Move the membership as the runbook for Octavia load balancers says: drain the source "
         "member before the cutover, and add the migrated server to a pool at the destination once "
         "it is verified.",
+    ),
+    "MAP_LB_POOL_INCOMPATIBLE": CatalogEntry(
+        Severity.warning,
+        (),
+        "Map the source pool to a pool of a load balancer whose provider serves what the pool "
+        "uses - an amphora one for HTTP, TLS termination or session persistence -, or accept "
+        "that the clients reach the VM through an L4 pool after the cutover.",
     ),
     "SRC_VM_LB_UNKNOWN": CatalogEntry(
         Severity.warning,
@@ -1613,6 +1631,7 @@ def run_preflight(
     dst_caps: Mapping[str, Any] | None = None,
     shares: Mapping[str, QuotaShare] | None = None,
     dns_ttl: int | None = None,
+    lb_pools: Mapping[str, PoolPair] | None = None,
 ) -> list[Finding]:
     """Evaluate the SDD §9.3 catalog for ``vm`` within ``plan``.
 
@@ -1621,7 +1640,8 @@ def run_preflight(
     without one (``quota_share``; the quota counts what a cutover will still create);
     ``source``/``destination`` enable the conversion-host check; ``dst_caps`` are the
     destination's capabilities as validation's check just reported them (its token's roles);
-    ``dns_ttl`` the TTL of the VM's DNS target's record as validation read it, None unread (§8.4).
+    ``dns_ttl`` the TTL of the VM's DNS target's record as validation read it, None unread (§8.4);
+    ``lb_pools`` each mapped pair of Octavia pools as validation read it, by source pool id (§8.5).
     """
     selected = list(all_vms) if all_vms is not None else [vm]
     out: list[Finding] = []
@@ -1696,7 +1716,8 @@ def run_preflight(
         )
 
     out.extend(_stack_findings(vm, plan, src_inv.stacks, source))
-    out.extend(_member_findings(vm, src_inv.lb_members, source))
+    out.extend(_member_findings(vm, plan, src_inv.lb_members, source))
+    out.extend(_lb_pool_findings(vm, plan, src_inv.lb_members, lb_pools))
 
     # a NIC its override sends to another network is checked by MAP_NIC_OVERRIDE_INVALID
     mapped_nics = [
@@ -2232,10 +2253,26 @@ def _stack_findings(
     return out
 
 
-def _member_findings(vm: VMRef, read: MemberRead, source: Provider | None) -> list[Finding]:
+def _memberships(vm: VMRef, read: MemberRead) -> list[PoolMember]:
+    """The VM's memberships of the source's Octavia pools (SDD §9.3): each member that is an
+    address of a NIC of the VM, on the NIC's network when the read names the member's."""
+    held: list[PoolMember] = []
+    for nic in vm.nics:
+        addresses = {_canonical_ip(a) for a in nic.fixed_ips}
+        held += [
+            m
+            for m in read.members
+            if _canonical_ip(m.address) in addresses and m.network in (None, nic.network)
+        ]
+    return held
+
+
+def _member_findings(
+    vm: VMRef, plan: Plan, read: MemberRead, source: Provider | None
+) -> list[Finding]:
     """SRC_VM_LB_MEMBER and SRC_VM_LB_UNKNOWN (SDD §9.3, plan task N2): each Octavia pool member at
     the source that is an address of the VM's NIC - on the NIC's network when the read names the
-    member's -, or why it is not known."""
+    member's -, or why it is not known; a member of a pool the plan maps is the helper's (§8.5)."""
     at = _source_label(source)
     if read.status == "unknown":
         return [
@@ -2245,15 +2282,13 @@ def _member_findings(vm: VMRef, read: MemberRead, source: Provider | None) -> li
                 f"known: {_unread('Octavia', read)}.",
             )
         ]
-    held: list[str] = []
-    for nic in vm.nics:
-        addresses = {_canonical_ip(a) for a in nic.fixed_ips}
-        for m in read.members:
-            if _canonical_ip(m.address) in addresses and m.network in (None, nic.network):
-                held.append(
-                    f"{_canonical_ip(m.address)} port {m.port} in pool {m.pool!r} of load "
-                    f"balancer {m.load_balancer!r}"
-                )
+    mapped = plan.network_cutover.lb_pools
+    held = [
+        f"{_canonical_ip(m.address)} port {m.port} in pool {m.pool!r} of load balancer "
+        f"{m.load_balancer!r}"
+        for m in _memberships(vm, read)
+        if m.pool_id not in mapped
+    ]
     if not held:
         return []
     return [
@@ -2263,6 +2298,41 @@ def _member_findings(vm: VMRef, read: MemberRead, source: Provider | None) -> li
             f"{'; '.join(dict.fromkeys(held))}. The memberships are not moved.",
         )
     ]
+
+
+def _lb_pool_findings(
+    vm: VMRef, plan: Plan, read: MemberRead, pairs: Mapping[str, PoolPair] | None
+) -> list[Finding]:
+    """MAP_LB_POOL_INCOMPATIBLE (SDD §9.3, §8.5, plan task N9): each membership of a pool the plan
+    maps whose destination pool's provider lacks what the source pool uses - OVN's L4 limits; a
+    pair either read could not see is not judged."""
+    # imported here: the helper imports the providers, which import this module
+    from ..lb_helper import lacks
+
+    out: list[Finding] = []
+    seen: set[str] = set()
+    for m in _memberships(vm, read):
+        pair = (pairs or {}).get(m.pool_id)
+        if m.pool_id not in plan.network_cutover.lb_pools or m.pool_id in seen or pair is None:
+            continue
+        seen.add(m.pool_id)
+        if pair.source is None or pair.destination is None:
+            continue
+        missing = lacks(pair.source, pair.destination)
+        if not missing:
+            continue
+        features = ", ".join(missing[:-1]) + (" and " if len(missing) > 1 else "") + missing[-1]
+        source_name = pair.source.get("name") or m.pool_id
+        pool = pair.destination.get("name") or pair.destination.get("id")
+        out.append(
+            finding(
+                "MAP_LB_POOL_INCOMPATIBLE",
+                f"{vm.name} is a member of source pool {source_name!r}, which the plan maps to "
+                f"pool {pool!r} of provider {pair.destination.get('provider')}: it serves TCP, "
+                f"UDP and SCTP alone, so the pool loses {features}.",
+            )
+        )
+    return out
 
 
 def _dns_domain(domain: str) -> str:

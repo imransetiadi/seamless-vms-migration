@@ -474,12 +474,21 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
                                       # in run order; a retry keeps them (§8.2, plan task N5)
             fip_moves: list[FipMove] = [],   # the journal of its floating IPs' keep-address move (§8.3, plan task N6)
             dns_swap: DnsSwap|null = null,   # the journal of its DNS target's swap (§8.4, plan task N7)
+            lb_moves: list[LbMove] = [],   # the journal of its Octavia memberships' move by the member helper (§8.5,
+                                      # plan task N9)
             created_at: datetime, updated_at: datetime }
 
 DnsSwap { name: str,                   # the record's fully qualified name: its target's record in its zone
           rdtype: "A"|"AAAA",          # by the old address's family
           old: str, new: str,          # the VM's address at the source and the one taking its place (§8.4)
           state: "swapping"|"swapped"|"unchanged"|"conflict"|"reverted" }   # §8.4
+
+LbMove { source_pool: str,             # the mapped source pool's id (a network_cutover.lb_pools key)
+         source_member: str,           # the VM's member there, by its id
+         address: str, port: int,      # that member's address - a fixed IP of the VM - and its protocol port
+         pool: str,                    # the destination pool the plan maps the source pool to
+         member: str|null,             # the destination member, by its id, once created
+         state: "draining"|"drained"|"joining"|"joined"|"restored" }   # §8.5
 
 FipMove { address: str,                # the floating IP's address, kept at the destination
           fixed_ip: str,               # the NIC's first address at the destination - its nic_overrides entry's,
@@ -2521,6 +2530,43 @@ never overwritten. Each swap is a `migration.action`, data `{"action": "dns", "n
 * The TSIG key reaches neither a log line, an event nor an error message; a DNS name and an address reach the operator
   in events and findings alone (§13.4).
 
+### 8.5 The Octavia member helper (plan task N9, §23.7)
+
+A plan that maps source Octavia pools (`network_cutover.lb_pools`, §4.2: a source pool's id to the id of a pool of a
+destination load balancer that the operator or a runbook created - never Seamless) moves each membership of a VM in a
+mapped pool: a member of the pool (§10: `pool_members`) whose address is one of the VM's fixed IPs. Each step is a
+`migration.action`, data `{"action": "lb_member", "pool", "address", "port", "step": "drain"|"join"|"restore",
+"outcome": "succeeded"|"failed", "detail"}`, `pool` the source pool's id. A VMware source has no Octavia pool.
+
+* **The drain**, in `cutover` at `pre_stop` (§8.2), before the point's hooks, while the source runs: each such member's
+  `LbMove` (§4.2) is saved as `draining`, its `admin_state_up` set to false (`set_pool_member`), and it is `drained`
+  once Octavia reads it `ACTIVE`: the load balancer sends it no new connection. A failure fails the attempt there, as a
+  `pre_stop` hook's does - the source keeps running -, and the members drained stay so: the journal names them, and a
+  rollback restores them (below).
+* **The join**, in `verifying` at `post_verify` (§8.2), after the verification passed and before the point's hooks:
+  each entry `drained`, saved as `joining`, gets a member in the destination pool (`add_pool_member`) - the address
+  that takes its address's place, the NIC's first address of its family at the destination (its `nic_overrides`
+  entry's, else its own: §8.4's rule), and the same protocol port; a member the pool already holds with that address
+  and port, a restart's, is taken. It is saved with the member's id and `joined` once Octavia reads it `ACTIVE`. A
+  failure fails the migration as a `post_verify` hook's does: the plan's `auto_rollback` decides.
+* **Octavia's pace.** A load balancer takes one change at a time and refuses another (409) while it is `PENDING_*`:
+  each change is sent again every 2 s, and its member read every 2 s until `ACTIVE`, for at most 60 s each; `ERROR`,
+  or the bound, fails the step.
+* **The restore**, in `rolling_back` after the floating IP return (§8.3) and before the hook reverts (§8.2): each entry
+  not `restored` has its destination member deleted (`delete_pool_member`; one gone is no error) and its source
+  member's `admin_state_up` set to true again (`restored`). A failure is recorded and the rollback goes on - the
+  source must run again -, the journal naming the member to fix. A retry after a rollback drains a `restored` entry
+  anew; one a failed attempt left `drained` or `joined` is not drained again, and joins (or stays joined) as it is.
+* **A finalize** leaves the drained source member: the source's load balancer is the operator's.
+* **A restart** resumes each step from the journal; each call is idempotent.
+* **Validation** reads each mapped pair once - the source pool and the destination pool (`lb_pool`, §10) - for
+  `MAP_LB_POOL_INCOMPATIBLE` (§9.3), and `SRC_VM_LB_MEMBER` leaves out a membership of a mapped pool.
+* A pool's id or name, a member's address and Octavia's answers name customer resources: they reach the operator in
+  events and findings alone (§13.4). The helper's `migration.error` names the step `lb_member`; as a hook's, no similar
+  incident is looked up for it and nothing of it reaches Jev or agentmemory. TLS containers are never read: a
+  listener's TLS container references are neither followed nor kept, and no request reaches the key manager - the
+  destination pool's listener holds its own, which its operator chose (§23.7).
+
 ---
 
 ## 9. Planning
@@ -2665,8 +2711,9 @@ Finding catalog (code — severity — condition):
 | `SRC_VM_HEAT_STACK` | warning | the VM's server is a resource of a Heat stack of the source (`SourceInventory.stacks`, §10: a resource of the stack, or of a stack nested in it, has the server's id as its `physical_resource_id`): the stack is not moved, and a stack update at the source may recreate the server. The message names the top-level stack and its resource the server is, or is nested under |
 | `SRC_VM_AUTOSCALED` | blocker; **warning** when the plan acknowledges it (`plan.acknowledged_findings[vm.source_id]` lists it, §4.2) | the VM's server is a member of an autoscaling group: a resource it is nested under is of type `OS::Heat::AutoScalingGroup` or `AWS::AutoScaling::AutoScalingGroup`, the groups a scaling policy (`OS::Heat::ScalingPolicy`, `AWS::AutoScaling::ScalingPolicy`) resizes on an alarm's signal, without a stack update - so the source may replace a server the cutover stopped, which leaves two live copies (owner decision 9, §23.8). An `OS::Heat::ResourceGroup` changes its size only by a stack update, which `SRC_VM_HEAT_STACK` warns of: its member is not autoscaled. The message names the group, its type and the stack; acknowledged, it adds that the plan acknowledges it, and its remediation is to keep the group's scaling suspended until the VM is finalized |
 | `SRC_VM_HEAT_UNKNOWN` | warning | an OpenStack source's Heat stacks could not be read (`SourceInventory.stacks` is `unknown`, §10: Heat refused the credential, or another failure, which the message names by its HTTP status or its kind): whether the VM belongs to a stack or an autoscaling group is not known. Nothing is guessed, and the VM is not blocked; a source whose catalog has no Heat has no stack and reads `ok` |
-| `SRC_VM_LB_MEMBER` | warning | an address of the VM's NIC is a member of an Octavia pool of the source (`SourceInventory.lb_members`, §10: a member whose address is one of the NIC's fixed IPs, on the NIC's network when the read names the member's): the membership is not moved, so the load balancer keeps sending to the stopped source. The message names each membership - the address and port, the pool and its load balancer |
+| `SRC_VM_LB_MEMBER` | warning | an address of the VM's NIC is a member of an Octavia pool of the source (`SourceInventory.lb_members`, §10: a member whose address is one of the NIC's fixed IPs, on the NIC's network when the read names the member's): the membership is not moved, so the load balancer keeps sending to the stopped source. The message names each membership - the address and port, the pool and its load balancer -; a membership of a pool the plan maps (`network_cutover.lb_pools`, by `PoolMember.pool_id`) is left out: the member helper moves it (§8.5, plan task N9) |
 | `SRC_VM_LB_UNKNOWN` | warning | an OpenStack source's Octavia pools could not be read (`SourceInventory.lb_members` is `unknown`, as for `SRC_VM_HEAT_UNKNOWN`): whether an address of the VM is a pool member is not known; a source whose catalog has no Octavia has no member and reads `ok` |
+| `MAP_LB_POOL_INCOMPATIBLE` | warning | the plan maps a source pool the VM is a member of (`network_cutover.lb_pools`; a membership as `SRC_VM_LB_MEMBER` reads it) to a destination pool whose load balancer's provider lacks what the source pool uses (§8.5, §10: `lb_pool`, read once per pair by validation): the OVN provider serves TCP, UDP and SCTP pools with the SOURCE_IP_PORT algorithm, TCP, UDP-CONNECT or SCTP monitors and no session persistence, so a source pool with another protocol, algorithm, monitor or persistence, or a listener of another protocol (HTTP, HTTPS, TERMINATED_HTTPS - TLS terminated at the load balancer -, PROMETHEUS), loses it there. The message names the source pool, the destination pool, its provider and each feature. Another provider, and a pool either read cannot see, is not judged (plan task N9) |
 | `SRC_PORT_ADDRESS_PAIRS` | warning | a NIC of an OpenStack VM has `allowed_address_pairs` (`Nic.allowed_address_pairs`, §4.2: a keepalived VIP, say): the import creates the destination port without them (owner decision 11), so an address the VM takes over from a peer is not reachable there. The message names each NIC by its MAC and network, with its pairs' addresses |
 | `MAP_NETWORK_MISSING` | blocker | a NIC network has no mapping and no same-named destination network, and `"networks"` is not in `plan.prestage_resources` (when it is — and the source is OpenStack; VMware sources have no pre-stage step — emit `MAP_NETWORK_PRESTAGED` — info — instead: the network will be created with the same name); also when a mapping's *target* network does not exist in the destination |
 | `MAP_FLAVOR_PRESTAGED` | info | `"flavors"` is in `plan.prestage_resources`, the source is OpenStack, the VM has no GPU (§22.4: pre-staging never creates a GPU VM's flavor), and the VM's flavor has no mapping and no same-named destination flavor: pre-staging creates it in RHOSO with the same name, size and extra specs, so nothing is matched automatically (`resolved_mappings` stays empty for it, and neither `MAP_FLAVOR_MISSING` nor `MAP_FLAVOR_AUTO` is emitted) |
@@ -2915,6 +2962,24 @@ class DestinationProvider(Protocol):
         # the project's floating IP of the address associated with the port; one already there is no error
     async def release_floating_ip(self, address: str) -> None
         # the project's floating IP of the address deleted - its allocation released; none is no error
+
+# an OpenStack provider, source or destination, reads and changes Octavia pools for the member helper (§8.5, plan
+# task N9) - raw requests, none logged (§13.4), each read under one read's bound; a failure, or a change Octavia
+# refuses (409 while the load balancer is PENDING_*), names its HTTP status or its kind alone:
+    async def lb_pool(self, pool_id: str) -> dict[str, Any] | None
+        # the pool as MAP_LB_POOL_INCOMPATIBLE compares it: {id, name, protocol, lb_algorithm, persistence: str|null
+        # (its session persistence's type), monitor: str|null (its health monitor's type), listeners: [protocol, ...],
+        # provider: str|null (its load balancer's)}; None when the credential sees no such pool. A listener's TLS
+        # container references are neither followed nor kept: no request reaches the key manager (§8.5)
+    async def pool_members(self, pool_id: str) -> list[dict[str, Any]]
+        # [{id, address (as Neutron writes it), protocol_port, admin_state_up, provisioning_status}]; [] when the
+        # credential sees no such pool - a mapped source pool gone has no membership to move
+    async def set_pool_member(self, pool_id: str, member_id: str, admin_state_up: bool) -> None
+    async def add_pool_member(self, pool_id: str, address: str, protocol_port: int) -> str
+        # the new member's id; on the subnet of the credential's that holds the address, without a subnet when none
+        # does (Octavia then reaches it from the load balancer's VIP subnet)
+    async def delete_pool_member(self, pool_id: str, member_id: str) -> None
+        # one gone is no error
 ```
 
 `SourceInventory {networks: dict[str, int|None] (name→mtu), projects: list[str], keypairs: list[str] (the names of
@@ -3038,6 +3103,7 @@ StackPlace { stack: str,                        # the top-level stack's name
 MemberRead { status, reason, detail,            # as StackRead's, for Octavia
              members: list[PoolMember] }
 PoolMember { load_balancer: str, pool: str,     # their names, else their ids
+             pool_id: str,                      # the pool's id: what network_cutover.lb_pools maps (§8.5)
              address: str,                      # the member's address, as Neutron writes it
              port: int,                         # its protocol port
              network: str|null }                # the network of its subnet - the load balancer's VIP subnet when it
@@ -5853,6 +5919,7 @@ Not in 0.4.0:
   * After the verification passed, the migrated VM joins the destination pool (`post_verify`).
   * A rollback removes it there and re-enables the source member.
   * TLS containers are mapped by reference, never read.
+  * §8.5 is the helper's contract, `MAP_LB_POOL_INCOMPATIBLE` (§9.3) the providers' finding (plan task N9).
 * **Providers.** The OVN provider is L4 only (`SOURCE_IP_PORT`, TCP and UDP-CONNECT monitors; its driver documentation).
   A finding warns when the destination pool's provider lacks what the source pool uses.
 
@@ -5933,7 +6000,7 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | the floating IP keep-address move: the blocker, the reservation, the journaled move, the return and the release (N6a); os-migrate's `auto` reporting whether it reused or created an address (N6b) | §4.2, §7.2, §8.3, §9.3, §10 (binding) | N6 |
 | the DNS swap: Designate and RFC 2136, the compare-and-swap, the revert, the TTL warning | §4.2, §8.4, §9.3, §10, §13.3 (binding) | N7 |
 | the reachability wait: a moved floating IP's check, bounded by the verification's `timeout_s`, inside the downtime | §5.2, §7.5, §14.2 (binding) | N8 |
-| the Octavia member helper | §7, §10 | N9 |
+| the Octavia member helper: the drain, the join, the restore, the provider finding | §4.2, §8.5, §9.3, §10 (binding) | N9 |
 | the hooks' time in the downtime estimate, and the TTL tail | §9.1 | N10 |
 | the demo's floating IPs, DNS zone, load balancer and stack | §7.4, §10 | N11 |
 | the dashboard (§23.9) | §16 | N12 |
