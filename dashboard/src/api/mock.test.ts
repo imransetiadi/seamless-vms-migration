@@ -13,7 +13,7 @@ import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { poolLabel } from '../lib/gpu';
 import { createMockFetch, MockServer, PLAN_EDITABLE_FIELDS, PROVIDER_EDITABLE } from './mock';
-import { HELD_VOLUMES_REASON } from './mockData';
+import { HELD_VOLUMES_REASON, sourceReads } from './mockData';
 import { summaryOf } from '../lib/summary';
 import { streamEvents } from './stream';
 import {
@@ -75,10 +75,12 @@ async function secondApprover(server: MockServer, migrationId: string): Promise<
   await admin.post(`/migrations/${migrationId}/approve`, { comment: 'Second approver: findings and window checked' });
 }
 
-function freeVms(server: MockServer, providerId: string, count: number): VMRef[] {
+function freeVms(server: MockServer, providerId: string, count: number, { unblocked = false } = {}): VMRef[] {
   const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories[providerId] ?? [];
   const taken = new Set(server.migrations.map((m) => m.vm.source_id));
-  const free = inventory.filter((v) => !taken.has(v.source_id)).slice(0, count);
+  // `unblocked`: no autoscaling group's member, which blocks a validation until a plan acknowledges it (SDD §16)
+  const grouped = unblocked ? sourceReads(providerId, inventory).stacks.servers : {};
+  const free = inventory.filter((v) => !taken.has(v.source_id) && !grouped[v.source_id]?.group).slice(0, count);
   if (free.length < count) throw new Error(`fixtures have fewer than ${count} free VMs on ${providerId}`);
   return free;
 }
@@ -1141,6 +1143,7 @@ describe('mock API', () => {
     expect(JSON.stringify(plan)).toBe(before);
     // the API's PLAN_EDITABLE_FIELDS, field for field
     expect([...PLAN_EDITABLE_FIELDS].sort()).toEqual([
+      'acknowledged_findings',
       'auto_cutover',
       'convergence_threshold_bytes',
       'cutover_window',
@@ -3145,6 +3148,37 @@ describe('mock plans: nic_overrides (SDD §4.2, §12)', () => {
   });
 });
 
+describe('mock plans: acknowledged_findings (SDD §4.2, §9.3, §12, plan task N2)', () => {
+  it('stores what a plan acknowledges and refuses any code but SRC_VM_AUTOSCALED with the API\'s message', async () => {
+    const { client } = setup('operator');
+    const body = { name: 'acks', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [] };
+    const created = await client.post<Plan>('/plans', body);
+    expect(created.acknowledged_findings).toEqual({});
+    const patched = await client.patch<Plan>(`/plans/${created.id}`, { acknowledged_findings: { 'vm-1': ['SRC_VM_AUTOSCALED'] } });
+    expect(patched.acknowledged_findings).toEqual({ 'vm-1': ['SRC_VM_AUTOSCALED'] });
+    await expect(client.post('/plans', { ...body, acknowledged_findings: { 'vm-1': ['SRC_VM_HEAT_STACK', 'SRC_VM_AUTOSCALED', 'NOPE'] } })).rejects.toMatchObject({
+      status: 422,
+      message: 'acknowledged_findings[vm-1]: SRC_VM_HEAT_STACK, NOPE cannot be acknowledged (only SRC_VM_AUTOSCALED can)',
+    });
+    await expect(client.patch(`/plans/${created.id}`, { acknowledged_findings: { 'vm-2': ['MAP_NETWORK_MISSING'] } })).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("finds the demo source's Heat stack, autoscaling group and Octavia pool, and the seeded plan's acknowledgement, as the API words them (SDD §16)", () => {
+    const { server } = setup('operator');
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    expect(plan.acknowledged_findings).toEqual({ 'os-0b32': ['SRC_VM_AUTOSCALED'] });
+    const broker = server.migrations.find((m) => m.plan_id === plan.id && m.vm.source_id === 'os-0b32')!;
+    const byCode = new Map(broker.findings.map((f) => [f.code, f]));
+    expect(byCode.get('SRC_VM_HEAT_STACK')?.message).toBe(
+      "mq-broker-02 belongs to Heat stack 'example-mq' at RHOSP 17.1 — DC1 (its resource 'broker_group'): the stack is not moved, and a stack update there may recreate the server.",
+    );
+    expect(byCode.get('SRC_VM_AUTOSCALED')).toMatchObject({ severity: 'warning' });
+    expect(byCode.get('SRC_VM_AUTOSCALED')?.message).toMatch(/autoscaling group 'broker_group' \(OS::Heat::AutoScalingGroup\).*The plan acknowledges it \(acknowledged_findings\)\.$/);
+    expect(byCode.get('SRC_VM_LB_MEMBER')?.message).toMatch(/port 5672 in pool 'example-mq-pool' of load balancer 'example-mq-lb'/);
+    expect(broker.findings.filter((f) => f.severity === 'blocker')).toEqual([]);
+  });
+});
+
 describe('providers of community destinations, like the API (SDD §4.2, §10, §10.1, §12; plan T8)', () => {
   const call = (server: MockServer, method: string, path: string, body?: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
   const keysOf = (o: object) => Object.keys(o).sort();
@@ -3750,7 +3784,7 @@ describe('mock retry and validation follow the plan, like the API (SDD §5.4, §
 
   it('a VM added after the waves were planned gets its wave from the next planning and validation, and the plan starts (review RV39-03)', async () => {
     const { server, client } = setup('operator');
-    const [a, b, c] = freeVms(server, 'rhosp17-dc1', 3).map((v) => v.source_id);
+    const [a, b, c] = freeVms(server, 'rhosp17-dc1', 3, { unblocked: true }).map((v) => v.source_id);
     const plan = await client.post<Plan>('/plans', { name: 'Grows', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [a, b] });
     await client.post(`/plans/${plan.id}/validate`);
     await client.patch(`/plans/${plan.id}`, { vm_ids: [a, b, c] });

@@ -1486,6 +1486,111 @@ function nicOverrideFindings(
   return [['MAP_NIC_OVERRIDE', `NIC override(s): ${applied.join('; ')}.`]];
 }
 
+/** Where a server is in the source's Heat stacks, as the API's StackPlace (SDD §10, plan task N2). */
+export interface StackPlace {
+  stack: string;
+  resource: string;
+  group: string | null;
+  group_type: string | null;
+}
+
+/** The source's Heat stacks by the servers they hold, as the API's StackRead (SDD §10, plan task N2). */
+export interface StackRead {
+  status: 'ok' | 'unknown';
+  reason: 'forbidden' | 'error' | null;
+  detail: string | null;
+  servers: Record<string, StackPlace>;
+}
+
+/** A member of an Octavia pool of the source, as the API's PoolMember (SDD §10, plan task N2). */
+export interface PoolMember {
+  load_balancer: string;
+  pool: string;
+  address: string;
+  port: number;
+  network: string | null;
+}
+
+/** The members of the source's Octavia pools, as the API's MemberRead (SDD §10, plan task N2). */
+export interface MemberRead {
+  status: 'ok' | 'unknown';
+  reason: 'forbidden' | 'error' | null;
+  detail: string | null;
+  members: PoolMember[];
+}
+
+/**
+ * The demo source's Heat and Octavia reads (SDD §16, plan task N2): on RHOSP 17.1 — DC1 one stack, example-mq, whose
+ * autoscaling group holds mq-broker-01 and mq-broker-02, and one pool of a load balancer, example-mq-pool of
+ * example-mq-lb, whose members are their addresses on AMQP's port; every other source reads both ok and empty.
+ */
+export function sourceReads(providerId: string, vms: readonly VMRef[]): { stacks: StackRead; lbMembers: MemberRead } {
+  const stacks: StackRead = { status: 'ok', reason: null, detail: null, servers: {} };
+  const lbMembers: MemberRead = { status: 'ok', reason: null, detail: null, members: [] };
+  if (providerId !== 'rhosp17-dc1') return { stacks, lbMembers };
+  for (const vm of vms.filter((v) => MQ_BROKERS.includes(v.source_id))) {
+    stacks.servers[vm.source_id] = { stack: 'example-mq', resource: 'broker_group', group: 'broker_group', group_type: 'OS::Heat::AutoScalingGroup' };
+    for (const nic of vm.nics)
+      for (const address of nic.fixed_ips) lbMembers.members.push({ load_balancer: 'example-mq-lb', pool: 'example-mq-pool', address, port: 5672, network: nic.network });
+  }
+  return { stacks, lbMembers };
+}
+
+/** The demo's message brokers, members of the example-mq stack's autoscaling group (SDD §16). */
+const MQ_BROKERS = ['os-0b31', 'os-0b32'];
+
+/** SRC_VM_AUTOSCALED's remediation once the plan acknowledges it, as the API's (SDD §9.3, owner decision 9). */
+const AUTOSCALED_ACKNOWLEDGED_REMEDIATION =
+  "Keep the group's scaling suspended at the source until the VM is finalized, as the runbook for Heat stacks says: a server the group creates meanwhile is a second live copy.";
+
+/** Why a read of the source's Heat or Octavia is unknown, as the API's _unread: by its HTTP status or kind (SDD §10). */
+function unread(service: string, read: StackRead | MemberRead): string {
+  if (read.reason === 'forbidden') return `${service} refused the source credential (${read.detail || 'HTTP 403'})`;
+  return `its read failed (${read.detail || 'no answer'})`;
+}
+
+/**
+ * SRC_VM_HEAT_STACK, SRC_VM_AUTOSCALED and SRC_VM_HEAT_UNKNOWN, as the API's _stack_findings (SDD §9.3, plan task N2): an
+ * autoscaling group's member blocks until the plan acknowledges it, then warns that it does.
+ */
+function stackFindings(vm: VMRef, plan: Plan, stacks: StackRead, at: string): Array<[string, string, { severity?: Severity; remediation?: string }?]> {
+  if (stacks.status === 'unknown')
+    return [['SRC_VM_HEAT_UNKNOWN', `Whether ${vm.name} belongs to a Heat stack or an autoscaling group at ${at} is not known: ${unread('Heat', stacks)}.`]];
+  const place = stacks.servers[vm.source_id];
+  if (!place) return [];
+  const out: Array<[string, string, { severity?: Severity; remediation?: string }?]> = [
+    [
+      'SRC_VM_HEAT_STACK',
+      `${vm.name} belongs to Heat stack ${pyRepr(place.stack)} at ${at} (its resource ${pyRepr(place.resource)}): the stack is not moved, and a stack update there may recreate the server.`,
+    ],
+  ];
+  if (place.group !== null) {
+    const text = `${vm.name} is a member of autoscaling group ${pyRepr(place.group)} (${place.group_type}) of Heat stack ${pyRepr(place.stack)} at ${at}: the group may replace the server once the cutover stops it, which leaves two live copies.`;
+    if ((plan.acknowledged_findings?.[vm.source_id] ?? []).includes('SRC_VM_AUTOSCALED'))
+      out.push(['SRC_VM_AUTOSCALED', `${text} The plan acknowledges it (acknowledged_findings).`, { severity: 'warning', remediation: AUTOSCALED_ACKNOWLEDGED_REMEDIATION }]);
+    else out.push(['SRC_VM_AUTOSCALED', text]);
+  }
+  return out;
+}
+
+/**
+ * SRC_VM_LB_MEMBER and SRC_VM_LB_UNKNOWN, as the API's _member_findings (SDD §9.3, plan task N2): each pool member that is
+ * an address of the VM's NIC - on the NIC's network when the read names the member's -, NIC by NIC, each named once.
+ */
+function memberFindings(vm: VMRef, read: MemberRead, at: string): Array<[string, string]> {
+  if (read.status === 'unknown')
+    return [['SRC_VM_LB_UNKNOWN', `Whether addresses of ${vm.name} are members of Octavia pools at ${at} is not known: ${unread('Octavia', read)}.`]];
+  const held: string[] = [];
+  for (const nic of vm.nics) {
+    const addresses = new Set(nic.fixed_ips.map(canonicalIp));
+    for (const m of read.members)
+      if (addresses.has(canonicalIp(m.address)) && (m.network === null || m.network === nic.network))
+        held.push(`${canonicalIp(m.address)} port ${m.port} in pool ${pyRepr(m.pool)} of load balancer ${pyRepr(m.load_balancer)}`);
+  }
+  if (!held.length) return [];
+  return [['SRC_VM_LB_MEMBER', `Addresses of ${vm.name} are members of Octavia pools at ${at}: ${[...new Set(held)].join('; ')}. The memberships are not moved.`]];
+}
+
 /** SRC_VM_DUPLICATE_NAME's remediation for two VMware VMs the migration kit names alike, as the API's (SDD §9.3). */
 const KIT_TWIN_REMEDIATION =
   'Rename one of the VMs in vCenter: the migration kit names a VM\'s server, ports and volumes after its name as it writes it, so the two would share them - in separate plans too, when they go to one destination project.';
@@ -1516,6 +1621,11 @@ export function preflight(
     shares?: Readonly<Record<string, QuotaShare>>;
     /** The source provider's declared vGPU profiles by flavor, which make a CUSTOM_ class a vGPU (SDD §22.2, §22.3). */
     gpuProfiles?: Record<string, string>;
+    /** The source provider's label, which a message about the source names (SDD §1 naming, §9.3). */
+    source?: string;
+    /** The source's Heat stacks and Octavia pool members as its inventory reads them; ok and empty when not given (SDD §10). */
+    stacks?: StackRead;
+    lbMembers?: MemberRead;
   } = {},
 ): Finding[] {
   const findings: Finding[] = [];
@@ -1560,6 +1670,10 @@ export function preflight(
   // the boot disk: the first bootable disk, else the first, as the API's VMRef.root_disk
   const root = vm.disks.find((d) => d.bootable) ?? vm.disks[0];
   if (root && (root.kind === 'image_root' || root.kind === 'ephemeral')) add('SRC_VM_EPHEMERAL_ROOT', `The root disk is ${root.kind.replaceAll('_', ' ')}.`);
+  // the VM's place in the source's Heat stacks and its Octavia memberships, as the API's (SDD §9.3, §10, plan task N2)
+  const at = context.source ?? 'the source';
+  if (context.stacks) for (const [code, message, own] of stackFindings(vm, plan, context.stacks, at)) add(code, message, own);
+  if (context.lbMembers) for (const [code, message] of memberFindings(vm, context.lbMembers, at)) add(code, message);
   // a network RHOSO lacks, as the API words it and lists it - before the networks it resolves (SDD §9.3, review RV25-03):
   // a NIC its override sends elsewhere is checked by
   // MAP_NIC_OVERRIDE_INVALID; pre-staging creates same-named networks for OpenStack sources only - the VMware kit has
@@ -1767,6 +1881,7 @@ export function defaultPlanFields(now: number) {
     prestage_resources: ['networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules'],
     port_creation_mode: 'nova' as const,
     nic_overrides: {} as Plan['nic_overrides'],
+    acknowledged_findings: {} as Plan['acknowledged_findings'],
     waves: [],
     // what the API derives from the migrations (SDD §8.1); the mock sets it on every response
     derived_status: 'draft' as const,
@@ -1839,6 +1954,8 @@ const PLAN_SPECS: PlanSpec[] = [
       mappings: { networks: { 'tenant-infra': 'tenant-infra' }, flavors: { 'g1.a10': 'm1.large' }, volume_types: { 'tripleo-ceph': 'ceph-hdd', 'tripleo-ceph-ssd': 'ceph-ssd' }, projects: {} },
       // PRD G1: warm cutovers within 15 minutes.
       downtime_slo_s: 900,
+      // the broker's autoscaling group is suspended at the source: the plan acknowledges its member (SDD §16, plan task N2)
+      acknowledged_findings: { 'os-0b32': ['SRC_VM_AUTOSCALED'] },
     },
     waves: [
       { id: 'wave-1', name: 'Pilot — stateless web', vms: ['os-0a11', 'os-0a12', 'os-0a13'], max_parallel: 3 },
@@ -2284,6 +2401,9 @@ export function buildFixtures(now: number): Fixtures {
       const findings = preflight(vm, source.kind, plan, dstInventory.networks, {
         selected,
         destination: providerLabel(destination),
+        // the source by its label, and its Heat and Octavia reads (SDD §9.3, §10, §16, plan task N2)
+        source: providerLabel(source),
+        ...sourceReads(source.id, vms),
         ...flavorContext(dstInventory, destination.gpu_profiles, iso(now)),
         shares,
         gpuProfiles: source.gpu_profiles,

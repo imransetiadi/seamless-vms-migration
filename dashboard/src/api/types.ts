@@ -448,6 +448,11 @@ export interface Plan {
   port_creation_mode: PortCreationMode;
   /** Per VM (source id), per NIC MAC (lower case): its RHOSO network and addresses; OpenStack sources (SDD §4.2). */
   nic_overrides: Record<string, Record<string, NicOverride>>;
+  /**
+   * Per VM (source id): the pre-flight codes the plan acknowledges for it - SRC_VM_AUTOSCALED alone, else 422; an
+   * acknowledged blocker stays a finding, a warning that says so (SDD §4.2, §9.3, plan task N2).
+   */
+  acknowledged_findings: Record<string, string[]>;
   waves: Wave[];
   status: PlanStatus;
   /** Read-only: from the plan and its migrations (SDD §8.1); every view shows it, never `status`. */
