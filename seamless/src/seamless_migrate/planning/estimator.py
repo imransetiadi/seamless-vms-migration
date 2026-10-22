@@ -169,10 +169,20 @@ def first_pass_seconds(vm: VMRef, strategy: Strategy, params: EstimatorParams) -
     raise ValueError(f"{strategy} has no pre-copy passes")
 
 
-def estimate(vm: VMRef, strategy: Strategy, params: EstimatorParams, slo_s: float) -> Estimate:
+def estimate(
+    vm: VMRef,
+    strategy: Strategy,
+    params: EstimatorParams,
+    slo_s: float,
+    *,
+    hooks_s: float = 0.0,
+    dns_tail_s: float | None = None,
+) -> Estimate:
     """Estimate pre-copy time, passes and downtime for ``vm`` under ``strategy``.
 
-    The result is always ``eligible=True``; eligibility is decided by the selector.
+    ``hooks_s`` is the plan's post_create hooks' time, a part of the downtime; ``dns_tail_s`` the
+    VM's DNS record's TTL, apart from it (SDD §9.1, plan task N10). The result is always
+    ``eligible=True``; eligibility is decided by the selector.
     """
     strategy = Strategy(strategy)
     p = params
@@ -215,7 +225,7 @@ def estimate(vm: VMRef, strategy: Strategy, params: EstimatorParams, slo_s: floa
         copy_s, conversion_s = final_delta / link, p.v2v_inplace_s
     else:  # pragma: no cover - exhaustive over the enum
         raise ValueError(f"unknown strategy {strategy}")
-    parts = _parts(p, copy_s, conversion_s)
+    parts = _parts(p, copy_s, conversion_s, hooks_s)
     downtime = sum(parts.values())
 
     return Estimate(
@@ -229,30 +239,48 @@ def estimate(vm: VMRef, strategy: Strategy, params: EstimatorParams, slo_s: floa
         final_delta_bytes=int(final_delta),
         meets_slo=downtime <= slo_s,
         downtime_parts=parts,
+        dns_tail_s=dns_tail_s,
     )
 
 
-def _parts(p: EstimatorParams, copy_s: float, conversion_s: float) -> dict[str, float]:
-    """The downtime's parts, shown by the Downtime panel (SDD §4, §9.1, ADV-16)."""
-    return {
+def _parts(
+    p: EstimatorParams, copy_s: float, conversion_s: float, hooks_s: float = 0.0
+) -> dict[str, float]:
+    """The downtime's parts, shown by the Downtime panel (SDD §4, §9.1, ADV-16): the post_create
+    hooks' part only when the plan runs some (plan task N10)."""
+    parts = {
         "shutdown_s": p.shutdown_s,
         "copy_s": copy_s,
         "conversion_s": conversion_s,
         "create_s": p.create_s,
         "boot_s": p.boot_s,
     }
+    if hooks_s > 0:
+        parts["hooks_s"] = hooks_s
+    return parts
+
+
+def hooks_part(estimate: Estimate | None) -> float:
+    """The post_create hooks' part of an estimate - what every later figure of its migration takes
+    (SDD §9.1, plan task N10); 0 without one."""
+    return estimate.downtime_parts.get("hooks_s", 0.0) if estimate is not None else 0.0
 
 
 def final_downtime_parts(
-    vm: VMRef, strategy: Strategy, last_pass_s: float, params: EstimatorParams
+    vm: VMRef,
+    strategy: Strategy,
+    last_pass_s: float,
+    params: EstimatorParams,
+    hooks_s: float = 0.0,
 ) -> dict[str, float]:
-    """The parts of the downtime if cut over now, after a pass of ``last_pass_s`` (SDD §5.3)."""
+    """The parts of the downtime if cut over now, after a pass of ``last_pass_s``, the post_create
+    hooks' ``hooks_s`` among them (SDD §5.3, §9.1)."""
     rate = vm.change_rate_bps if vm.change_rate_bps is not None else params.change_rate_bps
     delta = min(float(vm.disk_bytes), rate * max(0.0, last_pass_s))
     p = params
     if Strategy(strategy) == Strategy.vmware_warm:
-        return _parts(p, delta / p.link_bps, p.v2v_inplace_s)
-    return _parts(p, p.snapshot_s + max(scan_seconds(vm, p), delta / p.link_bps), 0.0)
+        return _parts(p, delta / p.link_bps, p.v2v_inplace_s, hooks_s)
+    return _parts(p, p.snapshot_s + max(scan_seconds(vm, p), delta / p.link_bps), 0.0, hooks_s)
 
 
 def whole_pass_seconds(sync_pass: SyncPass, strategy: Strategy, params: EstimatorParams) -> float:
@@ -266,20 +294,30 @@ def whole_pass_seconds(sync_pass: SyncPass, strategy: Strategy, params: Estimato
 
 
 def estimate_final_downtime(
-    vm: VMRef, strategy: Strategy, last_pass_s: float, params: EstimatorParams
+    vm: VMRef,
+    strategy: Strategy,
+    last_pass_s: float,
+    params: EstimatorParams,
+    hooks_s: float = 0.0,
 ) -> float:
-    """Downtime if cut over now, given the duration of the last completed pass (SDD §5.3)."""
-    return sum(final_downtime_parts(vm, strategy, last_pass_s, params).values())
+    """Downtime if cut over now, given the duration of the last completed pass, the post_create
+    hooks' ``hooks_s`` included (SDD §5.3, §9.1)."""
+    return sum(final_downtime_parts(vm, strategy, last_pass_s, params, hooks_s).values())
 
 
 def estimate_forced_downtime(
-    vm: VMRef, strategy: Strategy, last_pass_s: float | None, params: EstimatorParams
+    vm: VMRef,
+    strategy: Strategy,
+    last_pass_s: float | None,
+    params: EstimatorParams,
+    hooks_s: float = 0.0,
 ) -> float:
     """The downtime a Force cutover expects (SDD §5.4): after a pass as long as the last one that
-    ended, or - before any pass ended (``None``) - after the running first pass."""
+    ended, or - before any pass ended (``None``) - after the running first pass; the post_create
+    hooks' ``hooks_s`` included (§9.1)."""
     if last_pass_s is None:
         last_pass_s = first_pass_seconds(vm, strategy, params)
-    return estimate_final_downtime(vm, strategy, last_pass_s, params)
+    return estimate_final_downtime(vm, strategy, last_pass_s, params, hooks_s)
 
 
 # -- calibration (SDD §9.1 "Configuration and calibration") ----------------------------------
