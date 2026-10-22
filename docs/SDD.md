@@ -317,6 +317,8 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
                                         # acknowledges for it, each an acknowledgeable one - SRC_VM_AUTOSCALED alone
                                         # (§9.3) -, else refused (422, §12); an acknowledged blocker stays a finding,
                                         # a warning that says so (owner decision 9, §23.8, plan task N2)
+       network_cutover: NetworkCutover = {},   # the hooks it runs per point, the floating IP move, DNS targets and
+                                        # Octavia pool mappings (§23.3–§23.7, plan task N3); each run by its plan task
        prestage_resources: list[str] = ["networks","subnets","routers","router_interfaces",
                                         "security_groups","security_group_rules"],   # each names os-migrate resources with an
                                         # export_<r>.yml/import_<r>.yml pair other than workloads (the
@@ -332,6 +334,32 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
        created_at: datetime, updated_at: datetime }
 
 DerivedPlanStatus = draft | validated | running | paused | completed | finalized | failed | cancelled
+
+HookPoint = pre_stop | post_create | post_verify | on_rollback | on_finalize   # where a migration runs a plan's hooks (§23.3)
+
+NetworkCutover { hooks: dict[HookPoint, list[str]] = {},   # per point, the names of catalog hooks in their run order,
+                                        # each once per point; a name the catalog lacks is refused (422, §12)
+                 floating_ips: "auto"|"keep_address" = "auto",   # "keep_address": the move that keeps a floating IP's
+                                        # address (§23.4, owner decision 4); "auto": os-migrate's (§23.1)
+                 dns_targets: dict[str, DnsTarget] = {},   # per VM (source id): the record its new address goes to (§23.5)
+                 lb_pools: dict[str, str] = {} }   # a source Octavia pool (its id) to a destination pool (its id): the
+                                        # member helper's mapping (§23.7); each 1-255 characters
+
+DnsTarget { kind: "designate"|"rfc2136",
+            zone: str, record: str,     # 1-255 characters each: the zone (as "example.com.") and the record's name in it
+            server: str|null = null,    # rfc2136: the server, "host" or "host:port" (required); designate: none - it is
+                                        # reached with the destination provider's credential (owner decision 6)
+            tsig_secret: str|null = null }   # rfc2136: the secret (§13.3) holding its TSIG key (required); designate: none
+
+Hook { name: str (regex ^[a-z0-9][a-z0-9-]{1,62}$),   # the catalog's key, which a plan names (§23.3)
+       kind: "playbook"|"webhook", description: str|null = null,
+       playbook: str|null = null,   # playbook: the playbook's absolute path, a .yml or .yaml file (required); else none
+       url: str|null = null,        # webhook: an https:// URL without user information (required); else none
+       secret: str|null = null,     # webhook: the secret (§13.3) whose key `token` is its bearer token (required); else
+                                    # none; never a provider-* name nor a secret a provider names (§13.3)
+       timeout_s: int = 300,        # 1-1800 (§23.3)
+       revert: str|null = null,     # the hook a rollback runs to undo this one: another hook of the catalog
+       created_at: datetime, updated_at: datetime }   # server-owned
 
 SyncPass { number: int (1-based), kind: SyncPassKind, started_at: datetime,
            ended_at: datetime|null, bytes_scanned: int = 0, bytes_changed: int = 0,
@@ -483,11 +511,12 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `migration.source_stopped`, `plan.finalized` (§8.1), `plan.cancelled` (§12), `migration.gpu_wait` (§5.4, §22.7),
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
-`provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
-`auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
+`provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`, `hook.created`,
+`hook.updated`, `hook.deleted` (§23.3), `auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
-never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. `plan.cancelled`
+never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. The `hook.*` events carry the hook's
+`name` and `kind`, and `hook.updated` the fields it set (`fields`) - never a URL or a secret's name. `plan.cancelled`
 carries the reason given and how many migrations it cancelled. `migration.gpu_wait` carries `{"waiting", "pool",
 "needed", "free"}` - the pool, units needed and units free of a `GpuWait` (§4.2) - written with the migration's change in
 one transaction once when its cutover begins to wait for GPU capacity (`waiting` true) and once when a read finds room
@@ -2014,7 +2043,8 @@ is journaled as *sent* with the new server's id as soon as Nova accepts it: a cr
 it resumes by waiting for that server instead of creating a second one on the same volumes (one Nova no longer
 knows is created again), and the rollback deletes a sent destination server before it unmanages the volumes it
 holds. A recreated source server has a new id, and the plan follows it — `vm_ids`, the waves'
-`vm_ids`, `strategy_overrides`, `probe_overrides`, `nic_overrides` and `acknowledged_findings` (event `plan.updated`, data `{"vm_id_changed": {"from",
+`vm_ids`, `strategy_overrides`, `probe_overrides`, `nic_overrides`, `acknowledged_findings` and
+`network_cutover.dns_targets` (event `plan.updated`, data `{"vm_id_changed": {"from",
 "to"}}`) — in one transaction with the migration's new `vm` (§11), before the migration becomes `rolled_back`: a stop
 before it leaves both naming the old VM and resumes `rolling_back`, after it both name the new one, so a validation
 meanwhile never plans a second migration of the VM (audit OC-06), and a rolled-back migration's plan never names a VM
@@ -2972,7 +3002,7 @@ that does not own the tables start the control plane — the application role of
 `events` is insert-only — once the owner role created or upgraded the schema.
 
 Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `advisor_snapshot` (§14.5),
-`advisor_policy` (§14.6), `user` (§13.1).
+`advisor_policy` (§14.6), `user` (§13.1), `hook` (§23.3, its id its name).
 
 `Store` API: `put(kind, model, expected_version=None)` (optimistic concurrency; raises
 `ConflictError`; a versioned write is one statement — an `INSERT` for `expected_version=0`, where a document that
@@ -3115,9 +3145,14 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
+| GET | `/hooks` | viewer | — | `Hook[]` by name (§23.3) |
+| POST | `/hooks` | admin | `Hook` (`created_at`, `updated_at` ignored; a field `Hook` does not have: 422) | `201 Hook`; 409 when the name exists; 422 when its kind's fields are missing or another kind's are set, a webhook's URL is not `https://` or holds user information, its secret's name is no name §13.3 reads, a `provider-*` name or one a provider names (`credentials_secret`, `conversion_host.ssh_key_secret`) - a webhook would send that credential to its URL -, or `revert` names the hook itself or no hook of the catalog. Event `hook.created` |
+| GET | `/hooks/{name}` | viewer | — | `Hook` |
+| PATCH | `/hooks/{name}` | admin | any of `description`, `playbook`, `url`, `secret`, `timeout_s`, `revert` (`name`, `kind` and the server-owned fields are immutable: 422); the merged hook is checked as `POST /hooks` checks one | `Hook`; event `hook.updated` with the fields set |
+| DELETE | `/hooks/{name}` | admin | — | `204`; 409 while a plan other than a `cancelled` one names it at a point (`network_cutover.hooks`) - a completed plan may still roll back or finalize -, or another hook names it as its `revert`, each named. The check and the deletion hold the lock a plan's creation and edit check their hooks under. Event `hook.deleted` |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
-| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, an `acknowledged_findings` entry that names a code the pre-flight does not take as acknowledged (`SRC_VM_AUTOSCALED` alone, §9.3), and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them; a field `PlanCreate` does not have — a misspelt one too — is refused with 422, never dropped) | `201 Plan` |
+| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, an `acknowledged_findings` entry that names a code the pre-flight does not take as acknowledged (`SRC_VM_AUTOSCALED` alone, §9.3), a `network_cutover` whose point names a hook twice or a hook the catalog lacks (checked under the lock of `DELETE /hooks/{name}`, which a plan's creation and edit take as they take `DELETE /providers/{id}`'s - it is the same lock), or whose DNS target lacks what its kind needs or has what it does not take (§4.2), and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them; a field `PlanCreate` does not have — a misspelt one too — is refused with 422, never dropped) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
 | PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry — except its providers: a changed `source_provider_id` or `destination_provider_id` is refused (409) while a migration of the plan is `failed`, since its rollback acts on the clouds its attempt used (on the cold path it finds the destination server by the migration's record; a name serves only a migration cut over before records existed, after the stop, §7.2) — roll it back or cancel it first; the 409 names each such VM with what releases it — roll back or retry a `failed` one whose source is stopped, finish, roll back or cancel one in flight, finalize or roll back a `completed` one (§8.1); resets status to `draft`); setting `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}`, 1–1000 (422 outside); in `draft`, `validated` or `paused` (409 otherwise, and while a migration of the plan is in flight, as for `PATCH`: the plan returns to `draft`, which the tick does not drive) | `Plan` |
@@ -5696,7 +5731,7 @@ Each with the default the owner approved on 2026-10-21 (D18):
 |---|---|---|
 | PRD: FR-28's scope, goal and journey, and §3's non-goals as delivered | PRD (done) | N1 |
 | the findings of §23.8: the Heat and Octavia ones, the source's reads and `Plan.acknowledged_findings` (N2a); the network ones, `Nic`'s pairs, floating IPs and DNS names, the destination's floating IPs and DNS, `Provider.announces_tenant_networks` (N2b) | §4.2, §9.3, §10, §12 (binding) | N2 |
-| the hook catalog, the plan's network cut-over settings, the routes | §4.2, §12 | N3 |
+| the hook catalog, the plan's network cut-over settings, the routes | §4.2, §4.3, §11, §12 (binding) | N3 |
 | the hook runner: kinds, timeouts, the idempotency key, the context document | §7.2, §13 | N4 |
 | hook points in the cutover, verification, rollback and finalize of every strategy, resumed after a restart | §5, §7, §8 | N5 |
 | the floating IP keep-address move | §7.2, §7.3, §8 | N6 |
