@@ -371,7 +371,8 @@ Finding { code: str, severity: Severity, message: str, remediation: str|null,
 Estimate { strategy: Strategy, eligible: bool, reasons: list[str] = [], precopy_s: float,
            passes: int, downtime_s: float, total_s: float, final_delta_bytes: int,
            meets_slo: bool,
-           downtime_parts: dict[str, float] = {} }   # shutdown_s, copy_s (final sync or full copy), conversion_s, create_s, boot_s: they add up to downtime_s (§9.1, ADV-16)
+           downtime_parts: dict[str, float] = {},   # shutdown_s, copy_s (final sync or full copy), conversion_s, create_s, boot_s, and hooks_s when the plan runs post_create hooks (§9.1, plan task N10): they add up to downtime_s (§9.1, ADV-16)
+           dns_tail_s: float|null = null }   # the VM's DNS record's TTL, apart from the downtime: after the swap, clients may reach the old address for up to that long (§8.4, §9.1, plan task N10)
 
 ForceCutover { actor: str, at: datetime, reason: str, delta_bytes: int, estimated_downtime_s: float }   # §5.4
 
@@ -701,7 +702,7 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
 After each pass, the migration moves to `awaiting_cutover` when **any** of these holds:
 `last_pass.bytes_changed <= plan.convergence_threshold_bytes`, or
 `estimate_final_downtime(last pass) <= plan.downtime_slo_s` (after a pass as long as the last one's whole time, §9.1
-`T_last`), or `passes >= plan.max_sync_passes`.
+`T_last`, its `post_create` hooks' part included, §9.1), or `passes >= plan.max_sync_passes`.
 Otherwise another delta pass runs. The rule that moved the migration is recorded in `Migration.converged_by`
 (`threshold`, `slo`, `max_passes`, or `force` for a Force cutover, §5.4), and its estimate becomes the one that rule
 used — the final-downtime estimate with its parts (a final pass does not recalibrate it), so the Downtime panel compares
@@ -2637,6 +2638,17 @@ raise the calibrated `S` but never lower it (review RV38A-02). A pass that laste
 whatever the model's scan at the migration's current `S` says: the `S` it reads replaces it, lower too (review
 RV39-01). `migration.estimate` is recomputed with
 the calibrated values, so `downtime_s` converges on reality before the cutover is approved.
+
+**Hooks and the DNS tail** (plan task N10, §23.3, §23.5). A plan's `post_create` hooks run inside the downtime (§8.2):
+every estimate's downtime gets the part `hooks_s`, the sum of their `timeout_s` - their worst case, as nothing measured
+them yet -, which `downtime_s`, `total_s` and `meets_slo` count; the part is left out when the plan runs none.
+`pre_stop` runs before the stop and `post_verify` after the verification passed, so neither counts. Validation reads
+the timeouts from the hook catalog; every later figure of the migration takes the part from its estimate - a
+re-estimate after a pass, the SLO rule's final downtime and the estimate it records (§5.3), a Force cutover's figure
+(§5.4) and the dashboard's port of it - so they hold together whatever the catalog says later. The VM's DNS record
+(§8.4) is no downtime: validation's read of its TTL (§9.3 `NET_DNS_TTL_LONG`) gives `Estimate.dns_tail_s`, shown apart -
+in neither `downtime_s`, `total_s` nor `meets_slo` -, null without a DNS target or a record read; a re-estimate keeps
+it.
 
 Worked example (defaults, S = 500 MiB/s, L = 125 MiB/s, c = 2 MiB/s): a 200 GiB single-disk VM
 has `scan = 409.6 s` and a warm downtime of ≈ 60 + 30 + 409.6 + 60 + 120 ≈ 680 s (11.3 min); the
@@ -6001,7 +6013,7 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | the DNS swap: Designate and RFC 2136, the compare-and-swap, the revert, the TTL warning | §4.2, §8.4, §9.3, §10, §13.3 (binding) | N7 |
 | the reachability wait: a moved floating IP's check, bounded by the verification's `timeout_s`, inside the downtime | §5.2, §7.5, §14.2 (binding) | N8 |
 | the Octavia member helper: the drain, the join, the restore, the provider finding | §4.2, §8.5, §9.3, §10 (binding) | N9 |
-| the hooks' time in the downtime estimate, and the TTL tail | §9.1 | N10 |
+| the hooks' time in the downtime estimate (`hooks_s`), and the DNS TTL tail apart (`Estimate.dns_tail_s`) | §4.2, §5.3, §9.1 (binding) | N10 |
 | the demo's floating IPs, DNS zone, load balancer and stack | §7.4, §10 | N11 |
 | the dashboard (§23.9) | §16 | N12 |
 | QASuite (requirement rows, LAB-NET cases), Security.md, Operations.md's runbooks | QASuite, Security.md, Operations.md | N13 |
