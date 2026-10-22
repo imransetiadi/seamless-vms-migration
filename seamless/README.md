@@ -79,7 +79,7 @@ replacement and revocation currently need a database administrator (see Security
 
 ## Container image
 
-Built from the repository root (it installs this package with the `openstack,vmware,jev`
+Built from the repository root (it installs this package with the `openstack,vmware,jev,dns`
 extras, `ansible-core`, the collection, `os_migrate.vmware_migration_kit`, Node 22 for `npx`,
 and copies `dashboard/dist` when the build context has it, else builds one with its own Node 22). It runs as UID 1001 with data in `/var/lib/seamless`.
 

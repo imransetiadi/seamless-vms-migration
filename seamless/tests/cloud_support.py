@@ -54,8 +54,10 @@ class InProcessCloud:
     it answers with its headers. ``heat`` and ``octavia`` give Heat's and Octavia's answers by path
     below their endpoints (``/stacks``, ``/v2.0/lbaas/pools``: ``(status, body)``, or an exception
     the transport raises) and put them in the catalog, as ``designate`` gives Designate's
-    (``/v2/zones``, plan task N2b); ``heat_seen``, ``octavia_seen`` and ``designate_seen`` record
-    each request's path and query. ``networks``, ``subnets`` and ``keypairs`` are what Neutron's and
+    (``/v2/zones``, plan task N2b) - a request other than a GET answered by its method and path
+    (``PUT /v2/zones/z-1/recordsets/rs-1``, plan task N7); ``heat_seen``, ``octavia_seen`` and
+    ``designate_seen`` record each GET's path and query, ``written`` each other request's method,
+    path and JSON body. ``networks``, ``subnets`` and ``keypairs`` are what Neutron's and
     Nova's lists answer, as a source's inventory reads them; ``floatingips`` (filtered by the
     query's ``project_id`` and ``port_id``, as Neutron filters them) and ``extensions`` what
     Neutron's answer, and Cinder's volume types none, as a destination's reads them (plan task
@@ -81,6 +83,7 @@ class InProcessCloud:
     octavia_seen: list[tuple[str, dict[str, list[str]]]] = field(default_factory=list)
     designate: dict[str, Any] | None = None
     designate_seen: list[tuple[str, dict[str, list[str]]]] = field(default_factory=list)
+    written: list[tuple[str, str, Any]] = field(default_factory=list)
     networks: list[dict[str, Any]] = field(default_factory=list)
     subnets: list[dict[str, Any]] = field(default_factory=list)
     keypairs: list[dict[str, Any]] = field(default_factory=list)
@@ -294,7 +297,11 @@ class InProcessCloud:
             if answers is None or not url.startswith(root + "/"):
                 continue
             path = url[len(root) :]
-            seen.append((path, urllib.parse.parse_qs(parts.query)))
+            if request.method == "GET":
+                seen.append((path, urllib.parse.parse_qs(parts.query)))
+            else:
+                self.written.append((request.method, path, json.loads(request.body or "null")))
+                path = f"{request.method} {path}"
             answer = answers.get(path, (404, {"error": "none"}))
             if isinstance(answer, BaseException):
                 return answer

@@ -715,6 +715,15 @@ class OpenStackProvider:
     async def release_floating_ip(self, address: str) -> None:
         await self._run(self._release_floating_ip, address)
 
+    # the DNS swap's Designate calls (SDD §8.4, §10, plan task N7)
+    async def dns_recordset(self, zone: str, name: str, rdtype: str) -> dict[str, Any] | None:
+        return await self._run(self._dns_recordset, zone, name, rdtype)
+
+    async def update_dns_recordset(
+        self, zone_id: str, recordset_id: str, records: list[str]
+    ) -> None:
+        await self._run(self._update_dns_recordset, zone_id, recordset_id, records)
+
     # -- implementation (runs in worker threads) ----------------------------------------------
     def _check(self) -> dict[str, Any]:
         conn = self._connection()
@@ -1317,6 +1326,50 @@ class OpenStackProvider:
         fip = self._project_fip(conn, address)
         if fip is not None:
             conn.network.delete_ip(fip, ignore_missing=True)
+
+    def _dns_recordset(self, zone: str, name: str, rdtype: str) -> dict[str, Any] | None:
+        """Designate's recordset of the name and type in the zone the credential sees by that
+        name (SDD §8.4, §10): raw GETs under one read's bound, none logged - they name the zone and
+        the record (§13.4) -, a failure named by its HTTP status or its kind alone."""
+        get = _BudgetedGet(self._connection().dns)
+        try:
+            zones = get.get("/zones", {"name": zone}).get("zones") or []
+            if not zones:
+                return None
+            zone_id = str(zones[0]["id"])
+            found = get.get(f"/zones/{zone_id}/recordsets", {"name": name, "type": rdtype})
+        except Exception as exc:
+            raise ProviderError(f"{self.provider.id}: Designate: {_read_failure(exc)[1]}") from None
+        recordsets = found.get("recordsets") or []
+        if not recordsets:
+            return None
+        recordset = recordsets[0]
+        ttl = recordset.get("ttl")
+        return {
+            "zone_id": zone_id,
+            "id": str(recordset["id"]),
+            "records": [str(r) for r in recordset.get("records") or []],
+            # a recordset without its own TTL has its zone's
+            "ttl": ttl if ttl is not None else zones[0].get("ttl"),
+            "status": recordset.get("status"),
+        }
+
+    def _update_dns_recordset(self, zone_id: str, recordset_id: str, records: list[str]) -> None:
+        """The recordset's records replaced, its TTL kept (SDD §8.4, §10): a raw PUT, not logged;
+        a refusal named by its HTTP status alone."""
+        dns = self._connection().dns
+        try:
+            response = dns.put(
+                f"/zones/{zone_id}/recordsets/{recordset_id}",
+                json={"records": records},
+                raise_exc=False,
+                log=False,
+            )
+        except Exception as exc:
+            raise ProviderError(f"{self.provider.id}: Designate: {type(exc).__name__}") from None
+        status = int(response.status_code)
+        if status not in (200, 202):
+            raise ProviderError(f"{self.provider.id}: Designate refused the update: HTTP {status}")
 
     def _server_of_address(self, address: str) -> str | None:
         # a compute port's device only: a floating IP's own port names the floating IP, a

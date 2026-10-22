@@ -425,6 +425,12 @@ CATALOG: dict[str, CatalogEntry] = {
         "with a role that may choose a floating IP's address, and the quota for them - or let the "
         'plan take new addresses (network_cutover.floating_ips "auto").',
     ),
+    "NET_DNS_TTL_LONG": CatalogEntry(
+        Severity.warning,
+        (),
+        "Lower the record's TTL below the plan's downtime SLO well before the window - a pre_stop "
+        "hook may do it - or accept that clients keep the old address until the TTL runs out.",
+    ),
     "MAP_FIP_ADDRESS_CHANGE": CatalogEntry(
         Severity.warning,
         (S.cold, S.warm),
@@ -1606,6 +1612,7 @@ def run_preflight(
     destination: Provider | None = None,
     dst_caps: Mapping[str, Any] | None = None,
     shares: Mapping[str, QuotaShare] | None = None,
+    dns_ttl: int | None = None,
 ) -> list[Finding]:
     """Evaluate the SDD §9.3 catalog for ``vm`` within ``plan``.
 
@@ -1613,7 +1620,8 @@ def run_preflight(
     ``shares`` what a cutover of each one will still create, by source id - all of it for a VM
     without one (``quota_share``; the quota counts what a cutover will still create);
     ``source``/``destination`` enable the conversion-host check; ``dst_caps`` are the
-    destination's capabilities as validation's check just reported them (its token's roles).
+    destination's capabilities as validation's check just reported them (its token's roles);
+    ``dns_ttl`` the TTL of the VM's DNS target's record as validation read it, None unread (§8.4).
     """
     selected = list(all_vms) if all_vms is not None else [vm]
     out: list[Finding] = []
@@ -2150,6 +2158,19 @@ def run_preflight(
     missing = _app_probe_missing(vm, plan)
     if missing is not None:
         out.append(missing)
+    target = plan.network_cutover.dns_targets.get(vm.source_id)
+    if target is not None and dns_ttl is not None and dns_ttl > plan.downtime_slo_s:
+        # imported here: dns_swap imports the providers, which import this module
+        from ..dns_swap import record_name
+
+        out.append(
+            finding(
+                "NET_DNS_TTL_LONG",
+                f"The DNS record {record_name(target)} holds a TTL of {dns_ttl} s, longer than "
+                f"the plan's downtime SLO of {plan.downtime_slo_s} s: after the swap, clients may "
+                f"reach the old address for up to {dns_ttl} s.",
+            )
+        )
     return out
 
 

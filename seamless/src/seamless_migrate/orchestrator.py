@@ -44,6 +44,15 @@ from .ai.recommendations import LEGACY_PREFIX
 from .ai.redaction import redact, redact_cut
 from .ai.snapshots import created_event, decision_event, store_snapshot
 from .config import Settings
+from .dns_swap import (
+    DnsSwapError,
+    backend_for,
+    describe,
+    rdtype_for,
+    record_name,
+    record_ttls,
+    swap_addresses,
+)
 from .domain import fsm
 from .domain.enums import (
     SINGLE_SHOT_STRATEGIES,
@@ -66,6 +75,7 @@ from .domain.models import (
     AdvisorSubject,
     Approval,
     Decision,
+    DnsSwap,
     Estimate,
     Event,
     EvidenceItem,
@@ -1152,6 +1162,8 @@ class Orchestrator:
         items: list[ValidationItem] = []
         # a memory outage is met once per validation: the search is not repeated for every VM
         memory_up = True
+        # the TTL of each DNS target's record, for NET_DNS_TTL_LONG (SDD §8.4, §9.3)
+        ttls = await record_ttls(plan, vms, dst_impl, self.settings)
         for vm in vms:
             current = existing.get(vm.source_id)
             detached: list[Finding] = []
@@ -1178,6 +1190,7 @@ class Orchestrator:
                 dst_caps=dst_caps,
                 # the quota counts what a cutover will still create (SDD §9.3, review PL-02)
                 shares=shares,
+                dns_ttl=ttls.get(vm.source_id),
             )
             findings = [*findings, *detached]
             resolved = resolve_mappings(vm, plan, dst_inv)
@@ -4120,6 +4133,11 @@ class Orchestrator:
         if moved is not None:
             await self._fail(m.id, P.verifying, "floating_ips", moved)
             return
+        # SDD §8.4: then the DNS record, before the post_create hooks
+        swapped = await self._swap_dns(m)
+        if swapped is not None:
+            await self._fail(m.id, P.verifying, "dns", swapped)
+            return
         # SDD §8.2: post_create before the verification - the server exists, the clock is open
         failed = await self._run_hooks(m, "post_create")
         if failed is not None:
@@ -4234,7 +4252,12 @@ class Orchestrator:
         self.wake()
 
     async def _do_rollback(self, m: Migration) -> None:
-        # SDD §8.3: the floating IPs go back first; a failure leaves the source stopped
+        # SDD §8.4: the DNS record goes back first; a failure leaves the source stopped
+        reverted = await self._revert_dns(m)
+        if reverted is not None:
+            await self._fail(m.id, P.rolling_back, "dns", reverted)
+            return
+        # SDD §8.3: then the floating IPs; a failure leaves the source stopped
         returned = await self._return_floating_ips(m)
         if returned is not None:
             await self._fail(m.id, P.rolling_back, "floating_ips", returned)
@@ -4527,6 +4550,122 @@ class Orchestrator:
             m.fip_moves[i] = entry.model_copy(update={"state": "finalized"})
             await self._fip_action(m, entry.address, "release")
 
+    async def _dns_action(
+        self, m: Migration, name: str, step: str, outcome: str, detail: str | None = None
+    ) -> None:
+        """A DNS swap's migration.action (SDD §8.4); its detail redacted."""
+        await self._emit(
+            "migration.action",
+            f"{m.vm.name}: DNS record {name}: {step} {outcome}",
+            migration=m,
+            actor="orchestrator",
+            data={
+                "action": "dns",
+                "name": name,
+                "step": step,
+                "outcome": outcome,
+                "detail": None if detail is None else redact_cut(detail, 500),
+            },
+        )
+
+    async def _save_swap(self, mid: str, swap: DnsSwap) -> DnsSwap:
+        """Save the migration's DnsSwap (SDD §4.2, §8.4); the swap as saved."""
+        async with self._lock(mid):
+            cur, v = await self._load(mid)
+            cur.dns_swap = swap
+            await self._save(cur, v)
+        return swap
+
+    async def _swap_dns(self, m: Migration) -> BaseException | None:
+        """SDD §8.4: the VM's DNS record moves from its address at the source to the one taking
+        its place, by a compare-and-swap - saved as swapping before the first request, so a
+        restart resumes the same swap; one swapped, unchanged or in conflict is not made again, one
+        reverted is made anew. The failure, None otherwise."""
+        plan = await self._plan(m.plan_id)
+        target = plan.network_cutover.dns_targets.get(m.vm.source_id)
+        if target is None:
+            return None
+        cur = await self.db.get("migration", m.id, Migration)
+        swap = cur.dns_swap
+        if swap is not None and swap.state not in ("swapping", "reverted"):
+            return None
+        destination = await self.db.get("provider", plan.destination_provider_id, Provider)
+        dst = self.providers.get(destination)
+        name = record_name(target)
+        try:
+            if swap is None or swap.state == "reverted":
+                server = None
+                if any(nic.floating_ips for nic in cur.vm.nics):
+                    server = await dst.get_server(str(cur.destination_server_id))
+                old, new = swap_addresses(cur, plan, server)
+                state = "unchanged" if old == new else "swapping"
+                swap = await self._save_swap(
+                    m.id, DnsSwap(name=name, rdtype=rdtype_for(old), old=old, new=new, state=state)
+                )
+                if state == "unchanged":
+                    await self._dns_action(m, name, "swap", "unchanged", f"the address stays {old}")
+                    return None
+            backend = backend_for(target, dst, self.settings)
+            outcome, held = await backend.replace(swap.name, swap.rdtype, swap.old, swap.new)
+        except Exception as exc:
+            # its text alone, never what a library may have put in it (SDD §8.4)
+            failure = DnsSwapError(describe(exc))
+            await self._dns_action(m, swap.name if swap else name, "swap", "failed", str(failure))
+            return failure
+        if outcome == "swapped":
+            await self._save_swap(m.id, swap.model_copy(update={"state": "swapped"}))
+            await self._dns_action(m, swap.name, "swap", "succeeded", f"{swap.old} to {swap.new}")
+        else:
+            await self._save_swap(m.id, swap.model_copy(update={"state": "conflict"}))
+            holds = ", ".join(held) or "no address"
+            await self._dns_action(
+                m, swap.name, "swap", "conflict", f"it holds {holds}, not {swap.old}: left as it is"
+            )
+        return None
+
+    async def _revert_dns(self, m: Migration) -> BaseException | None:
+        """SDD §8.4: before a rollback returns the floating IPs and starts the source, a swap
+        swapping or swapped goes back, new to old, by the same compare-and-swap: reverted, or a
+        conflict left as it is. The failure, None otherwise - a plan that dropped the VM's target
+        has nothing to revert with, which is recorded."""
+        cur = await self.db.get("migration", m.id, Migration)
+        swap = cur.dns_swap
+        if swap is None or swap.state not in ("swapping", "swapped"):
+            return None
+        plan = await self._plan(m.plan_id)
+        target = plan.network_cutover.dns_targets.get(m.vm.source_id)
+        if target is None:
+            await self._dns_action(
+                m,
+                swap.name,
+                "revert",
+                "failed",
+                f"the plan names no DNS target for the VM any more: the record may hold {swap.new}",
+            )
+            return None
+        destination = await self.db.get("provider", plan.destination_provider_id, Provider)
+        try:
+            backend = backend_for(target, self.providers.get(destination), self.settings)
+            outcome, held = await backend.replace(swap.name, swap.rdtype, swap.new, swap.old)
+        except Exception as exc:
+            failure = DnsSwapError(describe(exc))
+            await self._dns_action(m, swap.name, "revert", "failed", str(failure))
+            return failure
+        if outcome == "swapped":
+            await self._save_swap(m.id, swap.model_copy(update={"state": "reverted"}))
+            await self._dns_action(m, swap.name, "revert", "succeeded", f"{swap.new} to {swap.old}")
+        else:
+            await self._save_swap(m.id, swap.model_copy(update={"state": "conflict"}))
+            holds = ", ".join(held) or "no address"
+            await self._dns_action(
+                m,
+                swap.name,
+                "revert",
+                "conflict",
+                f"it holds {holds}, not {swap.new}: left as it is",
+            )
+        return None
+
     async def _owe_revert(self, mid: str, revert: str) -> None:
         """Add ``revert`` to what the migration's rollback owes (SDD §4.2, §8.2)."""
         async with self._lock(mid):
@@ -4591,8 +4730,8 @@ class Orchestrator:
         )
         if rollback:
             self._launch(mid)
-        # nothing of a hook reaches agentmemory (SDD §8.2, §13.4)
-        if self.knowledge is not None and not str(step).startswith("hook:"):
+        # nothing of a hook or a DNS swap reaches agentmemory (SDD §8.2, §8.4, §13.4)
+        if self.knowledge is not None and not str(step).startswith("hook:") and step != "dns":
             # SDD §8 (audit OC-04): a task of its own - the driver that runs this goes on to the
             # rollback at once, never waiting for agentmemory; a stop cancels it
             lookup = asyncio.create_task(

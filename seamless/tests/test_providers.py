@@ -4520,6 +4520,69 @@ async def test_a_destination_without_designate_or_the_extension_reads_no_zone(tm
         caplog.clear()
 
 
+async def test_a_destination_reads_and_updates_a_designate_recordset_unlogged(tmp_path, caplog):
+    """SDD §8.4, §10 (plan task N7): the recordset of a name and type in the zone the credential
+    sees by that name - one without its own TTL has its zone's -, None when the zone or the
+    recordset is absent; its records replaced by a PUT that sends them alone. No request is
+    logged, and a failure names its HTTP status alone - never the zone, the record or an
+    address."""
+    caplog.set_level(logging.DEBUG)
+    recordset = {
+        "id": "rs-1",
+        "name": "web-01.example.com.",
+        "type": "A",
+        "records": ["192.0.2.10"],
+        "ttl": None,
+        "status": "ACTIVE",
+    }
+    designate = {
+        "/v2/zones": (200, {"zones": [{"id": "z-1", "name": "example.com.", "ttl": 3600}]}),
+        "/v2/zones/z-1/recordsets": (200, {"recordsets": [recordset]}),
+        "PUT /v2/zones/z-1/recordsets/rs-1": (202, {**recordset, "status": "PENDING"}),
+    }
+    cloud, dst = destination_cloud(tmp_path, designate=designate)
+    assert await dst.dns_recordset("example.com.", "web-01.example.com.", "A") == {
+        "zone_id": "z-1",
+        "id": "rs-1",
+        "records": ["192.0.2.10"],
+        "ttl": 3600,
+        "status": "ACTIVE",
+    }
+    assert cloud.designate_seen == [
+        ("/v2/zones", {"name": ["example.com."]}),
+        ("/v2/zones/z-1/recordsets", {"name": ["web-01.example.com."], "type": ["A"]}),
+    ]
+    await dst.update_dns_recordset("z-1", "rs-1", ["198.51.100.20"])
+    assert cloud.written == [
+        ("PUT", "/v2/zones/z-1/recordsets/rs-1", {"records": ["198.51.100.20"]})
+    ]
+    own = {
+        **designate,
+        "/v2/zones/z-1/recordsets": (200, {"recordsets": [{**recordset, "ttl": 60}]}),
+    }
+    _, dst = destination_cloud(tmp_path / "own", designate=own)
+    assert (await dst.dns_recordset("example.com.", "web-01.example.com.", "A"))["ttl"] == 60
+    for absent in (
+        {"/v2/zones": (200, {"zones": []})},
+        {**designate, "/v2/zones/z-1/recordsets": (200, {"recordsets": []})},
+    ):
+        _, dst = destination_cloud(tmp_path / str(len(absent)), designate=absent)
+        assert await dst.dns_recordset("example.com.", "web-01.example.com.", "A") is None
+    failing = {
+        "/v2/zones": (503, {"message": "zone example.com. unavailable"}),
+        "PUT /v2/zones/z-1/recordsets/rs-1": (403, {"message": "web-01.example.com. is not yours"}),
+    }
+    _, dst = destination_cloud(tmp_path / "failing", designate=failing)
+    with pytest.raises(ProviderError) as read:
+        await dst.dns_recordset("example.com.", "web-01.example.com.", "A")
+    with pytest.raises(ProviderError) as refused:
+        await dst.update_dns_recordset("z-1", "rs-1", ["198.51.100.20"])
+    assert str(read.value) == "dst: Designate: HTTP 503"
+    assert str(refused.value) == "dst: Designate refused the update: HTTP 403"
+    for text in ("example.com", "192.0.2.10", "198.51.100.20"):
+        assert text not in caplog.text
+
+
 async def test_the_demo_fakes_give_the_network_findings_their_data():
     """SDD §10, §16 (plan task N2b): the demo source's web-01 has a floating IP and a DNS name under
     example.com., and ledger-db-01 a keepalived address; the demo destination holds no detached
