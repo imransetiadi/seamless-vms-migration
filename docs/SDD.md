@@ -3075,6 +3075,29 @@ migrates: `dc2-portal-02` stays unplanned, for the operator to plan warm (§7.4)
 declare the two vGPU flavors' profiles, `gpu_profiles` `{"g1.a100-4c": "A100-4C", "g1.a100-3-20c": "A100-3-20C"}`.
 No demo plan uses `hibiscus-dc3`; a new plan can (plan task T9).
 
+**The demo's network cut-over** (plan task N11, §23.9). Every rule of §23 runs in the demo:
+
+* **The source's stack and pools.** The demo's OpenStack source reads one Heat stack, `example-portal`, whose server
+  resource `portal_web` is `web-01` and whose autoscaling group `app_group` (`OS::Heat::AutoScalingGroup`) holds the
+  Tomcat servers `app-01` and `app-02` - VMs a new plan of the demo's clean VMs leaves out, so its validation finds no
+  blocker -, and two Octavia pools: `example-portal-pool` (its id too) of `example-portal-lb` - an HTTP
+  pool, `ROUND_ROBIN`, an HTTP monitor and listener -, whose members are the three web servers' addresses on port 80,
+  and `example-api-pool` of `example-api-lb`, whose member is `api-gw-01`'s address on port 8443. Its Octavia reads and
+  changes these members (§10), each change `ACTIVE` at once; a fake rebuilt takes them over, as its power states.
+* **The destination's pool and zone.** The demo destination's Octavia holds `example-portal-pool-rhoso` of
+  `example-portal-lb-rhoso` (the `amphora` provider), empty, and its Designate zone `internal.example.org.` holds an
+  `A` recordset of `ledger-web-01.internal.example.org.` with `ledger-web-01`'s source address, TTL 300; an update is
+  `ACTIVE` at once. Its external network takes any floating IP address (§8.3).
+* **The finance plan's settings.** `network_cutover`: `floating_ips` `keep_address`, so `web-01`'s `203.0.113.10`
+  is reserved at pre-staging and moves with its address (§8.3); a DNS target for `ledger-web-01` (`designate`, zone
+  `internal.example.org.`, record `ledger-web-01`), whose NIC override (`nic_overrides`) gives it `10.20.1.133` at the
+  destination, so the swap moves its record there (§8.4); and `lb_pools` `{"example-portal-pool":
+  "example-portal-pool-rhoso"}`, so the member helper drains each web server's member before its stop and joins its
+  address after the verification (§8.5). The plan acknowledges `app-01`'s and `app-02`'s `SRC_VM_AUTOSCALED`, so its
+  validation warns of them (owner decision 9), with `web-01`'s `SRC_VM_HEAT_STACK` and `api-gw-01`'s
+  `SRC_VM_LB_MEMBER` - the portal pool's members are the helper's. The plan runs no hook: the demo catalog holds
+  none, since a hook runs code with the control plane's reach (§23.9).
+
 **The fake destinations' GPUs** (plan task G9, §22.10). Each lists three GPU flavors, with the sizes of the
 dashboard's mock (§16): `g1.a100-4c` (8 vCPUs, 32 GiB, 200 GB; `resources:VGPU=1` and
 `trait:CUSTOM_NVIDIA_A100_4C=required`), `g1.a100-3-20c` (16 vCPUs, 64 GiB, 300 GB; one vGPU with
@@ -3138,8 +3161,9 @@ PoolMember { load_balancer: str, pool: str,     # their names, else their ids
   other failure - an HTTP error, a timeout, a connection - `unknown`, reason `error`. The first failure ends that
   read and keeps nothing of it, since a partial read would guess, and costs at most one request's timeout (60 s,
   below). Neither read fails the inventory, the validation or a pre-staging.
-* `VMwareProvider` and the demo's `FakeSourceProvider` read neither: their inventory holds both reads `ok` and empty
-  (the demo's stack and load balancer come with plan task N11).
+* `VMwareProvider` reads neither: its inventory holds both reads `ok` and empty. The demo's OpenStack
+  `FakeSourceProvider` reads its stack and pools (below, "The demo's network cut-over", plan task N11); its VMware one
+  reads neither.
 * **Data minimization** (as §22.12 for Placement): the names of a stack, a resource, a group, a pool and a load
   balancer, and a member's address, are customer data. The read keeps them for the finding that shows them to the
   operator (§9.3), logs neither them nor a failure's message text, and the advisor sends Jev finding codes and
@@ -3156,7 +3180,7 @@ PoolMember { load_balancer: str, pool: str,     # their names, else their ids
   list (`GET /v2/zones`, the credential's project's), each read once; a catalog without Designate has no zone ([]),
   and a Designate that refuses or fails is not judged (null), its failure logged by its kind alone.
 * The demo's fakes give a NIC these fields as their VMs declare them, and their destination's floating IPs and DNS
-  (plan task N11 adds the rest of §23.9's demo).
+  (§23.9's other demo pieces: "The demo's network cut-over", plan task N11).
 * **Data minimization:** a DNS name, a domain and an address are customer data; they reach the operator in a finding's
   message alone (§13.4), as the stack names above.
 
@@ -6014,7 +6038,7 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | the reachability wait: a moved floating IP's check, bounded by the verification's `timeout_s`, inside the downtime | §5.2, §7.5, §14.2 (binding) | N8 |
 | the Octavia member helper: the drain, the join, the restore, the provider finding | §4.2, §8.5, §9.3, §10 (binding) | N9 |
 | the hooks' time in the downtime estimate (`hooks_s`), and the DNS TTL tail apart (`Estimate.dns_tail_s`) | §4.2, §5.3, §9.1 (binding) | N10 |
-| the demo's floating IPs, DNS zone, load balancer and stack | §7.4, §10 | N11 |
+| the demo's floating IPs, DNS zone, load balancer and stack | §7.4, §10 (binding) | N11 |
 | the dashboard (§23.9) | §16 | N12 |
 | QASuite (requirement rows, LAB-NET cases), Security.md, Operations.md's runbooks | QASuite, Security.md, Operations.md | N13 |
 | the lab on two clouds; the Technology Preview label goes when its cases pass | QASuite §13 | N14 |
