@@ -623,3 +623,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   result. The rescue runs it before the source cleanup, so a source cleanup
   that fails no longer keeps it from running, and a failed transfer is
   reported and classified by its own failure, not the cleanup's.
+- ``import_workload_create_instance`` returns ``floating_ips``: what became of
+  each floating IP of the server - its source address, its fixed IP, the
+  outcome (``kept`` already on the port, ``attached`` a detached one of the
+  address, ``created`` a new one, ``skipped`` under ``floating_ip_mode: skip``)
+  and the address the destination's floating IP has, so an ``auto`` import
+  tells whether the address was kept or a new one taken. A re-run that
+  finishes a recorded server returns it too.

@@ -227,6 +227,19 @@ server_id:
   returned: On successful creation of migrated server on destination cloud.
   type: str
   sample: 059635b7-451f-4a64-978a-7c2e9e4c15ff
+floating_ips:
+  description:
+    - What became of each floating IP of the server (Seamless Migrate SDD 7.2).
+    - C(outcome) is C(kept) (already on the port), C(attached) (a detached floating IP of the
+      address), C(created) (a new one, with a new address) or C(skipped) (I(floating_ip_mode) skip).
+  returned: When the server was created or finished.
+  type: list
+  elements: dict
+  sample:
+    - address: 172.20.9.135
+      fixed_ip_address: 192.168.20.7
+      outcome: created
+      new_address: 172.20.9.200
 """
 
 from ansible.module_utils.basic import AnsibleModule
@@ -294,6 +307,7 @@ def run_module():
                     changed=False,
                     server_id=existing.id,
                     msg="Destination server %s was already created." % existing.id,
+                    floating_ips=getattr(ser_server, "floating_ip_report", []),
                 )
 
         on_create = _destination_recorder(warm_state_dir, source_id, server_name)
@@ -323,6 +337,8 @@ def run_module():
         result["changed"] = True
         result["server"] = dst_ser_server.data
         result["server_id"] = sdk_server.id
+        # what became of each floating IP (Seamless Migrate SDD 7.2, plan task N6b)
+        result["floating_ips"] = getattr(ser_server, "floating_ip_report", [])
 
     module.exit_json(**result)
 

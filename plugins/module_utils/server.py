@@ -169,9 +169,12 @@ class Server(osm_resource.Resource):
 
     def _create_floating_ips(self, conn, sdk_srv):
         floating_ip_mode = self.migration_params()["floating_ip_mode"]
+        # what became of each floating IP (Seamless Migrate SDD 7.2, plan task N6b)
+        self.floating_ip_report = []
         for fip_data in self.params()["floating_ips"]:
             fip = ServerFloatingIP.from_data(fip_data)
-            fip.create(conn, sdk_srv, floating_ip_mode)
+            sdk_fip = fip.create(conn, sdk_srv, floating_ip_mode)
+            self.floating_ip_report.append(fip.report(sdk_fip))
 
     def update_migration_params(self, params_dict):
         if "floating_ip_mode" in params_dict:
