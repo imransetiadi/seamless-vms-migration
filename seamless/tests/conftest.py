@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import os
-from collections.abc import Callable, Iterator
+import sys
+from collections.abc import AsyncIterator, Callable, Iterator
 
 import pytest
 import sqlalchemy as sa
 
 from seamless_migrate.store import Store
+from tests.leftover_tasks import cancel_leftovers
 
 PG_URL = os.environ.get("SEAMLESS_TEST_PG_URL")
 
@@ -19,6 +23,37 @@ STORE_BACKENDS = [
         marks=pytest.mark.skipif(not PG_URL, reason="SEAMLESS_TEST_PG_URL is not set"),
     ),
 ]
+
+
+#: how long the tasks an async test leaves get to end once cancelled before the test fails naming
+#: them (tests/leftover_tasks.py, QASuite §14)
+LEFTOVER_GRACE_S = 30.0
+LEFTOVERS = "_no_task_outlives_its_test"
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Each async test gets LEFTOVERS as its first fixture: torn down last, right before its event
+    loop closes, it cancels what the test left as the close does - and names a task that does not
+    end instead of hanging the run."""
+    for item in items:
+        test = getattr(item, "obj", None)
+        names = getattr(item, "fixturenames", None)
+        if inspect.iscoroutinefunction(test) and names is not None and LEFTOVERS not in names:
+            names.insert(0, LEFTOVERS)
+
+
+@pytest.fixture
+async def _no_task_outlives_its_test(request: pytest.FixtureRequest) -> AsyncIterator[None]:
+    yield
+    this = asyncio.current_task()
+    report = await cancel_leftovers(
+        (task for task in asyncio.all_tasks() if task is not this), LEFTOVER_GRACE_S
+    )
+    if report:
+        report = f"{request.node.nodeid}: {report}"
+        # now, into the job's log: the loop's close still waits for those tasks afterwards
+        print(report, file=sys.stderr, flush=True)
+        pytest.fail(report, pytrace=False)
 
 
 def _make_store(backend: str, tmp_path) -> Store:
