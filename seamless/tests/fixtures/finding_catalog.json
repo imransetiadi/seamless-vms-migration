@@ -305,6 +305,11 @@
    "severity": "warning",
    "strategies": [],
    "remediation": "Put the VMs of each announced network into one wave, or have the network's prefix routed by hand while its waves are cut over."
+  },
+  "DST_FIP_ADDRESS_UNAVAILABLE": {
+   "severity": "blocker",
+   "strategies": [],
+   "remediation": "Keep only addresses the destination can hold: an address of a subnet of its external network, free there or held detached by the destination credential's project, a token with a role that may choose a floating IP's address, and the quota for them - or let the plan take new addresses (network_cutover.floating_ips \"auto\")."
   }
  }
 }

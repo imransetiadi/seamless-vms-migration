@@ -1328,6 +1328,17 @@ class PhaseChange(_Model):
     _storable = field_validator("reason", mode="before")(_storable_text_field)
 
 
+class FipMove(_Model):
+    """One floating IP of a migration's keep-address move (SDD §4.2, §8.3): its address, the NIC's
+    first address at the destination whose port receives it, the source port it was on - saved
+    before the disassociate -, and how far the move went."""
+
+    address: str
+    fixed_ip: str
+    source_port: str | None = None
+    state: Literal["releasing", "released", "moved", "returned", "finalized"] = "releasing"
+
+
 class Migration(_Model):
     id: str = Field(default_factory=new_migration_id)
     plan_id: str
@@ -1398,6 +1409,8 @@ class Migration(_Model):
     #: the reverts a rollback owes: the revert of each hook that ran with success at pre_stop,
     #: post_create or post_verify since the last rollback, in run order (SDD §4.2, §8.2)
     hook_reverts: list[str] = Field(default_factory=list)
+    #: the journal of its floating IPs' keep-address move (SDD §4.2, §8.3)
+    fip_moves: list[FipMove] = Field(default_factory=list)
     created_at: UTCDateTime = Field(default_factory=utcnow)
     updated_at: UTCDateTime = Field(default_factory=utcnow)
 

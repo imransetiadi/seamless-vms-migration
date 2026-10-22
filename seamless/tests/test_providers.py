@@ -4564,3 +4564,131 @@ def make_plan_for(vms):
     from tests.factories import make_plan
 
     return make_plan(vm_ids=[vm.source_id for vm in vms])
+
+
+class FipNetwork:
+    """Neutron as the keep-address move reads and changes it (SDD §8.3, §10): the floating IPs of
+    two projects, an external network with its subnet, and a destination server's port."""
+
+    def __init__(self):
+        self.fips = {
+            "203.0.113.10": NS(
+                id="fip-1",
+                floating_ip_address="203.0.113.10",
+                port_id="port-src",
+                project_id="proj-1",
+            ),
+            "203.0.113.20": NS(
+                id="fip-2", floating_ip_address="203.0.113.20", port_id="port-x", project_id="other"
+            ),
+        }
+        self.calls = []
+
+    def ips(self, floating_ip_address=None, project_id=None, port_id=None, **_):
+        return [
+            f
+            for f in self.fips.values()
+            if floating_ip_address in (None, f.floating_ip_address)
+            and project_id in (None, f.project_id)
+            and port_id in (None, f.port_id)
+        ]
+
+    def update_ip(self, fip, port_id=None):
+        self.calls.append(("update", fip.floating_ip_address, port_id))
+        fip.port_id = port_id
+        return fip
+
+    def create_ip(self, **attrs):
+        self.calls.append(("create", attrs))
+        fip = NS(id="fip-new", port_id=None, project_id="proj-1", **attrs)
+        self.fips[attrs["floating_ip_address"]] = fip
+        return fip
+
+    def delete_ip(self, fip, ignore_missing=True):
+        self.calls.append(("delete", fip.floating_ip_address))
+        self.fips.pop(fip.floating_ip_address, None)
+
+    def networks(self, is_router_external=None, **_):
+        public = NS(id="net-pub", name="public", is_router_external=True)
+        private = NS(id="net-1", name="app-net", is_router_external=False)
+        return [public] if is_router_external else [public, private]
+
+    def subnets(self, network_id=None, **_):
+        subnets = [
+            NS(id="sub-pub", network_id="net-pub", cidr="203.0.113.0/24"),
+            NS(id="sub-app", network_id="net-1", cidr="10.0.0.0/24"),
+        ]
+        return [s for s in subnets if network_id in (None, s.network_id)]
+
+    def ports(self, device_id=None, **_):
+        port = NS(id="port-dst", device_id="srv-dst", fixed_ips=[{"ip_address": "10.0.0.5"}])
+        return [port] if device_id in (None, "srv-dst") else []
+
+
+async def test_an_openstack_provider_reserves_moves_and_releases_a_floating_ip(stub_openstack):
+    """SDD §8.3, §10 (plan task N6a): the destination reserves an address on the external network
+    whose subnet holds it - keeping one its project holds detached, refusing one outside every
+    external subnet or held by a port - and finds the server's port with a fixed address; the
+    source reads, disassociates, associates and releases its project's floating IP of an address,
+    each call idempotent, another project's never touched."""
+    conn = fake_conn()
+    network = FipNetwork()
+    conn.network = network
+    stub_openstack(conn)
+    dst = OpenStackProvider(
+        make_provider(id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+        settings(),
+    )
+    src = OpenStackProvider(make_provider(), settings())
+    await dst.reserve_floating_ip("203.0.113.30")
+    await dst.reserve_floating_ip("203.0.113.30")
+    assert network.calls == [
+        ("create", {"floating_network_id": "net-pub", "floating_ip_address": "203.0.113.30"})
+    ]
+    with pytest.raises(ProviderError, match="no subnet of an external network"):
+        await dst.reserve_floating_ip("198.51.100.1")
+    with pytest.raises(ProviderError, match="held by a port"):
+        await dst.reserve_floating_ip("203.0.113.10")
+    assert await dst.server_port("srv-dst", "10.0.0.5") == "port-dst"
+    assert await dst.server_port("srv-dst", "10.0.0.6") is None
+    network.calls.clear()
+    assert await src.floating_ip_port("203.0.113.10") == "port-src"
+    assert await src.floating_ip_port("203.0.113.20") is None  # another project's
+    assert await src.disassociate_floating_ip("203.0.113.10") == "port-src"
+    assert await src.disassociate_floating_ip("203.0.113.10") is None
+    await src.associate_floating_ip("203.0.113.10", "port-src")
+    await src.associate_floating_ip("203.0.113.10", "port-src")
+    await src.release_floating_ip("203.0.113.10")
+    await src.release_floating_ip("203.0.113.10")
+    await src.release_floating_ip("203.0.113.20")  # another project's: not the credential's
+    assert network.calls == [
+        ("update", "203.0.113.10", None),
+        ("update", "203.0.113.10", "port-src"),
+        ("delete", "203.0.113.10"),
+    ]
+    assert "203.0.113.20" in network.fips
+    with pytest.raises(ProviderError, match="holds no floating IP 203.0.113.99"):
+        await src.associate_floating_ip("203.0.113.99", "port-src")
+
+
+async def test_a_destination_reads_its_projects_attached_floating_ips_and_their_quota(
+    stub_openstack,
+):
+    """SDD §10 (plan task N6a): the inventory names the project's floating IPs a port holds, and how
+    many more its quota allows - none known when unlimited or unread."""
+    conn = fake_conn()
+    stub_openstack(conn)
+    dst = OpenStackProvider(
+        make_provider(id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+        settings(),
+    )
+    inv = await dst.inventory()
+    assert (inv.attached_floating_ips, inv.floating_ip_quota) == (["203.0.113.10"], None)
+    conn.network.get_quota = lambda project, details=False: NS(
+        floating_ips={"limit": 10, "used": 3, "reserved": 1}
+    )
+    assert (await dst.inventory()).floating_ip_quota == 6
+    conn.network.get_quota = lambda project, details=False: NS(
+        floating_ips={"limit": -1, "used": 3, "reserved": 0}
+    )
+    assert (await dst.inventory()).floating_ip_quota is None

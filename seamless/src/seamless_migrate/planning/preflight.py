@@ -184,6 +184,11 @@ class DestinationInventory:
     floating_ips: list[str] = field(default_factory=list)
     #: Neutron's DNS integration and Designate's zones (SDD §10, §9.3)
     dns: DnsRead = field(default_factory=DnsRead)
+    #: the addresses of the credential's project's floating IPs a port holds; [] when they cannot
+    #: be read (SDD §10, §9.3)
+    attached_floating_ips: list[str] = field(default_factory=list)
+    #: how many more floating IPs the project may allocate; None when unlimited or not read
+    floating_ip_quota: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -411,6 +416,14 @@ CATALOG: dict[str, CatalogEntry] = {
         Severity.info,
         (),
         "Nothing to do: each NIC goes where its override says.",
+    ),
+    "DST_FIP_ADDRESS_UNAVAILABLE": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Keep only addresses the destination can hold: an address of a subnet of its external "
+        "network, free there or held detached by the destination credential's project, a token "
+        "with a role that may choose a floating IP's address, and the quota for them - or let the "
+        'plan take new addresses (network_cutover.floating_ips "auto").',
     ),
     "MAP_FIP_ADDRESS_CHANGE": CatalogEntry(
         Severity.warning,
@@ -2050,7 +2063,8 @@ def run_preflight(
 
     out.extend(_nic_override_findings(vm, plan, dst_inv, selected, source, where))
     if openstack_source:
-        out.extend(_port_findings(vm, dst_inv, source, where))
+        out.extend(_port_findings(vm, plan, dst_inv, source, where))
+        out.extend(_fip_keep_findings(vm, plan, dst_inv, selected, destination, dst_caps, where))
     out.extend(_prefix_split(vm, plan, selected, source, destination))
 
     out.extend(_gpu_findings(vm, plan, dst_inv, source, where, selected, shares or {}))
@@ -2236,7 +2250,7 @@ def _dns_domain(domain: str) -> str:
 
 
 def _port_findings(
-    vm: VMRef, dst_inv: DestinationInventory, source: Provider | None, where: str
+    vm: VMRef, plan: Plan, dst_inv: DestinationInventory, source: Provider | None, where: str
 ) -> list[Finding]:
     """SRC_PORT_ADDRESS_PAIRS, MAP_FIP_ADDRESS_CHANGE and DST_DNS_INTEGRATION_MISSING (SDD §9.3,
     plan task N2b): what an OpenStack VM's ports carry at the source that the migration does not -
@@ -2257,13 +2271,19 @@ def _port_findings(
             )
         )
     # os-migrate's `auto` attaches a detached floating IP of the source's address, else creates
-    # one with a new address (SDD §7.2, §23.1)
+    # one with a new address (SDD §7.2, §23.1); under keep_address the move keeps it (§8.3)
     detached = {_canonical_ip(a) for a in dst_inv.floating_ips}
-    moved = [
-        address
-        for address in dict.fromkeys(_canonical_ip(a) for nic in vm.nics for a in nic.floating_ips)
-        if address not in detached
-    ]
+    moved = (
+        []
+        if plan.network_cutover.floating_ips == "keep_address"
+        else [
+            address
+            for address in dict.fromkeys(
+                _canonical_ip(a) for nic in vm.nics for a in nic.floating_ips
+            )
+            if address not in detached
+        ]
+    )
     if moved:
         out.append(
             finding(
@@ -2303,6 +2323,69 @@ def _port_findings(
             )
         )
     return out
+
+
+#: the roles Neutron's create_floatingip:floating_ip_address takes, by policy profile (SDD §9.3)
+_FIP_ADDRESS_ROLES = {"secure_rbac": ("admin", "manager")}
+
+
+def _fip_keep_findings(
+    vm: VMRef,
+    plan: Plan,
+    dst_inv: DestinationInventory,
+    selected: Sequence[VMRef],
+    destination: Provider | None,
+    dst_caps: Mapping[str, Any] | None,
+    where: str,
+) -> list[Finding]:
+    """DST_FIP_ADDRESS_UNAVAILABLE (SDD §9.3, §8.3, plan task N6a): under keep_address, the floating
+    IPs of the VM the destination cannot keep - outside its external subnets, held by a port of
+    its project -, a token that may not choose an address for those it must create, or a quota
+    too small for the plan's; each judged only when the destination reports what it needs."""
+    if plan.network_cutover.floating_ips != "keep_address":
+        return []
+    mine = list(dict.fromkeys(_canonical_ip(a) for nic in vm.nics for a in nic.floating_ips))
+    if not mine:
+        return []
+    external = {n["id"] for n in dst_inv.network_details if n.get("external")}
+    cidrs = [s["cidr"] for s in dst_inv.subnets if s.get("network_id") in external]
+    attached = {_canonical_ip(a) for a in dst_inv.attached_floating_ips}
+    detached = {_canonical_ip(a) for a in dst_inv.floating_ips}
+    reasons: list[str] = []
+    for address in mine:
+        if cidrs and not _in_subnets(address, cidrs):
+            reasons.append(f"{address} lies in no subnet of an external network of {where}")
+        elif address in attached:
+            reasons.append(f"{address} is held by a port of its project")
+    extras: list[str] = []
+    roles = (dst_caps or {}).get("roles")
+    allowed = _FIP_ADDRESS_ROLES.get(policy_profile_of(dst_caps, destination), ("admin",))
+    if roles is not None and not set(roles) & set(allowed) and set(mine) - detached:
+        extras.append(
+            "the credential's token has no role that may choose a floating IP's address "
+            f"({' or '.join(allowed)})"
+        )
+    wanted = {
+        _canonical_ip(a) for other in selected for nic in other.nics for a in nic.floating_ips
+    } - detached
+    if dst_inv.floating_ip_quota is not None and dst_inv.floating_ip_quota < len(wanted):
+        extras.append(
+            f"the project's floating IP quota leaves {dst_inv.floating_ip_quota} for "
+            f"{len(wanted)} addresses"
+        )
+    if not reasons and not extras:
+        return []
+    tail = ", and ".join(extras)
+    if reasons and tail:
+        text = f"{'; '.join(reasons)}. {tail[0].upper()}{tail[1:]}"
+    else:
+        text = "; ".join(reasons) or tail
+    return [
+        finding(
+            "DST_FIP_ADDRESS_UNAVAILABLE",
+            f"Floating IPs of {vm.name} that {where} cannot keep: {text}.",
+        )
+    ]
 
 
 def _prefix_split(
