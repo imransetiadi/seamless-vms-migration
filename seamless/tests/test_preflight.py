@@ -195,6 +195,7 @@ def test_catalog_is_complete():
         "MAP_NIC_OVERRIDE_INVALID",
         "MAP_NIC_OVERRIDE",
         "MAP_FIP_ADDRESS_CHANGE",
+        "DST_FIP_ADDRESS_UNAVAILABLE",
         "VM_PCI_PASSTHROUGH",
         "VM_VGPU",
         # the GPU codes (SDD §22.5, plan task G4)
@@ -692,6 +693,42 @@ def test_finding_net_prefix_split():
     assert (
         found_codes(check(web, plan=unplanned, all_vms=vms, destination=bgp), NETWORK_CODES) == []
     )
+
+
+def test_finding_dst_fip_address_unavailable():
+    """SDD §9.3 (plan task N6a): the quota counts the floating IPs of every VM of the plan the
+    destination's project does not hold detached - the other VM's too -, a VMware VM has none to
+    keep, and under auto the blocker is never judged (tests/test_fip_move.py has its reasons)."""
+    keep = make_plan(network_cutover={"floating_ips": "keep_address"})
+    first = make_vm(
+        nics=[Nic(network="app-net", mac="fa:16:3e:00:00:01", floating_ips=["203.0.113.10"])]
+    )
+    second = make_vm(
+        source_id="vm-2",
+        name="web-02",
+        nics=[Nic(network="app-net", mac="fa:16:3e:00:00:02", floating_ips=["203.0.113.11"])],
+    )
+    quota = dst_inv(floating_ip_quota=1)
+    f = only(
+        check(first, plan=keep, dst=quota, all_vms=[first, second]), "DST_FIP_ADDRESS_UNAVAILABLE"
+    )
+    assert (f.severity, f.strategies) == (Severity.blocker, [])
+    assert f.message == (
+        "Floating IPs of web-01 that RHOSO 18.0 cannot keep: the project's floating IP quota "
+        "leaves 1 for 2 addresses."
+    )
+    assert f.remediation == CATALOG["DST_FIP_ADDRESS_UNAVAILABLE"].remediation
+    held = dst_inv(floating_ip_quota=1, floating_ips=["203.0.113.11"])
+    assert "DST_FIP_ADDRESS_UNAVAILABLE" not in [
+        x.code for x in check(first, plan=keep, dst=held, all_vms=[first, second])
+    ]
+    assert "DST_FIP_ADDRESS_UNAVAILABLE" not in [
+        x.code for x in check(first, dst=quota, all_vms=[first, second])
+    ]
+    vmware = make_vm(flavor=None, nics=[Nic(network="VM Network", mac="00:50:56:00:00:01")])
+    assert "DST_FIP_ADDRESS_UNAVAILABLE" not in [
+        x.code for x in check(vmware, plan=keep, dst=quota, source=VMWARE_SRC)
+    ]
 
 
 def test_a_provider_declares_announced_tenant_networks_only_for_openstack():

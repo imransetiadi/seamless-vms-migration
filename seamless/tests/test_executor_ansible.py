@@ -555,6 +555,29 @@ async def test_the_plans_port_creation_mode_reaches_workloads_before_the_import(
 
 
 @pytest.mark.parametrize(
+    ("floating_ips", "mode"), [("keep_address", "skip"), ("auto", "auto")], ids=["keep", "auto"]
+)
+async def test_a_keep_address_plan_leaves_floating_ips_to_the_control_plane(
+    env, monkeypatch, floating_ips, mode
+):
+    """SDD §7.2, §8.3 (plan task N6a): under keep_address the planned server's _migration_params
+    say floating_ip_mode skip before the import, so os-migrate leaves its floating IPs to the
+    control plane's move; under auto the collection's own mode stays."""
+    monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
+    plan = make_plan(
+        id="plan-00c0ffee",
+        mappings=MAPPINGS,
+        network_cutover={"floating_ips": floating_ips},
+    )
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.cold)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, env.settings)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["playbook"] == "import_workloads.yml"
+    assert exported_server(env)["_migration_params"]["floating_ip_mode"] == mode
+
+
+@pytest.mark.parametrize(
     "capabilities, profile",
     [
         ({"policy_profile": "secure_rbac"}, "secure_rbac"),

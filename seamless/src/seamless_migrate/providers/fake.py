@@ -386,7 +386,30 @@ def _vmware_vm(spec: _VSpec, rng: random.Random, index: int) -> VMRef:
     )
 
 
-class FakeSourceProvider:
+class _FloatingIPs:
+    """A fake's project's floating IPs as the keep-address move moves them (SDD §8.3, §10)."""
+
+    _floating: dict[str, str | None]
+
+    async def floating_ip_port(self, address: str) -> str | None:
+        return self._floating.get(address)
+
+    async def disassociate_floating_ip(self, address: str) -> str | None:
+        port = self._floating.get(address)
+        if address in self._floating:
+            self._floating[address] = None
+        return port
+
+    async def associate_floating_ip(self, address: str, port_id: str) -> None:
+        if address not in self._floating:
+            raise ProviderError(f"the project holds no floating IP {address}")
+        self._floating[address] = port_id
+
+    async def release_floating_ip(self, address: str) -> None:
+        self._floating.pop(address, None)
+
+
+class FakeSourceProvider(_FloatingIPs):
     def __init__(self, kind: ProviderKind | str, seed: int = 42) -> None:
         self.kind = ProviderKind(kind)
         self.seed = seed
@@ -399,12 +422,21 @@ class FakeSourceProvider:
         #: power states the demo changed (SDD §8.1): a simulated cutover stops the source, a
         #: rollback starts it, the demo power control either; the registry keeps one fake each
         self._power: dict[str, str] = {}
+        #: the floating IPs of its VMs' ports (SDD §8.3)
+        self._floating = {
+            address: f"port-{vm.source_id}-{i}"
+            for vm in self._vms
+            for i, nic in enumerate(vm.nics)
+            for address in nic.floating_ips
+        }
 
     def adopt(self, old: FakeSourceProvider) -> None:
         """Rebuilt for a changed provider document (SDD §10): its VMs keep the power states the
-        replaced fake gave them - the same states, which a call on either changes."""
+        replaced fake gave them - the same states, which a call on either changes -, and their
+        floating IPs where the replaced fake left them."""
         if old.kind == self.kind:
             self._power = old._power
+            self._floating = old._floating
 
     def _as_now(self, vm: VMRef) -> VMRef:
         copy = vm.model_copy(deep=True)
@@ -540,9 +572,11 @@ class _DestinationCloud:
     held: dict[str, dict[int, int]] = field(default_factory=dict)
     #: the cutover gate's reads that found the other tenant's GPU held (SDD §22.10)
     tenant_reads: int = 0
+    #: its project's floating IPs by address: the port each is on, None detached (SDD §8.3)
+    floating: dict[str, str | None] = field(default_factory=dict)
 
 
-class FakeDestinationProvider:
+class FakeDestinationProvider(_FloatingIPs):
     def __init__(self, seed: int = 42, provider: Provider | None = None) -> None:
         self.seed = seed
         #: the demo provider it stands for: its kind, declared series and profile (SDD §10)
@@ -842,3 +876,16 @@ class FakeDestinationProvider:
 
     async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
         return None
+
+    @property
+    def _floating(self) -> dict[str, str | None]:  # type: ignore[override]
+        return self._cloud.floating
+
+    async def reserve_floating_ip(self, address: str) -> None:
+        """SDD §8.3: the demo's external network takes any address; one a port holds is refused."""
+        if self._cloud.floating.get(address) is not None:
+            raise ProviderError(f"floating IP {address} is held by a port of the project")
+        self._cloud.floating[address] = None
+
+    async def server_port(self, server_id: str, address: str) -> str | None:
+        return f"port-{server_id}" if server_id in self._cloud.servers else None

@@ -228,12 +228,19 @@ def apply_mappings(doc: dict[str, Any], mappings: Mappings) -> dict[str, Any]:
     return out
 
 
+def import_floating_ip_mode(plan: Plan) -> str:
+    """The import's floating_ip_mode for the plan (SDD §7.2, §8.3): skip under keep_address - the
+    control plane moves the floating IPs -, else the collection's auto."""
+    return "skip" if plan.network_cutover.floating_ips == "keep_address" else "auto"
+
+
 def set_port_creation_mode(
-    doc: dict[str, Any], mode: str, profile: str = "legacy"
+    doc: dict[str, Any], mode: str, profile: str = "legacy", floating_ip_mode: str = "auto"
 ) -> dict[str, Any]:
     """Return a copy of an exported ``workloads.yml`` whose servers recreate their ports in
-    ``mode`` (``plan.port_creation_mode``, SDD §7.2) and whose destination check judges another
-    project's network by the destination's policy ``profile`` (SDD §6.6, §21.5)."""
+    ``mode`` (``plan.port_creation_mode``, SDD §7.2), whose destination check judges another
+    project's network by the destination's policy ``profile`` (SDD §6.6, §21.5), and whose
+    import treats floating IPs in ``floating_ip_mode`` (§7.2, §8.3)."""
     out = copy.deepcopy(doc)
     for resource in out.get("resources") or []:
         if resource.get("type") != SERVER_TYPE:
@@ -242,6 +249,7 @@ def set_port_creation_mode(
             resource["_migration_params"] = {}
         resource["_migration_params"]["port_creation_mode"] = mode
         resource["_migration_params"]["policy_profile"] = profile
+        resource["_migration_params"]["floating_ip_mode"] = floating_ip_mode
     return out
 
 
@@ -450,8 +458,10 @@ def _apply_port_mode(
     deferred: list[str] | None = None,
     profile: str = "legacy",
     where: str = "the destination",
+    floating_ip_mode: str = "auto",
 ) -> bool:
-    """Write the plan's port_creation_mode and the destination's policy ``profile`` into an
+    """Write the plan's port_creation_mode and floating_ip_mode and the destination's policy
+    ``profile`` into an
     existing export before a run, and resolve its
     network references again with the destination's ``networks`` when given, unless the run
     replaces the export: it ``exports`` anyway (the cold cutover), or True is returned (SDD §7.2).
@@ -475,7 +485,7 @@ def _apply_port_mode(
             or _overridden_ports(doc)
         )
     ) or (record is not None and _read_export_record(osm) != record)
-    doc = set_port_creation_mode(doc, mode, profile)
+    doc = set_port_creation_mode(doc, mode, profile, floating_ip_mode)
     # a new export is resolved after it instead: the one it replaces may no longer resolve
     if networks and not (reexport or exports):
         doc = resolve_network_refs(doc, networks, deferred, where)
@@ -1292,6 +1302,7 @@ class AnsibleExecutor:
                 deferred,
                 policy_profile_of(ctx.destination.capabilities, ctx.destination),
                 ctx.destination.label,
+                import_floating_ip_mode(ctx.plan),
             )
             await self._log_deferred(ctx, deferred)
         leftover = (
@@ -2207,6 +2218,7 @@ class AnsibleExecutor:
                         volumes,
                         policy_profile_of(destination.capabilities, destination),
                         destination.label,
+                        import_floating_ip_mode(ctx.plan) if ctx is not None else "auto",
                     )
                     if ctx is not None:
                         await self._log_deferred(ctx, deferred)
@@ -2227,6 +2239,7 @@ class AnsibleExecutor:
         validated_volumes: Sequence[str] | None = None,
         profile: str = "legacy",
         where: str = "the destination",
+        floating_ip_mode: str = "auto",
     ) -> None:
         """Keep only the planned server of the export, check that it still lists every volume
         the migration validated (``validated_volumes``), apply the mappings, the VM's NIC
@@ -2259,7 +2272,7 @@ class AnsibleExecutor:
         if mappings is not None:
             doc = apply_mappings(doc, mappings)
         if port_mode is not None:
-            doc = set_port_creation_mode(doc, port_mode, profile)
+            doc = set_port_creation_mode(doc, port_mode, profile, floating_ip_mode)
         # written first: a rollback reads the planned server from it, should an override fail
         path.write_text(yaml.safe_dump(doc, sort_keys=False))
         if validated_volumes:

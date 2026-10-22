@@ -890,3 +890,15 @@ describe("the mock's network context, as the API's validation reads it (SDD §9.
     expect(networkContext([], source, staging)).toEqual({ floatingIps: [], dns: { extension: null, zones: null }, announcers: [] });
   });
 });
+
+describe("the mock's floating IP warning under keep_address, as the API's (SDD §8.3, §9.3, plan task N6a)", () => {
+  it('warns of a new address under auto and not under keep_address, where the move keeps it', () => {
+    const plan = buildFixtures(now).plans[0]!;
+    const vm = makeVm({ id: 'os-9f01', name: 'fip-01', nics: [{ network: 'tenant-web', floating_ips: ['203.0.113.90'] }], disks: [{ size_gb: 20 }] });
+    const codes = (p: Plan) => preflight(vm, 'openstack', p, {}, { selected: [vm], destination: 'RHOSO 18.0', floatingIps: [] }).map((f) => f.code);
+    const auto = { ...plan, network_cutover: { hooks: {}, floating_ips: 'auto' as const, dns_targets: {}, lb_pools: {} } };
+    const keep = { ...plan, network_cutover: { ...auto.network_cutover, floating_ips: 'keep_address' as const } };
+    expect(codes(auto)).toContain('MAP_FIP_ADDRESS_CHANGE');
+    expect(codes(keep)).not.toContain('MAP_FIP_ADDRESS_CHANGE');
+  });
+});

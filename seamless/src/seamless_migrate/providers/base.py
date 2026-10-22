@@ -104,6 +104,31 @@ class DestinationProvider(Protocol):
         """Set the given metadata keys on the volume and keep its other keys (Cinder's merge),
         within the call's bound: the mark of a VMware kit copy that completed (§7.2)."""
 
+    async def reserve_floating_ip(self, address: str) -> None:
+        """The keep-address move's reservation (SDD §8.3, §10): a floating IP of the address the
+        project holds detached is kept, else one is created detached on the external network one
+        of whose subnets holds it; a provider error when none does or Neutron refuses it."""
+
+    async def server_port(self, server_id: str, address: str) -> str | None:
+        """The id of the server's port with the fixed address, None when it has none (§8.3)."""
+
+
+class FloatingIPMover(Protocol):
+    """What an OpenStack provider, source or destination, moves floating IPs with (SDD §8.3, §10):
+    each call on the credential's project's floating IP of the address."""
+
+    async def floating_ip_port(self, address: str) -> str | None:
+        """The port it is associated with; None when on none or when the project holds none."""
+
+    async def disassociate_floating_ip(self, address: str) -> str | None:
+        """Released from its port; returns that port's id, None when it was on none."""
+
+    async def associate_floating_ip(self, address: str, port_id: str) -> None:
+        """Associated with the port; one already there is no error."""
+
+    async def release_floating_ip(self, address: str) -> None:
+        """Deleted - its allocation released; none is no error."""
+
 
 def provider_caps(provider: Provider) -> dict[str, Any]:
     """Capabilities used by the selector: stored capabilities plus ``conversion_host``."""

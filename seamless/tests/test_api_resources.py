@@ -92,6 +92,8 @@ def test_provider_crud(api):
         "gpu_capacity",  # SDD §22.3: the Placement pools of their vGPU requests
         "floating_ips",  # SDD §10: the project's floating IPs no port holds (plan task N2b)
         "dns",  # SDD §10: Neutron's DNS integration and Designate's zones (plan task N2b)
+        "attached_floating_ips",  # SDD §10: the floating IPs a port holds (plan task N6a)
+        "floating_ip_quota",  # SDD §10: how many more the project may allocate (plan task N6a)
     }
     assert dst_inventory["dns"] == {"extension": True, "zones": ["internal.example.org."]}
 

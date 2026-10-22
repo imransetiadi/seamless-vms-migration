@@ -472,7 +472,14 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             hook_reverts: list[str] = [],   # the reverts a rollback owes: the `revert` of each hook that ran with
                                       # success at pre_stop, post_create or post_verify since the last rollback,
                                       # in run order; a retry keeps them (§8.2, plan task N5)
+            fip_moves: list[FipMove] = [],   # the journal of its floating IPs' keep-address move (§8.3, plan task N6)
             created_at: datetime, updated_at: datetime }
+
+FipMove { address: str,                # the floating IP's address, kept at the destination
+          fixed_ip: str,               # the NIC's first address at the destination - its nic_overrides entry's,
+                                       # else its own (§9.2): the new server's port holding it receives the address
+          source_port: str|null,       # the source port it was associated with, saved before the disassociate
+          state: "releasing"|"released"|"moved"|"returned"|"finalized" }   # §8.3
 
 MigrationSummary { id, plan_id, wave_id, vm: { source_id, name, project }, strategy, phase,
                    phase_since: datetime,   # the last PhaseChange's `at`, when the phase it is in began; created_at without one
@@ -1466,6 +1473,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   number yet (the attempt that ran it failed afterwards), that pass. A `cold` cutover the role skipped stays a
   permanent failure: the cold role skips the whole workload on a re-run, its floating IPs included.
 * Name filter: `os_migrate_workloads_filter: [{regex: "^" + re.escape(vm.name) + "$"}]`.
+* Floating IPs: a plan whose `network_cutover.floating_ips` is `"keep_address"` writes the workload's
+  `floating_ip_mode` `skip`, so the cold and warm imports leave its floating IPs to the control plane's move (§8.3);
+  otherwise the collection's `auto` stays (§23.1).
 * Every string in `vars.yml`, `secrets.yml` and the inventory is written with the YAML tag `!unsafe`
   (`ansible_yaml`): every value and every key of a nested mapping (a source network's name keys
   `network_map`); only the top-level keys — the variable names, the inventory's group names — stay
@@ -2417,6 +2427,34 @@ idempotency key (§7.2). A hook's failure is no step's for the advisor and agent
 for it and nothing of it reaches Jev or agentmemory (§13.4); its `migration.error` names the point and the hook
 (`step` `hook:<point>`), its message the run's `detail`.
 
+### 8.3 The floating IP move (plan task N6, §23.4)
+
+A plan whose `network_cutover.floating_ips` is `"keep_address"` keeps each floating IP's address across the cutover
+of an OpenStack VM, whatever its strategy: the control plane moves it, and the cold and warm imports leave floating IPs
+alone (`floating_ip_mode: skip`, §7.2). A VMware VM has none. Each step is a `migration.action`, data `{"action":
+"floating_ip", "address", "step": "reserve"|"move"|"return"|"release", "outcome": "succeeded"|"failed", "detail"}`.
+
+* **The reservation** comes with the plan's pre-staging (§8): for each floating IP of a VM it pre-stages, the
+  destination reserves the address (`reserve_floating_ip`, §10) - one the project holds detached is kept. A reservation
+  that fails fails the pre-staging (§8), before any source stops; `DST_FIP_ADDRESS_UNAVAILABLE` (§9.3) says why first.
+* **The move**, in `verifying`, after the cutover step created the server and before the `post_create` hooks (§8.2) -
+  the source stopped, the clock open: for each floating IP, its `FipMove` (§4.2) is saved as `releasing` with the port
+  the source's floating IP is on (`floating_ip_port`), the source's is disassociated (`released`), the destination
+  reserves the address again
+  when it no longer holds it (a rollback released it, below), and its floating IP is associated with the new server's
+  port holding the NIC's address (`server_port`; `moved`). The gap is seconds, inside the
+  downtime; the destination's gateway or BGP agent announces the address (`TODO(LAB): confirm`, §23.6). A failure
+  fails the migration as a `post_create` hook's does (§8.2): the plan's `auto_rollback` decides. A restart resumes the
+  move from the journal: each call is idempotent.
+* **The return**, in `rolling_back`, before the hook reverts (§8.2) and so before the source starts: for each entry
+  not `returned` or `finalized`, the destination's floating IP is disassociated and released (`release_floating_ip`),
+  then the source's is associated again with the port it was on, and the entry becomes `returned`; a retry's move
+  starts such an entry anew. A failure fails the
+  rollback (`rolling_back → failed`, the source not started): a rollback asked again resumes from the journal.
+* **The release**, in a finalize (§8.1), after its step and before the `on_finalize` hooks: the source project's
+  floating IP of each `moved` entry is deleted (`finalized`) - the address lives at the destination now. A failure is
+  recorded and the migration is finalized; the operator releases that allocation.
+
 ---
 
 ## 9. Planning
@@ -2584,7 +2622,8 @@ Finding catalog (code — severity — condition):
 | `NET_PREFIX_SPLIT` | warning | the source or the destination provider declares `announces_tenant_networks` (§4.2, §23.6), and the plan's waves put the VMs of one source network into more than one wave: while one wave is cut over and the next is not, the network's prefix has an origin in each cloud, and its tenant routes cannot be correct. The message names the network, its waves by name and the declaring provider; nothing is judged before the waves are planned |
 | `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one, resolved by the rule of §7.3 step 0; its `DestinationInventory.subnets` by `network_id`) or is no host address there — as Neutron's `check_subnet_ip` rules for a port created with no owner, an IPv4 subnet's network address (at any prefix length) and its broadcast address below a /31 (a /31 or /32 has none), while an IPv6 subnet's first address is taken (§6.6); on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode, and no address in `"nova"` mode (§6.6); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
-| `MAP_FIP_ADDRESS_CHANGE` | warning (cold, warm) | an OpenStack VM's NIC has a floating IP (`Nic.floating_ips`) whose address the destination credential's project does not hold detached (`DestinationInventory.floating_ips`, §10): os-migrate's `floating_ip_mode` `auto` (§7.2, §23.1) attaches a detached floating IP with the source's address, and without one creates a floating IP with a **new** address, so clients, allowlists and DNS records of the old one lose the VM. The message names each address and the destination; the storage handover and the VMware paths move no floating IP (§23.1) |
+| `MAP_FIP_ADDRESS_CHANGE` | warning (cold, warm) | the plan's `network_cutover.floating_ips` is `"auto"` (under `"keep_address"` the move of §8.3 keeps the address, and `DST_FIP_ADDRESS_UNAVAILABLE` judges it) and an OpenStack VM's NIC has a floating IP (`Nic.floating_ips`) whose address the destination credential's project does not hold detached (`DestinationInventory.floating_ips`, §10): os-migrate's `floating_ip_mode` `auto` (§7.2, §23.1) attaches a detached floating IP with the source's address, and without one creates a floating IP with a **new** address, so clients, allowlists and DNS records of the old one lose the VM. The message names each address and the destination; the storage handover and the VMware paths move no floating IP (§23.1) |
+| `DST_FIP_ADDRESS_UNAVAILABLE` | blocker | the plan's `network_cutover.floating_ips` is `"keep_address"` (§8.3, §23.4) and a floating IP of an OpenStack VM (`Nic.floating_ips`) cannot be kept at the destination: its address lies in no subnet of an external network of the destination (`DestinationInventory.subnets` of a `network_details` entry with `external`; not judged when the credential sees no such subnet); a port of the destination credential's project holds it (`DestinationInventory.attached_floating_ips`); the project does not hold it detached and the token lacks a role Neutron's `create_floatingip:floating_ip_address` takes - `admin`, and under the `secure_rbac` profile a project `manager` too (`TODO(LAB): confirm` on RHOSO 18.0; the roles and profile of the destination's check report, as `NET_PORT_NOT_PERMITTED` reads them; not judged without `roles`); or the project's floating IP quota leaves fewer than the addresses of the plan's VMs it does not hold (`DestinationInventory.floating_ip_quota`; not judged when unknown). The message names each address with its reason and the destination. A VMware VM has no floating IP |
 | `VM_PCI_PASSTHROUGH` | blocker | the VM has a passthrough device - an entry of kind `passthrough` in its `gpus` (§22.2): an OpenStack flavor's `pci_passthrough:alias`, a VMware `VirtualPCIPassthrough` device that is no vGPU (plan task G2) - and no GPU mapping applies to it, as for `VM_VGPU`; for a VMware device without ids, the message says that no mapping can name it (§22.4, plan task G4) |
 | `VM_VGPU` | blocker | the VM has a vGPU - an entry of kind `vgpu` in its `gpus` (§22.2): an OpenStack flavor's `resources:VGPU`, bare or in its request-group form `resources<suffix>:VGPU` (Nova's granular requests, e.g. `resources1:VGPU`; the suffix is `[A-Za-z0-9_-]`, review PL-08), or a custom resource class its source declares a profile for (§22.3); a VMware vGPU device (plan task G2) - and no GPU mapping applies to it (§22.4): no mapping names it (the message names the GPU key or the flavor to map), its mapping's flavor asks for no GPU (the message names the mapping and says the server would lose its GPU), or its GPUs' keys map to different flavors (plan task G4) |
 | `MAP_GPU_FLAVOR` | info; **warning** when the GPU flavor gives fewer vCPUs, less RAM or a smaller local root disk than the VM | a GPU mapping applies (§22.4): the message names the VM's GPUs, the GPU flavor with its size and GPU requests, and that GPU migration is a Technology Preview (§22.1) |
@@ -2783,6 +2822,24 @@ class DestinationProvider(Protocol):
     async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None
         # sets the given metadata keys on the volume and keeps its other keys (Cinder's merge), within the call's
         # bound (§8.1): the mark of a VMware kit copy that completed (§7.2, review RV30-01)
+    async def reserve_floating_ip(self, address: str) -> None
+        # the keep-address move's reservation (§8.3): a floating IP of that address the credential's project holds
+        # detached is kept; else one is created with it, detached, on the external network one of whose subnets holds
+        # the address - a provider error when none does, or when Neutron refuses it (another project holds it)
+    async def server_port(self, server_id: str, address: str) -> str | None
+        # the id of the server's port with the fixed address, None when it has none (§8.3)
+
+# an OpenStack provider, source or destination, moves floating IPs (§8.3, plan task N6):
+    async def floating_ip_port(self, address: str) -> str | None
+        # the port the credential's project's floating IP of the address is associated with; None when on none or
+        # when the project holds no floating IP of the address
+    async def disassociate_floating_ip(self, address: str) -> str | None
+        # the credential's project's floating IP of the address released from its port; returns that port's id,
+        # None when it was on none or the project holds no floating IP of the address
+    async def associate_floating_ip(self, address: str, port_id: str) -> None
+        # the project's floating IP of the address associated with the port; one already there is no error
+    async def release_floating_ip(self, address: str) -> None
+        # the project's floating IP of the address deleted - its allocation released; none is no error
 ```
 
 `SourceInventory {networks: dict[str, int|None] (name→mtu), projects: list[str], keypairs: list[str] (the names of
@@ -2790,7 +2847,9 @@ the source credential's own keypairs — what `export_keypairs.yml` can export),
 credential's project's Heat stacks, where each one is) and lb_members: MemberRead (the members of its project's Octavia
 pools) - both read by an OpenStack source alone, below (plan task N2, §9.3)}`;
 `DestinationInventory {networks: dict[str, int|None], flavors: list[{name, vcpus, ram_mb, disk_gb,
-extra_specs}], volume_types: list[str], quotas: dict[project, {cores, ram_mb, instances, volumes,
+extra_specs}], attached_floating_ips: list[str] (the addresses of the credential's project's floating IPs a port holds;
+[] when they cannot be read), floating_ip_quota: int|null (how many more floating IPs the project may allocate, by
+Neutron's quota details; null when unlimited or not read) (§9.3, plan task N6), volume_types: list[str], quotas: dict[project, {cores, ram_mb, instances, volumes,
 gigabytes}] (free amounts: -1 is unlimited and null not reported — pre-flight blocks on neither), projects:
 list[str], keypairs: list[str] (the destination credential's own keypairs: the server is created as that user, and
 a `key_name` it does not own fails `import_workload_dst_check` just before the source is stopped),
@@ -5793,7 +5852,7 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | the hook catalog, the plan's network cut-over settings, the routes | §4.2, §4.3, §11, §12 (binding) | N3 |
 | the hook runner: kinds, timeouts, the idempotency key, the context document | §7.2, §13.3 (binding) | N4 |
 | hook points in the cutover, verification, rollback and finalize of every strategy, resumed after a restart | §8.2 (binding) | N5 |
-| the floating IP keep-address move | §7.2, §7.3, §8 | N6 |
+| the floating IP keep-address move: the blocker, the reservation, the journaled move, the return and the release (N6a); os-migrate's `auto` reporting whether it reused or created an address (N6b) | §4.2, §7.2, §8.3, §9.3, §10 (binding for N6a) | N6 |
 | the DNS swap | §7, §13.3 | N7 |
 | the reachability wait | §7.5 | N8 |
 | the Octavia member helper | §7, §10 | N9 |

@@ -696,6 +696,25 @@ class OpenStackProvider:
     async def set_volume_metadata(self, volume_id: str, metadata: dict[str, str]) -> None:
         await self._run(self._set_volume_metadata, volume_id, metadata)
 
+    # the keep-address move of floating IPs (SDD §8.3, §10, plan task N6a)
+    async def reserve_floating_ip(self, address: str) -> None:
+        await self._run(self._reserve_floating_ip, address)
+
+    async def server_port(self, server_id: str, address: str) -> str | None:
+        return await self._run(self._server_port, server_id, address)
+
+    async def floating_ip_port(self, address: str) -> str | None:
+        return await self._run(self._floating_ip_port, address)
+
+    async def disassociate_floating_ip(self, address: str) -> str | None:
+        return await self._run(self._disassociate_floating_ip, address)
+
+    async def associate_floating_ip(self, address: str, port_id: str) -> None:
+        await self._run(self._associate_floating_ip, address, port_id)
+
+    async def release_floating_ip(self, address: str) -> None:
+        await self._run(self._release_floating_ip, address)
+
     # -- implementation (runs in worker threads) ----------------------------------------------
     def _check(self) -> dict[str, Any]:
         conn = self._connection()
@@ -900,14 +919,19 @@ class OpenStackProvider:
         )
         # what os-migrate's `auto` attaches: the project's floating IPs no port holds (SDD §10,
         # §9.3); [] when they cannot be read
-        floating_ips = _try(
-            lambda: [
-                _canonical_ip(str(_attr(ip, "floating_ip_address")))
-                for ip in conn.network.ips(project_id=own_project)
-                if not _attr(ip, "port_id")
-            ],
-            [],
-        )
+        # what os-migrate's `auto` attaches - the project's floating IPs no port holds -, and those
+        # a port holds, which the keep-address move cannot take (SDD §10, §9.3); [] when unread
+        listed = _try(lambda: list(conn.network.ips(project_id=own_project)), [])
+        floating_ips = [
+            _canonical_ip(str(_attr(ip, "floating_ip_address")))
+            for ip in listed
+            if not _attr(ip, "port_id")
+        ]
+        attached_floating_ips = [
+            _canonical_ip(str(_attr(ip, "floating_ip_address")))
+            for ip in listed
+            if _attr(ip, "port_id")
+        ]
         return DestinationInventory(
             networks=networks,
             flavors=flavors,
@@ -922,6 +946,8 @@ class OpenStackProvider:
             gpu_capacity=gpu_capacity,
             floating_ips=floating_ips,
             dns=self._read_dns(conn),
+            attached_floating_ips=attached_floating_ips,
+            floating_ip_quota=_try(lambda: _free_floating_ips(conn, own_project), None),
         )
 
     def _read_dns(self, conn: Any) -> DnsRead:
@@ -1221,6 +1247,77 @@ class OpenStackProvider:
                 )
             time.sleep(2)
 
+    def _project_fip(self, conn: Any, address: str) -> Any:
+        """The credential's project's floating IP of the address, None when it holds none."""
+        project = _attr(conn, "current_project_id", default=None)
+        canonical = _canonical_ip(address)
+        for fip in conn.network.ips(floating_ip_address=canonical, project_id=project):
+            if _canonical_ip(str(_attr(fip, "floating_ip_address"))) == canonical:
+                return fip
+        return None
+
+    def _reserve_floating_ip(self, address: str) -> None:
+        """SDD §8.3: keep the project's detached floating IP of the address, else create one on
+        the external network one of whose subnets holds it."""
+        conn = self._connection()
+        held = self._project_fip(conn, address)
+        if held is not None:
+            if _attr(held, "port_id"):
+                raise ProviderError(
+                    f"{self.provider.id}: floating IP {address} is held by a port of the project"
+                )
+            return
+        ip = ipaddress.ip_address(_canonical_ip(address))
+        for network in conn.network.networks(is_router_external=True):
+            for subnet in conn.network.subnets(network_id=_attr(network, "id")):
+                with contextlib.suppress(ValueError):
+                    if ip in ipaddress.ip_network(str(_attr(subnet, "cidr")), strict=False):
+                        conn.network.create_ip(
+                            floating_network_id=_attr(network, "id"),
+                            floating_ip_address=str(ip),
+                        )
+                        return
+        raise ProviderError(
+            f"{self.provider.id}: {address} lies in no subnet of an external network"
+        )
+
+    def _server_port(self, server_id: str, address: str) -> str | None:
+        canonical = _canonical_ip(address)
+        for port in self._connection().network.ports(device_id=server_id):
+            fixed = [
+                _canonical_ip(str(ip.get("ip_address"))) for ip in _attr(port, "fixed_ips") or []
+            ]
+            if canonical in fixed:
+                return str(_attr(port, "id"))
+        return None
+
+    def _floating_ip_port(self, address: str) -> str | None:
+        fip = self._project_fip(self._connection(), address)
+        return (_attr(fip, "port_id") or None) if fip is not None else None
+
+    def _disassociate_floating_ip(self, address: str) -> str | None:
+        conn = self._connection()
+        fip = self._project_fip(conn, address)
+        port = _attr(fip, "port_id") if fip is not None else None
+        if not port:
+            return None
+        conn.network.update_ip(fip, port_id=None)
+        return str(port)
+
+    def _associate_floating_ip(self, address: str, port_id: str) -> None:
+        conn = self._connection()
+        fip = self._project_fip(conn, address)
+        if fip is None:
+            raise ProviderError(f"{self.provider.id}: the project holds no floating IP {address}")
+        if _attr(fip, "port_id") != port_id:
+            conn.network.update_ip(fip, port_id=port_id)
+
+    def _release_floating_ip(self, address: str) -> None:
+        conn = self._connection()
+        fip = self._project_fip(conn, address)
+        if fip is not None:
+            conn.network.delete_ip(fip, ignore_missing=True)
+
     def _server_of_address(self, address: str) -> str | None:
         # a compute port's device only: a floating IP's own port names the floating IP, a
         # router's the router (SDD §7.2, §10, review RV30-06); of the credential's project only,
@@ -1302,6 +1399,16 @@ def _best_os_type(*candidates: str | None) -> str | None:
         if identify(candidate).distro is not None:
             return candidate
     return given[0] if given else None
+
+
+def _free_floating_ips(conn: Any, project: Any) -> int | None:
+    """How many more floating IPs the project may allocate, by Neutron's quota details (SDD §10):
+    None when unlimited."""
+    details = _attr(conn.network.get_quota(project, details=True), "floating_ips") or {}
+    limit = int(details.get("limit", -1))
+    if limit < 0:
+        return None
+    return max(0, limit - int(details.get("used", 0)) - int(details.get("reserved", 0)))
 
 
 class _MapContext:

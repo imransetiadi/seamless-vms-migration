@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import ipaddress
 import logging
 import random
 import time
@@ -69,12 +70,14 @@ from .domain.models import (
     Event,
     EvidenceItem,
     Finding,
+    FipMove,
     ForceCutover,
     GpuWait,
     Hook,
     HookPoint,
     Mappings,
     Migration,
+    Nic,
     PhaseChange,
     Plan,
     Provider,
@@ -145,6 +148,23 @@ PROGRESS_MIN_INTERVAL_S = 1.0
 PRESTAGE_RETRY_S = 60.0
 #: a migration.log line is cut to this many characters, after redaction (SDD §4)
 LOG_LINE_CHARS = 2000
+
+
+def _address(address: str) -> str:
+    """An address as Neutron writes it (SDD §8.3): canonical, else as given."""
+    try:
+        return ipaddress.ip_address(address).compressed
+    except ValueError:
+        return address
+
+
+def _floating_addresses(vm: VMRef) -> list[str]:
+    """The addresses of the floating IPs of the VM's NICs, each once (SDD §4.2, §8.3)."""
+    return list(dict.fromkeys(_address(a) for nic in vm.nics for a in nic.floating_ips))
+
+
+def _journal_entry(m: Migration, address: str) -> FipMove | None:
+    return next((e for e in m.fip_moves if e.address == address), None)
 
 
 #: the points whose hooks a rollback reverts (SDD §8.2)
@@ -2306,6 +2326,8 @@ class Orchestrator:
             except (TransientStepError, PermanentStepError) as exc:
                 # redacted and cut like any reason a skipped VM reports (SDD §8.1)
                 raise NotAllowed(f"finalize failed: {redact_cut(str(exc), 500)}") from exc
+            # SDD §8.3: the source's allocation of each moved floating IP is released
+            await self._release_floating_ips(m, source)
             # SDD §8.2: on_finalize after the step; a failure is recorded, the VM finalized
             await self._run_hooks(m, "on_finalize", keep_going=True)
             m.checkpoint = "finalized"
@@ -3541,6 +3563,9 @@ class Orchestrator:
                             }
                         )
                 await executor.prestage(plan, source, destination, **kwargs)
+            # SDD §8.3: a keep_address plan reserves its floating IPs' addresses at the destination
+            if plan.network_cutover.floating_ips == "keep_address":
+                await self._reserve_floating_ips(migs, destination)
             # what it read when it began: a migration assessed meanwhile waits for the next one
             self._prestage_done.setdefault(plan.id, set()).update(_assessment(m) for m in migs)
             self._prestage_retry_at.pop(plan.id, None)
@@ -4090,6 +4115,11 @@ class Orchestrator:
             )
 
     async def _do_verify(self, m: Migration) -> None:
+        # SDD §8.3: the floating IPs move first - the server exists, the clock is open
+        moved = await self._move_floating_ips(m)
+        if moved is not None:
+            await self._fail(m.id, P.verifying, "floating_ips", moved)
+            return
         # SDD §8.2: post_create before the verification - the server exists, the clock is open
         failed = await self._run_hooks(m, "post_create")
         if failed is not None:
@@ -4204,6 +4234,11 @@ class Orchestrator:
         self.wake()
 
     async def _do_rollback(self, m: Migration) -> None:
+        # SDD §8.3: the floating IPs go back first; a failure leaves the source stopped
+        returned = await self._return_floating_ips(m)
+        if returned is not None:
+            await self._fail(m.id, P.rolling_back, "floating_ips", returned)
+            return
         # SDD §8.2: the reverts of the attempt's hooks, then on_rollback, before the source starts
         await self._run_rollback_hooks(m)
         try:
@@ -4350,6 +4385,147 @@ class Orchestrator:
                 if not keep_going:
                     break
         return first
+
+    async def _fip_action(
+        self, m: Migration, address: str, step: str, error: BaseException | None = None
+    ) -> None:
+        """A floating IP step's migration.action (SDD §8.3); a failure's detail redacted."""
+        outcome = "succeeded" if error is None else "failed"
+        detail = None if error is None else redact_cut(str(error) or type(error).__name__, 500)
+        await self._emit(
+            "migration.action",
+            f"{m.vm.name}: floating IP {address}: {step} {outcome}",
+            migration=m,
+            actor="orchestrator",
+            data={
+                "action": "floating_ip",
+                "address": address,
+                "step": step,
+                "outcome": outcome,
+                "detail": detail,
+            },
+        )
+
+    async def _reserve_floating_ips(self, migs: list[Migration], destination: Provider) -> None:
+        """The keep-address move's reservations with a plan's pre-staging (SDD §8.3): a failure
+        fails the pre-staging, before any source stops."""
+        dst = self.providers.get(destination)
+        for m in migs:
+            for address in _floating_addresses(m.vm):
+                try:
+                    await dst.reserve_floating_ip(address)
+                except Exception as exc:
+                    await self._fip_action(m, address, "reserve", exc)
+                    raise
+                await self._fip_action(m, address, "reserve")
+
+    async def _journal(self, mid: str, address: str, **update: Any) -> FipMove:
+        """Save the floating IP's FipMove of the migration with ``update``, a new one when it has
+        none (SDD §4.2, §8.3); the entry as saved."""
+        async with self._lock(mid):
+            cur, v = await self._load(mid)
+            entry = _journal_entry(cur, address)
+            if entry is None:
+                entry = FipMove(address=address, **update)
+                cur.fip_moves.append(entry)
+            else:
+                entry = entry.model_copy(update=update)
+                cur.fip_moves = [entry if e.address == address else e for e in cur.fip_moves]
+            await self._save(cur, v)
+            return entry
+
+    async def _move_floating_ips(self, m: Migration) -> BaseException | None:
+        """SDD §8.3: each floating IP of the VM leaves the stopped source - the port it was on
+        journaled first - and lands on the new server's port holding the NIC's address; a restart
+        resumes from the journal. The failure, None when every one moved."""
+        plan = await self._plan(m.plan_id)
+        if plan.network_cutover.floating_ips != "keep_address" or not _floating_addresses(m.vm):
+            return None
+        source = await self.db.get("provider", plan.source_provider_id, Provider)
+        destination = await self.db.get("provider", plan.destination_provider_id, Provider)
+        src, dst = self.providers.get(source), self.providers.get(destination)
+        for nic in m.vm.nics:
+            for address in dict.fromkeys(_address(a) for a in nic.floating_ips):
+                try:
+                    if await self._move_one(m, plan, nic, address, src, dst, destination.label):
+                        await self._fip_action(m, address, "move")
+                except Exception as exc:
+                    await self._fip_action(m, address, "move", exc)
+                    return exc
+        return None
+
+    async def _move_one(
+        self, m: Migration, plan: Plan, nic: Nic, address: str, src: Any, dst: Any, where: str
+    ) -> bool:
+        """One floating IP's move from where its journal left it (SDD §8.3); False when it had
+        moved already."""
+        entry = _journal_entry(await self.db.get("migration", m.id, Migration), address)
+        if entry is not None and entry.state in ("moved", "finalized"):
+            return False
+        if entry is None or entry.state == "returned":
+            targets = plan.nic_target(m.vm.source_id, nic)[1]
+            port = await src.floating_ip_port(address)
+            entry = await self._journal(
+                m.id,
+                address,
+                fixed_ip=targets[0] if targets else "",
+                source_port=port,
+                state="releasing",
+            )
+        if entry.state == "releasing":
+            await src.disassociate_floating_ip(address)
+            entry = await self._journal(m.id, address, state="released")
+        await dst.reserve_floating_ip(address)
+        server = (await self.db.get("migration", m.id, Migration)).destination_server_id
+        port_id = await dst.server_port(str(server), entry.fixed_ip)
+        if port_id is None:
+            raise ProviderError(f"server {server} in {where} has no port with {entry.fixed_ip}")
+        await dst.associate_floating_ip(address, port_id)
+        await self._journal(m.id, address, state="moved")
+        return True
+
+    async def _return_floating_ips(self, m: Migration) -> BaseException | None:
+        """SDD §8.3: before a rollback starts the source, each floating IP the journal has not
+        returned leaves the destination - disassociated and released - and goes back to the port
+        it was on at the source. The failure, None when every one returned."""
+        cur = await self.db.get("migration", m.id, Migration)
+        pending = [e for e in cur.fip_moves if e.state in ("releasing", "released", "moved")]
+        if not pending:
+            return None
+        plan = await self._plan(m.plan_id)
+        source = await self.db.get("provider", plan.source_provider_id, Provider)
+        destination = await self.db.get("provider", plan.destination_provider_id, Provider)
+        src, dst = self.providers.get(source), self.providers.get(destination)
+        for entry in pending:
+            try:
+                await dst.disassociate_floating_ip(entry.address)
+                await dst.release_floating_ip(entry.address)
+                if entry.source_port:
+                    await src.associate_floating_ip(entry.address, entry.source_port)
+                await self._journal(m.id, entry.address, state="returned")
+            except Exception as exc:
+                await self._fip_action(m, entry.address, "return", exc)
+                return exc
+            await self._fip_action(m, entry.address, "return")
+        return None
+
+    async def _release_floating_ips(self, m: Migration, source: Provider) -> None:
+        """SDD §8.3: a finalize deletes the source's floating IP of each moved address - its
+        allocation; a failure is recorded and the migration finalized. ``m`` is the finalize's,
+        saved with its transition."""
+        if not any(e.state == "moved" for e in m.fip_moves):
+            return
+        src = self.providers.get(source)
+        for i, entry in enumerate(m.fip_moves):
+            if entry.state != "moved":
+                continue
+            try:
+                await src.release_floating_ip(entry.address)
+            except Exception as exc:
+                await self._fip_action(m, entry.address, "release", exc)
+                continue
+            m.fip_moves[i] = entry.model_copy(update={"state": "finalized"})
+            await self._fip_action(m, entry.address, "release")
 
     async def _owe_revert(self, mid: str, revert: str) -> None:
         """Add ``revert`` to what the migration's rollback owes (SDD §4.2, §8.2)."""

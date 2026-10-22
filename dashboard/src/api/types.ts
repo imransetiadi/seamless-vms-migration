@@ -421,6 +421,14 @@ export interface NicOverride {
   fixed_ips: string[] | null;
 }
 
+/** One floating IP of a migration's keep-address move (SDD §4.2, §8.3). */
+export interface FipMove {
+  address: string;
+  fixed_ip: string;
+  source_port: string | null;
+  state: 'releasing' | 'released' | 'moved' | 'returned' | 'finalized';
+}
+
 /** Where a migration runs a plan's hooks (SDD §4.2, §23.3). */
 export type HookPoint = 'pre_stop' | 'post_create' | 'post_verify' | 'on_rollback' | 'on_finalize';
 
@@ -850,6 +858,8 @@ export interface Migration {
   /** The reverts a rollback owes: the revert of each hook that ran with success since the last rollback, in run order
    * (SDD §4.2, §8.2); older answers omit it. */
   hook_reverts?: string[];
+  /** The journal of its floating IPs' keep-address move (SDD §4.2, §8.3); older answers omit it. */
+  fip_moves?: FipMove[];
   created_at: Timestamp;
   updated_at: Timestamp;
 }
@@ -1043,6 +1053,9 @@ export interface DestinationInventory {
   floating_ips?: string[];
   /** Neutron's DNS integration and Designate's zones (SDD §10, §9.3). */
   dns?: DnsRead;
+  /** The addresses of the project's floating IPs a port holds, and how many more its quota allows (SDD §10, §9.3). */
+  attached_floating_ips?: string[];
+  floating_ip_quota?: number | null;
 }
 
 /** Whether Neutron lists the dns-integration extension, and the Designate zones the credential sees; null where they could
