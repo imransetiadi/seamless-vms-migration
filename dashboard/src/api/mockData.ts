@@ -1519,10 +1519,12 @@ export interface StackRead {
   servers: Record<string, StackPlace>;
 }
 
-/** A member of an Octavia pool of the source, as the API's PoolMember (SDD §10, plan task N2). */
+/** A member of an Octavia pool of the source, as the API's PoolMember (SDD §10, plan tasks N2, N9). */
 export interface PoolMember {
   load_balancer: string;
   pool: string;
+  /** The pool's id: what a plan's network_cutover.lb_pools maps (SDD §8.5). */
+  pool_id: string;
   address: string;
   port: number;
   network: string | null;
@@ -1548,7 +1550,7 @@ export function sourceReads(providerId: string, vms: readonly VMRef[]): { stacks
   for (const vm of vms.filter((v) => MQ_BROKERS.includes(v.source_id))) {
     stacks.servers[vm.source_id] = { stack: 'example-mq', resource: 'broker_group', group: 'broker_group', group_type: 'OS::Heat::AutoScalingGroup' };
     for (const nic of vm.nics)
-      for (const address of nic.fixed_ips) lbMembers.members.push({ load_balancer: 'example-mq-lb', pool: 'example-mq-pool', address, port: 5672, network: nic.network });
+      for (const address of nic.fixed_ips) lbMembers.members.push({ load_balancer: 'example-mq-lb', pool: 'example-mq-pool', pool_id: 'example-mq-pool', address, port: 5672, network: nic.network });
   }
   return { stacks, lbMembers };
 }
@@ -1592,16 +1594,18 @@ function stackFindings(vm: VMRef, plan: Plan, stacks: StackRead, at: string): Ar
 
 /**
  * SRC_VM_LB_MEMBER and SRC_VM_LB_UNKNOWN, as the API's _member_findings (SDD §9.3, plan task N2): each pool member that is
- * an address of the VM's NIC - on the NIC's network when the read names the member's -, NIC by NIC, each named once.
+ * an address of the VM's NIC - on the NIC's network when the read names the member's -, NIC by NIC, each named once; a
+ * member of a pool the plan maps is the member helper's, left out (SDD §8.5, plan task N9).
  */
-function memberFindings(vm: VMRef, read: MemberRead, at: string): Array<[string, string]> {
+function memberFindings(vm: VMRef, plan: Plan, read: MemberRead, at: string): Array<[string, string]> {
   if (read.status === 'unknown')
     return [['SRC_VM_LB_UNKNOWN', `Whether addresses of ${vm.name} are members of Octavia pools at ${at} is not known: ${unread('Octavia', read)}.`]];
   const held: string[] = [];
+  const mapped = plan.network_cutover?.lb_pools ?? {};
   for (const nic of vm.nics) {
     const addresses = new Set(nic.fixed_ips.map(canonicalIp));
     for (const m of read.members)
-      if (addresses.has(canonicalIp(m.address)) && (m.network === null || m.network === nic.network))
+      if (addresses.has(canonicalIp(m.address)) && (m.network === null || m.network === nic.network) && !Object.hasOwn(mapped, m.pool_id))
         held.push(`${canonicalIp(m.address)} port ${m.port} in pool ${pyRepr(m.pool)} of load balancer ${pyRepr(m.load_balancer)}`);
   }
   if (!held.length) return [];
@@ -1789,7 +1793,7 @@ export function preflight(
   // the VM's place in the source's Heat stacks and its Octavia memberships, as the API's (SDD §9.3, §10, plan task N2)
   const at = context.source ?? 'the source';
   if (context.stacks) for (const [code, message, own] of stackFindings(vm, plan, context.stacks, at)) add(code, message, own);
-  if (context.lbMembers) for (const [code, message] of memberFindings(vm, context.lbMembers, at)) add(code, message);
+  if (context.lbMembers) for (const [code, message] of memberFindings(vm, plan, context.lbMembers, at)) add(code, message);
   // a network RHOSO lacks, as the API words it and lists it - before the networks it resolves (SDD §9.3, review RV25-03):
   // a NIC its override sends elsewhere is checked by
   // MAP_NIC_OVERRIDE_INVALID; pre-staging creates same-named networks for OpenStack sources only - the VMware kit has

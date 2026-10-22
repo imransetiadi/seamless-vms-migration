@@ -440,6 +440,18 @@ export interface DnsSwap {
   state: 'swapping' | 'swapped' | 'unchanged' | 'conflict' | 'reverted';
 }
 
+/** A membership the Octavia member helper moves (SDD §4.2, §8.5): the mapped source pool and the VM's member there, its
+ * address and port, the destination pool and the member created there, and how far the move went. */
+export interface LbMove {
+  source_pool: string;
+  source_member: string;
+  address: string;
+  port: number;
+  pool: string;
+  member: string | null;
+  state: 'draining' | 'drained' | 'joining' | 'joined' | 'restored';
+}
+
 /** Where a migration runs a plan's hooks (SDD §4.2, §23.3). */
 export type HookPoint = 'pre_stop' | 'post_create' | 'post_verify' | 'on_rollback' | 'on_finalize';
 
@@ -873,6 +885,8 @@ export interface Migration {
   fip_moves?: FipMove[];
   /** The journal of its DNS target's swap (SDD §4.2, §8.4); null without one, older answers omit it. */
   dns_swap?: DnsSwap | null;
+  /** The journal of its Octavia memberships' move by the member helper (SDD §4.2, §8.5); older answers omit it. */
+  lb_moves?: LbMove[];
   created_at: Timestamp;
   updated_at: Timestamp;
 }
