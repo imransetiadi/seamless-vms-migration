@@ -114,11 +114,17 @@ def swap_addresses(m: Migration, plan: Plan, server: dict[str, Any] | None) -> t
 
 
 class Backend(Protocol):
-    async def read(self, name: str, rdtype: str) -> Record | None: ...
+    """A DNS back end of the swap (SDD §8.4): Designate through the destination provider, or an
+    RFC 2136 server with its TSIG key."""
+
+    async def read(self, name: str, rdtype: str) -> Record | None:
+        """The record ``name`` of ``rdtype`` as the server holds it; None when it holds none."""
 
     async def replace(
         self, name: str, rdtype: str, old: str, new: str
-    ) -> tuple[Outcome, list[str]]: ...
+    ) -> tuple[Outcome, list[str]]:
+        """Compare-and-swap ``old`` to ``new``: ("swapped", []), or ("conflict", the addresses the
+        record holds) when it holds anything but ``old`` - or ``new``, a swap already made."""
 
 
 class DesignateBackend:
