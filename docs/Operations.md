@@ -321,6 +321,9 @@ Follow [RELEASING.md](../RELEASING.md) §9: back up, drain (section 5), roll the
 on Compose, the new tag in the overlay and `up` on a cluster -, verify `GET /api/v1/health` names the new
 version, then resume the plans.
 
+The first pre-staging after an upgrade from a version before issue #112's fix adopts the conversion key: see
+section 7.1.
+
 ---
 
 ## 7. Troubleshooting
@@ -365,49 +368,66 @@ version, then resume the plans.
 The tests that pin the script's behaviour are `seamless/tests/test_seamless_ctl.py` (stub tools record every
 call; QASuite FR-25).
 
-### 7.1 A second plan stops at its pre-staging: "Key name os_migrate_conv present but key hash not the same"
+### 7.1 The conversion key: one per installation (issue #112)
 
-A known issue of 0.4.0-rc.1 (GitHub issue #112), with managed conversion hosts (`conversion_host.manage: true`, the
-default):
-- every plan generates its own conversion key under `/data/plans/<plan id>/osm/conversion/`;
-- the Nova keypair `os_migrate_conv` and the conversion hosts are shared by every plan of the same OpenStack
-  credentials.
+Every OpenStack plan reaches the managed conversion hosts with one conversion key, `/data/conversion/ssh.key` and
+`ssh.key.pub` (directory 0700, key 0600). The link key between the two hosts stays per plan.
 
-So the pre-staging of the second plan stops at the keypair task, and the plan fails with:
+Before a pre-staging that deploys conversion hosts, the control plane reads the `os_migrate_conv` keypair on each side
+whose host it manages (`conversion_host.manage: true`). It compares keys by type and base64, never by the comment.
+Then:
+- **No installation key yet** (the first pre-staging after the upgrade):
+  - When every keypair that exists holds one plan's key, that plan's key pair is copied, never moved, to
+    `/data/conversion/`.
+  - When neither side holds the keypair, the deploy generates a new key there.
+  - Plans in flight keep their own key for their runs until the installation key exists, so a warm migration waiting
+    at its cutover gate keeps syncing across the upgrade.
+- **A cloud whose keypair holds an earlier plan's key** (one that a plan on other credentials deployed before the
+  upgrade) is re-keyed by the pre-staging first:
+  1. It logs in to that side's conversion host with the earlier key.
+  2. It adds the installation key to the SSH user's `~/.ssh/authorized_keys`.
+  3. The deploy then replaces the keypair.
 
-```
-Key name os_migrate_conv present but key hash not the same as offered. Delete key first.
-```
+  No host is recreated, and a migration on the host goes on: the earlier key stays authorized.
 
-**Do not delete the keypair, despite what the message says.** The conversion hosts would still hold the first plan's
-key, and the new plan could not log in to them.
+In the cases below the pre-staging is refused before any playbook runs, and nothing changes on either side. The plan
+fails; one with a migration in flight keeps running and pre-stages again every 60 s. The `plan.updated` "pre-staging
+failed" event carries the message.
 
-Until the fix lands, do one of these:
-- **Run one plan per OpenStack credential at a time.**
-- **Give the new plan the key of the plan that deployed the conversion hosts,** then start the new plan again (a
-  failed plan pre-stages again at its start):
-  1. Find the first plan. Its key's fingerprint is the keypair's, and Nova shows the MD5 form.
-  2. Copy that plan's key pair into the new plan's directory, which may already hold a key of its own, inside the
-     control plane's container. On Compose, `docker compose ... exec seamless sh`; on a cluster, `oc rsh
-     deploy/seamless`, or `kubectl exec -it deploy/seamless -- sh`.
+| Message | Meaning and fix |
+|---|---|
+| `the os_migrate_conv keypairs of <source> (SHA256:...) and <destination> (SHA256:...) hold different keys, and this installation has no conversion key yet to re-key them to` | Each cloud holds another plan's key. Make one of them the installation key (below) and start the plan again: the other side is then re-keyed. |
+| `the os_migrate_conv keypair of <provider> (SHA256:...) holds a key that neither this installation's conversion key nor any plan's matches, so its conversion host can be neither reached nor re-keyed` | The keypair was made outside this installation, or its plan's directory is gone. Restore that directory from a backup. If no migration uses that cloud's conversion host, you can instead delete the host and the keypair with that provider's credentials (`openstack server delete <host>`, `openstack keypair delete os_migrate_conv`) and start the plan again. |
+| `the installation's conversion key /data/conversion/ssh.key has no readable public key beside it (/data/conversion/ssh.key.pub)` | In the container, run `ssh-keygen -y -f /data/conversion/ssh.key > /data/conversion/ssh.key.pub`, then start the plan again. |
+
+Run these in the control plane's container (Compose: `docker compose ... exec seamless sh`; a cluster: `oc rsh
+deploy/seamless` or `kubectl exec -it deploy/seamless -- sh`):
 
 ```bash
-# where the OpenStack CLI reaches the source cloud
-openstack keypair show os_migrate_conv -f value -c fingerprint
-
-# in the control plane's container: the plan whose key matches
-for k in /data/plans/*/osm/conversion/ssh.key.pub; do echo "$(ssh-keygen -E md5 -lf "$k" | cut -d' ' -f2 | sed 's/^MD5://') $k"; done
-
-# still in the container: copy it to the new plan
-FIRST=<the plan id whose key matches>
-NEW=<the new plan's id>
-mkdir -p "/data/plans/$NEW/osm/conversion" && chmod 700 "/data/plans/$NEW/osm/conversion"
-cp -p "/data/plans/$FIRST/osm/conversion/ssh.key" "/data/plans/$FIRST/osm/conversion/ssh.key.pub" \
-  "/data/plans/$NEW/osm/conversion/"
+# which key a fingerprint of the message is
+for k in /data/conversion/ssh.key.pub /data/plans/*/osm/conversion/ssh.key.pub; do
+  [ -f "$k" ] && echo "$(ssh-keygen -lf "$k" | cut -d' ' -f2) $k"
+done
+# make a plan's key the installation key: the .pub first (the private key's presence marks the key)
+PLAN=<the plan id>
+mkdir -p /data/conversion && chmod 700 /data/conversion
+cp -p "/data/plans/$PLAN/osm/conversion/ssh.key.pub" /data/conversion/
+cp -p "/data/plans/$PLAN/osm/conversion/ssh.key" /data/conversion/ && chmod 600 /data/conversion/ssh.key
 ```
 
-The link key between the conversion hosts needs nothing: each pre-staging writes its plan's link key to both hosts,
-and the runs of every plan use the pair the hosts hold.
+Other cases:
+- **Hosts you manage yourself** (`manage: false`) are never read or changed. Add `/data/conversion/ssh.key.pub` to
+  their SSH user's `authorized_keys` once.
+- **Plans in flight on another cloud pair after the upgrade:**
+  1. If a run fails with `Permission denied (publickey)`, authorize the installation key on both of that plan's
+     conversion hosts, logging in with the plan's earlier key:
+     `ssh -i "/data/plans/$PLAN/osm/conversion/ssh.key" <ssh_user>@<host> 'cat >> ~/.ssh/authorized_keys' <
+     /data/conversion/ssh.key.pub`.
+  2. Then retry the migration.
+
+  The next pre-staging on that pair also replaces its keypair.
+- **Re-keyed hosts** keep the earlier key authorized. Once no plan of that key is in flight, remove its line by hand
+  (Security.md §6.4).
 
 ---
 
