@@ -5226,7 +5226,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D16 | GPU workloads (§22): how GPU VMs migrate in 0.3.0 | decided by the owner 2026-10-20: a Technology Preview; the plan's GPU mapping is the opt-in (no switch); one GPU flavor per GPU key in a plan; no wave tier of their own, and never in the pilot wave; the network cut-over hooks and the Octavia/Heat helpers move from 0.3.0 to 0.4.0 (PRD, plan task G14) | the lab cases of §22.14 on GPU hosts end the Technology Preview |
 | D17 | A per-VM GPU flavor (a plan field keyed by source id, as `nic_overrides`) for VMs that share a GPU key but need flavors of different sizes | not in 0.3.0: such VMs go into separate plans (D16) | after the Technology Preview, when users ask for it |
 | D18 | Network cut-over, Octavia and Heat (§23): what 0.4.0 does | decided by the owner 2026-10-21: §23.11's eleven defaults as written - both built-in actions and generic hooks, hooks in an admin's catalog, a failure after the stop following `auto_rollback`, `auto` kept with a new-address warning and the keep-address move opt-in, the source's floating IP disassociated (journaled) during the cutover, Designate and RFC 2136 built in, BGP by verification only, Octavia findings and the member helper as a Technology Preview, Heat findings with `SRC_VM_AUTOSCALED` blocking until acknowledged, the Technology Preview label until LAB-NET passes, `allowed_address_pairs` a finding in 0.4.0 | the LAB-NET cases of §23.10 end the Technology Preview |
-| D19 | Notifications (§24): what 0.5.0 does | proposed 2026-10-23: §24.11's twelve defaults, none taken yet | owner decision |
+| D19 | Notifications (§24): what 0.5.0 does | decided by the owner 2026-10-23: §24.11's twelve defaults as written | each item binds with its plan task (§24.12); the live smoke NT12 gates 0.5.0 |
 
 ## 21. Destination platforms: RHOSO 18.0 and community OpenStack
 
@@ -6150,17 +6150,18 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | QASuite (requirement rows, LAB-NET cases), Security.md, Operations.md's runbooks | QASuite, Security.md, Operations.md | N13 |
 | the lab on two clouds; the Technology Preview label goes when its cases pass | QASuite §13 | N14 |
 
-## 24. Notifications (proposed for 0.5.0)
+## 24. Notifications (0.5.0)
 
-Status: a proposal of 2026-10-23 for the owner's decisions (§24.11, D19). Nothing in this section is binding, and the
-PRD stays unchanged until the owner approves it (plan task NT1).
+Status: proposed 2026-10-23 and decided by the owner the same day (D19): §24.11's defaults as written. Each item
+becomes binding in the section §24.12 names when its plan task lands; until then nothing in this section is binding.
+The PRD follows with plan task NT1.
 
 What it answers:
 * the release table's "notifications (email/Slack webhooks)" (PRD §9): its 0.2.0 row named them, and no FR, design or
   code ever covered them;
 * the Application owner of PRD §4, whose surface is "notifications via events".
 
-The release is the owner's to choose (owner decision 1), and this section proposes 0.5.0. The plan is
+The owner chose 0.5.0 (owner decision 1). The plan is
 `superpowers/plans/2026-10-23-notifications.md`.
 
 The proposed models, event kinds, routes, variables and metric stay out of the tables the SDD-reading tests parse
@@ -6600,7 +6601,7 @@ with `outcome` `sent` or `failed`, joins §18 with plan task NT5, so that a fail
 
 ### 24.11 Owner decisions
 
-Each comes with the default this proposal recommends:
+The owner took each default as written on 2026-10-23 (D19):
 
 1. **The release: notifications in 0.5.0.**
    * The 0.2.0 row of PRD §9 named them, and 0.2.0 shipped without them.
