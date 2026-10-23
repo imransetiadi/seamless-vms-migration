@@ -158,7 +158,7 @@ item marked a Technology Preview stays one until its lab cases pass).
 | FR-24 | Demo mode with simulated providers and executor | M | `seamless serve --demo` exercises every phase including rollback |
 | FR-25 | Deploy on OpenShift, Kubernetes and Docker Compose (Docker Engine on a Linux host, Colima on macOS, or Podman) with PostgreSQL | M | Manifests in `deploy/openshift` and its overlay `deploy/kubernetes`, compose stack in `deploy/compose` |
 | FR-26 | Changed-extent tracking to remove the scan floor: Ceph-direct `rbd diff` and hypervisor-assisted libvirt checkpoints | C | 0.2.0 |
-| FR-27 | HA control plane (leader election) | C | 0.2.0 |
+| FR-27 | HA control plane: a lease on PostgreSQL elects one leader, whose epoch fences every write; two replicas on a cluster (SDD §25) | M5 | A leader lost on a cluster with a ReadWriteMany data volume is replaced, and its migrations resume, within about 35 s (60 s the lab's target); no write of a deposed leader lands after a takeover; a Technology Preview until LAB-HA01–LAB-HA05 pass (SDD §25.10) |
 | FR-28 | Network cut-over hooks: an admin's playbook and webhook hooks that a plan runs at `pre_stop`, `post_create`, `post_verify`, `on_rollback` and `on_finalize`, each with a timeout, an idempotency key and a revert | M4 | A hook's failure before the stop keeps the source running, one after it follows `auto_rollback`, and no credential reaches a hook's context (SDD §23.3) |
 | FR-29 | Community OpenStack destinations: a destination provider of kind `openstack` (distribution `openstack_community` or `kolla`) of a series in the support window, beside RHOSO 18.0 | M2 | Every strategy the destination's capabilities allow passes the lab matrix on each Tier 1 series (QASuite §6.7 AC-6, §7.1 M7–M12, §7.2 LAB-D); SDD §21.1 |
 | FR-30 | Release detection and support tier per destination: the series range the API version documents fit, an optional declared series, and the tier | M2 | The provider check shows range, declared series and tier; a declared series the detected range contradicts warns, and where the APIs cannot tell the series the declared one decides; with none declared the tier is the least favourable one the range allows (SDD §21.3) |
@@ -222,10 +222,10 @@ item marked a Technology Preview stays one until its lab cases pass).
 | Release | Scope |
 |---|---|
 | **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift, Kubernetes and Compose (Docker on Linux, Colima on macOS, or Podman) deployment, docs |
-| 0.2.0 | Ceph-direct incremental diff, HA (PostgreSQL leader election), per-tenant credentials; community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34). Notifications moved to 0.5.0 |
+| 0.2.0 | Ceph-direct incremental diff, per-tenant credentials; community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34). Notifications and HA moved to 0.5.0 |
 | 0.3.0 | GPU workloads as a Technology Preview (G8, FR-35–FR-41; SDD §22) |
 | 0.4.0 | Network cut-over as a Technology Preview (G9, FR-28, FR-42–FR-47; SDD §23): hooks, the keep-address floating IP move, the DNS swap, the BGP reachability wait, the Heat and Octavia findings and the Octavia member helper |
-| 0.5.0 | Notifications by email, Slack and signed webhooks (G10, FR-48–FR-51; SDD §24) |
+| 0.5.0 | Notifications by email, Slack and signed webhooks (G10, FR-48–FR-51; SDD §24); the HA control plane as a Technology Preview (FR-27; SDD §25) |
 | 1.0.0 | Certified on RHOSO 18.0.x FRs, validated on every Tier 1 community series of the day, scale test 5,000 VMs, signed releases |
 
 ## 10. Dependencies and assumptions
