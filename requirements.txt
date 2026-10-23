@@ -9,5 +9,5 @@
 openstacksdk @ git+https://github.com/os-migrate/openstacksdk.git@4.5.1
 python-openstackclient>=7.0
 passlib>=1.7.4
-PyYAML>=6.0.2
+PyYAML>=6.0.3
 jmespath>=1.1.0
