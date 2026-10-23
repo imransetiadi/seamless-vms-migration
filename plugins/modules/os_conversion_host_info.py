@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# Modified by the Seamless Migrate project, 2026.
 
 
 from __future__ import absolute_import, division, print_function
@@ -130,8 +131,12 @@ def main():
         elif hasattr(server, "public_v4") and server.public_v4 != "":
             conversion_host["address"] = server.public_v4
         else:
+            # the server by its name and id alone: its text holds its user data, which Nova details
+            # to an admin - an injected host key for a server the role created (Seamless Migrate
+            # SDD 6.5, 26.3)
             module.fail_json(
-                msg="Conversion host address cant be empty \n" + str(server)
+                msg="Conversion host address cant be empty: server %s (%s)"
+                % (server.name, server.id)
             )
         conversion_host["status"] = server.status
         conversion_host["name"] = server.name
