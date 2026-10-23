@@ -1665,4 +1665,21 @@ describe('PlanDetail', () => {
     expect(list).toHaveTextContent('grid_a100-4c → g1.a100-4c');
     expect(within(list).getByRole('button', { name: 'Technology Preview' })).toBeInTheDocument();
   });
+
+  it('closes an unchanged edit at once, and asks before Close discards a change (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan('plan-c81d44a0');
+    // the dialog mounts open with the plan's own form: closing it unchanged discards nothing, so nothing asks
+    await user.click(await actionButton(/^edit plan$/i));
+    await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: /edit plan/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    // a changed name: Close asks first
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), ' v2');
+    await user.keyboard('{Escape}');
+    expect(await screen.findByRole('alertdialog', { name: /discard unsaved plan changes/i })).toBeInTheDocument();
+  });
 });

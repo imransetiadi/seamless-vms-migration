@@ -155,4 +155,19 @@ describe('ConfirmDialog', () => {
     expect(input).toBeInvalid();
     expect(input).toHaveAccessibleDescription('The text does not match yet.');
   });
+
+  it('asks for the typed text anew each time it opens', async () => {
+    const user = userEvent.setup({ delay: null });
+    const dialog = (open: boolean) => (
+      <ConfirmDialog open={open} tone="danger" title="Finalize web-01?" confirmLabel="Finalize" requireText="web-01" onConfirm={vi.fn()} onCancel={vi.fn()} />
+    );
+    const { rerender } = render(dialog(true));
+    await user.type(screen.getByLabelText(/type web-01 to confirm/i), 'web-01');
+    expect(screen.getByRole('button', { name: 'Finalize' })).not.toHaveAttribute('aria-disabled');
+    // closed and opened again: an earlier confirmation's text never confirms the next one
+    rerender(dialog(false));
+    rerender(dialog(true));
+    expect(screen.getByLabelText(/type web-01 to confirm/i)).toHaveValue('');
+    expect(screen.getByRole('button', { name: 'Finalize' })).toHaveAttribute('aria-disabled', 'true');
+  });
 });

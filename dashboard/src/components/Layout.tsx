@@ -259,6 +259,16 @@ function HealthNotice() {
   );
 }
 
+/** What a change of the stream's status to `status` says; nothing before it has been live (`wasOpen`). */
+function streamChange(status: LiveStatus, wasOpen: boolean): string | null {
+  if (!wasOpen) return null;
+  if (status === 'open') return 'Live updates back.';
+  if (status === 'reconnecting') return 'Live updates lost: reconnecting.';
+  if (status === 'unauthorized') return 'Signed out: live updates stopped.';
+  if (status === 'closed' || status === 'idle') return 'Live updates stopped: the page shows what it last received.';
+  return null;
+}
+
 /**
  * The live event stream's changes once it has been live — lost, back, stopped, signed out — said once for the
  * page from a region already on it; the Live indicators only show them, and the first connection is not news
@@ -267,22 +277,14 @@ function HealthNotice() {
 function StreamNotice() {
   const { status } = useLiveSnapshot();
   const [text, setText] = useState('');
-  const wasOpen = useRef(false);
-  const last = useRef<LiveStatus>(status);
-  useEffect(() => {
-    const previous = last.current;
-    last.current = status;
-    if (status === previous) return;
-    if (status === 'open') {
-      if (wasOpen.current) setText('Live updates back.');
-      wasOpen.current = true;
-      return;
-    }
-    if (!wasOpen.current) return;
-    if (status === 'reconnecting') setText('Live updates lost: reconnecting.');
-    else if (status === 'unauthorized') setText('Signed out: live updates stopped.');
-    else if (status === 'closed' || status === 'idle') setText('Live updates stopped: the page shows what it last received.');
-  }, [status]);
+  // the status followed last, and whether the stream has been live: followed as the region renders, not by an effect a
+  // render later (react.dev, "Adjusting some state when a prop changes")
+  const [seen, setSeen] = useState<{ status: LiveStatus; wasOpen: boolean }>({ status, wasOpen: false });
+  if (status !== seen.status) {
+    setSeen({ status, wasOpen: seen.wasOpen || status === 'open' });
+    const said = streamChange(status, seen.wasOpen);
+    if (said !== null) setText(said);
+  }
   return (
     <p role="status" className="sr-only">
       {text}
@@ -413,6 +415,15 @@ export function Layout() {
     drawerReturnRef.current = to === pathname ? mainRef.current : null;
     setMenuOpen(false);
   };
+  // any navigation closes the drawer, as the shell renders the new location (react.dev, "Adjusting some state when a
+  // prop changes"). One that came while it was open - Back, a redirect, not a choice in it - leaves the focus to the
+  // drawer's close, which returns it to the drawer's button (drawerReturnRef), as it always did (SDD §16)
+  const [shown, setShown] = useState({ pathname, hash, state, drawerWasOpen: false });
+  if (pathname !== shown.pathname || hash !== shown.hash || state !== shown.state) {
+    setShown({ pathname, hash, state, drawerWasOpen: menuOpen });
+    setMenuOpen(false);
+  }
+  const drawerWasOpen = shown.drawerWasOpen;
 
   // Move focus to the main region after client-side navigation (screen readers announce the page).
   // Comparing paths (not a "first render" flag) keeps the initial load untouched — so the first Tab
@@ -421,7 +432,6 @@ export function Layout() {
   // runs first in the same commit. While it still loads that part, main takes focus and the page moves it
   // there once it shows (SDD §16).
   useEffect(() => {
-    setMenuOpen(false);
     if (lastPath.current === pathname) return;
     lastPath.current = pathname;
     // a control that switches the view in place (the inventory's Provider select) keeps the focus: moving it on
@@ -429,9 +439,9 @@ export function Layout() {
     if (keepsFocus(state)) return;
     const target = hash.length > 1 ? document.getElementById(decodeURIComponent(hash.slice(1))) : null;
     if (target && document.activeElement === target) return;
-    mainRef.current?.focus({ preventScroll: true });
+    if (!drawerWasOpen) mainRef.current?.focus({ preventScroll: true });
     window.scrollTo(0, 0);
-  }, [pathname, hash, state]);
+  }, [pathname, hash, state, drawerWasOpen]);
 
   const full = mode === 'full';
   return (

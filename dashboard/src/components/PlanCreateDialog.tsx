@@ -335,7 +335,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   // the approval policy is approver-only (SDD §12): below it the form shows the plan's policy read-only
   const canSetPolicy = hasRole(useRole(), 'approver');
   const [form, setForm] = useState<FormState>(() => (plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds)));
-  const baseline = useRef('');
+  // the form as it opened: Close asks before it discards changes to it
+  const [baseline, setBaseline] = useState('');
   const [discarding, setDiscarding] = useState(false);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   useLayoutEffect(() => {
@@ -351,18 +352,27 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   // which VMs another plan holds: the migrations as summaries, read while open (SDD §5.4, §16)
   const migrations = useMigrationSummaries({}, { enabled: open });
 
+  // each opening starts the form afresh, one that mounts open too: reset as the dialog renders, not by an effect a render
+  // later (react.dev, "Adjusting some state when a prop changes")
+  const [shownOpen, setShownOpen] = useState(false);
+  if (open !== shownOpen) {
+    setShownOpen(open);
+    if (open) {
+      const initial = plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds);
+      setBaseline(stable({ ...initial, vmIds: [...initial.vmIds].sort() }));
+      setForm(initial);
+      setDiscarding(false);
+      setErrors({});
+    }
+  }
+  // and the last request's outcome goes: the mutations keep it outside React's state
+  const resetCreate = create.reset;
+  const resetPatch = patch.reset;
   useEffect(() => {
     if (!open) return;
-    const initial = plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds);
-    baseline.current = stable({ ...initial, vmIds: [...initial.vmIds].sort() });
-    setForm(initial);
-    setDiscarding(false);
-    setErrors({});
-    create.reset();
-    patch.reset();
-    // Reset only when the dialog opens.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+    resetCreate();
+    resetPatch();
+  }, [open, resetCreate, resetPatch]);
 
   const sources = (providers.data ?? []).filter((p) => p.role === 'source');
   const destinations = (providers.data ?? []).filter((p) => p.role === 'destination');
@@ -685,7 +695,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   };
   const advancedHasErrors = ['keepWarm', 'finalizeReminder', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'appProbes', 'handover', 'cutover'].some((k) => k in errors);
   const close = () => {
-    if (stable({ ...form, vmIds: [...form.vmIds].sort() }) !== baseline.current) setDiscarding(true);
+    if (stable({ ...form, vmIds: [...form.vmIds].sort() }) !== baseline) setDiscarding(true);
     else onClose();
   };
   if (discarding) {

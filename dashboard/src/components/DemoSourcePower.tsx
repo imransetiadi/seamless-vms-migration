@@ -24,16 +24,18 @@ export function DemoSourcePower({ migration: m, role }: { migration: Migration; 
   // dropped for good - a power back where it was at the press is the record's, not the press's
   const basis = `${m.phase}|${m.attempts}|${m.source_running_at ?? ''}`;
   if (set && set.basis !== basis) setSet(null);
+  // dropped with the press, so a screen reader hears no stale state and no earlier attempt's failure shows
+  // (review RV46B-02): its announcement as the panel renders, its request's outcome - which the mutation keeps, outside
+  // React's state - right after
+  if (pressed !== null && pressed !== basis) {
+    setPressed(null);
+    setAnnouncement('');
+  }
   const resetPower = power.reset;
+  const dropped = pressed === null && power.status !== 'idle';
   useEffect(() => {
-    // dropped with the press, so a screen reader hears no stale state and no earlier attempt's failure shows
-    // (review RV46B-02)
-    if (pressed !== null && pressed !== basis) {
-      setPressed(null);
-      setAnnouncement('');
-      resetPower();
-    }
-  }, [basis, pressed, resetPower]);
+    if (dropped) resetPower();
+  }, [dropped, resetPower]);
   if (!health.data?.demo || m.phase !== 'completed') return null;
   const running = set ? set.on : Boolean(m.source_running_at);
   const press = () => {

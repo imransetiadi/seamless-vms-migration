@@ -1,5 +1,5 @@
 import { ArrowRight, CircleCheck, CircleHelp, CircleX, TriangleAlert, X, type LucideIcon } from 'lucide-react';
-import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode, type RefObject } from 'react';
+import { useId, useRef, useState, type FormEvent, type ReactNode, type RefObject } from 'react';
 import { cn } from '../lib/cn';
 import { ErrorBanner } from './ErrorBanner';
 import { Button } from './Button';
@@ -77,9 +77,13 @@ export function ConfirmDialog({
   const cancelRef = useRef<HTMLButtonElement>(null);
   const confirmRef = useRef<HTMLButtonElement>(null);
 
-  useEffect(() => {
+  // each opening asks for the text anew: reset as the dialog renders, not by an effect a render later (react.dev,
+  // "Adjusting some state when a prop changes")
+  const [shownOpen, setShownOpen] = useState(open);
+  if (open !== shownOpen) {
+    setShownOpen(open);
     if (open) setTyped('');
-  }, [open]);
+  }
 
   const typedOk = requireText === undefined || typed === requireText;
   const ready = typedOk && canConfirm && !pending;

@@ -21,7 +21,13 @@ export function ErrorBanner({ error, title = 'Something went wrong', onRetry, cl
   const code = error instanceof ApiError && error.code ? error.code : null;
   // Retry is busy until an answer comes: another failure ends it, a success removes the banner (SDD §16)
   const [retrying, setRetrying] = useState(false);
-  useEffect(() => setRetrying(false), [error]);
+  // another failure is an answer: adjusted as the banner renders the new error, not by an effect a render later
+  // (react.dev, "Adjusting some state when a prop changes")
+  const [shownError, setShownError] = useState(error);
+  if (error !== shownError) {
+    setShownError(error);
+    setRetrying(false);
+  }
   // a Retry that succeeded takes the banner away with the focused button: the focus goes to the page's heading,
   // never to nothing (SDD §16), unless something else took it meanwhile
   const root = useRef<HTMLDivElement>(null);

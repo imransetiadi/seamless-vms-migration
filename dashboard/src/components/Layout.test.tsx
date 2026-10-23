@@ -1,5 +1,6 @@
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { Route, Routes, useNavigate } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { LiveContext, LiveEventHub } from '../api/live';
 import { createTestServer, renderWithApp } from '../test/utils';
@@ -220,6 +221,31 @@ describe('Layout phone navigation (SDD §16 focus)', () => {
     await user.click(await screen.findByRole('button', { name: 'Open navigation' }));
     await user.click(screen.getByTestId('modal-backdrop'));
     expect(screen.queryByRole('dialog', { name: 'Navigation' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Open navigation' })).toHaveFocus();
+  });
+
+  it('a navigation from elsewhere while the menu is open closes it and returns the focus to its button', async () => {
+    const user = userEvent.setup({ delay: null });
+    let go: (to: string) => void = () => {};
+    function Page() {
+      go = useNavigate();
+      return <p>Overview page</p>;
+    }
+    renderWithApp(
+      <Routes>
+        <Route element={<Layout />}>
+          <Route path="/" element={<Page />} />
+          <Route path="/events" element={<p>Events page</p>} />
+        </Route>
+      </Routes>,
+      { route: '/' },
+    );
+    await user.click(await screen.findByRole('button', { name: 'Open navigation' }));
+    expect(screen.getByRole('dialog', { name: 'Navigation' })).toBeInTheDocument();
+    // the page moves on without a choice in the menu - Back, or a redirect - while it is open
+    act(() => go('/events'));
+    expect(await screen.findByText('Events page')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Navigation' })).toBeNull());
     expect(screen.getByRole('button', { name: 'Open navigation' })).toHaveFocus();
   });
 });

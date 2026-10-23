@@ -1,12 +1,15 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { Route, Routes } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 import type { MockServer } from '../api/mock';
 import { makeVm } from '../api/mockData';
 import type { VMRef } from '../api/types';
+import { Layout } from '../components/Layout';
 import { gpuDevice } from '../lib/gpu';
 import { phaseMeta } from '../lib/phase';
 import { createTestServer, formFields, recordScrolls, renderWithApp } from '../test/utils';
+import Inventory from './Inventory';
 import Plans from './Plans';
 
 
@@ -1118,4 +1121,55 @@ describe('Plans page', () => {
       expect(Object.entries(server.plans.find((p) => p.name === 'Odd type')!.handover.backend_map)).toEqual([[type, 'hostgroup@ontap-nfs']]);
     },
   );
+
+  it('asks before Close discards a changed form, and each opening starts afresh (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    // nothing changed: Close discards nothing, so it closes at once
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: /new migration plan/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    // a name typed: Close asks first
+    await user.click(screen.getByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Half done');
+    await user.keyboard('{Escape}');
+    const ask = await screen.findByRole('alertdialog', { name: /discard unsaved plan changes/i });
+    await user.click(within(ask).getByRole('button', { name: 'Discard changes' }));
+    expect(screen.queryByRole('dialog', { name: /new migration plan/i })).not.toBeInTheDocument();
+    // opened again: the discarded name is gone, and the fresh form counts as unchanged
+    await user.click(screen.getByRole('button', { name: /new plan/i }));
+    const fresh = await screen.findByRole('dialog', { name: /new migration plan/i });
+    expect(within(fresh).getByLabelText(/^name/i)).toHaveValue('');
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: /new migration plan/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
+  it('opens the new-plan dialog with the VMs chosen in the inventory, and closed gives the focus to the page (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(
+      <Routes>
+        <Route element={<Layout />}>
+          <Route path="/inventory/:providerId" element={<Inventory />} />
+          <Route path="/plans" element={<Plans />} />
+        </Route>
+      </Routes>,
+      { route: '/inventory/rhosp17-dc1', token: 'operator' },
+    );
+    const table = await screen.findByRole('table', { name: /^VMs on/ });
+    await user.click(within(table).getByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(screen.getByRole('button', { name: /^create plan with 1 vm$/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    // the selection comes with it, and the form has the focus: the move to the new page came first
+    expect(within(dialog).getByLabelText(/source provider/i)).toHaveValue('rhosp17-dc1');
+    expect(await within(dialog).findByRole('checkbox', { name: 'Select web-01' })).toBeChecked();
+    await waitFor(() => expect(within(dialog).getByLabelText(/^name/i)).toHaveFocus());
+    // closed unchanged, the focus goes back where the new page put it: its main region
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: /new migration plan/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('main')).toHaveFocus();
+  });
 });

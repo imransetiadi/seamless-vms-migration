@@ -1,5 +1,6 @@
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { Route, Routes, useNavigate } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 import { queryKeys } from '../api/hooks';
 import type { MockServer } from '../api/mock';
@@ -891,7 +892,8 @@ describe('MigrationDetail', () => {
     const [nic] = m.vm.nics;
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
     const panel = await screen.findByRole('region', { name: 'Network' });
-    const table = within(panel).getByRole('table', { name: `NICs of ${m.vm.name}` });
+    // the panel says it is loading the plan until the plan is read: its table comes then
+    const table = await within(panel).findByRole('table', { name: `NICs of ${m.vm.name}` });
     const row = within(table).getByRole('row', { name: new RegExp(nic!.mac!) });
     expect(row).toHaveTextContent(`${nic!.network}`);
     expect(row).toHaveTextContent(nic!.fixed_ips[0]!);
@@ -935,7 +937,8 @@ describe('MigrationDetail', () => {
     m.vm.nics[0]!.network = '__proto__';
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
     const panel = await screen.findByRole('region', { name: 'Network' }, { timeout: 5000 });
-    const table = within(panel).getByRole('table', { name: `NICs of ${m.vm.name}` });
+    // the panel says it is loading the plan until the plan is read: its table comes then
+    const table = await within(panel).findByRole('table', { name: `NICs of ${m.vm.name}` });
     const row = within(table).getByRole('row', { name: new RegExp(m.vm.nics[0]!.mac!) });
     // "Source" and "On the destination" both read the network's name
     await waitFor(() => expect(row.textContent!.split('__proto__').length - 1).toBe(2));
@@ -1449,5 +1452,31 @@ describe('MigrationDetail', () => {
     // once the control plane said it is not in demo mode
     await waitFor(() => expect(queryClient.getQueryData(queryKeys.health)).toMatchObject({ demo: false }));
     expect(within(step).queryByRole('button', { name: /source VM \(demo\)/ })).not.toBeInTheDocument();
+  });
+
+  it("drops the events streamed for the migration it showed before when it shows another one (SDD §16)", async () => {
+    const server = createTestServer();
+    const first = server.migrations.find((x) => x.vm.name === 'web-01')!;
+    const second = server.migrations.find((x) => x.vm.name === 'web-cache-01')!;
+    let go: (to: string) => void = () => {};
+    function Page() {
+      go = useNavigate();
+      return <MigrationDetail />;
+    }
+    renderWithApp(
+      <Routes>
+        <Route path="/migrations/:migrationId" element={<Page />} />
+      </Routes>,
+      { route: `/migrations/${first.id}`, token: 'viewer', server, live: true },
+    );
+    const timeline = await screen.findByRole('list', { name: 'Timeline, newest first' });
+    await waitFor(() => expect(server.subscriberCount).toBeGreaterThan(0));
+    server.emit({ kind: 'migration.action', plan_id: first.plan_id, migration_id: first.id, actor: 'rina', message: `${first.vm.name}: streamed note`, data: {} });
+    expect(await within(timeline).findByText(`${first.vm.name}: streamed note`)).toBeInTheDocument();
+    // the same page, another migration: what streamed for the first is not on its timeline
+    act(() => go(`/migrations/${second.id}`));
+    expect(await screen.findByRole('heading', { level: 1, name: second.vm.name })).toBeInTheDocument();
+    await within(await screen.findByRole('list', { name: 'Timeline, newest first' })).findAllByRole('listitem');
+    expect(screen.queryByText(`${first.vm.name}: streamed note`)).not.toBeInTheDocument();
   });
 });

@@ -1,5 +1,5 @@
 import { CircleAlert, CircleCheck, FileKey2, KeyRound, LockKeyhole, PlugZap, Plus, Trash2, TriangleAlert } from 'lucide-react';
-import { useEffect, useId, useRef, useState, type ChangeEvent, type FormEvent, type ReactNode, type Ref } from 'react';
+import { useId, useRef, useState, type ChangeEvent, type FormEvent, type ReactNode, type Ref } from 'react';
 import { ApiError } from '../api/client';
 import { useCheckProvider, useCreateProvider, useInventory, useSetConversionKey, useSetProviderCredentials, useUpdateProvider } from '../api/hooks';
 import type { ConversionHostConfig, Distribution, Provider, ProviderCredentials, ProviderPatch, ProviderRole } from '../api/types';
@@ -485,18 +485,21 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
   const inventory = useInventory(open && !busy && !outcome && current && current.kind !== 'vmware' ? current.id : undefined);
   const gpuHeadingRef = useRef<HTMLHeadingElement>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    setForm(initialState(provider));
-    setAdded(null);
-    setErrors({});
-    setOutcome(null);
-    setFailure(null);
-    setPasteKey(false);
-    setHostOpen(Boolean(provider && presetFor(provider.distribution, provider.kind).kind === 'vmware'));
-    // Reset only when the dialog opens.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  // each opening starts the form afresh, one that mounts open too: reset as the dialog renders, not by an effect a render
+  // later (react.dev, "Adjusting some state when a prop changes")
+  const [shownOpen, setShownOpen] = useState(false);
+  if (open !== shownOpen) {
+    setShownOpen(open);
+    if (open) {
+      setForm(initialState(provider));
+      setAdded(null);
+      setErrors({});
+      setOutcome(null);
+      setFailure(null);
+      setPasteKey(false);
+      setHostOpen(Boolean(provider && presetFor(provider.distribution, provider.kind).kind === 'vmware'));
+    }
+  }
 
   const preset = presetFor(form.distribution);
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((f) => ({ ...f, [key]: value }));

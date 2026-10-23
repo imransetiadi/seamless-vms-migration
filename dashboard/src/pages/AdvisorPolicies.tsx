@@ -148,13 +148,16 @@ export default function AdvisorPolicies() {
     () => [...(policies.data?.items ?? [])].sort((a, b) => level(a) - level(b) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id)),
     [policies.data],
   );
+  // the deleted card went with the button the dialog returns focus to: the list heading takes it (SDD §16) - once the
+  // list no longer has the card; the deletion is taken as the list renders, the heading focused once that is committed
+  const [headingFocus, setHeadingFocus] = useState<{ deleted: string } | null>(null);
+  if (deleted && !items.some((p) => p.id === deleted)) {
+    setDeleted(null);
+    setHeadingFocus({ deleted });
+  }
   useEffect(() => {
-    // the deleted card went with the button the dialog returns focus to: the list heading takes it (SDD §16)
-    if (deleted && !items.some((p) => p.id === deleted)) {
-      headingRef.current?.focus();
-      setDeleted(null);
-    }
-  }, [deleted, items]);
+    if (headingFocus) headingRef.current?.focus();
+  }, [headingFocus]);
 
   // a link to #policy-{id} lands on that policy once the list is there (SDD §16, ADV-20)
   useHashLanding(Boolean(policies.data));

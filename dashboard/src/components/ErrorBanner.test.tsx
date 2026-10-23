@@ -1,5 +1,6 @@
 import { render, screen } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import userEvent from '@testing-library/user-event';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { recordScrolls } from '../test/utils';
 import { ErrorBanner } from './ErrorBanner';
 
@@ -28,5 +29,21 @@ describe('ErrorBanner (SDD §16)', () => {
     const { rerender } = render(<ErrorBanner error={new Error('refused')} title="Plans are unavailable" />);
     rerender(<ErrorBanner error={new Error('refused again')} title="Plans are unavailable" />);
     expect(recorder.scrolls).toEqual([]);
+  });
+
+  it('keeps Retry busy while the same failure is shown, and frees it on the next failure', async () => {
+    const user = userEvent.setup({ delay: null });
+    const onRetry = vi.fn();
+    const first = new Error('refused');
+    const { rerender } = render(<ErrorBanner error={first} title="Plans are unavailable" onRetry={onRetry} />);
+    await user.click(screen.getByRole('button', { name: /retry/i }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: /retry/i })).toHaveAttribute('aria-busy', 'true');
+    // drawn again with the same failure while the retry runs: still busy
+    rerender(<ErrorBanner error={first} title="Plans are unavailable" onRetry={onRetry} />);
+    expect(screen.getByRole('button', { name: /retry/i })).toHaveAttribute('aria-busy', 'true');
+    // the retry failed again: that is its answer, and Retry can be pressed again
+    rerender(<ErrorBanner error={new Error('refused again')} title="Plans are unavailable" onRetry={onRetry} />);
+    expect(screen.getByRole('button', { name: /retry/i })).not.toHaveAttribute('aria-busy');
   });
 });

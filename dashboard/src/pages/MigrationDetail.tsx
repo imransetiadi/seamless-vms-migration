@@ -715,7 +715,13 @@ export default function MigrationDetail() {
   const announcement = useProgressAnnouncement(m);
   const gpuAnnouncement = useGpuWaitAnnouncement(m);
 
-  useEffect(() => setLiveEvents([]), [migrationId]);
+  // another migration's page drops the streamed events of the one before, as it renders (react.dev, "Adjusting some state
+  // when a prop changes")
+  const [eventsOf, setEventsOf] = useState(migrationId);
+  if (migrationId !== eventsOf) {
+    setEventsOf(migrationId);
+    setLiveEvents([]);
+  }
   useLiveEvents((event) => {
     if (event.migration_id === migrationId && event.seq > 0) setLiveEvents((list) => [...list, event].slice(-300));
   });
