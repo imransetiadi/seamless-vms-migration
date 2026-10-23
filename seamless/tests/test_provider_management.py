@@ -20,7 +20,7 @@ from seamless_migrate.api import routes_providers
 from seamless_migrate.api.app import create_app
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import PlanStatus, Role
-from seamless_migrate.domain.models import Plan, Provider
+from seamless_migrate.domain.models import HostKeyPin, Plan, Provider
 from seamless_migrate.security import secret_store as secret_store_module
 from seamless_migrate.security.secret_store import (
     FileSecretStore,
@@ -37,6 +37,7 @@ from seamless_migrate.security.secrets import (
 from seamless_migrate.store import Store
 from tests.api_support import DESTINATION, SOURCE, Api, api_settings
 from tests.factories import make_plan, make_provider
+from tests.key_support import bare, ecdsa_key, other_key, public_key, rsa_key
 
 KEY = (
     "-----BEGIN OPENSSH PRIVATE KEY-----\n"  # gitleaks:allow (header only, no key material)
@@ -564,6 +565,101 @@ def test_conversion_key_is_write_only(api):
     path = api.settings.secrets_dir / "provider-src-osp-ssh" / "private_key"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert resolve_private_key("provider-src-osp-ssh", api.settings) == KEY + "\n"
+
+
+#: entries ssh_host_keys refuses, each with what the 422 says of it (SDD §4.2, §12, §26.3)
+NO_PUBLIC_KEY = {
+    "options": (f'restrict,command="/bin/true" {public_key(7)}', "options or a host name"),
+    "host name": (f"conv-src.example.org,192.0.2.10 {public_key(7)}", "options or a host name"),
+    "private key": (KEY, "a private key"),
+    "one-line private key": (
+        "-----BEGIN RSA PRIVATE KEY----- MIIEpAIBAAKCAQEA",  # gitleaks:allow (a header, no key)
+        "a private key",
+    ),
+    "ssh-dss": (other_key("ssh-dss", 7), "ssh-dss is not an ed25519, ECDSA or RSA key"),
+    "security key": (
+        other_key("sk-ssh-ed25519@openssh.com", 7),
+        "sk-ssh-ed25519@openssh.com is not an ed25519, ECDSA or RSA key",
+    ),
+    "certificate": (
+        other_key("ssh-ed25519-cert-v01@openssh.com", 7),
+        "ssh-ed25519-cert-v01@openssh.com is not an ed25519, ECDSA or RSA key",
+    ),
+    "another type's key": (f"ssh-rsa {public_key(7).split()[1]}", "no ssh-rsa key"),
+    "a cut key": (public_key(7)[:40], "no ssh-ed25519 key"),
+    "two lines": (f"{public_key(7)}\n{public_key(8)}", "more than one line"),
+    "empty": ("  ", "empty"),
+    "no key": ("hello world", "no OpenSSH public key"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(NO_PUBLIC_KEY))
+def test_a_declared_host_key_that_is_no_public_key_is_refused(api, case):
+    """SDD §4.2, §12, §26.3: a conversion host's declared keys are OpenSSH one-line public keys,
+    ed25519, ECDSA or RSA. Anything else is refused with 422 naming its line and why - on POST and
+    PATCH alike - and never quoted: the line may be a private key."""
+    entry, why = NO_PUBLIC_KEY[case]
+    keys = [public_key(5, "root@conv-x"), entry]
+    host = {"name": "conv-x", "ssh_host_keys": keys}
+    created = api.post("/api/v1/providers", json={**SOURCE, "id": "src-x", "conversion_host": host})
+    patched = patch(api, "/api/v1/providers/src-osp", {"conversion_host": host})
+    for res in (created, patched):
+        assert res.status_code == 422, res.text
+        message = res.json()["error"]["message"]
+        assert message.startswith("conversion_host.ssh_host_keys: line 2: "), message
+        assert why in message, message
+        # no part of the line but a type the message names: a base64 field, a private key's body
+        quoted = [word for word in entry.split() if len(word) >= 12 and word not in why]
+        assert [word for word in quoted if word in res.text] == []
+    assert api.get("/api/v1/providers/src-x").status_code == 404
+    stored = api.get("/api/v1/providers/src-osp").json()["conversion_host"]
+    assert stored["ssh_host_keys"] == []
+    # each type it takes, a comment or none, stored as declared
+    good = [
+        public_key(1, "root@conv-x"),
+        ecdsa_key(2),
+        ecdsa_key(3, "root@conv-x", curve="nistp384"),
+        ecdsa_key(4, curve="nistp521"),
+        rsa_key(5, "root@conv-x"),
+    ]
+    res = patch(
+        api, "/api/v1/providers/src-osp", {"conversion_host": {**host, "ssh_host_keys": good}}
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["conversion_host"]["ssh_host_keys"] == good
+
+
+def test_the_pin_is_returned_and_cannot_be_written(api):
+    """SDD §4.2, §12, §26.4: the conversion host's pin is the server's - GET returns it, PATCH
+    refuses it as it refuses every server-owned field, POST ignores it -, and an edit of what the
+    operator owns, its conversion host's declared keys or its key, keeps it: it is its server's."""
+    pin = {
+        "server_id": "srv-conv-src",
+        "keys": [bare(public_key(1, "root@conv-src"))],
+        "source": "console",
+        "pinned_at": "2026-10-23T08:00:00Z",
+    }
+    stored = api.store.get("provider", "src-osp", Provider)
+    api.store.put("provider", stored.model_copy(update={"conversion_host_pin": HostKeyPin(**pin)}))
+    assert api.get("/api/v1/providers/src-osp").json()["conversion_host_pin"] == pin
+    listed = {p["id"]: p["conversion_host_pin"] for p in api.get("/api/v1/providers").json()}
+    assert listed == {"src-osp": pin, "dst-rhoso": None}
+    forged = {**pin, "server_id": "srv-elsewhere", "keys": [bare(public_key(2))]}
+    for value in (forged, None):
+        refused = patch(api, "/api/v1/providers/src-osp", {"conversion_host_pin": value})
+        assert refused.status_code == 422, refused.text
+        assert "fields cannot be changed: conversion_host_pin" in refused.text
+    declared = {"name": "conv-src", "ssh_host_keys": [public_key(3, "root@conv-src")]}
+    edited = patch(api, "/api/v1/providers/src-osp", {"name": "x", "conversion_host": declared})
+    assert edited.status_code == 200 and edited.json()["conversion_host_pin"] == pin
+    keyed = put(api, "/api/v1/providers/src-osp/conversion-key", {"private_key": KEY})
+    assert keyed.status_code == 200 and keyed.json()["conversion_host_pin"] == pin
+    assert api.get("/api/v1/providers/src-osp").json()["conversion_host_pin"] == pin
+    created = api.post(
+        "/api/v1/providers", json={**SOURCE, "id": "src-two", "conversion_host_pin": forged}
+    )
+    assert created.status_code == 201 and created.json()["conversion_host_pin"] is None
+    assert api.get("/api/v1/providers/src-two").json()["conversion_host_pin"] is None
 
 
 def test_deleting_a_provider_deletes_its_managed_secrets(api):

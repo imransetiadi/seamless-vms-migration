@@ -30,6 +30,7 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 
 from ..guest_os import GuestOS, identify
+from ..security.host_keys import declared_key_problems
 from .enums import (
     DecisionStatus,
     DecisionType,
@@ -124,6 +125,32 @@ class ConversionHostConfig(_Model):
     ssh_allowed_cidr: str | None = None
     #: secret holding the private key for an existing conversion host (required for VMware)
     ssh_key_secret: str | None = None
+    #: the host's public keys as its operator declares them, OpenSSH's one-line form: ed25519,
+    #: ECDSA or RSA; they win over the pin (SDD §4.2, §26.3)
+    ssh_host_keys: list[str] = Field(default_factory=list)
+
+    @field_validator("ssh_host_keys")
+    @classmethod
+    def _public_keys(cls, keys: list[str]) -> list[str]:
+        """Each entry one public key a host's key may be; else a 422 naming its line and why,
+        never quoting it: it may be a private key (SDD §4.2, §12)."""
+        problems = declared_key_problems(keys)
+        if problems:
+            raise PydanticCustomError("public_key", "{problems}", {"problems": "; ".join(problems)})
+        return [key.strip() for key in keys]
+
+
+class HostKeyPin(_Model):
+    """A conversion host's pinned host keys (SDD §4.2, §26.4): server-owned - the provider check
+    writes it (§10); the API returns it and never writes it (§12)."""
+
+    #: the Nova server whose keys they are: the pin applies to it alone
+    server_id: str
+    #: its public keys, each ``<type> <base64>``, without a comment
+    keys: list[str]
+    #: injected at the server's creation (§26.3), or read from its console (§10)
+    source: Literal["injected", "console"]
+    pinned_at: UTCDateTime
 
 
 ProviderStatus = Literal["unknown", "ok", "degraded", "error"]
@@ -175,6 +202,9 @@ class Provider(_Model):
     #: server-owned: when PUT …/credentials / …/conversion-key last wrote the secret store
     credentials_updated_at: UTCDateTime | None = None
     conversion_key_updated_at: UTCDateTime | None = None
+    #: server-owned: its conversion host's pinned host keys, which the provider check writes
+    #: (SDD §4.2, §10, §26.4) - POST ignores it, PATCH refuses it (§12)
+    conversion_host_pin: HostKeyPin | None = None
 
     @model_validator(mode="after")
     def _distribution_matches_kind(self) -> Provider:

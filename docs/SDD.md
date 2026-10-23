@@ -167,9 +167,16 @@ ReasonCode     = ABOVE_THRESHOLD_AUTO_APPLY | POLICY_REQUIRES_APPROVAL | INSUFFI
 ConversionHostConfig { manage: bool = true, name: str|null, flavor: str|null,
                        external_network: str|null, image: str|null,
                        ssh_user: str = "cloud-user", address: str|null,
-                       ssh_allowed_cidr: str|null, ssh_key_secret: str|null }
+                       ssh_allowed_cidr: str|null, ssh_key_secret: str|null,
+                       ssh_host_keys: list[str] = [] }
         # ssh_key_secret: secret holding the private key used to reach an existing conversion
         # host (required for VMware sources, whose kit has no prestage step)
+        # ssh_host_keys: the host's public keys as its operator declares them (§26.3), one per entry in
+        # OpenSSH's one-line form, `<type> <base64> [comment]`, of type ssh-ed25519, ecdsa-sha2-nistp256,
+        # ecdsa-sha2-nistp384, ecdsa-sha2-nistp521 or ssh-rsa, its base64 field holding a key of that type;
+        # an entry with options or a host name before the type, a private key, another type or more than
+        # one line is refused (422 naming its line - 1 for the first entry - and why, never quoting it);
+        # declared keys win over the pin (§10, §26.4)
 
 Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
            name: str,                                  # not blank: POST and PATCH refuse a name with no
@@ -199,8 +206,17 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$),
                                                        # refused on vmware (422)
            credentials_updated_at: datetime|null,      # server-owned: set by PUT …/credentials
            conversion_key_updated_at: datetime|null,   # server-owned: set by PUT …/conversion-key
+           conversion_host_pin: HostKeyPin|null,       # server-owned: its conversion host's pinned host keys,
+                                                       # set by the provider check (§10, §26.4); returned by the
+                                                       # API and never written through it (§12)
            capabilities: dict[str, Any] = {}, status: "unknown"|"ok"|"degraded"|"error" = "unknown",
            status_message: str|null, last_checked_at: datetime|null }
+
+HostKeyPin { server_id: str,                 # the Nova server whose keys they are: the pin applies to it alone
+             keys: list[str],                # its public keys, each `<type> <base64>`, without a comment
+             source: "injected"|"console",   # injected at the server's creation (§26.3), or read from its
+                                             # console (§10)
+             pinned_at: datetime }
 
 Disk  { id: str, name: str|null, size_gb: int, used_gb: float|null, bootable: bool = false,
         volume_type: str|null, device: str|null,
@@ -537,7 +553,8 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `migration.source_stopped`, `plan.finalized` (§8.1), `plan.cancelled` (§12), `migration.gpu_wait` (§5.4, §22.7),
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
-`provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`, `hook.created`,
+`provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
+`conversion_host.key_pinned` (§10, §26.5), `hook.created`,
 `hook.updated`, `hook.deleted` (§23.3), `auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
@@ -546,7 +563,10 @@ never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (
 carries the reason given and how many migrations it cancelled. `migration.gpu_wait` carries `{"waiting", "pool",
 "needed", "free"}` - the pool, units needed and units free of a `GpuWait` (§4.2) - written with the migration's change in
 one transaction once when its cutover begins to wait for GPU capacity (`waiting` true) and once when a read finds room
-(`waiting` false: the pool it waited for, as that read found it).
+(`waiting` false: the pool it waited for, as that read found it). `conversion_host.key_pinned` carries `{"provider_id",
+"side", "server_id", "fingerprints", "source"}` - the provider, its role (`source` or `destination`), the server pinned,
+its keys' SHA256 fingerprints as `ssh-keygen -l` prints them and the pin's source (§4.2) -, written with the provider's
+pin in one transaction; it never carries a key's comment or a line of the console (§26.3).
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
 `migration.log`, `heartbeat`. `migration.log` carries one line of a step's output (`StepContext.log`,
@@ -2955,7 +2975,10 @@ class DestinationProvider(Protocol):
     async def server_allocations(self, server_id: str) -> dict[str, int] | None
         # the units the server holds per resource class (GET /allocations/{server_id}, summed over its providers),
         # None when Placement refuses the read or holds no allocation for it (§22.3, §22.8, plan task G3)
-    async def console_log(self, server_id: str, lines: int = 200) -> str | None
+    async def console_log(self, server_id: str, lines: int | None = 200) -> str | None
+        # the console's last `lines` lines, all of it for None - the host key pin's read (below); None when the
+        # server has none or the read fails. The OpenStack read of all of it is a raw os-getConsoleOutput without
+        # `length`, which keystoneauth does not log (§13.4, §26.3)
     async def delete_server(self, server_id: str) -> None
     async def find_server(self, name: str) -> str | None
         # the id of the credential's project's server named exactly `name`, None when none, a provider error when
@@ -3250,6 +3273,41 @@ series}`; `pool_name(resource_class, traits, forbidden_traits) -> str` names a p
 `gpu_flavor(vm, plan, source_kind) -> str | None` names a GPU VM's GPU flavor by §22.4's rule, never a matched one
 (plan task G4).
 
+**Host key pins** (`seamless_migrate.security.host_keys`, plan task ST2; §26.3, §26.4). A provider's conversion
+host's pin is `Provider.conversion_host_pin` (§4.2), which the server alone writes:
+* **The check pins.** After a `check()` that answered, the provider check (`POST /providers/{id}/check`, and the check
+  of each validation, §8) of an OpenStack provider with a conversion host - kind `openstack` or `rhoso`, either role -
+  looks the host's server up: by its name, `conversion_host.name`, else its side's name as the executor names the host
+  (`os_migrate_conv_src` for a source, `os_migrate_conv_dst` for a destination, §7.2), with `find_server`; else by
+  `conversion_host.address`, with `server_of_address`. No server, or a lookup that fails (logged by its provider
+  error), pins nothing. Then:
+  * **no pin:** the check reads the server's whole console (`console_log(server_id, None)`) and pins what the parser
+    keeps of it - `{server_id, keys, source: "console", pinned_at}` -, written with the check's own write and
+    `conversion_host.key_pinned` (§4.3) in one transaction. A console that gives no key pins nothing, and the next
+    check reads it again;
+  * **a pin of that server:** nothing more is read; a host is pinned once;
+  * **a pin of another server** (the host deleted and created again, §26.4): the pin is kept, neither used nor
+    replaced, and the check reports it as its `status_message`, "conversion host replaced: {name} is now server
+    {new id}; its pin belongs to server {old id}" (§26.5), {name} being what the host was found by; its `status`
+    stays `ok`, so a validation goes on.
+
+  A check that failed (`error`) looks nothing up. The demo's consoles print no keys block: the demo pins nothing.
+* **The console parser** (`console_keys(console, read_keys=())`) keeps the key lines of cloud-init's block between
+  `-----BEGIN SSH HOST KEY KEYS-----` and `-----END SSH HOST KEY KEYS-----`, and nothing else: in a block, a line
+  that holds a key of a type `ssh_host_keys` takes (§4.2), whatever a console prefixes to it, gives that key without
+  its comment; any other line gives nothing. Two complete blocks that disagree (other keys) give nothing. A console
+  without a complete block, or whose blocks hold no key, gives no key of its own: only those of `read_keys` - keys
+  read from the host - whose SHA256 fingerprint it printed between `-----BEGIN SSH HOST KEY FINGERPRINTS-----` and
+  its END line (an image that prints the fingerprints alone), and none when two such blocks disagree. The check reads
+  no key from the host, so there a console without the keys block pins nothing. The parser logs nothing and keeps
+  no line: the console is the guest's text, never logged, stored or sent (§13.4, §26.3).
+* **The known_hosts writer** (`write_known_hosts(path, hosts)`) writes, 0600, one entry per key of each host, hashed as
+  OpenSSH's `HashKnownHosts` writes one - `|1|<salt>|<hash>`, the base64 of a new 20-byte salt and of the HMAC-SHA1 of
+  the alias keyed with it - under the host's alias (§26.4: `os_migrate_conv_src`, `os_migrate_conv_dst`, or
+  `conversion_host` for a VMware destination's host): its declared keys (`ssh_host_keys`) when it has some, else its
+  pin's keys when the pin's server is the one the host resolves to - never the pin of another server -, else nothing.
+  Runs write theirs from plan task ST5 (§26.4).
+
 **Bounds.** Each provider call runs its blocking SDK calls in a worker thread and is bounded (300 s, §8.1); the
 bound ends the wait, not the thread, so every request a call sends is bounded by the provider API timeout (60 s) as
 well: an endpoint that accepts a connection and never answers frees the thread once its requests give up (a
@@ -3487,13 +3545,13 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
 | GET | `/providers` | viewer | — | `Provider[]` |
-| POST | `/providers` | admin | `Provider` (status fields ignored; a field `Provider` does not have: 422) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
+| POST | `/providers` | admin | `Provider` (status fields and `conversion_host_pin` ignored, §4.2; a field `Provider` does not have: 422; a `conversion_host.ssh_host_keys` entry that is no public key of a type it takes: 422 naming its line and why, never quoting it) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown` and the check report (`capabilities`) to `{}`; 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution`, `release`, `policy_profile`, `gpu_profiles` (§22.3; refused on a vmware provider, as `release` is), `announces_tenant_networks` (§23.6; refused on a vmware provider alike) (`id`, `kind`, `role` and the server-owned fields - `conversion_host_pin` among them - are immutable: 422; a `conversion_host` is judged as on `POST`, its `ssh_host_keys` too); resets `status` to `unknown` and the check report (`capabilities`) to `{}`, and keeps the pin, which belongs to its server (§10); 409 while a `running` or `paused` plan uses the provider - checked and written under the lock of `DELETE /providers/{id}`, which a plan start also takes for its status write, so no start in the server lands between the check and the write (audit AP-07; a start from another process, the CLI beside the server, is not serialized by it); 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; `status` and the check report reset as by PATCH; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set; `status` and the check report reset as by PATCH) |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, §9.3's rule: recorded `sync_passes` of a `warm` migration, or passes a `vmware_warm` one recorded since the attempt after its last cutover began - none when its last attempt ran one) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1; a VMware one keeps the kit's copies and names them, for the operator to delete in the destination once no plan migrates the VM - a provider deleted after it leaves them there, §7.2) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets - each one tried, a secret the store cannot remove logged and named in `provider.deleted` (data `secrets_left`), the deletion audited whatever the store answers (audit AA-03) |
-| POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
+| POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed; a conversion host without a pin pinned from its console, event `conversion_host.key_pinned`, and a pin of another server reported in `status_message`, §10) |
 | GET | `/hooks` | viewer | — | `Hook[]` by name (§23.3) |
 | POST | `/hooks` | admin | `Hook` (`created_at`, `updated_at` ignored; a field `Hook` does not have: 422) | `201 Hook`; 409 when the name exists; 422 when its kind's fields are missing or another kind's are set, a webhook's URL is not `https://` or holds user information, its secret's name is no name §13.3 reads, a `provider-*` name or one a provider names (`credentials_secret`, `conversion_host.ssh_key_secret`) - a webhook would send that credential to its URL -, or `revert` names the hook itself or no hook of the catalog. Event `hook.created` |
 | GET | `/hooks/{name}` | viewer | — | `Hook` |
@@ -7017,7 +7075,9 @@ What it answers: D8, the findings SEC-02 (host keys not verified) and SEC-06 (an
 high-availability proposals of other branches.
 
 SSH trust adds no route. The proposed fields, events and findings, and the setting's new default, stay out of the
-tables the SDD-reading tests parse (§4.3, §9.3, §12, §15.1) until their tasks land, as §22's and §23's did. The facts
+tables the SDD-reading tests parse (§4.3, §9.3, §12, §15.1) until their tasks land, as §22's and §23's did. Plan task
+ST2's - `ssh_host_keys`, the pin, the console parser, the known_hosts writer, the check's pinning and
+`conversion_host.key_pinned` - are binding in §4.2, §4.3, §10 and §12 since that task. The facts
 come from OpenSSH's manuals, source and release notes, cloud-init's documentation and source, Nova's API and policy
 references, Ansible's ssh plugin, the VMware kit 2.2.7's playbooks and Repology, all read 2026-10-23. A fact only an
 excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
@@ -7110,26 +7170,30 @@ decision 10).
   log) and does not hide the block.
   * The parser keeps the block's key lines and nothing else. A console without the block, or with two blocks that
     disagree, pins nothing. When an image prints the fingerprints alone, a key read from the host is pinned only if
-    its SHA256 fingerprint is one the console printed.
+    its SHA256 fingerprint is one the console printed. The parser and the provider check's pinning are binding in
+    §10 since plan task ST2.
   * The console is the guest's text: it is never logged, stored, or sent to the advisor or to memory (§13.4).
-* **Declared, by the operator.** `conversion_host.ssh_host_keys` (proposed, §4.2): the host's public keys in OpenSSH's
-  one-line form, ed25519, ECDSA or RSA. Declared keys win over a pin.
+* **Declared, by the operator.** `conversion_host.ssh_host_keys` (§4.2, §12, binding since plan task ST2): the host's
+  public keys in OpenSSH's one-line form, ed25519, ECDSA or RSA. Declared keys win over a pin.
 * **Never** an SSH connection's word (no `accept-new`, no trust on first use), a scan alone, or DNS
   (`VerifyHostKeyDNS`).
 
 ### 26.4 Pins and their use
 
-* **The pin.** Each provider records its conversion host's pin (proposed, server-owned, §4.2): the Nova server's id,
+* **The pin.** Each provider records its conversion host's pin (server-owned, `Provider.conversion_host_pin`, binding
+  in §4.2, §10 and §12 since plan task ST2): the Nova server's id,
   the public keys, their source (`injected` or `console`) and the time. A public key is no secret: the API returns
   the pin, and the dashboard shows its fingerprints. A pin belongs to one server. When the provider's host resolves
-  to another server (deleted and created again), the pin no longer applies, and only a pre-staging that creates the
-  new server, or the new server's console, pins it again (§26.5).
+  to another server (deleted and created again), the pin no longer applies: the host is refused as replaced (§26.5)
+  until the operator declares its keys, or deletes it and a pre-staging creates and pins it again (LAB-SSH08). The
+  provider check does not pin the new server from its console; it reports the replacement (§10), since a host
+  replaced behind Seamless's back is a change an operator should see, not one to take in silence.
 * **Why per host.** A conversion host serves every plan of its provider, so a plan's pre-staging data would hold one
   pin per plan for one host. The database also keeps the pin when the data volume is lost or moved.
 * **A known_hosts file per run.** Each run writes `known_hosts` in its run directory (§7.2) from the declared keys,
   else the pins, of the hosts it uses: one hashed entry per key under the host's alias - its inventory name,
   `os_migrate_conv_src` or `os_migrate_conv_dst`, or the group's name, `conversion_host`, for a VMware destination's
-  host. No ssh writes to it.
+  host. No ssh writes to it. The writer is binding in §10 since plan task ST2; the runs use it with plan task ST5.
 * **The options of every hop:** `StrictHostKeyChecking=yes`, `UserKnownHostsFile=<the run's file>`,
   `GlobalKnownHostsFile=/dev/null`, `HostKeyAlias=<the alias>`, `CheckHostIP=no`, `UpdateHostKeys=no`,
   `VerifyHostKeyDNS=no`, `HashKnownHosts=yes`, `HostKeyAlgorithms` the pinned keys' algorithms and
@@ -7168,9 +7232,9 @@ decision 10).
   * "link refused by the source conversion host: {ssh's reason}";
   * "the conversion host {name}, created with an injected host key, does not present it: check its image's
     cloud-init".
-* **Events** (proposed, persisted): `conversion_host.key_pinned` (provider, side, server, fingerprints, source) and
-  `conversion_host.key_refused` (provider, side, server, pinned and offered fingerprints, the plan and migration). A
-  refused key may be an attack: an operator should be able to alert on it.
+* **Events** (persisted): `conversion_host.key_pinned` (provider, side, server, fingerprints, source), binding in §4.3
+  since plan task ST2, and, proposed, `conversion_host.key_refused` (provider, side, server, pinned and offered
+  fingerprints, the plan and migration). A refused key may be an attack: an operator should be able to alert on it.
 * **Findings** (proposed for §9.3, for `cold`, `warm`, `vmware_cold` and `vmware_warm`):
   * CONV_HOST_KEY_UNKNOWN, a blocker while keys are checked: a conversion host the plan needs has neither declared
     keys nor a pin, and Seamless will not create it (`manage: false`, a VMware destination's host); or its pin belongs
@@ -7311,7 +7375,7 @@ The owner took each default as written on 2026-10-23 (D8):
 | Change | Where | Task |
 |---|---|---|
 | PRD: NFR-06 names the pinned host keys and the restricted link, a 0.5.0 row; D8 decided | PRD, §20 | ST1 |
-| `ConversionHostConfig.ssh_host_keys`; the provider's pin; the console parser and the provider check's pinning; `conversion_host.key_pinned` | §4.2, §4.3, §10, §12 | ST2 |
+| `ConversionHostConfig.ssh_host_keys`; the provider's pin; the console parser and the provider check's pinning; `conversion_host.key_pinned` | §4.2, §4.3, §10, §12 (binding) | ST2 |
 | the collection's known_hosts variable and module option, `RemoteShell`'s options, the inventory's common arguments, a refusal as a permanent error | §6.4, §6.5, §6.6 | ST3 |
 | the injected host key at creation (`userdata`, `no_log`), the role's report of the servers it created | §6.5 | ST4 |
 | the executor: host key pairs for pre-staging, pins recorded, the run's known_hosts, `ANSIBLE_HOST_KEY_CHECKING=True`, refusals classified, `conversion_host.key_refused` | §4.3, §7.2 | ST5 |
