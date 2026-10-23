@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-openstack = ["openstacksdk>=4.5"]
+openstack = ["openstacksdk>=4.21.0"]
 vmware = ["pyvmomi>=8.0"]
 jev = ["mcp>=2.3,<3"]
 # the RFC 2136 DNS swap (SDD §8.4): DNS UPDATE with TSIG
@@ -46,7 +46,7 @@ collection = [
   "ansible-lint>=24",
   "pytest-mock>=3.12",
   "pyyaml>=6",
-  "openstacksdk>=4.5",
+  "openstacksdk>=4.21.0",
 ]
 
 [project.scripts]
