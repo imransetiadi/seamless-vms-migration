@@ -1175,6 +1175,42 @@ the known_hosts file that pins each conversion host's keys under its inventory n
 Unset or empty, the host gets upstream's `ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'` and neither of the
 others, and the modules get no `ssh_known_hosts`.
 
+**The injected host key** (§26.3, plan task ST4). `os_migrate_conversion_host_key_private_path`, unset by default,
+names the private half of an ed25519 host key pair for the conversion host that role `conversion_host` creates
+(`main.yml`): an OpenSSH private key file, 0600 - a path, never the key's text in a variable.
+`deploy_conversion_hosts.yml` passes each side's `os_migrate_src_conversion_host_key_private_path` or
+`os_migrate_dst_conversion_host_key_private_path` as it, empty when unset; a run sets those two alone, since an extra
+var outranks an include's vars and the role's own name would reach both sides. Right before its server task the role
+looks the host up by its name (`server_info`, the name matched exactly, as the server module finds it):
+* a server it does not find, it creates with the key as the server's `userdata`: `#cloud-config` with
+  `ssh_deletekeys: true` and `ssh_keys` holding `ed25519_private`, the file's text, and `ed25519_public`, the public
+  half `ssh-keygen -y` reads from the file. cloud-init deletes the image's host keys and writes that key alone. A file
+  `ssh-keygen` cannot read, or a key of another type, fails the role before the server task;
+* a server it finds gets no user data, whatever the variable says: it keeps its own key, and the run its pin;
+* without the variable, or with it empty, the server task passes no user data, as upstream.
+
+The lookup and the server task run with `no_log`: the server task's arguments hold the private half, and Nova's server
+details carry a server's user data (`OS-EXT-SRV-ATTR:user_data`, base64) to an admin credential, so the result of
+either can carry an injected private key back. Ansible reads the private half only into the server task's arguments
+(`lookup('file')`); `ssh-keygen -y` prints the public half alone. No fact holds it, and no task prints it, nor the
+server task's registered result, at any verbosity. A failure of either task prints no detail.
+
+**The report** (§26.3, §26.4, plan task ST4). After each server task the role writes
+`{{ os_migrate_data_dir }}/conversion/hosts.json`, beside its keys (`ssh.key`, `link-ssh.key` by default), 0600 in a
+0700 folder: each server the playbook run's role created and each it found, in plain JSON, with no key material:
+
+```json
+{ "created": [ {"alias": "os_migrate_conv_src", "id": "…"} ],
+  "found": [ {"alias": "os_migrate_conv_dst", "id": "…"} ] }
+```
+
+`alias` is the side's alias (§26.4): `os_migrate_conv_` and the role's `os_migrate_conversion_cloud`, `src` or `dst`.
+`id` is the Nova server's id from the server task's result. A server is `created` when the lookup found none of its
+name and the server task changed something, else `found`. A side's entry replaces that side's earlier one, and the file
+is written whole each time with what the playbook run reported so far: it names the sides of the last run that reached
+a server task, and a run that reaches none - or runs in check mode - leaves the file as it finds it. The run pins the
+injected key of a server under `created` alone (§26.4, plan task ST5).
+
 ### 6.6 Hardening of existing code (required)
 
 `roles/import_from_hypervisor/tasks/process_disk.yml` exports hypervisor disks with `qemu-nbd`
