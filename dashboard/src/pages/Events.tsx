@@ -177,30 +177,25 @@ export default function Events() {
   const [limit, setLimit] = useState(PAGE);
   const counter = useRef(0);
   const listRef = useRef<HTMLOListElement>(null);
-  const pausedRef = useRef(paused);
-  pausedRef.current = paused;
-  const progressRef = useRef(showProgress);
-  progressRef.current = showProgress;
 
   // Newest persisted sequence number already loaded: anything at or below it is a replay, not news
   // (a server may replay history when the stream connects without `since`).
   const historyMaxSeq = useMemo(() => (history.data ?? []).reduce((max, e) => Math.max(max, e.seq), 0), [history.data]);
-  const historyMaxRef = useRef(historyMaxSeq);
-  historyMaxRef.current = historyMaxSeq;
   // the persisted live events shown, by sequence, so a replay is shown once - bounded: an open page keeps no more
   // numbers than four times the live list it shows (perf audit PF-07)
   const seenLive = useRef(createSeenSeqs(4 * MAX_LIVE));
 
+  // the listener of the last render (an Effect Event, useLiveEvents): it reads the page's state as it is now
   useLiveEvents((event) => {
     if (event.kind === 'heartbeat') return;
-    if (event.seq === 0 && !progressRef.current) return;
+    if (event.seq === 0 && !showProgress) return;
     if (event.seq > 0) {
-      if (event.seq <= historyMaxRef.current || !seenLive.current.add(event.seq)) return;
+      if (event.seq <= historyMaxSeq || !seenLive.current.add(event.seq)) return;
     }
     counter.current += 1;
     const item = itemOf(event.seq > 0 ? `seq-${event.seq}` : `live-${counter.current}`, event);
     setReceived((n) => n + 1);
-    if (pausedRef.current) setHeld((h) => [...h, item].slice(-MAX_LIVE));
+    if (paused) setHeld((h) => [...h, item].slice(-MAX_LIVE));
     else setLive((l) => [...l, item].slice(-MAX_LIVE));
   });
 

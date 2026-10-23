@@ -83,14 +83,19 @@ export default function Plans() {
   const [dialog, setDialog] = useState<{ open: boolean; sourceId?: string; vmIds?: string[] }>({ open: false });
   const canCreate = hasRole(role, 'operator');
 
-  // Opened from Inventory with a VM selection.
+  // Opened from Inventory with a VM selection: taken from the navigation's state as the page renders, the state then
+  // cleared, and the dialog opened as the page renders without it - a render after the page's first, as when an effect
+  // opened it, so the layout has moved the focus to the page by then and the dialog gives it back there
+  const offered = canCreate ? (location.state as NewPlanState | null)?.newPlan : undefined;
+  const [taken, setTaken] = useState<NewPlanState['newPlan'] | null>(null);
+  if (offered && offered !== taken) setTaken(offered);
+  else if (!offered && taken) {
+    setTaken(null);
+    setDialog({ open: true, sourceId: taken.sourceId, vmIds: taken.vmIds });
+  }
   useEffect(() => {
-    const state = location.state as NewPlanState | null;
-    if (state?.newPlan && canCreate) {
-      setDialog({ open: true, sourceId: state.newPlan.sourceId, vmIds: state.newPlan.vmIds });
-      navigate(location.pathname, { replace: true, state: null });
-    }
-  }, [location.state, location.pathname, navigate, canCreate]);
+    if (offered) navigate(location.pathname, { replace: true, state: null });
+  }, [offered, location.pathname, navigate]);
 
   const providerName = useMemo(() => new Map((providers.data ?? []).map((p) => [p.id, providerLabel(p)])), [providers.data]);
 

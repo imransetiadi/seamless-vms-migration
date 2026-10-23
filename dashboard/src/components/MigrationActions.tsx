@@ -10,7 +10,7 @@ import {
   Zap,
   type LucideIcon,
 } from 'lucide-react';
-import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { Component, useId, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { Link } from 'react-router-dom';
 import { useMe, useMigrationAction, useProviders, type MigrationActionRequest } from '../api/hooks';
 import { ACTION_TEXT_MAX, ACTION_TEXT_UNITS, FORCE_REASON_MIN, type Migration, type Plan, type Role } from '../api/types';
@@ -32,6 +32,7 @@ import {
   type MigrationActionKey,
 } from '../lib/migrationActions';
 import { destinationName } from '../lib/providerUse';
+import { useNow } from '../lib/useNow';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { TextAreaField } from './Field';
@@ -69,11 +70,44 @@ const DONE: Record<MigrationActionKey, string> = {
   finalize: 'finalized',
 };
 
-function windowOpen(plan: Plan | null | undefined): boolean {
+function windowOpen(plan: Plan | null | undefined, now: number): boolean {
   const w = plan?.cutover_window;
   if (!w) return true;
-  const now = Date.now();
   return now >= Date.parse(w.start) && now <= Date.parse(w.end);
+}
+
+interface KeepsActionFocusProps {
+  /** The available actions in their order: a change mounts the buttons that changed rows anew. */
+  layout: string;
+  /** Each action's button, as last mounted. */
+  buttons: RefObject<Map<MigrationActionKey, HTMLButtonElement>>;
+  children: ReactNode;
+}
+
+/**
+ * A button that changes rows as the migration moves keeps the focus (SDD §16): the rows are two lists, so React mounts
+ * the button anew in the other one and the focus drops to the page. The action whose button has the focus is read just
+ * before React changes the page - getSnapshotBeforeUpdate, which function components lack - and only its new button
+ * gets it back: focus the user had moved elsewhere (the page, another control) is never taken back.
+ */
+class KeepsActionFocus extends Component<KeepsActionFocusProps> {
+  override getSnapshotBeforeUpdate(previous: Readonly<KeepsActionFocusProps>): MigrationActionKey | null {
+    // the first layout moves nothing, and as before neither does one from rows with no action available
+    if (previous.layout === '' || previous.layout === this.props.layout) return null;
+    for (const [key, node] of this.props.buttons.current) if (node === document.activeElement) return key;
+    return null;
+  }
+
+  override componentDidUpdate(_previous: Readonly<KeepsActionFocusProps>, _state: unknown, focused: MigrationActionKey | null): void {
+    const node = focused ? this.props.buttons.current.get(focused) : undefined;
+    if (node && document.activeElement !== node && (document.activeElement === document.body || document.activeElement === null)) {
+      node.focus({ preventScroll: true });
+    }
+  }
+
+  override render(): ReactNode {
+    return this.props.children;
+  }
 }
 
 export interface MigrationActionsProps {
@@ -95,7 +129,10 @@ export interface MigrationActionsProps {
 export function MigrationActions({ migration: m, plan, role, planUnavailable = false, planLoading = false }: MigrationActionsProps) {
   // the cutover's requester does not approve it (maker-checker, SDD §5.4)
   const me = useMe().data?.name;
-  const availability = migrationActions(m, role, plan, undefined, me);
+  // the time, read once per render for every rule that asks it (useNow): a cutover window that opens or closes shows
+  // within ten seconds, so the Cutover action's dialog never speaks of a window that has changed
+  const now = useNow(10_000);
+  const availability = migrationActions(m, role, plan, now, me);
   const fourEyes = Boolean(plan?.require_approval && plan.require_distinct_approver);
   // a request or a force records the user's approval only without a distinct approver (SDD §5.4, §16)
   const recordsApproval = plan?.require_distinct_approver === false;
@@ -105,13 +142,13 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
     availability.cutover = { enabled: false, reason: 'The plan is loading: its cutover window and approval policy are not known yet.' };
   }
   // a requested cutover waiting for a closed window: the Cutover action lets it start outside the window (SDD §5.4)
-  const forcing = waitsOnClosedWindow(m, plan, Date.now());
+  const forcing = waitsOnClosedWindow(m, plan, now);
   // a warm cutover requested before pre-copy converged starts once it does (SDD §5.4)
   const early = isWarmStrategy(m.strategy) && m.phase !== 'awaiting_cutover';
   // maker-checker with no other approval: the request waits for another approver, it starts nothing (SDD §16)
   const waitsForApprover = requestWaitsForApprover(m, plan, me);
   const providers = useProviders();
-  const step = nextStep(m, plan, Date.now(), destinationName(providers.data, plan));
+  const step = nextStep(m, plan, now, destinationName(providers.data, plan));
   // the advisor's decision that holds the migration, when one does (SDD §14.6)
   const waiting = waitingDecision(m);
   const action = useMigrationAction(m.id);
@@ -126,18 +163,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const [announcement, setAnnouncement] = useState('');
   const forceId = useId();
   const deleteId = useId();
-  // a button that changes rows as the migration moves keeps the focus (SDD §16): the rows are two lists, so React
-  // mounts the button anew in the other one and the focus drops to the page. The action that had the focus when this
-  // render began is noted, and only its new button gets it back - focus the user had moved elsewhere (the page,
-  // another control) is never taken back
+  // each action's button, for the one that changes rows to keep the focus (KeepsActionFocus, SDD §16)
   const buttons = useRef(new Map<MigrationActionKey, HTMLButtonElement>());
-  const focusedAtRender = useRef<MigrationActionKey | null>(null);
-  focusedAtRender.current = null;
-  if (typeof document !== 'undefined') {
-    for (const [key, node] of buttons.current) if (node === document.activeElement) focusedAtRender.current = key;
-  }
-  const rows = useRef('');
-  const remember = (key: MigrationActionKey) => (node: HTMLButtonElement | null) => {
+  const remember = (key: MigrationActionKey, node: HTMLButtonElement | null) => {
     if (node) buttons.current.set(key, node);
     else if (buttons.current.get(key)?.isConnected === false) buttons.current.delete(key);
   };
@@ -176,9 +204,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   // the API lists only passes that ended (SDD §4.2): the last one is what a Force cutover records
   const lastPass = m.sync_passes.filter((p) => p.ended_at !== null).sort((a, b) => a.number - b.number).at(-1);
   const slo = plan ? formatDuration(plan.downtime_slo_s) : null;
-  const closedWindow = !windowOpen(plan);
+  const closedWindow = !windowOpen(plan, now);
   const common = { pending: action.isPending, error: action.error, onCancel: close };
-  const approval = approveDialog(m, plan);
+  const approval = approveDialog(m, plan, now);
 
   // the actions available now first, the next step's first; the others in a quieter row (SDD §16)
   const offered = MIGRATION_ACTION_ORDER.filter((key) => key !== 'force-cutover' || isWarmStrategy(m.strategy));
@@ -187,16 +215,6 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
     .sort((a, b) => Number(b === step.action) - Number(a === step.action));
   const unavailable = offered.filter((key) => !availability[key].enabled);
   const layout = available.join(',');
-  useLayoutEffect(() => {
-    const moved = rows.current !== '' && rows.current !== layout;
-    rows.current = layout;
-    const key = focusedAtRender.current;
-    const node = key ? buttons.current.get(key) : undefined;
-    if (!moved || !node) return;
-    if (document.activeElement !== node && (document.activeElement === document.body || document.activeElement === null)) {
-      node.focus({ preventScroll: true });
-    }
-  }, [layout]);
 
   return (
     <div className="flex flex-col gap-3">
@@ -209,50 +227,52 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         <ArrowRight aria-hidden className={cn('mt-0.5 size-4 shrink-0', step.action ? 'text-status-success' : 'text-muted-foreground')} />
         {step.text}
       </p>
-      <div role="group" aria-label="Migration actions" className="flex flex-wrap items-center gap-2">
-        {waiting && (
-          // SDD §16: the decision the next step asks for comes first, ahead of the migration's own actions
-          <Link to={`/advisor/recommendations/${encodeURIComponent(waiting)}`} className={buttonClassName('primary', 'lg')}>
-            See the recommendation
-          </Link>
-        )}
-        {available.map((key) => {
-          const primary = key === step.action;
-          const destructive = key === 'rollback' || key === 'cancel' || key === 'finalize';
-          return (
+      <KeepsActionFocus layout={layout} buttons={buttons}>
+        <div role="group" aria-label="Migration actions" className="flex flex-wrap items-center gap-2">
+          {waiting && (
+            // SDD §16: the decision the next step asks for comes first, ahead of the migration's own actions
+            <Link to={`/advisor/recommendations/${encodeURIComponent(waiting)}`} className={buttonClassName('primary', 'lg')}>
+              See the recommendation
+            </Link>
+          )}
+          {available.map((key) => {
+            const primary = key === step.action;
+            const destructive = key === 'rollback' || key === 'cancel' || key === 'finalize';
+            return (
+              <Button
+                key={key}
+                ref={(node) => remember(key, node)}
+                size="lg"
+                icon={ICON[key]}
+                variant={primary ? (destructive && key !== 'finalize' ? 'danger' : 'primary') : 'secondary'}
+                onClick={() => show(key)}
+                className={cn(key === 'cancel' && available.length > 1 && 'sm:ml-auto')}
+              >
+                {key === 'cutover' && forcing ? 'Cut over outside the window' : LABEL[key]}
+              </Button>
+            );
+          })}
+          {unavailable.length > 0 && (
+            <p key="unavailable" className="mt-1 basis-full text-xs text-muted-foreground">
+              Unavailable now
+            </p>
+          )}
+          {unavailable.map((key) => (
+            // quieter and smaller, still focusable and saying why (SDD §16)
             <Button
               key={key}
-              ref={remember(key)}
-              size="lg"
+              ref={(node) => remember(key, node)}
+              size="sm"
               icon={ICON[key]}
-              variant={primary ? (destructive && key !== 'finalize' ? 'danger' : 'primary') : 'secondary'}
+              variant="secondary"
+              disabledReason={availability[key].reason}
               onClick={() => show(key)}
-              className={cn(key === 'cancel' && available.length > 1 && 'sm:ml-auto')}
             >
               {key === 'cutover' && forcing ? 'Cut over outside the window' : LABEL[key]}
             </Button>
-          );
-        })}
-        {unavailable.length > 0 && (
-          <p key="unavailable" className="mt-1 basis-full text-xs text-muted-foreground">
-            Unavailable now
-          </p>
-        )}
-        {unavailable.map((key) => (
-          // quieter and smaller, still focusable and saying why (SDD §16)
-          <Button
-            key={key}
-            ref={remember(key)}
-            size="sm"
-            icon={ICON[key]}
-            variant="secondary"
-            disabledReason={availability[key].reason}
-            onClick={() => show(key)}
-          >
-            {key === 'cutover' && forcing ? 'Cut over outside the window' : LABEL[key]}
-          </Button>
-        ))}
-      </div>
+          ))}
+        </div>
+      </KeepsActionFocus>
       <p role="status" className="sr-only">
         {announcement}
       </p>

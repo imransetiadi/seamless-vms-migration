@@ -1,7 +1,7 @@
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { Migration, Role } from '../api/types';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { formatDuration } from '../lib/format';
@@ -637,6 +637,44 @@ describe('MigrationActions', () => {
     expect(dialog).not.toHaveTextContent(/ignore the cutover window/i);
     await user.click(within(dialog).getByRole('button', { name: /^cut over outside the window$/i }));
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.force_window).toBe(true));
+  });
+
+  it('reads the cutover window at the time now: a requested cutover inside an open window is not offered outside it (SDD §5.4)', () => {
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
+    const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+    migration.cutover_requested = true;
+    migration.force_window = false;
+    // open now: from an hour ago to an hour from now
+    plan.cutover_window = { start: new Date(Date.now() - 3_600_000).toISOString(), end: new Date(Date.now() + 3_600_000).toISOString() };
+    const approver = 'approver' as const; // the component's role prop, not an ARIA role
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={approver} />, { server, token: approver });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    expect(within(group).getByRole('button', { name: /^cut over$/i })).toBeInTheDocument();
+    expect(within(group).queryByRole('button', { name: /outside the window/i })).not.toBeInTheDocument();
+  });
+
+  it('shows a cutover window that opens within ten seconds of its start, with no event to redraw it (SDD §5.4, §16)', () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const server = createTestServer();
+      const migration = server.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
+      const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+      migration.cutover_requested = true;
+      migration.force_window = false;
+      // closed now, open in five seconds
+      plan.cutover_window = { start: new Date(Date.now() + 5_000).toISOString(), end: new Date(Date.now() + 3_600_000).toISOString() };
+      const approver = 'approver' as const; // the component's role prop, not an ARIA role
+      renderWithApp(<MigrationActions migration={migration} plan={plan} role={approver} />, { server, token: approver });
+      const group = screen.getByRole('group', { name: /migration actions/i });
+      expect(within(group).getByRole('button', { name: /^cut over outside the window$/i })).toBeInTheDocument();
+
+      act(() => vi.advanceTimersByTime(10_000));
+      expect(within(group).getByRole('button', { name: /^cut over$/i })).toBeInTheDocument();
+      expect(within(group).queryByRole('button', { name: /outside the window/i })).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('disables every action for viewers', () => {

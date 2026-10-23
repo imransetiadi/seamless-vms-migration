@@ -31,12 +31,11 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
   const [drafts, setDrafts] = useState<NicDraft[] | null>(null);
   // what the API would refuse, by MAC: each address field carries its own (SDD §16)
   const [problems, setProblems] = useState<Record<string, string[]>>({});
-  const [focusField, setFocusField] = useState<number | null>(null);
-  // the first refused field gets the focus once it is marked invalid and described by its problem
+  // the first refused field gets the focus once it is marked invalid and described by its problem: each refused Save
+  // asks anew (a new object), so the same field is focused again on the next one
+  const [focusField, setFocusField] = useState<{ index: number } | null>(null);
   useEffect(() => {
-    if (focusField === null) return;
-    addressRefs.current[focusField]?.focus();
-    setFocusField(null);
+    if (focusField) addressRefs.current[focusField.index]?.focus();
   }, [focusField]);
   if (!plan) return <p className="text-sm text-muted-foreground">Loading the plan…</p>;
   const vmware = providers.data?.find((p) => p.id === plan.source_provider_id)?.kind === 'vmware';
@@ -82,7 +81,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
     setProblems(parsed.problems);
     const refused = (drafts ?? []).findIndex((d) => parsed.problems[d.mac]);
     if (refused >= 0) {
-      setFocusField(refused);
+      setFocusField({ index: refused });
       return;
     }
     save(parsed.entries, `${m.vm.name}'s network is saved.`);

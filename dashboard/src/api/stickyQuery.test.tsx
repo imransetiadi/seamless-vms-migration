@@ -86,4 +86,36 @@ describe('useApiQuery (SDD §16 Failed loads)', () => {
       onlineManager.setOnline(true);
     }
   });
+
+  it('reports the latest failure of the key while it is fetched again, never an earlier one', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let answer: () => Promise<string> = () => Promise.reject(new Error('first failure'));
+    const { result } = renderHook(() => useApiQuery({ queryKey: ['thing'], queryFn: () => answer() }), { wrapper: wrapper(client) });
+    await waitFor(() => expect(result.current.error?.message).toBe('first failure'));
+    // a Retry fails again, with another error
+    answer = () => Promise.reject(new Error('second failure'));
+    act(() => void result.current.refetch());
+    await waitFor(() => expect(result.current.error?.message).toBe('second failure'));
+    // while the next Retry runs, that failure is the one said
+    answer = () => new Promise<string>(() => {});
+    act(() => void result.current.refetch());
+    await waitFor(() => expect(result.current.isFetching).toBe(true));
+    expect(result.current.error?.message).toBe('second failure');
+  });
+
+  it('forgets a failure once an answer replaced it: a later load from scratch is loading, not failed', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let answer: () => Promise<string> = () => Promise.reject(new Error('first failure'));
+    const { result } = renderHook(() => useApiQuery({ queryKey: ['thing'], queryFn: () => answer() }), { wrapper: wrapper(client) });
+    await waitFor(() => expect(result.current.error?.message).toBe('first failure'));
+    answer = () => Promise.resolve('ok');
+    act(() => void result.current.refetch());
+    await waitFor(() => expect(result.current.data).toBe('ok'));
+    // the cache is reset and read from scratch: a first load again, without the failure the answer replaced
+    answer = () => new Promise<string>(() => {});
+    act(() => void client.resetQueries({ queryKey: ['thing'] }));
+    await waitFor(() => expect(result.current.isFetching).toBe(true));
+    expect(result.current.isPending).toBe(true);
+    expect(result.current.error).toBeNull();
+  });
 });

@@ -136,14 +136,21 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
   const [form, setForm] = useState<FormState>(() => formOf(policy, defaultThreshold));
   const [errors, setErrors] = useState<Errors>({});
 
+  // each opening starts the form afresh, one that mounts open too: reset as the dialog renders, not by an effect a render
+  // later (react.dev, "Adjusting some state when a prop changes")
+  const [shownOpen, setShownOpen] = useState(false);
+  if (open !== shownOpen) {
+    setShownOpen(open);
+    if (open) {
+      setForm(formOf(policy, defaultThreshold));
+      setErrors({});
+    }
+  }
+  // and the last request's outcome goes: the mutation keeps it outside React's state
+  const resetSave = save.reset;
   useEffect(() => {
-    if (!open) return;
-    setForm(formOf(policy, defaultThreshold));
-    setErrors({});
-    save.reset();
-    // Reset only when the dialog opens.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+    if (open) resetSave();
+  }, [open, resetSave]);
 
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((f) => ({ ...f, [key]: value }));
   const sources = (providers.data ?? []).filter((p) => p.role === 'source');

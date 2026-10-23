@@ -1,8 +1,9 @@
 import { Replace, ThumbsUp } from 'lucide-react';
-import { useRef, useState, type RefObject } from 'react';
+import { useContext, useRef, useState, type RefObject } from 'react';
 import { useDecideRecommendation, useMe, usePlan, usePolicies } from '../api/hooks';
 import { ACTION_TEXT_MAX, ACTION_TEXT_UNITS, OVERRIDE_REASON_MIN, type AdvisorRecommendation, type Migration, type MigrationSummary, type Strategy, type VMRef } from '../api/types';
 import { optionLabel } from '../lib/advisor';
+import { FocusAfterDecision } from '../lib/focusAfterDecision';
 import { pyLen, pyStrip, pyTooLong } from '../lib/format';
 import { resolvePolicy } from '../lib/policies';
 import { OWN_DECISION, ownReason } from '../lib/roles';
@@ -25,12 +26,17 @@ export function RecommendationActions({
 }: {
   rec: AdvisorRecommendation;
   migration: ActionMigration;
-  /** Where focus goes after a decision, when these actions may go with it (SDD §16). */
+  /**
+   * Where focus goes after a decision, when these actions may go with it (SDD §16); in an entry of a recommendation list,
+   * by default its Details link (FocusAfterDecision).
+   */
   focusAfterRef?: RefObject<HTMLElement | null>;
   /** Says what was decided, for the page's live region. */
   onDecided?: (message: string) => void;
 }) {
   const decide = useDecideRecommendation(rec.id);
+  const entryLink = useContext(FocusAfterDecision);
+  const focusAfter = focusAfterRef ?? entryLink;
   const policies = usePolicies();
   const [open, setOpen] = useState<'approve' | 'override' | null>(null);
   // a summary names them as the API reads its estimates (SDD §4)
@@ -62,7 +68,7 @@ export function RecommendationActions({
     decide.reset();
   };
   const decided = (message: string) => {
-    returnRef.current = focusAfterRef?.current ?? null;
+    returnRef.current = focusAfter?.current ?? null;
     setOpen(null);
     decide.reset();
     onDecided?.(message);

@@ -468,9 +468,9 @@ function MigrationAdvisor({ m }: { m: Migration }) {
             <RecommendationList
               items={page.items}
               showSubject={false}
-              actionsFor={(rec, focusAfterRef) =>
+              actionsFor={(rec) =>
                 can(role, 'advisor.approve') && decidable(rec, m, page.items.find((r) => !r.legacy)?.id) ? (
-                  <RecommendationActions rec={rec} migration={m} focusAfterRef={focusAfterRef} onDecided={setDecided} />
+                  <RecommendationActions rec={rec} migration={m} onDecided={setDecided} />
                 ) : null
               }
             />
@@ -715,7 +715,13 @@ export default function MigrationDetail() {
   const announcement = useProgressAnnouncement(m);
   const gpuAnnouncement = useGpuWaitAnnouncement(m);
 
-  useEffect(() => setLiveEvents([]), [migrationId]);
+  // another migration's page drops the streamed events of the one before, as it renders (react.dev, "Adjusting some state
+  // when a prop changes")
+  const [eventsOf, setEventsOf] = useState(migrationId);
+  if (migrationId !== eventsOf) {
+    setEventsOf(migrationId);
+    setLiveEvents([]);
+  }
   useLiveEvents((event) => {
     if (event.migration_id === migrationId && event.seq > 0) setLiveEvents((list) => [...list, event].slice(-300));
   });

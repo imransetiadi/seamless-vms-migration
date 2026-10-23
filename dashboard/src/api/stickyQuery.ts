@@ -1,5 +1,5 @@
 import { useQuery, type DefaultError, type QueryKey, type UseQueryOptions, type UseQueryResult } from '@tanstack/react-query';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 
 /**
  * `useQuery` that keeps a failed load said while it is fetched again (SDD §16 Failed loads). TanStack Query 5 puts a
@@ -17,10 +17,9 @@ export function useApiQuery<TQueryFnData = unknown, TError = DefaultError, TData
   const { error, isSuccess, isPlaceholderData } = result;
   // only a real answer clears it: a placeholder (another key's data) counts as 'success' too
   const answered = isSuccess && !isPlaceholderData;
-  useEffect(() => {
-    if (error) setLast({ key, error });
-    else if (answered) setLast(null);
-  }, [key, error, answered]);
+  // followed as the query renders, not by an effect a render later (react.dev, "Adjusting some state when a prop changes")
+  if (error && (last === null || last.key !== key || last.error !== error)) setLast({ key, error });
+  else if (!error && answered && last !== null) setLast(null);
   // fetched again (or waiting offline to be) with no answer yet: a pending query, or one showing another key's
   // figures as placeholder (keepPreviousData), reports the failure instead - never those figures for this key
   const refetching = result.isFetching || result.isPaused;

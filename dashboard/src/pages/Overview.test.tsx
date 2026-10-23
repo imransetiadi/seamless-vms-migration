@@ -331,6 +331,21 @@ describe('Overview page (mock data)', () => {
     expect(within(attention).getByRole('link', { name: 'gpu-render-01' })).toBeInTheDocument();
   });
 
+  it('lists a requested cutover waiting for its window in Needs attention, with when the window opens (SDD §5.4, §16)', async () => {
+    const server = createTestServer();
+    const billing = server.migrations.find((m) => m.vm.name === 'app-billing-01')!;
+    // approved and requested: only the window holds it, and it opens in two and a half hours
+    Object.assign(billing, { approvals: [{ actor: 'sari', at: new Date().toISOString(), comment: null }], cutover_requested: true, gpu_wait: null });
+    server.plans.find((p) => p.id === billing.plan_id)!.cutover_window = {
+      start: new Date(Date.now() + 9_000_000).toISOString(),
+      end: new Date(Date.now() + 12_600_000).toISOString(),
+    };
+    renderWithApp(<Overview />, { server });
+    const attention = await screen.findByRole('region', { name: 'Needs attention' });
+    const link = await within(attention).findByRole('link', { name: 'app-billing-01' });
+    expect(link.closest('li')!).toHaveTextContent('Waiting for the cutover window (opens in 2 h)');
+  });
+
   it('lists a migration waiting for GPU capacity in Needs attention', async () => {
     const server = createTestServer();
     const billing = server.migrations.find((m) => m.vm.name === 'app-billing-01')!;

@@ -507,14 +507,17 @@ function ProviderColumn({
   const headingId = useId();
   const headingRef = useRef<HTMLHeadingElement>(null);
   const [deleted, setDeleted] = useState<string | null>(null);
+  // the deleted card is gone (with the button the dialog returned the focus to): the column
+  // heading takes the focus, never the page body (SDD §16) - the deletion is taken as the column
+  // renders without the card, the heading focused once that is committed
+  const [headingFocus, setHeadingFocus] = useState<{ deleted: string } | null>(null);
+  if (deleted && !items.some((p) => p.id === deleted)) {
+    setDeleted(null);
+    setHeadingFocus({ deleted });
+  }
   useEffect(() => {
-    // the deleted card is gone (with the button the dialog returned the focus to): the column
-    // heading takes the focus, never the page body (SDD §16)
-    if (deleted && !items.some((p) => p.id === deleted)) {
-      headingRef.current?.focus();
-      setDeleted(null);
-    }
-  }, [deleted, items]);
+    if (headingFocus) headingRef.current?.focus();
+  }, [headingFocus]);
   return (
     <section aria-labelledby={headingId} className="flex min-w-0 flex-col gap-3">
       <div>

@@ -1,5 +1,5 @@
 import { CircleCheck, Pause, Timer } from 'lucide-react';
-import { Fragment, useEffect, useId, useRef, useState } from 'react';
+import { Fragment, useId, useState } from 'react';
 import { DOWNTIME_PARTS, HOOKS_PART, type DowntimePart, type Estimate, type Strategy, type Timestamp } from '../api/types';
 import { cn } from '../lib/cn';
 import { SLO_ICONS, sloTone, type SloTone } from '../lib/slo';
@@ -96,17 +96,17 @@ export function DowntimeClock({
   // a crossing seen while the page is open — into the warning, past the SLO — is said once, never each tick, and
   // not one that happened before the page opened (SDD §16)
   const liveTone = running && sloS ? sloTone(elapsed, sloS) : null;
-  const seenTone = useRef<SloTone | null>(liveTone);
+  // said as the clock renders the crossing, not by an effect a render later (react.dev, "Adjusting some state when a
+  // prop changes"): elapsed is read at the crossing only, the tone is what is followed
+  const [seenTone, setSeenTone] = useState<SloTone | null>(liveTone);
   const [crossing, setCrossing] = useState('');
-  useEffect(() => {
-    const before = seenTone.current;
-    seenTone.current = liveTone;
-    if (before === null || liveTone === null || liveTone === before || !sloS) return;
-    if (liveTone === 'warning') setCrossing(`Downtime reached 80 % of the SLO: ${formatClock(Math.max(0, sloS - elapsed))} left.`);
-    else if (liveTone === 'danger') setCrossing('Downtime is over the SLO.');
-    // elapsed is read at the crossing only: the effect follows the tone, not the clock
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveTone, sloS]);
+  if (liveTone !== seenTone) {
+    setSeenTone(liveTone);
+    if (seenTone !== null && liveTone !== null && sloS) {
+      if (liveTone === 'warning') setCrossing(`Downtime reached 80 % of the SLO: ${formatClock(Math.max(0, sloS - elapsed))} left.`);
+      else if (liveTone === 'danger') setCrossing('Downtime is over the SLO.');
+    }
+  }
   const pct = sloS ? Math.min(100, (elapsed / sloS) * 100) : 0;
 
   return (

@@ -13,8 +13,8 @@ export function Term({ children, definition, className }: { children: ReactNode;
   const id = useId();
   const ref = useRef<HTMLButtonElement>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // under the term, kept inside the viewport (lib/useAnchoredNote)
-  const note = useAnchoredNote();
+  // under the term, kept inside the viewport (lib/useAnchoredNote): where it shows, its element, and how to show and hide it
+  const { at, noteRef, show: showNote, hide: hideNote } = useAnchoredNote();
 
   const cancel = () => {
     if (timer.current) clearTimeout(timer.current);
@@ -22,16 +22,16 @@ export function Term({ children, definition, className }: { children: ReactNode;
   };
   const show = () => {
     cancel();
-    if (ref.current) note.show(ref.current);
+    if (ref.current) showNote(ref.current);
   };
   const hide = () => {
     cancel();
-    note.hide();
+    hideNote();
   };
   // leaving the term for the definition must not close it
   const hideSoon = () => {
     cancel();
-    timer.current = setTimeout(() => note.hide(), 150);
+    timer.current = setTimeout(hideNote, 150);
   };
   useEffect(() => cancel, []);
 
@@ -49,7 +49,7 @@ export function Term({ children, definition, className }: { children: ReactNode;
         onBlur={hide}
         onKeyDown={(event) => {
           // Escape dismisses a shown definition only: the dialog around it stays (WCAG 1.4.13, SDD §16)
-          if (event.key === 'Escape' && note.at) {
+          if (event.key === 'Escape' && at) {
             event.stopPropagation();
             hide();
           }
@@ -59,7 +59,7 @@ export function Term({ children, definition, className }: { children: ReactNode;
         {children}
       </button>
       {createPortal(
-        <span ref={note.noteRef} role="tooltip" id={id} hidden={!note.at} onMouseEnter={cancel} onMouseLeave={hide} className="anchored-note" style={note.at ?? undefined}>
+        <span ref={noteRef} role="tooltip" id={id} hidden={!at} onMouseEnter={cancel} onMouseLeave={hide} className="anchored-note" style={at ?? undefined}>
           {definition}
         </span>,
         document.body,

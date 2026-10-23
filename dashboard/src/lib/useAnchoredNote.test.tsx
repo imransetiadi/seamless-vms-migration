@@ -3,13 +3,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { useAnchoredNote } from './useAnchoredNote';
 
 function Note({ hideAfterMs }: { hideAfterMs?: number }) {
-  const note = useAnchoredNote(hideAfterMs);
+  const { at, noteRef, show } = useAnchoredNote(hideAfterMs);
   return (
     <>
-      <button type="button" onClick={(event) => note.show(event.currentTarget)}>
+      <button type="button" onClick={(event) => show(event.currentTarget)}>
         Show
       </button>
-      <span ref={note.noteRef} role="note" hidden={!note.at} style={note.at ?? undefined}>
+      <span ref={noteRef} role="note" hidden={!at} style={at ?? undefined}>
         the note
       </span>
     </>

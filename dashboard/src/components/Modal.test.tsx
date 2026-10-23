@@ -109,6 +109,29 @@ describe('Modal (SDD §16)', () => {
     expect(busy).not.toHaveBeenCalled();
   });
 
+  it("closes from the page with the dialog's props as they are now: never while its request runs (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const first = vi.fn();
+    const second = vi.fn();
+    const dialog = (onClose: () => void, dismissible: boolean) => (
+      <Modal open onClose={onClose} labelledBy="saving" dismissible={dismissible}>
+        <h2 id="saving">Save the plan</h2>
+        <button type="button">Save</button>
+      </Modal>
+    );
+    const view = render(dialog(first, true));
+    // its request starts after it opened: Escape on the page waits for it
+    view.rerender(dialog(first, false));
+    (document.activeElement as HTMLElement).blur();
+    await user.keyboard('{Escape}');
+    expect(first).not.toHaveBeenCalled();
+    // the request done, drawn again with another handler: that one closes it
+    view.rerender(dialog(second, true));
+    await user.keyboard('{Escape}');
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(first).not.toHaveBeenCalled();
+  });
+
   it('dismisses a shown note or definition on Escape and keeps the dialog; the next Escape closes it (WCAG 1.4.13, SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const onClose = vi.fn();
