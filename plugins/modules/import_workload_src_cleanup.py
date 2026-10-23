@@ -49,6 +49,15 @@ options:
       - SSH user for conversion host access.
     required: true
     type: str
+  ssh_known_hosts:
+    description:
+      - A known_hosts file that pins the conversion hosts' keys under their aliases,
+        C(os_migrate_conv_src) and C(os_migrate_conv_dst) (Seamless Migrate SDD 6.6).
+        With it, ssh and scp to the conversion host check its key strictly, and a
+        refused key fails the module at once.
+      - Unset or empty, the module connects as upstream does (C(StrictHostKeyChecking=no)).
+    required: false
+    type: path
   transfer_uuid:
     description:
       - Transfer UUID created by export/transfer modules.
@@ -113,6 +122,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils import serve
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
     DEFAULT_TIMEOUT,
     OpenstackVolumeClean,
+    SshRefused,
 )
 
 
@@ -132,6 +142,7 @@ class OpenStackSourceHostCleanup(OpenstackVolumeClean):
         state_file=None,
         log_file=None,
         timeout=DEFAULT_TIMEOUT,
+        ssh_known_hosts=None,
     ):
 
         super().__init__(
@@ -144,6 +155,7 @@ class OpenStackSourceHostCleanup(OpenstackVolumeClean):
             state_file=state_file,
             log_file=log_file,
             timeout=timeout,
+            ssh_known_hosts=ssh_known_hosts,
         )
 
         # Required unique parameters:
@@ -167,6 +179,7 @@ def run_module():
         conversion_host=dict(type="dict", required=True),
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
+        ssh_known_hosts=dict(type="path", required=False, default=None),
         transfer_uuid=dict(type="str", required=True),
         volume_map=dict(type="dict", required=True),
         src_conversion_host_address=dict(type="str", default=None),
@@ -203,20 +216,26 @@ def run_module():
     log_file = module.params.get("log_file", None)
     timeout = module.params["timeout"]
 
-    host_cleanup = OpenStackSourceHostCleanup(
-        conn,
-        source_conversion_host_id,
-        ssh_key_path,
-        ssh_user,
-        source_instance_id,
-        transfer_uuid,
-        volume_map,
-        source_conversion_host_address=source_conversion_host_address,
-        state_file=state_file,
-        log_file=log_file,
-        timeout=timeout,
-    )
-    host_cleanup.close_exports()
+    try:
+        host_cleanup = OpenStackSourceHostCleanup(
+            conn,
+            source_conversion_host_id,
+            ssh_key_path,
+            ssh_user,
+            source_instance_id,
+            transfer_uuid,
+            volume_map,
+            source_conversion_host_address=source_conversion_host_address,
+            state_file=state_file,
+            log_file=log_file,
+            timeout=timeout,
+            ssh_known_hosts=module.params["ssh_known_hosts"],
+        )
+        host_cleanup.close_exports()
+    except SshRefused as err:
+        # by its own message, never a traceback, which shows a call's arguments - "timeout"
+        # among them - on Python 3.13 and later (Seamless Migrate SDD 6.6)
+        module.fail_json(msg=str(err))
 
     module.exit_json(**result)
 

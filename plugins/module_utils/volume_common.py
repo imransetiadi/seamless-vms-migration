@@ -7,12 +7,17 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.server_volum
     ServerVolume,
 )
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import exc
+import base64
+import contextlib
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import fcntl
@@ -230,6 +235,23 @@ class DiskIdentityError(RuntimeError):
     RV15-01)."""
 
 
+class SshRefused(Exception):
+    """A conversion host's key, or the link to the source host, refused: permanent at once, never
+    an outage to wait out. Its message names no ssh command line and no "timeout", which the
+    control plane retries as transient, and it chains no error that does (Seamless Migrate SDD
+    6.6, review RV42B-02)."""
+
+
+class HostKeyRefused(SshRefused):
+    """ssh refused the key a conversion host presented: none the module's known_hosts file pins
+    under the host's alias (Seamless Migrate SDD 6.6)."""
+
+
+class LinkRefused(SshRefused):
+    """The source conversion host refused the destination host's link: its login, or a forward
+    (Seamless Migrate SDD 6.6)."""
+
+
 def _checked_give_up_prefix(prefix):
     """``prefix``, one of GIVE_UP_PREFIXES, which the control plane retries."""
     if prefix not in GIVE_UP_PREFIXES:
@@ -431,6 +453,10 @@ def serialized_volume_type(ser_server, device=None, volume_id=None):
 
 
 class OpenStackVolumeBase:
+    #: the side of the conversion host the module works on - "source" or "destination" -, whose
+    #: alias a known_hosts file pins the host's key under (Seamless Migrate SDD 6.6)
+    SIDE = None
+
     def __init__(
         self,
         openstack_connection,
@@ -445,6 +471,7 @@ class OpenStackVolumeBase:
         shell_factory=None,
         preserve_volume_type=False,
         src_ssh_user=None,
+        ssh_known_hosts=None,
     ):
         # Required common parameters:
         # openstack_connection: OpenStack connection object
@@ -467,8 +494,11 @@ class OpenStackVolumeBase:
         # src_ssh_user: the source conversion host's user, for the destination
         #               host's hop to it; ssh_user when unset (Seamless Migrate
         #               SDD 6.5: each host keeps its own provider's user)
+        # ssh_known_hosts: a known_hosts file that pins the conversion hosts'
+        #                  keys; unset or empty, upstream's ssh (SDD 6.6)
         self.conversion_host_address = conversion_host_address
         self.src_ssh_user = src_ssh_user or ssh_user
+        self.ssh_known_hosts = ssh_known_hosts or None
         self.state_file = state_file
         self.log_file = log_file
         self.timeout = timeout
@@ -492,13 +522,28 @@ class OpenStackVolumeBase:
         # shell_factory(address, ssh_user, key_path) builds the RemoteShell;
         # injectable so the volume logic can be tested without SSH.
         self.shell_factory = shell_factory or RemoteShell
-        self.shell = self.shell_factory(
-            self._converter_address(), ssh_user, ssh_key_path
+        self.shell = self._shell(
+            self._converter_address(), ssh_user, self.SIDE, server=conversion_host_id
         )
         self._check_ssh()
 
         # Ports chosen for NBD export
         self.claimed_ports = []
+
+    def _shell(self, address, ssh_user, side, server=None):
+        """The RemoteShell to the conversion host at ``address``: built as upstream builds it,
+        or, given ssh_known_hosts, pinned under ``side``'s alias and naming ``server`` - its
+        server id, when the module knows it - in a refusal (Seamless Migrate SDD 6.6)."""
+        if not self.ssh_known_hosts:
+            return self.shell_factory(address, ssh_user, self.ssh_key_path)
+        return self.shell_factory(
+            address,
+            ssh_user,
+            self.ssh_key_path,
+            known_hosts=self.ssh_known_hosts,
+            side=side,
+            server=server,
+        )
 
     def _check_ssh(self):
         """Quick SSH check of the conversion host: a module fails at once."""
@@ -1102,28 +1147,187 @@ class OpenStackVolumeBase:
         return result == 124
 
 
+#: each side's alias - the conversion host's inventory name -, under which a known_hosts file pins
+#: its keys (Seamless Migrate SDD 6.6)
+HOST_KEY_ALIASES = {"source": "os_migrate_conv_src", "destination": "os_migrate_conv_dst"}
+#: a pinned key type's host key algorithms where they are not the type's own name: an RSA key
+#: signs with SHA-2, never ssh-rsa, which OpenSSH 8.8 and later disable (SDD 6.6)
+_HOST_KEY_ALGORITHMS = {"ssh-rsa": ("rsa-sha2-512", "rsa-sha2-256")}
+#: a key type as ssh names it in its messages; every ecdsa-sha2-* type is ECDSA
+_KEY_TYPE_NAMES = {"ssh-ed25519": "ED25519", "ssh-rsa": "RSA", "ssh-dss": "DSA"}
+#: ssh's words for a host key it refused: a key it was not given, or no key of a pinned type,
+#: which HostKeyAlgorithms makes it refuse (SDD 6.6)
+_HOST_KEY_REFUSED = re.compile(
+    r"Host key verification failed\.|No \S+ host key is known for |no matching host key type found"
+)
+_OFFERED_KEY = re.compile(
+    r"The fingerprint for the (\S+) key sent by the remote host is\s+(SHA256:[A-Za-z0-9+/]+)"
+)
+_UNKNOWN_KEY = re.compile(r"No (\S+) host key is known for ")
+_OFFERED_TYPES = re.compile(r"no matching host key type found\. Their offer: (\S+)")
+
+
+def _names_alias(names, alias):
+    """Whether a known_hosts entry's names field names ``alias``: hashed as HashKnownHosts writes
+    it (|1|salt|HMAC-SHA1 of the name), or among its comma-separated names."""
+    if names.startswith("|1|"):
+        try:
+            salt, digest = [base64.b64decode(part) for part in names[3:].split("|")]
+        except (TypeError, ValueError):  # binascii.Error is a ValueError
+            return False
+        mac = hmac.new(salt, alias.encode("utf-8"), hashlib.sha1).digest()
+        return hmac.compare_digest(mac, digest)
+    return alias.lower() in names.lower().split(",")
+
+
+def pinned_host_keys(known_hosts, alias):
+    """The keys ``known_hosts`` pins under ``alias``: (key type, base64 key) pairs in the file's
+    order. A marked entry (@cert-authority, @revoked) pins none, and a file that cannot be read
+    pins none: ssh then refuses the host (Seamless Migrate SDD 6.6)."""
+    try:
+        with open(known_hosts, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    keys = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 3 or fields[0].startswith(("#", "@")) or not _names_alias(fields[0], alias):
+            continue
+        try:
+            base64.b64decode(fields[2], validate=True)
+        except (TypeError, ValueError):
+            continue
+        keys.append((fields[1], fields[2]))
+    return keys
+
+
+def host_key_algorithms(keys):
+    """The host key algorithms of pinned keys, each once, in the keys' order (SDD 6.6)."""
+    algorithms = []
+    for key_type, _key in keys:
+        for algorithm in _HOST_KEY_ALGORITHMS.get(key_type, (key_type,)):
+            if algorithm not in algorithms:
+                algorithms.append(algorithm)
+    return algorithms
+
+
+def _key_name(key_type, key):
+    """A pinned key as a refusal names it: its type as ssh names it and its SHA256 fingerprint."""
+    name = "ECDSA" if key_type.startswith("ecdsa-") else _KEY_TYPE_NAMES.get(key_type, key_type)
+    digest = hashlib.sha256(base64.b64decode(key)).digest()
+    return "%s SHA256:%s" % (name, base64.b64encode(digest).decode("ascii").rstrip("="))
+
+
+def refused_host_key(stderr):
+    """What the host presented when ssh's ``stderr`` says it refused the host's key - "the ED25519
+    key SHA256:...", "an ED25519 key", "no key of a pinned type (it offered ...)" -, or None when
+    ssh refused no key (Seamless Migrate SDD 6.6)."""
+    if not _HOST_KEY_REFUSED.search(stderr):
+        return None
+    offered = _OFFERED_KEY.search(stderr)
+    if offered:
+        return "the %s key %s" % offered.groups()
+    unknown = _UNKNOWN_KEY.search(stderr)
+    if unknown:
+        return "an %s key" % unknown.group(1)
+    types = _OFFERED_TYPES.search(stderr)
+    if types:
+        return "no key of a pinned type (it offered %s)" % types.group(1)
+    return "a key it does not pin"
+
+
+def refused_link(output, address):
+    """ssh's reason when ``output`` shows the source conversion host at ``address`` refusing the
+    link - its "Permission denied" for that host, or a forward "administratively prohibited" -,
+    else None (Seamless Migrate SDD 6.6)."""
+    denied = re.search(r"@%s: (Permission denied \([^)]*\))" % re.escape(address), output)
+    if denied:
+        return denied.group(1)
+    if "administratively prohibited" in output:
+        return "a forward administratively prohibited"
+    return None
+
+
+def link_refused(address, reason):
+    """The LinkRefused of the source conversion host at ``address`` (SDD 6.6)."""
+    return LinkRefused(
+        "link refused by the source conversion host (%s at %s): %s"
+        % (HOST_KEY_ALIASES["source"], address, reason)
+    )
+
+
 class RemoteShell:  # pylint: disable=ansible-bad-function
-    """Run SSH/SCP commands on a remote conversion host via subprocess."""
-    def __init__(self, address, ssh_user, key_path=None):
+    """Run SSH/SCP commands on a remote conversion host via subprocess.
+
+    Given ``known_hosts``, the host's key is pinned: ssh and scp check it strictly against that
+    file alone, under the alias of the host's ``side`` (HOST_KEY_ALIASES), and a key they refuse
+    raises HostKeyRefused at once, naming ``server`` - the conversion host's server id, when the
+    caller knows it. Without it - none, or an empty name - every command line is upstream's
+    (Seamless Migrate SDD 6.6)."""
+
+    def __init__(self, address, ssh_user, key_path=None, known_hosts=None, side=None, server=None):
         self.address = address
         self.ssh_user = ssh_user
         self.key_path = key_path
+        self.known_hosts = known_hosts or None
+        self.side = side
+        self.server = server
+        self.alias = None
+        self.pinned = []
+        if self.known_hosts:
+            if side not in HOST_KEY_ALIASES:
+                raise ValueError(
+                    "A pinned conversion host is on the source or the destination side, not %r"
+                    % (side,)
+                )
+            self.alias = HOST_KEY_ALIASES[side]
+            self.pinned = pinned_host_keys(self.known_hosts, self.alias)
 
-    def _default_options(self):
+    def _host_key_options(self):
+        """Upstream's StrictHostKeyChecking=no, or the pinned host's options (SDD 6.6, 26.4)."""
+        if not self.known_hosts:
+            return ["-o", "StrictHostKeyChecking=no"]
         options = [
             "-o",
-            "BatchMode=yes",
+            "StrictHostKeyChecking=yes",
             "-o",
-            "StrictHostKeyChecking=no",
+            "UserKnownHostsFile=" + self.known_hosts,
             "-o",
-            "ConnectTimeout=10",
-            # a silent partition ends the ssh in about a minute, not the
-            # kernel's ~2 h TCP keepalive, while the source may be stopped (SDD §6.6)
+            "GlobalKnownHostsFile=/dev/null",
+            # the alias keeps the check off the address: a floating IP that moves changes nothing
             "-o",
-            "ServerAliveInterval=15",
+            "HostKeyAlias=" + self.alias,
             "-o",
-            "ServerAliveCountMax=4",
+            "CheckHostIP=no",
+            "-o",
+            "UpdateHostKeys=no",
+            "-o",
+            "VerifyHostKeyDNS=no",
+            "-o",
+            "HashKnownHosts=yes",
         ]
+        algorithms = host_key_algorithms(self.pinned)
+        if algorithms:
+            options.extend(["-o", "HostKeyAlgorithms=" + ",".join(algorithms)])
+        options.extend(["-o", "IdentitiesOnly=yes"])
+        return options
+
+    def _default_options(self):
+        options = ["-o", "BatchMode=yes"]
+        options.extend(self._host_key_options())
+        options.extend(
+            [
+                "-o",
+                "ConnectTimeout=10",
+                # a silent partition ends the ssh in about a minute, not the
+                # kernel's ~2 h TCP keepalive, while the source may be stopped (SDD §6.6)
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=4",
+            ]
+        )
         if self.key_path:
             options.extend(["-i", self.key_path])
         return options
@@ -1135,35 +1339,97 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
         preamble.extend([self.ssh_user + "@" + self.address])
         return preamble
 
+    @contextlib.contextmanager
+    def _refusals(self, kwargs):
+        """``kwargs`` for subprocess, and ``refused(status)``. With a pinned key, ssh's stderr
+        goes to a file that ``refused`` reads when ssh exits 255: a host key ssh refused raises
+        HostKeyRefused at once - never the 255, or the error, that a wait takes for an outage.
+        What ssh printed reaches this module's stderr afterwards, as before. Unpinned, or given
+        the caller's own stderr, nothing changes (Seamless Migrate SDD 6.6)."""
+        if not self.known_hosts or "stderr" in kwargs:
+            yield kwargs, lambda status: None
+            return
+        with tempfile.TemporaryFile() as stderr:
+
+            def refused(status):
+                if status != SSH_FAILED:
+                    return
+                stderr.seek(0)
+                said = stderr.read().decode("utf-8", "replace")
+                offered = refused_host_key(said)
+                if offered is not None:
+                    logging.getLogger("osp-osp").debug(
+                        "ssh refused the host key of %s: %s", self.address, said
+                    )
+                    raise HostKeyRefused(self._refusal(offered)) from None
+
+            try:
+                yield dict(kwargs, stderr=stderr), refused
+            finally:
+                stderr.seek(0)
+                sys.stderr.write(stderr.read().decode("utf-8", "replace"))
+
+    def _refusal(self, offered):
+        """HostKeyRefused's message: the side, the alias, the server, what the host presented and
+        each key the file pins for it - never ssh's command line (SDD 6.6, review RV42B-02)."""
+        if self.server:
+            host = "%s, server %s at %s" % (self.alias, self.server, self.address)
+        else:
+            host = "%s at %s" % (self.alias, self.address)
+        pinned = []
+        for key_type, key in self.pinned:
+            name = _key_name(key_type, key)
+            if name not in pinned:
+                pinned.append(name)
+        if not pinned:
+            against = ", and none is pinned for it"
+        elif len(pinned) == 1:
+            against = ", not its pinned key " + pinned[0]
+        else:
+            against = ", not its pinned keys " + ", ".join(pinned)
+        return "host key refused: the %s conversion host (%s) presented %s%s" % (
+            self.side,
+            host,
+            offered,
+            against,
+        )
+
     def cmd_out(self, command, **kwargs):
         """Run command on the target conversion host and get the output. A command that fails
         by itself - a positive exit status - raises RemoteCommandFailed, its full command logged
         (debug); ssh's own failure (SSH_FAILED), and ssh killed by a signal on this host (a
         negative status: no remote command failed), subprocess's CalledProcessError, whose ssh
         command line the control plane retries as transient (Seamless Migrate SDD 6.6, reviews
-        RV42B-02, RV43B-05, RV43B-06)."""
+        RV42B-02, RV43B-05, RV43B-06) - unless the host's pinned key was refused:
+        HostKeyRefused."""
         args = self.ssh_preamble()
         args.extend(command)
-        try:
-            return subprocess.check_output(args, **kwargs).decode("utf-8").strip()
-        except subprocess.CalledProcessError as err:
-            if ssh_failed(err.returncode):
-                raise
-            logging.getLogger("osp-osp").debug(
-                "%s on the conversion host %s exited with status %d",
-                " ".join(str(part) for part in command),
-                self.address,
-                err.returncode,
-            )
-            raise RemoteCommandFailed(
-                err.returncode, list(command), err.output, err.stderr
-            ) from None
+        with self._refusals(kwargs) as (kwargs, refused):
+            try:
+                return subprocess.check_output(args, **kwargs).decode("utf-8").strip()
+            except subprocess.CalledProcessError as err:
+                refused(err.returncode)
+                if ssh_failed(err.returncode):
+                    raise
+                logging.getLogger("osp-osp").debug(
+                    "%s on the conversion host %s exited with status %d",
+                    " ".join(str(part) for part in command),
+                    self.address,
+                    err.returncode,
+                )
+                raise RemoteCommandFailed(
+                    err.returncode, list(command), err.output, err.stderr
+                ) from None
 
     def cmd_val(self, command, **kwargs):
-        """Run command on the target conversion host and get return code."""
+        """Run command on the target conversion host and get return code; a refused pinned key
+        raises HostKeyRefused (SDD 6.6)."""
         args = self.ssh_preamble()
         args.extend(command)
-        return subprocess.call(args, **kwargs)
+        with self._refusals(kwargs) as (kwargs, refused):
+            status = subprocess.call(args, **kwargs)
+            refused(status)
+            return status
 
     def cmd_sub(self, command, **kwargs):
         """Start a long-running command on the target conversion host."""
@@ -1171,13 +1437,20 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
         args.extend(command)
         return subprocess.Popen(args, **kwargs)
 
+    def _copy(self, command):
+        """scp ``command``'s exit status; a refused pinned key raises HostKeyRefused (SDD 6.6)."""
+        with self._refusals({}) as (kwargs, refused):
+            status = subprocess.call(command, **kwargs)
+            refused(status)
+            return status
+
     def scp_to(self, source, destination):
         """Copy a file to the target conversion host."""
         command = ["scp"]
         command.extend(self._default_options())
         remote_path = self.ssh_user + "@" + self.address + ":" + destination
         command.extend([source, remote_path])
-        return subprocess.call(command)
+        return self._copy(command)
 
     def scp_from(self, source, destination, recursive=False):
         """Copy a file from the source conversion host."""
@@ -1187,7 +1460,7 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
             command.extend(["-r"])
         remote_path = self.ssh_user + "@" + self.address + ":" + source
         command.extend([remote_path, destination])
-        return subprocess.call(command)
+        return self._copy(command)
 
     def test_ssh_connection(self):
         """Quick SSH connectivity check."""
@@ -1198,6 +1471,8 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
 
 class OpenstackVolumeExport(OpenStackVolumeBase):
     """Export volumes from an OpenStack instance over NBD."""
+
+    SIDE = "source"
 
     def prepare_exports(self):
         """
@@ -1553,6 +1828,10 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
 
 class OpenstackVolumeTransfer(OpenStackVolumeBase):
 
+    SIDE = "destination"
+    #: with ssh_known_hosts, the file the link's forward writes its stderr to (SDD 6.6)
+    link_output = None
+
     def transfer_exports(self):
         """
         Method to transfer volumes. This method needs to be implemented in the
@@ -1622,7 +1901,13 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         command = source_shell.ssh_preamble()
         command.extend(forward_ports)
         self.log.debug("SSH forwarding command: %s", " ".join(command))
-        self.forwarding_process = self.shell.cmd_sub(command)
+        if self.ssh_known_hosts:
+            # what the link says, read for a refusal each time an export does not answer
+            # (Seamless Migrate SDD 6.6)
+            self.link_output = tempfile.TemporaryFile()
+            self.forwarding_process = self.shell.cmd_sub(command, stderr=self.link_output)
+        else:
+            self.forwarding_process = self.shell.cmd_sub(command)
         self.forwarding_process_command = " ".join(command)
 
         # Check qemu-img info on all the disks to make sure everything is ready
@@ -1640,6 +1925,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     pending_disks.remove(disk)
             except subprocess.CalledProcessError as error:
                 outage.seen(ssh_failed(error.returncode))
+                self._check_link()
                 self.log.info("Got exception: %s", error)
                 self.log.info("Trying again.")
                 time.sleep(1)
@@ -1649,8 +1935,28 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         else:
             raise RuntimeError("Timed out starting nbdkit exports!")
 
+    def _link_said(self):
+        """What the link's forward wrote to its stderr so far, read without moving the offset ssh
+        writes at."""
+        fd = self.link_output.fileno()
+        return os.pread(fd, os.fstat(fd).st_size, 0).decode("utf-8", "replace")
+
+    def _check_link(self):
+        """LinkRefused, at once, when the forward's output shows the source host refusing the
+        link - its login, or a forward - where the transfer waited out its timeout and failed as
+        transient (Seamless Migrate SDD 6.6)."""
+        if self.link_output is None:
+            return
+        reason = refused_link(self._link_said(), self.source_conversion_host_address)
+        if reason is not None:
+            raise link_refused(self.source_conversion_host_address, reason) from None
+
     def _stop_forwarding_process(self):
         self.log.info("Stopping export forwarding on source conversion host...")
+        if self.link_output is not None:
+            self.log.debug("The link said: %s", self._link_said())
+            self.link_output.close()
+            self.link_output = None
         # a transfer that failed before the forwarding started has none: its own error stands,
         # and the ports it claimed are still released after this
         if self.forwarding_process:
@@ -2009,6 +2315,8 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
 
 
 class OpenstackVolumeClean(OpenStackVolumeBase):
+
+    SIDE = "source"
 
     def _check_ssh(self):
         """

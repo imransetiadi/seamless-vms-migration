@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# Modified by the Seamless Migrate project, 2026.
 
 
 from __future__ import absolute_import, division, print_function
@@ -65,6 +66,15 @@ options:
       - The SSH user to connect to the conversion hosts.
     required: true
     type: str
+  ssh_known_hosts:
+    description:
+      - A known_hosts file that pins the conversion hosts' keys under their aliases,
+        C(os_migrate_conv_src) and C(os_migrate_conv_dst) (Seamless Migrate SDD 6.6).
+        With it, ssh and scp to the conversion host check its key strictly, and a
+        refused key fails the module at once.
+      - Unset or empty, the module connects as upstream does (C(StrictHostKeyChecking=no)).
+    required: false
+    type: path
   src_conversion_host_address:
     description:
       - Source conversion host address override.
@@ -189,6 +199,7 @@ class OpenStackSourceVolume(OpenstackVolumeExport):
         source_conversion_host_address=None,
         transfer_uuid=None,
         timeout=DEFAULT_TIMEOUT,
+        ssh_known_hosts=None,
     ):
         # UUID marker for child processes on conversion hosts.
         transfer_uuid = str(uuid.uuid4())
@@ -203,6 +214,7 @@ class OpenStackSourceVolume(OpenstackVolumeExport):
             state_file=state_file,
             log_file=log_file,
             timeout=timeout,
+            ssh_known_hosts=ssh_known_hosts,
         )
         # Build up a list of VolumeMappings keyed by the original device path
         # provided by the OpenStack API. Details:
@@ -264,6 +276,7 @@ def run_module():
         conversion_host=dict(type="dict", required=True),
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
+        ssh_known_hosts=dict(type="path", required=False, default=None),
         src_conversion_host_address=dict(type="str", default=None),
         log_dir=dict(type="str", default=None),
         timeout=dict(type="int", default=DEFAULT_TIMEOUT),
@@ -306,6 +319,7 @@ def run_module():
         state_file=state_file,
         log_file=log_file,
         timeout=timeout,
+        ssh_known_hosts=module.params["ssh_known_hosts"],
     )
     source_volume.prepare_exports()
     result["log_file"] = source_volume.log_file

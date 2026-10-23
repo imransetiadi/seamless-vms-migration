@@ -15,6 +15,7 @@ import pytest
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import (
     blocksync,
     server,
+    volume_common,
     warm_migration,
 )
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.warm_migration import (
@@ -103,7 +104,7 @@ class Scenario:
     def state(self):
         return WarmState.load(self.state_dir, "srv-1")
 
-    def snapshot(self, transfer_uuid="uuid-1"):
+    def snapshot(self, transfer_uuid="uuid-1", **kwargs):
         return warm_migration.OpenstackWarmSnapshot(
             self.src,
             "src-conv",
@@ -113,6 +114,7 @@ class Scenario:
             self.ser_server(),
             self.state(),
             shell_factory=self.shells,
+            **kwargs
         )
 
     def sync(self, transfer_uuid="uuid-1", **kwargs):
@@ -1282,3 +1284,63 @@ def test_receive_command_runs_end_to_end_through_two_shells(tmp_path, monkeypatc
     assert "pwned" not in proc.stdout + proc.stderr
     progress = [warm_migration.parse_blocksync_progress(line) for line in proc.stderr.splitlines()]
     assert [p for p in progress if p][-1]["pct"] == 100.0
+
+
+def test_a_pinned_warm_pass_pins_each_conversion_host_and_keeps_the_links_options(tmp_path):
+    """Seamless Migrate SDD 6.6 (plan task ST3): given a known_hosts file, the warm snapshot pins
+    the source host under its alias by its server, the warm sync the destination host, and the
+    sync's copy of blocksync the source host by its address alone - no server id is known there.
+    The link the receiver opens from the destination host keeps today's options until ST6."""
+    known_hosts = str(tmp_path / "known_hosts")
+    scenario = Scenario(tmp_path)
+    scenario.snapshot(ssh_known_hosts=known_hosts).create()
+    scenario.sync(ssh_known_hosts=known_hosts).sync()
+
+    pins = [
+        (shell.address, shell.pin.get("side"), shell.pin.get("server"))
+        for shell in scenario.shells.shells
+    ]
+    assert set(pins) == {
+        (SRC_CONV, "source", None),
+        (SRC_CONV, "source", "src-conv"),
+        (DST_CONV, "destination", "dst-conv"),
+    }
+    assert {shell.pin.get("known_hosts") for shell in scenario.shells.shells} == {known_hosts}
+    receives = receive_commands(scenario)
+    assert receives
+    for receive in receives:
+        sender = receive[receive.index("--") + 1:]
+        assert "StrictHostKeyChecking=no" in sender, sender
+        assert not any("HostKeyAlias" in word or "UserKnownHostsFile" in word for word in sender)
+
+
+def test_a_link_the_source_host_refuses_fails_the_warm_sync_at_once(tmp_path):
+    """Seamless Migrate SDD 6.6, 26.5 (plan task ST3): with a known_hosts file, the warm sync reads
+    its receiver's output once the receiver exits: the sender's "Permission denied" for the source
+    host is a link the source host refused - LinkRefused, by the link's own message, for every
+    disk at once. A "Permission denied" for another host is no refusal of the link, and without
+    the file the sync fails as before."""
+    said = []
+
+    def receive(command):
+        return fake.FakeProcess(3, "", "".join(said) + "blocksync: error: the sender ended\n")
+
+    scenario = Scenario(tmp_path, receive=receive)
+    scenario.snapshot().create()
+    known_hosts = str(tmp_path / "known_hosts")
+
+    said[:] = ["cloud-user@%s: Permission denied (publickey).\n" % SRC_CONV]
+    with pytest.raises(volume_common.LinkRefused) as refused:
+        scenario.sync(ssh_known_hosts=known_hosts).sync()
+    assert str(refused.value) == (
+        "link refused by the source conversion host (os_migrate_conv_src at %s): "
+        "Permission denied (publickey)" % SRC_CONV
+    )
+    with pytest.raises(RuntimeError, match="blocksync failed") as unpinned:
+        scenario.sync().sync()
+    assert not isinstance(unpinned.value, volume_common.SshRefused)
+
+    said[:] = ["cloud-user@%s: Permission denied (publickey).\n" % DST_CONV]
+    with pytest.raises(RuntimeError, match="blocksync failed") as other_host:
+        scenario.sync(ssh_known_hosts=known_hosts).sync()
+    assert not isinstance(other_host.value, volume_common.SshRefused)

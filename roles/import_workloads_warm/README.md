@@ -96,6 +96,11 @@ and the conversion host variables (`os_migrate_src_conversion_host_name`,
 as its own user: `os_migrate_src_conversion_host_ssh_user` and
 `os_migrate_dst_conversion_host_ssh_user` (a RHEL host's `cloud-user`, an
 Ubuntu host's `ubuntu`) default to `os_migrate_conversion_host_ssh_user`.
+With `os_migrate_conversion_host_known_hosts`, a known_hosts file that pins
+each conversion host's keys under its inventory name (`os_migrate_conv_src`,
+`os_migrate_conv_dst`), every module checks the host's key strictly and fails
+at once on a refused key, or on a link the source host refuses (see the
+`conversion_host` role); unset, the hosts' keys are not checked, as upstream.
 
 ## Requirements
 

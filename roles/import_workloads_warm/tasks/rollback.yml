@@ -44,6 +44,7 @@
         data: "{{ item }}"
         conversion_host: "{{ import_workloads_warm_src_conversion_host.openstack_conversion_host }}"
         ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
+        ssh_known_hosts: "{{ os_migrate_conversion_host_known_hosts | default(omit, true) }}"
         ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
         state_dir: "{{ os_migrate_warm_state_dir }}"
         timeout: "{{ os_migrate_timeout }}"

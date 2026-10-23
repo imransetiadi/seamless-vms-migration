@@ -40,9 +40,12 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     DEFAULT_TIMEOUT,
     OpenStackVolumeBase,
     RemoteShell,
+    SshRefused,
     destination_volume_sdk_params,
     detach_volume_bounded,
     image_volume_size,
+    link_refused,
+    refused_link,
     use_lock,
     volume_or_none,
 )
@@ -414,6 +417,8 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
     interrupted run can always be cleaned up.
     """
 
+    SIDE = "source"
+
     def __init__(
         self,
         openstack_connection,
@@ -429,6 +434,7 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
         log_file=None,
         timeout=DEFAULT_TIMEOUT,
         shell_factory=None,
+        ssh_known_hosts=None,
     ):
         super(OpenstackWarmSnapshot, self).__init__(
             openstack_connection,
@@ -441,6 +447,7 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
             log_file=log_file,
             timeout=timeout,
             shell_factory=shell_factory,
+            ssh_known_hosts=ssh_known_hosts,
         )
         self.ser_server = ser_server
         self.source_instance_id = ser_server.info()["id"]
@@ -639,6 +646,8 @@ class OpenstackWarmSync(_WarmVolumeBase):
     the destination conversion host only for the duration of a pass.
     """
 
+    SIDE = "destination"
+
     def __init__(
         self,
         openstack_connection,
@@ -662,6 +671,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
         shell_factory=None,
         preserve_volume_type=False,
         src_ssh_user=None,
+        ssh_known_hosts=None,
     ):
         super(OpenstackWarmSync, self).__init__(
             openstack_connection,
@@ -676,6 +686,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
             shell_factory=shell_factory,
             preserve_volume_type=preserve_volume_type,
             src_ssh_user=src_ssh_user,
+            ssh_known_hosts=ssh_known_hosts,
         )
         self.ser_server = ser_server
         self.state = state
@@ -911,9 +922,9 @@ class OpenstackWarmSync(_WarmVolumeBase):
     # --- blocksync -----------------------------------------------------------
 
     def _source_shell(self):
-        return self.shell_factory(
-            self.source_conversion_host_address, self.src_ssh_user, self.ssh_key_path
-        )
+        """The control plane's shell to the source host - the copy of blocksync and its removal -,
+        pinned by its address alone: the module knows no server id for it (SDD 6.6)."""
+        return self._shell(self.source_conversion_host_address, self.src_ssh_user, "source")
 
     def _install_blocksync(self):
         script = blocksync_script_path(self.transfer_uuid)
@@ -940,6 +951,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
             return [self._sync_device(dev) for dev in devices]
         results = {}
         errors = []
+        refused = None
         with ThreadPoolExecutor(max_workers=parallel) as pool:
             futures = {pool.submit(self._sync_device, dev): dev for dev in devices}
             for future in as_completed(futures):
@@ -950,6 +962,11 @@ class OpenstackWarmSync(_WarmVolumeBase):
                     if not errors:
                         self._cancel_receivers()
                     errors.append("%s: %s" % (dev, err))
+                    if refused is None and isinstance(err, SshRefused):
+                        refused = err
+        if refused is not None:
+            # a refused link is every disk's: it fails the pass by its own message (SDD 6.6)
+            raise refused
         if errors:
             raise RuntimeError("blocksync failed: " + "; ".join(sorted(errors)))
         return [results[dev] for dev in devices]
@@ -989,6 +1006,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
         with self._receivers_lock:
             self._receivers[dev] = process
         stdout = []
+        said = []
         reader = threading.Thread(target=lambda: stdout.extend(process.stdout))
         reader.daemon = True
         reader.start()
@@ -998,12 +1016,19 @@ class OpenstackWarmSync(_WarmVolumeBase):
                 if progress is not None:
                     self._update_progress(dev, progress["pct"])
                 elif line.strip():
+                    said.append(line)
                     self.log.info("blocksync %s: %s", dev, line.rstrip())
             returncode = process.wait()
             reader.join()
         finally:
             with self._receivers_lock:
                 self._receivers.pop(dev, None)
+        if returncode != 0 and self.ssh_known_hosts:
+            # the sender's ssh - the link - speaks on the receiver's stderr: the source host
+            # refusing it is a refusal, never a failed pass to retry (SDD 6.6)
+            reason = refused_link("".join(said), self.source_conversion_host_address)
+            if reason is not None:
+                raise link_refused(self.source_conversion_host_address, reason)
         summary = parse_blocksync_summary("".join(stdout))
         if returncode != 0 or not summary or summary.get("ok") is not True:
             reason = (summary or {}).get("error") or "no summary was printed"

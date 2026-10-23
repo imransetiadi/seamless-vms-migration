@@ -1072,3 +1072,58 @@ def test_the_rekey_authorizes_the_installation_key_beside_the_old_one(env):
     assert sorted(c["args"]["server"] for c in calls if c["module"] == "server_info") == ["conv-dst*", "conv-src*"]
     with open(authorized) as f:
         assert f.read().splitlines() == lines
+
+
+# --- the known_hosts file of pinned conversion hosts (Seamless Migrate SDD 6.4, 6.5; plan task ST3)
+
+#: the modules that reach a conversion host over SSH (SDD 6.4)
+SSH_MODULES = (
+    "import_workload_export_volumes",
+    "import_workload_transfer_volumes",
+    "import_workload_src_cleanup",
+    "import_workload_dst_failure_cleanup",
+    "import_workload_warm_snapshot",
+    "import_workload_warm_sync",
+    "import_volumes_export",
+    "import_volumes_transfer",
+    "import_volumes_src_cleanup",
+)
+
+
+def _role_tasks(tasks):
+    """Every task of a task list, inside blocks, rescues and always sections too."""
+    for task in tasks or []:
+        yield task
+        for section in ("block", "rescue", "always"):
+            yield from _role_tasks(task.get(section))
+
+
+def test_every_module_that_reaches_a_conversion_host_gets_the_known_hosts_file(env):
+    """Seamless Migrate SDD 6.4, 6.5 (plan task ST3): every role task that runs a module reaching
+    a conversion host passes os_migrate_conversion_host_known_hosts as ssh_known_hosts, omitted
+    when it is unset or empty; a pass gets it to the modules - or nothing."""
+    expected = "{{ os_migrate_conversion_host_known_hosts | default(omit, true) }}"
+    calls_found = []
+    for role in sorted(os.listdir(os.path.join(REPO, "roles"))):
+        tasks_dir = os.path.join(REPO, "roles", role, "tasks")
+        for name in sorted(os.listdir(tasks_dir)) if os.path.isdir(tasks_dir) else []:
+            with open(os.path.join(tasks_dir, name)) as f:
+                tasks = yaml.safe_load(f)
+            for task in _role_tasks(tasks):
+                for module in SSH_MODULES:
+                    args = task.get("os_migrate.os_migrate." + module)
+                    if args is not None:
+                        calls_found.append((role, name, module))
+                        assert args.get("ssh_known_hosts") == expected, (role, name, task["name"])
+    assert len(calls_found) == 17, calls_found
+
+    rc, out, calls = env.run(
+        "import_workloads_precopy", os_migrate_conversion_host_known_hosts="/run/known_hosts"
+    )
+    assert rc == 0, out
+    given = [c["args"].get("ssh_known_hosts") for c in calls if c["module"] in SSH_MODULES]
+    assert len(given) == 6 and set(given) == {"/run/known_hosts"}, given
+    for unset in ({}, {"os_migrate_conversion_host_known_hosts": ""}):
+        rc, out, calls = env.run("import_workloads_precopy", **unset)
+        assert rc == 0, out
+        assert not [c for c in calls if "ssh_known_hosts" in c["args"]], unset

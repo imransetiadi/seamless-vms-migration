@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import time
+import traceback
 from unittest import mock
 
 import pytest
@@ -25,6 +26,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.modules import (
     import_workload_transfer_volumes as transfer_module,
 )
 from ansible_collections.os_migrate.os_migrate.tests.unit import fake_openstack as fake
+from ansible_collections.os_migrate.os_migrate.tests.unit import local_sshd
 
 CONV = "10.1.0.10"
 
@@ -1940,3 +1942,494 @@ def test_the_source_cleanup_rides_out_a_killed_ssh():
     with mock.patch.object(volume_common, "time", Clock()):
         clean._check_ssh()
     assert clean.shell.tries == 3
+
+
+# --- pinned host keys (Seamless Migrate SDD 6.6, 26.4, 26.5; plan task ST3) ----------------------
+
+SRC_ALIAS = "os_migrate_conv_src"
+DST_ALIAS = "os_migrate_conv_dst"
+
+#: upstream's options for a shell given the key /keys/k, which a shell without a known_hosts file
+#: keeps exactly
+UPSTREAM_OPTIONS = [
+    "-o", "BatchMode=yes",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "ConnectTimeout=10",
+    "-o", "ServerAliveInterval=15",
+    "-o", "ServerAliveCountMax=4",
+    "-i", "/keys/k",
+]
+
+needs_sshd = pytest.mark.skipif(
+    local_sshd.SSHD is None, reason="needs an sshd binary (openssh-server): SDD 26.9's real ssh"
+)
+
+
+def ssh_options(argv):
+    """The -o options of an ssh or scp command line: each name and the values it was given."""
+    options = {}
+    for flag, value in zip(argv, argv[1:]):
+        if flag == "-o":
+            name, _sep, setting = value.partition("=")
+            options.setdefault(name, []).append(setting)
+    return options
+
+
+class CommandLines:
+    """subprocess's check_output, call and Popen as RemoteShell runs them: each command line and
+    the keywords it was given, recorded, nothing run."""
+
+    def __init__(self, monkeypatch):
+        self.argvs = []
+        self.kwargs = []
+        for name, answer in (("check_output", b"done"), ("call", 0), ("Popen", None)):
+            monkeypatch.setattr(volume_common.subprocess, name, self._recorder(answer))
+
+    def _recorder(self, answer):
+        def run(args, **kwargs):
+            self.argvs.append(list(args))
+            self.kwargs.append(kwargs)
+            return answer
+
+        return run
+
+    def clear(self):
+        del self.argvs[:]
+        del self.kwargs[:]
+
+
+def every_command(shell):
+    """One of each: a command's output, its status, a long process, a copy each way."""
+    shell.cmd_out(["echo", "connected"])
+    shell.cmd_val(["true"])
+    shell.cmd_sub(["sleep", "1"])
+    shell.scp_to("/tmp/a", "/tmp/b")
+    shell.scp_from("/tmp/b", "/tmp/a", recursive=True)
+
+
+def test_a_pinned_shell_passes_strict_host_key_options_to_ssh_and_scp(tmp_path, monkeypatch):
+    """Seamless Migrate SDD 6.6, 26.4 (plan task ST3): given a known_hosts file, every command and
+    copy of a conversion host's RemoteShell - ssh and scp alike - checks the host's key strictly,
+    under its side's alias, against that file alone, with the algorithms of the keys the file pins
+    under that alias (an RSA key's as SHA-2), beside the options it always had - and without
+    upstream's StrictHostKeyChecking=no."""
+    keys = {
+        name: local_sshd.keygen(str(tmp_path / name), key_type)
+        for name, key_type in (("src-ed25519", "ed25519"), ("src-rsa", "rsa"), ("dst", "ecdsa"))
+    }
+    known_hosts = local_sshd.write_known_hosts(
+        str(tmp_path / "known_hosts"),
+        [(SRC_ALIAS, keys["src-ed25519"]), (DST_ALIAS, keys["dst"]), (SRC_ALIAS, keys["src-rsa"])],
+    )
+    lines = CommandLines(monkeypatch)
+    for side, alias, algorithms in (
+        ("source", SRC_ALIAS, "ssh-ed25519,rsa-sha2-512,rsa-sha2-256"),
+        ("destination", DST_ALIAS, "ecdsa-sha2-nistp256"),
+    ):
+        lines.clear()
+        every_command(
+            volume_common.RemoteShell(
+                "10.0.0.10", "cloud-user", "/keys/k", known_hosts=known_hosts, side=side,
+                server="srv-1",
+            )
+        )
+        assert [argv[0] for argv in lines.argvs] == ["ssh", "ssh", "ssh", "scp", "scp"]
+        for argv in lines.argvs:
+            assert ssh_options(argv) == {
+                "BatchMode": ["yes"],
+                "StrictHostKeyChecking": ["yes"],
+                "UserKnownHostsFile": [known_hosts],
+                "GlobalKnownHostsFile": ["/dev/null"],
+                "HostKeyAlias": [alias],
+                "CheckHostIP": ["no"],
+                "UpdateHostKeys": ["no"],
+                "VerifyHostKeyDNS": ["no"],
+                "HashKnownHosts": ["yes"],
+                "HostKeyAlgorithms": [algorithms],
+                "IdentitiesOnly": ["yes"],
+                "ConnectTimeout": ["10"],
+                "ServerAliveInterval": ["15"],
+                "ServerAliveCountMax": ["4"],
+            }, argv
+            assert argv[argv.index("-i") + 1] == "/keys/k"
+        assert lines.argvs[0][-3:] == ["cloud-user@10.0.0.10", "echo", "connected"]
+        assert lines.argvs[3][-2:] == ["/tmp/a", "cloud-user@10.0.0.10:/tmp/b"]
+        assert lines.argvs[4][-3:] == ["-r", "cloud-user@10.0.0.10:/tmp/b", "/tmp/a"]
+
+
+def test_a_shell_without_a_known_hosts_file_keeps_upstreams_options(monkeypatch):
+    """Seamless Migrate SDD 6.6, 26.4 (plan task ST3): without a known_hosts file - none, or an
+    empty name - a RemoteShell runs ssh and scp exactly as upstream does, StrictHostKeyChecking=no
+    among its options and their stderr left alone; a module without ssh_known_hosts builds its
+    shell with upstream's three arguments."""
+    lines = CommandLines(monkeypatch)
+    target = "cloud-user@10.0.0.10"
+    for shell in (
+        volume_common.RemoteShell("10.0.0.10", "cloud-user", "/keys/k"),
+        volume_common.RemoteShell(
+            "10.0.0.10", "cloud-user", "/keys/k", known_hosts="", side="source", server="srv-1"
+        ),
+    ):
+        lines.clear()
+        every_command(shell)
+        assert lines.argvs == [
+            ["ssh"] + UPSTREAM_OPTIONS + [target, "echo", "connected"],
+            ["ssh"] + UPSTREAM_OPTIONS + [target, "true"],
+            ["ssh"] + UPSTREAM_OPTIONS + [target, "sleep", "1"],
+            ["scp"] + UPSTREAM_OPTIONS + ["/tmp/a", target + ":/tmp/b"],
+            ["scp"] + UPSTREAM_OPTIONS + ["-r", target + ":/tmp/b", "/tmp/a"],
+        ]
+        assert lines.kwargs == [{}] * 5
+
+    src = fake.FakeCloud("src")
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    built = []
+
+    def shells(*args, **kwargs):
+        built.append((args, kwargs))
+        return fake.ShellFactory([src])(*args, **kwargs)
+
+    volume_common.OpenstackVolumeClean(
+        src, "src-conv", "/keys/k", "cloud-user", "uuid-1", shell_factory=shells
+    )
+    assert built == [(("10.0.0.10", "cloud-user", "/keys/k"), {})]
+
+
+@pytest.fixture
+def sshd():
+    server = local_sshd.LocalSshd()
+    try:
+        yield server
+    finally:
+        server.stop()
+
+
+def shells_of(server):
+    """RemoteShell reaching ``server``'s port. A conversion host listens on 22, which the shell
+    never names: the test adds ssh's Port option after the shell's own."""
+
+    class Shell(volume_common.RemoteShell):
+        def _default_options(self):
+            return super(Shell, self)._default_options() + ["-o", "Port=%d" % server.port]
+
+    return Shell
+
+
+def conversion_host_at_127_0_0_1():
+    src = fake.FakeCloud("src")
+    src.add_conversion_host("src-conv", "127.0.0.1")
+    return src
+
+
+@needs_sshd
+def test_a_pinned_key_connects_to_a_real_sshd(sshd, tmp_path):
+    """Seamless Migrate SDD 6.6, 26.9 (plan task ST3): a real sshd whose key the file pins, hashed,
+    under the shell's alias - beside another alias's entry and an RSA key of the same alias, which
+    only widen HostKeyAlgorithms - takes the shell's commands and copies and a module's SSH check,
+    and ssh writes nothing beside or into the file."""
+    other = local_sshd.keygen(str(tmp_path / "other"), "rsa")
+    known_hosts = local_sshd.write_known_hosts(
+        str(tmp_path / "known_hosts"),
+        [(DST_ALIAS, other), (SRC_ALIAS, sshd.host_keys["ed25519"]), (SRC_ALIAS, other)],
+    )
+    with open(known_hosts, "rb") as f:
+        pinned = f.read()
+    shells = shells_of(sshd)
+    shell = shells(
+        "127.0.0.1", sshd.user, sshd.client_key, known_hosts=known_hosts, side="source",
+        server="src-conv",
+    )
+
+    assert shell.cmd_out(["echo", "connected"]) == "connected"
+    assert shell.cmd_val(["true"]) == 0
+    assert shell.cmd_val(["false"]) == 1  # the remote command's own status: no refusal
+    (tmp_path / "payload").write_text("blocksync\n")
+    assert shell.scp_to(str(tmp_path / "payload"), str(tmp_path / "copied")) == 0
+    assert shell.scp_from(str(tmp_path / "copied"), str(tmp_path / "back")) == 0
+    assert (tmp_path / "back").read_text() == "blocksync\n"
+
+    clean = volume_common.OpenstackVolumeClean(
+        conversion_host_at_127_0_0_1(), "src-conv", sshd.client_key, sshd.user, "uuid-1",
+        shell_factory=shells, ssh_known_hosts=known_hosts,
+    )
+    assert (clean.shell.alias, clean.shell.server) == (SRC_ALIAS, "src-conv")
+    with open(known_hosts, "rb") as f:
+        assert f.read() == pinned
+    assert sorted(os.listdir(str(tmp_path))) == [
+        "back", "copied", "known_hosts", "other", "other.pub", "payload"
+    ]
+
+
+@needs_sshd
+@pytest.mark.parametrize(
+    ("pinned_type", "offered"),
+    [
+        ("ed25519", "the ED25519 key {fingerprint}"),
+        ("ecdsa", "no key of a pinned type (it offered ssh-ed25519)"),
+    ],
+    ids=["another key of its type", "a key of another type"],
+)
+def test_another_key_is_refused_at_once_without_an_outage_wait(
+    sshd, tmp_path, monkeypatch, pinned_type, offered
+):
+    """Seamless Migrate SDD 6.6, 26.5 (plan task ST3): a real sshd that presents another key than
+    the one pinned - of the pinned key's type, or of a type the file pins none of, which
+    HostKeyAlgorithms makes ssh refuse - is refused at once and for good. The source cleanup's SSH
+    check, which rides out an unreachable host for 15 minutes, raises HostKeyRefused without one
+    wait, and so do a command whose status a lock wait reads and a copy: never ssh's 255, which a
+    wait takes for an outage."""
+    other = local_sshd.keygen(str(tmp_path / "other"), pinned_type)
+    known_hosts = local_sshd.write_known_hosts(str(tmp_path / "known_hosts"), [(SRC_ALIAS, other)])
+    shells = shells_of(sshd)
+    waits = []
+    monkeypatch.setattr(volume_common.time, "sleep", waits.append)
+
+    with pytest.raises(volume_common.HostKeyRefused) as refused:
+        volume_common.OpenstackVolumeClean(
+            conversion_host_at_127_0_0_1(), "src-conv", sshd.client_key, sshd.user, "uuid-1",
+            shell_factory=shells, ssh_known_hosts=known_hosts,
+        )
+    assert waits == []
+    presented = offered.format(fingerprint=local_sshd.fingerprint(sshd.host_key_path()))
+    assert " presented %s, not its pinned key " % presented in str(refused.value)
+
+    shell = shells("127.0.0.1", sshd.user, sshd.client_key, known_hosts=known_hosts, side="source")
+    with pytest.raises(volume_common.HostKeyRefused):
+        shell.cmd_val(["true"])
+    with pytest.raises(volume_common.HostKeyRefused):
+        shell.scp_to(known_hosts, str(tmp_path / "copied"))
+    assert not (tmp_path / "copied").exists()
+    assert waits == []
+
+
+@needs_sshd
+def test_an_unknown_alias_is_refused_at_once(sshd, tmp_path, monkeypatch):
+    """Seamless Migrate SDD 6.6, 26.4 (plan task ST3): the alias decides, not the address. A file
+    that pins the sshd's very key, but under the destination's alias alone, has the source side
+    refused at once - its source cleanup waits nothing - and pinning no key for it, while the
+    destination side connects to the same sshd."""
+    known_hosts = local_sshd.write_known_hosts(
+        str(tmp_path / "known_hosts"), [(DST_ALIAS, sshd.host_keys["ed25519"])]
+    )
+    shells = shells_of(sshd)
+    waits = []
+    monkeypatch.setattr(volume_common.time, "sleep", waits.append)
+
+    with pytest.raises(volume_common.HostKeyRefused) as refused:
+        volume_common.OpenstackVolumeClean(
+            conversion_host_at_127_0_0_1(), "src-conv", sshd.client_key, sshd.user, "uuid-1",
+            shell_factory=shells, ssh_known_hosts=known_hosts,
+        )
+    assert waits == []
+    assert str(refused.value) == (
+        "host key refused: the source conversion host (os_migrate_conv_src, server src-conv at "
+        "127.0.0.1) presented an ED25519 key, and none is pinned for it"
+    )
+
+    destination = shells(
+        "127.0.0.1", sshd.user, sshd.client_key, known_hosts=known_hosts, side="destination",
+        server="dst-conv",
+    )
+    assert destination.cmd_out(["echo", "connected"]) == "connected"
+
+
+@needs_sshd
+def test_a_refusal_names_the_fingerprints_without_the_command_line_or_timeout(sshd, tmp_path):
+    """Seamless Migrate SDD 6.6, 26.5 (plan task ST3, review RV42B-02): a refusal names the side,
+    the alias, the server, every pinned key and the key ssh saw - never ssh's command line, whose
+    ConnectTimeout the control plane would read as a transient "timeout", nor the error that
+    holds it."""
+    pinned = []
+    for key_type in ("ed25519", "ecdsa"):
+        local_sshd.keygen(str(tmp_path / key_type), key_type)
+        pinned.append(tmp_path / (key_type + ".pub"))
+    known_hosts = local_sshd.write_known_hosts(
+        str(tmp_path / "known_hosts"), [(SRC_ALIAS, path.read_text()) for path in pinned]
+    )
+    shell = shells_of(sshd)(
+        "127.0.0.1", sshd.user, sshd.client_key, known_hosts=known_hosts, side="source",
+        server="src-conv",
+    )
+
+    with pytest.raises(volume_common.HostKeyRefused) as refused:
+        shell.cmd_out(["echo", "connected"])
+    message = str(refused.value)
+    assert message == (
+        "host key refused: the source conversion host (os_migrate_conv_src, server src-conv at "
+        "127.0.0.1) presented the ED25519 key %s, not its pinned keys ED25519 %s, ECDSA %s"
+        % (
+            local_sshd.fingerprint(sshd.host_key_path()),
+            local_sshd.fingerprint(str(pinned[0])),
+            local_sshd.fingerprint(str(pinned[1])),
+        )
+    )
+    assert "timeout" not in message.lower()
+    for word in ("ssh ", "-o", "BatchMode", known_hosts, sshd.client_key):
+        assert word not in message
+    err = refused.value
+    assert err.__cause__ is None and err.__suppress_context__
+    told = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    assert "ConnectTimeout" not in told and "returned non-zero exit status" not in told
+
+
+class RefusingHosts(fake.ShellFactory):
+    """Conversion hosts that refuse a pinned shell's SSH check as RemoteShell does; an unpinned
+    one connects."""
+
+    def __call__(self, address, ssh_user, key_path=None, **pin):
+        shell = super().__call__(address, ssh_user, key_path, **pin)
+        if pin:
+            def refuse():
+                raise volume_common.HostKeyRefused(
+                    "host key refused: the %s conversion host (%s, server %s at %s) presented an "
+                    "ED25519 key, and none is pinned for it"
+                    % (pin["side"], volume_common.HOST_KEY_ALIASES[pin["side"]], pin["server"],
+                       address)
+                )
+
+            shell.test_ssh_connection = refuse
+        return shell
+
+
+def test_every_module_pins_its_sides_conversion_host_and_fails_with_the_refusal(tmp_path):
+    """Seamless Migrate SDD 6.4, 6.6 (plan task ST3): each module that reaches a conversion host
+    takes ssh_known_hosts and pins its own side's host - the source host for the exports, the
+    source cleanups and the warm snapshot, the destination host for the transfers and the
+    destination failure cleanup - by the server it was given. A refusal fails the cold path's
+    modules with it as their message, the warm snapshot with its own message around it, and the
+    destination failure cleanup, best effort, not at all; upstream's modules raise it."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_volumes_export,
+        import_volumes_src_cleanup,
+        import_volumes_transfer,
+        import_workload_dst_failure_cleanup,
+        import_workload_src_cleanup,
+        import_workload_warm_snapshot,
+    )
+
+    src, dst = fake.FakeCloud("src"), cloud()
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    known_hosts = str(tmp_path / "known_hosts")
+    common = {"ssh_key_path": "/keys/k", "ssh_user": "cloud-user", "ssh_known_hosts": known_hosts}
+    on_src = dict(common, conversion_host={"id": "src-conv"})
+    on_dst = dict(common, conversion_host={"id": "dst-conv"})
+    a_map = {"/dev/vdb": dict(cold_volume_map()["/dev/vdb"], port=10810)}
+    runs = [
+        (export_module, src, "source", dict(on_src, data=fake.workload_data()), "message"),
+        (import_workload_src_cleanup, src, "source",
+         dict(on_src, data=fake.workload_data(), transfer_uuid="uuid-1", volume_map=a_map),
+         "message"),
+        (transfer_module, dst, "destination",
+         dict(on_dst, data=fake.workload_data(), transfer_uuid="uuid-1",
+              src_conversion_host_address="10.0.0.10", volume_map=a_map), "message"),
+        (import_workload_dst_failure_cleanup, dst, "destination",
+         dict(on_dst, data=fake.workload_data(), transfer_uuid="uuid-1", volume_map={}), None),
+        (import_workload_warm_snapshot, src, "source",
+         dict(on_src, data=fake.workload_data(), state_dir=str(tmp_path / "warm")),
+         "Warm snapshot (present) of server srv-1 failed: "),
+        (import_volumes_export, src, "source",
+         dict(on_src, data=[], log_dir=str(tmp_path)), "raised"),
+        (import_volumes_src_cleanup, src, "source",
+         dict(on_src, transfer_uuid="uuid-1", volume_map=a_map), "raised"),
+        (import_volumes_transfer, dst, "destination",
+         dict(on_dst, transfer_uuid="uuid-1", src_conversion_host_address="10.0.0.10",
+              volume_map=a_map), "raised"),
+    ]
+    for module, conn, side, args, failing in runs:
+        hosts = RefusingHosts([src, dst])
+        server = args["conversion_host"]["id"]
+        refusal = (
+            "host key refused: the %s conversion host (%s, server %s at %s) presented an ED25519 "
+            "key, and none is pinned for it"
+            % (side, volume_common.HOST_KEY_ALIASES[side], server, conn.servers[server].access_ipv4)
+        )
+        if failing == "raised":
+            with pytest.raises(volume_common.HostKeyRefused, match=re.escape(refusal)):
+                fake.run_module(module, args, conn, shell_factory=hosts)
+        else:
+            result = fake.run_module(module, args, conn, shell_factory=hosts)
+            if failing is None:
+                assert not result.get("failed"), (module.__name__, result)
+            elif failing == "message":
+                assert result.get("failed") and result["msg"] == refusal, (module.__name__, result)
+            else:
+                assert result.get("failed") and result["msg"] == failing + refusal, result
+        assert [shell.pin for shell in hosts.shells] == [
+            {"known_hosts": known_hosts, "side": side, "server": server}
+        ], module.__name__
+
+
+class RefusedLink(PortShell):
+    """A destination conversion host whose forward to the source host prints ``said`` - as ssh
+    writes it, into the file the transfer gives it for stderr; no forwarded export answers."""
+
+    def __init__(self, said):
+        super().__init__(free=2)
+        self.said = said
+        self.address = CONV
+        self.forward = None
+
+    def cmd_out(self, command, **kwargs):
+        if command[:2] == ["qemu-img", "info"]:
+            self.commands.append(list(command))
+            raise volume_common.RemoteCommandFailed(1, list(command))
+        return super().cmd_out(command, **kwargs)
+
+    def cmd_sub(self, command, **kwargs):
+        if command[0] != "ssh":
+            return super().cmd_sub(command, **kwargs)
+        self.commands.append(list(command))
+        self.forward = list(command)
+        stderr = kwargs.get("stderr")
+        if stderr is not None:
+            stderr.write(self.said.encode("utf-8"))
+            stderr.flush()
+        return fake.FakeProcess(255 if "Permission" in self.said else 0)
+
+
+@pytest.mark.parametrize(
+    ("said", "reason"),
+    [
+        ("cloud-user@10.0.0.10: Permission denied (publickey).\n", "Permission denied (publickey)"),
+        (
+            "channel 2: open failed: administratively prohibited: open failed\n",
+            "a forward administratively prohibited",
+        ),
+    ],
+    ids=["the login", "a forward"],
+)
+def test_a_link_the_source_host_refuses_fails_the_cold_transfer_at_once(
+    tmp_path, monkeypatch, said, reason
+):
+    """Seamless Migrate SDD 6.6, 26.5 (plan task ST3): with a known_hosts file, the cold transfer
+    reads its forward's output each time a forwarded export does not answer. A link the source
+    host refuses - its login, or a forward - fails it at once with LinkRefused, where it waited
+    out its timeout and failed as a transient "Timed out ..."; the link's own options stay
+    today's (plan task ST6 pins it), and without the file the transfer waits as before."""
+    waits = []
+    monkeypatch.setattr(volume_common.time, "sleep", waits.append)
+    volume_map = {"/dev/vdb": dict(cold_volume_map()["/dev/vdb"], port=10810)}
+
+    def transfer(**pinned):
+        with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([cloud()])):
+            moved = transfer_module.OpenStackDestinationVolume(
+                cloud(), "dst-conv", "/keys/k", "cloud-user", "uuid-1", "10.0.0.10",
+                dict(volume_map), workload(), timeout=5, **pinned
+            )
+        moved.shell = RefusedLink(said)
+        return moved
+
+    pinned = transfer(ssh_known_hosts=str(tmp_path / "known_hosts"))
+    with pytest.raises(volume_common.LinkRefused) as refused:
+        pinned._create_forwarding_process()
+    assert str(refused.value) == (
+        "link refused by the source conversion host (os_migrate_conv_src at 10.0.0.10): " + reason
+    )
+    assert waits == [] and refused.value.__suppress_context__
+    assert "StrictHostKeyChecking=no" in pinned.shell.forward
+    assert not any(word.startswith("HostKeyAlias") for word in pinned.shell.forward)
+
+    unpinned = transfer()
+    with pytest.raises(RuntimeError, match="Timed out starting nbdkit exports"):
+        unpinned._create_forwarding_process()
+    assert len(waits) == 5

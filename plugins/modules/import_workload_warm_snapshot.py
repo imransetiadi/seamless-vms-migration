@@ -58,6 +58,15 @@ options:
       - The SSH user to connect to the conversion hosts.
     required: true
     type: str
+  ssh_known_hosts:
+    description:
+      - A known_hosts file that pins the conversion hosts' keys under their aliases,
+        C(os_migrate_conv_src) and C(os_migrate_conv_dst) (Seamless Migrate SDD 6.6).
+        With it, ssh and scp to the conversion host check its key strictly, and a
+        refused key fails the module at once.
+      - Unset or empty, the module connects as upstream does (C(StrictHostKeyChecking=no)).
+    required: false
+    type: path
   state_dir:
     description:
       - Directory of the warm state files, normally C({{ os_migrate_data_dir }}/workload_warm).
@@ -174,6 +183,7 @@ def run_module():
         conversion_host=dict(type="dict", required=True),
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
+        ssh_known_hosts=dict(type="path", required=False, default=None),
         state_dir=dict(type="str", required=True),
         state=dict(type="str", default="present", choices=["present", "absent"]),
         transfer_uuid=dict(type="str", default=None),
@@ -220,6 +230,7 @@ def run_module():
             state_file=params["state_file"],
             log_file=params["log_file"],
             timeout=params["timeout"],
+            ssh_known_hosts=params["ssh_known_hosts"],
         )
         if params["state"] == "present":
             volume_map = snapshot.create()

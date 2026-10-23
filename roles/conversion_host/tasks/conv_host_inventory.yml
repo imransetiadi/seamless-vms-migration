@@ -18,6 +18,24 @@
     - _server_info.servers|length == 0
     - not ignore_missing_conversion_hosts|default(false)|bool
 
+# the keys a known_hosts file pins under the host's inventory name give ssh its HostKeyAlgorithms;
+# a file ssh-keygen cannot read fails here (Seamless Migrate SDD 6.5)
+- name: Read the keys the known_hosts file pins for the conversion host
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -F
+      - "{{ inventory_name }}"
+      - -f
+      - "{{ os_migrate_conversion_host_known_hosts }}"
+  register: conversion_host_pinned_host_keys
+  changed_when: false
+  failed_when: conversion_host_pinned_host_keys.rc not in [0, 1]
+  check_mode: false
+  when:
+    - os_migrate_conversion_host_known_hosts | default('', true) | length > 0
+    - _server_info.servers|length > 0
+
 - name: Add conversion host to inventory
   ansible.builtin.add_host:
     name: "{{ inventory_name }}"
@@ -30,9 +48,32 @@
     # the key the re-key logs in with, under a name extra vars never set - they outrank an
     # include's vars, and carry the installation's key (Seamless Migrate SDD 7.2)
     ansible_ssh_private_key_file: "{{ os_migrate_conversion_host_inventory_private_path | default(os_migrate_conversion_keypair_private_path) }}"
-    ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
+    # with a known_hosts file, the host's key is checked strictly under its inventory name - by
+    # ssh, scp and sftp alike - and Ansible puts no StrictHostKeyChecking=no of its own before
+    # those options, which would win; without one, upstream's (Seamless Migrate SDD 6.5)
+    ansible_ssh_common_args: "{{ _pinned_host_options if _pinned_known_hosts else omit }}"
+    ansible_ssh_extra_args: "{{ omit if _pinned_known_hosts else '-o StrictHostKeyChecking=no' }}"
+    ansible_ssh_host_key_checking: "{{ true if _pinned_known_hosts else omit }}"
     # Generally conversion hosts act as centos, not as
     # root. E.g. link ssh keys need to be added to centos.
     ansible_become: false
+  vars:
+    _pinned_known_hosts: "{{ os_migrate_conversion_host_known_hosts | default('', true) }}"
+    # an RSA key signs with SHA-2, never ssh-rsa, which OpenSSH 8.8 and later disable
+    _pinned_host_key_algorithms: >-
+      {{ conversion_host_pinned_host_keys.stdout_lines | default([])
+         | reject('match', '[#@]|$') | map('split') | map(attribute='1')
+         | map('replace', 'ssh-rsa', 'rsa-sha2-512,rsa-sha2-256') | unique | join(',') }}
+    _pinned_host_options: >-
+      -o StrictHostKeyChecking=yes
+      -o UserKnownHostsFile={{ _pinned_known_hosts }}
+      -o GlobalKnownHostsFile=/dev/null
+      -o HostKeyAlias={{ inventory_name }}
+      -o CheckHostIP=no
+      -o UpdateHostKeys=no
+      -o VerifyHostKeyDNS=no
+      -o HashKnownHosts=yes
+      {{ ('-o HostKeyAlgorithms=' ~ _pinned_host_key_algorithms) if _pinned_host_key_algorithms else '' }}
+      -o IdentitiesOnly=yes
   when:
     - _server_info.servers|length > 0

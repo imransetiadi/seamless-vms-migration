@@ -1078,6 +1078,14 @@ Common module options follow the existing conventions (`cloud`, `validate_certs`
 `transfer_uuid`, `log_file`, `state_file`, `timeout`) plus `state_dir`, `chunk_size`
 (default 4194304), `workers` (default 4).
 
+**`ssh_known_hosts`** (§26.4, plan task ST3). Every module that reaches a conversion host over SSH takes it, a path,
+unset by default: `import_workload_warm_snapshot` and `import_workload_warm_sync` above (`import_workload_rollback`
+reaches none), the cold path's `import_workload_export_volumes`, `import_workload_transfer_volumes`,
+`import_workload_src_cleanup` and `import_workload_dst_failure_cleanup`, and upstream's `import_volumes_export`,
+`import_volumes_transfer` and `import_volumes_src_cleanup`. It names the known_hosts file that pins the conversion hosts'
+keys under their aliases. Given it, the module's SSH checks the host's key and fails at once on a refusal (§6.6);
+unset or empty, the module connects as upstream does.
+
 ### 6.5 New role and playbooks
 
 Role `import_workloads_warm` with task files `precopy.yml`, `cutover.yml`, `rollback.yml`, reusing
@@ -1151,6 +1159,21 @@ the destination host, which also take the source's as `src_ssh_user`: the destin
 and the hop to the source host — the transfer's port forward, the warm sync's sender and its copy of blocksync —
 logs in as the source's. Both variables default to upstream's single `os_migrate_conversion_host_ssh_user`, and
 `src_ssh_user` to `ssh_user`, so a run that sets only that one works as before (audit EX-08).
+
+**Pinned conversion hosts** (§26.4, plan task ST3). `os_migrate_conversion_host_known_hosts`, unset by default, names
+the known_hosts file that pins each conversion host's keys under its inventory name, `os_migrate_conv_src` or
+`os_migrate_conv_dst`. The roles `import_workloads`, `import_workloads_warm` and `import_detached_volumes` pass it as
+`ssh_known_hosts` to every module that reaches a conversion host (§6.4). `conv_host_inventory.yml` (role
+`conversion_host`) gives each conversion host it adds to the inventory:
+* `ansible_ssh_common_args`, which Ansible gives ssh, scp and sftp alike: §6.6's host key options with the host's
+  inventory name as `HostKeyAlias`, and as `HostKeyAlgorithms` the algorithms of the keys `ssh-keygen -F` finds under
+  that name in the file; a file `ssh-keygen` cannot read fails the task;
+* `ansible_ssh_host_key_checking: true`, so that Ansible's ssh plugin puts no `StrictHostKeyChecking=no` of its own
+  before those options, whatever `ANSIBLE_HOST_KEY_CHECKING` says: OpenSSH keeps an option's first value;
+* no `ansible_ssh_extra_args`: upstream's `-o StrictHostKeyChecking=no` goes.
+
+Unset or empty, the host gets upstream's `ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'` and neither of the
+others, and the modules get no `ssh_known_hosts`.
 
 ### 6.6 Hardening of existing code (required)
 
@@ -1444,6 +1467,39 @@ The conversion-host SSH (`volume_common.RemoteShell`: every module command and t
 from the destination to the source host) runs with `ServerAliveInterval=15` and `ServerAliveCountMax=4`: a silent
 network partition ends the ssh about a minute later and the pass fails — a transient failure, retried — instead of
 keeping the source stopped for the kernel's TCP keepalive, about two hours (Security.md C3-08).
+
+**Pinned host keys** (§26.4, §26.5, plan task ST3). Given `ssh_known_hosts` (§6.4), `RemoteShell` - every command and
+copy the control plane runs on a conversion host - checks the host's key against that file under its side's alias,
+the host's inventory name: `os_migrate_conv_src` for the source host (the exports, the source cleanups, the warm
+snapshot, and the warm sync's copy of blocksync there), `os_migrate_conv_dst` for the destination host (the transfers,
+the destination failure cleanup, the warm sync). ssh and scp then run with `StrictHostKeyChecking=yes`,
+`UserKnownHostsFile=<the file>`, `GlobalKnownHostsFile=/dev/null`, `HostKeyAlias=<the alias>`, `CheckHostIP=no`,
+`UpdateHostKeys=no`, `VerifyHostKeyDNS=no`, `HashKnownHosts=yes`, `HostKeyAlgorithms` and `IdentitiesOnly=yes`, where
+`StrictHostKeyChecking=no` stood, beside `BatchMode`, `ConnectTimeout` and `ServerAlive*`. `HostKeyAlgorithms` lists
+the algorithms of the keys the file pins under the alias - an entry hashed for the alias, or one that names it -, each
+once, in the file's order: an RSA key's are `rsa-sha2-512,rsa-sha2-256`, and a file that pins no key under the alias,
+or cannot be read, gets no `HostKeyAlgorithms`. The alias keeps the check off the address: a floating IP that moves
+changes nothing. Without `ssh_known_hosts` the options are upstream's. The link's preamble, which runs on the
+destination host (the cold transfer's forward, the warm sync's sender), keeps them until plan task ST6 pins it (§26.6).
+
+A refusal fails the module at once and for good, never as an outage: no wait of the window above, no "SSH timeout".
+With a pinned key, ssh's or scp's exit status 255 with "Host key verification failed.", "No ... host key is known for
+..." or "no matching host key type found" - the host offers no key of a pinned type - raises `HostKeyRefused`: "host
+key refused: the {side} conversion host ({alias}, server {id} at {address}) presented {offered}, not its pinned key
+{pinned}". {offered} is the key's type and SHA256 fingerprint as ssh printed them ("the ED25519 key SHA256:..."), its
+type alone when ssh printed no fingerprint ("an ED25519 key"), or what the host offered ("no key of a pinned type (it
+offered ...)"); {pinned} is each pinned key's type and fingerprint ("not its pinned keys ..." for several, ", and none
+is pinned for it" for none). The warm sync's copy of blocksync names the source host by its address alone: the module
+knows no server id for it. With `ssh_known_hosts`, a link the source host refuses - its ssh's "Permission denied" for
+the source host, or a forward "administratively prohibited" - raises `LinkRefused`: "link refused by the source
+conversion host (os_migrate_conv_src at {address}): {ssh's reason}". The cold transfer reads its forward's output each
+time a forwarded export does not answer, where it waited out its timeout, and the warm sync its receiver's output once
+the receiver exits. Neither message holds ssh's command line or the word "timeout" (review RV42B-02), and neither
+chains the error that would. `import_workload_export_volumes`, `import_workload_transfer_volumes` and
+`import_workload_src_cleanup` fail with the refusal as their message, not a traceback, which shows a call's arguments on
+Python 3.13 and later; the warm modules' messages carry it as before. A module's SSH check at its start meets a refused
+key first: a long process it starts later (a copy, the forward, the receiver) is not read for its own hop's refusal and
+fails as before. The destination failure cleanup takes a refused check as an unreachable host (audit A-08).
 
 ---
 
@@ -7077,7 +7133,9 @@ high-availability proposals of other branches.
 SSH trust adds no route. The proposed fields, events and findings, and the setting's new default, stay out of the
 tables the SDD-reading tests parse (§4.3, §9.3, §12, §15.1) until their tasks land, as §22's and §23's did. Plan task
 ST2's - `ssh_host_keys`, the pin, the console parser, the known_hosts writer, the check's pinning and
-`conversion_host.key_pinned` - are binding in §4.2, §4.3, §10 and §12 since that task. The facts
+`conversion_host.key_pinned` - are binding in §4.2, §4.3, §10 and §12 since that task; plan task ST3's - the
+collection's known_hosts variable and module option, `RemoteShell`'s pinned options, the inventory's common arguments
+and a refusal as its own permanent error - in §6.4, §6.5 and §6.6 since that task. The facts
 come from OpenSSH's manuals, source and release notes, cloud-init's documentation and source, Nova's API and policy
 references, Ansible's ssh plugin, the VMware kit 2.2.7's playbooks and Repology, all read 2026-10-23. A fact only an
 excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
@@ -7199,10 +7257,12 @@ decision 10).
   `VerifyHostKeyDNS=no`, `HashKnownHosts=yes`, `HostKeyAlgorithms` the pinned keys' algorithms and
   `IdentitiesOnly=yes`, beside today's `BatchMode`, `ConnectTimeout` and `ServerAlive*` (§6.6). The alias keeps the
   check off the address: a floating IP that moves changes nothing.
-* **In the collection.** A variable and a module option name the file (proposed:
-  `os_migrate_conversion_host_known_hosts`, `ssh_known_hosts`). With them `RemoteShell` uses the options above for ssh
-  and scp, and `conv_host_inventory.yml` puts them in `ansible_ssh_common_args` (read by scp and sftp too) instead of
-  the extra arguments' `StrictHostKeyChecking=no`. Without them the collection behaves as upstream.
+* **In the collection** (binding in §6.4, §6.5 and §6.6 since plan task ST3). A variable and a module option name the
+  file: `os_migrate_conversion_host_known_hosts`, `ssh_known_hosts`. With them `RemoteShell` uses the options above for
+  ssh and scp, and `conv_host_inventory.yml` puts them in `ansible_ssh_common_args` (read by scp and sftp too) instead
+  of the extra arguments' `StrictHostKeyChecking=no`, with `ansible_ssh_host_key_checking: true` so that Ansible's own
+  `no` does not come first. An RSA key's algorithms are `rsa-sha2-512,rsa-sha2-256`. Without them the collection
+  behaves as upstream.
 * **In the executor.** Every run with pins gets `ANSIBLE_HOST_KEY_CHECKING=True` - else Ansible's own `no` comes first
   and wins - and the VMware inventory's entry gets the same common arguments.
 * **A host created in the run.** Before a pre-staging the executor looks each host up: one that exists runs on its
@@ -7213,23 +7273,24 @@ decision 10).
 
 * **A refused key is never accepted:** no prompt, no `accept-new`, no retry with another file, no new pin for the
   same server.
-* **In the collection.** ssh's exit 255 with "Host key verification failed." or "No ... host key is known for ... and
-  you have requested strict checking." is a refusal, not an outage: the module fails at once, without §6.6's 15-minute
+* **In the collection** (binding in §6.6 since plan task ST3). ssh's exit 255 with "Host key verification failed.",
+  "No ... host key is known for ... and you have requested strict checking." or "no matching host key type found" (the
+  host offers no key of a pinned type) is a refusal, not an outage: the module fails at once, without §6.6's 15-minute
   wait. So does a link the source host refuses ("Permission denied", a forward "administratively prohibited"). The
-  message names the side, the alias, the server, the pinned fingerprints and, when ssh printed it, the offered one. It
-  holds neither ssh's command line nor the word "timeout" (§6.6, review RV42B-02).
+  message names the side, the alias, the server, the host's address, the pinned fingerprints and, when ssh printed it,
+  the offered one. It holds neither ssh's command line nor the word "timeout" (§6.6, review RV42B-02).
 * **In the control plane.** A failure whose output names a refused host key or link is permanent, whatever else the
   output holds: the check comes before §7.2's transient patterns.
 * **Before the stop.** A cutover connects to both hosts and sets up and probes its link (§26.6) before the source
   stops. A refusal there ends the cutover with the source running.
 * **After the stop** (a host replaced during a cutover) the automatic rollback runs (§8). The warm rollback reports a
   temporary snapshot it cannot remove and goes on to start the source (its role's `rollback.yml`).
-* **Failure reasons** (proposed):
-  * "host key refused: the {side} conversion host ({alias}, server {id}) presented {offered}, not its pinned key
-    {pinned}";
+* **Failure reasons** (proposed; the collection's two, the first and the fourth, binding in §6.6 since plan task ST3):
+  * "host key refused: the {side} conversion host ({alias}, server {id} at {address}) presented {offered}, not its
+    pinned key {pinned}";
   * "host key unknown: no key is pinned or declared for the {side} conversion host {name}";
   * "conversion host replaced: {name} is now server {new id}; its pin belongs to server {old id}";
-  * "link refused by the source conversion host: {ssh's reason}";
+  * "link refused by the source conversion host (os_migrate_conv_src at {address}): {ssh's reason}";
   * "the conversion host {name}, created with an injected host key, does not present it: check its image's
     cloud-init".
 * **Events** (persisted): `conversion_host.key_pinned` (provider, side, server, fingerprints, source), binding in §4.3
@@ -7376,7 +7437,7 @@ The owner took each default as written on 2026-10-23 (D8):
 |---|---|---|
 | PRD: NFR-06 names the pinned host keys and the restricted link, a 0.5.0 row; D8 decided | PRD, §20 | ST1 |
 | `ConversionHostConfig.ssh_host_keys`; the provider's pin; the console parser and the provider check's pinning; `conversion_host.key_pinned` | §4.2, §4.3, §10, §12 (binding) | ST2 |
-| the collection's known_hosts variable and module option, `RemoteShell`'s options, the inventory's common arguments, a refusal as a permanent error | §6.4, §6.5, §6.6 | ST3 |
+| the collection's known_hosts variable and module option, `RemoteShell`'s options, the inventory's common arguments, a refusal as a permanent error | §6.4, §6.5, §6.6 (binding) | ST3 |
 | the injected host key at creation (`userdata`, `no_log`), the role's report of the servers it created | §6.5 | ST4 |
 | the executor: host key pairs for pre-staging, pins recorded, the run's known_hosts, `ANSIBLE_HOST_KEY_CHECKING=True`, refusals classified, `conversion_host.key_refused` | §4.3, §7.2 | ST5 |
 | the link: the per-run key, the source host's entry, the gate (§6.2), the probe before the stop, the forward to `127.0.0.1`, the leftovers and 0.4.0's link removed, the content install's sshd settings; R-02 if decided | §6.2, §6.4, §6.5, §6.6, §7.2 | ST6 |
