@@ -36,6 +36,8 @@
         os_migrate_conversion_manage_network: "{{ os_migrate_src_conversion_manage_network | default(true) }}"
         os_migrate_conversion_manage_fip: "{{ os_migrate_src_conversion_manage_fip | default(true) }}"
         os_migrate_conversion_floating_ip_address: "{{ os_migrate_src_conversion_floating_ip_address | default(false) }}"
+        # the private half of the host key a server the role creates gets (Seamless Migrate SDD 6.5)
+        os_migrate_conversion_host_key_private_path: "{{ os_migrate_src_conversion_host_key_private_path | default('') }}"
       when: os_migrate_deploy_src_conversion_host | default(true) | bool
 
     - name: Deploy the dst conversion host inventory
@@ -69,6 +71,8 @@
         os_migrate_conversion_manage_network: "{{ os_migrate_dst_conversion_manage_network | default(true) }}"
         os_migrate_conversion_manage_fip: "{{ os_migrate_dst_conversion_manage_fip | default(true) }}"
         os_migrate_conversion_floating_ip_address: "{{ os_migrate_dst_conversion_floating_ip_address | default(false) }}"
+        # the private half of the host key a server the role creates gets (Seamless Migrate SDD 6.5)
+        os_migrate_conversion_host_key_private_path: "{{ os_migrate_dst_conversion_host_key_private_path | default('') }}"
       when: os_migrate_deploy_dst_conversion_host | default(true) | bool
 
     - name: Prepare the conversion host link
