@@ -7906,7 +7906,7 @@ diff" of PRD §9. No release delivered them. The owner chose 0.5.0 (owner decisi
 here depends on them.
 
 The proposed fields, route, check keys and findings stay out of the tables the SDD-reading tests parse (§4.3, §9.3,
-§12, §15.1, §18) until their tasks land; a proposed finding code is written without code quotes. The facts about Ceph,
+§12, §15.1, §18) until their tasks land; a proposed finding code is written without code quotes. Plan task CE3's extent query - its command, the image and snapshot names, the chunk mapping, the timeout, the Ceph files on the conversion host and the result plan task CE4 reads - is binding in §6.4 since that task. The facts about Ceph,
 Cinder, Nova, libvirt and QEMU come from their documentation and sources, read 2026-10-23 and listed in the pull
 request; one only an excerpt or a secondary source showed, or only a lab can show, is marked `TODO(LAB): confirm`.
 
@@ -7985,7 +7985,7 @@ Ceph clusters per provider; reading the RBD snapshot without a temporary volume 
   source project's snapshot quota must allow it (Operations.md). The cutover deletes the bases with the final
   snapshot's cleanup; a rollback, a cancel's cleanup and a change of strategy delete them (§7.3 step 0 refuses volumes
   with snapshots).
-* **The query:** on the source conversion host,
+* **The query** (binding in §6.4 since plan task CE3): on the source conversion host,
   `rbd diff --from-snap snapshot-<base> --whole-object --format json <pool>/volume-<name_id>@snapshot-<current>` lists
   `{offset, length, exists}` extents of the whole image. With `--whole-object` librbd diffs the snapshots' object maps
   when the image has fast-diff (with object-map and exclusive-lock, "Default: yes" in Ceph's RBD configuration
@@ -8203,7 +8203,7 @@ The owner took each default as written on 2026-10-23 (D1):
 |---|---|---|
 | PRD: FR-26 rewritten with its acceptance criteria and release, NFR-05 for passes that read extents, SM-1b and G1's scan removal moved to 0.5.0, PRD §9's 0.2.0 item moved; D1 decided | PRD, §20 | CE1 |
 | blocksync protocol v2, `--extents` and `--extents-mode`, the check's counts | §6.2 | CE2 |
-| the extent query: its command, the image and snapshot names, the chunk mapping, the timeout, the files on the conversion host | §6.4 | CE3 |
+| the extent query: its command, the image and snapshot names, the chunk mapping, the timeout, the files on the conversion host | §6.4 (binding) | CE3 |
 | the bases in the warm state, kept and deleted; the modes and reasons per pass; the sync's options; the roles' variables; the rollback's clearing | §6.1, §6.3–§6.5, §7.2 | CE4 |
 | the Ceph client on the source conversion host | §6.5, §21.6 | CE5 |
 | `Provider.ceph`, `PUT /providers/{id}/ceph-key`, the secret's name and its 409s, the check's `ceph_fsid` and `ceph_pool`, the redaction | §4.2, §10, §12, §13.3, §13.4 | CE6 |
