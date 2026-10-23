@@ -1,11 +1,10 @@
 # Modified by the Seamless Migrate project, 2026.
-# os-migrate fork = openstacksdk 4.5.0 + the merged owner_seen fix
+# openstacksdk 4.21.0 is the first upstream release with the owner_seen fix
 # (resource: Fix re-entrant alias resolution, Closes-Bug #2046838 ->
-# https://bugs.launchpad.net/openstacksdk/+bug/2046838), which is not yet in any
-# upstream release. Pinning upstream master breaks the vendored openstack.cloud
-# 2.5.0 modules (openstack.version no longer imported transitively), so we pin a
-# 4.5.1 tag on the fork instead; this keeps pbr/StrictVersion reporting a real
-# version. Revert to an upstream version pin once the fix ships in a release.
-openstacksdk @ git+https://github.com/os-migrate/openstacksdk.git@4.5.1
+# https://bugs.launchpad.net/openstacksdk/+bug/2046838) that the os-migrate fork's
+# 4.5.1 tag carried, so it comes from PyPI again (Security.md SEC-09). It needs
+# Python 3.11 or later. The vendored openstack.cloud modules (2.6.0) no longer read
+# openstack.version, which had kept the fork's pin for 2.5.0.
+openstacksdk>=4.21.0
 PyYAML==6.0.3
 jmespath>=1.1.0

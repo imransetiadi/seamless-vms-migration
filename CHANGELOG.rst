@@ -633,3 +633,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
 - The ``json_query`` filter's jmespath requirement is 1.1.0 or later
   (``requirements.txt`` and the execution environment's
   ``aee/requirements.txt``).
+- openstacksdk comes from PyPI again, 4.21.0 or later (``requirements.txt``
+  and ``aee/requirements.txt``): it is the first upstream release with the
+  re-entrant alias fix (bug 2046838) that the os-migrate fork's 4.5.1 tag
+  carried, so no requirement installs from a git URL any more (Security.md
+  SEC-09). openstacksdk 4.21.0 needs Python 3.11 or later.
