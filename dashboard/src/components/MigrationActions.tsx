@@ -130,8 +130,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   // the cutover's requester does not approve it (maker-checker, SDD §5.4)
   const me = useMe().data?.name;
   // the time, read once per render for every rule that asks it (useNow): a cutover window that opens or closes shows
-  // within a minute
-  const now = useNow(60_000);
+  // within ten seconds, so the Cutover action's dialog never speaks of a window that has changed
+  const now = useNow(10_000);
   const availability = migrationActions(m, role, plan, now, me);
   const fourEyes = Boolean(plan?.require_approval && plan.require_distinct_approver);
   // a request or a force records the user's approval only without a distinct approver (SDD §5.4, §16)
