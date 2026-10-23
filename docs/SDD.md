@@ -554,7 +554,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
-`conversion_host.key_pinned` (§10, §26.5), `hook.created`,
+`conversion_host.key_pinned` (§7.2, §10, §26.5), `conversion_host.key_refused` (§7.2, §26.5), `hook.created`,
 `hook.updated`, `hook.deleted` (§23.3), `auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
@@ -566,7 +566,13 @@ one transaction once when its cutover begins to wait for GPU capacity (`waiting`
 (`waiting` false: the pool it waited for, as that read found it). `conversion_host.key_pinned` carries `{"provider_id",
 "side", "server_id", "fingerprints", "source"}` - the provider, its role (`source` or `destination`), the server pinned,
 its keys' SHA256 fingerprints as `ssh-keygen -l` prints them and the pin's source (§4.2) -, written with the provider's
-pin in one transaction; it never carries a key's comment or a line of the console (§26.3).
+pin in one transaction, by the provider check (§10) or by a run: a console's pin, or the key a pre-staging injected
+into a host its role created (§7.2); it never carries a key's comment or a line of the console (§26.3).
+`conversion_host.key_refused` carries `{"provider_id", "side", "server_id", "pinned", "offered", "plan_id",
+"migration_id"}` - the provider and the role whose conversion host a run's output names refused (its host key, or the
+link the source host refused), its server, the SHA256 fingerprints the run pinned for it, the one the host offered
+when ssh printed it, the run's plan and its migration (null for a pre-staging) -, each null when the run cannot know
+it (§7.2); it never carries a line of the output, of a console or an ssh command line.
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
 `migration.log`, `heartbeat`. `migration.log` carries one line of a step's output (`StepContext.log`,
@@ -1597,7 +1603,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 * Command: `ansible-playbook -i <inventory> <playbook> -e @vars.yml -e @secrets.yml`, environment
   `ANSIBLE_STDOUT_CALLBACK=ansible.builtin.json` is **not** used; instead stdout lines are logged and
   progress is read by tailing the os-migrate per-workload `state_file` JSON (`{dev: pct}`) and the
-  warm state file. Non-zero exit → `TransientStepError` when the output matches a transient pattern
+  warm state file. Non-zero exit → `PermanentStepError` when the output names a refused host key or link, whatever
+  else it holds (below, "Conversion host keys"); else `TransientStepError` when the output matches a transient pattern
   (`Timeout`, `HTTP 503`, `Connection reset`), otherwise `PermanentStepError`. A `cold` cutover records its
   copy as a `full` pass when it ends — the VM's used bytes (`bytes_total`, what the state file's 100 % stands
   for) changed and transferred, its disks' size scanned, the step's duration, which the copy dominates — so
@@ -2016,6 +2023,52 @@ state (the orchestrator resumes from `Migration.checkpoint`).
     installation's key nor any plan's key on disk matches. The reason names each such provider and the key's SHA256
     fingerprint, as `ssh-keygen -l` prints it, and points to docs/Operations.md §7.1. An installation key whose
     public key cannot be read is refused the same way.
+* **Conversion host keys** (§26.3-§26.5, §26.8, plan task ST5), while `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` is `true`
+  (§15.1); `false` keeps 0.4.0's runs: no known_hosts file, no refusal, the warning once per run. The executor writes
+  pins and events through the orchestrator (`StepContext.host_keys`, a pre-staging's `host_keys`), each pin with its
+  `conversion_host.key_pinned` in one transaction (§4.3).
+  * **The hosts.** An OpenStack run - a pre-staging that deploys conversion hosts, a pre-copy, sync, cutover or
+    rollback - uses both conversion hosts, under their aliases `os_migrate_conv_src` and `os_migrate_conv_dst` (§26.4);
+    a VMware kit run (pre-copy, sync, cutover) the destination's host of the inventory's `conversion_host` group, under
+    `conversion_host`. A host without declared keys is looked up as the provider check finds it (§10): by its name
+    (`conversion_host.name`, else its side's alias), else by its address. A lookup that fails fails the run as
+    transient, a rollback's excepted, which logs it.
+  * **Before any playbook** the run writes `known_hosts` in its run directory - a pre-staging's in
+    `{data_dir}/plans/{plan_id}/` - with §10's writer: each host's declared keys, else the pin of the server it
+    resolves to. It passes the file as `os_migrate_conversion_host_known_hosts` (§6.5), runs its playbooks with
+    `ANSIBLE_HOST_KEY_CHECKING=True`, and gives the VMware inventory's `conversion_host` entry what
+    `conv_host_inventory.yml` gives an OpenStack host (§6.5): `ansible_ssh_common_args` with §26.4's options,
+    `HostKeyAlias=conversion_host` and the pinned keys' `HostKeyAlgorithms`, and `ansible_ssh_host_key_checking: true`.
+  * **A host without a pin** - no declared keys, no pin - has its console read once and pinned by the provider check's
+    path (§10, §26.8: `conversion_host.key_pinned`, source `console`). A pre-staging, pre-copy, sync or cutover then
+    refuses before any playbook, as a permanent failure, a host it has no key for: "host key unknown: no key is pinned
+    or declared for the {side} conversion host {name}", and one whose pin belongs to another server than the one it
+    resolves to: "conversion host replaced: {name} is now server {new id}; its pin belongs to server {old id}" ({name}
+    is what the host was found by, else its name). A rollback refuses nothing and reads no console: it starts the
+    source whatever its hosts' keys (§26.5).
+  * **The injected key** (§26.3). Before a pre-staging, a host the deploy manages (`conversion_host.manage`, or a
+    provider without `conversion_host`), without declared keys, whose name finds no server - the role creates it - gets
+    an ed25519 key pair made in memory: its private half in `{data_dir}/plans/{plan_id}/host-key-{side}.key` (`src`,
+    `dst`), 0600 with its final newline, passed as `os_migrate_{side}_conversion_host_key_private_path` and removed
+    after the run whatever its outcome, never logged; its public half under the side's alias in the run's
+    `known_hosts`. The role's report (`osm/conversion/hosts.json`, §6.5) is removed before the run and read after it,
+    also after a failure: a server under `created` of a side that got a key is pinned with it (source `injected`,
+    `conversion_host.key_pinned`); one under `found` does not hold it and is not pinned - a run that succeeded is
+    refused for it "host key unknown: ...", unless the provider's pin is that server's. A run whose output refuses the
+    key of a server it created fails "the conversion host {name}, created with an injected host key, does not present
+    it: check its image's cloud-init".
+  * **A refusal in the output** - the collection's "host key refused: " and "link refused by the source conversion
+    host" (§6.6), ssh's "Host key verification failed.", "No ... host key is known for ... and you have requested strict
+    checking" and "no matching host key type found", also as Ansible's unreachable message carries them - fails the run
+    permanently whatever else the output holds: it is read before the transient patterns (above). It emits
+    `conversion_host.key_refused` (§4.3): the side and server the output names - the collection's message, an alias, an
+    inventory name -, a VMware run's one host, else null; the fingerprints the run pinned for it; the one ssh printed
+    as offered, else null.
+  * **ControlPersist.** Ansible's ssh keeps a connection's master open 60 s (`ControlPersist=60s`) in
+    `ANSIBLE_SSH_CONTROL_PATH_DIR` - by default `~/.ansible/cp`, which every run shares -, its socket named after the
+    host's address, port and user, not its alias: another run's master, unpinned or pinned to another file, would
+    carry this run's connection without a check of the key. Each run so has its own, `cp` in its run directory,
+    emptied before the run and removed after it, and the control plane's `ANSIBLE_SSH_CONTROL_PATH` does not reach it.
 * **Hooks** (`seamless_migrate.hooks`, plan task N4, §23.3): how a catalog hook runs at a migration's point; the points
   that call it are §23.3's (plan task N5).
   * **The context document** a hook gets, never a credential: `{"migration_id", "attempt", "point", "plan_id",
