@@ -49,7 +49,7 @@ or Bahasa Indonesia.
 | --- | --- |
 | `plugins/`, `roles/`, `playbooks/` | The os-migrate Ansible collection plus the warm migration path |
 | `seamless/` | Control plane: `src/seamless_migrate/`, `tests/`, `Containerfile` |
-| `dashboard/` | React 18 + Vite + TypeScript dashboard |
+| `dashboard/` | React 19 + Vite + TypeScript dashboard |
 | `deploy/compose/`, `deploy/openshift/`, `deploy/kubernetes/` | Docker Compose stack and Kustomize manifests |
 | `scripts/` | Tooling: `seamless-ctl.sh` (a deployment's lifecycle, docs/Operations.md), `dotenv-value.sh`, `compose-init.sh`, `collection-sanity.sh` |
 | `tests/` | Collection tests (`unit/`, `sanity/`, `func/`, `perf/`); `e2e/` holds the demo-stack scripts and the upstream end-to-end playbooks |
