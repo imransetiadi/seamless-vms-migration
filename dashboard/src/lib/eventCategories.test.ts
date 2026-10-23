@@ -27,6 +27,11 @@ describe('the Events page categories (SDD §4.3, §14.5, §16)', () => {
     expect(categoriesOf('conversion_host.key_pinned')).toEqual(['providers', 'security']);
   });
 
+  it('files conversion_host.key_refused under Providers and Security: a run refused a conversion host\'s key or link (SDD §4.3, §26.5, plan task ST5)', () => {
+    expect(PERSISTED_EVENT_KINDS).toContain('conversion_host.key_refused');
+    expect(categoriesOf('conversion_host.key_refused')).toEqual(['providers', 'security']);
+  });
+
   it.each(['hook.created', 'hook.updated', 'hook.deleted'])(
     'files %s under Security: a hook runs code with the control plane\'s reach (SDD §23.3, plan task N3)',
     (kind) => {

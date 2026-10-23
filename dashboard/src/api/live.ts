@@ -448,6 +448,12 @@ export function applyEventToCache(
     invalidate(['stats']);
     return;
   }
+  // a conversion host pinned, or its key refused, by a check or a run - also a migration's: the providers list shows
+  // its pin (SDD §4.3, §26.5)
+  if (kind.startsWith('conversion_host.')) {
+    invalidate(['providers']);
+    return;
+  }
   if (kind.startsWith('provider.')) {
     invalidate(['providers']);
     // new endpoint or credentials (or a deleted provider): the cached inventory came from the old ones

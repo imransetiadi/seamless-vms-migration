@@ -1010,6 +1010,8 @@ export const PERSISTED_EVENT_KINDS = [
   'provider.checked',
   // the provider check pinned its conversion host from the console (SDD §4.3, §10, §26.5, plan task ST2)
   'conversion_host.key_pinned',
+  // a run refused a conversion host's key, or the link (SDD §4.3, §7.2, §26.5, plan task ST5)
+  'conversion_host.key_refused',
   // the hook catalog's changes (SDD §4.3, §23.3, plan task N3)
   'hook.created',
   'hook.updated',
