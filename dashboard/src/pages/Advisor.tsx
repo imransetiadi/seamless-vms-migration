@@ -92,7 +92,7 @@ function WaitingDecision({
 }: {
   rec: AdvisorRecommendation;
   migrationId: string;
-  focusAfterRef?: RefObject<HTMLElement>;
+  focusAfterRef?: RefObject<HTMLElement | null>;
   onDecided: (message: string) => void;
 }) {
   const migration = useMigration(migrationId).data;

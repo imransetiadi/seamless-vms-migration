@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type Ref } from 'react';
 
 /** Where an anchored note shows, in viewport coordinates. */
 export interface NoteAt {
@@ -17,7 +17,7 @@ export interface AnchoredNote {
   /** Where the note shows; null while it is hidden. */
   at: NoteAt | null;
   /** The note element: measured once shown, so it stays inside the viewport. */
-  noteRef: RefObject<HTMLSpanElement>;
+  noteRef: Ref<HTMLSpanElement>;
   /** Shows the note under `anchor`. */
   show(anchor: Element): void;
   hide(): void;

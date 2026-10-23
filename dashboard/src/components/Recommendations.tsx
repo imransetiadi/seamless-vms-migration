@@ -41,7 +41,7 @@ export function DecisionLine({ rec, className }: { rec: AdvisorRecommendation; c
 }
 
 /** The actions for one entry; `focusAfterRef` is where focus goes after a decision that removes them (SDD §16). */
-export type ActionsFor = (rec: AdvisorRecommendation, focusAfterRef: RefObject<HTMLElement>) => ReactNode;
+export type ActionsFor = (rec: AdvisorRecommendation, focusAfterRef: RefObject<HTMLElement | null>) => ReactNode;
 
 /** What the advisor recommended, then what was decided: the line the migration runs (SDD §16). Untrusted text renders as plain text. */
 /** The entry's line on its evidence (SDD §16, ADV-02): its details hold the card. */

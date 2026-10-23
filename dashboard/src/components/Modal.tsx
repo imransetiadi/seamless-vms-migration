@@ -40,12 +40,12 @@ export interface ModalProps {
   describedBy?: string;
   /** `alertdialog` for confirmations of consequential actions. */
   role?: 'dialog' | 'alertdialog';
-  initialFocusRef?: RefObject<HTMLElement>;
+  initialFocusRef?: RefObject<HTMLElement | null>;
   /**
    * Where focus goes on close instead of the control that opened the dialog, when that control may
    * be gone by then (an empty state the action replaces): focus never drops to the page (SDD §16).
    */
-  returnFocusRef?: RefObject<HTMLElement>;
+  returnFocusRef?: RefObject<HTMLElement | null>;
   /** When false, Escape does nothing (e.g. while a request is in flight). */
   dismissible?: boolean;
   size?: 'md' | 'lg';

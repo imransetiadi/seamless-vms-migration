@@ -1,5 +1,5 @@
 import { ChevronRight } from 'lucide-react';
-import type { ReactNode, RefObject } from 'react';
+import type { ReactNode, Ref } from 'react';
 import { Link } from 'react-router-dom';
 
 export interface Crumb {
@@ -14,7 +14,7 @@ export interface PageHeaderProps {
   breadcrumbs?: Crumb[];
   meta?: ReactNode;
   /** Makes the title a focus target, for an action that takes the focused control with it (SDD §16). */
-  titleRef?: RefObject<HTMLHeadingElement>;
+  titleRef?: Ref<HTMLHeadingElement>;
 }
 
 export function PageHeader({ title, description, actions, breadcrumbs, meta, titleRef }: PageHeaderProps) {

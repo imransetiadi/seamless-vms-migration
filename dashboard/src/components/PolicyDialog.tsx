@@ -119,7 +119,7 @@ export interface PolicyDialogProps {
   /** The built-in default's threshold, 0..1: a new policy starts from it. */
   defaultThreshold: number;
   /** Where focus goes on close when the control that opened the dialog may be gone (SDD §16). */
-  returnFocusRef?: RefObject<HTMLElement>;
+  returnFocusRef?: RefObject<HTMLElement | null>;
   onClose: () => void;
   onSaved: (policy: AdvisorPolicy, message: string) => void;
 }
