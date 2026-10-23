@@ -5215,7 +5215,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D5 | Dashboard navigation item **Users** for non-admins: hidden (today) or soft-disabled with the reason, as every other action (§16) | hidden | owner decision (audit C-01) |
 | D6 | Collection identity on Galaxy: FQCN `os_migrate.os_migrate` 1.1.0 with the fork's own metadata; a version scheme that cannot collide with a future upstream 1.1.0; whether `scripts/publish.sh` stays | FQCN kept for upstreamability; the tarball is attached to GitHub Releases and never published to Galaxy (RELEASING.md) | owner decision (audit D-10) |
 | D7 | Python floor of the conversion hosts (§6.2: 3.6, RHEL 8 `platform-python`); CI runs the tests on 3.11 and later only | 3.6 kept; `test_blocksync.py` passed on Python 3.6.15 and 3.8.20 in containers on 2026-10-23, run by hand (QASuite §14.2) | a CI job that runs QASuite §14.2's container command, or a 3.9 floor (audit A-12) |
-| D8 | SSH trust on both data-path hops: host keys (SEC-02) and the dst→src link key (SEC-06) | `StrictHostKeyChecking=no` with the compensating controls of Security.md §6; the executor's `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` (§15.1) | 0.2.0 (audit A-01, A-02) |
+| D8 | SSH trust on both data-path hops: host keys (SEC-02) and the dst→src link key (SEC-06) (§26) | `StrictHostKeyChecking=no` with the compensating controls of Security.md §6; the executor's `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` (§15.1); accepted up to 0.4.0; decided by the owner 2026-10-23: §26.10's ten defaults as written - host keys injected at creation or read from the console and pinned per conversion host, `StrictHostKeyChecking=yes` on every hop, a link key per run held to a forced command, the setting on by default, in 0.5.0 | each item binds with its plan task (§26.11); planned for 0.2.0 (audit A-01, A-02); the LAB-SSH cases of §26.9 gate the release |
 | D9 | Backups of the cluster deployment: the optional CronJob of §17, or the cluster's backup product (Velero/OADP) as the standard | CronJob shipped | owner decision (audit D-06) |
 | D10 | The commit trailer's model name (CLAUDE.md §2.7) | fixed `Claude Opus 5.5` | owner decision (audit F-13) |
 | D11 | Product documents in the collection artifact (the SDD, PRD, QASuite, Security and Performance documents are packed; audit material and agent plans are not) | packed | owner decision (audit D-21) |
@@ -7002,3 +7002,319 @@ The owner took each default as written on 2026-10-23 (D2):
 | the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 | HA6 |
 | QASuite rows and LAB-HA cases; Security.md (§25.9, its single-instance row); Operations.md (enabling HA, moving `/data`, a failover, the database settings); Performance.md §9.3 and §11; MEMORY.md M-03 and its D2 row | QASuite, Security.md, Operations.md, Performance.md, MEMORY.md | HA7 |
 | the lab; the Technology Preview label goes when LAB-HA01–LAB-HA05 pass | QASuite §13 | HA8 |
+
+## 26. SSH trust on the data path (0.5.0)
+
+Status: proposed 2026-10-23 and decided by the owner the same day (D8): §26.10's defaults as written. Each item
+becomes binding in the section §26.11 names when its plan task lands; until then nothing in this section is binding.
+The PRD follows with plan task ST1. The LAB-SSH cases of §26.9 gate the release (owner decision 1).
+
+What it answers: D8, the findings SEC-02 (host keys not verified) and SEC-06 (an unrestricted link key) of Security.md
+§11.1, its threats C3-01 and C3-06, and QASuite's target cases S-10 and S-11. Security.md and D8 planned both for
+0.2.0 (PRD §9's release table does not name them), and no release closed them. The owner chose 0.5.0 (owner decision
+1). The plan is `superpowers/plans/2026-10-23-ssh-trust.md`. §24 and §25 are left to the notifications and
+high-availability proposals of other branches.
+
+SSH trust adds no route. The proposed fields, events and findings, and the setting's new default, stay out of the
+tables the SDD-reading tests parse (§4.3, §9.3, §12, §15.1) until their tasks land, as §22's and §23's did. The facts
+come from OpenSSH's manuals, source and release notes, cloud-init's documentation and source, Nova's API and policy
+references, Ansible's ssh plugin, the VMware kit 2.2.7's playbooks and Repology, all read 2026-10-23. A fact only an
+excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confirm`.
+
+### 26.1 What 0.4.0 has
+
+* **Four hops, none checked:**
+
+| Hop | Runs on | Logs in with | Host key options |
+|---|---|---|---|
+| control plane → each conversion host: the modules' commands and `scp` | the control plane (`migrator`, a local connection) | the plan's conversion key, `{plan}/osm/conversion/ssh.key` (§7.2) | `RemoteShell._default_options`: `StrictHostKeyChecking=no`, the default known_hosts files of the user that runs ssh |
+| Ansible → the conversion hosts (`deploy_conversion_hosts.yml`) | the control plane | the conversion key | `ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'` (`conv_host_inventory.yml`) |
+| destination host → source host: the link | the destination conversion host | the plan's link key, the destination user's `~/.ssh/id_rsa` | the same `RemoteShell` options, built on the control plane |
+| Ansible → a VMware destination's conversion host (the kit's plays) | the control plane | `ssh_key_secret`, else the conversion key (§7.2) | `ANSIBLE_HOST_KEY_CHECKING` from `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING`, default `false` (§15.1) |
+
+* **The setting reaches one hop.** Ansible's ssh plugin puts `-o StrictHostKeyChecking=no` before the inventory's
+  arguments when its host key checking is off, and OpenSSH keeps the first value of an option. With the setting
+  `true`, the inventory's own `StrictHostKeyChecking=no` is still the only value for the OpenStack conversion hosts,
+  and the collection's ssh never reads the setting: only the VMware hop is checked, and only against a key the
+  control plane's known_hosts already holds.
+* **What `no` allows.** A first connection accepts any key. A changed key still connects, but OpenSSH then turns off
+  port forwarding, with agent and X11 forwarding and password logins. A destination host whose known_hosts holds an
+  older key for the source host's address - a source host created again at the same floating IP
+  (`conversion_host.address`) - thus loses the cold path's forward, and the transfer waits for its timeout
+  (`TODO(LAB): confirm`).
+* **A refused key would look like an outage.** §6.6 takes ssh's exit status 255 for an unreachable host: waits give up
+  after 15 minutes with "SSH timeout", which the control plane retries as transient (§7.2). OpenSSH exits 255 after
+  "Host key verification failed." too.
+* **No SSH before the stop.** A cold cutover's first SSH contact is its export, after the source stopped (its
+  destination and source checks use the APIs); a warm cutover stops the source before its snapshot step.
+* **Hosts are found by name:** `conv_host_inventory.yml` looks a host up as `<name>*` and takes the first match.
+* **The link key** is made once per plan (`ssh-keygen -t ed25519 -N ""` at `{plan}/osm/conversion/link-ssh.key`, kept
+  when it exists). Pre-staging copies it to the destination host as `~/.ssh/id_rsa` and adds its public key, with no
+  option, to a block marked `CONVERSION LINK KEY` in the source host's `~/.ssh/authorized_keys`. Nothing removes
+  either, and nothing deletes a plan's or a run's directory. The last plan that pre-stages a host pair replaces the
+  earlier plan's key on both hosts. Security.md §6.4 and §7.1 said the keys lived in the run directory and went with
+  it, until PR #113 corrected them to what the code does.
+* **What the link carries.** Cold: `ssh -N -T -L <port>:localhost:<nbd port>`, forwards only, to NBD exports that bind
+  `127.0.0.1` (§6.6). Warm: one command per disk, `sudo -n python3 /tmp/seamless-blocksync-<uuid>.py send ...` (§6.4).
+  sshd's `restrict` turns off forwarding, PTYs, agent and X11 forwarding and `~/.ssh/rc`, not commands: with the
+  remediation SEC-06 named before PR #113, `restrict,port-forwarding,permitopen="127.0.0.1:*",from=...`, the
+  destination host can still run any command, with sudo, on the source host. And `permitopen` compares the forward's
+  host name as written: `127.0.0.1:*` refuses a forward that names `localhost`.
+* **Pre-staging** creates the conversion hosts without user data; the vendored openstack.cloud 2.6.0 `server` module
+  takes `userdata`. Their Nova keypair, `os_migrate_conv`, holds the plan's conversion key, and the `keypair` module
+  refuses a name present with another key: a second plan of the same providers stops there (`TODO(LAB): confirm`).
+* **Out of the data path.** The control plane never runs the collection's hypervisor path (`import_from_hypervisor`,
+  `nbd+ssh://`). The VMware kit opens no SSH session of its own (§26.7).
+
+### 26.2 Scope
+
+Proposed for 0.5.0, in the order of the plan:
+1. Every conversion host's key known before the first connection to it: injected at its creation, read from its
+   console, or declared by the operator (§26.3); never learned from an SSH connection.
+2. Pins kept per conversion host, a known_hosts file per run, and `StrictHostKeyChecking=yes` on every hop: the
+   modules' ssh and scp, Ansible, the link (§26.4).
+3. Refusals that fail at once and for good, and a cutover that checks its hosts and its link before the source stops
+   (§26.5).
+4. A link key per run, made on the destination host and held on the source host to a forced command, `from=`,
+   `expiry-time` and the run's own forwards, removed when the run ends (§26.6).
+5. The VMware destination's conversion host pinned the same way (§26.7).
+6. Existing installs: pins for 0.4.0's hosts, their link keys removed, the setting on by default (§26.8).
+
+Not in 0.5.0: SSH certificates and a host CA; the conversion key itself (one per plan today, one per installation with
+issue #112's fix; with sudo; SEC-11 accepted) and its Nova keypair; the hypervisor path; the VMware kit's own
+connections; the helper script's private directory and checksum (R-02), unless the owner joins them to the gate (owner
+decision 10).
+
+### 26.3 Learning a host's key
+
+* **Injected, for a host Seamless creates.** Before a pre-staging that may create a conversion host, the control plane
+  makes an ed25519 host key pair for it. The role passes it as the server's user data: cloud-init's `ssh_keys`
+  (`ed25519_private`, `ed25519_public`) with `ssh_deletekeys: true`. cloud-init then writes that key and generates no
+  other type. The private half reaches the run as a 0600 file deleted after it (§7.2) and is never stored or logged:
+  the server task runs with `no_log`, since a module result can carry the user data back. The public half is pinned
+  only when the role reports that it created the server; a server it found keeps its pin.
+* **Who can read an injected private key.** Nova keeps the user data for the server's life. The API shows it
+  (`OS-EXT-SRV-ATTR:user_data`) to admins alone by default (`rule:context_is_admin`). Any process on the host can
+  read it from the metadata service (`/openstack/latest/user_data`) or the config drive, and cloud-init warns that
+  such keys may be visible to unprivileged users. On a single-purpose host whose one login user has sudo, these
+  readers could impersonate the host anyway; the attacker of C3-01, on the data network, is not among them.
+* **Read from the console**, for a host Seamless did not create (`manage: false`, a VMware destination's host) and for
+  0.4.0's hosts. Nova's `os-getConsoleOutput` returns the console log, all of it without `length`, and its default
+  policy lets the project's members call it (`rule:project_member_or_admin`). cloud-init's keys-to-console module
+  prints, once per instance, the host keys' fingerprints and the public keys between
+  `-----BEGIN SSH HOST KEY KEYS-----` and `-----END SSH HOST KEY KEYS-----`. It is on by default
+  (`ssh.emit_keys_to_console`), and its lists of key types not printed (`ssh_fp_console_blacklist`,
+  `ssh_key_console_blacklist`) are empty by default. RHEL 8's `cloud.cfg` runs it; the other images of §21.6
+  `TODO(LAB): confirm`. `no_ssh_fingerprints` belongs to another module (the authorized keys' fingerprints, in the
+  log) and does not hide the block.
+  * The parser keeps the block's key lines and nothing else. A console without the block, or with two blocks that
+    disagree, pins nothing. When an image prints the fingerprints alone, a key read from the host is pinned only if
+    its SHA256 fingerprint is one the console printed.
+  * The console is the guest's text: it is never logged, stored, or sent to the advisor or to memory (§13.4).
+* **Declared, by the operator.** `conversion_host.ssh_host_keys` (proposed, §4.2): the host's public keys in OpenSSH's
+  one-line form, ed25519, ECDSA or RSA. Declared keys win over a pin.
+* **Never** an SSH connection's word (no `accept-new`, no trust on first use), a scan alone, or DNS
+  (`VerifyHostKeyDNS`).
+
+### 26.4 Pins and their use
+
+* **The pin.** Each provider records its conversion host's pin (proposed, server-owned, §4.2): the Nova server's id,
+  the public keys, their source (`injected` or `console`) and the time. A public key is no secret: the API returns
+  the pin, and the dashboard shows its fingerprints. A pin belongs to one server. When the provider's host resolves
+  to another server (deleted and created again), the pin no longer applies, and only a pre-staging that creates the
+  new server, or the new server's console, pins it again (§26.5).
+* **Why per host.** A conversion host serves every plan of its provider, so a plan's pre-staging data would hold one
+  pin per plan for one host. The database also keeps the pin when the data volume is lost or moved.
+* **A known_hosts file per run.** Each run writes `known_hosts` in its run directory (§7.2) from the declared keys,
+  else the pins, of the hosts it uses: one hashed entry per key under the host's alias - its inventory name,
+  `os_migrate_conv_src` or `os_migrate_conv_dst`, or the group's name, `conversion_host`, for a VMware destination's
+  host. No ssh writes to it.
+* **The options of every hop:** `StrictHostKeyChecking=yes`, `UserKnownHostsFile=<the run's file>`,
+  `GlobalKnownHostsFile=/dev/null`, `HostKeyAlias=<the alias>`, `CheckHostIP=no`, `UpdateHostKeys=no`,
+  `VerifyHostKeyDNS=no`, `HashKnownHosts=yes`, `HostKeyAlgorithms` the pinned keys' algorithms and
+  `IdentitiesOnly=yes`, beside today's `BatchMode`, `ConnectTimeout` and `ServerAlive*` (§6.6). The alias keeps the
+  check off the address: a floating IP that moves changes nothing.
+* **In the collection.** A variable and a module option name the file (proposed:
+  `os_migrate_conversion_host_known_hosts`, `ssh_known_hosts`). With them `RemoteShell` uses the options above for ssh
+  and scp, and `conv_host_inventory.yml` puts them in `ansible_ssh_common_args` (read by scp and sftp too) instead of
+  the extra arguments' `StrictHostKeyChecking=no`. Without them the collection behaves as upstream.
+* **In the executor.** Every run with pins gets `ANSIBLE_HOST_KEY_CHECKING=True` - else Ansible's own `no` comes first
+  and wins - and the VMware inventory's entry gets the same common arguments.
+* **A host created in the run.** Before a pre-staging the executor looks each host up: one that exists runs on its
+  pin; for one that does not, it writes the injected public key under the host's alias. A server the role finds
+  instead does not hold that key and is refused (§26.5).
+
+### 26.5 Refusals
+
+* **A refused key is never accepted:** no prompt, no `accept-new`, no retry with another file, no new pin for the
+  same server.
+* **In the collection.** ssh's exit 255 with "Host key verification failed." or "No ... host key is known for ... and
+  you have requested strict checking." is a refusal, not an outage: the module fails at once, without §6.6's 15-minute
+  wait. So does a link the source host refuses ("Permission denied", a forward "administratively prohibited"). The
+  message names the side, the alias, the server, the pinned fingerprints and, when ssh printed it, the offered one. It
+  holds neither ssh's command line nor the word "timeout" (§6.6, review RV42B-02).
+* **In the control plane.** A failure whose output names a refused host key or link is permanent, whatever else the
+  output holds: the check comes before §7.2's transient patterns.
+* **Before the stop.** A cutover connects to both hosts and sets up and probes its link (§26.6) before the source
+  stops. A refusal there ends the cutover with the source running.
+* **After the stop** (a host replaced during a cutover) the automatic rollback runs (§8). The warm rollback reports a
+  temporary snapshot it cannot remove and goes on to start the source (its role's `rollback.yml`).
+* **Failure reasons** (proposed):
+  * "host key refused: the {side} conversion host ({alias}, server {id}) presented {offered}, not its pinned key
+    {pinned}";
+  * "host key unknown: no key is pinned or declared for the {side} conversion host {name}";
+  * "conversion host replaced: {name} is now server {new id}; its pin belongs to server {old id}";
+  * "link refused by the source conversion host: {ssh's reason}";
+  * "the conversion host {name}, created with an injected host key, does not present it: check its image's
+    cloud-init".
+* **Events** (proposed, persisted): `conversion_host.key_pinned` (provider, side, server, fingerprints, source) and
+  `conversion_host.key_refused` (provider, side, server, pinned and offered fingerprints, the plan and migration). A
+  refused key may be an attack: an operator should be able to alert on it.
+* **Findings** (proposed for §9.3, for `cold`, `warm`, `vmware_cold` and `vmware_warm`):
+  * CONV_HOST_KEY_UNKNOWN, a blocker while keys are checked: a conversion host the plan needs has neither declared
+    keys nor a pin, and Seamless will not create it (`manage: false`, a VMware destination's host); or its pin belongs
+    to another server than the one the provider's host resolves to;
+  * CONV_HOST_KEYS_UNCHECKED, a warning while `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` is `false`: the plan's data path
+    authenticates no conversion host.
+
+### 26.6 The link
+
+* **Which hop pins which key:**
+
+| Hop | Pins | Its known_hosts file |
+|---|---|---|
+| control plane → source host (ssh, scp, Ansible) | the source host's key | the run's, on the control plane |
+| control plane → destination host | the destination host's key | the run's |
+| destination host → source host (the link) | the source host's key | the link's, beside its key on the destination host |
+| control plane → a VMware destination's host (Ansible, the kit's plays) | that host's key | the run's |
+
+* **A key per run** (owner decision 5). Each pre-copy, sync or cutover run makes its own link key on the destination
+  host (`ssh-keygen -t ed25519`), so the private half never leaves that host. Beside it the run writes the source
+  host's pin. The run removes both when it ends, whether it succeeded or not.
+* **The source host's entry**, written by the control plane over its pinned hop into the source user's
+  `authorized_keys`, under a lock and replaced whole (a temporary file renamed), with a comment that names the
+  migration and the run:
+  * `restrict` and `command="<the gate>"`, so no session runs anything else;
+  * `from="<address>"`: the destination host's address as the source host sees it. The probe below reads it from
+    `SSH_CONNECTION` on the source host, so no network topology is guessed (`TODO(LAB): confirm` what each topology
+    shows);
+  * `expiry-time="<UTC time>Z"`: the run's start plus the step timeout when one is set (§15.1), else 7 days - a bound
+    for an entry a crash leaves behind;
+  * cold runs: `port-forwarding` and one `permitopen="127.0.0.1:<port>"` per disk, written once the export has claimed
+    its ports; the forward then names `127.0.0.1` instead of `localhost`.
+* **The gate** is a `gate` command of the run's blocksync script (§6.2), which the forced command runs as the source
+  user. It reads `SSH_ORIGINAL_COMMAND` and admits two commands:
+  * `probe`, which answers the client address of `SSH_CONNECTION`;
+  * on a warm run, exactly `sudo -n <python> <the run's script> send --device <path> --chunk-size <n> --workers <n>
+    --expect-serial <id>`, where `<id>` is one of the run's temporary volumes (their ids are written into the forced
+    command) and `<path>` a disk that shows that serial (§6.2). It runs it without a shell.
+
+  It refuses everything else with one line on stderr: a shell, a copy, another disk.
+* **The order of a run:** the key on the destination host; the entry; the probe from the destination host, which
+  checks the source host's pin; `from=` added; after the export or the snapshot, the ports or the volume ids; the
+  transfer or the sync; the removal. A cutover does the first four before the stop (§26.5).
+* **Leftovers.** A run first removes its migration's earlier entries and every expired one. The first 0.5.0 run on a
+  host pair removes 0.4.0's link: the `CONVERSION LINK KEY` block on the source host, and the destination's
+  `~/.ssh/id_rsa` only when it holds the plan's old link key. Pre-staging gets `os_migrate_link_conversion_hosts:
+  false`, so no static link is made again.
+* **The source host's sshd**, set by the content install on a host Seamless creates and by Security.md §6.4's
+  checklist on the others (`TODO(LAB): confirm` per image):
+  * `AllowTcpForwarding local` (`no` on a destination host): a key's `port-forwarding` allows remote forwards (`-R`)
+    as well as local ones, and a key's `permitlisten` (OpenSSH 7.8) can narrow remote listens but not forbid them;
+  * `PermitTunnel no`, sshd's default: before OpenSSH 10.6 `restrict` did not cover tunnel forwarding (the release
+    notes of 10.5 and 10.6), and the images ship older versions.
+* **Versions.** `restrict` (OpenSSH 7.2), `accept-new` (7.6) and `expiry-time` (7.7) exist on every image of §21.6
+  and in the control plane's UBI 9 image: OpenSSH 8.0 on the RHEL 8 family, 9.9 on CentOS Stream 9 and 10, Rocky
+  Linux 9 and AlmaLinux 9, 9.6 on Ubuntu 24.04 (Repology); RHEL 9's own `TODO(LAB): confirm`.
+
+### 26.7 The VMware path
+
+* **Pinned:** the VMware destination's conversion host, which the operator brings (§7.2:
+  `already_deploy_conversion_host: true`) - its declared keys, else its console (the server the provider check finds
+  by `name`, else by `address`). The kit's plays (`conversion_host_content.yml`,
+  `run_migration_from_conversion_host.yml`, the `fetch` of a failed migration's log) reach it only through Ansible,
+  with the inventory the executor writes, which gets the common arguments of §26.4.
+* **As is:** the kit 2.2.7 opens no SSH session of its own. Its `migrate` module reaches vCenter and the ESXi hosts
+  over HTTPS and VDDK (`vmware_insecure` from `verify_tls`), not SSH, and gets the vCenter credential as an argument
+  on the conversion host. Neither changes here. There is no link: the kit uses one conversion host.
+
+### 26.8 Existing installs
+
+* **The setting** `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` stays, with a new default and a wider reach (owner decision
+  8): `true` by default, and it governs every hop of §26.6, not only Ansible's. `false` keeps 0.4.0's options, with
+  the warning once per run and the warning finding. The restricted link applies either way.
+* **Pins for 0.4.0's hosts.** The provider check (§10), and a pre-staging or a run that meets a host without a pin,
+  read its console once and pin what it shows (source `console`). A host whose console no longer holds the block
+  blocks its plans (§26.5) until the operator declares its keys, or deletes it and pre-stages again.
+* **`yes` at once.** Every host has its key before its first connection, so an `accept-new` phase adds nothing; with
+  a known_hosts file per run, `accept-new` would accept any key once per run.
+* **Runs in flight.** Drain before the upgrade (`--drain`, §17.2). A cutover resumed without pins fails its check
+  before the stop; one whose source was already stopped is rolled back (§26.5).
+* **0.4.0's link keys** go with the first 0.5.0 run on each host pair (§26.6). A link an operator made by hand stays
+  the operator's to remove; Operations.md says so.
+
+### 26.9 Validation
+
+* **In the test process:** a real `sshd` on 127.0.0.1 with host keys the test made shows that a pinned key connects,
+  and that another key, an unknown alias and a refused link fail at once with their reasons; the gate's parser meets
+  each refused form; console texts with one block, none, two that disagree and fingerprints alone; the executor's
+  known_hosts file and inventory arguments.
+* **Lab cases** (proposed; QASuite with ST8, their results with ST9), on the images of §21.6:
+  * LAB-SSH01 (S-10): a rogue sshd with another key at a conversion host's address is refused before any data moves,
+    in a cutover before the stop;
+  * LAB-SSH02: each image presents its injected key (and which other types);
+  * LAB-SSH03: each image's console block: present, parsable, how soon after boot, still there after a reboot;
+  * LAB-SSH04 (S-11): with a run's link key, `ssh <source> id`, a shell, `scp` and a forward to another port are
+    refused, the run's forwards and sender work, the entry is gone after the run, an expired entry is refused;
+  * LAB-SSH05: the address the source host sees for the destination host with floating IPs, a routed management
+    network and router SNAT (`from=`);
+  * LAB-SSH06: an upgrade from 0.4.0 with pre-staged plans: pins from the consoles, the old link keys removed, a host
+    without the block blocked until its key is declared;
+  * LAB-SSH07: a VMware migration whose destination host is pinned by declared keys, then by its console;
+  * LAB-SSH08: a conversion host deleted and created again under its name and address is refused as replaced until a
+    pre-staging creates and pins it.
+* **The open questions the lab closes:** the images' key types and console blocks; the address `from=` meets; a
+  policy that limits `os-getConsoleOutput`, a driver without a console log; brought source hosts whose sshd reads no
+  `~/.ssh/authorized_keys`; virtio-scsi hosts, whose disks show no serial for the gate; RHEL 9's OpenSSH.
+
+### 26.10 Owner decisions
+
+The owner took each default as written on 2026-10-23 (D8):
+
+1. **The release: 0.5.0,** with the LAB-SSH cases a gate of the release, not a Technology Preview label: the change
+   touches every migration's data path. Should the lab not run before 0.5.0, the release ships the setting off by
+   default and turns it on in the next one. Security.md and D8 planned the work for 0.2.0, and no release did it.
+2. **The key source: injected for the hosts Seamless creates, the console for the others, declared keys over both.**
+   Injection depends neither on the image's console nor on the console policy, needs no wait and no parsing, and
+   gives the key to no reader who could not impersonate the host anyway. The console serves the hosts Seamless did
+   not create.
+3. **`StrictHostKeyChecking=yes` at once, no `accept-new` phase** (§26.8).
+4. **Pins per conversion host, on its provider, with a known_hosts file per run** (§26.4), rather than files in a
+   plan's pre-staging data: a host serves many plans, and the pin outlives the data volume.
+5. **A link key per run,** made on the destination host, held to the gate, `from=`, `expiry-time` and the run's own
+   ports. The alternative, one restricted key per host pair with `permitopen="127.0.0.1:*"`, is simpler but lets the
+   destination host reach every export on the source host for as long as the plans run.
+6. **The warm sender through the gate,** which keeps blocksync's protocol over SSH's standard input and output. The
+   alternative, a link that only forwards (`ssh -W` to a sender the control plane starts on a loopback port), needs a
+   listening sender and an authenticated handshake: a change of §6.2's protocol.
+7. **Hosts Seamless did not create: declared keys or the console, never trust on first use;** the blocker otherwise.
+   An operator who brings a host can read its key out of band.
+8. **`SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` kept, `true` by default, for every hop.** `false` stays as the way out, with
+   the warning finding. A new name would break the installs' environment files for little.
+9. **The two events and the two findings** of §26.5: a refused key is a security event an operator should see.
+10. **R-02 joined to the gate's task:** the gate runs the helper script by its path, so the private 0700 directory and
+    the SHA-256 check before `sudo python3` (C3-07) belong with it.
+
+### 26.11 Contract changes (each binding from its plan task)
+
+| Change | Where | Task |
+|---|---|---|
+| PRD: NFR-06 names the pinned host keys and the restricted link, a 0.5.0 row; D8 decided | PRD, §20 | ST1 |
+| `ConversionHostConfig.ssh_host_keys`; the provider's pin; the console parser and the provider check's pinning; `conversion_host.key_pinned` | §4.2, §4.3, §10, §12 | ST2 |
+| the collection's known_hosts variable and module option, `RemoteShell`'s options, the inventory's common arguments, a refusal as a permanent error | §6.4, §6.5, §6.6 | ST3 |
+| the injected host key at creation (`userdata`, `no_log`), the role's report of the servers it created | §6.5 | ST4 |
+| the executor: host key pairs for pre-staging, pins recorded, the run's known_hosts, `ANSIBLE_HOST_KEY_CHECKING=True`, refusals classified, `conversion_host.key_refused` | §4.3, §7.2 | ST5 |
+| the link: the per-run key, the source host's entry, the gate (§6.2), the probe before the stop, the forward to `127.0.0.1`, the leftovers and 0.4.0's link removed, the content install's sshd settings; R-02 if decided | §6.2, §6.4, §6.5, §6.6, §7.2 | ST6 |
+| the two findings; the setting's new default, once every hop is pinned; the dashboard: the provider page's pin and fingerprints, the form's declared keys, the findings' catalog | §9.3, §15.1, §16 | ST7 |
+| QASuite (S-10, S-11, the NFR-06 row, the LAB-SSH cases); Security.md (§6.3, §6.4, §7.1, SEC-02, SEC-06, SEC-11, C3-01, C3-06, C3-07, R-02); Operations.md (the upgrade, declaring a key, a refused key) | QASuite, Security.md, Operations.md | ST8 |
+| the lab: LAB-SSH01–LAB-SSH08 | QASuite §13 | ST9 |
