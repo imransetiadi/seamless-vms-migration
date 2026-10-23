@@ -59,6 +59,15 @@ options:
       - The SSH user to connect to the conversion hosts.
     required: true
     type: str
+  ssh_known_hosts:
+    description:
+      - A known_hosts file that pins the conversion hosts' keys under their aliases,
+        C(os_migrate_conv_src) and C(os_migrate_conv_dst) (Seamless Migrate SDD 6.6).
+        With it, ssh and scp to the conversion host check its key strictly, and a
+        refused key fails the module at once.
+      - Unset or empty, the module connects as upstream does (C(StrictHostKeyChecking=no)).
+    required: false
+    type: path
   src_ssh_user:
     description:
       - The SSH user the destination conversion host logs in to the source conversion host as,
@@ -239,6 +248,7 @@ def run_module():
         conversion_host=dict(type="dict", required=True),
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
+        ssh_known_hosts=dict(type="path", required=False, default=None),
         src_ssh_user=dict(type="str", required=False, default=None),
         state_dir=dict(type="str", required=True),
         src_conversion_host_address=dict(type="str", required=True),
@@ -306,6 +316,7 @@ def run_module():
             log_file=params["log_file"],
             timeout=params["timeout"],
             src_ssh_user=params["src_ssh_user"],
+            ssh_known_hosts=params["ssh_known_hosts"],
         )
         sync_pass = warm_sync.sync(params["pass_kind"])
         block_device_mapping = warm_sync.block_device_mapping()

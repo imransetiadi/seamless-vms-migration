@@ -660,3 +660,17 @@ This project follows a simple changelog to satisfy collection metadata validatio
   else ``os_migrate_conversion_keypair_private_path``: extra vars outrank an
   include's vars, so a playbook that logs in with another key than the extra
   var names it under this name.
+- Pinned conversion host keys (Seamless Migrate SDD 6.4-6.6, plan task ST3):
+  every module that reaches a conversion host over SSH takes
+  ``ssh_known_hosts``, a known_hosts file that pins the hosts' keys under
+  their inventory names, ``os_migrate_conv_src`` and ``os_migrate_conv_dst``;
+  the roles pass ``os_migrate_conversion_host_known_hosts`` as it. With it,
+  ssh and scp check the host's key with ``StrictHostKeyChecking=yes`` against
+  that file alone (``HostKeyAlias``, the pinned keys' ``HostKeyAlgorithms``,
+  an RSA key's as ``rsa-sha2-512,rsa-sha2-256``), and ``conv_host_inventory.yml``
+  gives Ansible the same options in ``ansible_ssh_common_args`` with
+  ``ansible_ssh_host_key_checking: true``, without the extra arguments'
+  ``StrictHostKeyChecking=no``. A refused key - or a link the source host
+  refuses - fails the module at once with "host key refused: ..." or "link
+  refused by the source conversion host (...): ...", never as an outage waited
+  out for 15 minutes. Unset or empty, everything is as before.

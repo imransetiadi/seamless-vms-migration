@@ -87,6 +87,15 @@ options:
       - Provided by the import_workloads_export_volumes module.
     required: true
     type: str
+  ssh_known_hosts:
+    description:
+      - A known_hosts file that pins the conversion hosts' keys under their aliases,
+        C(os_migrate_conv_src) and C(os_migrate_conv_dst) (Seamless Migrate SDD 6.6).
+        With it, ssh and scp to the conversion host check its key strictly, and a
+        refused key fails the module at once.
+      - Unset or empty, the module connects as upstream does (C(StrictHostKeyChecking=no)).
+    required: false
+    type: path
   src_ssh_user:
     description:
       - The SSH user the destination conversion host logs in to the source conversion host as,
@@ -276,6 +285,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     OpenstackVolumeTransfer,
     DEFAULT_TIMEOUT,
     DiskIdentityError,
+    SshRefused,
     volume_or_none,
 )
 
@@ -305,6 +315,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         preserve_volume_type=False,
         warm_state_dir=None,
         src_ssh_user=None,
+        ssh_known_hosts=None,
     ):
 
         super().__init__(
@@ -319,6 +330,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
             timeout=timeout,
             preserve_volume_type=preserve_volume_type,
             src_ssh_user=src_ssh_user,
+            ssh_known_hosts=ssh_known_hosts,
         )
 
         # Required unique parameters:
@@ -566,6 +578,7 @@ def run_module():
         conversion_host=dict(type="dict", required=True),
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
+        ssh_known_hosts=dict(type="path", required=False, default=None),
         src_ssh_user=dict(type="str", required=False, default=None),
         transfer_uuid=dict(type="str", required=True),
         src_conversion_host_address=dict(type="str", required=True),
@@ -621,27 +634,28 @@ def run_module():
     if use_nbdkit_direct and not nbdkit_disks and not nbdkit_socket_uri:
         module.fail_json(msg="nbdkit_disks or nbdkit_socket_uri is required when use_nbdkit_direct is true")
 
-    destination_host = OpenStackDestinationVolume(
-        conn,
-        destination_conversion_host_id,
-        ssh_key_path,
-        ssh_user,
-        transfer_uuid,
-        source_conversion_host_address,
-        volume_map,
-        ser_server,
-        destination_conversion_host_address=destination_conversion_host_address,
-        state_file=state_file,
-        log_file=log_file,
-        timeout=timeout,
-        use_nbdkit_direct=use_nbdkit_direct,
-        nbdkit_socket_uri=nbdkit_socket_uri,
-        nbdkit_export_name=nbdkit_export_name,
-        preserve_volume_type=module.params["preserve_volume_type"],
-        warm_state_dir=module.params["warm_state_dir"],
-        src_ssh_user=module.params["src_ssh_user"],
-    )
     try:
+        destination_host = OpenStackDestinationVolume(
+            conn,
+            destination_conversion_host_id,
+            ssh_key_path,
+            ssh_user,
+            transfer_uuid,
+            source_conversion_host_address,
+            volume_map,
+            ser_server,
+            destination_conversion_host_address=destination_conversion_host_address,
+            state_file=state_file,
+            log_file=log_file,
+            timeout=timeout,
+            use_nbdkit_direct=use_nbdkit_direct,
+            nbdkit_socket_uri=nbdkit_socket_uri,
+            nbdkit_export_name=nbdkit_export_name,
+            preserve_volume_type=module.params["preserve_volume_type"],
+            warm_state_dir=module.params["warm_state_dir"],
+            src_ssh_user=module.params["src_ssh_user"],
+            ssh_known_hosts=module.params["ssh_known_hosts"],
+        )
         destination_host.transfer_exports()
     except DiskIdentityError as err:
         # by its own message, as the export reports its own: the message is what the control
@@ -649,6 +663,10 @@ def run_module():
         # would have this permanent failure retried; every other error leaves the module as
         # before (Seamless Migrate SDD 6.6, review RV15-01)
         module.fail_json(msg=str(err), exception=traceback.format_exc())
+    except SshRefused as err:
+        # a refused host key or link, by its own message: never a traceback, which shows a
+        # call's arguments - "timeout" among them - on Python 3.13 and later (SDD 6.6)
+        module.fail_json(msg=str(err))
 
     block_device_mapping = []
     for path in sorted(destination_host.volume_map.keys()):

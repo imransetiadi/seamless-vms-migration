@@ -85,6 +85,15 @@ options:
       - The SSH user to connect to the conversion hosts.
     required: true
     type: str
+  ssh_known_hosts:
+    description:
+      - A known_hosts file that pins the conversion hosts' keys under their aliases,
+        C(os_migrate_conv_src) and C(os_migrate_conv_dst) (Seamless Migrate SDD 6.6).
+        With it, ssh and scp to the conversion host check its key strictly, and a
+        refused key fails the module at once.
+      - Unset or empty, the module connects as upstream does (C(StrictHostKeyChecking=no)).
+    required: false
+    type: path
   transfer_uuid:
     description:
       - A UUID used to keep track of this tranfer's resources on the conversion hosts.
@@ -163,6 +172,8 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
 class OpenStackDstFailureCleanup(OpenStackVolumeBase):
     """Removes volumes after a failed migration from the destination cloud."""
 
+    SIDE = "destination"
+
     def __init__(
         self,
         openstack_connection,
@@ -174,6 +185,7 @@ class OpenStackDstFailureCleanup(OpenStackVolumeBase):
         state_file=None,
         log_file=None,
         timeout=DEFAULT_TIMEOUT,
+        ssh_known_hosts=None,
     ):
 
         super().__init__(
@@ -185,6 +197,7 @@ class OpenStackDstFailureCleanup(OpenStackVolumeBase):
             state_file=state_file,
             log_file=log_file,
             timeout=timeout,
+            ssh_known_hosts=ssh_known_hosts,
         )
         self.volume_map = volume_map
 
@@ -281,6 +294,7 @@ def run_module():
         conversion_host=dict(type="dict", required=True),
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
+        ssh_known_hosts=dict(type="path", required=False, default=None),
         transfer_uuid=dict(type="str", required=True),
         volume_map=dict(type="dict", default=None),
         warm_state_dir=dict(type="str", default=None),
@@ -342,6 +356,7 @@ def run_module():
             state_file=state_file,
             log_file=log_file,
             timeout=timeout,
+            ssh_known_hosts=module.params["ssh_known_hosts"],
         )
         result["volumes_left"] = failure_cleanup.delete_migrated_volumes()
     except Exception as err:  # pylint: disable=broad-except

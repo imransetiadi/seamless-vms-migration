@@ -685,9 +685,12 @@ class ShellFactory:
         self.val = val
         self.shells = []
 
-    def __call__(self, address, ssh_user, key_path=None):
+    def __call__(self, address, ssh_user, key_path=None, **pin):
         cloud = next(c for c in self.clouds if address in c.addresses)
         shell = FakeShell(cloud, address, ssh_user, key_path, receive=self.receive, val=self.val)
+        # what a pinned module gives RemoteShell: known_hosts, side, server (Seamless Migrate
+        # SDD 6.6); {} for a module without ssh_known_hosts, which passes upstream's three
+        shell.pin = pin
         self.shells.append(shell)
         return shell
 

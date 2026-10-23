@@ -76,6 +76,15 @@ options:
       - Provided by the import_volumes_export_volumes module.
     required: true
     type: str
+  ssh_known_hosts:
+    description:
+      - A known_hosts file that pins the conversion hosts' keys under their aliases,
+        C(os_migrate_conv_src) and C(os_migrate_conv_dst) (Seamless Migrate SDD 6.6).
+        With it, ssh and scp to the conversion host check its key strictly, and a
+        refused key fails the module at once.
+      - Unset or empty, the module connects as upstream does (C(StrictHostKeyChecking=no)).
+    required: false
+    type: path
   src_ssh_user:
     description:
       - The SSH user the destination conversion host logs in to the source conversion host as,
@@ -199,6 +208,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         log_file=None,
         timeout=DEFAULT_TIMEOUT,
         src_ssh_user=None,
+        ssh_known_hosts=None,
     ):
 
         super().__init__(
@@ -212,6 +222,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
             log_file=log_file,
             timeout=timeout,
             src_ssh_user=src_ssh_user,
+            ssh_known_hosts=ssh_known_hosts,
         )
 
         # Required unique parameters:
@@ -246,6 +257,7 @@ def run_module():
         conversion_host=dict(type="dict", required=True),
         ssh_key_path=dict(type="str", required=True, no_log=True),
         ssh_user=dict(type="str", required=True),
+        ssh_known_hosts=dict(type="path", required=False, default=None),
         src_ssh_user=dict(type="str", required=False, default=None),
         transfer_uuid=dict(type="str", required=True),
         src_conversion_host_address=dict(type="str", required=True),
@@ -295,6 +307,7 @@ def run_module():
         log_file=log_file,
         timeout=timeout,
         src_ssh_user=module.params["src_ssh_user"],
+        ssh_known_hosts=module.params["ssh_known_hosts"],
     )
     destination_host.transfer_exports()
     result["volume_map"] = destination_host.volume_map
