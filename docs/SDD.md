@@ -1195,6 +1195,13 @@ either can carry an injected private key back. Ansible reads the private half on
 (`lookup('file')`); `ssh-keygen -y` prints the public half alone. No fact holds it, and no task prints it, nor the
 server task's registered result, at any verbosity. A failure of either task prints no detail.
 
+A server keeps its user data for its life (§26.3), so the collection's other reads of a conversion host's server
+hold it too. `os_conversion_host_info` names a host it fails on - one without an address - by its name and id alone,
+never by the server's text. `conv_host_inventory.yml`'s lookup (`server_info`) prints its result only at `-v`. The
+control plane runs no playbook verbose: the executor passes no `-v` and keeps `ANSIBLE_VERBOSITY` out of a
+playbook's environment (`ansible_env`, §7.2), so no run's log holds a host's user data. A playbook run by hand at
+`-v` with an admin credential prints it, as the API shows it to that admin.
+
 **The report** (§26.3, §26.4, plan task ST4). After each server task the role writes
 `{{ os_migrate_data_dir }}/conversion/hosts.json`, beside its keys (`ssh.key`, `link-ssh.key` by default), 0600 in a
 0700 folder: each server the playbook run's role created and each it found, in plain JSON, with no key material:
