@@ -1079,6 +1079,35 @@ plane sets it to `true` whenever `plan.mappings.volume_types` is non-empty — `
 rewritten every volume type to a RHOSO type, and preflight has verified each disk's type is mapped or
 exists on the destination (`MAP_VOLUME_TYPE_MISSING`).
 
+**The extent query** (§28.4, plan task CE3). `plugins/module_utils/extents.py`'s `query_extents` lists the extents of
+a Cinder RBD volume that changed between two of Cinder's snapshots of it - the base and the current pass's - on the
+source conversion host, through the module's `RemoteShell` (§6.6): `rbd --id <client> --conf <dir>/ceph.conf
+--keyring <dir>/keyring diff --from-snap snapshot-<base> --whole-object --format json
+<pool>/volume-<name_id>@snapshot-<current>`. The image is named by the volume's `name_id` (`volume_name_template`; the
+caller passes the volume's id when Cinder shows none), each snapshot by its Cinder id (`snapshot_name_template`). Every
+word is quoted for the remote shell, and a word rbd could misread - a pool, `name_id` or snapshot id other than a
+letter or digit followed by letters, digits, `.`, `-` and `_`, a client outside §28.4's pattern - or a base that is the
+current snapshot, whose diff lists nothing, fails the query before anything runs. For each query the module makes a
+fresh directory `/tmp/seamless-extents-<random>` with `mkdir -m 0700`, copies the run's `ceph.conf` and keyring - local
+0600 files the caller names - into it with scp, and runs rbd in `sh -c` under `timeout -k 10 <timeout>` (`timeout`
+300 s by default): rbd reads those two files alone, never `/etc/ceph`; its standard error is discarded on the host,
+where Ceph prints a key it cannot parse ("error setting modifier ... val=..."); and the shell removes the directory as
+rbd ends, so a module killed during the query leaves no key behind. The module waits for the answer at most 30 s
+longer than `timeout`, then removes the directory itself, also when the query failed, timed out or never ran (a copy
+that failed). rbd's JSON list of `{offset, length, exists}` (`exists` the string `"true"` or `"false"`) becomes
+`[offset, length]` pairs, sorted, those that overlap or touch merged: what blocksync's `--extents` takes (§6.2, plan
+task CE2), which lists every chunk an extent touches; with `--whole-object` an extent covers whole RBD objects, 4 MiB
+by default as blocksync's chunk. A zeroed extent (`exists` false) is kept like a data extent: it is read like the
+others, which sends a zero frame. A non-zero exit, output that is not such a list, an extent that ends beyond the
+volume's size (Cinder's, in GiB) or the timeout fails the query as a reason, never an exception - `{"extents": null,
+"reason": "query_failed", "query_s": s}`, its cause logged as a warning -, where a query that succeeded returns
+`{"extents": [[offset, length], ...], "reason": null, "query_s": s}`, an empty list when nothing changed: a caller reads
+`reason`, not the list. `s` is the query's seconds, its copies and removal included (`ExtentUse.reason` and `query_s`,
+§28.5). A refused host key is no failure of tracking: `HostKeyRefused` propagates and fails the module at once, as from
+every other SSH use of a module (§26.5: a refused key is never accepted, and may be an attack the run reports); a
+pinned host's key is checked before the keyring is copied. No key reaches a log line, the result, an exception or a
+command line: the module never reads the keyring, whose key stays in the copied files.
+
 Common module options follow the existing conventions (`cloud`, `validate_certs`, `ca_cert`,
 `client_cert`, `client_key`, `data`, `conversion_host`, `ssh_key_path`, `ssh_user`,
 `transfer_uuid`, `log_file`, `state_file`, `timeout`) plus `state_dir`, `chunk_size`
