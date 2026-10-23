@@ -730,10 +730,10 @@ def test_digests_are_fips_tolerant(monkeypatch):
         return real(*args, **kwargs)
 
     def fips(*args, **kwargs):  # FIPS mode: BLAKE2 only when not for security
-        seen.append(kwargs)
-        if kwargs.get("usedforsecurity", True):
+        seen.append(dict(kwargs))
+        if kwargs.pop("usedforsecurity", True):
             raise ValueError("[digital envelope routines] unsupported")
-        return real(*args, **kwargs)
+        return real(*args, **kwargs)  # the kwarg is the fake's: Python < 3.9 refuses it
 
     for fake_blake2b in (without_kwarg, fips):
         monkeypatch.setattr(blocksync.hashlib, "blake2b", fake_blake2b)
