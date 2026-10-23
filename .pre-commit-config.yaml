@@ -28,7 +28,7 @@ repos:
         args: [--config=.gitleaks.toml, --redact]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.10  # the ruff line pyproject's dev extra pins: one formatter style for hook, venv and CI
+    rev: v0.17.2  # the ruff line pyproject's dev extra pins: one formatter style for hook, venv and CI
     hooks:
       - id: ruff
         files: ^seamless/
