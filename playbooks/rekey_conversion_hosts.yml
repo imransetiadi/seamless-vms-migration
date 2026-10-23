@@ -1,0 +1,69 @@
+---
+# Seamless Migrate (SDD 7.2 "Conversion key", issue #112). Runs before deploy_conversion_hosts.yml
+# for each side whose os_migrate_conv keypair holds an older plan's key: the side named by
+# os_migrate_{src,dst}_conversion_rekey_private_path, that plan's private key. Its conversion host
+# is found by name, as the deploy finds it, and logged in to with the old key, which
+# conv_host_inventory.yml takes as os_migrate_conversion_host_inventory_private_path: a name
+# extra vars never set, since they outrank an include's vars and carry the installation's key.
+# The installation's public key (os_migrate_conversion_keypair_private_path + '.pub') is then
+# appended to the host's SSH user's authorized_keys; the old key stays authorized. The deploy
+# replaces the side's keypair afterwards (os_migrate_{src,dst}_conversion_keypair_state: replace).
+- name: Find the conversion hosts to re-key
+  hosts: migrator
+  environment:
+    OS_CLIENT_CONFIG_FILE: "{{ os_migrate_clouds_path | default(os_migrate_data_dir ~ '/clouds.yaml') }}"
+  any_errors_fatal: true
+  tasks:
+    - name: Add the src conversion host, reached with the key its keypair holds
+      ansible.builtin.include_role:
+        name: os_migrate.os_migrate.conversion_host
+        tasks_from: conv_host_inventory.yml
+      vars:
+        inventory_name: os_migrate_conv_src
+        inventory_group: conversion_hosts_src
+        os_migrate_conversion_host_name: "{{ os_migrate_src_conversion_host_name }}"
+        os_migrate_conversion_cloud: src
+        os_migrate_conversion_validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+        os_migrate_conversion_ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+        os_migrate_conversion_client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+        os_migrate_conversion_client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+        os_migrate_conversion_host_inventory_ssh_user: "{{ os_migrate_src_conversion_host_ssh_user }}"
+        os_migrate_conversion_host_inventory_private_path: "{{ os_migrate_src_conversion_rekey_private_path }}"
+        # a host gone needs no re-key: the deploy creates it with the installation's key
+        ignore_missing_conversion_hosts: true
+      when: os_migrate_src_conversion_rekey_private_path is defined
+
+    - name: Add the dst conversion host, reached with the key its keypair holds
+      ansible.builtin.include_role:
+        name: os_migrate.os_migrate.conversion_host
+        tasks_from: conv_host_inventory.yml
+      vars:
+        inventory_name: os_migrate_conv_dst
+        inventory_group: conversion_hosts_dst
+        os_migrate_conversion_host_name: "{{ os_migrate_dst_conversion_host_name }}"
+        os_migrate_conversion_cloud: dst
+        os_migrate_conversion_validate_certs: "{{ os_migrate_dst_validate_certs | default(omit) }}"
+        os_migrate_conversion_ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
+        os_migrate_conversion_client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
+        os_migrate_conversion_client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
+        os_migrate_conversion_host_inventory_ssh_user: "{{ os_migrate_dst_conversion_host_ssh_user }}"
+        os_migrate_conversion_host_inventory_private_path: "{{ os_migrate_dst_conversion_rekey_private_path }}"
+        ignore_missing_conversion_hosts: true
+      when: os_migrate_dst_conversion_rekey_private_path is defined
+
+- name: Authorize the installation's conversion key beside the old one
+  hosts: conversion_hosts
+  any_errors_fatal: true
+  tasks:
+    - name: Ensure .ssh exists
+      ansible.builtin.file:
+        path: "{{ ansible_env['HOME'] }}/.ssh"
+        state: directory
+        mode: "0700"
+
+    - name: Add the installation's conversion key to the authorized keys
+      ansible.builtin.lineinfile:
+        path: "{{ ansible_env['HOME'] }}/.ssh/authorized_keys"
+        line: "{{ lookup('file', os_migrate_conversion_keypair_private_path + '.pub') }}"
+        create: true
+        mode: "0600"

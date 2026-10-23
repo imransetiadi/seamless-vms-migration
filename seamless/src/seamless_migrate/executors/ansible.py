@@ -29,6 +29,7 @@ import yaml
 
 from ..ai.redaction import redact_cut, redact_tail
 from ..config import Settings
+from ..conversion_key import installation_key, run_key
 from ..domain.enums import ProviderKind, Strategy, SyncPassKind
 from ..domain.fsm import source_stopped
 from ..domain.models import (
@@ -571,11 +572,14 @@ def run_dir(settings: Settings, plan_id: str, migration_id: str) -> Path:
 
 
 def _common_openstack_vars(
-    source: Provider, destination: Provider, osm: Path, plan_osm: Path
+    source: Provider, destination: Provider, osm: Path, plan_osm: Path, conversion_key: Path
 ) -> dict[str, Any]:
     out: dict[str, Any] = {
         "os_migrate_data_dir": str(osm),
-        "os_migrate_conversion_keypair_private_path": str(plan_osm / "conversion" / "ssh.key"),
+        # the installation's, the one key the managed hosts accept - a run's, until it exists, the
+        # key an earlier version made for its plan -; the link key is the plan's (SDD §7.2
+        # "Conversion key", issue #112)
+        "os_migrate_conversion_keypair_private_path": str(conversion_key),
         "os_migrate_conversion_link_keypair_private_path": str(
             plan_osm / "conversion" / "link-ssh.key"
         ),
@@ -656,7 +660,11 @@ def build_vars(
             out["flavor_uuid"] = flavor
         return out
     out = _common_openstack_vars(
-        ctx.source, ctx.destination, rdir / "osm", plan_dir(ctx.settings, ctx.plan.id) / "osm"
+        ctx.source,
+        ctx.destination,
+        rdir / "osm",
+        plan_dir(ctx.settings, ctx.plan.id) / "osm",
+        run_key(ctx.settings, ctx.plan.id),
     )
     out["os_migrate_workloads_filter"] = workload_filter(m.vm.name)
     out["os_migrate_workload_stop_before_migration"] = (
@@ -787,13 +795,12 @@ def build_inventory(ctx: StepContext) -> str:
     """Inventory: ``migrator`` (local); VMware adds the RHOSO ``conversion_host``.
 
     The host is reached with the ``ssh_key_secret`` key when configured (the kit has no
-    prestage step that could generate one), else with the plan's conversion keypair.
+    prestage step that could generate one), else with the installation's conversion key (SDD
+    §7.2 "Conversion key").
     """
     host = ctx.destination.conversion_host
     if ctx.migration.strategy in VMWARE and host is not None and host.address:
-        key = conversion_key_path(ctx) or (
-            plan_dir(ctx.settings, ctx.plan.id) / "osm" / "conversion" / "ssh.key"
-        )
+        key = conversion_key_path(ctx) or run_key(ctx.settings, ctx.plan.id)
         return _inventory(
             {
                 host.address: {
@@ -1176,9 +1183,17 @@ class AnsibleExecutor:
         deploy_conversion_hosts: bool | None = None,
         prestage_flavors: list[str] | None = None,
         prestage_keypairs: list[str] | None = None,
+        rekey_conversion_hosts: Mapping[str, Path | str] | None = None,
     ) -> None:
+        """Pre-stage the plan's resources, then deploy the conversion hosts - first re-keying
+        each side ``rekey_conversion_hosts`` names, logged in to with the earlier plan's key its
+        keypair holds (SDD §7.2 "Conversion key")."""
         if source.kind == ProviderKind.vmware:
             return  # the kit prepares its own conversion host
+        rekey = dict(rekey_conversion_hosts or {})
+        unknown = sorted(set(rekey) - {"src", "dst"})
+        if unknown:
+            raise PermanentStepError(f"no conversion host side is called {unknown!r}")
         pdir = plan_dir(self.settings, plan.id)
         osm = pdir / "osm"
         playbooks: list[_Playbook] = []
@@ -1195,9 +1210,21 @@ class AnsibleExecutor:
         if deploy_conversion_hosts is None:
             hosts = [source.conversion_host, destination.conversion_host]
             deploy_conversion_hosts = all(hosts) and any(h.manage for h in hosts if h)
+        if deploy_conversion_hosts and rekey:
+            # the hosts must accept the installation's key before the deploy logs in with it
+            playbooks.append(_Playbook("rekey_conversion_hosts.yml"))
         if deploy_conversion_hosts:
             playbooks.append(_Playbook("deploy_conversion_hosts.yml"))
-        variables = _common_openstack_vars(source, destination, osm, osm)
+        # a pre-staging always passes the installation's key: the orchestrator resolved it, and
+        # the deploy generates it when none exists yet (SDD §7.2)
+        variables = _common_openstack_vars(
+            source, destination, osm, osm, installation_key(self.settings)
+        )
+        if deploy_conversion_hosts:
+            for side, old_key in sorted(rekey.items()):
+                variables[f"os_migrate_{side}_conversion_rekey_private_path"] = str(old_key)
+                # the deploy's keypair task replaces the key the side's keypair holds
+                variables[f"os_migrate_{side}_conversion_keypair_state"] = "replace"
         for key, names in (
             ("os_migrate_flavors_filter", prestage_flavors),
             ("os_migrate_keypairs_filter", prestage_keypairs),

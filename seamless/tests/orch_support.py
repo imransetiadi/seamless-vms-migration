@@ -27,9 +27,21 @@ from seamless_migrate.providers.base import VMNotFound
 from seamless_migrate.store import Store
 
 
-class StaticSource:
+class _Keypairs:
+    """The public keys of the credential's user's keypairs, by name (SDD §10): none unless a test
+    gives some - the os_migrate_conv one a pre-staging resolves the conversion key with (§7.2)."""
+
+    keypairs: dict[str, str]
+
+    async def keypair_public_key(self, name: str) -> str | None:
+        # a subclass whose __init__ sets none holds no keypair
+        return (getattr(self, "keypairs", None) or {}).get(name)
+
+
+class StaticSource(_Keypairs):
     def __init__(self, vms: list[VMRef]) -> None:
         self.vms = {vm.source_id: vm for vm in vms}
+        self.keypairs = {}
 
     async def check(self) -> dict[str, Any]:
         return {"admin": True, "compute_microversion": "2.88", "ovn": True}
@@ -46,8 +58,9 @@ class StaticSource:
         return SourceInventory(networks={"app-net": 1500}, projects=["finance"])
 
 
-class StaticDestination:
+class StaticDestination(_Keypairs):
     def __init__(self) -> None:
+        self.keypairs = {}
         self.status = "ACTIVE"
         self.console: str | None = "[  OK  ] Reached target Multi-User System.\nweb-01 login: "
         self.deleted: list[str] = []

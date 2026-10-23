@@ -638,3 +638,25 @@ This project follows a simple changelog to satisfy collection metadata validatio
   re-entrant alias fix (bug 2046838) that the os-migrate fork's 4.5.1 tag
   carried, so no requirement installs from a git URL any more (Security.md
   SEC-09). openstacksdk 4.21.0 needs Python 3.11 or later.
+- ``deploy_conversion_hosts.yml`` takes ``os_migrate_src_conversion_keypair_state``
+  and ``os_migrate_dst_conversion_keypair_state`` (default ``present``), which
+  the ``conversion_host`` role's keypair task takes as
+  ``os_migrate_conversion_keypair_state``: ``replace`` replaces a keypair of
+  the name that holds another public key, where ``present`` fails with "Key
+  name os_migrate_conv present but key hash not the same as offered".
+- New ``rekey_conversion_hosts.yml``: for each side named by
+  ``os_migrate_src_conversion_rekey_private_path`` or
+  ``os_migrate_dst_conversion_rekey_private_path`` (the private key that
+  side's conversion host accepts today), it finds the host by name as the
+  deploy does, logs in with that key and appends the public key of
+  ``os_migrate_conversion_keypair_private_path`` to its SSH user's
+  ``authorized_keys``, keeping the old line; a host that is gone is skipped.
+  Seamless Migrate runs it right before ``deploy_conversion_hosts.yml``, with
+  ``replace`` for those sides, so a conversion host an earlier plan's key
+  deployed takes the installation's one conversion key without being
+  recreated (Seamless Migrate SDD 7.2, issue #112).
+- ``conv_host_inventory.yml`` gives a conversion host
+  ``os_migrate_conversion_host_inventory_private_path`` as its key when set,
+  else ``os_migrate_conversion_keypair_private_path``: extra vars outrank an
+  include's vars, so a playbook that logs in with another key than the extra
+  var names it under this name.

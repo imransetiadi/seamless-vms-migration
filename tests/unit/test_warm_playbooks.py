@@ -990,6 +990,9 @@ def test_the_conversion_hosts_inventory_gives_each_host_its_sides_user(env):
             "    - ansible.builtin.debug:\n"
             "        msg: \"USERS {{ hostvars['os_migrate_conv_src'].ansible_ssh_user }} "
             "{{ hostvars['os_migrate_conv_dst'].ansible_ssh_user }}\"\n"
+            "    - ansible.builtin.debug:\n"
+            "        msg: \"KEYS {{ hostvars['os_migrate_conv_src'].ansible_ssh_private_key_file }} "
+            "{{ hostvars['os_migrate_conv_dst'].ansible_ssh_private_key_file }}\"\n"
         )
     rc, out, calls = env.run(
         "inventory_users",
@@ -999,3 +1002,73 @@ def test_the_conversion_hosts_inventory_gives_each_host_its_sides_user(env):
     )
     assert rc == 0, out
     assert "USERS cloud-user ubuntu" in out
+    # no re-key: both hosts are reached with the conversion key itself (Seamless Migrate SDD 7.2)
+    key = os.path.join(env.root, "conv.key")
+    assert "KEYS %s %s" % (key, key) in out
+
+
+# --- the re-key of a conversion host an older plan's key reaches (Seamless Migrate SDD 7.2) -----
+
+REKEY_REPORT = """---
+- name: Re-key
+  ansible.builtin.import_playbook: rekey_conversion_hosts.yml
+
+- name: Report the hosts the re-key reached and the key each was reached with
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Report them
+      ansible.builtin.debug:
+        msg: "REKEYED {{ groups['conversion_hosts'] | default([]) | sort
+          | map('extract', hostvars, 'ansible_ssh_private_key_file') | join(' ') }}"
+"""
+
+
+def test_the_rekey_authorizes_the_installation_key_beside_the_old_one(env):
+    """Seamless Migrate SDD 7.2 (issue #112): rekey_conversion_hosts.yml finds each side named for
+    a re-key by its conversion host's name and logs in with that side's old key, which
+    conv_host_inventory.yml gives the host; it appends the installation's public key to the SSH
+    user's authorized_keys and keeps the old line. A side not named is never looked up; one whose
+    host is gone is skipped; a second run adds nothing."""
+    ssh = os.path.join(env.root, "home", ".ssh")
+    os.makedirs(ssh, mode=0o700)
+    authorized = os.path.join(ssh, "authorized_keys")
+    with open(authorized, "w") as f:
+        f.write("ssh-ed25519 placeholder-old seamless@plan-b\n")
+    installation = os.path.join(env.root, "conversion", "ssh.key")
+    os.makedirs(os.path.dirname(installation))
+    with open(installation + ".pub", "w") as f:
+        f.write("ssh-ed25519 placeholder-new seamless@installation\n")
+    with open(os.path.join(env.playbooks, "rekey_report.yml"), "w") as f:
+        f.write(REKEY_REPORT)
+    old = {side: os.path.join(env.root, "plan-%s.key" % side) for side in ("src", "dst")}
+    common = dict(
+        PER_SIDE,
+        os_migrate_src_conversion_host_name="conv-src",
+        os_migrate_dst_conversion_host_name="conv-dst",
+        os_migrate_conversion_keypair_private_path=installation,
+        # the conversion host is this machine: its user's home is the run's HOME
+        ansible_connection="local",
+        ansible_python_interpreter=sys.executable,
+    )
+    lines = ["ssh-ed25519 placeholder-old seamless@plan-b", "ssh-ed25519 placeholder-new seamless@installation"]
+
+    rc, out, calls = env.run("rekey_report", os_migrate_dst_conversion_rekey_private_path=old["dst"], **common)
+    assert rc == 0, out
+    assert '"REKEYED %s"' % old["dst"] in out, out
+    assert [c["args"]["server"] for c in calls if c["module"] == "server_info"] == ["conv-dst*"]
+    with open(authorized) as f:
+        assert f.read().splitlines() == lines
+
+    env.world["server_status"] = {"conv-src*": "MISSING"}
+    rc, out, calls = env.run(
+        "rekey_report",
+        os_migrate_src_conversion_rekey_private_path=old["src"],
+        os_migrate_dst_conversion_rekey_private_path=old["dst"],
+        **common
+    )
+    assert rc == 0, out
+    assert '"REKEYED %s"' % old["dst"] in out, out
+    assert sorted(c["args"]["server"] for c in calls if c["module"] == "server_info") == ["conv-dst*", "conv-src*"]
+    with open(authorized) as f:
+        assert f.read().splitlines() == lines

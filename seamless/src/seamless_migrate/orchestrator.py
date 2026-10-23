@@ -45,6 +45,7 @@ from .ai.recommendations import LEGACY_PREFIX
 from .ai.redaction import redact, redact_cut
 from .ai.snapshots import created_event, decision_event, store_snapshot
 from .config import Settings
+from .conversion_key import resolve as resolve_conversion_key
 from .dns_swap import (
     DnsSwapError,
     backend_for,
@@ -3624,6 +3625,13 @@ class Orchestrator:
                                 if m.vm.key_name and keypair_prestaged(m.vm, plan, src_inv, dst_inv)
                             }
                         )
+                if kwargs.get("deploy_conversion_hosts") and "rekey_conversion_hosts" in params:
+                    # one conversion key per installation: adopt the key the clouds' keypairs
+                    # hold, name the sides to re-key, or refuse before any playbook runs (SDD
+                    # §7.2 "Conversion key", issue #112)
+                    kwargs["rekey_conversion_hosts"] = await resolve_conversion_key(
+                        self.settings, source, destination, self.providers.get
+                    )
                 await executor.prestage(plan, source, destination, **kwargs)
             # SDD §8.3: a keep_address plan reserves its floating IPs' addresses at the destination
             if plan.network_cutover.floating_ips == "keep_address":

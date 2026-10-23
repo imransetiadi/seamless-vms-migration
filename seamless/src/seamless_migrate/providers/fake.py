@@ -498,7 +498,15 @@ class _FloatingIPs:
         self._floating.pop(address, None)
 
 
-class FakeSourceProvider(_FloatingIPs, _DemoOctavia):
+class _NoKeypairs:
+    """A fake's credential's keypairs (SDD §10): the demo's hold none - its simulated executor
+    deploys no conversion host (§7.4), so no conversion key is ever resolved (§7.2)."""
+
+    async def keypair_public_key(self, name: str) -> str | None:
+        return None
+
+
+class FakeSourceProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
     def __init__(self, kind: ProviderKind | str, seed: int = 42) -> None:
         self.kind = ProviderKind(kind)
         self.seed = seed
@@ -734,7 +742,7 @@ class _DestinationCloud:
     )
 
 
-class FakeDestinationProvider(_FloatingIPs, _DemoOctavia):
+class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
     def __init__(self, seed: int = 42, provider: Provider | None = None) -> None:
         self.seed = seed
         #: the demo provider it stands for: its kind, declared series and profile (SDD §10)

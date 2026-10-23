@@ -73,6 +73,7 @@ from seamless_migrate.store import ConflictError, NotFound, Store, UnstorableVal
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_vm
 from tests.jev_fakes import fixture_responder, load_fixture, session_factory, tool_result
+from tests.key_support import fingerprint, installation_key, plan_key, public_key
 from tests.orch_support import (
     DST_PROVIDER,
     SRC_PROVIDER,
@@ -8709,6 +8710,74 @@ async def test_a_prestage_failure_writes_the_status_under_the_plans_lock(tmp_pat
     await _prestage_failure_recorded(h)
     await h.orch.stop()
     assert (await h.plan(plan.id)).status == PlanStatus.failed
+
+
+@dataclasses.dataclass
+class _RekeyRecorder(ScriptedExecutor):
+    """Records what each pre-staging was handed: the sides to re-key, with their old keys."""
+
+    rekeys: list[dict] = dataclasses.field(default_factory=list)
+
+    async def prestage(
+        self,
+        plan,
+        source,
+        destination,
+        *,
+        deploy_conversion_hosts=None,
+        rekey_conversion_hosts=None,
+    ):
+        self.rekeys.append({"deploy": deploy_conversion_hosts, "rekey": rekey_conversion_hosts})
+        self.prestaged.append(plan.id)
+
+
+async def test_a_prestage_hands_the_executor_the_sides_its_conversion_key_rekeys(tmp_path, store):
+    """SDD §7.2 (issue #112): before a pre-staging that deploys conversion hosts the orchestrator
+    reads each managed side's os_migrate_conv keypair through its provider and resolves the
+    conversion key: the source's holds the installation key, the destination's an older plan's,
+    so the executor is handed the destination and that plan's key to re-key it with."""
+    settings = make_settings(tmp_path)
+    executor = _RekeyRecorder(settings)
+    installation_key(settings, 3)
+    old = plan_key(settings, "plan-0000000b", 2)
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    h.source.keypairs["os_migrate_conv"] = public_key(3, "as Nova keeps it")
+    h.destination.keypairs["os_migrate_conv"] = public_key(2)
+    await run_plan(h, plan)
+    deadline = asyncio.get_running_loop().time() + 5
+    while not executor.rekeys:
+        assert asyncio.get_running_loop().time() < deadline, "the plan was never pre-staged"
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert executor.rekeys == [{"deploy": True, "rekey": {"dst": old}}]
+
+
+async def test_a_refused_conversion_key_fails_the_plan_before_the_executor_runs(tmp_path, store):
+    """SDD §7.2, §8 (issue #112): the two sides' keypairs hold different plans' keys and the
+    installation has none yet: the pre-staging fails before the executor runs anything - the plan
+    failed, its event naming both providers' keys and the runbook."""
+    settings = make_settings(tmp_path)
+    executor = _RekeyRecorder(settings)
+    plan_key(settings, "plan-0000000a", 1)
+    plan_key(settings, "plan-0000000b", 2)
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    h.source.keypairs["os_migrate_conv"] = public_key(1)
+    h.destination.keypairs["os_migrate_conv"] = public_key(2)
+    await run_plan(h, plan)
+    await h.wait_plan(plan.id, PlanStatus.failed)
+    [failure] = await _prestage_failure_recorded(h)
+    await h.orch.stop()
+    assert executor.rekeys == []
+    error = failure.data["error"]
+    for part in (SRC_PROVIDER.label, DST_PROVIDER.label, fingerprint(1), fingerprint(2)):
+        assert part in error, error
+    assert "docs/Operations.md §7.1" in error
 
 
 async def test_verification_review_error_is_logged_not_fatal(tmp_path, store, caplog):
