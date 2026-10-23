@@ -798,24 +798,59 @@ def conversion_key_path(ctx: StepContext) -> Path | None:
     return run_dir(ctx.settings, ctx.plan.id, ctx.migration.id) / CONVERSION_KEY_FILE
 
 
-def build_inventory(ctx: StepContext) -> str:
+#: a pinned key type's host key algorithms where they are not the type's own name: an RSA key
+#: signs with SHA-2, never ssh-rsa, which OpenSSH 8.8 and later disable (SDD §6.5, §26.4)
+_HOST_KEY_ALGORITHMS = {"ssh-rsa": ("rsa-sha2-512", "rsa-sha2-256")}
+
+
+def pinned_ssh_args(known_hosts: Path, alias: str, keys: Sequence[str]) -> str:
+    """The ssh options that check a host's key against the run's ``known_hosts`` alone, under
+    ``alias``, as conv_host_inventory.yml gives an OpenStack conversion host (SDD §6.5, §26.4):
+    strict checking, the alias as HostKeyAlias, and the pinned ``keys``' algorithms, each once in
+    the keys' order - none when nothing is pinned."""
+    algorithms: list[str] = []
+    for key in keys:
+        kind = key.split()[0]
+        algorithms += [a for a in _HOST_KEY_ALGORITHMS.get(kind, (kind,)) if a not in algorithms]
+    options = [
+        "StrictHostKeyChecking=yes",
+        f"UserKnownHostsFile={known_hosts}",
+        "GlobalKnownHostsFile=/dev/null",
+        f"HostKeyAlias={alias}",
+        "CheckHostIP=no",
+        "UpdateHostKeys=no",
+        "VerifyHostKeyDNS=no",
+        "HashKnownHosts=yes",
+        *([f"HostKeyAlgorithms={','.join(algorithms)}"] if algorithms else []),
+        "IdentitiesOnly=yes",
+    ]
+    return " ".join(f"-o {option}" for option in options)
+
+
+def build_inventory(ctx: StepContext, trust: _Trust | None = None) -> str:
     """Inventory: ``migrator`` (local); VMware adds the RHOSO ``conversion_host``.
 
     The host is reached with the ``ssh_key_secret`` key when configured (the kit has no
     prestage step that could generate one), else with the installation's conversion key (SDD
-    §7.2 "Conversion key").
+    §7.2 "Conversion key"). Given the run's ``trust`` - host keys checked -, its key is checked
+    against the run's known_hosts under the group's name, as an OpenStack host's is (SDD §7.2
+    "Conversion host keys", §26.7).
     """
     host = ctx.destination.conversion_host
     if ctx.migration.strategy in VMWARE and host is not None and host.address:
         key = conversion_key_path(ctx) or run_key(ctx.settings, ctx.plan.id)
-        return _inventory(
-            {
-                host.address: {
-                    "ansible_ssh_user": host.ssh_user,
-                    "ansible_ssh_private_key_file": str(key),
-                }
-            }
-        )
+        entry: dict[str, Any] = {
+            "ansible_ssh_user": host.ssh_user,
+            "ansible_ssh_private_key_file": str(key),
+        }
+        if trust is not None:
+            keys = [k for h in trust.hosts if h.alias == VMWARE_ALIAS for k in h.keys]
+            entry["ansible_ssh_common_args"] = pinned_ssh_args(
+                trust.known_hosts, VMWARE_ALIAS, keys
+            )
+            # Ansible puts no StrictHostKeyChecking=no of its own before those options
+            entry["ansible_ssh_host_key_checking"] = True
+        return _inventory({host.address: entry})
     return _inventory()
 
 
@@ -1542,7 +1577,7 @@ class AnsibleExecutor:
                 build_vars(step, ctx, network_map),
                 ctx.source,
                 ctx.destination,
-                build_inventory(ctx),
+                build_inventory(ctx, trust),
                 playbooks,
                 ctx,
                 effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings),

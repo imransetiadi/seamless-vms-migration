@@ -6165,3 +6165,71 @@ async def test_a_run_with_pins_checks_host_keys_in_ansible(env, caplog):
         assert known_keys(call["known_hosts"], "os_migrate_conv_src") == [bare_key(public_key(1))]
         assert known_keys(call["known_hosts"], "os_migrate_conv_dst") == [bare_key(public_key(2))]
     assert warnings() == []
+
+
+async def test_the_vmware_inventory_pins_the_conversion_host(env):
+    """SDD §7.2, §26.4, §26.7 (plan task ST5): a VMware kit run reaches the destination's
+    conversion host through the inventory the executor writes. With host keys checked, its
+    conversion_host entry gets what conv_host_inventory.yml gives an OpenStack host -
+    ansible_ssh_common_args with the strict options under the alias conversion_host, the run's
+    known_hosts and the pinned keys' algorithms (an RSA key's SHA-2 ones), and
+    ansible_ssh_host_key_checking, so that Ansible's own StrictHostKeyChecking=no never comes
+    first - and the run's known_hosts holds the host's pin under that alias: the server the
+    provider check finds by its address when no server bears its name. Off, the entry is
+    0.4.0's."""
+    from tests.key_support import rsa_key
+
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    inventory = load_ansible_yaml(read_log(env.log)[-1]["inventory"])
+    entry = inventory["conversion_host"]["hosts"]["192.0.2.10"]
+    assert set(entry) == {"ansible_ssh_user", "ansible_ssh_private_key_file"}
+
+    check_keys(env)
+    env.registry.addresses = {"192.0.2.10": "srv-dst-1"}
+    pin = HostKeyPin(
+        server_id="srv-dst-1",
+        keys=[bare_key(public_key(5)), bare_key(rsa_key(6))],
+        source="console",
+        pinned_at=utcnow(),
+    )
+    destination = hosted(DST, name=None).model_copy(update={"conversion_host_pin": pin})
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        nics=VMW_NICS,
+        destination=destination,
+    )
+    await env.executor.run(StepName.SYNC, ctx)
+    [call] = read_log(env.log)[1:]
+    known = run_dir(env) / "known_hosts"
+    entry = load_ansible_yaml(call["inventory"])["conversion_host"]["hosts"]["192.0.2.10"]
+    assert entry["ansible_ssh_user"] == "cloud-user"
+    assert entry["ansible_ssh_host_key_checking"] is True
+    assert "ansible_ssh_extra_args" not in entry
+    assert entry["ansible_ssh_common_args"].split() == [
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        f"UserKnownHostsFile={known}",
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        "-o",
+        "HostKeyAlias=conversion_host",
+        "-o",
+        "CheckHostIP=no",
+        "-o",
+        "UpdateHostKeys=no",
+        "-o",
+        "VerifyHostKeyDNS=no",
+        "-o",
+        "HashKnownHosts=yes",
+        "-o",
+        "HostKeyAlgorithms=ssh-ed25519,rsa-sha2-512,rsa-sha2-256",
+        "-o",
+        "IdentitiesOnly=yes",
+    ]
+    assert known_keys(call["known_hosts"], "conversion_host") == pin.keys
+    assert call["env"]["ANSIBLE_HOST_KEY_CHECKING"] == "True"
+    assert call["vars"]["os_migrate_conversion_host_known_hosts"] == str(known)
