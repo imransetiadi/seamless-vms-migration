@@ -5208,7 +5208,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 
 | # | Decision | Default taken | Revisit when |
 |---|---|---|---|
-| D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with per-disk parallelism and read-ahead workers; proposed 2026-10-23: §28.11's ten defaults, none taken yet - Ceph `rbd diff` between Cinder's pass snapshots, queried on the source conversion host with a metadata-only Ceph user; pre-copy and keep-warm passes check the extents and the final pass reads them; a disk that cannot use them scans in full; libvirt dirty bitmaps after a lab spike; a Technology Preview in 0.5.0 | owner decision (§28, FR-26); the LAB-CE cases and PERF-E2E-SM1b of §28.10 end the Technology Preview |
+| D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with per-disk parallelism and read-ahead workers; decided by the owner 2026-10-23: §28.11's ten defaults as written - Ceph `rbd diff` between Cinder's pass snapshots, queried on the source conversion host with a metadata-only Ceph user; pre-copy and keep-warm passes check the extents and the final pass reads them; a disk that cannot use them scans in full; libvirt dirty bitmaps after a lab spike; a Technology Preview in 0.5.0 | each item binds with its plan task (§28.12, FR-26); the LAB-CE cases and PERF-E2E-SM1b of §28.10 end the Technology Preview |
 | D2 | Single-replica orchestrator; a highly available control plane (§25) | accepted up to 0.4.0; decided by the owner 2026-10-23: §25.11's ten defaults as written - a PostgreSQL lease with an epoch that fences every write, followers that relay to the leader, two replicas on a cluster with a ReadWriteMany data volume, a Technology Preview in 0.5.0 | each item binds with its plan task (§25.12); the LAB-HA cases of §25.10 end the Technology Preview |
 | D3 | Network cut-over (FIP/DNS/BGP), Octavia and Heat | out of scope up to 0.3.0, with no hook documented and no finding (the old default said "hooks documented", which was never done) | decided: D18 (0.4.0, §23) |
 | D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL`; partly decided by the §13.4 knobs (`SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`, `TODO(ADV-06)`) |
@@ -7631,17 +7631,18 @@ The owner took each default as written on 2026-10-23 (D20):
 | QASuite rows and LAB-TC cases; Security.md (C4-01, C4-03, C4-04, §7.1, the checklist); Operations.md (writing and rotating project credentials, a user per project) | QASuite, Security.md, Operations.md | TC10 |
 | the lab; the Technology Preview label goes when LAB-TC01–LAB-TC06 pass | QASuite §13 | TC11 |
 
-## 28. Changed-extent tracking (proposed for 0.5.0)
+## 28. Changed-extent tracking (0.5.0, Technology Preview)
 
-Status: a proposal of 2026-10-23 for the owner's decisions (§28.11, D1). Nothing in this section is binding, and the
-PRD stays as it is until the owner decides (plan task CE1).
+Status: proposed 2026-10-23 and decided by the owner the same day (D1): §28.11's defaults as written. Each item
+becomes binding in the section §28.12 names when its plan task lands; until then nothing in this section is binding.
+The PRD follows with plan task CE1. Changed-extent tracking ships as a **Technology Preview** until LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass (§28.10).
 
 What it answers: FR-26 ("Changed-extent tracking to remove the scan floor: Ceph-direct `rbd diff` and
 hypervisor-assisted libvirt checkpoints", priority C, release 0.2.0), the open decision D1 (§20), PRD §8's target of a
 "≤ 5 min median independent of disk size" (SM-1b in Performance.md §3.1) and the 0.2.0 item "Ceph-direct incremental
-diff" of PRD §9. No release delivered them. The release is the owner's to choose (owner decision 1); this section
-proposes 0.5.0. The plan is `superpowers/plans/2026-10-23-changed-extents.md`. §24 to §27 are left to the proposals of
-other branches; nothing here depends on them.
+diff" of PRD §9. No release delivered them. The owner chose 0.5.0 (owner decision 1). The plan is
+`superpowers/plans/2026-10-23-changed-extents.md`. §24 to §27 are left to the proposals of other branches; nothing
+here depends on them.
 
 The proposed fields, route, check keys and findings stay out of the tables the SDD-reading tests parse (§4.3, §9.3,
 §12, §15.1, §18) until their tasks land; a proposed finding code is written without code quotes. The facts about Ceph,
@@ -7906,7 +7907,7 @@ present, a live migration, the scratch storage of a pull-mode job, and the read 
 
 ### 28.11 Owner decisions
 
-Each comes with the default this proposal recommends:
+The owner took each default as written on 2026-10-23 (D1):
 
 1. **The release: 0.5.0, as a Technology Preview** until LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass. FR-26 and PRD §9
    put it in 0.2.0, and no release delivered it.
