@@ -51,6 +51,7 @@ Today's tooling forces painful trade-offs:
 | G7 | Destination choice (0.2.0) | Besides RHOSO 18.0, every community OpenStack release series from 2023.1 Antelope to 2026.2 Hibiscus is a destination, by the support tiers of SDD §21: each strategy a destination's capabilities allow runs as on RHOSO 18.0; each Tier 1 series (the upstream-Maintained 2025.1 Epoxy, 2025.2 Flamingo, 2026.1 Gazpacho and 2026.2 Hibiscus) passes the destination lab matrix before a release; every destination's series, tier and missing capabilities are shown before a plan runs |
 | G8 | GPU workloads (0.3.0, Technology Preview) | VMs with an NVIDIA vGPU (MIG-backed profiles included) or a passed-through GPU migrate with an explicit GPU mapping instead of being blocked (SDD §22): the GPU rules of SDD §22 hold in simulation for 0.3.0 (the demo's GPU VMs through mapping, validation, the cutover gate's wait, cutover and verification), and the lab cases LAB-GPU01–LAB-GPU08 pass on GPU hosts before the Technology Preview label goes |
 | G9 | Network cut-over (0.4.0, Technology Preview) | A migrated VM keeps its network identity where Seamless can move it: on an opt-in plan a floating IP keeps its address, a DNS record follows a changed address, and BGP announcements follow the floating IP. An admin's hooks run at fixed points of each migration for the rest, and the pre-flight reports the Heat stacks, autoscaling groups and Octavia memberships it does not move (SDD §23). The rules hold in simulation for 0.4.0, and the LAB-NET cases pass before the label goes |
+| G10 | Notifications (0.5.0) | People who do not watch the dashboard are told at once what concerns them: a change approver that a cutover waits for an approval, an application owner that the VM is down and that it runs again, an operator that a migration failed (SDD §24). Every notified event reaches each subscribed channel at least once, deduplicated by its key and in order per channel, and no channel ever delays or fails a migration; the live smoke (SDD §24.10) passes before 0.5.0 ships |
 
 ### Non-goals (0.1.0)
 
@@ -75,7 +76,7 @@ Today's tooling forces painful trade-offs:
 | **Migration architect** (Rina) | Inventory, readiness, strategy per VM, wave plan, downtime estimates to negotiate windows | Plans, Inventory, estimates, CLI |
 | **Platform operator** (Bayu) | Run waves, watch progress, react to failures, retry/rollback | Dashboard migration view, events, CLI |
 | **Change approver** (Sari) | Approve cutovers inside the change window; see risk and evidence; finalize | Approve/Cutover/Finalize actions, audit log |
-| **Application owner** (Dimas) | Know when their VM is down and for how long; confirm it works afterwards | Plan view (read-only), notifications via events |
+| **Application owner** (Dimas) | Know when their VM is down and for how long; confirm it works afterwards | Plan view (read-only); messages about their plan's downtime by email, Slack or a webhook (SDD §24) |
 | **Security officer** | Credentials never leak; every action attributable; AI use is bounded | Security.md, audit trail, RBAC |
 | **Community cloud operator** (Arif) | Move tenants from an old cloud to a new upstream release side by side, without a Red Hat stack; know before a plan runs whether the destination's release and policies fit | Providers (destination check: series, tier, roles), validation findings, Security.md roles |
 | **ML platform engineer** (Nadia) | Move inference servers, notebook hosts and render nodes with their GPUs; know before a plan runs whether the destination has the GPUs, and that no source stops before its GPU is free at the destination | Inventory (GPU column), the plan's GPU mappings, the provider card's GPU capacity, validation findings |
@@ -117,12 +118,17 @@ Today's tooling forces painful trade-offs:
    acknowledges it, and names the Octavia pools the VMs belong to; the helper drains each member before its source
    stops and joins the migrated VM to the destination's pool after its verification. A hook that fails after a stop
    rolls that VM back, its floating IP associated at the source again.
+9. **Told, not watching** (0.5.0) — Dimas's team list is an email channel that Bayu subscribed to the finance plan.
+   Dimas gets one message when his VM stops for its cutover and one when it is verified on the destination, with the
+   downtime it took. Sari gets one when a cutover waits for her approval, and a failed migration reaches the
+   operators' Slack channel. No message carries a credential, an address or an error's text.
 
 ## 6. Functional requirements
 
 Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = could (later), **M2** = must
 for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview until its lab cases pass), **M4** = must for
-0.4.0 (goal G9, a Technology Preview until its lab cases pass).
+0.4.0 (goal G9, a Technology Preview until its lab cases pass), **M5** = must for 0.5.0 (goal G10 and §9's 0.5.0 row; an
+item marked a Technology Preview stays one until its lab cases pass).
 
 | ID | Requirement | P | Acceptance criteria |
 |---|---|---|---|
@@ -173,6 +179,10 @@ for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview unti
 | FR-45 | A moved floating IP is reachable before the verification passes | M4 | The wait counts in the downtime; Seamless speaks no BGP (SDD §23.6) |
 | FR-46 | An Octavia member helper | M4 | The source member is drained before the stop and the migrated VM joins the mapped destination pool after its verification; TLS keys are never read (SDD §23.7) |
 | FR-47 | Technology Preview: every network cut-over surface says so, and no text claims a lab validation | M4 | The label stays until the LAB-NET cases pass on two clouds (SDD §23.10) |
+| FR-48 | Notification channels: an admin keeps a catalog of email channels (through the installation's SMTP relay), Slack incoming webhooks and HTTPS webhooks signed as Standard Webhooks specify | M5 | A channel's secret is written write-only and never returned; email never leaves without TLS; a channel's test reports its outcome (SDD §24.3) |
+| FR-49 | Subscriptions: an operator subscribes a channel to a plan and an admin to every plan, each for topics - approval, downtime and problem by default, outcome and progress on request | M5 | A subscription changes no plan's status, and a channel sends an event once whatever subscriptions match it (SDD §24.4) |
+| FR-50 | Messages of fixed content: the VM, the plan and the wave, their ids, the phase, times, the downtime, the estimate and the SLO | M5 | No message holds a credential, an address, an error's text or who acted; names are escaped for each format, and a channel can send ids instead (SDD §24.5, §24.8) |
+| FR-51 | Delivery that never holds a migration back: at least once with a dedupe key, in order per channel, with bounded retries, an hour's expiry and at most one message a second per channel | M5 | Each message is audited once as sent or failed, and a channel that never answers leaves every migration as it would be without it (SDD §24.6, §24.7) |
 
 ## 7. Non-functional requirements
 
@@ -212,9 +222,10 @@ for 0.2.0 (goal G7), **M3** = must for 0.3.0 (goal G8, a Technology Preview unti
 | Release | Scope |
 |---|---|
 | **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift, Kubernetes and Compose (Docker on Linux, Colima on macOS, or Podman) deployment, docs |
-| 0.2.0 | Ceph-direct incremental diff, HA (PostgreSQL leader election), per-tenant credentials, notifications (email/Slack webhooks); community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34) |
+| 0.2.0 | Ceph-direct incremental diff, HA (PostgreSQL leader election), per-tenant credentials; community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34). Notifications moved to 0.5.0 |
 | 0.3.0 | GPU workloads as a Technology Preview (G8, FR-35–FR-41; SDD §22) |
 | 0.4.0 | Network cut-over as a Technology Preview (G9, FR-28, FR-42–FR-47; SDD §23): hooks, the keep-address floating IP move, the DNS swap, the BGP reachability wait, the Heat and Octavia findings and the Octavia member helper |
+| 0.5.0 | Notifications by email, Slack and signed webhooks (G10, FR-48–FR-51; SDD §24) |
 | 1.0.0 | Certified on RHOSO 18.0.x FRs, validated on every Tier 1 community series of the day, scale test 5,000 VMs, signed releases |
 
 ## 10. Dependencies and assumptions
