@@ -1,10 +1,9 @@
-# Changed-extent tracking — implementation plan (2026-10-23, proposal)
+# Changed-extent tracking — implementation plan (2026-10-23)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or
-> superpowers:executing-plans to implement this plan task by task. **Do not start a task before the owner has
-> decided SDD §28.11**: this plan is a proposal, like §28 itself.
+> superpowers:executing-plans to implement this plan task by task.
 
-**Goal.** The release is 0.5.0 if the owner agrees (owner decision 1). The plan answers FR-26 ("Changed-extent tracking
+**Goal.** The release is 0.5.0 (owner decision 1). The plan answers FR-26 ("Changed-extent tracking
 to remove the scan floor"), the open decision D1 and PRD §8's SM-1b (a 5 min median warm downtime independent of disk
 size), which no release delivered:
 - An OpenStack or RHOSO source provider holds a Ceph access - the cluster's fsid, its monitors, a Ceph user - and the
@@ -20,11 +19,10 @@ size), which no release delivered:
   show it. libvirt dirty bitmaps stay out (SDD §28.7). Tracking is a Technology Preview until LAB-CE01–LAB-CE07 and
   PERF-E2E-SM1b pass.
 
-**Spec:** SDD §28 and D1. §28 is a proposal until the owner decides §28.11; after that, each item becomes binding when
-its task moves it into the section §28.12 names. The PRD changes with CE1.
+**Spec:** SDD §28 and D1. Each item becomes binding when its task moves it into the section §28.12 names. The PRD changes with CE1.
 
-**Decisions:** the ten of SDD §28.11, each with its proposed default, are the owner's, and D1 records them once taken.
-The research behind the proposal was done on 2026-10-23: the rbd(8) page and librbd's diff code (`Diff.cc`,
+**Decisions:** the owner took the ten defaults of SDD §28.11 as written on 2026-10-23 (D1).
+The research behind the design was done on 2026-10-23: the rbd(8) page and librbd's diff code (`Diff.cc`,
 `DiffIterate.cc`, `object_map/DiffRequest.cc`, `rbd.pyx`), Ceph's RBD configuration and user-management pages, Ceph
 trackers #53784 and #61616 with their backports, Cinder's RBD driver, name templates and Ceph backup driver, Nova's
 image backend and guest code, libvirt's checkpoint and backup XML pages, virsh(1), its incremental-backup internals and
