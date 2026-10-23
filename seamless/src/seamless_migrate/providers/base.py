@@ -135,6 +135,16 @@ class FloatingIPMover(Protocol):
         """Deleted - its allocation released; none is no error."""
 
 
+@runtime_checkable
+class KeypairReader(Protocol):
+    """What an OpenStack provider, source or destination, reads the os_migrate_conv keypair with
+    before a pre-staging deploys conversion hosts (SDD §7.2 "Conversion key", §10, issue #112)."""
+
+    async def keypair_public_key(self, name: str) -> str | None:
+        """The public key of the credential's user's keypair called ``name``; None when the user
+        holds none. Any other failure is a ProviderError, never None."""
+
+
 def provider_caps(provider: Provider) -> dict[str, Any]:
     """Capabilities used by the selector: stored capabilities plus ``conversion_host``."""
     caps = dict(provider.capabilities)

@@ -14,12 +14,18 @@ from seamless_migrate.domain.models import GpuDevice
 from seamless_migrate.planning.platforms import destination_release
 from seamless_migrate.planning.preflight import DestinationInventory, SourceInventory, is_legacy_os
 from seamless_migrate.providers import registry
-from seamless_migrate.providers.base import ProviderError, VMNotFound, provider_caps
+from seamless_migrate.providers.base import (
+    KeypairReader,
+    ProviderError,
+    VMNotFound,
+    provider_caps,
+)
 from seamless_migrate.providers.fake import FakeDestinationProvider, FakeSourceProvider
 from seamless_migrate.providers.openstack import OpenStackProvider
 from seamless_migrate.providers.vmware import VMwareProvider
 from tests.cloud_support import AUTH_URL, InProcessCloud
 from tests.factories import make_provider
+from tests.key_support import public_key
 
 GIB = 2**30
 
@@ -1889,6 +1895,61 @@ async def test_openstack_find_server_sends_an_anchored_pattern_and_refuses_two_o
     cloud.servers.append({"id": "srv-3", "name": "web-01"})
     with pytest.raises(ProviderError, match=r"^dst: more than one server is named 'web-01'$"):
         await provider.find_server("web-01")
+
+
+async def test_openstack_reads_a_keypairs_public_key_by_its_name(tmp_path):
+    """SDD §10, §7.2 (issue #112): keypair_public_key(name) is the public key of the credential's
+    user's keypair of that name as openstacksdk finds it - Nova's GET /os-keypairs/{name}, then its
+    list -, None when the user holds none; another keypair's key is never taken for it."""
+    held = public_key(1, "as Nova keeps it")
+    cloud = InProcessCloud(
+        tmp_path,
+        keypairs=[
+            {"name": "ops-key", "public_key": public_key(2), "type": "ssh"},
+            {"name": "os_migrate_conv", "public_key": held, "type": "ssh"},
+        ],
+    )
+    dst = make_provider(id="dst", role=ProviderRole.destination, endpoint=AUTH_URL, cloud="dst")
+    provider = OpenStackProvider(dst, cloud.settings, connect_fn=cloud.connect)
+
+    assert await provider.keypair_public_key("os_migrate_conv") == held
+    assert await provider.keypair_public_key("absent") is None
+    asked = [
+        urllib.parse.urlsplit(url).path
+        for method, url in cloud.seen
+        if method == "GET" and "/os-keypairs" in url
+    ]
+    assert asked == [
+        "/v2.1/os-keypairs/os_migrate_conv",
+        "/v2.1/os-keypairs/absent",
+        "/v2.1/os-keypairs",
+    ]
+
+
+async def test_a_keypair_read_that_fails_is_a_provider_error_never_none():
+    """SDD §10 (issue #112): a keypair read Nova fails is a provider error naming the provider -
+    never None, which the conversion key's resolution would take for no keypair, letting the
+    deploy generate a key the hosts do not accept."""
+
+    class Compute:
+        def find_keypair(self, name, ignore_missing=True):
+            raise RuntimeError("HTTP 503: Service Unavailable")
+
+    dst = make_provider(id="dst", role=ProviderRole.destination, cloud="dst")
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: NS(compute=Compute()))
+    with pytest.raises(ProviderError, match=r"^dst: HTTP 503"):
+        await provider.keypair_public_key("os_migrate_conv")
+
+
+async def test_every_openstack_provider_reads_keypairs_and_the_demos_hold_none():
+    """SDD §10: OpenStackProvider and the demo's fakes, source and destination, read keypairs as
+    KeypairReader says; the demo's credentials hold none - its simulated executor deploys no
+    conversion host (§7.4)."""
+    fakes = (FakeSourceProvider(ProviderKind.openstack), FakeDestinationProvider())
+    for reader in (*fakes, OpenStackProvider(make_provider(), settings())):
+        assert isinstance(reader, KeypairReader), type(reader).__name__
+    for fake in fakes:
+        assert await fake.keypair_public_key("os_migrate_conv") is None
 
 
 async def test_openstack_destination_ports_match_every_filter_and_delete_is_idempotent():

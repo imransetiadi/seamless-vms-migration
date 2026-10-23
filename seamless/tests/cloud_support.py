@@ -58,7 +58,9 @@ class InProcessCloud:
     (``PUT /v2/zones/z-1/recordsets/rs-1``, plan task N7); ``heat_seen``, ``octavia_seen`` and
     ``designate_seen`` record each GET's path and query, ``written`` each other request's method,
     path and JSON body. ``networks``, ``subnets`` and ``keypairs`` are what Neutron's and
-    Nova's lists answer, as a source's inventory reads them; ``floatingips`` (filtered by the
+    Nova's lists answer, as a source's inventory reads them - and a keypair's GET by its name
+    answers its entry, a 404 for a name none has (``os-keypairs/{name}``, issue #112);
+    ``floatingips`` (filtered by the
     query's ``project_id`` and ``port_id``, as Neutron filters them) and ``extensions`` what
     Neutron's answer, and Cinder's volume types none, as a destination's reads them (plan task
     N2b). ``connect`` is what OpenStackProvider
@@ -228,6 +230,7 @@ class InProcessCloud:
             self._placement_answer,
             self._service_answer,
             self._lists_answer,
+            self._keypair_answer,
         )
 
         class Transport(requests.adapters.BaseAdapter):
@@ -335,6 +338,20 @@ class InProcessCloud:
         if request.method != "GET" or url not in lists:
             return None
         return 200, lists[url], {}
+
+    def _keypair_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
+        """Nova's answer to a keypair's GET by its name (``os-keypairs/{name}``): the credential's
+        user's keypair of that name, 404 when the user holds none; None for any other request."""
+        compute = {**CATALOG, **self.catalog}["compute"].rstrip("/") + "/os-keypairs/"
+        parts = urllib.parse.urlsplit(request.url)
+        url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+        if request.method != "GET" or not url.startswith(compute):
+            return None
+        name = urllib.parse.unquote(url[len(compute) :])
+        found = [k for k in self.keypairs if k.get("name") == name]
+        if not found:
+            return 404, {"itemNotFound": {"code": 404, "message": "Keypair not found"}}, {}
+        return 200, {"keypair": found[0]}, {}
 
     def _servers_answer(self, request: Any) -> tuple[int, Any, dict[str, str]] | None:
         """Nova's answer to a list of the project's servers, None for any other request."""

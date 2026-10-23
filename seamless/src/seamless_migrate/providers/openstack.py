@@ -722,6 +722,10 @@ class OpenStackProvider:
     async def release_floating_ip(self, address: str) -> None:
         await self._run(self._release_floating_ip, address)
 
+    # the conversion keypair a pre-staging resolves its key with (SDD §7.2, §10, issue #112)
+    async def keypair_public_key(self, name: str) -> str | None:
+        return await self._run(self._keypair_public_key, name)
+
     # the Octavia member helper's calls (SDD §8.5, §10, plan task N9)
     async def lb_pool(self, pool_id: str) -> dict[str, Any] | None:
         return await self._run(self._lb_pool, pool_id)
@@ -1207,6 +1211,20 @@ class OpenStackProvider:
 
     def _delete_port(self, port_id: str) -> None:
         self._connection().network.delete_port(port_id, ignore_missing=True)
+
+    def _keypair_public_key(self, name: str) -> str | None:
+        """The credential's user's keypair of that name, by Nova's GET of it, then its list
+        (openstacksdk's find): its public key, None when the user holds none (SDD §10)."""
+        conn = self._connection()
+        import openstack.exceptions
+
+        try:
+            # ignore_missing=False: openstacksdk deprecates True for removal (6.0)
+            keypair = conn.compute.find_keypair(name, ignore_missing=False)
+        except openstack.exceptions.NotFoundException:
+            return None  # Nova answered that the user holds none - never a failure taken for it
+        # a keypair Nova holds is never taken for none, whatever its key reads
+        return str(_attr(keypair, "public_key", default="") or "")
 
     def _volumes(self) -> list[dict[str, Any]]:
         """The project's volumes, with their metadata and the servers holding them (SDD §10)."""

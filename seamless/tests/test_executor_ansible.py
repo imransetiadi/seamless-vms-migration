@@ -427,11 +427,11 @@ async def test_warm_precopy_runs_export_once_then_precopy(env):
         assert call["cwd"] == str(run_dir(env))
     v = calls[1]["vars"]
     osm = run_dir(env) / "osm"
-    plan_osm = env.settings.data_dir / "plans" / "plan-00c0ffee" / "osm"
     assert v["os_migrate_data_dir"] == str(osm)
     assert v["os_migrate_workloads_filter"] == workload_filter("web-01")
+    # the installation's conversion key, the one key the managed hosts accept (SDD §7.2, #112)
     assert v["os_migrate_conversion_keypair_private_path"] == str(
-        plan_osm / "conversion" / "ssh.key"
+        env.settings.data_dir / "conversion" / "ssh.key"
     )
     assert v["os_migrate_warm_chunk_size"] == 4194304 and v["os_migrate_warm_workers"] == 4
     assert v["os_migrate_dst_conversion_host_name"] == "conv-dst"
@@ -2064,6 +2064,170 @@ async def test_prestage_scopes_keypairs_to_the_plan(env):
     before = len(calls)
     await env.executor.prestage(plan, SRC, DST, deploy_conversion_hosts=False)
     assert read_log(env.log)[before:] == []
+
+
+def _plan_ctx(env, plan_id, strategy):
+    """A migration of plan ``plan_id`` (SDD §7.2): ctx_for's, moved to that plan."""
+    ctx, _ = ctx_for(
+        env, strategy=strategy, source=VCENTER if strategy in VMWARE_STRATEGIES else SRC
+    )
+    ctx.plan = ctx.plan.model_copy(update={"id": plan_id})
+    ctx.migration = ctx.migration.model_copy(update={"plan_id": plan_id})
+    return ctx
+
+
+VMWARE_STRATEGIES = (Strategy.vmware_cold, Strategy.vmware_warm)
+
+
+async def test_every_plan_uses_the_installations_conversion_key(env):
+    """SDD §7.2 (issue #112): the managed conversion hosts are per provider and the os_migrate_conv
+    keypair per credential user, so every OpenStack plan reaches them with one key,
+    {data_dir}/conversion/ssh.key - in its pre-staging and in each run -, and so does a VMware
+    migration's conversion host without ssh_key_secret. The link key stays the plan's own."""
+    installation = env.settings.data_dir / "conversion" / "ssh.key"
+    for plan_id in ("plan-0000000a", "plan-0000000b"):
+        link = env.settings.data_dir / "plans" / plan_id / "osm" / "conversion" / "link-ssh.key"
+        before = len(read_log(env.log))
+        await env.executor.prestage(make_plan(id=plan_id, prestage_resources=[]), SRC, DST)
+        [deploy] = read_log(env.log)[before:]
+        assert deploy["playbook"] == "deploy_conversion_hosts.yml"
+        assert deploy["vars"]["os_migrate_conversion_keypair_private_path"] == str(installation)
+        assert deploy["vars"]["os_migrate_conversion_link_keypair_private_path"] == str(link)
+        for strategy, step in (
+            (Strategy.warm, StepName.PRECOPY),
+            (Strategy.warm, StepName.CUTOVER),
+            (Strategy.cold, StepName.CUTOVER),
+            (Strategy.cold, StepName.ROLLBACK),
+        ):
+            variables = build_vars(step, _plan_ctx(env, plan_id, strategy))
+            assert variables["os_migrate_conversion_keypair_private_path"] == str(installation)
+            assert variables["os_migrate_conversion_link_keypair_private_path"] == str(link)
+        inventory = load_ansible_yaml(
+            build_inventory(_plan_ctx(env, plan_id, Strategy.vmware_cold))
+        )
+        host = inventory["conversion_host"]["hosts"]["192.0.2.10"]
+        assert host["ansible_ssh_private_key_file"] == str(installation)
+
+
+def _generated(path: str) -> Path:
+    """The key pair generate_keypair.yml leaves at ``path`` (SDD §7.2): placeholders."""
+    key = Path(path)
+    key.parent.mkdir(mode=0o700, parents=True)
+    key.write_text("placeholder private key\n", encoding="utf-8")
+    Path(f"{key}.pub").write_text("ssh-ed25519 placeholder seamless@first\n", encoding="utf-8")
+    return key
+
+
+def _generated_text(key: Path) -> str:
+    return key.read_text(encoding="utf-8")
+
+
+async def test_a_second_plan_reuses_the_conversion_hosts_key(env):
+    """SDD §7.2 (issue #112): the first plan's deploy generated the installation key and put it on
+    the conversion hosts and in the os_migrate_conv keypair. A second plan of the same
+    credentials pre-stages and runs with that same key - its keypair task finds the public key the
+    keypair holds, and its logins reach the hosts the first plan made -, never a key of its own,
+    and its pre-staging leaves the key as it is."""
+    first, second = (
+        make_plan(id=i, prestage_resources=[]) for i in ("plan-0000000a", "plan-0000000b")
+    )
+    await env.executor.prestage(first, SRC, DST)
+    [deployed] = read_log(env.log)
+    key = _generated(deployed["vars"]["os_migrate_conversion_keypair_private_path"])
+
+    await env.executor.prestage(second, SRC, DST)
+    await env.executor.run(StepName.PRECOPY, _plan_ctx(env, second.id, Strategy.warm))
+
+    runs = read_log(env.log)[1:]
+    assert [run["playbook"] for run in runs] == [
+        "deploy_conversion_hosts.yml",
+        "export_workloads.yml",
+        "import_workloads_precopy.yml",
+    ]
+    assert {run["vars"]["os_migrate_conversion_keypair_private_path"] for run in runs} == {str(key)}
+    assert _generated_text(key) == "placeholder private key\n", "left as the deploy made it"
+    own = env.settings.data_dir / "plans" / second.id / "osm" / "conversion" / "ssh.key"
+    assert not own.exists() and str(own) not in json.dumps(runs)
+
+
+async def test_the_rekey_runs_right_before_the_deploy_with_each_sides_variables(env):
+    """SDD §7.2 (issue #112): the sides the orchestrator names to re-key - each with the older
+    plan's private key its keypair holds - get rekey_conversion_hosts.yml right before
+    deploy_conversion_hosts.yml, after the plan's resources: os_migrate_{side}_conversion_rekey_
+    private_path for the login and os_migrate_{side}_conversion_keypair_state: replace for the
+    deploy's keypair task, each side its own. No deploy, no re-key; a side but src and dst is
+    refused before any playbook."""
+    data = env.settings.data_dir
+    old = {
+        side: data / "plans" / f"plan-0000000{n}" / "osm" / "conversion" / "ssh.key"
+        for side, n in (("src", 1), ("dst", 2))
+    }
+    plan = make_plan(id="plan-000000c0", prestage_resources=["networks"])
+
+    await env.executor.prestage(
+        plan, SRC, DST, deploy_conversion_hosts=True, rekey_conversion_hosts=old
+    )
+
+    runs = read_log(env.log)
+    assert [run["playbook"] for run in runs] == [
+        "export_networks.yml",
+        "import_networks.yml",
+        "rekey_conversion_hosts.yml",
+        "deploy_conversion_hosts.yml",
+    ]
+    for run in runs:
+        for side in ("src", "dst"):
+            assert run["vars"][f"os_migrate_{side}_conversion_rekey_private_path"] == str(old[side])
+            assert run["vars"][f"os_migrate_{side}_conversion_keypair_state"] == "replace"
+        assert run["vars"]["os_migrate_conversion_keypair_private_path"] == str(
+            data / "conversion" / "ssh.key"
+        )
+
+    before = len(runs)
+    await env.executor.prestage(
+        plan, SRC, DST, deploy_conversion_hosts=False, rekey_conversion_hosts=old
+    )
+    later = read_log(env.log)[before:]
+    assert [run["playbook"] for run in later] == ["export_networks.yml", "import_networks.yml"]
+    assert not [
+        name for run in later for name in run["vars"] if "rekey" in name or "keypair_state" in name
+    ]
+
+    before = len(read_log(env.log))
+    with pytest.raises(PermanentStepError, match="side"):
+        await env.executor.prestage(
+            plan,
+            SRC,
+            DST,
+            deploy_conversion_hosts=True,
+            rekey_conversion_hosts={"both": old["src"]},
+        )
+    assert len(read_log(env.log)) == before
+
+
+async def test_a_plan_in_flight_keeps_its_own_key_until_the_installation_key_exists(env):
+    """SDD §7.2 (issue #112): a plan an earlier version pre-staged holds a conversion key of its
+    own, which its conversion hosts accept; after a restart a plan with no ready migration is not
+    pre-staged (§8). Until the installation key exists its runs keep that key, so a migration in
+    flight across the upgrade still reaches its hosts; once a pre-staging adopted or generated
+    the installation key, they use it. A pre-staging always passes the installation's path."""
+    plan_id = "plan-0000000a"
+    own = env.settings.data_dir / "plans" / plan_id / "osm" / "conversion" / "ssh.key"
+    own.parent.mkdir(mode=0o700, parents=True)
+    own.write_text("placeholder private key\n", encoding="utf-8")
+    installation = env.settings.data_dir / "conversion" / "ssh.key"
+    ctx = _plan_ctx(env, plan_id, Strategy.warm)
+
+    assert build_vars(StepName.SYNC, ctx)["os_migrate_conversion_keypair_private_path"] == str(own)
+    await env.executor.prestage(make_plan(id=plan_id, prestage_resources=[]), SRC, DST)
+    [deploy] = read_log(env.log)
+    assert deploy["vars"]["os_migrate_conversion_keypair_private_path"] == str(installation)
+
+    installation.parent.mkdir(mode=0o700)
+    installation.write_text("placeholder private key\n", encoding="utf-8")
+    assert build_vars(StepName.SYNC, ctx)["os_migrate_conversion_keypair_private_path"] == str(
+        installation
+    )
 
 
 async def test_flavor_pre_staging_leaves_out_gpu_flavors(env):
