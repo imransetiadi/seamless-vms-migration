@@ -5215,7 +5215,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D5 | Dashboard navigation item **Users** for non-admins: hidden (today) or soft-disabled with the reason, as every other action (§16) | hidden | owner decision (audit C-01) |
 | D6 | Collection identity on Galaxy: FQCN `os_migrate.os_migrate` 1.1.0 with the fork's own metadata; a version scheme that cannot collide with a future upstream 1.1.0; whether `scripts/publish.sh` stays | FQCN kept for upstreamability; the tarball is attached to GitHub Releases and never published to Galaxy (RELEASING.md) | owner decision (audit D-10) |
 | D7 | Python floor of the conversion hosts (§6.2: 3.6, RHEL 8 `platform-python`); CI runs the tests on 3.11 and later only | 3.6 kept; `test_blocksync.py` passed on Python 3.6.15 and 3.8.20 in containers on 2026-10-23, run by hand (QASuite §14.2) | a CI job that runs QASuite §14.2's container command, or a 3.9 floor (audit A-12) |
-| D8 | SSH trust on both data-path hops: host keys (SEC-02) and the dst→src link key (SEC-06) (§26) | `StrictHostKeyChecking=no` with the compensating controls of Security.md §6; the executor's `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` (§15.1); accepted up to 0.4.0; proposed 2026-10-23: §26.10's ten defaults, none taken yet - host keys injected at creation or read from the console and pinned per conversion host, `StrictHostKeyChecking=yes` on every hop, a link key per run held to a forced command, the setting on by default, in 0.5.0 | owner decision; planned for 0.2.0 (audit A-01, A-02); the LAB-SSH cases of §26.9 gate the release |
+| D8 | SSH trust on both data-path hops: host keys (SEC-02) and the dst→src link key (SEC-06) (§26) | `StrictHostKeyChecking=no` with the compensating controls of Security.md §6; the executor's `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` (§15.1); accepted up to 0.4.0; decided by the owner 2026-10-23: §26.10's ten defaults as written - host keys injected at creation or read from the console and pinned per conversion host, `StrictHostKeyChecking=yes` on every hop, a link key per run held to a forced command, the setting on by default, in 0.5.0 | each item binds with its plan task (§26.11); planned for 0.2.0 (audit A-01, A-02); the LAB-SSH cases of §26.9 gate the release |
 | D9 | Backups of the cluster deployment: the optional CronJob of §17, or the cluster's backup product (Velero/OADP) as the standard | CronJob shipped | owner decision (audit D-06) |
 | D10 | The commit trailer's model name (CLAUDE.md §2.7) | fixed `Claude Opus 5.5` | owner decision (audit F-13) |
 | D11 | Product documents in the collection artifact (the SDD, PRD, QASuite, Security and Performance documents are packed; audit material and agent plans are not) | packed | owner decision (audit D-21) |
@@ -7003,17 +7003,17 @@ The owner took each default as written on 2026-10-23 (D2):
 | QASuite rows and LAB-HA cases; Security.md (§25.9, its single-instance row); Operations.md (enabling HA, moving `/data`, a failover, the database settings); Performance.md §9.3 and §11; MEMORY.md M-03 and its D2 row | QASuite, Security.md, Operations.md, Performance.md, MEMORY.md | HA7 |
 | the lab; the Technology Preview label goes when LAB-HA01–LAB-HA05 pass | QASuite §13 | HA8 |
 
-## 26. SSH trust on the data path (proposed for 0.5.0)
+## 26. SSH trust on the data path (0.5.0)
 
-Status: a proposal of 2026-10-23 for the owner's decisions (§26.10, D8). Nothing in this section is binding, and the
-PRD stays as it is until the owner decides (plan task ST1).
+Status: proposed 2026-10-23 and decided by the owner the same day (D8): §26.10's defaults as written. Each item
+becomes binding in the section §26.11 names when its plan task lands; until then nothing in this section is binding.
+The PRD follows with plan task ST1. The LAB-SSH cases of §26.9 gate the release (owner decision 1).
 
-What it answers: D8, the findings SEC-02 (host keys not verified) and SEC-06 (an unrestricted link key) of
-Security.md §11.1, its threats C3-01 and C3-06, and QASuite's target cases S-10 and S-11. Security.md and D8 planned
-both for 0.2.0 (PRD §9's release table does not name them), and no release closed them. The release is the owner's to
-choose (owner decision 1), and this section proposes 0.5.0. The plan is
-`superpowers/plans/2026-10-23-ssh-trust.md`. §24 and §25 are left to the notifications and high-availability
-proposals of other branches.
+What it answers: D8, the findings SEC-02 (host keys not verified) and SEC-06 (an unrestricted link key) of Security.md
+§11.1, its threats C3-01 and C3-06, and QASuite's target cases S-10 and S-11. Security.md and D8 planned both for
+0.2.0 (PRD §9's release table does not name them), and no release closed them. The owner chose 0.5.0 (owner decision
+1). The plan is `superpowers/plans/2026-10-23-ssh-trust.md`. §24 and §25 are left to the notifications and
+high-availability proposals of other branches.
 
 SSH trust adds no route. The proposed fields, events and findings, and the setting's new default, stay out of the
 tables the SDD-reading tests parse (§4.3, §9.3, §12, §15.1) until their tasks land, as §22's and §23's did. The facts
@@ -7279,7 +7279,7 @@ decision 10).
 
 ### 26.10 Owner decisions
 
-Each comes with the default this proposal recommends:
+The owner took each default as written on 2026-10-23 (D8):
 
 1. **The release: 0.5.0,** with the LAB-SSH cases a gate of the release, not a Technology Preview label: the change
    touches every migration's data path. Should the lab not run before 0.5.0, the release ships the setting off by
