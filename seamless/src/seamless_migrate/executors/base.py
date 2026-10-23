@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, TypeVar, runtime_checkable
@@ -42,6 +42,12 @@ class HostKeys(Protocol):
         (§4.3, §26.3)."""
         ...
 
+    async def refused(self, message: str, data: Mapping[str, Any]) -> None:
+        """conversion_host.key_refused with ``message`` and ``data`` - the provider, side,
+        server, pinned and offered of a refusal in the run's output -, the run's plan and
+        migration added (§4.3, §7.2)."""
+        ...
+
 
 class NoHostKeys:
     """The book of a run the orchestrator handed none: it reads no console and records
@@ -53,6 +59,9 @@ class NoHostKeys:
     async def pin_injected(
         self, provider: Provider, side: str, server_id: str, keys: Sequence[str]
     ) -> None:
+        return None
+
+    async def refused(self, message: str, data: Mapping[str, Any]) -> None:
         return None
 
 

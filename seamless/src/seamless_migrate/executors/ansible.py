@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 import uuid
@@ -61,6 +62,7 @@ from ..security.host_keys import (
     SIDE_ALIASES,
     VMWARE_ALIAS,
     KnownHost,
+    fingerprint,
     trusted_keys,
     write_known_hosts,
 )
@@ -151,6 +153,29 @@ VMWARE = frozenset({Strategy.vmware_cold, Strategy.vmware_warm})
 WARM_CHUNK_SIZE = 4194304
 WARM_WORKERS = 4
 TRANSIENT = re.compile(r"(?i)timeout|http 503|connection reset")
+#: a conversion host's key, or the link, refused in a run's output (SDD §6.6, §7.2, §26.5): the
+#: collection's two refusals, and ssh's own words - also as Ansible's unreachable message carries
+#: them. Read before TRANSIENT: such a run fails permanently, whatever else its output holds.
+REFUSED = re.compile(
+    r"host key refused: |link refused by the source conversion host|Host key verification failed\."
+    r"|host key is known for \S+ and you have requested strict checking"
+    r"|no matching host key type found"
+)
+#: what a refusal names (SDD §6.6, §7.2): the collection's host key refusal - its side, its alias
+#: and its server when it knew it -, its link refusal - the source host's alias -, and the
+#: inventory name of a host Ansible's ssh could not reach
+_KEY_REFUSAL = re.compile(
+    r"host key refused: the (source|destination) conversion host "
+    r"\(([^,\s)]+)(?:, server (\S+))? at "
+)
+_LINK_REFUSAL = re.compile(r"link refused by the source conversion host \(([^\s)]+) at ")
+_UNREACHABLE = re.compile(r"^fatal: \[([^\]]+)\]: UNREACHABLE! ")
+#: the fingerprint of the key a host offered: as ssh prints it - its line breaks escaped in
+#: Ansible's JSON -, or as the collection's refusal names it
+_OFFERED = re.compile(
+    r"(?:key sent by the remote host is(?:\s|\\[rn])+|presented the \S+ key )"
+    r"(SHA256:[A-Za-z0-9+/]{43})"
+)
 #: Playbook output lines that start the source-stop task (SDD §7.2 downtime clock): the warm
 #: role's "Stop the source server", the cold role's "Perform workload stop …", and the kit's
 #: "Migrate Guest from Vmware using nbdkit <vm>" - kit 2.2.7 has no power-off task, its migrate
@@ -568,8 +593,49 @@ def gpu_mapping_refusal(
 
 
 def classify_failure(output: str) -> type[Exception]:
-    """Transient (retried) when the failure output matches a transient pattern."""
+    """Permanent when the failure output names a refused host key or link, whatever else it holds
+    (SDD §7.2, §26.5); else transient (retried) when it matches a transient pattern."""
+    if REFUSED.search(output):
+        return PermanentStepError
     return TransientStepError if TRANSIENT.search(output[-8000:]) else PermanentStepError
+
+
+@dataclass(frozen=True)
+class _Refusal:
+    """What a failed run's output names of a conversion host it refused (SDD §7.2): each None
+    when the output does not say."""
+
+    #: source or destination
+    side: str | None
+    #: the alias or inventory name the output names it by
+    name: str | None
+    server_id: str | None
+    #: the SHA256 fingerprint of the key the host offered, as ssh prints it
+    offered: str | None
+    #: the link the source host refused, not a host key
+    link: bool = False
+
+
+def refusal_in(output: str) -> _Refusal | None:
+    """What ``output`` names of the conversion host whose key, or link, it refuses (SDD §6.6,
+    §7.2): the collection's refusal, else ssh's own words in Ansible's unreachable message, by
+    the host's inventory name; None when it refuses nothing. Nothing of the output is kept but
+    the side, the names, a server id and a fingerprint."""
+    if not REFUSED.search(output):
+        return None
+    offered = _OFFERED.search(output)
+    fingerprint = offered.group(1) if offered else None
+    key = _KEY_REFUSAL.search(output)
+    if key:
+        return _Refusal(key.group(1), key.group(2), key.group(3), fingerprint)
+    link = _LINK_REFUSAL.search(output)
+    if link:
+        return _Refusal("source", link.group(1), None, None, link=True)
+    for line in output.splitlines():
+        unreachable = _UNREACHABLE.match(line)
+        if unreachable and REFUSED.search(line):
+            return _Refusal(None, unreachable.group(1), None, fingerprint)
+    return _Refusal(None, None, None, fingerprint)
 
 
 def plan_dir(settings: Settings, plan_id: str) -> Path:
@@ -1192,13 +1258,17 @@ class _Playbook:
 @dataclass
 class _RunTrace:
     """What a run's output showed: whether a playbook's source-stop task started - on VMware the
-    kit's migrate task, the only one that writes to a volume (SDD §7.2, review RV34A-02)."""
+    kit's migrate task, the only one that writes to a volume (SDD §7.2, review RV34A-02) - and
+    what a failed playbook's output names of a conversion host it refused (SDD §7.2)."""
 
     stop_task_started: bool = False
+    refusal: _Refusal | None = None
 
 
 #: a run's known_hosts, in its run directory (SDD §7.2 "Conversion host keys", §26.4)
 KNOWN_HOSTS_FILE = "known_hosts"
+#: a run's own ControlPersist directory, in its run directory (SDD §7.2 "Conversion host keys")
+CONTROL_PATH_DIR = "cp"
 #: the role's report of the servers it created and found, in a pre-staging's osm/ (SDD §6.5)
 HOSTS_REPORT = Path("conversion") / "hosts.json"
 #: each side's short name, as the collection's variables name it
@@ -1286,6 +1356,8 @@ class _Host:
     private: Path | None = None
     #: the public half of the key injected into it, once made
     injected: str | None = None
+    #: the server the role reported it created with that key
+    created: str | None = None
 
     @property
     def keys(self) -> list[str]:
@@ -1315,6 +1387,19 @@ class _Trust:
     def secrets(self) -> list[Path]:
         """The injected keys' private halves, removed after the run whatever its outcome."""
         return [host.private for host in self.hosts if host.private is not None]
+
+    def named(self, refusal: _Refusal) -> _Host | None:
+        """The host a refusal names (SDD §7.2): by its alias - the collection's message, an
+        inventory name -, else by its side; else a VMware run's one host; else None."""
+        for host in self.hosts:
+            if refusal.name is not None and host.alias == refusal.name:
+                return host
+        for host in self.hosts:
+            if refusal.side is not None and host.side == refusal.side:
+                return host
+        if [host.alias for host in self.hosts] == [VMWARE_ALIAS]:
+            return self.hosts[0]
+        return None
 
     def write(self) -> None:
         """The injected keys made, each private half in its file and its public half under its
@@ -1426,6 +1511,7 @@ class AnsibleExecutor:
         if injecting:
             # a run whose role reaches no server task leaves an earlier run's report (SDD §6.5)
             await asyncio.to_thread(remove_quietly, report)
+        trace = _RunTrace()
         try:
             await self._execute(
                 pdir,
@@ -1437,13 +1523,24 @@ class AnsibleExecutor:
                 playbooks,
                 None,
                 None,
+                trace=trace,
                 trust=trust,
             )
-        except BaseException:
+        except BaseException as exc:
             if injecting:
                 # a server the role created before the failure holds the key: pinned all the same
                 assert trust is not None
                 await outlive_cancel(self._pin_created(trust, report, book))
+            if trust is not None and trace.refusal is not None:
+                refusal = trace.refusal
+                host = await outlive_cancel(self._key_refused(refusal, trust, book))
+                if host is not None and host.created is not None and not refusal.link:
+                    # the server holds the key the run injected unless its image's cloud-init
+                    # left it out (SDD §7.2, §26.3)
+                    raise PermanentStepError(
+                        f"the conversion host {host.name}, created with an injected host key, "
+                        "does not present it: check its image's cloud-init"
+                    ) from exc
             raise
         if injecting:
             assert trust is not None
@@ -1463,9 +1560,8 @@ class AnsibleExecutor:
             if host.injected is None:
                 continue
             if host.alias in created:
-                await book.pin_injected(
-                    host.provider, host.side, created[host.alias], [host.injected]
-                )
+                host.created = created[host.alias]
+                await book.pin_injected(host.provider, host.side, host.created, [host.injected])
                 continue
             pin = host.provider.conversion_host_pin
             server = found.get(host.alias)
@@ -1477,6 +1573,41 @@ class AnsibleExecutor:
         return refusal
 
     # -- the conversion hosts' keys ----------------------------------------------------------
+    @staticmethod
+    async def _key_refused(refusal: _Refusal, trust: _Trust, book: HostKeys) -> _Host | None:
+        """conversion_host.key_refused through ``book`` for what a run's output refused (SDD §4.3,
+        §7.2): the provider and side of the host it names, the server it names - else the one
+        the host resolved to, or its role created -, the fingerprints the run pinned for it and
+        the one the host offered, each None when the run cannot know it; never a line of the
+        output. The host it names, if any. An event that cannot be written is logged: the run's
+        failure is what the step reports."""
+        host = trust.named(refusal)
+        side = host.side if host is not None else refusal.side
+        server = refusal.server_id
+        if host is not None:
+            server = server or host.server_id or host.created
+        data = {
+            "provider_id": host.provider.id if host is not None else None,
+            "side": side,
+            "server_id": server,
+            "pinned": [fingerprint(key) for key in host.keys] if host is not None else None,
+            "offered": refusal.offered,
+        }
+        what = f"the {side} conversion host" if side else "a conversion host"
+        if host is not None:
+            what += f" of provider {host.provider.id}"
+        if server:
+            what += f" (server {server})"
+        if refusal.link:
+            message = f"{what} refused the run's link"
+        else:
+            message = f"the run refused the host key of {what}"
+        try:
+            await book.refused(message, data)
+        except Exception as exc:  # noqa: BLE001 - the run's own failure is reported
+            log.warning("conversion_host.key_refused was not recorded: %s", type(exc).__name__)
+        return host
+
     async def _run_trust(self, ctx: StepContext, step: StepName, rdir: Path) -> _Trust | None:
         """The conversion hosts a run reaches and the keys it checks them against, while
         SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is on; None while it is off - 0.4.0's runs (SDD §7.2
@@ -1753,6 +1884,9 @@ class AnsibleExecutor:
                 # the kit never reached its migrate task, the only one that writes to a volume:
                 # what this run marked is a completed copy still (SDD §7.2, review RV34A-02)
                 await outlive_cancel(self._mark_copies_back(ctx, marked))
+            if trust is not None and trace.refusal is not None:
+                book = ctx.host_keys or NoHostKeys()
+                await outlive_cancel(self._key_refused(trace.refusal, trust, book))
             raise
         if stop_skipped and strategy == Strategy.cold:
             # the cold role skips every task (the stop included) when the destination already
@@ -2544,16 +2678,23 @@ class AnsibleExecutor:
         cleanup = (secrets_path, osm / "clouds.yaml", workdir / "clouds.yaml")
         if key_path is not None:
             cleanup += (key_path,)
+        control: Path | None = None
         if trust is not None:
             variables = {**variables, **trust.variables()}
             # the injected keys' private halves go with the run, whatever its outcome (SDD §7.2)
             cleanup += tuple(trust.secrets())
+            # Ansible's ssh masters, named by address and not by alias, of this run alone: an
+            # earlier run's would carry its connections without a check of the key (SDD §7.2)
+            control = workdir / CONTROL_PATH_DIR
 
         def prepare() -> None:
             osm.mkdir(parents=True, exist_ok=True, mode=0o700)
             if trust is not None:
                 # before any playbook: no ssh of the run meets a host without its keys
                 trust.write()
+            if control is not None:
+                shutil.rmtree(control, ignore_errors=True)
+                control.mkdir(mode=0o700)
             write_secret_file(vars_path, ansible_yaml(variables))
             write_secret_file(inventory_path, inventory)
             secret_vars = build_secret_vars(source, destination, self.settings)
@@ -2569,6 +2710,9 @@ class AnsibleExecutor:
         try:
             await asyncio.to_thread(prepare)
             env = await asyncio.to_thread(self._env)
+            if control is not None:
+                env["ANSIBLE_SSH_CONTROL_PATH_DIR"] = str(control)
+                env.pop("ANSIBLE_SSH_CONTROL_PATH", None)
             for playbook in playbooks:
                 if playbook.name == "export_workloads.yml":
                     # written again once the rewrite of the new export finishes (SDD §7.2)
@@ -2612,6 +2756,8 @@ class AnsibleExecutor:
         finally:
             # synchronous on purpose: runs even when the step task is being cancelled
             remove_quietly(*cleanup)
+            if control is not None:
+                shutil.rmtree(control, ignore_errors=True)
         return stop_skipped
 
     @staticmethod
@@ -2814,6 +2960,9 @@ class AnsibleExecutor:
                     returncode,
                     redact_tail(output, 4000),
                 )
+            if trace is not None:
+                # for the run's conversion_host.key_refused (SDD §7.2)
+                trace.refusal = refusal_in(output)
             raise classify_failure(output)(
                 f"{name} failed (exit {returncode}): {redact_cut(detail, 500)}"
             )

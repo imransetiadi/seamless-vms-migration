@@ -77,6 +77,7 @@ PERSISTED_KINDS = frozenset(
         "provider.checked",
         # the provider check pinned its conversion host from the console (SDD §4.3, §10, §26.5)
         "conversion_host.key_pinned",
+        "conversion_host.key_refused",
         # the hook catalog's changes (SDD §4.3, §23.3)
         "hook.created",
         "hook.updated",

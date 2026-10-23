@@ -6768,3 +6768,255 @@ async def test_the_pin_of_a_created_host_is_recorded_after_the_run(env, store, m
     await env.executor.prestage(plan, source, DST, deploy_conversion_hosts=True, host_keys=book)
     assert store.get("provider", "dst-rhoso", Provider).conversion_host_pin == dst_pin
     assert len(pins()) == 2
+
+
+def offered_by(seed):
+    """The SHA256 fingerprint of the key a host offered, as ssh prints it."""
+    from tests.key_support import fingerprint_of
+
+    return fingerprint_of(public_key(seed))
+
+
+def ssh_refused(seed):
+    """Ansible's unreachable result for a host whose key ssh refused: what ssh printed, the
+    fingerprint of the key the host offered among it."""
+    said = "\n".join(
+        [
+            "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+            "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @",
+            "The fingerprint for the ED25519 key sent by the remote host is",
+            offered_by(seed) + ".",
+            "Host key verification failed.",
+        ]
+    )
+    return json.dumps(
+        {
+            "changed": False,
+            "msg": f"Task failed: Failed to connect to the host via ssh: {said}",
+            "unreachable": True,
+        }
+    )
+
+
+async def test_a_refused_host_key_is_recorded_as_an_event(env, store, monkeypatch):
+    """SDD §4.3, §7.2, §26.5 (plan task ST5): a run whose output refuses a conversion host's key or
+    link fails permanently and emits conversion_host.key_refused: the provider and side whose host
+    the output names - the collection's message, an alias, an inventory name -, a VMware run's one
+    host, else null; the server it names, else the one the host resolved to; the fingerprints the
+    run pinned for it; the one ssh printed as offered, else null; the run's plan and migration (null
+    for a pre-staging). It never carries a line of the output. A pre-staging whose output refuses
+    the key it injected into a server its role created fails "the conversion host {name}, created
+    with an injected host key, does not present it: check its image's cloud-init". With host keys
+    unchecked, a run records no refusal."""
+    from tests.key_support import fingerprint_of
+    from tests.orch_support import build_harness
+
+    h = build_harness(env.settings.data_dir.parent / "orchestrator", store, [])
+    h.orch.providers = env.registry
+    env.registry.servers = {"conv-src": "srv-src-1", "conv-dst": "srv-dst-1"}
+    source, destination = pinned(SRC, "srv-src-1", 1), pinned(DST, "srv-dst-1", 2)
+    store.put("provider", source)
+    store.put("provider", destination)
+    pinned_src = [fingerprint_of(public_key(1))]
+    pinned_dst = [fingerprint_of(public_key(2))]
+
+    def refusals():
+        return [e for e in store.events(since_seq=0) if e.kind == "conversion_host.key_refused"]
+
+    async def fails(step, **kw):
+        ctx, _ = ctx_for(env, **{"source": source, "destination": destination, **kw})
+        booked(ctx, h.orch.host_keys(ctx.plan.id, ctx.migration.id))
+        with pytest.raises(PermanentStepError) as failed:
+            await env.executor.run(step, ctx)
+        return failed.value
+
+    collection = (
+        "host key refused: the source conversion host (os_migrate_conv_src, server srv-src-1 at "
+        f"192.0.2.21) presented the ED25519 key {offered_by(7)}, not its pinned key ED25519 "
+        f"{pinned_src[0]}"
+    )
+    # unchecked, a refusal is permanent and recorded nowhere
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", json.dumps({"msg": "Timeout. " + collection}))
+    await fails(StepName.SYNC)
+    assert refusals() == []
+
+    check_keys(env)
+    expected = []
+    await fails(StepName.SYNC)
+    expected.append(
+        {
+            "provider_id": "src-osp",
+            "side": "source",
+            "server_id": "srv-src-1",
+            "pinned": pinned_src,
+            "offered": offered_by(7),
+        }
+    )
+
+    # ssh's own words in Ansible's unreachable message, by the host's inventory name
+    monkeypatch.setenv("ANSIBLE_FAKE_UNREACHABLE", "os_migrate_conv_dst")
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", ssh_refused(8))
+    await fails(StepName.CUTOVER)
+    expected.append(
+        {
+            "provider_id": "dst-rhoso",
+            "side": "destination",
+            "server_id": "srv-dst-1",
+            "pinned": pinned_dst,
+            "offered": offered_by(8),
+        }
+    )
+
+    # the link the source host refused: no key was offered
+    monkeypatch.delenv("ANSIBLE_FAKE_UNREACHABLE")
+    link = (
+        "link refused by the source conversion host (os_migrate_conv_src at 192.0.2.21): "
+        "Permission denied (publickey)"
+    )
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", json.dumps({"msg": link}))
+    await fails(StepName.PRECOPY)
+    expected.append(
+        {
+            "provider_id": "src-osp",
+            "side": "source",
+            "server_id": "srv-src-1",
+            "pinned": pinned_src,
+            "offered": None,
+        }
+    )
+
+    # ssh's words with no host named: nothing is known of it
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", json.dumps({"msg": "Host key verification failed."}))
+    await fails(StepName.SYNC)
+    expected.append(
+        {"provider_id": None, "side": None, "server_id": None, "pinned": None, "offered": None}
+    )
+
+    # a VMware run's one host, Ansible's inventory naming it by its address
+    env.registry.addresses = {"192.0.2.10": "srv-dst-1"}
+    monkeypatch.setenv("ANSIBLE_FAKE_UNREACHABLE", "192.0.2.10")
+    said = "Unable to negotiate with 192.0.2.10 port 22: no matching host key type found."
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", json.dumps({"msg": said, "unreachable": True}))
+    await fails(
+        StepName.SYNC,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        nics=VMW_NICS,
+        destination=hosted(destination, name=None),
+    )
+    expected.append(
+        {
+            "provider_id": "dst-rhoso",
+            "side": "destination",
+            "server_id": "srv-dst-1",
+            "pinned": pinned_dst,
+            "offered": None,
+        }
+    )
+    events = refusals()
+    assert [e.data for e in events] == [
+        {**data, "plan_id": "plan-00c0ffee", "migration_id": "mig-00000000aa"} for data in expected
+    ]
+    for event in events:
+        assert (event.plan_id, event.migration_id) == ("plan-00c0ffee", "mig-00000000aa")
+        text = json.dumps(event.model_dump(mode="json"))
+        for line in ("host key refused", "link refused", "192.0.2.", "Host key verification"):
+            assert line not in text, line
+
+    # a pre-staging: the server its role created does not present the key the run injected
+    monkeypatch.delenv("ANSIBLE_FAKE_UNREACHABLE")
+    env.registry.servers = {"conv-dst": "srv-dst-1"}
+    env.registry.addresses = {}
+    monkeypatch.setenv(
+        "ANSIBLE_FAKE_HOSTS_REPORT",
+        hosts_report(
+            created=[("os_migrate_conv_src", "srv-src-5")],
+            found=[("os_migrate_conv_dst", "srv-dst-1")],
+        ),
+    )
+    refused = (
+        "host key refused: the source conversion host (os_migrate_conv_src at 192.0.2.21) "
+        f"presented the ED25519 key {offered_by(9)}, not its pinned key ED25519 SHA256:x"
+    )
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", json.dumps({"msg": refused}))
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL_ON", "deploy_conversion_hosts.yml")
+    store.put("provider", SRC)
+    seen = capture_host_keys(env, monkeypatch)
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    book = h.orch.host_keys(plan.id)
+    with pytest.raises(PermanentStepError) as failed:
+        await env.executor.prestage(
+            plan, SRC, destination, deploy_conversion_hosts=True, host_keys=book
+        )
+    assert str(failed.value) == (
+        "the conversion host conv-src, created with an injected host key, does not present it: "
+        "check its image's cloud-init"
+    )
+    injected = public_half(seen["os_migrate_src_conversion_host_key_private_path"][2])
+    [*_, event] = refusals()
+    assert (event.plan_id, event.migration_id) == (plan.id, None)
+    assert event.data == {
+        "provider_id": "src-osp",
+        "side": "source",
+        "server_id": "srv-src-5",
+        "pinned": [fingerprint_of(injected)],
+        "offered": offered_by(9),
+        "plan_id": plan.id,
+        "migration_id": None,
+    }
+
+
+async def test_each_run_has_its_own_ssh_control_path_while_host_keys_are_checked(env, monkeypatch):
+    """SDD §7.2 "Conversion host keys" (plan task ST5): Ansible's ssh keeps a master connection
+    open 60 s in ANSIBLE_SSH_CONTROL_PATH_DIR, its socket named after the host's address, port and
+    user - not the alias its key is checked under -, so another run's master would carry this
+    run's connection unchecked. With host keys checked each run has its own - ``cp`` in its run
+    directory, a pre-staging's in its plan's -, 0700 and empty as the run starts, removed after it
+    whatever its outcome; the control plane's ANSIBLE_SSH_CONTROL_PATH does not reach it. Off, the
+    control plane's own setting reaches a run as before."""
+    monkeypatch.setenv("ANSIBLE_SSH_CONTROL_PATH_DIR", "/shared/cp")
+    monkeypatch.setenv("ANSIBLE_SSH_CONTROL_PATH", "%(directory)s/%%h-%%p-%%r")
+    env.registry.servers = {"conv-src": "srv-src-1", "conv-dst": "srv-dst-1"}
+    source, destination = pinned(SRC, "srv-src-1", 1), pinned(DST, "srv-dst-1", 2)
+    ctx, _ = ctx_for(env, source=source, destination=destination)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    off = read_log(env.log)
+    assert off
+    for call in off:
+        assert call["env"]["ANSIBLE_SSH_CONTROL_PATH_DIR"] == "/shared/cp"
+        assert call["env"]["ANSIBLE_SSH_CONTROL_PATH"] == "%(directory)s/%%h-%%p-%%r"
+
+    check_keys(env)
+    control = run_dir(env) / "cp"
+    control.mkdir(parents=True, exist_ok=True)
+    (control / "4f1c0a9e2b").write_text("")  # an earlier run's socket
+    seen = len(off)
+    for failing in (False, True):
+        if failing:
+            monkeypatch.setenv("ANSIBLE_FAKE_FAIL", json.dumps({"msg": "the import failed"}))
+        ctx, _ = ctx_for(env, source=source, destination=destination)
+        if failing:
+            with pytest.raises(PermanentStepError):
+                await env.executor.run(StepName.SYNC, ctx)
+        else:
+            await env.executor.run(StepName.SYNC, ctx)
+        calls = read_log(env.log)[seen:]
+        seen += len(calls)
+        assert calls
+        for call in calls:
+            assert call["env"]["ANSIBLE_SSH_CONTROL_PATH_DIR"] == str(control)
+            assert call["env"]["ANSIBLE_SSH_CONTROL_PATH"] is None
+            assert call["control_path_dir"] == [[], "0o700"]
+        assert not control.exists()
+    monkeypatch.delenv("ANSIBLE_FAKE_FAIL")
+
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    await env.executor.prestage(
+        plan, source, destination, deploy_conversion_hosts=True, host_keys=Book()
+    )
+    calls = read_log(env.log)[seen:]
+    assert calls
+    for call in calls:
+        assert call["env"]["ANSIBLE_SSH_CONTROL_PATH_DIR"] == str(plan_dir(env) / "cp")
+        assert call["control_path_dir"] == [[], "0o700"]
+    assert not (plan_dir(env) / "cp").exists()

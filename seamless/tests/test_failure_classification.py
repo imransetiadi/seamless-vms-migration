@@ -589,3 +589,175 @@ def test_the_transient_guard_flags_every_name_that_reads_transient(
     monkeypatch.setattr(sys.modules[__name__], "find_repo_root", lambda: root)
     with pytest.raises(AssertionError):
         test_nothing_ansible_core_prints_of_the_collection_reads_transient()
+
+
+#: the collection's refusals (SDD §6.6) in the words its modules fail with: argv[1] the kind -
+#: "key", a host key refused, or "link" -, argv[2] a known_hosts file that pins the source host;
+#: prints the module's failure result
+REFUSAL = textwrap.dedent(
+    """\
+    import json
+    import sys
+
+    from ansible_collections.os_migrate.os_migrate.plugins.module_utils import volume_common
+
+    kind, known_hosts = sys.argv[1:3]
+    if kind == "key":
+        shell = volume_common.RemoteShell(
+            "192.0.2.21", "cloud-user", known_hosts=known_hosts, side="source", server="srv-src-9"
+        )
+        said = "\\n".join([
+            "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @",
+            "The fingerprint for the ED25519 key sent by the remote host is",
+            "SHA256:" + "A" * 43 + ".",
+            "Host key verification failed.",
+        ])
+        message = shell._refusal(volume_common.refused_host_key(said))
+    else:
+        message = str(volume_common.link_refused("192.0.2.21", "Permission denied (publickey)"))
+    print(json.dumps({"msg": message}))
+    """
+)
+
+#: what an earlier task of the run printed, which TRANSIENT reads as transient
+RETRIED = "the last pass met a Timeout, then HTTP 503 and a Connection reset: retried"
+
+
+def _collection_refusal(tmp_path: Path, kind: str) -> Path:
+    """The collection's own refusal message of ``kind``, as a module's failure result in a
+    file."""
+    from seamless_migrate.security.host_keys import KnownHost, write_known_hosts
+    from tests.key_support import public_key
+
+    known_hosts = tmp_path / "known_hosts"
+    write_known_hosts(known_hosts, [KnownHost("os_migrate_conv_src", None, (public_key(1),))])
+    run = subprocess.run(
+        [sys.executable, "-c", REFUSAL, kind, str(known_hosts)],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(_collections(tmp_path)),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    path = tmp_path / f"{kind}-refusal.json"
+    path.write_text(run.stdout)
+    return path
+
+
+def _failing_with(tmp_path: Path, result_file: Path) -> str:
+    """A run that printed something TRANSIENT reads, then failed with the module result in
+    ``result_file``: its output."""
+    work = tmp_path / "work"
+    (work / "library").mkdir(parents=True)
+    (work / "library" / "fail_as.py").write_text(FAIL_AS)
+    play = {
+        "name": "Import workloads",
+        "hosts": "localhost",
+        "connection": "local",
+        "gather_facts": False,
+        "tasks": [
+            {"name": "Report the last pass", "ansible.builtin.debug": {"msg": RETRIED}},
+            {"name": "Transfer the volumes", "fail_as": {"result_file": str(result_file)}},
+        ],
+    }
+    (work / "play.yml").write_text(yaml.safe_dump([play], sort_keys=False))
+    return _run_playbook(tmp_path, _playbook(), work)
+
+
+def _unreachable_with(tmp_path: Path, said: str) -> str:
+    """A run that printed something TRANSIENT reads, then met a conversion host whose ssh - a
+    stand-in for OpenSSH's client, which prints ``said`` and exits 255 as ssh does on a refusal -
+    refused it: Ansible's unreachable message carries ssh's words. Its output."""
+    work = tmp_path / "work"
+    work.mkdir(parents=True)
+    ssh = work / "ssh"
+    ssh.write_text("#!/bin/sh\ncat >&2 <<'SAID'\n" + said + "\nSAID\nexit 255\n")
+    ssh.chmod(0o755)
+    plays = [
+        {
+            "name": "Add the conversion host",
+            "hosts": "localhost",
+            "connection": "local",
+            "gather_facts": False,
+            "tasks": [
+                {"name": "Report the last pass", "ansible.builtin.debug": {"msg": RETRIED}},
+                {
+                    "name": "Add conversion host to inventory",
+                    "ansible.builtin.add_host": {
+                        "name": "os_migrate_conv_dst",
+                        "ansible_host": "192.0.2.10",
+                        "ansible_user": "cloud-user",
+                        "ansible_connection": "ssh",
+                        "ansible_ssh_executable": str(ssh),
+                    },
+                },
+            ],
+        },
+        {
+            "name": "Configure destination conversion host",
+            "hosts": "os_migrate_conv_dst",
+            "gather_facts": False,
+            "tasks": [{"name": "Reach the host", "ansible.builtin.ping": {}}],
+        },
+    ]
+    (work / "play.yml").write_text(yaml.safe_dump(plays, sort_keys=False))
+    return _run_playbook(tmp_path, _playbook(), work)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["the collection's refusal", "Host key verification failed.", "no matching host key type"],
+)
+def test_a_refused_host_key_is_permanent_whatever_else_the_output_says(tmp_path, case):
+    """SDD §7.2, §26.5 (plan task ST5): an output that names a refused host key fails the run
+    permanently, whatever else it holds - here a Timeout, an HTTP 503 and a Connection reset an
+    earlier task printed, which TRANSIENT reads: the refusal is read before the transient
+    patterns. The collection's refusal ("host key refused: ...", §6.6), and ssh's own words as
+    Ansible's unreachable message carries them: "Host key verification failed." and "no matching
+    host key type found". Real ansible-playbook runs."""
+    if case == "the collection's refusal":
+        output = _failing_with(tmp_path, _collection_refusal(tmp_path, "key"))
+        assert "host key refused: the source conversion host (os_migrate_conv_src, server" in output
+    elif case == "Host key verification failed.":
+        output = _unreachable_with(
+            tmp_path,
+            "No ED25519 host key is known for os_migrate_conv_dst and you have requested strict "
+            "checking.\nHost key verification failed.",
+        )
+        assert "UNREACHABLE!" in output and "Host key verification failed." in output
+    else:
+        output = _unreachable_with(
+            tmp_path,
+            "Unable to negotiate with 192.0.2.10 port 22: no matching host key type found. "
+            "Their offer: ssh-rsa",
+        )
+        assert "UNREACHABLE!" in output and "no matching host key type found" in output
+    assert TRANSIENT.search(output[-8000:]), output[-2000:]
+    assert classify_failure(output) is PermanentStepError
+
+
+@pytest.mark.parametrize("carried", [False, True], ids=["the transfer's", "the warm sync's"])
+def test_a_refused_link_is_permanent(tmp_path, carried):
+    """SDD §7.2, §26.5 (plan task ST5): the collection's refusal of the link by the source
+    conversion host ("link refused by the source conversion host ...", §6.6) - the cold transfer's
+    message, or a warm sync's failure that carries it - fails the run permanently, whatever else
+    the output holds."""
+    result_file = _collection_refusal(tmp_path, "link")
+    refusal = json.loads(result_file.read_text())["msg"]
+    assert refusal == (
+        "link refused by the source conversion host (os_migrate_conv_src at 192.0.2.21): "
+        "Permission denied (publickey)"
+    )
+    if carried:
+        message = f"the warm sync of /dev/vdb failed: {refusal}; the receiver exited 1"
+        result_file.write_text(json.dumps({"msg": message}))
+    output = _failing_with(tmp_path, result_file)
+    assert refusal in output
+    assert TRANSIENT.search(output[-8000:]), output[-2000:]
+    assert classify_failure(output) is PermanentStepError

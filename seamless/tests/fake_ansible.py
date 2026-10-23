@@ -65,6 +65,11 @@ SCRIPT = textwrap.dedent(
     # what decides how Ansible's ssh checks a host's key and shares its connections (SDD 7.2)
     record["env"] = {{key: os.environ.get(key) for key in (
         "ANSIBLE_HOST_KEY_CHECKING", "ANSIBLE_SSH_CONTROL_PATH_DIR", "ANSIBLE_SSH_CONTROL_PATH")}}
+    # what the control path directory holds as the playbook starts, and its mode
+    control = os.environ.get("ANSIBLE_SSH_CONTROL_PATH_DIR")
+    record["control_path_dir"] = (
+        [sorted(os.listdir(control)), oct(os.stat(control).st_mode & 0o777)]
+        if control and os.path.isdir(control) else None)
     # the run's known_hosts as the playbook finds it (SDD 7.2, 26.4): None when there is none
     known_hosts = merged.get("os_migrate_conversion_host_known_hosts")
     record["known_hosts"] = (
@@ -216,6 +221,12 @@ SCRIPT = textwrap.dedent(
 
     failure = os.environ.get("ANSIBLE_FAKE_FAIL", "")
     if failure and (os.environ.get("ANSIBLE_FAKE_FAIL_ON", base) == base):
+        unreachable = os.environ.get("ANSIBLE_FAKE_UNREACHABLE")
+        if unreachable:
+            # a host Ansible's ssh could not reach, by its inventory name: its message carries
+            # what ssh printed (SDD 7.2)
+            print("fatal: [" + unreachable + "]: UNREACHABLE! => " + failure)
+            sys.exit(4)
         print("fatal: [localhost]: FAILED! => " + failure)
         sys.exit(2)
     # a successful import/cutover created the destination server (a skipped stop means the

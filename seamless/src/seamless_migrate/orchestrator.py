@@ -200,6 +200,19 @@ class _HostKeyBook:
         it (§26.3)."""
         await self._orchestrator._pin_injected(provider.id, side, server_id, keys, self.plan_id)
 
+    async def refused(self, message: str, data: Mapping[str, Any]) -> None:
+        """conversion_host.key_refused (§4.3, §7.2): what the run's output refused, with the
+        run's plan and migration."""
+        ids = {"plan_id": self.plan_id, "migration_id": self.migration_id}
+        await emit(
+            self._orchestrator.store,
+            self._orchestrator.bus,
+            "conversion_host.key_refused",
+            message,
+            **ids,
+            data={**data, **ids},
+        )
+
 
 def _address(address: str) -> str:
     """An address as Neutron writes it (SDD §8.3): canonical, else as given."""
