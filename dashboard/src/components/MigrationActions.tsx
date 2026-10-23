@@ -32,6 +32,7 @@ import {
   type MigrationActionKey,
 } from '../lib/migrationActions';
 import { destinationName } from '../lib/providerUse';
+import { useNow } from '../lib/useNow';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { TextAreaField } from './Field';
@@ -69,10 +70,9 @@ const DONE: Record<MigrationActionKey, string> = {
   finalize: 'finalized',
 };
 
-function windowOpen(plan: Plan | null | undefined): boolean {
+function windowOpen(plan: Plan | null | undefined, now: number): boolean {
   const w = plan?.cutover_window;
   if (!w) return true;
-  const now = Date.now();
   return now >= Date.parse(w.start) && now <= Date.parse(w.end);
 }
 
@@ -129,7 +129,10 @@ export interface MigrationActionsProps {
 export function MigrationActions({ migration: m, plan, role, planUnavailable = false, planLoading = false }: MigrationActionsProps) {
   // the cutover's requester does not approve it (maker-checker, SDD §5.4)
   const me = useMe().data?.name;
-  const availability = migrationActions(m, role, plan, undefined, me);
+  // the time, read once per render for every rule that asks it (useNow): a cutover window that opens or closes shows
+  // within a minute
+  const now = useNow(60_000);
+  const availability = migrationActions(m, role, plan, now, me);
   const fourEyes = Boolean(plan?.require_approval && plan.require_distinct_approver);
   // a request or a force records the user's approval only without a distinct approver (SDD §5.4, §16)
   const recordsApproval = plan?.require_distinct_approver === false;
@@ -139,13 +142,13 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
     availability.cutover = { enabled: false, reason: 'The plan is loading: its cutover window and approval policy are not known yet.' };
   }
   // a requested cutover waiting for a closed window: the Cutover action lets it start outside the window (SDD §5.4)
-  const forcing = waitsOnClosedWindow(m, plan, Date.now());
+  const forcing = waitsOnClosedWindow(m, plan, now);
   // a warm cutover requested before pre-copy converged starts once it does (SDD §5.4)
   const early = isWarmStrategy(m.strategy) && m.phase !== 'awaiting_cutover';
   // maker-checker with no other approval: the request waits for another approver, it starts nothing (SDD §16)
   const waitsForApprover = requestWaitsForApprover(m, plan, me);
   const providers = useProviders();
-  const step = nextStep(m, plan, Date.now(), destinationName(providers.data, plan));
+  const step = nextStep(m, plan, now, destinationName(providers.data, plan));
   // the advisor's decision that holds the migration, when one does (SDD §14.6)
   const waiting = waitingDecision(m);
   const action = useMigrationAction(m.id);
@@ -201,9 +204,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   // the API lists only passes that ended (SDD §4.2): the last one is what a Force cutover records
   const lastPass = m.sync_passes.filter((p) => p.ended_at !== null).sort((a, b) => a.number - b.number).at(-1);
   const slo = plan ? formatDuration(plan.downtime_slo_s) : null;
-  const closedWindow = !windowOpen(plan);
+  const closedWindow = !windowOpen(plan, now);
   const common = { pending: action.isPending, error: action.error, onCancel: close };
-  const approval = approveDialog(m, plan);
+  const approval = approveDialog(m, plan, now);
 
   // the actions available now first, the next step's first; the others in a quieter row (SDD §16)
   const offered = MIGRATION_ACTION_ORDER.filter((key) => key !== 'force-cutover' || isWarmStrategy(m.strategy));

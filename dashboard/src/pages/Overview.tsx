@@ -178,7 +178,9 @@ function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migratio
 }
 
 function NeedsAttention({ migrations, plans, plansUnknown }: { migrations: MigrationSummary[]; plans: ReadonlyMap<string, Plan>; plansUnknown: boolean }) {
-  const items = attentionItems(migrations, plans, Date.now(), { plansUnknown });
+  // the time, read once per render (useNow): a cutover window that opens or closes shows within a minute
+  const now = useNow(60_000);
+  const items = attentionItems(migrations, plans, now, { plansUnknown });
   const shown = items.slice(0, 8);
   return (
     <Panel title="Needs attention" description="The next human action, most urgent first">
