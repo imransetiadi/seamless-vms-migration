@@ -49,6 +49,9 @@
   os_migrate.os_migrate.keypair:
     name: "{{ os_migrate_conversion_keypair_name }}"
     public_key_file: "{{ os_migrate_conversion_keypair_private_path }}.pub"
+    # replace: a keypair of the name that holds another key is replaced, where present refuses
+    # it - set for a side rekey_conversion_hosts.yml re-keyed (Seamless Migrate SDD 7.2)
+    state: "{{ os_migrate_conversion_keypair_state | default('present') }}"
     cloud: "{{ os_migrate_conversion_cloud }}"
     validate_certs: "{{ os_migrate_conversion_validate_certs | default(omit) }}"
     ca_cert: "{{ os_migrate_conversion_ca_cert | default(omit) }}"

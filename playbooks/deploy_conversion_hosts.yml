@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: Deploy conversion hosts
   hosts: migrator
   environment:
@@ -15,6 +16,8 @@
         os_migrate_conversion_router_name: "{{ os_migrate_src_conversion_router_name | default('os_migrate_conv') }}"
         os_migrate_conversion_secgroup_name: "{{ os_migrate_src_conversion_secgroup_name | default('os_migrate_conv') }}"
         os_migrate_conversion_keypair_name: "{{ os_migrate_src_conversion_keypair_name | default('os_migrate_conv') }}"
+        # replace for a side whose conversion host was re-keyed (Seamless Migrate SDD 7.2)
+        os_migrate_conversion_keypair_state: "{{ os_migrate_src_conversion_keypair_state | default('present') }}"
         os_migrate_conversion_host_boot_from_volume: "{{ os_migrate_src_conversion_host_boot_from_volume | default(omit) }}"
         os_migrate_conversion_host_volume_size: "{{ os_migrate_src_conversion_host_volume_size | default(omit) }}"
         os_migrate_conversion_availability_zone: "{{ os_migrate_src_conversion_availability_zone | default(omit) }}"
@@ -46,6 +49,8 @@
         os_migrate_conversion_router_name: "{{ os_migrate_dst_conversion_router_name | default('os_migrate_conv') }}"
         os_migrate_conversion_secgroup_name: "{{ os_migrate_dst_conversion_secgroup_name | default('os_migrate_conv') }}"
         os_migrate_conversion_keypair_name: "{{ os_migrate_dst_conversion_keypair_name | default('os_migrate_conv') }}"
+        # replace for a side whose conversion host was re-keyed (Seamless Migrate SDD 7.2)
+        os_migrate_conversion_keypair_state: "{{ os_migrate_dst_conversion_keypair_state | default('present') }}"
         os_migrate_conversion_host_boot_from_volume: "{{ os_migrate_dst_conversion_host_boot_from_volume | default(omit) }}"
         os_migrate_conversion_host_volume_size: "{{ os_migrate_dst_conversion_host_volume_size | default(omit) }}"
         os_migrate_conversion_availability_zone: "{{ os_migrate_dst_conversion_availability_zone | default(omit) }}"
