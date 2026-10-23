@@ -1199,6 +1199,60 @@ class _RunTrace:
 
 #: a run's known_hosts, in its run directory (SDD §7.2 "Conversion host keys", §26.4)
 KNOWN_HOSTS_FILE = "known_hosts"
+#: the role's report of the servers it created and found, in a pre-staging's osm/ (SDD §6.5)
+HOSTS_REPORT = Path("conversion") / "hosts.json"
+#: each side's short name, as the collection's variables name it
+_SIDE_KEY = {"source": "src", "destination": "dst"}
+
+
+def _host_key_file(rdir: Path, side: str) -> Path:
+    """Where the private half of the key a pre-staging injects into a side's conversion host waits
+    for the role (SDD §7.2, §26.3): ``host-key-src.key``, ``host-key-dst.key``."""
+    return rdir / f"host-key-{_SIDE_KEY[side]}.key"
+
+
+def _write_host_key(path: Path) -> str:
+    """An ed25519 host key pair made in memory (SDD §7.2, §26.3): its private half written to
+    ``path`` alone, 0600, in OpenSSH's format with its final newline - a leftover of a run a crash
+    cut short replaced -, its public half returned, ``ssh-ed25519 <base64>``. Nothing of the
+    private half is logged or kept."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+        PublicFormat,
+    )
+
+    key = Ed25519PrivateKey.generate()
+    remove_quietly(path)
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as out:
+        out.write(key.private_bytes(Encoding.PEM, PrivateFormat.OpenSSH, NoEncryption()))
+    os.chmod(path, 0o600)
+    return key.public_key().public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH).decode()
+
+
+def _read_hosts_report(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """The servers the role reported it created and found, each by its side's alias (SDD §6.5):
+    none of either when the run wrote no report, or one that cannot be read - logged by the
+    failure's kind alone."""
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, {}
+    except (OSError, ValueError) as exc:
+        log.warning("the conversion host report %s cannot be read: %s", path, type(exc).__name__)
+        return {}, {}
+
+    def servers(key: str) -> dict[str, str]:
+        listed = report.get(key) if isinstance(report, dict) else None
+        return {
+            str(entry["alias"]): str(entry["id"])
+            for entry in (listed if isinstance(listed, list) else [])
+            if isinstance(entry, dict) and entry.get("alias") and entry.get("id")
+        }
+
+    return servers("created"), servers("found")
 
 
 def _host_label(provider: Provider, side: str) -> str:
@@ -1225,8 +1279,13 @@ class _Host:
     name: str
     #: the server it resolves to; None when it resolves to none, or was not looked up
     server_id: str | None
-    #: what the run's known_hosts holds for it: its declared keys, else its pin (SDD §10)
+    #: what the run's known_hosts holds for it: its declared keys, else its pin (SDD §10), or the
+    #: key the run injects into a host the role creates
     known: KnownHost
+    #: a host a pre-staging's role creates: where the private half of its injected key waits
+    private: Path | None = None
+    #: the public half of the key injected into it, once made
+    injected: str | None = None
 
     @property
     def keys(self) -> list[str]:
@@ -1243,11 +1302,28 @@ class _Trust:
     hosts: list[_Host]
 
     def variables(self) -> dict[str, Any]:
-        """The variables that pin the collection's hosts to the run's file (SDD §6.5)."""
-        return {"os_migrate_conversion_host_known_hosts": str(self.known_hosts)}
+        """The variables that pin the collection's hosts to the run's file (SDD §6.5), and name
+        the injected keys' private halves to the role - each side's own variable: the role's own
+        name, an extra var, would reach both sides."""
+        out: dict[str, Any] = {"os_migrate_conversion_host_known_hosts": str(self.known_hosts)}
+        for host in self.hosts:
+            if host.private is not None:
+                side = _SIDE_KEY[host.side]
+                out[f"os_migrate_{side}_conversion_host_key_private_path"] = str(host.private)
+        return out
+
+    def secrets(self) -> list[Path]:
+        """The injected keys' private halves, removed after the run whatever its outcome."""
+        return [host.private for host in self.hosts if host.private is not None]
 
     def write(self) -> None:
-        """The run's known_hosts, 0600, written whole before its playbooks (SDD §10)."""
+        """The injected keys made, each private half in its file and its public half under its
+        host's alias, then the run's known_hosts, 0600, written whole - all before the run's
+        playbooks (SDD §7.2, §10)."""
+        for host in self.hosts:
+            if host.private is not None:
+                host.injected = _write_host_key(host.private)
+                host.known = KnownHost(host.alias, None, (host.injected,))
         write_known_hosts(self.known_hosts, [host.known for host in self.hosts])
 
 
@@ -1331,28 +1407,74 @@ class AnsibleExecutor:
         ):
             if names:
                 variables[key] = [{"regex": "^" + re.escape(name) + "$"} for name in names]
+        book = host_keys or NoHostKeys()
         trust = None
         if deploy_conversion_hosts and self.settings.ansible_host_key_checking:
-            # the deploy reaches both conversion hosts: their keys are settled before it (SDD
-            # §7.2 "Conversion host keys")
-            book = host_keys or NoHostKeys()
-            hosts = [
-                await self._host_of(side, provider, SIDE_ALIASES[side], book)
-                for side, provider in (("source", source), ("destination", destination))
-            ]
+            # the deploy reaches both conversion hosts: their keys are settled before it, and a
+            # host its role creates gets a key injected (SDD §7.2 "Conversion host keys")
+            hosts = []
+            for side, provider in (("source", source), ("destination", destination)):
+                host = provider.conversion_host
+                managed = host.manage if host is not None else True
+                creates = _host_key_file(pdir, side) if managed else None
+                hosts.append(
+                    await self._host_of(side, provider, SIDE_ALIASES[side], book, creates=creates)
+                )
             trust = _Trust(pdir / KNOWN_HOSTS_FILE, hosts)
-        await self._execute(
-            pdir,
-            osm,
-            variables,
-            source,
-            destination,
-            _inventory(),
-            playbooks,
-            None,
-            None,
-            trust=trust,
-        )
+        injecting = trust is not None and bool(trust.secrets())
+        report = osm / HOSTS_REPORT
+        if injecting:
+            # a run whose role reaches no server task leaves an earlier run's report (SDD §6.5)
+            await asyncio.to_thread(remove_quietly, report)
+        try:
+            await self._execute(
+                pdir,
+                osm,
+                variables,
+                source,
+                destination,
+                _inventory(),
+                playbooks,
+                None,
+                None,
+                trust=trust,
+            )
+        except BaseException:
+            if injecting:
+                # a server the role created before the failure holds the key: pinned all the same
+                assert trust is not None
+                await outlive_cancel(self._pin_created(trust, report, book))
+            raise
+        if injecting:
+            assert trust is not None
+            refusal = await self._pin_created(trust, report, book)
+            if refusal is not None:
+                raise PermanentStepError(refusal)
+
+    async def _pin_created(self, trust: _Trust, report: Path, book: HostKeys) -> str | None:
+        """After a pre-staging's run, whatever its outcome (SDD §7.2, §26.3, §26.4): the role's
+        report read, each server it created with the key the run injected is pinned with it
+        through ``book`` - source injected, with conversion_host.key_pinned. A server it found
+        instead does not hold that key and is never pinned with it: the refusal of such a host
+        is returned - a host without a key -, unless the provider's pin is that server's."""
+        created, found = await asyncio.to_thread(_read_hosts_report, report)
+        refusal = None
+        for host in trust.hosts:
+            if host.injected is None:
+                continue
+            if host.alias in created:
+                await book.pin_injected(
+                    host.provider, host.side, created[host.alias], [host.injected]
+                )
+                continue
+            pin = host.provider.conversion_host_pin
+            server = found.get(host.alias)
+            if server is not None and (pin is None or pin.server_id != server) and not refusal:
+                refusal = (
+                    f"host key unknown: no key is pinned or declared for the {host.side} "
+                    f"conversion host {host.name}"
+                )
+        return refusal
 
     # -- the conversion hosts' keys ----------------------------------------------------------
     async def _run_trust(self, ctx: StepContext, step: StepName, rdir: Path) -> _Trust | None:
@@ -1390,6 +1512,7 @@ class AnsibleExecutor:
         book: HostKeys,
         *,
         rollback: Callable[[str], Awaitable[None]] | None = None,
+        creates: Path | None = None,
     ) -> _Host:
         """The side's conversion host as the run checks it (SDD §7.2, §10, §26.4): its declared
         keys, else the pin of the server it resolves to - looked up as the provider check finds
@@ -1398,14 +1521,27 @@ class AnsibleExecutor:
         for is refused before any playbook: "host key unknown", or "conversion host replaced"
         when its pin is another server's (§26.5). Given ``rollback`` - a rollback's log: it must
         start the source whatever its hosts' keys - nothing is refused or read, and a lookup that
-        fails is logged: the host then resolves to no server, and no pin applies."""
+        fails is logged: the host then resolves to no server, and no pin applies. Given
+        ``creates`` - a pre-staging whose deploy manages the host - the host is looked up by its
+        name alone, as the role looks it up, and one the role will create - no server bears its
+        name - gets a key injected, its private half to wait at ``creates`` (§26.3)."""
         host = provider.conversion_host
         declared = tuple(host.ssh_host_keys) if host is not None else ()
         name = _host_label(provider, side)
         if declared:
             return _Host(side, alias, provider, name, None, KnownHost(alias, None, declared))
         try:
-            name, server = await self._find_conversion_host(provider, side)
+            if creates is None:
+                name, server = await self._find_conversion_host(provider, side)
+            else:
+                # the role looks its server up by its exact name, and creates it when none bears
+                # it (SDD §6.5)
+                name = (host.name if host is not None else None) or SIDE_ALIASES[side]
+                found = await self.providers.get(provider).find_server(name)
+                if found is None:
+                    known = KnownHost(alias, None)
+                    return _Host(side, alias, provider, name, None, known, private=creates)
+                server = str(found)
         except ProviderError as exc:
             failure = f"could not look up the {side} conversion host {name} in {provider.label}"
             if rollback is None:
@@ -2410,6 +2546,8 @@ class AnsibleExecutor:
             cleanup += (key_path,)
         if trust is not None:
             variables = {**variables, **trust.variables()}
+            # the injected keys' private halves go with the run, whatever its outcome (SDD §7.2)
+            cleanup += tuple(trust.secrets())
 
         def prepare() -> None:
             osm.mkdir(parents=True, exist_ok=True, mode=0o700)

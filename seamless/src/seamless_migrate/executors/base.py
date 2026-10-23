@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, TypeVar, runtime_checkable
@@ -34,6 +34,14 @@ class HostKeys(Protocol):
         pinned."""
         ...
 
+    async def pin_injected(
+        self, provider: Provider, side: str, server_id: str, keys: Sequence[str]
+    ) -> None:
+        """The server a pre-staging's role created with the key the run injected, pinned with
+        those ``keys`` - source injected - and conversion_host.key_pinned in one transaction
+        (§4.3, §26.3)."""
+        ...
+
 
 class NoHostKeys:
     """The book of a run the orchestrator handed none: it reads no console and records
@@ -41,6 +49,11 @@ class NoHostKeys:
 
     async def pin_from_console(self, provider: Provider) -> Provider:
         return provider
+
+    async def pin_injected(
+        self, provider: Provider, side: str, server_id: str, keys: Sequence[str]
+    ) -> None:
+        return None
 
 
 @dataclass

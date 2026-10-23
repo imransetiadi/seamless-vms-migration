@@ -6461,3 +6461,310 @@ async def test_a_run_reads_the_console_of_a_host_without_a_pin_once_before_it_re
     for key in (src_key, dst_key):
         assert key.split()[1] not in text
     assert "ci-info" not in text and "login:" not in text
+
+
+def capture_host_keys(env, monkeypatch) -> dict:
+    """The injected keys' private halves as each pre-staging's deploy finds them, by the variable
+    that names them: (path, mode, text) - read by the test alone (SDD §7.2, §26.3)."""
+    seen: dict[str, tuple[Path, str, str]] = {}
+    original = env.executor._run_playbook
+
+    def read(variables):
+        for name, value in load_ansible_yaml(Path(variables).read_text()).items():
+            if name.endswith("conversion_host_key_private_path"):
+                path = Path(value)
+                seen[name] = (path, oct(path.stat().st_mode & 0o777), path.read_text())
+
+    async def spy(playbook, workdir, inventory, variables, *args, **kw):
+        if playbook.name == "deploy_conversion_hosts.yml":
+            read(variables)
+        return await original(playbook, workdir, inventory, variables, *args, **kw)
+
+    monkeypatch.setattr(env.executor, "_run_playbook", spy)
+    return seen
+
+
+def public_half(private: str) -> str:
+    """The public half of an OpenSSH private key, ``<type> <base64>``."""
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        PublicFormat,
+        load_ssh_private_key,
+    )
+
+    key = load_ssh_private_key(private.encode(), password=None)
+    return key.public_key().public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH).decode()
+
+
+def hosts_report(created=(), found=()):
+    """The conversion_host role's report (SDD §6.5): (alias, server id) pairs it created and
+    found."""
+    return json.dumps(
+        {
+            "created": [{"alias": alias, "id": server} for alias, server in created],
+            "found": [{"alias": alias, "id": server} for alias, server in found],
+        }
+    )
+
+
+async def test_a_prestaging_injects_a_host_key_only_for_a_host_it_will_create(env, monkeypatch):
+    """SDD §7.2, §26.3, §26.4 (plan task ST5): before a pre-staging each side's conversion host is
+    looked up by its name, as the role looks it up. For one the role will create - the deploy
+    manages it, no server bears its name, no keys are declared for it - an ed25519 key pair is
+    made: its private half waits in a 0600 file of the plan's directory, with its final newline,
+    named to the role by that side's variable alone - never the role's own, which as an extra var
+    would reach both sides -, and its public half is what the run's known_hosts holds under the
+    side's alias. A host that exists runs on its pin, one with declared keys on them, and with
+    host keys unchecked nothing is injected."""
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    await env.executor.prestage(plan, SRC, DST, deploy_conversion_hosts=True)
+    off = read_log(env.log)
+    assert off and [k for c in off for k in c["vars"] if "conversion_host_key" in k] == []
+
+    check_keys(env)
+    seen = capture_host_keys(env, monkeypatch)
+    env.registry.servers = {"conv-dst": "srv-dst-1"}  # no server named conv-src: created
+    destination = pinned(DST, "srv-dst-1", 2)
+    await env.executor.prestage(
+        plan, SRC, destination, deploy_conversion_hosts=True, host_keys=Book()
+    )
+    [(variable, (path, mode, text))] = seen.items()
+    assert variable == "os_migrate_src_conversion_host_key_private_path"
+    assert (path, mode) == (plan_dir(env) / "host-key-src.key", "0o600")
+    assert text.startswith("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+    assert text.endswith("-----END OPENSSH PRIVATE KEY-----\n")
+    injected = public_half(text)
+    assert injected.startswith("ssh-ed25519 ")
+    calls = read_log(env.log)[len(off) :]
+    for unset in (
+        "os_migrate_conversion_host_key_private_path",
+        "os_migrate_dst_conversion_host_key_private_path",
+    ):
+        assert [c for c in calls if unset in c["vars"]] == [], unset
+    [deploy] = [c for c in calls if c["playbook"] == "deploy_conversion_hosts.yml"]
+    assert known_keys(deploy["known_hosts"], "os_migrate_conv_src") == [injected]
+    assert known_keys(deploy["known_hosts"], "os_migrate_conv_dst") == [bare_key(public_key(2))]
+
+    # a key of its own for each pre-staging; a provider without a conversion host is the
+    # collection's own host, os_migrate_conv_src, which the deploy manages
+    seen.clear()
+    unset = SRC.model_copy(update={"conversion_host": None})
+    await env.executor.prestage(
+        plan, unset, destination, deploy_conversion_hosts=True, host_keys=Book()
+    )
+    assert list(seen) == ["os_migrate_src_conversion_host_key_private_path"]
+    assert public_half(seen["os_migrate_src_conversion_host_key_private_path"][2]) != injected
+    assert ("find_server", "os_migrate_conv_src") in env.registry.calls
+
+    # no key for a host that exists, nor for one with declared keys
+    seen.clear()
+    env.registry.servers["conv-src"] = "srv-src-1"
+    await env.executor.prestage(
+        plan,
+        pinned(SRC, "srv-src-1", 1),
+        destination,
+        deploy_conversion_hosts=True,
+        host_keys=Book(),
+    )
+    del env.registry.servers["conv-src"]
+    await env.executor.prestage(
+        plan, declaring(SRC, 3), destination, deploy_conversion_hosts=True, host_keys=Book()
+    )
+    assert seen == {}
+    deploys = [c for c in read_log(env.log) if c["playbook"] == "deploy_conversion_hosts.yml"]
+    assert known_keys(deploys[-2]["known_hosts"], "os_migrate_conv_src") == [
+        bare_key(public_key(1))
+    ]
+    assert known_keys(deploys[-1]["known_hosts"], "os_migrate_conv_src") == [
+        bare_key(public_key(3))
+    ]
+
+
+async def test_the_injected_private_key_is_removed_after_the_run_and_never_logged(
+    env, store, monkeypatch, caplog
+):
+    """SDD §7.2, §26.3 (plan task ST5): the injected key's private half lives as long as the
+    pre-staging's playbooks - removed after the run whatever its outcome: a success, a failure, a
+    cancel - and is never logged, stored, written into an event, a failure, the vars file, which
+    names its path alone, or any other file of the data directory."""
+    from tests.orch_support import build_harness
+
+    caplog.set_level(logging.DEBUG)
+    check_keys(env)
+    h = build_harness(env.settings.data_dir.parent / "orchestrator", store, [])
+    h.orch.providers = env.registry
+    destination = pinned(DST, "srv-dst-1", 2)
+    store.put("provider", SRC)
+    store.put("provider", destination)
+    env.registry.servers = {"conv-dst": "srv-dst-1"}
+    created = hosts_report(
+        created=[("os_migrate_conv_src", "srv-src-1")], found=[("os_migrate_conv_dst", "srv-dst-1")]
+    )
+    monkeypatch.setenv("ANSIBLE_FAKE_HOSTS_REPORT", created)
+    seen = capture_host_keys(env, monkeypatch)
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    book = h.orch.host_keys(plan.id)
+    key = plan_dir(env) / "host-key-src.key"
+    variable = "os_migrate_src_conversion_host_key_private_path"
+    texts = []
+
+    async def prestage():
+        await env.executor.prestage(
+            plan, SRC, destination, deploy_conversion_hosts=True, host_keys=book
+        )
+
+    await prestage()
+    texts.append(seen.pop(variable)[2])
+    assert not key.exists()
+
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", '{"msg": "the content install failed"}')
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL_ON", "deploy_conversion_hosts.yml")
+    with pytest.raises(PermanentStepError) as failed:
+        await prestage()
+    texts.append(seen.pop(variable)[2])
+    assert not key.exists()
+    monkeypatch.delenv("ANSIBLE_FAKE_FAIL")
+
+    monkeypatch.setenv("ANSIBLE_FAKE_HANG_ON", "deploy_conversion_hosts.yml")
+    running = asyncio.create_task(prestage())
+    for _ in range(500):
+        if variable in seen and "deploy_conversion_hosts.yml" in [
+            c["playbook"] for c in read_log(env.log)
+        ]:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError("the deploy never started")
+    assert key.exists()
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    texts.append(seen.pop(variable)[2])
+    assert not key.exists()
+
+    assert len(set(texts)) == 3, "a key pair of its own for each run"
+    bodies = [line for text in texts for line in text.splitlines() if not line.startswith("---")]
+    assert bodies
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    events = json.dumps([e.model_dump(mode="json") for e in store.events(since_seq=0)])
+    vars_file = (plan_dir(env) / "vars.yml").read_text()
+    assert str(key) in vars_file
+    files = [p for p in env.settings.data_dir.rglob("*") if p.is_file()]
+    written = "\n".join(p.read_text(errors="replace") for p in files)
+    for body in bodies:
+        assert body not in logged
+        assert body not in events
+        assert body not in str(failed.value)
+        assert body not in written
+
+
+async def test_the_pin_of_a_created_host_is_recorded_after_the_run(env, store, monkeypatch):
+    """SDD §7.2, §26.3, §26.4 (plan task ST5): after a pre-staging - also one that failed after the
+    role's server task - the role's report is read: each server the role created with the key the
+    run injected is pinned with it (source injected) with conversion_host.key_pinned, in one
+    transaction; the next pre-staging finds it and runs on that pin. A server the role found
+    instead, while the run injected a key for its side, does not hold that key: it is never pinned
+    with it, and the pre-staging is refused, the server a host without a key. A report an earlier
+    run wrote is never read for a run that wrote none."""
+    from seamless_migrate.domain.models import Provider
+    from tests.key_support import fingerprint_of
+    from tests.orch_support import build_harness
+
+    check_keys(env)
+    h = build_harness(env.settings.data_dir.parent / "orchestrator", store, [])
+    h.orch.providers = env.registry
+    destination = pinned(DST, "srv-dst-1", 2)
+    store.put("provider", SRC)
+    store.put("provider", destination)
+    env.registry.servers = {"conv-dst": "srv-dst-1"}
+    seen = capture_host_keys(env, monkeypatch)
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    book = h.orch.host_keys(plan.id)
+
+    def pins():
+        return [e for e in store.events(since_seq=0) if e.kind == "conversion_host.key_pinned"]
+
+    monkeypatch.setenv(
+        "ANSIBLE_FAKE_HOSTS_REPORT",
+        hosts_report(
+            created=[("os_migrate_conv_src", "srv-src-1")],
+            found=[("os_migrate_conv_dst", "srv-dst-1")],
+        ),
+    )
+    await env.executor.prestage(
+        plan, SRC, destination, deploy_conversion_hosts=True, host_keys=book
+    )
+    injected = public_half(seen.pop("os_migrate_src_conversion_host_key_private_path")[2])
+    source = store.get("provider", "src-osp", Provider)
+    pin = source.conversion_host_pin
+    assert (pin.server_id, pin.keys, pin.source) == ("srv-src-1", [injected], "injected")
+    stored_dst = store.get("provider", "dst-rhoso", Provider)
+    assert stored_dst.conversion_host_pin == destination.conversion_host_pin
+    [event] = pins()
+    assert (event.plan_id, event.migration_id) == (plan.id, None)
+    assert event.data == {
+        "provider_id": "src-osp",
+        "side": "source",
+        "server_id": "srv-src-1",
+        "fingerprints": [fingerprint_of(injected)],
+        "source": "injected",
+    }
+
+    # the next pre-staging finds the server and runs on its pin
+    env.registry.servers["conv-src"] = "srv-src-1"
+    monkeypatch.setenv(
+        "ANSIBLE_FAKE_HOSTS_REPORT",
+        hosts_report(
+            found=[("os_migrate_conv_src", "srv-src-1"), ("os_migrate_conv_dst", "srv-dst-1")]
+        ),
+    )
+    await env.executor.prestage(
+        plan, source, destination, deploy_conversion_hosts=True, host_keys=book
+    )
+    assert seen == {} and len(pins()) == 1
+    deploy = [c for c in read_log(env.log) if c["playbook"] == "deploy_conversion_hosts.yml"][-1]
+    assert known_keys(deploy["known_hosts"], "os_migrate_conv_src") == [injected]
+
+    # a server the role found while the run injected a key for its side holds no such key
+    del env.registry.servers["conv-dst"]
+    store.put("provider", DST)
+    monkeypatch.setenv(
+        "ANSIBLE_FAKE_HOSTS_REPORT",
+        hosts_report(
+            found=[("os_migrate_conv_src", "srv-src-1"), ("os_migrate_conv_dst", "srv-dst-7")]
+        ),
+    )
+    with pytest.raises(PermanentStepError) as refused:
+        await env.executor.prestage(plan, source, DST, deploy_conversion_hosts=True, host_keys=book)
+    assert "os_migrate_dst_conversion_host_key_private_path" in seen
+    assert str(refused.value) == (
+        "host key unknown: no key is pinned or declared for the destination conversion host "
+        "conv-dst"
+    )
+    assert store.get("provider", "dst-rhoso", Provider).conversion_host_pin is None
+    assert len(pins()) == 1
+
+    # a run that failed after the role created its server pins it all the same
+    monkeypatch.setenv(
+        "ANSIBLE_FAKE_HOSTS_REPORT",
+        hosts_report(
+            created=[("os_migrate_conv_dst", "srv-dst-8")],
+            found=[("os_migrate_conv_src", "srv-src-1")],
+        ),
+    )
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", '{"msg": "the content install failed"}')
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL_ON", "deploy_conversion_hosts.yml")
+    seen.clear()
+    with pytest.raises(PermanentStepError, match="the content install failed"):
+        await env.executor.prestage(plan, source, DST, deploy_conversion_hosts=True, host_keys=book)
+    dst_pin = store.get("provider", "dst-rhoso", Provider).conversion_host_pin
+    dst_key = public_half(seen["os_migrate_dst_conversion_host_key_private_path"][2])
+    assert (dst_pin.server_id, dst_pin.keys, dst_pin.source) == ("srv-dst-8", [dst_key], "injected")
+    assert len(pins()) == 2
+
+    # a run whose role reached no server task wrote no report: the last one is not read
+    monkeypatch.delenv("ANSIBLE_FAKE_FAIL")
+    monkeypatch.delenv("ANSIBLE_FAKE_HOSTS_REPORT")
+    await env.executor.prestage(plan, source, DST, deploy_conversion_hosts=True, host_keys=book)
+    assert store.get("provider", "dst-rhoso", Provider).conversion_host_pin == dst_pin
+    assert len(pins()) == 2

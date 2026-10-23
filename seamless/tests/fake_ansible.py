@@ -83,6 +83,18 @@ SCRIPT = textwrap.dedent(
     base = record["playbook"]
     print("PLAY [migrator] ****")
     print("TASK [" + base + "] ****")
+    report = os.environ.get("ANSIBLE_FAKE_HOSTS_REPORT")
+    if base == "deploy_conversion_hosts.yml" and report:
+        # the conversion_host role's report of the servers it created and found, written after
+        # its server tasks - before what may fail later in the deploy (SDD 6.5)
+        folder = osm / "conversion"
+        folder.mkdir(mode=0o700, exist_ok=True)
+        (folder / "hosts.json").write_text(report)
+    if os.environ.get("ANSIBLE_FAKE_HANG_ON") == base:
+        # a playbook still running when its step is cancelled
+        print("TASK [" + base + " : wait] ****")
+        sys.stdout.flush()
+        time.sleep(30)
     long_line = int(os.environ.get("ANSIBLE_FAKE_LONG_LINE", "0"))
     if long_line:
         print("ok: [localhost] => " + "x" * long_line)

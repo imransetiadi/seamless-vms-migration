@@ -193,6 +193,13 @@ class _HostKeyBook:
         the provider check's path (§10, §26.8); as stored when nothing was pinned."""
         return await self._orchestrator._pin_from_console(provider.id)
 
+    async def pin_injected(
+        self, provider: Provider, side: str, server_id: str, keys: Sequence[str]
+    ) -> None:
+        """The server the pre-staging's role created with the key the run injected, pinned with
+        it (§26.3)."""
+        await self._orchestrator._pin_injected(provider.id, side, server_id, keys, self.plan_id)
+
 
 def _address(address: str) -> str:
     """An address as Neutron writes it (SDD §8.3): canonical, else as given."""
@@ -1142,6 +1149,39 @@ class Orchestrator:
             )
             await put_and_emit(self.store, self.bus, "provider", updated, version, pinned)
             return updated
+
+    async def _pin_injected(
+        self,
+        provider_id: str,
+        side: str,
+        server_id: str,
+        keys: Sequence[str],
+        plan_id: str | None,
+    ) -> None:
+        """The pin of a server a pre-staging's role created with the key the run injected (SDD
+        §7.2, §26.3, §26.4): its keys, source injected, with conversion_host.key_pinned in one
+        transaction - over any earlier pin, another server's -, under the provider's lock as a
+        check holds it."""
+        async with self._lock(f"provider:{provider_id}"):
+            provider, version = await self.db.get_versioned("provider", provider_id, Provider)
+            pin = HostKeyPin(
+                server_id=server_id, keys=list(keys), source="injected", pinned_at=self._now()
+            )
+            event = new_event(
+                "conversion_host.key_pinned",
+                f"the {side} conversion host of provider {provider_id} (server {server_id}) "
+                "pinned with the host key its pre-staging injected",
+                plan_id=plan_id,
+                data={
+                    "provider_id": provider_id,
+                    "side": side,
+                    "server_id": server_id,
+                    "fingerprints": [fingerprint(key) for key in keys],
+                    "source": "injected",
+                },
+            )
+            updated = provider.model_copy(update={"conversion_host_pin": pin})
+            await put_and_emit(self.store, self.bus, "provider", updated, version, event)
 
     async def _caps(self, provider: Provider, actor: str) -> dict[str, Any]:
         checked = await self.check_provider(provider.id, actor)
