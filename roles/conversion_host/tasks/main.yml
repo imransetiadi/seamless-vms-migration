@@ -58,6 +58,47 @@
     client_cert: "{{ os_migrate_conversion_client_cert | default(omit) }}"
     client_key: "{{ os_migrate_conversion_client_key | default(omit) }}"
 
+# only a server the role creates gets the injected host key: one it finds keeps its own, and the
+# report below tells the run which it created and which it found (Seamless Migrate SDD 6.5)
+- name: Look up the os_migrate conversion host
+  os_migrate.os_migrate.server_info:
+    server: "{{ os_migrate_conversion_host_name }}"
+    cloud: "{{ os_migrate_conversion_cloud }}"
+    validate_certs: "{{ os_migrate_conversion_validate_certs | default(omit) }}"
+    ca_cert: "{{ os_migrate_conversion_ca_cert | default(omit) }}"
+    client_cert: "{{ os_migrate_conversion_client_cert | default(omit) }}"
+    client_key: "{{ os_migrate_conversion_client_key | default(omit) }}"
+  # Nova details a server's user data - a host key injected at its creation - to an admin
+  no_log: true
+  register: conversion_host_lookup
+
+- name: Note whether the conversion host gets the injected host key
+  ansible.builtin.set_fact:
+    conversion_host_found: "{{ conversion_host_named | length > 0 }}"
+    conversion_host_injects_key: >-
+      {{ conversion_host_named | length == 0
+         and os_migrate_conversion_host_key_private_path | default('', true) | length > 0 }}
+  vars:
+    conversion_host_named: >-
+      {{ conversion_host_lookup.servers | selectattr('name', 'equalto', os_migrate_conversion_host_name) | list }}
+
+# cloud-init writes the key as the host's ed25519 key: a key of another type fails here, before the
+# server task; ssh-keygen prints the public half alone (Seamless Migrate SDD 6.5)
+- name: Read the public half of the injected host key
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -y
+      - -f
+      - "{{ os_migrate_conversion_host_key_private_path }}"
+  register: conversion_host_key_public
+  changed_when: false
+  failed_when: >-
+    conversion_host_key_public.rc != 0
+    or not conversion_host_key_public.stdout.startswith('ssh-ed25519 ')
+  check_mode: false
+  when: conversion_host_injects_key | bool
+
 - name: Create os_migrate conversion host
   os_migrate.os_migrate.server:
     name: "{{ os_migrate_conversion_host_name }}"
@@ -79,6 +120,57 @@
     ca_cert: "{{ os_migrate_conversion_ca_cert | default(omit) }}"
     client_cert: "{{ os_migrate_conversion_client_cert | default(omit) }}"
     client_key: "{{ os_migrate_conversion_client_key | default(omit) }}"
+    # the injected host key as cloud-init's ssh_keys, the image's keys deleted, so that the host
+    # presents that key alone; no user data for a server the role finds, nor without a host key,
+    # as upstream (Seamless Migrate SDD 6.5)
+    userdata: "{{ conversion_host_user_data if conversion_host_injects_key | bool else omit }}"
+  vars:
+    # the key file's text as it is, final newline included: OpenSSH reads no private key without
+    # it, and the previous task's ssh-keygen has read this one
+    conversion_host_user_data: |-
+      #cloud-config
+      {{ {'ssh_deletekeys': true,
+          'ssh_keys': {'ed25519_private': lookup('ansible.builtin.file', os_migrate_conversion_host_key_private_path, rstrip=false),
+                       'ed25519_public': conversion_host_key_public.stdout}} | to_nice_yaml(indent=2) }}
+  # the private half is read here alone, and a module result can carry the user data back - Nova
+  # details it to an admin: neither the arguments nor the result are printed (Seamless Migrate SDD 6.5)
+  no_log: true
+  register: conversion_host_server
+
+# each server the role created and each it found, with its id and its side's alias: the run pins
+# the injected key of a server the role created alone; no key material (Seamless Migrate SDD 6.5)
+- name: Report the conversion host the role created or found
+  when: not ansible_check_mode
+  block:
+    - name: Note the conversion host in the report
+      ansible.builtin.set_fact:
+        conversion_host_report:
+          created: >-
+            {{ (conversion_host_report.created | default([]) | rejectattr('alias', 'equalto', conversion_host_alias) | list)
+               + ([conversion_host_entry] if conversion_host_reported_as == 'created' else []) }}
+          found: >-
+            {{ (conversion_host_report.found | default([]) | rejectattr('alias', 'equalto', conversion_host_alias) | list)
+               + ([conversion_host_entry] if conversion_host_reported_as == 'found' else []) }}
+      vars:
+        conversion_host_alias: "os_migrate_conv_{{ os_migrate_conversion_cloud }}"
+        conversion_host_entry:
+          alias: "{{ conversion_host_alias }}"
+          id: "{{ conversion_host_server.server.id }}"
+        # created: the lookup found no server of the name, and the server task made one
+        conversion_host_reported_as: >-
+          {{ 'created' if not conversion_host_found | bool and conversion_host_server is changed else 'found' }}
+
+    - name: Create the folder of the conversion host report
+      ansible.builtin.file:
+        path: "{{ os_migrate_data_dir }}/conversion"
+        state: directory
+        mode: "0700"
+
+    - name: Write the conversion host report
+      ansible.builtin.copy:
+        content: "{{ conversion_host_report | to_nice_json }}\n"
+        dest: "{{ os_migrate_data_dir }}/conversion/hosts.json"
+        mode: "0600"
 
 - name: Create a floating IP for the conversion host
   ansible.builtin.include_tasks: create_fip.yml

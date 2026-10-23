@@ -52,3 +52,48 @@ os_migrate_conversion_host_known_hosts: /path/to/known_hosts
 
 Unset or empty, the hosts are added as upstream adds them, with
 `-o StrictHostKeyChecking=no`.
+
+## Injected host key
+
+With `os_migrate_conversion_host_key_private_path` naming the private half of
+an ed25519 key pair (an OpenSSH private key file, 0600), the role creates the
+conversion host with that key as its SSH host key: the server's user data is
+cloud-init's `ssh_keys` (`ed25519_private`, the file's text, and
+`ed25519_public`, which `ssh-keygen -y` reads from the file) with
+`ssh_deletekeys: true`: cloud-init deletes the image's host keys and writes
+that key alone, so the host's key is known before anything connects to it. A
+file `ssh-keygen` cannot read, or a key of another type, fails the role before
+the server is created.
+`deploy_conversion_hosts.yml` takes each side's key as
+`os_migrate_src_conversion_host_key_private_path` and
+`os_migrate_dst_conversion_host_key_private_path`.
+
+```yaml
+os_migrate_src_conversion_host_key_private_path: /path/to/src_host_key
+os_migrate_dst_conversion_host_key_private_path: /path/to/dst_host_key
+```
+
+The role looks the host up by its name first. A server it finds keeps its own
+key and gets no user data, whatever the variable says; without the variable no
+server gets user data, as upstream.
+
+The lookup and the server task run with `no_log`: the server task's arguments
+hold the private key, and Nova returns a server's user data, base64-encoded, to
+an admin credential, so their results could carry it back. Neither prints
+anything at any verbosity, a failure's message included.
+
+After each server task the role writes, beside its keys,
+`{{ os_migrate_data_dir }}/conversion/hosts.json` (0600): the servers the
+playbook run created and those it found, by their side's inventory name and
+their Nova server id. It holds no key material:
+
+```json
+{
+    "created": [{"alias": "os_migrate_conv_src", "id": "<server id>"}],
+    "found": [{"alias": "os_migrate_conv_dst", "id": "<server id>"}]
+}
+```
+
+A server is created when the lookup found none of its name and the server task
+changed something, else found. Only a server under `created` holds the injected
+key.

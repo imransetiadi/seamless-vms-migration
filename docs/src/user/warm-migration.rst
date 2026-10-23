@@ -191,6 +191,12 @@ each conversion host's keys under its inventory name (``os_migrate_conv_src``,
 ``os_migrate_conv_dst``), every module checks the host's key strictly and fails
 at once on a refused key, or on a link the source host refuses (see the
 ``conversion_host`` role); unset, the hosts' keys are not checked, as upstream.
+``deploy_conversion_hosts.yml`` creates a conversion host with the ed25519 host
+key whose private half ``os_migrate_src_conversion_host_key_private_path`` or
+``os_migrate_dst_conversion_host_key_private_path`` names, so that its key can
+be pinned before anything connects to it, and lists the hosts it created and
+those it found in ``conversion/hosts.json`` in the data directory (see the
+``conversion_host`` role).
 
 Requirements and limits
 -----------------------

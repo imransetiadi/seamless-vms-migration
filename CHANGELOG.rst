@@ -674,3 +674,16 @@ This project follows a simple changelog to satisfy collection metadata validatio
   refuses - fails the module at once with "host key refused: ..." or "link
   refused by the source conversion host (...): ...", never as an outage waited
   out for 15 minutes. Unset or empty, everything is as before.
+- The injected host key (Seamless Migrate SDD 6.5, plan task ST4): with
+  ``os_migrate_conversion_host_key_private_path`` - each side's
+  ``os_migrate_src_conversion_host_key_private_path`` and
+  ``os_migrate_dst_conversion_host_key_private_path`` in
+  ``deploy_conversion_hosts.yml`` -, the private half of an ed25519 key pair,
+  the ``conversion_host`` role creates its conversion host with cloud-init's
+  ``ssh_keys`` (``ed25519_private``, ``ed25519_public``) and
+  ``ssh_deletekeys: true`` as the server's ``userdata``. The role looks the
+  host up first: a server it finds gets no user data, nor does any without the
+  variable, as before. The lookup and the server task run with ``no_log``. After
+  each server task the role writes ``conversion/hosts.json`` in the data
+  directory: the servers it created and those it found, each with its side's
+  inventory name and its Nova server id, and no key material.
