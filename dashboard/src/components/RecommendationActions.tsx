@@ -26,7 +26,7 @@ export function RecommendationActions({
   rec: AdvisorRecommendation;
   migration: ActionMigration;
   /** Where focus goes after a decision, when these actions may go with it (SDD §16). */
-  focusAfterRef?: RefObject<HTMLElement>;
+  focusAfterRef?: RefObject<HTMLElement | null>;
   /** Says what was decided, for the page's live region. */
   onDecided?: (message: string) => void;
 }) {

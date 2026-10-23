@@ -41,7 +41,7 @@ export interface ConfirmDialogProps {
   pending?: boolean;
   error?: unknown;
   /** Where focus goes on close when the control that opened the dialog may be gone (SDD §16). */
-  returnFocusRef?: RefObject<HTMLElement>;
+  returnFocusRef?: RefObject<HTMLElement | null>;
   onConfirm: () => void;
   onCancel: () => void;
 }

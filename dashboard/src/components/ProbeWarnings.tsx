@@ -16,7 +16,7 @@ export interface ProbeWarningsProps {
   edit: Availability;
   onSaved?: (text: string) => void;
   /** Where focus goes once Use suggested probe saved and its row went (the plan's heading, SDD §16). */
-  focusAfterRef?: RefObject<HTMLElement>;
+  focusAfterRef?: RefObject<HTMLElement | null>;
 }
 
 /**

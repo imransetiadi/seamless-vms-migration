@@ -135,7 +135,7 @@ export interface FinalizePlanDialogProps {
   /** The outcome: the page announces the counts and lists the VMs it skipped (SDD §16). */
   onDone: (result: PlanFinalizeResult) => void;
   /** Where focus goes on close when the Finalize button that opened the dialog goes with the finalize (SDD §16). */
-  returnFocusRef?: RefObject<HTMLElement>;
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
 /** The VMs a bulk finalize skipped, each with the reason the API gave, until dismissed (SDD §8.1, §16). */
