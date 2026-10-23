@@ -7052,14 +7052,14 @@ excerpt showed, and a behaviour only a lab can show, is marked `TODO(LAB): confi
   when it exists). Pre-staging copies it to the destination host as `~/.ssh/id_rsa` and adds its public key, with no
   option, to a block marked `CONVERSION LINK KEY` in the source host's `~/.ssh/authorized_keys`. Nothing removes
   either, and nothing deletes a plan's or a run's directory. The last plan that pre-stages a host pair replaces the
-  earlier plan's key on both hosts. Security.md §6.4 and §7.1 say the keys live in the run directory and go with it;
-  the code keeps them per plan.
-* **What the link carries.** Cold: `ssh -N -T -L <port>:localhost:<nbd port>`, forwards only, to NBD exports that
-  bind `127.0.0.1` (§6.6). Warm: one command per disk, `sudo -n python3 /tmp/seamless-blocksync-<uuid>.py send ...`
-  (§6.4). sshd's `restrict` turns off forwarding, PTYs, agent and X11 forwarding and `~/.ssh/rc`, not commands: with
-  SEC-06's `restrict,port-forwarding,permitopen="127.0.0.1:*",from=...` the destination host can still run any
-  command, with sudo, on the source host. And `permitopen` compares the forward's host name as written:
-  `127.0.0.1:*` refuses a forward that names `localhost`.
+  earlier plan's key on both hosts. Security.md §6.4 and §7.1 said the keys lived in the run directory and went with
+  it, until PR #113 corrected them to what the code does.
+* **What the link carries.** Cold: `ssh -N -T -L <port>:localhost:<nbd port>`, forwards only, to NBD exports that bind
+  `127.0.0.1` (§6.6). Warm: one command per disk, `sudo -n python3 /tmp/seamless-blocksync-<uuid>.py send ...` (§6.4).
+  sshd's `restrict` turns off forwarding, PTYs, agent and X11 forwarding and `~/.ssh/rc`, not commands: with the
+  remediation SEC-06 named before PR #113, `restrict,port-forwarding,permitopen="127.0.0.1:*",from=...`, the
+  destination host can still run any command, with sudo, on the source host. And `permitopen` compares the forward's
+  host name as written: `127.0.0.1:*` refuses a forward that names `localhost`.
 * **Pre-staging** creates the conversion hosts without user data; the vendored openstack.cloud 2.6.0 `server` module
   takes `userdata`. Their Nova keypair, `os_migrate_conv`, holds the plan's conversion key, and the `keypair` module
   refuses a name present with another key: a second plan of the same providers stops there (`TODO(LAB): confirm`).
@@ -7080,9 +7080,10 @@ Proposed for 0.5.0, in the order of the plan:
 5. The VMware destination's conversion host pinned the same way (§26.7).
 6. Existing installs: pins for 0.4.0's hosts, their link keys removed, the setting on by default (§26.8).
 
-Not in 0.5.0: SSH certificates and a host CA; the conversion key itself (one per plan, with sudo; SEC-11 accepted) and
-its Nova keypair; the hypervisor path; the VMware kit's own connections; the helper script's private directory and
-checksum (R-02), unless the owner joins them to the gate (owner decision 10).
+Not in 0.5.0: SSH certificates and a host CA; the conversion key itself (one per plan today, one per installation with
+issue #112's fix; with sudo; SEC-11 accepted) and its Nova keypair; the hypervisor path; the VMware kit's own
+connections; the helper script's private directory and checksum (R-02), unless the owner joins them to the gate (owner
+decision 10).
 
 ### 26.3 Learning a host's key
 
