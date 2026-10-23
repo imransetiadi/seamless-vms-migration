@@ -5208,7 +5208,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 
 | # | Decision | Default taken | Revisit when |
 |---|---|---|---|
-| D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with per-disk parallelism and read-ahead workers | 0.2.0: changed-extent sources that remove the scan — Ceph-direct `rbd diff` between pass snapshots (opt-in, Ceph credentials) and hypervisor-assisted tracking via libvirt checkpoints / incremental backup on the source compute nodes (builds on the existing `import_from_hypervisor` access model) |
+| D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with per-disk parallelism and read-ahead workers; decided by the owner 2026-10-23: §28.11's ten defaults as written - Ceph `rbd diff` between Cinder's pass snapshots, queried on the source conversion host with a metadata-only Ceph user; pre-copy and keep-warm passes check the extents and the final pass reads them; a disk that cannot use them scans in full; libvirt dirty bitmaps after a lab spike; a Technology Preview in 0.5.0 | each item binds with its plan task (§28.12, FR-26); the LAB-CE cases and PERF-E2E-SM1b of §28.10 end the Technology Preview |
 | D2 | Single-replica orchestrator; a highly available control plane (§25) | accepted up to 0.4.0; decided by the owner 2026-10-23: §25.11's ten defaults as written - a PostgreSQL lease with an epoch that fences every write, followers that relay to the leader, two replicas on a cluster with a ReadWriteMany data volume, a Technology Preview in 0.5.0 | each item binds with its plan task (§25.12); the LAB-HA cases of §25.10 end the Technology Preview |
 | D3 | Network cut-over (FIP/DNS/BGP), Octavia and Heat | out of scope up to 0.3.0, with no hook documented and no finding (the old default said "hooks documented", which was never done) | decided: D18 (0.4.0, §23) |
 | D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL`; partly decided by the §13.4 knobs (`SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`, `TODO(ADV-06)`) |
@@ -7630,3 +7630,326 @@ The owner took each default as written on 2026-10-23 (D20):
 | the demo's tenant projects and its plan with a project pair | §10 | TC9 |
 | QASuite rows and LAB-TC cases; Security.md (C4-01, C4-03, C4-04, §7.1, the checklist); Operations.md (writing and rotating project credentials, a user per project) | QASuite, Security.md, Operations.md | TC10 |
 | the lab; the Technology Preview label goes when LAB-TC01–LAB-TC06 pass | QASuite §13 | TC11 |
+
+## 28. Changed-extent tracking (0.5.0, Technology Preview)
+
+Status: proposed 2026-10-23 and decided by the owner the same day (D1): §28.11's defaults as written. Each item
+becomes binding in the section §28.12 names when its plan task lands; until then nothing in this section is binding.
+The PRD follows with plan task CE1. Changed-extent tracking ships as a **Technology Preview** until LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass (§28.10).
+
+What it answers: FR-26 ("Changed-extent tracking to remove the scan floor: Ceph-direct `rbd diff` and
+hypervisor-assisted libvirt checkpoints", priority C, release 0.2.0), the open decision D1 (§20), PRD §8's target of a
+"≤ 5 min median independent of disk size" (SM-1b in Performance.md §3.1) and the 0.2.0 item "Ceph-direct incremental
+diff" of PRD §9. No release delivered them. The owner chose 0.5.0 (owner decision 1). The plan is
+`superpowers/plans/2026-10-23-changed-extents.md`. §24 to §27 are left to the proposals of other branches; nothing
+here depends on them.
+
+The proposed fields, route, check keys and findings stay out of the tables the SDD-reading tests parse (§4.3, §9.3,
+§12, §15.1, §18) until their tasks land; a proposed finding code is written without code quotes. The facts about Ceph,
+Cinder, Nova, libvirt and QEMU come from their documentation and sources, read 2026-10-23 and listed in the pull
+request; one only an excerpt or a secondary source showed, or only a lab can show, is marked `TODO(LAB): confirm`.
+
+### 28.1 What 0.4.0 has
+
+* **Every warm pass reads both devices in full.** Blocksync learns what changed only by hashing: the receiver streams
+  a digest of every destination chunk, the sender reads and hashes every source chunk and sends the chunks whose
+  digests differ (§6.2). The manifest digest over all chunk digests proves that the destination equals the source
+  snapshot (NFR-05). Nothing tells blocksync which chunks the guest wrote; `assume_zero`, never applied to a final
+  pass, relies on that later full scan (Security.md R-01).
+* **Pass snapshots are Cinder's.** Each pass force-snapshots every source volume (`os-migrate-<volume id>`), makes a
+  temporary volume from the snapshot, attaches it to the source conversion host, syncs, and deletes the temporary
+  volume, then the snapshot (§6.1, §6.4). No snapshot outlives its pass. An image-booted VM with `boot_disk_copy` gets
+  a Glance image of the server per pass instead. The final pass after the stop does the same: the downtime holds a scan.
+* **The estimator charges the scan** `max(Dmax/S, D/min(S·P, A))` to every delta pass and to the final pass, and
+  calibrates `S` from each delta or final pass's `bytes_scanned` (§9.1); the dashboard ports the final downtime (§16).
+* **The source check knows the Cinder backends:** with `admin` it reports each pool's family, `rbd` when its
+  `storage_protocol` is `ceph` (§7.3.1, §10); a volume disk records its `pool` (§4.2). Nothing in Seamless reads Ceph.
+* **The hypervisor access model exists in the collection alone:** `roles/import_from_hypervisor` reaches the compute
+  nodes over SSH as a sudo user and exports a stopped VM's local disks read-only on the loopback, read over SSH, each
+  format from Nova's `disk.info` (§6.6; SEC-01, SEC-13), for the cold `use_nbdkit_direct` mode, which the warm role
+  refuses and the control plane never sets.
+* **VMware's warm path copies by changed blocks:** the kit copies what changed since the CBT change id it recorded per
+  volume, and the estimator charges it no scan (§7.2, §9.1). It records that id before its full copy ends, so a first
+  copy cut off left a volume no pass completes (review RV30-01): record a base only once its pass completed.
+
+### 28.2 The problem
+
+After the stop, the final pass reads and hashes every source and destination chunk, so the warm downtime is
+`F + scan`, `F` = shutdown + snapshot + create + boot = 270 s, unless the final delta takes longer over the link
+(Performance.md §4.1). A faster link does not shorten it; only a faster scan, or more disks in parallel, does. With the
+defaults (`S` = 500 MiB/s per stream, Performance.md §4.3) a 100 GiB disk scans in 205 s (downtime 475 s, 7.9 min),
+200 GiB in 410 s (680 s, 11.3 min), 500 GiB in 1,024 s (1,294 s, 21.6 min; 1,550 s at the NFR-02a floor of
+400 MiB/s) and 1 TiB in 2,097 s (39.5 min); 4 × 100 GiB behind a 1,190 MiB/s storage path takes 614 s. It blocks:
+* **SM-1b** (PRD §8): a "≤ 5 min median independent of disk size", for which `F` alone (4.5 min) leaves about 30 s:
+  reachable only when the scan term goes (Performance.md §3.2);
+* **SM-1's p95** for a single 500 GiB disk, met only if the measured `S` is at least 416 MiB/s (LAB-W12);
+* **G1a** for multi-disk VMs behind a host's storage ceiling, and **G1b** on fast links, where a single-disk VM is
+  cheaper cold because the warm path scans its free space too (Performance.md §3.2, notes 1 and 2);
+* **convergence:** a delta pass lasts at least `snapshot + scan`, so at 2 MiB/s a single disk above about 235 GiB never
+  converges below 1 GiB and runs every pass `max_sync_passes` allows (Performance.md §4.1, property 3);
+* **source load:** each keep-warm pass, while a migration waits for its cutover, reads every disk again (§5.4).
+
+NFR-02a (400 MiB/s per stream) stays: first passes, checks and fallbacks still scan.
+
+### 28.3 Scope
+
+Proposed for 0.5.0, in the order of the plan:
+1. A source provider's Ceph access (cluster, monitors, a read-only user, its key write-only), a plan switch (§28.9).
+2. Changed extents from `rbd diff` between Cinder's pass snapshots of an RBD volume, on the source conversion host.
+3. Blocksync reads only the chunks the extents name in the final pass, and every pre-copy and keep-warm pass checks the
+   extents against its full scan (§28.5, owner decision 5); any doubt scans the disk in full, as today.
+4. The estimator's final-pass term and its calibration (§28.6); checks, findings, the dashboard and the demo.
+
+Not in 0.5.0: libvirt dirty bitmaps (§28.7, owner decision 2); disks without a Cinder RBD snapshot to diff from -
+Nova's ephemeral disks on RBD, `boot_disk_copy` images, volumes of other backends; encrypted volumes (§28.4); several
+Ceph clusters per provider; reading the RBD snapshot without a temporary volume (owner decision 7); VMware (CBT).
+
+### 28.4 Ceph-direct extents
+
+* **Which disks:** a `volume` disk, not `encrypted`, whose Cinder pool is of the `rbd` family (§7.3.1) on the
+  provider's cluster. Cinder's RBD driver reports a backend's `location_info` as `cluster:conf:fsid:user:pool`, which
+  the source check reads with the pools (`TODO(LAB): confirm` that get_pools shows it): a disk qualifies when its
+  pool's fsid is the provider's `ceph.fsid`. An encrypted volume is left out: the diff is of the image's bytes, LUKS
+  header included, while the conversion host reads it through Nova's attach, which decrypts it (`TODO(LAB): confirm`).
+* **Names:** Cinder names a volume's RBD image `volume-<name_id>` (`volume_name_template`; `name_id` is the id unless a
+  migration or a retype gave the volume another back-end object; an admin reads it as `os-vol-mig-status-attr:name_id`,
+  `TODO(LAB): confirm`) and a snapshot `snapshot-<snapshot id>` (`snapshot_name_template`), which its driver creates and
+  protects on that image. So a Cinder pass snapshot is an RBD snapshot: the diff base needs no write to Ceph, and Cinder
+  keeps creating and deleting every snapshot. A source credential that cannot read a volume's host and `name_id` (admin
+  reads under the default policies, as `Disk.pool` is, §4.2) leaves the disk untracked.
+* **The base:** the Cinder snapshot the last completed pass copied stays, instead of being deleted with its temporary
+  volume, until the next pass of the disk completes. The warm state records per device (§6.3, proposed `extent_bases`)
+  the snapshot's id, the pass's number, the source volume's id, size and `name_id`, the destination volume's id and
+  whether that pass read the destination in full. A volume holds one more snapshot than today (two during a pass): the
+  source project's snapshot quota must allow it (Operations.md). The cutover deletes the bases with the final
+  snapshot's cleanup; a rollback, a cancel's cleanup and a change of strategy delete them (§7.3 step 0 refuses volumes
+  with snapshots).
+* **The query:** on the source conversion host,
+  `rbd diff --from-snap snapshot-<base> --whole-object --format json <pool>/volume-<name_id>@snapshot-<current>` lists
+  `{offset, length, exists}` extents of the whole image. With `--whole-object` librbd diffs the snapshots' object maps
+  when the image has fast-diff (with object-map and exclusive-lock, "Default: yes" in Ceph's RBD configuration
+  reference) and a valid map; otherwise it lists every data object's snapshots: correct, one request per object. A diff
+  from a snapshot leaves a clone's parent out (librbd reads it only for a diff from the beginning of time); the parent
+  is the same in both snapshots. Each chunk an extent touches is listed (blocksync's 4 MiB chunk is RBD's default
+  object); a zeroed extent (`exists` false) is read like the others, which sends a zero frame.
+* **Over and under:** listing too much - a flatten, a rewrite of the same bytes, a whole object for one sector, a map
+  listing every allocated object (a report on Octopus 15.2.11 with krbd) - costs copy time alone. Listing too little
+  loses data: in Ceph #61616 ("volume data corruption when using rbd-mirror w/failover") an object map forked for a
+  snapshot taken under I/O could miss writes, so "some object deltas may be incomplete". Its librbd fix targets Pacific
+  16.2.14, Quincy 17.2.7 and Reef 18.1.2; the map is kept by the image's writer, QEMU's librbd on the source compute
+  nodes, whose version no OpenStack API shows, and RHCS 6.1, which RHOSP 17.1 supports, is built from 17.2.6
+  (`TODO(LAB): confirm` that support statement, and which builds carry the fix). Ceph #53784 (wrong offsets in fast-diff
+  mode, fixed in 17.2.0) needs a diff that starts inside an object, which `rbd diff` never makes. §28.5's checks are the
+  guard.
+* **Where it runs:** the source conversion host, with `ceph-common` (installed by `conversion_host_content` for a plan
+  that tracks extents; its repository per image `TODO(LAB): confirm`), reaching the monitors and OSDs. A managed
+  conversion host sits on its own tenant network behind a router (§6.5), while a director-deployed RHOSP 17.1 keeps
+  Ceph on the isolated Storage network (`TODO(LAB): confirm`): the operator routes it there, or uses an existing
+  conversion host (`manage` false) that reaches Ceph (owner decision 4). The temporary volume stays the read path.
+* **Credentials** (proposed, §4.2 and §12 with plan task CE6): `Provider.ceph: CephAccess|null`, on an OpenStack or
+  RHOSO source alone (422 on a VMware provider or a destination):
+  ```text
+  CephAccess { fsid: str,                 # the cluster's fsid; a pool whose location_info names another is untracked
+               monitors: list[str],       # 1-9 monitor addresses ("host" or "host:port") the conversion host reaches
+               client: str = "seamless",  # the Ceph user without "client." (1-64 letters, digits, ".", "-" or "_")
+               key_updated_at: datetime|null }   # server-owned: set by PUT …/ceph-key
+  ```
+  `PUT /providers/{id}/ceph-key` (admin, write-only) takes `{key}`, as `ceph auth get-key` prints it, writes it to the
+  secret store as `provider-{id}.ceph` (key `key`) and sets `key_updated_at`; event `provider.credentials_updated`
+  names the secret and the key, never a value. A provider id never holds a `.`, so the name is no other provider's;
+  the `SEAMLESS_SECRET_*` variables read `.` and `-` alike, so `POST /providers` refuses (409) an id ending in `-ceph`
+  whose prefix is another provider's id, and that provider while such an id exists, as for `-ssh` (§13.3, audit AP-04).
+  `ceph` set to null, and the provider's deletion, delete the secret. Each run gets a minimal `ceph.conf` (fsid,
+  monitors) and a keyring as 0600 files beside `secrets.yml`, deleted with it (§7.2); the sync copies them to the source
+  conversion host for each query, into a 0700 directory removed after it, as blocksync's script is (§6.4).
+* **Caps** (owner decision 3): a metadata-only user - mon `profile rbd`; osd `allow r class-read` on each tracked pool,
+  limited with `object_prefix` to the image metadata (`rbd_header.`, `rbd_object_map.`, `rbd_id.`, `rbd_directory`,
+  `rbd_info`) and with `network <conversion host>/32`. It computes fast diffs and cannot read a volume's data
+  (`TODO(LAB): confirm` the object set; without fast-diff its query fails and the disk scans). The alternative,
+  `osd 'profile rbd-read-only pool=<pool>'`, reads every tenant's volumes of the pool.
+* **The check:** the source's check adds to each `rbd` entry of `storage_backends` its `ceph_fsid` and `ceph_pool` from
+  `location_info` (null when missing). The control plane cannot reach Ceph: a pass's first query shows whether the
+  monitors answer, the key works and an image's fast-diff map is valid, and the pass records it (§28.5).
+
+### 28.5 Passes, blocksync and what the manifest proves
+
+* **How a pass used a disk's extents** (proposed `SyncPass.extents: dict[str, ExtentUse] = {}`, per device, §4.2):
+  ```text
+  ExtentUse { mode: "read"|"checked"|"scanned",  # read: only the chunks the extents name; checked: a full scan that
+                                                 # compared the extents with what changed; scanned: a full scan alone
+              reason: str|null = null,           # scanned: why (below)
+              query_s: float|null = null,        # the extent query's time
+              missed: int = 0 }                  # checked: chunks that changed outside the extents
+  ```
+  `{}` when the plan does not track extents. The reasons: `first_pass`, `not_tracked` (§28.4), `encrypted`, `no_base`,
+  `base_gone` (Cinder no longer has the base `available`), `resized` (the size or `name_id` changed), `missed` (an
+  earlier check of this migration missed), `unchecked` (no check of the disk passed yet), `assumed_zero` (the base pass
+  did not read the destination in full), `query_failed` (failed, timed out - proposed 300 s - or beyond the volume).
+* **Which mode** (owner decision 5): the first pass scans (`first_pass`); a later pre-copy, sync or keep-warm pass of a
+  qualifying disk with a base is `checked`; the final pass is `read` when all of these hold: a base is recorded from
+  the last completed pass, which read the destination in full; at least one `checked` pass of the disk ran and none
+  found a miss; Cinder still has the base, `available`, of the same volume with the same size and `name_id`; the
+  destination volume is the recorded one, and no destination server held it since the base (the rollback of a cutover
+  that created a server clears the bases: that server wrote to the volumes); and the query succeeded. Otherwise a pass
+  scans the disk in full, with its reason; a miss turns tracking off for that disk until the migration ends. Tracking
+  never fails a pass.
+* **A failed pass** leaves the bases where they were: the next pass diffs from the last completed pass's snapshot.
+  RBD's diff reports writes since that snapshot, not content, so it covers whatever a failed pass may have copied.
+* **Blocksync** (proposed protocol v2, binding in §6.2 with plan task CE2): `send` takes `--extents FILE` (sorted,
+  merged `[offset, length]` pairs) and `--extents-mode read|check`.
+  * `read`: HELLO `b"SMBS"`, `u8 version=2`, `u32 chunk_size`, `u64 source_size`, `u64 n`, then n `u64` chunk indexes,
+    strictly increasing and within the source. The receiver checks them, then streams the digests of those chunks
+    alone, reading no other chunk; frames are v1's, each for a listed chunk; the end frame carries `n`, the changed
+    count, the bytes sent and a manifest over each listed chunk's index (`u64`) and digest, in order. `bytes_scanned`
+    counts the listed chunks. A v1 receiver refuses version 2 (exit 3), and `--assume-zero` is refused with it.
+  * `check`: protocol v1 on the wire, a full scan; the sender also counts the chunks whose digests differed and that
+    the extents do not list, and the receiver's summary adds `extent_chunks` and `missed_chunks`.
+* **What the manifest proves:** a v1 pass, that the destination equals the snapshot (NFR-05). A v2 pass, that the
+  listed chunks arrived and were written; that nothing else changed rests on the chain: the base pass proved in full
+  that the destination equals the base snapshot, and the extents, checked on this disk in every interval before, name
+  every write since. A miss in the final interval alone remains; a full comparison after the cutover would close it
+  (owner decision 6). R-01's later full scan is the first `checked` pass, where a destination that did not read as
+  zeros after an `assume_zero` pass shows as misses, which turn tracking off.
+
+### 28.6 Estimator, calibration and convergence
+
+* **The final pass** (proposed, §9.1 with plan task CE8): with `T` the disks it is expected to read from extents and
+  `U` the others, `copy_s = snapshot + max(scan_U, q + max(Δf/S, Δf/L))`, `scan_U` being the scan term over `U` alone
+  (0 when `U` is empty) and `q` the new `EstimatorParams.extent_query_s` (default 10 s, `TODO(LAB): confirm`; a
+  duration override with the others' bounds). Validation puts a qualifying disk of a plan that tracks extents in `T`;
+  after passes, a disk whose last pass scanned for a lasting reason (`not_tracked`, `encrypted`, `missed`) moves to
+  `U`. The SLO rule, a Force cutover's figure and the dashboard's port use the same term (§5.3, §5.4, §16).
+* **Pre-copy:** a `checked` pass costs its query too, `Tk = snapshot + q + max(scan, Δk/L)`. Under owner decision 5's
+  alternative, a pass that reads extents takes `snapshot + max(scan_U, q + max(Δk/S, Δk/L))`.
+* **Calibration:** a `checked` pass scanned in full: it calibrates `S` as today, and its longest query replaces `q`; a
+  pass that read any disk from extents never calibrates `S`. `c` calibrates as today, from the chunks that differed.
+* **Worked example** (defaults, `q` = 10 s, 1 Gbit/s): the 200 GiB disk of §9.1 runs pass 1 (1,013 s), then checked
+  passes of 450 s; its final delta is `2 MiB/s × 450 s` ≈ 900 MiB, 7.2 s over the link, so its downtime is
+  `60 + 30 + 10 + 7.2 + 60 + 120` ≈ 287 s (4.8 min) instead of 680 s. A 500 GiB disk takes 297 s (301 s at `S` =
+  400 MiB/s) instead of 1,294 s (1,550 s), and 1 TiB 314 s instead of 39.5 min; on 10 Gbit/s each takes 282-289 s.
+  The final delta grows with the last checked pass; under owner decision 5's alternative, whose last pre-copy pass is
+  short, each takes about 281 s. The SLO rule moves such a migration to `awaiting_cutover` after its first checked
+  pass. SM-1b's 300 s is met in the model up to 500 GiB on 1 Gbit/s and for every size on 10 Gbit/s, with little to
+  spare: the real `F` and `q` decide (§28.10).
+
+### 28.7 libvirt dirty bitmaps (not in 0.5.0)
+
+The mechanism: before each pass, a libvirt checkpoint of the source VM's domain starts a persistent dirty bitmap per
+disk (`virDomainCheckpointCreateXML`, libvirt 5.6.0); a pull-mode backup job (`virDomainBackupBegin`) whose
+`<incremental>` names the previous checkpoint serves each disk as of its start over an NBD server, which tells its
+client which blocks changed. libvirt 7.6.0 with QEMU 6.1 supports it; RHEL 9.2, which RHOSP 17.1 runs, ships libvirt
+9.0 and QEMU 7.2 (secondary; `TODO(LAB): confirm` for RHOSP 17.1's libvirt container and for RHEL 8.4 compute nodes of
+a multi-RHEL cloud). It would reach the compute nodes as `import_from_hypervisor` does: SSH as a sudo user, an NBD
+export on the loopback read over SSH (SEC-01), nothing guessed (SEC-13). It is left out of 0.5.0 (owner decision 2):
+* **qcow2 only:** libvirt supports it "only ... for the QEMU hypervisor when using qcow2 disks at the active layer".
+  Cinder volumes and Nova's RBD ephemeral disks are raw, so it covers Nova's local qcow2 disks alone.
+* **Nova does not know checkpoints:** its `delete_configuration` undefines a domain without libvirt's checkpoint flag,
+  and "attempts to undefine an inactive domain with checkpoint metadata will fail" (virsh(1)): a hard reboot, a resize,
+  a migration, a shelve or a delete may fail while a checkpoint exists (`TODO(LAB): confirm` each). libvirt forbids
+  checkpoints while external snapshots exist, and documents no live migration of them. oVirt keeps its checkpoints in
+  its own database and redefines them before each backup; a later design would too, deleting libvirt's metadata
+  (`checkpoint-delete --metadata`) after each pass so that Nova never meets one.
+* **Bitmaps are lost:** one QEMU could not save on a crash is marked in-use and serves no incremental backup.
+* **Root SSH to the compute nodes** for every warm migration, where today only the cold direct mode needs it.
+
+A later release could take it after a lab spike on RHOSP 17.1 compute nodes: those Nova operations with a checkpoint
+present, a live migration, the scratch storage of a pull-mode job, and the read path.
+
+### 28.8 Security
+
+* **The Ceph key** is the new secret: written by an admin, never read back, never in the database, `vars.yml`, an
+  event, a log or a check report; 0600 run files deleted after each run (§13.3), a copy on the conversion host for one
+  query; `redact` learns a keyring's `key = <base64>` line and a bare Ceph key (§13.4, plan task CE6).
+* **Blast radius:** today a stolen conversion host reads only the volumes attached to it. With the key it reaches the
+  tracked pools: with the metadata-only user, which images exist and which of their objects changed, never their data;
+  with `profile rbd-read-only`, every tenant's volumes of the pool. The `network` limit keeps a stolen key from working
+  from another address (owner decision 3).
+* **The network path:** the conversion host gains a route to Ceph's public network. Operations.md asks the operator to
+  open only the monitor and OSD ports, to the conversion host's address alone.
+* **No write to Ceph:** Cinder makes and deletes every snapshot; the temporary volume and its serial check stay (§6.2).
+* **Audit:** `provider.credentials_updated` names the secret and its key's name; each pass records its extent use.
+
+### 28.9 Checks, findings and the plan switch
+
+* **The plan switch** (proposed, §4.2 with plan task CE7): `Plan.extent_tracking: bool = false`; refused (422) for a
+  VMware source. `PATCH /plans/{id}` may change it at any time: off, the next pass scans; on, the next pass checks.
+* **Findings** (proposed; each enters §9.3 with plan task CE9, with its catalog entry, its tests and the mock):
+  * CEPH_ACCESS_MISSING, warning (warm): the plan tracks extents, and its source has no Ceph access, no key, or no
+    `rbd` pool whose fsid is its own: every pass scans in full;
+  * EXTENT_TRACKING_PARTIAL, info (warm): the plan tracks extents, and a disk of the VM does not qualify (not a Cinder
+    RBD volume of the cluster, encrypted, an image copy, a host or `name_id` the source credential cannot read): its
+    final pass scans in full, and the estimate counts its scan; the message names each disk and why;
+  * EXTENT_TRACKING_MISSED, warning (warm): a check of this migration found changes outside a disk's extents: it scans
+    in full from then on; the remediation asks for the Ceph releases of the source's compute nodes and cluster.
+* **No new event kind:** `migration.sync_pass` carries each pass's `extents`, which the migration page shows (§16).
+
+### 28.10 Validation
+
+* **In the test process:** blocksync's tests write random chunks to a source file and give extents that cover them (a
+  `read` pass ends with equal devices) or miss one (a `check` counts it, a `read` cannot see it); a fake `rbd` answers
+  extents from a model of the writes; the warm module's tests cover each reason; the demo tracks a plan's extents.
+* **Lab cases** (proposed; QASuite with CE12, results with CE13), on RHOSP 17.1 with RHCS 6.1 as it ships and on a
+  community source with Ceph Quincy or Reef:
+  * LAB-CE01: P-M, P-L, P-XL and a 1 TiB disk, a 2 MiB/s `fio` writer: the final pass reads extents, the checksums
+    are equal, the downtime is about `F + q + Δf/L`;
+  * LAB-CE02: no chunk missed in any check of LAB-CE01 and of a 10 MiB/s random writer: at least 50 snapshots under
+    I/O per Ceph release;
+  * LAB-CE03: fast-diff off, an invalid map, a deleted base, a resize, a retype that moves the volume, unreachable
+    monitors, a wrong key: each disk scans in full with its reason, and the migration completes;
+  * LAB-CE04: the metadata-only user diffs and reads no data; `network` refuses another address; `rbd-read-only` works;
+  * LAB-CE05: a volume cloned from a Glance image on the same cluster, and a flatten between two passes;
+  * LAB-CE06: the rollback of a cutover that created the server: the next attempt's final pass scans in full;
+  * LAB-CE07: a VM with an RBD volume and a volume of another backend: the estimate and the final pass track one.
+* **Performance gate** (proposed PERF-E2E-SM1b): LAB-CE01's downtimes, at least 10 runs per size on 10 Gbit/s and 5
+  on 1 Gbit/s: a median of at most 300 s for each size, each estimate within ±30 % (G2).
+* **The lab closes:** the metadata-only user's objects; `location_info` in get_pools; the builds with #61616's fix and
+  the compute nodes' librbd; the route to Ceph; the client package; an encrypted volume's read; `q` per size; `F`.
+
+### 28.11 Owner decisions
+
+The owner took each default as written on 2026-10-23 (D1):
+
+1. **The release: 0.5.0, as a Technology Preview** until LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass. FR-26 and PRD §9
+   put it in 0.2.0, and no release delivered it.
+2. **The Ceph source alone in 0.5.0.** libvirt dirty bitmaps cover only Nova's local qcow2 disks, change domains Nova
+   manages, may make Nova's undefines fail, and add root SSH to the compute nodes (§28.7); a lab spike comes first.
+3. **A metadata-only Ceph user, limited to the conversion host's address,** if the lab confirms it diffs; else
+   `profile rbd-read-only` on the tracked pools, with the same limit.
+4. **The query on the source conversion host,** the route to Ceph the operator's, or an existing conversion host. The
+   alternative, a Ceph client host named on the provider and reached over SSH, keeps the key off the conversion host
+   but adds an SSH trust to an infrastructure host (D8).
+5. **Pre-copy and keep-warm passes check; the final pass reads.** Pre-copy keeps today's cost and calibration, every
+   interval but the last proves the tracker on this VM, and the downtime loses its scan (§28.6: 287-314 s on
+   1 Gbit/s). The alternative - the passes after a first clean check read too - also shortens pre-copy and the source's
+   load, and keeps the downtime at about 281 s for every size, on one checked interval of evidence.
+6. **No full comparison after the cutover in 0.5.0.** The alternative - a Cinder snapshot of each destination volume
+   before the boot, kept with the final source snapshot, both compared in full after the cutover, and `finalize`
+   refused until that passed - closes the final interval's gap, but puts the destination snapshots in the downtime and
+   adds a full read of both sides, a field and a rule. Revisit after LAB-CE02.
+7. **The temporary volume stays the read path.** Reading the RBD snapshot itself (rbd-nbd or krbd, read-only) would
+   save its create and attach (part of `snapshot_s`) and the clone chain, but would read data outside Nova with a key
+   that reads every volume of the pool.
+8. **Opt-in: the source provider's Ceph access, and the plan's switch, off by default** while a Technology Preview;
+   after it, on by default for plans whose source has access.
+9. **The Ceph releases are documented, not declared:** Operations.md names the releases with #61616's fix and how to
+   read the compute nodes' librbd; the checks guard at run time. Alternative: a declared release, below which it is off.
+10. **Fallback, never failure:** a disk that cannot use extents scans in full, as today, with its reason recorded; a
+    miss turns tracking off for that disk until the migration ends.
+
+### 28.12 Contract changes (each binding from its plan task)
+
+| Change | Where | Task |
+|---|---|---|
+| PRD: FR-26 rewritten with its acceptance criteria and release, NFR-05 for passes that read extents, SM-1b and G1's scan removal moved to 0.5.0, PRD §9's 0.2.0 item moved; D1 decided | PRD, §20 | CE1 |
+| blocksync protocol v2, `--extents` and `--extents-mode`, the check's counts | §6.2 | CE2 |
+| the extent query: its command, the image and snapshot names, the chunk mapping, the timeout, the files on the conversion host | §6.4 | CE3 |
+| the bases in the warm state, kept and deleted; the modes and reasons per pass; the sync's options; the roles' variables; the rollback's clearing | §6.1, §6.3–§6.5, §7.2 | CE4 |
+| the Ceph client on the source conversion host | §6.5, §21.6 | CE5 |
+| `Provider.ceph`, `PUT /providers/{id}/ceph-key`, the secret's name and its 409s, the check's `ceph_fsid` and `ceph_pool`, the redaction | §4.2, §10, §12, §13.3, §13.4 | CE6 |
+| `Plan.extent_tracking`, `SyncPass.extents` and `ExtentUse`, the executor's Ceph files and the passes' modes | §4.2, §7.2, §12 | CE7 |
+| `extent_query_s`, the final-pass term, the calibration rules, the dashboard's port | §5.3, §9.1, §16 | CE8 |
+| the findings of §28.9 | §9.3, §16 | CE9 |
+| the dashboard: the provider's Ceph access and key, the plan switch, each pass's extent use, the findings | §16 | CE10 |
+| the demo's Ceph access and tracked plan; the simulator's tracked passes | §7.4, §10 | CE11 |
+| QASuite (FR-26 rows, LAB-CE cases, PERF-E2E-SM1b), Security.md, Operations.md, Performance.md | QASuite, Security.md, Operations.md, Performance.md | CE12 |
+| the lab; the Technology Preview label goes when LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass | QASuite §13 | CE13 |
