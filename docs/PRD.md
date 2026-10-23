@@ -183,6 +183,7 @@ item marked a Technology Preview stays one until its lab cases pass).
 | FR-49 | Subscriptions: an operator subscribes a channel to a plan and an admin to every plan, each for topics - approval, downtime and problem by default, outcome and progress on request | M5 | A subscription changes no plan's status, and a channel sends an event once whatever subscriptions match it (SDD §24.4) |
 | FR-50 | Messages of fixed content: the VM, the plan and the wave, their ids, the phase, times, the downtime, the estimate and the SLO | M5 | No message holds a credential, an address, an error's text or who acted; names are escaped for each format, and a channel can send ids instead (SDD §24.5, §24.8) |
 | FR-51 | Delivery that never holds a migration back: at least once with a dedupe key, in order per channel, with bounded retries, an hour's expiry and at most one message a second per channel | M5 | Each message is audited once as sent or failed, and a channel that never answers leaves every migration as it would be without it (SDD §24.6, §24.7) |
+| FR-52 | Per-tenant credentials: a provider holds a Keystone application credential per project, and a plan acts in its source and destination projects with them (SDD §27) | M5 | A plan names one source and one destination project; each step acts with its project's credential, or for admin-only work with the provider's own, and never falls back to it silently; a credential that expires within 24 hours holds the cutover; a Technology Preview until LAB-TC01–LAB-TC06 pass (SDD §27.10) |
 
 ## 7. Non-functional requirements
 
@@ -222,10 +223,10 @@ item marked a Technology Preview stays one until its lab cases pass).
 | Release | Scope |
 |---|---|
 | **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift, Kubernetes and Compose (Docker on Linux, Colima on macOS, or Podman) deployment, docs |
-| 0.2.0 | Ceph-direct incremental diff, per-tenant credentials; community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34). Notifications and HA moved to 0.5.0 |
+| 0.2.0 | Ceph-direct incremental diff; community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34). Notifications, HA and per-tenant credentials moved to 0.5.0 |
 | 0.3.0 | GPU workloads as a Technology Preview (G8, FR-35–FR-41; SDD §22) |
 | 0.4.0 | Network cut-over as a Technology Preview (G9, FR-28, FR-42–FR-47; SDD §23): hooks, the keep-address floating IP move, the DNS swap, the BGP reachability wait, the Heat and Octavia findings and the Octavia member helper |
-| 0.5.0 | Notifications by email, Slack and signed webhooks (G10, FR-48–FR-51; SDD §24); the HA control plane as a Technology Preview (FR-27; SDD §25); SSH trust on the data path, its lab cases a gate of the release (NFR-06; SDD §26) |
+| 0.5.0 | Notifications by email, Slack and signed webhooks (G10, FR-48–FR-51; SDD §24); the HA control plane as a Technology Preview (FR-27; SDD §25); SSH trust on the data path, its lab cases a gate of the release (NFR-06; SDD §26); per-tenant credentials as a Technology Preview (FR-52; SDD §27) |
 | 1.0.0 | Certified on RHOSO 18.0.x FRs, validated on every Tier 1 community series of the day, scale test 5,000 VMs, signed releases |
 
 ## 10. Dependencies and assumptions
