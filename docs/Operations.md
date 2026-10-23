@@ -365,6 +365,50 @@ version, then resume the plans.
 The tests that pin the script's behaviour are `seamless/tests/test_seamless_ctl.py` (stub tools record every
 call; QASuite FR-25).
 
+### 7.1 A second plan stops at its pre-staging: "Key name os_migrate_conv present but key hash not the same"
+
+A known issue of 0.4.0-rc.1 (GitHub issue #112), with managed conversion hosts (`conversion_host.manage: true`, the
+default):
+- every plan generates its own conversion key under `/data/plans/<plan id>/osm/conversion/`;
+- the Nova keypair `os_migrate_conv` and the conversion hosts are shared by every plan of the same OpenStack
+  credentials.
+
+So the pre-staging of the second plan stops at the keypair task, and the plan fails with:
+
+```
+Key name os_migrate_conv present but key hash not the same as offered. Delete key first.
+```
+
+**Do not delete the keypair, despite what the message says.** The conversion hosts would still hold the first plan's
+key, and the new plan could not log in to them.
+
+Until the fix lands, do one of these:
+- **Run one plan per OpenStack credential at a time.**
+- **Give the new plan the key of the plan that deployed the conversion hosts,** then start the new plan again (a
+  failed plan pre-stages again at its start):
+  1. Find the first plan. Its key's fingerprint is the keypair's, and Nova shows the MD5 form.
+  2. Copy that plan's key pair into the new plan's directory, which may already hold a key of its own, inside the
+     control plane's container. On Compose, `docker compose ... exec seamless sh`; on a cluster, `oc rsh
+     deploy/seamless`, or `kubectl exec -it deploy/seamless -- sh`.
+
+```bash
+# where the OpenStack CLI reaches the source cloud
+openstack keypair show os_migrate_conv -f value -c fingerprint
+
+# in the control plane's container: the plan whose key matches
+for k in /data/plans/*/osm/conversion/ssh.key.pub; do echo "$(ssh-keygen -E md5 -lf "$k" | cut -d' ' -f2 | sed 's/^MD5://') $k"; done
+
+# still in the container: copy it to the new plan
+FIRST=<the plan id whose key matches>
+NEW=<the new plan's id>
+mkdir -p "/data/plans/$NEW/osm/conversion" && chmod 700 "/data/plans/$NEW/osm/conversion"
+cp -p "/data/plans/$FIRST/osm/conversion/ssh.key" "/data/plans/$FIRST/osm/conversion/ssh.key.pub" \
+  "/data/plans/$NEW/osm/conversion/"
+```
+
+The link key between the conversion hosts needs nothing: each pre-staging writes its plan's link key to both hosts,
+and the runs of every plan use the pair the hosts hold.
+
 ---
 
 ## 8. Runbooks: what a migration leaves to the operator
