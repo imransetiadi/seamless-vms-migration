@@ -14,7 +14,8 @@ export default [
   ...[
     js.configs.recommended,
     ...tsPlugin.configs['flat/recommended'],
-    reactHooks.configs['recommended-latest'],
+    // The flat preset (7.x): the hooks rules plus the React Compiler-based ones (refs, purity, set-state-in-effect).
+    reactHooks.configs.flat['recommended-latest'],
     jsxA11y.flatConfigs.recommended,
   ].map((config) => ({ ...config, files: config.files ?? sources })),
   {
