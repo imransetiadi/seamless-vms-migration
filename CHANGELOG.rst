@@ -630,3 +630,6 @@ This project follows a simple changelog to satisfy collection metadata validatio
   and the address the destination's floating IP has, so an ``auto`` import
   tells whether the address was kept or a new one taken. A re-run that
   finishes a recorded server returns it too.
+- The ``json_query`` filter's jmespath requirement is 1.1.0 or later
+  (``requirements.txt`` and the execution environment's
+  ``aee/requirements.txt``).

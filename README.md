@@ -164,6 +164,41 @@ under the vGPU manager (a time-sliced and a MIG-backed profile) and one with a D
 and a Tier 1 community destination with Nova's vGPU and a PCI alias configured. The Technology Preview label goes
 when they pass ([SDD §22.14](docs/SDD.md)).
 
+## Network cut-over (Technology Preview, validated in simulation)
+
+0.4.0 lets a migration take the VM's network identity along ([SDD §23](docs/SDD.md)). Each part is opt-in per plan
+(`network_cutover`), and a plan without it migrates as before.
+
+* **Hooks:** an admin registers playbook and webhook hooks on the Hooks page (`/hooks`). A plan runs them at
+  `pre_stop`, `post_create`, `post_verify`, `on_rollback` and `on_finalize`, each with a timeout, an idempotency key
+  and an optional revert. A failure before the stop keeps the source running; one after it follows `auto_rollback`. A
+  hook runs code with the control plane's reach, so only an admin registers one ([Security.md](docs/Security.md)
+  C2-09). Mount hook playbooks read-only where the control plane reads them.
+* **Floating IPs that keep their address** (`floating_ips: keep_address`, both clouds on one external network): the
+  address is reserved at the destination during pre-staging, moves after the source stops, and goes back to the
+  source on a rollback before the source starts. With `auto`, os-migrate's way, `MAP_FIP_ADDRESS_CHANGE` warns of a new
+  address.
+* **DNS:** a DNS target per VM - a Designate zone, or an RFC 2136 server with a TSIG key - swaps the VM's record by a
+  compare-and-swap at `post_create`, and swaps it back on a rollback. `NET_DNS_TTL_LONG` warns of a TTL longer than the
+  downtime SLO, and the estimate shows that DNS tail apart from the downtime.
+* **Reachability:** the verification waits until each moved address answers, and counts the wait in the downtime.
+  Seamless speaks no BGP.
+* **Octavia:** a plan maps a source pool to a destination pool the operator created. The member helper drains the
+  VM's source member before its stop and joins the migrated VM after its verification.
+* **Findings and runbooks:** the pre-flight names Heat stacks and autoscaling groups (`SRC_VM_AUTOSCALED` blocks until
+  the plan acknowledges it), Octavia memberships and pools that waves split, address pairs, announced prefixes that
+  waves split, and DNS the destination cannot publish. [Operations.md §8](docs/Operations.md) holds the runbooks for
+  what stays the operator's: Heat stacks, Octavia load balancers, Designate zones and Manila shares.
+
+**In the demo** (`make seamless-demo`), the finance plan keeps `web-01`'s floating IP with its address, swaps
+`ledger-web-01`'s record in the destination's Designate zone after a NIC override changes its address, maps the portal
+pool to the destination's, and acknowledges the autoscaling group's `app-01` and `app-02` ([SDD §10](docs/SDD.md)).
+
+**Not yet run on the lab's clouds.** Everything above runs against simulated clouds. The lab cases LAB-NET01…LAB-NET09
+([QASuite §7.2](docs/QASuite.md)) have not run yet. They need two clouds on one external VLAN, a BGP fabric with the
+OVN BGP agent, Designate and BIND with TSIG, Octavia's amphora and OVN providers, and a Heat autoscaling group. The
+Technology Preview label goes when they pass ([SDD §23.10](docs/SDD.md)).
+
 ## Quick start — Linux server with Docker (Ubuntu, Debian, RHEL, Rocky Linux, AlmaLinux)
 
 On Linux the stack runs on the machine's own Docker Engine: no Colima and no Node.js (the image builds the

@@ -148,7 +148,7 @@ Compose file wires explicitly:
 | `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | `seamless-migrate`, `false` | memory project id / privacy ([MEMORY.md](../../docs/MEMORY.md) §3) |
 | `SEAMLESS_SECRET_STORE`, `SEAMLESS_SECRETS_DIR` | `files`, `/var/run/secrets/seamless` | provider credentials and conversion-host keys entered in the dashboard (Providers → Add or Edit): 0600 files in the `seamless-secrets` volume — back it up like a secret; `make seamless-reset` deletes it |
 | `SEAMLESS_CORS_ORIGINS`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | empty, `false`, `INFO`, `true` | misc (JSON logs for forwarders, SDD §15.1) |
-| `SEAMLESS_HOST_PORT`, `SEAMLESS_VERSION` | `8080`, `0.1.0-rc.2` | published loopback port, image tag |
+| `SEAMLESS_HOST_PORT`, `SEAMLESS_VERSION` | `8080`, `0.4.0-rc.1` | published loopback port, image tag |
 
 Authentication is always on (`SEAMLESS_AUTH_DISABLED=false`): the process listens on `0.0.0.0` inside the
 container, which the CLI only permits with authentication enabled (SDD §13.1). **Demo mode therefore also needs
