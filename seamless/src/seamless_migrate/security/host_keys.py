@@ -26,10 +26,7 @@ import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:  # the domain model reads this module to judge its declared keys
-    from ..domain.models import HostKeyPin
+from typing import Protocol
 
 #: the types a conversion host's key may have: ed25519, ECDSA or RSA (SDD §4.2, §26.3)
 KEY_TYPES = (
@@ -201,6 +198,19 @@ def console_keys(console: str | None, read_keys: Iterable[str] = ()) -> list[str
     return [key for key in dict.fromkeys(read) if fingerprint(key) in printed]
 
 
+class Pin(Protocol):
+    """What the writer reads of a provider's pin, ``domain.models.HostKeyPin`` (SDD §4.2): the
+    domain model reads this module to judge its declared keys, so this one names no model."""
+
+    @property
+    def server_id(self) -> str:
+        """The Nova server whose keys they are: the pin applies to it alone."""
+
+    @property
+    def keys(self) -> Sequence[str]:
+        """Its public keys, each ``<type> <base64>``."""
+
+
 @dataclass(frozen=True)
 class KnownHost:
     """A conversion host as a run's known_hosts holds it (SDD §10, §26.4)."""
@@ -212,7 +222,7 @@ class KnownHost:
     #: its declared keys, ``conversion_host.ssh_host_keys``
     declared: Sequence[str] = ()
     #: its provider's ``conversion_host_pin``
-    pin: HostKeyPin | None = None
+    pin: Pin | None = None
 
 
 def trusted_keys(host: KnownHost) -> list[str]:
