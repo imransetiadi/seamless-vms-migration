@@ -5209,7 +5209,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | # | Decision | Default taken | Revisit when |
 |---|---|---|---|
 | D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with per-disk parallelism and read-ahead workers | 0.2.0: changed-extent sources that remove the scan — Ceph-direct `rbd diff` between pass snapshots (opt-in, Ceph credentials) and hypervisor-assisted tracking via libvirt checkpoints / incremental backup on the source compute nodes (builds on the existing `import_from_hypervisor` access model) |
-| D2 | Single-replica orchestrator | accepted | PostgreSQL + leader election — 0.2.0 |
+| D2 | Single-replica orchestrator; a highly available control plane (§25) | accepted up to 0.4.0; decided by the owner 2026-10-23: §25.11's ten defaults as written - a PostgreSQL lease with an epoch that fences every write, followers that relay to the leader, two replicas on a cluster with a ReadWriteMany data volume, a Technology Preview in 0.5.0 | each item binds with its plan task (§25.12); the LAB-HA cases of §25.10 end the Technology Preview |
 | D3 | Network cut-over (FIP/DNS/BGP), Octavia and Heat | out of scope up to 0.3.0, with no hook documented and no finding (the old default said "hooks documented", which was never done) | decided: D18 (0.4.0, §23) |
 | D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL`; partly decided by the §13.4 knobs (`SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`, `TODO(ADV-06)`) |
 | D5 | Dashboard navigation item **Users** for non-admins: hidden (today) or soft-disabled with the reason, as every other action (§16) | hidden | owner decision (audit C-01) |
@@ -6668,3 +6668,337 @@ The owner took each default as written on 2026-10-23 (D19):
 | the demo's recording senders and seeded channels | §7.4, §10 | NT10 |
 | QASuite rows; Security.md (assets, flows, the data that leaves); Operations.md (the relay, Slack, a receiver, the egress); MEMORY.md's erasure bullet | QASuite, Security.md, Operations.md, MEMORY.md | NT11 |
 | the live smoke | QASuite §13 | NT12 |
+
+## 25. High availability of the control plane (0.5.0, Technology Preview)
+
+Status: proposed 2026-10-23 and decided by the owner the same day (D2): §25.11's defaults as written. Each item
+becomes binding in the section §25.12 names when its plan task lands; until then nothing in this section is binding.
+The PRD follows with plan task HA1. HA ships as a **Technology Preview** until LAB-HA01–LAB-HA05 pass (§25.10).
+
+What it answers: FR-27 ("HA control plane (leader election)", priority C), the 0.2.0 item "HA (PostgreSQL leader
+election)" of the release table (PRD §9) and D2. No release delivered them. The owner chose 0.5.0 (owner decision
+1). The plan is `superpowers/plans/2026-10-23-ha-control-plane.md`.
+§24 is left to the notifications proposal of another branch.
+
+HA adds no route. The proposed table, variable, events, metrics, health fields and error code stay out of the tables
+the SDD-reading tests parse (§4.3, §12, §15.1, §18) until their tasks land, as §22's and §23's did. The facts about
+PostgreSQL and Kubernetes come from their documentation, and the fencing argument from Martin Kleppmann's "How to do
+distributed locking" (2016), all read 2026-10-23. A fact only an excerpt showed, and a figure only a lab can measure,
+is marked `TODO(LAB): confirm`.
+
+### 25.1 What 0.4.0 has
+
+* **One orchestrator by convention.** The manifests run one replica with `strategy: Recreate`, `seamless-ctl.sh scale`
+  refuses more than 1 (§17.2), and Operations.md asks for one orchestrator per database. Nothing in the code stops a
+  second `seamless serve` against the same database: it would start, cut over and roll back the same migrations.
+* **One process.** The API's lifespan starts and stops the orchestrator (§8). This state lives in that process alone:
+  * the locks that order a person's action with a migration's driver, a plan's validations and the provider checks;
+  * the step tasks and their playbooks, each in a session of its own, stopped by SIGTERM to its process group, then
+    SIGKILL after 10 s (§7.2, §8);
+  * the GPU reads' outcomes (§5.4), what a pre-staging covered, the drivers' crash counts (§8);
+  * the ephemeral events, `migration.progress` and `migration.log`, which reach only that process's streams (§4.3).
+* **A restart resumes** (FR-16). A migration is saved after every state change, its phase changes with their events
+  in one transaction (§5.1, §11). `start()` drives again the migrations in `precopy`, `syncing`, `cutover`,
+  `verifying` and `rolling_back` from their checkpoints, and runs the cleanups a stop cut short. Nothing counts as
+  pre-staged after a restart, and a GPU read comes before a cutover (§5.4, §8). `test_resume_mid_cutover_is_idempotent`
+  proves one source stop, one destination server and the first stop's clock kept; QASuite FR-16 lists the other
+  restart tests, and R-01 and LAB-R04 the lab's.
+* **Other processes.** The CLI beside the server shares the VM-claim lock with it, a session advisory lock on a
+  connection of its own on PostgreSQL (§5.4), and the event stream reads the CLI's events from the store each tick
+  (§12). The CLI runs no tick; `plan validate` and `plan start` run the cleanups of the migrations they cancel in
+  their own process (§15).
+* **The data directory is state.** A resume reads it: each run directory's os-migrate data dir with the warm state file
+  and the workload record (§6.3), the handover journal (§7.3), and the plan's pre-staging data, its conversion host
+  keys among them (§7.2). While a playbook runs it holds the run's `secrets.yml`, `clouds.yaml` and conversion key
+  (§7.2). On a cluster it is the ReadWriteOnce volume `seamless-data`.
+* **PostgreSQL** is one StatefulSet pod in the bundled manifests (§17).
+* **A lost node today.** Kubernetes marks a silent node unhealthy after 50 s (`--node-monitor-grace-period`), keeps its
+  pods bound 300 s more (the automatic not-ready and unreachable tolerations), and force-detaches the volume of a pod
+  whose deletion has not finished after 6 minutes. A control plane on a lost node is thus replaced, with its volume,
+  after about 12 minutes, unless an admin marks the node out of service. A source VM stopped for its cutover waits as
+  long.
+
+### 25.2 Scope
+
+Proposed for 0.5.0, in the order of the plan:
+1. A lease in PostgreSQL elects one leader among the control plane's replicas (§25.3). Only the leader runs the
+   orchestrator, and any other worker that must act once (a notifier, if the owner takes one).
+2. Fencing (§25.4): an epoch the database checks in every write, a check before every action on a cloud, and the
+   playbooks killed when the lease is lost.
+3. A takeover through the restart recovery of §8, with a recovery time (§25.5).
+4. Followers that relay the API and the event stream to the leader (§25.6).
+5. An HA component for the OpenShift and Kubernetes manifests: two replicas on two nodes, a shared data volume and a
+   disruption budget (§25.7).
+6. The lease on every PostgreSQL installation, so a second server never runs a second orchestrator.
+7. Metrics, events and health fields for the leadership (§25.8).
+
+Not in 0.5.0: two orchestrators that share the migrations (active-active); the high availability of PostgreSQL itself
+(owner decision 10); two replicas on Compose or Podman (decision 8); upgrades without an outage (decision 6); followers
+that answer reads themselves (decision 4); the run directories' state in the database (decision 5).
+
+### 25.3 The lease
+
+* **The row.** A table `leases` beside `documents` and `events` (§11) holds one row, `orchestrator`:
+  * `holder`: the replica's host name and 8 random hex digits, new at each process start;
+  * `address`: where the other replicas reach its API, its host name's address and `SEAMLESS_PORT`;
+  * `epoch`: an integer that each takeover increases;
+  * `acquired_at`, `renewed_at`, `expires_at`, and `health` (§25.6).
+* **The database's clock.** Every timestamp the lease sets or compares comes from the database (`now()`), never from a
+  replica, so the replicas' clocks may disagree by any amount.
+* **Campaign.** Every retry period, a replica that does not lead reads the row. When there is none it inserts it with
+  epoch 1. When it reads the lease expired, it locks the row `FOR UPDATE` and, in the same transaction, takes it with
+  `epoch + 1` where `expires_at < now()` (§25.4). A `lock_timeout` of the retry period keeps a candidate from queueing
+  behind the row, and a valid lease is never locked.
+* **Renewal.** The leader renews every retry period: `expires_at = now() + lease` where `holder` and `epoch` are its
+  own. It notes its monotonic clock *before* it sends a renewal, and one that succeeds sets its deadline to that time
+  plus the renew deadline. A renewal that updates no row (the lease was taken) deposes it at once.
+* **Timing** (owner decision 3): lease 30 s (`SEAMLESS_LEADER_LEASE_S`, proposed, at least 10), renew deadline two
+  thirds of it (20 s), retry period 2 s; client-go and kube-controller-manager default to 15, 10 and 2 s. The database
+  sets an expiry when it runs the renewal, after the leader noted its time. So the leader's deadline comes at least 10 s
+  before a candidate may take the lease: that is the margin.
+* **A thread of its own.** The campaign and the renewals run in a thread with a connection outside the pool, their
+  statements and connects bounded by the retry period, so neither a busy event loop nor a busy pool delays them. A
+  watchdog timer that no database call can hold up deposes the leader when its deadline passes.
+* **Only a working leader renews:** while its tick loop is healthy by §12's rule (a tick within max(5 × `tick_s`,
+  30 s), fewer than three failed ticks in a row). A leader whose loop hangs lets its lease go.
+* **Release.** A leader that stops (SIGTERM, an eviction, a rollout) stops its orchestrator as today (§8), then sets
+  `expires_at = now()` and writes `leader.released` in one transaction. A follower takes over at its next try.
+* **Why a row** (owner decision 2):
+  * *A session advisory lock on a dedicated connection*, as the VM-claim lock (§5.4), gives no number to fence writes
+    with. It lives until PostgreSQL sees its session end: a client that vanished silently keeps it for the server's
+    TCP keepalive time, by default the operating system's (on Linux 2 h idle, then 9 probes 75 s apart). A database
+    restart drops it under every replica at once, and PgBouncer's transaction pooling does not support it.
+  * *A Kubernetes Lease* (`coordination.k8s.io/v1`) does not exist on Compose and Podman, and client-go's leader
+    election says itself that it does not fence. A leader cut off from the API server but not from PostgreSQL would
+    lose it while it can still write, and its epoch would still have to reach PostgreSQL to fence the writes.
+
+  The row puts the election and the fence in the database that holds every write, on every platform. Performance.md
+  §9.3 and MEMORY.md M-03 named advisory locks; M-03's revisit condition, another coordination primitive, applies.
+* **SQLite.** The table exists there too, so both engines and the tests share one code path. A server on SQLite also
+  takes an exclusive `flock` on `{database}.server.lock` and exits 1 ("another server runs against this database")
+  while another holds it. SQLite in WAL mode serves one host's processes only, so it never has a second replica.
+
+### 25.4 Fencing
+
+A deposed leader may not know it yet: its process paused, its network cut, its loop stuck. Three layers keep it from
+acting.
+
+1. **Writes carry the epoch.** In a server process each store write (`put`, `put_with_event`, `put_all_with_events`,
+   `append_event`, the deletes, `prune_events`, `create_user`, §11) begins its transaction by reading the lease row with
+   a key-share lock (`FOR KEY SHARE` on PostgreSQL). When the epoch is not the process's own, the write raises
+   `Fenced` (a `StoreError`) and nothing of it is written.
+   * A takeover locks the row `FOR UPDATE` before it changes the epoch, and that lock waits for every key-share lock.
+     So each write of an old epoch commits before the takeover or not at all: Kleppmann's fencing token, checked by the
+     store. A renewal changes no key column, so renewals and writes never wait for each other.
+   * A `Fenced` write deposes its leader at once, whatever the code around it catches.
+   * `auth.denied` is written without the check: the replica that refuses a request records it (§13.1).
+   * The CLI's store holds no lease and checks none: its writes are a person's (`actor: cli`, §15), as today.
+   * The application role runs with an `idle_in_transaction_session_timeout` of 10 s, so a leader cut off inside a
+     write holds its key-share lock no longer than that (§25.7).
+2. **Actions on the clouds start only while the lease holds.** Before a step's attempt, a hook, a floating IP move, a
+   DNS swap or an Octavia member change (§8, §8.2–§8.5), the orchestrator checks its deadline and reads the epoch in
+   the lease row. A pause between this check and the action defeats it (Kleppmann); layer 3 and the margin cover that.
+3. **A deposed leader kills its playbooks.** The executors register each playbook's process group, a playbook hook's
+   included. When the watchdog deposes the leader, it sends SIGKILL to every registered group from its own thread,
+   without waiting for the event loop. Then it schedules `stop()` on the loop: the tasks are cancelled, nothing new
+   starts, and the replica campaigns again as a follower.
+   * SIGKILL, not §8's SIGTERM with 10 s of grace: the margin has no room for the grace.
+   * A killed playbook is never adopted: its output, exit status and run files belong to the process that started it,
+     and another pod cannot attach to them. The new leader runs the step again from its checkpoint (FR-16, NFR-04).
+   * A call a playbook already sent to a cloud (a server's stop, a volume's attach) completes there. The step run again
+     reads the cloud's state, as after a restart.
+
+**The hazard.** Two orchestrators on one migration would run its step twice at once: two stops of the source VM, two
+final passes onto the same destination volumes, two server creates - and, had their phases diverged, a stop and a
+start of the same source VM. The fence keeps the phases from diverging; the kill and the margin keep the old leader's
+step from running beside the new one's. Two risks remain, named rather than solved. One is the control plane's process
+unable to run for longer than the margin while its playbooks run on: stopped alone, or its interpreter held by one long
+call (a frozen container or node freezes the playbooks too). The other is a database clock that steps forward by more
+than the margin: the database host's clock must slew, never step.
+
+### 25.5 Takeover
+
+* **The new leader does what a restart does** (§25.1). It reads the migrations after its takeover committed, so it
+  sees every write of the old epoch, and it drives again those in a resumable phase from their checkpoints. In demo
+  mode the seed's restore of the fake clouds (§8.1, §10) runs at the takeover instead of the process's start.
+* **The cutover gate** reads the store: approvals, window, request and cutover slots (§5.4 rules 1–4). The old
+  leader's migrations still in `cutover` count against `max_concurrent_cutovers`; rule 5 reads GPU capacity anew.
+* **The downtime clock** is the migration's (§5.2). An open clock stays open, and the failover's time counts as the
+  outage it is (`test_resume_mid_cutover_is_idempotent` keeps the first stop's time). A stop the old leader made but
+  could not record is the case of a crash between a stop and its save (§7.2): the resumed cutover's clock opens at its
+  own stop task, or at the step's start when that task is skipped, and can read short by the failover's gap
+  (`TODO(LAB): confirm` what the roles' stop tasks print for a server already stopped).
+* **Detection.** After a crash, a lost node or a cut network, the lease expires at most 30 s after the last renewal,
+  and a follower tries every 2 s. After a clean stop the release lets a follower take over within 2 s.
+* **Recovery time** (owner decision 3): about 35 s from a leader's loss to a leader driving the migrations again
+  (lease 30 s, retry 2 s, about 3 s to start), against about 12 minutes on a lost node today. Each step that was
+  running then starts again, and a playbook takes seconds to reach its first task (`TODO(LAB): confirm` both).
+* **Effect on downtime.** A VM whose source is stopped stays down for the recovery time plus the work its step does
+  again: a final delta pass starts over, and a destination server already created is found by its record or its name
+  (§7.2). A migration before its stop loses time only.
+* **A database outage.** While the database is down nobody can renew or take the lease, and an outage longer than the
+  renew deadline deposes the leader: its steps are cancelled, and they resume once the database is back and a leader
+  is elected. Today nothing cancels a step for a database outage (QASuite R-05). The timing lets a database restart
+  or failover shorter than 20 s depose nobody (`TODO(LAB): confirm` the database's restart and failover times).
+
+### 25.6 The followers and the API
+
+* **A follower relays** (owner decision 4). It answers `/api/v1/health`, `/api/v1/ready` and `/api/v1/metrics` and
+  serves the dashboard's files and the API documents itself. Every other `/api/v1` request, and the event stream, it
+  relays to the leader's `address`:
+  * as it came: method, path, query, body and the caller's `Authorization` header; the leader authenticates,
+    authorizes and audits it as a direct request;
+  * with `X-Forwarded-For` extended, so the leader's lockout and audit see the caller's address (§13.1, §25.9);
+  * marked as relayed by a header: a replica that gets a relayed request and does not lead answers 503, never relays;
+  * after the body limit (§12); a stream without a read bound, any other request within 300 s.
+
+  While no replica leads, or the leader does not answer, the follower answers 503 `no_leader` (proposed) with
+  `Retry-After: 2`. A relayed stream ends when the leader goes; the client reconnects with `?since=` (§12) and gets
+  what it missed from the new leader. The ephemeral events of the gap are lost, as across a restart.
+* **Why relay.** A request that needs the orchestrator must run in its process: the locks that order a cancel with a
+  driver, the step a cancel ends and the plan's lock a validation holds exist only there (§8). A follower that wrote
+  through the store alone would bypass them. A relayed stream needs neither a store poll nor LISTEN/NOTIFY and carries
+  the ephemeral events, which the store never holds (§4.3). NOTIFY, weighed for the fan-out, carries less than 8000
+  bytes by default (a 2000-character log line in UTF-8 and JSON can exceed it), reaches only the sessions listening at
+  the time, and does not pass PgBouncer's transaction pooling.
+* **Both replicas are ready.** `/ready` judges the replica itself, as today: the database reachable and its loop alive,
+  the tick on the leader, the campaign on a follower. The Deployment then reports both replicas available, `rollout
+  status` completes, and a disruption budget can let one go. Liveness stays `/health`.
+* **Health** (proposed, §12 with HA4): `/health` gains `leader`, `{"leading": bool, "holder": str|null, "epoch":
+  int|null, "since": datetime|null}`. The leader writes its orchestrator's health into the lease row with each renewal,
+  so every replica reports the leader's `orchestrator` object as of its last renewal, while a follower's `status` and
+  `/ready` still judge the follower. The dashboard's orchestrator indicator thus shows the leader's (§16, HA4).
+* **The CLI** is unchanged: no lease, no tick, and its validations' cleanups in its own process (§15). `seamless
+  status` names the leader and its epoch (HA5).
+
+### 25.7 Deployment
+
+* **OpenShift and Kubernetes: an HA component**, a kustomize component that both overlays may include; the base stays
+  one replica, which runs on any cluster. The component sets:
+  * `replicas: 2` with a required pod anti-affinity on `kubernetes.io/hostname`. During a drain the evicted replica
+    waits for a node without the other one, which leads meanwhile;
+  * `strategy: Recreate`, kept (owner decision 6). Kubernetes ends a rollout's old pods before it starts new ones, so
+    one version runs at a time, and the first upgrade never runs 0.4.0's unfenced orchestrator beside a 0.5.0 one. An
+    upgrade stays an outage of the control plane, as today; `--drain` keeps cutovers out of it (§17.2);
+  * a PodDisruptionBudget with `maxUnavailable: 1` and `unhealthyPodEvictionPolicy: AlwaysAllow` (stable since
+    Kubernetes 1.31; `TODO(LAB): confirm` on NFR-10's 1.28): a drain evicts one replica at a time, and a replica that
+    is not ready never blocks it. Security.md had no budget because a single replica's would block drains;
+  * the data volume `seamless-data` ReadWriteMany (owner decision 5): the new leader reads the run directories the old
+    one wrote (§25.1). A ReadWriteOnce volume attaches to one node, so without a ReadWriteMany class the control plane
+    stays one replica. On OpenShift a CephFS class of OpenShift Data Foundation serves ReadWriteMany (`TODO(LAB):
+    confirm` the class and its encryption in transit). An installation copies `/data` to the new volume once, with
+    the control plane stopped (Operations.md, HA7);
+  * NetworkPolicy rules that let the replicas reach each other's API port (the relay), and nothing else between them.
+    No Kubernetes RBAC is added: the lease is the database's.
+* **PostgreSQL** (owner decision 10). Two nodes help only with a database that outlives a node; the bundled StatefulSet
+  stays one pod, and while its node is down nobody leads. The database must drop a vanished client within about a
+  minute, or a cut-off leader's VM-claim lock (§5.4) outlives it by hours: `tcp_keepalives_idle` 10 s,
+  `tcp_keepalives_interval` 5 s and `tcp_keepalives_count` 6 on the server, and `idle_in_transaction_session_timeout`
+  10 s for the application role. The bundled StatefulSet sets them; a managed database needs them set (`TODO(LAB):
+  confirm` which ones a managed service lets one change).
+* **Compose and Podman** stay one replica (owner decision 8): two containers on one host fail with it, and
+  `restart: unless-stopped` already restarts a crashed container. The lease runs there too, so a second server
+  started against the same database waits as a follower.
+* **`seamless-ctl.sh`** (§17.2) on a cluster: `scale` takes 0, 1 or 2, and 2 only while `seamless-data` is
+  ReadWriteMany (refused otherwise, naming why); `up` and `start` restore the overlay's count (1, or 2 with the HA
+  component) instead of 1; `status` names the leading pod. `restart`, `capacity`, `--drain` and `resume` are
+  unchanged: a rollout ends both replicas, and a drain's calls reach the leader through the relay. `docker` and
+  `podman` keep `scale` 0 or 1.
+
+### 25.8 Observability
+
+Proposed; each enters §4.3, §12 or §18 with its task, since tests read those tables (HA3–HA5):
+* metrics: `seamless_leader`, a gauge, 1 on the replica that leads and 0 on a follower; `seamless_leader_epoch`, a
+  gauge, the epoch this replica last read, whose increases are the changes of leader. `/metrics` answers on each
+  replica with the same store figures, and `seamless_leader` tells which one drives;
+* events: `leader.acquired`, in the takeover's transaction, with `holder`, `epoch`, the previous holder and epoch,
+  `cause` (`first`, `expired` or `released`) and the number of migrations it resumes; `leader.released` with a release.
+  A leader deposed by a failed renewal can write nothing, so the next `leader.acquired` says `expired`;
+* `/health`'s `leader` (§25.6) and the leader line of `seamless status`;
+* logs: each takeover, each failed renewal and each deposition with its reason, and each write the fence refused with
+  both epochs.
+
+### 25.9 Security
+
+* The relay is plain HTTP between the replicas inside the namespace and carries the caller's bearer token, as the
+  router's hop to the pod does today (edge TLS, §17). The NetworkPolicy admits only the replicas on that port.
+* uvicorn's `FORWARDED_ALLOW_IPS` lists the replicas' pod network beside the router's addresses; otherwise every
+  relayed caller shares the follower's address in the lockout (§13.1).
+* The application role needs SELECT, INSERT and UPDATE on `leases`; the owner role creates the table, as it creates
+  the indexes (§11).
+* On a ReadWriteMany volume the run's secret files (§7.2) cross the storage network while a playbook runs, and a dead
+  leader's stay until the step runs again: the class must encrypt in transit (`TODO(LAB): confirm` per class).
+* The fence makes the leader the only writer of the audit trail, `auth.denied` aside. The lease adds no credential.
+
+### 25.10 Validation
+
+* **In the test process:** two electors and two orchestrators on one SQLite file and, with `SEAMLESS_TEST_PG_URL`, on
+  PostgreSQL; leases of a second or two; an executor whose playbooks are real process groups, so the kill is real. A
+  takeover that waits for a write in flight is a PostgreSQL test.
+* **Lab cases** (proposed; QASuite with HA7, their results with HA8), on OpenShift and Kubernetes, with a database that
+  outlives a node:
+  * LAB-HA01: the leader's node powered off during a cutover, its source stopped;
+  * LAB-HA02: the leader cut off from PostgreSQL during a cutover, its pod alive;
+  * LAB-HA03: PostgreSQL restarted, and failed over, within the renew deadline, during a pre-copy and a cutover: nobody
+    is deposed;
+  * LAB-HA04: the leader's node drained during a pre-copy;
+  * LAB-HA05: `restart --drain` while plans run.
+
+  Each records the time until a leader drives again and the downtime added. Each checks one source stop and one
+  destination server per VM and `migration.phase` orders the FSM allows, as DEMO-06 does, and reads in the deposed
+  replica's log, where it survives, that the fence refused every write it tried after the takeover.
+* **The open questions the lab closes:** the recovery time and its parts; the database's restart and failover times
+  against the renew deadline; whether the container runtime ends the playbooks when the control plane's process exits
+  in a pod with a shared process namespace; what the stop tasks print for a server already stopped (§25.5); the
+  ReadWriteMany class and its encryption; `X-Forwarded-For` through the router and the relay; and whether two replicas
+  creating the schema at once race (concurrent `CREATE TABLE IF NOT EXISTS` failed on a catalog index in pgsql-bugs
+  #9956, 2014), which `create_schema()` avoids under the cross-process lock (HA2).
+
+### 25.11 Owner decisions
+
+The owner took each default as written on 2026-10-23 (D2):
+
+1. **The release: 0.5.0, as a Technology Preview** until LAB-HA01–LAB-HA05 pass. PRD §9 put HA in 0.2.0 and no
+   release delivered it; 0.4.0 is at its release candidate, and HA needs nothing it still changes. Only real nodes can
+   show a failover, as only a lab could show §22's GPUs and §23's two clouds. Notifications, proposed separately for
+   0.5.0, are independent: a notifier would run on the leader alone.
+2. **The election: a lease row in PostgreSQL with an epoch,** timed by the database's clock, rather than a session
+   advisory lock or a Kubernetes Lease (§25.3). One database orders the election and fences every write, on every
+   platform the product supports.
+3. **The timing: lease 30 s, renew deadline 20 s, retry 2 s;** a recovery of about 35 s, with 60 s the lab's target.
+   * A deposition cancels the running steps, and a step run again costs work and, in a cutover, downtime: a database
+     blip shorter than 20 s must not cause one. client-go's 15, 10 and 2 s suit work that is cheap to repeat.
+   * A lost node then costs about 35 s instead of about 12 minutes (§25.1).
+4. **The follower relays the API and the event stream to the leader** (§25.6): every request runs where the
+   orchestrator's locks and steps are. The alternatives:
+   * a follower that is never ready: no relay, but a Deployment that never reports its replicas available, a `rollout
+     status` that never completes, and a disruption budget that can evict neither replica;
+   * a follower that answers reads from the store and relays writes: the dashboard stays readable for the 35 s or so of
+     a failover, but every read route must be checked for process state, and the streams still need the leader's
+     ephemeral events.
+5. **The data directory on a ReadWriteMany volume** on a cluster, and one replica without one. The collection writes
+   the run directories as files; moving that state into PostgreSQL would change its warm state and journals, which is
+   out of 0.5.0.
+6. **`Recreate`, two replicas on two nodes, a disruption budget of one.** One version runs at a time, and nothing
+   overlaps 0.4.0's unfenced orchestrator. A rolling update, which keeps the API up during an upgrade, can follow once
+   every release in the field holds the lease.
+7. **SQLite: one server per database file;** a second one exits, and there is no follower mode (§25.3).
+8. **Compose and Podman: one replica,** with the lease on; `scale` keeps 0 or 1 there.
+9. **The lease on every PostgreSQL installation, whatever its replica count:** a second server started by mistake
+   against the same database waits instead of driving the same migrations. The cost: a database outage longer than
+   20 s cancels even a single replica's steps (§25.5).
+10. **The database's part.** The manifests set the bundled PostgreSQL's keepalive and idle-transaction settings
+    (§25.7); a database that outlives a node, from an operator or a managed service, is the deployment's.
+
+### 25.12 Contract changes (each binding from its plan task)
+
+| Change | Where | Task |
+|---|---|---|
+| PRD: FR-27's priority and acceptance criteria, the 0.2.0 row as delivered, a 0.5.0 row; D2 decided | PRD, §20 | HA1 |
+| the `leases` table; the fence on each write of a server process and `Fenced`, `auth.denied` aside; `create_schema()` under the cross-process lock; SQLite's server lock; `SEAMLESS_LEADER_LEASE_S` | §11, §15, §15.1 | HA2 |
+| the elector (campaign, renewal, deadline, watchdog, release); the orchestrator started and stopped by the leadership; the check before each action on a cloud; the registered process groups and their kill; `leader.acquired` and `leader.released`; the demo seed's restore at the takeover | §4.3, §7.1, §8, §10 | HA3 |
+| the relay, its marker header and 503 `no_leader`; `/health`'s `leader` and the leader's orchestrator health; the dashboard's orchestrator indicator | §12, §13.1, §16 | HA4 |
+| `seamless_leader` and `seamless_leader_epoch`; the leader line of `seamless status` | §15, §18 | HA5 |
+| the HA component; the PostgreSQL settings; `seamless-ctl.sh`: `scale 2`, the count `up` and `start` restore, `status` | §17, §17.2 | HA6 |
+| QASuite rows and LAB-HA cases; Security.md (§25.9, its single-instance row); Operations.md (enabling HA, moving `/data`, a failover, the database settings); Performance.md §9.3 and §11; MEMORY.md M-03 and its D2 row | QASuite, Security.md, Operations.md, Performance.md, MEMORY.md | HA7 |
+| the lab; the Technology Preview label goes when LAB-HA01–LAB-HA05 pass | QASuite §13 | HA8 |
