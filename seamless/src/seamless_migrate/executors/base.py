@@ -24,6 +24,25 @@ class StepName(StrEnum):
     FINALIZE = "finalize"
 
 
+class HostKeys(Protocol):
+    """What a run records of its conversion hosts' keys, through the orchestrator (SDD §7.2
+    "Conversion host keys", §26.4, §26.8)."""
+
+    async def pin_from_console(self, provider: Provider) -> Provider:
+        """The provider once the provider check's path (§10) pinned its conversion host from its
+        console - read once, for a host without a pin -; as it is stored when nothing was
+        pinned."""
+        ...
+
+
+class NoHostKeys:
+    """The book of a run the orchestrator handed none: it reads no console and records
+    nothing."""
+
+    async def pin_from_console(self, provider: Provider) -> Provider:
+        return provider
+
+
 @dataclass
 class StepContext:
     plan: Plan
@@ -41,6 +60,9 @@ class StepContext:
     log: Callable[[str], Awaitable[None]]
     #: step options, e.g. ``{"delete_source": True}`` for FINALIZE (extension of SDD §7.1)
     options: dict[str, Any] = field(default_factory=dict)
+    #: what the run records of its conversion hosts' keys: the orchestrator's book of the step's
+    #: plan and migration (SDD §7.2 "Conversion host keys"; extension of SDD §7.1)
+    host_keys: HostKeys | None = None
 
 
 @dataclass

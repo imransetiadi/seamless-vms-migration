@@ -73,6 +73,8 @@ from ..security.secrets import (
     write_secret_file,
 )
 from .base import (
+    HostKeys,
+    NoHostKeys,
     PermanentStepError,
     StepContext,
     StepName,
@@ -1280,10 +1282,12 @@ class AnsibleExecutor:
         prestage_flavors: list[str] | None = None,
         prestage_keypairs: list[str] | None = None,
         rekey_conversion_hosts: Mapping[str, Path | str] | None = None,
+        host_keys: HostKeys | None = None,
     ) -> None:
         """Pre-stage the plan's resources, then deploy the conversion hosts - first re-keying
         each side ``rekey_conversion_hosts`` names, logged in to with the earlier plan's key its
-        keypair holds (SDD §7.2 "Conversion key")."""
+        keypair holds (SDD §7.2 "Conversion key"). ``host_keys`` is the orchestrator's book of
+        the run's conversion host keys (SDD §7.2 "Conversion host keys")."""
         if source.kind == ProviderKind.vmware:
             return  # the kit prepares its own conversion host
         rekey = dict(rekey_conversion_hosts or {})
@@ -1331,8 +1335,9 @@ class AnsibleExecutor:
         if deploy_conversion_hosts and self.settings.ansible_host_key_checking:
             # the deploy reaches both conversion hosts: their keys are settled before it (SDD
             # §7.2 "Conversion host keys")
+            book = host_keys or NoHostKeys()
             hosts = [
-                await self._host_of(side, provider, SIDE_ALIASES[side])
+                await self._host_of(side, provider, SIDE_ALIASES[side], book)
                 for side, provider in (("source", source), ("destination", destination))
             ]
             trust = _Trust(pdir / KNOWN_HOSTS_FILE, hosts)
@@ -1369,9 +1374,10 @@ class AnsibleExecutor:
                 ("source", ctx.source, SIDE_ALIASES["source"]),
                 ("destination", ctx.destination, SIDE_ALIASES["destination"]),
             ]
-        rollback = step == StepName.ROLLBACK
+        book = ctx.host_keys or NoHostKeys()
+        rollback = ctx.log if step == StepName.ROLLBACK else None
         hosts = [
-            await self._host_of(side, provider, alias, log=ctx.log if rollback else None)
+            await self._host_of(side, provider, alias, book, rollback=rollback)
             for side, provider, alias in reached
         ]
         return _Trust(rdir / KNOWN_HOSTS_FILE, hosts)
@@ -1381,14 +1387,18 @@ class AnsibleExecutor:
         side: str,
         provider: Provider,
         alias: str,
+        book: HostKeys,
         *,
-        log: Callable[[str], Awaitable[None]] | None = None,
+        rollback: Callable[[str], Awaitable[None]] | None = None,
     ) -> _Host:
         """The side's conversion host as the run checks it (SDD §7.2, §10, §26.4): its declared
         keys, else the pin of the server it resolves to - looked up as the provider check finds
-        it. A lookup that fails is a transient failure, or, given ``log`` (a rollback, which
-        must start the source whatever its hosts' keys), logged: the host then resolves to no
-        server, and no pin applies."""
+        it; a lookup that fails is a transient failure. A host without a pin has its console read
+        once through ``book``, which pins what it shows (§26.8). A host the run then has no key
+        for is refused before any playbook: "host key unknown", or "conversion host replaced"
+        when its pin is another server's (§26.5). Given ``rollback`` - a rollback's log: it must
+        start the source whatever its hosts' keys - nothing is refused or read, and a lookup that
+        fails is logged: the host then resolves to no server, and no pin applies."""
         host = provider.conversion_host
         declared = tuple(host.ssh_host_keys) if host is not None else ()
         name = _host_label(provider, side)
@@ -1398,12 +1408,28 @@ class AnsibleExecutor:
             name, server = await self._find_conversion_host(provider, side)
         except ProviderError as exc:
             failure = f"could not look up the {side} conversion host {name} in {provider.label}"
-            if log is None:
+            if rollback is None:
                 raise TransientStepError(f"{failure}: {exc}") from exc
-            await log(f"{failure} ({exc}): no pin applies to it in this run")
+            await rollback(f"{failure} ({exc}): no pin applies to it in this run")
             server = None
-        known = KnownHost(alias, server, pin=provider.conversion_host_pin)
-        return _Host(side, alias, provider, name, server, known)
+        if rollback is None and server is not None and provider.conversion_host_pin is None:
+            # a host without a pin: its console, read once, pins what it shows (SDD §26.8)
+            provider = await book.pin_from_console(provider)
+        pin = provider.conversion_host_pin
+        declared = tuple(provider.conversion_host.ssh_host_keys) if provider.conversion_host else ()
+        known = KnownHost(alias, server, declared, pin)
+        checked = _Host(side, alias, provider, name, server, known)
+        if rollback is None and not checked.keys:
+            if pin is not None and server is not None and pin.server_id != server:
+                raise PermanentStepError(
+                    f"conversion host replaced: {name} is now server {server}; its pin belongs "
+                    f"to server {pin.server_id}"
+                )
+            raise PermanentStepError(
+                f"host key unknown: no key is pinned or declared for the {side} conversion host "
+                f"{name}"
+            )
+        return checked
 
     async def _find_conversion_host(self, provider: Provider, side: str) -> tuple[str, str | None]:
         """The server the side's conversion host resolves to, as the provider check finds it

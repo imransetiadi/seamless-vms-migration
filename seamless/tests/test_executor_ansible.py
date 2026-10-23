@@ -6233,3 +6233,231 @@ async def test_the_vmware_inventory_pins_the_conversion_host(env):
     assert known_keys(call["known_hosts"], "conversion_host") == pin.keys
     assert call["env"]["ANSIBLE_HOST_KEY_CHECKING"] == "True"
     assert call["vars"]["os_migrate_conversion_host_known_hosts"] == str(known)
+
+
+class Book:
+    """The orchestrator's book of a run's conversion host keys as an executor test reads it (SDD
+    §7.2 "Conversion host keys"): the providers whose console it was asked to pin - each pinned as
+    ``consoles`` says, by provider id -, the injected keys it pinned and the refusals it
+    recorded."""
+
+    def __init__(self, consoles=None):
+        self.consoles = dict(consoles or {})
+        self.read: list[str] = []
+        self.injected: list[tuple] = []
+        self.refusals: list[tuple[str, dict]] = []
+
+    async def pin_from_console(self, provider):
+        self.read.append(provider.id)
+        pin = self.consoles.get(provider.id)
+        if pin is None:
+            return provider
+        return provider.model_copy(update={"conversion_host_pin": pin})
+
+    async def pin_injected(self, provider, side, server_id, keys):
+        self.injected.append((provider.id, side, server_id, list(keys)))
+
+    async def refused(self, message, data):
+        self.refusals.append((message, data))
+
+
+def booked(ctx, book):
+    """The context with the book of its run's conversion host keys (SDD §7.2)."""
+    ctx.host_keys = book
+    return ctx
+
+
+async def test_a_host_without_a_pin_is_refused_before_any_playbook(env):
+    """SDD §7.2, §26.5, §26.8 (plan task ST5): with host keys checked, a pre-copy, sync, cutover or
+    pre-staging refuses before any playbook a conversion host it has no key for - neither declared
+    keys nor a pin of the server it resolves to - once its console, read once, pinned nothing:
+    "host key unknown: no key is pinned or declared for the {side} conversion host {name}". A host
+    that resolves to no server is refused alike, no console read. With the setting off the same
+    run goes on, as 0.4.0's did."""
+    env.registry.servers = {"conv-src": "srv-src-1", "conv-dst": "srv-dst-1"}
+    destination = pinned(DST, "srv-dst-1", 2)
+    unknown = (
+        "host key unknown: no key is pinned or declared for the source conversion host conv-src"
+    )
+    ctx, _ = ctx_for(env, destination=destination)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    ran = len(read_log(env.log))
+    assert ran, "the setting off refuses nothing"
+
+    check_keys(env)
+    for step in (StepName.SYNC, StepName.CUTOVER):
+        book = Book()
+        ctx, rec = ctx_for(env, destination=destination)
+        with pytest.raises(PermanentStepError) as refused:
+            await env.executor.run(step, booked(ctx, book))
+        assert str(refused.value) == unknown
+        assert book.read == ["src-osp"], "its console, read once"
+        assert rec.downtime_marks == 0
+    assert len(read_log(env.log)) == ran, "no playbook ran"
+
+    # a host no server answers for, by its name or its address: no console to read
+    env.registry.servers = {"conv-src": "srv-src-1"}
+    book = Book()
+    ctx, _ = ctx_for(env, source=pinned(SRC, "srv-src-1", 1), destination=destination)
+    with pytest.raises(PermanentStepError) as refused:
+        await env.executor.run(StepName.PRECOPY, booked(ctx, book))
+    assert str(refused.value) == (
+        "host key unknown: no key is pinned or declared for the destination conversion host "
+        "conv-dst"
+    )
+    assert book.read == []
+
+    # a pre-staging: an operator's host without a pin
+    env.registry.servers = {"conv-src": "srv-src-1", "conv-dst": "srv-dst-1"}
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    book = Book()
+    with pytest.raises(PermanentStepError) as refused:
+        await env.executor.prestage(
+            plan,
+            hosted(SRC, manage=False),
+            destination,
+            deploy_conversion_hosts=True,
+            host_keys=book,
+        )
+    assert str(refused.value) == unknown
+    assert book.read == ["src-osp"]
+    assert len(read_log(env.log)) == ran
+
+
+async def test_a_replaced_host_is_refused_before_any_playbook(env):
+    """SDD §7.2, §26.4, §26.5 (plan task ST5): a conversion host whose pin belongs to another
+    server than the one it resolves to - deleted and created again behind Seamless's back - is
+    refused before any playbook: "conversion host replaced: {name} is now server {new id}; its pin
+    belongs to server {old id}", {name} what found it, its name or its address. Its new console is
+    not read, and its pin is never used: a rollback, which refuses nothing - it starts the source -
+    runs without a key for it."""
+    check_keys(env)
+    env.registry.servers = {"conv-src": "srv-src-2", "conv-dst": "srv-dst-1"}
+    source = pinned(SRC, "srv-src-1", 1)
+    destination = pinned(DST, "srv-dst-1", 2)
+    book = Book()
+    ctx, rec = ctx_for(env, source=source, destination=destination)
+    with pytest.raises(PermanentStepError) as refused:
+        await env.executor.run(StepName.CUTOVER, booked(ctx, book))
+    assert str(refused.value) == (
+        "conversion host replaced: conv-src is now server srv-src-2; its pin belongs to server "
+        "srv-src-1"
+    )
+    assert rec.downtime_marks == 0
+
+    # found by its address, no server bearing its name
+    env.registry.servers = {"conv-src": "srv-src-1"}
+    env.registry.addresses = {"192.0.2.10": "srv-dst-9"}
+    ctx, _ = ctx_for(env, source=pinned(SRC, "srv-src-1", 1), destination=destination)
+    with pytest.raises(PermanentStepError) as refused:
+        await env.executor.run(StepName.PRECOPY, booked(ctx, book))
+    assert str(refused.value) == (
+        "conversion host replaced: 192.0.2.10 is now server srv-dst-9; its pin belongs to server "
+        "srv-dst-1"
+    )
+
+    # a pre-staging, the source's managed host replaced under its name
+    env.registry.servers = {"conv-src": "srv-src-2", "conv-dst": "srv-dst-1"}
+    env.registry.addresses = {}
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    with pytest.raises(PermanentStepError, match="^conversion host replaced: conv-src is now"):
+        await env.executor.prestage(
+            plan, source, destination, deploy_conversion_hosts=True, host_keys=book
+        )
+    assert book.read == [] and read_log(env.log) == []
+
+    # a rollback runs, without the replaced host's pin
+    ctx, _ = ctx_for(env, source=source, destination=destination)
+    await env.executor.run(StepName.ROLLBACK, booked(ctx, book))
+    [call] = read_log(env.log)
+    assert known_keys(call["known_hosts"], "os_migrate_conv_src") == []
+    assert known_keys(call["known_hosts"], "os_migrate_conv_dst") == [bare_key(public_key(2))]
+    assert book.read == []
+
+
+def keys_console(*keys):
+    """A conversion host's console as cloud-init leaves it, with its keys block when keys are
+    given (synthetic, its address in RFC 5737's 192.0.2.0/24)."""
+    block = ["-----BEGIN SSH HOST KEY KEYS-----", *keys, "-----END SSH HOST KEY KEYS-----"]
+    return "\r\n".join(
+        [
+            "ci-info: | eth0 | True | 192.0.2.21 | 255.255.255.0 | global | fa:16:3e:00:00:02 |",
+            *(block if keys else []),
+            "[   24.912007] cloud-init[1203]: Cloud-init v. 23.4 finished",
+            "conv login: ",
+        ]
+    )
+
+
+async def test_a_run_reads_the_console_of_a_host_without_a_pin_once_before_it_refuses_it(
+    env, store, caplog
+):
+    """SDD §7.2, §26.8 (plan task ST5): a run that meets a conversion host without a pin reads its
+    whole console once, through the orchestrator's book of the run's keys - the provider check's
+    path (§10) - and pins what it shows, with conversion_host.key_pinned, before it would refuse the
+    host. A console with cloud-init's keys block pins the host and the run checks it against that
+    pin; one without pins nothing, and the run is refused before any playbook. A host with a pin is
+    read no more, nor is any host in a rollback, and no line of a console reaches a log."""
+    from seamless_migrate.domain.models import Provider
+    from tests.key_support import fingerprint_of
+    from tests.orch_support import build_harness
+
+    caplog.set_level(logging.DEBUG)
+    check_keys(env)
+    h = build_harness(env.settings.data_dir.parent / "orchestrator", store, [])
+    h.orch.providers = env.registry
+    store.put("provider", SRC)
+    store.put("provider", DST)
+    env.registry.servers = {"conv-src": "srv-src-1", "conv-dst": "srv-dst-1"}
+    src_key, dst_key = public_key(1, "root@conv-src"), public_key(2, "root@conv-dst")
+    env.registry.consoles = {"srv-src-1": keys_console(src_key), "srv-dst-1": keys_console()}
+
+    def reads():
+        return [call for call in env.registry.calls if call[0] == "console_log"]
+
+    def book_of(ctx):
+        return booked(ctx, h.orch.host_keys(ctx.plan.id, ctx.migration.id))
+
+    ctx, _ = ctx_for(env)
+    with pytest.raises(PermanentStepError) as refused:
+        await env.executor.run(StepName.PRECOPY, book_of(ctx))
+    assert str(refused.value) == (
+        "host key unknown: no key is pinned or declared for the destination conversion host "
+        "conv-dst"
+    )
+    assert reads() == [("console_log", "srv-src-1", None), ("console_log", "srv-dst-1", None)]
+    assert read_log(env.log) == []
+    source = store.get("provider", "src-osp", Provider)
+    pin = source.conversion_host_pin
+    assert (pin.server_id, pin.keys, pin.source) == ("srv-src-1", [bare_key(src_key)], "console")
+    assert store.get("provider", "dst-rhoso", Provider).conversion_host_pin is None
+    [event] = [e for e in store.events(since_seq=0) if e.kind == "conversion_host.key_pinned"]
+    assert event.data == {
+        "provider_id": "src-osp",
+        "side": "source",
+        "server_id": "srv-src-1",
+        "fingerprints": [fingerprint_of(src_key)],
+        "source": "console",
+    }
+
+    # the destination's console shows its block now: the next run pins it and goes on, the
+    # source's pin read no more
+    env.registry.consoles["srv-dst-1"] = keys_console(dst_key)
+    ctx, _ = ctx_for(env, source=source)
+    await env.executor.run(StepName.PRECOPY, book_of(ctx))
+    assert reads()[2:] == [("console_log", "srv-dst-1", None)]
+    calls = read_log(env.log)
+    assert calls
+    for call in calls:
+        assert known_keys(call["known_hosts"], "os_migrate_conv_src") == [bare_key(src_key)]
+        assert known_keys(call["known_hosts"], "os_migrate_conv_dst") == [bare_key(dst_key)]
+
+    # a rollback reads no console
+    env.registry.consoles["srv-dst-1"] = keys_console(public_key(3))
+    ctx, _ = ctx_for(env, source=source)
+    await env.executor.run(StepName.ROLLBACK, book_of(ctx))
+    assert len(reads()) == 3
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    for key in (src_key, dst_key):
+        assert key.split()[1] not in text
+    assert "ci-info" not in text and "login:" not in text
