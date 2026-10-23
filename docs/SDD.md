@@ -7184,8 +7184,10 @@ decision 10).
   in §4.2, §10 and §12 since plan task ST2): the Nova server's id,
   the public keys, their source (`injected` or `console`) and the time. A public key is no secret: the API returns
   the pin, and the dashboard shows its fingerprints. A pin belongs to one server. When the provider's host resolves
-  to another server (deleted and created again), the pin no longer applies, and only a pre-staging that creates the
-  new server, or the new server's console, pins it again (§26.5).
+  to another server (deleted and created again), the pin no longer applies: the host is refused as replaced (§26.5)
+  until the operator declares its keys, or deletes it and a pre-staging creates and pins it again (LAB-SSH08). The
+  provider check does not pin the new server from its console; it reports the replacement (§10), since a host
+  replaced behind Seamless's back is a change an operator should see, not one to take in silence.
 * **Why per host.** A conversion host serves every plan of its provider, so a plan's pre-staging data would hold one
   pin per plan for one host. The database also keeps the pin when the data volume is lost or moved.
 * **A known_hosts file per run.** Each run writes `known_hosts` in its run directory (§7.2) from the declared keys,
