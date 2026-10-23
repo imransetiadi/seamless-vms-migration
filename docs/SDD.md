@@ -5209,7 +5209,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | # | Decision | Default taken | Revisit when |
 |---|---|---|---|
 | D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with per-disk parallelism and read-ahead workers | 0.2.0: changed-extent sources that remove the scan — Ceph-direct `rbd diff` between pass snapshots (opt-in, Ceph credentials) and hypervisor-assisted tracking via libvirt checkpoints / incremental backup on the source compute nodes (builds on the existing `import_from_hypervisor` access model) |
-| D2 | Single-replica orchestrator; a highly available control plane (§25) | accepted up to 0.4.0; proposed 2026-10-23: §25.11's ten defaults, none taken yet - a PostgreSQL lease with an epoch that fences every write, followers that relay to the leader, two replicas on a cluster with a ReadWriteMany data volume, a Technology Preview in 0.5.0 | owner decision; the LAB-HA cases of §25.10 end the Technology Preview |
+| D2 | Single-replica orchestrator; a highly available control plane (§25) | accepted up to 0.4.0; decided by the owner 2026-10-23: §25.11's ten defaults as written - a PostgreSQL lease with an epoch that fences every write, followers that relay to the leader, two replicas on a cluster with a ReadWriteMany data volume, a Technology Preview in 0.5.0 | each item binds with its plan task (§25.12); the LAB-HA cases of §25.10 end the Technology Preview |
 | D3 | Network cut-over (FIP/DNS/BGP), Octavia and Heat | out of scope up to 0.3.0, with no hook documented and no finding (the old default said "hooks documented", which was never done) | decided: D18 (0.4.0, §23) |
 | D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL`; partly decided by the §13.4 knobs (`SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`, `TODO(ADV-06)`) |
 | D5 | Dashboard navigation item **Users** for non-admins: hidden (today) or soft-disabled with the reason, as every other action (§16) | hidden | owner decision (audit C-01) |
@@ -6669,14 +6669,15 @@ The owner took each default as written on 2026-10-23 (D19):
 | QASuite rows; Security.md (assets, flows, the data that leaves); Operations.md (the relay, Slack, a receiver, the egress); MEMORY.md's erasure bullet | QASuite, Security.md, Operations.md, MEMORY.md | NT11 |
 | the live smoke | QASuite §13 | NT12 |
 
-## 25. High availability of the control plane (proposed for 0.5.0)
+## 25. High availability of the control plane (0.5.0, Technology Preview)
 
-Status: a proposal of 2026-10-23 for the owner's decisions (§25.11, D2). Nothing in this section is binding, and the
-PRD stays as it is until the owner decides (plan task HA1).
+Status: proposed 2026-10-23 and decided by the owner the same day (D2): §25.11's defaults as written. Each item
+becomes binding in the section §25.12 names when its plan task lands; until then nothing in this section is binding.
+The PRD follows with plan task HA1. HA ships as a **Technology Preview** until LAB-HA01–LAB-HA05 pass (§25.10).
 
 What it answers: FR-27 ("HA control plane (leader election)", priority C), the 0.2.0 item "HA (PostgreSQL leader
-election)" of the release table (PRD §9) and D2. No release delivered them. The release is the owner's to choose
-(owner decision 1), and this section proposes 0.5.0. The plan is `superpowers/plans/2026-10-23-ha-control-plane.md`.
+election)" of the release table (PRD §9) and D2. No release delivered them. The owner chose 0.5.0 (owner decision
+1). The plan is `superpowers/plans/2026-10-23-ha-control-plane.md`.
 §24 is left to the notifications proposal of another branch.
 
 HA adds no route. The proposed table, variable, events, metrics, health fields and error code stay out of the tables
@@ -6955,7 +6956,7 @@ Proposed; each enters §4.3, §12 or §18 with its task, since tests read those 
 
 ### 25.11 Owner decisions
 
-Each comes with the default this proposal recommends:
+The owner took each default as written on 2026-10-23 (D2):
 
 1. **The release: 0.5.0, as a Technology Preview** until LAB-HA01–LAB-HA05 pass. PRD §9 put HA in 0.2.0 and no
    release delivered it; 0.4.0 is at its release candidate, and HA needs nothing it still changes. Only real nodes can
