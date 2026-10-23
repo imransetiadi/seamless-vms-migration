@@ -42,7 +42,7 @@ Today's tooling forces painful trade-offs:
 
 | ID | Goal | Measure |
 |---|---|---|
-| G1 | Minimize downtime | In the reference lab (Performance.md): warm VMs whose scan term (SDD §9.1) is ≤ 330 s — e.g. largest disk ≤ 100 GiB and total ≤ 400 GiB at the default 500 MiB/s per stream × 4 streams — cut over in ≤ 10 min at p90, and a warm cutover beats the cold copy whenever more than ~25 % of the disk is used (scan at 500 MiB/s vs transfer at 125 MiB/s); handover-eligible VMs cut over in ≤ 6 min regardless of size. Warm downtime is bounded by fixed overhead (~4.5 min) + largest-disk scan (≈ 3.4 min per 100 GiB at 500 MiB/s); 0.2.0 removes the scan term (SDD §20 D1) |
+| G1 | Minimize downtime | In the reference lab (Performance.md): warm VMs whose scan term (SDD §9.1) is ≤ 330 s — e.g. largest disk ≤ 100 GiB and total ≤ 400 GiB at the default 500 MiB/s per stream × 4 streams — cut over in ≤ 10 min at p90, and a warm cutover beats the cold copy whenever more than ~25 % of the disk is used (scan at 500 MiB/s vs transfer at 125 MiB/s); handover-eligible VMs cut over in ≤ 6 min regardless of size. Warm downtime is bounded by fixed overhead (~4.5 min) + largest-disk scan (≈ 3.4 min per 100 GiB at 500 MiB/s); 0.5.0 removes it from the final pass for Ceph RBD volumes (SDD §28, D1) |
 | G2 | Predictability | Downtime estimate within ±30 % of actual for ≥ 80 % of migrations once one delta pass has calibrated change rate and scan throughput (SDD §9.1 calibration) |
 | G3 | Safety | 100 % of cutovers reversible until finalize; no source data deleted without an explicit finalize by an approver |
 | G4 | One workflow for all sources | RHOSP 17.1, community OpenStack and VMware handled by the same plan/wave/approval model |
@@ -157,7 +157,7 @@ item marked a Technology Preview stays one until its lab cases pass).
 | FR-23 | Prometheus metrics | S | SDD §18 metric names |
 | FR-24 | Demo mode with simulated providers and executor | M | `seamless serve --demo` exercises every phase including rollback |
 | FR-25 | Deploy on OpenShift, Kubernetes and Docker Compose (Docker Engine on a Linux host, Colima on macOS, or Podman) with PostgreSQL | M | Manifests in `deploy/openshift` and its overlay `deploy/kubernetes`, compose stack in `deploy/compose` |
-| FR-26 | Changed-extent tracking to remove the scan floor: Ceph-direct `rbd diff` and hypervisor-assisted libvirt checkpoints | C | 0.2.0 |
+| FR-26 | Changed-extent tracking: the final warm pass reads only the chunks that Ceph's `rbd diff` lists between Cinder's pass snapshots, instead of scanning whole disks (SDD §28); libvirt dirty bitmaps follow a lab spike | M5 | A disk that cannot use extents, or any doubt, scans the disk in full and never fails a pass; every earlier pass checks the extents against its scan; a Technology Preview until LAB-CE01–LAB-CE07 and PERF-E2E-SM1b pass (SDD §28.10) |
 | FR-27 | HA control plane: a lease on PostgreSQL elects one leader, whose epoch fences every write; two replicas on a cluster (SDD §25) | M5 | A leader lost on a cluster with a ReadWriteMany data volume is replaced, and its migrations resume, within about 35 s (60 s the lab's target); no write of a deposed leader lands after a takeover; a Technology Preview until LAB-HA01–LAB-HA05 pass (SDD §25.10) |
 | FR-28 | Network cut-over hooks: an admin's playbook and webhook hooks that a plan runs at `pre_stop`, `post_create`, `post_verify`, `on_rollback` and `on_finalize`, each with a timeout, an idempotency key and a revert | M4 | A hook's failure before the stop keeps the source running, one after it follows `auto_rollback`, and no credential reaches a hook's context (SDD §23.3) |
 | FR-29 | Community OpenStack destinations: a destination provider of kind `openstack` (distribution `openstack_community` or `kolla`) of a series in the support window, beside RHOSO 18.0 | M2 | Every strategy the destination's capabilities allow passes the lab matrix on each Tier 1 series (QASuite §6.7 AC-6, §7.1 M7–M12, §7.2 LAB-D); SDD §21.1 |
@@ -193,7 +193,7 @@ item marked a Technology Preview stays one until its lab cases pass).
 | NFR-02 | Throughput | Per-disk delta sync ≥ 400 MiB/s local scan per side on a 4 vCPU conversion host; WAN-bound transfer saturates ≥ 90 % of a 10 Gbit/s link with ≥ 4 parallel disks |
 | NFR-03 | Scale | 1,000 VMs per plan; 10 concurrent migrations and 3 concurrent cutovers by default (configurable) |
 | NFR-04 | Reliability | Idempotent steps; at-least-once execution with safe retries; no data loss on control-plane crash |
-| NFR-05 | Integrity | End-to-end manifest digest per disk per pass (BLAKE2b-128 over chunk digests) |
+| NFR-05 | Integrity | End-to-end manifest digest per disk per pass (BLAKE2b-128 over chunk digests); a final pass that reads Ceph's extents (0.5.0) proves the chunks it read, and the earlier passes' checks prove the extents (SDD §28.5) |
 | NFR-06 | Security | No credentials in DB/API/logs; TLS to all endpoints; NBD only on loopback or SSH; RBAC; audit (Security.md); from 0.5.0 the data path's SSH checks every conversion host's pinned key, and the dst→src link key is held to a forced command (SDD §26) |
 | NFR-07 | AI safety | AI outputs advisory, bounded, logged with source and confidence; untrusted text screened; secrets redacted |
 | NFR-08 | Usability | Dashboard WCAG 2.2 AA; dense ops layout; live updates ≤ 2 s latency |
@@ -206,7 +206,7 @@ item marked a Technology Preview stays one until its lab cases pass).
 
 * Median warm cutover downtime ≤ 10 min for VMs whose largest disk ≤ 100 GiB and total ≤ 400 GiB;
   p95 ≤ 26 min for largest disk ≤ 500 GiB at the NFR-02 floor of 400 MiB/s per stream; storage handover ≤ 6 min regardless of size (0.1.0 model, SDD §9.1).
-  0.2.0 target with changed-extent tracking (SDD §20 D1): ≤ 5 min median independent of disk size.
+  0.5.0 target with changed-extent tracking (SDD §28, D1): ≤ 5 min median independent of disk size (SM-1b; PERF-E2E-SM1b).
 * ≥ 95 % of migrations complete without manual intervention after pilot wave.
 * 0 incidents of source data loss.
 * Estimate accuracy (G2).
@@ -223,10 +223,10 @@ item marked a Technology Preview stays one until its lab cases pass).
 | Release | Scope |
 |---|---|
 | **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift, Kubernetes and Compose (Docker on Linux, Colima on macOS, or Podman) deployment, docs |
-| 0.2.0 | Ceph-direct incremental diff; community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34). Notifications, HA and per-tenant credentials moved to 0.5.0 |
+| 0.2.0 | Community OpenStack destinations 2023.1 Antelope – 2026.2 Hibiscus (G7, FR-29–FR-34), as delivered. Its other planned items - notifications, HA, per-tenant credentials and the Ceph-direct incremental diff - moved to 0.5.0 |
 | 0.3.0 | GPU workloads as a Technology Preview (G8, FR-35–FR-41; SDD §22) |
 | 0.4.0 | Network cut-over as a Technology Preview (G9, FR-28, FR-42–FR-47; SDD §23): hooks, the keep-address floating IP move, the DNS swap, the BGP reachability wait, the Heat and Octavia findings and the Octavia member helper |
-| 0.5.0 | Notifications by email, Slack and signed webhooks (G10, FR-48–FR-51; SDD §24); the HA control plane as a Technology Preview (FR-27; SDD §25); SSH trust on the data path, its lab cases a gate of the release (NFR-06; SDD §26); per-tenant credentials as a Technology Preview (FR-52; SDD §27) |
+| 0.5.0 | Notifications by email, Slack and signed webhooks (G10, FR-48–FR-51; SDD §24); the HA control plane as a Technology Preview (FR-27; SDD §25); SSH trust on the data path, its lab cases a gate of the release (NFR-06; SDD §26); per-tenant credentials as a Technology Preview (FR-52; SDD §27); changed-extent tracking for warm passes as a Technology Preview (FR-26; SDD §28) |
 | 1.0.0 | Certified on RHOSO 18.0.x FRs, validated on every Tier 1 community series of the day, scale test 5,000 VMs, signed releases |
 
 ## 10. Dependencies and assumptions
@@ -258,7 +258,7 @@ item marked a Technology Preview stays one until its lab cases pass).
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Scan floor of hash-based delta for very large disks | Downtime grows with disk size | Parallel read-ahead; recommend handover for shared Ceph or NetApp storage; Ceph-direct diff in 0.2.0 |
+| Scan floor of hash-based delta for very large disks | Downtime grows with disk size | Parallel read-ahead; recommend handover for shared Ceph or NetApp storage; Ceph-direct extents for the final pass in 0.5.0 (SDD §28) |
 | LVM-backed Cinder makes snapshot→volume a full copy | Slow pre-copy passes | Detect backend; prefer RBD; warn in validation; tune `max_sync_passes` |
 | Guest change rate higher than link | Warm never converges | `max_sync_passes` cap; estimate shows non-convergence; advisor suggests cold window or handover |
 | Network semantics differ (OVS→OVN, MTU) | Post-boot connectivity issues | MTU finding, verification probes, rollback |
