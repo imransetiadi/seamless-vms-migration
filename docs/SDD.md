@@ -5226,6 +5226,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D16 | GPU workloads (§22): how GPU VMs migrate in 0.3.0 | decided by the owner 2026-10-20: a Technology Preview; the plan's GPU mapping is the opt-in (no switch); one GPU flavor per GPU key in a plan; no wave tier of their own, and never in the pilot wave; the network cut-over hooks and the Octavia/Heat helpers move from 0.3.0 to 0.4.0 (PRD, plan task G14) | the lab cases of §22.14 on GPU hosts end the Technology Preview |
 | D17 | A per-VM GPU flavor (a plan field keyed by source id, as `nic_overrides`) for VMs that share a GPU key but need flavors of different sizes | not in 0.3.0: such VMs go into separate plans (D16) | after the Technology Preview, when users ask for it |
 | D18 | Network cut-over, Octavia and Heat (§23): what 0.4.0 does | decided by the owner 2026-10-21: §23.11's eleven defaults as written - both built-in actions and generic hooks, hooks in an admin's catalog, a failure after the stop following `auto_rollback`, `auto` kept with a new-address warning and the keep-address move opt-in, the source's floating IP disassociated (journaled) during the cutover, Designate and RFC 2136 built in, BGP by verification only, Octavia findings and the member helper as a Technology Preview, Heat findings with `SRC_VM_AUTOSCALED` blocking until acknowledged, the Technology Preview label until LAB-NET passes, `allowed_address_pairs` a finding in 0.4.0 | the LAB-NET cases of §23.10 end the Technology Preview |
+| D19 | Notifications (§24): what 0.5.0 does | proposed 2026-10-23: §24.11's twelve defaults, none taken yet | owner decision |
 
 ## 21. Destination platforms: RHOSO 18.0 and community OpenStack
 
@@ -6148,3 +6149,521 @@ Each with the default the owner approved on 2026-10-21 (D18):
 | the dashboard (§23.9): the Hooks page and the badge rule (N12a), the plan form (N12b), the migration page and the findings (N12c) | §16 (binding) | N12 |
 | QASuite (requirement rows, LAB-NET cases), Security.md, Operations.md's runbooks | QASuite, Security.md, Operations.md | N13 |
 | the lab on two clouds; the Technology Preview label goes when its cases pass | QASuite §13 | N14 |
+
+## 24. Notifications (proposed for 0.5.0)
+
+Status: a proposal of 2026-10-23 for the owner's decisions (§24.11, D19). Nothing in this section is binding, and the
+PRD stays unchanged until the owner approves it (plan task NT1).
+
+What it answers:
+* the release table's "notifications (email/Slack webhooks)" (PRD §9): its 0.2.0 row named them, and no FR, design or
+  code ever covered them;
+* the Application owner of PRD §4, whose surface is "notifications via events".
+
+The release is the owner's to choose (owner decision 1), and this section proposes 0.5.0. The plan is
+`superpowers/plans/2026-10-23-notifications.md`.
+
+The proposed models, event kinds, routes, variables and metric stay out of the tables the SDD-reading tests parse
+(§4.3, §9.3, §12, §15.1, §18) until their tasks land, as §22's and §23's did. The facts about SMTP, Slack and signed
+webhooks come from the standards' and the vendors' documentation, read 2026-10-23. A fact only an excerpt showed is
+marked `TODO(LAB): confirm`. What only a real relay or workspace can show is left to the live smoke (§24.10).
+
+### 24.1 What 0.4.0 has
+
+* **Events nobody is told about.** Every change the control plane makes is a persisted event (§4.3). The event is
+  written in the transaction of the change it records (§11), and the event stream (§12) shows it to an open
+  dashboard. Nothing leaves the installation on an event. A person learns that a VM is down, that a cutover waits for
+  an approval or that a migration failed only by looking: at the dashboard, at the Events page or at
+  `seamless events export` (§15).
+* **A reader that resumes.** The bus's subscription (`EventBus.subscribe(since)`, §12) replays from the store the
+  persisted events after a `seq`, then streams the live ones. It gives each event once and in `seq` order, the ones
+  another process wrote included (the CLI, §15). A reader that keeps the last `seq` it handled resumes where it
+  stopped.
+* **What a message can say.**
+  * `migration.downtime_started` carries the stop's time and `migration.downtime_ended` the downtime
+    (`actual_downtime_s`). `migration.phase` carries its `from`, `to` and `reason`.
+  * `migration.data_inconsistent`, `migration.source_running`, `decision.pending_approval`, `plan.*` and `wave.*`
+    each name what they record.
+  * Two facts a message needs are not in the events. One is whether a downtime ended with the VM verified on the
+    destination or with the VM running at the source again: the three places that emit `migration.downtime_ended`
+    differ only in their message. The other is whether a failed migration's source is stopped.
+  * A cutover approval that waits has no event either: the dashboard's Pending approvals derives it from the
+    migration, its plan and the gate's rule 1 (§5.4, §16).
+* **The hooks' webhook machinery** (§7.2, §23.3, `seamless_migrate.hooks`), which a notifier reuses:
+  * an `https://` URL with a host and no user information (`Hook`'s check, §4.2);
+  * a secret read from the secret store each time it is used (`read_secret`, §13.3), never stored in the database;
+  * a POST that follows no redirect, the server's certificate verified against the system's CAs, and the answer's body
+    neither logged nor kept;
+  * a failure named by its HTTP status or its kind, never by the exception's text;
+  * a timeout, and `redact()` on what reaches a log (§13.4).
+
+  A notifier must not take over a hook's place in the migration. A hook runs inside a phase, and its failure fails
+  the attempt (§8.2); a notification must never delay or fail a migration.
+* **The audit trail is insert-only** for the application role (Security.md §9.4, §11), so a delivery's state cannot
+  be kept in `events`.
+* **The network.** The OpenShift NetworkPolicy lets the control plane reach port 443 outside the cluster (for a
+  webhook hook's endpoint, §17) and no SMTP port. Compose's `frontend` network does not restrict egress.
+* **Redaction.** `redact()` knows Slack's tokens (`xox…`, §13.4) but not a Slack incoming webhook's URL, whose path is
+  its credential.
+
+### 24.2 Scope
+
+Proposed for 0.5.0, in the order of the plan:
+
+1. A catalog of notification channels that an admin keeps (§24.3): email through the installation's SMTP relay, Slack
+   incoming webhooks, and generic HTTPS webhooks signed with HMAC.
+2. Subscriptions (§24.4): an operator subscribes a channel to a plan and an admin subscribes one to every plan, each
+   for a set of topics.
+3. Five topics over the events of §4.3 (§24.5), with fixed messages. A message carries ids, names, phases, times and
+   the downtime, never a credential, an address or an error's text.
+4. A notifier beside the orchestrator (§24.6): asynchronous, at least once with a dedupe key, in order per channel,
+   with bounded retries, and never in a migration's path. Its audit events are §24.7's.
+5. The dashboard's Notifications page, the plan page's subscriptions and the demo's recording senders (§24.9).
+
+Not in 0.5.0:
+* digests and grouping: a channel gets one message per notified event (owner decision 7);
+* personal subscriptions, where a dashboard user subscribes an address of their own (owner decision 6);
+* Microsoft Teams, other chat services, SMS and paging services: a webhook channel reaches them through a receiver
+  the operator runs, which turns the signed document into the service's call;
+* actions from a message, such as approving a cutover from Slack or by a reply: messages go one way;
+* OAuth 2.0 for SMTP (XOAUTH2), and HTML mail;
+* Prometheus alert rules: §18's metrics already let an operator write them (owner decision 2).
+
+### 24.3 Channels
+
+* **The catalog.** An admin registers channels by name, under the rule of a hook's name (§4.2). Each channel is of one
+  kind:
+  * **`email`** sends one message through the installation's SMTP relay (below) to the channel's recipients. A
+    channel has 1–50 recipients, each an RFC 5322 addr-spec of at most 254 characters, all in `To`: a channel is one
+    audience.
+  * **`slack`** POSTs to one Slack incoming webhook.
+    * Slack fixes the Slack channel, the name and the icon a webhook posts with, so a channel of the catalog is one
+      webhook.
+    * The URL is the credential: Slack's documentation calls it a secret, and Slack revokes one it finds published.
+    * The URL lives only in the channel's secret (below), as the key `url`, and must begin with
+      `https://hooks.slack.com/services/`. The database, the API, events and logs never hold it.
+  * **`webhook`** POSTs a JSON document (§24.5) to the channel's `url`. The URL follows a webhook hook's rule:
+    `https://`, a host and no user information (§4.2).
+    * The request is signed as Standard Webhooks specify. `webhook-id` carries the message's dedupe key (§24.6),
+      `webhook-timestamp` the try's time in Unix seconds, and `webhook-signature` the prefix `v1,` and the base64
+      HMAC-SHA256 of `<id>.<timestamp>.<body>`.
+    * The key is the `signing_key` of the channel's secret: `whsec_` and the base64 of 24 to 64 random bytes.
+    * The receiver compares the signature in constant time, refuses an old timestamp and drops a `webhook-id` it has
+      seen. A changed or replayed body therefore fails, and the key never travels.
+    * Such a receiver is also the way to reach a service 0.5.0 does not speak (§24.2).
+* **Secrets.**
+  * A channel's secret is named after the channel, `notify-{name}`, and the admin never chooses the name. So no
+    channel reads another channel's, a provider's or a hook's secret.
+  * An admin writes the secret through a write-only route, as provider credentials are written (§13.3; owner decision
+    5). An admin may instead create it outside the control plane under that name: as files under
+    `SEAMLESS_SECRETS_DIR`, as a Kubernetes Secret, or as `SEAMLESS_SECRET_NOTIFY_{NAME}_{KEY}` variables.
+  * Names that start with `notify-` become the channels' own. A provider's, a hook's or a DNS target's secret never
+    starts with it, folded as §13.3 folds `provider-`, so writing a channel's secret never replaces theirs.
+  * The secret is read each time a message is sent, so a rotation needs no restart. Deleting a channel deletes the
+    secret the store manages for it, as deleting a provider does (§12).
+* **The SMTP relay** belongs to the installation (owner decision 4). Its environment configures it, as it configures
+  the database and agentmemory (§15.1). The proposed variables are:
+  * `SEAMLESS_SMTP_HOST` and `SEAMLESS_SMTP_FROM`: the relay and the sender's address. While either is unset, an email
+    channel cannot be registered (422), and an existing one's messages fail (`no_relay`).
+  * `SEAMLESS_SMTP_PORT`: `587` by default.
+  * `SEAMLESS_SMTP_SECURITY`: `starttls` (the default) or `tls`, implicit TLS on port 465, which RFC 8314 prefers.
+    * There is no plain-text mode (NFR-06). A relay that offers no STARTTLS fails the message, and the client never
+      falls back.
+    * The relay's certificate is verified against the system's CAs, or against `SEAMLESS_SMTP_CA_FILE` when it is set.
+  * `SEAMLESS_SMTP_SECRET`: the secret (§13.3) whose `username` and `password` the client authenticates with, after
+    TLS only. Unset, the client does not authenticate: the relay admits the control plane by its address.
+
+  The client is the standard library's `smtplib`, running in threads of the notifier's own (§24.6), so 0.5.0 adds no
+  runtime dependency.
+* **Test.** An admin's test sends a fixed message through the channel at once and answers with its outcome. The test
+  is recorded as a delivery is (§24.7).
+* **Proposed routes** (they enter §12 with plan task NT3, and the test route with NT5):
+  * `GET /notifications/channels` and `GET /notifications/channels/{name}` (viewer) list the catalog by name, each
+    channel with its delivery state (`NotificationCursor`, below). Recipients are personal data and a webhook's URL
+    may hold a token (§24.8), so only an admin sees them in full. Any other role sees the number of recipients and the
+    URL's host.
+  * `POST /notifications/channels` (admin) emits `channel.created`. It answers 409 when the name exists, and 422 when
+    any of these holds:
+    * the kind's fields are missing, or another kind's are set;
+    * a recipient is no addr-spec, or there are more than 50;
+    * a webhook's URL is not `https://` or holds user information.
+  * `PATCH /notifications/channels/{name}` (admin) takes any of `description`, `recipients`, `url`, `redact_names` and
+    `enabled`. `name` and `kind` are immutable (422). It emits `channel.updated` with the fields set.
+  * `DELETE /notifications/channels/{name}` (admin) answers 409 while a subscription names the channel, naming each, as
+    the hook catalog refuses (§12). It deletes the channel's cursor and its secret, and emits `channel.deleted`.
+  * `PUT /notifications/channels/{name}/secret` (admin) is write-only: `{"url"}` for Slack, `{"signing_key"}` for a
+    webhook.
+    * It answers 422 for an email channel or for a value outside the rules above, and 503 when the store cannot write
+      the secret (§13.3).
+    * It emits `channel.updated` with `"fields": ["secret"]`, never a value.
+  * `POST /notifications/channels/{name}/test` (admin) answers `{"outcome": "sent"|"failed", "reason"}` after one try
+    within the timeouts of §24.6. It answers 409 for a disabled channel.
+
+```text
+NotificationChannel { name: str (regex ^[a-z0-9][a-z0-9-]{1,62}$),   # the catalog's key, which subscriptions name
+                      kind: "email"|"slack"|"webhook", description: str|null = null,
+                      recipients: list[str] = [],   # email: 1-50 addresses (required); else none
+                      url: str|null = null,         # webhook: an https:// URL without user information (required);
+                                                    # else none
+                      redact_names: bool = false,   # its messages name the VM, the plan and the wave by their ids
+                                                    # (owner decision 8)
+                      enabled: bool = true,         # false: its cursor follows the events and it sends nothing
+                      created_at: datetime, updated_at: datetime }   # server-owned; its secret is notify-{name}
+
+NotificationSubscription { id: str ("sub-<8 hex>"), channel: str,
+                           plan_id: str|null,   # null: every plan (admin)
+                           topics: list[NotifyTopic] = ["approval", "downtime", "problem"],
+                           created_by: str, created_at: datetime }
+
+NotifyTopic = approval | downtime | problem | outcome | progress   (§24.5)
+
+NotificationCursor { channel: str, seq: int,   # the last event the channel handled (§24.6)
+                     last_outcome: "sent"|"failed"|null, last_outcome_at: datetime|null,
+                     last_reason: str|null, failures_in_a_row: int = 0 }
+```
+
+The document kinds `notification_channel` (its id is its name), `notification_subscription` and `notification_cursor`
+(its id is the channel's name) join §11's.
+
+### 24.4 Subscriptions and roles
+
+A subscription names a channel, a plan or every plan, and its topics. The default topics are `approval`, `downtime`
+and `problem` (§24.5, owner decision 7). The roles (§13.2):
+
+| Action | Role |
+|---|---|
+| read the catalog and the subscriptions | viewer |
+| register, edit, enable, disable and delete a channel; write its secret; send its test | admin |
+| subscribe a channel to a plan, and remove that subscription | operator |
+| subscribe a channel to every plan, and remove that subscription | admin |
+
+* **The catalog belongs to an admin**, as the hook catalog does (§23.3): a channel decides where the installation's
+  data goes (§24.8). An operator, the role that edits plans (§12), routes a plan's events to a channel already in the
+  catalog.
+* **A subscription is not a field of the plan.**
+  * Adding or removing one leaves the plan's status as it is, and is allowed at any time. `PATCH /plans/{id}`, by
+    contrast, returns a plan to `draft` and is refused while a migration is in flight (§12).
+  * An operator who asks for every plan gets 403 and an `auth.denied`, as for an approver-only plan field (§13.1).
+* **Once per channel.** Two subscriptions of one channel can match the same event: a plan's and an every-plan one. The
+  channel then sends that event once, for the union of their topics.
+* **Personal subscriptions are not in 0.5.0** (owner decision 6):
+  * a dashboard user has no address (§13.1), and a bootstrap token cannot carry one;
+  * an address a user sets without verification would send the installation's data wherever it points;
+  * an email channel that holds a team's distribution list reaches an application owner who has no dashboard account.
+* **Proposed routes** (they enter §12 with plan task NT3):
+  * `GET /notifications/subscriptions` (viewer) takes the query `plan_id` and `channel`.
+  * `POST /notifications/subscriptions` (operator; admin for `plan_id` null) takes `{"channel", "plan_id",
+    "topics"?}` and emits `subscription.created`. It answers 422 for an unknown channel or plan, or for an empty or
+    unknown topic, and 409 when the channel already has a subscription to that plan.
+  * `DELETE /notifications/subscriptions/{id}` (operator; admin for an every-plan one) emits `subscription.deleted`.
+
+### 24.5 Notified events and messages
+
+**Topics.**
+
+| Topic | Default | Notified on | Who it is for |
+|---|---|---|---|
+| `approval` | on | a migration that reaches its cutover gate while its plan requires an approval that none gives (`approval.cutover`, `approval.wave`); an advisor decision that waits for approval (`approval.advisor`) | the change approver |
+| `downtime` | on | a source VM stopped (`downtime.started`); its downtime ended, with the VM verified on the destination or running at the source again (`downtime.ended`) | the application owner |
+| `problem` | on | a migration failed (`problem.failed`); its figures do not hold together (`problem.data_inconsistent`, §5.5); a completed migration's source VM runs again (`problem.source_running`, §8.1) | the operator |
+| `outcome` | off | a migration completed and was verified (`outcome.completed`), rolled back (`outcome.rolled_back`) or was finalized (`outcome.finalized`) | the application owner, the operator |
+| `progress` | off | a plan started, paused, completed, was cancelled or was finalized; a wave started or completed (`progress.plan_started` … `progress.wave_completed`) | the architect, the operator |
+
+**Triggers.** A trigger fires on events of §4.3, read when the notifier routes them:
+* `approval.cutover` fires on `migration.phase` to `awaiting_cutover`, on a cutover request (`migration.action`
+  `cutover`) and on a forced cutover (`migration.force_cutover`). It fires only while the plan requires approval and
+  no approval counts (§5.4 rule 1, `counted_approvals`), which is the rule of the dashboard's Pending approvals (§16).
+* `approval.wave` fires on `wave.started`, or on `plan.started` for a plan without waves, under the same condition. It
+  covers the single-shot migrations in `ready` that the wave releases to their gate, in one message that gives their
+  number.
+* `approval.advisor` fires on `decision.pending_approval` (§14.6).
+* `downtime.started` and `downtime.ended` fire on `migration.downtime_started` and `migration.downtime_ended`.
+* `problem.failed` fires on `migration.phase` to `failed`, `problem.data_inconsistent` on
+  `migration.data_inconsistent`, and `problem.source_running` on `migration.source_running`.
+* `outcome.completed`, `outcome.rolled_back` and `outcome.finalized` fire on `migration.phase` to `completed`,
+  `rolled_back` and `finalized`.
+* `progress.*` fires on `plan.started`, `plan.paused`, `plan.completed`, `plan.cancelled`, `plan.finalized`,
+  `wave.started` and `wave.completed`, one trigger per kind.
+
+Two event data additions close the gap of §24.1 (plan task NT4):
+* `migration.downtime_ended` carries `cause`: `verified` (the verification passed) or `source_started` (a rollback
+  started the source again);
+* `migration.phase` to `failed` carries `source_stopped`: whether the downtime clock was open at the failure.
+
+**Messages.** Each message is a title and lines, the same for every kind; only the format differs (below).
+
+| Trigger | Title | Lines |
+|---|---|---|
+| `approval.cutover` | Cutover approval needed: {vm} | {vm} waits at its cutover gate for an approval. Strategy {strategy}; estimated downtime {estimate}; SLO {slo}. When the plan has a window: cutover window {start} to {end}. |
+| `approval.wave` | Cutover approval needed: {n} VMs of {wave} | Wave {wave} started; {n} of its migrations wait at their cutover gate for an approval. |
+| `approval.advisor` | Advisor decision awaits approval: {vm} | The advisor's {decision type} decision for {vm} waits for a person allowed to approve it, and the migration does not start meanwhile (§14.6). |
+| `downtime.started` | {vm} is down for its cutover | The source VM stopped at {at}. Estimated downtime {estimate}; SLO {slo}. |
+| `downtime.ended`, `verified` | {vm} is up on the destination after {downtime} | Verified at {at}. Downtime {downtime}; SLO {slo}: met, or exceeded. |
+| `downtime.ended`, `source_started` | {vm} runs again at the source after {downtime} | The cutover did not complete; the source VM runs again since {at}. |
+| `problem.failed` | {vm} failed in {phase} | The source VM is stopped, and the plan's automatic rollback starts it again; or: the source VM is stopped and waits for a person, who rolls the migration back or retries it; or: the source VM runs. |
+| `problem.data_inconsistent` | {vm}: its migration's figures do not hold together | Its downtime is left out of the statistics until a person reviews it (§5.5). |
+| `problem.source_running` | {vm} runs again at the source after its migration | Seen running at {at}: it writes data the destination no longer receives. Stop it or roll the migration back; finalize refuses meanwhile (§8.1). |
+| `outcome.completed` | {vm} migrated | Verified on the destination at {at}; downtime {downtime}; SLO {slo}. The source VM stays until the migration is finalized. |
+| `outcome.rolled_back` | {vm} rolled back | Its source VM runs, and the destination server was removed. |
+| `outcome.finalized` | {vm} finalized | The migration can no longer be rolled back. |
+| `progress.*` | {plan}: started, paused, completed, cancelled or finalized; {plan}: {wave} started or completed | The counts the event carries: `plan.completed`'s migrations and the ones that succeeded. |
+
+* **The ending.** Every message ends with `Plan {plan} ({plan_id})`, then `migration {migration_id}` when it has one,
+  then a link to the dashboard's page for it.
+  * The page is `/migrations/{id}`, `/advisor/recommendations/{id}` for `approval.advisor`, else `/plans/{id}`.
+  * The link is built on `SEAMLESS_PUBLIC_URL` (proposed: the address people reach the dashboard at). Unset, a message
+    carries no link.
+  * A link carries ids alone, never a token.
+* **The values.**
+  * `{vm}`, `{plan}` and `{wave}` are names cut at 200 characters, or ids on a channel that redacts names (owner
+    decision 8).
+  * Times are in ISO 8601 UTC (§4). Durations are in minutes and seconds.
+  * `{estimate}` is the `downtime_s` of the migration's estimate, and `{slo}` is the plan's `downtime_slo_s` (§4.2).
+* **What a message never holds:**
+  * a credential, a token or a secret;
+  * an address (a fixed or a floating IP, a DNS name) or a hostname;
+  * a provider's name or endpoint;
+  * the text of an error, a phase change's `reason`, a step's or a hook's output, a finding's message, or Jev's or
+    agentmemory's text;
+  * a comment or a reason a person typed, or who acted.
+
+**Formats:**
+* **Email.** Plain text in UTF-8.
+  * `Subject: [Seamless] {title}`, with every control character of a name replaced by a space. Before 3.11.10 and
+    3.12.5, Python's `email` package did not quote a newline in a header it wrote (CVE-2024-6923).
+  * `From` is `SEAMLESS_SMTP_FROM`, `To` the channel's recipients, and `Message-ID` `<{key}@{the sender's domain}>`.
+  * `Auto-Submitted: auto-generated` tells responders not to answer (RFC 3834).
+* **Slack.** `{"text": title, "blocks": […], "unfurl_links": false, "unfurl_media": false}`.
+  * The blocks are a header block with the title (at most 150 characters, Slack's limit), a section with the lines,
+    and a context block with the ids and the link.
+  * Every value has `&`, `<` and `>` escaped (`&amp;`, `&lt;`, `&gt;`), so a name can neither mention a channel
+    (`<!channel>`) nor forge a link.
+  * `text` is what a phone's notification shows.
+  * Nothing unfurls, so Slack fetches no page.
+* **Webhook.** The Standard Webhooks payload, `{"type": "{trigger}", "timestamp": "{the event's ts}", "data": {…}}`.
+  Its data holds what the message says, as fields:
+  * the title, the lines and the link;
+  * the topic, and the event's `seq` and `kind`;
+  * the plan's and the wave's id and name;
+  * the migration's id, VM name, strategy and phase;
+  * the downtime, the estimate and the SLO, in seconds.
+
+### 24.6 Delivery
+
+* **The notifier** (`seamless_migrate.notify`, proposed) runs in the server's process beside the orchestrator, and
+  starts and stops with it (§8). The control plane runs one replica (D2), so one notifier sends. The CLI (§15) sends
+  nothing: the server notifies the CLI's events, which it reads from the store (§12).
+* **One cursor per channel, in order.**
+  * Each enabled channel has a cursor: the `seq` of the last event it handled (`NotificationCursor`, §24.3).
+  * The notifier reads the events after the cursor through the bus's subscription (§12). It routes each event through
+    the channel's subscriptions and topics, and sends what matches one message at a time, in `seq` order.
+  * A channel that fails holds back its own messages, never another channel's, and never a step.
+* **Never in a migration's path.**
+  * No step, gate, transition or route waits for the notifier: it reads events after their transaction committed.
+  * HTTP goes through `httpx`'s asynchronous client. SMTP runs in at most two threads of the notifier's own, never in
+    asyncio's default pool, which the store's calls and the GPU reads need (§5.4).
+  * The notifier logs an unexpected error of its own and starts again from the cursors after a backoff, as a
+    migration's driver is relaunched (§8). It never stops the server or the tick.
+* **At least once, with a dedupe key.**
+  * A message's key is `<channel>_<seq>`: the channel and the event that made the message. It holds no `.`, which
+    Standard Webhooks keeps out of an id.
+  * When a message's outcome is known, the cursor moves past its event in the same store transaction that writes the
+    outcome's event (`put_with_event`, §11, §24.7).
+  * So a restart sends again only a message whose outcome was not written, and with the same key: a webhook's
+    `webhook-id`, an email's `Message-ID`. A receiver that keeps the keys it saw drops the copy.
+  * Slack takes no such key, so a Slack channel can show a message twice after a crash in that window.
+  * While events match nothing, the cursor is written at most once a minute. After a restart those events are read
+    again, and nothing is sent for them.
+* **Bounded retries.**
+  * A message is tried at most 5 times over about 5 minutes, with capped exponential backoff and jitter: 10, 20, 40
+    and 80 s before the second to the fifth try, each ±20 %. A `Retry-After` of up to 300 s is honoured.
+  * A try is repeated after a timeout, a connection or TLS error, HTTP 408, 429 or 5xx, or a temporary SMTP 4yz reply
+    (RFC 5321).
+  * The outcome is final at once in these cases:
+    * any other HTTP 4xx;
+    * a 3xx, since no redirect is followed, as a webhook hook follows none;
+    * an SMTP 5yz reply;
+    * a missing secret or relay.
+
+    Slack's `invalid_payload`, `channel_not_found`, `channel_is_archived` and `no_service`, and a webhook's 410, are
+    such answers, and the channel's state shows them.
+  * After the last try, or after a final answer, the message is recorded as failed (§24.7) and the channel goes on to
+    the next.
+* **Pacing.** A channel sends at most one message a second, Slack's limit for a webhook, kept for every kind. A burst,
+  such as a wave's cutovers, waits behind it.
+* **Expiry.** A message whose event is more than an hour old when its turn comes is not sent (owner decision 9). After
+  an outage of the channel or of the control plane, "web-01 is down" an hour late would mislead. The channel records
+  a run of expired messages as one `notification.failed`, with the reason `expired`, their number and their first and
+  last `seq`.
+* **New and disabled channels.** A new channel starts at its own `channel.created` event, so it never receives the
+  history. A disabled channel's cursor follows the events, and nothing is queued for it.
+* **Timeouts.** An HTTP request has 15 s (Standard Webhooks recommends 15 to 30 s), and an SMTP session 30 s.
+* **A partly refused email.** When the relay accepts some recipients and refuses others, the message counts as sent.
+  Its event gives the number refused, never their addresses.
+
+### 24.7 Audit events
+
+These kinds are proposed. Each enters §4.3, `events.py` and the dashboard's `PERSISTED_EVENT_KINDS` together, with
+its plan task, since one test reads all three (`test_event_kinds_match_sdd_4_3_and_the_dashboard`).
+
+* **`channel.created`, `channel.updated` and `channel.deleted`** (NT3) carry the channel's `name` and `kind`.
+  * `channel.updated` also carries the fields it set (`fields`), with `secret` among them when the secret was written.
+  * `channel.deleted` names a secret the store could not remove (`secret_left`), as `provider.deleted` does.
+  * None of them carries a URL, a recipient or a secret's value.
+* **`subscription.created` and `subscription.deleted`** (NT3) carry the subscription's id, its channel, its plan (null
+  for every plan) and its topics.
+* **`notification.sent` and `notification.failed`** (NT5) are written once per message, never once per try.
+  * Their `plan_id` and `migration_id` are the notified event's, and their message is the title and the channel.
+  * Their data is `{"channel", "kind", "trigger", "event_seq", "key", "tries", "reason", "refused"}`. `reason` names a
+    failure by an HTTP status, an SMTP reply code, the failure's kind or `expired`, and `refused` counts an email's
+    refused recipients.
+  * They never carry the URL, a recipient, the body or the answer.
+  * A test message is recorded with the trigger `test`.
+
+Each change to the catalog or to the subscriptions has its event, with the principal as actor (§13.2). Neither the
+notification events nor the catalog's are ever notified. The metric `seamless_notifications_total{kind,outcome}`,
+with `outcome` `sent` or `failed`, joins §18 with plan task NT5, so that a failing channel can be alerted on.
+
+### 24.8 Data that leaves the installation
+
+| Channel kind | Sent to | Sent | Never sent |
+|---|---|---|---|
+| `email` | the installation's SMTP relay, then the recipients' mail systems | the title and the lines of §24.5: VM, plan and wave names (ids when the channel redacts names), migration, plan and wave ids, the strategy, the phase, times, the downtime, the estimate, the SLO, counts, the dashboard link; the sender's and the recipients' addresses | credentials, tokens and secrets; IP addresses, DNS names and hostnames; provider names and endpoints; the text of errors and output; findings' messages; console output; what people typed; who acted |
+| `slack` | Slack's service, outside the organization | the same | the same; the webhook's URL serves as the request's address and nothing else |
+| `webhook` | the receiver at the channel's URL | the same, as JSON fields, with the event's `seq` and `kind` and the key | the same; the signing key, since only the signature travels |
+
+* **Names are untrusted text.** The source's tenants and the operators wrote them (Security.md TB8). They are escaped
+  for Slack, made safe in an email's subject and sent as JSON strings to a webhook; nothing interprets them.
+* **A channel may send ids instead of names** (`redact_names`, owner decision 8): a channel outside the organization
+  whose VM and plan names are confidential.
+* **Recipients are personal data.** The API shows them to an admin alone (§24.3), no event names one, and an erasure
+  request reaches them (MEMORY.md §5, plan task NT11).
+* Nothing of a notification reaches Jev or agentmemory (§13.4).
+* `redact()` learns Slack incoming webhook URLs (`hooks.slack.com/services/…`), so one in an error or a log line is
+  removed (§13.4, plan task NT7).
+* The NetworkPolicy gains egress to the relay's port, 587 or 465, beside 443 (§17, plan task NT6).
+
+### 24.9 Dashboard and demo
+
+* **Notifications** (`/notifications`), a page in the Activity group beside Events:
+  * Every role reads the catalog:
+    * each channel's name, kind and description;
+    * its state: enabled or not, the last outcome with its time and reason, and the failures in a row;
+    * for an admin, its recipients and a webhook's URL; for any other role, their number and the URL's host.
+
+    The page never shows a Slack URL or a signing key: the API does not return them.
+  * An admin manages the channels:
+    * adds one (Name, Kind, Description, and the kind's fields: Recipients, or URL);
+    * edits, enables and disables one;
+    * deletes one through a `ConfirmDialog`; a refusal names the subscriptions;
+    * sets its secret, write-only: the Slack webhook's URL, or a signing key, which the page can generate in the browser
+      and shows once to copy to the receiver;
+    * sends its test, and sees the outcome.
+  * The page lists the every-plan subscriptions, with Add and Remove for an admin.
+  * Any other role is told that changing channels requires the admin role.
+* **The plan page's Notifications panel** lists the plan's subscriptions and the every-plan ones that reach it, each
+  channel with its topics. An operator adds a subscription (a channel of the catalog, its topics with the defaults
+  checked) or removes one.
+* **The Events page** lists the new kinds as it lists any other.
+* **The offline mock** keeps channels and subscriptions as the API does, and sends nothing.
+* **Demo.** In demo mode every sender records instead of sending (owner decision 11).
+  * A message is rendered and recorded as `notification.sent`, and nothing leaves the process, whatever a channel
+    names.
+  * The seeded demo has one channel of each kind, subscribed to its plans. The demo's cutovers show their
+    notifications on the Events page and their state on the Notifications page.
+
+### 24.10 Validation
+
+* **Fakes, never a network outside the test process:**
+  * An SMTP server in the test process: `aiosmtpd`. Python 3.12 removed `smtpd`, and its documentation names aiosmtpd
+    instead.
+    * It runs with STARTTLS and with implicit TLS, on a certificate the test makes, and allows AUTH only after TLS.
+    * It is a dev dependency only: the runtime sends with `smtplib`.
+  * Slack and webhook receivers on `httpx.MockTransport`, as the hook runner's tests use. A second implementation of
+    the Standard Webhooks rule in the test checks the webhook's signature, compared in constant time.
+  * A notifier stopped between a send and the write of its outcome, which sends again with the same key after its
+    restart.
+  * An orchestrator test with a channel that never answers, whose migrations finish as they would without it.
+* **A live smoke before the release** (plan task NT12). Its tests are marked `live` and skipped unless enabled, as
+  `test_live_integrations.py`'s are. They send:
+  * to a Slack workspace's webhook;
+  * to a relay with STARTTLS and to one with implicit TLS (a test mailbox);
+  * to a receiver that verifies with a Standard Webhooks library.
+
+  QASuite §13 records the results with the versions.
+* **The open questions the smoke closes:**
+  * Slack's answer to a burst above one message a second on one webhook (429 and its `Retry-After`);
+  * a relay's answer to 50 recipients in one message;
+  * whether the installation's relay still takes a password. Exchange Online disables basic SMTP AUTH by default at
+    the end of 2026 (Microsoft's notice MC786329, seen in excerpts; `TODO(LAB): confirm`). A tenant there sends
+    through an internal relay, since 0.5.0 has no XOAUTH2.
+
+### 24.11 Owner decisions
+
+Each comes with the default this proposal recommends:
+
+1. **The release: notifications in 0.5.0.**
+   * The 0.2.0 row of PRD §9 named them, and 0.2.0 shipped without them.
+   * 0.4.0 is at its release candidate, and the notifier needs nothing that release still changes.
+   * The other 0.2.0 leftovers (Ceph-direct incremental diff, HA, per-tenant credentials) are separate decisions.
+2. **In the control plane, not alert rules:** this section's notifier rather than Prometheus rules for an
+   Alertmanager.
+   * A VM going down or a cutover waiting for an approval is an event, not a metric's state.
+   * A Compose installation has no Alertmanager.
+   * A message names the VM, the plan and the downtime, which a metric's labels must not carry.
+
+   Rules for those who run Alertmanager can follow, on §18's metrics.
+3. **Channel kinds:** email, Slack and a signed generic webhook. Microsoft Teams and paging services are reached
+   through a webhook receiver.
+4. **The SMTP relay: one per installation**, set by its environment and a secret (§24.3), with the recipients per
+   channel.
+   * Alertmanager and Argo CD likewise keep their SMTP server in the deployment's configuration and the recipients
+     elsewhere, and this keeps a relay's password out of every channel.
+   * TLS is always on (STARTTLS or implicit TLS; NFR-06).
+   * Authentication is a password or none, with no XOAUTH2 in 0.5.0.
+5. **Channel secrets from the dashboard:** a write-only route into the secret store under `notify-{name}`, as provider
+   credentials are written; the same name created outside the control plane works too.
+   * Pasting a Slack URL is how an admin sets one up.
+   * The fixed name keeps a channel from reading or replacing another's secret.
+
+   The alternative is the hook catalog's way: only a secret made outside the control plane, named by the admin.
+6. **Who subscribes:** an admin keeps the catalog; an operator subscribes a channel to a plan at any time; an admin
+   subscribes one to every plan. There are no personal subscriptions in 0.5.0 (§24.4).
+7. **What is sent, and when:** `approval`, `downtime` and `problem` by default, with `outcome` and `progress` opt-in;
+   one message per event, sent at once; no digest in 0.5.0.
+   * An application owner needs the stop and the end of the downtime as they happen, and a digest would delay the
+     one fact that matters.
+   * `outcome` is off because `downtime.ended` already says where the VM runs, so a verified cutover makes one message
+     rather than two.
+   * A plan of hundreds of VMs subscribes its operators to `problem` and `progress` instead.
+8. **Names in messages:** sent by default, with a per-channel switch to ids (`redact_names`).
+   * A message without the VM's name is of little use to the VM's owner.
+   * A channel outside the organization can keep names in the installation, as `SEAMLESS_MEMORY_REDACT_NAMES` keeps
+     them from agentmemory (§13.4).
+9. **Delivery:** at least once with the dedupe key; 5 tries over about 5 minutes; a message dropped once its event is
+   an hour old; one message a second per channel.
+   * Exactly once cannot be had with Slack or SMTP.
+   * Standard Webhooks' days of retries would deliver news of a cutover long after it mattered.
+10. **The audit of deliveries:** a `notification.sent` or a `notification.failed` for each message, rather than
+    failures alone. Whether the approver was told is a change-management question, and the answer costs one event per
+    message.
+11. **The demo never sends:** in demo mode every channel records instead, as the demo's clouds are fakes.
+12. **No Technology Preview label.** The protocols are standards and the fakes cover them. The live smoke (NT12) runs
+    before 0.5.0 ships rather than after, unlike §22's GPU hosts and §23's two clouds.
+
+### 24.12 Contract changes (each binding from its plan task)
+
+| Change | Where | Task |
+|---|---|---|
+| PRD: a goal, FRs from FR-48 (channels, subscriptions, messages, delivery), the Application owner's surface, a journey, the 0.2.0 row as delivered and a 0.5.0 row | PRD | NT1 |
+| the models `NotificationChannel`, `NotificationSubscription`, `NotificationCursor` and `NotifyTopic`, and the triggers; the three document kinds | §4.1, §4.2, §11 | NT2 |
+| the routes of §24.3 and §24.4 with their roles; the `notify-` secret names; `channel.*` and `subscription.*` | §4.3, §12, §13.2, §13.3 | NT3 |
+| the topics, triggers and messages; `SEAMLESS_PUBLIC_URL`; the `cause` of `migration.downtime_ended` and the `source_stopped` of a failure | §4.3, §8 (a section of its own), §15.1 | NT4 |
+| the notifier: cursors, routing, order, retries, pacing, expiry and the dedupe key; the test route; `notification.*`; `seamless_notifications_total` | §4.3, §8, §11, §12, §18 | NT5 |
+| the email sender; the `SEAMLESS_SMTP_*` variables; the NetworkPolicy's SMTP egress | §13.3, §15.1, §17 | NT6 |
+| the Slack sender; `redact()` and Slack webhook URLs | §8, §13.4 | NT7 |
+| the webhook sender: the Standard Webhooks signature, its headers and its document | §8, §13.3 | NT8 |
+| the dashboard: the Notifications page, the plan page's panel, the mock | §16 | NT9 |
+| the demo's recording senders and seeded channels | §7.4, §10 | NT10 |
+| QASuite rows; Security.md (assets, flows, the data that leaves); Operations.md (the relay, Slack, a receiver, the egress); MEMORY.md's erasure bullet | QASuite, Security.md, Operations.md, MEMORY.md | NT11 |
+| the live smoke | QASuite §13 | NT12 |
