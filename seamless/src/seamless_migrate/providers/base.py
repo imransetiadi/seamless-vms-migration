@@ -62,8 +62,9 @@ class DestinationProvider(Protocol):
         """The units the server holds per resource class, summed over its providers; None when
         Placement refuses the read or holds no allocation for it (SDD §22.3, §22.8)."""
 
-    async def console_log(self, server_id: str, lines: int = 200) -> str | None:
-        """The last ``lines`` lines of the server's console; None when it has none."""
+    async def console_log(self, server_id: str, lines: int | None = 200) -> str | None:
+        """The last ``lines`` lines of the server's console, all of it for None - a host key
+        pin's read, never logged (SDD §10, §26.3); None when it has none."""
 
     async def delete_server(self, server_id: str) -> None:
         """Delete the server and wait, within the call's bound, until it is gone."""

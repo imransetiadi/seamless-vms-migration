@@ -979,7 +979,8 @@ class FakeDestinationProvider(_FloatingIPs, _DemoOctavia, _NoKeypairs):
             "flavor": {"name": flavor, "extra_specs": dict(specs)},
         }
 
-    async def console_log(self, server_id: str, lines: int = 200) -> str | None:
+    async def console_log(self, server_id: str, lines: int | None = 200) -> str | None:
+        # no keys block: the demo pins no conversion host (SDD §10 "Host key pins")
         return (
             "[    1.902] EXT4-fs (vda1): mounted filesystem with ordered data mode.\n"
             "[  OK  ] Reached target Multi-User System.\n"

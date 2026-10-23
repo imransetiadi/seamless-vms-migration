@@ -87,6 +87,7 @@ from .domain.models import (
     GpuWait,
     Hook,
     HookPoint,
+    HostKeyPin,
     LbMove,
     Mappings,
     Migration,
@@ -161,6 +162,7 @@ from .planning.probes import suggest_probes
 from .planning.selector import HELD_VOLUMES_REASON, eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
 from .providers.base import ProviderError, VMNotFound
+from .security.host_keys import console_keys, fingerprint
 from .store import AsyncStore, ConflictError, NotFound, Store, VersionedDocuments
 from .verification import VerificationResult, Verifier, review_reason
 
@@ -172,6 +174,8 @@ PROGRESS_MIN_INTERVAL_S = 1.0
 PRESTAGE_RETRY_S = 60.0
 #: a migration.log line is cut to this many characters, after redaction (SDD §4)
 LOG_LINE_CHARS = 2000
+#: the name the executor gives a side's conversion host that has none (SDD §7.2, §10)
+CONVERSION_HOST_NAMES = {"source": "os_migrate_conv_src", "destination": "os_migrate_conv_dst"}
 
 
 def _address(address: str) -> str:
@@ -1008,14 +1012,21 @@ class Orchestrator:
             # versioned write: a provider deleted or edited while the check ran is not re-inserted
             provider, version = await self.db.get_versioned("provider", provider_id, Provider)
             impl = self.providers.get(provider)
+            pinned: Event | None = None
             try:
                 caps = await impl.check()
                 update = {"capabilities": dict(caps), "status": "ok", "status_message": None}
             except ProviderError as exc:
                 update = {"status": "error", "status_message": redact(str(exc))[:500]}
+            if update["status"] == "ok":
+                pinning, pinned = await self._pin_conversion_host(provider, impl, actor)
+                update.update(pinning)
             update["last_checked_at"] = self._now()
             updated = provider.model_copy(update=update)
-            await self.db.put("provider", updated, expected_version=version)
+            if pinned is None:
+                await self.db.put("provider", updated, expected_version=version)
+            else:  # the pin and its event in one transaction (SDD §4.3, §10)
+                await put_and_emit(self.store, self.bus, "provider", updated, version, pinned)
         await self._emit(
             "provider.checked",
             f"provider {provider.id}: {updated.status}",
@@ -1027,6 +1038,69 @@ class Orchestrator:
             },
         )
         return updated
+
+    async def _pin_conversion_host(
+        self, provider: Provider, impl: Any, actor: str
+    ) -> tuple[dict[str, Any], Event | None]:
+        """What a check that answered changes of the provider's conversion host's pin, and the
+        event that announces a new one (SDD §10 "Host key pins", §26.3, §26.4). The host's server
+        is found by its name - the side's as the executor names the host when it has none -, else
+        by its address. Without a pin, its whole console pins what the parser keeps; a pin of that
+        server reads nothing more; a pin of another server is kept, neither used nor replaced, and
+        reported in the status message. Nothing of the console is logged."""
+        host = provider.conversion_host
+        find = getattr(impl, "find_server", None)
+        read = getattr(impl, "console_log", None)
+        if host is None or provider.kind == ProviderKind.vmware or find is None or read is None:
+            return {}, None
+        side = str(provider.role)
+        found_by = host.name or CONVERSION_HOST_NAMES[side]
+        try:
+            server = await find(found_by)
+            by_address = getattr(impl, "server_of_address", None)
+            if server is None and host.address and by_address is not None:
+                found_by, server = host.address, await by_address(host.address)
+            if server is None:
+                return {}, None
+            server = str(server)
+            pin = provider.conversion_host_pin
+            if pin is not None:
+                if pin.server_id == server:
+                    return {}, None
+                return {
+                    "status_message": f"conversion host replaced: {found_by} is now server "
+                    f"{server}; its pin belongs to server {pin.server_id}"
+                }, None
+            keys = console_keys(await read(server, None))
+        except ProviderError as exc:
+            log.warning(
+                "the conversion host of provider %s was not pinned: %s",
+                provider.id,
+                redact(str(exc)),
+            )
+            return {}, None
+        if not keys:
+            log.debug(
+                "the conversion host %s of provider %s: its console shows no host key to pin",
+                server,
+                provider.id,
+            )
+            return {}, None
+        event = new_event(
+            "conversion_host.key_pinned",
+            f"the {side} conversion host {found_by} of provider {provider.id} (server {server}) "
+            "pinned from its console",
+            actor=actor,
+            data={
+                "provider_id": provider.id,
+                "side": side,
+                "server_id": server,
+                "fingerprints": [fingerprint(key) for key in keys],
+                "source": "console",
+            },
+        )
+        pin = HostKeyPin(server_id=server, keys=keys, source="console", pinned_at=self._now())
+        return {"conversion_host_pin": pin}, event
 
     async def _caps(self, provider: Provider, actor: str) -> dict[str, Any]:
         checked = await self.check_provider(provider.id, actor)

@@ -4815,3 +4815,193 @@ async def test_a_destination_reads_its_projects_attached_floating_ips_and_their_
         floating_ips={"limit": -1, "used": 3, "reserved": 0}
     )
     assert (await dst.inventory()).floating_ip_quota is None
+
+
+# --------------------------------------------------------------------------------------------
+# the provider check's host key pin (SDD §10 "Host key pins", §26.3, §26.4; plan task ST2)
+
+
+class ConsoleCloud:
+    """An OpenStack provider for the check's pinning (SDD §10): its check answers, its conversion
+    host's server is found by name or by address, and its console is what the test writes."""
+
+    def __init__(self, console, servers=None, addresses=None):
+        self.console = console
+        self.servers = dict(servers or {})  # name -> server id
+        self.addresses = dict(addresses or {})  # address -> server id
+        self.reads = []  # (server id, lines) of each console read
+
+    async def check(self):
+        return {"admin": True, "compute_microversion": "2.88", "ovn": True}
+
+    async def find_server(self, name):
+        return self.servers.get(name)
+
+    async def server_of_address(self, address):
+        return self.addresses.get(address)
+
+    async def console_log(self, server_id, lines=200):
+        self.reads.append((server_id, lines))
+        return self.console
+
+
+def _host_console(*keys):
+    """A conversion host's console as cloud-init leaves it, with the keys block when keys are
+    given (synthetic, its address in RFC 5737's 192.0.2.0/24)."""
+    block = ["-----BEGIN SSH HOST KEY KEYS-----", *keys, "-----END SSH HOST KEY KEYS-----"]
+    return "\r\n".join(
+        [
+            "ci-info: | eth0 | True | 192.0.2.21 | 255.255.255.0 | global | fa:16:3e:00:00:02 |",
+            *(block if keys else []),
+            "[   24.912007] cloud-init[1203]: Cloud-init v. 23.4 finished",
+            "conv-src login: ",
+        ]
+    )
+
+
+async def test_the_provider_check_pins_a_conversion_host_from_its_console_once(
+    tmp_path, store, caplog
+):
+    """SDD §10, §26.3, §26.8: the check pins a conversion host without a pin from its whole
+    console, once - its server found by name, else, as a VMware destination's host, by address -,
+    with conversion_host.key_pinned in the write; a console without the keys block pins nothing,
+    and the next check reads it again. No line of the console reaches a log."""
+    from seamless_migrate.domain.models import ConversionHostConfig, Provider
+    from seamless_migrate.security.host_keys import fingerprint
+    from tests.key_support import bare, ecdsa_key, fingerprint_of
+    from tests.orch_support import DST_PROVIDER, build_harness
+
+    caplog.set_level(logging.DEBUG)
+    h = build_harness(tmp_path, store, [])
+    keys = [public_key(1, "root@conv-src"), ecdsa_key(2, "root@conv-src")]
+    source = ConsoleCloud(_host_console(), servers={"conv-src": "srv-src-1"})
+    h.orch.providers = NS(get=lambda p: source)
+
+    first = await h.orch.check_provider("src-osp", "alice")
+    assert (first.status, first.conversion_host_pin) == ("ok", None)
+    source.console = _host_console(*keys)
+    pinned = await h.orch.check_provider("src-osp", "alice")
+    pin = pinned.conversion_host_pin
+    assert (pin.server_id, pin.keys, pin.source) == (
+        "srv-src-1",
+        [bare(k) for k in keys],
+        "console",
+    )
+    assert pinned.status == "ok" and pinned.status_message is None
+    again = await h.orch.check_provider("src-osp", "bob")
+    assert again.conversion_host_pin == pin
+    assert (await h.orch.db.get("provider", "src-osp", Provider)).conversion_host_pin == pin
+    # the whole console, once a check has nothing pinned - never again once it has
+    assert source.reads == [("srv-src-1", None), ("srv-src-1", None)]
+    events = [e for e in store.events(since_seq=0) if e.kind == "conversion_host.key_pinned"]
+    assert [(e.actor, e.data) for e in events] == [
+        (
+            "alice",
+            {
+                "provider_id": "src-osp",
+                "side": "source",
+                "server_id": "srv-src-1",
+                "fingerprints": [fingerprint_of(k) for k in keys],
+                "source": "console",
+            },
+        )
+    ]
+    assert [fingerprint(k) for k in keys] == [fingerprint_of(k) for k in keys]
+
+    # a VMware destination's host: no name, found by its address when its side's name is none
+    store.put(
+        "provider",
+        DST_PROVIDER.model_copy(
+            update={"conversion_host": ConversionHostConfig(manage=False, address="192.0.2.30")}
+        ),
+    )
+    destination = ConsoleCloud(
+        _host_console(keys[0]), servers={"conv-dst": "srv-x"}, addresses={"192.0.2.30": "srv-dst-1"}
+    )
+    h.orch.providers = NS(get=lambda p: destination)
+    checked = await h.orch.check_provider("dst-rhoso", "alice")
+    assert checked.conversion_host_pin.server_id == "srv-dst-1"
+    assert destination.reads == [("srv-dst-1", None)]
+    assert events[0].data["side"] == "source"
+    last = [e for e in store.events(since_seq=0) if e.kind == "conversion_host.key_pinned"][-1]
+    assert (last.data["side"], last.data["server_id"]) == ("destination", "srv-dst-1")
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    for line in _host_console(*keys).splitlines():
+        assert line.strip() not in text or not line.strip(), line
+    assert not any(k.split()[1] in text for k in keys)
+
+
+async def test_the_provider_check_reports_a_pin_of_another_server(tmp_path, store):
+    """SDD §10, §26.4, §26.5: a host that resolves to another server than its pin's - deleted and
+    created again - keeps the pin, neither used nor replaced: the new server's console is not read,
+    and the check reports it in its status message, its status ok so validations go on."""
+    from seamless_migrate.domain.models import HostKeyPin, utcnow
+    from tests.key_support import bare
+    from tests.orch_support import SRC_PROVIDER, build_harness
+
+    h = build_harness(tmp_path, store, [])
+    pin = HostKeyPin(
+        server_id="srv-src-1",
+        keys=[bare(public_key(1, "root@conv-src"))],
+        source="console",
+        pinned_at=utcnow(),
+    )
+    store.put("provider", SRC_PROVIDER.model_copy(update={"conversion_host_pin": pin}))
+    cloud = ConsoleCloud(
+        _host_console(public_key(2, "root@conv-src")), servers={"conv-src": "srv-src-2"}
+    )
+    h.orch.providers = NS(get=lambda p: cloud)
+    checked = await h.orch.check_provider("src-osp", "alice")
+    report = (
+        "conversion host replaced: conv-src is now server srv-src-2; "
+        "its pin belongs to server srv-src-1"
+    )
+    assert (checked.status, checked.status_message) == ("ok", report)
+    assert checked.conversion_host_pin == pin
+    assert cloud.reads == []
+    kinds = [e.kind for e in store.events(since_seq=0)]
+    assert "conversion_host.key_pinned" not in kinds
+    [event] = [e for e in store.events(since_seq=0) if e.kind == "provider.checked"]
+    assert event.data == {"provider_id": "src-osp", "status": "ok", "message": report}
+    # the pin's own server again: nothing to report
+    cloud.servers["conv-src"] = "srv-src-1"
+    assert (await h.orch.check_provider("src-osp", "alice")).status_message is None
+
+
+async def test_openstack_reads_a_whole_console_without_logging_it(caplog):
+    """SDD §10, §13.4, §26.3: the pin's read of a whole console is a raw os-getConsoleOutput
+    without length, sent unlogged - keystoneauth would write the guest's text at DEBUG; a refusal
+    or a failure reads no console."""
+    caplog.set_level(logging.DEBUG)
+    conn = fake_conn()
+    sent = []
+    console = "-----BEGIN SSH HOST KEY KEYS-----\nconv-src login: "
+
+    def post(path, **kwargs):
+        sent.append((path, kwargs))
+        return NS(status_code=200, json=lambda: {"output": console})
+
+    conn.compute.post = post
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: conn)
+    assert await provider.console_log("srv/1", None) == console
+    assert sent == [
+        (
+            "/servers/srv%2F1/action",
+            {"json": {"os-getConsoleOutput": {}}, "raise_exc": False, "log": False},
+        )
+    ]
+    conn.compute.post = lambda path, **kwargs: NS(status_code=409, json=lambda: {})
+    assert await provider.console_log("srv-1", None) is None
+
+    def refused(path, **kwargs):
+        raise RuntimeError("connection reset")
+
+    conn.compute.post = refused
+    assert await provider.console_log("srv-1", None) is None
+    # the last lines, as the verification reads them, still come through the SDK
+    assert await provider.console_log("srv-1") == "Booting...\nweb-01 login: "
+    assert "HOST KEY" not in caplog.text

@@ -185,8 +185,14 @@ async def create_provider(
     svc = services(request)
     await refuse_unknown_fields(request, ProviderCreate)
     _check_secret_names(body, {"credentials_secret", "conversion_host"})
+    # the server-owned fields are ignored: the pin is the provider check's alone (SDD §10, §12)
     provider = body.model_copy(
-        update={**_SERVER_OWNED, "credentials_updated_at": None, "conversion_key_updated_at": None}
+        update={
+            **_SERVER_OWNED,
+            "credentials_updated_at": None,
+            "conversion_key_updated_at": None,
+            "conversion_host_pin": None,
+        }
     )
     # the store names a provider's secrets provider-{id} and provider-{id}-ssh: an id that makes
     # them another provider's would overwrite (and on deletion remove) its key (SDD §13.3)

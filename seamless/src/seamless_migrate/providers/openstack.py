@@ -664,7 +664,7 @@ class OpenStackProvider:
     async def server_allocations(self, server_id: str) -> dict[str, int] | None:
         return await self._run(self._server_allocations, server_id)
 
-    async def console_log(self, server_id: str, lines: int = 200) -> str | None:
+    async def console_log(self, server_id: str, lines: int | None = 200) -> str | None:
         return await self._run(self._console_log, server_id, lines)
 
     async def delete_server(self, server_id: str) -> None:
@@ -1134,14 +1134,36 @@ class OpenStackProvider:
             return None
         return units or None
 
-    def _console_log(self, server_id: str, lines: int) -> str | None:
+    def _console_log(self, server_id: str, lines: int | None) -> str | None:
         conn = self._connection()
+        if lines is None:
+            return self._whole_console(conn, server_id)
         try:
             result = conn.compute.get_server_console_output(server_id, length=lines)
         except Exception:
             log.info("console log unavailable for %s", server_id, exc_info=True)
             return None
         output = _attr(result, "output") if result is not None else None
+        return str(output) if output is not None else None
+
+    @staticmethod
+    def _whole_console(conn: Any, server_id: str) -> str | None:
+        """The server's whole console, which a host key pin reads (SDD §10, §26.3): a raw
+        os-getConsoleOutput without ``length``, sent unlogged - keystoneauth writes an answer's body
+        at DEBUG, and the console is the guest's text (§13.4); None when Nova refuses or fails to
+        answer, its failure logged by its status or kind alone."""
+        path = f"/servers/{urllib.parse.quote(server_id, safe='')}/action"
+        try:
+            response = conn.compute.post(
+                path, json={"os-getConsoleOutput": {}}, raise_exc=False, log=False
+            )
+            status = int(response.status_code)
+            output = response.json().get("output") if status == 200 else None
+        except Exception as exc:
+            log.info("console of server %s not read: %s", server_id, type(exc).__name__)
+            return None
+        if status != 200:
+            log.info("console of server %s not read: HTTP %s", server_id, status)
         return str(output) if output is not None else None
 
     def _delete_server(self, server_id: str) -> None:
