@@ -1,5 +1,5 @@
 # Modified by the Seamless Migrate project, 2026.
 gitchangelog==3.0.4
-markdown==3.8.2
-ruamel.yaml==0.18.14
-sphinx-rtd-theme==3.0.2
+markdown==3.11.2
+ruamel.yaml==0.19.1
+sphinx-rtd-theme==3.1.0
