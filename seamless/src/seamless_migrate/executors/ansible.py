@@ -16,11 +16,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 import uuid
 from collections import deque
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,14 @@ from ..planning.networks import (
 )
 from ..providers.base import ProviderError
 from ..providers.vmware import parse_endpoint
+from ..security.host_keys import (
+    SIDE_ALIASES,
+    VMWARE_ALIAS,
+    KnownHost,
+    fingerprint,
+    trusted_keys,
+    write_known_hosts,
+)
 from ..security.secrets import (
     SecretNotFound,
     openstack_cloud_entry,
@@ -66,6 +75,8 @@ from ..security.secrets import (
     write_secret_file,
 )
 from .base import (
+    HostKeys,
+    NoHostKeys,
     PermanentStepError,
     StepContext,
     StepName,
@@ -142,6 +153,29 @@ VMWARE = frozenset({Strategy.vmware_cold, Strategy.vmware_warm})
 WARM_CHUNK_SIZE = 4194304
 WARM_WORKERS = 4
 TRANSIENT = re.compile(r"(?i)timeout|http 503|connection reset")
+#: a conversion host's key, or the link, refused in a run's output (SDD §6.6, §7.2, §26.5): the
+#: collection's two refusals, and ssh's own words - also as Ansible's unreachable message carries
+#: them. Read before TRANSIENT: such a run fails permanently, whatever else its output holds.
+REFUSED = re.compile(
+    r"host key refused: |link refused by the source conversion host|Host key verification failed\."
+    r"|host key is known for \S+ and you have requested strict checking"
+    r"|no matching host key type found"
+)
+#: what a refusal names (SDD §6.6, §7.2): the collection's host key refusal - its side, its alias
+#: and its server when it knew it -, its link refusal - the source host's alias -, and the
+#: inventory name of a host Ansible's ssh could not reach
+_KEY_REFUSAL = re.compile(
+    r"host key refused: the (source|destination) conversion host "
+    r"\(([^,\s)]+)(?:, server (\S+))? at "
+)
+_LINK_REFUSAL = re.compile(r"link refused by the source conversion host \(([^\s)]+) at ")
+_UNREACHABLE = re.compile(r"^fatal: \[([^\]]+)\]: UNREACHABLE! ")
+#: the fingerprint of the key a host offered: as ssh prints it - its line breaks escaped in
+#: Ansible's JSON -, or as the collection's refusal names it
+_OFFERED = re.compile(
+    r"(?:key sent by the remote host is(?:\s|\\[rn])+|presented the \S+ key )"
+    r"(SHA256:[A-Za-z0-9+/]{43})"
+)
 #: Playbook output lines that start the source-stop task (SDD §7.2 downtime clock): the warm
 #: role's "Stop the source server", the cold role's "Perform workload stop …", and the kit's
 #: "Migrate Guest from Vmware using nbdkit <vm>" - kit 2.2.7 has no power-off task, its migrate
@@ -559,8 +593,49 @@ def gpu_mapping_refusal(
 
 
 def classify_failure(output: str) -> type[Exception]:
-    """Transient (retried) when the failure output matches a transient pattern."""
+    """Permanent when the failure output names a refused host key or link, whatever else it holds
+    (SDD §7.2, §26.5); else transient (retried) when it matches a transient pattern."""
+    if REFUSED.search(output):
+        return PermanentStepError
     return TransientStepError if TRANSIENT.search(output[-8000:]) else PermanentStepError
+
+
+@dataclass(frozen=True)
+class _Refusal:
+    """What a failed run's output names of a conversion host it refused (SDD §7.2): each None
+    when the output does not say."""
+
+    #: source or destination
+    side: str | None
+    #: the alias or inventory name the output names it by
+    name: str | None
+    server_id: str | None
+    #: the SHA256 fingerprint of the key the host offered, as ssh prints it
+    offered: str | None
+    #: the link the source host refused, not a host key
+    link: bool = False
+
+
+def refusal_in(output: str) -> _Refusal | None:
+    """What ``output`` names of the conversion host whose key, or link, it refuses (SDD §6.6,
+    §7.2): the collection's refusal, else ssh's own words in Ansible's unreachable message, by
+    the host's inventory name; None when it refuses nothing. Nothing of the output is kept but
+    the side, the names, a server id and a fingerprint."""
+    if not REFUSED.search(output):
+        return None
+    offered = _OFFERED.search(output)
+    fingerprint = offered.group(1) if offered else None
+    key = _KEY_REFUSAL.search(output)
+    if key:
+        return _Refusal(key.group(1), key.group(2), key.group(3), fingerprint)
+    link = _LINK_REFUSAL.search(output)
+    if link:
+        return _Refusal("source", link.group(1), None, None, link=True)
+    for line in output.splitlines():
+        unreachable = _UNREACHABLE.match(line)
+        if unreachable and REFUSED.search(line):
+            return _Refusal(None, unreachable.group(1), None, fingerprint)
+    return _Refusal(None, None, None, fingerprint)
 
 
 def plan_dir(settings: Settings, plan_id: str) -> Path:
@@ -791,24 +866,59 @@ def conversion_key_path(ctx: StepContext) -> Path | None:
     return run_dir(ctx.settings, ctx.plan.id, ctx.migration.id) / CONVERSION_KEY_FILE
 
 
-def build_inventory(ctx: StepContext) -> str:
+#: a pinned key type's host key algorithms where they are not the type's own name: an RSA key
+#: signs with SHA-2, never ssh-rsa, which OpenSSH 8.8 and later disable (SDD §6.5, §26.4)
+_HOST_KEY_ALGORITHMS = {"ssh-rsa": ("rsa-sha2-512", "rsa-sha2-256")}
+
+
+def pinned_ssh_args(known_hosts: Path, alias: str, keys: Sequence[str]) -> str:
+    """The ssh options that check a host's key against the run's ``known_hosts`` alone, under
+    ``alias``, as conv_host_inventory.yml gives an OpenStack conversion host (SDD §6.5, §26.4):
+    strict checking, the alias as HostKeyAlias, and the pinned ``keys``' algorithms, each once in
+    the keys' order - none when nothing is pinned."""
+    algorithms: list[str] = []
+    for key in keys:
+        kind = key.split()[0]
+        algorithms += [a for a in _HOST_KEY_ALGORITHMS.get(kind, (kind,)) if a not in algorithms]
+    options = [
+        "StrictHostKeyChecking=yes",
+        f"UserKnownHostsFile={known_hosts}",
+        "GlobalKnownHostsFile=/dev/null",
+        f"HostKeyAlias={alias}",
+        "CheckHostIP=no",
+        "UpdateHostKeys=no",
+        "VerifyHostKeyDNS=no",
+        "HashKnownHosts=yes",
+        *([f"HostKeyAlgorithms={','.join(algorithms)}"] if algorithms else []),
+        "IdentitiesOnly=yes",
+    ]
+    return " ".join(f"-o {option}" for option in options)
+
+
+def build_inventory(ctx: StepContext, trust: _Trust | None = None) -> str:
     """Inventory: ``migrator`` (local); VMware adds the RHOSO ``conversion_host``.
 
     The host is reached with the ``ssh_key_secret`` key when configured (the kit has no
     prestage step that could generate one), else with the installation's conversion key (SDD
-    §7.2 "Conversion key").
+    §7.2 "Conversion key"). Given the run's ``trust`` - host keys checked -, its key is checked
+    against the run's known_hosts under the group's name, as an OpenStack host's is (SDD §7.2
+    "Conversion host keys", §26.7).
     """
     host = ctx.destination.conversion_host
     if ctx.migration.strategy in VMWARE and host is not None and host.address:
         key = conversion_key_path(ctx) or run_key(ctx.settings, ctx.plan.id)
-        return _inventory(
-            {
-                host.address: {
-                    "ansible_ssh_user": host.ssh_user,
-                    "ansible_ssh_private_key_file": str(key),
-                }
-            }
-        )
+        entry: dict[str, Any] = {
+            "ansible_ssh_user": host.ssh_user,
+            "ansible_ssh_private_key_file": str(key),
+        }
+        if trust is not None:
+            keys = [k for h in trust.hosts if h.alias == VMWARE_ALIAS for k in h.keys]
+            entry["ansible_ssh_common_args"] = pinned_ssh_args(
+                trust.known_hosts, VMWARE_ALIAS, keys
+            )
+            # Ansible puts no StrictHostKeyChecking=no of its own before those options
+            entry["ansible_ssh_host_key_checking"] = True
+        return _inventory({host.address: entry})
     return _inventory()
 
 
@@ -1148,9 +1258,158 @@ class _Playbook:
 @dataclass
 class _RunTrace:
     """What a run's output showed: whether a playbook's source-stop task started - on VMware the
-    kit's migrate task, the only one that writes to a volume (SDD §7.2, review RV34A-02)."""
+    kit's migrate task, the only one that writes to a volume (SDD §7.2, review RV34A-02) - and
+    what a failed playbook's output names of a conversion host it refused (SDD §7.2)."""
 
     stop_task_started: bool = False
+    refusal: _Refusal | None = None
+
+
+#: a run's known_hosts, in its run directory (SDD §7.2 "Conversion host keys", §26.4)
+KNOWN_HOSTS_FILE = "known_hosts"
+#: a run's own ControlPersist directory, in its run directory (SDD §7.2 "Conversion host keys")
+CONTROL_PATH_DIR = "cp"
+#: the role's report of the servers it created and found, in a pre-staging's osm/ (SDD §6.5)
+HOSTS_REPORT = Path("conversion") / "hosts.json"
+#: each side's short name, as the collection's variables name it
+_SIDE_KEY = {"source": "src", "destination": "dst"}
+
+
+def _host_key_file(rdir: Path, side: str) -> Path:
+    """Where the private half of the key a pre-staging injects into a side's conversion host waits
+    for the role (SDD §7.2, §26.3): ``host-key-src.key``, ``host-key-dst.key``."""
+    return rdir / f"host-key-{_SIDE_KEY[side]}.key"
+
+
+def _write_host_key(path: Path) -> str:
+    """An ed25519 host key pair made in memory (SDD §7.2, §26.3): its private half written to
+    ``path`` alone, 0600, in OpenSSH's format with its final newline - a leftover of a run a crash
+    cut short replaced -, its public half returned, ``ssh-ed25519 <base64>``. Nothing of the
+    private half is logged or kept."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+        PublicFormat,
+    )
+
+    key = Ed25519PrivateKey.generate()
+    remove_quietly(path)
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as out:
+        out.write(key.private_bytes(Encoding.PEM, PrivateFormat.OpenSSH, NoEncryption()))
+    os.chmod(path, 0o600)
+    return key.public_key().public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH).decode()
+
+
+def _read_hosts_report(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """The servers the role reported it created and found, each by its side's alias (SDD §6.5):
+    none of either when the run wrote no report, or one that cannot be read - logged by the
+    failure's kind alone."""
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, {}
+    except (OSError, ValueError) as exc:
+        log.warning("the conversion host report %s cannot be read: %s", path, type(exc).__name__)
+        return {}, {}
+
+    def servers(key: str) -> dict[str, str]:
+        listed = report.get(key) if isinstance(report, dict) else None
+        return {
+            str(entry["alias"]): str(entry["id"])
+            for entry in (listed if isinstance(listed, list) else [])
+            if isinstance(entry, dict) and entry.get("alias") and entry.get("id")
+        }
+
+    return servers("created"), servers("found")
+
+
+def _host_label(provider: Provider, side: str) -> str:
+    """What names a side's conversion host when nothing found it: its name, else its address,
+    else its side's alias - the collection's default name (SDD §7.2, §10)."""
+    host = provider.conversion_host
+    if host is None:
+        return SIDE_ALIASES[side]
+    return host.name or host.address or SIDE_ALIASES[side]
+
+
+@dataclass
+class _Host:
+    """A conversion host a run reaches, as the run checks its key (SDD §7.2, §26.4)."""
+
+    #: its provider's role, source or destination
+    side: str
+    #: what ssh checks its key under: its inventory name, os_migrate_conv_src or _dst, or the
+    #: VMware inventory group's, conversion_host
+    alias: str
+    provider: Provider
+    #: what the run found it by - its name, else its address -, or what names it when nothing
+    #: did (SDD §10)
+    name: str
+    #: the server it resolves to; None when it resolves to none, or was not looked up
+    server_id: str | None
+    #: what the run's known_hosts holds for it: its declared keys, else its pin (SDD §10), or the
+    #: key the run injects into a host the role creates
+    known: KnownHost
+    #: a host a pre-staging's role creates: where the private half of its injected key waits
+    private: Path | None = None
+    #: the public half of the key injected into it, once made
+    injected: str | None = None
+    #: the server the role reported it created with that key
+    created: str | None = None
+
+    @property
+    def keys(self) -> list[str]:
+        """The keys the run's known_hosts holds for it, without comments."""
+        return trusted_keys(self.known)
+
+
+@dataclass
+class _Trust:
+    """What a run checks its conversion hosts' keys against, while host keys are checked (SDD
+    §7.2 "Conversion host keys", §26.4): its known_hosts file and the hosts it holds."""
+
+    known_hosts: Path
+    hosts: list[_Host]
+
+    def variables(self) -> dict[str, Any]:
+        """The variables that pin the collection's hosts to the run's file (SDD §6.5), and name
+        the injected keys' private halves to the role - each side's own variable: the role's own
+        name, an extra var, would reach both sides."""
+        out: dict[str, Any] = {"os_migrate_conversion_host_known_hosts": str(self.known_hosts)}
+        for host in self.hosts:
+            if host.private is not None:
+                side = _SIDE_KEY[host.side]
+                out[f"os_migrate_{side}_conversion_host_key_private_path"] = str(host.private)
+        return out
+
+    def secrets(self) -> list[Path]:
+        """The injected keys' private halves, removed after the run whatever its outcome."""
+        return [host.private for host in self.hosts if host.private is not None]
+
+    def named(self, refusal: _Refusal) -> _Host | None:
+        """The host a refusal names (SDD §7.2): by its alias - the collection's message, an
+        inventory name -, else by its side; else a VMware run's one host; else None."""
+        for host in self.hosts:
+            if refusal.name is not None and host.alias == refusal.name:
+                return host
+        for host in self.hosts:
+            if refusal.side is not None and host.side == refusal.side:
+                return host
+        if [host.alias for host in self.hosts] == [VMWARE_ALIAS]:
+            return self.hosts[0]
+        return None
+
+    def write(self) -> None:
+        """The injected keys made, each private half in its file and its public half under its
+        host's alias, then the run's known_hosts, 0600, written whole - all before the run's
+        playbooks (SDD §7.2, §10)."""
+        for host in self.hosts:
+            if host.private is not None:
+                host.injected = _write_host_key(host.private)
+                host.known = KnownHost(host.alias, None, (host.injected,))
+        write_known_hosts(self.known_hosts, [host.known for host in self.hosts])
 
 
 # -- executor -----------------------------------------------------------------------------------
@@ -1184,10 +1443,12 @@ class AnsibleExecutor:
         prestage_flavors: list[str] | None = None,
         prestage_keypairs: list[str] | None = None,
         rekey_conversion_hosts: Mapping[str, Path | str] | None = None,
+        host_keys: HostKeys | None = None,
     ) -> None:
         """Pre-stage the plan's resources, then deploy the conversion hosts - first re-keying
         each side ``rekey_conversion_hosts`` names, logged in to with the earlier plan's key its
-        keypair holds (SDD §7.2 "Conversion key")."""
+        keypair holds (SDD §7.2 "Conversion key"). ``host_keys`` is the orchestrator's book of
+        the run's conversion host keys (SDD §7.2 "Conversion host keys")."""
         if source.kind == ProviderKind.vmware:
             return  # the kit prepares its own conversion host
         rekey = dict(rekey_conversion_hosts or {})
@@ -1231,9 +1492,227 @@ class AnsibleExecutor:
         ):
             if names:
                 variables[key] = [{"regex": "^" + re.escape(name) + "$"} for name in names]
-        await self._execute(
-            pdir, osm, variables, source, destination, _inventory(), playbooks, None, None
-        )
+        book = host_keys or NoHostKeys()
+        trust = None
+        if deploy_conversion_hosts and self.settings.ansible_host_key_checking:
+            # the deploy reaches both conversion hosts: their keys are settled before it, and a
+            # host its role creates gets a key injected (SDD §7.2 "Conversion host keys")
+            hosts = []
+            for side, provider in (("source", source), ("destination", destination)):
+                host = provider.conversion_host
+                managed = host.manage if host is not None else True
+                creates = _host_key_file(pdir, side) if managed else None
+                hosts.append(
+                    await self._host_of(side, provider, SIDE_ALIASES[side], book, creates=creates)
+                )
+            trust = _Trust(pdir / KNOWN_HOSTS_FILE, hosts)
+        injecting = trust is not None and bool(trust.secrets())
+        report = osm / HOSTS_REPORT
+        if injecting:
+            # a run whose role reaches no server task leaves an earlier run's report (SDD §6.5)
+            await asyncio.to_thread(remove_quietly, report)
+        trace = _RunTrace()
+        try:
+            await self._execute(
+                pdir,
+                osm,
+                variables,
+                source,
+                destination,
+                _inventory(),
+                playbooks,
+                None,
+                None,
+                trace=trace,
+                trust=trust,
+            )
+        except BaseException as exc:
+            if injecting:
+                # a server the role created before the failure holds the key: pinned all the same
+                assert trust is not None
+                await outlive_cancel(self._pin_created(trust, report, book))
+            if trust is not None and trace.refusal is not None:
+                refusal = trace.refusal
+                host = await outlive_cancel(self._key_refused(refusal, trust, book))
+                if host is not None and host.created is not None and not refusal.link:
+                    # the server holds the key the run injected unless its image's cloud-init
+                    # left it out (SDD §7.2, §26.3)
+                    raise PermanentStepError(
+                        f"the conversion host {host.name}, created with an injected host key, "
+                        "does not present it: check its image's cloud-init"
+                    ) from exc
+            raise
+        if injecting:
+            assert trust is not None
+            refusal = await self._pin_created(trust, report, book)
+            if refusal is not None:
+                raise PermanentStepError(refusal)
+
+    async def _pin_created(self, trust: _Trust, report: Path, book: HostKeys) -> str | None:
+        """After a pre-staging's run, whatever its outcome (SDD §7.2, §26.3, §26.4): the role's
+        report read, each server it created with the key the run injected is pinned with it
+        through ``book`` - source injected, with conversion_host.key_pinned. A server it found
+        instead does not hold that key and is never pinned with it: the refusal of such a host
+        is returned - a host without a key -, unless the provider's pin is that server's."""
+        created, found = await asyncio.to_thread(_read_hosts_report, report)
+        refusal = None
+        for host in trust.hosts:
+            if host.injected is None:
+                continue
+            if host.alias in created:
+                host.created = created[host.alias]
+                await book.pin_injected(host.provider, host.side, host.created, [host.injected])
+                continue
+            pin = host.provider.conversion_host_pin
+            server = found.get(host.alias)
+            if server is not None and (pin is None or pin.server_id != server) and not refusal:
+                refusal = (
+                    f"host key unknown: no key is pinned or declared for the {host.side} "
+                    f"conversion host {host.name}"
+                )
+        return refusal
+
+    # -- the conversion hosts' keys ----------------------------------------------------------
+    @staticmethod
+    async def _key_refused(refusal: _Refusal, trust: _Trust, book: HostKeys) -> _Host | None:
+        """conversion_host.key_refused through ``book`` for what a run's output refused (SDD §4.3,
+        §7.2): the provider and side of the host it names, the server it names - else the one
+        the host resolved to, or its role created -, the fingerprints the run pinned for it and
+        the one the host offered, each None when the run cannot know it; never a line of the
+        output. The host it names, if any. An event that cannot be written is logged: the run's
+        failure is what the step reports."""
+        host = trust.named(refusal)
+        side = host.side if host is not None else refusal.side
+        server = refusal.server_id
+        if host is not None:
+            server = server or host.server_id or host.created
+        data = {
+            "provider_id": host.provider.id if host is not None else None,
+            "side": side,
+            "server_id": server,
+            "pinned": [fingerprint(key) for key in host.keys] if host is not None else None,
+            "offered": refusal.offered,
+        }
+        what = f"the {side} conversion host" if side else "a conversion host"
+        if host is not None:
+            what += f" of provider {host.provider.id}"
+        if server:
+            what += f" (server {server})"
+        if refusal.link:
+            message = f"{what} refused the run's link"
+        else:
+            message = f"the run refused the host key of {what}"
+        try:
+            await book.refused(message, data)
+        except Exception as exc:  # noqa: BLE001 - the run's own failure is reported
+            log.warning("conversion_host.key_refused was not recorded: %s", type(exc).__name__)
+        return host
+
+    async def _run_trust(self, ctx: StepContext, step: StepName, rdir: Path) -> _Trust | None:
+        """The conversion hosts a run reaches and the keys it checks them against, while
+        SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is on; None while it is off - 0.4.0's runs (SDD §7.2
+        "Conversion host keys", §26.4). An OpenStack run reaches both hosts, a VMware kit run the
+        destination's host of its inventory, under the group's name."""
+        if not self.settings.ansible_host_key_checking:
+            return None
+        if Strategy(ctx.migration.strategy) in VMWARE:
+            host = ctx.destination.conversion_host
+            reached = (
+                [("destination", ctx.destination, VMWARE_ALIAS)]
+                if host is not None and host.address
+                else []
+            )
+        else:
+            reached = [
+                ("source", ctx.source, SIDE_ALIASES["source"]),
+                ("destination", ctx.destination, SIDE_ALIASES["destination"]),
+            ]
+        book = ctx.host_keys or NoHostKeys()
+        rollback = ctx.log if step == StepName.ROLLBACK else None
+        hosts = [
+            await self._host_of(side, provider, alias, book, rollback=rollback)
+            for side, provider, alias in reached
+        ]
+        return _Trust(rdir / KNOWN_HOSTS_FILE, hosts)
+
+    async def _host_of(
+        self,
+        side: str,
+        provider: Provider,
+        alias: str,
+        book: HostKeys,
+        *,
+        rollback: Callable[[str], Awaitable[None]] | None = None,
+        creates: Path | None = None,
+    ) -> _Host:
+        """The side's conversion host as the run checks it (SDD §7.2, §10, §26.4): its declared
+        keys, else the pin of the server it resolves to - looked up as the provider check finds
+        it; a lookup that fails is a transient failure. A host without a pin has its console read
+        once through ``book``, which pins what it shows (§26.8). A host the run then has no key
+        for is refused before any playbook: "host key unknown", or "conversion host replaced"
+        when its pin is another server's (§26.5). Given ``rollback`` - a rollback's log: it must
+        start the source whatever its hosts' keys - nothing is refused or read, and a lookup that
+        fails is logged: the host then resolves to no server, and no pin applies. Given
+        ``creates`` - a pre-staging whose deploy manages the host - the host is looked up by its
+        name alone, as the role looks it up, and one the role will create - no server bears its
+        name - gets a key injected, its private half to wait at ``creates`` (§26.3)."""
+        host = provider.conversion_host
+        declared = tuple(host.ssh_host_keys) if host is not None else ()
+        name = _host_label(provider, side)
+        if declared:
+            return _Host(side, alias, provider, name, None, KnownHost(alias, None, declared))
+        try:
+            if creates is None:
+                name, server = await self._find_conversion_host(provider, side)
+            else:
+                # the role looks its server up by its exact name, and creates it when none bears
+                # it (SDD §6.5)
+                name = (host.name if host is not None else None) or SIDE_ALIASES[side]
+                found = await self.providers.get(provider).find_server(name)
+                if found is None:
+                    known = KnownHost(alias, None)
+                    return _Host(side, alias, provider, name, None, known, private=creates)
+                server = str(found)
+        except ProviderError as exc:
+            failure = f"could not look up the {side} conversion host {name} in {provider.label}"
+            if rollback is None:
+                raise TransientStepError(f"{failure}: {exc}") from exc
+            await rollback(f"{failure} ({exc}): no pin applies to it in this run")
+            server = None
+        if rollback is None and server is not None and provider.conversion_host_pin is None:
+            # a host without a pin: its console, read once, pins what it shows (SDD §26.8)
+            provider = await book.pin_from_console(provider)
+        pin = provider.conversion_host_pin
+        declared = tuple(provider.conversion_host.ssh_host_keys) if provider.conversion_host else ()
+        known = KnownHost(alias, server, declared, pin)
+        checked = _Host(side, alias, provider, name, server, known)
+        if rollback is None and not checked.keys:
+            if pin is not None and server is not None and pin.server_id != server:
+                raise PermanentStepError(
+                    f"conversion host replaced: {name} is now server {server}; its pin belongs "
+                    f"to server {pin.server_id}"
+                )
+            raise PermanentStepError(
+                f"host key unknown: no key is pinned or declared for the {side} conversion host "
+                f"{name}"
+            )
+        return checked
+
+    async def _find_conversion_host(self, provider: Provider, side: str) -> tuple[str, str | None]:
+        """The server the side's conversion host resolves to, as the provider check finds it
+        (SDD §10): by its name - its side's alias when it has none -, else by its address; with
+        what found it, or what names it when nothing did. Raises ProviderError."""
+        host = provider.conversion_host
+        impl = self.providers.get(provider)
+        name = (host.name if host is not None else None) or SIDE_ALIASES[side]
+        server = await impl.find_server(name)
+        if server is not None:
+            return name, str(server)
+        if host is not None and host.address:
+            server = await impl.server_of_address(host.address)
+            if server is not None:
+                return host.address, str(server)
+        return _host_label(provider, side), None
 
     # -- steps ---------------------------------------------------------------------------------
     def _playbooks(
@@ -1282,6 +1761,8 @@ class AnsibleExecutor:
             return await self._vmware_rollback(ctx)
         rdir = run_dir(self.settings, ctx.plan.id, ctx.migration.id)
         osm = rdir / "osm"
+        # the conversion hosts' keys first: nothing of the run happens before them (SDD §7.2)
+        trust = await self._run_trust(ctx, step, rdir)
         reexport = False
         networks: list[dict[str, Any]] | None = None
         # a warm pre-copy or sync run makes no port: what only the cutover's ports would meet is
@@ -1389,19 +1870,23 @@ class AnsibleExecutor:
                 build_vars(step, ctx, network_map),
                 ctx.source,
                 ctx.destination,
-                build_inventory(ctx),
+                build_inventory(ctx, trust),
                 playbooks,
                 ctx,
                 effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings),
                 networks,
                 deferred,
                 trace=trace,
+                trust=trust,
             )
         except BaseException:
             if marked and not trace.stop_task_started:
                 # the kit never reached its migrate task, the only one that writes to a volume:
                 # what this run marked is a completed copy still (SDD §7.2, review RV34A-02)
                 await outlive_cancel(self._mark_copies_back(ctx, marked))
+            if trust is not None and trace.refusal is not None:
+                book = ctx.host_keys or NoHostKeys()
+                await outlive_cancel(self._key_refused(trace.refusal, trust, book))
             raise
         if stop_skipped and strategy == Strategy.cold:
             # the cold role skips every task (the stop included) when the destination already
@@ -2181,9 +2666,11 @@ class AnsibleExecutor:
         deferred: list[str] | None = None,
         *,
         trace: _RunTrace | None = None,
+        trust: _Trust | None = None,
     ) -> bool:
         """Run the playbooks; True when the source-stop task of one of them was skipped. What the
-        output showed is kept in ``trace``."""
+        output showed is kept in ``trace``; ``trust``, while host keys are checked, is what the
+        run checks its conversion hosts' keys against (SDD §7.2)."""
         vars_path = workdir / "vars.yml"
         secrets_path = workdir / "secrets.yml"
         inventory_path = workdir / "inventory.yml"
@@ -2191,9 +2678,23 @@ class AnsibleExecutor:
         cleanup = (secrets_path, osm / "clouds.yaml", workdir / "clouds.yaml")
         if key_path is not None:
             cleanup += (key_path,)
+        control: Path | None = None
+        if trust is not None:
+            variables = {**variables, **trust.variables()}
+            # the injected keys' private halves go with the run, whatever its outcome (SDD §7.2)
+            cleanup += tuple(trust.secrets())
+            # Ansible's ssh masters, named by address and not by alias, of this run alone: an
+            # earlier run's would carry its connections without a check of the key (SDD §7.2)
+            control = workdir / CONTROL_PATH_DIR
 
         def prepare() -> None:
             osm.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if trust is not None:
+                # before any playbook: no ssh of the run meets a host without its keys
+                trust.write()
+            if control is not None:
+                shutil.rmtree(control, ignore_errors=True)
+                control.mkdir(mode=0o700)
             write_secret_file(vars_path, ansible_yaml(variables))
             write_secret_file(inventory_path, inventory)
             secret_vars = build_secret_vars(source, destination, self.settings)
@@ -2209,6 +2710,9 @@ class AnsibleExecutor:
         try:
             await asyncio.to_thread(prepare)
             env = await asyncio.to_thread(self._env)
+            if control is not None:
+                env["ANSIBLE_SSH_CONTROL_PATH_DIR"] = str(control)
+                env.pop("ANSIBLE_SSH_CONTROL_PATH", None)
             for playbook in playbooks:
                 if playbook.name == "export_workloads.yml":
                     # written again once the rewrite of the new export finishes (SDD §7.2)
@@ -2252,6 +2756,8 @@ class AnsibleExecutor:
         finally:
             # synchronous on purpose: runs even when the step task is being cancelled
             remove_quietly(*cleanup)
+            if control is not None:
+                shutil.rmtree(control, ignore_errors=True)
         return stop_skipped
 
     @staticmethod
@@ -2454,6 +2960,9 @@ class AnsibleExecutor:
                     returncode,
                     redact_tail(output, 4000),
                 )
+            if trace is not None:
+                # for the run's conversion_host.key_refused (SDD §7.2)
+                trace.refusal = refusal_in(output)
             raise classify_failure(output)(
                 f"{name} failed (exit {returncode}): {redact_cut(detail, 500)}"
             )

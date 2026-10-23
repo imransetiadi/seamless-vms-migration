@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, TypeVar, runtime_checkable
@@ -24,6 +24,47 @@ class StepName(StrEnum):
     FINALIZE = "finalize"
 
 
+class HostKeys(Protocol):
+    """What a run records of its conversion hosts' keys, through the orchestrator (SDD §7.2
+    "Conversion host keys", §26.4, §26.8)."""
+
+    async def pin_from_console(self, provider: Provider) -> Provider:
+        """The provider once the provider check's path (§10) pinned its conversion host from its
+        console - read once, for a host without a pin -; as it is stored when nothing was
+        pinned."""
+        ...
+
+    async def pin_injected(
+        self, provider: Provider, side: str, server_id: str, keys: Sequence[str]
+    ) -> None:
+        """The server a pre-staging's role created with the key the run injected, pinned with
+        those ``keys`` - source injected - and conversion_host.key_pinned in one transaction
+        (§4.3, §26.3)."""
+        ...
+
+    async def refused(self, message: str, data: Mapping[str, Any]) -> None:
+        """conversion_host.key_refused with ``message`` and ``data`` - the provider, side,
+        server, pinned and offered of a refusal in the run's output -, the run's plan and
+        migration added (§4.3, §7.2)."""
+        ...
+
+
+class NoHostKeys:
+    """The book of a run the orchestrator handed none: it reads no console and records
+    nothing."""
+
+    async def pin_from_console(self, provider: Provider) -> Provider:
+        return provider
+
+    async def pin_injected(
+        self, provider: Provider, side: str, server_id: str, keys: Sequence[str]
+    ) -> None:
+        return None
+
+    async def refused(self, message: str, data: Mapping[str, Any]) -> None:
+        return None
+
+
 @dataclass
 class StepContext:
     plan: Plan
@@ -41,6 +82,9 @@ class StepContext:
     log: Callable[[str], Awaitable[None]]
     #: step options, e.g. ``{"delete_source": True}`` for FINALIZE (extension of SDD §7.1)
     options: dict[str, Any] = field(default_factory=dict)
+    #: what the run records of its conversion hosts' keys: the orchestrator's book of the step's
+    #: plan and migration (SDD §7.2 "Conversion host keys"; extension of SDD §7.1)
+    host_keys: HostKeys | None = None
 
 
 @dataclass

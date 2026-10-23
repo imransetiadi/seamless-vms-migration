@@ -69,6 +69,7 @@ def test_kind_catalog_matches_sdd():
         "provider.checked",
         # the provider check's pin of its conversion host (SDD §4.3, §10, plan task ST2)
         "conversion_host.key_pinned",
+        "conversion_host.key_refused",
         # the hook catalog's changes (SDD §4.3, plan task N3)
         "hook.created",
         "hook.updated",

@@ -8780,6 +8780,50 @@ async def test_a_refused_conversion_key_fails_the_plan_before_the_executor_runs(
     assert "docs/Operations.md §7.1" in error
 
 
+@dataclasses.dataclass
+class _KeyBookRecorder(ScriptedExecutor):
+    """Records the book of the conversion hosts' keys each pre-staging and each step was handed
+    (SDD §7.2 "Conversion host keys")."""
+
+    books: list[tuple] = dataclasses.field(default_factory=list)
+
+    async def prestage(
+        self, plan, source, destination, *, deploy_conversion_hosts=None, host_keys=None
+    ):
+        self.books.append(("prestage", plan.id, None, host_keys))
+        self.prestaged.append(plan.id)
+
+    async def run(self, step, ctx):
+        self.books.append((str(step), ctx.plan.id, ctx.migration.id, ctx.host_keys))
+        return await super().run(step, ctx)
+
+
+async def test_each_pre_staging_and_step_gets_the_book_of_its_conversion_host_keys(tmp_path, store):
+    """SDD §7.2 "Conversion host keys" (plan task ST5): the orchestrator hands each pre-staging and
+    each step's context its book of the conversion hosts' keys, through which the executor pins a
+    host from its console (the provider check's path, §10, §26.8)."""
+    settings = make_settings(tmp_path)
+    executor = _KeyBookRecorder(settings)
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert [entry[:3] for entry in executor.books] == [
+        ("prestage", plan.id, None),
+        ("cutover", plan.id, mid),
+    ]
+    assert all(book is not None for *_, book in executor.books)
+    # the book pins through the provider check's path: a console without a keys block pins
+    # nothing, and the provider is handed back as stored
+    [(*_, book), _] = executor.books
+    source = await h.orch.db.get("provider", "src-osp", Provider)
+    assert await book.pin_from_console(source) == source
+
+
 async def test_verification_review_error_is_logged_not_fatal(tmp_path, store, caplog):
     h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
     await h.orch.validate_plan(plan.id, "alice")

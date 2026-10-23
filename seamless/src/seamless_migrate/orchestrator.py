@@ -178,6 +178,42 @@ LOG_LINE_CHARS = 2000
 CONVERSION_HOST_NAMES = {"source": "os_migrate_conv_src", "destination": "os_migrate_conv_dst"}
 
 
+class _HostKeyBook:
+    """What a run of a plan - a migration's step, or the plan's pre-staging - records of its
+    conversion hosts' keys (SDD §7.2 "Conversion host keys", §26.4, §26.8): each pin with
+    conversion_host.key_pinned in one transaction."""
+
+    def __init__(self, orchestrator: Orchestrator, plan_id: str, migration_id: str | None) -> None:
+        self._orchestrator = orchestrator
+        self.plan_id = plan_id
+        self.migration_id = migration_id
+
+    async def pin_from_console(self, provider: Provider) -> Provider:
+        """The provider once its conversion host, without a pin, was pinned from its console by
+        the provider check's path (§10, §26.8); as stored when nothing was pinned."""
+        return await self._orchestrator._pin_from_console(provider.id)
+
+    async def pin_injected(
+        self, provider: Provider, side: str, server_id: str, keys: Sequence[str]
+    ) -> None:
+        """The server the pre-staging's role created with the key the run injected, pinned with
+        it (§26.3)."""
+        await self._orchestrator._pin_injected(provider.id, side, server_id, keys, self.plan_id)
+
+    async def refused(self, message: str, data: Mapping[str, Any]) -> None:
+        """conversion_host.key_refused (§4.3, §7.2): what the run's output refused, with the
+        run's plan and migration."""
+        ids = {"plan_id": self.plan_id, "migration_id": self.migration_id}
+        await emit(
+            self._orchestrator.store,
+            self._orchestrator.bus,
+            "conversion_host.key_refused",
+            message,
+            **ids,
+            data={**data, **ids},
+        )
+
+
 def _address(address: str) -> str:
     """An address as Neutron writes it (SDD §8.3): canonical, else as given."""
     try:
@@ -1101,6 +1137,64 @@ class Orchestrator:
         )
         pin = HostKeyPin(server_id=server, keys=keys, source="console", pinned_at=self._now())
         return {"conversion_host_pin": pin}, event
+
+    def host_keys(self, plan_id: str, migration_id: str | None = None) -> _HostKeyBook:
+        """The book of the conversion hosts' keys of a run of the plan - a migration's step, or
+        the plan's pre-staging (SDD §7.2 "Conversion host keys")."""
+        return _HostKeyBook(self, plan_id, migration_id)
+
+    async def _pin_from_console(self, provider_id: str) -> Provider:
+        """A run's pin of a conversion host without one (SDD §7.2, §26.8): the provider check's
+        path (§10) - the host's whole console read once, what the parser keeps pinned with
+        conversion_host.key_pinned in one transaction -, under the provider's lock as a check
+        holds it; the provider as stored when it was pinned meanwhile or nothing was pinned."""
+        async with self._lock(f"provider:{provider_id}"):
+            provider, version = await self.db.get_versioned("provider", provider_id, Provider)
+            if provider.conversion_host_pin is not None:
+                return provider
+            pinning, pinned = await self._pin_conversion_host(
+                provider, self.providers.get(provider), "system"
+            )
+            if pinned is None:
+                return provider
+            updated = provider.model_copy(
+                update={"conversion_host_pin": pinning["conversion_host_pin"]}
+            )
+            await put_and_emit(self.store, self.bus, "provider", updated, version, pinned)
+            return updated
+
+    async def _pin_injected(
+        self,
+        provider_id: str,
+        side: str,
+        server_id: str,
+        keys: Sequence[str],
+        plan_id: str | None,
+    ) -> None:
+        """The pin of a server a pre-staging's role created with the key the run injected (SDD
+        §7.2, §26.3, §26.4): its keys, source injected, with conversion_host.key_pinned in one
+        transaction - over any earlier pin, another server's -, under the provider's lock as a
+        check holds it."""
+        async with self._lock(f"provider:{provider_id}"):
+            provider, version = await self.db.get_versioned("provider", provider_id, Provider)
+            pin = HostKeyPin(
+                server_id=server_id, keys=list(keys), source="injected", pinned_at=self._now()
+            )
+            event = new_event(
+                "conversion_host.key_pinned",
+                f"the {side} conversion host of provider {provider_id} (server {server_id}) "
+                "pinned with the host key its pre-staging injected",
+                plan_id=plan_id,
+                data={
+                    "provider_id": provider_id,
+                    "side": side,
+                    "server_id": server_id,
+                    "fingerprints": [fingerprint(key) for key in keys],
+                    "source": "injected",
+                },
+            )
+            updated = provider.model_copy(update={"conversion_host_pin": pin})
+            await put_and_emit(self.store, self.bus, "provider", updated, version, event)
 
     async def _caps(self, provider: Provider, actor: str) -> dict[str, Any]:
         checked = await self.check_provider(provider.id, actor)
@@ -3706,6 +3800,9 @@ class Orchestrator:
                     kwargs["rekey_conversion_hosts"] = await resolve_conversion_key(
                         self.settings, source, destination, self.providers.get
                     )
+                if "host_keys" in params:
+                    # what the pre-staging pins and refuses of its conversion hosts (SDD §7.2)
+                    kwargs["host_keys"] = self.host_keys(plan.id)
                 await executor.prestage(plan, source, destination, **kwargs)
             # SDD §8.3: a keep_address plan reserves its floating IPs' addresses at the destination
             if plan.network_cutover.floating_ips == "keep_address":
@@ -3887,6 +3984,8 @@ class Orchestrator:
             mark_downtime_end=mark_downtime_end,
             log=log_line,
             options=dict(options or {}),
+            # what the step pins and refuses of its conversion hosts (SDD §7.2)
+            host_keys=self.host_keys(plan.id, mid),
         )
 
     async def _on_progress(

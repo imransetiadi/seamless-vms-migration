@@ -287,6 +287,20 @@ describe('applyEventToCache for providers', () => {
     }
   });
 
+  it.each(['conversion_host.key_pinned', 'conversion_host.key_refused'])(
+    'refreshes the providers list on %s - a pin, or a refusal of its key, from a check or a run - and nothing else (SDD §4.3, §26.5, plan task ST5)',
+    (kind) => {
+      const { queryClient, invalidate } = setup();
+      applyEventToCache(
+        queryClient,
+        { ...progressEvent({ provider_id: 'rhosp-dc1', side: 'source' }), seq: 46, kind, migration_id: 'mig-1', plan_id: 'plan-1' },
+        invalidate,
+      );
+      expect(invalidate).toHaveBeenCalledTimes(1);
+      expect(invalidate).toHaveBeenCalledWith(['providers']);
+    },
+  );
+
   it('leaves the inventory alone for a health check', () => {
     const { queryClient, invalidate } = setup();
     applyEventToCache(
