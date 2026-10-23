@@ -126,12 +126,14 @@
     userdata: "{{ conversion_host_user_data if conversion_host_injects_key | bool else omit }}"
   vars:
     # the key file's text as it is, final newline included: OpenSSH reads no private key without
-    # it, and the previous task's ssh-keygen has read this one
+    # it, and the previous task's ssh-keygen has read this one. Built for a server that gets it
+    # alone: ansible-core before 2.19 templates every variable a task's arguments name, the branch
+    # they do not take included, and the file lookup of an empty path fails
     conversion_host_user_data: |-
-      #cloud-config
+      {% if conversion_host_injects_key | bool %}#cloud-config
       {{ {'ssh_deletekeys': true,
           'ssh_keys': {'ed25519_private': lookup('ansible.builtin.file', os_migrate_conversion_host_key_private_path, rstrip=false),
-                       'ed25519_public': conversion_host_key_public.stdout}} | to_nice_yaml(indent=2) }}
+                       'ed25519_public': conversion_host_key_public.stdout}} | to_nice_yaml(indent=2) }}{% endif %}
   # the private half is read here alone, and a module result can carry the user data back - Nova
   # details it to an admin: neither the arguments nor the result are printed (Seamless Migrate SDD 6.5)
   no_log: true
