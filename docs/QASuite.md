@@ -1144,6 +1144,16 @@ PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest t
 PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest tests/unit/test_blocksync.py -v   # the engine alone; it imports through the collection layout
 python3 plugins/module_utils/blocksync.py --help
 
+# the engine on the conversion hosts' own Pythons (SDD §6.2, D7): RHEL 8's platform-python 3.6 and its 3.8 module.
+# pytest 7.0.1 is the last for 3.6, and procps gives the tests' pkill; 60 passed on each, 2026-10-23. CI runs neither.
+for v in 3.6 3.8; do
+  docker --context colima-seamless run --rm -v "$PWD:/src:ro" "python:$v-slim" sh -c '
+    apt-get -qq update && apt-get -qq install -y procps >/dev/null && pip install -q "pytest==7.0.1" &&
+    c=$(mktemp -d) && mkdir -p "$c/ansible_collections/os_migrate" &&
+    ln -s /src "$c/ansible_collections/os_migrate/os_migrate" && cd /src &&
+    PYTHONPATH="$c" PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider tests/unit/test_blocksync.py'
+done
+
 # playbook syntax checks (Tasks A3, A4)
 export ANSIBLE_COLLECTIONS_PATH="$COLL"
 for p in import_workloads import_workloads_precopy import_workloads_cutover rollback_workloads import_from_hypervisor; do
