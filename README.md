@@ -559,9 +559,9 @@ a command fails, you can retry with the same command.
 ### Requirements
 
 - **Ansible**: 2.16.0 or higher
-- **Python**: 3.10 or higher
+- **Python**: 3.11 or higher
 - **Python Dependencies**: See `requirements.txt` for runtime dependencies including:
-  - openstacksdk >= 4.5.0
+  - openstacksdk >= 4.21.0
   - python-openstackclient >= 7.0
   - passlib >= 1.7.4
   - PyYAML >= 6.0.2
