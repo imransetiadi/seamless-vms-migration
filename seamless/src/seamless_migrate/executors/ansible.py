@@ -20,7 +20,7 @@ import signal
 import sys
 import uuid
 from collections import deque
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,6 +57,13 @@ from ..planning.networks import (
 )
 from ..providers.base import ProviderError
 from ..providers.vmware import parse_endpoint
+from ..security.host_keys import (
+    SIDE_ALIASES,
+    VMWARE_ALIAS,
+    KnownHost,
+    trusted_keys,
+    write_known_hosts,
+)
 from ..security.secrets import (
     SecretNotFound,
     openstack_cloud_entry,
@@ -1153,6 +1160,60 @@ class _RunTrace:
     stop_task_started: bool = False
 
 
+#: a run's known_hosts, in its run directory (SDD §7.2 "Conversion host keys", §26.4)
+KNOWN_HOSTS_FILE = "known_hosts"
+
+
+def _host_label(provider: Provider, side: str) -> str:
+    """What names a side's conversion host when nothing found it: its name, else its address,
+    else its side's alias - the collection's default name (SDD §7.2, §10)."""
+    host = provider.conversion_host
+    if host is None:
+        return SIDE_ALIASES[side]
+    return host.name or host.address or SIDE_ALIASES[side]
+
+
+@dataclass
+class _Host:
+    """A conversion host a run reaches, as the run checks its key (SDD §7.2, §26.4)."""
+
+    #: its provider's role, source or destination
+    side: str
+    #: what ssh checks its key under: its inventory name, os_migrate_conv_src or _dst, or the
+    #: VMware inventory group's, conversion_host
+    alias: str
+    provider: Provider
+    #: what the run found it by - its name, else its address -, or what names it when nothing
+    #: did (SDD §10)
+    name: str
+    #: the server it resolves to; None when it resolves to none, or was not looked up
+    server_id: str | None
+    #: what the run's known_hosts holds for it: its declared keys, else its pin (SDD §10)
+    known: KnownHost
+
+    @property
+    def keys(self) -> list[str]:
+        """The keys the run's known_hosts holds for it, without comments."""
+        return trusted_keys(self.known)
+
+
+@dataclass
+class _Trust:
+    """What a run checks its conversion hosts' keys against, while host keys are checked (SDD
+    §7.2 "Conversion host keys", §26.4): its known_hosts file and the hosts it holds."""
+
+    known_hosts: Path
+    hosts: list[_Host]
+
+    def variables(self) -> dict[str, Any]:
+        """The variables that pin the collection's hosts to the run's file (SDD §6.5)."""
+        return {"os_migrate_conversion_host_known_hosts": str(self.known_hosts)}
+
+    def write(self) -> None:
+        """The run's known_hosts, 0600, written whole before its playbooks (SDD §10)."""
+        write_known_hosts(self.known_hosts, [host.known for host in self.hosts])
+
+
 # -- executor -----------------------------------------------------------------------------------
 class AnsibleExecutor:
     name = "ansible"
@@ -1231,9 +1292,99 @@ class AnsibleExecutor:
         ):
             if names:
                 variables[key] = [{"regex": "^" + re.escape(name) + "$"} for name in names]
+        trust = None
+        if deploy_conversion_hosts and self.settings.ansible_host_key_checking:
+            # the deploy reaches both conversion hosts: their keys are settled before it (SDD
+            # §7.2 "Conversion host keys")
+            hosts = [
+                await self._host_of(side, provider, SIDE_ALIASES[side])
+                for side, provider in (("source", source), ("destination", destination))
+            ]
+            trust = _Trust(pdir / KNOWN_HOSTS_FILE, hosts)
         await self._execute(
-            pdir, osm, variables, source, destination, _inventory(), playbooks, None, None
+            pdir,
+            osm,
+            variables,
+            source,
+            destination,
+            _inventory(),
+            playbooks,
+            None,
+            None,
+            trust=trust,
         )
+
+    # -- the conversion hosts' keys ----------------------------------------------------------
+    async def _run_trust(self, ctx: StepContext, step: StepName, rdir: Path) -> _Trust | None:
+        """The conversion hosts a run reaches and the keys it checks them against, while
+        SEAMLESS_ANSIBLE_HOST_KEY_CHECKING is on; None while it is off - 0.4.0's runs (SDD §7.2
+        "Conversion host keys", §26.4). An OpenStack run reaches both hosts, a VMware kit run the
+        destination's host of its inventory, under the group's name."""
+        if not self.settings.ansible_host_key_checking:
+            return None
+        if Strategy(ctx.migration.strategy) in VMWARE:
+            host = ctx.destination.conversion_host
+            reached = (
+                [("destination", ctx.destination, VMWARE_ALIAS)]
+                if host is not None and host.address
+                else []
+            )
+        else:
+            reached = [
+                ("source", ctx.source, SIDE_ALIASES["source"]),
+                ("destination", ctx.destination, SIDE_ALIASES["destination"]),
+            ]
+        rollback = step == StepName.ROLLBACK
+        hosts = [
+            await self._host_of(side, provider, alias, log=ctx.log if rollback else None)
+            for side, provider, alias in reached
+        ]
+        return _Trust(rdir / KNOWN_HOSTS_FILE, hosts)
+
+    async def _host_of(
+        self,
+        side: str,
+        provider: Provider,
+        alias: str,
+        *,
+        log: Callable[[str], Awaitable[None]] | None = None,
+    ) -> _Host:
+        """The side's conversion host as the run checks it (SDD §7.2, §10, §26.4): its declared
+        keys, else the pin of the server it resolves to - looked up as the provider check finds
+        it. A lookup that fails is a transient failure, or, given ``log`` (a rollback, which
+        must start the source whatever its hosts' keys), logged: the host then resolves to no
+        server, and no pin applies."""
+        host = provider.conversion_host
+        declared = tuple(host.ssh_host_keys) if host is not None else ()
+        name = _host_label(provider, side)
+        if declared:
+            return _Host(side, alias, provider, name, None, KnownHost(alias, None, declared))
+        try:
+            name, server = await self._find_conversion_host(provider, side)
+        except ProviderError as exc:
+            failure = f"could not look up the {side} conversion host {name} in {provider.label}"
+            if log is None:
+                raise TransientStepError(f"{failure}: {exc}") from exc
+            await log(f"{failure} ({exc}): no pin applies to it in this run")
+            server = None
+        known = KnownHost(alias, server, pin=provider.conversion_host_pin)
+        return _Host(side, alias, provider, name, server, known)
+
+    async def _find_conversion_host(self, provider: Provider, side: str) -> tuple[str, str | None]:
+        """The server the side's conversion host resolves to, as the provider check finds it
+        (SDD §10): by its name - its side's alias when it has none -, else by its address; with
+        what found it, or what names it when nothing did. Raises ProviderError."""
+        host = provider.conversion_host
+        impl = self.providers.get(provider)
+        name = (host.name if host is not None else None) or SIDE_ALIASES[side]
+        server = await impl.find_server(name)
+        if server is not None:
+            return name, str(server)
+        if host is not None and host.address:
+            server = await impl.server_of_address(host.address)
+            if server is not None:
+                return host.address, str(server)
+        return _host_label(provider, side), None
 
     # -- steps ---------------------------------------------------------------------------------
     def _playbooks(
@@ -1282,6 +1433,8 @@ class AnsibleExecutor:
             return await self._vmware_rollback(ctx)
         rdir = run_dir(self.settings, ctx.plan.id, ctx.migration.id)
         osm = rdir / "osm"
+        # the conversion hosts' keys first: nothing of the run happens before them (SDD §7.2)
+        trust = await self._run_trust(ctx, step, rdir)
         reexport = False
         networks: list[dict[str, Any]] | None = None
         # a warm pre-copy or sync run makes no port: what only the cutover's ports would meet is
@@ -1396,6 +1549,7 @@ class AnsibleExecutor:
                 networks,
                 deferred,
                 trace=trace,
+                trust=trust,
             )
         except BaseException:
             if marked and not trace.stop_task_started:
@@ -2181,9 +2335,11 @@ class AnsibleExecutor:
         deferred: list[str] | None = None,
         *,
         trace: _RunTrace | None = None,
+        trust: _Trust | None = None,
     ) -> bool:
         """Run the playbooks; True when the source-stop task of one of them was skipped. What the
-        output showed is kept in ``trace``."""
+        output showed is kept in ``trace``; ``trust``, while host keys are checked, is what the
+        run checks its conversion hosts' keys against (SDD §7.2)."""
         vars_path = workdir / "vars.yml"
         secrets_path = workdir / "secrets.yml"
         inventory_path = workdir / "inventory.yml"
@@ -2191,9 +2347,14 @@ class AnsibleExecutor:
         cleanup = (secrets_path, osm / "clouds.yaml", workdir / "clouds.yaml")
         if key_path is not None:
             cleanup += (key_path,)
+        if trust is not None:
+            variables = {**variables, **trust.variables()}
 
         def prepare() -> None:
             osm.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if trust is not None:
+                # before any playbook: no ssh of the run meets a host without its keys
+                trust.write()
             write_secret_file(vars_path, ansible_yaml(variables))
             write_secret_file(inventory_path, inventory)
             secret_vars = build_secret_vars(source, destination, self.settings)

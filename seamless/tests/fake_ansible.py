@@ -62,6 +62,13 @@ SCRIPT = textwrap.dedent(
         record["servers"] = [
             (r.get("params") or {{}}).get("name")
             for r in resources if r.get("type") == "openstack.compute.Server"]
+    # what decides how Ansible's ssh checks a host's key and shares its connections (SDD 7.2)
+    record["env"] = {{key: os.environ.get(key) for key in (
+        "ANSIBLE_HOST_KEY_CHECKING", "ANSIBLE_SSH_CONTROL_PATH_DIR", "ANSIBLE_SSH_CONTROL_PATH")}}
+    # the run's known_hosts as the playbook finds it (SDD 7.2, 26.4): None when there is none
+    known_hosts = merged.get("os_migrate_conversion_host_known_hosts")
+    record["known_hosts"] = (
+        Path(known_hosts).read_text() if known_hosts and Path(known_hosts).is_file() else None)
     log = Path(os.environ["ANSIBLE_FAKE_LOG"])
     with log.open("a") as fh:
         fh.write(json.dumps(record) + "\\n")

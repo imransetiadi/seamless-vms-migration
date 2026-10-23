@@ -16,7 +16,14 @@ import yaml
 
 from seamless_migrate.config import Settings, find_repo_root
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy, SyncPassKind
-from seamless_migrate.domain.models import ConversionHostConfig, GpuDevice, Mappings, Nic, utcnow
+from seamless_migrate.domain.models import (
+    ConversionHostConfig,
+    GpuDevice,
+    HostKeyPin,
+    Mappings,
+    Nic,
+    utcnow,
+)
 from seamless_migrate.executors.ansible import (
     CONVERSION_KEY_FILE,
     KIT_PLAYBOOK,
@@ -41,6 +48,8 @@ from seamless_migrate.providers.base import ProviderError
 from tests.executor_support import make_ctx
 from tests.factories import make_migration, make_plan, make_provider, make_vm
 from tests.fake_ansible import install, read_log
+from tests.key_support import bare as bare_key
+from tests.key_support import known_keys, public_key
 
 SRC = make_provider(cloud="src")
 DST = make_provider(
@@ -93,6 +102,11 @@ class FakeImpl:
 
     async def find_server(self, name):
         self.calls.append(("find_server", name))
+        if name in self.registry.lookup_errors:
+            raise ProviderError("servers: HTTP 503")
+        if name in self.registry.servers:
+            # a conversion host's server, by its exact name (SDD §10)
+            return self.registry.servers[name]
         if name in self.registry.existing:
             return f"dst-{name}"
         return f"dst-{name}" if name in self.registry.created() else None
@@ -159,6 +173,8 @@ class FakeImpl:
     async def server_of_address(self, address):
         """The Nova server holding the address (SDD §10): a compute port with it as a fixed IP,
         else the compute port its floating IP is associated with."""
+        if address in self.registry.addresses:
+            return self.registry.addresses[address]
         compute = [
             p
             for p in self.registry.ports
@@ -173,6 +189,11 @@ class FakeImpl:
                     if port["id"] == fip["port_id"]:
                         return port["device_id"]
         return None
+
+    async def console_log(self, server_id, lines=200):
+        """The server's console as the test wrote it, all of it for None (SDD §10)."""
+        self.calls.append(("console_log", server_id, lines))
+        return self.registry.consoles.get(server_id)
 
     async def server_volumes(self, server_id):
         """Nova's record of the volumes attached to the server (SDD §10)."""
@@ -261,6 +282,12 @@ class FakeRegistry:
         self.roles: list[str] | None = None
         # the destination's flavors, {name, vcpus, ram_mb, disk_gb, extra_specs} (SDD §10, §22.3)
         self.flavors: list[dict] = []
+        # the conversion hosts' servers by their names and by their addresses, their consoles by
+        # server id, and the names whose lookup fails (SDD §10, §26.3)
+        self.servers: dict[str, str] = {}
+        self.addresses: dict[str, str] = {}
+        self.consoles: dict[str, str] = {}
+        self.lookup_errors: set[str] = set()
 
     def get(self, provider):
         return FakeImpl(self)
@@ -6010,3 +6037,131 @@ async def test_a_destination_without_network_details_keeps_the_exported_referenc
     [port] = exported_server(env)["params"]["ports"]
     assert port["params"]["fixed_ips_refs"][0]["subnet_ref"]["name"] == "app-subnet"
     assert read_log(env.log)[-1]["playbook"] == "import_workloads.yml"
+
+
+# --------------------------------------------------------------------------------------------
+# the conversion hosts' keys (SDD §7.2 "Conversion host keys", §26.3-§26.5, §26.8; plan task ST5)
+
+
+def check_keys(env, on=True):
+    """SEAMLESS_ANSIBLE_HOST_KEY_CHECKING set for the env's executor and the contexts its tests
+    build from then on (SDD §7.2, §15.1)."""
+    env.settings = env.settings.model_copy(update={"ansible_host_key_checking": on})
+    env.executor = AnsibleExecutor(env.settings, providers=env.registry, poll_s=0.02)
+
+
+def pinned(provider, server_id, *seeds, source="console"):
+    """The provider with its conversion host's pin: the server and the keys of ``seeds`` (SDD
+    §4.2)."""
+    pin = HostKeyPin(
+        server_id=server_id,
+        keys=[bare_key(public_key(seed)) for seed in seeds],
+        source=source,
+        pinned_at=utcnow(),
+    )
+    return provider.model_copy(update={"conversion_host_pin": pin})
+
+
+def declaring(provider, *seeds, **host):
+    """The provider with the keys of ``seeds`` declared for its conversion host (SDD §4.2), and
+    the host's other fields as given."""
+    keys = [public_key(seed, "root@conversion-host") for seed in seeds]
+    config = provider.conversion_host.model_copy(update={"ssh_host_keys": keys, **host})
+    return provider.model_copy(update={"conversion_host": config})
+
+
+def hosted(provider, **host):
+    """The provider with its conversion host's fields as given."""
+    config = provider.conversion_host.model_copy(update=host)
+    return provider.model_copy(update={"conversion_host": config})
+
+
+def plan_dir(env) -> Path:
+    return env.settings.data_dir / "plans" / "plan-00c0ffee"
+
+
+async def test_each_run_writes_known_hosts_from_declared_keys_else_pins(env):
+    """SDD §7.2, §26.4 (plan task ST5): with SEAMLESS_ANSIBLE_HOST_KEY_CHECKING on, every run - a
+    pre-copy, a sync, a cutover, a rollback, a pre-staging - writes known_hosts in its run
+    directory before its playbooks, 0600, each key hashed under its side's alias: a conversion
+    host's declared keys, else the keys of its pin of the server the host resolves to - found by
+    its name, else by its address (§10) -, and names the file in
+    os_migrate_conversion_host_known_hosts."""
+    check_keys(env)
+    env.registry.servers = {"conv-src": "srv-src-1"}
+    env.registry.addresses = {"192.0.2.10": "srv-dst-1"}  # no server is named conv-dst
+    # the source's declared keys win over its pin; the destination runs on its pin
+    source = declaring(pinned(SRC, "srv-src-1", 1), 2)
+    destination = pinned(DST, "srv-dst-1", 3, 4)
+    expected = {
+        "os_migrate_conv_src": [bare_key(public_key(2))],
+        "os_migrate_conv_dst": [bare_key(public_key(3)), bare_key(public_key(4))],
+    }
+
+    def held(text):
+        return {alias: known_keys(text or "", alias) for alias in expected}
+
+    known = run_dir(env) / "known_hosts"
+    seen = 0
+    for step in (StepName.PRECOPY, StepName.SYNC, StepName.CUTOVER, StepName.ROLLBACK):
+        ctx, _ = ctx_for(env, source=source, destination=destination)
+        await env.executor.run(step, ctx)
+        calls = read_log(env.log)[seen:]
+        seen += len(calls)
+        assert calls, step
+        for call in calls:
+            assert call["vars"]["os_migrate_conversion_host_known_hosts"] == str(known), step
+            assert held(call["known_hosts"]) == expected, (step, call["playbook"])
+        assert oct(known.stat().st_mode & 0o777) == "0o600"
+
+    # a pre-staging's run directory is its plan's: an operator's destination host, found by its
+    # address, runs on its pin
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    brought = hosted(destination, manage=False)
+    await env.executor.prestage(plan, source, brought, deploy_conversion_hosts=True)
+    calls = read_log(env.log)[seen:]
+    assert "deploy_conversion_hosts.yml" in [c["playbook"] for c in calls]
+    for call in calls:
+        assert call["vars"]["os_migrate_conversion_host_known_hosts"] == str(
+            plan_dir(env) / "known_hosts"
+        )
+        assert held(call["known_hosts"]) == expected, call["playbook"]
+
+
+async def test_a_run_with_pins_checks_host_keys_in_ansible(env, caplog):
+    """SDD §7.2, §26.4, §26.8 (plan task ST5): with SEAMLESS_ANSIBLE_HOST_KEY_CHECKING on, every
+    playbook of a run runs with ANSIBLE_HOST_KEY_CHECKING=True - else Ansible's own
+    StrictHostKeyChecking=no comes first and wins - and finds the run's known_hosts, holding its
+    hosts' pins, in os_migrate_conversion_host_known_hosts; nothing warns. Off, a run stays
+    0.4.0's: False, no known_hosts file and no variable, and one warning."""
+    logger = "seamless_migrate.executors.ansible"
+
+    def warnings():
+        return [r for r in caplog.records if "host keys are not verified" in r.getMessage()]
+
+    ctx, _ = ctx_for(env)
+    with caplog.at_level(logging.WARNING, logger=logger):
+        await env.executor.run(StepName.PRECOPY, ctx)
+    off = read_log(env.log)
+    assert off and [c["env"]["ANSIBLE_HOST_KEY_CHECKING"] for c in off] == ["False"] * len(off)
+    assert [c for c in off if "os_migrate_conversion_host_known_hosts" in c["vars"]] == []
+    assert not (run_dir(env) / "known_hosts").exists()
+    assert len(warnings()) == 1
+
+    caplog.clear()
+    check_keys(env)
+    env.registry.servers = {"conv-src": "srv-src-1", "conv-dst": "srv-dst-1"}
+    ctx, _ = ctx_for(
+        env, source=pinned(SRC, "srv-src-1", 1), destination=pinned(DST, "srv-dst-1", 2)
+    )
+    with caplog.at_level(logging.WARNING, logger=logger):
+        await env.executor.run(StepName.SYNC, ctx)
+    on = read_log(env.log)[len(off) :]
+    assert on and [c["env"]["ANSIBLE_HOST_KEY_CHECKING"] for c in on] == ["True"] * len(on)
+    for call in on:
+        assert call["vars"]["os_migrate_conversion_host_known_hosts"] == str(
+            run_dir(env) / "known_hosts"
+        )
+        assert known_keys(call["known_hosts"], "os_migrate_conv_src") == [bare_key(public_key(1))]
+        assert known_keys(call["known_hosts"], "os_migrate_conv_dst") == [bare_key(public_key(2))]
+    assert warnings() == []

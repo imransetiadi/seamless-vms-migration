@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import struct
 from pathlib import Path
 
@@ -69,6 +70,27 @@ def fingerprint_of(line: str) -> str:
 def bare(line: str) -> str:
     """A public key line without its comment: its type and its base64 field."""
     return " ".join(line.split()[:2])
+
+
+def known_keys(text: str, alias: str) -> list[str]:
+    """The keys of a known_hosts file's ``text`` that OpenSSH matches ``alias`` against, in the
+    file's order: each ``|1|salt|hash`` entry whose hash is the HMAC-SHA1 of the alias keyed with
+    its salt, or an entry that names the alias (OpenSSH's hostfile.c)."""
+    keys = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        names, key_type, key = line.split()[:3]
+        if names.startswith("|1|"):
+            salt, digest = (base64.b64decode(part) for part in names[3:].split("|"))
+            matched = hmac.compare_digest(
+                hmac.new(salt, alias.encode(), hashlib.sha1).digest(), digest
+            )
+        else:
+            matched = alias in names.split(",")
+        if matched:
+            keys.append(f"{key_type} {key}")
+    return keys
 
 
 def write_pair(private: Path, seed: int, comment: str) -> Path:
