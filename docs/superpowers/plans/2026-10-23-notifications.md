@@ -1,10 +1,9 @@
-# Notifications — implementation plan (2026-10-23, proposal)
+# Notifications — implementation plan (2026-10-23)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or
-> superpowers:executing-plans to implement this plan task by task. **Do not start a task before the owner has
-> decided SDD §24.11**: this plan is a proposal, like §24 itself.
+> superpowers:executing-plans to implement this plan task by task.
 
-**Goal.** The release is 0.5.0 if the owner agrees (owner decision 1). The plan answers PRD §9's 0.2.0 row,
+**Goal.** The release is 0.5.0 (owner decision 1). The plan answers PRD §9's 0.2.0 row,
 "notifications (email/Slack webhooks)", and the Application owner's "notifications via events" (PRD §4):
 - An admin keeps a catalog of channels:
   - email through the installation's SMTP relay;
@@ -19,11 +18,10 @@
 - Fakes test everything. A live smoke against a real workspace, relay and receiver runs before the release (SDD
   §24.10).
 
-**Spec:** SDD §24 and D19. §24 is a proposal until the owner decides §24.11; after that, each item becomes binding when
-its task moves it into the section §24.12 names. The PRD's §4 and §9 change with NT1.
+**Spec:** SDD §24 and D19. Each item becomes binding when its task moves it into the section §24.12 names. The PRD's §4 and §9 change with NT1.
 
-**Decisions:** the twelve of SDD §24.11, each with its proposed default, are the owner's, and D19 records them once
-taken. The research behind the proposal was done on 2026-10-23 from the standards' and the vendors' documentation.
+**Decisions:** the owner took the twelve defaults of SDD §24.11 as written on 2026-10-23 (D19). The research behind the
+design was done on 2026-10-23 from the standards' and the vendors' documentation.
 The pull request that proposes this plan lists the sources.
 
 ## Rules for every task
