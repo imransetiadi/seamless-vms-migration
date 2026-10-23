@@ -5227,7 +5227,7 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D17 | A per-VM GPU flavor (a plan field keyed by source id, as `nic_overrides`) for VMs that share a GPU key but need flavors of different sizes | not in 0.3.0: such VMs go into separate plans (D16) | after the Technology Preview, when users ask for it |
 | D18 | Network cut-over, Octavia and Heat (§23): what 0.4.0 does | decided by the owner 2026-10-21: §23.11's eleven defaults as written - both built-in actions and generic hooks, hooks in an admin's catalog, a failure after the stop following `auto_rollback`, `auto` kept with a new-address warning and the keep-address move opt-in, the source's floating IP disassociated (journaled) during the cutover, Designate and RFC 2136 built in, BGP by verification only, Octavia findings and the member helper as a Technology Preview, Heat findings with `SRC_VM_AUTOSCALED` blocking until acknowledged, the Technology Preview label until LAB-NET passes, `allowed_address_pairs` a finding in 0.4.0 | the LAB-NET cases of §23.10 end the Technology Preview |
 | D19 | Notifications (§24): what 0.5.0 does | decided by the owner 2026-10-23: §24.11's twelve defaults as written | each item binds with its plan task (§24.12); the live smoke NT12 gates 0.5.0 |
-| D20 | Per-tenant credentials (§27): a provider's credential per Keystone project, PRD §9's 0.2.0 item no release delivered | proposed 2026-10-23: §27.11's ten defaults, none taken yet - application credentials on the provider by project id, written by an admin; a plan names one source and one destination project; no fallback to the provider's credential; admin-only steps keep the provider's; a Technology Preview in 0.5.0 | owner decision; the LAB-TC cases of §27.10 end the Technology Preview |
+| D20 | Per-tenant credentials (§27): a provider's credential per Keystone project, PRD §9's 0.2.0 item no release delivered | decided by the owner 2026-10-23: §27.11's ten defaults as written - application credentials on the provider by project id, written by an admin; a plan names one source and one destination project; no fallback to the provider's credential; admin-only steps keep the provider's; a Technology Preview in 0.5.0 | each item binds with its plan task (§27.12); the LAB-TC cases of §27.10 end the Technology Preview |
 
 ## 21. Destination platforms: RHOSO 18.0 and community OpenStack
 
@@ -7320,14 +7320,15 @@ The owner took each default as written on 2026-10-23 (D8):
 | QASuite (S-10, S-11, the NFR-06 row, the LAB-SSH cases); Security.md (§6.3, §6.4, §7.1, SEC-02, SEC-06, SEC-11, C3-01, C3-06, C3-07, R-02); Operations.md (the upgrade, declaring a key, a refused key) | QASuite, Security.md, Operations.md | ST8 |
 | the lab: LAB-SSH01–LAB-SSH08 | QASuite §13 | ST9 |
 
-## 27. Per-tenant credentials (proposed for 0.5.0)
+## 27. Per-tenant credentials (0.5.0, Technology Preview)
 
-Status: a proposal of 2026-10-23 for the owner's decisions (§27.11, D20). Nothing in this section is binding, and the
-PRD stays as it is until the owner decides (plan task TC1).
+Status: proposed 2026-10-23 and decided by the owner the same day (D20): §27.11's defaults as written. Each item
+becomes binding in the section §27.12 names when its plan task lands; until then nothing in this section is binding.
+The PRD follows with plan task TC1. Per-tenant credentials ship as a **Technology Preview** until LAB-TC01–LAB-TC06 pass (§27.10).
 
 What it answers: the 0.2.0 item "per-tenant credentials" of the release table (PRD §9), and PRD §10's assumption
-"Tenant credentials (or admin with role assignment) on both clouds". No FR, design or code covered them, and no release
-delivered them. The release is the owner's to choose (owner decision 1); this section proposes 0.5.0. The plan is
+"Tenant credentials (or admin with role assignment) on both clouds". No FR, design or code covered them, and no
+release delivered them. The owner chose 0.5.0 (owner decision 1). The plan is
 `superpowers/plans/2026-10-23-tenant-credentials.md`. §24 to §26 are left to the proposals of other branches.
 
 The proposed fields, routes, check keys, findings and gate rule stay out of the tables the SDD-reading tests parse
@@ -7585,7 +7586,7 @@ another only where a service lets an admin act by id or on the project's behalf.
 
 ### 27.11 Owner decisions
 
-Each comes with the default this proposal recommends:
+The owner took each default as written on 2026-10-23 (D20):
 
 1. **The release: 0.5.0, as a Technology Preview** until LAB-TC01–LAB-TC06 pass. PRD §9 put per-tenant credentials in
    0.2.0, and no release delivered them. What a cloud's Keystone and policies allow differs per series and per
