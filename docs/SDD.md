@@ -1470,7 +1470,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   keep records, one per attempt, in `.seamless/` (`rollback-kept.<server>.<unique>.json`, below) - one level below
   the guest directories the migration kit creates there, `{run directory}/{VM name}`, so no VM's name is a record's
   (reviews RV32A-08, RV36A-03).
-  Plan-level prestage uses `{data_dir}/plans/{plan_id}/osm/`.
+  Plan-level prestage uses `{data_dir}/plans/{plan_id}/osm/`. The conversion key is the installation's,
+  `{data_dir}/conversion/ssh.key`, and the link key the plan's (below, "Conversion key").
 * Secrets: `secrets.yml` (mode 0600) holds `os_migrate_src_auth`/`os_migrate_dst_auth` (resolved
   from the providers' `cloud` entries, §13.3) and is deleted in a `finally` block together with the
   `clouds.yaml` os-migrate writes into the data dir.
@@ -1845,7 +1846,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   inside the outage defeats that check.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
-  migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
+  migration uses `cold`/`warm` - right after `rekey_conversion_hosts.yml` when the conversion key's resolution (below)
+  names a side to re-key. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
   to the plan: only the flavors of its VMs that have neither a plan mapping nor a same-named destination flavor, and
   are no GPU VM's (§22.4: the GPU type its traits ask for may not exist at the destination), are exported and imported (`os_migrate_flavors_filter`, each name anchored and `re.escape`d), and with none
   the flavor playbooks are skipped — os-migrate's import rewrites the extra specs of a same-named flavor it
@@ -1853,6 +1855,48 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   destination flavors up when it pre-stages. `keypairs` is scoped the same way: only the `key_name`s of the plan's
   VMs that the source credential owns and the destination credential lacks (`os_migrate_keypairs_filter`); with
   none, its playbooks are skipped.
+* **Conversion key** (issue #112). The managed conversion hosts are per provider - found by name - and the
+  `os_migrate_conv` keypair belongs to the credential's user (the collection's default name, which the executor never
+  changes), so a plan meets the hosts and the keypair an earlier plan of the same credentials made. Every OpenStack
+  plan's pre-stagings and runs therefore reach them with **one conversion key per installation**,
+  `{data_dir}/conversion/ssh.key` and `ssh.key.pub` - a directory new with this change, 0700, the private key 0600 -,
+  passed as `os_migrate_conversion_keypair_private_path`; a VMware migration's conversion host without `ssh_key_secret`
+  is reached with it too (`build_inventory`). Until it exists, the runs of a plan that holds a conversion key of its
+  own from an earlier version (`{data_dir}/plans/{plan_id}/osm/conversion/ssh.key`) use that one, so a migration in
+  flight across the upgrade keeps reaching its hosts - after a restart a plan with no `ready` migration is not
+  pre-staged (§8) -; a pre-staging always passes the installation's path. The **link key** stays per plan
+  (`…/osm/conversion/link-ssh.key`): each pre-staging writes its plan's pair to both hosts, and the last one's stands
+  on both.
+
+  Before a pre-staging that deploys conversion hosts, the orchestrator resolves the key
+  (`seamless_migrate.conversion_key`, for an executor whose `prestage` takes `rekey_conversion_hosts`). It reads the
+  public key of the `os_migrate_conv` keypair on each side whose conversion host the deploy manages
+  (`conversion_host.manage`) with `keypair_public_key` (§10) - a read that fails fails the pre-staging (§8) - and
+  compares keys by their type and base64 fields alone, never a comment, with the installation's key and with each
+  plan's (`plans/*/osm/conversion/ssh.key.pub` beside its private key):
+  * **No installation key yet.** One plan's key matches every side that holds the keypair: that plan's pair is
+    copied, never moved, to the installation's path, the private key 0600, and never over a key that exists: one
+    another pre-staging's deploy generated meanwhile stays, and the resolution judges the sides against it instead.
+    No side holds the keypair: nothing is adopted, and the deploy's `generate_keypair.yml` creates the installation
+    key.
+  * **The installation key exists.** A side whose keypair holds it, or holds none (the deploy creates it), needs
+    nothing. A side whose keypair holds a plan's other key is **re-keyed**: the executor gets the sides as
+    `prestage(…, rekey_conversion_hosts={side: that plan's private key})` and runs `rekey_conversion_hosts.yml`
+    before `deploy_conversion_hosts.yml`, with `os_migrate_{side}_conversion_rekey_private_path` for each side. The
+    playbook finds the side's conversion host by name as the deploy does - none found: nothing to do there -, logs in
+    with the old key and appends the installation's public key to its SSH user's `~/.ssh/authorized_keys`.
+    `conv_host_inventory.yml` takes the old key as `os_migrate_conversion_host_inventory_private_path`, a name extra
+    vars never set (default `os_migrate_conversion_keypair_private_path`): extra vars outrank an include's vars and
+    carry the installation's key, as for the per-side user (§6.5). The old key stays authorized,
+    so a migration on the host goes on, and nothing removes it. The deploy then replaces that side's keypair
+    (`os_migrate_{side}_conversion_keypair_state: replace`; the role's keypair task takes
+    `os_migrate_conversion_keypair_state`, default `present`): no host is recreated (`TODO(LAB): confirm` on a
+    cloud).
+  * **Refused**, a permanent failure of the pre-staging before any playbook, so nothing changes on either side: the
+    two sides hold different keys while the installation has none, or a side holds a key that neither the
+    installation's key nor any plan's key on disk matches. The reason names each such provider and the key's SHA256
+    fingerprint, as `ssh-keygen -l` prints it, and points to docs/Operations.md §7.1. An installation key whose
+    public key cannot be read is refused the same way.
 * **Hooks** (`seamless_migrate.hooks`, plan task N4, §23.3): how a catalog hook runs at a migration's point; the points
   that call it are §23.3's (plan task N5).
   * **The context document** a hook gets, never a credential: `{"migration_id", "attempt", "point", "plan_id",
@@ -2978,6 +3022,13 @@ class DestinationProvider(Protocol):
         # the project's floating IP of the address associated with the port; one already there is no error
     async def release_floating_ip(self, address: str) -> None
         # the project's floating IP of the address deleted - its allocation released; none is no error
+
+# an OpenStack provider, source or destination, reads the conversion keypair a pre-staging resolves its key with
+# (§7.2 "Conversion key", issue #112):
+    async def keypair_public_key(self, name: str) -> str | None
+        # the public key of the credential's user's keypair of that name (Nova's GET /os-keypairs/{name}, then its
+        # list, as openstacksdk finds one), None when the user holds none; any other failure is a provider error, never
+        # None. The demo's fakes hold no keypair
 
 # an OpenStack provider, source or destination, reads and changes Octavia pools for the member helper (§8.5, plan
 # task N9) - raw requests, none logged (§13.4), each read under one read's bound; a failure, or a change Octavia
