@@ -83,7 +83,7 @@ def _run(
     codes=None,
     missing=(),
     venv=("3.13", 0),
-    ruff="ruff 0.16.10",
+    ruff="ruff 0.17.2",
     hook=True,
     chromium=True,
     node_modules=True,
@@ -173,7 +173,7 @@ def test_the_doctor_passes_on_a_machine_with_every_pinned_tool(tmp_path):
     assert "may differ" not in proc.stdout
     for text in (
         "Python 3.13",
-        "ruff 0.16.10",
+        "ruff 0.17.2",
         "node 22.23.3",
         "npm 10.9.9",
         "gitleaks 8.30.1",
@@ -190,7 +190,7 @@ def test_the_doctor_passes_on_a_machine_with_every_pinned_tool(tmp_path):
 @pytest.mark.parametrize(
     "rel, old, new, named",
     [
-        (".pre-commit-config.yaml", "rev: v0.16.10", "rev: v0.16.11", "0.16.11"),
+        (".pre-commit-config.yaml", "rev: v0.17.2", "rev: v0.17.3", "0.17.3"),
         (
             "seamless/pyproject.toml",
             'requires-python = ">=3.11"',

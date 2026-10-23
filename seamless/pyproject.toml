@@ -37,7 +37,7 @@ dev = [
   "pytest>=8.2",
   "pytest-asyncio>=0.24",
   "pytest-cov>=5",
-  "ruff>=0.16,<0.17",  # the pre-commit hook pins the same line (one formatter style)
+  "ruff>=0.17,<0.18",  # the pre-commit hook pins the same line (one formatter style)
   "dnspython>=2.6",  # the RFC 2136 swap's tests run a TSIG-checking DNS server (SDD §8.4)
 ]
 # what `make seamless-check` needs to run the collection's unit and playbook tests from this venv
